@@ -723,13 +723,21 @@ the tree's lifetime and those EOF semantics structural guarantees ---
 properties of types and call ordering --- rather than conventions each call
 site re-implements.
 
-#r("builder.exec.fd-keep-set")[
+#r("builder.exec.fd-keep-set+1")[
   Every forked executor process MUST close all inherited file descriptors
   outside its explicit keep set before its first blocking read: the
   intermediate immediately after fork, keeping only the status-pipe write
-  end, the go-pipe read end, and the capture fds; and again down to stdio
-  immediately after forking the sandbox child. A forked process MUST NOT
-  hold a copy of a pipe end whose EOF it (or its supervisor) waits on.
+  end, the go-pipe read end, the placement-socket write end, and the
+  capture fds; and again down to stdio immediately after forking the
+  sandbox child and sending the placement message. A forked process MUST
+  NOT hold a copy of a pipe end whose EOF it (or its supervisor) waits
+  on. The go pipe carries a two-byte gate --- byte 1 releases the
+  intermediate once the parent has attached it to the cgroup, byte 2
+  releases the sandbox child once the parent has placed it in the build
+  sub-cgroup --- so the intermediate MUST keep the read end open across
+  its own gate (the child it forks inherits the live byte-2 gate) and
+  MUST shed its copy in the post-fork sweep, which is what keeps both
+  gates' EOF semantics parent-only.
 ]
 
 The keep-set sweep is what turns go-pipe EOF into a genuine parent-death
@@ -742,7 +750,11 @@ side closes its inherited write end immediately after fork in
 can ever inherit at the keep set, independent of which fds the embedding
 process (rio-builder, a test harness) happens to have open --- a future fd
 added to the worker cannot silently leak into the sandbox or re-break the
-EOF protocols.
+EOF protocols. The placement socket is the keep set's fifth member: the
+intermediate uses it once, between forking the sandbox child and the
+sweep, to hand the parent the child's pid plus a pidfd (`SCM_RIGHTS`) ---
+the recycle-proof principal handle that the sub-cgroup placement and
+every later principal-directed kill consume.
 
 #r("builder.exec.pdeathsig-first")[
   The sandbox child MUST arm its parent-death signal (`PR_SET_PDEATHSIG`
@@ -853,6 +865,39 @@ worker-internal stalled consumer can be silence-killed where it
 previously froze alongside its enforcement --- reaching that state
 requires a worker bug, since the worker's own consumer is structurally
 non-stalling (#rref("builder.relay.log-shed")).
+
+#r("builder.exec.kill-targets-principal")[
+  The executor MUST supervise the build principal --- the sandbox
+  child, the root of the tree that runs tenant code --- as its own
+  kill target, distinct from the relay: the relay MUST hand the parent
+  the principal's pid and pidfd (over the placement socket) before the
+  principal passes its release gate, the parent MUST place the
+  principal in the `build` sub-cgroup before releasing it, and a limit
+  kill issued after placement MUST signal only the principal's kill
+  scope --- the build sub-cgroup and the pidfd --- never the relay.
+  The relay's forwarded exit status is the corroborating evidence for
+  every kill verdict and MUST NOT be destroyable by the executor's own
+  limit-kill machinery.
+]
+
+Three iterations of the same race preceded this rule (071cac1ca's
+mutex, c46da633e's acted-kill narrowing, 890de547f's corroboration
+layer), each correct about the window it named and each leaving the
+next: with kills aimed at the relay, a deadline firing inside the
+[child exit, status forward] window destroyed the only carrier of the
+natural exit and *manufactured its own corroboration* --- the relay's
+death by our SIGKILL was indistinguishable from a killed build, so a
+completed build could still be relabeled `TimedOut`/`Silent`
+(merged_bug_046/074). Supervising the principal makes that window
+unexpressible rather than narrower: the relay is never a target, so it
+always survives to forward what the principal actually did, and the
+forwarded status either corroborates the kill (`128+9`) or convicts it
+of losing the race (anything else). The placement handshake closes the
+bootstrap gap --- no tenant instruction runs before the principal is
+inside its kill scope --- and the pidfd makes the principal handle
+recycle-proof (a pidfd names the process instance, not a reusable
+number) and namespace-correct (the principal is pid 1 of the new PID
+namespace; a pidfd signals it from outside without pid translation).
 
 #r("builder.exec.event-budget")[
   The pending-event queue between the executor's supervision loop and the

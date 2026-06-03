@@ -13,15 +13,28 @@
 //!
 //! ```text
 //! parent (tokio)
-//!   ├─ go pipe ──────────► intermediate: blocks until the parent has
-//!   │                      attached it to the cgroup; EOF = the
+//!   ├─ go pipe ──────────► two-byte gate. Byte 1 → intermediate: the
+//!   │                      parent has attached it to `<cg>`; byte 2 →
+//!   │                      sandbox child: the parent has placed it in
+//!   │                      `<cg>/build`. EOF at either gate = the
 //!   │                      parent died first (abort, do not build)
+//!   ├─ placement sock ◄─── intermediate: the sandbox child's pid plus
+//!   │                      a pidfd (`SCM_RIGHTS`), sent right after
+//!   │                      the fork — the parent's recycle-proof
+//!   │                      handle to the build principal
 //!   ├─ status pipe ◄────── intermediate + sandbox child: 8 bytes on
 //!   │                      setup failure; EOF with 0 bytes when the
 //!   │                      program exec'd (the write end is
 //!   │                      close-on-exec)
 //!   └─ pty master / pipes ◄ the program's stdout/stderr
 //! ```
+//!
+//! The *build principal* is the sandbox child: the root of the tree
+//! that runs tenant code. It lives in the `<cg>/build` sub-cgroup
+//! (created and populated by the parent before the release byte), so
+//! limit kills can target exactly the build — never the intermediate,
+//! which is the executor's own relay and the sole carrier of the
+//! principal's true exit status.
 //!
 //! Each forked process starts by closing every inherited fd outside its
 //! keep set ([`ChildFds`]): the intermediate immediately after fork —
@@ -76,7 +89,7 @@
 //! this contract with `BuildSlot`: one build per pod, busy assignments
 //! rejected, never queued.
 
-use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -424,6 +437,8 @@ pub async fn execute(
     // ---- Pipes and capture fds ------------------------------------------
     let (status_r, status_w) = make_pipe().map_err(spawn_err("create the status pipe"))?;
     let (go_r, go_w) = make_pipe().map_err(spawn_err("create the go pipe"))?;
+    let (placement_r, placement_w) =
+        make_placement_socketpair().map_err(spawn_err("create the placement socket"))?;
     let capture = CaptureFds::new(request, &plan).map_err(ExecError::Spawn)?;
     let (parent_capture, child_capture) = capture.split();
 
@@ -434,6 +449,7 @@ pub async fn execute(
     let owners = ChildFdOwners {
         status_w,
         go_r,
+        placement_w,
         capture: child_capture,
     };
     let child_fds = owners.child_fds();
@@ -531,27 +547,99 @@ pub async fn execute(
     // process tree) must be inside the caller's cgroup before it starts
     // doing accountable work; it blocks on the go pipe until told
     // otherwise. The attach is a single small write to cgroupfs, done
-    // inline rather than through spawn_blocking.
-    if let Some(cgroup) = &request.limits.cgroup
-        && let Err(e) = std::fs::write(
+    // inline rather than through spawn_blocking. The build sub-cgroup
+    // is created first so the placement step below cannot find it
+    // missing: by the time any process exists in `<cg>`, `<cg>/build`
+    // exists too. (No controllers are delegated into it — `<cg>`'s
+    // limits cover both levels hierarchically — so populating `<cg>`
+    // itself stays legal under the no-internal-process rule.)
+    if let Some(cgroup) = &request.limits.cgroup {
+        if let Err(e) = create_build_subcgroup(cgroup) {
+            return Err(sandbox
+                .abort(
+                    e,
+                    "create the build sub-cgroup",
+                    &bind_targets,
+                    &special_targets,
+                )
+                .await);
+        }
+        if let Err(e) = std::fs::write(
             cgroup.join("cgroup.procs"),
             format!("{}\n", intermediate.as_raw()),
-        )
-    {
-        return Err(sandbox
-            .abort(
-                e,
-                "attach the sandbox to the cgroup",
-                &bind_targets,
-                &special_targets,
-            )
-            .await);
+        ) {
+            return Err(sandbox
+                .abort(
+                    e,
+                    "attach the sandbox to the cgroup",
+                    &bind_targets,
+                    &special_targets,
+                )
+                .await);
+        }
     }
     if let Err(e) = nix::unistd::write(&go_w, &[1u8]) {
         return Err(sandbox
             .abort(
                 std::io::Error::from(e),
                 "signal the sandbox to proceed",
+                &bind_targets,
+                &special_targets,
+            )
+            .await);
+    }
+
+    // ---- Principal placement, then the release byte ------------------------
+    // The intermediate forks the sandbox child and hands back its pid
+    // plus a pidfd; the parent moves the child into `<cg>/build` and
+    // stores the pidfd as the kill target. Only then does the release
+    // byte let the child proceed — no tenant instruction ever runs
+    // outside the principal kill scope. The recv is blocking (the
+    // message arrives microseconds after the go byte unless the
+    // intermediate died, which closes the socket and EOFs the recv).
+    // r[impl builder.exec.kill-targets-principal]
+    let (principal_pid, principal_pidfd) =
+        match tokio::task::spawn_blocking(move || recv_placement(placement_r))
+            .await
+            .map_err(|e| ExecError::Spawn(std::io::Error::other(e)))?
+        {
+            Ok(placement) => placement,
+            Err(e) => {
+                return Err(sandbox
+                    .abort(
+                        e,
+                        "receive the build principal placement",
+                        &bind_targets,
+                        &special_targets,
+                    )
+                    .await);
+            }
+        };
+    if let Some(cgroup) = &request.limits.cgroup
+        && let Err(e) = std::fs::write(
+            cgroup.join(BUILD_SUBCGROUP).join("cgroup.procs"),
+            format!("{principal_pid}\n"),
+        )
+        && !placement_attach_tolerable(&e)
+    {
+        // A tolerable failure means the principal already exited (its
+        // status is en route through the relay); anything else means
+        // the kill scope could not be established — do not run.
+        return Err(sandbox
+            .abort(
+                e,
+                "place the build principal in the build sub-cgroup",
+                &bind_targets,
+                &special_targets,
+            )
+            .await);
+    }
+    tree.place_principal(principal_pidfd);
+    if let Err(e) = nix::unistd::write(&go_w, &[1u8]) {
+        return Err(sandbox
+            .abort(
+                std::io::Error::from(e),
+                "release the placed build principal",
                 &bind_targets,
                 &special_targets,
             )
@@ -828,7 +916,7 @@ fn intermediate_main(
     // below would otherwise wait on a write end this very process
     // holds — and it caps what the sandbox child can inherit at the
     // keep set.
-    // r[impl builder.exec.fd-keep-set]
+    // r[impl builder.exec.fd-keep-set+1]
     if let Err(err) = child::shed_inherited_fds(fds) {
         child::report_failure_and_exit(fds.status_pipe_w, &err);
     }
@@ -852,6 +940,17 @@ fn intermediate_main(
             child::report_failure_and_exit(fds.status_pipe_w, &err);
         }
         grandchild => {
+            // Hand the parent its recycle-proof handle to the build
+            // principal — the freshly forked sandbox child — before
+            // shedding anything: pid (host namespace; unshare affects
+            // only our children) plus a pidfd over SCM_RIGHTS. The
+            // child is gated on the release byte, which the parent
+            // sends only after using this message to place it in the
+            // build sub-cgroup.
+            // r[impl builder.exec.kill-targets-principal]
+            if let Err(err) = send_placement(fds.placement_sock_w, grandchild) {
+                child::report_failure_and_exit(fds.status_pipe_w, &err);
+            }
             // This process needs no fds beyond stdio any more: it only
             // waits for the sandbox child and forwards its exit status.
             // One full best-effort sweep (instead of hand-enumerated
@@ -859,8 +958,11 @@ fn intermediate_main(
             // EOF on the parent side tracks the sandbox child alone:
             // the status pipe must EOF the moment the child execs (its
             // copy is close-on-exec), and the pty/pipes must EOF the
-            // moment the child exits, not when this process does.
-            // r[impl builder.exec.fd-keep-set]
+            // moment the child exits, not when this process does —
+            // and the sweep takes this process's copies of the go pipe
+            // and the placement socket with it, which is what keeps
+            // the gated child's EOF semantics parent-only.
+            // r[impl builder.exec.fd-keep-set+1]
             // SAFETY: close_range over a numeric range; this process
             // touches no fd >= 3 after this point.
             unsafe {
@@ -916,6 +1018,12 @@ enum TreePhase {
         /// A dedicated waitpid task owns reaping (the guard's drop
         /// must not blocking-reap).
         reaper_attached: bool,
+        /// The build principal's pidfd, present from the placement
+        /// handshake on: the recycle-proof handle that lets kills
+        /// target the sandbox child directly instead of the relay.
+        /// `None` before placement (no tenant instruction has run
+        /// yet — the child is gated on the release byte).
+        principal: Option<OwnedFd>,
     },
     /// The tree has been reaped. The pid may be recycled: nothing may
     /// ever signal it again.
@@ -982,6 +1090,7 @@ impl TreeState {
                     pid,
                     killed: false,
                     reaper_attached: false,
+                    principal: None,
                 };
                 Ok(())
             }
@@ -1020,6 +1129,34 @@ impl TreeState {
     /// nothing may ever signal it again.
     fn mark_reaped(&self) {
         *self.lock() = TreePhase::Reaped;
+    }
+
+    /// Store the build principal's pidfd received from the placement
+    /// handshake. From here on, kills can target the principal
+    /// directly.
+    ///
+    /// If a kill (or the guard's drop) already acted by the time
+    /// placement completes, the tree-level kill covered the principal
+    /// — it was still cgroup-confined under `<cg>` and the relay's
+    /// death cascades via `PR_SET_PDEATHSIG` — but send the pidfd
+    /// SIGKILL anyway as belt-and-braces (a no-op on a dead process;
+    /// pidfds never recycle) and discard the handle.
+    // r[impl builder.exec.kill-targets-principal]
+    fn place_principal(&self, pidfd: OwnedFd) {
+        let mut phase = self.lock();
+        match &mut *phase {
+            TreePhase::Adopted {
+                killed: false,
+                principal,
+                ..
+            } => {
+                *principal = Some(pidfd);
+            }
+            _ => {
+                drop(phase);
+                pidfd_kill(&pidfd);
+            }
+        }
     }
 
     /// Kill the adopted process tree, once, and never after it was
@@ -1090,6 +1227,7 @@ impl Drop for ProcessTreeGuard {
                 pid,
                 killed,
                 reaper_attached,
+                ..
             } => {
                 let pid = *pid;
                 let attached = *reaper_attached;
@@ -1111,6 +1249,33 @@ impl Drop for ProcessTreeGuard {
             }
             TreePhase::Reaped | TreePhase::Dead => {}
         }
+    }
+}
+
+/// Name of the principal's sub-cgroup under the caller's cgroup. The
+/// parent creates `<cg>/build` before the fork and moves the sandbox
+/// child into it at placement; the intermediate stays a direct member
+/// of `<cg>`. No controllers are delegated into it (`<cg>` keeps its
+/// `subtree_control` empty), so `<cg>`'s limits and accounting cover
+/// both levels hierarchically while `<cg>/build/cgroup.kill` scopes a
+/// kill to exactly the build.
+const BUILD_SUBCGROUP: &str = "build";
+
+/// SIGKILL via pidfd: recycle-proof by construction (a pidfd names the
+/// process instance, never a reusable number) and namespace-correct
+/// (works on a pid-namespace init from outside). Best-effort like
+/// every other kill primitive here; a dead target is a no-op.
+fn pidfd_kill(pidfd: &OwnedFd) {
+    // SAFETY: pidfd_send_signal(2) on an owned pidfd; no memory
+    // preconditions (null siginfo = same semantics as kill(2)).
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0u32,
+        );
     }
 }
 
@@ -1334,6 +1499,187 @@ fn make_pipe() -> nix::Result<(OwnedFd, OwnedFd)> {
     nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
 }
 
+// ---------------------------------------------------------------------------
+// Principal placement: the relay-handed pidfd.
+// ---------------------------------------------------------------------------
+
+/// Create the placement socketpair as `(parent_recv, child_send)`.
+///
+/// `SOCK_SEQPACKET` so the single placement message keeps its boundary;
+/// `SOCK_CLOEXEC` for hygiene (the sandbox child's own sweep is the
+/// real guarantee — fork inheritance ignores CLOEXEC).
+fn make_placement_socketpair() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    use std::os::fd::FromRawFd as _;
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: socketpair(2) into a stack array; on success both fds
+    // are fresh and owned here, immediately wrapped.
+    let rc = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fresh fds from a successful socketpair, owned exactly once.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// The placement message's data payload: the sandbox child's pid in
+/// the *host* PID namespace (the intermediate unshares only for its
+/// children, so its `fork` return value is host-namespace), as native
+/// bytes. The pidfd rides alongside as `SCM_RIGHTS`.
+const PLACEMENT_MSG_LEN: usize = std::mem::size_of::<libc::pid_t>();
+
+/// Intermediate side: open a pidfd for the freshly forked sandbox
+/// child and send `(pid, pidfd)` to the parent over the placement
+/// socket.
+///
+/// The pid datum alone would be a recycle hazard everywhere EXCEPT
+/// here: this process is the child's parent and has not reaped it, so
+/// the kernel cannot recycle the pid while the message is in flight —
+/// dead or alive, the child holds it (zombies pin their pid). The
+/// pidfd is what the *parent* keeps long-term; the raw pid is only
+/// used for the immediate sub-cgroup attach.
+///
+/// Async-signal-safe: raw syscalls over stack buffers only.
+fn send_placement(sock: RawFd, pid: libc::pid_t) -> Result<(), SetupError> {
+    // SAFETY: pidfd_open(2) for a direct, un-reaped child.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+    if pidfd < 0 {
+        return Err(SetupError::new(SetupPhase::PlacementSend, Errno::last()));
+    }
+    let pidfd = pidfd as libc::c_int;
+
+    let payload = pid.to_ne_bytes();
+    let mut iov = libc::iovec {
+        iov_base: payload.as_ptr().cast_mut().cast(),
+        iov_len: payload.len(),
+    };
+    // One fd's worth of control message, in a zeroed, aligned buffer.
+    // 64 bytes, u64-aligned: comfortably ≥ CMSG_SPACE(4) (24 on LP64).
+    let mut cmsg_buf = [0u64; 8];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr().cast();
+    // SAFETY: CMSG_* macros over the zeroed header/buffer just built.
+    let rc = unsafe {
+        msg.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) as _;
+        let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
+        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::c_int>(), pidfd);
+        libc::sendmsg(sock, &raw const msg, 0)
+    };
+    let send_errno = Errno::last();
+    // SAFETY: closing the fd this function opened; the kernel holds
+    // its own reference inside the queued message.
+    unsafe { libc::close(pidfd) };
+    if rc != payload.len() as isize {
+        return Err(SetupError::new(
+            SetupPhase::PlacementSend,
+            if rc < 0 { send_errno } else { Errno::EPROTO },
+        ));
+    }
+    Ok(())
+}
+
+/// Parent side: receive the `(pid, pidfd)` placement message. Blocking
+/// — call from `spawn_blocking`. EOF (the intermediate died before
+/// sending — its setup failed) and malformed messages surface as
+/// errors for the abort path; the status pipe carries the real
+/// diagnosis.
+fn recv_placement(sock: OwnedFd) -> std::io::Result<(libc::pid_t, OwnedFd)> {
+    use std::os::fd::FromRawFd as _;
+    let mut payload = [0u8; PLACEMENT_MSG_LEN];
+    let mut iov = libc::iovec {
+        iov_base: payload.as_mut_ptr().cast(),
+        iov_len: payload.len(),
+    };
+    let mut cmsg_buf = [0u64; 4]; // ≥ CMSG_SPACE(4), aligned
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr().cast();
+    msg.msg_controllen = std::mem::size_of_val(&cmsg_buf) as _;
+    let n = loop {
+        // SAFETY: recvmsg into the stack buffers wired above;
+        // MSG_CMSG_CLOEXEC so the received pidfd cannot leak into a
+        // concurrent fork+exec elsewhere in the process.
+        let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &raw mut msg, libc::MSG_CMSG_CLOEXEC) };
+        if n >= 0 {
+            break n as usize;
+        }
+        if Errno::last() != Errno::EINTR {
+            return Err(std::io::Error::last_os_error());
+        }
+    };
+    // Walk the control messages for the SCM_RIGHTS fd FIRST: even a
+    // malformed message may have transferred an fd, and an unclaimed
+    // fd is a leak.
+    let mut received_fd: Option<OwnedFd> = None;
+    // SAFETY: CMSG_* walk over the msghdr recvmsg just filled.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let fd = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::c_int>());
+                let fd = OwnedFd::from_raw_fd(fd);
+                if received_fd.replace(fd).is_some() {
+                    return Err(std::io::Error::other(
+                        "placement message carried more than one fd",
+                    ));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&raw mut msg, cmsg);
+        }
+    }
+    if n == 0 {
+        // EOF: every write end is gone — the intermediate died before
+        // placing the principal (its setup failed; the status pipe has
+        // the typed error).
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "the sandbox exited before the build principal was placed",
+        ));
+    }
+    if n != PLACEMENT_MSG_LEN || (msg.msg_flags & libc::MSG_CTRUNC) != 0 {
+        return Err(std::io::Error::other("malformed placement message"));
+    }
+    let Some(pidfd) = received_fd else {
+        return Err(std::io::Error::other("placement message carried no pidfd"));
+    };
+    Ok((libc::pid_t::from_ne_bytes(payload), pidfd))
+}
+
+/// Create `<cg>/build`, tolerating a leftover from a previous attempt
+/// against the same caller-owned cgroup (`EEXIST` — the directory is
+/// just a kill scope; an empty pre-existing one is as good as fresh).
+fn create_build_subcgroup(cgroup: &Path) -> std::io::Result<()> {
+    match std::fs::create_dir(cgroup.join(BUILD_SUBCGROUP)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Is a `cgroup.procs` write failure tolerable at placement time?
+///
+/// `ESRCH`/`EINVAL` mean the principal already exited (its zombie pins
+/// the pid but is no longer attachable) — the build is over and the
+/// relay is about to forward its true status, so placement has nothing
+/// left to scope. Anything else (`EACCES`, `ENOENT`, `EBUSY`, …) means
+/// the sub-cgroup itself is broken and limit kills could not target
+/// the principal: fail the execution rather than run unsupervised.
+fn placement_attach_tolerable(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::ESRCH) | Some(libc::EINVAL))
+}
+
 /// Annotate an io::Error from early sandbox spawning with what was
 /// being attempted.
 fn spawn_err<E: Into<std::io::Error>>(what: &'static str) -> impl FnOnce(E) -> ExecError {
@@ -1471,6 +1817,7 @@ struct ChildCapture {
 struct ChildFdOwners {
     status_w: OwnedFd,
     go_r: OwnedFd,
+    placement_w: OwnedFd,
     capture: ChildCapture,
 }
 
@@ -1481,6 +1828,7 @@ impl ChildFdOwners {
         ChildFds {
             status_pipe_w: self.status_w.as_raw_fd(),
             go_pipe_r: self.go_r.as_raw_fd(),
+            placement_sock_w: self.placement_w.as_raw_fd(),
             stdout_fd: self.capture.stdout.as_raw_fd(),
             stderr_fd: self
                 .capture
@@ -2360,6 +2708,135 @@ mod tests {
             map_exit(status, Some(KillReason::Timeout)),
             ExitOutcome::Exited(0),
             "the uncorroborated claim must not relabel the clean exit"
+        );
+    }
+
+    /// The placement handshake end to end against a real two-level
+    /// fork: the relay-side `send_placement` delivers the grandchild's
+    /// pid plus a pidfd over `SCM_RIGHTS`, and the received pidfd is a
+    /// usable kill handle for a process that is NOT our child — alive
+    /// until `pidfd_kill`, observably dead after (pidfd polls
+    /// readable on exit).
+    // r[verify builder.exec.kill-targets-principal]
+    #[test]
+    fn placement_handshake_delivers_pid_and_live_pidfd() {
+        let (sock_r, sock_w) = make_placement_socketpair().expect("socketpair");
+
+        // SAFETY: the child branch only calls async-signal-safe code
+        // (fork, the function under test, _exit).
+        let relay = match unsafe { libc::fork() } {
+            -1 => panic!("fork failed: {}", std::io::Error::last_os_error()),
+            0 => {
+                // The relay: fork a parked grandchild, place it, exit.
+                match unsafe { libc::fork() } {
+                    -1 => unsafe { libc::_exit(10) },
+                    0 => loop {
+                        // The grandchild parks until SIGKILLed.
+                        unsafe { libc::pause() };
+                    },
+                    grandchild => {
+                        if send_placement(sock_w.as_raw_fd(), grandchild).is_err() {
+                            unsafe { libc::_exit(11) };
+                        }
+                        unsafe { libc::_exit(0) };
+                    }
+                }
+            }
+            pid => nix::unistd::Pid::from_raw(pid),
+        };
+        drop(sock_w); // parent's copy: EOF must track the relay alone
+
+        let (pid, pidfd) = recv_placement(sock_r).expect("placement message");
+        assert!(pid > 0, "placement pid must be a real pid");
+        // The relay exits cleanly after sending.
+        let status = wait_for(relay).expect("reap relay");
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "relay failed: status {status} (10=fork, 11=send_placement)"
+        );
+
+        let poll_pidfd = |timeout_ms: libc::c_int| {
+            let mut pfd = libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll over one stack pollfd.
+            unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) }
+        };
+        assert_eq!(
+            poll_pidfd(0),
+            0,
+            "the parked grandchild must still be alive (pidfd not readable)"
+        );
+        pidfd_kill(&pidfd);
+        assert_eq!(
+            poll_pidfd(10_000),
+            1,
+            "the pidfd kill must terminate the grandchild (pidfd readable)"
+        );
+        // The grandchild reparented when the relay exited; init reaps it.
+    }
+
+    /// A relay that dies before sending the placement message must
+    /// surface as EOF to the parent's recv, not park it.
+    // r[verify builder.exec.kill-targets-principal]
+    #[test]
+    fn placement_recv_eofs_when_the_relay_dies_before_sending() {
+        let (sock_r, sock_w) = make_placement_socketpair().expect("socketpair");
+        // SAFETY: the child branch only calls _exit.
+        let relay = match unsafe { libc::fork() } {
+            -1 => panic!("fork failed: {}", std::io::Error::last_os_error()),
+            0 => unsafe { libc::_exit(7) },
+            pid => nix::unistd::Pid::from_raw(pid),
+        };
+        drop(sock_w);
+        let err = recv_placement(sock_r).expect_err("EOF must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        let _ = wait_for(relay);
+    }
+
+    /// `place_principal` stores the pidfd only on a live, unkilled
+    /// tree; on a tree that was already killed the handle is consumed
+    /// without resurrecting kill eligibility.
+    // r[verify builder.exec.kill-targets-principal]
+    #[test]
+    fn place_principal_stores_only_on_a_live_tree() {
+        let dummy_fd = || {
+            let (r, _w) = make_pipe().expect("pipe");
+            r
+        };
+
+        let tree = TreeState::new(None);
+        let (_child, pid) = spawn_exiting(0);
+        tree.adopt(pid).expect("adopt");
+        tree.place_principal(dummy_fd());
+        assert!(
+            matches!(
+                &*tree.lock(),
+                TreePhase::Adopted {
+                    principal: Some(_),
+                    ..
+                }
+            ),
+            "placement on a live tree must store the principal handle"
+        );
+
+        let tree = TreeState::new(None);
+        let (_child2, pid2) = spawn_exiting(0);
+        tree.adopt(pid2).expect("adopt");
+        assert!(tree.kill_tree(), "kill acts on the live tree");
+        tree.place_principal(dummy_fd());
+        assert!(
+            matches!(
+                &*tree.lock(),
+                TreePhase::Adopted {
+                    killed: true,
+                    principal: None,
+                    ..
+                }
+            ),
+            "placement after a kill must not store the handle"
         );
     }
 

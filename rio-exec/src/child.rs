@@ -45,7 +45,7 @@ use crate::request::Personality;
 use crate::seccomp;
 
 /// File descriptors handed to the forked processes — and, just as
-/// importantly, the complete **keep set**: these four fds (plus stdio
+/// importantly, the complete **keep set**: these five fds (plus stdio
 /// 0–2) are the only file descriptors a forked executor process may
 /// retain. [`shed_inherited_fds`] closes everything else as the
 /// intermediate's first act, which is what makes the executor's
@@ -75,10 +75,22 @@ pub(crate) struct ChildFds {
     /// after forking the sandbox child** — holding it open would delay
     /// the parent's exec notification until the whole build exits.
     pub status_pipe_w: RawFd,
-    /// Read end of the go pipe. The intermediate blocks on it until
-    /// the parent has attached it to the cgroup, so every descendant
-    /// is accounted from its first instruction.
+    /// Read end of the go pipe, which carries a two-byte protocol:
+    /// byte 1 releases the *intermediate* (the parent has attached it
+    /// to the cgroup, so every descendant is accounted from its first
+    /// instruction), byte 2 releases the *sandbox child* (the parent
+    /// has placed it in the kill-scoped build sub-cgroup, so no tenant
+    /// instruction runs outside the principal kill scope). The
+    /// intermediate reads byte 1 and keeps the fd open for the child
+    /// it is about to fork; its own copy is shed by the post-fork
+    /// `close_range` sweep.
     pub go_pipe_r: RawFd,
+    /// Write end of the placement socketpair. The intermediate sends
+    /// the sandbox child's pid plus a pidfd (`SCM_RIGHTS`) over it
+    /// right after the fork, giving the parent a recycle-proof handle
+    /// to the build principal; the post-fork sweep sheds it along with
+    /// everything else.
+    pub placement_sock_w: RawFd,
     /// Becomes the sandboxed process's fd 1.
     pub stdout_fd: RawFd,
     /// Becomes the sandboxed process's fd 2 (the same fd as
@@ -174,6 +186,17 @@ pub enum SetupPhase {
     /// execution order (right after the fork); the wire discriminant
     /// is append-only (29).
     PdeathsigEarly = 29,
+    /// Reading the release byte (byte 2 of the go-pipe protocol) in
+    /// the sandbox child: the parent writes it only after placing the
+    /// child in the build sub-cgroup. Declared in execution order
+    /// (right after the early death-signal arm); the wire discriminant
+    /// is append-only (30).
+    ReleasePipe = 30,
+    /// The intermediate could not hand the parent the build
+    /// principal's pid and pidfd over the placement socket
+    /// (`pidfd_open(2)` or `sendmsg(2)` failed). Wire discriminant
+    /// append-only (31).
+    PlacementSend = 31,
 }
 
 impl SetupPhase {
@@ -186,7 +209,9 @@ impl SetupPhase {
         SetupPhase::GoPipe,
         SetupPhase::Unshare,
         SetupPhase::ForkSandboxChild,
+        SetupPhase::PlacementSend,
         SetupPhase::PdeathsigEarly,
+        SetupPhase::ReleasePipe,
         SetupPhase::Setsid,
         SetupPhase::DupStdio,
         SetupPhase::CloseRange,
@@ -252,6 +277,8 @@ impl SetupPhase {
             SetupPhase::VerifyIds => "verifying the privilege drop",
             SetupPhase::Pdeathsig => "re-arming the parent-death signal",
             SetupPhase::PdeathsigEarly => "arming the parent-death signal",
+            SetupPhase::ReleasePipe => "waiting for the placement release",
+            SetupPhase::PlacementSend => "handing the build principal to the parent",
             SetupPhase::Exec => "executing the program",
             SetupPhase::ForkSandboxChild => "forking the sandbox child",
         }
@@ -282,7 +309,7 @@ pub struct SetupError {
 pub(crate) const SETUP_ERROR_WIRE_LEN: usize = 8;
 
 impl SetupError {
-    fn new(phase: SetupPhase, errno: Errno) -> SetupError {
+    pub(crate) fn new(phase: SetupPhase, errno: Errno) -> SetupError {
         SetupError {
             phase,
             errno: errno as i32,
@@ -382,11 +409,12 @@ fn close_fd_range(first: libc::c_uint, last: libc::c_uint) -> Result<(), Errno> 
 /// Async-signal-safe: stack-only bookkeeping (at most 4 fds, sorted in
 /// place) plus `close_range(2)` syscalls. Must only be called between
 /// `fork` and `exec`/`_exit`.
-// r[impl builder.exec.fd-keep-set]
+// r[impl builder.exec.fd-keep-set+1]
 pub(crate) fn shed_inherited_fds(keep: &ChildFds) -> Result<(), SetupError> {
-    let mut kept: [i64; 4] = [
+    let mut kept: [i64; 5] = [
         i64::from(keep.status_pipe_w),
         i64::from(keep.go_pipe_r),
+        i64::from(keep.placement_sock_w),
         i64::from(keep.stdout_fd),
         i64::from(keep.stderr_fd),
     ];
@@ -412,8 +440,8 @@ pub(crate) fn shed_inherited_fds(keep: &ChildFds) -> Result<(), SetupError> {
     Ok(())
 }
 
-/// Block until the parent writes the go byte — or report that the
-/// parent died first.
+/// Block until the parent writes the go byte (byte 1 of the go-pipe
+/// protocol) — or report that the parent died first.
 ///
 /// EOF (0 bytes) means every copy of the go pipe's write end is gone:
 /// the parent died or gave up before releasing this process, and the
@@ -424,30 +452,71 @@ pub(crate) fn shed_inherited_fds(keep: &ChildFds) -> Result<(), SetupError> {
 /// the very write end it was waiting on) and a crashed parent left the
 /// intermediate parked here forever.
 ///
-/// On success the go-pipe read end is closed (it has served its
-/// purpose).
+/// The fd is **kept open**: the sandbox child forked next inherits it
+/// and waits on byte 2 ([`await_release_signal`]). The intermediate's
+/// own copy is shed by its post-fork `close_range` sweep, which is what
+/// keeps the child's EOF semantics intact.
 ///
 /// # Safety contract
 ///
 /// Must only be called between `fork` and `exec`/`_exit`, after
 /// [`shed_inherited_fds`].
-// r[impl builder.exec.fd-keep-set]
+// r[impl builder.exec.fd-keep-set+1]
 pub(crate) fn await_go_signal(fds: &ChildFds) -> Result<(), SetupError> {
+    read_one_gate_byte(fds.go_pipe_r, SetupPhase::GoPipe)
+}
+
+/// Block until the parent writes the release byte (byte 2 of the
+/// go-pipe protocol): the parent has placed this process in the build
+/// sub-cgroup, so every instruction from here on runs inside the
+/// principal kill scope. EOF means the parent died or aborted before
+/// placement — the build must not run.
+///
+/// This process's inherited copy of the placement socket is closed
+/// **before** parking on the read: the socket was the intermediate's
+/// to use, and a copy held here across the park would mean an
+/// intermediate that died *before* sending the placement message
+/// leaves the parent's recv without its EOF — the parent waiting on a
+/// message whose only remaining "sender" is this gated child, while
+/// this child waits on a release byte the blocked parent can never
+/// send. Closing first makes the placement socket's EOF track the
+/// intermediate alone. On success the go-pipe read end is closed too
+/// (it has served its purpose).
+///
+/// # Safety contract
+///
+/// Must only be called in the sandbox child, after the early
+/// parent-death arm.
+// r[impl builder.exec.fd-keep-set+1]
+pub(crate) fn await_release_signal(fds: &ChildFds) -> Result<(), SetupError> {
+    // SAFETY: closing an fd this process owns (its fork-inherited
+    // copy; the intermediate's own copy is unaffected).
+    unsafe {
+        libc::close(fds.placement_sock_w);
+    }
+    read_one_gate_byte(fds.go_pipe_r, SetupPhase::ReleasePipe)?;
+    // SAFETY: closing an fd this process owns.
+    unsafe {
+        libc::close(fds.go_pipe_r);
+    }
+    Ok(())
+}
+
+/// Read exactly one gate byte from `fd`, attributing failures (and the
+/// parent-death EOF) to `phase`.
+fn read_one_gate_byte(fd: RawFd, phase: SetupPhase) -> Result<(), SetupError> {
     let mut go = [0u8; 1];
     loop {
         // SAFETY: reading into a stack buffer from an fd this process
         // owns.
-        let n = unsafe { libc::read(fds.go_pipe_r, go.as_mut_ptr().cast(), 1) };
+        let n = unsafe { libc::read(fd, go.as_mut_ptr().cast(), 1) };
         match n {
-            1 => break,
-            0 => return Err(SetupError::new(SetupPhase::GoPipe, Errno::EPIPE)),
+            1 => return Ok(()),
+            0 => return Err(SetupError::new(phase, Errno::EPIPE)),
             _ if Errno::last() == Errno::EINTR => continue,
-            _ => return Err(SetupError::new(SetupPhase::GoPipe, Errno::last())),
+            _ => return Err(SetupError::new(phase, Errno::last())),
         }
     }
-    // SAFETY: closing an fd this process owns.
-    unsafe { libc::close(fds.go_pipe_r) };
-    Ok(())
 }
 
 /// The intermediate process's setup: wait for the parent's go signal,
@@ -539,6 +608,16 @@ fn setup(plan: &SandboxPlan, fds: &ChildFds) -> Result<(), SetupError> {
     // pdeath_signal on credential changes.
     // r[impl builder.exec.pdeathsig-first]
     arm_pdeathsig(SetupPhase::PdeathsigEarly)?;
+
+    // --- Placement gate ------------------------------------------------------
+    // Block until the parent has moved this process into the build
+    // sub-cgroup (byte 2 of the go-pipe protocol). Ordered immediately
+    // after the death-signal arm so no later setup step — let alone a
+    // tenant instruction — runs outside the principal kill scope, and
+    // a parent that dies mid-placement takes this process with it
+    // (EOF here, pdeathsig as the backstop).
+    // r[impl builder.exec.kill-targets-principal]
+    await_release_signal(fds)?;
 
     // --- Session and stdio -------------------------------------------------
     // A fresh session so the build has NO controlling terminal — the
@@ -1051,17 +1130,19 @@ mod tests {
 
     /// The keep-set sweep closes decoys and parent-side ends but leaves
     /// the keep set and stdio open.
-    // r[verify builder.exec.fd-keep-set]
+    // r[verify builder.exec.fd-keep-set+1]
     #[test]
     fn shed_inherited_fds_closes_everything_outside_the_keep_set() {
         let (decoy_r, decoy_w) = plain_pipe();
         let (status_r, status_w) = plain_pipe();
         let (go_r, go_w) = plain_pipe();
+        let (placement_r, placement_w) = plain_pipe();
         let (out_r, out_w) = plain_pipe();
         let (err_r, err_w) = plain_pipe();
         let fds = ChildFds {
             status_pipe_w: status_w.as_raw_fd(),
             go_pipe_r: go_r.as_raw_fd(),
+            placement_sock_w: placement_w.as_raw_fd(),
             stdout_fd: out_w.as_raw_fd(),
             stderr_fd: err_w.as_raw_fd(),
         };
@@ -1069,6 +1150,7 @@ mod tests {
         let parent_side = [
             status_r.as_raw_fd(),
             go_w.as_raw_fd(),
+            placement_r.as_raw_fd(),
             out_r.as_raw_fd(),
             err_r.as_raw_fd(),
         ];
@@ -1097,6 +1179,7 @@ mod tests {
                 }
                 if !fd_is_open(fds.status_pipe_w)
                     || !fd_is_open(fds.go_pipe_r)
+                    || !fd_is_open(fds.placement_sock_w)
                     || !fd_is_open(fds.stdout_fd)
                     || !fd_is_open(fds.stderr_fd)
                 {
@@ -1124,15 +1207,17 @@ mod tests {
     /// its own copy of the write end, so this EOF could never arrive
     /// and the child hung forever (which the deadline converts into a
     /// test failure).
-    // r[verify builder.exec.fd-keep-set]
+    // r[verify builder.exec.fd-keep-set+1]
     #[test]
     fn parent_go_pipe_close_unblocks_intermediate_after_sweep() {
         let (status_r, status_w) = plain_pipe();
         let (go_r, go_w) = plain_pipe();
+        let (_placement_r, placement_w) = plain_pipe();
         let (out_r, out_w) = plain_pipe();
         let fds = ChildFds {
             status_pipe_w: status_w.as_raw_fd(),
             go_pipe_r: go_r.as_raw_fd(),
+            placement_sock_w: placement_w.as_raw_fd(),
             stdout_fd: out_w.as_raw_fd(),
             stderr_fd: out_w.as_raw_fd(),
         };
@@ -1177,17 +1262,19 @@ mod tests {
 
     /// The sweep must not break the normal handshake: a go byte written
     /// by the parent still arrives.
-    // r[verify builder.exec.fd-keep-set]
+    // r[verify builder.exec.fd-keep-set+1]
     #[test]
     fn go_byte_still_arrives_after_sweep() {
         // The parent keeps every end open here (underscore bindings
         // hold them alive): only the write of the go byte matters.
         let (_status_r, status_w) = plain_pipe();
         let (go_r, go_w) = plain_pipe();
+        let (_placement_r, placement_w) = plain_pipe();
         let (_out_r, out_w) = plain_pipe();
         let fds = ChildFds {
             status_pipe_w: status_w.as_raw_fd(),
             go_pipe_r: go_r.as_raw_fd(),
+            placement_sock_w: placement_w.as_raw_fd(),
             stdout_fd: out_w.as_raw_fd(),
             stderr_fd: out_w.as_raw_fd(),
         };
@@ -1208,6 +1295,113 @@ mod tests {
                 nix::unistd::write(&go_w, &[1u8]).expect("write the go byte");
                 let code = wait_with_deadline(pid, Duration::from_secs(10));
                 assert_eq!(code, 0, "the go byte must still arrive after the sweep");
+            }
+        }
+    }
+
+    /// The two-byte protocol end to end: byte 1 passes the intermediate
+    /// gate without closing the pipe, byte 2 passes the release gate,
+    /// and the release closes both the go pipe and the placement copy.
+    // r[verify builder.exec.fd-keep-set+1]
+    #[test]
+    fn release_byte_arrives_after_go_byte_on_the_same_pipe() {
+        let (_status_r, status_w) = plain_pipe();
+        let (go_r, go_w) = plain_pipe();
+        let (_placement_r, placement_w) = plain_pipe();
+        let (_out_r, out_w) = plain_pipe();
+        let fds = ChildFds {
+            status_pipe_w: status_w.as_raw_fd(),
+            go_pipe_r: go_r.as_raw_fd(),
+            placement_sock_w: placement_w.as_raw_fd(),
+            stdout_fd: out_w.as_raw_fd(),
+            stderr_fd: out_w.as_raw_fd(),
+        };
+
+        // SAFETY: the child branch only calls async-signal-safe code.
+        match unsafe { libc::fork() } {
+            -1 => panic!("fork failed: {}", std::io::Error::last_os_error()),
+            0 => {
+                if shed_inherited_fds(&fds).is_err() {
+                    unsafe { libc::_exit(10) };
+                }
+                if await_go_signal(&fds).is_err() {
+                    unsafe { libc::_exit(11) };
+                }
+                // The go gate must NOT have closed the fd (the release
+                // gate reads from it next).
+                if !fd_is_open(fds.go_pipe_r) {
+                    unsafe { libc::_exit(12) };
+                }
+                if await_release_signal(&fds).is_err() {
+                    unsafe { libc::_exit(13) };
+                }
+                // The release gate closes both fds it owns.
+                if fd_is_open(fds.go_pipe_r) || fd_is_open(fds.placement_sock_w) {
+                    unsafe { libc::_exit(14) };
+                }
+                unsafe { libc::_exit(0) };
+            }
+            pid => {
+                nix::unistd::write(&go_w, &[1u8]).expect("write the go byte");
+                nix::unistd::write(&go_w, &[1u8]).expect("write the release byte");
+                let code = wait_with_deadline(pid, Duration::from_secs(10));
+                assert_eq!(
+                    code, 0,
+                    "two-byte gate sequence failed (10=sweep, 11=go, 12=go closed \
+                     the pipe, 13=release, 14=release left an fd open)"
+                );
+            }
+        }
+    }
+
+    /// A parent that aborts between placement and release (drops the go
+    /// pipe after byte 1) must abort the gated child with a typed
+    /// `ReleasePipe` parent-death error, not leave it parked.
+    // r[verify builder.exec.fd-keep-set+1]
+    #[test]
+    fn release_eof_after_go_byte_aborts_the_child() {
+        let (_status_r, status_w) = plain_pipe();
+        let (go_r, go_w) = plain_pipe();
+        let (_placement_r, placement_w) = plain_pipe();
+        let (_out_r, out_w) = plain_pipe();
+        let fds = ChildFds {
+            status_pipe_w: status_w.as_raw_fd(),
+            go_pipe_r: go_r.as_raw_fd(),
+            placement_sock_w: placement_w.as_raw_fd(),
+            stdout_fd: out_w.as_raw_fd(),
+            stderr_fd: out_w.as_raw_fd(),
+        };
+
+        // SAFETY: the child branch only calls async-signal-safe code.
+        match unsafe { libc::fork() } {
+            -1 => panic!("fork failed: {}", std::io::Error::last_os_error()),
+            0 => {
+                if shed_inherited_fds(&fds).is_err() {
+                    unsafe { libc::_exit(10) };
+                }
+                if await_go_signal(&fds).is_err() {
+                    unsafe { libc::_exit(11) };
+                }
+                match await_release_signal(&fds) {
+                    Err(e)
+                        if e.phase == SetupPhase::ReleasePipe && e.errno == Errno::EPIPE as i32 =>
+                    {
+                        unsafe { libc::_exit(42) };
+                    }
+                    Err(_) => unsafe { libc::_exit(12) },
+                    Ok(()) => unsafe { libc::_exit(13) },
+                }
+            }
+            pid => {
+                nix::unistd::write(&go_w, &[1u8]).expect("write the go byte");
+                drop(go_w); // abort before the release byte
+                drop(go_r); // parent's read-end copy must not hold EOF off
+                let code = wait_with_deadline(pid, Duration::from_secs(10));
+                assert_eq!(
+                    code, 42,
+                    "release-gate EOF must abort with ReleasePipe/EPIPE \
+                     (10=sweep, 11=go, 12=wrong error, 13=spurious release)"
+                );
             }
         }
     }

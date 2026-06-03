@@ -93,7 +93,12 @@ impl BuildCgroup {
         // investigates. Don't try to be clever with SIGKILL-ing
         // unknown PIDs.
         if path.exists() {
-            // Best-effort; mkdir below surfaces the real error.
+            // Best-effort; mkdir below surfaces the real error. The
+            // executor's `build` sub-cgroup (rio-exec places the build
+            // principal in `<cg>/build`) must go first — rmdir refuses
+            // non-empty directories, and cgroupfs children are
+            // directories.
+            let _ = fs::remove_dir(path.join("build"));
             let _ = fs::remove_dir(&path);
         }
 
@@ -203,7 +208,12 @@ impl Drop for BuildCgroup {
         // Best-effort. EBUSY if processes remain; we log and leak.
         // The leaked cgroup is an empty (or nearly-empty) pseudo-
         // directory under /sys/fs/cgroup — harmless but untidy.
-        // Pod restart clears the whole subtree.
+        // Pod restart clears the whole subtree. The executor's `build`
+        // sub-cgroup goes first: rmdir refuses non-empty directories,
+        // so leaving it would turn every parent removal into a
+        // guaranteed leak. ENOENT is fine (no-cgroup runs, or the
+        // execution aborted before the sub-cgroup was created).
+        let _ = fs::remove_dir(self.path.join("build"));
         if let Err(e) = fs::remove_dir(&self.path) {
             metrics::counter!("rio_builder_cgroup_leak_total").increment(1);
             tracing::warn!(
