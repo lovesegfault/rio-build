@@ -2386,10 +2386,13 @@ refresh for free.
   and, for rows whose persisted evidence rank is byte-anchored
   (`path_bound_bytes` or `verified_built`), the dual byte-anchor of
   the declared path itself --- the row's recorded identity was derived
-  from bytes text-CA-bound to the declared path, and an incoming claim
-  of the same path with matching public attributes and no
-  contradicting evidence anchors to the same definition. An
-  undecodable persisted rank MUST NOT grant the dual-anchor basis. The
+  from bytes text-CA-bound to the declared path, and a
+  NON-authoritative incoming claim of the same path with matching
+  public attributes and no contradicting evidence anchors to the same
+  definition (an authoritative claim's bytes are bound to themselves,
+  not to the declared path, so it has no second anchor and MUST prove
+  identity through the classical bases). An undecodable persisted
+  rank MUST NOT grant the dual-anchor basis. The
   persistence layer MUST additionally refuse to update a settled row
   whose public identity conflicts with the incoming re-creation,
   independent of the pre-merge check, admitting only the per-merge
@@ -2519,7 +2522,14 @@ rank-uniform victim clause closes the resident bare x bare cell
 escaped both the row check (resident hashes are skipped) and the
 resident scan (which gated on authoritative content), so a
 genuine owner's conflicting store-backed submission silently JOINED
-the squat and was served its forged outputs as a cache hit. The rank gate on byte-anchored row-only victims is
+the squat and was served its forged outputs as a cache hit. One
+residual is deliberate: a CLAIMS-FREE submission (no expected paths,
+no declared hash) of a resident store-anchored node still joins ---
+it asserts nothing the resident could contradict, a resident join
+rewrites no state, and refusing would demand evidence from the shape
+every hash-less re-reference of a floating node takes; gateway
+submissions always carry a hash or paths and are therefore never in
+this population. The rank gate on byte-anchored row-only victims is
 uniform with the displacement primitive's settled rule
 (#rref("sched.merge.evidence-ranked-displacement")); it is also
 unreachable in honest operation --- store bytes cannot contradict an

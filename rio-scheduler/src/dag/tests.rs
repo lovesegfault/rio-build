@@ -4921,12 +4921,25 @@ fn recovered_poisoned_squat_keeps_authoritative_gate() -> anyhow::Result<()> {
     DefinitionEvidence::PathBoundBytes,
     DisplaceVerdict::RefusedStoreAnchored
 )]
-#[case::store_anchored_completed(
+// SETTLED bare victims are rank-arbitrated, not categorically exempt
+// (sched.merge.store-evidence-displacement+2 rank-uniform; bug_072):
+// byte-anchored settled bare nodes refuse by rank...
+#[case::settled_bare_outranking(
     false,
     DerivationStatus::Completed,
     DefinitionEvidence::VerifiedBuilt,
     DefinitionEvidence::PathBoundBytes,
-    DisplaceVerdict::RefusedStoreAnchored
+    DisplaceVerdict::RefusedSettledOutranked
+)]
+// ...while a cache-hit squat (Skipped, never dispatched, so stuck at
+// unverified_claim) is displaced by store-verified standing — THE
+// bug_072 cell.
+#[case::settled_bare_cache_squat_displaced(
+    false,
+    DerivationStatus::Skipped,
+    DefinitionEvidence::UnverifiedClaim,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::Displaced
 )]
 // In-flight victims: live and Failed (non-terminal) keep first-writer-wins.
 #[case::live_running(
@@ -5231,6 +5244,124 @@ fn store_evidence_grant_strip_applies_at_creation() -> anyhow::Result<()> {
         "the declared value is preserved out-of-band (M_070)"
     );
     assert!(created.ca.needs_resolve, "byte-derived resolve recorded");
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement+2]
+/// bug_072 gate half, fail-closed cell: a settled BARE node and a
+/// conflicting bare incoming WITHOUT a store-evidence grant must
+/// REFUSE — never silently join (pre-fix this cell fell through the
+/// store-backed exemption and the genuine owner was served the
+/// squat's outputs as a cache hit). With a grant, the displacement
+/// primitive erases the squat. Identity-matching resubmissions —
+/// including the M_070 dual-anchor shape (stripped resident: live
+/// hash None, paths empty, byte-anchored rank) — keep the join.
+#[test]
+fn settled_bare_conflict_refuses_without_grant_and_displaces_with() -> anyhow::Result<()> {
+    // Cell 1: conflict without grant -> refuse (fail closed).
+    let mut dag = DerivationDag::new();
+    let mut squat = make_node("bare-cell", "x86_64-linux");
+    squat.expected_output_paths = vec!["/nix/store/forged-out".into()];
+    dag.merge(Uuid::new_v4(), &[squat.clone()], &[], "")?;
+    dag.nodes
+        .get_mut("bare-cell")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Skipped);
+
+    let mut genuine = make_node("bare-cell", "x86_64-linux");
+    genuine.expected_output_paths = vec!["/nix/store/genuine-out".into()];
+    let err = dag
+        .merge_with_evidence(Uuid::new_v4(), &[genuine.clone()], &[], "", &HashMap::new())
+        .unwrap_err();
+    assert!(
+        matches!(err, DagError::ConflictingInFlightContent { .. }),
+        "ungranted settled bare x bare conflict refuses, never joins: {err:?}"
+    );
+    assert_eq!(
+        dag.node("bare-cell").unwrap().expected_output_paths,
+        vec!["/nix/store/forged-out".to_string()],
+        "refusal leaves the settled node untouched"
+    );
+
+    // Cell 2: same conflict WITH the grant -> displaced.
+    let evidence: HashMap<DrvHash, StoreEvidenceGrant> = HashMap::from([(
+        "bare-cell".into(),
+        StoreEvidenceGrant {
+            needs_resolve: false,
+            stripped_declared_hash: None,
+        },
+    )]);
+    let res = dag.merge_with_evidence(Uuid::new_v4(), &[genuine], &[], "", &evidence)?;
+    assert!(res.displaced.contains(&"bare-cell".into()));
+    assert_eq!(
+        dag.node("bare-cell").unwrap().expected_output_paths,
+        vec!["/nix/store/genuine-out".to_string()],
+        "granted claim displaces the squat"
+    );
+    Ok(())
+}
+
+// r[verify sched.persist.settled-identity-freeze+2]
+/// Resident-matcher M_070 bases: an honest rebuild against a STRIPPED
+/// settled bare resident (live hash None, every path empty — zero
+/// classical evidence) must JOIN, not refuse: preserved-claim when the
+/// declaration is re-presented byte-equal, dual-anchor when the node
+/// is byte-anchored and the incoming is hash-free. Authoritative
+/// incomings get NO dual-anchor (their bytes are self-bound — no
+/// second anchor; the claim-no-redefine population).
+#[test]
+fn stripped_settled_bare_resident_rejoins_instead_of_refusing() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let mut stripped = make_node("strip-res", "x86_64-linux");
+    stripped.is_content_addressed = true;
+    stripped.expected_output_paths = vec![String::new()];
+    dag.merge(Uuid::new_v4(), &[stripped.clone()], &[], "")?;
+    {
+        let n = dag.nodes.get_mut("strip-res").unwrap();
+        n.set_status_for_test(DerivationStatus::Completed);
+        // Dispatch-strip end state: rank raised on verified bytes,
+        // live hash shed, claim preserved (M_070).
+        n.evidence = DefinitionEvidence::PathBoundBytes;
+        n.ca.modular_hash = None;
+        n.ca.modular_hash_stripped = Some([0xCC; 32]);
+    }
+
+    // Byte-equal re-presentation: preserved-claim basis.
+    let mut represent = stripped.clone();
+    represent.ca_modular_hash = Some([0xCC; 32]);
+    let res = dag.merge_with_evidence(Uuid::new_v4(), &[represent], &[], "", &HashMap::new())?;
+    assert!(
+        res.displaced.is_empty() && res.newly_inserted.is_empty(),
+        "byte-equal preserved claim JOINS the settled resident"
+    );
+
+    // Hash-free resubmission: dual-anchor basis (byte-anchored node).
+    let res = dag.merge_with_evidence(
+        Uuid::new_v4(),
+        &[stripped.clone()],
+        &[],
+        "",
+        &HashMap::new(),
+    )?;
+    assert!(
+        res.displaced.is_empty() && res.newly_inserted.is_empty(),
+        "hash-free resubmission of a byte-anchored node JOINS"
+    );
+
+    // Authoritative incoming with no evidence: NOT granted dual-anchor
+    // — falls into the claim-no-redefine population (settled node is
+    // not retriable, so the no-redefine arm does not fire either; the
+    // claim joins-and-is-ignored per the store-backed exemption for
+    // authoritative-incoming x bare-existing... it must NOT adopt).
+    let mut auth = stripped.clone();
+    auth.drv_content = b"Derive-claim".to_vec();
+    auth.drv_content_authoritative = true;
+    let _ = dag.merge_with_evidence(Uuid::new_v4(), &[auth], &[], "", &HashMap::new());
+    assert!(
+        dag.node("strip-res").unwrap().drv_content.is_empty(),
+        "an evidence-free authoritative claim never adopts its bytes \
+         into a byte-anchored settled node"
+    );
     Ok(())
 }
 

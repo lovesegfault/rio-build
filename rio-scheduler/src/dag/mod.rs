@@ -240,7 +240,66 @@ pub(crate) fn verifiable_identity_matches(
             path_evidence = true;
         }
     }
-    path_evidence || hash_evidence == ModularHashEvidence::Match
+    if path_evidence || hash_evidence == ModularHashEvidence::Match {
+        return true;
+    }
+    // CLAIMS-FREE incoming against a STORE-ANCHORED resident: beyond
+    // the public attributes (already equal above), the submission
+    // declares NOTHING — every expected path empty, no modular hash.
+    // Nothing it asserts can contradict the resident definition, a
+    // resident join is interest-only (no row rewrite, no
+    // displacement), and a bare resident's claims are re-verified
+    // against the store at dispatch before anything is signed —
+    // refusing here would demand evidence from a submission that
+    // makes no claims, which is the shape every hash-less
+    // re-reference of a resident floating node takes. Restricted to
+    // NON-authoritative residents: an authoritative claim's identity
+    // is unverifiable until byte-anchored, and a claims-free join
+    // would let such a squat CAPTURE bare submitters (the
+    // squat-capture defense pinned by
+    // floating_ca_squat_without_evidence_conflicts_in_flight). The
+    // positive-evidence bar also stays where re-CREATION happens —
+    // the settled-ROW matcher (its joins refresh the row's creation
+    // snapshot) and the displacement arbitration.
+    if !existing.drv_content_authoritative
+        && node.ca_modular_hash.is_none()
+        && node.expected_output_paths.iter().all(|p| p.is_empty())
+    {
+        return true;
+    }
+    // r[impl sched.persist.settled-identity-freeze+2]
+    // M_070 bases, resident form — the row matcher's twin clauses
+    // (settled_row_identity_matches): a STRIPPED resident node
+    // (floating-CA/deferred-IA: every expected path empty, live hash
+    // None) retains no classical evidence, so without these an honest
+    // resident-window rebuild reads as a conflict and the settled
+    // bare x bare gate arm would refuse it — the resident-window form
+    // of the merged_bug_038 brick. Preserved-claim: byte-equal
+    // re-presentation of the stripped declaration (positive basis
+    // only; differing preserved values fall through, never veto).
+    // Dual-anchor: a byte-anchored node's identity was derived from
+    // the text-CA bytes its declared path names; an incoming claim of
+    // the same path with agreeing public attributes and no
+    // contradicting evidence anchors to the same definition.
+    if existing.ca.modular_hash.is_none()
+        && let (Some(preserved), Some(incoming)) = (
+            existing.ca.modular_hash_stripped.as_ref(),
+            node.ca_modular_hash.as_ref(),
+        )
+        && preserved == incoming
+    {
+        return true;
+    }
+    // Dual-anchor is restricted to NON-authoritative incomings: an
+    // authoritative claim's bytes are bound to themselves, not to the
+    // declared path (the reverse-squat axiom), so there is no second
+    // anchor — and granting it identity-by-rank would let a
+    // hook-fallback-shaped claim with deliberately evidence-free
+    // claims ride the resubmit-reset into adopting its bytes over a
+    // byte-anchored definition (the claim-no-redefine guard's
+    // population). Bare and inline-bound incomings are the production
+    // rebuild shapes and carry no adoptable bytes.
+    !node.drv_content_authoritative && existing.evidence >= DefinitionEvidence::PathBoundBytes
 }
 
 /// Per-hash grant minted by the actor's merge-time store-evidence
@@ -711,10 +770,18 @@ impl DerivationDag {
     /// - victim absent → `debug_assert` (caller bug: arms only call
     ///   this for resident victims) and `RefusedInFlight` as the safe
     ///   release no-op;
-    /// - store-anchored victim (no authoritative bytes — its truth
-    ///   lives in the store, which holds at most one text-CA `.drv`
-    ///   per path) → `RefusedStoreAnchored`, categorically: nothing
-    ///   outranks the store about a store-backed definition;
+    /// - NON-SETTLED store-anchored victim (no authoritative bytes —
+    ///   its truth lives in the store, which holds at most one
+    ///   text-CA `.drv` per path) → `RefusedStoreAnchored`: while the
+    ///   claim is live or parked in the retry machinery, in-flight
+    ///   joins are dedup and dispatch re-verifies bare claims against
+    ///   the store before signing. SETTLED bare victims are NOT
+    ///   exempt (sched.merge.store-evidence-displacement+2,
+    ///   rank-uniform; bug_072): a settled bare node's recorded
+    ///   outputs are served as cache hits, so its protection is the
+    ///   same strict rank rule as every other settled form — a
+    ///   cache-hit squat at `unverified_claim` is displaced by
+    ///   byte-anchored standing;
     /// - non-terminal victim → `RefusedInFlight` (first-writer-wins
     ///   while the claim is live or owned by the retry machinery);
     /// - settled victim (`Completed`/`Skipped`) with
@@ -740,17 +807,23 @@ impl DerivationDag {
             debug_assert!(false, "displace() called for an absent victim");
             return DisplaceVerdict::RefusedInFlight;
         };
-        if !victim.drv_content_authoritative {
-            return DisplaceVerdict::RefusedStoreAnchored;
-        }
         let status = victim.status();
-        if !status.is_terminal() {
-            return DisplaceVerdict::RefusedInFlight;
-        }
         let settled = matches!(
             status,
             DerivationStatus::Completed | DerivationStatus::Skipped
         );
+        // r[impl sched.merge.store-evidence-displacement+2]
+        // Store-anchored exemption is scoped to NON-settled victims;
+        // settled bare nodes are rank-arbitrated below (rank-uniform
+        // with the row arbitration — bug_072: the categorical
+        // exemption is what let a cache-hit squat sit undisplaceable
+        // while serving forged outputs).
+        if !victim.drv_content_authoritative && !settled {
+            return DisplaceVerdict::RefusedStoreAnchored;
+        }
+        if !status.is_terminal() {
+            return DisplaceVerdict::RefusedInFlight;
+        }
         if settled && victim.evidence >= displacer {
             return DisplaceVerdict::RefusedSettledOutranked;
         }
@@ -1062,6 +1135,58 @@ impl DerivationDag {
                                 drv_path: node.drv_path.clone(),
                             });
                         }
+                    }
+                } else if !node.drv_content_authoritative
+                    && !existing.drv_content_authoritative
+                    && matches!(
+                        existing.status(),
+                        DerivationStatus::Completed | DerivationStatus::Skipped
+                    )
+                    && !verifiable_identity_matches(existing, node)
+                {
+                    // r[impl sched.merge.store-evidence-displacement+2]
+                    // Settled bare x bare identity conflict (bug_072):
+                    // the store-backed join exemption is for nodes
+                    // whose truth lives in the store — but a SETTLED
+                    // bare node's recorded outputs are served as a
+                    // cache hit to every joiner, so a conflicting
+                    // incoming claim must never silently attach (the
+                    // genuine owner would be handed a squat's forged
+                    // outputs). The displacement primitive owns the
+                    // decision, rank-uniform with every other settled
+                    // victim form: a store-evidence-granted incoming
+                    // (PathBoundBytes, verified by Step 0.6 against
+                    // the store's own text-CA bytes) displaces an
+                    // UnverifiedClaim/ContentBoundClaim squat; an
+                    // ungranted conflicting echo is REFUSED — fail
+                    // closed, never join-by-default. Identity-MATCHING
+                    // bare resubmissions (incl. the M_070
+                    // preserved-claim/dual-anchor bases) never reach
+                    // this arm and keep the join semantics.
+                    let verdict = self.displace(
+                        &drv_hash,
+                        displacer_evidence,
+                        &mut DisplacementBookkeeping {
+                            removed_retriable: &mut removed_retriable,
+                            displaced_scrubbed_edges: &mut displaced_scrubbed_edges,
+                            displaced: &mut displaced,
+                        },
+                    );
+                    if verdict != DisplaceVerdict::Displaced {
+                        self.rollback_merge(
+                            &newly_inserted,
+                            &new_edges,
+                            &interest_added,
+                            &traceparent_upgraded,
+                            &wanted_grown,
+                            &contributions_recorded,
+                            build_id,
+                            removed_retriable,
+                            displaced_scrubbed_edges,
+                        );
+                        return Err(DagError::ConflictingInFlightContent {
+                            drv_path: node.drv_path.clone(),
+                        });
                     }
                 } else if node.drv_content_authoritative
                     && !existing.drv_content_authoritative

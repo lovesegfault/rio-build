@@ -11016,6 +11016,103 @@ async fn test_store_evidence_displaces_settled_resident_squat() -> TestResult {
 }
 
 // r[verify sched.merge.store-evidence-displacement+2]
+/// THE bug_072 kill (resident settled bare x bare squat cell; depth-3
+/// fix-child of 9d83580f6 <- 1c8cc6877 <- f0a8ffcc9): a bare squat at
+/// the victim's drv_path settles as a CACHE HIT (forged expected
+/// outputs pre-seeded in the store; never dispatched, so it stays
+/// UnverifiedClaim) and remains DAG-resident. Pre-fix, the genuine
+/// owner's conflicting store-backed submission was silently JOINED
+/// through the gate's store-backed exemption — handed the squat's
+/// forged outputs as a DerivationCached result. Post-fix: Step 0.6
+/// scans bare settled victims, the store proves the genuine claim,
+/// and the displacement primitive erases the squat.
+#[tokio::test]
+async fn test_store_evidence_displaces_settled_bare_squat() -> TestResult {
+    let (db, store, handle, _task) = setup_with_mock_store().await?;
+    let (victim_node, aterm, _out) = mint_text_ca_leaf("evi-bare-squat");
+    let drv_path = victim_node.drv_path.clone();
+
+    // Bare squat: same hash key, FORGED output path (pre-seeded so the
+    // cache check settles it without any build), conflicting with the
+    // genuine identity (the genuine .drv derives a different out path).
+    let forged_out = test_store_path("bare-squat-forged-out");
+    store.seed_with_content(&forged_out, b"forged");
+    let squat = rio_proto::types::DerivationNode {
+        drv_path: drv_path.clone(),
+        drv_hash: drv_path.clone(),
+        pname: "bare-squat".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        expected_output_paths: vec![forged_out.clone()],
+        ..Default::default()
+    };
+    let squatter = Uuid::new_v4();
+    merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, squatter).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "squat settles as a cache hit (never dispatched: UnverifiedClaim)"
+    );
+    let resident = handle
+        .debug_query_derivation(&drv_path)
+        .await?
+        .expect("squat resident");
+    assert!(
+        matches!(
+            resident.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "squat is settled and resident"
+    );
+    let (squat_rank,): (String,) =
+        sqlx::query_as("SELECT evidence_rank FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        squat_rank, "unverified_claim",
+        "cache-hit squat never gained byte-bound standing"
+    );
+
+    // Genuine owner: uploads the real .drv and resubmits store-backed.
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+    let victim = Uuid::new_v4();
+    merge_dag(&handle, victim, vec![victim_node.clone()], vec![], false).await?;
+    barrier(&handle).await;
+
+    // NOT a silent join onto the forged outputs: the squat is
+    // displaced and the genuine build proceeds on a fresh node.
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "genuine claim displaces the bare squat instead of joining it"
+    );
+    let d = handle
+        .debug_query_derivation(&drv_path)
+        .await?
+        .expect("displacing node resident");
+    assert_ne!(
+        d.status,
+        DerivationStatus::Completed,
+        "fresh lifecycle — not the squat's settled state"
+    );
+    assert_ne!(
+        d.output_paths,
+        vec![forged_out.clone()],
+        "the genuine node does not carry the forged output claim"
+    );
+    let (rank, pname): (String, String) =
+        sqlx::query_as("SELECT evidence_rank, pname FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(rank, "path_bound_bytes", "store-verified standing");
+    assert_ne!(pname, "bare-squat", "squat row identity displaced");
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement+2]
 /// A claim the store's own bytes CONTRADICT is rejected outright — the
 /// fetched `.drv` is text-CA-bound to the declared path, so the
 /// contradiction is content-bound truth, not transport noise. The

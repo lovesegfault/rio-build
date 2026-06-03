@@ -241,6 +241,15 @@ fn settled_row_identity_matches(
     // unverified_claim, which fail-safes this clause CLOSED (no
     // dual-anchor for undecodable ranks — the refusal path keeps
     // owning those).
+    // Restricted to NON-authoritative incomings, same as the resident
+    // twin: an authoritative claim's bytes are bound to themselves,
+    // not to the declared path — no second anchor — and a matching
+    // identity admits the re-creation into the settled row's
+    // creation-snapshot refresh, which must not be reachable by an
+    // evidence-free byte-carrying claim.
+    if node.drv_content_authoritative {
+        return None;
+    }
     let row_rank = crate::state::DefinitionEvidence::parse_lossy(&row.evidence_rank);
     if row_rank >= crate::state::DefinitionEvidence::PathBoundBytes {
         return Some(SettledMatchBasis::DualAnchor);
@@ -1528,15 +1537,19 @@ impl DagActor {
         // r[impl sched.merge.store-evidence-displacement+2]
         // The DAG-resident form of the same remediation: a bare
         // store-backed echo whose identity conflicts with a SETTLED
-        // authoritative node would be rejected by the merge gate
-        // (RefusedSettledOutranked). When the store can prove the
-        // claim, raise the submission's standing so displace() —
-        // which still owns the decision — sees PathBoundBytes against
-        // the squat's ContentBoundClaim. Victims already at
-        // path_bound_bytes / verified_built are unreachable
-        // (rank-uniform with the row gate above), and store-anchored
-        // residents never need this (the gate joins or refuses them
-        // on its own).
+        // resident node — authoritative (would be rejected by the
+        // merge gate, RefusedSettledOutranked) or BARE (would
+        // previously have silently JOINED through the gate's
+        // store-backed exemption and been served the squat's outputs
+        // as a cache hit, bug_072) — gets the budgeted store check.
+        // When the store can prove the claim, raise the submission's
+        // standing so displace() — which still owns the decision —
+        // sees PathBoundBytes against the squat's ContentBoundClaim /
+        // UnverifiedClaim. Rank-uniform with the row gate above
+        // (store-evidence-displacement+2): no settled victim form
+        // below the byte-anchored ranks is exempt; victims already at
+        // path_bound_bytes / verified_built are unreachable here and
+        // refuse through the gate.
         for node in &nodes {
             if node.drv_content_authoritative || !node.drv_content.is_empty() {
                 continue;
@@ -1545,13 +1558,10 @@ impl DagActor {
             let Some(existing) = self.dag.node(&node.drv_hash) else {
                 continue;
             };
-            if !existing.drv_content_authoritative
-                || !matches!(
-                    existing.status(),
-                    crate::state::DerivationStatus::Completed
-                        | crate::state::DerivationStatus::Skipped
-                )
-                || existing.evidence >= crate::state::DefinitionEvidence::PathBoundBytes
+            if !matches!(
+                existing.status(),
+                crate::state::DerivationStatus::Completed | crate::state::DerivationStatus::Skipped
+            ) || existing.evidence >= crate::state::DefinitionEvidence::PathBoundBytes
                 || crate::dag::verifiable_identity_matches(existing, node)
             {
                 continue;
