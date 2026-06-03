@@ -242,9 +242,9 @@ pub struct Config {
     /// `--set store.logRetentionDays`), and the S3 `logs/` lifecycle
     /// backstop expires at the SAME variable + 7 days of slack — the
     /// two deleters derive from one source and cannot drift. Operators
-    /// outside that chain must keep any bucket lifecycle ≥ this value
-    /// + slack (an undercutting lifecycle hard-deletes chunks the read
-    /// path still references). Default 30. Env:
+    /// outside that chain must keep any bucket lifecycle at or above
+    /// this value plus slack (an undercutting lifecycle hard-deletes
+    /// chunks the read path still references). Default 30. Env:
     /// `RIO_LOG_RETENTION_DAYS`.
     pub log_retention_days: u32,
 }

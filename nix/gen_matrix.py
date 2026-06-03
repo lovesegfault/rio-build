@@ -474,15 +474,12 @@ def cluster_formal(names, shard_size=None, heap_by_name=None):
     # `--max-jobs 2` blow the runner envelope (FORMAL_SHARD_BUDGET_MB).
     # Isolate each into a singleton named for the check (the kani
     # pattern: exact attribution, no neighbor to starve).
-    heavy = sorted(
-        n
-        for n in names
-        if not n.startswith("kani-")
-        and heap_by_name.get(n, DEFAULT_SERVER_HEAP_MB) > DEFAULT_SERVER_HEAP_MB
-    )
-    rest = sorted(
-        n for n in names if not n.startswith("kani-") and n not in set(heavy)
-    )
+    def is_heavy(n):
+        return heap_by_name.get(n, DEFAULT_SERVER_HEAP_MB) > DEFAULT_SERVER_HEAP_MB
+
+    nonkani = [n for n in names if not n.startswith("kani-")]
+    heavy = sorted(n for n in nonkani if is_heavy(n))
+    rest = sorted(n for n in nonkani if not is_heavy(n))
     clusters = [{"name": n, "targets": n} for n in kani]
     clusters.extend({"name": n, "targets": n} for n in heavy)
     if rest:
