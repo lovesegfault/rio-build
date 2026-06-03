@@ -642,7 +642,7 @@ owns). All other controller reconcilers remain non-leader-gated.
   Every `SpotInterrupted` Event observed by the spot-interrupt watcher MUST
   be either attributed to a `hw_class` (appending the λ-numerator
   interrupt sample) or counted as a typed drop on
-  `rio_controller_spot_interrupt_dropped_total{reason}` with a warning ---
+  #(refs.metric)("rio_controller_spot_interrupt_dropped_total")`{reason}` with a warning ---
   a silent skip is not an outcome. Attribution resolves the node's labels
   by per-need GET first; when the node is already gone or unreadable (the
   COMMON reclaim case --- the instance is deleted moments after the Event)
@@ -1317,7 +1317,7 @@ scheduler's cost table when the outage ends.
   and expired build attempts) is past the cluster threshold and at least two
   nodes are affected, the verdict is SYSTEMIC --- the reconciler MUST mark
   no node, MUST increment the suppression counter
-  (`rio_controller_wedge_systemic_suppressed_total`), and the unhealthy
+  (#(refs.metric)("rio_controller_wedge_systemic_suppressed_total")), and the unhealthy
   reap's `Dead` arm MUST NOT receive any wedge-derived input that tick. Only
   a per-node (non-systemic) verdict may feed the `Dead` arm. The wedge
   observation grace plus two reconcile ticks MUST fit inside the scheduler's
