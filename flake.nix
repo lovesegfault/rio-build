@@ -800,12 +800,30 @@
                 # picks runs-on by prefix. Each entry is file-shaped
                 # (the lcov is $out directly) to match perTestLcov.
                 coverage =
-                  pkgs.lib.mapAttrs' (
-                    n: d:
-                    pkgs.lib.nameValuePair "unit-${n}" (
-                      pkgs.runCommand "rio-cov-unit-${n}" { } "ln -s ${d}/lcov.info $out"
+                  pkgs.lib.mapAttrs'
+                    (
+                      n: d:
+                      pkgs.lib.nameValuePair "unit-${n}" (
+                        pkgs.runCommand "rio-cov-unit-${n}" { } "ln -s ${d}/lcov.info $out"
+                      )
                     )
-                  ) crateChecks.covLcovs
+                    (
+                      removeAttrs crateChecks.covLcovs [
+                        # rio-buildhash is build-dependency-only: its rlib
+                        # links into build_script_build binaries that
+                        # buildRustCrate compiles without extraRustcOpts, so
+                        # the whole crate is exempt from
+                        # -Cinstrument-coverage (nix/crate2nix.nix
+                        # buildDepOnlyCrates) and its unit lcov is
+                        # deterministically 0 bytes. coverage-upload.py
+                        # skips empty lcovs, so an included entry would
+                        # leave Codecov waiting at N-1 of after_n_builds
+                        # forever. Same pattern as the vm-* exclusions
+                        # above; codecov-matrix-sync keeps the count
+                        # honest.
+                        "rio-buildhash"
+                      ]
+                    )
                   // coverage.perTestLcov;
 
               };

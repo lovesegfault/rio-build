@@ -108,7 +108,25 @@ let
   # rlibs link into build_script_build binaries, which buildRustCrate
   # compiles WITHOUT extraRustcOpts). Excluded from instrumentation
   # flags in buildRustCrateForPkgs below.
-  buildDepOnlyCrates = [ "rio-buildhash" ];
+  #
+  # DERIVED from the resolved Cargo.json instead of hand-listed: a hand
+  # list drifts both ways — the next build-dep-only crate silently
+  # reintroduces the fuzz-tree asan build-script link failure, and a
+  # crate gaining a runtime consumer would silently stay exempt from
+  # instrumenting runtime-reachable code. Membership = referenced from
+  # some workspace member's [build-dependencies] and from NO member's
+  # [dependencies]/[dev-dependencies].
+  buildDepOnlyCrates =
+    let
+      resolved = builtins.fromJSON (builtins.readFile resolvedJson);
+      memberCrates = map (id: resolved.crates.${id}) (lib.attrValues resolved.workspaceMembers);
+      depNames = kind: lib.unique (lib.concatMap (c: map (d: d.name) (c.${kind} or [ ])) memberCrates);
+      buildNames = depNames "buildDependencies";
+      runtimeNames = depNames "dependencies" ++ depNames "devDependencies";
+    in
+    lib.filter (n: lib.elem n buildNames && !lib.elem n runtimeNames) (
+      map (c: c.crateName) memberCrates
+    );
 
   buildRustCrateForPkgs =
     cratePkgs:
@@ -170,6 +188,12 @@ let
           crate_ // { src = memberSrcs.${crate_.crateName}; }
         else
           crate_;
+      # Tree-level instrumentation/extra opts for THIS crate, post
+      # buildDepOnlyCrates exclusion — bound once so the extraRustcOpts
+      # payload and the LLVM_PROFILE_FILE gate below cannot diverge.
+      effectiveTreeOpts = lib.optionals (!lib.elem crate_.crateName buildDepOnlyCrates) (
+        globalExtraRustcOpts ++ lib.optionals isLocal localExtraRustcOpts
+      );
     in
     base (
       crate_'
@@ -185,22 +209,21 @@ let
           # the sanitizer runtime — and coverage instrumentation is dead
           # weight at best. Same reasoning cargo itself applies by never
           # passing RUSTFLAGS to host units.
-          ++ lib.optionals (!lib.elem crate_.crateName buildDepOnlyCrates) (
-            globalExtraRustcOpts ++ lib.optionals isLocal localExtraRustcOpts
-          )
+          ++ effectiveTreeOpts
           ++ lib.optionals isLocal [ localRemap ]
           ++ (crate_'.extraRustcOpts or [ ]);
       }
       //
-        lib.optionalAttrs
-          (lib.elem "-Cinstrument-coverage" (
-            globalExtraRustcOpts ++ lib.optionals isLocal localExtraRustcOpts
-          ))
-          {
-            # Discard build-time profraws. Test runners override at
-            # runtime to collect real data.
-            LLVM_PROFILE_FILE = "/dev/null";
-          }
+        # Gate keyed on the SAME post-exclusion list as the payload above
+        # — a gate on the pre-exclusion list forked the coverage tree's
+        # rio-buildhash drv from the plain tree's byte-identical compile
+        # via a no-op env var, forfeiting exactly the store sharing the
+        # comment below describes.
+        lib.optionalAttrs (lib.elem "-Cinstrument-coverage" effectiveTreeOpts) {
+          # Discard build-time profraws. Test runners override at
+          # runtime to collect real data.
+          LLVM_PROFILE_FILE = "/dev/null";
+        }
     );
 
   # ──────────────────────────────────────────────────────────────────
