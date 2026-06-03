@@ -6209,6 +6209,7 @@ version = "0.1.0"
 dependencies = [
  "k8s-openapi",
  "kube",
+ "regex",
  "schemars",
  "serde",
  "serde-saphyr",

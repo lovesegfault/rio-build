@@ -19658,6 +19658,12 @@
           "packageId": "workspace-hack"
         }
       ],
+      "devDependencies": [
+        {
+          "name": "regex",
+          "packageId": "regex"
+        }
+      ],
       "crateBin": [
         {
           "name": "crdgen",

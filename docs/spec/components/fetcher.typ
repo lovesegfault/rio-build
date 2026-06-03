@@ -98,6 +98,33 @@ scheduler knows the expected hash before dispatch; the fetcher re-derives
   the worker as `RIO_HASHED_MIRRORS`; an empty list disables the lookup.
 ]
 
+#r("fetcher.mirrors.admission-accept-set")[
+  The `hashedMirrors` admission accept-set MUST be single-sourced from the
+  terminal fetch consumers' contracts and MUST equal: http(s)-scheme URLs
+  whose remaining bytes are printable ASCII excluding comma. Every
+  derivation of the constraint (the CEL admission rule, the reconciler's
+  runtime filter) MUST be derived from the one defining pattern; an entry
+  outside the set MUST be rejected at admission, and the reconciler MUST
+  skip-and-warn --- never silently mangle --- such entries on resources
+  admitted under older rules.
+]
+
+The accept-set is an intersection, not a style choice: the value transits a
+comma-joined env (`RIO_HASHED_MIRRORS`) and a whitespace-split env
+(`RIO_FETCHURL_MIRRORS`), the candidate loop skips `s3://` per candidate
+(#rref("fetcher.divergence.s3-transport")), and the HTTP client serves only
+http(s) --- so anything outside the set is either fragmented in transit or
+dead weight that burns the per-candidate retry ladder. r17 merged_bug_003
+found three independent spellings of this constraint (CEL, reconciler,
+candidate loop) with three different accept-sets: the CEL admitted Unicode
+the reconciler dropped, and the reconciler passed schemes the candidate loop
+skipped, each layer mislabeling the population the next one saw. The single
+defining pattern lives in `rio-crds` (`HASHED_MIRROR_URL_PATTERN`); its two
+derivations are pinned equal axis-by-axis, the generated schema is pinned to
+carry the rule verbatim, apiserver acceptance is witnessed end-to-end in the
+fetcher-split scenario, and a CI deny-grep refuses pattern copies outside
+the defining file.
+
 = netrc credential scope
 
 #r("fetcher.fetchurl.netrc-origin-scope")[

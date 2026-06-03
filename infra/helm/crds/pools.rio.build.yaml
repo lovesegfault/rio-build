@@ -99,9 +99,10 @@ spec:
                   URL). Maps to `RIO_HASHED_MIRRORS`. Mostly relevant for
                   `kind=Fetcher` pools, but allowed on both kinds — builders may
                   also run non-builtin FODs that never consult it. `None` = no
-                  mirrors (origin URLs only). CEL-validated: each entry must be
-                  an absolute URL with no comma or whitespace (the env transport
-                  is comma- and space-delimited; r16 bug_097).
+                  mirrors (origin URLs only). CEL-validated against the
+                  single-source accept-set ([`HASHED_MIRROR_URL_PATTERN`]):
+                  http(s) URLs of printable ASCII without commas (r16 bug_097,
+                  r17 merged_bug_003).
                   Bounds (32 entries x 2048 chars) exist for the apiserver's CEL
                   cost estimator: an unbounded array of unbounded strings under a
                   `matches()` rule exceeds the per-schema cost budget >100x and
@@ -298,11 +299,12 @@ spec:
                 self.kind != 'Builder' || !has(self.nodeSelector) || !('rio.build/fetcher' in
                 self.nodeSelector)
             - message: >-
-                hashedMirrors entries must be absolute URLs containing no comma or whitespace —
-                the value is transported through comma- and space-delimited env vars
-                (RIO_HASHED_MIRRORS), so a delimiter inside a URL silently fragments it into garbage mirror
-                candidates (r16 bug_097)
-              rule: "!has(self.hashedMirrors) || self.hashedMirrors.all(m, m.matches('^[a-zA-Z][a-zA-Z0-9+.-]*://[^,\\t\\r\\n ]+$'))"
+                hashedMirrors entries must be http(s) URLs of printable ASCII without commas —
+                the accept-set is single-sourced from the terminal fetch consumers (comma/space
+                env transports; http(s)-only candidate loop), so a mirror the worker cannot
+                consume is rejected here instead of dying silently in the fetch path (r16 bug_097, r17
+                merged_bug_003)
+              rule: "!has(self.hashedMirrors) || self.hashedMirrors.all(m, m.matches('^https?://[-!-+.-~]+$'))"
           status:
             description: |-
               Pool status — reconciler writes, operators read.
