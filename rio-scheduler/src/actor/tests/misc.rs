@@ -2559,6 +2559,144 @@ async fn test_dispatch_claims_derived_from_store_bytes() -> TestResult {
     Ok(())
 }
 
+/// Round-16 bug_094: a deferred-IA node's dispatch-time resolution
+/// must record its computed REAL paths as the claim
+/// (`set_claim_output_paths`) — the HMAC `expected_outputs` site reads
+/// `claim_output_paths()` — while `expected_output_paths` keeps its
+/// INGRESS shape (the empty slot). Pre-fix, dispatch overwrote the
+/// expected slots, which destroyed the emptiness signal the
+/// byte-derived resolve probe (`child_unknown`, merge.rs) reads off
+/// resident children: a bare store-backed FOD parent dispatching after
+/// this child built recorded a sticky `needs_resolve=false` at its
+/// PathBoundBytes raise and then failed deterministically on the
+/// un-rewritten placeholder until poison. (Unsigned fixture: the claim
+/// values are asserted via the debug surface, which exposes exactly
+/// what the HMAC site signs — `claim_output_paths()`; the signed-token
+/// mechanics are pinned by the claims suite above.)
+#[tokio::test]
+async fn test_deferred_ia_resolve_claims_real_path_and_preserves_ingress_shape() -> TestResult {
+    use crate::ca::resolve::downstream_placeholder;
+    use rio_nix::store_path::StorePath;
+    let (db, _store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Child: floating-CA leaf with a known modular hash.
+    let child_modular: [u8; 32] = [0x11; 32];
+    let mut child = make_node("dia-child");
+    child.is_content_addressed = true;
+    child.needs_resolve = true;
+    child.ca_modular_hash = child_modular.to_vec();
+    let child_drv_path = child.drv_path.clone();
+
+    // Parent: deferred-IA — IA drv whose own output path is unknown
+    // until its floating input resolves. Ingress shape: ONE empty
+    // expected slot. Minted store-shaped: canonical ATerm with the
+    // deferred output ("out","","","") and the child placeholder in
+    // env, drv_path = the bytes' text content-address (the dispatch
+    // claims gate re-derives and compares it), bare submission (the
+    // gate fetches the seeded store bytes).
+    let placeholder = downstream_placeholder(&StorePath::parse(&child_drv_path).unwrap(), "out");
+    let parent_aterm = format!(
+        r#"Derive([("out","","","")],[("{child_drv_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","build"],[("DEP","{placeholder}"),("name","dia-parent"),("out",""),("system","x86_64-linux")])"#
+    );
+    {
+        use rio_nix::derivation::Derivation;
+        let drv = Derivation::parse(&parent_aterm).expect("fixture parses");
+        assert_eq!(drv.to_aterm(), parent_aterm, "fixture must be canonical");
+    }
+    let parent_path = {
+        use rio_nix::hash::{HashAlgo, NixHash};
+        use sha2::{Digest, Sha256};
+        let h = NixHash::new(
+            HashAlgo::SHA256,
+            Sha256::digest(parent_aterm.as_bytes()).to_vec(),
+        )
+        .unwrap();
+        StorePath::make_text(
+            "dia-parent.drv",
+            &h,
+            &[StorePath::parse(&child_drv_path).unwrap()],
+        )
+        .unwrap()
+        .as_str()
+        .to_owned()
+    };
+    let parent = rio_proto::types::DerivationNode {
+        drv_path: parent_path.clone(),
+        drv_hash: parent_path.clone(),
+        pname: "dia-parent".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_content_addressed: false,
+        needs_resolve: true,
+        expected_output_paths: vec![String::new()],
+        ..Default::default()
+    };
+    _store.seed_with_content(&parent_path, parent_aterm.as_bytes());
+
+    let mut worker_rx = connect_executor(&handle, "dia-w", "x86_64-linux").await?;
+    merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![child, parent],
+        vec![rio_proto::types::DerivationEdge {
+            parent_drv_path: parent_path.clone(),
+            child_drv_path: child_drv_path.clone(),
+        }],
+        false,
+    )
+    .await?;
+
+    // Child dispatches first (leaf). Seed its realisation AFTER the
+    // merge (so it does not cache-hit), then complete it — the parent
+    // becomes Ready and resolves at dispatch.
+    let a1 = recv_assignment(&mut worker_rx).await;
+    assert!(a1.drv_path.contains("dia-child"), "child dispatches first");
+    let realized = test_store_path("dia-child-realized-out");
+    sqlx::query(
+        "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
+         VALUES ($1, 'out', $2, $3)",
+    )
+    .bind(child_modular.as_slice())
+    .bind(&realized)
+    .bind([0x33u8; 32].as_slice())
+    .execute(&db.pool)
+    .await?;
+    complete_success(&handle, "dia-w", "dia-child", &realized).await?;
+
+    // The first executor drains after its completion (one-shot worker
+    // semantics) — connect a fresh one for the parent, like the
+    // recovered CA-on-CA dispatch test.
+    let mut worker_rx2 = connect_executor(&handle, "dia-w2", "x86_64-linux").await?;
+    let assignment = recv_assignment(&mut worker_rx2).await;
+    assert_eq!(assignment.drv_path, parent_path);
+    // Resolution actually happened: the forwarded bytes carry the
+    // realized input path, not the placeholder.
+    let sent = String::from_utf8(assignment.drv_content.clone())?;
+    assert!(
+        sent.contains(&realized) && !sent.contains(&placeholder),
+        "parent must dispatch with the placeholder rewritten"
+    );
+
+    let info = expect_drv(&handle, &parent_path).await;
+    // The claim carries the RESOLVED real path, not the ingress "".
+    assert_eq!(info.claim_output_paths.len(), 1);
+    let claimed = &info.claim_output_paths[0];
+    assert!(
+        claimed.starts_with("/nix/store/") && claimed.ends_with("-dia-parent"),
+        "the claim field must carry the resolved deferred-IA path; got {claimed:?}"
+    );
+    // The node's expected paths keep the INGRESS shape — the resolve
+    // probe contract (pre-fix this read [claimed] and the emptiness
+    // signal was gone).
+    assert_eq!(
+        info.expected_output_paths,
+        vec![String::new()],
+        "expected_output_paths must keep its ingress shape across dispatch"
+    );
+    Ok(())
+}
+
 // r[verify sched.ca.absent-hash-surfaced]
 /// THE ingress-stripped node, followed end-to-end PAST ingress for the
 /// first time (round-15 C3c6, bug_048 part 2). Shape provenance: a

@@ -167,9 +167,11 @@ pub struct ResolvedDerivation {
     /// path was computed post-resolve via
     /// [`BasicDerivation::fill_deferred_outputs`]. Empty for
     /// floating-CA-self (its outputs stay `""` — nix-daemon computes
-    /// scratch paths) and for concrete IA. Dispatch overwrites
-    /// `state.expected_output_paths` from this so the HMAC
-    /// `expected_outputs` claim carries the real path, not `""`.
+    /// scratch paths) and for concrete IA. Dispatch records these as
+    /// the node's CLAIM paths (`DerivationState::set_claim_output_paths`)
+    /// so the HMAC `expected_outputs` claim carries the real path, not
+    /// `""` — never written to `expected_output_paths`, whose ingress
+    /// shape is the resolve probes' contract (round-16 bug_094).
     pub output_paths: Vec<(String, String)>,
 }
 
@@ -1027,7 +1029,7 @@ mod tests {
     /// `resolve_ca_inputs`, the parent's own `$out` MUST be a real
     /// store path in BOTH `outputs[0].path` and `env["out"]`, and
     /// `ResolvedDerivation.output_paths` must surface it for the
-    /// dispatch-side `expected_output_paths` overwrite.
+    /// dispatch-side claim recording (`set_claim_output_paths`).
     ///
     /// Regression: pre-fix, `resolve_ca_inputs` only did phase 1
     /// (input collapse + placeholder rewrite); the resolved ATerm
@@ -1080,7 +1082,7 @@ mod tests {
             Some(out_path),
             "env[\"out\"] must match outputs[0].path"
         );
-        // Surfaced for dispatch's expected_output_paths overwrite.
+        // Surfaced for dispatch's claim recording.
         assert_eq!(
             resolved.output_paths,
             vec![("out".to_string(), out_path.to_string())]
@@ -1099,8 +1101,8 @@ mod tests {
     /// Floating-CA-self with a CA input: `("out","","sha256","")`.
     /// `fill_deferred_outputs` must leave it alone — nix-daemon
     /// computes the scratch path internally from `hash_algo`.
-    /// `output_paths` stays empty so dispatch doesn't clobber
-    /// `expected_output_paths` with a wrong value.
+    /// `output_paths` stays empty so dispatch records no claim
+    /// override (the HMAC path for floating-CA is `is_ca`).
     #[tokio::test]
     async fn resolve_floating_ca_self_leaves_out_empty() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;

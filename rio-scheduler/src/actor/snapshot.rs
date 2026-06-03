@@ -2052,8 +2052,19 @@ impl DagActor {
             .iter_nodes()
             .filter(|(_, s)| !s.status().is_terminal())
             .flat_map(|(_, s)| {
+                // TRUE union of all three path tiers: merge-time
+                // expected ∪ dispatch-resolved claim ∪ realized. The
+                // worker uploads to the RESOLVED paths, which must be
+                // GC roots from the moment of dispatch, not from
+                // completion (round-16 bug_094: pre-fix the resolved
+                // paths reached this union by mutating
+                // expected_output_paths; the claim field now carries
+                // them, and unioning rather than substituting keeps
+                // any concrete ingress path retained even if a resolve
+                // recomputes it differently).
                 s.expected_output_paths
                     .iter()
+                    .chain(s.claim_output_paths().iter())
                     .chain(s.output_paths.iter())
                     .filter(|p| !p.is_empty())
                     .cloned()

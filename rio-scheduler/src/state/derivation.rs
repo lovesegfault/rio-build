@@ -1206,7 +1206,32 @@ pub struct DerivationState {
     /// Used for: cache-check (merge.rs), and prefetch-hint closure
     /// approximation (children's expected_output_paths = parent's
     /// inputs; see `approx_input_closure`).
+    ///
+    /// INGRESS-SHAPE INVARIANT (round-16 bug_094): this field keeps its
+    /// merge-time shape for the node's whole life — an empty slot means
+    /// "path unknown until placeholder resolution", and the byte-derived
+    /// resolve probe (`child_unknown` in merge.rs) plus the recovery
+    /// degrade (`should_resolve_from_expected_paths`) read exactly that
+    /// emptiness signal off RESIDENT siblings. Dispatch-time resolution
+    /// writes its computed paths via [`Self::set_claim_output_paths`] —
+    /// the field's one historical mutator (the deferred-IA HMAC-claim
+    /// overwrite in dispatch.rs) is deleted; do not add another.
     pub expected_output_paths: Vec<String>,
+    /// Dispatch-resolved output paths for the HMAC claim and GC roots —
+    /// a deferred-IA node's REAL paths computed by `maybe_resolve_ca`
+    /// once its floating inputs have realisations. Kept apart from
+    /// [`Self::expected_output_paths`] so the ingress-shape invariant
+    /// above holds (round-16 bug_094: overwriting expected slots
+    /// destroyed the emptiness signal a bare store-backed FOD parent's
+    /// `child_unknown` probe needed, recording a sticky
+    /// `needs_resolve=false` at its PathBoundBytes raise — the honest
+    /// FOD then dispatched with its input's placeholder un-rewritten
+    /// and failed deterministically until poison). Private: written
+    /// only via [`Self::set_claim_output_paths`], read via
+    /// [`Self::claim_output_paths`] (falls back to the expected paths
+    /// while empty). Not persisted — recomputed on every resolve;
+    /// post-failover the first dispatch re-resolves.
+    claim_output_paths: Vec<String>,
     /// Output NAMES any consumer actually references (∪ over parents'
     /// inputDrvs sets ∪ the root OutputsSpec). EMPTY = all declared
     /// outputs wanted. This is the STORED node-level union: it grows
@@ -1480,6 +1505,7 @@ impl DerivationState {
             retry: RetryState::default(),
             output_paths: Vec::new(),
             expected_output_paths: node.expected_output_paths.clone(),
+            claim_output_paths: Vec::new(),
             wanted_output_names: node.wanted_output_names.clone(),
             // The submitting build's contribution is recorded by
             // `dag.merge` (the build_id isn't known here).
@@ -1727,6 +1753,7 @@ impl DerivationState {
             },
             output_paths: Vec::new(), // completed rows not loaded
             expected_output_paths: row.expected_output_paths,
+            claim_output_paths: Vec::new(),
             // Persisted with union-on-conflict (`migrations/062`,
             // `batch_upsert_derivations`). Pre-migration rows carry the
             // column DEFAULT '{}' = all declared outputs wanted, so
@@ -1831,6 +1858,28 @@ impl DerivationState {
     /// soft-strip — pre §13e FOD↔fetcher derivation).
     pub fn effective_features(&self) -> &EffectiveFeatures {
         &self.effective_features
+    }
+
+    /// The output paths the dispatch CLAIM should carry: the resolved
+    /// real paths once `maybe_resolve_ca` computed them, else the
+    /// merge-time expected paths. Consumers: the HMAC
+    /// `expected_outputs` claim and the GC-roots union — never the
+    /// resolve probes, which read [`Self::expected_output_paths`]'s
+    /// preserved ingress shape (round-16 bug_094).
+    pub fn claim_output_paths(&self) -> &[String] {
+        if self.claim_output_paths.is_empty() {
+            &self.expected_output_paths
+        } else {
+            &self.claim_output_paths
+        }
+    }
+
+    /// Record the dispatch-resolved output paths (full list,
+    /// index-aligned with `output_names`). Sole writer of the private
+    /// claim field; `expected_output_paths` is NEVER touched — its
+    /// ingress shape is the resolve probes' contract.
+    pub fn set_claim_output_paths(&mut self, resolved: Vec<String>) {
+        self.claim_output_paths = resolved;
     }
 
     /// In-memory `requiredSystemFeatures`, post I-204 soft-strip (the

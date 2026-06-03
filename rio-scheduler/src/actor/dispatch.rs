@@ -2846,21 +2846,34 @@ impl DagActor {
         // Empty vec → no-op; non-empty only for CA-on-CA chains
         // that actually resolved.
         //
-        // Deferred-IA: also overwrite expected_output_paths with the
-        // post-resolve computed paths (index-aligned with output_names)
-        // so the HMAC `expected_outputs` claim below carries the real
-        // path, not `""`. Floating-CA leaves resolved_output_paths
-        // empty → no overwrite (its HMAC path is `is_ca` instead).
+        // Deferred-IA: record the post-resolve computed paths
+        // (index-aligned with output_names) in the CLAIM field so the
+        // HMAC `expected_outputs` claim below carries the real path,
+        // not `""`. NEVER written to `expected_output_paths` — the
+        // round-16 bug_094 fix: that field's ingress shape (empty slot
+        // = path unknown until resolution) is the contract of the
+        // byte-derived resolve probe (`child_unknown`, merge.rs) and
+        // the recovery degrade; the old per-slot overwrite destroyed
+        // the emptiness signal, so a bare store-backed FOD parent
+        // dispatching after its deferred-IA child recorded a STICKY
+        // `needs_resolve=false` at its PathBoundBytes raise and then
+        // failed deterministically on the un-rewritten placeholder.
+        // Floating-CA leaves resolved_output_paths empty → claim falls
+        // back to expected (its HMAC path is `is_ca` instead).
         if (!resolve_lookups.is_empty() || !resolved_output_paths.is_empty())
             && let Some(state) = self.dag.node_mut(drv_hash)
         {
             state.ca.pending_realisation_deps = resolve_lookups;
-            for (name, path) in resolved_output_paths {
-                if let Some(i) = state.output_names.iter().position(|n| n == &name)
-                    && let Some(slot) = state.expected_output_paths.get_mut(i)
-                {
-                    *slot = path;
+            if !resolved_output_paths.is_empty() {
+                let mut claim = state.expected_output_paths.clone();
+                for (name, path) in resolved_output_paths {
+                    if let Some(i) = state.output_names.iter().position(|n| n == &name)
+                        && let Some(slot) = claim.get_mut(i)
+                    {
+                        *slot = path;
+                    }
                 }
+                state.set_claim_output_paths(claim);
             }
         }
 
@@ -2905,7 +2918,7 @@ impl DagActor {
             signer.sign(&rio_auth::hmac::AssignmentClaims {
                 executor_id: executor_id.to_string(),
                 drv_hash: drv_hash.to_string(),
-                expected_outputs: state.expected_output_paths.clone(),
+                expected_outputs: state.claim_output_paths().to_vec(),
                 // Floating-CA: output path is computed post-build
                 // from the NAR hash, so expected_output_paths is
                 // [""] here. Store skips the path-in-claims check
