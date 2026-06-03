@@ -1261,6 +1261,16 @@ pub async fn process_settled_batch(
     // projections — see `ledger::measured_attempt_requeues`. Loaded once
     // per settled batch so every record this pass writes shares one view.
     let prior_attempts = measured_attempt_requeues(state)?;
+    // Whether the CURRENT settled submission was itself a cluster attempt,
+    // derived once from batch evidence so no writer arm can hand-tune the
+    // +1: a build id or in-band results prove the cluster saw the
+    // submission; their joint absence is the engine-side shape
+    // (submission failure, fully cancelled engine-cancel cycle) whose
+    // requeue class `RequeueReason::counts_as_cluster_attempt` pins as
+    // never-reached-the-cluster — the same judgment, asked of the current
+    // event instead of journaled history. False by construction in the
+    // no-result arm below; true by construction in every with-result arm.
+    let current_is_cluster_attempt = batch.build_id.is_some() || !batch.results.is_empty();
     // Members of timed batches are never re-offered to the timeless pending
     // pool: the timed dispatcher owns its own retries (confirmation
     // re-submissions), and whatever stays unresolved is covered by the
@@ -1369,7 +1379,18 @@ pub async fn process_settled_batch(
                         &HashMap::new(),
                         mode,
                         campaign_id,
-                        stamped_attempts(prior_attempts.get(job).copied().unwrap_or(0), true),
+                        // No current cluster attempt: this arm IS the
+                        // engine-side shape (false by construction —
+                        // see `current_is_cluster_attempt`), so the
+                        // record reports only the cluster attempts the
+                        // journal measured. A job whose every submission
+                        // failed at channel open stamps 0, agreeing with
+                        // the stalled-queued writer for the same
+                        // zero-cluster-contact truth.
+                        stamped_attempts(
+                            prior_attempts.get(job).copied().unwrap_or(0),
+                            current_is_cluster_attempt,
+                        ),
                         None,
                         first_active.get(job).cloned(),
                         None,
@@ -1641,7 +1662,14 @@ pub async fn process_settled_batch(
                             &HashMap::new(),
                             mode,
                             campaign_id,
-                            stamped_attempts(prior_attempts.get(job).copied().unwrap_or(0), true),
+                            // True by construction past the no-result
+                            // gate: the batch carries cluster evidence,
+                            // and the replayed interruption ran on the
+                            // cluster until its recorded offset.
+                            stamped_attempts(
+                                prior_attempts.get(job).copied().unwrap_or(0),
+                                current_is_cluster_attempt,
+                            ),
                             None,
                             first_active.get(job).cloned(),
                             None,
@@ -1678,11 +1706,17 @@ pub async fn process_settled_batch(
                 // reports initial + retries (flakiness then surfaces on
                 // the verdict); every other batch derives attempts from
                 // the journal's cluster-attempt projection
-                // ([`stamped_attempts`] over [`measured_attempt_requeues`]).
+                // ([`stamped_attempts`] over [`measured_attempt_requeues`])
+                // plus this settled submission — a cluster attempt by
+                // construction here (the arm is reachable only past the
+                // no-result gate, so `current_is_cluster_attempt` holds).
                 let attempts = if batch.confirmation_attempt > 0 {
                     batch.confirmation_attempt + 1
                 } else {
-                    stamped_attempts(prior_attempts.get(job).copied().unwrap_or(0), true)
+                    stamped_attempts(
+                        prior_attempts.get(job).copied().unwrap_or(0),
+                        current_is_cluster_attempt,
+                    )
                 };
                 // Evidence capture: NAR hashes for successes, log tail for
                 // failures.
@@ -4418,6 +4452,16 @@ mod tests {
     /// transport failure (unreachable gateway, host-key mismatch) drains
     /// the campaign instead of re-offering forever. No scheduler evidence
     /// RPCs fire: the failure happened before any build existed.
+    ///
+    /// Attempts on the exhaustion records report what the CLUSTER saw,
+    /// per `RequeueReason::counts_as_cluster_attempt`'s contract (the
+    /// ONLY path from events to the measurement; an engine-side
+    /// submission failure "never reached the cluster at all"): the final
+    /// failed submission this record is about is itself that excluded
+    /// event class, so it adds nothing — "spent" stamps exactly its one
+    /// journaled cluster attempt, and "never" (every submission failed at
+    /// channel open) stamps 0, agreeing with the stalled-queued writer's
+    /// stamp for the same zero-cluster-contact truth.
     #[tokio::test]
     async fn engine_submission_failure_consumes_budget_then_terminalizes() {
         let dir = tempfile::tempdir().unwrap();
@@ -4432,6 +4476,10 @@ mod tests {
                 "spent.x86_64-linux".to_string(),
                 ctx("spent.x86_64-linux", DEP, &[], ExpectedOutcome::Built),
             ),
+            (
+                "never.x86_64-linux".to_string(),
+                ctx("never.x86_64-linux", OTHER, &[], ExpectedOutcome::Built),
+            ),
         ]
         .into();
         let batch = BatchView {
@@ -4439,30 +4487,44 @@ mod tests {
             stderr_tail: Some("engine submission error: ssh handshake: host key mismatch".into()),
             ..BatchView::default()
         };
-        // Knobs::default() grants one auto-retry: "spent" already burned it
-        // on a real transport retry. The budget map drives the decision; the
-        // journal is what the record's attempts derive from (production
-        // keeps the two in lockstep via journal-then-increment).
-        let prior: HashMap<String, PriorBudgets> =
-            [("spent.x86_64-linux".to_string(), prior(1))].into();
-        state
-            .append_jsonl(
-                StateFile::Requeues,
-                &crate::run::model::RequeueRecord {
-                    job: "spent.x86_64-linux".to_string(),
-                    source: crate::run::model::REQUEUE_SOURCE_COLLECT.to_string(),
-                    why: RequeueReason::NoInbandResult.as_str().to_string(),
-                    at: "2026-05-26T00:00:00Z".to_string(),
-                },
-            )
-            .unwrap();
+        // Knobs::default() grants one auto-retry: "spent" burned it on a
+        // real transport retry (a cluster attempt), "never" on an earlier
+        // engine-side submission failure (not one). The budget map drives
+        // the decision; the journal is what the record's attempts derive
+        // from (production keeps the two in lockstep via
+        // journal-then-increment).
+        let prior: HashMap<String, PriorBudgets> = [
+            ("spent.x86_64-linux".to_string(), prior(1)),
+            ("never.x86_64-linux".to_string(), prior(1)),
+        ]
+        .into();
+        for (job, why) in [
+            ("spent.x86_64-linux", RequeueReason::NoInbandResult),
+            ("never.x86_64-linux", RequeueReason::EngineSubmissionFailure),
+        ] {
+            state
+                .append_jsonl(
+                    StateFile::Requeues,
+                    &crate::run::model::RequeueRecord {
+                        job: job.to_string(),
+                        source: crate::run::model::REQUEUE_SOURCE_COLLECT.to_string(),
+                        why: why.as_str().to_string(),
+                        at: "2026-05-26T00:00:00Z".to_string(),
+                    },
+                )
+                .unwrap();
+        }
         let decisions = process_settled_batch(
             &state,
             &admin,
             &FakeStoreApi::default(),
             None,
             &contexts,
-            &["fresh.x86_64-linux".into(), "spent.x86_64-linux".into()],
+            &[
+                "fresh.x86_64-linux".into(),
+                "spent.x86_64-linux".into(),
+                "never.x86_64-linux".into(),
+            ],
             &batch,
             &prior,
             &Knobs::default(),
@@ -4474,10 +4536,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(requeued(&decisions), vec!["fresh.x86_64-linux".to_string()]);
-        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
-        assert_eq!(records.len(), 1, "{records:?}");
-        let rec = &records[0];
-        assert_eq!(rec.job, "spent.x86_64-linux");
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        assert_eq!(records.len(), 2, "{records:?}");
+        let rec = &records["spent.x86_64-linux"];
         assert_eq!(
             rec.verdict.as_deref(),
             Some(Verdict::InfraIndeterminate.as_str())
@@ -4488,10 +4549,20 @@ mod tests {
             rec.evidence.as_deref(),
             Some("engine submission error: ssh handshake: host key mismatch")
         );
-        // attempts = the journaled cluster-attempt requeue + the final
-        // failed submission this record is about.
-        assert_eq!(rec.attempts, 2);
+        // attempts = the one journaled cluster-attempt requeue; the final
+        // failed submission never reached the cluster
+        // (counts_as_cluster_attempt pins EngineSubmissionFailure false),
+        // so it cannot add a current attempt.
+        assert_eq!(rec.attempts, 1);
         assert!(rec.build_ids.is_empty());
+        // Zero cluster contact across the job's whole history: the
+        // measurement reports zero attempts, not a fabricated 1.
+        let never = &records["never.x86_64-linux"];
+        assert_eq!(
+            never.verdict.as_deref(),
+            Some(Verdict::InfraIndeterminate.as_str())
+        );
+        assert_eq!(never.attempts, 0);
         // The failure pre-dates any build: nothing to fetch poison evidence
         // or a log tail for.
         assert_eq!(admin.poisoned_calls.load(Ordering::SeqCst), 0);

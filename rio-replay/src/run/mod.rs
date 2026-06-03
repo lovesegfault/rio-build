@@ -1679,10 +1679,12 @@ async fn apply_stall_actions(
 ///
 /// `currently_committed` is whether the job sits in a committed batch as
 /// the stall fires: true for a stalled-active terminal (its committed,
-/// stalled attempt counts), false for a stalled-queued one (the job has
-/// waited in the queue since its last requeue — there is no current
-/// attempt to count). The stamped `attempts` goes through the same
-/// journal projection and stamping helper as every collect writer
+/// stalled attempt is cluster-held — exactly the
+/// `current_is_cluster_attempt` question `ledger::stamped_attempts`
+/// asks), false for a stalled-queued one (the job has waited in the
+/// queue since its last requeue — there is no current attempt to
+/// count). The stamped `attempts` goes through the same journal
+/// projection and stamping helper as every collect writer
 /// (`ledger::stamped_attempts`), so the stall arm can no longer drift to
 /// a different +1 convention.
 ///

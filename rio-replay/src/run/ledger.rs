@@ -129,15 +129,25 @@ pub fn measured_attempt_requeues(state: &StateDir) -> Result<HashMap<String, u32
 /// stamping convention for every record writer (collect terminals and the
 /// stall writer alike, so the two cannot diverge on +1 conventions again):
 /// the job's prior cluster-attempt requeues
-/// ([`measured_attempt_requeues`]) plus the current attempt when the job
-/// is, or just was, committed to a batch. Collect terminals always count
-/// the current attempt (the record is about the submission that just
-/// settled — for the submission-failure exhaustion arm, the final failed
-/// submission itself); a stalled-active terminal counts its committed,
-/// stalled attempt; a stalled-queued terminal has no current attempt (the
-/// job sat in the queue since its last requeue).
-pub fn stamped_attempts(prior_cluster_requeues: u32, currently_committed: bool) -> u32 {
-    prior_cluster_requeues + u32::from(currently_committed)
+/// ([`measured_attempt_requeues`]) plus the current event when that event
+/// is itself a cluster attempt.
+///
+/// `current_is_cluster_attempt` is the SAME judgment
+/// [`RequeueReason::counts_as_cluster_attempt`] applies to journaled
+/// history, asked of the event the record is about — never "was the job
+/// committed to a batch", which diverges from it exactly where it
+/// matters. Collect terminals derive it from batch evidence (a build id
+/// or in-band results prove the cluster saw the submission); the
+/// no-result engine-side arm — submission failures and fully cancelled
+/// engine-cancel cycles — has NO current cluster attempt, because its
+/// settled submission is the very event class the predicate excludes
+/// ("never reached the cluster"). A stalled-active terminal counts its
+/// committed, cluster-held stalled attempt; a stalled-queued terminal has
+/// no current attempt (the job sat in the queue since its last requeue).
+/// Both zero-cluster-contact writers therefore stamp the same value for
+/// the same truth: the attempts the cluster actually saw.
+pub fn stamped_attempts(prior_cluster_requeues: u32, current_is_cluster_attempt: bool) -> u32 {
+    prior_cluster_requeues + u32::from(current_is_cluster_attempt)
 }
 
 /// The convergence bounds whose consumed budgets are backed by
@@ -156,9 +166,9 @@ pub const JOURNAL_BACKED_BOUNDS: &[&str] = &[
     // The single stall auto-retry before stalled-active goes terminal.
     "stall-auto-retry-gate",
     // `attempts` on terminal records: the cluster-attempt projection
-    // ([`measured_attempt_requeues`]) plus the current attempt
-    // ([`stamped_attempts`]) — the measurement folds the same journal,
-    // through the reason predicate.
+    // ([`measured_attempt_requeues`]) plus the current event when it is
+    // itself a cluster attempt ([`stamped_attempts`]) — the measurement
+    // folds the same journal, through the reason predicate.
     "attempts-accounting",
     // `requeues >= max_queued_requeues` escalates the queued ladder.
     "queued-escalation-ladder",
@@ -654,7 +664,10 @@ mod tests {
             );
             // Measurement consumer: only cluster-attempt reasons count, so
             // a subsequent success is flaky (attempts > 1) exactly per the
-            // table.
+            // table. The `true` is the SUCCESS's own cluster contact — a
+            // settled success carries in-band results by construction, so
+            // its writer derives current_is_cluster_attempt = true from
+            // batch evidence.
             let state = StateDir::new(dir.path()).unwrap();
             let measured = measured_attempt_requeues(&state)
                 .unwrap()
@@ -756,6 +769,75 @@ mod tests {
             0,
             "a stalled-queued record reports the attempts the cluster saw"
         );
+    }
+
+    /// Writer-arm agreement on zero-cluster-contact histories, both
+    /// directions. Quantification domain: the (writer-arm ×
+    /// current-event-class) cells the per-reason lattice above cannot
+    /// see — it crosses reasons with a SUCCESS current event, while the
+    /// two zero-current-attempt writers settle on an event the predicate
+    /// excludes.
+    ///
+    /// A job whose journaled history is exclusively engine-side (every
+    /// submission failed before reaching the cluster) measures 0 cluster
+    /// attempts; the submission-failure exhaustion arm — whose current
+    /// settled submission is itself the excluded
+    /// `EngineSubmissionFailure` class, so `current_is_cluster_attempt`
+    /// is false by batch-evidence construction — stamps 0, and the
+    /// stalled-queued writer stamps 0 for the same history: identical
+    /// truth (zero cluster contact), identical stamp, per
+    /// [`RequeueReason::counts_as_cluster_attempt`]'s contract ("never
+    /// reached the cluster at all"). The contrast direction: one REAL
+    /// cluster attempt in the same history shifts both writers to 1 —
+    /// the writers may never diverge on what the cluster saw.
+    #[tokio::test]
+    async fn zero_cluster_contact_histories_stamp_zero_in_both_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        for at in ["2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z"] {
+            state
+                .append_jsonl(
+                    StateFile::Requeues,
+                    &RequeueRecord {
+                        job: "unreached.x".to_string(),
+                        source: REQUEUE_SOURCE_COLLECT.to_string(),
+                        why: RequeueReason::EngineSubmissionFailure.as_str().to_string(),
+                        at: at.to_string(),
+                    },
+                )
+                .unwrap();
+        }
+        let measured = measured_attempt_requeues(&state).unwrap();
+        assert_eq!(
+            measured.get("unreached.x"),
+            None,
+            "engine-side requeues never enter the cluster-attempt measurement"
+        );
+        let prior = measured.get("unreached.x").copied().unwrap_or(0);
+        // Submission-failure exhaustion arm: no current cluster attempt
+        // (the settled submission is the excluded event class).
+        assert_eq!(stamped_attempts(prior, false), 0);
+        // Stalled-queued writer over the same journal: same truth, same
+        // stamp.
+        assert_eq!(stamped_attempts(prior, false), 0);
+
+        // Contrast: one real cluster attempt in the history moves BOTH
+        // writers to 1 — the divergence axis is the history, never the
+        // writer arm.
+        state
+            .append_jsonl(
+                StateFile::Requeues,
+                &RequeueRecord {
+                    job: "unreached.x".to_string(),
+                    source: REQUEUE_SOURCE_COLLECT.to_string(),
+                    why: RequeueReason::NoInbandResult.as_str().to_string(),
+                    at: "2026-01-01T02:00:00Z".to_string(),
+                },
+            )
+            .unwrap();
+        let measured = measured_attempt_requeues(&state).unwrap();
+        let prior = measured.get("unreached.x").copied().unwrap_or(0);
+        assert_eq!(stamped_attempts(prior, false), 1);
     }
 
     /// Resume rehydration is a pure fold of the requeue journal: a fresh
