@@ -10,10 +10,14 @@
 //! Failure attribution combines two independent signals: the failing root's
 //! in-band error message, falling back to the relayed stderr reason captured
 //! at submission time (Signal 1), and the scheduler's failed-builder poison
-//! evidence from `ListPoisoned` (Signal 2). Only their agreement counts a
-//! failure as infrastructure; ambiguous, contradictory, or decayed evidence
-//! defaults to a genuine target failure so rio is never given the benefit of
-//! the doubt. A dependency-failed root is re-attributed through its own
+//! evidence from `ListPoisoned` (Signal 2). Per the design's two-signal
+//! rule (§6.6): a positive Signal-1 infra classification stands unless
+//! Signal 2 contradicts it with recorded on-worker failures — decayed
+//! Signal-2 evidence does not contradict; with Signal 1 lost, only a
+//! positive poison row with an empty builder list identifies infra; double
+//! losses default to a genuine target failure carrying the log-tail-only
+//! evidence flag, so rio is never excused on absence of evidence alone.
+//! A dependency-failed root is re-attributed through its own
 //! dependency closure: a failing drv inside the closure is a real blocked
 //! dependency, while a failing drv outside it means the job was merely a
 //! fail-fast batch-mate and is re-queued. A failed root whose row carries
@@ -458,11 +462,16 @@ pub fn resolve_failure_kind(
         Some(ReasonClass::ResourceCeiling) => (FailureKind::ResourceCeiling, None),
         Some(ReasonClass::Infra) => match failed_builders {
             // Contradicting target evidence (real on-worker failures
-            // recorded) ⇒ NOT infra: both signals must agree before a
-            // failure is excused as infrastructure. Charged to rio — the
-            // infra-vocabulary reason is not upstream-fetch evidence, so
-            // the needle scan does not get a say here either.
+            // recorded) ⇒ NOT infra: per §6.6, Signal 2 must not
+            // contradict a positive Signal-1 infra classification.
+            // Charged to rio — the infra-vocabulary reason is not
+            // upstream-fetch evidence, so the needle scan does not get a
+            // say here either.
             Some(builders) if !builders.is_empty() => (FailureKind::Genuine, None),
+            // Empty poison row corroborates; decayed evidence (`None`)
+            // does not contradict (§6.6: decay is "evidence
+            // unavailable", not corroboration of either side) — the
+            // positive Signal-1 classification stands in both cells.
             _ => (FailureKind::Infra, None),
         },
         Some(ReasonClass::Target) | Some(ReasonClass::Dependency { .. }) => {
@@ -1055,17 +1064,21 @@ fn lossy_log_text(bytes: &[u8]) -> String {
 
 /// Process one settled batch end-to-end: take its in-band per-root results,
 /// decide each job, capture evidence (log tails for failures, NAR hashes
-/// for successes), append terminal records, and return the decision made
-/// for every member that transitioned.
+/// for successes), append terminal records, and return exactly one decision
+/// per batch member.
 ///
-/// The returned map is the function's whole contract: a
-/// [`CollectDecision::Terminal`] entry means the job's results.jsonl record
-/// has been appended (the caller retires the job), a
-/// [`CollectDecision::Requeue`] entry means the job must be re-offered to
-/// the timeless pending pool (the caller counts the resubmission). Members
-/// that made no transition — timed-batch members left to the timed
-/// dispatcher, members with no job context, members already terminal — have
-/// no entry.
+/// The returned map is the function's whole contract, and it is TOTAL over
+/// the batch's members — see [`CollectDecision`], which owns the variant
+/// semantics. In caller terms: [`CollectDecision::Terminal`] means the
+/// job's results.jsonl record has been appended (the caller retires the
+/// job); [`CollectDecision::Requeue`] means the job must be re-offered to
+/// the timeless pending pool (the caller counts the resubmission);
+/// [`CollectDecision::Defer`] means another owner holds the resolution —
+/// the timed dispatcher's retries, the end-of-run backfill, or no job
+/// context to record against (the caller releases the member's watchdog
+/// stall clock); [`CollectDecision::AlreadyTerminal`] is a duplicate
+/// dropped by the belt below (the caller retires the job). Absence from
+/// the map is not a signal — every member gets an entry.
 ///
 /// `prior_budgets` carries each job's consumed budgets so far: the TOTAL
 /// engine resubmission count (every requeue reason counts, not just infra
@@ -1404,8 +1417,9 @@ pub async fn process_settled_batch(
                     // other requeue-shaped member — including one the
                     // engine's own build deadline cut — stays outstanding
                     // for a later confirmation-retry batch or the
-                    // end-of-run backfill (no transition, so no decision
-                    // entry).
+                    // end-of-run backfill (no transition; its explicit
+                    // `Defer` entry below only releases the watchdog
+                    // stall clock).
                     if timed_interruption_for(batch, &ctx.drv_path, None)
                         == Some(TimedInterruption::Replayed)
                     {
@@ -1704,8 +1718,9 @@ mod tests {
             .0,
             FailureKind::Infra
         );
-        // Signal1 infra + contradicting target evidence → Genuine (the two
-        // signals must agree).
+        // Signal1 infra + contradicting target evidence → Genuine (§6.6:
+        // Signal 2's recorded on-worker failures contradict the infra
+        // classification).
         assert_eq!(
             resolve_failure_kind(
                 Some("max_infra_retries=3 exhausted after infrastructure failures: x"),
@@ -1715,6 +1730,20 @@ mod tests {
             )
             .0,
             FailureKind::Genuine
+        );
+        // Signal1 infra + Signal 2 decayed (None) → Infra (§6.6: "infra
+        // only when Signal 1 says infra and Signal 2 does not contradict"
+        // — decayed evidence is "evidence unavailable", which does not
+        // contradict; agreement is NOT required).
+        assert_eq!(
+            resolve_failure_kind(
+                Some("max_infra_retries=3 exhausted after infrastructure failures: x"),
+                None,
+                false,
+                None
+            )
+            .0,
+            FailureKind::Infra
         );
         // No signal1, poisoned with empty failed_builders → Infra.
         assert_eq!(
@@ -1774,8 +1803,8 @@ mod tests {
             FailureKind::Genuine
         );
         // Positive structured classification beats the needle scan, even
-        // for a fixed-output drv whose reason text contains a needle: an
-        // agreed-infra reason embedding rio's own "timed out" transport
+        // for a fixed-output drv whose reason text contains a needle: a
+        // corroborated-infra reason embedding rio's own "timed out" transport
         // text is infrastructure (design §7.1 gives the two-signal infra
         // attribution precedence over every verdict; source-unavailable
         // is upstream-origin-only). Pre-empting it as SourceRot would
@@ -2010,7 +2039,8 @@ mod tests {
             }
         ));
         // Same infra reason but contradicting worker evidence → genuine,
-        // terminal immediately (the two signals must agree).
+        // terminal immediately (§6.6: recorded on-worker failures
+        // contradict the infra classification).
         let poisoned_with_builders: HashMap<String, Vec<String>> =
             HashMap::from([(T.to_string(), vec!["b1".to_string()])]);
         assert!(matches!(
@@ -2030,7 +2060,8 @@ mod tests {
                 ..
             }
         ));
-        // A FIXED-OUTPUT target with the same agreed-infra shape, whose
+        // A FIXED-OUTPUT target with the same corroborated-infra shape
+        // (positive Signal 1, empty-builders poison row), whose
         // reason embeds rio's own "timed out" transport text: the positive
         // infra classification wins over the source-rot needle scan
         // (design §7.1 precedence; source-unavailable is upstream-origin

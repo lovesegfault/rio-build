@@ -633,16 +633,24 @@ impl CampaignSpec {
             "campaign spec field knobs.speedup must be a positive finite number"
         );
         // The schedule's duration math divides recorded offsets by the
-        // speedup before Duration::from_secs_f64. The archive reader
-        // clamps every recorded offset and stop offset to
-        // MAX_RECORDED_OFFSET_S (one year), so the worst-case quotient is
-        // MAX_RECORDED_OFFSET_S / speedup — demand here that it stays a
-        // representable Duration, as a named-field refusal like every
-        // other bad knob, instead of letting an absurdly small stretch
-        // factor panic schedule construction and crash-loop the campaign
-        // Job. The bound is derived from those two contracts, not picked:
-        // anything that survives this check cannot overflow any of the
-        // schedule's division sites.
+        // speedup before Duration::from_secs_f64. The engine's schedule
+        // wiring (run/mod.rs converters — the archive reader itself only
+        // floors request offsets at zero) bounds every recorded number
+        // the schedule consumes by MAX_RECORDED_OFFSET_S (one year):
+        // `recorded_request_from` clamps request offsets into
+        // [0, MAX_RECORDED_OFFSET_S] (non-finite → 0), and
+        // `recorded_timing_from` drops non-finite and over-cap stop
+        // offsets to None — filtered, not clamped: a dropped stop falls
+        // back to the scaled default gap (a 60s constant), and any gap
+        // from a stop below its request offset is floored at zero by the
+        // timeline's `(stop - offset).max(0.0)`. So the worst-case
+        // quotient is MAX_RECORDED_OFFSET_S / speedup — demand here that
+        // it stays a representable Duration, as a named-field refusal
+        // like every other bad knob, instead of letting an absurdly
+        // small stretch factor panic schedule construction and
+        // crash-loop the campaign Job. The bound is derived from those
+        // contracts, not picked: anything that survives this check
+        // cannot overflow any of the schedule's division sites.
         anyhow::ensure!(
             std::time::Duration::try_from_secs_f64(
                 super::MAX_RECORDED_OFFSET_S / self.knobs.speedup
@@ -1511,8 +1519,10 @@ mod tests {
     #[test]
     fn speedup_too_small_for_the_offset_cap_is_refused() {
         let base = spec_base();
-        // The timed schedule divides recorded offsets — clamped to the
-        // one-year MAX_RECORDED_OFFSET_S by the archive reader — by the
+        // The timed schedule divides recorded offsets — bounded by the
+        // one-year MAX_RECORDED_OFFSET_S at the engine's conversion
+        // points (`recorded_request_from` clamps request offsets,
+        // `recorded_timing_from` drops over-cap stops) — by the
         // speedup before Duration::from_secs_f64. A divisor small enough
         // to push that worst-case quotient past Duration's representable
         // range must die here as a named-field refusal like every other

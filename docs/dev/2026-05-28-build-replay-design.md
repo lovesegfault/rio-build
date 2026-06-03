@@ -589,7 +589,7 @@ NAR identity for built outputs continues to come from rio-store `BatchQueryPathI
 
 ### 6.6 Infra attribution under the client-ops transport
 
-The two-signal AND rule is unchanged; only the plumbing of Signal 1 changes.
+The two-signal rule is unchanged (a non-contradiction rule, not an AND — the verdict bullet below is the precise statement); only the plumbing of Signal 1 changes.
 
 - **Signal 1 — relayed scheduler reason.** Source order: the failing root's `PathOutcome.error_msg`, falling back to the captured `derivation '<drv>' failed:` relay line for that drv (`BatchOutcome.reasons`). Both carry the same scheduler terminal-failure text the gateway relays today, so `classify_reason()` and `ReasonClass { Infra, Timeout, ResourceCeiling, Target, Dependency { failing_drv } }` apply verbatim. The per-root `error_msg` is also the primary key for the failure-signature table; the relayed lines are the fallback key and are always retained as evidence. Because both sources carry the same relayed scheduler text, signature grouping does not depend on which one supplied the key; consistency between them is covered by the gateway conformance tests (§6.4), not by a live baseline comparison (R5, §12.1).
 - **Signal 2 — poison evidence.** `AdminApi::list_poisoned()` unchanged: a poisoned entry with empty `failed_executors` corroborates infra; a non-empty list contradicts it (some builder genuinely ran and failed it) and the failure is charged to the workload. Evidence decay (`failed_builders: None`) is still treated as "evidence unavailable", not as corroboration.

@@ -1427,10 +1427,13 @@ mod tests {
 
     #[test]
     fn schedule_offsets_at_the_cap_survive_the_smallest_admitted_speedup() {
-        // The archive reader clamps recorded offsets and stop offsets to
-        // MAX_RECORDED_OFFSET_S, and spec validation refuses any speedup
-        // whose worst-case quotient MAX_RECORDED_OFFSET_S / speedup does
-        // not fit a Duration (see
+        // The engine's conversion points bound what the schedule
+        // consumes by MAX_RECORDED_OFFSET_S (`recorded_request_from`
+        // clamps request offsets, `recorded_timing_from` drops over-cap
+        // stop offsets — both in run/mod.rs; the archive reader itself
+        // only floors request offsets at zero), and spec validation
+        // refuses any speedup whose worst-case quotient
+        // MAX_RECORDED_OFFSET_S / speedup does not fit a Duration (see
         // `speedup_too_small_for_the_offset_cap_is_refused` in spec.rs).
         // This pins that the two bounds compose: at the offset cap, with
         // a speedup the spec still admits, all three division sites —

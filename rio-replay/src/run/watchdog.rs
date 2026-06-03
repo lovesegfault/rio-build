@@ -1064,8 +1064,9 @@ mod tests {
     /// not reset the clock, so an unconsumed verdict re-fires on the very
     /// next tick — and only the committed ledger transition (observe_job's
     /// phase change for the auto-retry, remove_job for a terminal record)
-    /// clears the level. QueuedRequeue stays edge-consumed (its action is
-    /// an infallible log line) and must NOT re-fire.
+    /// clears the level. QueuedRequeue is armed the same way: it re-fires
+    /// with the same un-committed count until the run loop journals the
+    /// ladder step and `confirm_queued_requeue` commits it.
     #[test]
     fn unconsumed_stall_verdicts_re_fire_until_a_transition_commits() {
         let mut wd = Watchdog::new(knobs());
