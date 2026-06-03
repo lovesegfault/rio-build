@@ -142,19 +142,24 @@ pub(crate) fn admit_worker_abort(
     rio_retry_kernel::admit_worker_abort(&rows, rio_retry_kernel::WORKER_ABORT_FREE_CLOSES)
 }
 
-/// Index where the MATERIALIZATION lane's window of `history` begins:
-/// the kernel's per-lane suffix cut
-/// ([`rio_retry_kernel::ledger_suffix_start`] over the
-/// materialization lane), projected through the same record→row
-/// conversion `decide()` uses. The in-memory history is the loaded
-/// per-lane view (each lane already cut at ITS OWN last reset by the
-/// suffix loaders); this helper re-derives the mat-lane cut for the
-/// budget/one-shot COUNT consumers in `actor/materialize.rs`, so a
-/// materialization-lane reset row (live from the
-/// materialization-lifecycle workstream's job-creation resets on)
-/// re-windows those counts exactly as it re-windows
-/// [`rio_retry_kernel::materialization_decide`]'s own fold. Build-lane
-/// rows (reset or not) never move this cut.
+/// The materialization lane's windowed counters (the kernel fold over
+/// the in-memory history, projected through the same record→row
+/// conversion `decide()` uses) — THE single budget/one-shot/strictness
+/// counter for `actor/materialize.rs` (merged_bug_020: the flat
+/// per-class history counts are deleted). A mat-lane job-creation
+/// reset row (migration 085) re-windows all three counts exactly as it
+/// re-windows [`rio_retry_kernel::materialization_decide`]'s own fold;
+/// build-lane rows (reset or not) neither count nor cut.
+pub(crate) fn materialization_counters(history: &[AttemptRecord]) -> rio_retry_kernel::MatCounters {
+    let rows: Vec<rio_retry_kernel::LedgerRow<String>> =
+        history.iter().map(record_to_row).collect();
+    rio_retry_kernel::materialization_counters(&rows)
+}
+
+/// Index where the MATERIALIZATION lane's window of `history` begins
+/// (the kernel's per-lane suffix cut projected through `record_to_row`
+/// — see [`materialization_counters`], which budget consumers use
+/// directly).
 pub(crate) fn materialization_window_start(history: &[AttemptRecord]) -> usize {
     let rows: Vec<rio_retry_kernel::LedgerRow<String>> =
         history.iter().map(record_to_row).collect();
@@ -229,6 +234,7 @@ fn kernel_outcome_class(class: OutcomeClass) -> rio_retry_kernel::OutcomeClass {
             rio_retry_kernel::OutcomeClass::MaterializationUnobtainable
         }
         OutcomeClass::MaterializationInfra => rio_retry_kernel::OutcomeClass::MaterializationInfra,
+        OutcomeClass::MaterializationReset => rio_retry_kernel::OutcomeClass::MaterializationReset,
     }
 }
 
@@ -262,6 +268,7 @@ fn db_outcome_class(class: rio_retry_kernel::OutcomeClass) -> OutcomeClass {
             OutcomeClass::MaterializationUnobtainable
         }
         rio_retry_kernel::OutcomeClass::MaterializationInfra => OutcomeClass::MaterializationInfra,
+        rio_retry_kernel::OutcomeClass::MaterializationReset => OutcomeClass::MaterializationReset,
     }
 }
 
@@ -1245,6 +1252,67 @@ mod tests {
             rio_proto::CONCURRENT_PUTPATH_MSG,
             "rio-retry-kernel's CONCURRENT_PUTPATH marker must stay in \
              lockstep with rio_proto::CONCURRENT_PUTPATH_MSG"
+        );
+    }
+
+    /// merged_bug_020 differential: the in-memory `AttemptRecord`
+    /// projection (`record_to_row`) and the kernel fold agree —
+    /// [`materialization_counters`] over a mixed two-lane history
+    /// counts exactly the mat-lane rows since the LAST mat-lane reset
+    /// (party split included); build rows and build resets neither
+    /// count nor cut, and the cut index matches
+    /// [`materialization_window_start`].
+    #[test]
+    fn materialization_counters_projection_differential() {
+        use crate::db::attempts::AttemptRow;
+        use crate::state::{AttemptKind as K, OutcomeClass as C, ReportingParty as P};
+        let d = uuid::Uuid::new_v4();
+        let history: Vec<crate::state::AttemptRecord> = vec![
+            // Pre-window: a mat infra charge, then a BUILD reset (must
+            // not cut the mat lane), then a mat unobtainable.
+            AttemptRow::new(d, C::MaterializationInfra, P::Worker, K::Materialization).to_record(),
+            AttemptRow::new_reset(d, C::ResubmitReset, P::Scheduler, 1, K::Build).to_record(),
+            AttemptRow::new(
+                d,
+                C::MaterializationUnobtainable,
+                P::Worker,
+                K::Materialization,
+            )
+            .to_record(),
+            // THE mat-lane reset (migration 085 job creation): the cut.
+            AttemptRow::new_reset(
+                d,
+                C::MaterializationReset,
+                P::Scheduler,
+                0,
+                K::Materialization,
+            )
+            .to_record(),
+            // Window: 1 worker infra + 1 scheduler (establishment)
+            // infra + 1 unobtainable + build noise.
+            AttemptRow::new(d, C::MaterializationInfra, P::Worker, K::Materialization).to_record(),
+            AttemptRow::new(d, C::MaterializationInfra, P::Scheduler, K::Materialization)
+                .to_record(),
+            AttemptRow::new(
+                d,
+                C::MaterializationUnobtainable,
+                P::Worker,
+                K::Materialization,
+            )
+            .to_record(),
+            AttemptRow::new(d, C::Infra, P::Worker, K::Build).to_record(),
+        ];
+        let c = materialization_counters(&history);
+        assert_eq!(c.infra_since_reset, 2, "both parties charge the window");
+        assert_eq!(c.worker_infra_since_reset, 1, "the Item-T worker subset");
+        assert_eq!(
+            c.unobtainable_since_reset, 1,
+            "pre-window unobtainable cut away"
+        );
+        assert_eq!(
+            materialization_window_start(&history),
+            3,
+            "the cut anchors at the last mat-lane reset row"
         );
     }
 }

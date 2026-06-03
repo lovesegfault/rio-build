@@ -328,6 +328,7 @@ impl DagActor {
                         "origin" => origin.as_str()
                     )
                     .increment(1);
+                    self.mirror_job_creation_reset(drv_hash);
                 }
                 if upgraded {
                     metrics::counter!("rio_scheduler_materialization_jobs_origin_upgraded_total")
@@ -457,12 +458,38 @@ impl DagActor {
                     "origin" => job.origin.as_str()
                 )
                 .increment(1);
+                self.mirror_job_creation_reset(&job.drv_hash);
             }
             if job.upgraded {
                 metrics::counter!("rio_scheduler_materialization_jobs_origin_upgraded_total")
                     .increment(1);
             }
         }
+    }
+
+    /// Mirror the migration-085 job-creation reset row into the node's
+    /// in-memory history (the durable row was written inside the
+    /// creating transaction): the in-memory [`Self::mat_counters`]
+    /// re-window immediately, identically to a post-failover suffix
+    /// reload. The mirrored record's attempt_id differs from the
+    /// committed row's (both are independent mints); no fold reads it.
+    fn mirror_job_creation_reset(&mut self, drv_hash: &DrvHash) {
+        let Some(state) = self.dag.node_mut(drv_hash) else {
+            return;
+        };
+        let Some(db_id) = state.db_id else {
+            return;
+        };
+        let record = crate::db::attempts::AttemptRow::new_reset(
+            db_id,
+            crate::state::OutcomeClass::MaterializationReset,
+            crate::state::ReportingParty::Scheduler,
+            0,
+            crate::state::AttemptKind::Materialization,
+        )
+        .to_record();
+        state.push_attempt_record(record);
+        self.refresh_retry_view(drv_hash);
     }
 
     /// Project the node's materialization-job state for pull admission
@@ -927,10 +954,7 @@ impl DagActor {
                 row.exec_id = Some(exec_id);
                 row.executor_id = Some(executor.clone());
                 row.error_msg = (!u.cause.is_empty()).then(|| u.cause.clone());
-                let prior_unobtainable = self.count_materialization_rows_in_history(
-                    &drv_hash,
-                    crate::state::OutcomeClass::MaterializationUnobtainable,
-                );
+                let prior_unobtainable = self.mat_counters(&drv_hash).unobtainable_since_reset;
                 let close_d = self
                     .close_materialization_attempt(
                         exec_id,
@@ -1077,54 +1101,24 @@ impl DagActor {
             Some(Outcome::InfraFailure(f)) => {
                 // The infra charge: counts toward the materialization
                 // budget and toward NOTHING else. Never fail-fasts,
-                // never routes from source (B3).
-                let mut row = crate::db::attempts::AttemptRow::new(
-                    attempt.core.derivation_id,
-                    crate::state::OutcomeClass::MaterializationInfra,
-                    crate::state::ReportingParty::Worker,
-                    crate::state::AttemptKind::Materialization,
-                );
-                row.exec_id = Some(exec_id);
-                row.executor_id = Some(executor.clone());
-                row.error_msg = (!f.detail.is_empty()).then(|| f.detail.clone());
-                let close_d = self
-                    .close_materialization_attempt(
+                // never routes from source (B3). Charge + park verdict
+                // are ONE chokepoint (view-settlement gate, verdict,
+                // and requeue all inside) — no arm hangs on the
+                // disposition here.
+                let _ = self
+                    .charge_materialization_infra(
                         exec_id,
+                        attempt.core.derivation_id,
                         &drv_hash,
-                        Some(row),
-                        serving_generation,
-                    )
-                    .await;
-                if !close_d.settled() {
-                    // view-settlement gate (mirrors the Success arm).
-                    return Ok(());
-                }
-                // Budget: at max_attempts the job parks (durable
-                // park_until + the view), else it re-arms claimable.
-                let infra_count = self.count_materialization_rows_in_history(
-                    &drv_hash,
-                    crate::state::OutcomeClass::MaterializationInfra,
-                );
-                if infra_count >= self.materialization_cfg.max_attempts {
-                    self.park_materialization_job(
-                        &drv_hash,
+                        &executor,
                         job_id,
-                        infra_count,
+                        crate::state::ReportingParty::Worker,
+                        (!f.detail.is_empty()).then(|| f.detail.clone()),
+                        None,
+                        None,
                         serving_generation,
                     )
                     .await;
-                } else {
-                    self.rearm_materialization_job(&drv_hash, &executor).await;
-                }
-                // Either way the node itself returns to the queue
-                // (claimable again / from-source dispatchable per the
-                // admission table).
-                self.requeue_after_attempt(
-                    std::slice::from_ref(&drv_hash),
-                    crate::state::AttemptKind::Materialization,
-                    Some(&executor),
-                )
-                .await;
                 Ok(())
             }
             Some(Outcome::Aborted(a)) => {
@@ -1213,57 +1207,93 @@ impl DagActor {
         Ok(paths.into_iter().filter(|p| !p.is_empty()).collect())
     }
 
-    /// Count this node's in-memory ledger rows of one materialization
-    /// outcome class (the budget/one-shot inputs), WINDOWED at the
-    /// materialization lane's last reset row (the kernel cut, via
-    /// `retry_policy::materialization_window_start`) — the same window
-    /// `materialization_decide` folds, so a mat-lane job-creation
-    /// reset re-zeros these counts exactly when it re-opens the
-    /// budget. The in-memory history mirrors committed rows
-    /// (read-through cache of the per-lane loaded view).
-    fn count_materialization_rows_in_history(
-        &self,
-        drv_hash: &DrvHash,
-        class: crate::state::OutcomeClass,
-    ) -> u32 {
+    /// The node's [`rio_retry_kernel::MatCounters`] over the in-memory
+    /// history (the loaded per-lane view) — THE single
+    /// budget/one-shot/strictness counter (merged_bug_020). All three
+    /// counts share the kernel's mat-lane reset window; party survives
+    /// recovery (the suffix load parses `reporting_party` into every
+    /// rebuilt record), so the worker-only Item-T recount is identical
+    /// live and post-failover.
+    fn mat_counters(&self, drv_hash: &DrvHash) -> rio_retry_kernel::MatCounters {
         self.dag
             .node(drv_hash)
-            .map(|s| {
-                let history = s.attempt_history();
-                let window = crate::retry_policy::materialization_window_start(history);
-                history[window..]
-                    .iter()
-                    .filter(|r| {
-                        r.attempt_kind == crate::state::AttemptKind::Materialization
-                            && r.outcome_class == class
-                    })
-                    .count() as u32
-            })
-            .unwrap_or(0)
+            .map(|s| crate::retry_policy::materialization_counters(s.attempt_history()))
+            .unwrap_or_default()
     }
 
-    /// Worker-reported-only variant of the count above (the Item T
-    /// strictness recount, `sched.materialize.conversion-strictness`):
-    /// `materialization_infra` rows whose reporting party is Worker —
-    /// Scheduler-party establishment ("unreported") rows are excluded.
-    /// Party survives recovery: the suffix load parses
-    /// `drv_attempts.reporting_party` into every rebuilt record.
-    fn count_worker_materialization_infra_in_history(&self, drv_hash: &DrvHash) -> u32 {
-        self.dag
-            .node(drv_hash)
-            .map(|s| {
-                let history = s.attempt_history();
-                let window = crate::retry_policy::materialization_window_start(history);
-                history[window..]
-                    .iter()
-                    .filter(|r| {
-                        r.attempt_kind == crate::state::AttemptKind::Materialization
-                            && r.outcome_class == crate::state::OutcomeClass::MaterializationInfra
-                            && r.reporting_party == crate::state::ReportingParty::Worker
-                    })
-                    .count() as u32
-            })
-            .unwrap_or(0)
+    /// THE charge→verdict chokepoint (bug_067 + merged_bug_020): every
+    /// `materialization_infra` charge — worker-reported AND
+    /// establishment-written — closes through here, and the park
+    /// decision runs UNCONDITIONALLY on the post-append kernel
+    /// counters. Party-blind by the config contract
+    /// (`max_attempts`: "worker-reported AND establishment-written —
+    /// both channels charge the same budget"); the owner-signed Q5
+    /// reversal (2026-06-03) of counter-signed residual (a)
+    /// "establishment never parks" is exactly this fusion — a charging
+    /// channel without the decision no longer exists. Park backs off
+    /// the job durably (and the node is requeued either way: claimable
+    /// again / from-source dispatchable per the admission table).
+    // r[impl sched.materialize.routing+3]
+    #[allow(clippy::too_many_arguments)]
+    async fn charge_materialization_infra(
+        &mut self,
+        exec_id: Uuid,
+        derivation_id: Uuid,
+        drv_hash: &DrvHash,
+        executor: &ExecutorId,
+        job_id: Option<Uuid>,
+        party: crate::state::ReportingParty,
+        error_detail: Option<String>,
+        source_node: Option<String>,
+        termination_reason: Option<&'static str>,
+        serving_generation: i64,
+    ) -> WriteDisposition {
+        let mut row = crate::db::attempts::AttemptRow::new(
+            derivation_id,
+            crate::state::OutcomeClass::MaterializationInfra,
+            party,
+            crate::state::AttemptKind::Materialization,
+        );
+        row.exec_id = Some(exec_id);
+        row.executor_id = Some(executor.clone());
+        row.error_msg = error_detail;
+        row.source_node = source_node;
+        row.termination_reason = termination_reason.map(Into::into);
+        let close_d = self
+            .close_materialization_attempt(exec_id, drv_hash, Some(row), serving_generation)
+            .await;
+        // The companions gate on the close disposition
+        // (sched.materialize.view-settlement): a deposed believer's
+        // fenced charge runs no verdict and no requeue; a failed close
+        // leaves the establishment sweep as the armed action.
+        if !close_d.settled() {
+            return close_d;
+        }
+        // The verdict, post-append: park at budget exhaustion, rearm
+        // claimable under it. The job_id falls back to the view entry
+        // (the establishment path has no report-context job id).
+        let counters = self.mat_counters(drv_hash);
+        let job_id = job_id.or_else(|| self.materialization_jobs.get(drv_hash).map(|e| e.job_id));
+        if counters.infra_since_reset >= self.materialization_cfg.max_attempts {
+            self.park_materialization_job(
+                drv_hash,
+                job_id,
+                counters.infra_since_reset,
+                serving_generation,
+            )
+            .await;
+        } else {
+            self.rearm_materialization_job(drv_hash, executor).await;
+        }
+        // Either way the node itself returns to the queue (claimable
+        // again / from-source dispatchable per the admission table).
+        self.requeue_after_attempt(
+            std::slice::from_ref(drv_hash),
+            crate::state::AttemptKind::Materialization,
+            Some(executor),
+        )
+        .await;
+        close_d
     }
 
     /// Close the open materialization attempt (assignment row) and
@@ -1563,15 +1593,17 @@ impl DagActor {
 
 impl DagActor {
     /// Establish one expired open materialization attempt (the
-    /// dead-store-replica case): append the `materialization_infra`
-    /// charge (kind=materialization, party=Scheduler, "unreported"),
-    /// close the assignment row in the same fenced transaction, clear
-    /// the in-memory claim, and leave the job pending (claimable
-    /// again). NO adopt arm (BC-3: a mid-walk crash leaves outputs
-    /// present but the closure incomplete) and never `executor_crash`
-    /// (BC-2: the charge feeds the materialization budget and nothing
-    /// else). Mirrors `close_pull_attempt_uncharged`'s transaction
-    /// shape WITH the charge row.
+    /// dead-store-replica case): the `materialization_infra` charge
+    /// (kind=materialization, party=Scheduler, "unreported") routes
+    /// through [`Self::charge_materialization_infra`] — close, charge,
+    /// and the PARK DECISION in one chokepoint. Establishment-only
+    /// crash-loops therefore park at `max_attempts` like every other
+    /// charge channel (the owner-signed Q5 reversal of counter-signed
+    /// residual (a), 2026-06-03: party-blind parking; the parked
+    /// population is MD-D1's stalled gauge). NO adopt arm (BC-3: a
+    /// mid-walk crash leaves outputs present but the closure
+    /// incomplete) and never `executor_crash` (BC-2: the charge feeds
+    /// the materialization budget and nothing else).
     // r[impl sched.materialize.routing+3]
     pub(super) async fn establish_materialization_attempt(
         &mut self,
@@ -1580,48 +1612,34 @@ impl DagActor {
         let drv_hash = DrvHash::from(attempt.drv_hash.as_str());
         let executor = ExecutorId::from(attempt.executor_id.as_str());
         let serving_generation = self.serving_generation();
-        let mut row = crate::db::attempts::AttemptRow::new(
-            attempt.derivation_id,
-            crate::state::OutcomeClass::MaterializationInfra,
-            crate::state::ReportingParty::Scheduler,
-            crate::state::AttemptKind::Materialization,
-        );
-        row.exec_id = Some(attempt.exec_id);
-        row.executor_id = Some(executor.clone());
-        row.source_node = attempt.source_node.clone();
-        row.termination_reason = Some("unreported".into());
+        // A deposed/failed close runs no verdict and no requeue — the
+        // successor's own sweep owns this attempt now; a failed close
+        // re-runs next tick (the sweep is idempotent).
         let close_d = self
-            .close_materialization_attempt(
+            .charge_materialization_infra(
                 attempt.exec_id,
+                attempt.derivation_id,
                 &drv_hash,
-                Some(row),
+                &executor,
+                None,
+                crate::state::ReportingParty::Scheduler,
+                None,
+                attempt.source_node.clone(),
+                Some("unreported"),
                 serving_generation,
             )
             .await;
-        // The companions gate on the close disposition
-        // (sched.materialize.view-settlement): a deposed believer's
-        // fenced establishment performs NO rearm and NO requeue — the
-        // successor's own sweep owns this attempt now. A failed close
-        // re-runs next tick (the sweep is idempotent).
         if !close_d.settled() {
             return;
         }
-        // The claim is gone; the job stays pending (claimable again).
-        self.rearm_materialization_job(&drv_hash, &executor).await;
-        // The node returns to its dispatchable status.
-        self.requeue_after_attempt(
-            std::slice::from_ref(&drv_hash),
-            crate::state::AttemptKind::Materialization,
-            Some(&executor),
-        )
-        .await;
         tracing::info!(
             drv_hash = %drv_hash,
             exec_id = %attempt.exec_id,
             executor_id = %executor,
             age_secs = attempt.age_secs,
             "establishment sweep: open materialization attempt established as \
-             materialization_infra (no adopt arm; the job stays pending)"
+             materialization_infra (no adopt arm; park decision applied — the \
+             job re-armed claimable or parked at budget exhaustion)"
         );
     }
 
@@ -1707,7 +1725,7 @@ impl DagActor {
             let dwell_secs = self.materialization_cfg.conversion_min_park_dwell_secs;
             let max_attempts = self.materialization_cfg.max_attempts;
             if strict_worker {
-                let worker_only = self.count_worker_materialization_infra_in_history(&drv_hash);
+                let worker_only = self.mat_counters(&drv_hash).worker_infra_since_reset;
                 if worker_only < max_attempts {
                     debug!(
                         drv_hash = %drv_hash, %job_id, worker_only, max_attempts,

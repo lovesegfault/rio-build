@@ -1890,6 +1890,29 @@ pub const M_083: () = ();
 ///   migration posture).
 pub const M_084: () = ();
 
+/// `migrations/085_materialization_reset_class.sql`
+///
+/// The materialization lane's reset class (bughunt wave A3
+/// materialization-lifecycle-kernel, merged_bug_020 / bug_067 — the
+/// per-job budget window). Expands the drv_attempts outcome-class
+/// CHECK alphabet with `'materialization_reset'` (DROP+ADD over the
+/// 079 constraint, the same never-edit-frozen-files discipline).
+///
+/// Written by `create_materialization_jobs_in_tx` — ONE row per
+/// genuinely created job (`event_kind='reset'`,
+/// `attempt_kind='materialization'`, `party='scheduler'`), in the SAME
+/// transaction as the job INSERT; the dedup arm writes none. The row
+/// re-windows every materialization counter at job creation: the
+/// kernel cut is `(attempt_kind, event_kind)` (`ledger_suffix_start`),
+/// so a successor job's budget/one-shot/strictness counts start fresh
+/// instead of inheriting the resolved predecessor's charges, and the
+/// count is identical live, post-failover (suffix loaders), and under
+/// the GC sweep (which preserves per-lane suffixes). The class string
+/// is row DATA — the cut predicate never keys on it (a class-keyed
+/// anchor would diverge from the kernel on any future mat-kind reset
+/// row of another class).
+pub const M_085: () = ();
+
 /// `migrations/087_build_terminal_payload.sql`
 ///
 /// Durable terminal payload for builds (bughunt fix wave C1

@@ -660,6 +660,12 @@ db_str_enum! {
         /// max_materialization_attempts and toward NOTHING else —
         /// invisible to every build budget.
         MaterializationInfra = "materialization_infra",
+        /// Reset row, materialization lane (migration 085): written at
+        /// job creation — one fresh budget window per job. Cuts the
+        /// materialization-lane suffix exactly as the build resets cut
+        /// the build lane (the cut is `(attempt_kind, event_kind)`;
+        /// this class is row data, never the cut predicate).
+        MaterializationReset = "materialization_reset",
     }
     parse_err(_s) = &'static str:
         "invalid outcome class (not in the migration-066 alphabet)";

@@ -2637,21 +2637,27 @@ materialization-decision information relative to the full history),
 and the bounded-exhaustive twin re-drawn over an 8-shape two-lane
 alphabet.
 
-**Mat-lane reset rows — documented absence (superseded by the
-materialization-lifecycle workstream).** `AttemptRow::new_reset(..,
-AttemptKind::Materialization)` is constructible and fully supported by
-the cut/sweep/proofs from this entry on, but has NO production writer
-yet: every reset site today (resubmit, cache-hit clear, poison clear)
-is build-lane. Until the materialization-lifecycle workstream's
-job-creation reset rows land (migration 085, outcome class
-`materialization_reset`), the materialization lane simply has no cut —
-its full per-derivation history stays live (bounded by the
-derivation-deletion orphan arm of the GC). That workstream REPLACES
-this paragraph with the live mechanism when it lands; if it somehow
-does not, the absence is behavior-preserving (the lane's counts and
-`materialization_decide` fold the same rows they always did).
-`count_materialization_rows_in_history` /
-`count_worker_materialization_infra_in_history` are already windowed
-through the kernel cut (`retry_policy::materialization_window_start`),
-so the counts re-zero exactly when the first mat-lane reset row
-appears.
+**Mat-lane reset rows — LIVE (A3 materialization-lifecycle-kernel,
+2026-06-03; replaces the documented-absence paragraph this slot
+carried).** The production writer is `create_materialization_jobs_in_tx`
+(migration 085, outcome class `materialization_reset`): ONE
+`AttemptRow::new_reset(.., AttemptKind::Materialization)` row per
+genuinely created job, in the SAME transaction as the job INSERT — the
+dedup arm writes none, so a found pending job keeps its window. The
+row is the per-job budget window (merged_bug_020): the kernel cut is
+`(attempt_kind, event_kind)` (`ledger_suffix_start`; the class string
+is row data, never the cut predicate), so a successor job's
+budget/one-shot/strictness counts start fresh — identically live (the
+post-commit `mirror_job_creation_reset` feed), post-failover (the
+suffix loaders return the suffix INCLUDING its anchor reset), and
+under the GC sweep (which preserves per-lane suffixes). The flat
+per-class history counts were deleted with the writers' fusion: every
+consumer reads `rio_retry_kernel::materialization_counters` (one
+windowed fold; `materialization_decide` is its `infra >= max`
+projection, pinned by the `check_materialization_counters_window`
+harness and the `materialization_counters_projection_differential`
+unit), and every `materialization_infra` charge — worker-reported AND
+establishment-written — executes the park verdict through the single
+`charge_materialization_infra` chokepoint (bug_067, the owner-signed
+Q5 reversal of residual (a): party-blind parking; see the
+substitution-replacement map's superseded residual block).

@@ -24,6 +24,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::{FencedBegin, FencedOutcome, SchedulerDb};
+use crate::db::attempts::AttemptRow;
 use crate::state::{JobOrigin, JobState};
 
 /// One materialization-job row, as the store poll and the consumption
@@ -255,6 +256,32 @@ impl SchedulerDb {
             .bind(carried)
             .execute(&mut *tx)
             .await?;
+        }
+
+        // Migration 085: ONE materialization-lane reset row per genuinely
+        // created job, in the SAME transaction — the per-job budget
+        // window. The dedup arm writes none (a found pending job keeps
+        // its window); the row's class is data, the kernel cut is
+        // `(attempt_kind, event_kind)`.
+        let reset_rows: Vec<AttemptRow> = rows
+            .iter()
+            .filter(|r| {
+                by_drv
+                    .get(&r.derivation_id)
+                    .is_some_and(|id| inserted.contains(id))
+            })
+            .map(|r| {
+                AttemptRow::new_reset(
+                    r.derivation_id,
+                    crate::state::OutcomeClass::MaterializationReset,
+                    crate::state::ReportingParty::Scheduler,
+                    0,
+                    crate::state::AttemptKind::Materialization,
+                )
+            })
+            .collect();
+        if !reset_rows.is_empty() {
+            Self::append_attempts_batch(&mut *tx, &reset_rows).await?;
         }
 
         rows.iter()

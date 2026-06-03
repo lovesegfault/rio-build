@@ -617,6 +617,36 @@ in
   # join; a new `FROM/JOIN assignments` anywhere else fails the
   # policy. (Red-verified at introduction: a planted
   # `JOIN assignments` outside the allowlist fails the pipeline.)
+  # A3 materialization-lifecycle-kernel (bughunt wave) — bug_067/020's
+  # class: the `materialization_infra` charge class is constructible
+  # ONLY inside the charge→verdict chokepoint module
+  # (actor/materialize.rs, charge_materialization_infra) — a charging
+  # channel that skips the park decision must not compile-and-hide.
+  # state/derivation.rs (the enum definition) and retry_policy.rs (the
+  # kernel mappings) NAME the variant without constructing rows; tests
+  # may reference it freely.
+  mat-charge-chokepoint =
+    pkgs.runCommand "rio-mat-charge-chokepoint"
+      {
+        srcDir = pkgs.lib.fileset.toSource {
+          root = ../rio-scheduler/src;
+          fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src;
+        };
+      }
+      ''
+        set -euo pipefail
+        hits=$(grep -rl 'OutcomeClass::MaterializationInfra' $srcDir           | grep -v '/actor/materialize.rs$'           | grep -v '/state/derivation.rs$'           | grep -v '/retry_policy.rs$'           | grep -v '/tests/' || true)
+        if [ -n "$hits" ]; then
+          echo "FAIL: OutcomeClass::MaterializationInfra outside the charge chokepoint module:" >&2
+          echo "$hits" >&2
+          echo "Every materialization_infra charge routes through" >&2
+          echo "charge_materialization_infra (actor/materialize.rs) — the" >&2
+          echo "charge+park-verdict fusion (bug_067, owner-signed Q5 reversal)." >&2
+          exit 1
+        fi
+        touch $out
+      '';
+
   assignments-join-policy =
     pkgs.runCommand "rio-assignments-join-policy"
       {

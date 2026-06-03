@@ -454,9 +454,10 @@ async fn job_cancellation_marks_cancelled_and_closes_attempt() -> anyhow::Result
         a_status, "cancelled",
         "the open attempt closes in the same fenced transaction"
     );
-    let (charges,): (i64,) = sqlx::query_as("SELECT count(*) FROM drv_attempts")
-        .fetch_one(&test_db.pool)
-        .await?;
+    let (charges,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM drv_attempts WHERE event_kind = 'attempt'")
+            .fetch_one(&test_db.pool)
+            .await?;
     assert_eq!(charges, 0, "charge-free (BC-2)");
 
     // Cancelling again (nothing pending): idempotent re-entry.

@@ -304,8 +304,9 @@ in
     name = "rio-retry-kernel";
     crate = crateBuildKani.members.rio-retry-kernel;
     # A2's 12 (kind-partition restatements + worker-abort bound) +
-    # B2's check_exec_row_sweep_guards (store.log.sweep-ownership).
-    expectedHarnesses = 13;
+    # B2's check_exec_row_sweep_guards (store.log.sweep-ownership) +
+    # A3's check_materialization_counters_window (the per-job budget window).
+    expectedHarnesses = 14;
   };
 
   # rio-evidence-kernel: the scheduler's closure-evidence decision kernel

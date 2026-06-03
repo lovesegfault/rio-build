@@ -154,14 +154,16 @@ impl AttemptRow {
 
     /// A new reset-event row (`event_kind = 'reset'`). `outcome_class`
     /// must be one of the reset classes (`resubmit_reset`,
-    /// `cache_hit_clear`, `poison_cleared`); `resubmit_cycle` carries
-    /// the cycle index the reset starts. The reset CARRIES ITS LANE
-    /// (migration 084): a build reset cuts only the build suffix, a
-    /// materialization reset only the materialization suffix — the
-    /// loaders and the GC sweep key their cuts on it. No production
-    /// writer constructs a materialization reset until the
-    /// materialization-lifecycle workstream's job-creation resets land
-    /// (085) — see the retry-invariant-map "mat-lane reset" entry.
+    /// `cache_hit_clear`, `poison_cleared`, `materialization_reset`);
+    /// `resubmit_cycle` carries the cycle index the reset starts (0
+    /// for the mat-lane job-creation resets — not a resubmit). The
+    /// reset CARRIES ITS LANE (migration 084): a build reset cuts only
+    /// the build suffix, a materialization reset only the
+    /// materialization suffix — the loaders and the GC sweep key their
+    /// cuts on it. The materialization lane's production writer is
+    /// `create_materialization_jobs_in_tx` (migration 085: one reset
+    /// per created job, same transaction) — see the
+    /// retry-invariant-map "mat-lane reset" entry.
     pub(crate) fn new_reset(
         derivation_id: Uuid,
         outcome_class: OutcomeClass,

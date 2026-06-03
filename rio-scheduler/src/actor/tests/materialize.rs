@@ -525,9 +525,10 @@ async fn build_attempt_with_materialization_payload_acked_and_ignored() -> TestR
 
     // Nothing changed: no ledger row, the node is still Running on its
     // open attempt, and no materialization rows exist.
-    let attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_attempts")
-        .fetch_one(&db.pool)
-        .await?;
+    let attempts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM drv_attempts WHERE event_kind = 'attempt'")
+            .fetch_one(&db.pool)
+            .await?;
     assert_eq!(attempts, 0, "no ledger row appended");
     let drv = expect_drv(&handle, "rb5-pin").await;
     assert_eq!(
@@ -623,9 +624,8 @@ async fn flag_on_infra_failure_charges_and_rearms() -> TestResult {
     // joined kind=materialization (invisible to build budgets by the
     // kernel's kind partition).
     let (class, joined_kind): (String, String) = sqlx::query_as(
-        "SELECT t.outcome_class, COALESCE(e.attempt_kind, 'build') \
-           FROM drv_attempts t \
-           LEFT JOIN drv_executions e ON e.exec_id = t.exec_id",
+        "SELECT outcome_class, attempt_kind FROM drv_attempts \
+          WHERE event_kind = 'attempt'",
     )
     .fetch_one(&db.pool)
     .await?;
@@ -714,9 +714,10 @@ async fn aborted_outcome_closes_attempt_uncharged() -> TestResult {
     barrier(&handle).await;
 
     // CHARGE-FREE: zero ledger rows of any class.
-    let charges: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_attempts")
-        .fetch_one(&db.pool)
-        .await?;
+    let charges: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM drv_attempts WHERE event_kind = 'attempt'")
+            .fetch_one(&db.pool)
+            .await?;
     assert_eq!(charges, 0, "an aborted walk charges nothing (owner Q3)");
 
     // The job is pending and claimable again.
@@ -808,9 +809,8 @@ async fn establishment_writes_materialization_infra_never_adopts() -> TestResult
     // arm would have written NO row at all (and completed the node);
     // the as-built C2 arm would have written executor_crash.
     let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT t.outcome_class, COALESCE(e.attempt_kind, 'build') \
-           FROM drv_attempts t \
-           LEFT JOIN drv_executions e ON e.exec_id = t.exec_id",
+        "SELECT outcome_class, attempt_kind FROM drv_attempts \
+          WHERE event_kind = 'attempt'",
     )
     .fetch_all(&db.pool)
     .await?;
@@ -1150,7 +1150,14 @@ async fn flag_on_materialization_job_end_to_end() -> TestResult {
             .fetch_one(&db.pool)
             .await?;
     let suffix = sdb(&db.pool).load_attempt_suffix(&[derivation_id]).await?;
-    let rows = suffix.get(&derivation_id).cloned().unwrap_or_default();
+    let loaded = suffix.get(&derivation_id).cloned().unwrap_or_default();
+    // The loaded suffix includes its 085 creation-reset anchor (the
+    // window cut); exactly one CHARGE row rides above it.
+    let rows: Vec<_> = loaded
+        .iter()
+        .filter(|r| r.event_kind == crate::state::AttemptEventKind::Attempt)
+        .cloned()
+        .collect();
     assert_eq!(
         rows.len(),
         1,
@@ -1304,9 +1311,8 @@ async fn flag_on_moot_unobtainable_never_fail_fasts() -> TestResult {
     // materialization budget) but carries the materialization kind —
     // invisible to build budgets — and the node was never poisoned.
     let (class, joined_kind): (String, String) = sqlx::query_as(
-        "SELECT t.outcome_class, COALESCE(e.attempt_kind, 'build') \
-           FROM drv_attempts t \
-           LEFT JOIN drv_executions e ON e.exec_id = t.exec_id",
+        "SELECT outcome_class, attempt_kind FROM drv_attempts \
+          WHERE event_kind = 'attempt'",
     )
     .fetch_one(&db.pool)
     .await?;
@@ -1472,9 +1478,8 @@ async fn flag_on_stale_unobtainable_two_build_dedup_never_fails() -> TestResult 
     let (unob_rows, build_kind_rows): (i64, i64) = sqlx::query_as(
         "SELECT \
            count(*) FILTER (WHERE t.outcome_class = 'materialization_unobtainable'), \
-           count(*) FILTER (WHERE COALESCE(e.attempt_kind, 'build') = 'build') \
-         FROM drv_attempts t \
-         LEFT JOIN drv_executions e ON e.exec_id = t.exec_id",
+           count(*) FILTER (WHERE t.attempt_kind = 'build') \
+         FROM drv_attempts t",
     )
     .fetch_one(&db.pool)
     .await?;
@@ -2105,9 +2110,10 @@ async fn flag_on_queued_mint_crash_between_commit_and_transition_recovers() -> T
         open, 0,
         "the establishment sweep closed the orphaned attempt"
     );
-    let charges: Vec<String> = sqlx::query_scalar("SELECT outcome_class FROM drv_attempts")
-        .fetch_all(&db.pool)
-        .await?;
+    let charges: Vec<String> =
+        sqlx::query_scalar("SELECT outcome_class FROM drv_attempts WHERE event_kind = 'attempt'")
+            .fetch_all(&db.pool)
+            .await?;
     assert_eq!(
         charges,
         vec!["materialization_infra".to_string()],
@@ -3323,7 +3329,12 @@ async fn flag_on_every_job_state_has_armed_action() -> TestResult {
         "state 3 (claimed, executor alive): the report consumption resolves the job"
     );
 
-    // ════ State 4: claimed, executor DEAD → establishment charges + re-arms ════
+    // ════ State 4: claimed, executor DEAD → establishment charges + PARKS ════
+    // The Q5-signed residual-(a) reversal (2026-06-03): the
+    // establishment channel runs the SAME park decision as a worker
+    // charge. With max_attempts=1 the single establishment charge
+    // exhausts the budget — the job parks (durable park_until) instead
+    // of re-arming into an invisible crash-loop.
     let assignment = match claim_materialization(&handle, "tot-pending", "store-test-0").await {
         Ok(PullOutcome::Deliver(a)) => *a,
         other => panic!("state 4 claim must deliver, got {other:?}"),
@@ -3339,11 +3350,12 @@ async fn flag_on_every_job_state_has_armed_action() -> TestResult {
     .await?;
     tick(&handle).await?;
     barrier(&handle).await;
-    let (job_state, infra_rows): (String, i64) = sqlx::query_as(
+    let (job_state, infra_rows, park4): (String, i64, Option<f64>) = sqlx::query_as(
         "SELECT mj.state, \
                 (SELECT count(*) FROM drv_attempts a \
                   WHERE a.derivation_id = mj.derivation_id \
-                    AND a.outcome_class = 'materialization_infra') \
+                    AND a.outcome_class = 'materialization_infra'), \
+                EXTRACT(EPOCH FROM mj.park_until)::float8 \
            FROM materialization_jobs mj \
            JOIN derivations d ON d.derivation_id = mj.derivation_id \
           WHERE d.drv_hash = 'tot-pending'",
@@ -3352,22 +3364,39 @@ async fn flag_on_every_job_state_has_armed_action() -> TestResult {
     .await?;
     assert_eq!(
         job_state, "pending",
-        "state 4 (claimed, executor dead): the establishment sweep re-arms the job"
+        "state 4 (claimed, executor dead): the job stays pending (parked is a \
+         wait, not a resolution)"
     );
     assert_eq!(
         infra_rows, 1,
         "state 4: the establishment charged exactly one materialization_infra row"
     );
+    assert!(
+        park4.is_some(),
+        "state 4: the establishment charge runs the park decision — at \
+         max_attempts=1 the job parks (the residual-(a) reversal)"
+    );
 
-    // ════ State 5: parked (budget exhausted) → durable park_until; refused
-    //      while parked; re-claimable after the backoff expires ════
-    // Re-claim the re-armed job and report a WORKER infra failure: the
-    // history now holds 2 infra rows (1 establishment + 1 worker) >=
-    // max_attempts(1) → the job parks.
+    // ════ State 5: parked → refused while parked; re-claimable after the
+    //      backoff expires; the WORKER channel parks identically ════
+    // While parked: the claim is refused (NotYetReady — backoff unexpired).
+    let refused = claim_materialization(&handle, "tot-pending", "store-test-0").await;
+    assert!(
+        matches!(refused, Ok(PullOutcome::NotYetReady { .. })),
+        "state 5: a parked job's claim is refused while the backoff runs, got {refused:?}"
+    );
+    // The park is a WAIT, not a terminal state: after the backoff
+    // expires (1 s base, exp 1-1=0 → 1 s here) the job is claimable again.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     let assignment = match claim_materialization(&handle, "tot-pending", "store-test-0").await {
         Ok(PullOutcome::Deliver(a)) => *a,
-        other => panic!("state 5 re-claim must deliver, got {other:?}"),
+        other => panic!(
+            "state 5: the park backoff expiry re-arms the claim (the park is a \
+             visible wait, never a strand), got {other:?}"
+        ),
     };
+    // The WORKER channel parks through the same chokepoint: a reported
+    // infra failure (2 infra rows >= max_attempts=1) re-parks the job.
     let exec5: Uuid = assignment.exec_id.parse()?;
     report_materialization_outcome(
         &handle,
@@ -3388,22 +3417,16 @@ async fn flag_on_every_job_state_has_armed_action() -> TestResult {
     .await?;
     assert!(
         park_until.is_some(),
-        "state 5 (parked): the budget exhaustion writes a durable park_until row"
+        "state 5 (parked): the worker-channel budget exhaustion writes a \
+         durable park_until row through the same chokepoint"
     );
-    // While parked: the claim is refused (NotYetReady — backoff unexpired).
-    let refused = claim_materialization(&handle, "tot-pending", "store-test-0").await;
-    assert!(
-        matches!(refused, Ok(PullOutcome::NotYetReady { .. })),
-        "state 5: a parked job's claim is refused while the backoff runs, got {refused:?}"
-    );
-    // The park is a WAIT, not a terminal state: after the backoff
-    // expires (1 s base, exp 2 → 2 s here) the job is claimable again.
+    // Re-claimable again after the longer backoff (exp 2-1=1 → 2 s).
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     let reclaimed = claim_materialization(&handle, "tot-pending", "store-test-0").await;
     assert!(
         matches!(reclaimed, Ok(PullOutcome::Deliver(_))),
-        "state 5: the park backoff expiry re-arms the claim (the park is a \
-         visible wait, never a strand), got {reclaimed:?}"
+        "state 5: the park backoff expiry re-arms the claim after the worker \
+         park too, got {reclaimed:?}"
     );
 
     // ════ State 5b (PD-20 / T-6.1): parked + from-source viable → the
@@ -3531,7 +3554,8 @@ async fn flag_on_every_job_state_has_armed_action() -> TestResult {
     let (job_state, charge_rows): (String, i64) = sqlx::query_as(
         "SELECT mj.state, \
                 (SELECT count(*) FROM drv_attempts a \
-                  WHERE a.derivation_id = mj.derivation_id) \
+                  WHERE a.derivation_id = mj.derivation_id \
+                    AND a.event_kind = 'attempt') \
            FROM materialization_jobs mj \
            JOIN derivations d ON d.derivation_id = mj.derivation_id \
           WHERE d.drv_hash = 'tot-zero-interest'",
@@ -4405,9 +4429,8 @@ async fn flag_on_genuine_unobtainable_fail_fasts_with_resubmit_error() -> TestRe
     let (unob, build_kind): (i64, i64) = sqlx::query_as(
         "SELECT \
            count(*) FILTER (WHERE t.outcome_class = 'materialization_unobtainable'), \
-           count(*) FILTER (WHERE COALESCE(e.attempt_kind, 'build') = 'build') \
-         FROM drv_attempts t \
-         LEFT JOIN drv_executions e ON e.exec_id = t.exec_id",
+           count(*) FILTER (WHERE t.attempt_kind = 'build') \
+         FROM drv_attempts t",
     )
     .fetch_one(&db.pool)
     .await?;
@@ -6614,9 +6637,10 @@ async fn zero_interest_cancel_closes_attempt_without_dag_node() -> TestResult {
     .await?;
     tick(&handle).await?;
     barrier(&handle).await;
-    let charges: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_attempts")
-        .fetch_one(&db.pool)
-        .await?;
+    let charges: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM drv_attempts WHERE event_kind = 'attempt'")
+            .fetch_one(&db.pool)
+            .await?;
     assert_eq!(
         charges, 0,
         "a cancelled job's closed attempt must never be establishment-charged"
@@ -6661,9 +6685,10 @@ async fn deposed_establishment_performs_no_rearm_or_requeue() -> TestResult {
     tick(&handle).await?;
     barrier(&handle).await;
 
-    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_attempts")
-        .fetch_one(&db.pool)
-        .await?;
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM drv_attempts WHERE event_kind = 'attempt'")
+            .fetch_one(&db.pool)
+            .await?;
     assert_eq!(rows, 0, "the deposed establishment's charge must be fenced");
     assert_eq!(
         expect_drv(&handle, "est-mat-fence").await.status,
@@ -7025,6 +7050,198 @@ async fn requeued_dep_racing_claim_returns_to_queued() -> TestResult {
         "the requeued dep-racing claim returns to its dep-derived status \
          (deps unbuilt => Queued; pre-fix: forced Ready, from-source \
          dispatchable against missing inputs)"
+    );
+    Ok(())
+}
+
+// ── A3 [A]: charge→verdict fusion (bug_067 + merged_bug_020) ───────────
+
+/// bug_067 (the Q5-signed reversal of counter-signed residual (a)):
+/// establishment-written charges run the SAME park decision as worker
+/// charges — party-blind parking via the kernel verdict. A job whose
+/// claiming replica dies before reporting, `max_attempts` times in a
+/// row, PARKS (durable `park_until`; excluded from the listing; claim
+/// refused) instead of re-listing forever as an armed-cycle crash-loop
+/// invisible to the MD-D1 stalled population.
+// r[verify sched.materialize.routing+3]
+#[tokio::test]
+async fn establishment_only_charges_park_at_max_attempts() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+            cfg.materialization.max_attempts = 2;
+            // Long base so the park cannot expire mid-assertion.
+            cfg.materialization.park_backoff_base_secs = 600;
+        });
+    let _tasks = (store_task, actor_task);
+
+    let out = test_store_path("est-park-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("est-park");
+    n.expected_output_paths = vec![out.clone()];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    // max_attempts establishment cycles: claim → the replica dies
+    // unreported (assignment aged out) → the sweep establishes the
+    // scheduler-party charge.
+    for cycle in 0..2 {
+        let claimed = claim_materialization(&handle, "est-park", "store-replica-0").await;
+        let assignment = match claimed {
+            Ok(PullOutcome::Deliver(a)) => *a,
+            other => panic!("cycle {cycle}: claim must deliver, got {other:?}"),
+        };
+        let exec_id: Uuid = assignment.exec_id.parse()?;
+        sqlx::query(
+            "UPDATE assignments SET assigned_at = now() - interval '100 days' \
+              WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .execute(&db.pool)
+        .await?;
+        tick(&handle).await?;
+        barrier(&handle).await;
+    }
+
+    let (charges, park_until): (i64, Option<f64>) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM drv_attempts a \
+                  WHERE a.derivation_id = mj.derivation_id \
+                    AND a.outcome_class = 'materialization_infra'), \
+                EXTRACT(EPOCH FROM mj.park_until)::float8 \
+           FROM materialization_jobs mj WHERE mj.drv_hash = 'est-park'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(charges, 2, "two establishment charges accrued");
+    assert!(
+        park_until.is_some(),
+        "establishment charges park at max_attempts (party-blind budget, \
+         residual-(a) reversal): an establishment-only crash-loop must not \
+         re-list forever"
+    );
+    let listed = list_materialization_jobs(&handle, 16).await;
+    assert!(
+        !listed.iter().any(|j| j.drv_hash == "est-park"),
+        "a parked job is excluded from the claimable listing, got {listed:?}"
+    );
+    let refused = claim_materialization(&handle, "est-park", "store-replica-1").await;
+    assert!(
+        matches!(refused, Ok(PullOutcome::NotYetReady { .. })),
+        "a parked job's claim is refused while the backoff runs, got {refused:?}"
+    );
+    Ok(())
+}
+
+/// merged_bug_020: the budget window is PER JOB. Migration 085 writes a
+/// materialization-lane reset row at job creation, so a successor job's
+/// budget starts fresh instead of inheriting the resolved predecessor's
+/// charges through the flat drv-level history count.
+#[tokio::test]
+async fn second_job_budget_window_starts_fresh() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+            cfg.materialization.max_attempts = 2;
+            cfg.materialization.park_backoff_base_secs = 600;
+        });
+    let _tasks = (store_task, actor_task);
+
+    let out = test_store_path("fresh-window-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("fresh-window");
+    n.expected_output_paths = vec![out.clone()];
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(&handle, b1, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Job 1: one worker infra charge (max-1), then resolution via the
+    // zero-interest cancellation closer.
+    let assignment = match claim_materialization(&handle, "fresh-window", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("job-1 claim must deliver, got {other:?}"),
+    };
+    let exec1: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(
+        &handle,
+        exec1,
+        "fresh-window",
+        mat_infra_outcome("upstream 503"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("job-1 infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    cancel_build(&handle, b1).await?;
+    barrier(&handle).await;
+    tick(&handle).await?; // the cancellation-closer backstop
+    barrier(&handle).await;
+    let job1_state: String = sqlx::query_scalar(
+        "SELECT state FROM materialization_jobs WHERE drv_hash = 'fresh-window' \
+          ORDER BY job_id LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(job1_state, "cancelled", "job 1 resolved by the closer");
+
+    // Job 2: a new build re-merges the node; the probe partition
+    // creates a fresh job (job 1 is terminal → the dedup finds nothing).
+    let b2 = Uuid::new_v4();
+    let mut n2 = make_node("fresh-window");
+    n2.expected_output_paths = vec![out.clone()];
+    let _ev2 = merge_dag(&handle, b2, vec![n2], vec![], false).await?;
+    barrier(&handle).await;
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    // Every genuinely created job writes ONE mat-lane reset row (the
+    // 085 window): job 1's creation + job 2's creation = two. Job 2's
+    // is the LAST ledger event, so its window holds zero charges.
+    let resets: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM drv_attempts WHERE outcome_class = 'materialization_reset'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        resets, 2,
+        "one creation reset per created job (job 1 + job 2)"
+    );
+
+    // Job 2's first infra charge: ONE row in the fresh window (< max 2)
+    // — the job re-arms claimable. Pre-085 the flat count spans job 1's
+    // charge (2 >= 2) and wrongly parks.
+    let assignment = match claim_materialization(&handle, "fresh-window", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("job-2 claim must deliver, got {other:?}"),
+    };
+    let exec2: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(
+        &handle,
+        exec2,
+        "fresh-window",
+        mat_infra_outcome("upstream 503"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("job-2 infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    let park2: Option<f64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM park_until)::float8 FROM materialization_jobs \
+          WHERE drv_hash = 'fresh-window' AND state = 'pending'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        park2.is_none(),
+        "job 2's first charge stays under ITS OWN budget window (one row \
+         since the 085 creation reset) — the predecessor's charges must \
+         not park the successor"
+    );
+    let reclaimed = claim_materialization(&handle, "fresh-window", "store-test-1").await;
+    assert!(
+        matches!(reclaimed, Ok(PullOutcome::Deliver(_))),
+        "job 2 re-arms claimable after an under-budget charge, got {reclaimed:?}"
     );
     Ok(())
 }

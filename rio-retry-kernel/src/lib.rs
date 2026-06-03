@@ -1199,6 +1199,13 @@ pub enum OutcomeClass {
     /// budget and toward NOTHING else — invisible to every build
     /// budget (the kind partition, design §2.5).
     MaterializationInfra,
+    /// Substitution-replacement (migration 085): the materialization
+    /// lane's reset row, written at job creation — one fresh budget
+    /// window per job. Cuts the materialization-lane suffix exactly as
+    /// a build reset cuts the build lane's (the cut predicate is
+    /// `(kind, event_kind)`; this class is row DATA, never the cut).
+    /// Invisible to every build budget (the kind partition).
+    MaterializationReset,
 }
 
 /// Which party observed/reported the event behind an attempt-ledger
@@ -1630,7 +1637,9 @@ fn row_to_event<Id: Clone>(row: &LedgerRow<Id>) -> Option<AttemptEvent<Id>> {
         // the malformed reset-class arms above. Nothing constructs
         // these classes yet (dormant until the materialization flags
         // enable the consumption/establishment writers).
-        OutcomeClass::MaterializationUnobtainable | OutcomeClass::MaterializationInfra => None,
+        OutcomeClass::MaterializationUnobtainable
+        | OutcomeClass::MaterializationInfra
+        | OutcomeClass::MaterializationReset => None,
     }
 }
 
@@ -1675,7 +1684,40 @@ pub fn materialization_decide<Id: Ord + Clone>(
     rows: &[LedgerRow<Id>],
     max_materialization_attempts: u32,
 ) -> MaterializationVerdict {
-    let infra_since_reset = rows
+    if materialization_counters(rows).infra_since_reset >= max_materialization_attempts {
+        MaterializationVerdict::Park
+    } else {
+        MaterializationVerdict::Claimable
+    }
+}
+
+/// The materialization lane's windowed counters — THE single counter
+/// for every budget/one-shot/strictness consumer (merged_bug_020: the
+/// scheduler's flat per-class history counts are deleted in favor of
+/// this fold). All three counts share ONE window: the suffix after the
+/// last materialization-kind reset row (same cut as
+/// [`materialization_decide`]; a migration-085 job-creation reset
+/// re-zeros all three at once). Build-kind rows neither count nor cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MatCounters {
+    /// `MaterializationInfra` rows in the window — worker-reported AND
+    /// establishment-written (OQ1 amendment 1: both channels charge
+    /// the same budget). The park predicate's count.
+    pub infra_since_reset: u32,
+    /// The worker-reported subset of `infra_since_reset` (the Item-T
+    /// `conversion_requires_worker_charge` recount).
+    pub worker_infra_since_reset: u32,
+    /// `MaterializationUnobtainable` rows in the window (routing
+    /// verdicts — the arm-0 one-shot discriminator, never a retry
+    /// charge).
+    pub unobtainable_since_reset: u32,
+}
+
+/// Fold one derivation's ledger rows into [`MatCounters`]. The window
+/// is the materialization lane's reset cut; see [`MatCounters`].
+pub fn materialization_counters<Id>(rows: &[LedgerRow<Id>]) -> MatCounters {
+    let mut c = MatCounters::default();
+    for r in rows
         .iter()
         // Same reset-cut discipline as the build fold, applied to the
         // materialization-kind view: count after the last
@@ -1685,16 +1727,20 @@ pub fn materialization_decide<Id: Ord + Clone>(
         .take_while(|r| {
             !(r.kind == AttemptKind::Materialization && r.event_kind == AttemptEventKind::Reset)
         })
-        .filter(|r| {
-            r.kind == AttemptKind::Materialization
-                && r.outcome_class == OutcomeClass::MaterializationInfra
-        })
-        .count();
-    if infra_since_reset >= max_materialization_attempts as usize {
-        MaterializationVerdict::Park
-    } else {
-        MaterializationVerdict::Claimable
+        .filter(|r| r.kind == AttemptKind::Materialization)
+    {
+        match r.outcome_class {
+            OutcomeClass::MaterializationInfra => {
+                c.infra_since_reset += 1;
+                if r.reporting_party == ReportingParty::Worker {
+                    c.worker_infra_since_reset += 1;
+                }
+            }
+            OutcomeClass::MaterializationUnobtainable => c.unobtainable_since_reset += 1,
+            _ => {}
+        }
     }
+    c
 }
 
 // ---------------------------------------------------------------------------
@@ -2897,7 +2943,7 @@ mod proofs {
     /// proven domain and covered by the fold's no-op arms.
     fn any_outcome_class() -> OutcomeClass {
         let i: u8 = kani::any();
-        kani::assume(i < 15);
+        kani::assume(i < 16);
         match i {
             0 => OutcomeClass::Transient,
             1 => OutcomeClass::Infra,
@@ -2913,7 +2959,8 @@ mod proofs {
             11 => OutcomeClass::CacheHitClear,
             12 => OutcomeClass::PoisonCleared,
             13 => OutcomeClass::MaterializationUnobtainable,
-            _ => OutcomeClass::MaterializationInfra,
+            14 => OutcomeClass::MaterializationInfra,
+            _ => OutcomeClass::MaterializationReset,
         }
     }
 
@@ -3523,5 +3570,33 @@ mod proofs {
         if !terminal || active || referenced || !aged {
             assert!(!eligible);
         }
+    }
+
+    /// `materialization_counters` window theorem (the [A] charge
+    /// chokepoint's decision input): the three counts depend ONLY on
+    /// the materialization lane's reset-cut suffix — recomputing over
+    /// `rows[ledger_suffix_start(rows, Materialization)..]` is
+    /// bit-identical, the worker subset is bounded by the total, and
+    /// `materialization_decide` is exactly the `infra_since_reset >=
+    /// max` projection of the same fold (the wrapper identity the
+    /// scheduler's chokepoint relies on). MAX=5/unwind 8, the sweep
+    /// theorems' bound family.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn check_materialization_counters_window() {
+        const MAX: usize = 5;
+        let (rows, n) = any_history::<MAX>();
+        let rows = &rows[..n];
+
+        let c = materialization_counters(rows);
+        let cut = ledger_suffix_start(rows, AttemptKind::Materialization);
+        let c_suffix = materialization_counters(&rows[cut..]);
+        assert!(c == c_suffix);
+        assert!(c.worker_infra_since_reset <= c.infra_since_reset);
+
+        let max: u8 = kani::any();
+        let max = u32::from(max);
+        let parked = materialization_decide(rows, max) == MaterializationVerdict::Park;
+        assert!(parked == (c.infra_since_reset >= max));
     }
 }
