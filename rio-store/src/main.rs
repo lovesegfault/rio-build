@@ -24,6 +24,14 @@ use rio_store::config::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // One-shot diagnostic mode for `xtask deploy`'s pg preflight: a
+    // throwaway pod runs `rio-store pg-preflight` to MEASURE the live
+    // server's max_connections (the value the rds.tf model predicts —
+    // see infra/eks/rds.tf locals). Intercepted before CliArgs::parse
+    // so the positional mode word never reaches the config layering.
+    if std::env::args().nth(1).as_deref() == Some("pg-preflight") {
+        return pg_preflight().await;
+    }
     let cli = CliArgs::parse();
     let rio_common::server::Bootstrap::<Config> {
         cfg,
@@ -444,6 +452,31 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     info!("store shut down cleanly");
+    Ok(())
+}
+
+/// `rio-store pg-preflight`: connect via `RIO_DATABASE_URL`, print the
+/// server's `max_connections` in `key=value` form, exit. The output
+/// contract (`max_connections=N` on stdout) is parsed by
+/// `xtask::k8s::eks::deploy`'s pg-preflight step — change both
+/// together. Uses a single connection and no migrations: this mode
+/// must work against a fully-booted production database without side
+/// effects.
+async fn pg_preflight() -> anyhow::Result<()> {
+    use anyhow::Context;
+    let url = std::env::var("RIO_DATABASE_URL")
+        .context("pg-preflight requires RIO_DATABASE_URL (the rio-postgres secret's url key)")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .context("pg-preflight: connect failed")?;
+    let max_connections: i32 =
+        sqlx::query_scalar("SELECT setting::int FROM pg_settings WHERE name = 'max_connections'")
+            .fetch_one(&pool)
+            .await
+            .context("pg-preflight: SELECT max_connections failed")?;
+    println!("max_connections={max_connections}");
     Ok(())
 }
 
