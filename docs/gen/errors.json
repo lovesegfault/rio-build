@@ -275,6 +275,13 @@
     },
     {
       "enum": "KeyFmtError",
+      "name": "NameForbiddenChar",
+      "crate": "rio-common",
+      "msg": "key name {0:?} contains whitespace or a control byte (it would fragment the whitespace-tokenized trusted-public-keys entry or corrupt Sig: line framing)",
+      "doc": "Key name contains a byte that fragments or corrupts the entry in its consuming contexts. The published entry lands in Nix's `trusted-public-keys` — \"a whitespace-separated list of public keys\" (`globals.hh:239-266`) tokenized on `\" \\t\\n\\r\"` (`strings.hh:28`) — and in line-framed `Sig:` narinfo fields, so a space-bearing name silently splits into two garbage tokens and a control byte corrupts line framing. Rejected at every constructor; the name is echoed (escaped) because key names are public identifiers, not key material."
+    },
+    {
+      "enum": "KeyFmtError",
       "name": "PubKeyLength",
       "crate": "rio-common",
       "msg": "public key must be {SEED_LEN} bytes, got {0}",
@@ -1496,7 +1503,7 @@
       "name": "Base64",
       "crate": "rio-store",
       "msg": "base64 decode failed: {0}",
-      "doc": ""
+      "doc": "Sanitized decode failure (position/shape only). The raw `base64::DecodeError` echoes the offending BYTE VALUE in its `Display` — for a secret-key file that is a byte of key material, and `SignerError` lands in startup logs. Type-level sanitization: this variant has nowhere to put a payload byte."
     },
     {
       "enum": "SignerError",
@@ -1518,6 +1525,13 @@
       "crate": "rio-store",
       "msg": "secret key entry is internally inconsistent (expanded tail does not match the seed-derived public key); refusing to load a corrupt signing key",
       "doc": "64-byte entry whose trailing 32 bytes are not the seed-derived public key (corrupt or hand-assembled file). Refused at load: signing with the seed while the redundant pub half disagrees would produce signatures the published key never verifies."
+    },
+    {
+      "enum": "SignerError",
+      "name": "InvalidName",
+      "crate": "rio-store",
+      "msg": "key name {0:?} contains whitespace or a control byte",
+      "doc": "Name carries whitespace or a control byte — it would fragment the whitespace-tokenized `trusted-public-keys` entry this key's public half is published as, or corrupt `Sig:` line framing. Refused at load (the codec refuses it at every constructor)."
     },
     {
       "enum": "SignerError",
