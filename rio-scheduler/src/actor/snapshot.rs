@@ -849,6 +849,9 @@ impl DagActor {
                     AuthBinding {
                         node: b.node_name.clone(),
                         tenant,
+                        // Wire `0` = absent (pre-upgrade controller):
+                        // the mint falls back to its re-solve alone.
+                        deadline_secs: (b.deadline_secs > 0).then_some(b.deadline_secs),
                     },
                 );
             }

@@ -180,6 +180,16 @@ pub struct MaterializationConfig {
     /// window, so a dwell beyond `park_backoff_cap_secs` could never
     /// convert via PD-20 — rejected at config validation.
     pub conversion_min_park_dwell_secs: u64,
+    /// The deadline a MATERIALIZATION attempt is minted under
+    /// (seconds): the establishment sweep establishes an unreported
+    /// store claim this long (plus `establishment_report_slack_secs`)
+    /// after the mint. Materialization never runs under a build pod's
+    /// `activeDeadlineSeconds`, so the build solve is the wrong anchor
+    /// (bug_075's secondary effect: establishment waited
+    /// build-deadline+slack). Large closures on slow upstreams may
+    /// need this raised per-deployment. Must be ≥ 1 — `0` would
+    /// establish every claim on its first sweep tick.
+    pub attempt_deadline_secs: u64,
 }
 
 impl Default for MaterializationConfig {
@@ -190,6 +200,7 @@ impl Default for MaterializationConfig {
             park_backoff_cap_secs: 900,
             conversion_requires_worker_charge: false,
             conversion_min_park_dwell_secs: 0,
+            attempt_deadline_secs: 3600,
         }
     }
 }
@@ -347,6 +358,13 @@ impl rio_common::config::ValidateConfig for Config {
          disables conversion entirely",
             cfg.materialization.conversion_min_park_dwell_secs,
             cfg.materialization.park_backoff_cap_secs
+        );
+        // attempt_deadline_secs = 0 would establish every store claim
+        // on its first sweep visit (deadline already past at mint) —
+        // the unvalidated-degenerate-knob class (082's sibling).
+        anyhow::ensure!(
+            cfg.materialization.attempt_deadline_secs >= 1,
+            "materialization.attempt_deadline_secs must be >= 1, got 0              (a zero deadline establishes every claim on its first sweep tick)"
         );
         // `actor/completion.rs` resets the per-executor `infra_count` when
         // `last.elapsed().as_secs_f64() > infra_retry_window_secs`. `as_secs_f64()`

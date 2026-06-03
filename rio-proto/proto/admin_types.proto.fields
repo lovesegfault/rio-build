@@ -244,6 +244,7 @@ uint32 cached_derivations = 7;
 uint32 completed_derivations = 6;
 uint32 cores = 2;
 uint32 cores = 3;
+uint32 deadline_secs = 3;
 uint32 deadline_secs = 4;
 uint32 deadline_secs = 9;
 uint32 draining_executors = 3;

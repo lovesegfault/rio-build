@@ -1023,6 +1023,7 @@ async fn pull_attempt_failure_stamps_source_node_and_excludes_node() -> TestResu
             bound_intents: vec![rio_proto::types::BoundIntent {
                 intent_id: "psn-a".into(),
                 node_name: "node-7".into(),
+                deadline_secs: 0,
             }],
         })
         .await?;
@@ -1184,6 +1185,7 @@ async fn establishment_charge_falls_back_to_late_binding_ack() -> TestResult {
             bound_intents: vec![rio_proto::types::BoundIntent {
                 intent_id: "psn-c".into(),
                 node_name: "node-10".into(),
+                deadline_secs: 0,
             }],
         })
         .await?;
@@ -1441,6 +1443,60 @@ async fn worker_abort_uncharged_closes_are_ledger_bounded() -> TestResult {
     assert_eq!(
         facts[0].0, "infra",
         "the charged fall-through classifies as infra, not disconnected"
+    );
+    Ok(())
+}
+
+// r[verify sched.attempt.establishment-window+4]
+/// bug_106 (A2.3 MintProfile): the build mint must FLOOR its persisted
+/// deadline at the rendered deadline the pod was actually dispatched
+/// under (`BoundIntent.deadline_secs`, carried as data from the
+/// controller's `rio.build/deadline-secs` pod annotation). Pre-fix the
+/// mint persisted the mint-time re-solve alone — a between-solve
+/// estimate shrink anchored the establishment window BELOW the
+/// `activeDeadlineSeconds` the pod really runs under, the same
+/// shrink-class the sweep's widen-only rule already closes one phase
+/// later.
+#[tokio::test]
+async fn build_mint_floors_deadline_at_carried_rendered() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "mint-floor",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+
+    // The controller-rendered deadline arrives as DATA on the binding
+    // — far above anything the unit-corpus re-solve produces.
+    handle
+        .send_unchecked(ActorCommand::AckSpawnedIntents {
+            spawned: vec![],
+            unfulfillable_cells: vec![],
+            registered_cells: vec![],
+            observed_instance_types: vec![],
+            bound_intents: vec![rio_proto::types::BoundIntent {
+                intent_id: "mint-floor".into(),
+                node_name: "node-floor".into(),
+                deadline_secs: 7200,
+            }],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let assignment = pull_attempt(&handle, "mint-floor").await;
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    let deadline: Option<f64> =
+        sqlx::query_scalar("SELECT deadline_secs FROM drv_executions WHERE exec_id = $1")
+            .bind(exec_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        deadline,
+        Some(7200.0),
+        "the mint floors its persisted deadline at the carried rendered value \
+         (pre-fix: the re-solve alone was persisted)"
     );
     Ok(())
 }

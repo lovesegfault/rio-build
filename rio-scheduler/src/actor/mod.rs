@@ -209,6 +209,14 @@ pub(crate) const DISPATCH_PROBE_BATCH_CAP: usize = 2048;
 pub(crate) struct AuthBinding {
     pub node: String,
     pub tenant: Option<Uuid>,
+    /// The rendered deadline the bound pod was dispatched under
+    /// (`BoundIntent.deadline_secs`; `None` = wire `0` = absent —
+    /// pre-upgrade controller or unparseable annotation). The build
+    /// mint floors its persisted deadline at this value (bug_106): the
+    /// establishment window must never shrink below the deadline the
+    /// pod is REALLY running under, whatever the mint-time re-solve
+    /// says.
+    pub deadline_secs: Option<u32>,
 }
 
 /// The DAG actor state.

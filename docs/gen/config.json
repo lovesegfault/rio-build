@@ -328,6 +328,12 @@
         "description": "Item T conversion-strictness, dwell half: minimum seconds since the job's MOST RECENT park began (re-park restarts the clock; durable `materialization_jobs.park_began_at`, failover-exact) before PD-20 may convert. `0` = off (knob disabled — the shipped default)."
       },
       {
+        "key": "materialization.attempt_deadline_secs",
+        "type": "uint64",
+        "default": "3600",
+        "description": "The deadline a MATERIALIZATION attempt is minted under (seconds): the establishment sweep establishes an unreported store claim this long (plus `establishment_report_slack_secs`) after the mint."
+      },
+      {
         "key": "dashboard.cors_allow_origins",
         "type": "string",
         "default": "http://rio-dashboard.rio-system.svc.cluster.local",

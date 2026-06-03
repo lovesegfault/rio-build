@@ -560,6 +560,7 @@ async fn ack_bound_intents_populates_authoritative_binding() {
     let bi = |id: &str, node: &str| BoundIntent {
         intent_id: id.into(),
         node_name: node.into(),
+        deadline_secs: 0,
     };
     let abc = crate::state::DrvHash::from("abc123");
     let def = crate::state::DrvHash::from("def456");

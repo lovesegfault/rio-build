@@ -6721,3 +6721,144 @@ async fn controller_verdict_never_consumes_materialization_attempt() -> TestResu
     );
     Ok(())
 }
+
+// r[verify sched.materialize.job+2]
+/// bug_075 (A2.3 MintProfile): a materialization mint must NOT inherit
+/// the builder pod's controller-authoritative binding. The dep-racing
+/// shape — a builder pod bound for the same derivation while the
+/// materialization job is claimed — pre-fix stamped the builder's
+/// `source_node` onto the STORE execution row (feeding wrong exclusion
+/// keys) and, with migration 084's build-only CHECK, turned every such
+/// claim into a mint error. The mat profile pins `source_node = None`
+/// and anchors the deadline to `materialization.attempt_deadline_secs`,
+/// never the build solve.
+#[tokio::test]
+async fn materialization_mint_carries_no_builder_binding() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("mat075-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("mat075");
+    n.expected_output_paths = vec![out.clone()];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    // The dep-racing ingredient: a builder pod binding for the SAME
+    // derivation (controller pod informer → authoritative_binding).
+    bind_intent_node(&handle, "mat075", "builder-node-a").await?;
+
+    let outcome = claim_materialization(&handle, "mat075", "store-replica-0").await;
+    let assignment = match outcome {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!(
+            "materialization claim must mint cleanly with a builder binding present \
+             (pre-fix: the binding leaked into the mint and the 084 CHECK rejected \
+             the row), got {other:?}"
+        ),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    let (source_node, deadline): (Option<String>, Option<f64>) =
+        sqlx::query_as("SELECT source_node, deadline_secs FROM drv_executions WHERE exec_id = $1")
+            .bind(exec_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        source_node, None,
+        "node attribution is a build-lane concept; the mat profile pins None"
+    );
+    assert_eq!(
+        deadline,
+        Some(3600.0),
+        "the mat deadline anchors to materialization.attempt_deadline_secs \
+         (default 3600), never the build solve"
+    );
+    Ok(())
+}
+
+// r[verify sched.sla.hw-class.ice-mask]
+/// bug_091 (A2.3 MintProfile): a materialization claim is NOT the
+/// build-spawn success edge — it must neither clear an ICE mask nor
+/// consume the `dispatched_cells` arming for its derivation. Pre-fix
+/// the un-gated clear at the mint fired for both work classes, so a
+/// store replica claiming a job silently un-ICEd a cell whose builder
+/// pod had never scheduled.
+#[tokio::test]
+async fn materialization_mint_leaves_ice_mask_untouched() -> TestResult {
+    use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm, SpawnIntent};
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("mat091-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("mat091");
+    n.expected_output_paths = vec![out.clone()];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Arm a SINGLE cell for the derivation and mark it ICE — the
+    // |A'| == 1 shape the build-pull clear targets.
+    handle
+        .send_unchecked(ActorCommand::AckSpawnedIntents {
+            spawned: vec![SpawnIntent {
+                intent_id: "mat091".into(),
+                hw_class_names: vec!["h-mat".into()],
+                node_affinity: vec![NodeSelectorTerm {
+                    match_expressions: vec![
+                        NodeSelectorRequirement {
+                            key: "rio.build/hw-class".into(),
+                            operator: "In".into(),
+                            values: vec!["h-mat".into()],
+                        },
+                        NodeSelectorRequirement {
+                            key: "karpenter.sh/capacity-type".into(),
+                            operator: "In".into(),
+                            values: vec!["spot".into()],
+                        },
+                    ],
+                }],
+                ..Default::default()
+            }],
+            unfulfillable_cells: vec!["h-mat:spot".into()],
+            registered_cells: vec![],
+            observed_instance_types: vec![],
+            bound_intents: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let masked = |snap: &crate::actor::SpawnIntentsSnapshot| {
+        snap.ice_masked_cells.iter().any(|c| c == "h-mat:spot")
+    };
+    let snap = handle
+        .query_unchecked(|reply| {
+            ActorCommand::Admin(AdminQuery::GetSpawnIntents {
+                req: crate::actor::SpawnIntentsRequest::default(),
+                reply,
+            })
+        })
+        .await
+        .expect("actor alive");
+    assert!(
+        masked(&snap),
+        "precondition: h-mat:spot is ICE before the claim"
+    );
+
+    let outcome = claim_materialization(&handle, "mat091", "store-replica-0").await;
+    assert!(
+        matches!(outcome, Ok(PullOutcome::Deliver(_))),
+        "claim must deliver, got {outcome:?}"
+    );
+    let snap = handle
+        .query_unchecked(|reply| {
+            ActorCommand::Admin(AdminQuery::GetSpawnIntents {
+                req: crate::actor::SpawnIntentsRequest::default(),
+                reply,
+            })
+        })
+        .await
+        .expect("actor alive");
+    assert!(
+        masked(&snap),
+        "a materialization claim is not the build-spawn success edge: \
+         the ICE mask must survive the mint"
+    );
+    Ok(())
+}

@@ -129,7 +129,8 @@
           "park_backoff_base_secs": 30,
           "park_backoff_cap_secs": 900,
           "conversion_requires_worker_charge": false,
-          "conversion_min_park_dwell_secs": 0
+          "conversion_min_park_dwell_secs": 0,
+          "attempt_deadline_secs": 3600
         }
       },
       "dashboard": {
@@ -310,6 +311,13 @@
             "format": "uint64",
             "minimum": 0,
             "default": 0
+          },
+          "attempt_deadline_secs": {
+            "description": "The deadline a MATERIALIZATION attempt is minted under\n(seconds): the establishment sweep establishes an unreported\nstore claim this long (plus `establishment_report_slack_secs`)\nafter the mint. Materialization never runs under a build pod's\n`activeDeadlineSeconds`, so the build solve is the wrong anchor\n(bug_075's secondary effect: establishment waited\nbuild-deadline+slack). Large closures on slow upstreams may\nneed this raised per-deployment. Must be ≥ 1 — `0` would\nestablish every claim on its first sweep tick.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "default": 3600
           }
         }
       },
@@ -367,7 +375,8 @@
       "park_backoff_base_secs": 30,
       "park_backoff_cap_secs": 900,
       "conversion_requires_worker_charge": false,
-      "conversion_min_park_dwell_secs": 0
+      "conversion_min_park_dwell_secs": 0,
+      "attempt_deadline_secs": 3600
     },
     "dashboard": {
       "cors_allow_origins": "http://rio-dashboard.rio-system.svc.cluster.local"

@@ -191,6 +191,10 @@ mod tests {
             generation: 1,
             assigned_at_age_secs: 100 + WEDGE_DEADLINE_GRACE_SECS + over_secs,
             deadline_secs: 100,
+            // Compile-forced by `OpenAttempt.attempt_kind` (A2): the
+            // wedge's kind-aware consumption is C2's co-land (§4.R3);
+            // UNSPECIFIED is the documented skew posture (⇒ build).
+            attempt_kind: 0,
         }
     }
 

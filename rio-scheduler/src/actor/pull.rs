@@ -35,6 +35,49 @@ use super::DagActor;
 /// existing builder `idle_timeout`, so no second number exists here.
 pub(crate) const NOT_YET_READY_RETRY_AFTER_SECS: u32 = 5;
 
+/// The kind-selected side-effect profile of one pull mint (A2.3 —
+/// bug_075/091/106): every kind-divergent decision in
+/// [`DagActor::mint_and_deliver`] is made HERE, in the single match on
+/// the work class at the top of the mint. The body below the match
+/// consumes profile fields only — adding a new kind-divergent side
+/// effect to the mint without deciding it for BOTH classes is
+/// unwritable (a missing struct field does not compile).
+struct MintProfile {
+    /// The persisted work class — data for the durable write and the
+    /// kinded transition, never compared below the profile match.
+    attempt_kind: crate::state::AttemptKind,
+    /// Node attribution. Build: the controller-authoritative binding.
+    /// Materialization: `None` BY PROFILE — node attribution is a
+    /// build-lane concept (the 084 CHECK makes the regression
+    /// unrepresentable; bug_075's primary effect was a builder-pod
+    /// binding stamped onto a store execution, feeding wrong exclusion
+    /// keys — and post-084, failing every dep-racing claim).
+    source_node: Option<String>,
+    /// The deadline the establishment window anchors to. Build:
+    /// `max(carried rendered, mint-time re-solve)` — the carried
+    /// rendered deadline (`BoundIntent.deadline_secs`) is what the
+    /// pod's `activeDeadlineSeconds` was REALLY rendered from, so the
+    /// persisted anchor must never sit below it (bug_106).
+    /// Materialization: `materialization.attempt_deadline_secs` — a
+    /// store walk never runs under a build pod's deadline (bug_075's
+    /// establishment half).
+    deadline_secs: Option<f64>,
+    /// Whether this mint is the spawn-success edge that clears the
+    /// single-cell ICE mask and consumes `dispatched_cells`. Build
+    /// only: a store replica's claim says nothing about builder-pod
+    /// scheduling (bug_091).
+    clear_ice: bool,
+    /// GC live-input pins — build-lane lifecycle only (pin-at-ingest
+    /// is store-side for materialization).
+    pin_live_inputs: bool,
+    /// Whether the committed mint is noted in the in-memory
+    /// materialization job view (the kernel's one-winner arbitration).
+    note_claimed: bool,
+    /// The display surface, via the kernel's single kind-to-surface
+    /// projection (`r[sched.pull.kinded-running-surface]`).
+    surface: rio_evidence_kernel::pull::DisplaySurface,
+}
+
 /// What the scheduler answers a `PullAssignment` with.
 #[derive(Debug)]
 pub enum PullOutcome {
@@ -336,40 +379,66 @@ impl DagActor {
             .path_for_hash(drv_hash)
             .map(rio_nix::store_path::drv_log_hash)
             .unwrap_or_default();
-        // Controller-authoritative pod→node binding, when known.
-        let source_node = self
-            .authoritative_binding
-            .get(drv_hash)
-            .map(|b| b.node.clone());
-        // The deadline this attempt is dispatched under (the same solve
-        // that sized the spawn intent / activeDeadlineSeconds),
-        // persisted so the establishment window is anchored to it and
-        // can never shrink below it while the attempt is open. The
-        // solve is NOT stamped onto the node: with the stream dispatch
-        // pass gone there is no dispatch-time intent writer, and the
-        // pull-path conventions (recorded with the unit-corpus
-        // re-point) treat the explicit per-test/operator seed as the
-        // only source for `last_intent`-derived baselines.
-        let deadline_secs = {
-            let (hw, cost, inputs_gen) = self.solve_inputs();
-            self.dag.node(drv_hash).map(|state| {
-                f64::from(
-                    self.solve_intent_for(state, &hw, &cost, inputs_gen)
-                        .deadline_secs,
-                )
-            })
-        };
-
-        // Substitution-replacement: the work class is persisted on the
-        // execution row (`drv_executions.attempt_kind`) — keyed on the
-        // request's claimed kind, never derived from an identity prefix.
-        // Build pulls write 'build' (the column default — value-identical
-        // to the as-built rows).
-        let attempt_kind = match kind {
-            rio_evidence_kernel::pull::PullKind::Build => crate::state::AttemptKind::Build,
-            rio_evidence_kernel::pull::PullKind::Materialization => {
-                crate::state::AttemptKind::Materialization
-            }
+        // THE one kind match (A2.3): every kind-divergent decision of
+        // this mint is selected here; the body below consumes profile
+        // fields only. The work class is keyed on the request's claimed
+        // kind, never derived from an identity prefix; build pulls
+        // write 'build' (value-identical to the as-built rows).
+        let profile = match kind {
+            rio_evidence_kernel::pull::PullKind::Build => MintProfile {
+                attempt_kind: crate::state::AttemptKind::Build,
+                // Controller-authoritative pod→node binding, when known.
+                source_node: self
+                    .authoritative_binding
+                    .get(drv_hash)
+                    .map(|b| b.node.clone()),
+                // The deadline this attempt is dispatched under,
+                // persisted so the establishment window is anchored to
+                // it and can never shrink below it while the attempt
+                // is open: the max of the CARRIED rendered deadline
+                // (`BoundIntent.deadline_secs` — the same solve
+                // `activeDeadlineSeconds` was rendered from; bug_106)
+                // and the mint-time re-solve. The solve is NOT stamped
+                // onto the node: with the stream dispatch pass gone
+                // there is no dispatch-time intent writer, and the
+                // pull-path conventions (recorded with the unit-corpus
+                // re-point) treat the explicit per-test/operator seed
+                // as the only source for `last_intent`-derived
+                // baselines.
+                deadline_secs: {
+                    let resolved = {
+                        let (hw, cost, inputs_gen) = self.solve_inputs();
+                        self.dag.node(drv_hash).map(|state| {
+                            f64::from(
+                                self.solve_intent_for(state, &hw, &cost, inputs_gen)
+                                    .deadline_secs,
+                            )
+                        })
+                    };
+                    let carried = self
+                        .authoritative_binding
+                        .get(drv_hash)
+                        .and_then(|b| b.deadline_secs)
+                        .map(f64::from);
+                    match (resolved, carried) {
+                        (Some(r), Some(c)) => Some(r.max(c)),
+                        (r, c) => r.or(c),
+                    }
+                },
+                clear_ice: true,
+                pin_live_inputs: true,
+                note_claimed: false,
+                surface: rio_evidence_kernel::pull::display_class(kind),
+            },
+            rio_evidence_kernel::pull::PullKind::Materialization => MintProfile {
+                attempt_kind: crate::state::AttemptKind::Materialization,
+                source_node: None,
+                deadline_secs: Some(self.materialization_cfg.attempt_deadline_secs as f64),
+                clear_ice: false,
+                pin_live_inputs: false,
+                note_claimed: true,
+                surface: rio_evidence_kernel::pull::display_class(kind),
+            },
         };
         let minted = self
             .db
@@ -379,9 +448,9 @@ impl DagActor {
                 serving_generation as i64,
                 exec_id,
                 &log_hash,
-                source_node.as_deref(),
-                deadline_secs,
-                attempt_kind,
+                profile.source_node.as_deref(),
+                profile.deadline_secs,
+                profile.attempt_kind,
             )
             .await
             .map_err(|e| PullRejection::Internal(format!("pull mint transaction failed: {e}")))?;
@@ -399,7 +468,7 @@ impl DagActor {
         // one-winner arbitration (Claimed{held_by_puller}) answers
         // re-pulls and competing claims correctly. Reachable only
         // flag-on (no materialization pull is delivered flag-off).
-        if attempt_kind == crate::state::AttemptKind::Materialization {
+        if profile.note_claimed {
             self.note_materialization_claimed(drv_hash, pulling_identity);
         }
 
@@ -414,7 +483,11 @@ impl DagActor {
         // remains the per-cell signal. NotYetReady / Gone / rejected
         // pulls never reach here, so they never clear. Arming
         // (`AckSpawnedIntents`) and the DAG-state sweep are untouched.
-        if let Some((_, cells)) = self.dispatched_cells.remove(drv_hash.as_str())
+        // Build-profile only (bug_091): a materialization claim says
+        // nothing about builder-pod scheduling — it must neither clear
+        // the mask nor consume the arming.
+        if profile.clear_ice
+            && let Some((_, cells)) = self.dispatched_cells.remove(drv_hash.as_str())
             && let [cell] = cells.as_slice()
         {
             self.ice.clear(cell);
@@ -431,7 +504,9 @@ impl DagActor {
         // one decision — a rejection here for an admitted claim would
         // re-open the PDQ-6 stranded-mint window).
         if let Some(state) = self.dag.node_mut(drv_hash) {
-            if let Err(e) = state.transition_for_mint(DerivationStatus::Assigned, attempt_kind) {
+            if let Err(e) =
+                state.transition_for_mint(DerivationStatus::Assigned, profile.attempt_kind)
+            {
                 // TOCTOU vs a concurrent cancel between the admit and
                 // the commit: the durable rows exist but the node left
                 // Ready/Queued. The attempt resolves via the normal
@@ -448,7 +523,7 @@ impl DagActor {
             // r[impl sched.pull.kinded-running-surface]
             // Captured at the single mint site for BOTH work classes,
             // cleared in lockstep with exec_id (bug_144).
-            state.open_attempt_kind = Some(attempt_kind);
+            state.open_attempt_kind = Some(profile.attempt_kind);
             if let Err(e) = state.transition(DerivationStatus::Running) {
                 warn!(drv_hash = %drv_hash, error = %e,
                       "pull-minted attempt could not enter Running (left Assigned)");
@@ -467,7 +542,7 @@ impl DagActor {
         // build-input pins are not materialization's lifecycle (design
         // §5 — pin-at-ingest is store-side, and a materialization
         // attempt never reads build inputs).
-        if attempt_kind == crate::state::AttemptKind::Build {
+        if profile.pin_live_inputs {
             let input_paths = crate::assignment::approx_input_closure(&self.dag, drv_hash);
             if !input_paths.is_empty()
                 && let Err(e) = self.db.pin_live_inputs(drv_hash, &input_paths).await
@@ -488,12 +563,7 @@ impl DagActor {
         // SUBSTITUTING (BC-4 — the wire-retained kind whose emission
         // moves from walk-spawn to claim intake; STARTED would stop the
         // gateway's actSubstitute/actCopyPath pair the instant it opened).
-        match rio_evidence_kernel::pull::display_class(match attempt_kind {
-            crate::state::AttemptKind::Build => rio_evidence_kernel::pull::PullKind::Build,
-            crate::state::AttemptKind::Materialization => {
-                rio_evidence_kernel::pull::PullKind::Materialization
-            }
-        }) {
+        match profile.surface {
             rio_evidence_kernel::pull::DisplaySurface::Build => {
                 self.emit_assignment_started(drv_hash, pulling_identity);
             }

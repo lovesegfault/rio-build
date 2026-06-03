@@ -1937,6 +1937,7 @@ async fn clear_persisted_state_clears_per_generation_maps() {
         crate::actor::AuthBinding {
             node: "nA".into(),
             tenant: None,
+            deadline_secs: None,
         },
     );
 

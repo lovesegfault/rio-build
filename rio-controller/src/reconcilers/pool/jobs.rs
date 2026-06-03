@@ -60,6 +60,14 @@ use rio_proto::types::SpawnIntent;
 /// Pod-template annotation carrying `SpawnIntent.intent_id`. Read by
 /// the builder via downward-API → `RIO_INTENT_ID` → heartbeat.
 pub(crate) const INTENT_ID_ANNOTATION: &str = "rio.build/intent-id";
+/// The rendered deadline the pod is dispatched under — the SAME
+/// `ephemeral_deadline` solve `activeDeadlineSeconds` is rendered from,
+/// stamped as data so the scheduler can floor its mint-persisted
+/// deadline at the value the pod really runs under (bug_106: a
+/// between-solve estimate shrink must never establish a healthy
+/// attempt early). Parsed by `nodeclaim_pool/pods.rs` into
+/// `BoundIntent.deadline_secs`.
+pub(crate) const DEADLINE_SECS_ANNOTATION: &str = "rio.build/deadline-secs";
 
 /// Job-metadata annotation carrying a fingerprint of
 /// `SpawnIntent.node_selector`. Compared on each tick so a Pending Job
@@ -1151,6 +1159,10 @@ pub(super) fn build_job(
         .and_then(|m| m.annotations.as_mut())
         .expect("ephemeral_job sets template.metadata.annotations");
     pod_anns.insert(INTENT_ID_ANNOTATION.into(), intent.intent_id.clone());
+    pod_anns.insert(
+        DEADLINE_SECS_ANNOTATION.into(),
+        ephemeral_deadline(intent).to_string(),
+    );
     pod_anns.insert(HW_BENCH_NEEDED_ANNOTATION.into(), bench_needed.to_string());
     // Stamp the selector fingerprint on the JOB metadata (not pod
     // template) so `reap_stale_for_intents` can compare without

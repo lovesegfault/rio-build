@@ -59,6 +59,14 @@ pub(super) struct PodSnapshot {
     /// Rules (b)/(c): `intent_id → node_name` for bound, non-terminating
     /// pods.
     bound: HashMap<String, String>,
+    /// The winning pod's `rio.build/deadline-secs` annotation (the
+    /// rendered `ephemeral_deadline` the pod was dispatched under),
+    /// keyed like [`Self::bound`] and derived from the SAME rule-(c)
+    /// winner in the same pass — the two maps structurally cannot
+    /// disagree about which pod they describe. Absent/unparseable
+    /// annotation (pre-upgrade pods) ⇒ no entry ⇒ proto `0` ⇒ the
+    /// scheduler's re-solve fallback (bug_106).
+    bound_deadlines: HashMap<String, u32>,
 }
 
 impl PodSnapshot {
@@ -66,8 +74,8 @@ impl PodSnapshot {
     pub(super) fn derive(pods: &[Pod]) -> Self {
         let mut requested: HashMap<String, (u32, u64, u64)> = HashMap::new();
         // Rule (c) working state: intent_id → (creation epoch, pod name,
-        // node name) of the winning pod so far.
-        let mut bound: HashMap<String, (i64, String, String)> = HashMap::new();
+        // node name, rendered deadline) of the winning pod so far.
+        let mut bound: HashMap<String, (i64, String, String, Option<u32>)> = HashMap::new();
         for pod in pods {
             // Terminal pods hold no resources and carry no binding —
             // kube-scheduler's NodeResourcesFit excludes them too; with
@@ -94,14 +102,14 @@ impl PodSnapshot {
             if pod.metadata.deletion_timestamp.is_some() {
                 continue;
             }
-            let Some(id) = pod
-                .metadata
-                .annotations
-                .as_ref()
-                .and_then(|a| a.get(INTENT_ID_ANNOTATION))
-            else {
+            let anns = pod.metadata.annotations.as_ref();
+            let Some(id) = anns.and_then(|a| a.get(INTENT_ID_ANNOTATION)) else {
                 continue;
             };
+            let deadline = anns
+                .and_then(|a| a.get(crate::reconcilers::pool::jobs::DEADLINE_SECS_ANNOTATION))
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|d| *d > 0);
             // Rule (c): newest creationTimestamp wins; pod name breaks
             // exact ties deterministically.
             let created = pod
@@ -111,22 +119,28 @@ impl PodSnapshot {
                 .map_or(0, |t| t.0.as_second());
             match bound.entry(id.clone()) {
                 std::collections::hash_map::Entry::Occupied(mut o) => {
-                    let (cur_created, cur_name, _) = o.get();
+                    let (cur_created, cur_name, _, _) = o.get();
                     if (created, name) > (*cur_created, cur_name.as_str()) {
-                        *o.get_mut() = (created, name.to_string(), node.to_string());
+                        *o.get_mut() = (created, name.to_string(), node.to_string(), deadline);
                     }
                 }
                 std::collections::hash_map::Entry::Vacant(v) => {
-                    v.insert((created, name.to_string(), node.to_string()));
+                    v.insert((created, name.to_string(), node.to_string(), deadline));
                 }
             }
         }
+        let mut nodes = HashMap::with_capacity(bound.len());
+        let mut deadlines = HashMap::new();
+        for (id, (_, _, node, deadline)) in bound {
+            if let Some(d) = deadline {
+                deadlines.insert(id.clone(), d);
+            }
+            nodes.insert(id, node);
+        }
         Self {
             requested,
-            bound: bound
-                .into_iter()
-                .map(|(id, (_, _, node))| (id, node))
-                .collect(),
+            bound: nodes,
+            bound_deadlines: deadlines,
         }
     }
 
@@ -156,6 +170,9 @@ impl PodSnapshot {
             .map(|(intent_id, node_name)| rio_proto::types::BoundIntent {
                 intent_id: intent_id.clone(),
                 node_name: node_name.clone(),
+                // 0 = absent (see the proto field comment): the
+                // scheduler falls back to its mint-time re-solve.
+                deadline_secs: self.bound_deadlines.get(intent_id).copied().unwrap_or(0),
             })
             .collect()
     }

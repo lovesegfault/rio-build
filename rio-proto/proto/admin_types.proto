@@ -608,6 +608,16 @@ message AckSpawnedIntentsRequest {
 message BoundIntent {
   string intent_id = 1;
   string node_name = 2;
+  // The rendered deadline the pod was actually dispatched under
+  // (`rio.build/deadline-secs` pod annotation = the same
+  // `ephemeral_deadline` solve `activeDeadlineSeconds` is rendered
+  // from). The scheduler floors the mint-persisted deadline at this
+  // value so a between-solve estimate shrink can never establish a
+  // healthy attempt still inside its pod's real deadline (bug_106).
+  // 0 = absent (annotation missing / pre-upgrade controller): the
+  // render floors at 180s, so 0 is never a real deadline — the
+  // scheduler falls back to its mint-time re-solve alone.
+  uint32 deadline_secs = 3;
 }
 
 message ObservedInstanceType {

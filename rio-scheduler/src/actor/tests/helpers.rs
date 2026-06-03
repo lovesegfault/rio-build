@@ -1202,6 +1202,7 @@ pub(crate) async fn bind_intent_node(
             bound_intents: vec![rio_proto::types::BoundIntent {
                 intent_id: intent.into(),
                 node_name: node.into(),
+                deadline_secs: 0,
             }],
         })
         .await?;
