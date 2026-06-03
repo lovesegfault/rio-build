@@ -1029,16 +1029,23 @@ content-addressed output mappings independently of narinfo signatures.
   and the 5-minute stale-reclaim.
 ]
 
-#r("store.substitute.untrusted-upstream+3")[
+#r("store.substitute.untrusted-upstream+4")[
   `tenant_upstreams` rows (URL and `trusted_keys`) are tenant-supplied via
   `AddUpstream`, and the substituter is process-global, so one tenant's hostile
-  upstream MUST NOT be able to OOM or stall rio-store for all tenants. Every
+  upstream MUST NOT be able to OOM or stall rio-store for all tenants --- nor
+  mint resident rows that violate the store's own admission bounds. Every
   upstream-supplied body is size-capped: narinfo bodies at `MAX_NARINFO_BYTES`
   (1 MiB --- sized for `MAX_REFERENCES` basenames), `/nix-cache-info` bodies at
-  `MAX_CACHE_INFO_BYTES` (4 KiB), and decompressed NARs at `MAX_NAR_SIZE` (4
-  GiB) --- the decompressed cap is applied AFTER the decoder so a zstd bomb is
-  bounded regardless of what `NarSize` claimed. The actual decompressed length
-  MUST equal the narinfo's declared `NarSize` (rejected as integrity failure on
+  `MAX_CACHE_INFO_BYTES` (4 KiB), and NARs at the path's CLASS cap
+  (`nar_size_cap(is_derivation)`: `MAX_DRV_NAR_BYTES`, 16 MiB, for `.drv`
+  paths; `MAX_NAR_SIZE`, 4 GiB, otherwise) applied to BOTH the declared
+  `NarSize` (refused before download) and the decompressed byte count AFTER
+  the decoder, so a zstd bomb is bounded regardless of what `NarSize` claimed
+  and a substituted `.drv` can never exceed the bound `PutPath` enforces ---
+  an over-cap resident `.drv` would be permanently unfetchable by every
+  capped consumer (gateway derivation cache, worker glue) and would void the
+  proof-walk arena's sizing assumption. The actual decompressed length MUST
+  equal the narinfo's declared `NarSize` (rejected as integrity failure on
   mismatch); signatures are computed only after this check so stored
   `(nar_size, signatures)` are always mutually consistent. narinfo
   `References:` count MUST NOT exceed `MAX_REFERENCES`. The
@@ -1047,14 +1054,14 @@ content-addressed output mappings independently of narinfo signatures.
   a tokio worker.
 ]
 
-#r("store.substitute.compression")[
+#r("store.substitute.compression+1")[
   `fetch_nar` MUST decode every `Compression:` value reference Nix's
   `libutil/compression.cc` accepts: `none`/empty, `xz`, `zstd`, `bzip2`, `br`,
   `gzip`. cache.nixos.org never recompresses; pre-2016 paths still serve
   `bzip2`. An unrecognised value is treated as a per-upstream fetch failure
   (`Ok(None)` after exhausting upstreams), not a hard error, so a single
   oddly-configured tenant upstream cannot fail the originating RPC. The
-  `MAX_NAR_SIZE` decompressed-side cap from
+  class-capped decompressed-side bound from
   #rref("store.substitute.untrusted-upstream") applies uniformly across all
   decoders.
 ]

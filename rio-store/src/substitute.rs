@@ -33,7 +33,7 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use rio_common::limits::{
     MAX_CACHE_INFO_BYTES, MAX_NAR_SIZE, MAX_NARINFO_BYTES, MAX_REFERENCES, MAX_SIGNATURES,
-    MIN_NAR_CHUNK_CHARGE,
+    MIN_NAR_CHUNK_CHARGE, nar_size_cap,
 };
 
 use crate::admission::{AdmissionError, AdmissionGate};
@@ -100,17 +100,19 @@ const SUBSTITUTE_PROBE_CACHE_CAP: u64 = 100_000;
 /// `reqwest::Client` has only `connect_timeout` — without a per-request
 /// body timeout a slow-loris upstream holds 128 probe slots indefinitely
 /// and stalls `FindMissingPaths`. The NAR GET is intentionally NOT
-/// timeboxed (a multi-GB body legitimately runs long; the
-/// [`MAX_NAR_SIZE`] decompressed cap and 5-min stale-reclaim bound it).
+/// timeboxed (a multi-GB body legitimately runs long; the class-capped
+/// decompressed bound and 5-min stale-reclaim bound it).
 #[cfg(not(test))]
 const SUBSTITUTE_SMALL_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const SUBSTITUTE_SMALL_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Decompressed-NAR size cap applied in [`Substituter::fetch_nar`].
-/// Equals [`MAX_NAR_SIZE`] in production; overridable to a small value
-/// in tests so the bomb-protection path is exercisable without
-/// allocating 4 GiB.
+/// Decompressed-NAR size-cap CEILING applied in
+/// [`Substituter::fetch_nar`] — the effective cap is
+/// `min(nar_size_cap(is_derivation), this)`, so `.drv` fetches are
+/// bounded at `MAX_DRV_NAR_BYTES` (16 MiB) and everything else at
+/// [`MAX_NAR_SIZE`]. Overridable to a small value in tests so the
+/// bomb-protection path is exercisable without allocating 4 GiB.
 #[cfg(not(test))]
 const SUBSTITUTE_NAR_DECOMPRESSED_CAP: u64 = MAX_NAR_SIZE;
 #[cfg(test)]
@@ -841,15 +843,25 @@ impl Substituter {
         // ValidatedPathInfo + the post-decompress hash check.
         let expected_hash = parse_nar_hash(&ni.nar_hash)?;
 
-        // r[impl store.substitute.untrusted-upstream+3]
-        // Declared-size gate. `trusted_keys` is also tenant-supplied so
-        // a verified sig is NOT a trust boundary; gate before download.
-        // The decompressed cap in `fetch_nar` catches a narinfo that
-        // lies about `NarSize`.
-        if ni.nar_size > MAX_NAR_SIZE {
+        // r[impl store.substitute.untrusted-upstream+4]
+        // Declared-size gate at the path's CLASS cap. `trusted_keys`
+        // is also tenant-supplied so a verified sig is NOT a trust
+        // boundary; gate before download. The decompressed cap in
+        // `fetch_nar` catches a narinfo that lies about `NarSize`.
+        //
+        // The class split matters for `.drv` paths: the W1 admission
+        // bound (`MAX_DRV_NAR_BYTES`, 16 MiB) is what every consumer
+        // fetch caps on (gateway drv_cache, worker glue — over-cap is
+        // PERMANENT there) and what the proof-walk arena sizing
+        // assumes. Substituting a multi-GiB ".drv" under the generic
+        // 4 GiB cap would mint a resident row no consumer can ever
+        // fetch — a permanent wedge for any DAG referencing it.
+        // Suffix-keyed like every .drv detection site (F3 unifies).
+        let class_cap = nar_size_cap(store_path.ends_with(".drv"));
+        if ni.nar_size > class_cap {
             return Err(SubstituteError::TooLarge {
                 what: "NarSize",
-                limit: MAX_NAR_SIZE,
+                limit: class_cap,
             });
         }
 
@@ -935,12 +947,13 @@ impl Substituter {
                     &nar_url,
                     &ni.compression,
                     ni.nar_size,
+                    class_cap,
                     base,
                     progress,
                 )
                 .await?;
 
-            // r[impl store.substitute.untrusted-upstream+3]
+            // r[impl store.substitute.untrusted-upstream+4]
             // Size check: actual decompressed length MUST equal the
             // narinfo's `NarSize:` line. The Nix signature fingerprint
             // is `1;path;hash;size;refs`; persisting an unchecked size
@@ -1051,6 +1064,12 @@ impl Substituter {
     /// the [`nar_bytes_budget`](Self::nar_bytes_budget) permits backing
     /// them; caller holds the permits until after `persist_nar`.
     ///
+    /// `class_cap` is the path's class size bound
+    /// (`nar_size_cap(is_derivation)`); the decompressed-side cap is
+    /// `min(class_cap, SUBSTITUTE_NAR_DECOMPRESSED_CAP)` so a `.drv`
+    /// fetch is bounded at 16 MiB even when the narinfo lied about
+    /// `NarSize` (and the test-profile 64 KiB override keeps working).
+    ///
     /// Accumulates fully before ingest — `cas::put_chunked` needs the
     /// whole `&[u8]` for FastCDC. Streaming-chunker would avoid the
     /// full buffer but isn't here yet; TODO(P0463) tracks it.
@@ -1062,6 +1081,7 @@ impl Substituter {
         nar_url: &str,
         compression: &str,
         expected_nar_size: u64,
+        class_cap: u64,
         upstream_base: &str,
         progress: Option<&SubstProgressFn>,
     ) -> Result<(Bytes, Vec<OwnedSemaphorePermit>), SubstituteError> {
@@ -1093,7 +1113,7 @@ impl Substituter {
                 resp.status()
             )));
         }
-        // r[impl store.substitute.untrusted-upstream+3]
+        // r[impl store.substitute.untrusted-upstream+4]
         // bytes_stream → StreamReader → decoder → `.take(cap+1)` →
         // budgeted read loop. The `.take()` wraps the DECOMPRESSED
         // side so a zstd bomb is bounded regardless of what `NarSize`
@@ -1106,9 +1126,13 @@ impl Substituter {
             .map_err(|e| std::io::Error::other(format!("NAR stream: {e}")));
         let reader = StreamReader::new(stream);
 
-        let cap = SUBSTITUTE_NAR_DECOMPRESSED_CAP;
+        // r[impl store.substitute.untrusted-upstream+4]
+        // Decompressed-side cap at the path's CLASS bound (16 MiB for
+        // `.drv`, 4 GiB otherwise), min'd with the profile override so
+        // the 64 KiB test cap still exercises the bomb arm cheaply.
+        let cap = class_cap.min(SUBSTITUTE_NAR_DECOMPRESSED_CAP);
         use async_compression::tokio::bufread as ac;
-        // r[impl store.substitute.compression]
+        // r[impl store.substitute.compression+1]
         let mut capped: Box<dyn AsyncRead + Unpin + Send> = match compression {
             "xz" => Box::new(ac::XzDecoder::new(reader).take(cap + 1)),
             "zstd" => Box::new(ac::ZstdDecoder::new(reader).take(cap + 1)),
@@ -1574,7 +1598,7 @@ fn is_not_found(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 404 | 403 | 410)
 }
 
-// r[impl store.substitute.untrusted-upstream+3]
+// r[impl store.substitute.untrusted-upstream+4]
 /// Read a small text body (`.narinfo`, `/nix-cache-info`) with a hard
 /// size cap. `tenant_upstreams` rows are tenant-supplied; an unbounded
 /// `.text()` against a hostile upstream is an OOM vector for the
@@ -1641,7 +1665,7 @@ fn narinfo_to_validated(
 ) -> Result<ValidatedPathInfo, SubstituteError> {
     use rio_proto::types::PathInfo;
 
-    // r[impl store.substitute.untrusted-upstream+3]
+    // r[impl store.substitute.untrusted-upstream+4]
     // Per-node count caps — parity with PutPath (`put_path/common.rs`).
     // `ValidatedPathInfo::try_from` validates per-element syntax only;
     // it does NOT bound the count.
@@ -2195,7 +2219,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.compression]
+    // r[verify store.substitute.compression+1]
     /// `fetch_nar` decodes every `Compression:` value reference Nix's
     /// `libutil/compression.cc` accepts, end-to-end through
     /// `try_substitute` so the NarHash check proves the decompressed
@@ -3959,7 +3983,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.untrusted-upstream+3]
+    // r[verify store.substitute.untrusted-upstream+4]
     /// bug_172: oversized narinfo body → `TooLarge`, NAR endpoint never
     /// hit.
     #[tokio::test]
@@ -4005,7 +4029,7 @@ mod tests {
         assert_eq!(fake.nar_hits.load(Ordering::SeqCst), 0);
     }
 
-    // r[verify store.substitute.untrusted-upstream+3]
+    // r[verify store.substitute.untrusted-upstream+4]
     /// bug_093: a NAR larger than the decompressed cap → `TooLarge`.
     /// Uses the test-only 64 KiB `SUBSTITUTE_NAR_DECOMPRESSED_CAP` so
     /// this doesn't allocate 4 GiB.
@@ -4046,6 +4070,119 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "abort_placeholder must run on TooLarge"
+        );
+    }
+
+    // r[verify store.substitute.untrusted-upstream+4]
+    /// merged_bug_063: the declared-size gate is CLASS-split. A `.drv`
+    /// narinfo declaring NarSize over `MAX_DRV_NAR_BYTES` (16 MiB) is
+    /// refused BEFORE download (the NAR endpoint is never hit) even
+    /// though it is far under the generic 4 GiB bound — pre-fix,
+    /// substitution was the one ingest route on the generic cap, so a
+    /// hostile upstream could mint a resident `.drv` row every capped
+    /// consumer (gateway drv_cache, worker glue) permanently fails to
+    /// fetch. The same declared size on a NON-drv path passes the
+    /// declared gate (its class cap is 4 GiB) and proceeds to the
+    /// download, failing only on the post-fetch size mismatch — the
+    /// asymmetry pins the split, not just a tighter global bound.
+    #[tokio::test]
+    async fn declared_drv_nar_size_capped_at_class_bound() {
+        use rio_common::limits::MAX_DRV_NAR_BYTES;
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-drv-cap").await;
+
+        // .drv path: declared 17 MiB → refused at the declared gate.
+        let drv_path = rio_test_support::fixtures::test_store_path("oversized.drv");
+        let (nar, _h) = rio_test_support::fixtures::make_nar(b"tiny");
+        let hp = StorePath::parse(&drv_path).unwrap().hash_part();
+        let body = signed_narinfo_for(
+            &drv_path,
+            &nar,
+            "cache.drvcap",
+            &hp,
+            Some(MAX_DRV_NAR_BYTES + 1024 * 1024),
+        );
+        let fake = spawn_flex_upstream(
+            &drv_path,
+            nar.clone(),
+            "cache.drvcap",
+            FlexCfg {
+                narinfo_override: Some(body),
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_flex(&db.pool, tid, &fake, 50).await;
+
+        let sub = test_substituter(db.pool.clone());
+        let http = sub.http.as_ref().unwrap();
+        let upstreams = metadata::upstreams::list_for_tenant(&db.pool, tid)
+            .await
+            .unwrap();
+        let err = sub
+            .try_upstream(http, tid, &upstreams[0], &drv_path, &hp, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SubstituteError::TooLarge {
+                    what: "NarSize",
+                    limit,
+                } if limit == MAX_DRV_NAR_BYTES
+            ),
+            "17 MiB declared .drv must be refused at the 16 MiB class cap, got {err:?}"
+        );
+        assert_eq!(
+            fake.nar_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "refused before download — the NAR endpoint must never be hit"
+        );
+
+        // Same declared size, non-.drv path: passes the declared gate
+        // (class cap 4 GiB) and reaches the download.
+        let (plain_path, nar2) = make_path();
+        let hp2 = StorePath::parse(&plain_path).unwrap().hash_part();
+        let body2 = signed_narinfo_for(
+            &plain_path,
+            &nar2,
+            "cache.drvcap2",
+            &hp2,
+            Some(MAX_DRV_NAR_BYTES + 1024 * 1024),
+        );
+        let fake2 = spawn_flex_upstream(
+            &plain_path,
+            nar2,
+            "cache.drvcap2",
+            FlexCfg {
+                narinfo_override: Some(body2),
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_flex(&db.pool, tid, &fake2, 60).await;
+        let upstreams = metadata::upstreams::list_for_tenant(&db.pool, tid)
+            .await
+            .unwrap();
+        let up2 = upstreams.iter().find(|u| u.url == fake2.url).unwrap();
+        let err2 = sub
+            .try_upstream(http, tid, up2, &plain_path, &hp2, None)
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(
+                err2,
+                SubstituteError::TooLarge {
+                    what: "NarSize",
+                    ..
+                }
+            ),
+            "non-.drv path must pass the declared gate at the same size, got {err2:?}"
+        );
+        assert_eq!(
+            fake2.nar_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "non-.drv proceeds to the download (fails later on size mismatch)"
         );
     }
 
@@ -4311,7 +4448,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.untrusted-upstream+3]
+    // r[verify store.substitute.untrusted-upstream+4]
     /// bug_005: a narinfo whose `NarSize` differs from the actual
     /// decompressed length MUST be rejected (integrity failure).
     /// Signatures are computed over `nar_size`; persisting an unchecked
@@ -4561,7 +4698,7 @@ mod tests {
         assert_eq!(got2.nar_size, nar.len() as u64);
     }
 
-    // r[verify store.substitute.untrusted-upstream+3]
+    // r[verify store.substitute.untrusted-upstream+4]
     /// bug_144: `narinfo_to_validated` MUST reject `References:` count
     /// > MAX_REFERENCES (parity with PutPath).
     #[test]
