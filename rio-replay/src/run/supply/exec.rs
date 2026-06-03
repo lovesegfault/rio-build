@@ -774,10 +774,16 @@ impl GatewayBreaker {
     fn record_failure(&self) {
         let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
         if failures >= self.threshold && !self.tripped.swap(true, Ordering::Relaxed) {
+            // The recorded outcome is interpolated from the vocabulary
+            // const so this operator-facing text cannot drift from what
+            // the journal rows actually say (see the struct doc above:
+            // skipped is non-settling bookkeeping, never a failed row).
             tracing::warn!(
                 consecutive_failures = failures,
+                outcome = SUPPLY_OUTCOME_SKIPPED,
                 "supply upload circuit breaker tripped: the gateway looks unreachable; remaining \
-                 uploads are marked failed without further transport calls"
+                 uploads are recorded skipped (re-attemptable on a later invocation) without \
+                 further transport calls"
             );
         }
     }
