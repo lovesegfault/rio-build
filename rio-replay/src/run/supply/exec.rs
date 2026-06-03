@@ -3569,6 +3569,67 @@ mod tests {
         }
     }
 
+    /// The executor's lane decision at the EXACT threshold boundary, both
+    /// sides: a non-relay planner-batch item of exactly
+    /// `large_nar_threshold_mib` rides the streamed lane (the routing is
+    /// `>=`, matching the planner's relay-side comparison and the knob's
+    /// "at or above" contract in spec.rs), while one byte under stays on
+    /// the wire batch lane. `large_items_stream_individually` covers the
+    /// far field (2x threshold); this pins the boundary cell, so an
+    /// off-by-one regression of the executor seam's comparison
+    /// (`>=` -> `>`) fails here, not in production. Both items sit in
+    /// the planner's BATCH — the size routing under test is the
+    /// execution side's, the only size routing non-relay payloads get
+    /// (see the lane contract on `UploadPlan`); the decision keys on
+    /// `info.nar_size` alone, never the payload variant, so the drv-text
+    /// fixture exercises the identical routing the embedded ArchivePath
+    /// class takes.
+    #[tokio::test]
+    async fn lane_routing_boundary_at_exactly_the_threshold() {
+        let (_dir, state) = state();
+        let fake = FakeSupplyTransport::default();
+        let ctx = SupplyContext::new(SupplyDependencies::Substituters);
+        let claims = UploadClaims::new();
+        let knobs = Knobs {
+            large_nar_threshold_mib: 1,
+            ..Knobs::default()
+        };
+        let threshold_bytes = 1024 * 1024_usize;
+        let plan = batch_plan(vec![
+            // Exactly AT the threshold: must stream (>= semantics).
+            item(PATH_A, vec![7u8; threshold_bytes], &[]),
+            // One byte UNDER: must ride the wire batch.
+            item(PATH_B, vec![8u8; threshold_bytes - 1], &[]),
+        ]);
+
+        prewarm_uploads(&fake, None, &ctx, &plan, &knobs, &state, &claims)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fake.uploaded_streamed.lock().unwrap().clone(),
+            vec![PATH_A.to_string()],
+            "an embedded item at exactly the threshold takes the streamed lane"
+        );
+        assert_eq!(
+            fake.uploaded_batches.lock().unwrap().clone(),
+            vec![vec![PATH_B.to_string()]],
+            "one byte under the threshold stays on the wire batch lane"
+        );
+        let entries = entries(&state);
+        assert_eq!(
+            entry_for(&entries, PATH_A).mechanism,
+            SUPPLY_MECHANISM_UPLOAD_STREAM
+        );
+        assert_eq!(
+            entry_for(&entries, PATH_B).mechanism,
+            SUPPLY_MECHANISM_UPLOAD_BATCH
+        );
+        for path in [PATH_A, PATH_B] {
+            assert_eq!(entry_for(&entries, path).outcome, SUPPLY_OUTCOME_DELIVERED);
+        }
+    }
+
     /// A relay cache that completes the TCP handshake but never sends
     /// response headers must not wedge the streamed arm: the relay
     /// materialization's header-phase wait is bounded by `op_timeout`

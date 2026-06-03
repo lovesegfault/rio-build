@@ -519,14 +519,32 @@ pub enum UploadPayload {
 pub(crate) const MAX_RELAY_NAR_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Reference-safe upload plan for one closure.
+///
+/// LANE CONTRACT (two seams, one threshold): "no item at or above the
+/// large-NAR threshold ever rides a wire batch" is enforced at two
+/// places. RELAY paths are size-routed here at plan time into
+/// [`UploadPlan::large`] — their size is peer-declared, so it must pass
+/// the plausibility screen before it may steer anything. EMBEDDED
+/// archive paths (and drv texts) are deliberately NOT size-routed here:
+/// the executor (`exec::execute_plan`) re-partitions every batch item by
+/// `nar_size >= threshold` within each topological level and streams the
+/// large ones individually, so [`UploadPlan::batch`] is reference-order
+/// truth, not the wire batch lane. Splitting the seams keeps relay
+/// screening at the only boundary where peer data enters, while embedded
+/// items keep their reference-safe level ordering until execution.
 #[derive(Debug, Clone)]
 pub struct UploadPlan {
     /// Relayed paths whose uncompressed `nar_size` is at or above the
     /// large-NAR threshold passed to [`plan_uploads`], each sent
-    /// individually (streaming) BEFORE the batch.
+    /// individually (streaming) BEFORE the batch. Relay-only by design —
+    /// see the lane contract on [`UploadPlan`] for where embedded items
+    /// of the same size are routed.
     pub large: Vec<UploadItem>,
     /// Everything else, in reference-safe order: a path appears only after
     /// every reference of it that is also being uploaded by this plan.
+    /// NOT the wire batch lane: members at or above the large-NAR
+    /// threshold are re-routed to individual streaming by the executor
+    /// (see the lane contract on [`UploadPlan`]).
     pub batch: Vec<UploadItem>,
     /// `(path, reason)` pairs that could not be planned — informational; the
     /// affected requests degrade rather than abort.
@@ -552,7 +570,11 @@ pub struct UploadPlan {
 /// plausibility screen on that peer-declared size: entries declaring more
 /// than `MAX_RELAY_NAR_BYTES` (crate-private, 64 GiB) are skipped (same
 /// per-path degrade), so a fabricated `NarSize` can neither steer lane
-/// routing nor parameterize the streamed wire op.
+/// routing nor parameterize the streamed wire op. This is only the RELAY
+/// half of the size routing: embedded items of any size land in
+/// [`UploadPlan::batch`], and the executor streams the at-or-above-
+/// threshold ones individually within their topo level (the lane
+/// contract on [`UploadPlan`] states the full two-seam invariant).
 ///
 /// Batch ordering: per node, inputSrcs → outputs → the `.drv` itself, nodes
 /// in children-first order, then settled in passes so every reference that
