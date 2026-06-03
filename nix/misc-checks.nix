@@ -270,6 +270,11 @@ in
             # partial tree).
             ../Cargo.toml
             ../infra/helm/rio-build/templates/scheduler.yaml
+            # contract-registry rows declare contracts in the design
+            # doc (gate tables, closure completeness, demotion pin) —
+            # the lint reads it, so it must be staged and an edit to
+            # it rehashes this check.
+            ../docs/dev/2026-05-28-build-replay-design.md
             # seccomp-allowlist validates both Localhost profiles —
             # rio-builder.json and rio-fetcher.json. Both must be in
             # the fileset so an edit to either rehashes this check.
