@@ -187,12 +187,17 @@ async fn flag_on_pruned_root_creates_job_at_merge() -> TestResult {
 // ── The four-arm Unobtainable routing core (pure — no PG) ──────────────
 
 use crate::actor::materialize::{
-    DurableEvidence, ReprobeAnswer, RoutingInputs, UnobtainableRouting, route_unobtainable,
+    LiveWanted, ReprobeAnswer, RoutingInputs, UnobtainableRouting, route_unobtainable,
     success_covers_live_wanted,
 };
+use rio_evidence_kernel::ClosureEvidence as DurableEvidence;
 
 fn paths(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| (*s).to_string()).collect()
+}
+
+fn live_wanted(v: &[&str]) -> LiveWanted {
+    LiveWanted::new(paths(v)).expect("test live-wanted sets are non-empty")
 }
 
 // r[verify sched.materialize.routing+3]
@@ -205,8 +210,8 @@ fn routing_moot_failure_completes_for_live_interest() {
     let routing = route_unobtainable(&RoutingInputs {
         missing_paths: &paths(&["out2-path"]),
         verified_paths: &paths(&["out1-path"]),
-        live_wanted_paths: &paths(&["out1-path"]), // b2 gone; b1 wants out1 only
-        durable_evidence: DurableEvidence::Broken, // irrelevant for arm 0
+        live_wanted_paths: &live_wanted(&["out1-path"]), // b2 gone; b1 wants out1 only
+        durable_evidence: DurableEvidence::Holed,        // irrelevant for arm 0
         prior_unobtainable_count: 0,
         reprobe: None,
         pruned_origin: false,
@@ -220,8 +225,8 @@ fn routing_moot_but_uncovered_rearms() {
     let routing = route_unobtainable(&RoutingInputs {
         missing_paths: &paths(&["out2-path"]),
         verified_paths: &paths(&[]),
-        live_wanted_paths: &paths(&["out1-path"]),
-        durable_evidence: DurableEvidence::Broken,
+        live_wanted_paths: &live_wanted(&["out1-path"]),
+        durable_evidence: DurableEvidence::Holed,
         prior_unobtainable_count: 0,
         reprobe: None,
         pruned_origin: false,
@@ -235,7 +240,7 @@ fn routing_durable_vouched_resolves_from_source() {
     let routing = route_unobtainable(&RoutingInputs {
         missing_paths: &paths(&["out-path"]),
         verified_paths: &paths(&[]),
-        live_wanted_paths: &paths(&["out-path"]),
+        live_wanted_paths: &live_wanted(&["out-path"]),
         durable_evidence: DurableEvidence::Vouched,
         prior_unobtainable_count: 0,
         reprobe: None,
@@ -250,7 +255,7 @@ fn routing_durable_pending_resolves_from_source() {
     let routing = route_unobtainable(&RoutingInputs {
         missing_paths: &paths(&["out-path"]),
         verified_paths: &paths(&[]),
-        live_wanted_paths: &paths(&["out-path"]),
+        live_wanted_paths: &live_wanted(&["out-path"]),
         durable_evidence: DurableEvidence::Pending,
         prior_unobtainable_count: 0,
         reprobe: None,
@@ -268,12 +273,12 @@ fn routing_broken_with_obtainable_reprobe_rearms_once() {
     // hold the path vecs alive for the borrow
     let missing = paths(&["out-path"]);
     let verified = paths(&[]);
-    let live = paths(&["out-path"]);
+    let live = live_wanted(&["out-path"]);
     let mk = |prior: u32, reprobe| RoutingInputs {
         missing_paths: &missing,
         verified_paths: &verified,
         live_wanted_paths: &live,
-        durable_evidence: DurableEvidence::Broken,
+        durable_evidence: DurableEvidence::Holed,
         prior_unobtainable_count: prior,
         reprobe,
         // The marked (topdown-pruned root) shape: the only shape where
@@ -309,12 +314,12 @@ fn routing_unmarked_broken_confirmed_missing_resolves_from_source() {
     // hold the path vecs alive for the borrow
     let missing = paths(&["out-path"]);
     let verified = paths(&[]);
-    let live = paths(&["out-path"]);
+    let live = live_wanted(&["out-path"]);
     let mk = |prior: u32, reprobe| RoutingInputs {
         missing_paths: &missing,
         verified_paths: &verified,
         live_wanted_paths: &live,
-        durable_evidence: DurableEvidence::Broken,
+        durable_evidence: DurableEvidence::Holed,
         prior_unobtainable_count: prior,
         reprobe,
         pruned_origin: false,
@@ -357,7 +362,7 @@ fn routing_fail_fast_requires_all_four_conjuncts() {
     let missing_miss = paths(&["unwanted-path"]);
     let verified = paths(&[]);
     let verified_covering = paths(&["out-path"]);
-    let live = paths(&["out-path"]);
+    let live = live_wanted(&["out-path"]);
     // Exhaustive over the 16 combinations of (missing∩W≠∅, evidence
     // Broken, reprobe-confirms-or-spent, marked): exactly one yields
     // FailFast.
@@ -384,7 +389,7 @@ fn routing_fail_fast_requires_all_four_conjuncts() {
                         },
                         live_wanted_paths: &live,
                         durable_evidence: if broken {
-                            DurableEvidence::Broken
+                            DurableEvidence::Holed
                         } else {
                             DurableEvidence::Vouched
                         },
@@ -425,20 +430,18 @@ fn success_consumption_coverage_check() {
     assert!(success_covers_live_wanted(
         &paths(&["out1"]),
         &paths(&["out2"]),
-        &paths(&["out1", "out2"]),
+        &live_wanted(&["out1", "out2"]),
     ));
     // Not covered: a live-wanted path is in neither set.
     assert!(!success_covers_live_wanted(
         &paths(&["out1"]),
         &paths(&[]),
-        &paths(&["out1", "out2"]),
+        &live_wanted(&["out1", "out2"]),
     ));
-    // Empty live-wanted set is vacuously covered.
-    assert!(success_covers_live_wanted(
-        &paths(&[]),
-        &paths(&[]),
-        &paths(&[])
-    ));
+    // The empty live-wanted set is UNREPRESENTABLE (merged_bug_194):
+    // the witness constructor rejects it, so the vacuously-covered
+    // cell cannot reach the coverage check at all.
+    assert!(LiveWanted::new(vec![]).is_none());
 }
 
 /// InfraFailure routing is decided by the budget (the kernel's
@@ -454,12 +457,12 @@ fn infra_failure_never_failfasts_never_routes_from_source() {
     // confirmed). Mapped onto the core's vocabulary that is the
     // empty-missing input — which can only ever produce arm 0
     // (Complete when covered / ReArm when not), never FailFast.
-    let live = paths(&["out-path"]);
+    let live = live_wanted(&["out-path"]);
     let routing = route_unobtainable(&RoutingInputs {
         missing_paths: &paths(&[]),
         verified_paths: &paths(&[]),
         live_wanted_paths: &live,
-        durable_evidence: DurableEvidence::Broken,
+        durable_evidence: DurableEvidence::Holed,
         prior_unobtainable_count: 99,
         reprobe: Some(ReprobeAnswer::ConfirmedMissing),
         // Even a MARKED node: an empty missing set can never fail-fast.
@@ -3369,11 +3372,20 @@ async fn flag_on_every_job_state_has_armed_action() -> TestResult {
     };
     let exec4: Uuid = assignment.exec_id.parse()?;
     // The replica dies (never reports). Age the open attempt past every
-    // deadline+slack, then sweep.
+    // deadline+slack, then sweep. merged_bug_301: pin the pruned origin
+    // so the parked state survives the same tick's re-evaluation (a
+    // NON-pruned childless leaf converts now); this state's subject is
+    // the establishment sweep + park, not the conversion.
     sqlx::query(
         "UPDATE assignments SET assigned_at = now() - interval '100 days' WHERE exec_id = $1",
     )
     .bind(exec4)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "UPDATE materialization_jobs SET origin = 'pruned' \
+          WHERE derivation_id = (SELECT derivation_id FROM derivations WHERE drv_hash = 'tot-pending')",
+    )
     .execute(&db.pool)
     .await?;
     tick(&handle).await?;
@@ -4838,6 +4850,12 @@ async fn parked_job_stalled_gauge_and_reevaluation() -> TestResult {
     .fetch_one(&db.pool)
     .await?;
     assert_eq!(parked_count, 2, "precondition: both jobs parked");
+    // merged_bug_301: a NON-pruned childless leaf now CONVERTS at the
+    // re-evaluation; the stays-parked arm of this test is the
+    // pruned-origin shape (closure deliberately dropped).
+    sqlx::query("UPDATE materialization_jobs SET origin = 'pruned' WHERE drv_hash = 'pd20-broken'")
+        .execute(&db.pool)
+        .await?;
 
     // ── The tick: re-evaluation + the gauge. ──
     tick(&handle).await?;
@@ -4861,16 +4879,17 @@ async fn parked_job_stalled_gauge_and_reevaluation() -> TestResult {
         "Y returns to normal dep-gated dispatch, got {y_status:?}"
     );
 
-    // X (Broken evidence): stays parked — from-source is impossible
-    // (childless), so the park (+ backoff-expiry re-claim) remains its
-    // armed action and the gauge makes it visible.
+    // X (pruned-origin, childless): stays parked — the prune dropped
+    // its closure on purpose, so the park (+ backoff-expiry re-claim)
+    // remains its armed action and the gauge makes it visible.
     let x_state: String =
         sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = 'pd20-broken'")
             .fetch_one(&db.pool)
             .await?;
     assert_eq!(
         x_state, "pending",
-        "a Broken-evidence (childless) parked job stays parked (never force-resolved)"
+        "a pruned-origin childless parked job stays parked (never force-resolved; \
+         a NON-pruned childless leaf converts — merged_bug_301)"
     );
 
     // One snapshot serves both reads (debugging snapshots are
@@ -7140,6 +7159,13 @@ async fn establishment_only_charges_park_at_max_attempts() -> TestResult {
     n.expected_output_paths = vec![out.clone()];
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
     barrier(&handle).await;
+    // merged_bug_301: pin the pruned origin so the eventual park
+    // survives the same ticks' re-evaluation (a NON-pruned childless
+    // leaf converts now); this test's subject is the party-blind
+    // establishment budget, not the conversion.
+    sqlx::query("UPDATE materialization_jobs SET origin = 'pruned' WHERE drv_hash = 'est-park'")
+        .execute(&db.pool)
+        .await?;
 
     // max_attempts establishment cycles: claim → the replica dies
     // unreported (assignment aged out) → the sweep establishes the
@@ -7753,6 +7779,12 @@ async fn backstop_refeeds_untracked_rows_and_cancels_moot() -> TestResult {
          got {pre:?}"
     );
 
+    // merged_bug_301: pin the pruned origin so the park survives 30
+    // re-evaluation ticks (a NON-pruned childless leaf converts now);
+    // the subject here is the backstop re-feed of an untracked row.
+    sqlx::query("UPDATE materialization_jobs SET origin = 'pruned' WHERE drv_hash = 'bk-live'")
+        .execute(&db.pool)
+        .await?;
     // Drive past the backstop cadence (every 30th tick).
     for _ in 0..30 {
         handle.send_unchecked(ActorCommand::Tick).await?;
@@ -7852,6 +7884,15 @@ async fn flag_on_parked_jobs_leave_substituting_bucket() -> TestResult {
         park.is_some_and(|s| s > 0.0),
         "precondition: the job parked"
     );
+    // merged_bug_301: keep the job in the PARKED population across the
+    // tick (a non-pruned childless leaf would convert at the
+    // re-evaluation now) — this test pins the gauge semantics of a
+    // parked job, not the conversion.
+    sqlx::query(
+        "UPDATE materialization_jobs SET origin = 'pruned' WHERE drv_hash = 'parked-bucket'",
+    )
+    .execute(&db.pool)
+    .await?;
 
     tick(&handle).await?;
     let snap = handle.cluster_snapshot_cached();
@@ -8053,6 +8094,266 @@ async fn failover_preserves_job_budget_window() -> TestResult {
         park.is_some_and(|s| s > 0.0),
         "the post-failover second charge parks at the budget — the loaded \
          suffix and the live fold agree (020c)"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.routing+3]
+/// merged_bug_301 (bughunt wave, A4): a parked CHILDLESS LEAF with a
+/// non-pruned origin must CONVERT at the park re-evaluation — a
+/// structural leaf has no closure to be missing, so from-source is
+/// viable; only the pruned origin (the prune deliberately dropped a
+/// closure) and the holed cell (stale produced evidence) keep a job
+/// parked. Pre-fix the classifier conflated leaf and hole into one
+/// `Broken` cell and the gate skipped both.
+#[tokio::test]
+async fn parked_childless_leaf_non_pruned_converts() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+            cfg.materialization.max_attempts = 1;
+            cfg.materialization.park_backoff_base_secs = 3600;
+            cfg.materialization.park_backoff_cap_secs = 3600;
+        });
+    let _tasks = (store_task, actor_task);
+
+    let out = test_store_path("a4leaf-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut r = make_node("a4leaf");
+    r.expected_output_paths = vec![out.clone()];
+    r.wanted_output_names = vec!["out".into()];
+    let b1 = Uuid::new_v4();
+    let _ev = merge_dag(&handle, b1, vec![r], vec![], false).await?;
+    barrier(&handle).await;
+    let assignment = match claim_materialization(&handle, "a4leaf", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "a4leaf",
+        mat_infra_outcome("dead upstream"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    let parked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM materialization_jobs \
+          WHERE drv_hash = 'a4leaf' AND state = 'pending' AND park_until > now()",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(parked, 1, "precondition: the job is parked");
+
+    // No PG children at all: a structural leaf. Tick the park
+    // re-evaluation — the leaf must convert to from-source.
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let (job_state, origin): (String, String) =
+        sqlx::query_as("SELECT state, origin FROM materialization_jobs WHERE drv_hash = 'a4leaf'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_ne!(
+        origin, "pruned",
+        "fixture premise: non-pruned origin (got {origin})"
+    );
+    assert_eq!(
+        job_state, "resolved_from_source",
+        "a parked childless leaf with a non-pruned origin converts \
+         (ChildlessLeaf is from-source-viable; only Pruned/Holed stay parked)"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.routing+3]
+/// merged_bug_301 green guard: a parked childless job whose origin IS
+/// `pruned` stays parked — the prune dropped its closure on purpose;
+/// converting it would dispatch the doomed from-source build the
+/// classification exists to prevent.
+#[tokio::test]
+async fn parked_pruned_childless_stays_parked() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+            cfg.materialization.max_attempts = 1;
+            cfg.materialization.park_backoff_base_secs = 3600;
+            cfg.materialization.park_backoff_cap_secs = 3600;
+        });
+    let _tasks = (store_task, actor_task);
+
+    let out = test_store_path("a4prn-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut r = make_node("a4prn");
+    r.expected_output_paths = vec![out.clone()];
+    r.wanted_output_names = vec!["out".into()];
+    let b1 = Uuid::new_v4();
+    let _ev = merge_dag(&handle, b1, vec![r], vec![], false).await?;
+    barrier(&handle).await;
+    let assignment = match claim_materialization(&handle, "a4prn", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "a4prn",
+        mat_infra_outcome("dead upstream"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    sqlx::query("UPDATE materialization_jobs SET origin = 'pruned' WHERE drv_hash = 'a4prn'")
+        .execute(&db.pool)
+        .await?;
+
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let (job_state, parked): (String, bool) = sqlx::query_as(
+        "SELECT state, park_until > now() FROM materialization_jobs WHERE drv_hash = 'a4prn'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        (job_state.as_str(), parked),
+        ("pending", true),
+        "a parked PRUNED childless job stays parked (closure deliberately dropped)"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.routing+3]
+/// merged_bug_301 green guard: the HOLED cell (produced children whose
+/// only voucher is a terminal build — the stale-evidence shape) stays
+/// parked at the re-evaluation, exactly as the dead-voucher
+/// classification demands.
+#[tokio::test]
+async fn parked_holed_stays_parked() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+            cfg.materialization.max_attempts = 1;
+            cfg.materialization.park_backoff_base_secs = 3600;
+            cfg.materialization.park_backoff_cap_secs = 3600;
+        });
+    let _tasks = (store_task, actor_task);
+
+    let out = test_store_path("a4hole-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut r = make_node("a4hole");
+    r.expected_output_paths = vec![out.clone()];
+    r.wanted_output_names = vec!["out".into()];
+    let b1 = Uuid::new_v4();
+    let _ev = merge_dag(&handle, b1, vec![r], vec![], false).await?;
+    barrier(&handle).await;
+    let assignment = match claim_materialization(&handle, "a4hole", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "a4hole",
+        mat_infra_outcome("dead upstream"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // Durable: a produced child whose ONLY voucher is a terminal
+    // build (the previous-generation shape) — the holed cell.
+    let r_id = pg_derivation_id(&db.pool, "a4hole").await?;
+    let c_id = insert_pg_derivation(&db.pool, "a4hole-child", "completed").await?;
+    pg_edge(&db.pool, r_id, c_id).await?;
+    let dead_build = Uuid::new_v4();
+    sqlx::query("INSERT INTO builds (build_id, status) VALUES ($1, 'succeeded')")
+        .bind(dead_build)
+        .execute(&db.pool)
+        .await?;
+    pg_link(&db.pool, dead_build, c_id).await?;
+
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let (job_state, parked): (String, bool) = sqlx::query_as(
+        "SELECT state, park_until > now() FROM materialization_jobs WHERE drv_hash = 'a4hole'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        (job_state.as_str(), parked),
+        ("pending", true),
+        "the holed cell (stale produced evidence) stays parked"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.routing+3]
+/// merged_bug_194 (bughunt wave, A4): wanted names that match NO
+/// declared output resolve to an EMPTY live-wanted path set — coverage
+/// over the empty set is vacuously true, and pre-fix the consumption
+/// completed the node for live interest having verified NOTHING. The
+/// witness type makes the vacuous cell unrepresentable: an empty
+/// verifiable set re-arms instead.
+#[tokio::test]
+async fn bogus_wanted_names_never_complete_vacuously() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_, _| {});
+    let _tasks = (store_task, actor_task);
+
+    let out = test_store_path("a4bogus-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut r = make_node("a4bogus");
+    r.expected_output_paths = vec![out.clone()];
+    // The wanted name matches no declared output: the verifiable
+    // wanted set is empty.
+    r.wanted_output_names = vec!["bogus".into()];
+    let b1 = Uuid::new_v4();
+    let _ev = merge_dag(&handle, b1, vec![r], vec![], false).await?;
+    barrier(&handle).await;
+    let assignment = match claim_materialization(&handle, "a4bogus", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    // The executor confirms the (unwanted) declared output missing and
+    // verified nothing: with an empty verifiable wanted set, coverage
+    // is vacuous.
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "a4bogus",
+        mat_unobtainable_outcome(vec![out.clone()], vec![], "404 everywhere"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    let job_state: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = 'a4bogus'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        job_state, "pending",
+        "an empty verifiable wanted set must RE-ARM, never complete \
+         vacuously (nothing was verified for the live interest)"
+    );
+    let status = expect_drv(&handle, "a4bogus").await.status;
+    assert_ne!(
+        status,
+        DerivationStatus::Completed,
+        "the node must not complete on vacuous coverage"
     );
     Ok(())
 }

@@ -2571,3 +2571,134 @@ async fn test_merge_onto_poisoned_at_limit_snapshot_reports_cached_failure() -> 
     );
     Ok(())
 }
+
+// r[verify sched.merge.substitute-topdown+13]
+/// bug_390 (bughunt wave, A4): the pruned-origin gate must read the
+/// DURABLE relation, not the truncatable in-memory child set. Shape:
+/// R's durable children are {A (produced, live-vouched), B (unbuilt)};
+/// B was sole-interest of a cancelled build and got reaped, truncating
+/// the in-memory set to {A} — which is all-produced, so the in-memory
+/// predicate laundered a Vouched verdict and the prune-merge created a
+/// `cache`-lane job for a node whose closure is genuinely incomplete.
+/// The durable read sees B unproduced and classifies the kept node
+/// pruned-origin.
+#[tokio::test]
+async fn pruned_gate_uses_durable_evidence_not_truncated_view() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let r_out = test_store_path("tdg-r-out");
+    let a_out = test_store_path("tdg-a-out");
+    let mk_r = || {
+        let mut n = make_node("tdg-r");
+        n.expected_output_paths = vec![r_out.clone()];
+        n
+    };
+    let mk_a = || {
+        let mut n = make_node("tdg-a");
+        n.expected_output_paths = vec![a_out.clone()];
+        n
+    };
+    let mk_b = || {
+        let mut n = make_node("tdg-b");
+        n.expected_output_paths = vec![test_store_path("tdg-b-out")];
+        n
+    };
+
+    // B-keep: R -> A, with A's output locally present (A completes at
+    // merge). Keeps R and A alive across the cancellation below.
+    store.seed_with_content(&a_out, b"tdg-a-contents");
+    let b_keep = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b_keep,
+        vec![mk_r(), mk_a()],
+        vec![make_test_edge("tdg-r", "tdg-a")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "tdg-a").await.status,
+        DerivationStatus::Completed,
+        "fixture premise: A is produced"
+    );
+
+    // B0: R -> {A, B}; B is unbuilt and sole-interest of B0.
+    let b0 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b0,
+        vec![mk_r(), mk_a(), mk_b()],
+        vec![
+            make_test_edge("tdg-r", "tdg-a"),
+            make_test_edge("tdg-r", "tdg-b"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Cancel B0: B (sole interest) is reaped from the DAG; R's
+    // in-memory child set truncates to {A} (all produced).
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        handle
+            .send_unchecked(crate::actor::ActorCommand::CancelBuild {
+                build_id: b0,
+                caller_tenant: None,
+                reason: "test cancel".into(),
+                reply: tx,
+            })
+            .await?;
+        let _ = rx.await??;
+    }
+    barrier(&handle).await;
+    // Drive the deferred terminal cleanup directly (the tests'
+    // standard bypass of TERMINAL_CLEANUP_DELAY): the reap truncates
+    // R's in-memory child set to {A}.
+    handle
+        .send_unchecked(crate::actor::ActorCommand::CleanupTerminalBuild { build_id: b0 })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation("tdg-b").await?.is_none(),
+        "fixture premise: B is reaped (sole interest cancelled)"
+    );
+
+    // B1: R's wanted output substitutable -> the prune keeps {R}. The
+    // gate must classify over the DURABLE relation (B unproduced) and
+    // stamp pruned-origin; the truncated in-memory set would launder a
+    // Vouched.
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+    let b1 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b1,
+        vec![mk_r(), mk_a(), mk_b()],
+        vec![
+            make_test_edge("tdg-r", "tdg-a"),
+            make_test_edge("tdg-r", "tdg-b"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let (origin,): (String,) = sqlx::query_as(
+        "SELECT origin FROM materialization_jobs WHERE drv_hash = 'tdg-r' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        origin, "pruned",
+        "the pruned-origin gate reads the durable relation (B unproduced) — \
+         the reap-truncated in-memory set must not launder a vouch"
+    );
+    Ok(())
+}

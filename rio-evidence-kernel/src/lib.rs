@@ -2,9 +2,10 @@
 //!
 //! This crate is the dependency-free home of the closure-evidence
 //! campaign's decision surface: the trust classification of a node's
-//! current DAG child set ([`closure_evidence`] → [`ClosureEvidence`])
-//! and the predicate layered on it ([`closure_vouched`]), together
-//! with their CBMC proof harnesses (`#[cfg(kani)] mod proofs`).
+//! current child-set projection ([`closure_evidence`] →
+//! [`ClosureEvidence`]) together with its CBMC proof harnesses
+//! (`#[cfg(kani)] mod proofs`), and the four-arm Unobtainable routing
+//! ([`routing`]).
 //!
 //! ## Why a separate crate
 //!
@@ -29,26 +30,27 @@
 //! ## What the classifier is
 //!
 //! [`closure_evidence`] answers one question for one node: may this
-//! node's *current* child set be trusted as evidence about its
-//! dependency closure? The scheduler's roots-only prune
+//! node's child set be trusted as evidence about its dependency
+//! closure? The scheduler's roots-only prune
 //! (`sched.merge.substitute-topdown`) deliberately merges kept nodes
 //! without their dependency closures; the merge-time pruned-origin
 //! selection gate exempts a kept node from the `origin = 'pruned'`
 //! materialization-job classification only on
-//! [`ClosureEvidence::Vouched`] — at least one child, every one of
-//! them produced; that judgment is [`closure_vouched`]. (The
-//! settlement-time judgments classify over the scheduler's durable
-//! relation instead — `classify_durable_evidence`, the strict
-//! three-part criterion — so this in-memory classifier's only consumer
-//! is the merge-time gate. The walk-era mark/breadcrumb inputs and the
-//! `must_substitute` predicate died with the evidence columns.)
+//! [`ClosureEvidence::Vouched`]. Since bug_390 (bughunt wave) EVERY
+//! production consumer — the merge-time gate, the consumption routing,
+//! and the park re-evaluation — classifies over the scheduler's
+//! DURABLE relation (`classify_durable_evidence{,_in_tx}`, which
+//! reports its strict three-part criterion in this alphabet); the
+//! in-memory child set is reap-truncatable and must never decide a
+//! verdict. This fold is the alphabet's verified semantics — the
+//! durable classifier mirrors its cell map cell-for-cell.
 //!
 //! ## Inputs are projections, not state
 //!
 //! The kernel never sees the DAG. The caller projects, per node:
 //!
-//! - `present`: the node exists in the DAG (an absent node's evidence
-//!   is vacuously Broken — there is nothing to vouch);
+//! - `present`: the node exists in the projection (an absent node's
+//!   evidence is vacuously Holed — there is nothing to vouch);
 //! - `children`: `None` when the DAG has no child-set entry for the
 //!   node, otherwise one `bool` per declared child edge — `true` iff
 //!   that child is present in the DAG with a produced status
@@ -69,30 +71,32 @@
 //! Over the full bounded input domain (every presence value × every
 //! child set up to `PROOF_CHILD_BOUND` children):
 //!
-//! - the classifier's **exhaustive case analysis** — absent → Broken;
-//!   childless (no entry or empty) → Broken; all children produced →
+//! - the classifier's **exhaustive case analysis** — absent/no-entry →
+//!   Holed; empty child set → ChildlessLeaf; all children produced →
 //!   Vouched; otherwise Pending — exactly, totally, and panic-free
 //!   (`check_classifier_exhaustive_case_analysis`);
 //! - the **Vouched iff** — evidence is Vouched exactly when the node is
 //!   present and has a non-empty all-produced child set
-//!   (`check_vouched_iff_nonempty_all_produced`);
-//! - the [`closure_vouched`] **function contract** (`#[kani::ensures]`,
-//!   verified by a `proof_for_contract` harness over the full evidence
-//!   alphabet).
+//!   (`check_vouched_iff_nonempty_all_produced`).
 
 pub mod establish;
 pub mod pull;
+pub mod routing;
 
-/// Trust classification of a node's current DAG child set as evidence
-/// about its dependency closure — the judgment behind the merge-time
-/// pruned-origin selection gate, and the shape the scheduler's durable
-/// classifier (`classify_durable_evidence`) reports its three-part
-/// criterion in. Computed by [`closure_evidence`].
+/// Trust classification of a node's child set as evidence about its
+/// dependency closure — the judgment behind the merge-time
+/// pruned-origin selection gate, the consumption routing, and the park
+/// re-evaluation; the shape the scheduler's durable classifier
+/// (`classify_durable_evidence`) reports its three-part criterion in.
+/// Computed by [`closure_evidence`].
 ///
-/// `Broken` means "the current child set must NOT vouch for a
-/// from-source dispatch": the node is absent or has no children at all
-/// (a fired prune dropped its closure from the submission, or every
-/// child was reaped).
+/// The structural-leaf-vs-pruned-root ambiguity (merged_bug_301): a
+/// `ChildlessLeaf` cell cannot tell a genuine dep-less leaf from a
+/// pruned ROOT whose closure was deliberately dropped — the two need
+/// opposite dispositions (a leaf is from-source-viable; a pruned root
+/// is doomed). Every consumer therefore pairs this cell with the job
+/// ORIGIN conjunct (`origin != 'pruned'`); the conjunct is
+/// load-bearing, never decorative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClosureEvidence {
     /// At least one child, every child produced (Completed/Skipped):
@@ -103,15 +107,24 @@ pub enum ClosureEvidence {
     /// At least one child, but not every child is produced yet: the
     /// closure is buildable but not yet built (normal dep gating).
     Pending,
-    /// Absent or childless: the child set must not vouch for a
-    /// from-source dispatch.
-    Broken,
+    /// A child set that is present but EMPTY: a structural leaf. The
+    /// cell is from-source-viable for a non-pruned origin (a leaf has
+    /// no closure to be missing) — but a structural leaf is
+    /// indistinguishable here from a pruned ROOT whose closure was
+    /// deliberately dropped, so the origin conjunct stays load-bearing
+    /// at every consumer (merged_bug_301).
+    ChildlessLeaf,
+    /// Absent node, no child-set entry, or stale produced evidence
+    /// (children produced but no live co-owning voucher — the
+    /// previous-generation shape): the evidence affirmatively must NOT
+    /// vouch for a from-source dispatch.
+    Holed,
 }
 
 /// Classify a node's current child set as closure evidence (see
-/// [`ClosureEvidence`]): absent node → `Broken`; no child-set entry or
-/// no children → `Broken`; at least one child and all of them produced
-/// → `Vouched`; otherwise `Pending`.
+/// [`ClosureEvidence`]): absent node or no child-set entry → `Holed`;
+/// an empty child set → `ChildlessLeaf`; at least one child and all of
+/// them produced → `Vouched`; otherwise `Pending`.
 ///
 /// `children` is the per-declared-child produced-ness projection:
 /// `None` when the DAG has no child-set entry for the node, otherwise
@@ -123,14 +136,14 @@ where
     I: IntoIterator<Item = bool>,
 {
     if !present {
-        return ClosureEvidence::Broken;
+        return ClosureEvidence::Holed;
     }
     let Some(children) = children else {
-        return ClosureEvidence::Broken;
+        return ClosureEvidence::Holed;
     };
 
     // One pass, short-circuiting: `any_child` distinguishes the empty
-    // child set (Broken) from a non-empty one; `all_produced` falls to
+    // child set (ChildlessLeaf) from a non-empty one; `all_produced` falls to
     // false at the first un-produced child and the loop stops there
     // (the remaining children cannot change the verdict).
     let mut any_child = false;
@@ -143,29 +156,13 @@ where
         }
     }
     if !any_child {
-        return ClosureEvidence::Broken;
+        return ClosureEvidence::ChildlessLeaf;
     }
     if all_produced {
         ClosureEvidence::Vouched
     } else {
         ClosureEvidence::Pending
     }
-}
-
-/// True when the evidence is [`ClosureEvidence::Vouched`]: at least one
-/// child, every one of them already produced — the only children shape
-/// that says the node's dependency closure exists in the store, so a
-/// from-source dispatch is not doomed.
-///
-/// Sole consumer: the merge-time pruned-origin selection gate (a kept
-/// closure-dropped node is exempted from the `origin = 'pruned'`
-/// classification only when its closure is vouched).
-#[cfg_attr(
-    kani,
-    kani::ensures(|verdict: &bool| *verdict == (evidence == ClosureEvidence::Vouched))
-)]
-pub fn closure_vouched(evidence: ClosureEvidence) -> bool {
-    evidence == ClosureEvidence::Vouched
 }
 
 #[cfg(test)]
@@ -178,18 +175,17 @@ mod tests {
     }
 
     #[test]
-    fn absent_node_is_broken() {
-        assert_eq!(classify(false, None), ClosureEvidence::Broken);
-        assert_eq!(
-            classify(false, Some(&[true, true])),
-            ClosureEvidence::Broken
-        );
+    fn absent_node_is_holed() {
+        assert_eq!(classify(false, None), ClosureEvidence::Holed);
+        assert_eq!(classify(false, Some(&[true, true])), ClosureEvidence::Holed);
     }
 
     #[test]
-    fn childless_node_is_broken() {
-        assert_eq!(classify(true, None), ClosureEvidence::Broken);
-        assert_eq!(classify(true, Some(&[])), ClosureEvidence::Broken);
+    fn childless_node_cells() {
+        // No child-set entry at all: holed (nothing is known).
+        assert_eq!(classify(true, None), ClosureEvidence::Holed);
+        // A present-but-EMPTY child set: a structural leaf.
+        assert_eq!(classify(true, Some(&[])), ClosureEvidence::ChildlessLeaf);
     }
 
     #[test]
@@ -210,13 +206,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn closure_vouched_only_on_vouched() {
-        assert!(closure_vouched(ClosureEvidence::Vouched));
-        assert!(!closure_vouched(ClosureEvidence::Pending));
-        assert!(!closure_vouched(ClosureEvidence::Broken));
-    }
-
     /// Differential pin against an independent restatement of the
     /// classifier (the documentation's if-chain over pre-computed
     /// predicates), exhaustively over every child set of up to 8
@@ -226,11 +215,11 @@ mod tests {
     fn classifier_matches_case_analysis_exhaustively() {
         fn reference(present: bool, children: Option<&[bool]>) -> ClosureEvidence {
             if !present {
-                return ClosureEvidence::Broken;
+                return ClosureEvidence::Holed;
             }
             match children {
-                None => ClosureEvidence::Broken,
-                Some([]) => ClosureEvidence::Broken,
+                None => ClosureEvidence::Holed,
+                Some([]) => ClosureEvidence::ChildlessLeaf,
                 Some(c) if c.iter().all(|&p| p) => ClosureEvidence::Vouched,
                 Some(_) => ClosureEvidence::Pending,
             }
@@ -325,9 +314,19 @@ mod proofs {
         let ev = classify_bounded(present, has_entry, &bits, n);
 
         if !present {
-            assert_eq!(ev, ClosureEvidence::Broken, "absent node must be Broken");
-        } else if !has_entry || n == 0 {
-            assert_eq!(ev, ClosureEvidence::Broken, "childless node must be Broken");
+            assert_eq!(ev, ClosureEvidence::Holed, "absent node must be Holed");
+        } else if !has_entry {
+            assert_eq!(
+                ev,
+                ClosureEvidence::Holed,
+                "no child-set entry must be Holed"
+            );
+        } else if n == 0 {
+            assert_eq!(
+                ev,
+                ClosureEvidence::ChildlessLeaf,
+                "an empty child set is the structural-leaf cell"
+            );
         } else {
             let mut all_produced = true;
             let mut i = 0;
@@ -377,19 +376,6 @@ mod proofs {
         }
         let should_vouch = present && has_entry && n > 0 && all_produced;
 
-        assert_eq!(closure_vouched(ev), should_vouch);
         assert_eq!(ev == ClosureEvidence::Vouched, should_vouch);
-    }
-
-    /// `proof_for_contract` form of [`closure_vouched`]'s
-    /// `#[kani::ensures]` clause, over the full evidence alphabet.
-    #[kani::proof_for_contract(closure_vouched)]
-    fn check_closure_vouched_contract() {
-        let evidence = match kani::any::<u8>() {
-            0 => ClosureEvidence::Vouched,
-            1 => ClosureEvidence::Pending,
-            _ => ClosureEvidence::Broken,
-        };
-        let _ = closure_vouched(evidence);
     }
 }

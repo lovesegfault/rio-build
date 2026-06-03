@@ -908,140 +908,13 @@ impl DagActor {
 // wires it to the fenced db operations.
 // ──────────────────────────────────────────────────────────────────────
 
-/// What the Unobtainable routing decided (design §2.4's four arms).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UnobtainableRouting {
-    /// Arm 0, covered: consume as success-for-live-interest.
-    CompleteForLiveInterest,
-    /// Arms 0 (uncovered) / 3a: job returns to pending.
-    ReArm,
-    /// Arms 1/2: node becomes from-source dispatchable.
-    ResolveFromSource,
-    /// Arm 3b: fail-fast every live DAG-interested build.
-    FailFast,
-}
-
-/// The durable declared-relation classification (computed by the caller
-/// from the dependency relation + statuses; the routing core never
-/// touches the DAG).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DurableEvidence {
-    /// Children all produced, no closure hole: from-source is viable.
-    Vouched,
-    /// Children exist but not all produced yet: normal dep gating.
-    Pending,
-    /// Absent/childless/holed: from-source is doomed.
-    Broken,
-}
-
-/// The same-transaction FMP re-probe answer over the live wanted paths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReprobeAnswer {
-    /// Every live-wanted path present, substitutable, or indeterminate.
-    Obtainable,
-    /// Some live-wanted path confirmed missing-and-unsubstitutable.
-    ConfirmedMissing,
-}
-
-/// The inputs of one Unobtainable routing decision.
-pub(crate) struct RoutingInputs<'a> {
-    /// Paths the executor confirmed absent upstream.
-    pub missing_paths: &'a [String],
-    /// Paths the executor verified present (and pinned).
-    pub verified_paths: &'a [String],
-    /// The live effective wanted PATHS (the §6 join, resolved to store
-    /// paths by the caller inside the consumption transaction).
-    pub live_wanted_paths: &'a [String],
-    pub durable_evidence: DurableEvidence,
-    /// Prior materialization_unobtainable rows for THIS job (the
-    /// re-probe one-shot; design §2.4 arm 3).
-    pub prior_unobtainable_count: u32,
-    /// The same-transaction FMP re-probe answer over live_wanted_paths.
-    /// `None` = not fetched (arms 0–2 decided without it); the caller
-    /// fetches it only when arms 0–2 do not apply (purity by
-    /// parameterization — design §9.4).
-    pub reprobe: Option<ReprobeAnswer>,
-    /// Whether the consumed job's `origin == 'pruned'` — the durable
-    /// successor of the walk-era pruned mark (design §4/A2/A13,
-    /// T-D2.1) and the arm-3 settlement discriminator (finding 11):
-    /// only a pruned-origin job may fail-fast (the prune deliberately
-    /// dropped the node's closure, so from-source is doomed); a
-    /// non-pruned-origin job whose evidence is Broken by structure
-    /// (childless leaf / probe blip) releases to from-source dispatch
-    /// instead — non-pruned nodes are never affected, whatever their
-    /// evidence.
-    pub pruned_origin: bool,
-}
-
-// r[impl sched.materialize.routing+3]
-/// The four-arm routing core. PURE (no IO, no clocks) — kani-liftable
-/// per design §9.4; the FMP re-probe answer is an input.
-///
-/// The probe-failure case: the consumption HANDLER maps "the re-probe
-/// RPC itself failed/timed out" to ReArm before calling this core (B3:
-/// an indeterminate answer never fail-fasts) — the core's `None`
-/// reprobe arm is therefore only reachable as one-shot-spent.
-pub(crate) fn route_unobtainable(inputs: &RoutingInputs<'_>) -> UnobtainableRouting {
-    let missing_live: Vec<&String> = inputs
-        .missing_paths
-        .iter()
-        .filter(|p| inputs.live_wanted_paths.contains(p))
-        .collect();
-    // Arm 0 — moot-failure (the C3 arm).
-    if missing_live.is_empty() {
-        let covered = inputs
-            .live_wanted_paths
-            .iter()
-            .all(|w| inputs.verified_paths.contains(w));
-        return if covered {
-            UnobtainableRouting::CompleteForLiveInterest
-        } else {
-            UnobtainableRouting::ReArm
-        };
-    }
-    // Arms 1/2 — durable Vouched / Pending: from-source.
-    match inputs.durable_evidence {
-        DurableEvidence::Vouched | DurableEvidence::Pending => {
-            return UnobtainableRouting::ResolveFromSource;
-        }
-        DurableEvidence::Broken => {}
-    }
-    // Arm 3 — Broken + live-wanted missing: the re-probe gate.
-    match inputs.reprobe {
-        Some(ReprobeAnswer::Obtainable) if inputs.prior_unobtainable_count == 0 => {
-            UnobtainableRouting::ReArm
-        }
-        // Re-probe confirms missing, or the one-shot is spent. (A
-        // missing probe is mapped to ReArm by the caller before this
-        // core runs — see the doc above.)
-        //
-        // The settlement discriminates on the consumed job's ORIGIN
-        // (finding 11, durably re-sourced by T-D2.1): only a
-        // pruned-origin job fail-fasts — the prune deliberately
-        // dropped the node's closure ("this was not built because
-        // outputs were expected available"), so from-source is doomed
-        // and the resubmit-directing error is the correct verdict. A
-        // non-pruned-origin job — a genuine leaf whose evidence is
-        // Broken by structure (childless) or by a probe blip —
-        // releases to from-source dispatch instead; non-pruned nodes
-        // are never affected, whatever their evidence.
-        _ if inputs.pruned_origin => UnobtainableRouting::FailFast,
-        _ => UnobtainableRouting::ResolveFromSource,
-    }
-}
-
-/// Success-consumption coverage check (the CE-17 closer): the live
-/// wanted set is covered by what the execution ingested or verified.
-// r[impl sched.materialize.routing+3]
-pub(crate) fn success_covers_live_wanted(
-    ingested: &[String],
-    verified: &[String],
-    live_wanted: &[String],
-) -> bool {
-    live_wanted
-        .iter()
-        .all(|w| ingested.contains(w) || verified.contains(w))
-}
+// The pure routing core lives in rio-evidence-kernel (bughunt wave,
+// A4): rio-scheduler is a bin crate and the kani gate is lib-only —
+// the kernel sweep proves the cells; this module keeps the wiring.
+pub(crate) use rio_evidence_kernel::routing::{
+    LiveWanted, ReprobeAnswer, RoutingInputs, UnobtainableRouting, route_unobtainable,
+    success_covers_live_wanted,
+};
 
 impl DagActor {
     // r[impl sched.materialize.routing+3]
@@ -1094,16 +967,33 @@ impl DagActor {
 
         // 1. The live effective wanted set (the §6 join), resolved to
         //    store paths — the presence-re-check half of D7's closure.
-        let mut live_wanted_paths = self
+        let mut wanted_union = self
             .live_wanted_paths_for(attempt.core.derivation_id, &drv_hash)
             .await
-            .map_err(|e| super::pull::PullRejection::Internal(format!("wanted-union read: {e}")))?;
+            .map_err(|e| super::pull::PullRejection::Internal(format!("wanted-union read: {e}")))?
+            .unwrap_or_default();
         // r[impl sched.merge.stale-substitutable+3]
         for p in &carried_paths {
-            if !p.is_empty() && !live_wanted_paths.contains(p) {
-                live_wanted_paths.push(p.clone());
+            if !p.is_empty() && !wanted_union.contains(p) {
+                wanted_union.push(p.clone());
             }
         }
+        // The non-empty witness (merged_bug_194): no verifiable wanted
+        // set even after the carrier union means NOTHING can be
+        // verified for live interest — every completion would be
+        // vacuous. Conservative branch for BOTH Success and
+        // Unobtainable: the job stays pending and the node leaves the
+        // mint's Running state (the ReArm posture; the next claim or
+        // the zero-interest closer settles it).
+        let Some(live_wanted_paths) = LiveWanted::new(wanted_union) else {
+            crate::state::note_wanted_width_saturated(&Uuid::nil());
+            warn!(
+                %exec_id, drv_hash = %drv_hash,
+                "no verifiable live-wanted path set; re-arming instead of consuming"
+            );
+            self.release_claim(&drv_hash, Some(&executor)).await;
+            return Ok(());
+        };
 
         match outcome.outcome {
             Some(Outcome::Success(s)) => {
@@ -1192,7 +1082,7 @@ impl DagActor {
                 //    criterion), never the in-memory child set, so a
                 //    reap-truncated or post-failover view cannot
                 //    launder a verdict (the F9 hazard).
-                let durable_evidence = match self
+                let durable_evidence = self
                     .db
                     .classify_durable_evidence(attempt.core.derivation_id)
                     .await
@@ -1200,11 +1090,7 @@ impl DagActor {
                         super::pull::PullRejection::Internal(format!(
                             "durable evidence classification: {e}"
                         ))
-                    })? {
-                    rio_evidence_kernel::ClosureEvidence::Vouched => DurableEvidence::Vouched,
-                    rio_evidence_kernel::ClosureEvidence::Pending => DurableEvidence::Pending,
-                    rio_evidence_kernel::ClosureEvidence::Broken => DurableEvidence::Broken,
-                };
+                    })?;
                 // The arm-3 discriminator (finding 11) is the consumed
                 // job's origin — `pruned_origin` was read from the job
                 // row above (T-D2.1: the durable fact, not the
@@ -1212,11 +1098,15 @@ impl DagActor {
                 let needs_probe = u
                     .missing_paths
                     .iter()
-                    .any(|p| live_wanted_paths.contains(p))
-                    && durable_evidence == DurableEvidence::Broken;
+                    .any(|p| live_wanted_paths.contains(p.as_str()))
+                    && matches!(
+                        durable_evidence,
+                        rio_evidence_kernel::ClosureEvidence::ChildlessLeaf
+                            | rio_evidence_kernel::ClosureEvidence::Holed
+                    );
                 let reprobe = if needs_probe {
                     match self
-                        .reprobe_live_wanted_paths(&drv_hash, &live_wanted_paths)
+                        .reprobe_live_wanted_paths(&drv_hash, live_wanted_paths.paths())
                         .await
                     {
                         Some(answer) => Some(answer),
@@ -1377,43 +1267,40 @@ impl DagActor {
     }
 
     /// The live effective wanted PATHS for a node: the §6 wanted-union
-    /// (joined over live builds' contributions), resolved to store
-    /// paths against the node's declared outputs. Zero live relation
-    /// rows (the legacy shape) saturate to ALL DECLARED outputs — the
-    /// conservative-absent arm (T-D2.3/PD-D5, DQ-2): arm-0 coverage
-    /// becomes HARDER to satisfy, never vacuously complete.
+    /// (the 086 membership-derived view), resolved to store paths
+    /// against the node's declared outputs through THE single guard
+    /// (`rio_common::wanted_outputs::verifiable_wanted_paths`,
+    /// merged_bug_194 — the open-coded zip-filter copies are deleted).
+    ///
+    /// `None` means "no verifiable live wanted set exists": the node
+    /// is missing from the DAG, no live build is interested, or every
+    /// resolved path is empty (the floating-CA placeholder shape
+    /// before the carrier union). The CONSUMER decides the
+    /// conservative branch — re-arm, never a completion.
     async fn live_wanted_paths_for(
         &self,
         derivation_id: Uuid,
         drv_hash: &DrvHash,
-    ) -> Result<Vec<String>, sqlx::Error> {
+    ) -> Result<Option<Vec<String>>, sqlx::Error> {
         let union = self.db.effective_wanted_union(derivation_id).await?;
         let Some(state) = self.dag.node(drv_hash) else {
-            return Ok(Vec::new());
+            // Missing DAG node: no verifiable wanted set (the
+            // conservative-absent arm — never a vacuous verdict).
+            return Ok(None);
         };
         let wanted_names: Vec<String> = match union {
-            // Zero live relation rows: the conservative-absent arm —
-            // saturate to all-declared width (observable).
-            None => {
-                crate::state::note_wanted_width_saturated(&Uuid::nil());
-                Vec::new()
-            }
-            // '{}' saturation = all declared outputs.
-            Some(v) if v.is_empty() => Vec::new(),
+            // Zero live interest rows: nothing wants this node.
+            None => return Ok(None),
+            // '{}' saturation = all declared outputs (the
+            // membership-derived default rows saturate here too).
             Some(v) => v,
         };
-        let paths: Vec<String> = if wanted_names.is_empty() {
-            state.expected_output_paths.clone()
-        } else {
-            state
-                .output_names
-                .iter()
-                .zip(state.expected_output_paths.iter())
-                .filter(|(name, _)| wanted_names.iter().any(|w| w == *name))
-                .map(|(_, path)| path.clone())
-                .collect()
-        };
-        Ok(paths.into_iter().filter(|p| !p.is_empty()).collect())
+        Ok(rio_common::wanted_outputs::verifiable_wanted_paths(
+            &state.output_names,
+            &state.expected_output_paths,
+            &wanted_names,
+        )
+        .map(|paths| paths.into_iter().map(str::to_string).collect()))
     }
 
     /// The node's [`rio_retry_kernel::MatCounters`] over the in-memory
@@ -1933,9 +1820,12 @@ impl DagActor {
     ///      `resolved_from_source` NOW (the same arm-1/arm-2 disposition
     ///      the consumption routing takes) and requeues the node for
     ///      normal dispatch: the park can never outlive from-source
-    ///      viability. Broken evidence (childless/holed — from-source is
-    ///      structurally impossible) stays parked, with the
-    ///      backoff-expiry re-claim as its armed action.
+    ///      viability. A CHILDLESS LEAF with a non-pruned origin
+    ///      converts too (merged_bug_301: a structural leaf has no
+    ///      closure to be missing — from-source is viable; pre-fix the
+    ///      conflated Broken cell stranded leaves parked forever).
+    ///      Pruned-origin and holed evidence stay parked, with the
+    ///      backoff-expiry re-claim as the armed action.
     ///   2. **Visibility**: `rio_scheduler_materialization_stalled`
     ///      (gauge) is set to the ground-truth count of jobs still
     ///      parked after the pass — the §2.5 operator signal ("a
@@ -1980,11 +1870,33 @@ impl DagActor {
                     continue;
                 }
             };
+            // The origin read is HOISTED above the gate
+            // (merged_bug_301): PG is the origin authority (the dedup
+            // may have upgraded it after the view entry was created),
+            // and the ChildlessLeaf cell is from-source-viable exactly
+            // when the origin is not `pruned` — a structural leaf has
+            // no closure to be missing, while a pruned root's closure
+            // was deliberately dropped. An unreadable origin is
+            // conservative: the leaf arm stays parked, the metric
+            // label says `unknown`.
+            let origin = match self.db.unresolved_job_for_derivation(db_id).await {
+                Ok(Some((_, origin, _))) => Some(origin),
+                Ok(None) => None,
+                Err(e) => {
+                    warn!(drv_hash = %drv_hash, error = %e,
+                          "conversion-origin read failed; leaf arm stays parked");
+                    None
+                }
+            };
             let from_source_viable = matches!(
                 evidence,
                 rio_evidence_kernel::ClosureEvidence::Vouched
                     | rio_evidence_kernel::ClosureEvidence::Pending
-            );
+            ) || (matches!(
+                evidence,
+                rio_evidence_kernel::ClosureEvidence::ChildlessLeaf
+            ) && origin
+                .is_some_and(|o| o != crate::state::JobOrigin::Pruned));
             if !from_source_viable {
                 continue;
             }
@@ -2040,20 +1952,10 @@ impl DagActor {
                     continue;
                 }
             }
-            // Item T conversion visibility: read the (still-pending)
-            // job's origin BEFORE resolving — PG is the origin
-            // authority (the dedup may have upgraded it after the view
-            // entry was created). `unknown` only on a query/decode
-            // failure, never silently dropped.
-            let origin_label = match self.db.unresolved_job_for_derivation(db_id).await {
-                Ok(Some((_, origin, _))) => origin.as_str(),
-                Ok(None) => "unknown",
-                Err(e) => {
-                    warn!(drv_hash = %drv_hash, error = %e,
-                          "conversion-origin read failed; counting origin=unknown");
-                    "unknown"
-                }
-            };
+            // Item T conversion visibility: the origin label reuses
+            // the hoisted PG-authoritative read above. `unknown` only
+            // on a query/decode failure, never silently dropped.
+            let origin_label = origin.map(|o| o.as_str()).unwrap_or("unknown");
             // From-source is viable: resolve the job (no exec_id — the
             // re-evaluation, not an execution, resolved it) and requeue
             // the node. The spawn-intent filter and the admission table

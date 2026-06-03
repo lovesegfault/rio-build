@@ -263,8 +263,10 @@ impl SchedulerDb {
     ///   (`completed`/`skipped`) ∧ vouched by a live co-owning build
     ///   (the `EXISTS` conjunct inside the `bool_and`, exactly as the
     ///   recovery gate has it).
-    /// - `Broken` — childless/absent (as the in-memory judgment), PLUS
-    ///   the produced-without-a-live-voucher cell: the
+    /// - `ChildlessLeaf` — zero durable children: a structural leaf
+    ///   (from-source-viable for a non-pruned origin; the origin
+    ///   conjunct discriminates the pruned root — merged_bug_301).
+    /// - `Holed` — the produced-without-a-live-voucher cell: the
     ///   previous-generation shape (a long-terminal build's completed
     ///   children persist in PG indefinitely; classifying them Vouched
     ///   would launder a stale closure into a doomed from-source
@@ -281,18 +283,36 @@ impl SchedulerDb {
         &self,
         derivation_id: Uuid,
     ) -> Result<rio_evidence_kernel::ClosureEvidence, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        Self::classify_durable_evidence_in_tx(&mut conn, derivation_id).await
+    }
+
+    /// The in-transaction form (bug_390): the merge-time pruned-origin
+    /// gate classifies INSIDE the merge transaction so the verdict and
+    /// the job-creation row are crash-atomic — and over the durable
+    /// relation, never the reap-truncatable in-memory child set.
+    ///
+    /// The 4-cell map (merged_bug_301): zero children →
+    /// `ChildlessLeaf` (a structural leaf — from-source-viable for a
+    /// non-pruned origin); all produced + live-vouched → `Vouched`;
+    /// produced-without-a-live-voucher (the previous-generation shape)
+    /// → `Holed`; otherwise `Pending`.
+    pub(crate) async fn classify_durable_evidence_in_tx(
+        conn: &mut sqlx::PgConnection,
+        derivation_id: Uuid,
+    ) -> Result<rio_evidence_kernel::ClosureEvidence, sqlx::Error> {
         let (n_children, all_strict, stale_produced): (i64, Option<bool>, Option<bool>) =
             sqlx::query_as(CLASSIFY_EVIDENCE_SQL.as_str())
                 .bind(derivation_id)
-                .fetch_one(&self.pool)
+                .fetch_one(conn)
                 .await?;
         use rio_evidence_kernel::ClosureEvidence;
         Ok(if n_children == 0 {
-            ClosureEvidence::Broken
+            ClosureEvidence::ChildlessLeaf
         } else if all_strict == Some(true) {
             ClosureEvidence::Vouched
         } else if stale_produced == Some(true) {
-            ClosureEvidence::Broken
+            ClosureEvidence::Holed
         } else {
             ClosureEvidence::Pending
         })

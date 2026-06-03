@@ -93,25 +93,6 @@ pub struct ReapOutcome {
     pub surviving_parents: Vec<DrvHash>,
 }
 
-/// Trust classification of a node's current DAG child set as evidence
-/// about its dependency closure — the judgment behind the merge-time
-/// pruned-origin selection gate (`closure_vouched` in `merge.rs`).
-/// Computed by `DerivationDag::closure_evidence`.
-///
-/// Re-exported from `rio_evidence_kernel`, the dependency-free
-/// CBMC-verified decision kernel: the variant semantics, the case
-/// analysis that produces them, and the `closure_vouched` predicate
-/// are owned and proven there; this DAG owns only the projection of
-/// its node/edge maps into the kernel's inputs.
-///
-/// The settlement-time judgments do NOT use this in-memory view: the
-/// consumption routing and the park re-evaluation classify over the
-/// durable relation (`SchedulerDb::classify_durable_evidence` — the
-/// strict three-part criterion with live co-owning build links), so a
-/// reap-truncated or post-failover in-memory child set never decides
-/// a routing verdict.
-pub use rio_evidence_kernel::ClosureEvidence;
-
 /// The global derivation DAG maintained by the actor.
 #[derive(Debug, Default)]
 pub struct DerivationDag {
@@ -779,40 +760,6 @@ impl DerivationDag {
                 )
             })
         })
-    }
-
-    /// Classify `drv_hash`'s current child set as closure evidence (see
-    /// [`ClosureEvidence`]): absent node → `Broken`; no children →
-    /// `Broken`; at least one child and all of them Completed/Skipped
-    /// → `Vouched`; otherwise `Pending`.
-    ///
-    /// Projection shim over [`rio_evidence_kernel::closure_evidence`] —
-    /// the CBMC-verified kernel owns the case analysis and the
-    /// child-set fold; this method gathers the kernel's inputs out of
-    /// the node/edge maps: presence and one lazy produced-ness bool per
-    /// declared child (a child edge whose node is missing from the DAG
-    /// projects as un-produced, exactly as the pre-extraction
-    /// `is_some_and` lookup did).
-    ///
-    /// Sole consumer: the merge-time pruned-origin selection gate
-    /// (`closure_vouched`). The settlement-time judgments classify
-    /// over the durable relation instead
-    /// (`SchedulerDb::classify_durable_evidence`).
-    pub fn closure_evidence(&self, drv_hash: &str) -> ClosureEvidence {
-        let node = self.nodes.get(drv_hash);
-        rio_evidence_kernel::closure_evidence(
-            node.is_some(),
-            self.children.get(drv_hash).map(|children| {
-                children.iter().map(|child_hash| {
-                    self.nodes.get(child_hash).is_some_and(|n| {
-                        matches!(
-                            n.status(),
-                            DerivationStatus::Completed | DerivationStatus::Skipped
-                        )
-                    })
-                })
-            }),
-        )
     }
 
     /// Check whether any dependency is in a terminal failure state.

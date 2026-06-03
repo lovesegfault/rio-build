@@ -386,6 +386,11 @@ in
     # 11 → 12: + check_no_build_mint_inside_backoff_window (A3/282 —
     # the named (Build, None) backoff cell; the wide partition proofs
     # already cover it, the named harness pins the conjunct).
-    expectedHarnesses = 13;
+    # 13 → 12: − check_closure_vouched_contract (A4/bug_390 — the
+    # closure_vouched predicate is DELETED with its sole caller, the
+    # in-memory merge gate; every consumer reads the durable
+    # classifier's 4-cell verdict now; recount composed over B1-s2's
+    # 12 → 13 resume-token harness, second-lander reconcile).
+    expectedHarnesses = 12;
   };
 }

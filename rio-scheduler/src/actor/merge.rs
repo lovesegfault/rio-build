@@ -1870,32 +1870,6 @@ impl DagActor {
         reset
     }
 
-    /// True when [`crate::dag::DerivationDag::closure_evidence`] judges
-    /// `drv_hash`'s child set [`ClosureEvidence::Vouched`](crate::dag::ClosureEvidence::Vouched): at least
-    /// one DAG child, every one of them already produced
-    /// (Completed/Skipped) — the only children shape that says the
-    /// node's dependency closure exists in the store, so a from-source
-    /// dispatch is not doomed.
-    ///
-    /// Sole caller: the pruned-origin selection gate in
-    /// `persist_merge_to_db`'s in-tx job creation — a kept
-    /// closure-dropped node whose existing DAG children are vouched
-    /// does not need the `origin = 'pruned'` classification (its
-    /// closure is in the store). Children that are merely *present*
-    /// but unbuilt do NOT vouch
-    /// ([`ClosureEvidence::Pending`](crate::dag::ClosureEvidence::Pending)) — they can belong to another
-    /// build and be reaped unbuilt later (cancel → cascade terminal →
-    /// reap → `children` scrubbed), leaving the node childless with a
-    /// never-produced closure. The settlement-time judgment is NOT
-    /// this in-memory one: the consumption routing and the park
-    /// re-evaluation classify over the durable relation
-    /// (`classify_durable_evidence` — the strict three-part criterion
-    /// with live co-owning build links), so a reap-truncated or
-    /// post-failover in-memory view never decides a routing verdict.
-    pub(super) fn closure_vouched(&self, drv_hash: &str) -> bool {
-        rio_evidence_kernel::closure_vouched(self.dag.closure_evidence(drv_hash))
-    }
-
     /// Persist nodes and edges to the DB after a successful DAG merge,
     /// and flip the build to Active as the transaction's last statement.
     /// Extracted from handle_merge_dag so failures can be caught and
@@ -1904,8 +1878,10 @@ impl DagActor {
     /// `pruned_closure_parents`: kept nodes whose dependency closure a
     /// fired prune dropped (empty otherwise) — only they get
     /// `origin = 'pruned'` materialization jobs, additionally gated on
-    /// the closure classifier not vouching for their existing children
-    /// (`closure_vouched`). Inside the same transaction so a rejected
+    /// the DURABLE closure classifier not vouching
+    /// (`classify_durable_evidence_in_tx`, bug_390 — gate and
+    /// settlement read one source; the in-memory child set is
+    /// reap-truncatable). Inside the same transaction so a rejected
     /// merge can never leak the pruned classification into PG, and a
     /// committed one can never lose it to a failover racing the
     /// post-commit phase.
@@ -2079,9 +2055,20 @@ impl DagActor {
             // origin (the more specific classification).
             let mut job_rows: Vec<crate::db::materialization::NewJobRow<'_>> = Vec::new();
             for node in nodes {
+                // bug_390: the vouch exemption reads the DURABLE
+                // relation IN THIS TRANSACTION (gate and settlement
+                // share one source) — the in-memory child set is
+                // reap-truncatable (cancel → cascade terminal → reap →
+                // `children` scrubbed) and laundered a Vouched for a
+                // node whose durable closure is genuinely incomplete.
+                // One SELECT per pruned candidate: bounded by the
+                // prune's kept-root count (small; batch if merge
+                // timing ever shows it).
                 if pruned_closure_parents.contains(node.drv_hash.as_str())
-                    && !self.closure_vouched(&node.drv_hash)
                     && let Some((db_id, _)) = id_map.get(node.drv_hash.as_str())
+                    && crate::db::SchedulerDb::classify_durable_evidence_in_tx(tx.conn(), *db_id)
+                        .await?
+                        != rio_evidence_kernel::ClosureEvidence::Vouched
                 {
                     job_rows.push(crate::db::materialization::NewJobRow {
                         derivation_id: *db_id,
