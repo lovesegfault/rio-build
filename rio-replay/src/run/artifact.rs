@@ -601,7 +601,7 @@ pub async fn sync_state(
 
 /// Resume support: if the local state dir has no campaign.json but the
 /// store does, download the synced state files — certifiers first, data
-/// after, per the [`UploadOrder`] column inverted (see the ordering
+/// after, per the `UploadOrder` column inverted (see the ordering
 /// comment in the body) — so resume can proceed after a pod reschedule
 /// wiped the local volume. Returns true when a campaign was restored
 /// from the store. The local campaign.json doubles as the

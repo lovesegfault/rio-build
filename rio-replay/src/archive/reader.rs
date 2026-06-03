@@ -670,7 +670,7 @@ impl ReplayArchive {
     /// otherwise the scoped record of the highest informativeness rank
     /// (`informativeness_rank` below — the design doc's expected-outcome
     /// vocabulary carries the same table), with ties WITHIN a rank class
-    /// resolved by record content (the [`consumed_truth`] ordering:
+    /// resolved by record content (the `consumed_truth` ordering:
     /// outcome, then recorded output hashes) and the highest-numbered
     /// session deciding only between records whose consumed truth is
     /// identical.
@@ -720,7 +720,7 @@ impl ReplayArchive {
 
     /// Workload units whose session-scoped truth records disagree on the
     /// CONSUMED truth — the outcome enum or the recorded output hashes
-    /// ([`consumed_truth`]) — with no session-less record to supersede
+    /// (`consumed_truth`) — with no session-less record to supersede
     /// them: exactly the units whose one truth slot the scoped collapse
     /// had to resolve by rank or content order, discarding recorded
     /// information. Surfaced in the report's comparability block so

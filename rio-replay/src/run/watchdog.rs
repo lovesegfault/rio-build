@@ -52,7 +52,7 @@
 //! This is a pure state machine over [`PollTick`]s — the run loop owns the
 //! polling cadence, feeds the observations, and acts on the verdicts.
 //!
-//! Scope: only campaign jobs registered via [`Watchdog::observe_job`] are
+//! Scope: only campaign jobs registered via `Watchdog::observe_job` are
 //! tracked — the job ledger emits those observations at the transition
 //! sites (batch commitment, requeue, retirement), so a job is tracked
 //! from its first offer and never before. Warm-stage batches are
@@ -225,7 +225,7 @@ pub enum StallKind {
     /// Queued for at least `queued_watchdog_hours` of unsuspended time
     /// with re-enqueue budget remaining: non-terminal re-enqueue. Armed
     /// like the other arms — the clock resets and the consumed-requeue
-    /// count increments only when [`Watchdog::confirm_queued_requeue`]
+    /// count increments only when `Watchdog::confirm_queued_requeue`
     /// commits after the run loop journals the ladder step, so a failed
     /// append re-fires the verdict instead of losing a budget move that
     /// resume would never see.
