@@ -427,6 +427,28 @@ epilogue in the success path).
   (now() - poisoned_at))`, so the 24h TTL check survives scheduler restart.
 ]
 
+#r("sched.retry.revival-total-reset")[
+  A cache-hit revival of a previously-failed derivation
+  (`Poisoned`/`DependencyFailed`/`Failed` transitioning to `Completed`
+  because the output now exists) MUST reset the COMPLETE
+  failure-tracking state --- every retry counter, every capped deferral
+  budget, every backoff deadline, and the failure attribution set ---
+  not an enumerated subset. The reset MUST be implemented so that
+  adding a failure-tracking field without deciding its revival
+  disposition fails compilation.
+]
+The clause exists because the enumerated-subset form regressed twice on
+the same shape (round-16 merged_bug_022): `claims_unavailable_count`
+and `backoff_until` were silently omitted from `RetryState::clear()`,
+so a revived node with a maxed claims budget re-poisoned on its FIRST
+post-revival store blip (the charge gate saw the stale counter at cap,
+emitting a message that falsely claimed the full ladder had run), and a
+stale pre-revival backoff deadline silently deferred the re-probe
+dispatch by up to a full backoff window. Exhaustive destructuring in
+`clear()` makes the omission a compile error; a future field that must
+survive revival gets an explicit no-op arm with rationale, never a
+silent omission.
+
 #r("sched.retry.per-executor-budget")[
   `BuildResultStatus::InfrastructureFailure` does NOT count toward the poison
   threshold. It routes through a separate `handle_infrastructure_failure`

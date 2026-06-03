@@ -703,25 +703,52 @@ impl RetryState {
 }
 
 impl RetryState {
-    /// Reset all failure-tracking fields. Call after a cache-hit
+    // r[impl sched.retry.revival-total-reset]
+    /// Reset ALL failure-tracking state. Call after a cache-hit
     /// transition from Poisoned/DependencyFailed/Failed to Completed
     /// (I-099/I-094) — the prior failures are moot once the output
     /// exists. Does NOT change `status`; caller transitions separately.
+    ///
+    /// EXHAUSTIVE DESTRUCTURING (round-16 merged_bug_022): the old
+    /// field-by-field zeroing silently omitted `claims_unavailable_count`
+    /// and `backoff_until` — a revived node with a maxed claims budget
+    /// re-poisoned on its FIRST post-revival store blip (charge() saw
+    /// `>= cap` immediately, with a message falsely claiming "{cap}
+    /// dispatch attempts"), and a stale pre-moot backoff deadline
+    /// silently deferred the re-probe dispatch by up to a full backoff
+    /// window. Destructuring `Self` makes the omission class
+    /// unwritable: adding a field without deciding its revival
+    /// disposition HERE is a compile error.
     pub fn clear(&mut self) {
-        self.count = 0;
-        self.resubmit_cycles = 0;
-        self.infra_count = 0;
-        self.timeout_count = 0;
-        self.last_infra_failure_at = None;
-        self.exempt_infra_count = 0;
-        self.failed_builders.clear();
-        self.failure_count = 0;
-        self.poisoned_at = None;
-        // Claims-deferral budgets (NOTE: claims_unavailable_count is
-        // known-missing here pre-round-16 — merged_bug_022's W2-S8
-        // completeness sweep owns that; the unseeded twin is cleared
-        // from birth so the sweep finds one gap, not two).
-        self.unseeded_inputs_count = 0;
+        let Self {
+            count,
+            resubmit_cycles,
+            infra_count,
+            timeout_count,
+            last_infra_failure_at,
+            exempt_infra_count,
+            failed_builders,
+            failure_count,
+            poisoned_at,
+            backoff_until,
+            claims_unavailable_count,
+            unseeded_inputs_count,
+        } = self;
+        // Every field is failure-tracking; every field resets. A future
+        // field that must SURVIVE revival gets an explicit `let _ = x;`
+        // arm with a doc comment — never a silent omission.
+        *count = 0;
+        *resubmit_cycles = 0;
+        *infra_count = 0;
+        *timeout_count = 0;
+        *last_infra_failure_at = None;
+        *exempt_infra_count = 0;
+        failed_builders.clear();
+        *failure_count = 0;
+        *poisoned_at = None;
+        *backoff_until = None;
+        *claims_unavailable_count = 0;
+        *unseeded_inputs_count = 0;
     }
 }
 
@@ -2264,6 +2291,94 @@ pub const POISON_TTL: std::time::Duration = std::time::Duration::from_millis(100
 
 #[cfg(test)]
 mod tests {
+
+    // r[verify sched.retry.revival-total-reset]
+    /// merged_bug_022: clear() must reset EVERY field. The construction
+    /// below populates every field non-default through the same
+    /// exhaustive-destructure discipline as clear() itself — adding a
+    /// RetryState field breaks this test at compile time until both
+    /// sites decide its disposition.
+    #[test]
+    fn retry_clear_resets_every_field() {
+        use super::RetryState;
+        let mut r = RetryState {
+            count: 3,
+            resubmit_cycles: 2,
+            infra_count: 4,
+            timeout_count: 1,
+            last_infra_failure_at: Some(std::time::Instant::now()),
+            exempt_infra_count: 5,
+            failed_builders: [crate::state::ExecutorId::from("w1")].into_iter().collect(),
+            failure_count: 6,
+            poisoned_at: Some(std::time::Instant::now()),
+            backoff_until: Some(std::time::Instant::now() + std::time::Duration::from_secs(3600)),
+            claims_unavailable_count: 7,
+            unseeded_inputs_count: 8,
+        };
+        r.clear();
+        let RetryState {
+            count,
+            resubmit_cycles,
+            infra_count,
+            timeout_count,
+            last_infra_failure_at,
+            exempt_infra_count,
+            failed_builders,
+            failure_count,
+            poisoned_at,
+            backoff_until,
+            claims_unavailable_count,
+            unseeded_inputs_count,
+        } = r;
+        assert_eq!(count, 0);
+        assert_eq!(resubmit_cycles, 0);
+        assert_eq!(infra_count, 0);
+        assert_eq!(timeout_count, 0);
+        assert!(last_infra_failure_at.is_none());
+        assert_eq!(exempt_infra_count, 0);
+        assert!(failed_builders.is_empty());
+        assert_eq!(failure_count, 0);
+        assert!(poisoned_at.is_none());
+        assert!(
+            backoff_until.is_none(),
+            "a stale pre-revival backoff deadline must not defer the re-probe"
+        );
+        assert_eq!(
+            claims_unavailable_count, 0,
+            "a maxed claims budget must not survive revival"
+        );
+        assert_eq!(unseeded_inputs_count, 0);
+    }
+
+    // r[verify sched.retry.revival-total-reset]
+    /// The harm path: a node whose claims budget was EXHAUSTED before
+    /// revival must get the full ladder again — first post-revival
+    /// store blip charges as Backoff(0), never instant Exhausted (the
+    /// pre-fix poison falsely claimed "{cap} dispatch attempts" on
+    /// attempt one).
+    #[test]
+    fn retry_clear_restores_full_claims_ladder() {
+        use super::{ChargeDecision, FailureClass, RetryState};
+        let cap = 3;
+        let mut r = RetryState::default();
+        for _ in 0..cap {
+            assert!(matches!(
+                r.charge(FailureClass::ClaimsUnavailable, cap),
+                ChargeDecision::Backoff(_)
+            ));
+        }
+        assert_eq!(
+            r.charge(FailureClass::ClaimsUnavailable, cap),
+            ChargeDecision::Exhausted,
+            "fixture premise: budget exhausted pre-revival"
+        );
+        r.clear();
+        assert_eq!(
+            r.charge(FailureClass::ClaimsUnavailable, cap),
+            ChargeDecision::Backoff(0),
+            "revival must restore the full ladder, not instant re-poison"
+        );
+    }
 
     // r[verify sched.closure.witness-epoch]
     /// The witness-epoch boundary in the type: a same-definition carry
