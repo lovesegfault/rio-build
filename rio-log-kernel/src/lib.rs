@@ -238,6 +238,71 @@ pub fn visit_chunk(next_line: u64, first_line: u64, n_lines: u64) -> ChunkVisit 
     }
 }
 
+/// Why one connected `TailLog` stream stopped yielding messages, as
+/// the relay's loop observed it. The conflations this enum forbids are
+/// the merged_bug_076 class: an `Err` is always [`TransportErr`] and a
+/// clean `None` is always [`NaturalEnd`] — neither means "drained"
+/// on its own; only [`tail_next`] decides that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailStopCause {
+    /// The stream ended cleanly (the serving session closed).
+    NaturalEnd,
+    /// The stream (or its open) died with a transport/status error.
+    TransportErr,
+    /// The open call itself failed — there was never a stream.
+    OpenFailed,
+    /// The relay observed a forward jump it has not yet accepted (the
+    /// gap-discipline path: re-open once at the gap before relaying a
+    /// disclosure).
+    GapObserved,
+}
+
+/// The verdict of [`tail_next`].
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailNext {
+    /// Re-open the stream (after the caller-owned backoff, capped at
+    /// the remaining grace).
+    Reopen,
+    /// The subscription is finished.
+    Exit,
+}
+
+/// The relay's exit-decision kernel: may a `TailLog` subscription stop
+/// re-opening?
+///
+/// The law (merged_bug_076): **Exit iff the grace budget is spent, or
+/// the stream ended naturally with the derivation terminal and the
+/// served log complete.** Every other shape re-opens — a transport
+/// error after terminal, an open failure at terminal, a natural end
+/// with an incomplete served log, a gap awaiting its second chance:
+/// all of these have lines that may still be servable and budget to
+/// fetch them with. "Give up with grace unspent and the log
+/// incomplete" is unrepresentable by this function.
+///
+/// `terminal` is "the derivation reached a terminal status";
+/// `grace_expired` is "the armed-once post-terminal grace deadline has
+/// passed" (false whenever the deadline is not yet armed);
+/// `served_complete` is the most recent final message's `is_complete`
+/// — the store's own claim that everything durable was served.
+pub fn tail_next(
+    cause: TailStopCause,
+    terminal: bool,
+    grace_expired: bool,
+    served_complete: bool,
+) -> TailNext {
+    if grace_expired {
+        return TailNext::Exit;
+    }
+    match cause {
+        TailStopCause::NaturalEnd if terminal && served_complete => TailNext::Exit,
+        TailStopCause::NaturalEnd
+        | TailStopCause::TransportErr
+        | TailStopCause::OpenFailed
+        | TailStopCause::GapObserved => TailNext::Reopen,
+    }
+}
+
 /// The divergence between a chunk's manifest claim and what its object
 /// actually decompressed to. The manifest row and the object are
 /// written from the same line slice in the same call, so any
@@ -702,6 +767,59 @@ mod proofs {
         }
     }
 
+    /// [`tail_next`] never exits prematurely: with grace budget
+    /// remaining and the served log not complete, the verdict is
+    /// Reopen for EVERY cause/terminal combination — the three
+    /// premature-exit shapes of merged_bug_076 (Err conflated to
+    /// drained, open-failure at terminal, natural end with an
+    /// incomplete log) are unrepresentable. Exhaustive over the
+    /// 4x2x2x2 input domain.
+    #[kani::proof]
+    fn check_tail_next_no_premature_exit() {
+        let cause: u8 = kani::any();
+        kani::assume(cause < 4);
+        let cause = match cause {
+            0 => TailStopCause::NaturalEnd,
+            1 => TailStopCause::TransportErr,
+            2 => TailStopCause::OpenFailed,
+            _ => TailStopCause::GapObserved,
+        };
+        let terminal: bool = kani::any();
+        let served_complete: bool = kani::any();
+        // Grace unspent + log not served-complete => never Exit.
+        if !served_complete {
+            assert!(tail_next(cause, terminal, false, served_complete) == TailNext::Reopen);
+        }
+        // Grace unspent + not a natural end => never Exit, even when
+        // complete (an erred stream gets its retry).
+        if cause != TailStopCause::NaturalEnd {
+            assert!(tail_next(cause, terminal, false, served_complete) == TailNext::Reopen);
+        }
+    }
+
+    /// [`tail_next`] always honours the spent grace budget: Exit for
+    /// every cause/terminal/completeness combination once
+    /// `grace_expired` — the loop is provably finite past the
+    /// deadline. And the one legitimate early exit is exactly
+    /// (NaturalEnd && terminal && served_complete).
+    #[kani::proof]
+    fn check_tail_next_grace_exit() {
+        let cause: u8 = kani::any();
+        kani::assume(cause < 4);
+        let cause = match cause {
+            0 => TailStopCause::NaturalEnd,
+            1 => TailStopCause::TransportErr,
+            2 => TailStopCause::OpenFailed,
+            _ => TailStopCause::GapObserved,
+        };
+        let terminal: bool = kani::any();
+        let served_complete: bool = kani::any();
+        assert!(tail_next(cause, terminal, true, served_complete) == TailNext::Exit);
+        // The early-exit cell, exactly.
+        let early = tail_next(cause, terminal, false, served_complete) == TailNext::Exit;
+        assert!(early == (cause == TailStopCause::NaturalEnd && terminal && served_complete));
+    }
+
     /// Verify [`visit_object`] against its contracts for every
     /// quadruple under the BIGINT precondition: the visit equals the
     /// dedup verdict over the clamped count, and the divergence
@@ -1041,6 +1159,37 @@ mod tests {
             assert_eq!(v, expected, "visit_chunk({cursor}, {first}, {n})");
             assert_eq!(v.is_empty(), matches!(expected, Skip { .. }));
             assert_eq!(v.next_line(), expected.next_line());
+        }
+    }
+
+    /// The full tail_next decision table: 4 causes x terminal x
+    /// grace_expired x served_complete. Exit cells: every
+    /// grace_expired row, plus exactly (NaturalEnd, terminal,
+    /// !grace_expired, served_complete).
+    #[test]
+    fn tail_next_decision_table() {
+        use TailNext::*;
+        use TailStopCause::*;
+        let causes = [NaturalEnd, TransportErr, OpenFailed, GapObserved];
+        for cause in causes {
+            for terminal in [false, true] {
+                for grace_expired in [false, true] {
+                    for served_complete in [false, true] {
+                        let got = tail_next(cause, terminal, grace_expired, served_complete);
+                        let want = if grace_expired
+                            || (cause == NaturalEnd && terminal && served_complete)
+                        {
+                            Exit
+                        } else {
+                            Reopen
+                        };
+                        assert_eq!(
+                            got, want,
+                            "tail_next({cause:?}, {terminal}, {grace_expired}, {served_complete})"
+                        );
+                    }
+                }
+            }
         }
     }
 
