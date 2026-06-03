@@ -19551,6 +19551,10 @@
           "packageId": "rio-crds"
         },
         {
+          "name": "rio-log-kernel",
+          "packageId": "rio-log-kernel"
+        },
+        {
           "name": "rio-proto",
           "packageId": "rio-proto"
         },

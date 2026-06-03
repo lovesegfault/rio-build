@@ -13,6 +13,7 @@ name = "rio-cli"
 path = "src/main.rs"
 
 [dependencies]
+rio-log-kernel = { workspace = true }
 rio-auth = { workspace = true }
 rio-common = { workspace = true }
 rio-proto = { workspace = true }

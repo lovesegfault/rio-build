@@ -13,7 +13,8 @@
 use std::io::Write;
 
 use anyhow::anyhow;
-use rio_proto::store::TailLogRequest;
+use rio_log_kernel::{ChunkVisit, visit_chunk};
+use rio_proto::store::{TailLogChunk, TailLogRequest};
 
 use crate::LogsClient;
 use crate::RPC_TIMEOUT;
@@ -98,20 +99,147 @@ pub(crate) async fn run(client: &mut LogsClient, a: Args) -> anyhow::Result<()> 
     // error) stays silent.
     // r[impl obs.log.incomplete-surfaced+2]
     let mut last_complete = true;
+    // The shared kernel cursor: dedups chunk-granularity resends (the
+    // store legally re-serves whole containing chunks) and names
+    // forward jumps instead of printing a seamless splice
+    // (merged_bug_306 CLI half).
+    let mut cursor = 0u64;
+    let mut gap_seen = false;
     while let Some(chunk) = stream
         .message()
         .await
         .map_err(|s| anyhow!("TailLog: stream: {} ({:?})", s.message(), s.code()))?
     {
         last_complete = chunk.is_complete;
-        for line in &chunk.lines {
+        emit_chunk(&mut out, &mut cursor, &mut gap_seen, &chunk)?;
+    }
+    out.flush()?;
+    // Interior gaps and a truncated tail are different failure shapes:
+    // the marker lines above name the former; the note here says which
+    // applies so a clean-looking log is never silently partial.
+    if !last_complete && gap_seen {
+        eprintln!(
+            "(log incomplete — interior lines missing from the stored log (marked inline); \
+             the tail may also be truncated)"
+        );
+    } else if !last_complete {
+        eprintln!("(log incomplete — build still running, cancelled, or flush pending)");
+    } else if gap_seen {
+        eprintln!("(stored log has interior gaps — marked inline)");
+    }
+    Ok(())
+}
+
+/// Emit one chunk through the shared cursor: skip the already-printed
+/// prefix, print the new lines, and disclose a forward jump with one
+/// inline marker line before the chunk that revealed it.
+fn emit_chunk<W: Write>(
+    out: &mut W,
+    cursor: &mut u64,
+    gap_seen: &mut bool,
+    chunk: &TailLogChunk,
+) -> std::io::Result<()> {
+    let write_range = |out: &mut W, from: u64, until: u64| -> std::io::Result<()> {
+        let first = chunk.first_line_number;
+        for n in from..until {
+            // The kernel guarantees [from, until) lies inside the
+            // chunk; the index arithmetic cannot wrap.
+            let line = &chunk.lines[usize::try_from(n - first).expect("kernel-bounded index")];
             out.write_all(line)?;
             out.write_all(b"\n")?;
         }
-    }
-    out.flush()?;
-    if !last_complete {
-        eprintln!("(log incomplete — build still running, cancelled, or flush pending)");
+        Ok(())
+    };
+    match visit_chunk(*cursor, chunk.first_line_number, chunk.lines.len() as u64) {
+        ChunkVisit::Skip { .. } => {}
+        ChunkVisit::Serve {
+            yield_from,
+            yield_until,
+            next_line,
+        } => {
+            write_range(out, yield_from, yield_until)?;
+            *cursor = next_line;
+        }
+        ChunkVisit::GapThenServe {
+            gap_from,
+            gap_until,
+            yield_from,
+            yield_until,
+            next_line,
+        } => {
+            *gap_seen = true;
+            writeln!(
+                out,
+                "≡ rio: lines {}-{} missing from stored log ≡",
+                gap_from,
+                gap_until.saturating_sub(1)
+            )?;
+            write_range(out, yield_from, yield_until)?;
+            *cursor = next_line;
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(first: u64, lines: &[&str]) -> TailLogChunk {
+        TailLogChunk {
+            exec_id: String::new(),
+            lines: lines.iter().map(|l| l.as_bytes().to_vec()).collect(),
+            first_line_number: first,
+            is_complete: false,
+        }
+    }
+
+    fn drain(chunks: &[TailLogChunk]) -> (String, bool) {
+        let mut out = Vec::new();
+        let mut cursor = 0u64;
+        let mut gap_seen = false;
+        for c in chunks {
+            emit_chunk(&mut out, &mut cursor, &mut gap_seen, c).unwrap();
+        }
+        (String::from_utf8(out).unwrap(), gap_seen)
+    }
+
+    /// The store's chunk granularity legally re-serves whole containing
+    /// chunks; the cursor prints each line exactly once.
+    #[test]
+    fn resent_prefix_is_not_double_printed() {
+        let (out, gap) = drain(&[chunk(0, &["a", "b"]), chunk(0, &["a", "b", "c"])]);
+        assert_eq!(out, "a\nb\nc\n", "no double-printed prefix");
+        assert!(!gap);
+    }
+
+    // r[verify store.log.tail-reconnect]
+    /// A wholly-stale chunk (everything below the cursor) prints
+    /// nothing and does not move the cursor.
+    #[test]
+    fn stale_chunk_is_skipped() {
+        let (out, gap) = drain(&[chunk(0, &["a", "b", "c"]), chunk(0, &["a", "b"])]);
+        assert_eq!(out, "a\nb\nc\n");
+        assert!(!gap);
+    }
+
+    /// A forward jump prints one marker naming the missing span, then
+    /// the chunk — never a seamless splice (merged_bug_306).
+    #[test]
+    fn gap_prints_inline_marker() {
+        let (out, gap) = drain(&[chunk(0, &["a"]), chunk(100, &["z"])]);
+        assert_eq!(
+            out, "a\n≡ rio: lines 1-99 missing from stored log ≡\nz\n",
+            "the marker sits between line 0 and line 100"
+        );
+        assert!(gap, "the gap flag drives the stderr note");
+    }
+
+    /// A zero-line (final-state) chunk is invisible to the cursor.
+    #[test]
+    fn empty_final_chunk_prints_nothing() {
+        let (out, gap) = drain(&[chunk(0, &["a"]), chunk(1, &[])]);
+        assert_eq!(out, "a\n");
+        assert!(!gap);
+    }
 }
