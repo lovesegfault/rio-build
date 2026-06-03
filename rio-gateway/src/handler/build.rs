@@ -2527,7 +2527,12 @@ mod tests {
                     unverifiable: false,
                 },
                 MISSING => TargetOutputsCheck {
-                    missing: vec!["output 'out' (/nix/store/x-out) is not valid".into()],
+                    // The producer's exact entry shape
+                    // (check_targets_against_store's FindMissingPaths arm:
+                    // "output '{name}' ({path}) is not valid in the store").
+                    missing: vec![
+                        "output 'out' (/nix/store/x-out) is not valid in the store".into(),
+                    ],
                     confirmed_present: false,
                     realized: HashMap::new(),
                     wanted_names: vec!["out".into()],
