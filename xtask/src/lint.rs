@@ -73,6 +73,16 @@ pub enum Lint {
     /// registered. Catches write-only witnesses: contracts that are
     /// produced and documented but never demanded by any consumer.
     ContractRegistry,
+    /// Every external-IO call shape (`.send()` dispatch, awaited
+    /// `.collect()`/`.text()` body buffering, `.read_to_end(`) in
+    /// rio-replay's supply/substituter/archive modules carries an
+    /// adjacent `// bounded-io: <bound>` marker stating its time/size
+    /// bound or deliberate waiver, and every marker annotates such a
+    /// call. Catches a new unbounded arm at introduction — the
+    /// per-arm-guard pattern (deadline added where a problem was
+    /// noticed, sibling arms left exposed) that produced the relay
+    /// header-wait wedge and the unbounded narinfo collect.
+    BoundedIo,
 }
 
 impl Lint {
@@ -93,6 +103,7 @@ impl Lint {
             Lint::ReplayCnpPreflight,
             Lint::StructuredAttrReads,
             Lint::ContractRegistry,
+            Lint::BoundedIo,
         ]
     }
 }
@@ -107,6 +118,7 @@ pub fn run(lint: &Lint) -> Result<()> {
         Lint::ReplayCnpPreflight => replay_cnp_preflight(),
         Lint::StructuredAttrReads => structured_attr_reads(),
         Lint::ContractRegistry => contract_registry(),
+        Lint::BoundedIo => bounded_io(),
     }
 }
 
@@ -1688,6 +1700,296 @@ fn contract_registry() -> Result<()> {
     check_contract_registry(CONTRACT_REGISTRY, &capability_flags, &digest_fields, &read)
 }
 
+/// Marker comment tag for [`bounded_io`]: `// bounded-io: <bound>`.
+const BOUNDED_IO_MARKER: &str = "bounded-io:";
+
+/// Bounded-IO marker gate over the replay engine's external-IO modules.
+///
+/// Quantification domain (stated, per the lint contract): production
+/// code — everything before a file's first `#[cfg(test)]` line — under
+/// EXACTLY these roots:
+///
+/// - `rio-replay/src/run/supply/` (the upload/prefetch execution arms),
+/// - `rio-replay/src/substituter.rs` (the binary-cache client),
+/// - `rio-replay/src/archive/` (the S3 layout and image backends);
+///
+/// and EXACTLY this needle alphabet ([`bounded_io_needle`]): `.send()`
+/// (empty-parens HTTP/SDK request dispatch — channel/`mpsc` sends take an
+/// argument and do not match), `.collect()`/`.text()` immediately awaited
+/// (wholesale body buffering; iterator collects are never awaited), and
+/// `.read_to_end(` (reader draining). These are the modules where the
+/// resource-bound defect class clustered and the call shapes it wore: a
+/// deadline or size cap added at the arm where a problem was noticed
+/// while sibling arms stayed exposed (the narinfo collect outliving its
+/// send-only timeout, the relay header wait with no deadline at all).
+///
+/// The gate is two-directional:
+///
+/// - every needle must carry an adjacent `// bounded-io: <bound>` marker
+///   — on the needle's line, or above it within the same statement — so
+///   new IO in these modules cannot land without DECIDING and STATING
+///   its time/size bound (or explicitly waiving one with the rationale);
+/// - every marker must annotate a needle in its own statement, so a
+///   justification cannot outlive the call it vouches for.
+///
+/// HONESTY CLAUSE: this is a textual tripwire, not a by-construction
+/// guarantee. IO routed through helpers outside the alphabet, or living
+/// outside the three roots, is invisible to it. The by-construction
+/// version is transport-handle encapsulation — bounded combinators that
+/// OWN the reqwest/aws clients so a raw `.send()` is unreachable outside
+/// them, making an unbounded arm unwritable rather than unblessed.
+// TODO: transport-handle encapsulation for the replay engine's external
+// IO: move the reqwest client and the aws-sdk clients behind combinators
+// that demand a (deadline, size-bound) at construction or per call
+// (`fetch_nar`'s take-discipline and `narinfo`'s deadline+cap are the
+// shapes to generalize), then narrow this lint to "no raw client handles
+// outside the combinator module" — at which point the by-construction
+// claim above becomes real instead of aspirational.
+fn bounded_io() -> Result<()> {
+    let root = repo_root();
+    // Module allowlist — see the doc comment for why exactly these.
+    let file_roots = ["rio-replay/src/substituter.rs"];
+    let dir_roots = ["rio-replay/src/run/supply", "rio-replay/src/archive"];
+
+    let mut needles = 0usize;
+    let mut files = 0usize;
+    let mut violations: Vec<String> = Vec::new();
+    let mut scan = |path: &Path| -> Result<()> {
+        let src =
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        files += 1;
+        needles += check_bounded_io_file(&src, &rel, &mut violations);
+        Ok(())
+    };
+    for rel in file_roots {
+        let path = root.join(rel);
+        ensure!(path.is_file(), "bounded-io scan root {rel} not found");
+        scan(&path)?;
+    }
+    for rel in dir_roots {
+        let path = root.join(rel);
+        ensure!(path.is_dir(), "bounded-io scan root {rel} not found");
+        walk_rs(&path, &mut scan)?;
+    }
+
+    // Floor guards: ~19 production needles across ~12 files today. A
+    // collapse means the needle detection or the roots regressed, not
+    // that the modules stopped doing IO.
+    ensure!(
+        files >= 5,
+        "bounded-io scan visited only {files} file(s) — a scan root has regressed",
+    );
+    ensure!(
+        needles >= 12,
+        "bounded-io scan found only {needles} IO call site(s) — suspiciously few; the needle \
+         detection or the scan roots have regressed",
+    );
+    if !violations.is_empty() {
+        bail!(
+            "{} bounded-io violation(s):\n    {}\n  every external-IO call in the \
+             supply/substituter/archive modules needs an adjacent `// {BOUNDED_IO_MARKER} \
+             <time/size bound, or the deliberate waiver>` comment, and every marker must \
+             annotate such a call",
+            violations.len(),
+            violations.join("\n    "),
+        );
+    }
+    tracing::info!(files, needles, "bounded-io ok");
+    Ok(())
+}
+
+/// Scan one file for [`bounded_io`]: returns the number of needles found,
+/// pushing a violation for every unblessed needle and every stale marker.
+/// Only the production region is scanned — everything from the first
+/// `#[cfg(test)]` line onward is test code (loopback fixtures, mock
+/// clients), where bounding IO is meaningless.
+fn check_bounded_io_file(src: &str, rel: &str, violations: &mut Vec<String>) -> usize {
+    let lines: Vec<&str> = src.lines().collect();
+    let prod_end = lines
+        .iter()
+        .position(|line| line.trim() == "#[cfg(test)]")
+        .unwrap_or(lines.len());
+    let lines = &lines[..prod_end];
+    let mut needles = 0usize;
+    for i in 0..lines.len() {
+        let trimmed = lines[i].trim_start();
+        if !trimmed.starts_with("//") && bounded_io_needle(lines, i).is_some() {
+            needles += 1;
+            if !bounded_io_marker_blesses(lines, i) {
+                violations.push(format!(
+                    "{rel}:{}: external-IO call (`{}`) without an adjacent \
+                     `{BOUNDED_IO_MARKER}` bound statement",
+                    i + 1,
+                    bounded_io_needle(lines, i).expect("needle was just matched"),
+                ));
+            }
+        }
+        // Staleness covers BOTH marker placements — pure comment lines
+        // AND markers trailing code — so a refactor cannot leave either
+        // shape vouching for nothing.
+        if lines[i].contains(BOUNDED_IO_MARKER)
+            && !trimmed.starts_with("///")
+            && !trimmed.starts_with("//!")
+            && !bounded_io_marker_annotates(lines, i)
+        {
+            violations.push(format!(
+                "{rel}:{}: stale `{BOUNDED_IO_MARKER}` marker — no external-IO call in the \
+                 statement it annotates",
+                i + 1,
+            ));
+        }
+    }
+    needles
+}
+
+/// Needle test for [`bounded_io`] at line `idx`: the comment-stripped
+/// code's external-IO call shape, if any.
+///
+/// `.collect()`/`.text()` count only when immediately awaited (same line,
+/// or the next non-empty/non-comment line starts with `.await`) — that is
+/// the body-buffering shape; iterator collects are never awaited, so the
+/// adjacency requirement is what keeps them out of the alphabet.
+fn bounded_io_needle(lines: &[&str], idx: usize) -> Option<&'static str> {
+    let code = strip_line_comment(lines[idx]);
+    if code.contains(".send()") {
+        return Some(".send()");
+    }
+    if code.contains(".read_to_end(") {
+        return Some(".read_to_end(");
+    }
+    for (token, name) in [
+        (".collect()", ".collect().await"),
+        (".text()", ".text().await"),
+    ] {
+        if !code.contains(token) {
+            continue;
+        }
+        if code.contains(".await") {
+            return Some(name);
+        }
+        for line in lines.iter().skip(idx + 1) {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.starts_with(".await") {
+                return Some(name);
+            }
+            break;
+        }
+    }
+    None
+}
+
+/// Is this trimmed line a plain `//` comment carrying the bounded-io
+/// marker? Doc comments (`///`, `//!`) describing the convention are
+/// prose, not per-site bound statements.
+fn is_bounded_io_marker_comment(trimmed: &str) -> bool {
+    trimmed.starts_with("//")
+        && !trimmed.starts_with("///")
+        && !trimmed.starts_with("//!")
+        && trimmed.contains(BOUNDED_IO_MARKER)
+}
+
+/// Upward adjacency: does a `bounded-io:` marker bless the needle at
+/// `needle_idx`? The marker may trail the needle line itself, or sit
+/// above it separated only by comment/attribute/statement-continuation
+/// lines. The statement boundary is checked on the COMMENT-STRIPPED code
+/// FIRST: a line whose code part carries `;`, `{`, or `}` belongs to a
+/// different statement, so a marker trailing IT cannot bless this needle
+/// (honoring the trailing marker before the boundary would let one
+/// statement's justification leak onto its neighbor).
+fn bounded_io_marker_blesses(lines: &[&str], needle_idx: usize) -> bool {
+    if lines[needle_idx].contains(BOUNDED_IO_MARKER) {
+        return true;
+    }
+    let mut budget = 30usize;
+    for line in lines[..needle_idx].iter().rev() {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            if is_bounded_io_marker_comment(trimmed) {
+                return true;
+            }
+            continue;
+        }
+        if trimmed.starts_with("#[") {
+            continue;
+        }
+        let code = strip_line_comment(line);
+        if code.contains(';') || code.contains('{') || code.contains('}') {
+            return false;
+        }
+        if line.contains(BOUNDED_IO_MARKER) {
+            // Trailing marker on a continuation line of this statement.
+            return true;
+        }
+    }
+    false
+}
+
+/// Staleness check, mirroring [`bounded_io_marker_blesses`] exactly: the
+/// marker at `marker_idx` (a pure comment line, or trailing a code line)
+/// must share a statement with a needle. Pure comment lines look DOWN
+/// into the first statement below; trailing markers look at their own
+/// line and UP through the statement they terminate. Per code line the
+/// needle test runs before the boundary test, so `…send().await?;` —
+/// needle and terminator on one line — still counts.
+fn bounded_io_marker_annotates(lines: &[&str], marker_idx: usize) -> bool {
+    if bounded_io_needle(lines, marker_idx).is_some() {
+        return true;
+    }
+    let mut budget = 30usize;
+    if lines[marker_idx].trim_start().starts_with("//") {
+        // Pure comment: scan down into the first statement.
+        for (j, line) in lines.iter().enumerate().skip(marker_idx + 1) {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("#[") {
+                continue;
+            }
+            if bounded_io_needle(lines, j).is_some() {
+                return true;
+            }
+            let code = strip_line_comment(line);
+            if code.contains(';') || code.contains('{') || code.contains('}') {
+                return false;
+            }
+        }
+    } else {
+        // Trailing marker: scan up through its own statement.
+        for j in (0..marker_idx).rev() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            let trimmed = lines[j].trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("#[") {
+                continue;
+            }
+            if bounded_io_needle(lines, j).is_some() {
+                return true;
+            }
+            let code = strip_line_comment(lines[j]);
+            if code.contains(';') || code.contains('{') || code.contains('}') {
+                return false;
+            }
+        }
+    }
+    false
+}
+
 /// Recursive `.rs` walk via `std` (no `walkdir` dep). Follows symlinks
 /// — under the nix flake check, the corpus dirs are staged into a
 /// store-path source tree and may be symlinked.
@@ -2279,4 +2581,115 @@ mod tests {
     // walk needs the real repo layout, which the nextest sandbox
     // doesn't guarantee. The pure pieces are tested here; the
     // `xtask-lint` flake check runs the scan against the real tree.
+
+    // ── bounded-io ─────────────────────────────────────────────────
+
+    /// Run [`check_bounded_io_file`] over a synthetic source; returns
+    /// (needles, violations).
+    fn bio(src: &str) -> (usize, Vec<String>) {
+        let mut violations = Vec::new();
+        let needles = check_bounded_io_file(src, "synthetic.rs", &mut violations);
+        (needles, violations)
+    }
+
+    #[test]
+    fn bounded_io_unmarked_send_fails_marked_passes() {
+        // Bare dispatch: flagged with file:line and the needle shape.
+        let (needles, v) = bio("let resp = client.get(url).send().await?;\n");
+        assert_eq!((needles, v.len()), (1, 1), "{v:?}");
+        assert!(
+            v[0].contains("synthetic.rs:1") && v[0].contains(".send()"),
+            "{v:?}"
+        );
+
+        // Trailing marker on the needle line blesses it.
+        let (needles, v) = bio(
+            "let resp = client.get(url).send().await?; // bounded-io: request timeout spans body\n",
+        );
+        assert_eq!((needles, v.len()), (1, 0), "{v:?}");
+
+        // Marker comment above the statement blesses a multi-line chain.
+        let (needles, v) = bio("let resp = client\n\
+             \x20   .get(url)\n\
+             \x20   // bounded-io: request timeout spans body\n\
+             \x20   .send()\n\
+             \x20   .await?;\n");
+        assert_eq!((needles, v.len()), (1, 0), "{v:?}");
+
+        // A channel-style send (argument present) is not in the alphabet.
+        let (needles, v) = bio("tx.send(value).await?;\n");
+        assert_eq!((needles, v.len()), (0, 0), "{v:?}");
+    }
+
+    #[test]
+    fn bounded_io_collect_needs_await_adjacency() {
+        // ByteStream collect (awaited): a needle.
+        let (needles, v) = bio("let bytes = resp\n\
+             \x20   .body\n\
+             \x20   .collect()\n\
+             \x20   .await?;\n");
+        assert_eq!((needles, v.len()), (1, 1), "{v:?}");
+
+        // Iterator collect (never awaited): not a needle, and a marker
+        // on it is stale.
+        let (needles, v) = bio("let xs: Vec<_> = ys.iter().map(f).collect();\n");
+        assert_eq!((needles, v.len()), (0, 0), "{v:?}");
+        let (_, v) = bio("// bounded-io: stale — annotates an iterator collect\n\
+             let xs: Vec<_> = ys.iter().map(f).collect();\n");
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].contains("stale"), "{v:?}");
+    }
+
+    #[test]
+    fn bounded_io_statement_boundary_cuts_a_trailing_marker() {
+        // A marker trailing the PREVIOUS statement (its code part ends
+        // with `;`) must not bless the next statement's needle — the
+        // boundary is checked on the comment-stripped code BEFORE the
+        // trailing marker is honored.
+        let (needles, v) = bio(
+            "let a = setup(); // bounded-io: belongs to this statement only\n\
+             let resp = client\n\
+             \x20   .get(url)\n\
+             \x20   .send()\n\
+             \x20   .await?;\n",
+        );
+        assert_eq!(needles, 1);
+        assert_eq!(v.len(), 2, "unblessed needle AND stale marker: {v:?}");
+        assert!(v.iter().any(|m| m.contains("without an adjacent")), "{v:?}");
+        assert!(v.iter().any(|m| m.contains("stale")), "{v:?}");
+
+        // The same trailing marker IS valid when its own statement has
+        // the needle.
+        let (needles, v) = bio("let r = c.send().await?; // bounded-io: deadline upstream\n");
+        assert_eq!((needles, v.len()), (1, 0), "{v:?}");
+    }
+
+    #[test]
+    fn bounded_io_test_region_is_skipped() {
+        // Needles after `#[cfg(test)]` are loopback fixtures, not
+        // production IO — neither flagged nor counted.
+        let (needles, v) = bio("fn prod() {} \n\
+             #[cfg(test)]\n\
+             mod tests {\n\
+             \x20   async fn t() { client.get(u).send().await; }\n\
+             }\n");
+        assert_eq!((needles, v.len()), (0, 0), "{v:?}");
+    }
+
+    #[test]
+    fn bounded_io_doc_comment_mention_is_prose() {
+        // `///` prose describing the convention is neither a marker nor
+        // stale.
+        let (needles, v) = bio(
+            "/// Sites carry `// bounded-io: <bound>` markers, enforced\n\
+             /// by xtask lint.\n\
+             pub struct Client;\n",
+        );
+        assert_eq!((needles, v.len()), (0, 0), "{v:?}");
+    }
+
+    // As with the other file-walking lints, `bounded_io` itself (root
+    // existence, floor guards, the real-tree scan) runs in the
+    // `xtask-lint` flake check; the per-file scanner and its adjacency
+    // semantics are fully covered here.
 }

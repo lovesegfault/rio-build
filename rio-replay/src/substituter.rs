@@ -229,6 +229,8 @@ impl Substituter {
                 let resp = client
                     .get(url.clone())
                     .timeout(deadline)
+                    // bounded-io: per-request timeout(deadline) spans
+                    // dispatch, headers, and the body read below
                     .send()
                     .await
                     .with_context(|| format!("GET {url}"))?;
@@ -268,6 +270,8 @@ impl Substituter {
                 // discharge at response headers and leave the collect free
                 // to pend on a stalled or trickling backend forever.
                 let fetch = async {
+                    // bounded-io: dispatch and body both run inside the
+                    // probe deadline wrapped around this whole block
                     let resp = match client.get_object().bucket(bucket).key(&key).send().await {
                         Ok(resp) => resp,
                         Err(err) if err.as_service_error().is_some_and(|e| e.is_no_such_key()) => {
@@ -322,6 +326,9 @@ impl Substituter {
         // size-mismatch check below then fires deterministically.
         let mut reader = reader.take(declared_size.saturating_add(1));
         reader
+            // bounded-io: size-capped by the take(declared_size + 1) above;
+            // deliberately no overall deadline (NAR bodies are huge), the
+            // streaming fetch's header phase is bounded by the caller
             .read_to_end(&mut nar)
             .await
             .with_context(|| format!("read NAR {} from {}", info.url, self.url()))?;
@@ -389,6 +396,11 @@ impl Substituter {
                 let url = base.object_url(&info.url)?;
                 let resp = client
                     .get(url.clone())
+                    // bounded-io: header-phase wait; supply callers wrap
+                    // this call in their op deadline, and the returned
+                    // body reader is consumed under the wire op's
+                    // payload-scaled deadline (no overall bound here by
+                    // design: NAR bodies are huge)
                     .send()
                     .await
                     .with_context(|| format!("GET {url}"))?;
@@ -415,6 +427,9 @@ impl Substituter {
                     .get_object()
                     .bucket(bucket)
                     .key(&key)
+                    // bounded-io: header-phase wait; same caller-owned
+                    // deadline contract as the HTTP arm above, body
+                    // consumed under the wire op's payload-scaled deadline
                     .send()
                     .await
                     .with_context(|| format!("GET s3://{bucket}/{key}"))?;
@@ -489,6 +504,8 @@ async fn read_capped_narinfo_body(reader: impl AsyncRead + Unpin, source: &str) 
     let mut reader = reader.take(MAX_NARINFO_BYTES + 1);
     let mut bytes = Vec::new();
     reader
+        // bounded-io: size-capped by the take(MAX_NARINFO_BYTES + 1)
+        // above; time-bounded by the probe deadline both callers hold
         .read_to_end(&mut bytes)
         .await
         .with_context(|| format!("read narinfo body from {source}"))?;

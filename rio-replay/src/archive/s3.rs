@@ -238,6 +238,8 @@ impl ArchiveStore {
             .head_object()
             .bucket(&self.bucket)
             .key(&key)
+            // bounded-io: HEAD of one control object, no body; SDK
+            // connect/dispatch defaults bound the wait
             .send()
             .await
         {
@@ -337,6 +339,8 @@ impl ArchiveStore {
             .bucket(&self.bucket)
             .key(key)
             .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+            // bounded-io: HEAD of one data object, no body; SDK
+            // connect/dispatch defaults bound the wait
             .send()
             .await
         {
@@ -479,6 +483,8 @@ impl ArchiveStore {
             .get_object()
             .bucket(&self.bucket)
             .key(key)
+            // bounded-io: dispatch of a small-control-object GET; SDK
+            // connect/dispatch defaults bound the header wait
             .send()
             .await
         {
@@ -494,6 +500,8 @@ impl ArchiveStore {
         };
         let bytes = resp
             .body
+            // bounded-io: small control object (complete.json-scale); the
+            // SDK's stalled-stream protection bounds a dead peer
             .collect()
             .await
             .with_context(|| format!("read s3://{}/{key}", self.bucket))?
@@ -621,6 +629,9 @@ impl ArchiveStore {
             .if_none_match("*")
             .checksum_sha256(sha256_base64(&image_digest.sha256)?)
             .body(body)
+            // bounded-io: multi-GiB image upload — deliberately no overall
+            // deadline; the payload is pre-checked against the S3
+            // single-PUT cap (ensure_single_put_size) before any traffic
             .send()
             .await
         {
@@ -654,6 +665,8 @@ impl ArchiveStore {
             .if_none_match("*")
             .checksum_sha256(sha256_base64(&archive_id)?)
             .body(ByteStream::from(manifest_bytes.to_vec()))
+            // bounded-io: small manifest body; SDK connect/dispatch
+            // defaults bound the wait
             .send()
             .await
         {
@@ -762,6 +775,8 @@ impl ArchiveStore {
             .if_none_match("*")
             .checksum_sha256(sha256_base64(&marker_sha256)?)
             .body(ByteStream::from(marker_bytes))
+            // bounded-io: small marker body; SDK connect/dispatch
+            // defaults bound the wait
             .send()
             .await
         {
@@ -856,6 +871,8 @@ impl ArchiveStore {
             .get_object()
             .bucket(&self.bucket)
             .key(&complete_key)
+            // bounded-io: dispatch of a marker-object GET; SDK
+            // connect/dispatch defaults bound the header wait
             .send()
             .await
             .with_context(|| {
@@ -866,6 +883,8 @@ impl ArchiveStore {
             })?;
         let marker_bytes = resp
             .body
+            // bounded-io: small marker object; the SDK's stalled-stream
+            // protection bounds a dead peer
             .collect()
             .await
             .with_context(|| format!("read s3://{}/{complete_key}", self.bucket))?
@@ -976,6 +995,8 @@ impl ArchiveStore {
                 request = request.continuation_token(token);
             }
             let page = request
+                // bounded-io: one LIST page (bounded response size); SDK
+                // connect/dispatch defaults bound the wait
                 .send()
                 .await
                 .with_context(|| format!("LIST s3://{}/{prefix}", self.bucket))?;
@@ -1006,6 +1027,8 @@ impl ArchiveStore {
                 .get_object()
                 .bucket(&self.bucket)
                 .key(&key)
+                // bounded-io: dispatch of a marker-object GET; SDK
+                // connect/dispatch defaults bound the header wait
                 .send()
                 .await
             {
@@ -1028,6 +1051,8 @@ impl ArchiveStore {
             };
             let bytes = resp
                 .body
+                // bounded-io: small marker object; the SDK's stalled-stream
+                // protection bounds a dead peer
                 .collect()
                 .await
                 .with_context(|| format!("read s3://{}/{key}", self.bucket))?
@@ -1060,6 +1085,10 @@ impl ArchiveStore {
             .get_object()
             .bucket(&self.bucket)
             .key(key)
+            // bounded-io: dispatch/header wait for the image download; the
+            // multi-GiB body below is deliberately unbounded in time
+            // (stalled-stream protection bounds a dead peer) and is
+            // streamed to disk, never buffered
             .send()
             .await
             .with_context(|| format!("GET s3://{}/{key}", self.bucket))?;

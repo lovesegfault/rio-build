@@ -264,7 +264,10 @@ in
             ../rio-migrations/migrations
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../.)
             # structured-attr-reads derives its scan domain from the
-            # workspace member list.
+            # workspace member list; bounded-io scans rio-replay's
+            # supply/substituter/archive modules — the whole-tree .rs
+            # fileset covers both (scan-root guards fail loud on a
+            # partial tree).
             ../Cargo.toml
             ../infra/helm/rio-build/templates/scheduler.yaml
             # seccomp-allowlist validates both Localhost profiles —
