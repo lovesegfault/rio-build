@@ -538,6 +538,11 @@
   ],
   "rio-evidence-kernel": [
     {
+      "path": "establish.rs",
+      "depth": 0,
+      "doc": "Total establishment decision kernel (§4.R2: ONE function, one home)."
+    },
+    {
       "path": "lib.rs",
       "depth": 0,
       "doc": "Pure closure-evidence decision kernel."

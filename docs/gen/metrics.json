@@ -139,6 +139,7 @@
     "rio_scheduler_stale_completed_reset_total",
     "rio_scheduler_stale_completed_substituted_total",
     "rio_scheduler_stale_realisation_filtered_total",
+    "rio_scheduler_status_outbox_depth",
     "rio_scheduler_substituting_derivations",
     "rio_scheduler_topdown_prune_total",
     "rio_scheduler_topdown_substitute_fail_total",
@@ -916,6 +917,11 @@
         "name": "rio_scheduler_stale_realisation_filtered_total",
         "kind": "counter",
         "help": "CA realisations dropped from cache-hit set because the realized path was GC'd from store. Same operator signal as stale_completed_reset; this counts the newly-inserted-CA path, that one counts the pre-existing-completed path."
+      },
+      {
+        "name": "rio_scheduler_status_outbox_depth",
+        "kind": "gauge",
+        "help": "Failed terminal-status persist batches awaiting the housekeeping tick's re-drive. Nonzero means PG persists are failing; a sustained nonzero depth means cancelled derivations' attempts stay open (their close rides the persist) until the flush succeeds."
       },
       {
         "name": "rio_scheduler_substituting_derivations",

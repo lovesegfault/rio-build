@@ -394,6 +394,13 @@
     },
     {
       "enum": "StreamProcessError",
+      "name": "ResyncRequired",
+      "crate": "rio-gateway",
+      "msg": "scheduler signalled event loss; resync via snapshot",
+      "doc": "The scheduler signalled irrecoverable event loss for this watcher (broadcast ring overrun → `BuildEvent.resync_required`). Reconnect-worthy with ZERO backoff: the server is healthy, this WATCHER fell behind — the fresh WatchBuild's snapshot is the recovery (gw.resync.loss-signal)."
+    },
+    {
+      "enum": "StreamProcessError",
       "name": "Transport",
       "crate": "rio-gateway",
       "msg": "build event stream error: {0}",
