@@ -1563,6 +1563,13 @@
     },
     {
       "enum": "SubstituteError",
+      "name": "AdmissionRefused",
+      "crate": "rio-store",
+      "msg": "NAR refused at admission: {0}",
+      "doc": "The NAR failed residency admission (`ingest::AdmittedNar`): for `.drv` paths, the bytes are not the text-CA preimage of the claimed path (or not a single-file NAR). Upstream signing keys are tenant-supplied — a verified sig is NOT a trust boundary — so without this gate a hostile upstream could park non-preimage bytes at a victim `.drv` path and seed forged `drv_modulo_cache` rows consumed as trusted evidence by the IA deriver-proof gate (round-17 merged_bug_063)."
+    },
+    {
+      "enum": "SubstituteError",
       "name": "Fetch",
       "crate": "rio-store",
       "msg": "upstream fetch failed: {0}",

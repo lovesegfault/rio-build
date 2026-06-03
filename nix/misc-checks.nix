@@ -1794,8 +1794,8 @@ in
           "1 test SIGNATURE decode; production entries via Signer::trusted_key_entry -> codec"
         check_count rio-store/src/metadata/cluster_key_history.rs 0 \
           "passes DB strings through; parse happens at the read gate via the codec"
-        check_count rio-store/src/substitute.rs 4 \
-          "3 test trusted-entry fixtures + 1 test SIGNATURE decode"
+        check_count rio-store/src/substitute.rs 5 \
+          "4 test trusted-entry fixtures (W1-S4's narinfo suite added one) + 1 test SIGNATURE decode; production entries via the codec"
         check_count rio-cli/src/keygen.rs 3 \
           "3 test fixtures verifying codec output; production writes via SecretEntry/PublicEntry encode"
 
