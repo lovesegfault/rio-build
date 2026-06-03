@@ -40,7 +40,8 @@ module ggCalibTerminatingPending {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).* from "../spawnCoherence"
 
   /// PRE-FIX pending predicate: no deletionTimestamp filter.
@@ -236,6 +237,7 @@ module ggCalibTerminatingPending {
       streak' = streak,
       pendingClose' = pendingClose,
       obsLive' = obsLive,
+      inBackoff' = inBackoff,
     }
   }
 

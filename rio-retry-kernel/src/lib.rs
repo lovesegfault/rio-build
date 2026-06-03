@@ -3470,6 +3470,20 @@ mod proofs {
             materialization_decide(&v1[..l1], u32::from(k)),
             materialization_decide(&v2[..l2], u32::from(k)),
         );
+
+        // A3: the sweep is invisible to the FULL counters fold, not
+        // just the park projection — `materialization_counters` (the
+        // [A] charge chokepoint's decision input: infra, worker-infra,
+        // and unobtainable counts since the lane's reset cut) is
+        // bit-identical over the swept view. `materialization_decide`
+        // is its `infra_since_reset >= max` projection, so this
+        // strictly subsumes the assertion above; both stay (the
+        // projection identity is the wrapper contract the scheduler
+        // relies on).
+        assert_eq!(
+            materialization_counters(&v1[..l1]),
+            materialization_counters(&v2[..l2]),
+        );
     }
 
     /// merged_bug_011, the loader-cut theorem: the per-lane loaded view

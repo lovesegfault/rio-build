@@ -1,32 +1,32 @@
 // -*- mode: Bluespec; -*-
 //
-// C-prime calibration override, family F3 soundness (CE-61 -> B3),
-// direction (i). Transfer row: §9.3 "override 'InfraFailure treated as
-// Unobtainable' must falsify noWrongfulFromSourceRouting" — re-pointed
-// at this model to noWrongfulTerminalFailure: an infra blip charged to
-// the unobtainable budget spends the re-probe one-shot WITHOUT
-// evidence, so the next unobtainable consumption fail-fasts a marked
-// node on a spent-but-unbacked one-shot (the wrongful terminal class;
-// the unobChargeBacked ghost is the production oracle).
+// Bughunt-wave A3 calibration override, the merged_bug_020 shape —
+// THE REMOVED AS-BUILT ENCODING, preserved per the re-derivation's
+// polarity rule: the unobtainable one-shot read the DRV-LEVEL history
+// (count_materialization_rows_in_history spanned jobs), so job 2's
+// first evidence-backed unobtainable inherited job 1's consumed
+// one-shot and routed from-source instead of re-arming. The
+// production fix is rio_retry_kernel::materialization_counters over
+// the per-job window realized by migration 085's job-creation reset
+// row.
 //
-// PRE-FIX behavior modeled: the InfraFailure consumption charges
-// materialization_unobtainable (not materialization_infra) and runs the
-// four-arm routing as if the executor had verified every absent
-// live-wanted path missing — without any verification.
+// PRE-FIX behavior modeled: calibUnscopedOneShot is
+// consumeUnobtainable with oneShotSpent read from the drv-level
+// ledger; the budget-soundness latch compares it against the job's
+// OWN count and records the divergence.
 //
-// PREDICTED: noWrongfulTerminalFailure falsifies (a fail-fast whose
-// spent one-shot was infra-corrupted). noWrongfulFromSourceRouting may
-// additionally falsify through the arm-1/2 leg (recorded, secondary).
+// PREDICTED: budgetSoundness falsifies — a routing decision consumed
+// another job's window.
 //
 // Run (falsification):
-//   quint verify --backend=tlc --main=matCalibF3InfraAsUnobtainable \
-//     --step=calibStep --invariant=noWrongfulTerminalFailure \
-//     docs/spec/models/calibration/mat-f3-infra-as-unobtainable.qnt
+//   quint verify --backend=tlc --main=matCalibUnscopedCount \
+//     --step=calibStep --invariant=budgetSoundness \
+//     docs/spec/models/calibration/mat-unscoped-count.qnt
 // Baseline (as-built step, must HOLD):
-//   quint verify --backend=tlc --main=matCalibF3InfraAsUnobtainable \
-//     --invariant=noWrongfulTerminalFailure \
-//     docs/spec/models/calibration/mat-f3-infra-as-unobtainable.qnt
-module matCalibF3InfraAsUnobtainable {
+//   quint verify --backend=tlc --main=matCalibUnscopedCount \
+//     --invariant=budgetSoundness \
+//     docs/spec/models/calibration/mat-unscoped-count.qnt
+module matCalibUnscopedCount {
   import materializationJob(
     BUILDS = Set("b1", "b2"),
     DRVS = Set("d1"),
@@ -34,10 +34,10 @@ module matCalibF3InfraAsUnobtainable {
     REPLICAS = Set("r1", "r2"),
     BUILDERS = Set("w1"),
     MAT_BUDGET = 2,
-    MAX_EXECS = 4,
+    MAX_EXECS = 6,
     MAX_GEN = 0,
-    MAX_UPSTREAM_FLIPS = 2,
-    MAX_LEGACY = 1,
+    MAX_UPSTREAM_FLIPS = 4,
+    MAX_LEGACY = 0,
     ENABLE_FAILOVER = false,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
@@ -45,22 +45,29 @@ module matCalibF3InfraAsUnobtainable {
     ENABLE_RESOLVE_FAULTS = false
   ).* from "../materializationJob"
 
-  /// PRE-FIX InfraFailure consumption: charged as unobtainable, routed
-  /// through the four arms with UNVERIFIED missing paths. The
-  /// unobChargeBacked ghost records the corruption; the justification
-  /// latches keep the production oracle.
-  action calibInfraChargedAsUnobtainable(d: str): bool = all {
+  /// PRE-FIX consumption: the drv-level one-shot read (everything
+  /// else verbatim from consumeUnobtainable).
+  action calibUnscopedOneShot(d: str, missing: Set[str]): bool = all {
+    missing != Set(),
+    missing.subseteq(OUTPUTS),
     match attempts.get(d) {
       | NoAttempt => false
       | OpenAttempt(a) => a.kind == KMaterialization and not(channelStale.get(a.instance))
     },
     match jobs.get(d) { | NoJob => false | SomeJob(j) => j.state == JClaimed },
+    // the report's missing paths really are missing-and-unavailable
+    // (the executor verified them; B3's evidence-backed direction).
+    missing.forall(o => not(present.get((d, o))) and not(upstreamAvail.get((d, o)))),
     matUnobtainableLedger.get(d) < MAT_BUDGET + 2,
     val w = liveWanted(d)
-    val missingLive = w.filter(o => not(present.get((d, o))))
+    val missingLive = missing.intersect(w)
     val execId = match attempts.get(d) { | NoAttempt => 0 | OpenAttempt(a) => a.execId }
     val marked = topdownPruned.get(d)
+    // THE BUG: the drv-level one-shot (the as-built history read,
+    // count_materialization_rows_in_history) — job 2's routing
+    // consults job 1's spent shot.
     val oneShotSpent = matUnobtainableLedger.get(d) > 0
+    val ownShotSpent = match jobs.get(d) { | NoJob => false | SomeJob(j) => j.matUnobtainableCount > 0 }
     val arm0 = missingLive == Set()
     val arm0covered = arm0 and liveWantedCovered(d)
     val arm12 = not(arm0) and (durableRel.get(d) == RVouched or durableRel.get(d) == RPending)
@@ -94,13 +101,21 @@ module matCalibF3InfraAsUnobtainable {
       else
         nodeStatus.put(d, NQueued),
       attempts' = attempts.put(d, NoAttempt),
+      // delta 1: the mark is consumed by success (arm0covered),
+      // from-source (arm12; arm3fs is unmarked already) AND the
+      // fail-fast itself (dispatch.rs:1126).
       topdownPruned' = if (arm0covered or arm12 or arm3fail)
         topdownPruned.put(d, false)
       else topdownPruned,
       matUnobtainableLedger' = matUnobtainableLedger.put(d, matUnobtainableLedger.get(d) + 1),
-      // the corrupted charge: NOT evidence-backed.
-      unobChargeBacked' = unobChargeBacked.put(d, false),
+      // A3/020: the one-shot routing consulted the job's OWN window —
+      // the mat-unscoped-count override records false on divergence.
+      budgetSoundAll' = and { budgetSoundAll, oneShotSpent == ownShotSpent },
       failFastCount' = if (arm3fail) failFastCount.put(d, failFastCount.get(d) + 1) else failFastCount,
+      // delta 1: the four-conjunct justification, at decision time.
+      // marked/Broken/missing-live are structural at the arm3fail
+      // site; the latch records the fourth conjunct, with the spent
+      // one-shot only counting when its charges were evidence-backed.
       ffJustifiedAll' = and {
         ffJustifiedAll,
         arm3fail implies or {
@@ -108,16 +123,20 @@ module matCalibF3InfraAsUnobtainable {
           oneShotSpent and unobChargeBacked.get(d),
         },
       },
+      // the 6-row from-source justification, at decision time.
       fsJustifiedAll' = and {
         fsJustifiedAll,
         arm12 implies (durableRel.get(d) == RVouched or durableRel.get(d) == RPending),
         arm3fs implies (durableRel.get(d) == RBroken and not(marked)),
       },
+      // C2: the from-source routing consumed evidence-backed missing
+      // paths (verified absent-and-unavailable at this decision).
       fsReportSoundAll' = and {
         fsReportSoundAll,
         (arm12 or arm3fs) implies
           missingLive.forall(o => not(present.get((d, o))) and not(upstreamAvail.get((d, o)))),
       },
+      // CE-17 latch: the moot-covered arm is a success resolution.
       covAtResolveAll' = and { covAtResolveAll, arm0covered implies liveWantedCovered(d) },
       covLiveOnlyAll' = covLiveOnlyAll,
     },
@@ -125,13 +144,13 @@ module matCalibF3InfraAsUnobtainable {
     relUnchanged, storeUnchanged, envUnchanged,
     matInfraLedger' = matInfraLedger, buildCrashLedger' = buildCrashLedger,
     establishCount' = establishCount, buildCrashEstablished' = buildCrashEstablished,
+    unobChargeBacked' = unobChargeBacked,
     tenureUnchanged,
     creationResolvableAll' = creationResolvableAll,
     chargedAfterCancel' = chargedAfterCancel,
     claimOrigin' = claimOrigin,
-    carried' = carried,
-    budgetSoundAll' = budgetSoundAll,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
+    carried' = carried,
   }
 
   action calibStep = {
@@ -152,9 +171,9 @@ module matCalibF3InfraAsUnobtainable {
       claimJob(d, replica),
       executeStep(d, o),
       consumeSuccess(d),
-      consumeUnobtainable(d, missing),
-      calibInfraChargedAsUnobtainable(d),
-      establishCrashedAttempt(d),
+      // the override REPLACES consumeUnobtainable
+      calibUnscopedOneShot(d, missing),
+      reportInfra(d),
       cancelOnZeroInterest(d),
       obsoleteOnProduced(d),
       parkReevaluate(d),
@@ -163,11 +182,7 @@ module matCalibF3InfraAsUnobtainable {
       builderPull(d, builder),
       dispatchFromSource(d),
       completeReadyFromStore(d),
-      failover,
-      redialChannel(replica),
-      staleTenureWriteDiscarded(d),
       releasePins(d),
-      storeGc(d, o),
       upstreamChange(d, o),
       durableRelationChange(d, rel),
     }

@@ -3116,8 +3116,9 @@ async fn test_recovery_heals_corrupted_ready() -> TestResult {
 /// PG-computed submitted age already exceeds its `build_timeout` must
 /// be stamped TimedOut by the FIRST watchdog tick of the new term.
 ///
-/// RED (pre-fix): `submitted_at` was reconstructed via
-/// `Instant::now().checked_sub(age).unwrap_or_else(Instant::now)` — on
+/// RED (pre-fix): `submitted_at` was reconstructed by subtracting the
+/// PG-computed age from the boot clock, falling back to the bare
+/// current instant when the subtraction underflowed — on
 /// a leader whose process is younger than the build's age the fallback
 /// silently re-anchored the clock to "now", granting a fresh full
 /// build_timeout window every failover (a 30h-old build read as 0s

@@ -40,7 +40,8 @@ module gaCalibNoLiveRecheck {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the live pod-phase re-check is
@@ -228,6 +229,7 @@ module gaCalibNoLiveRecheck {
       streak' = streak,
       pendingClose' = pendingClose,
       obsLive' = obsLive,
+      inBackoff' = inBackoff,
     }
   }
 
@@ -285,7 +287,8 @@ module gaCalibOrphanGateEmptyOk {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the orphan-reap decision uses a
@@ -479,6 +482,7 @@ module gaCalibOrphanGateEmptyOk {
       streak' = streak,
       pendingClose' = pendingClose,
       obsLive' = obsLive,
+      inBackoff' = inBackoff,
     }
   }
 
@@ -536,7 +540,8 @@ module gaCalibCrdAbsentArmed {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).* from "../spawnCoherence"
 
   /// PRE-FIX gate retain: the crd-absent arm arms the gate (pass-through
@@ -741,6 +746,7 @@ module gaCalibCrdAbsentArmed {
       streak' = streak,
       pendingClose' = pendingClose,
       obsLive' = obsLive,
+      inBackoff' = inBackoff,
     }
   }
 

@@ -1992,6 +1992,14 @@ impl DagActor {
             // deferred-conversion class. A refused job stays parked:
             // counted by the gauge below, armed via park-expiry
             // re-claim, accruing further worker charges across cycles.
+            // Post-reversal population note (2026-06-03, Q5):
+            // establishment-only-parked jobs (zero worker charges —
+            // the never-reporting-replica crash-loop, which the
+            // reversal sends HERE instead of re-listing forever) can
+            // never satisfy the worker-charge gate; with the knob ON
+            // they stay parked until a worker charge lands or the job
+            // is cancelled. Deliberate — see the
+            // conversion_requires_worker_charge config doc.
             let strict_worker = self.materialization_cfg.conversion_requires_worker_charge;
             let dwell_secs = self.materialization_cfg.conversion_min_park_dwell_secs;
             let max_attempts = self.materialization_cfg.max_attempts;

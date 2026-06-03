@@ -1173,6 +1173,33 @@ mod kinded_proofs {
     /// the dep-racing Queued claim is legal) with no open attempt held
     /// by anyone else; a re-delivery (DeliverExisting) requires the open
     /// attempt to be the puller's own and carries exactly its exec id.
+    /// bug_282 (A3, the named cell): a BUILD pull with no
+    /// materialization job and an UNEXPIRED transient backoff is never
+    /// minted fresh — the (Build, None) arm downgrades DeliverNew to
+    /// NotYetReady while the window runs. The wide partition proof
+    /// (`check_kinded_no_build_delivery_while_job_unresolved` +
+    /// `check_kinded_partition_total`) already covers the cell; this
+    /// harness names the contract so the backoff conjunct cannot be
+    /// dropped without a targeted failure.
+    #[kani::proof]
+    fn check_no_build_mint_inside_backoff_window() {
+        let mut inputs = any_inputs();
+        inputs.backoff_expired = false;
+
+        let decision = run_kinded(
+            &inputs,
+            MaterializationInputs {
+                kind: PullKind::Build,
+                job: JobView::None,
+            },
+        );
+
+        // The fresh mint is refused while the backoff runs; everything
+        // else (rejections, Gone, NotYetReady, the bound-identity
+        // re-delivery whose attempt already exists) passes through.
+        assert!(!matches!(decision, PullAdmission::DeliverNew));
+    }
+
     #[kani::proof]
     fn check_kinded_one_winner_arbitration() {
         let inputs = any_inputs();

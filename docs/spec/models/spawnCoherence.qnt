@@ -263,6 +263,14 @@ module spawnCoherence {
   /// otherwise refused) vs the as-built newest-open-wins resolution.
   const ENABLE_SYNTH_CLOSE: bool
   const ENABLE_EXEC_PINNED: bool
+  /// Bughunt wave A3 axis (bug_282; same §4.F16 gating —
+  /// default-false, existing regimes state-space-identical): the
+  /// transient-retry backoff is enforced at the SPAWN edge — a Ready
+  /// node inside its backoff window is excluded from spawn intents
+  /// (compute_spawn_intents' conjunct; the kernel's
+  /// build_backoff_expired consumes the same fact at pull
+  /// admission).
+  const ENABLE_RETRY_BACKOFF: bool
 
   pure val INTENTS: Set[IntentId] = Set("i1", "i2")
 
@@ -354,6 +362,12 @@ module spawnCoherence {
   /// the open one (false the moment that attempt ends, and never set by
   /// a successor attempt). Constant-false unless ENABLE_SYNTH_CLOSE.
   var obsLive: IntentId -> bool
+  /// A3/282: the drv sits inside its transient-retry backoff window
+  /// (env-driven; constant-false unless ENABLE_RETRY_BACKOFF). The
+  /// backoff may only START on a non-queued intent (the failure that
+  /// opens the window also leaves Ready), and the spawn edge refuses
+  /// in-backoff intents — noSpawnIntentInsideBackoff.
+  var inBackoff: IntentId -> bool
 
   // ------------------------------------------------------------------
   // 5. Invariants
@@ -365,6 +379,13 @@ module spawnCoherence {
   val ackCoversPending = not(violations.contains(VAckMissedPending))
   val degradedPolarity = not(violations.contains(VDegraded))
   val gateFailClosed = not(violations.contains(VGate))
+  /// A3/282: no spawn intent inside the transient-retry backoff
+  /// window — the spawn edge's conjunct holds (trivially when the
+  /// axis is off; the controller-282 calibration drops the conjunct
+  /// and reaches the violation).
+  val noSpawnIntentInsideBackoff = INTENTS.forall(i =>
+    queued.get(i) implies not(inBackoff.get(i))
+  )
   val freedSlotsSpendable = not(violations.contains(VFreedSlotUnused))
   /// PD-7: a fresh, successful GetSpawnIntents serve never contains a
   /// job-carrying intent (the spawn-intent filter; the stale-poll
@@ -767,6 +788,7 @@ module spawnCoherence {
       exhausted' = exhausted,
       pendingClose' = pendingClose,
       obsLive' = obsLive,
+      inBackoff' = inBackoff,
     }
   }
 
@@ -790,11 +812,16 @@ module spawnCoherence {
     exhausted' = exhausted,
     streak' = streak,
     pendingClose' = pendingClose,
+    inBackoff' = inBackoff,
   }
 
   /// A drv becomes Ready: the intent (re-)appears in the queue.
+  /// A3/282: the spawn edge refuses an intent inside its backoff
+  /// window (compute_spawn_intents' conjunct — trivially true when
+  /// the axis is off).
   action intentArrives(i: IntentId): bool = all {
     not(queued.get(i)),
+    not(inBackoff.get(i)),
     queued' = queued.set(i, true),
     intentFp' = intentFp, job' = job, execr' = execr,
     leaderOld' = leaderOld, gate' = gate,
@@ -922,6 +949,7 @@ module spawnCoherence {
     renderedFarDl' = if (ENABLE_RENDERED_DEADLINE)
       renderedFarDl.set(i, true)
     else renderedFarDl,
+    inBackoff' = inBackoff,
     queued' = queued, intentFp' = intentFp, job' = job,
     leaderOld' = leaderOld, gate' = gate,
     dispatched' = dispatched, effects' = effects,
@@ -988,6 +1016,7 @@ module spawnCoherence {
     streak' = streak,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
+    inBackoff' = inBackoff,
   }
 
   /// A dispatched_cells entry is consumed scheduler-side (heartbeat
@@ -1006,6 +1035,7 @@ module spawnCoherence {
     streak' = streak,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
+    inBackoff' = inBackoff,
   }
 
   /// The L10 producer publishes a placeable set (assume-guarantee: any
@@ -1038,6 +1068,7 @@ module spawnCoherence {
     streak' = streak,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
+    inBackoff' = inBackoff,
   }
 
   /// PD-7: the job resolves (success / from-source / cancelled) — the
@@ -1057,6 +1088,7 @@ module spawnCoherence {
     streak' = streak,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
+    inBackoff' = inBackoff,
   }
 
   /// The producer loses its lease (or restarts): the gate is unarmed
@@ -1103,6 +1135,7 @@ module spawnCoherence {
     streak' = streak,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
+    inBackoff' = inBackoff,
   }
 
   /// C2/077: the spawnable-source universe flips for the intent —
@@ -1118,6 +1151,7 @@ module spawnCoherence {
     renderedFarDl' = renderedFarDl,
     closedCause' = closedCause, seenOpen' = seenOpen,
     streak' = streak, pendingClose' = pendingClose, obsLive' = obsLive,
+    inBackoff' = inBackoff,
   }
 
   /// C2/120: the scheduler cancels the intent's open attempt (user
@@ -1136,6 +1170,7 @@ module spawnCoherence {
     renderedFarDl' = renderedFarDl,
     seenOpen' = seenOpen, exhausted' = exhausted,
     streak' = streak, pendingClose' = pendingClose,
+    inBackoff' = inBackoff,
   }
 
   /// C2/120: the attempt completes NORMALLY but the Job's status has
@@ -1156,6 +1191,7 @@ module spawnCoherence {
     renderedFarDl' = renderedFarDl,
     seenOpen' = seenOpen, exhausted' = exhausted,
     streak' = streak, pendingClose' = pendingClose,
+    inBackoff' = inBackoff,
   }
 
   /// C2/120: the close ages out of the recently_closed window (120 s).
@@ -1170,6 +1206,7 @@ module spawnCoherence {
     renderedFarDl' = renderedFarDl,
     seenOpen' = seenOpen, exhausted' = exhausted,
     streak' = streak, pendingClose' = pendingClose, obsLive' = obsLive,
+    inBackoff' = inBackoff,
   }
 
   /// C2/135: the disruption watcher decides to preempt — it OBSERVES
@@ -1187,6 +1224,7 @@ module spawnCoherence {
     renderedFarDl' = renderedFarDl,
     closedCause' = closedCause, seenOpen' = seenOpen,
     exhausted' = exhausted, streak' = streak,
+    inBackoff' = inBackoff,
   }
 
   /// C2/135: the synthesized close lands at the scheduler. As-built
@@ -1225,6 +1263,48 @@ module spawnCoherence {
     renderedFarDl' = renderedFarDl,
     closedCause' = closedCause, seenOpen' = seenOpen,
     exhausted' = exhausted, streak' = streak,
+    inBackoff' = inBackoff,
+  }
+
+  /// A3/282 environment: a transient failure opens the backoff
+  /// window — only on a non-queued intent (the failing attempt's
+  /// release left Ready; the spawn edge is what the conjunct guards).
+  action backoffStarts(i: IntentId): bool = all {
+    ENABLE_RETRY_BACKOFF,
+    not(queued.get(i)),
+    not(inBackoff.get(i)),
+    inBackoff' = inBackoff.set(i, true),
+    queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
+    leaderOld' = leaderOld, gate' = gate,
+    dispatched' = dispatched, effects' = effects, violations' = violations,
+    prevQueuedSnap' = prevQueuedSnap,
+    matJob' = matJob,
+    renderedFarDl' = renderedFarDl,
+    closedCause' = closedCause,
+    seenOpen' = seenOpen,
+    exhausted' = exhausted,
+    streak' = streak,
+    pendingClose' = pendingClose,
+    obsLive' = obsLive,
+  }
+
+  /// The backoff window expires — the intent is spawnable again.
+  action backoffExpires(i: IntentId): bool = all {
+    ENABLE_RETRY_BACKOFF,
+    inBackoff.get(i),
+    inBackoff' = inBackoff.set(i, false),
+    queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
+    leaderOld' = leaderOld, gate' = gate,
+    dispatched' = dispatched, effects' = effects, violations' = violations,
+    prevQueuedSnap' = prevQueuedSnap,
+    matJob' = matJob,
+    renderedFarDl' = renderedFarDl,
+    closedCause' = closedCause,
+    seenOpen' = seenOpen,
+    exhausted' = exhausted,
+    streak' = streak,
+    pendingClose' = pendingClose,
+    obsLive' = obsLive,
   }
 
   // ------------------------------------------------------------------
@@ -1249,6 +1329,7 @@ module spawnCoherence {
     streak' = INTENTS.mapBy(i => 0),
     pendingClose' = INTENTS.mapBy(i => false),
     obsLive' = INTENTS.mapBy(i => false),
+    inBackoff' = INTENTS.mapBy(i => false),
   }
 
   action step = {
@@ -1283,6 +1364,8 @@ module spawnCoherence {
       windowExpires(i),
       disruptionDecides(i),
       closeLands(i),
+      backoffStarts(i),
+      backoffExpires(i),
     }
   }
 }
@@ -1310,7 +1393,8 @@ module spawnCoherenceBase {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).*
 }
 
@@ -1332,7 +1416,8 @@ module spawnCoherenceFaultRpc {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).*
 }
 
@@ -1355,7 +1440,8 @@ module spawnCoherenceFaultLease {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).*
 }
 
@@ -1378,7 +1464,8 @@ module spawnCoherenceFaultStale {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).*
 }
 
@@ -1401,7 +1488,8 @@ module spawnCoherenceCrdAbsent {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).*
 }
 
@@ -1423,7 +1511,8 @@ module spawnCoherenceFetcher {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).*
 }
 
@@ -1449,7 +1538,8 @@ module spawnCoherenceMatJobs {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).*
 }
 
@@ -1476,7 +1566,8 @@ module spawnCoherenceRenderedDeadline {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).*
 }
 
@@ -1499,7 +1590,8 @@ module spawnCoherenceExhaustAsBuilt {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).*
 }
 
@@ -1523,7 +1615,8 @@ module spawnCoherenceExhaustPersist {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).*
 }
 
@@ -1546,7 +1639,8 @@ module spawnCoherenceCancelAsBuilt {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).*
 }
 
@@ -1569,7 +1663,8 @@ module spawnCoherenceCancelCause {
     ENABLE_CANCEL_CAUSE = true,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).*
 }
 
@@ -1596,7 +1691,8 @@ module spawnCoherenceReapYoungLeader {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = true,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).*
 }
 
@@ -1620,7 +1716,8 @@ module spawnCoherenceSynthCloseAsBuilt {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = true,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).*
 }
 
@@ -1644,6 +1741,31 @@ module spawnCoherenceSynthClosePinned {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = true,
-    ENABLE_EXEC_PINNED = true
+    ENABLE_EXEC_PINNED = true,
+    ENABLE_RETRY_BACKOFF = false
+  ).*
+}
+
+/// A3/282 axis regime: the transient-retry backoff at the spawn edge
+/// (backoffStarts/backoffExpires drive the window; intentArrives
+/// refuses in-backoff intents — noSpawnIntentInsideBackoff).
+module spawnCoherenceRetryBackoff {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = true
   ).*
 }

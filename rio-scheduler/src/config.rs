@@ -175,9 +175,18 @@ pub struct MaterializationConfig {
     /// ONLY when worker-reported `materialization_infra` charges alone
     /// exhaust `max_attempts`; Scheduler-party establishment
     /// ("unreported") charges still count toward PARKING (OQ1
-    /// amendment 1 — unchanged) but no longer authorize conversion.
-    /// The job stays parked (armed: park-expiry re-claim; further
-    /// worker charges accrue across cycles) until they do. Flipping
+    /// amendment 1 — unchanged; since the 2026-06-03 establishment-park
+    /// reversal they park party-blind at the budget) but no longer
+    /// authorize conversion. The job stays parked (armed: park-expiry
+    /// re-claim; further worker charges accrue across cycles) until
+    /// they do. KNOB-ON POPULATION NOTE (the reversal's consequence):
+    /// an establishment-only-parked job — zero worker charges, the
+    /// never-reporting-replica crash-loop — can NEVER satisfy this
+    /// gate; with the knob ON such jobs stay parked until a worker
+    /// charge lands or the job is cancelled (deliberate: a from-source
+    /// conversion on zero worker evidence is exactly what the knob
+    /// exists to forbid; the population is visible as parked jobs
+    /// whose ledger rows are all establishment-written). Flipping
     /// the default ON later is an operational act gated on
     /// `RioSchedulerMaterializationConversions` alert evidence.
     pub conversion_requires_worker_charge: bool,

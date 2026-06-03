@@ -211,7 +211,8 @@ pub struct BuildInfo {
     first_failure: Option<FirstFailure>,
     /// When the build was submitted (for
     /// rio_scheduler_build_duration_seconds and the per-build timeout
-    /// watchdog). [`RecoveredInstant`]: survives failover with its
+    /// watchdog). [`RecoveredInstant`](crate::state::RecoveredInstant):
+    /// survives failover with its
     /// PG-recovered age intact — a 30h-old build on a 1h-booted leader
     /// reads 30h elapsed, never "submitted just now" (merged_bug_300).
     pub submitted_at: crate::state::RecoveredInstant,

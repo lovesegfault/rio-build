@@ -89,6 +89,8 @@ module matCalibDedupRemoved {
     covLiveOnlyAll' = covLiveOnlyAll,
     chargedAfterCancel' = chargedAfterCancel,
     claimOrigin' = claimOrigin,
+    carried' = carried,
+    budgetSoundAll' = budgetSoundAll,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
   }
 

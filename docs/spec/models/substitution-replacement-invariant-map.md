@@ -529,7 +529,7 @@ are unchanged.
 
 | ID | Item | What to do / what it means | Evidence |
 |---|---|---|---|
-| MD-D1 | **Park alerting + runbook** | A parked materialization job means UPSTREAM trouble, never build failure: builds wait visibly (`rio_scheduler_materialization_stalled` > 0; the `RioSchedulerMaterializationStalled` alert at 15 m). Every parked job has Broken closure evidence (no from-source fallback) — jobs with buildable closures are auto-resolved from-source by the housekeeping re-evaluation arm within one tick. Runbook: check the tenant's upstream cache config/health (`rio_store_substitute_total{result="error"}` rate, store logs); builds resume on upstream recovery (park-expiry re-claim) or can be cancelled. Do NOT restart the scheduler to "fix" a park — the park is durable state and survives restarts by design. | T-6.1 (re-evaluation arm + gauge), T-6.2 (alert), vm-materialization-standalone infra-park subtest |
+| MD-D1 | **Park alerting + runbook** | A parked materialization job means UPSTREAM trouble, never build failure: builds wait visibly (`rio_scheduler_materialization_stalled` > 0; the `RioSchedulerMaterializationStalled` alert at 15 m). Every parked job has Broken closure evidence (no from-source fallback) — jobs with buildable closures are auto-resolved from-source by the housekeeping re-evaluation arm within one tick. **[POPULATION RE-KEYED 2026-06-03, the Q5 reversal: establishment-only crash-loops (a never-reporting store replica) now park at the budget and JOIN this population — same gauge, same alert, no new label per the Q5 sub-decision.]** Runbook: check the tenant's upstream cache config/health (`rio_store_substitute_total{result="error"}` rate, store logs) — **and the store-replica arm: a parked job whose ledger rows are all establishment-written (zero worker reports) with k8s CrashLoopBackOff on a store replica and NO `rio_store_substitute_total{result="error"}` signal is the crash-looping-replica case; fix the replica, not the upstream**; builds resume on upstream recovery (park-expiry re-claim) or can be cancelled. Do NOT restart the scheduler to "fix" a park — the park is durable state and survives restarts by design. | T-6.1 (re-evaluation arm + gauge), T-6.2 (alert), vm-materialization-standalone infra-park subtest, `establishment_only_charges_park_at_max_attempts` (the reversal's red-first pin) |
 | MD-D2 | **Flag rollback procedure (ON → OFF)** | Set both helm values false (`scheduler.materialization.enabled`, `store.materialization.enabled`) and roll. The walk serves all new work immediately. Flag-on-era state drains, never strands: pending job rows are inert (nothing claims them); claimed jobs' reports drain through the always-on consumption transaction; flag-on-era marks were cleared at resolution (the §4 clear-mirror), so no wrongful fail-fast can fire on stale marks; flag-on-era pins release through the always-on §5.3 wiring once jobs resolve and interest goes terminal. The chart's AND-guard makes the hazardous persistent state (scheduler on / store off) unrenderable in either direction. | vm-materialization-transition-k3s (both directions, 8/8 subtests incl. flip-off marks + pins); T-1.7 revert-with-state test; T-1.8 always-on release tests |
 | MD-D3 | **Mixed-flag window guidance** | During a rollout where the scheduler is flag-on before the store (the transient AS-6 race the AND-guard cannot eliminate): jobs are created but not claimed — a visible wait (`substituting_derivations` > 0 via rio-cli status, builds Active), bounded by the store rollout completing, never a strand (the store's first poll drains the backlog). The reverse window (store on / scheduler off) is a no-op: the store polls empty lists harmlessly. | T-3.3 mixed-flag subtest (45 s observation window, drains on store rollout) |
 | MD-D4 | **Mixed-version (rolling upgrade) posture of the instance-bound credential** | The T-5.1 instance binding is FAIL-CLOSED across version skew: a pre-Phase-B scheduler that receives an instance-bound store token REJECTS it (`deny_unknown_fields` — `unknown field 'instance'`), so no mixed-version window exists in which an instance-bound token is authenticated while the binding check is skipped. The failure mode of that (unsupported, unreachable pre-D′) skew direction is store claim retries against the rolling scheduler — self-healing within the rollout window — never unenforced binding and never a wrongful build outcome. No deployment-ordering step is required for security: the store's instance-bound minting is flag-gated and the flag rolls atomically with the pod template (a pod is either old-binary+flag-off or new-binary+flag-on, never a cross). | `service_claims_instance_forward_skew` (the fail-closed pin); T-5.1 wire-compat battery; PD-B8/PDB-8 adjudication record |
@@ -888,7 +888,7 @@ commits (not the Phase A draft, not the design text):
 | 1 | Per-drv `topdownPruned` ghost set by `createJob(OPruned)`; `consumeUnobtainable` arm selection split marked/unmarked per the 6-row B2 table (arm-3 FailFast = the four-conjunct corner; unmarked → `JResolvedFromSource`); the mark consumed by success/from-source resolution (the §4 clear-mirror), by the park re-evaluation, AND by the fail-fast itself; `ffJustifiedAll` carries the four-conjunct justification at decision time | `route_unobtainable` (materialize.rs:530–579, the `_ if inputs.topdown_pruned` arm), `clear_pruned_mark_on_job_resolution` (:979), `fail_fast_topdown_pruned_root` (dispatch.rs:1126 — the fail-fast clear the handoff table did not list; encoded as found in code) | The draft's arm 3 fail-fasted ANY node on confirmed-missing/spent — against the as-built system its `routingRequiresDurableVouchOrFailFast` would VIOLATE on every unmarked-leaf release (the B2 fix's exact disposition) and its `noFailFast` witness would violate through traces the production system routes from-source: wired as drafted it would have verified the pre-B2 system |
 | 2a | Per-replica `channelStale` (failover stales every channel — the kube-proxy ClusterIP pinning); claims and report consumptions gate on a fresh channel; `redialChannel` is the abandon-and-redial (the UNAVAILABLE trigger RPC collapsed into the action); `claimAfterFailover` ghost + the `noPostFailoverClaim` witness make the redial's liveness checkable | `MaterializeTransport::abandon_connection` / `inspect_outcome` (rio-store/src/materialize/client.rs:338–365); the two transport unit pins (`poll_abandons_connection_pinned_to_standby_replica`, `report_abandons_…`) | The draft's atomic direct claim could not represent the dead-end at all — the B3 class was unfalsifiable, so the transition VM scenario's bug had no model-level guard |
 | 2b | `legacyInterest` per (build, drv) (in-memory interest with NO wanted rows — the FP-4(b) window), bounded by `MAX_LEGACY`; the standalone creation sites (`OProbe`, `OStaleReset`) backfill the relation for every live legacy build; the in-tx origins require the creating tenant's rows (the same-tx batch); `creationLeavesTenantResolvable` is the new invariant; the dispatch-probe `dedupRefeed` carries the as-built lazy-heal backfill | `create_materialization_job_if_enabled`'s `live_interested` loop (materialize.rs:184–217 — the loop runs on the dedup arm too, which is the lazy heal the invariant's creation-scoped form prices in) | The draft's `liveWanted(d) != Set()` creation guard made the no-wanted-rows state UNREPRESENTABLE — the B4 bug class could not be expressed, falsified, or guarded |
-| 3 | The park rides the InfraFailure consumption at the budget (`reportInfra`: `newCount >= MAT_BUDGET` ⟹ parked in the same action — the draft's separate `parkOnBudgetExhaustion` transition deleted as not-as-built); `parkReevaluate` (Vouched/Pending → `JResolvedFromSource`, mark cleared, no exec id) vs `parkBackoffExpires` (un-park, count NOT reset); the establishment never parks (`establish_materialization_attempt` leaves the job pending claimable at any count); `stalledJobs` derived val = parked ∧ Broken (the gauge population) | `consume_materialization_outcome` InfraFailure arm (materialize.rs:826), `tick_reevaluate_parked_materialization_jobs` (:1285–1334), `establish_materialization_attempt` (:1243), `park_materialization_job` (:1119 — backoff derives from the SURVIVING count) | The draft's `housekeepingReevaluatePark` unconditionally un-parked Broken-evidence jobs AND reset `matInfraCount` to 0 — against the as-built system it would have verified a park cycle that cannot stall (the MD-D1 alert population would be model-empty, and the budget-reset would mask the as-built exponential-backoff posture) |
+| 3 | The park rides the InfraFailure consumption at the budget (`reportInfra`: `newCount >= MAT_BUDGET` ⟹ parked in the same action — the draft's separate `parkOnBudgetExhaustion` transition deleted as not-as-built); `parkReevaluate` (Vouched/Pending → `JResolvedFromSource`, mark cleared, no exec id) vs `parkBackoffExpires` (un-park, count NOT reset); ~~the establishment never parks~~ **[RE-KEYED 2026-06-03, the Q5 reversal: the establishment now parks through the SAME predicate — `establishCrashedAttempt` applies `newCount >= MAT_BUDGET` party-blind, matching `charge_materialization_infra`'s kernel verdict; the as-built-never-parks encoding is preserved as the `mat-establish-never-parks` calibration]**; `stalledJobs` derived val = parked ∧ Broken (the gauge population — establishment-only crash-loops now ENTER it) | `charge_materialization_infra` (materialize.rs — the [A] chokepoint fusing both charge channels with `rio_retry_kernel::materialization_counters`), `tick_reevaluate_parked_materialization_jobs`, `park_materialization_job` (backoff derives from the SURVIVING count) | The draft's `housekeepingReevaluatePark` unconditionally un-parked Broken-evidence jobs AND reset `matInfraCount` to 0 — against the as-built system it would have verified a park cycle that cannot stall (the MD-D1 alert population would be model-empty, and the budget-reset would mask the as-built exponential-backoff posture). **Post-reversal note (2026-06-03): the wrong-verdict record stands as history — the reversal did NOT adopt the draft's shape (no count reset at establishment, no unconditional Broken un-park); it added ONLY the park predicate to the establishment charge, and the recalibration the residual priced was paid: the never-parks encoding moved to the calibration set, `budgetSoundness` + `establishmentParkRun` pin the contract, all six holds regimes re-measured green at unchanged 2M/15.** |
 | 4 | `OReprobe` added (the AS-5 6d reset → NQueued in the creation action); `OStaleReset` requires `NCompleted` ∧ a live-wanted output absent and resets to NQueued in the same action (the draft's `nodeStatus != NCompleted` precondition REVERSED for this origin); the 3-in-tx/2-standalone posture is below model atomicity — encoded as the wanted-rows-precondition (in-tx) vs backfill (standalone) split; `poison_cleared` recorded out-of-model (no poison state) | merge.rs:919–934 (`apply_reprobe_reset_in_memory`, the flag-gated 6d slot), merge.rs:1670 (`verify_preexisting_completed`), the T-5.2 five-site posture table | The draft BLOCKED the as-built stale-verify shape (a Completed node with vanished outputs is exactly what creates `stale_reset` jobs) — its `staleResetRun` analogue was unwritable, and `noStaleResetCreation` would have been permanently unviolated (vacuous) |
 | 5 | An explicit `view: str -> ViewState` layer (`VNone`/`VPending(parked)`/`VClaimed(holder)`) — the kernel admission's input; `claimJob` and `builderPull` read the VIEW while the invariants read PG truth; `failover` rebuilds eagerly and faithfully (`projView` over jobs+attempts — holders and park expiries mirrored); `dedupRefeed` is or_insert (armament-preserving); `unresolvedJobAlwaysArmed` re-encoded as view-faithfulness (`view == projView(jobs, attempts)` per drv) | `rebuild_materialization_job_view` (materialize.rs:428, recovery.rs:197), the `entry().or_insert()` dedup feed (materialize.rs:160–176), `materialization_job_view` (:302) | The draft had `failoverPreservesJobs = true` (a placeholder constant) and no view at all — the F10/L1 strand class and the B5(a) overwrite class were both unfalsifiable |
 | 6 | `claimJob` admits NQueued|NReady with NO mark conjunct (the claim IS the substitution; the B1 upgrade); `builderPull` carries the A11 `mustSubstitute` refusal (marked ∧ Broken ⟹ refused — the JobView::None dual-predicate window); `noMarkedClaim` is the B1 regression witness | `admit_pull_kinded`'s two upgraded NotYetReady→DeliverNew cells (rio-evidence-kernel/src/pull.rs:783–810), the as-built `must_substitute` arm (:188) | The draft anticipated PD-6 (Queued claims) but had no mark at all — with Δ1's mark imported naively (a mark conjunct on the claim), the model would have re-introduced the B1 admission gap and verified the pre-B1 system |
@@ -1447,7 +1447,10 @@ resubmission-healed): the directed-error downgrade for pre-Phase-B-era
 marks whose upstream later vanished, and the pre-relation wanted-width
 saturation (counter + warn). MD-D1 (park alerting:
 `rio_scheduler_materialization_stalled` + the alert + PD-20 instrumentation)
-SURVIVES VERBATIM.
+SURVIVES VERBATIM. *(2026-06-03: the SURFACES survive verbatim; the
+POPULATION was re-keyed by the Q5 establishment-park reversal —
+establishment-only crash-loops now park into it. See the MD-D1 row and
+the residual-(a) supersession block.)*
 
 ### What D′ does not claim
 
@@ -1642,7 +1645,7 @@ this table does not restate their bodies.
 | GW-D3 NAR-buffering memory headroom | SURVIVES unchanged. |
 | GW-D4 conn-permit occupancy alert | SURVIVES unchanged. |
 | GW-D5 SIGKILL / terminationGracePeriodSeconds | SURVIVES unchanged. |
-| MD-D1 park alerting + runbook | SURVIVES VERBATIM — `rio_scheduler_materialization_stalled`, the `RioSchedulerMaterializationStalled` alert and the runbook are intact; Item T builds on them; harden-store trigger 1's observation point. |
+| MD-D1 park alerting + runbook | SURVIVES, population re-keyed (2026-06-03, the Q5 reversal) — `rio_scheduler_materialization_stalled`, the `RioSchedulerMaterializationStalled` alert and the runbook are intact (same gauge, no new label); the population now INCLUDES establishment-only crash-loops (party-blind parking) and the runbook gained the store-replica arm; Item T builds on them; harden-store trigger 1's observation point. |
 | MD-D2 / MD-D3 flag rollback / mixed-flag guidance | RETIRED at D′ — replaced by the §7.5 deployment-and-rollback posture (the D′ stage record): binary rollback through D′.1; migration 080 roll-forward only; binaries-first deployment order; bounded self-identifying transition residuals. |
 | MD-D4 instance-binding skew posture | SURVIVES — fail-closed across version skew; the binding check is unconditional post-D′. |
 | MD-D5 post-wipe cold-start observation set (NEW — lands with this consolidation per harden-store memo §6.3) | The memo §3.4 P1–P10 predicates in materialization terms + the warm-phase capture (Item I's threshold-calibration seed); observation, never a gate; a P7 wall-clock miss adjudicates against P8's lever record before reading as harden-store trigger 3. |
@@ -1733,7 +1736,30 @@ stalled alert.
 **The two deliberate residuals** (recorded as record, NOT defects — owner
 ratified 2026-06-02, §6 block C):
 
-- *(a) Establishment never parks.* The park/budget decision rides ONLY the
+> **Residual (a) SUPERSEDED — reversed by the bughunt fix wave under its
+> own recorded terms (owner-signed 2026-06-03, bughunt wave §5 Q5).** The
+> block below is preserved verbatim as the historical record; the three
+> preconditions it set for exactly this change were each discharged:
+> red-first justification (test
+> `establishment_only_charges_park_at_max_attempts` — RED on the pre-fix
+> tree: the crash-loop re-listed forever), model recalibration per C′
+> delta row 3 (the contract re-derivation of `materializationJob.qnt`:
+> the never-parks encoding REMOVED from the main model and preserved as
+> the expect-violation calibration `mat-establish-never-parks`;
+> `establishmentParkRun` + `budgetSoundness` are the contract pins; all
+> six holds regimes re-measured at unchanged budgets), and owner
+> sign-off (Q5, 2026-06-03 — "silence ratifies the REVERSAL" was NOT
+> relied on; the reversal was affirmatively signed). Parking is now
+> PARTY-BLIND: `charge_materialization_infra` fuses BOTH charge channels
+> with the kernel park verdict (`rio_retry_kernel::materialization_counters`
+> — the per-job 085 window), so an establishment-only crash-loop parks
+> at the budget and joins the MD-D1 stalled population (the alert
+> population re-key is recorded at the MD-D1 row and the
+> FINAL-CONSOLIDATION row below; the alert keeps the existing gauge, no
+> new label, per the Q5 sub-decision). Residual (b) STANDS unchanged.
+
+- *(a) Establishment never parks.* ***[SUPERSEDED 2026-06-03 — see the
+  block above.]*** The park/budget decision rides ONLY the
   worker-reported InfraFailure consumption arm, while establishment-written
   rows DO count toward that budget (OQ1 amendment 1: "worker-reported AND
   establishment-written — both channels charge the same budget"). A store
@@ -1755,10 +1781,13 @@ ratified 2026-06-02, §6 block C):
   report against the closed attempt. Item S's progress/stall machinery is
   store-side by scope and deliberately does not feed this window.
 
-NO mechanism is missing; NO materialization-specific deadline knob exists
-or is needed. Any future establishment-side park ladder or per-kind window
-is a behavior change requiring red-first justification, model recalibration
-(C′ delta row 3), and owner sign-off — out of scope for this closure.
+NO mechanism is missing beyond the reversal recorded above; NO
+materialization-specific deadline knob exists or is needed. ***[The "out
+of scope" coda below is part of the superseded record:]*** Any future
+establishment-side park ladder or per-kind window is a behavior change
+requiring red-first justification, model recalibration (C′ delta row 3),
+and owner sign-off — out of scope for this closure. *(Those terms were
+met in full by the 2026-06-03 reversal — see the supersession block.)*
 
 ---
 
@@ -1843,3 +1872,132 @@ Item S forced-stall VM subtest (`954989dd8`); Item S helm stall knob
 (`045ddcdd5`). Counter-signature batch: items 5–8 + the Item I delta entry
 signed 2026-06-02 (see the Counter-signature record note); the
 executor-campaign 1c OA2 landed form signed 2026-06-02 (S-OA2).
+
+## Bughunt fix wave — A3 materialization-lifecycle-kernel record (2026-06-03)
+
+### merged_bug_307 — documented rationale (the DeliverExisting refusal cells)
+
+The triage's headline mechanism for merged_bug_307 — "the kinded admission
+table swallows DeliverExisting in both Pending/Claimed override arms" — is
+**deliberate and proof-pinned**, NOT a defect. The refusal of base-table
+`DeliverNew | DeliverExisting | NotYetReady` outcomes under
+`(Build, Pending | Claimed)` and `(Materialization, Pending{parked})`
+implements the one-winner arbitration and the no-from-source-while-job-
+unresolved contract: a build re-delivery against an unresolved
+materialization job would mint from-source work the job is about to
+satisfy, and the kani harnesses
+`check_kinded_no_build_delivery_while_job_unresolved` and
+`check_kinded_one_winner_arbitration` (rio-evidence-kernel/src/pull.rs)
+fail on any pass-through, as does the model invariant
+`noFromSourceWhileJobUnresolved`. The wave's close therefore: (a) named
+the cells — the `_ =>` catch-alls became explicit
+`DeliverNew | DeliverExisting { .. } | NotYetReady` arms (behavior-
+identical, commit 3 of the A3 series) so the refusal is a read fact, not
+a fall-through accident; (b) fixed the REAL defects the triage
+re-attribution found beside it — the bare-rearm wedges (release_claim,
+015) and the PD-20 fenced-resolve view-drop (rider, leg c) — and added
+the `rio_scheduler_materialization_view_node_skew_total` tripwire;
+(c) pinned the wedge pair in the model:
+`pendingUnclaimedImpliesClaimableNode` (calibration
+`mat-split-rearm-without-reassign`) joins A2's
+`claimedImpliesOpenAttempt`. **B1 §4.R5 amendment pointer:** B1's
+resume-token condition gates the `(Materialization,
+Claimed{held_by_puller})` DELIVERY arm — a different cell from these
+refusal catch-alls, which stay unconditional; B1's landed T-0e.6
+addendum extension records that amendment (executor-invariant-map.md).
+
+### The A3 model re-derivation — invariants, calibrations, measurements
+
+`materializationJob.qnt` is re-derived FROM CONTRACTS (the encoding
+polarity of the wave's done criteria):
+
+- **Removed-and-preserved-as-calibration** (the two as-built bug
+  encodings that lived in the main model): the establishment-never-parks
+  posture (header delta-3 + the establishment action + the crash-loop
+  regime docs) → `mat-establish-never-parks` (TLC first violation 2.4 s);
+  the drv-level unobtainable one-shot (`oneShotSpent` read the
+  cross-job ledger) → `mat-unscoped-count` (TLC 14.4 s). Both falsify
+  `budgetSoundness`; both baselines (as-built step) HOLD.
+- **Introduced calibration-only** (pre-fix splits not representable in
+  the atomic main model): `mat-split-rearm-without-reassign` (the
+  rearm-without-reassign wedge; falsifies
+  `pendingUnclaimedImpliesClaimableNode`, TLC 2.8 s) and
+  `mat-f10b-swallowed-rebuild` (the failable rebuild — a per-drv load
+  failure swallowed while the term serves a partial view as hydrated,
+  the model twin of the kani projection gap; falsifies
+  `unresolvedJobAlwaysArmed`, TLC 4.3 s — the PARTIAL shape, vs
+  `mat-f10-failover-view-drop`'s pre-existing no-rebuild-at-all).
+- **New invariants** (joining `matJobInvariants`, single-owner A3):
+  `budgetSoundness` (the per-job-window latch — park applied exactly at
+  the budget on BOTH charge channels, one-shot reads the job's own
+  count), `pendingUnclaimedImpliesClaimableNode` (a pending unparked
+  unclaimed job never strands its node Running — the code twin of
+  release_claim's atomicity), `carrierConservation` +
+  `completionRecordsRealizedPaths` (the stale-reset carrier survives
+  creation→completion over the new `carried` image; calibrations
+  `mat-chain-reset-carrier` 3.7 s / `mat-chain-reset-completion` 3.6 s
+  at the F13 reduced single-drv scope — the two-drv completion trace is
+  ~9 min to first violation, recorded here as the sub-regime
+  justification). **Extensions (F13 single-owner respected):**
+  `claimedImpliesOpenAttempt` (A2's definition untouched; its
+  calibration set gains the 015/307 runs via the split-rearm pin) and
+  `chargeFreeCancellation` (A1's latch; new pin `mat-charge-on-cancel` —
+  the split cancel leaving the attempt open, TLC 2.6 s). Ghost
+  fan-out cost (recorded for the next lander): the two ghost images
+  (`carried`, `budgetSoundAll`) extend the model's variable vector, so
+  every pre-existing calibration override that enumerates frames
+  explicitly gained the two frame lines — ten files, frame-only
+  (quint's effect checker enforces the completeness; the corpus
+  re-falsified across the board after the fan-out).
+- **bug_385 head-starvation** is a RUN pin
+  (`headStarvationRun`, `mat-head-starvation.qnt`): the sim-witness
+  encoding is edge-shaped (a pending head can legitimately appear after
+  a younger claim opened) and cannot flip as a state invariant — the
+  deterministic run asserts the pre-fix LIMIT-1 oldest-first admission
+  refuses the younger claim behind a parked head while the as-built
+  free claim proceeds from the same state.
+- **Named contract runs:** `twoJobFreshWindowRun` (job 2's creation
+  reset starts a fresh per-job window — migration 085's image) and
+  `establishmentParkRun` (the pure-establishment crash-loop parks at
+  the budget — the Q5 reversal's pin; runs under the CrashLoop regime,
+  new check `quint-materialization-runs-crash-loop`).
+- **Holds regimes** (all six — Base, Failover, AdversarialStore,
+  StaleTenure, CrashLoop, ResolveFaults — at UNCHANGED 2M samples /
+  15 steps): re-measured green with the 31-invariant conjunction
+  (27 prior + 4 new), full 2 M samples per regime — Base [ok] 39.4 s
+  (50.7 K traces/s), Failover [ok] 28.9 s (69.3 K), AdversarialStore
+  [ok] 33.8 s (59.1 K), StaleTenure [ok] 36.5 s (54.7 K), CrashLoop
+  [ok] 38.6 s (51.9 K), ResolveFaults [ok] 34.1 s (58.7 K) — all
+  inside the historical 32–45 s envelope, no §4.F13 ladder action
+  needed; the CrashLoop regime's state space CHANGES by design (the
+  reversal parks establishment loops — the regime doc records the new
+  bounding: park cycle + ledger ceilings).
+- **spawnCoherence backoff axis (bug_282, second F16 lander):** const
+  `ENABLE_RETRY_BACKOFF` bound `false` at every pre-existing
+  instantiation (post-C2-compose that is ALL fifteen prior regimes —
+  the seven C2-era modules gained the binding and
+  `spawnCoherenceRetryBackoff` reciprocally binds C2's seven axes
+  false; quint typecheck does NOT catch a missing instance-module
+  const, only the verify-time flattener does — wave hazard, run one
+  flatten before trusting a green typecheck) — `spawnCoherenceBase`
+  re-verified **bit-exact post-compose** (36,084,961 generated /
+  2,013,280 distinct, the fork-6 F16 record); the new
+  `spawnCoherenceRetryBackoff` regime holds exhaustively
+  (82,701,121 / 4,529,880, 33 s post-compose) with
+  `noSpawnIntentInsideBackoff`; calibration
+  `controller-282-backoff-ignored` falsifies in 1.3 s (TLC).
+- **Kani:** `check_sweep_decide_invariant` extended with the
+  `materialization_counters` fold (the sweep is invisible to the FULL
+  counters, not just the park projection; rio-retry-kernel stays
+  14 harnesses); `check_no_build_mint_inside_backoff_window` names the
+  (Build, None) backoff cell in rio-evidence-kernel (11 → 12,
+  tripwire updated same-commit; the wide partition proofs already
+  covered the cell — the named harness pins the conjunct).
+
+**Manual exhaustive targets** (TLC, 60 workers, NOT gate checks — the
+C′ posture): the 31-invariant conjunction over the -Ex reduced scopes
+remains the documented manual sweep
+(`quint verify --backend=tlc --main=materializationJob{Base,CrashLoop,…}Ex
+--invariant=<conjunction>`); the bounded-simulation holds checks plus
+the calibration pins above are the gate-wired deliverable, unchanged in
+shape from C′.

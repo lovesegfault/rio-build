@@ -136,6 +136,21 @@ let
     "claimedImpliesOpenAttempt"
     "claimedByOnlyMatHolders"
     "readyImpliesDepsProducedOnRequeue"
+    # A3 materialization-lifecycle-kernel (bughunt wave) — the
+    # contract re-derivation: budget verdicts are per-job-window sound
+    # on BOTH charge channels (067 — the owner-signed Q5 reversal of
+    # counter-signed residual (a) — and 020's 085-window), a pending
+    # unclaimed job never strands its node Running (015/307 — the
+    # atomic release_claim), and the stale-reset carrier survives
+    # creation-to-completion (257/055 — #[must_use]
+    # RealizedPathCarrier + the completion chokepoint). Calibration
+    # pairs: quint-materialization-calib-{establish-never-parks,
+    # unscoped-count,split-rearm,chain-reset-carrier,
+    # chain-reset-completion}.
+    "budgetSoundness"
+    "pendingUnclaimedImpliesClaimableNode"
+    "carrierConservation"
+    "completionRecordsRealizedPaths"
   ];
 
   # The leader-election model as its own single-file store path (the
@@ -3867,7 +3882,7 @@ in
       name = "materialization-runs-base";
       spec = "materializationJob";
       main = "materializationJobBase";
-      match = "happyPathRun|parkSplitRun|prunedFailFastRun|unmarkedArm3FromSourceRun|markedClaimUpgradeRun|legacyBackfillRun|reprobeResetRun";
+      match = "happyPathRun|parkSplitRun|prunedFailFastRun|unmarkedArm3FromSourceRun|markedClaimUpgradeRun|legacyBackfillRun|reprobeResetRun|twoJobFreshWindowRun";
     };
     quint-materialization-runs-failover = mkQuintRunCheck {
       name = "materialization-runs-failover";
@@ -3880,6 +3895,15 @@ in
       spec = "materializationJob";
       main = "materializationJobAdversarialStore";
       match = "staleResetRun";
+    };
+    # A3 (bughunt wave): the owner-signed Q5 reversal's contract pin —
+    # a pure-establishment crash-loop parks at the budget
+    # (establishmentParkRun needs ENABLE_CRASH).
+    quint-materialization-runs-crash-loop = mkQuintRunCheck {
+      name = "materialization-runs-crash-loop";
+      spec = "materializationJob";
+      main = "materializationJobCrashLoop";
+      match = "establishmentParkRun";
     };
 
     # Bounded-simulation HOLDS checks, one per design-scale regime —
@@ -4353,6 +4377,102 @@ in
       step = "calibStep";
       witness = "readyImpliesDepsProducedOnRequeue";
     };
+    # A3 materialization-lifecycle-kernel calibrations (bughunt wave):
+    # the re-derivation's polarity rule — the two REMOVED as-built
+    # encodings preserved as expect-violation pins, the two
+    # not-representable pre-fix splits INTRODUCED calibration-only.
+    # never-parks: the establishment charge without the park decision
+    # (bug_067 — the counter-signed residual the Q5 reversal
+    # superseded; TLC first violation ~2.6s).
+    quint-materialization-calib-establish-never-parks = mkQuintWitnessCheck {
+      name = "materialization-calib-establish-never-parks";
+      spec = "calibration/mat-establish-never-parks";
+      main = "matCalibEstablishNeverParks";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "budgetSoundness";
+    };
+    # unscoped-count: the drv-level one-shot read spanning jobs
+    # (merged_bug_020 — the flat history count; TLC ~14s).
+    quint-materialization-calib-unscoped-count = mkQuintWitnessCheck {
+      name = "materialization-calib-unscoped-count";
+      spec = "calibration/mat-unscoped-count";
+      main = "matCalibUnscopedCount";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "budgetSoundness";
+    };
+    # split-rearm: the claim drop without the node requeue — the
+    # second-replica wedge (merged_bug_015/307; TLC ~2.2s).
+    quint-materialization-calib-split-rearm = mkQuintWitnessCheck {
+      name = "materialization-calib-split-rearm";
+      spec = "calibration/mat-split-rearm-without-reassign";
+      main = "matCalibSplitRearm";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "pendingUnclaimedImpliesClaimableNode";
+    };
+    # chain-reset, conservation leg: the stale-reset creation drops
+    # the carrier (merged_bug_257; TLC ~3.8s at full scope).
+    quint-materialization-calib-chain-reset-carrier = mkQuintWitnessCheck {
+      name = "materialization-calib-chain-reset-carrier";
+      spec = "calibration/mat-chain-reset-drops-carrier";
+      main = "matCalibChainResetDropsCarrier";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "carrierConservation";
+    };
+    # chain-reset, completion leg: the dropped carrier reaches a
+    # success resolution — the [""] stamp image (merged_bug_055).
+    # Reduced single-drv scope per the F13 sub-regime ladder: the
+    # two-drv TLC run is ~9min to first violation, the Ex scope ~3s.
+    quint-materialization-calib-chain-reset-completion = mkQuintWitnessCheck {
+      name = "materialization-calib-chain-reset-completion";
+      spec = "calibration/mat-chain-reset-drops-carrier";
+      main = "matCalibChainResetDropsCarrierEx";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "completionRecordsRealizedPaths";
+    };
+    # charge-on-cancel: the split cancel leaves the attempt open and
+    # the establishment charges the cancelled job (the A3 leg of the
+    # 276 class — extends A1's chargeFreeCancellation latch; TLC
+    # ~2.7s).
+    quint-materialization-calib-charge-on-cancel = mkQuintWitnessCheck {
+      name = "materialization-calib-charge-on-cancel";
+      spec = "calibration/mat-charge-on-cancel";
+      main = "matCalibChargeOnCancel";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "chargeFreeCancellation";
+    };
+    # head-starvation (bug_385): a deterministic RUN pin, not an
+    # invariant falsification — the LIMIT-1 oldest-first admission
+    # refuses the younger claim behind a parked head while the
+    # as-built free claim (the in-pass skip) proceeds from the same
+    # state. The sim-witness encoding is edge-shaped and cannot flip
+    # (recorded in the calibration header + the invariant map).
+    quint-materialization-calib-head-starvation = mkQuintRunCheck {
+      name = "materialization-calib-head-starvation";
+      spec = "calibration/mat-head-starvation";
+      main = "matCalibHeadStarvation";
+      extraSpecs = [ "materializationJob" ];
+      match = "headStarvationRun";
+    };
+    # f10b swallowed-rebuild (merged_bug_246): the failover rebuild
+    # runs but a per-drv load failure is swallowed — partial view
+    # served as hydrated. INTRODUCED calibration-only (the as-built
+    # failover rebuilds faithfully; the pre-fix shape is not
+    # representable in the main model — §2.A3 polarity, model twin of
+    # the kani projection gap).
+    quint-materialization-calib-f10b-swallowed-rebuild = mkQuintWitnessCheck {
+      name = "materialization-calib-f10b-swallowed-rebuild";
+      spec = "calibration/mat-f10b-swallowed-rebuild";
+      main = "matCalibF10bSwallowedRebuild";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "unresolvedJobAlwaysArmed";
+    };
 
     # ------------------------------------------------------------------
     # A1 fenced-write-discipline — the fence over interleaved
@@ -4474,6 +4594,40 @@ in
       spec = "spawnCoherence";
       main = "spawnCoherenceRenderedDeadline";
       witness = "canReachEstablished";
+    };
+    # A3/282 axis regime (bughunt wave; §4.F16 gating — every other
+    # regime binds ENABLE_RETRY_BACKOFF=false and stays
+    # state-space-identical, re-measured bit-exact at
+    # 36,084,961/2,013,280 for spawnCoherenceBase): the spawn edge
+    # refuses in-backoff intents. Exhaustive [ok] at
+    # 82,701,121/4,529,880 in ~25s. Falsifiability pair:
+    # quint-controller-calib-282-backoff-ignored.
+    quint-spawn-coherence-retry-backoff = mkQuintCheck {
+      name = "spawn-coherence-retry-backoff";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceRetryBackoff";
+      invariants = [
+        "ceilingRespected"
+        "reapSafety"
+        "orphanRemoved"
+        "ackSoundness"
+        "ackCoversPending"
+        "degradedPolarity"
+        "gateFailClosed"
+        "freedSlotsSpendable"
+        "establishedOnlyPastRenderedDeadline"
+        "noSpawnIntentInsideBackoff"
+      ];
+    };
+    # The 282 pre-fix flip: intentArrives without the backoff conjunct
+    # (TLC first violation ~1.1s).
+    quint-controller-calib-282-backoff-ignored = mkQuintWitnessCheck {
+      name = "controller-calib-282-backoff-ignored";
+      spec = "calibration/controller-282-backoff-ignored";
+      main = "ctrlCalib282BackoffIgnored";
+      extraSpecs = [ "spawnCoherence" ];
+      step = "calibStep";
+      witness = "noSpawnIntentInsideBackoff";
     };
 
     # ------------------------------------------------------------------

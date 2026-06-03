@@ -35,7 +35,8 @@ module gbCalibAckAttempted {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the ack covers the attempted
@@ -222,6 +223,7 @@ module gbCalibAckAttempted {
       streak' = streak,
       pendingClose' = pendingClose,
       obsLive' = obsLive,
+      inBackoff' = inBackoff,
     }
   }
 
@@ -280,7 +282,8 @@ module gbCalibAckOnlyNew {
     ENABLE_CANCEL_CAUSE = false,
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
-    ENABLE_EXEC_PINNED = false
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_RETRY_BACKOFF = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: only the spawned-this-tick set is
@@ -467,6 +470,7 @@ module gbCalibAckOnlyNew {
       streak' = streak,
       pendingClose' = pendingClose,
       obsLive' = obsLive,
+      inBackoff' = inBackoff,
     }
   }
 

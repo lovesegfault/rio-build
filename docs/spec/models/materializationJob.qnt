@@ -54,10 +54,18 @@
 //     `stalledJobs` derived val) until `parkBackoffExpires`. The
 //     budget counter is NOT reset at unpark (as built:
 //     park_materialization_job derives backoff from the surviving
-//     count); the park itself rides the InfraFailure consumption
-//     (materialize.rs:826), not a separate transition, and the
-//     establishment sweep never parks (materialize.rs:1243 — the job
-//     stays pending claimable, however large the count).
+//     count); the park itself rides the charge chokepoint
+//     (charge_materialization_infra fuses charge + kernel verdict —
+//     materialize.rs), not a separate transition, and parking is
+//     PARTY-BLIND (the bughunt-wave Q5 reversal of counter-signed
+//     residual (a), owner-signed 2026-06-03): worker InfraFailure and
+//     establishment charges count toward the SAME per-job budget
+//     window and both park at MAT_BUDGET (config.rs
+//     conversion_requires_worker_charge doc — "worker-reported AND
+//     establishment-written, both channels charge the same budget").
+//     The per-job window is the 085 job-creation reset row's image:
+//     freshJob's zeroed counts ARE the window (each job's ledger
+//     suffix starts at its creation reset).
 //   Delta 4 — five origins, split posture (T-1.5/T-1.6/T-5.2,
 //     finding 20): `OReprobe` added (carries the AS-5 6d status
 //     reset, merge.rs:934 apply_reprobe_reset_in_memory);
@@ -462,6 +470,26 @@ module materializationJob {
   /// validate_transition_for_release); the mat-318 calibration's
   /// forced-Ready requeue reaches the violation.
   var requeueReadyJustifiedAll: bool
+  /// CARRIER IMAGE (bughunt wave, A3/257+055): the stale-reset job
+  /// carries the realized output paths captured AT CREATION
+  /// (take_realized_paths -> #[must_use] RealizedPathCarrier ->
+  /// create_materialization_job — the bare clear is unwritable in
+  /// code). Set by createJob's OStaleReset arm, never cleared while
+  /// the job exists; completion stamps what the carrier holds, so the
+  /// success-resolved stale-reset job must still be carried
+  /// (completionRecordsRealizedPaths). The
+  /// mat-chain-reset-drops-carrier calibration re-introduces the
+  /// pre-fix drop.
+  var carried: str -> bool
+  /// GHOST LATCH (bughunt wave, A3/067+020): every budget verdict
+  /// read the PER-JOB window — the park predicate applied exactly at
+  /// newCount >= MAT_BUDGET on BOTH charge channels (party-blind, the
+  /// Q5 reversal), and the unobtainable one-shot consulted the job's
+  /// OWN count (the 085 reset-row window), never the drv-level
+  /// history. Constant-true under the as-built actions; the
+  /// mat-establish-never-parks and mat-unscoped-count calibrations
+  /// reach the violations.
+  var budgetSoundAll: bool
 
   // --- 5. derived state -------------------------------------------------------
 
@@ -673,6 +701,60 @@ module materializationJob {
   /// Assigned->Ready release) is the calibration arm. Falsifiability
   /// pair: mat-318-requeue-forces-ready.
   val readyImpliesDepsProducedOnRequeue = requeueReadyJustifiedAll
+
+  /// A3/067+020 (bughunt wave, the contract re-derivation): every
+  /// budget verdict read the PER-JOB window — the park predicate
+  /// applied exactly at newCount >= MAT_BUDGET on BOTH charge
+  /// channels (party-blind, the owner-signed Q5 reversal of
+  /// counter-signed residual (a)), and the unobtainable one-shot
+  /// consulted the job's own count (the 085 reset-row window). The
+  /// mat-establish-never-parks and mat-unscoped-count calibrations
+  /// preserve the removed as-built encodings and reach the
+  /// violations.
+  val budgetSoundness = budgetSoundAll
+
+  /// A3/015+307 (bughunt wave): a pending unparked job with no open
+  /// attempt never strands its node Running — release_claim is
+  /// atomic (view rearm + reassign in ONE step; consumeUnobtainable
+  /// at qnt is the code twin). The
+  /// mat-split-rearm-without-reassign calibration splits the step
+  /// and reaches the violation.
+  val pendingUnclaimedImpliesClaimableNode = DRVS.forall(d =>
+    match jobs.get(d) {
+      | NoJob => true
+      | SomeJob(j) =>
+        (j.state == JPending and not(j.parked) and attempts.get(d) == NoAttempt)
+          implies nodeStatus.get(d) != NRunning
+    }
+  )
+
+  /// A3/257 (bughunt wave): an unresolved stale-reset job keeps its
+  /// carrier — capture-at-creation (#[must_use] RealizedPathCarrier
+  /// makes the bare clear unwritable in code). The
+  /// mat-chain-reset-drops-carrier calibration re-introduces the
+  /// pre-fix drop.
+  val carrierConservation = DRVS.forall(d =>
+    match jobs.get(d) {
+      | NoJob => true
+      | SomeJob(j) =>
+        (j.origin == OStaleReset and (j.state == JPending or j.state == JClaimed))
+          implies carried.get(d)
+    }
+  )
+
+  /// A3/055 (bughunt wave): a success-resolved stale-reset job
+  /// recorded the realized paths — the completion chokepoint
+  /// (complete_materialization_for_live_interest) cannot skip the
+  /// stamp; a [""]-stamped carried completion is the violation image
+  /// (the calibration's resolution-discard arm).
+  val completionRecordsRealizedPaths = DRVS.forall(d =>
+    match jobs.get(d) {
+      | NoJob => true
+      | SomeJob(j) =>
+        (j.origin == OStaleReset and j.state == JResolvedSuccess)
+          implies carried.get(d)
+    }
+  )
 
   /// §3.6: the attempt kind matches the worker class.
   val kindMatchesWorker = DRVS.forall(d =>
@@ -926,6 +1008,8 @@ module materializationJob {
     chargedAfterCancel' = chargedAfterCancel,
     claimOrigin' = claimOrigin,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
+    carried' = carried,
+    budgetSoundAll' = budgetSoundAll,
   }
   /// Job-core vars unchanged.
   action jobCoreUnchanged = all {
@@ -1040,6 +1124,14 @@ module materializationJob {
     chargedAfterCancel' = chargedAfterCancel,
     claimOrigin' = claimOrigin,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
+    // A3/257 carrier capture-at-creation: the stale-reset origin
+    // creates WITH the realized paths (take_realized_paths ->
+    // create_materialization_job in one pass; the !deps_ok exit
+    // creates too — PD-6 Queued claims). The
+    // mat-chain-reset-drops-carrier calibration re-introduces the
+    // pre-fix drop.
+    carried' = if (origin == OStaleReset) carried.put(d, true) else carried,
+    budgetSoundAll' = budgetSoundAll,
   }
 
   /// Delta 5: the dispatch-probe dedup re-encounters an existing
@@ -1143,6 +1235,8 @@ module materializationJob {
     creationResolvableAll' = creationResolvableAll,
     chargedAfterCancel' = chargedAfterCancel,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
+    carried' = carried,
+    budgetSoundAll' = budgetSoundAll,
   }
 
   /// §2.2 item 3 / §5: the claiming replica ingests one
@@ -1204,6 +1298,8 @@ module materializationJob {
     chargedAfterCancel' = chargedAfterCancel,
     claimOrigin' = claimOrigin,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
+    carried' = carried,
+    budgetSoundAll' = budgetSoundAll,
   }
 
   /// §2.4: the executor's Unobtainable report + the four-arm
@@ -1238,8 +1334,11 @@ module materializationJob {
     val missingLive = missing.intersect(w)
     val execId = match attempts.get(d) { | NoAttempt => 0 | OpenAttempt(a) => a.execId }
     val marked = topdownPruned.get(d)
-    // drv-level one-shot (the as-built history read).
-    val oneShotSpent = matUnobtainableLedger.get(d) > 0
+    // PER-JOB one-shot (the 085 reset-row window — the job's own
+    // count, A3/020): the drv-level history read is preserved ONLY as
+    // the mat-unscoped-count calibration.
+    val oneShotSpent = match jobs.get(d) { | NoJob => false | SomeJob(j) => j.matUnobtainableCount > 0 }
+    val ownShotSpent = oneShotSpent
     val arm0 = missingLive == Set()
     val arm0covered = arm0 and liveWantedCovered(d)
     val arm12 = not(arm0) and (durableRel.get(d) == RVouched or durableRel.get(d) == RPending)
@@ -1280,6 +1379,9 @@ module materializationJob {
         topdownPruned.put(d, false)
       else topdownPruned,
       matUnobtainableLedger' = matUnobtainableLedger.put(d, matUnobtainableLedger.get(d) + 1),
+      // A3/020: the one-shot routing consulted the job's OWN window —
+      // the mat-unscoped-count override records false on divergence.
+      budgetSoundAll' = and { budgetSoundAll, oneShotSpent == ownShotSpent },
       failFastCount' = if (arm3fail) failFastCount.put(d, failFastCount.get(d) + 1) else failFastCount,
       // delta 1: the four-conjunct justification, at decision time.
       // marked/Broken/missing-live are structural at the arm3fail
@@ -1319,6 +1421,7 @@ module materializationJob {
     chargedAfterCancel' = chargedAfterCancel,
     claimOrigin' = claimOrigin,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
+    carried' = carried,
   }
 
   /// §2.5: the executor's InfraFailure report — the charge rides the
@@ -1344,6 +1447,8 @@ module materializationJob {
         | SomeJob(j) => SomeJob({ ...j, state: JPending, parked: parks, matInfraCount: newCount })
       }),
       view' = view.put(d, VPending(parks)),
+      // A3/067: the budget-soundness contract at this charge edge.
+      budgetSoundAll' = and { budgetSoundAll, parks == (newCount >= MAT_BUDGET) },
     },
     attempts' = attempts.put(d, NoAttempt),
     nodeStatus' = nodeStatus.put(d, NQueued),
@@ -1354,16 +1459,33 @@ module materializationJob {
     buildCrashLedger' = buildCrashLedger,
     establishCount' = establishCount, buildCrashEstablished' = buildCrashEstablished,
     unobChargeBacked' = unobChargeBacked,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged,
+    // ghostsUnchanged expanded: this charge edge writes the
+    // budget-soundness latch (A3/067 — park applied iff the per-job
+    // window reached the budget).
+    failFastCount' = failFastCount,
+    ffJustifiedAll' = ffJustifiedAll, fsJustifiedAll' = fsJustifiedAll,
+    fsReportSoundAll' = fsReportSoundAll, covAtResolveAll' = covAtResolveAll,
+    covLiveOnlyAll' = covLiveOnlyAll,
+    creationResolvableAll' = creationResolvableAll,
+    chargedAfterCancel' = chargedAfterCancel,
+    claimOrigin' = claimOrigin,
+    requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
+    carried' = carried,
   }
 
   /// §2.4 establishment (BC-2/BC-3/PP-4): a crashed worker's open
   /// attempt is established — BOTH kinds modeled. Materialization
-  /// kind: materialization_infra charge, NO adopt arm, NO park (as
-  /// built, materialize.rs:1243 — the job stays pending claimable
-  /// whatever the count); build kind: executor_crash into the build
-  /// ledger (+ the legitimate-channel ghost). Scheduler-internal —
-  /// no channel gate.
+  /// kind: materialization_infra charge THROUGH the kernel park
+  /// verdict (the bughunt-wave Q5 reversal, owner-signed 2026-06-03:
+  /// charge_materialization_infra fuses charge + decision; parking is
+  /// party-blind, so establishment-only crash-loops park at
+  /// MAT_BUDGET and join the stalled population instead of re-listing
+  /// forever), NO adopt arm; build kind: executor_crash into the
+  /// build ledger (+ the legitimate-channel ghost).
+  /// Scheduler-internal — no channel gate. The pre-reversal
+  /// never-parks behavior is preserved ONLY as the
+  /// mat-establish-never-parks calibration.
   action establishCrashedAttempt(d: str): bool = all {
     ENABLE_CRASH,
     attempts.get(d) != NoAttempt,
@@ -1379,21 +1501,33 @@ module materializationJob {
       | NoAttempt => false
       | OpenAttempt(a) => a.kind == KMaterialization
     }
+    // The Q5 reversal: the establishment charge runs the SAME park
+    // predicate as the worker consumption (per-job window — the 085
+    // reset-row image; party-blind per config.rs's
+    // conversion_requires_worker_charge doc).
+    val newCount = match jobs.get(d) { | NoJob => 0 | SomeJob(j) => j.matInfraCount + 1 }
+    val parks = isMat and newCount >= MAT_BUDGET
     all {
       attempts' = attempts.put(d, NoAttempt),
       jobs' = if (isMat) jobs.put(d, match jobs.get(d) {
         | NoJob => NoJob
-        | SomeJob(j) => SomeJob({ ...j, state: JPending, matInfraCount: j.matInfraCount + 1 })
+        | SomeJob(j) => SomeJob({ ...j, state: JPending, parked: parks, matInfraCount: newCount })
       }) else jobs,
       view' = if (isMat) view.put(d, match jobs.get(d) {
         | NoJob => VNone
-        | SomeJob(j) => VPending(j.parked)
+        | SomeJob(j) => VPending(parks)
       }) else view,
       nodeStatus' = nodeStatus.put(d, NQueued),
       matInfraLedger' = if (isMat) matInfraLedger.put(d, matInfraLedger.get(d) + 1) else matInfraLedger,
       establishCount' = if (isMat) establishCount.put(d, establishCount.get(d) + 1) else establishCount,
       buildCrashLedger' = if (isMat) buildCrashLedger else buildCrashLedger.put(d, buildCrashLedger.get(d) + 1),
       buildCrashEstablished' = if (isMat) buildCrashEstablished else buildCrashEstablished.put(d, true),
+      // A3/067: the park applied iff the per-job window reached the
+      // budget — the mat-establish-never-parks override records false.
+      budgetSoundAll' = and {
+        budgetSoundAll,
+        isMat implies (parks == (newCount >= MAT_BUDGET)),
+      },
     },
     dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, envUnchanged,
@@ -1421,6 +1555,7 @@ module materializationJob {
     // sets nodeStatus NQueued) — the latch formula is preserved-true
     // structurally, not merely framed.
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
+    carried' = carried,
   }
 
   /// §2.4 / BC-2: zero live in-memory interest cancels the job and
@@ -1540,6 +1675,8 @@ module materializationJob {
     chargedAfterCancel' = chargedAfterCancel,
     claimOrigin' = claimOrigin,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
+    carried' = carried,
+    budgetSoundAll' = budgetSoundAll,
   }
 
   /// Delta 3 arm 2: the durable backoff lapses — the job un-parks for
@@ -1786,6 +1923,8 @@ module materializationJob {
     staleWriteDiscarded' = false,
     staleJobWriteApplied' = false,
     chargedAfterCancel' = false,
+    carried' = DRVS.mapBy(d => false),
+    budgetSoundAll' = true,
     channelStale' = REPLICAS.mapBy(r => false),
     failedOver' = false,
     claimAfterFailover' = false,
@@ -2028,6 +2167,73 @@ module materializationJob {
 
   /// Delta 4: the reprobe lane — an existing Ready node re-merged
   /// creates a reprobe-origin job WITH the AS-5 status reset.
+  /// A3/020 (the per-job budget window — migration 085's image):
+  /// job 1 accrues budget-1 charges and resolves from source; job 2
+  /// is created (the creation reset starts a FRESH window) and its
+  /// first infra charge re-arms instead of parking. The pre-fix flat
+  /// history count would have parked job 2 immediately
+  /// (mat-unscoped-count preserves that encoding).
+  run twoJobFreshWindowRun = {
+    init
+      .then(recordWantedRelation("b1", "d1", Set("o1")))
+      .then(createJob("d1", OProbe, "b1"))
+      .then(claimJob("d1", "r1"))
+      .then(reportInfra("d1"))
+      .expect(match jobs.get("d1") {
+        | NoJob => false
+        | SomeJob(j) => j.state == JPending and not(j.parked) and j.matInfraCount == 1
+      })
+      // kill the upstream so the next report's missing path is
+      // evidence-backed, then resolve job 1 from source (arm 3,
+      // RBroken + unmarked).
+      .then(upstreamChange("d1", "o1"))
+      .then(claimJob("d1", "r1"))
+      .then(consumeUnobtainable("d1", Set("o1")))
+      .expect(match jobs.get("d1") {
+        | NoJob => false
+        | SomeJob(j) => j.state == JResolvedFromSource
+      })
+      // job 2: the creation reset starts a FRESH per-job window — its
+      // first infra charge re-arms (count 1 < MAT_BUDGET 2), where the
+      // pre-fix flat history count (already 2 by job 1) would park.
+      .then(createJob("d1", OProbe, "b1"))
+      .then(claimJob("d1", "r2"))
+      .then(reportInfra("d1"))
+      .expect(and {
+        match jobs.get("d1") {
+          | NoJob => false
+          | SomeJob(j) => j.state == JPending and not(j.parked) and j.matInfraCount == 1
+        },
+        budgetSoundAll,
+      })
+  }
+
+  /// A3/067 (the owner-signed Q5 reversal): a pure-establishment
+  /// crash-loop parks at the budget — the job joins the stalled
+  /// population instead of re-listing forever.
+  run establishmentParkRun = {
+    init
+      .then(recordWantedRelation("b1", "d1", Set("o1")))
+      .then(createJob("d1", OProbe, "b1"))
+      .then(claimJob("d1", "r1"))
+      .then(establishCrashedAttempt("d1"))
+      .expect(match jobs.get("d1") {
+        | NoJob => false
+        | SomeJob(j) => j.state == JPending and not(j.parked) and j.matInfraCount == 1
+      })
+      .then(claimJob("d1", "r1"))
+      .then(establishCrashedAttempt("d1"))
+      .expect(and {
+        match jobs.get("d1") {
+          // MAT_BUDGET = 2 in every regime: the second establishment
+          // charge parks, party-blind (zero worker reports).
+          | NoJob => false
+          | SomeJob(j) => j.state == JPending and j.parked and j.matInfraCount == 2
+        },
+        budgetSoundAll,
+      })
+  }
+
   run reprobeResetRun = {
     init
       .then(recordWantedRelation("b1", "d1", Set("o1")))
@@ -2271,8 +2477,11 @@ module materializationJobStaleTenureEx {
 
 /// Crash-loop regime (the PP-4 channel): repeated establishment of
 /// crashed attempts of BOTH kinds — the partition invariants' and the
-/// charge-once invariant's contended regime. The establishment never
-/// parks (as built) — the loop is bounded by the ledger ceilings.
+/// charge-once invariant's contended regime. Post-Q5-reversal the
+/// establishment PARKS at the budget (party-blind), so pure
+/// crash-loops enter the stalled population and re-arm only through
+/// the backoff expiry — the loop is bounded by the park cycle plus
+/// the ledger ceilings.
 module materializationJobCrashLoop {
   import materializationJob(
     BUILDS = Set("b1", "b2"),
