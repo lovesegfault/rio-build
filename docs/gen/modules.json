@@ -848,6 +848,11 @@
       "doc": "`rio-replay eval` — record a v1 replay archive from a Hydra"
     },
     {
+      "path": "cmd/record_drvs.rs",
+      "depth": 1,
+      "doc": "`rio-replay record-drvs` — record a v1 replay archive from local"
+    },
+    {
       "path": "evalset/",
       "depth": 0,
       "doc": "Evaluation recording."

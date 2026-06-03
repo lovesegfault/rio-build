@@ -18,6 +18,9 @@ enum Cmd {
     /// Record a v1 replay archive (workload units, expected outcomes,
     /// closures, derivations) from a Hydra evaluation.
     Eval(rio_replay::cmd::eval::EvalArgs),
+    /// Record a v1 replay archive from local derivation files (dev/test
+    /// recorder for smoke-scale archives).
+    RecordDrvs(rio_replay::cmd::record_drvs::RecordDrvsArgs),
     /// Run a replay campaign against a recorded replay archive.
     Run(rio_replay::run::RunArgs),
 }
@@ -32,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
     let _otel_guard = rio_common::observability::init_tracing("replay")?;
     match cli.cmd {
         Cmd::Eval(args) => rio_replay::cmd::eval::run(args).await,
+        Cmd::RecordDrvs(args) => rio_replay::cmd::record_drvs::run(args).await,
         Cmd::Run(args) => rio_replay::run::run(args).await,
     }
 }

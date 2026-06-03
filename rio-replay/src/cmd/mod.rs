@@ -4,3 +4,4 @@
 //! `main.rs` stays a thin dispatcher.
 
 pub mod eval;
+pub mod record_drvs;
