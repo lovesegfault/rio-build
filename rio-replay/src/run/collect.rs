@@ -2044,6 +2044,7 @@ mod tests {
             &self,
             _key: &str,
             _dest: &std::path::Path,
+            _max_bytes: u64,
         ) -> Result<Option<(String, u64)>> {
             Ok(None)
         }

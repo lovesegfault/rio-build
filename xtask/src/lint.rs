@@ -75,7 +75,7 @@ pub enum Lint {
     ContractRegistry,
     /// Every external-IO call shape (`.send()` dispatch, awaited
     /// `.collect()`/`.text()` body buffering, `.read_to_end(`) in
-    /// rio-replay's supply/substituter/archive modules carries an
+    /// rio-replay's supply/substituter/archive/artifact modules carries an
     /// adjacent `// bounded-io: <bound>` marker stating its time/size
     /// bound or deliberate waiver, and every marker annotates such a
     /// call. Catches a new unbounded arm at introduction — the
@@ -2129,7 +2129,11 @@ const BOUNDED_IO_MARKER: &str = "bounded-io:";
 /// - `rio-replay/src/substituter.rs` (the binary-cache client),
 /// - `rio-replay/src/nixcache.rs` (the operator binary-cache client the
 ///   upstream-coverage probe rides),
-/// - `rio-replay/src/archive/` (the S3 layout and image backends);
+/// - `rio-replay/src/archive/` (the S3 layout and image backends),
+/// - `rio-replay/src/run/artifact.rs` (the campaign artifact store — the
+///   module performing the largest single download in the system onto the
+///   most disk-constrained pod; it holds a raw `aws_sdk_s3::Client`, which
+///   is the property that should select scan roots, not incident history);
 ///
 /// and EXACTLY this needle alphabet ([`bounded_io_needle`]): `.send()`
 /// (empty-parens HTTP/SDK request dispatch — channel/`mpsc` sends take an
@@ -2163,7 +2167,7 @@ const BOUNDED_IO_MARKER: &str = "bounded-io:";
 ///
 /// HONESTY CLAUSE: this is a textual tripwire, not a by-construction
 /// guarantee. IO routed through helpers outside the alphabet, or living
-/// outside the three roots, is invisible to it. The by-construction
+/// outside the listed roots, is invisible to it. The by-construction
 /// version is transport-handle encapsulation — bounded combinators that
 /// OWN the reqwest/aws clients so a raw `.send()` is unreachable outside
 /// them, making an unbounded arm unwritable rather than unblessed.
@@ -2180,6 +2184,7 @@ fn bounded_io() -> Result<()> {
     let file_roots = [
         "rio-replay/src/substituter.rs",
         "rio-replay/src/nixcache.rs",
+        "rio-replay/src/run/artifact.rs",
     ];
     let dir_roots = ["rio-replay/src/run/supply", "rio-replay/src/archive"];
 
@@ -2209,22 +2214,22 @@ fn bounded_io() -> Result<()> {
         walk_rs(&path, &mut scan)?;
     }
 
-    // Floor guards: ~21 production needles across ~11 files today. A
+    // Floor guards: ~26 production needles across ~12 files today. A
     // collapse means the needle detection or the roots regressed, not
     // that the modules stopped doing IO.
     ensure!(
-        files >= 5,
+        files >= 6,
         "bounded-io scan visited only {files} file(s) — a scan root has regressed",
     );
     ensure!(
-        needles >= 12,
+        needles >= 17,
         "bounded-io scan found only {needles} IO call site(s) — suspiciously few; the needle \
          detection or the scan roots have regressed",
     );
     if !violations.is_empty() {
         bail!(
             "{} bounded-io violation(s):\n    {}\n  every external-IO call in the \
-             supply/substituter/archive modules needs an adjacent `// {BOUNDED_IO_MARKER} \
+             supply/substituter/archive/artifact modules needs an adjacent `// {BOUNDED_IO_MARKER} \
              <time/size bound, or the deliberate waiver>` comment, and every marker must \
              annotate such a call",
             violations.len(),

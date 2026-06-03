@@ -32,7 +32,25 @@ pub trait ArtifactStore: Send + Sync {
     /// SHA-256 (lowercase hex) and byte length so callers verify without a
     /// second pass; `Ok(None)` — with no file created — when the key does
     /// not exist.
-    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<Option<(String, u64)>>;
+    ///
+    /// `max_bytes` is the caller's expected size for the object — every
+    /// bulk download in this system has one in hand before the GET (the
+    /// completion marker's recorded member size, operator-trust) — and is
+    /// enforced IN the streaming loop: the bytes at the key are whatever
+    /// the backend currently holds (a swept-and-republished prefix or an
+    /// out-of-band bucket writer can put a foreign object there), so a
+    /// post-download comparison alone would let an over-sized object fill
+    /// the pod's ephemeral volume (kubelet eviction) before any refusal.
+    /// Implementations stop within one chunk past `max_bytes`, remove the
+    /// partial `dest`, and fail with an error naming the bound; the
+    /// signature makes an unbounded streamed download unwritable rather
+    /// than merely discouraged.
+    async fn get_to_file(
+        &self,
+        key: &str,
+        dest: &Path,
+        max_bytes: u64,
+    ) -> Result<Option<(String, u64)>>;
     async fn exists(&self, key: &str) -> Result<bool>;
 }
 
@@ -75,7 +93,12 @@ impl ArtifactStore for LocalDirArtifactStore {
         }
     }
 
-    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<Option<(String, u64)>> {
+    async fn get_to_file(
+        &self,
+        key: &str,
+        dest: &Path,
+        max_bytes: u64,
+    ) -> Result<Option<(String, u64)>> {
         use sha2::Digest as _;
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -92,25 +115,40 @@ impl ArtifactStore for LocalDirArtifactStore {
         let mut hasher = sha2::Sha256::new();
         let mut size: u64 = 0;
         let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let n = src
-                .read(&mut buf)
-                .await
-                .with_context(|| format!("read {}", path.display()))?;
-            if n == 0 {
-                break;
+        let result: Result<()> = async {
+            loop {
+                let n = src
+                    .read(&mut buf)
+                    .await
+                    .with_context(|| format!("read {}", path.display()))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                size += n as u64;
+                anyhow::ensure!(
+                    size <= max_bytes,
+                    "{} exceeds the {max_bytes} bytes the caller expects for {key} — the \
+                     artifact is not the one the caller's record vouches for",
+                    path.display()
+                );
+                writer
+                    .write_all(&buf[..n])
+                    .await
+                    .with_context(|| format!("write {}", dest.display()))?;
             }
-            hasher.update(&buf[..n]);
-            size += n as u64;
             writer
-                .write_all(&buf[..n])
+                .flush()
                 .await
-                .with_context(|| format!("write {}", dest.display()))?;
+                .with_context(|| format!("flush {}", dest.display()))
         }
-        writer
-            .flush()
-            .await
-            .with_context(|| format!("flush {}", dest.display()))?;
+        .await;
+        if let Err(err) = result {
+            // The size belt (and any read/write failure) must not strand
+            // partial bytes at `dest`.
+            let _ = tokio::fs::remove_file(dest).await;
+            return Err(err);
+        }
         Ok(Some((hex::encode(hasher.finalize()), size)))
     }
 
@@ -146,6 +184,9 @@ impl ArtifactStore for S3ArtifactStore {
             .bucket(&self.bucket)
             .key(key)
             .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
+            // bounded-io: dispatch of a state-object PUT whose body the
+            // engine produced and already holds in memory; SDK
+            // connect/dispatch defaults bound the header wait
             .send()
             .await
             .with_context(|| format!("s3 put s3://{}/{key}", self.bucket))?;
@@ -158,10 +199,19 @@ impl ArtifactStore for S3ArtifactStore {
             .get_object()
             .bucket(&self.bucket)
             .key(key)
+            // bounded-io: dispatch/header wait of a metadata-object GET
             .send()
             .await
         {
             Ok(out) => {
+                // bounded-io: buffers the body whole — get_bytes is the
+                // small-metadata read of the trait contract (markers, JSONL
+                // state, campaign.json, all engine-written under the
+                // campaign prefix); the SDK's stalled-stream protection
+                // bounds a dead peer. Accepted residual: an out-of-band
+                // over-sized object at a state key buffers before any
+                // check — bulk payloads must use get_to_file, whose
+                // signature demands the size bound.
                 let data = out.body.collect().await.context("collect s3 body")?;
                 Ok(Some(data.into_bytes().to_vec()))
             }
@@ -174,7 +224,12 @@ impl ArtifactStore for S3ArtifactStore {
         }
     }
 
-    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<Option<(String, u64)>> {
+    async fn get_to_file(
+        &self,
+        key: &str,
+        dest: &Path,
+        max_bytes: u64,
+    ) -> Result<Option<(String, u64)>> {
         use sha2::Digest as _;
         use tokio::io::AsyncWriteExt as _;
 
@@ -183,6 +238,11 @@ impl ArtifactStore for S3ArtifactStore {
             .get_object()
             .bucket(&self.bucket)
             .key(key)
+            // bounded-io: dispatch/header wait for a bulk-object GET; the
+            // body below is deliberately unbounded in time (stalled-stream
+            // protection bounds a dead peer), streamed to disk (never
+            // buffered), and disk-bounded in the loop at the caller's
+            // `max_bytes` (the trait contract)
             .send()
             .await
         {
@@ -201,22 +261,37 @@ impl ArtifactStore for S3ArtifactStore {
         let mut writer = tokio::io::BufWriter::new(file);
         let mut hasher = sha2::Sha256::new();
         let mut size: u64 = 0;
-        while let Some(chunk) = body
-            .try_next()
-            .await
-            .with_context(|| format!("read s3://{}/{key}", self.bucket))?
-        {
-            hasher.update(&chunk);
-            size += chunk.len() as u64;
-            writer
-                .write_all(&chunk)
+        let result: Result<()> = async {
+            while let Some(chunk) = body
+                .try_next()
                 .await
-                .with_context(|| format!("write {}", dest.display()))?;
+                .with_context(|| format!("read s3://{}/{key}", self.bucket))?
+            {
+                hasher.update(&chunk);
+                size += chunk.len() as u64;
+                anyhow::ensure!(
+                    size <= max_bytes,
+                    "s3://{}/{key} exceeds the {max_bytes} bytes the caller expects — the \
+                     object at the key is not the one the caller's record vouches for",
+                    self.bucket
+                );
+                writer
+                    .write_all(&chunk)
+                    .await
+                    .with_context(|| format!("write {}", dest.display()))?;
+            }
+            writer
+                .flush()
+                .await
+                .with_context(|| format!("flush {}", dest.display()))
         }
-        writer
-            .flush()
-            .await
-            .with_context(|| format!("flush {}", dest.display()))?;
+        .await;
+        if let Err(err) = result {
+            // The size belt (and any read/write failure) must not strand
+            // partial bytes at `dest`.
+            let _ = tokio::fs::remove_file(dest).await;
+            return Err(err);
+        }
         Ok(Some((hex::encode(hasher.finalize()), size)))
     }
 
@@ -226,6 +301,8 @@ impl ArtifactStore for S3ArtifactStore {
             .head_object()
             .bucket(&self.bucket)
             .key(key)
+            // bounded-io: HEAD dispatch, no body; SDK connect/dispatch
+            // defaults bound the wait
             .send()
             .await
         {
@@ -821,10 +898,16 @@ mod tests {
             .await
             .unwrap();
 
+        // Must-admit boundary: an artifact of exactly the expected size
+        // streams through untouched.
         let dest_dir = tempfile::tempdir().unwrap();
         let dest = dest_dir.path().join("archive.dwarfs");
         let (sha256, size) = store
-            .get_to_file("replay/archives/aa/archive.dwarfs", &dest)
+            .get_to_file(
+                "replay/archives/aa/archive.dwarfs",
+                &dest,
+                body.len() as u64,
+            )
             .await
             .unwrap()
             .expect("the object exists");
@@ -836,12 +919,47 @@ mod tests {
         let missing_dest = dest_dir.path().join("missing");
         assert!(
             store
-                .get_to_file("replay/archives/aa/nope", &missing_dest)
+                .get_to_file("replay/archives/aa/nope", &missing_dest, u64::MAX)
                 .await
                 .unwrap()
                 .is_none()
         );
         assert!(!missing_dest.exists());
+    }
+
+    /// The in-loop size belt of [`LocalDirArtifactStore::get_to_file`]:
+    /// an artifact larger than the caller's expected size is refused from
+    /// INSIDE the streaming loop — the 200 KiB body crosses the 100 KiB
+    /// bound on its second 64 KiB chunk, two chunks before the source
+    /// ends, so the refusal cannot be a post-download comparison (the
+    /// impl has none; without the in-loop belt this call returns Ok) —
+    /// and no partial destination file is left behind.
+    #[tokio::test]
+    async fn get_to_file_refuses_oversized_artifact_in_loop_and_removes_partial() {
+        let adir = tempfile::tempdir().unwrap();
+        let store = LocalDirArtifactStore::new(adir.path());
+        let body = vec![7u8; 200 * 1024];
+        store
+            .put_bytes("replay/archives/aa/archive.dwarfs", body)
+            .await
+            .unwrap();
+
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("archive.dwarfs");
+        let max_bytes = 100 * 1024_u64;
+        let err = store
+            .get_to_file("replay/archives/aa/archive.dwarfs", &dest, max_bytes)
+            .await
+            .expect_err("an over-sized artifact must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&max_bytes.to_string()),
+            "the refusal must name the bound: {msg}"
+        );
+        assert!(
+            !dest.exists(),
+            "the refused download must not strand partial bytes"
+        );
     }
 
     #[tokio::test]
@@ -872,7 +990,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("archive.dwarfs");
         let (sha256, size) = store
-            .get_to_file("replay/archives/aa/archive.dwarfs", &dest)
+            .get_to_file(
+                "replay/archives/aa/archive.dwarfs",
+                &dest,
+                body.len() as u64,
+            )
             .await
             .unwrap()
             .expect("the object exists");
@@ -883,12 +1005,59 @@ mod tests {
         let missing_dest = dir.path().join("missing");
         assert!(
             store
-                .get_to_file("replay/archives/aa/nope", &missing_dest)
+                .get_to_file("replay/archives/aa/nope", &missing_dest, u64::MAX)
                 .await
                 .unwrap()
                 .is_none()
         );
         assert!(!missing_dest.exists());
+    }
+
+    /// The in-loop size belt of [`S3ArtifactStore::get_to_file`]: a body
+    /// larger than the caller's expected size is refused with an error
+    /// naming the bound (the impl has no post-download size comparison —
+    /// without the in-loop belt this call returns Ok with the larger
+    /// size), and the partial destination file is removed. This is the
+    /// foreign-object case: the marker the caller verifies against
+    /// records one size, the bucket serves something bigger, and the belt
+    /// is what keeps the difference from landing on the pod's ephemeral
+    /// volume.
+    #[tokio::test]
+    async fn s3_get_to_file_refuses_oversized_object_and_removes_partial() {
+        use aws_sdk_s3::operation::get_object::GetObjectOutput;
+        use aws_sdk_s3::primitives::ByteStream;
+        use aws_smithy_mocks::{RuleMode, mock, mock_client};
+
+        let foreign_body = vec![9u8; 64 * 1024];
+        let get_hit = {
+            let body = foreign_body.clone();
+            mock!(aws_sdk_s3::Client::get_object)
+                .match_requests(|req| req.key() == Some("replay/archives/aa/archive.dwarfs"))
+                .then_output(move || {
+                    GetObjectOutput::builder()
+                        .body(ByteStream::from(body.clone()))
+                        .build()
+                })
+        };
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&get_hit]);
+        let store = S3ArtifactStore::from_client(client, "rio-chunks".into());
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("archive.dwarfs");
+        let expected_size = 1024_u64; // what the caller's marker records
+        let err = store
+            .get_to_file("replay/archives/aa/archive.dwarfs", &dest, expected_size)
+            .await
+            .expect_err("an over-sized object must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&expected_size.to_string()),
+            "the refusal must name the bound: {msg}"
+        );
+        assert!(
+            !dest.exists(),
+            "the refused download must not strand partial bytes"
+        );
     }
 
     /// [`ArtifactStore`] wrapper that records the order of uploaded and
@@ -921,8 +1090,13 @@ mod tests {
             self.inner.get_bytes(key).await
         }
 
-        async fn get_to_file(&self, key: &str, dest: &Path) -> Result<Option<(String, u64)>> {
-            self.inner.get_to_file(key, dest).await
+        async fn get_to_file(
+            &self,
+            key: &str,
+            dest: &Path,
+            max_bytes: u64,
+        ) -> Result<Option<(String, u64)>> {
+            self.inner.get_to_file(key, dest, max_bytes).await
         }
 
         async fn exists(&self, key: &str) -> Result<bool> {
@@ -1349,8 +1523,13 @@ mod tests {
             self.inner.get_bytes(key).await
         }
 
-        async fn get_to_file(&self, key: &str, dest: &Path) -> Result<Option<(String, u64)>> {
-            self.inner.get_to_file(key, dest).await
+        async fn get_to_file(
+            &self,
+            key: &str,
+            dest: &Path,
+            max_bytes: u64,
+        ) -> Result<Option<(String, u64)>> {
+            self.inner.get_to_file(key, dest, max_bytes).await
         }
 
         async fn exists(&self, key: &str) -> Result<bool> {

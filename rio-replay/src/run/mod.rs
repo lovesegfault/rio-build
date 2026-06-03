@@ -572,9 +572,13 @@ fn file_sha256_and_size(path: &Path) -> Result<(String, u64)> {
 /// The download streams to disk through [`ArtifactStore::get_to_file`] —
 /// archive members include the multi-gigabyte (fat archives: tens-to-
 /// hundreds of GiB) `archive.dwarfs` image, which must never be buffered
-/// in memory against the campaign pod's limit. The bytes land in a
-/// `.partial` sibling and are renamed into place only after the digest
-/// verified, so `target` never holds unverified bytes.
+/// in memory against the campaign pod's limit — and the marker's recorded
+/// size bounds the stream IN the loop, so an object swapped at the key
+/// (delete/republish race, out-of-band bucket writer) cannot fill the
+/// pod's ephemeral volume before the refusal: the kubelet would evict the
+/// pod on disk pressure with no diagnosable error otherwise. The bytes
+/// land in a `.partial` sibling and are renamed into place only after the
+/// digest verified, so `target` never holds unverified bytes.
 async fn fetch_archive_object(
     store: &dyn ArtifactStore,
     prefix: &str,
@@ -603,7 +607,7 @@ async fn fetch_archive_object(
         target.with_file_name(name)
     };
     let (sha256, size) = store
-        .get_to_file(&key, &partial)
+        .get_to_file(&key, &partial, expected.size)
         .await?
         .ok_or_else(|| anyhow::anyhow!("archive object missing in S3: {key}"))?;
     if !(sha256 == expected.sha256 && size == expected.size) {

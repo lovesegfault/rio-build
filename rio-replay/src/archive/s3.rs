@@ -901,10 +901,10 @@ impl ArchiveStore {
     /// `manifest.json` hashes to the marker's `archive_id`. The image is
     /// downloaded as-is and opened in place — there is no unpack step.
     ///
-    /// A failed download or digest check can leave partial files behind in
-    /// `dest_dir`; a retry overwrites them in place. Treat the destination
-    /// directory of a failed fetch as scratch — nothing in it has been
-    /// verified.
+    /// The object that fails its download or verification is removed; other
+    /// objects the failed fetch already completed remain in `dest_dir`, and
+    /// a retry overwrites them in place. Treat the destination directory of
+    /// a failed fetch as scratch — nothing in it has been verified.
     pub async fn fetch(
         &self,
         client: &aws_sdk_s3::Client,
@@ -1114,8 +1114,20 @@ impl ArchiveStore {
         Ok(archives)
     }
 
-    /// GET one object and stream it to `dest`, verifying its SHA-256 and
-    /// size against the completion marker's entry as the bytes arrive.
+    /// GET one object and stream it to `dest`, enforcing the completion
+    /// marker's size IN the streaming loop (the disk-fill bound: writing
+    /// stops within one chunk of the marker's byte count, whatever object
+    /// is actually at the key) and verifying SHA-256 plus exact size after
+    /// the stream ends. On any verification failure the partial `dest` is
+    /// removed — an over-declared foreign object must not leave its bytes
+    /// behind either.
+    ///
+    /// `expected` comes from the completion marker the operator's publish
+    /// wrote (operator-trust); the bytes at the key are whatever the bucket
+    /// currently holds — the module doc's delete/republish race and any
+    /// out-of-band bucket writer make the two diverge, which is exactly
+    /// when the in-loop bound matters: a swapped object can otherwise fill
+    /// the volume before the post-download digest refusal is reached.
     async fn download_verified(
         &self,
         client: &aws_sdk_s3::Client,
@@ -1132,8 +1144,9 @@ impl ArchiveStore {
             .key(key)
             // bounded-io: dispatch/header wait for the image download; the
             // multi-GiB body below is deliberately unbounded in time
-            // (stalled-stream protection bounds a dead peer) and is
-            // streamed to disk, never buffered
+            // (stalled-stream protection bounds a dead peer), streamed to
+            // disk (never buffered), and disk-bounded in the loop at the
+            // completion marker's recorded size
             .send()
             .await
             .with_context(|| format!("GET s3://{}/{key}", self.bucket))?;
@@ -1144,34 +1157,50 @@ impl ArchiveStore {
         let mut writer = tokio::io::BufWriter::new(file);
         let mut hasher = sha2::Sha256::new();
         let mut size: u64 = 0;
-        while let Some(chunk) = body
-            .try_next()
-            .await
-            .with_context(|| format!("read s3://{}/{key}", self.bucket))?
-        {
-            hasher.update(&chunk);
-            size += chunk.len() as u64;
-            writer
-                .write_all(&chunk)
+        let result: anyhow::Result<()> = async {
+            while let Some(chunk) = body
+                .try_next()
                 .await
-                .with_context(|| format!("write {}", dest.display()))?;
-        }
-        writer
-            .flush()
-            .await
-            .with_context(|| format!("flush {}", dest.display()))?;
+                .with_context(|| format!("read s3://{}/{key}", self.bucket))?
+            {
+                hasher.update(&chunk);
+                size += chunk.len() as u64;
+                anyhow::ensure!(
+                    size <= expected.size,
+                    "download for {object} at s3://{}/{key} exceeds the {} bytes \
+                     {ARCHIVE_COMPLETE_OBJECT} records — the object at the key is not the one \
+                     the marker vouches for",
+                    self.bucket,
+                    expected.size
+                );
+                writer
+                    .write_all(&chunk)
+                    .await
+                    .with_context(|| format!("write {}", dest.display()))?;
+            }
+            writer
+                .flush()
+                .await
+                .with_context(|| format!("flush {}", dest.display()))?;
 
-        let sha256 = hex::encode(hasher.finalize());
-        let expected_sha256 = &expected.sha256;
-        let expected_size = expected.size;
-        anyhow::ensure!(
-            sha256 == *expected_sha256 && size == expected_size,
-            "download digest mismatch for {object} at s3://{}/{key}: downloaded {size} bytes \
-             with sha256 {sha256}, {ARCHIVE_COMPLETE_OBJECT} says {expected_size} bytes with \
-             sha256 {expected_sha256}",
-            self.bucket
-        );
-        Ok(())
+            let sha256 = hex::encode(hasher.finalize());
+            let expected_sha256 = &expected.sha256;
+            let expected_size = expected.size;
+            anyhow::ensure!(
+                sha256 == *expected_sha256 && size == expected_size,
+                "download digest mismatch for {object} at s3://{}/{key}: downloaded {size} \
+                 bytes with sha256 {sha256}, {ARCHIVE_COMPLETE_OBJECT} says {expected_size} \
+                 bytes with sha256 {expected_sha256}",
+                self.bucket
+            );
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            // Best effort: a refused download must not strand its bytes.
+            let _ = tokio::fs::remove_file(dest).await;
+        }
+        result
     }
 }
 
@@ -2622,6 +2651,81 @@ mod tests {
             "got: {message}"
         );
         assert!(message.contains(ARCHIVE_IMAGE_OBJECT), "got: {message}");
+    }
+
+    /// The over-size sibling of the truncated-image case in
+    /// `fetch_verifies_digests_and_identity`: when the object at the key
+    /// is BIGGER than the marker records (delete/republish race, foreign
+    /// bucket writer), `download_verified` refuses from INSIDE the
+    /// streaming loop — the error is the in-loop size-bound message, not
+    /// the post-download digest mismatch (which an arbitrarily large
+    /// foreign object would never reach before filling the disk) — and
+    /// the partial file is removed.
+    #[tokio::test]
+    async fn fetch_refuses_an_oversized_image_in_loop_and_removes_partial() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+        let image_bytes = std::fs::read(&image).unwrap();
+        let archive_id = identity::archive_id_from_manifest_bytes(&manifest_bytes);
+        let short = identity::short_id(&archive_id);
+
+        let marker = CompleteMarker {
+            archive_id: archive_id.clone(),
+            archive_id_short: short.clone(),
+            objects: BTreeMap::from([
+                (
+                    ARCHIVE_IMAGE_OBJECT.to_string(),
+                    MemberDigest {
+                        sha256: identity::sha256_hex(&image_bytes),
+                        size: image_bytes.len() as u64,
+                    },
+                ),
+                (
+                    ARCHIVE_MANIFEST_OBJECT.to_string(),
+                    MemberDigest {
+                        sha256: archive_id.clone(),
+                        size: manifest_bytes.len() as u64,
+                    },
+                ),
+            ]),
+            uploaded_at: test_stamp(),
+            uploader: "rio-replay/test".to_string(),
+        };
+        let marker_bytes = serde_json::to_vec(&marker).unwrap();
+
+        // The object at the image key is a foreign body larger than the
+        // marker's recorded size (the marker itself is intact).
+        let mut foreign = image_bytes.clone();
+        foreign.extend_from_slice(&vec![0xAAu8; 256 * 1024]);
+
+        let complete_key = format!("replay/archives/{short}/complete.json");
+        let image_key = format!("replay/archives/{short}/archive.dwarfs");
+        let manifest_key = format!("replay/archives/{short}/manifest.json");
+        let get_complete = get_rule(complete_key, marker_bytes);
+        let get_image = get_rule(image_key, foreign);
+        let get_manifest = get_rule(manifest_key, manifest_bytes);
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[&get_complete, &get_image, &get_manifest]
+        );
+
+        let store = ArchiveStore::new("rio-chunks", "replay");
+        let dest = dir.path().join("fetched-oversized");
+        let err = store.fetch(&client, &short, &dest).await.unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("exceeds") && message.contains(&image_bytes.len().to_string()),
+            "the refusal must be the in-loop size bound naming the marker's size: {message}"
+        );
+        assert!(
+            !message.contains("download digest mismatch"),
+            "the refusal must fire in the loop, before the post-download comparison: {message}"
+        );
+        assert!(
+            !dest.join(ARCHIVE_IMAGE_OBJECT).exists(),
+            "the refused download must not strand partial bytes"
+        );
     }
 
     #[tokio::test]
