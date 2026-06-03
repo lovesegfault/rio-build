@@ -278,6 +278,16 @@ pub(crate) struct SettledIdentityRow {
     // gate cannot drift.
     #[allow(dead_code)]
     pub evidence_rank: String,
+    /// Preserved stripped declared hash (`M_070`) — written by the
+    /// strip writers (ingress move, dispatch
+    /// `persist_evidence_rank_and_strip_modular_hash`); selected here
+    /// so the loader and its first reader (the settled-row matcher's
+    /// preserved-claim basis, `sched.persist.settled-identity-freeze+2`,
+    /// next commit) cannot drift. NEVER evidence: the matcher may
+    /// admit a byte-equal value as match basis but a differing value
+    /// must fall through (an unverified value cannot contradict).
+    #[allow(dead_code)]
+    pub ca_modular_hash_stripped: Option<Vec<u8>>,
 }
 
 /// Row from `load_nonterminal_derivations`. Mirrors the INSERT
@@ -345,6 +355,10 @@ pub(crate) struct RecoveryDerivationRow {
     /// and rows whose creating submission carried no hash; wrong-length
     /// values degrade to unset at hydration.
     pub ca_modular_hash: Option<Vec<u8>>,
+    /// Preserved stripped declared hash (`M_070`) — restored verbatim
+    /// into `CaState::modular_hash_stripped`; never evidence (see the
+    /// field doc there). Wrong-length values degrade to unset.
+    pub ca_modular_hash_stripped: Option<Vec<u8>>,
     /// Persisted definition-evidence rank (`M_067`). Restored verbatim
     /// by `from_recovery_row`, floored at `content_bound_claim` when
     /// authoritative bytes are present; unparseable values degrade to
@@ -391,6 +405,7 @@ impl RecoveryDerivationRow {
             evidence_rank: "unverified_claim".into(),
             drv_content: None,
             ca_modular_hash: None,
+            ca_modular_hash_stripped: None,
             exec_id: None,
         }
     }
@@ -518,6 +533,15 @@ pub(crate) struct DerivationRow {
     /// own ingress rank). Settle/dispatch upgrades use the separate
     /// runtime `persist_evidence_rank` writer.
     pub evidence_rank: crate::state::DefinitionEvidence,
+    /// Preserved stripped declared hash (`M_070`). `Some` only when
+    /// the creating submission's INGRESS strip removed an unverifiable
+    /// declared hash; the dispatch strip writes the column through its
+    /// own single-statement mover
+    /// (`persist_evidence_rank_and_strip_modular_hash`), never this
+    /// upsert. On conflict the upsert supersedes the preserved value
+    /// with NULL when the re-creation carries a live hash (strictly
+    /// better evidence), else carries the prior value forward.
+    pub ca_modular_hash_stripped: Option<[u8; 32]>,
 }
 
 /// Shared SELECT / FROM clause for `list_builds` and

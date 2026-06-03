@@ -296,16 +296,23 @@ impl SchedulerService for SchedulerGrpc {
         // gate above has already bounded how much of this work a caller
         // can queue.
         let mut nodes_for_validation = std::mem::take(&mut req.nodes);
-        req.nodes = tokio::task::spawn_blocking(
-            move || -> Result<Vec<rio_proto::types::DerivationNode>, Status> {
+        let (validated_nodes, ingress_stripped) = tokio::task::spawn_blocking(
+            move || -> Result<
+                (
+                    Vec<rio_proto::types::DerivationNode>,
+                    Vec<(String, [u8; 32])>,
+                ),
+                Status,
+            > {
                 validate_authoritative_drv_content(&nodes_for_validation)?;
-                validate_inline_drv_content(&mut nodes_for_validation)?;
+                let stripped = validate_inline_drv_content(&mut nodes_for_validation)?;
                 normalize_inline_needs_resolve(&mut nodes_for_validation);
-                Ok(nodes_for_validation)
+                Ok((nodes_for_validation, stripped))
             },
         )
         .await
         .map_err(|e| Status::internal(format!("inline-content validation task failed: {e}")))??;
+        req.nodes = validated_nodes;
 
         // UUID v7 (time-ordered, RFC 9562): the high 48 bits are Unix-ms
         // timestamp, so lexicographic sort == chronological sort. This
@@ -359,6 +366,7 @@ impl SchedulerService for SchedulerGrpc {
         let req = MergeDagRequest {
             build_id,
             tenant_id,
+            ingress_stripped: ingress_stripped.into_iter().collect(),
             priority_class: if req.priority_class.is_empty() {
                 crate::state::PriorityClass::default()
             } else {
@@ -949,9 +957,14 @@ fn validate_authoritative_drv_content(
 /// hash moves every derived path AWAY from honest paths (SHA-256 second
 /// preimage to collide one), so seeding cannot help an attacker reach a
 /// victim's path — see `input_addressed_output_paths`' soundness note.
+/// Returns the set of nodes whose unverifiable declared modular hash
+/// was STRIPPED, as `(drv_hash, stripped_hash)` pairs — the caller
+/// preserves them out-of-band (M_070,
+/// `sched.persist.settled-identity-freeze+2`); the live field is
+/// cleared in place and must never carry an unverified value forward.
 pub(crate) fn validate_inline_drv_content(
     nodes: &mut [rio_proto::types::DerivationNode],
-) -> Result<(), Status> {
+) -> Result<Vec<(String, [u8; 32])>, Status> {
     use rio_nix::derivation::{Derivation, DerivationLike};
     use rio_nix::hash::{HashAlgo, NixHash};
     use rio_nix::store_path::StorePath;
@@ -961,7 +974,7 @@ pub(crate) fn validate_inline_drv_content(
         .iter()
         .any(|n| !n.drv_content.is_empty() && !n.drv_content_authoritative)
     {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     // Phase A runs over a shared reborrow; the only mutation (stripping
@@ -1314,10 +1327,18 @@ pub(crate) fn validate_inline_drv_content(
 
     // Phase B: an unverifiable claim is no claim. Mutation happens only
     // here, after every borrow into the slice from phase A is dead.
+    // The cleared value is MOVED to the caller (M_070): destroying it
+    // was round-16 merged_bug_038 — a stripped floating-CA settled row
+    // kept zero matchable identity evidence and every resubmission
+    // bricked. Preservation never re-enters the live field.
+    let mut stripped = Vec::with_capacity(strip_unverifiable.len());
     for idx in strip_unverifiable {
+        if let Ok(h) = <[u8; 32]>::try_from(nodes[idx].ca_modular_hash.as_slice()) {
+            stripped.push((nodes[idx].drv_hash.clone(), h));
+        }
         nodes[idx].ca_modular_hash.clear();
     }
-    Ok(())
+    Ok(stripped)
 }
 
 /// Overwrite each inline node's `needs_resolve` echo with the value

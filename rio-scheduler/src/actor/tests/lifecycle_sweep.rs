@@ -404,6 +404,7 @@ async fn test_upsert_at_merge_cache_hit() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id,
+            ingress_stripped: Default::default(),
             tenant_id: Some(tenant),
             priority_class: PriorityClass::Scheduled,
             nodes: vec![node],
@@ -450,6 +451,7 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id: build_a,
+            ingress_stripped: Default::default(),
             tenant_id: Some(tenant_a),
             priority_class: PriorityClass::Scheduled,
             nodes: vec![make_node("pre-drv")],
@@ -473,6 +475,7 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id: build_b,
+            ingress_stripped: Default::default(),
             tenant_id: Some(tenant_b),
             priority_class: PriorityClass::Scheduled,
             nodes: vec![make_node("pre-drv")],

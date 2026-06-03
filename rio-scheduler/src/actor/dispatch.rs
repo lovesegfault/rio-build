@@ -2554,6 +2554,10 @@ impl DagActor {
                         is_fixed_output: state.is_fixed_output,
                         is_content_addressed: state.ca.is_ca,
                         ca_modular_hash: state.ca.modular_hash,
+                        // The synth is a verification INPUT; preserved
+                        // stripped claims are not part of the claimed
+                        // identity being verified.
+                        ca_modular_hash_stripped: None,
                         drv_content: Vec::new(),
                         drv_content_authoritative: false,
                         required_features: Vec::new(),
@@ -2690,7 +2694,15 @@ impl DagActor {
                          proceeding on the verified bytes"
                     );
                     if let Some(state) = self.dag.node_mut(drv_hash) {
-                        state.ca.modular_hash = None;
+                        // MOVE, never destroy (M_070): the preserved
+                        // claim is what lets a settled row formed from
+                        // this node match a byte-equal resubmission
+                        // after reap (merged_bug_038). take() keeps an
+                        // earlier preserved value when the live hash is
+                        // already None (re-strip idempotence).
+                        if let Some(stripped) = state.ca.modular_hash.take() {
+                            state.ca.modular_hash_stripped = Some(stripped);
+                        }
                         state.evidence = crate::state::DefinitionEvidence::PathBoundBytes;
                         // r[impl sched.dispatch.claims-derived+2]
                         // Same record-at-raise as the Verified arm:
@@ -2702,7 +2714,7 @@ impl DagActor {
                     }
                     if let Err(e) = self
                         .db
-                        .persist_evidence_rank_and_clear_modular_hash(
+                        .persist_evidence_rank_and_strip_modular_hash(
                             drv_hash.as_str(),
                             crate::state::DefinitionEvidence::PathBoundBytes,
                         )

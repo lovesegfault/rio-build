@@ -434,6 +434,7 @@ async fn test_hmac_assignment_carries_tenant() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id: Uuid::new_v4(),
+            ingress_stripped: Default::default(),
             tenant_id: Some(tenant),
             priority_class: PriorityClass::Scheduled,
             nodes: vec![{
@@ -547,6 +548,7 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id: Uuid::new_v4(),
+            ingress_stripped: Default::default(),
             tenant_id: None,
             priority_class: PriorityClass::Scheduled,
             nodes: vec![{
@@ -701,6 +703,7 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
         .send_unchecked(ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id,
+                ingress_stripped: Default::default(),
                 tenant_id: None,
                 priority_class: PriorityClass::Scheduled,
                 nodes: vec![make_node("orphan-drv")],
@@ -2879,6 +2882,7 @@ fn input_form_seed_constructor_excludes_floating_published_hashes() {
         is_fixed_output: fod,
         is_content_addressed: is_ca,
         ca_modular_hash: Some([7u8; 32]),
+        ca_modular_hash_stripped: None,
         drv_content: Vec::new(),
         drv_content_authoritative: false,
         required_features: Vec::new(),
@@ -3116,8 +3120,17 @@ async fn test_dispatch_strips_unverifiable_declared_hash_and_assigns() -> TestRe
         info.ca.modular_hash.is_none(),
         "in-memory declared hash cleared (an unverifiable claim is no claim)"
     );
-    let (rank, hash): (String, Option<Vec<u8>>) = sqlx::query_as(
-        "SELECT evidence_rank, ca_modular_hash FROM derivations WHERE drv_hash = $1",
+    // M_070 (merged_bug_038): the strip MOVES the claim — preserved in
+    // the segregated field, never destroyed — so the settled row this
+    // node becomes can still match a byte-equal resubmission.
+    assert_eq!(
+        info.ca.modular_hash_stripped,
+        Some([0xCC; 32]),
+        "in-memory stripped claim preserved out-of-band"
+    );
+    let (rank, hash, stripped): (String, Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT evidence_rank, ca_modular_hash, ca_modular_hash_stripped \
+         FROM derivations WHERE drv_hash = $1",
     )
     .bind(&fparent_path)
     .fetch_one(&db.pool)
@@ -3127,6 +3140,11 @@ async fn test_dispatch_strips_unverifiable_declared_hash_and_assigns() -> TestRe
         "rank raised on the verified bytes"
     );
     assert!(hash.is_none(), "persisted declared hash cleared");
+    assert_eq!(
+        stripped.as_deref(),
+        Some([0xCC; 32].as_slice()),
+        "persisted stripped claim moved to the preservation column"
+    );
     Ok(())
 }
 

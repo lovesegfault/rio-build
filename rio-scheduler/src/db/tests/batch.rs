@@ -115,6 +115,7 @@ async fn test_batch_upsert_10k_nodes() -> anyhow::Result<()> {
             closure_hole: false,
             drv_content: None,
             ca_modular_hash: None,
+            ca_modular_hash_stripped: None,
             evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         })
         .collect();
@@ -199,6 +200,7 @@ async fn test_batch_persist_1k_fk_perf_bound() -> anyhow::Result<()> {
             closure_hole: false,
             drv_content: None,
             ca_modular_hash: None,
+            ca_modular_hash_stripped: None,
             evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         })
         .collect();
@@ -280,6 +282,7 @@ async fn wanted_output_names_round_trip_and_union_on_conflict() -> anyhow::Resul
             closure_hole: false,
             drv_content: None,
             ca_modular_hash: None,
+            ca_modular_hash_stripped: None,
             evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         };
         let mut tx = db.pool().begin().await?;
@@ -377,6 +380,7 @@ async fn topdown_pruned_or_on_conflict_clear_on_children_and_recovery() -> anyho
         closure_hole: false,
         drv_content: None,
         ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
         evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
     };
     let upsert = async |row: DerivationRow| -> anyhow::Result<Uuid> {
@@ -470,6 +474,7 @@ async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Res
         closure_hole: false,
         drv_content: None,
         ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
         evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
     };
     let upsert = async |row: DerivationRow| -> anyhow::Result<()> {
@@ -639,6 +644,7 @@ async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
             closure_hole: false,
             drv_content: None,
             ca_modular_hash: None,
+            ca_modular_hash_stripped: None,
             evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         })
         .collect();
@@ -690,6 +696,7 @@ async fn test_batch_upsert_persists_authoritative_drv_content() -> anyhow::Resul
         is_ca: true,
         drv_content: content,
         ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
         evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
@@ -826,6 +833,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
         is_ca: true,
         drv_content: None,
         ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
         evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
@@ -852,6 +860,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
         is_ca: true,
         drv_content: None,
         ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
         evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
@@ -918,6 +927,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
         is_ca: true,
         drv_content: Some(b"Derive-same".to_vec()),
         ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
         evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
@@ -975,6 +985,7 @@ async fn test_batch_upsert_resets_accumulators_on_definition_change() -> anyhow:
         is_ca: true,
         drv_content: Some(content.to_vec()),
         ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
         evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
@@ -1006,6 +1017,7 @@ async fn test_batch_upsert_resets_accumulators_on_definition_change() -> anyhow:
         is_ca: true,
         drv_content: None,
         ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
         evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
@@ -1110,6 +1122,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
         is_ca: true,
         drv_content: Some(b"Derive-squat".to_vec()),
         ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
         evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
@@ -1144,6 +1157,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
         is_ca: true,
         drv_content: None,
         ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
         evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
@@ -1420,6 +1434,7 @@ async fn test_batch_upsert_persists_and_refreshes_ca_modular_hash() -> anyhow::R
         is_ca: true,
         drv_content: None,
         ca_modular_hash: ca_hash,
+        ca_modular_hash_stripped: None,
         evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
@@ -1514,6 +1529,117 @@ async fn test_batch_upsert_persists_and_refreshes_ca_modular_hash() -> anyhow::R
     Ok(())
 }
 
+/// M_070 preservation-column write semantics, all three writers:
+/// the creation upsert (insert + supersede-vs-carry on conflict) and
+/// the dispatch strip mover (single-statement live→stripped move,
+/// idempotent on re-strip).
+#[tokio::test]
+async fn test_preserved_stripped_hash_supersede_carry_and_move() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let row = |live: Option<[u8; 32]>, stripped: Option<[u8; 32]>| DerivationRow {
+        drv_hash: "strip-sem".into(),
+        drv_path: format!("/nix/store/{}-strip-sem.drv", "d".repeat(32)),
+        pname: Some("strip-sem".into()),
+        system: "x86_64-linux".into(),
+        status: DerivationStatus::Created,
+        required_features: vec![],
+        expected_output_paths: vec![],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: true,
+        drv_content: None,
+        ca_modular_hash: live,
+        ca_modular_hash_stripped: stripped,
+        evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+        wanted_output_names: vec![],
+        topdown_pruned: false,
+        closure_hole: false,
+    };
+    let fetch = || {
+        let pool = test_db.pool.clone();
+        async move {
+            let r: (Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as(
+                "SELECT ca_modular_hash, ca_modular_hash_stripped \
+                 FROM derivations WHERE drv_hash = 'strip-sem'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            anyhow::Ok(r)
+        }
+    };
+    let upsert = |r: DerivationRow| {
+        let db = db.clone();
+        async move {
+            let mut tx = db.pool().begin().await?;
+            SchedulerDb::batch_upsert_derivations(&mut tx, &[r], &[]).await?;
+            tx.commit().await?;
+            anyhow::Ok(())
+        }
+    };
+
+    // Insert with an ingress-stripped claim: preserved, live NULL.
+    upsert(row(None, Some([0xAA; 32]))).await?;
+    assert_eq!(
+        fetch().await?,
+        (None, Some(vec![0xAA; 32])),
+        "preserved at insert"
+    );
+
+    // Bare re-creation (no live, no stripped): the older preserved
+    // claim is CARRIED FORWARD — same drv_hash means the same text-CA
+    // definition, so the prior claim is still about this row.
+    upsert(row(None, None)).await?;
+    assert_eq!(
+        fetch().await?,
+        (None, Some(vec![0xAA; 32])),
+        "bare re-creation carries the preserved claim forward"
+    );
+
+    // Re-creation with a NEW stripped claim: overwritten.
+    upsert(row(None, Some([0xBB; 32]))).await?;
+    assert_eq!(
+        fetch().await?,
+        (None, Some(vec![0xBB; 32])),
+        "newer stripped claim wins"
+    );
+
+    // Re-creation with a LIVE (verifiable) hash: strictly better
+    // evidence — the preserved unverified claim is SUPERSEDED to NULL.
+    upsert(row(Some([7u8; 32]), None)).await?;
+    assert_eq!(
+        fetch().await?,
+        (Some(vec![7u8; 32]), None),
+        "live hash supersedes the preserved claim"
+    );
+
+    // Dispatch strip mover: live → stripped in one statement.
+    db.persist_evidence_rank_and_strip_modular_hash(
+        "strip-sem",
+        crate::state::DefinitionEvidence::PathBoundBytes,
+    )
+    .await?;
+    assert_eq!(
+        fetch().await?,
+        (None, Some(vec![7u8; 32])),
+        "strip mover moves the live value into preservation"
+    );
+    // Idempotent re-strip: live already NULL — preserved value KEPT
+    // (COALESCE), never zeroed by a second strip.
+    db.persist_evidence_rank_and_strip_modular_hash(
+        "strip-sem",
+        crate::state::DefinitionEvidence::PathBoundBytes,
+    )
+    .await?;
+    assert_eq!(
+        fetch().await?,
+        (None, Some(vec![7u8; 32])),
+        "re-strip keeps the preserved value"
+    );
+    Ok(())
+}
+
 // r[verify sched.persist.settled-identity-freeze+1]
 /// The upsert's settled-row WHERE guard (defense-in-depth twin of the
 /// pre-merge check): a `completed`/`skipped` row whose public identity
@@ -1540,6 +1666,7 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
         is_ca: false,
         drv_content: Some(b"Derive-victim".to_vec()),
         ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
         evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
@@ -1565,6 +1692,7 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
         is_ca: false,
         drv_content: None,
         ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
         evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
@@ -1613,6 +1741,7 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
         is_ca: false,
         drv_content: None,
         ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
         evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
@@ -1659,6 +1788,7 @@ async fn settled_row_upsert_guard_admits_evidence_approved_hash() -> anyhow::Res
         is_ca: false,
         drv_content: Some(b"Derive-squat".to_vec()),
         ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
         evidence_rank: crate::state::DefinitionEvidence::ContentBoundClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
@@ -1681,6 +1811,7 @@ async fn settled_row_upsert_guard_admits_evidence_approved_hash() -> anyhow::Res
         is_ca: false,
         drv_content: None,
         ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
         evidence_rank: crate::state::DefinitionEvidence::PathBoundBytes,
         wanted_output_names: vec![],
         topdown_pruned: false,
@@ -1754,6 +1885,7 @@ async fn test_batch_upsert_evidence_rank_roundtrip_and_recreation() -> anyhow::R
         closure_hole: false,
         drv_content: None,
         ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
         evidence_rank: rank,
     };
 

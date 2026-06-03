@@ -3315,6 +3315,7 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
             .send_unchecked(ActorCommand::MergeDag {
                 req: MergeDagRequest {
                     build_id,
+                    ingress_stripped: Default::default(),
                     tenant_id: Some(tenant),
                     priority_class: PriorityClass::Scheduled,
                     nodes: vec![make_node(drv_tag)],

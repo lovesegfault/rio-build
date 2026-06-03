@@ -1368,6 +1368,41 @@ pub const M_068: () = ();
 /// too via the per-path registry — see the store-side equivalent).
 pub const M_069: () = ();
 
+/// `070_derivations_ca_modular_hash_stripped.sql` — segregated
+/// preservation column for STRIPPED declared CA modular hashes
+/// (round-16 merged_bug_038, the deploy blocker; class
+/// strip-consequence-parity).
+///
+/// Why a second column and not "keep it in `ca_modular_hash`": the
+/// live column is trusted-plane identity EVIDENCE — the merge gate's
+/// hash veto, realisation keys, and the HMAC claims path all read it,
+/// and an unverifiable claim must never flow there
+/// (`ingress-inline-drv-binding+1`: an unverifiable claim is NO
+/// claim). But round-15's strip writers DESTROYED the value
+/// (`ca_modular_hash = NULL`), and for floating-CA / deferred-IA rows
+/// (the strip's documented mainstream population: every expected
+/// output path empty) that left the settled row with ZERO matchable
+/// identity evidence — `settled_row_identity_matches` requires a
+/// shared non-empty path or a byte-equal hash, so every resubmission
+/// of a previously-built stripped closure terminated in
+/// `SettledIdentityConflict` (a deterministic FAILED_PRECONDITION
+/// with no client-side escape). The segregated column preserves the
+/// claim WITHOUT laundering it into evidence: the settled-row matcher
+/// admits a byte-equal preserved claim as match-basis only
+/// (`sched.persist.settled-identity-freeze+2` — never ranked, never
+/// vetoing: a DIFFERING preserved value falls through instead of
+/// rejecting, because an unverified value cannot contradict anything).
+///
+/// Write discipline (single-writer per direction): the ingress strip
+/// (validate_inline_drv_content) and the dispatch strip
+/// (`persist_evidence_rank_and_strip_modular_hash`) MOVE live →
+/// stripped in one statement; the creation upsert supersedes the
+/// preserved value with NULL whenever the re-creating submission
+/// carries a live (verifiable) hash, and otherwise carries forward
+/// COALESCE(EXCLUDED.stripped, old stripped). No writer ever copies
+/// stripped → live.
+pub const M_070: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

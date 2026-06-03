@@ -533,6 +533,7 @@ pub(crate) async fn merge_single_node(
         .send_unchecked(ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id,
+                ingress_stripped: Default::default(),
                 tenant_id: None,
                 priority_class,
                 nodes: vec![make_node(tag)],
@@ -564,6 +565,7 @@ pub(crate) async fn merge_dag(
         .send_unchecked(ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id,
+                ingress_stripped: Default::default(),
                 tenant_id: None,
                 priority_class: PriorityClass::Scheduled,
                 nodes,

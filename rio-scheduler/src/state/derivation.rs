@@ -768,6 +768,19 @@ pub struct CaState {
     ///   `(modular_hash, output_name)` for the `realisation_deps`
     ///   insert (the PARENT side of the junction).
     pub modular_hash: Option<[u8; 32]>,
+    /// A declared modular hash a STRIP writer removed from
+    /// `modular_hash` because it was unverifiable (ingress strip:
+    /// floating store-backed input missing from the seeds; dispatch
+    /// strip: `VerifiedExceptDeclaredHash`). Preserved — never
+    /// destroyed — so a settled row's matcher can admit a byte-equal
+    /// re-presentation of the same claim after the node is reaped
+    /// (M_070, `sched.persist.settled-identity-freeze+2`). NEVER
+    /// evidence: no consumer ranks on it, vetoes on it, or keys
+    /// realisations/claims by it; a differing preserved value falls
+    /// through instead of contradicting (an unverified value cannot
+    /// contradict anything). Persisted; restored verbatim at
+    /// recovery.
+    pub modular_hash_stripped: Option<[u8; 32]>,
     /// Realisation lookups from dispatch-time resolve. Consumed by
     /// `handle_success_completion` → `insert_realisation_deps` AFTER
     /// the parent's own realisation lands (the FK needs the parent's
@@ -1366,6 +1379,10 @@ impl DerivationState {
                 // `domain::DerivationNode::from` maps non-32-byte
                 // (including empty) → None.
                 modular_hash: node.ca_modular_hash,
+                // Ingress-stripped claim, preserved (M_070). Only the
+                // SubmitBuild strip phase produces this on a domain
+                // node; wire nodes always carry None.
+                modular_hash_stripped: node.ca_modular_hash_stripped,
                 pending_realisation_deps: Vec::new(),
                 output_unchanged: false,
             },
@@ -1557,6 +1574,13 @@ impl DerivationState {
                 // Re-derived above from expected-output-path emptiness
                 // (sched.recovery.deferred-resolve).
                 needs_resolve,
+                // Preserved stripped claim (M_070): restored verbatim;
+                // wrong-length values degrade to unset like the live
+                // hash above.
+                modular_hash_stripped: row
+                    .ca_modular_hash_stripped
+                    .as_deref()
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok()),
                 // Remaining CA fields lossy on recovery — see CaState doc.
                 ..Default::default()
             },
@@ -2732,6 +2756,7 @@ mod tests {
             floor_deadline_secs: 0,
             drv_content: None,
             ca_modular_hash: None,
+            ca_modular_hash_stripped: None,
             evidence_rank: "unverified_claim".into(),
             exec_id: None,
         };
@@ -3143,6 +3168,43 @@ mod tests {
             ia.ca.modular_hash,
             Some(persisted),
             "a non-CA row carrying a persisted hash restores it"
+        );
+    }
+
+    #[test]
+    fn from_recovery_row_restores_preserved_stripped_hash() {
+        // M_070 roundtrip: the preservation column hydrates verbatim —
+        // independent of the live hash and of is_ca — and wrong-length
+        // values degrade to unset exactly like the live column.
+        let preserved = [0xCCu8; 32];
+        let state = DerivationState::from_recovery_row(
+            crate::db::RecoveryDerivationRow {
+                is_ca: true,
+                ca_modular_hash: None,
+                ca_modular_hash_stripped: Some(preserved.to_vec()),
+                ..crate::db::RecoveryDerivationRow::test_default("strip-rt", "x86_64-linux")
+            },
+            DerivationStatus::Ready,
+        )
+        .expect("hydrates");
+        assert_eq!(
+            state.ca.modular_hash_stripped,
+            Some(preserved),
+            "preserved stripped claim survives failover"
+        );
+        assert_eq!(state.ca.modular_hash, None, "live hash stays unset");
+
+        let short = DerivationState::from_recovery_row(
+            crate::db::RecoveryDerivationRow {
+                ca_modular_hash_stripped: Some(vec![1, 2, 3]),
+                ..crate::db::RecoveryDerivationRow::test_default("strip-short", "x86_64-linux")
+            },
+            DerivationStatus::Ready,
+        )
+        .expect("hydrates");
+        assert_eq!(
+            short.ca.modular_hash_stripped, None,
+            "wrong length degrades to None"
         );
     }
 

@@ -484,6 +484,7 @@ async fn merge_chain(
         .send_unchecked(ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id,
+                ingress_stripped: Default::default(),
                 tenant_id: None,
                 priority_class,
                 nodes,
@@ -2394,6 +2395,7 @@ async fn test_recovery_restores_build_timeout_baseline() -> TestResult {
             .send_unchecked(ActorCommand::MergeDag {
                 req: MergeDagRequest {
                     build_id,
+                    ingress_stripped: Default::default(),
                     tenant_id: None,
                     priority_class: PriorityClass::Scheduled,
                     nodes: vec![make_node("bto-drv")],

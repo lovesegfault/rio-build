@@ -540,13 +540,13 @@ pub(super) fn classify_store_evidence(
         // can never be. The variant carries both facts — consumers
         // decide (dispatch strips-and-proceeds; merge treats the
         // declared hash as unprovable).
-        Ok(()) if claimed_modular_hash && slice[0].ca_modular_hash.is_empty() => {
+        Ok(strips) if claimed_modular_hash && !strips.is_empty() => {
             StoreEvidenceOutcome::VerifiedExceptDeclaredHash(VerifiedDefinition {
                 bytes: std::mem::take(&mut slice[0].drv_content),
                 needs_resolve,
             })
         }
-        Ok(()) => {
+        Ok(_) => {
             // `synth.drv_content` was moved into the slice; the
             // verified bytes are returned from there.
             StoreEvidenceOutcome::Verified(VerifiedDefinition {
@@ -1103,12 +1103,25 @@ impl DagActor {
             traceparent,
             jti,
             jwt_token,
+            ingress_stripped,
         } = req;
         // Arch#13: proto→domain at the actor boundary. `MergeDagRequest`
         // keeps proto-typed `nodes`/`edges` so `actor/tests/` and
         // `rio-test-support` (b03 territory) can keep constructing it
         // unchanged; everything downstream of this line is wire-agnostic.
-        let nodes = crate::domain::nodes_from_proto(nodes);
+        let mut nodes = crate::domain::nodes_from_proto(nodes);
+        // M_070: re-attach the ingress strip's preserved claims at the
+        // boundary (the wire field was cleared in place — an
+        // unverifiable claim must never travel as a live hash; the
+        // preserved value rides the domain node into the creation
+        // snapshot and the DAG state).
+        if !ingress_stripped.is_empty() {
+            for n in &mut nodes {
+                if let Some(h) = ingress_stripped.get(n.drv_hash.as_str()) {
+                    n.ca_modular_hash_stripped = Some(*h);
+                }
+            }
+        }
         let edges = crate::domain::edges_from_proto(edges);
         let mut t_phase = Instant::now();
         macro_rules! phase {
@@ -3209,6 +3222,10 @@ impl DagActor {
                         .node(node.drv_hash.as_str())
                         .map(|s| s.evidence)
                         .unwrap_or_else(|| crate::state::DefinitionEvidence::from_node_shape(node)),
+                    // M_070: the ingress strip's preserved claim rides
+                    // the creation snapshot (the only producer of a
+                    // Some here is the SubmitBuild strip phase).
+                    ca_modular_hash_stripped: node.ca_modular_hash_stripped,
                 }
             })
             .collect();
@@ -4340,6 +4357,7 @@ mod matcher_tests {
             is_fixed_output: false,
             is_ca: true,
             ca_modular_hash: hash,
+            ca_modular_hash_stripped: None,
             evidence_rank: "content_bound_claim".into(),
         }
     }
@@ -4355,6 +4373,7 @@ mod matcher_tests {
             is_fixed_output: false,
             is_content_addressed: true,
             ca_modular_hash: hash,
+            ca_modular_hash_stripped: None,
             drv_content: Vec::new(),
             drv_content_authoritative: false,
             required_features: Vec::new(),

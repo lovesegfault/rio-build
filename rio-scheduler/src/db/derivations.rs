@@ -487,7 +487,8 @@ impl SchedulerDb {
                    is_ca, topdown_pruned, closure_hole,
                    failed_builders,
                    floor_mem_bytes, floor_disk_bytes, floor_deadline_secs,
-                   drv_content, ca_modular_hash, evidence_rank,
+                   drv_content, ca_modular_hash, ca_modular_hash_stripped,
+                   evidence_rank,
                    NULL::uuid AS exec_id,
                    COALESCE(
                        EXTRACT(EPOCH FROM (now() - poisoned_at))::float8,
@@ -523,7 +524,7 @@ impl SchedulerDb {
             r#"
             SELECT drv_hash, drv_path, system, output_names,
                    expected_output_paths, is_fixed_output, is_ca,
-                   ca_modular_hash, evidence_rank
+                   ca_modular_hash, evidence_rank, ca_modular_hash_stripped
             FROM derivations
             WHERE drv_hash = ANY($1) AND status IN ('completed', 'skipped')
             "#,
@@ -561,18 +562,30 @@ impl SchedulerDb {
 
     /// Persist a stripped-claim verification: the rank rises on the
     /// verified bytes AND the unverifiable declared modular hash is
-    /// cleared in the same statement (`sched.dispatch.claims-derived+2`
-    /// — an unverifiable claim is NO claim, never persisted; exact
-    /// ingress-strip parity, `ingress-inline-drv-binding+1`). One
-    /// statement so a failover between the two writes cannot leave the
-    /// raised rank with the unverified hash still attached.
-    pub(crate) async fn persist_evidence_rank_and_clear_modular_hash(
+    /// MOVED to the segregated preservation column in the same
+    /// statement (`sched.dispatch.claims-derived+2` — an unverifiable
+    /// claim is NO claim and never stays in the live evidence column;
+    /// exact ingress-strip parity, `ingress-inline-drv-binding+1`).
+    /// M_070: round-15 destroyed the value here, which left
+    /// floating-CA / deferred-IA settled rows with zero matchable
+    /// identity evidence and bricked every resubmission
+    /// (merged_bug_038); preserving it keeps the settled-row matcher's
+    /// preserved-claim basis available without laundering the
+    /// unverified value into evidence. One statement so a failover
+    /// between the writes cannot leave the raised rank with the
+    /// unverified hash still attached (or the moved value lost):
+    /// PostgreSQL evaluates both SET expressions against the OLD row,
+    /// and COALESCE keeps an earlier preserved claim when the live
+    /// column is already NULL (re-strip idempotence).
+    pub(crate) async fn persist_evidence_rank_and_strip_modular_hash(
         &self,
         drv_hash: &str,
         rank: crate::state::DefinitionEvidence,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE derivations SET evidence_rank = $2, ca_modular_hash = NULL, \
+            "UPDATE derivations SET evidence_rank = $2, \
+             ca_modular_hash_stripped = COALESCE(ca_modular_hash, ca_modular_hash_stripped), \
+             ca_modular_hash = NULL, \
              updated_at = now() WHERE drv_hash = $1",
         )
         .bind(drv_hash)

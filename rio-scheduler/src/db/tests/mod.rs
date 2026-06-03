@@ -53,6 +53,7 @@ pub(super) async fn insert_test_derivation(
         closure_hole: false,
         drv_content: None,
         ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
         evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
     };
     let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[row], &[]).await?;

@@ -55,6 +55,7 @@ async fn test_shared_node_priority_bumps_on_higher_pri_merge() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id: build_hi,
+            ingress_stripped: Default::default(),
             tenant_id: None,
             priority_class: PriorityClass::Interactive,
             nodes: vec![make_node("shared-x")],
@@ -180,6 +181,7 @@ async fn test_cache_check_circuit_breaker_opens_then_closes() -> TestResult {
         let cmd = ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id: Uuid::new_v4(),
+                ingress_stripped: Default::default(),
                 tenant_id: None,
                 priority_class: PriorityClass::Scheduled,
                 nodes: vec![node],
@@ -279,6 +281,7 @@ async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
         let cmd = ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id,
+                ingress_stripped: Default::default(),
                 tenant_id: None,
                 priority_class: PriorityClass::Scheduled,
                 nodes: vec![node],
@@ -5885,6 +5888,7 @@ async fn test_topdown_stamp_not_leaked_when_merge_fails_at_persist() -> TestResu
         &handle,
         MergeDagRequest {
             build_id: b2,
+            ingress_stripped: Default::default(),
             tenant_id: None,
             priority_class: PriorityClass::Scheduled,
             nodes: vec![r_b2, s, s_dep],
@@ -6131,6 +6135,7 @@ async fn test_topdown_stamp_rolled_back_when_activation_fails() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id: b2,
+            ingress_stripped: Default::default(),
             tenant_id: None,
             priority_class: PriorityClass::Scheduled,
             nodes: vec![r_b2, r_dep, s, s_dep],

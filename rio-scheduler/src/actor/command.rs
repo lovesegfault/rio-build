@@ -68,6 +68,13 @@ pub struct HeartbeatPayload {
 pub struct MergeDagRequest {
     pub build_id: Uuid,
     pub tenant_id: Option<Uuid>,
+    /// Declared modular hashes the SubmitBuild ingress strip removed
+    /// (unverifiable: floating store-backed input missing from the
+    /// seeds), keyed by `drv_hash`. Applied to the domain nodes at the
+    /// actor's proto→domain boundary so the preserved claim (M_070)
+    /// rides the creation snapshot. Always empty for test-constructed
+    /// requests unless the test exercises the strip itself.
+    pub ingress_stripped: std::collections::HashMap<String, [u8; 32]>,
     pub priority_class: PriorityClass,
     pub nodes: Vec<rio_proto::types::DerivationNode>,
     pub edges: Vec<rio_proto::types::DerivationEdge>,

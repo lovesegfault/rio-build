@@ -2241,17 +2241,25 @@ async fn test_submit_build_accepts_inline_consumer_of_realized_floating_input() 
     );
 
     // The honest-but-unverifiable declaration was stripped at ingress:
-    // the persisted row has no hash for the merge gate / recovery to
-    // consume.
-    let (persisted,): (Option<Vec<u8>>,) =
-        sqlx::query_as("SELECT ca_modular_hash FROM derivations WHERE drv_hash = $1")
-            .bind(&c_key)
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
+    // the persisted row has no LIVE hash for the merge gate / recovery
+    // to consume — but the claim is PRESERVED in the segregated column
+    // (M_070, merged_bug_038: destroying it left stripped floating-CA
+    // settled rows permanently unmatchable).
+    let (persisted, preserved): (Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT ca_modular_hash, ca_modular_hash_stripped \
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(&c_key)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
     assert_eq!(
         persisted, None,
         "unverifiable declaration stripped, not persisted"
+    );
+    assert!(
+        preserved.is_some(),
+        "stripped declaration preserved out-of-band (M_070)"
     );
 }
 
@@ -2289,15 +2297,27 @@ async fn test_submit_build_strips_forged_unverifiable_modular_hash() {
         "forged-but-unverifiable hash does not reject the submission: {result:?}"
     );
 
-    let (persisted,): (Option<Vec<u8>>,) =
-        sqlx::query_as("SELECT ca_modular_hash FROM derivations WHERE drv_hash = $1")
-            .bind(&c_key)
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
+    let (persisted, preserved): (Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT ca_modular_hash, ca_modular_hash_stripped \
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(&c_key)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
     assert_eq!(
         persisted, None,
         "forged declaration stripped — never persisted as identity evidence"
+    );
+    // The forged value IS preserved — harmless by construction: the
+    // preservation column never ranks, never vetoes, and only ever
+    // matches a byte-equal RE-presentation of the same claim, which
+    // grants the forger nothing beyond the row identity their own
+    // submission already established.
+    assert_eq!(
+        preserved.as_deref(),
+        Some([0xAB; 32].as_slice()),
+        "stripped value preserved verbatim in the segregated column"
     );
 }
 

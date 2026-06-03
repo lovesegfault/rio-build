@@ -58,6 +58,7 @@ async fn test_build_options_propagated_to_worker() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id,
+            ingress_stripped: Default::default(),
             tenant_id: None,
             priority_class: PriorityClass::Scheduled,
             nodes: vec![make_node("opts-hash")],
@@ -115,6 +116,7 @@ async fn test_dispatch_carries_submitter_traceparent() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id,
+            ingress_stripped: Default::default(),
             tenant_id: None,
             priority_class: PriorityClass::Scheduled,
             nodes: vec![make_node("trace-hash")],
@@ -153,6 +155,7 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
     // Helper: merge dedup-hash with a given traceparent (defaults otherwise).
     let merge_with_tp = |tp: &str| MergeDagRequest {
         build_id: Uuid::new_v4(),
+        ingress_stripped: Default::default(),
         tenant_id: None,
         priority_class: PriorityClass::Scheduled,
         nodes: vec![make_node("dedup-hash")],
@@ -192,6 +195,7 @@ async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
 
     let merge_with_tp = |tp: &str| MergeDagRequest {
         build_id: Uuid::new_v4(),
+        ingress_stripped: Default::default(),
         tenant_id: None,
         priority_class: PriorityClass::Scheduled,
         nodes: vec![make_node("upgrade-hash")],
@@ -255,6 +259,7 @@ async fn test_interactive_priority_boost() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id: build2,
+            ingress_stripped: Default::default(),
             tenant_id: None,
             priority_class: PriorityClass::Interactive,
             nodes: vec![make_node("prioA"), make_node("prioB")],

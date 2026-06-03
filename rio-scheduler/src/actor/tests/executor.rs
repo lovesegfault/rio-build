@@ -3040,6 +3040,7 @@ async fn test_per_build_timeout_fails_build_on_tick() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id,
+            ingress_stripped: Default::default(),
             tenant_id: None,
             priority_class: PriorityClass::Scheduled,
             nodes: vec![make_node("pbt-drv")],
