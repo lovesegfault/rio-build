@@ -477,20 +477,24 @@ const MAX_ATTR_LEN: usize = 256;
 /// and 64 is well past any legitimate `requiredSystemFeatures` set.
 const MAX_LIST_LEN: usize = 64;
 
-/// `__structuredAttrs`-aware env lookup, mirroring Nix's
-/// `ParsedDerivation::get{String,Bool,Strings}Attr`.
+/// `__structuredAttrs`-aware env lookup under the payload-first
+/// precedence rule owned by `rio_nix::derivation::structured_attrs`
+/// (see that module's doc for the rule, including exactly where it
+/// deliberately diverges from upstream Nix's `getStringSetAttr` /
+/// `getBoolAttr` — the missing-key and wrong-type fall-throughs to the
+/// flat env are rio-local tolerance for hand-assembled wire envs, not
+/// an upstream mirror; the scalar arms below share that divergence).
 ///
 /// When a derivation sets `__structuredAttrs = true`, Nix's
 /// `derivationStrict` serializes user attrs into `env["__json"]` ONLY —
 /// they do NOT appear as separate env keys. Direct `env.get("foo")`
 /// returns None, so the ADR-023 sizing hints (and pre-existing
 /// `requiredSystemFeatures` / `__noChroot`) were always None for
-/// structuredAttrs drvs. The payload-first precedence comes from the
-/// shared `rio_nix::derivation::structured_attrs` view: the string-list
-/// arm IS the canonical [`structured_attrs::string_list_attr`] rule (one
-/// implementation with the recorder and the replay engine), and the
-/// gateway-only scalar arms (string/bool, plus the trust-boundary
-/// clamps below) are built on the same two view accessors.
+/// structuredAttrs drvs. The string-list arm IS the canonical
+/// [`structured_attrs::string_list_attr`] rule (one implementation with
+/// the recorder and the replay engine), and the gateway-only scalar
+/// arms (string/bool, plus the trust-boundary clamps below) are built
+/// on the same two view accessors.
 pub(crate) struct StructuredEnv<'a> {
     view: structured_attrs::AtermEnv<'a>,
 }

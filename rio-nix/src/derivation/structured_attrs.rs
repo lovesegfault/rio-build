@@ -12,13 +12,28 @@
 //! two consumers can never again disagree about what one derivation
 //! declares.
 //!
-//! The rule, mirroring Nix's `ParsedDerivation::getStringsAttr`: read the
-//! structured payload first; when the payload is absent, or present but
-//! lacking the key (or holding it as a non-array), fall back to the flat
-//! env key, an ASCII-whitespace-separated name list (Nix tokenizes flat
-//! lists on `" \t\n\r"`). Carriers stay dumb: a [`StructuredAttrsEnv`]
-//! adapter only answers "the flat value of key K" and "your structured
-//! payload, if any" — all precedence lives in [`string_list_attr`].
+//! The rule: read the structured payload first; when the payload is
+//! absent, or present but lacking the key (or holding it as a non-array),
+//! fall back to the flat env key, an ASCII-whitespace-separated name list
+//! (Nix tokenizes flat lists on `" \t\n\r"`). Only the payload-ABSENT arm
+//! mirrors upstream Nix (`getStringSetAttr` in
+//! `src/libstore/derivation-options.cc` at the corpus-pinned producer
+//! version, nix 2.34.7 — the legacy `ParsedDerivation::getStringsAttr`
+//! name no longer exists there): upstream guards on `if (parsed)`, so a
+//! PRESENT payload makes its flat env unreachable — a missing key reads
+//! as empty (never the flat value) and a non-array or non-string element
+//! throws. The missing-key and non-array fall-throughs, and the
+//! per-element skipping of non-strings, are deliberate rio-local
+//! tolerance instead: the carriers include hand-assembled envs from
+//! untrusted wire ATerms and foreign archives, where `__json` and flat
+//! keys CAN co-occur, and reading the flat declaration there beats
+//! erroring or silently declaring emptiness. The divergence is
+//! adversarial-input-only — `derivationStrict` output never co-occurs a
+//! flat decoy with `__json` — and its inflation direction is demotive
+//! (more `impureEnvVars` / `requiredSystemFeatures` constrain placement,
+//! never widen it). Carriers stay dumb: a [`StructuredAttrsEnv`] adapter
+//! only answers "the flat value of key K" and "your structured payload,
+//! if any" — all precedence lives in [`string_list_attr`].
 //!
 //! The `structured-attr-reads` workspace lint (xtask) enforces that no
 //! call site reads a [`STRING_LIST_USER_ATTRS`] key straight off an env
@@ -204,8 +219,11 @@ mod tests {
     fn payload_without_the_key_falls_through_to_flat() {
         // A structured payload that simply lacks the attr (or holds it as
         // a non-array) is not a declaration of emptiness — the read falls
-        // through to the flat env, mirroring upstream's getStringsAttr
-        // chain.
+        // through to the flat env. This is rio-local tolerance, NOT an
+        // upstream mirror: nix 2.34.7's getStringSetAttr
+        // (derivation-options.cc) never reads the flat env once a payload
+        // exists — missing key is empty, non-array throws (see the module
+        // doc for why rio's hand-assembled-env carriers tolerate instead).
         for key in STRING_LIST_USER_ATTRS {
             let env = aterm_env(&[
                 (STRUCTURED_PAYLOAD_KEY, "{\"name\":\"other\"}"),
