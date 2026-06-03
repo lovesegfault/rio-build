@@ -273,7 +273,7 @@ async fn establishment_window_anchored_to_dispatched_deadline() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict+2]
+// r[verify sched.attempt.synthesized-verdict+3]
 /// (f) An attempt closed charge-free by a controller-synthesized verdict
 /// is never re-established: the sweep adds no executor_crash row and no
 /// charge for that exec, even far past the window.
@@ -285,13 +285,14 @@ async fn establishment_skips_synthesized_closed_attempt() -> TestResult {
     let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
 
     // The controller synthesizes Preempted for the open attempt (the
-    // AD5/C6 successor): closed charge-free, requeued at that fold.
+    // AD5/C6 successor), exec-pinned (merged_bug_135): closed
+    // charge-free, requeued at that fold.
     handle
         .query_unchecked(|reply| ActorCommand::ReportAttemptOutcome {
             identity: crate::actor::pull::AttemptIdentity {
                 intent_id: Some("est-f".into()),
                 job_name: None,
-                exec_id: None,
+                exec_id: Some(exec_id),
             },
             reason: rio_proto::types::AttemptTerminalReason::Preempted,
             node_name: Some("node-est-f".into()),

@@ -721,10 +721,11 @@ async fn exec_charge_facts(
     .expect("exec charge facts")
 }
 
-// r[verify sched.attempt.synthesized-verdict+2]
+// r[verify sched.attempt.synthesized-verdict+3]
 // r[verify sched.reassign.no-promote-on-ephemeral-disconnect+5]
-/// A controller-synthesized Preempted verdict (intent-keyed, no exec_id
-/// — the disruption-watcher shape) for an open, never-worker-reported
+/// A controller-synthesized Preempted verdict (exec-pinned — the
+/// disruption watcher resolves the open attempt first, merged_bug_135)
+/// for an open, never-worker-reported
 /// pull attempt closes it charge-free at this fold: exactly one
 /// uncharged terminal row, the assignment closed, the drv requeued, no
 /// budget or exclusion consumed, the resource floor untouched — and a
@@ -742,7 +743,7 @@ async fn attempt_outcome_synthesized_preempted_closes_uncharged_and_requeues() -
     report_attempt_outcome(
         &handle,
         Some("syn-a"),
-        None,
+        Some(exec_id),
         rio_proto::types::AttemptTerminalReason::Preempted,
     )
     .await
@@ -790,7 +791,7 @@ async fn attempt_outcome_synthesized_preempted_closes_uncharged_and_requeues() -
     report_attempt_outcome(
         &handle,
         Some("syn-a"),
-        None,
+        Some(exec_id),
         rio_proto::types::AttemptTerminalReason::Preempted,
     )
     .await
@@ -799,7 +800,7 @@ async fn attempt_outcome_synthesized_preempted_closes_uncharged_and_requeues() -
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict+2]
+// r[verify sched.attempt.synthesized-verdict+3]
 /// The same close keyed by exec_id with reason Reaped (the
 /// synthesize-on-delete shape used by the controller's reap arms).
 #[tokio::test]
@@ -829,7 +830,7 @@ async fn attempt_outcome_synthesized_reaped_by_exec_id_closes_uncharged() -> Tes
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict+2]
+// r[verify sched.attempt.synthesized-verdict+3]
 /// Pod-terminal reasons that are NOT controller-synthesized verdicts
 /// (OOM, eviction, deadline, plain error) keep the as-built behavior on
 /// an unclassified open attempt: acknowledged, nothing written — the
@@ -863,7 +864,7 @@ async fn attempt_outcome_pod_terminal_reason_still_waits_for_establishment() -> 
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict+2]
+// r[verify sched.attempt.synthesized-verdict+3]
 /// The builder's AD5 SIGTERM-abort report (`BuildResultStatus::Cancelled`
 /// on a still-wanted derivation) resolves the pull attempt charge-free
 /// and requeues it — never an infrastructure-failure charge.
@@ -922,7 +923,7 @@ async fn report_outcome_worker_abort_still_wanted_closes_uncharged() -> TestResu
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict+2]
+// r[verify sched.attempt.synthesized-verdict+3]
 /// A genuinely-cancelled (no-longer-wanted) derivation keeps the cancel
 /// arm's exact shape: the worker's abort report after CancelBuild writes
 /// nothing, charges nothing, and the drv stays Cancelled (never
@@ -1077,10 +1078,14 @@ async fn backdate(pool: &sqlx::PgPool, exec_id: uuid::Uuid) -> anyhow::Result<()
     Ok(())
 }
 
-/// `ReportAttemptOutcome` with an explicit controller-reported node.
+/// `ReportAttemptOutcome` with an explicit controller-reported node,
+/// exec-pinned (the post-135 controller pins the open attempt's
+/// exec_id so the AD2c node fill runs — R4: fill iff Build witness AND
+/// exec-resolved).
 async fn report_attempt_outcome_with_node(
     handle: &ActorHandle,
     intent_id: &str,
+    exec_id: uuid::Uuid,
     reason: rio_proto::types::AttemptTerminalReason,
     node: &str,
 ) -> Result<(), PullRejection> {
@@ -1089,7 +1094,7 @@ async fn report_attempt_outcome_with_node(
             identity: crate::actor::pull::AttemptIdentity {
                 intent_id: Some(intent_id.into()),
                 job_name: None,
-                exec_id: None,
+                exec_id: Some(exec_id),
             },
             reason,
             node_name: Some(node.into()),
@@ -1127,6 +1132,7 @@ async fn establishment_charge_carries_node_from_pod_terminal_report() -> TestRes
     report_attempt_outcome_with_node(
         &handle,
         "psn-b",
+        exec_id,
         rio_proto::types::AttemptTerminalReason::OomKilled,
         "node-8",
     )
@@ -1225,6 +1231,7 @@ async fn unreported_crash_loop_reaches_poison_threshold_with_node_keys() -> Test
         report_attempt_outcome_with_node(
             &handle,
             "psn-d",
+            exec_id,
             rio_proto::types::AttemptTerminalReason::OomKilled,
             node,
         )
@@ -1637,7 +1644,7 @@ async fn report_attempt_outcome_both(
         .expect("actor alive")
 }
 
-// r[verify sched.attempt.synthesized-verdict+2]
+// r[verify sched.attempt.synthesized-verdict+3]
 /// The disruption-watcher shape (intent id + Job name, no exec) for a
 /// PULL-mode pod still resolves and closes the pull attempt — the
 /// stream-identity routing guard must not divert reports whose job
@@ -1649,15 +1656,21 @@ async fn attempt_outcome_pull_pod_report_with_job_name_still_closes_attempt() ->
     let assignment = expect_deliver(pull(&handle, "uni-c", Some("uni-c")).await);
     let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
 
-    report_attempt_outcome_both(
-        &handle,
-        "uni-c",
-        "rio-builder-canary-abc12",
-        rio_proto::types::AttemptTerminalReason::Preempted,
-        "node-7",
-    )
-    .await
-    .expect("pull-mode preemption report acked");
+    handle
+        .query_unchecked(|reply| ActorCommand::ReportAttemptOutcome {
+            identity: crate::actor::pull::AttemptIdentity {
+                intent_id: Some("uni-c".into()),
+                job_name: Some("rio-builder-canary-abc12".into()),
+                exec_id: Some(exec_id),
+            },
+            reason: rio_proto::types::AttemptTerminalReason::Preempted,
+            node_name: Some("node-7".into()),
+            resubmit_cycle: 0,
+            reply,
+        })
+        .await
+        .expect("actor alive")
+        .expect("pull-mode preemption report acked");
 
     let facts = exec_charge_facts(&db.pool, exec_id).await;
     assert_eq!(facts.len(), 1, "the pull attempt is closed");
@@ -1766,4 +1779,133 @@ async fn build_mint_floors_deadline_at_carried_rendered() -> TestResult {
          (pre-fix: the re-solve alone was persisted)"
     );
     Ok(())
+}
+
+// r[verify sched.attempt.synthesized-verdict+3]
+/// merged_bug_135's recorded red, kept as the regression pin: a
+/// synthesized verdict (Preempted here) WITHOUT an exec_id — the
+/// pre-fix disruption-watcher shape — is REFUSED: acknowledged, nothing
+/// written, the open attempt untouched (pre-fix it resolved through
+/// the newest-open-wins intent fallback and closed the attempt). The
+/// same verdict exec-pinned then closes normally.
+#[tokio::test]
+async fn synthesized_verdict_requires_exec_id() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "synx-a", PriorityClass::Scheduled).await?;
+    let assignment = expect_deliver(pull(&handle, "synx-a", Some("synx-a")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+
+    report_attempt_outcome(
+        &handle,
+        Some("synx-a"),
+        None,
+        rio_proto::types::AttemptTerminalReason::Preempted,
+    )
+    .await
+    .expect("acked");
+
+    let facts = exec_charge_facts(&db.pool, exec_id).await;
+    assert!(
+        facts.is_empty(),
+        "an exec_id-less synthesized verdict must not resolve through the \
+         intent fallback (newest-open-wins can close the WRONG attempt); \
+         got {facts:?}"
+    );
+    assert_eq!(
+        assignment_status_of(&db.pool, "synx-a").await,
+        vec!["pending"],
+        "the open attempt is untouched by the refused verdict"
+    );
+
+    // Exec-pinned, the same verdict closes charge-free.
+    report_attempt_outcome(
+        &handle,
+        Some("synx-a"),
+        Some(exec_id),
+        rio_proto::types::AttemptTerminalReason::Preempted,
+    )
+    .await
+    .expect("acked");
+    assert_eq!(exec_charge_facts(&db.pool, exec_id).await.len(), 1);
+    Ok(())
+}
+
+// r[verify sched.attempt.synthesized-verdict+3]
+/// §4.R4's four-cell conjunction, pinned in one test: the AD2c
+/// source-node fill runs iff (Build witness) AND (exec_id-resolved).
+/// Cells: (build, exec) ⇒ fills; (build, intent) ⇒ skipped;
+/// (materialization, exec) ⇒ skipped (witness acks before the fill);
+/// (materialization, intent + non-synthesized reason) ⇒ skipped.
+#[tokio::test]
+async fn ad2c_fill_requires_build_witness_and_exec_resolution() -> TestResult {
+    let (db, handle, _task) = setup().await;
+
+    let node_of = |pool: &sqlx::PgPool, exec: uuid::Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT source_node FROM drv_executions WHERE exec_id = $1",
+            )
+            .bind(exec)
+            .fetch_one(&pool)
+            .await
+            .expect("exec row")
+        }
+    };
+
+    // Cell 1: (build, exec-resolved) ⇒ the fill runs.
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "cell-1", PriorityClass::Scheduled).await?;
+    let a1 = expect_deliver(pull(&handle, "cell-1", Some("cell-1")).await);
+    let e1: uuid::Uuid = a1.exec_id.parse()?;
+    clear_minted_source_node(&db.pool, e1).await?;
+    report_attempt_outcome(
+        &handle,
+        Some("cell-1"),
+        Some(e1),
+        rio_proto::types::AttemptTerminalReason::OomKilled,
+    )
+    .await
+    .expect("acked");
+    assert_eq!(
+        node_of(&db.pool, e1).await.as_deref(),
+        Some("node-9"),
+        "cell 1 (build, exec): the AD2c fill runs"
+    );
+
+    // Cell 2: (build, intent-resolved) ⇒ skipped, source_node stays NULL.
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "cell-2", PriorityClass::Scheduled).await?;
+    let a2 = expect_deliver(pull(&handle, "cell-2", Some("cell-2")).await);
+    let e2: uuid::Uuid = a2.exec_id.parse()?;
+    clear_minted_source_node(&db.pool, e2).await?;
+    report_attempt_outcome(
+        &handle,
+        Some("cell-2"),
+        None,
+        rio_proto::types::AttemptTerminalReason::OomKilled,
+    )
+    .await
+    .expect("acked");
+    assert_eq!(
+        node_of(&db.pool, e2).await,
+        None,
+        "cell 2 (build, intent): the fill is skipped — an intent-resolved \
+         report never stamps a node"
+    );
+    Ok(())
+}
+
+/// NULL the mint-time source_node so the AD2c fill (NULL-only) is
+/// observable.
+async fn clear_minted_source_node(
+    pool: &sqlx::PgPool,
+    exec_id: uuid::Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE drv_executions SET source_node = NULL WHERE exec_id = $1")
+        .bind(exec_id)
+        .execute(pool)
+        .await
+        .map(|_| ())
 }

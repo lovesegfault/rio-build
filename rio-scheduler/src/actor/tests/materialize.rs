@@ -6674,7 +6674,7 @@ async fn deposed_establishment_performs_no_rearm_or_requeue() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict+2]
+// r[verify sched.attempt.synthesized-verdict+3]
 /// merged_bug_146 (A2): controller-facing attempt surfaces are
 /// kind-typed. A controller-synthesized verdict (`ReportAttemptOutcome`
 /// with reason Reaped/Cancelled/Preempted) names a BUILD-lifecycle

@@ -926,7 +926,7 @@ fn pull_attempt(intent_id: &str, exec_id: &str, source_node: &str) -> OpenAttemp
 }
 
 /// The expected one-foreground-DELETE scenario for `name`.
-fn delete_scenario(name: &str) -> Scenario {
+pub(super) fn delete_scenario(name: &str) -> Scenario {
     Scenario {
         method: http::Method::DELETE,
         path_contains: Box::leak(format!("/namespaces/rio/jobs/{name}").into_boxed_str()),
@@ -940,7 +940,7 @@ fn delete_scenario(name: &str) -> Scenario {
 /// whose admin client points at it, so the synthesized
 /// `ReportAttemptOutcome` actually lands and the OA1 histogram sample
 /// is observable.
-async fn ctx_with_mock_admin(
+pub(super) async fn ctx_with_mock_admin(
     client: kube::Client,
 ) -> (
     std::sync::Arc<crate::reconcilers::Ctx>,

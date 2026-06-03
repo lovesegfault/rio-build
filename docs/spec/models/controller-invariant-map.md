@@ -1381,7 +1381,7 @@ counter-signature collected with the 1d landing.
   authoritative on its own (durable ledger state). The DisruptionTarget
   watcher's `DrainExecutor` force-drain hop is removed: every
   disruption-targeted pod takes the synthesize-preempted +
-  foreground-delete path (`ctrl.drain.disruption-target+3`,
+  foreground-delete path (`ctrl.drain.disruption-target+4`,
   `ctrl.pool.disruption+2`). The nodeclaim Dead-arm input is the OA2
   wedge clustering alone (`dead_union` removed; the
   `GetSpawnIntentsResponse.dead_nodes` field is reserved at the proto).

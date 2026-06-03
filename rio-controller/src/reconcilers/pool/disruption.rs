@@ -23,12 +23,14 @@
 //!
 //! `DisruptionTarget` stays True for the pod's remaining lifetime
 //! (the condition is sticky until pod termination). Every watcher
-//! event for that pod re-synthesizes the same terminal report — the
-//! scheduler's first-classifier-wins fill makes the repeat a no-op —
-//! and re-issues the (idempotent) Job delete. No client-side dedup
-//! needed.
+//! event for that pod re-resolves the open attempt: the same attempt
+//! re-synthesizes the same exec-pinned report (idempotent at the
+//! scheduler's attempt-terminal gate); a closed/absent attempt
+//! synthesizes NOTHING (no RPC at all — a sticky re-fire can never
+//! close a newer attempt it did not observe). The Job delete is
+//! idempotent either way. No client-side dedup needed.
 
-// r[impl ctrl.drain.disruption-target+3]
+// r[impl ctrl.drain.disruption-target+4]
 // r[impl ctrl.pool.disruption+2]
 
 use futures_util::StreamExt;
@@ -107,7 +109,7 @@ pub async fn run(client: Client, mut admin: AdminClient, shutdown: rio_common::s
             continue;
         };
 
-        // r[impl ctrl.drain.disruption-target+3]
+        // r[impl ctrl.drain.disruption-target+4]
         // AD5/C6: preemption is synthesize the terminal report, then
         // foreground-delete the owning Job — the deletion's SIGTERM is
         // the abort (the builder cgroup-kills and makes its one
@@ -194,44 +196,81 @@ pub(super) fn preemption_for_pod(pod: &Pod, pod_name: &str) -> PullPreemption {
 /// — the establishment sweep is the fallback classifier), then
 /// foreground-delete the owning Job so the pod's SIGTERM-abort fires
 /// now instead of at `activeDeadlineSeconds`.
-async fn preempt_disrupted_pod(client: &Client, admin: &mut AdminClient, p: &PullPreemption) {
-    match admin_call(
-        admin.report_attempt_outcome(rio_proto::types::ReportAttemptOutcomeRequest {
-            resubmit_cycle: 0,
-            intent_id: p.intent_id.clone(),
-            job_name: p.job_name.clone().unwrap_or_else(|| p.pod_name.clone()),
-            exec_id: String::new(),
-            reason: rio_proto::types::AttemptTerminalReason::Preempted.into(),
-            node_name: p.node_name.clone(),
-        }),
+pub(super) async fn preempt_disrupted_pod(
+    client: &Client,
+    admin: &mut AdminClient,
+    p: &PullPreemption,
+) {
+    // merged_bug_135: resolve the attempt identity FIRST. A synthesized
+    // verdict is exec-pinned — it exists only for an attempt the
+    // controller actually observed open. No open attempt (pod never
+    // pulled, or the attempt already closed) ⇒ NO report; the Job
+    // delete below still proceeds and the establishment sweep remains
+    // the classifier for anything that appears later. The view read is
+    // best-effort: on error we skip the report (never invent one) and
+    // still delete.
+    let report = match admin_call(
+        admin
+            .clone()
+            .list_open_attempts(rio_proto::types::ListOpenAttemptsRequest {}),
     )
     .await
     {
-        Ok(_) => {
-            metrics::counter!(
-                "rio_controller_disruption_drains_total",
-                "result" => "preempted_pull"
-            )
-            .increment(1);
-            info!(
-                pod = %p.pod_name,
-                job = ?p.job_name,
-                intent_id = %p.intent_id,
-                "DisruptionTarget: synthesized preempted report for the disrupted pod"
-            );
-        }
+        Ok(resp) => super::job::synthesized_report_for_intent(
+            Some(p.intent_id.as_str()).filter(|i| !i.is_empty()),
+            p.job_name.clone().unwrap_or_else(|| p.pod_name.clone()),
+            rio_proto::types::AttemptTerminalReason::Preempted,
+            &resp.into_inner().attempts,
+        ),
         Err(e) => {
-            metrics::counter!(
-                "rio_controller_disruption_drains_total",
-                "result" => "preempted_pull_report_failed"
-            )
-            .increment(1);
             warn!(
                 pod = %p.pod_name, error = %e,
-                "DisruptionTarget: preempted report failed; proceeding with the Job delete \
-                 (the establishment sweep is the fallback classifier)"
+                "DisruptionTarget: ListOpenAttempts failed; skipping the synthesized \
+                 report (the establishment sweep is the fallback classifier)"
+            );
+            None
+        }
+    };
+    match report {
+        None => {
+            metrics::counter!(
+                "rio_controller_disruption_drains_total",
+                "result" => "preempted_pull_no_attempt"
+            )
+            .increment(1);
+            debug!(
+                pod = %p.pod_name,
+                intent_id = %p.intent_id,
+                "DisruptionTarget: no open attempt for the disrupted pod; nothing to report"
             );
         }
+        Some(req) => match admin_call(admin.report_attempt_outcome(req)).await {
+            Ok(_) => {
+                metrics::counter!(
+                    "rio_controller_disruption_drains_total",
+                    "result" => "preempted_pull"
+                )
+                .increment(1);
+                info!(
+                    pod = %p.pod_name,
+                    job = ?p.job_name,
+                    intent_id = %p.intent_id,
+                    "DisruptionTarget: synthesized preempted report for the disrupted pod"
+                );
+            }
+            Err(e) => {
+                metrics::counter!(
+                    "rio_controller_disruption_drains_total",
+                    "result" => "preempted_pull_report_failed"
+                )
+                .increment(1);
+                warn!(
+                    pod = %p.pod_name, error = %e,
+                    "DisruptionTarget: preempted report failed; proceeding with the Job delete \
+                     (the establishment sweep is the fallback classifier)"
+                );
+            }
+        },
     }
     let Some(job_name) = p.job_name.as_deref() else {
         debug!(pod = %p.pod_name, "disrupted pod has no owning Job; nothing to delete");

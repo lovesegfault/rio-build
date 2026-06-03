@@ -804,14 +804,17 @@ establishment sweep. A preStop hook would be redundant: K8s sends SIGTERM
 on pod termination regardless, and the signal handler implements the abort.
 The Job pod template does NOT define a preStop.
 
-#r("ctrl.drain.disruption-target+3")[
+#r("ctrl.drain.disruption-target+4")[
   *Eviction-triggered preemption:* the controller runs a Pod watcher filtered
   to `rio.build/pool`-labeled pods with
   `status.conditions[type=DisruptionTarget,status=True]`. When K8s marks an
   executor pod for eviction (node drain, spot interrupt), the watcher MUST
-  preempt by report-then-delete: synthesize the terminal
-  `ReportAttemptOutcome(preempted)` for the pod's attempt, then
-  foreground-delete the owning Job, so the pod's SIGTERM-abort fires within
+  preempt by report-then-delete: resolve the pod's OPEN attempt from
+  `ListOpenAttempts` and synthesize the terminal
+  `ReportAttemptOutcome(preempted)` keyed by THAT attempt's `exec_id` ---
+  when no open attempt exists (never pulled, or already closed) the watcher
+  MUST send no report at all --- then foreground-delete the owning Job, so
+  the pod's SIGTERM-abort fires within
   the 45 s grace and the requeue happens at the report fold, never the
   establishment sweep. The pod's own SIGTERM abort is the fallback if the
   watcher misses the window. There is no per-executor drain RPC --- the

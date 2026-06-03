@@ -847,7 +847,7 @@ impl DagActor {
             }
             ReportAdmission::Process => {
                 let executor_id = ExecutorId::from(b.core.executor_id.as_str());
-                // r[impl sched.attempt.synthesized-verdict+2]
+                // r[impl sched.attempt.synthesized-verdict+3]
                 // AD5 abort charge class: a pod reporting `Cancelled`
                 // for a derivation the scheduler still wants is the
                 // SIGTERM-abort report (preemption, scale-down,
@@ -945,7 +945,7 @@ impl DagActor {
     /// the derivation if this attempt was still the in-flight one.
     /// Idempotent: a row already present for the exec (any classifier
     /// won first) makes the append a no-op and nothing else changes.
-    // r[impl sched.attempt.synthesized-verdict+2]
+    // r[impl sched.attempt.synthesized-verdict+3]
     /// Takes the BUILD witness: a materialization attempt cannot be
     /// closed by this path — the cross-kind call no longer typechecks
     /// (merged_bug_146's structural half).
@@ -1127,6 +1127,39 @@ impl DagActor {
                 .handle_no_eligible_source(&identity, resubmit_cycle)
                 .await;
         }
+        // r[impl sched.attempt.synthesized-verdict+3]
+        // Synthesized verdicts (cancelled / preempted / reaped) REQUIRE
+        // the attempt's exec_id (merged_bug_135): the controller holds
+        // it from the same ListOpenAttempts read that justified the
+        // verdict, and the intent fallback below is newest-open-wins —
+        // a sticky DisruptionTarget re-fire or a stale verdict would
+        // close a NEWER attempt it never observed. Refused = ack +
+        // warn, nothing resolved; the establishment sweep remains the
+        // bounded fallback classifier for the (skewed-controller) case.
+        let synthesized = matches!(
+            reason,
+            rio_proto::types::AttemptTerminalReason::Cancelled
+                | rio_proto::types::AttemptTerminalReason::Preempted
+                | rio_proto::types::AttemptTerminalReason::Reaped
+        );
+        if synthesized && identity.exec_id.is_none() {
+            // Same stale-watch hygiene as the no-attempt arm: a
+            // refused synthesized report still proves the pod is gone.
+            if let Some(intent) = identity.intent_id.as_deref().filter(|s| !s.is_empty()) {
+                self.dispatched_cells.remove(intent);
+            }
+            warn!(
+                intent_id = ?identity.intent_id,
+                job_name = ?identity.job_name,
+                ?reason,
+                "synthesized verdict without exec_id refused (acked charge-free;                  synthesized closes are exec-pinned)"
+            );
+            return Ok(());
+        }
+        // Whether the report named the execution directly — the AD2c
+        // fill below is gated on it (R4: fill iff Build witness AND
+        // exec_id-resolved).
+        let exec_resolved = identity.exec_id.is_some();
         // Resolve the attempt: exec_id first, then the intent's open
         // pull-mode attempt. A Job-name-only report cannot be resolved
         // here yet (the deterministic name embeds only a derived
@@ -1202,7 +1235,13 @@ impl DagActor {
         // charge carries the node key even when this report itself
         // classifies nothing. Never a worker-supplied value — the
         // node here comes from the controller's informer view.
-        if let Some(node) = node_name.as_deref().filter(|s| !s.is_empty())
+        // §4.R4 conjunction (second toucher): the fill runs iff the
+        // report resolved as a BUILD witness (the match above) AND
+        // named the execution directly (exec_id-resolved) — an
+        // intent-resolved report is newest-open-wins and could stamp
+        // the node onto an execution the controller never observed.
+        if exec_resolved
+            && let Some(node) = node_name.as_deref().filter(|s| !s.is_empty())
             && let Err(e) = self.db.fill_open_execution_source_node(exec_id, node).await
         {
             debug!(%exec_id, error = %e,
@@ -1283,7 +1322,7 @@ impl DagActor {
         //     deadline, plain error) keep waiting: the establishment
         //     sweep stays their classifier (the 1b gate text), because
         //     the worker's own classifying report may still arrive.
-        // r[impl sched.attempt.synthesized-verdict+2]
+        // r[impl sched.attempt.synthesized-verdict+3]
         use rio_proto::types::AttemptTerminalReason as R;
         if b.core.assignment_active && matches!(reason, R::Cancelled | R::Preempted | R::Reaped) {
             let drv_hash = DrvHash::from(b.core.drv_hash.as_str());

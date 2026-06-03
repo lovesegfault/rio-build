@@ -424,3 +424,78 @@ fn degrade_builder_fuse_cache_ignored() {
         "Builder without fuseCacheBytes → no Warning"
     );
 }
+
+// r[verify ctrl.drain.disruption-target+4]
+/// merged_bug_135's recorded red, kept as the regression pin: a
+/// disrupted pod with NO open attempt produces NO synthesized report
+/// RPC at all (pre-fix: an exec_id-less Preempted request was sent and
+/// resolved scheduler-side through newest-open-wins) — and the Job is
+/// still deleted.
+#[tokio::test]
+async fn disruption_no_open_attempt_sends_no_report() {
+    use super::jobs_tests::{ctx_with_mock_admin, delete_scenario};
+    use crate::reconcilers::pool::disruption::{PullPreemption, preempt_disrupted_pod};
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let (ctx, mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let mut admin = ctx.admin.clone();
+
+    let p = PullPreemption {
+        namespace: "rio".into(),
+        job_name: Some("rio-builder-p-dis1".into()),
+        intent_id: "drv-disrupted".into(),
+        node_name: "node-3".into(),
+        pod_name: "rio-builder-p-dis1-xyz".into(),
+    };
+    // No open attempt exists for the intent (mock view is empty).
+    let guard = verifier.run(vec![delete_scenario("rio-builder-p-dis1")]);
+    preempt_disrupted_pod(&client, &mut admin, &p).await;
+    guard.verified().await;
+
+    assert!(
+        mock.outcome_calls.read().unwrap().is_empty(),
+        "no open attempt -> no synthesized report RPC (the Job is still deleted)"
+    );
+}
+
+// r[verify ctrl.drain.disruption-target+4]
+/// With an open attempt, the synthesized report is exec-pinned: it
+/// carries THAT attempt's exec_id (never an empty string), the
+/// attempt's source_node, and the preempted reason.
+#[tokio::test]
+async fn disruption_open_attempt_sends_exec_pinned_report() {
+    use super::jobs_tests::{ctx_with_mock_admin, delete_scenario};
+    use crate::reconcilers::pool::disruption::{PullPreemption, preempt_disrupted_pod};
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let (ctx, mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    mock.open_attempts.write().unwrap().attempts = vec![rio_proto::types::OpenAttempt {
+        intent_id: "drv-disrupted".into(),
+        exec_id: "exec-dis-1".into(),
+        source_node: "node-3".into(),
+        ..Default::default()
+    }];
+    let mut admin = ctx.admin.clone();
+
+    let p = PullPreemption {
+        namespace: "rio".into(),
+        job_name: Some("rio-builder-p-dis2".into()),
+        intent_id: "drv-disrupted".into(),
+        node_name: "node-3".into(),
+        pod_name: "rio-builder-p-dis2-xyz".into(),
+    };
+    let guard = verifier.run(vec![delete_scenario("rio-builder-p-dis2")]);
+    preempt_disrupted_pod(&client, &mut admin, &p).await;
+    guard.verified().await;
+
+    let calls = mock.outcome_calls.read().unwrap();
+    assert_eq!(calls.len(), 1, "exactly one synthesized report");
+    assert_eq!(
+        calls[0].exec_id, "exec-dis-1",
+        "the report is pinned to the OPEN attempt's exec_id"
+    );
+    assert_eq!(
+        calls[0].reason,
+        rio_proto::types::AttemptTerminalReason::Preempted as i32
+    );
+}

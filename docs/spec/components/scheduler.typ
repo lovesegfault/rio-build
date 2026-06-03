@@ -2751,10 +2751,16 @@ This carries forward the as-built rule that never-assigned/assigned-only pod
 deaths never count (the `recently_disconnected` no-entry no-op arms), re-keyed
 onto the durable open-attempt view.
 
-#r("sched.attempt.synthesized-verdict+2")[
+#r("sched.attempt.synthesized-verdict+3")[
   A controller-synthesized terminal report (reason cancelled, preempted, or
-  reaped) for an open pull-mode BUILD attempt that has no worker-reported
-  classification row MUST close that attempt charge-free in one
+  reaped) MUST name the attempt by `exec_id`: the scheduler refuses
+  (acknowledges charge-free, resolves nothing) a synthesized verdict that
+  arrives intent- or job-keyed only --- intent resolution is
+  newest-open-wins, and a sticky disruption re-fire or stale verdict would
+  close a newer attempt the controller never observed. An exec-pinned
+  synthesized report for an open pull-mode BUILD attempt that has no
+  worker-reported classification row MUST close that attempt charge-free in
+  one
   generation-fenced appending transaction --- exactly one uncharged terminal
   row whose `termination_reason` carries the synthesized reason, with the
   assignment row closed --- and MUST requeue a still-wanted derivation at
@@ -2768,7 +2774,10 @@ onto the durable open-attempt view.
   charge-free with nothing written --- the consumption transaction stays
   the attempt's only consumer. Neither close path may requeue a derivation
   that is no longer wanted, and other pod-terminal reasons without a worker
-  classification remain the establishment sweep's to classify.
+  classification remain the establishment sweep's to classify. The AD2c
+  source-node fill runs iff the report resolved as a BUILD witness AND
+  named the execution directly (exec-resolved) --- an intent-resolved
+  report never stamps a node onto an execution row.
 ]
 The synthesized-verdict close is the scheduler half of the AD5/C5/C6
 successor (`ctrl.job.synthesize-on-delete`, `ctrl.drain.disruption-target`):

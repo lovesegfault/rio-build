@@ -820,7 +820,7 @@ fn executor_pod_has_downward_hwclass_volume() {
     );
 }
 
-// r[verify ctrl.drain.disruption-target+3]
+// r[verify ctrl.drain.disruption-target+4]
 /// DisruptionTarget filter: Pod with `conditions[DisruptionTarget]=
 /// True` → `Some(name)`. Anything else → `None`.
 ///
@@ -1059,7 +1059,7 @@ fn job_pod_image_pull_policy_passthrough() {
 // AD5: preemption decision (DisruptionTarget watcher)
 // ───────────────────────────────────────────────────────────────────
 
-// r[verify ctrl.drain.disruption-target+3]
+// r[verify ctrl.drain.disruption-target+4]
 /// Every disruption-targeted executor pod takes the
 /// synthesize-preempted + foreground-delete-the-Job path: the decision
 /// carries the owning Job, the intent identity, and the node

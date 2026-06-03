@@ -562,14 +562,36 @@ pub(super) fn synthesized_report_for_job(
     reason: rio_proto::types::AttemptTerminalReason,
     open_attempts: &[rio_proto::types::OpenAttempt],
 ) -> Option<rio_proto::types::ReportAttemptOutcomeRequest> {
-    let intent = job_intent_id(job);
+    synthesized_report_for_intent(
+        job_intent_id(job),
+        job.metadata.name.clone().unwrap_or_default(),
+        reason,
+        open_attempts,
+    )
+}
+
+// r[impl ctrl.drain.disruption-target+4]
+/// The shared synthesized-verdict constructor (merged_bug_135): a
+/// controller-synthesized terminal report exists ONLY when an open
+/// attempt exists for the intent, and is keyed by THAT attempt's
+/// `exec_id` — the scheduler refuses exec_id-less synthesized
+/// verdicts, so a caller with no open attempt sends nothing (the Job
+/// delete still proceeds; the establishment sweep classifies any
+/// attempt that appears later). One constructor means the disruption
+/// watcher and every Job-delete arm speak the same identity rule.
+pub(super) fn synthesized_report_for_intent(
+    intent: Option<&str>,
+    job_name: String,
+    reason: rio_proto::types::AttemptTerminalReason,
+    open_attempts: &[rio_proto::types::OpenAttempt],
+) -> Option<rio_proto::types::ReportAttemptOutcomeRequest> {
     let attempt = open_attempts
         .iter()
         .find(|a| intent.is_some_and(|i| !i.is_empty() && a.intent_id == i))?;
     Some(rio_proto::types::ReportAttemptOutcomeRequest {
         resubmit_cycle: 0,
         intent_id: attempt.intent_id.clone(),
-        job_name: job.metadata.name.clone().unwrap_or_default(),
+        job_name,
         exec_id: attempt.exec_id.clone(),
         reason: reason.into(),
         node_name: attempt.source_node.clone(),
@@ -922,7 +944,7 @@ pub(super) fn select_closed_attempt_jobs<'a>(
         .collect()
 }
 
-// r[impl ctrl.drain.disruption-target+3]
+// r[impl ctrl.drain.disruption-target+4]
 /// AD5 cancel arm: each tick, foreground-delete an active Job whose
 /// attempt has CLOSED while the Job is still active, so a
 /// scheduler-side cancel verdict aborts the pod now (Job deletion →
@@ -1481,6 +1503,37 @@ pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
         }
     };
     let mut admin = ctx.admin.clone();
+    // merged_bug_135 sibling (the AD2c fill is exec-resolved-only on
+    // the scheduler side): pin the pod-terminal classification to the
+    // open attempt's exec_id when one exists, so the kube-authoritative
+    // node attribution keeps flowing into the establishment charge.
+    // One view read per tick, only when a promoting pod exists; on
+    // error the reports go intent-keyed (the scheduler then skips the
+    // node fill — conservative, never wrong-attempt).
+    let open_attempts: Vec<rio_proto::types::OpenAttempt> = if list.items.iter().any(|pod| {
+        matches!(
+            pod_termination_reason(pod),
+            TerminationReason::OomKilled | TerminationReason::EvictedDiskPressure
+        )
+    }) {
+        match admin_call(
+            admin
+                .clone()
+                .list_open_attempts(rio_proto::types::ListOpenAttemptsRequest {}),
+        )
+        .await
+        {
+            Ok(resp) => resp.into_inner().attempts,
+            Err(e) => {
+                debug!(pool, error = %e,
+                       "report_terminated_pods: open-attempt view unavailable; \
+                        reports go intent-keyed (node fill skipped scheduler-side)");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
     for pod in &list.items {
         let reason = pod_termination_reason(pod);
         // Only the promoting reasons go over the wire. `Completed`/
@@ -1513,12 +1566,19 @@ pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
             .as_ref()
             .and_then(|s| s.node_name.clone())
             .unwrap_or_default();
+        // Exec-pinned when the attempt is open (R4: only an
+        // exec-resolved Build report may fill the node).
+        let exec_id = open_attempts
+            .iter()
+            .find(|a| !intent_id.is_empty() && a.intent_id == intent_id)
+            .map(|a| a.exec_id.clone())
+            .unwrap_or_default();
         match admin_call(admin.report_attempt_outcome(
             rio_proto::types::ReportAttemptOutcomeRequest {
                 resubmit_cycle: 0,
                 intent_id,
                 job_name: name.to_owned(),
-                exec_id: String::new(),
+                exec_id,
                 reason: unified_attempt_reason(reason).into(),
                 node_name,
             },
