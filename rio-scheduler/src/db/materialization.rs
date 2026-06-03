@@ -546,4 +546,3 @@ impl SchedulerDb {
         Ok(result.rows_affected())
     }
 }
-

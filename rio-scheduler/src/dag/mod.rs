@@ -283,7 +283,6 @@ impl DerivationDag {
         self.nodes.iter().map(|(k, v)| (k.as_str(), v))
     }
 
-
     /// Merge a set of nodes and edges from a new build into the global DAG.
     ///
     /// Returns a `MergeResult` with the hashes of newly-inserted nodes,
