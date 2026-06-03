@@ -254,13 +254,35 @@ impl BuildResult {
     /// (lines arriving before `Started`, post-terminal stragglers —
     /// `relay_log_batch` in rio-gateway), and the observer's line split
     /// puts the non-first lines of a multi-line failure payload at
-    /// byte 0. The load-bearing bound is consumer-enforced instead: a
-    /// spoofed marker only flips THAT drv's same-batch `Substituted`
-    /// row from a recorded substitution event to conservative
-    /// evidence-loss exclusion — never minting a success or a violation
-    /// — the same channel-exposure class as the existing relayed-reason
-    /// capture (rio-replay's `DRV_FAILED_RE`), which is strictly looser
-    /// (it matches anywhere in any line).
+    /// byte 0.
+    ///
+    /// The load-bearing bound is consumer-enforced instead, and its
+    /// worst case is a GATE TRIP, not an exclusion: a spoofed marker
+    /// flips THAT drv's same-batch `Substituted` row from a recorded
+    /// substitution event to the evidence-loss leg, which CONSUMES the
+    /// drv's shared auto-retry budget per occurrence (any-reason
+    /// consumption, default `max_auto_retries = 1`) and at exhaustion
+    /// terminalizes as infra-indeterminate —
+    /// `GateAccounting::TripsRegression`, failing `report --check`
+    /// under both gating `fail_on` policies (regression and
+    /// divergence). The conservative half still holds — never minting a
+    /// success or a violation, so a spoof can never launder a real
+    /// failure into a pass — which makes the surface a bounded
+    /// denial-of-measurement primitive (CI-red, budget burn) available
+    /// to recorded third-party build output, accepted with that price
+    /// on record. The comparison with the relayed-reason capture
+    /// (rio-replay's `DRV_FAILED_RE`, strictly looser — it matches
+    /// anywhere in any line) holds for CHANNEL EXPOSURE only, not
+    /// effect strength: a forged failure reason cannot flip a
+    /// success-shaped row, a forged marker can.
+    ///
+    /// TODO: only gateway-owned structured wire metadata (a typed
+    /// per-root evidence-loss field on the result, not a stderr line)
+    /// deletes this spoof surface — the fallback relay emits raw
+    /// worker lines as single-line payloads, so no parser-side
+    /// anchoring can distinguish a relayed forgery from the genuine
+    /// gateway-authored marker. Wire-protocol change; priced as above
+    /// until then.
     pub fn lost_terminal_relay_drv(line: &str) -> Option<&str> {
         let drv = line
             .strip_prefix(Self::LOST_TERMINAL_RELAY_PREFIX)?
