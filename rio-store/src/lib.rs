@@ -176,6 +176,19 @@ pub fn describe_metrics() {
          outgrowing the budget — raise the const, do not let \
          RESOURCE_EXHAUSTED retries discover it"
     );
+    describe_counter!(
+        "rio_store_ia_proof_admission_total",
+        "Proof-walk/heal admission decisions (PROOF_WALK_CONCURRENCY=4 \
+         shared permits; round-16 bug_080), labeled by event: fast_path \
+         (cached row, no permit consumed) | admitted (cold walk holds a \
+         permit) | heal_skipped_memo (negative memo fresh — this path \
+         failed to populate within the 10-min TTL) | \
+         heal_skipped_inflight (another heal of the same path is \
+         running) | heal_skipped_saturated (no permit free; heal is \
+         best-effort and the proof-time read-through owns correctness). \
+         Sustained heal_skipped_saturated alongside cold-walk latency \
+         means walk concurrency is the bottleneck"
+    );
     describe_histogram!(
         "rio_store_ia_proof_arena_bytes",
         "Arena bytes RETAINED per deriver-proof walk (cap \

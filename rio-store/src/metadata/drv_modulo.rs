@@ -321,6 +321,16 @@ pub(crate) async fn populate_on_ingest(
 /// retry signal for rows whose original population skipped (the
 /// inputs arrived later) — without this, such rows were only ever
 /// filled by a proof-time read-through.
+///
+/// ADMITTED, best-effort (round-16 bug_080): the spawn site fires one
+/// task per AlreadyComplete `.drv` re-upload, so the heal itself is
+/// the chokepoint — a fresh negative memo (this path failed to
+/// populate within [`HEAL_NEGATIVE_MEMO_TTL`]) skips before any I/O;
+/// the row probe runs un-permitted (probe-before-admit); a concurrent
+/// heal of the SAME path skips (singleflight); fetch+populate runs
+/// only under one of the [`PROOF_WALK_CONCURRENCY`] shared permits,
+/// and a saturated pool skips rather than queueing (the proof-time
+/// read-through, not the heal, owns correctness).
 pub(crate) async fn heal_if_missing(
     pool: &PgPool,
     chunks: Option<&crate::cas::ChunkCache>,
@@ -329,23 +339,48 @@ pub(crate) async fn heal_if_missing(
     if !drv_path.ends_with(".drv") {
         return;
     }
+    if PROOF_ADMISSION.memo_fresh(drv_path) {
+        admission_event("heal_skipped_memo");
+        return;
+    }
     match load_drv_modulo(pool, drv_path).await {
-        Ok(Some(_)) => return, // probe-first: row present, nothing to heal
+        Ok(Some(_)) => {
+            // Probe-first: row present, nothing to heal. Drop any
+            // stale memo so the map tracks only still-missing paths.
+            PROOF_ADMISSION.memo_clear(drv_path);
+            return;
+        }
         Ok(None) => {}
         Err(e) => {
             warn!(drv_path, error = %e, "modulo-cache heal probe failed (best-effort)");
             return;
         }
     }
+    let Some(_flight) = PROOF_ADMISSION.begin_heal(drv_path) else {
+        admission_event("heal_skipped_inflight");
+        return;
+    };
+    let Ok(_permit) = PROOF_ADMISSION.permits.try_acquire() else {
+        // Saturated: skip WITHOUT a memo — saturation is a global
+        // condition, not evidence about this path.
+        admission_event("heal_skipped_saturated");
+        return;
+    };
     let mut budget = WorkBudget::new(PROOF_WALK_WORK_MAX, PROOF_WALK_ARENA_BYTES_MAX);
-    match own_drv_bytes(pool, chunks, drv_path, &mut budget).await {
+    let healed = match own_drv_bytes(pool, chunks, drv_path, &mut budget).await {
         Ok(FetchedDrv::Bytes(bytes)) => {
-            let _ = populate_on_ingest(pool, drv_path, &bytes).await;
+            populate_on_ingest(pool, drv_path, &bytes).await == PopulateOutcome::Populated
         }
-        Ok(_) => {}
+        Ok(_) => false,
         Err(e) => {
             warn!(drv_path, error = %e, "modulo-cache heal fetch failed (best-effort)");
+            false
         }
+    };
+    if healed {
+        PROOF_ADMISSION.memo_clear(drv_path);
+    } else {
+        PROOF_ADMISSION.memo_record(drv_path);
     }
 }
 
@@ -428,9 +463,10 @@ pub(crate) const DRV_REASSEMBLY_CAP: u64 = 64 * 1024 * 1024;
 /// by [`DRV_REASSEMBLY_CAP`] and is freed (parsed into retained bytes
 /// or dropped) before the next retention.
 ///
-/// AGGREGATE: per-walk; the store-process aggregate clause lands with
-/// the walk-admission permits (round-16 bug_080, next commit), which
-/// bound concurrent walks so aggregate = permits × this const.
+/// AGGREGATE (R4): per-walk. Cold walks run only under a
+/// [`PROOF_WALK_CONCURRENCY`] admission permit, so the store-process
+/// aggregate of retained arenas is `PROOF_WALK_CONCURRENCY ×
+/// PROOF_WALK_ARENA_BYTES_MAX` = 1 GiB.
 ///
 /// The `rio_store_ia_proof_arena_bytes` histogram (registered with
 /// this const) records per-walk charged bytes so approach is visible
@@ -443,6 +479,133 @@ pub(crate) const PROOF_WALK_ARENA_BYTES_MAX: usize = 256 * 1024 * 1024;
 /// containers' inline parts on 64-bit).
 fn arena_charge(path: &str, bytes: &[u8], inputs: &[String]) -> usize {
     bytes.len() + path.len() + inputs.iter().map(String::len).sum::<usize>() + 64
+}
+
+/// Concurrent budgeted-walk admission permits (round-16 bug_080;
+/// pattern R4 AGGREGATE/ADMISSION). Cold proof walks and heal tasks
+/// share one process-wide pool, so the AGGREGATE retained-byte bound
+/// is `PROOF_WALK_CONCURRENCY × PROOF_WALK_ARENA_BYTES_MAX` = 1 GiB
+/// (heal tasks retain at most one [`DRV_REASSEMBLY_CAP`] buffer each,
+/// strictly below the per-walk arena cap).
+///
+/// SIZING: cold walks are PG/S3-bound, not CPU-bound — 4 concurrent
+/// walks keep a recovering store busy without letting a cold-cache
+/// stampede (every post-wipe upload misses the cache simultaneously)
+/// multiply the worst-case arena by the request count. Warm traffic
+/// NEVER queues here: the row probe runs before admission
+/// (probe-before-admit), so a cached proof costs one indexed point
+/// query and no permit.
+pub(crate) const PROOF_WALK_CONCURRENCY: usize = 4;
+
+/// How long a failed heal attempt for a path suppresses further heal
+/// spawns for that path (round-16 bug_080: permanently-unpopulatable
+/// `.drv`s — garbage bytes at a text-CA path, perpetually-missing
+/// inputs — re-fired a fetch+parse per AlreadyComplete re-upload,
+/// forever). 10 minutes per owner sign-off (plan Q3): long enough to
+/// collapse re-upload stampedes to one attempt per window, short
+/// enough that a path healed sideways (inputs arrive later) is retried
+/// the same operator-minute; correctness never depends on the heal —
+/// the proof-time read-through still completes chains on demand.
+pub(crate) const HEAL_NEGATIVE_MEMO_TTL: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+
+/// Negative-memo capacity. 4096 paths × ~150 B ≈ 600 KiB worst case.
+/// When full after purging expired entries, new failures are NOT
+/// memoized (fail-open): the cost of a lost memo is one extra
+/// permit-bounded heal attempt per TTL, never unbounded work.
+const HEAL_MEMO_MAX: usize = 4096;
+
+/// Process-wide admission state for budgeted walks and heals
+/// (chokepoint per R2: it lives with the walk it admits; the only
+/// route to a cold walk is [`prove_drv_modulo_with_caps`] and the only
+/// heal entry is [`heal_if_missing`], both of which consult this).
+struct ProofAdmission {
+    /// Cold-walk/heal concurrency permits ([`PROOF_WALK_CONCURRENCY`]).
+    permits: tokio::sync::Semaphore,
+    /// Heal singleflight: paths with a heal currently in flight.
+    heal_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Heal negative memo: path → when its last heal attempt failed.
+    heal_memo: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+}
+
+/// Removes the path from the inflight set when the heal exits (any
+/// path: success, failure, panic-unwind).
+struct HealFlight<'a> {
+    admission: &'a ProofAdmission,
+    path: String,
+}
+
+impl Drop for HealFlight<'_> {
+    fn drop(&mut self) {
+        self.admission
+            .heal_inflight
+            .lock()
+            .expect("heal_inflight mutex poisoned")
+            .remove(&self.path);
+    }
+}
+
+impl ProofAdmission {
+    fn new() -> Self {
+        ProofAdmission {
+            permits: tokio::sync::Semaphore::new(PROOF_WALK_CONCURRENCY),
+            heal_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            heal_memo: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Is there a fresh negative memo for `path`?
+    fn memo_fresh(&self, path: &str) -> bool {
+        self.heal_memo
+            .lock()
+            .expect("heal_memo mutex poisoned")
+            .get(path)
+            .is_some_and(|t| t.elapsed() < HEAL_NEGATIVE_MEMO_TTL)
+    }
+
+    /// Record a failed heal attempt for `path`. Purges expired entries
+    /// when at capacity; fails open (no memo) if still full.
+    fn memo_record(&self, path: &str) {
+        let mut memo = self.heal_memo.lock().expect("heal_memo mutex poisoned");
+        if memo.len() >= HEAL_MEMO_MAX && !memo.contains_key(path) {
+            memo.retain(|_, t| t.elapsed() < HEAL_NEGATIVE_MEMO_TTL);
+            if memo.len() >= HEAL_MEMO_MAX {
+                return; // fail-open; cost bounded by permits
+            }
+        }
+        memo.insert(path.to_string(), std::time::Instant::now());
+    }
+
+    /// Drop any memo for `path` (it populated, or its row exists).
+    fn memo_clear(&self, path: &str) {
+        self.heal_memo
+            .lock()
+            .expect("heal_memo mutex poisoned")
+            .remove(path);
+    }
+
+    /// Singleflight entry: claim the in-flight slot for `path`, or
+    /// `None` if another heal for the same path is already running.
+    fn begin_heal(&self, path: &str) -> Option<HealFlight<'_>> {
+        let mut inflight = self
+            .heal_inflight
+            .lock()
+            .expect("heal_inflight mutex poisoned");
+        if !inflight.insert(path.to_string()) {
+            return None;
+        }
+        Some(HealFlight {
+            admission: self,
+            path: path.to_string(),
+        })
+    }
+}
+
+static PROOF_ADMISSION: std::sync::LazyLock<ProofAdmission> =
+    std::sync::LazyLock::new(ProofAdmission::new);
+
+fn admission_event(event: &'static str) {
+    metrics::counter!("rio_store_ia_proof_admission_total", "event" => event).increment(1);
 }
 
 /// Typed work budget (pattern R4). All metered operations in the proof
@@ -689,7 +852,7 @@ pub(crate) async fn prove_drv_modulo_with_caps(
     arena_cap: usize,
 ) -> Result<(ProofOutcome, usize), super::MetadataError> {
     let mut budget = WorkBudget::new(cap, arena_cap);
-    let result = prove_inner(pool, chunks, drv_path, &mut budget).await;
+    let result = prove_admitted(pool, chunks, drv_path, &mut budget).await;
     let work = budget.used();
     metrics::histogram!("rio_store_ia_proof_work_units").record(work as f64);
     metrics::histogram!("rio_store_ia_proof_arena_bytes").record(budget.arena_used() as f64);
@@ -706,13 +869,47 @@ pub(crate) async fn prove_drv_modulo_with_caps(
     result.map(|o| (o, work))
 }
 
+/// Probe-before-admit wrapper (round-16 bug_080): the warm fast path —
+/// a cached row — costs one charged probe and NO permit; only a cache
+/// miss (a genuinely cold, budgeted walk) acquires one of the
+/// [`PROOF_WALK_CONCURRENCY`] permits, held for the walk's lifetime so
+/// the process aggregate of retained arenas is permits × arena cap.
+/// `prove_inner`'s own initial probe re-checks after the (possibly
+/// queued) acquire — a concurrent admitted walk that proved this path
+/// while we waited turns our walk into a second fast path.
+async fn prove_admitted(
+    pool: &PgPool,
+    chunks: Option<&crate::cas::ChunkCache>,
+    drv_path: &str,
+    budget: &mut WorkBudget,
+) -> Result<ProofOutcome, super::MetadataError> {
+    if budget.charge(1).is_err() {
+        return Ok(ProofOutcome::Absent(AbsentReason::OverBudget {
+            persisted: 0,
+            work_used: budget.used(),
+        }));
+    }
+    if let Some(row) = load_drv_modulo(pool, drv_path).await? {
+        admission_event("fast_path");
+        return Ok(ProofOutcome::Proven(row));
+    }
+    let _permit = PROOF_ADMISSION
+        .permits
+        .acquire()
+        .await
+        .expect("proof-walk admission semaphore is never closed");
+    admission_event("admitted");
+    prove_inner(pool, chunks, drv_path, budget).await
+}
+
 async fn prove_inner(
     pool: &PgPool,
     chunks: Option<&crate::cas::ChunkCache>,
     drv_path: &str,
     budget: &mut WorkBudget,
 ) -> Result<ProofOutcome, super::MetadataError> {
-    // Fast path: cached row (charged — it is a probe like any other).
+    // Post-admission probe (charged — it is a probe like any other):
+    // re-checks the cache after a possibly-queued permit acquire.
     if budget.charge(1).is_err() {
         return Ok(ProofOutcome::Absent(AbsentReason::OverBudget {
             persisted: 0,
@@ -865,6 +1062,153 @@ async fn prove_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Admission semantics (bug_080), unit-level: memo TTL freshness,
+    /// capacity fail-open, singleflight claim/release, permit count.
+    #[test]
+    fn admission_memo_ttl_singleflight_and_permits() {
+        let adm = ProofAdmission::new();
+        let p = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv";
+
+        // Negative memo: absent → not fresh; recorded → fresh;
+        // cleared → not fresh.
+        assert!(!adm.memo_fresh(p));
+        adm.memo_record(p);
+        assert!(adm.memo_fresh(p));
+        adm.memo_clear(p);
+        assert!(!adm.memo_fresh(p));
+
+        // TTL: a backdated entry is stale.
+        adm.heal_memo.lock().unwrap().insert(
+            p.to_string(),
+            std::time::Instant::now()
+                - (HEAL_NEGATIVE_MEMO_TTL + std::time::Duration::from_secs(1)),
+        );
+        assert!(!adm.memo_fresh(p), "expired memo must not suppress heals");
+
+        // Capacity: at HEAL_MEMO_MAX with all-fresh entries, a NEW path
+        // fails open (not memoized) instead of evicting fresh state.
+        let adm2 = ProofAdmission::new();
+        for i in 0..HEAL_MEMO_MAX {
+            adm2.memo_record(&format!("/nix/store/{i:032}-f.drv"));
+        }
+        adm2.memo_record(p);
+        assert!(
+            !adm2.memo_fresh(p),
+            "full memo of fresh entries fails OPEN for new paths \
+             (cost bounded by permits, never unbounded growth)"
+        );
+        // …but an EXISTING key refreshes in place even at capacity.
+        let existing = format!("/nix/store/{:032}-f.drv", 0);
+        adm2.memo_record(&existing);
+        assert!(adm2.memo_fresh(&existing));
+
+        // Singleflight: second claim for the same path refuses while
+        // the first flight lives; releases on drop (incl. unwind).
+        let flight = adm.begin_heal(p).expect("first claim wins");
+        assert!(
+            adm.begin_heal(p).is_none(),
+            "concurrent same-path heal refused"
+        );
+        drop(flight);
+        assert!(adm.begin_heal(p).is_some(), "slot released on drop");
+
+        // Permit pool size is the const (aggregate = permits × arena cap).
+        assert_eq!(adm.permits.available_permits(), PROOF_WALK_CONCURRENCY);
+    }
+
+    /// Heal negative-memo end-to-end (bug_080): a permanently-
+    /// unpopulatable `.drv` (garbage bytes at a text-CA path) records a
+    /// memo on its first heal; within the TTL the memo is fresh, so the
+    /// spawn-site stampede (one task per AlreadyComplete re-upload)
+    /// collapses to memo checks. A path whose row EXISTS clears its
+    /// memo on probe.
+    #[tokio::test]
+    async fn heal_memo_records_failure_and_clears_on_present_row() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-garbage.drv";
+        // Stage garbage bytes as a complete inline manifest (the
+        // text-CA gate binds bytes to paths; it does not parse them).
+        let node = rio_nix::nar::NarNode::Regular {
+            executable: false,
+            contents: b"not a derivation".to_vec(),
+        };
+        let mut nar = Vec::new();
+        rio_nix::nar::serialize(&mut nar, &node).unwrap();
+        let key = rio_nix::store_path::StorePath::parse(path)
+            .unwrap()
+            .sha256_digest();
+        sqlx::query(
+            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(key.as_slice())
+        .bind(path)
+        .bind([0u8; 32].as_slice())
+        .bind(nar.len() as i64)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO manifests (store_path_hash, status, inline_blob) \
+             VALUES ($1, 'complete', $2)",
+        )
+        .bind(key.as_slice())
+        .bind(&nar)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        assert!(!PROOF_ADMISSION.memo_fresh(path));
+        heal_if_missing(&db.pool, None, path).await;
+        assert!(
+            PROOF_ADMISSION.memo_fresh(path),
+            "failed heal must record a negative memo"
+        );
+        // Second heal within the TTL: the memo short-circuits before
+        // any probe/fetch — observable as the row still being absent
+        // and the memo unchanged (behavioral pin: no panic, no work).
+        heal_if_missing(&db.pool, None, path).await;
+        assert!(PROOF_ADMISSION.memo_fresh(path));
+
+        // A path with a PRESENT row: a FRESH memo short-circuits before
+        // the probe (memo check is free; the heal would no-op anyway) —
+        // once the memo EXPIRES, the probe finds the row and clears the
+        // entry so the map tracks only still-missing paths.
+        let healthy = "/nix/store/cccccccccccccccccccccccccccccccc-ok.drv";
+        upsert_drv_modulo(
+            &db.pool,
+            healthy,
+            &DrvModuloRow {
+                modulo_hash: [7u8; 32],
+                ia_output_paths: HashMap::new(),
+                deferred: false,
+            },
+        )
+        .await
+        .unwrap();
+        PROOF_ADMISSION.memo_record(healthy);
+        heal_if_missing(&db.pool, None, healthy).await;
+        assert!(
+            PROOF_ADMISSION.memo_fresh(healthy),
+            "fresh memo short-circuits before the probe (free check first)"
+        );
+        PROOF_ADMISSION.heal_memo.lock().unwrap().insert(
+            healthy.to_string(),
+            std::time::Instant::now()
+                - (HEAL_NEGATIVE_MEMO_TTL + std::time::Duration::from_secs(1)),
+        );
+        heal_if_missing(&db.pool, None, healthy).await;
+        assert!(
+            PROOF_ADMISSION
+                .heal_memo
+                .lock()
+                .unwrap()
+                .get(healthy)
+                .is_none(),
+            "expired memo + present row: probe must clear the entry"
+        );
+    }
 
     /// THE masked-form regression (vm-ca-cutoff class, store edition):
     /// a floating-CA derivation consumed as an INPUT must contribute

@@ -548,7 +548,14 @@ unit ledger alone would admit padded-`.drv` byte floods that retain
 GiBs while "within budget" (round-16 bug_079); exhaustion of either
 dimension is the same typed `RESOURCE_EXHAUSTED` monotone exit, and the
 `rio_store_ia_proof_arena_bytes` histogram makes byte-pressure approach
-visible.
+visible. Cold walks are ADMITTED: a cache miss acquires one of
+`PROOF_WALK_CONCURRENCY = 4` shared permits — probe-before-admit keeps
+warm traffic permit-free — bounding the process aggregate of retained
+arenas at permits × byte cap = 1 GiB; best-effort heals share the same
+pool, skip (rather than queue) when saturated, and a per-path negative
+memo (`HEAL_NEGATIVE_MEMO_TTL` = 10 min) collapses
+AlreadyComplete-re-upload heal stampedes to one attempt per window
+(round-16 bug_080).
 
 #r("store.put.idempotent")[
   *Idempotency:* If `PutPath` is called for a store path that already has a

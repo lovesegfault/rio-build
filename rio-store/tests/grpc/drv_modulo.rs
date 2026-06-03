@@ -842,9 +842,9 @@ mod proof_walk {
 
     // r[verify store.put.ia-deriver-proof+3]
     /// Diamond dedup: A→{B,C}, B→D, C→D — D is fetched and probed ONCE.
-    /// Exact op accounting (1 initial probe + 4 fetches + 2 input
-    /// probes = 7): a regression that re-queues D shows up as a count
-    /// change, not a flake.
+    /// Exact op accounting (1 pre-admission probe + 1 post-admission
+    /// probe + 4 fetches + 2 input probes = 8): a regression that
+    /// re-queues D shows up as a count change, not a flake.
     #[tokio::test]
     async fn diamond_dedup() -> TestResult {
         let s = StoreSession::new().await?;
@@ -861,9 +861,9 @@ mod proof_walk {
             proof_walk_for_tests(&s.db.pool, None, &a, PROOF_WALK_WORK_MAX_FOR_TESTS).await?;
         assert!(report.proven);
         assert_eq!(
-            report.work_used, 7,
-            "1 initial probe + 4 fetches + 2 input probes; dedup-on-push \
-             means D costs exactly once"
+            report.work_used, 8,
+            "1 pre-admission probe + 1 post-admission probe + 4 fetches \
+             + 2 input probes; dedup-on-push means D costs exactly once"
         );
         Ok(())
     }
