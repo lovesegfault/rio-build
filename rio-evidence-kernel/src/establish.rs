@@ -110,6 +110,58 @@ pub fn establish_expired_attempt(
     probe: ProbeEvidence<'_>,
     verifiable_wanted: Option<&[&str]>,
 ) -> EstablishmentDisposition {
+    establish_from_classes(kind, node, classify_probe(probe, verifiable_wanted))
+}
+
+/// The probe axis collapsed to its decision-relevant classes — the
+/// set/slice inputs of [`establish_expired_attempt`] reduce to exactly
+/// these five cells, and the CBMC proof sweeps THIS alphabet (no heap
+/// collections under kani — the `nix/kani.nix` bounded-representation
+/// discipline; `HashSet` construction reaches `getrandom`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeClass {
+    /// Probe ran; a non-empty verifiable wanted set is ALL present.
+    VerifiedAllWantedPresent,
+    /// Probe ran; some verifiable wanted path is missing.
+    VerifiedMissingWanted,
+    /// Probe ran but nothing is verifiable (`None`/empty saturates to
+    /// cannot-verify, never to vacuously-present — the
+    /// `verifiable_wanted_paths` None-on-empty contract).
+    VerifiedNothingVerifiable,
+    /// Probe attempted and failed: no evidence in either direction.
+    Unavailable,
+    /// No store client configured: presence can never be verified.
+    NoStoreConfigured,
+}
+
+/// Total projection from the caller-shaped probe inputs to the
+/// decision alphabet. Pure; pinned by the unit decision table over
+/// real sets.
+pub fn classify_probe(probe: ProbeEvidence<'_>, verifiable_wanted: Option<&[&str]>) -> ProbeClass {
+    match probe {
+        ProbeEvidence::Unavailable => ProbeClass::Unavailable,
+        ProbeEvidence::NoStoreConfigured => ProbeClass::NoStoreConfigured,
+        ProbeEvidence::Verified(missing) => match verifiable_wanted {
+            Some(wanted) if !wanted.is_empty() => {
+                if wanted.iter().all(|p| !missing.contains(*p)) {
+                    ProbeClass::VerifiedAllWantedPresent
+                } else {
+                    ProbeClass::VerifiedMissingWanted
+                }
+            }
+            _ => ProbeClass::VerifiedNothingVerifiable,
+        },
+    }
+}
+
+/// The set-free decision core: total over
+/// (kind × node × probe-class), no catch-all. This is the function the
+/// kani harness sweeps exhaustively.
+pub fn establish_from_classes(
+    kind: PullKind,
+    node: NodeDisposition,
+    probe: ProbeClass,
+) -> EstablishmentDisposition {
     match (node, kind) {
         (NodeDisposition::Cancelled | NodeDisposition::Absent, _) => {
             EstablishmentDisposition::CloseChargeFree
@@ -118,16 +170,12 @@ pub fn establish_expired_attempt(
             EstablishmentDisposition::ChargeMaterializationInfra
         }
         (NodeDisposition::WantedLive, PullKind::Build) => match probe {
-            ProbeEvidence::Unavailable => EstablishmentDisposition::Defer,
-            ProbeEvidence::NoStoreConfigured => EstablishmentDisposition::ChargeExecutorCrash,
-            ProbeEvidence::Verified(missing) => match verifiable_wanted {
-                Some(wanted)
-                    if !wanted.is_empty() && wanted.iter().all(|p| !missing.contains(*p)) =>
-                {
-                    EstablishmentDisposition::AdoptCompleted
-                }
-                _ => EstablishmentDisposition::ChargeExecutorCrash,
-            },
+            ProbeClass::Unavailable => EstablishmentDisposition::Defer,
+            ProbeClass::NoStoreConfigured => EstablishmentDisposition::ChargeExecutorCrash,
+            ProbeClass::VerifiedAllWantedPresent => EstablishmentDisposition::AdoptCompleted,
+            ProbeClass::VerifiedMissingWanted | ProbeClass::VerifiedNothingVerifiable => {
+                EstablishmentDisposition::ChargeExecutorCrash
+            }
         },
     }
 }
@@ -216,12 +264,13 @@ mod proofs {
     use super::*;
 
     /// Cancelled/absent nodes are NEVER charged (and never adopted):
-    /// for every kind, every probe shape, and every verifiable-wanted
-    /// shape, a `Cancelled` or `Absent` node yields exactly
-    /// `CloseChargeFree`. Probe CONTENTS cannot matter — the row never
-    /// inspects them — so the sweep enumerates the probe SHAPES with
-    /// fixed small sets (the kani.nix bounded-representation
-    /// discipline: no symbolic heap collections).
+    /// for every kind and EVERY probe class, a `Cancelled` or `Absent`
+    /// node yields exactly `CloseChargeFree`. The sweep targets the
+    /// set-free decision core (`establish_from_classes`) — the public
+    /// wrapper only collapses its set/slice inputs to `ProbeClass`
+    /// (a pure projection pinned by the unit decision table), and heap
+    /// collections under CBMC reach `getrandom` (the kani.nix
+    /// bounded-representation discipline).
     #[kani::proof]
     fn check_cancelled_never_charged() {
         let kind = if kani::any() {
@@ -234,20 +283,15 @@ mod proofs {
         } else {
             NodeDisposition::Absent
         };
-        let empty: HashSet<String> = HashSet::new();
         let probe = match kani::any::<u8>() {
-            0 => ProbeEvidence::Verified(&empty),
-            1 => ProbeEvidence::Unavailable,
-            _ => ProbeEvidence::NoStoreConfigured,
-        };
-        let wanted_one = ["/nix/store/a"];
-        let verifiable_wanted: Option<&[&str]> = match kani::any::<u8>() {
-            0 => None,
-            1 => Some(&[]),
-            _ => Some(&wanted_one),
+            0 => ProbeClass::VerifiedAllWantedPresent,
+            1 => ProbeClass::VerifiedMissingWanted,
+            2 => ProbeClass::VerifiedNothingVerifiable,
+            3 => ProbeClass::Unavailable,
+            _ => ProbeClass::NoStoreConfigured,
         };
         assert_eq!(
-            establish_expired_attempt(kind, node, probe, verifiable_wanted),
+            establish_from_classes(kind, node, probe),
             EstablishmentDisposition::CloseChargeFree
         );
     }
