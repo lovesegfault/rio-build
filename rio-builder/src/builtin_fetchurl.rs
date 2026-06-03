@@ -293,7 +293,7 @@ impl FetchError {
 /// restore's error chain distinguish "the payload is over budget"
 /// (permanent) from "the worker's disk hiccuped" (transient errno)
 /// at the statement that produced each.
-// r[impl fetcher.fetchurl.permanence-at-source+2]
+// r[impl fetcher.fetchurl.permanence-at-source+3]
 #[derive(Debug, thiserror::Error)]
 #[error(
     "{what} exceeded the {cap}-byte per-attempt transfer cap (decompression bomb or unbounded body?)"
@@ -543,7 +543,7 @@ fn build_client(ca_bundle: &Path) -> anyhow::Result<(reqwest::Client, bool)> {
     // request URL to redirect-target failures, so classifying by
     // `e.url()` after the fact would mistake the redirected https
     // failure for a plain-http transient (round-17 merged_bug_017).
-    // r[impl fetcher.fetchurl.permanence-at-source+2]
+    // r[impl fetcher.fetchurl.permanence-at-source+3]
     builder = builder.redirect(if tls_roots_available {
         reqwest::redirect::Policy::limited(10)
     } else {
@@ -766,7 +766,7 @@ async fn try_fetch_one(
 ///   flat-FOD fetch in a rootless sandbox.
 /// - Everything else (DNS, connect, timeouts, TLS with roots
 ///   available): transient.
-// r[impl fetcher.fetchurl.permanence-at-source+2]
+// r[impl fetcher.fetchurl.permanence-at-source+3]
 fn classify_send_error(
     e: reqwest::Error,
     candidate_url: &str,
@@ -874,7 +874,7 @@ async fn finalize_output(
         // Worker-local output-tree I/O: ENOSPC/EIO/EROFS here is the
         // worker's disk, not the payload — the identical fault during
         // the download phase is retried, so this one is too.
-        // r[impl fetcher.fetchurl.permanence-at-source+2]
+        // r[impl fetcher.fetchurl.permanence-at-source+3]
         tokio::fs::rename(tmp, &params.output)
             .await
             .with_context(|| format!("renaming download to {}", params.output.display()))
@@ -991,8 +991,15 @@ async fn restore_unpacked(
             .with_context(|| format!("restoring NAR to {}", dest.display()))
     })
     .await
+    // A spawn_blocking JoinError is a restore PANIC (blocking tasks
+    // are never cancelled mid-flight): a panic in a pure function of
+    // the payload bytes reproduces on the same bytes — permanent for
+    // the candidate, exactly like a typed decode failure. The old
+    // Transient arm here re-downloaded a panic-triggering payload on
+    // every attempt (round-17 merged_bug_022).
+    // r[impl fetcher.fetchurl.permanence-at-source+3]
     .context("NAR restore task panicked")
-    .map_err(FetchError::Transient)?
+    .map_err(FetchError::PermanentForCandidate)?
     .map_err(classify_restore_error)?;
     Ok(())
 }
@@ -1004,25 +1011,38 @@ async fn restore_unpacked(
 ///
 /// - typed [`CapExhausted`] (riding the metered read's io chain): the
 ///   payload's nature — permanent for the candidate;
-/// - an `io::Error` carrying a REAL errno (`ENOSPC`/`EIO`/`EROFS`/… —
-///   `raw_os_error().is_some()`): the worker's filesystem — transient,
-///   exactly like the identical fault during the download phase
-///   (decode-side wrappers — xz `InvalidData`, the metered-read
-///   wrapper — carry no errno, so errno presence discriminates);
-/// - everything else (xz format errors, NAR structure errors):
-///   deterministic for these bytes — permanent for the candidate.
-// r[impl fetcher.fetchurl.permanence-at-source+2]
+/// - an `io::Error` whose errno is in the worker-environmental
+///   ALLOWLIST (`ENOSPC`/`EIO`/`EROFS`/`EDQUOT`/`ENOMEM`): the
+///   worker's filesystem/memory — transient, exactly like the
+///   identical fault during the download phase;
+/// - EVERYTHING else — errno-free decode errors (xz format, NAR
+///   structure) and errno-bearing failures outside the allowlist
+///   alike — deterministic for these bytes: permanent for the
+///   candidate. Errno PRESENCE is not transience: the restorer
+///   performs syscalls with payload-controlled arguments, so a
+///   payload can compose errnos (`ENAMETOOLONG` before the
+///   kernel-equivalent bounds; `EILSEQ`-class oddities on exotic
+///   filesystems) — an errno the worker did not cause must not buy
+///   the payload another download (round-17 merged_bug_022; under the
+///   presence rule a crafted NAR moved up to attempts × cap bytes).
+// r[impl fetcher.fetchurl.permanence-at-source+3]
 fn classify_restore_error(e: anyhow::Error) -> FetchError {
     if e.chain()
         .any(|c| c.downcast_ref::<CapExhausted>().is_some())
     {
         return FetchError::PermanentForCandidate(e);
     }
-    let has_errno = e
+    let worker_environmental = e
         .chain()
         .filter_map(|c| c.downcast_ref::<std::io::Error>())
-        .any(|io| io.raw_os_error().is_some());
-    if has_errno {
+        .filter_map(|io| io.raw_os_error())
+        .any(|errno| {
+            matches!(
+                errno,
+                libc::ENOSPC | libc::EIO | libc::EROFS | libc::EDQUOT | libc::ENOMEM
+            )
+        });
+    if worker_environmental {
         FetchError::Transient(e)
     } else {
         FetchError::PermanentForCandidate(e)
@@ -1502,7 +1522,7 @@ mod tests {
     /// transport as `s3://` and takes the same skip arm — an
     /// uppercased letter must not route the candidate into the
     /// transient retry ladder (round-17 merged_bug_017).
-    // r[verify fetcher.fetchurl.permanence-at-source+2]
+    // r[verify fetcher.fetchurl.permanence-at-source+3]
     #[test]
     fn s3_scheme_skip_is_case_insensitive() {
         for url in ["S3://bucket/key", "s3://bucket/key", "S3://BUCKET/key"] {
@@ -1529,7 +1549,7 @@ mod tests {
     /// is permanent for the candidate: one attempt, no backoff ladder.
     /// Oracle parity: `CURLE_UNSUPPORTED_PROTOCOL` is non-retriable
     /// `Misc` in the pinned transfer loop (`filetransfer.cc:689-707`).
-    // r[verify fetcher.fetchurl.permanence-at-source+2]
+    // r[verify fetcher.fetchurl.permanence-at-source+3]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn builder_error_is_permanent_for_candidate() {
         let dir = tempfile::tempdir().unwrap();
@@ -1554,7 +1574,7 @@ mod tests {
     /// literal https candidate — the chart-default
     /// `http://tarballs.nixos.org/` mirror hits exactly this shape
     /// (round-17 merged_bug_017).
-    // r[verify fetcher.fetchurl.permanence-at-source+2]
+    // r[verify fetcher.fetchurl.permanence-at-source+3]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn http_redirect_into_https_without_roots_is_permanent() {
         use axum::{Router, routing::get};
@@ -2027,13 +2047,47 @@ mod tests {
         );
     }
 
-    /// The restore classifier's three arms, each pinned on the chain
-    /// shape the real flow produces (round-16 merged_bug_068): typed
-    /// cap exhaustion → permanent; a real errno (worker fs) →
-    /// transient; decode/structure errors (no errno) → permanent.
-    // r[verify fetcher.fetchurl.permanence-at-source+2]
+    /// The restore classifier's arms, each pinned on the chain shape
+    /// the real flow produces (round-16 merged_bug_068; round-17
+    /// merged_bug_022): typed cap exhaustion → permanent; an
+    /// ALLOWLISTED worker-environmental errno → transient;
+    /// decode/structure errors AND payload-composable errnos →
+    /// permanent. Errno presence is not transience.
+    // r[verify fetcher.fetchurl.permanence-at-source+3]
     #[test]
     fn restore_classifier_discriminates_at_source() {
+        // A payload-composable errno (a too-long name reaching the
+        // syscall on a pre-bounds tree shape) must NOT buy the payload
+        // another download: outside the allowlist → permanent.
+        let payload_errno: anyhow::Error = anyhow::Error::from(rio_nix::nar::NarError::Io(
+            std::io::Error::from_raw_os_error(libc::ENAMETOOLONG),
+        ))
+        .context("restoring NAR to /out");
+        assert!(
+            matches!(
+                classify_restore_error(payload_errno),
+                FetchError::PermanentForCandidate(_)
+            ),
+            "ENAMETOOLONG is a function of the payload, not the worker — permanent"
+        );
+
+        // Every allowlisted worker-environmental errno stays transient.
+        for errno in [
+            libc::ENOSPC,
+            libc::EIO,
+            libc::EROFS,
+            libc::EDQUOT,
+            libc::ENOMEM,
+        ] {
+            let chain: anyhow::Error = anyhow::Error::from(rio_nix::nar::NarError::Io(
+                std::io::Error::from_raw_os_error(errno),
+            ))
+            .context("restoring NAR to /out");
+            assert!(
+                matches!(classify_restore_error(chain), FetchError::Transient(_)),
+                "allowlisted errno {errno} is the worker's environment — transient"
+            );
+        }
         // Cap exhaustion rides the metered-read io chain.
         let cap_chain: anyhow::Error = anyhow::Error::from(rio_nix::nar::NarError::Io(
             std::io::Error::other(CapExhausted {
@@ -2079,7 +2133,7 @@ mod tests {
     /// ever verify a certificate, so the send failure is permanent for
     /// the candidate (one attempt, no backoff ladder); the same
     /// transport failure WITH roots available stays transient.
-    // r[verify fetcher.fetchurl.permanence-at-source+2]
+    // r[verify fetcher.fetchurl.permanence-at-source+3]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn https_without_roots_is_permanent_for_candidate() {
         // A listener that accepts and immediately closes: any https

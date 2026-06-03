@@ -2013,11 +2013,9 @@ in
         # when this pin drops to 0).
         for f in $(find . -name '*.rs' | sed 's|^\./||'); do
           case "$f" in
-            rio-builder/src/builtin_fetchurl.rs)
-              check_pin 'raw_os_error().is_some()' "$f" 1 \
-                "classify_restore_error errno-presence discrimination — drops to 0 at W2-S3 c3" ;;
             *)
-              check_pin 'raw_os_error().is_some()' "$f" 0 "no carve-out" ;;
+              check_pin 'raw_os_error().is_some()' "$f" 0 \
+                "no carve-out anywhere: errno transience goes through the classify_restore_error ALLOWLIST (W2-S3 c3 dropped the last presence-form pin)" ;;
           esac
         done
 

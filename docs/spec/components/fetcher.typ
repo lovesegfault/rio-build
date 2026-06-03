@@ -304,7 +304,7 @@ previous, branch-local hand cleanup was exactly one fallible step too
 narrow: a chmod failure after a successful unpack stranded the
 fully-restored tree.
 
-#r("fetcher.fetchurl.permanence-at-source+2")[
+#r("fetcher.fetchurl.permanence-at-source+3")[
   Every fetch failure MUST be classified transient or
   permanent-for-candidate at the statement that produces it, with the
   classification derived from that statement's own failure mode --- a
@@ -313,9 +313,15 @@ fully-restored tree.
   to eliminate). Where one statement's error value interleaves several
   sources (the unpack restore: payload decode, worker-filesystem I/O,
   budget exhaustion), the producing function MUST discriminate them
-  structurally --- typed exhaustion by downcast, worker-local
-  filesystem faults by errno presence --- never by matching error
-  text. Deterministic predicates MUST be evaluated against the
+  structurally --- typed exhaustion by downcast, worker-environmental
+  faults by an errno ALLOWLIST (`ENOSPC`, `EIO`, `EROFS`, `EDQUOT`,
+  `ENOMEM`) --- never by matching error text and never by errno
+  PRESENCE: restore syscalls take payload-controlled arguments, so a
+  payload can compose errnos, and an errno the worker did not cause
+  must default permanent (transience is the claim that a retry can
+  see a different answer; only the worker's own environment can
+  change between attempts). A restore-task panic is a pure function
+  of the payload bytes and is permanent for the candidate. Deterministic predicates MUST be evaluated against the
   EFFECTIVE request and the error's own typed properties, never the
   literal candidate string alone: scheme tests are ASCII-case-
   insensitive (RFC 3986 schemes are case-insensitive --- `S3://` and
