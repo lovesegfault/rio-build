@@ -293,7 +293,7 @@ impl AdminService for AdminServiceImpl {
     /// existing CLI/dashboard/controller callers keep a working
     /// endpoint until the 1d proto sweep; `ListOpenAttempts` is the
     /// attempt-keyed form of the same view.
-    // r[impl sched.admin.list-executors+2]
+    // r[impl sched.admin.list-executors+3]
     #[instrument(skip(self, request), fields(rpc = "ListExecutors"))]
     async fn list_executors(
         &self,

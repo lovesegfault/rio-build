@@ -11,7 +11,7 @@ use super::*;
 use crate::actor::tests::{merge_single_node, pull_attempt, pull_complete_success_empty};
 use crate::state::PriorityClass;
 
-// r[verify sched.admin.list-executors+2]
+// r[verify sched.admin.list-executors+3]
 // r[verify sched.admin.list-executors-leader-age+3]
 #[tokio::test]
 async fn test_list_workers_open_attempt_backed() -> anyhow::Result<()> {
@@ -61,8 +61,7 @@ async fn test_list_workers_open_attempt_backed() -> anyhow::Result<()> {
         rio_proto::types::ExecutorKind::Builder as i32,
         "non-FOD attempt → builder kind"
     );
-    assert!(entry_a.connected_since.is_some());
-    assert!(entry_a.last_heartbeat.is_some());
+    assert!(entry_a.attempt_opened.is_some());
 
     // "alive" filter → same set; "draining" (not producible on this
     // surface any more) → empty; unknown filter → lenient (all).

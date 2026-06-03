@@ -745,17 +745,20 @@ freshness hint --- the controller's orphan reap no longer consults
 `ListExecutors` at all (its busy view is `ListOpenAttempts`,
 #rref("ctrl.job.busy-from-open-attempts")).
 
-#r("sched.admin.list-executors+2")[
+#r("sched.admin.list-executors+3")[
   `AdminService.ListExecutors` MUST return one entry per open pull-mode
   attempt, read from the same durable open-attempt view as
   #rref("sched.admin.list-open-attempts"): the entry's `executor_id` is the
   attempt's executor identity, `busy` is true, `status` is "alive",
   `systems`/`kind` come from the attempt's derivation, and
-  `connected_since`/`last_heartbeat` carry the attempt-open time (the pull).
-  The optional `status_filter` matches "alive" (or empty) to return the
-  list, any other known historical status ("draining"/"degraded"/
-  "connecting") to return an empty list, and unknown values leniently
-  (show all). The response's `leader_for_secs` keeps the
+  `attempt_opened` carries the attempt-open time (the pull) --- set once,
+  never advancing mid-build; consumers MUST NOT derive a staleness
+  threshold from it (per-pod liveness is the Job/pod phase plus attempt
+  age vs deadline, the OA2 alert). The optional `status_filter` matches
+  "alive" (or empty) to return the list, any other known historical
+  status ("draining"/"degraded"/"connecting") to return an empty list,
+  and unknown values leniently (show all). The response's
+  `leader_for_secs` keeps the
   #rref("sched.admin.list-executors-leader-age+2") semantics.
 ]
 This is the busy-fleet projection kept for existing CLI/dashboard callers;
@@ -2906,7 +2909,7 @@ about work nobody wanted.
 The same view feeds the #(refs.metric)("rio_scheduler_open_attempts") gauge
 (the busy-fleet gauge; the stream fleet's `workers_active` is retired) and
 the establishment sweep, and backs the re-implemented
-#rref("sched.admin.list-executors+2") projection.
+#rref("sched.admin.list-executors+3") projection.
 
 = Backpressure
 

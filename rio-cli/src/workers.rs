@@ -57,12 +57,12 @@ pub(crate) async fn run_pg(
 fn print_worker(w: &ExecutorInfo) {
     println!("worker {} [{}]", w.executor_id, w.status);
     println!("  state:    {}", if w.busy { "busy" } else { "idle" });
-    // Both timestamps are the attempt-open time (the pull) — the last
-    // protocol contact the scheduler has had from this pod.
+    // Attempt-open time (the pull). Plain age — a long-running pull is
+    // a long build, not a dead pod (liveness = Job/pod phase + the
+    // OA2 wedge alert).
     println!(
-        "  pulled:   {}   up: {}",
-        crate::fmt_ts_ago(w.last_heartbeat.as_ref().map(|t| t.seconds)),
-        crate::fmt_ts_ago(w.connected_since.as_ref().map(|t| t.seconds))
+        "  pulled:   {}",
+        crate::fmt_ts_ago(w.attempt_opened.as_ref().map(|t| t.seconds)),
     );
     println!("  systems:  {}", w.systems.join(", "));
     if !w.supported_features.is_empty() {

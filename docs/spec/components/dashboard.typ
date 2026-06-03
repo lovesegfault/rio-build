@@ -145,7 +145,8 @@ visualization, `@dagrejs/dagre` for layout (falls back to a Web Worker above
   [Executors],
   [`AdminService.ListExecutors`],
   [Busy/idle pill (one-build-per-pod ⇒ binary), kind filter (builder/fetcher),
-    stale-heartbeat highlight, drain button],
+    attempt-open age ("pulled" --- plain relative time, no staleness
+    highlight: the timestamp never advances mid-build)],
 
   [GC],
   [`AdminService.TriggerGC` (server stream)],

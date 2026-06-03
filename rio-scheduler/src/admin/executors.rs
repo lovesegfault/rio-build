@@ -35,7 +35,7 @@ const KNOWN_STATUSES: [&str; 4] = ["alive", "draining", "degraded", "connecting"
 /// failover. `None` is unreachable here (`ensure_leader()` is checked
 /// first); treated as 0 (young).
 // r[impl sched.admin.list-executors-leader-age+3]
-// r[impl sched.admin.list-executors+2]
+// r[impl sched.admin.list-executors+3]
 pub(super) async fn list_executors(
     db: &SchedulerDb,
     status_filter: &str,
@@ -73,13 +73,12 @@ pub(super) async fn list_executors(
 }
 
 fn row_to_proto(r: OpenAttemptRow) -> ExecutorInfo {
-    // The pull that opened the attempt is both "when this pod bound
-    // to the scheduler" and the last protocol contact the scheduler
-    // has had from it (pull-mode pods send nothing between the pull
-    // and the report) — populate both timestamp fields from it. The
-    // stream-era 30s heartbeat-staleness reading does not apply to
-    // these values; per-pod liveness is the Job/pod phase plus
-    // attempt age (the OA5 successor view).
+    // The pull that opened the attempt — the one timestamp this
+    // surface carries (the redundant `connected_since` twin is
+    // deleted; the field is renamed to what it always held). Per-pod
+    // liveness is the Job/pod phase plus attempt age (the OA5
+    // successor view + the OA2 wedge alert); consumers render plain
+    // relative age.
     let attempt_opened = SystemTime::UNIX_EPOCH
         .checked_add(Duration::from_secs_f64(r.assigned_at_epoch_secs.max(0.0)))
         .map(prost_types::Timestamp::from);
@@ -92,8 +91,7 @@ fn row_to_proto(r: OpenAttemptRow) -> ExecutorInfo {
         busy: true,
         status: "alive".to_string(),
         resources: None,
-        last_heartbeat: attempt_opened,
-        connected_since: attempt_opened,
+        attempt_opened,
         kind: crate::state::kind_for_drv(r.is_fixed_output) as i32,
     }
 }

@@ -70,8 +70,19 @@ message ExecutorInfo {
   reserved 5;                            // was uint32 running_builds (P0537: → bool busy)
   string status = 6;                     // always "alive" (an open attempt is an active build)
   ResourceUsage resources = 7;           // unset (no per-pod telemetry on this surface)
-  google.protobuf.Timestamp last_heartbeat = 8;   // attempt-open time (the pull)
-  google.protobuf.Timestamp connected_since = 9;  // attempt-open time (the pull)
+  // Attempt-open time (the pull). Producer contract: set once at the
+  // pull and NEVER advances mid-build — pull-mode pods send nothing
+  // between the pull and the report, so this is plain attempt age,
+  // not a liveness heartbeat. Per-pod liveness = Job/pod phase +
+  // attempt age vs deadline (the OA2 wedge alert); clients MUST NOT
+  // re-derive a staleness threshold from this field (the stream-era
+  // ">30s = dead" reading inverts on long builds). Renamed in place
+  // from `last_heartbeat` (same field number, same value semantics —
+  // both 8 and 9 already carried attempt-open time); field 9
+  // (`connected_since`) deleted as the redundant twin.
+  google.protobuf.Timestamp attempt_opened = 8;
+  reserved 9;
+  reserved "connected_since";
   ExecutorKind kind = 11;                // builder or fetcher (from the attempt's derivation)
   bool busy = 12;                        // always true (an open attempt IS a build in flight)
 }

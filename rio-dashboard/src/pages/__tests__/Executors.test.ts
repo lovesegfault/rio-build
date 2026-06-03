@@ -1,7 +1,8 @@
-// Executors page: ListExecutors render + heartbeat-stale classification
-// + kind filter. The >30s-ago → red-cell rule is the operator's
-// dead-executor signal; this test pins it down with fixture timestamps
-// on either side of the threshold.
+// Executors page: ListExecutors render + kind filter + the bug_357
+// pin: NO staleness class at any attempt age — the timestamp is the
+// attempt-open time (never advances mid-build), so a threshold
+// highlight inverts into 'every long build screams red'. Liveness is
+// the OA2 wedge alert + Job census, not this page.
 import { timestampFromMs } from '@bufbuild/protobuf/wkt';
 import { fireEvent, render, screen } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -37,7 +38,7 @@ describe('Executors page', () => {
       supportedFeatures: [],
       busy: true,
       status,
-      lastHeartbeat: timestampFromMs(now - ageSeconds * 1000),
+      attemptOpened: timestampFromMs(now - ageSeconds * 1000),
       kind,
     };
   }
@@ -56,21 +57,31 @@ describe('Executors page', () => {
     expect(screen.getAllByTestId('load-pill')[0]).toHaveTextContent('busy');
   });
 
-  it('flags >30s-stale heartbeat', async () => {
+  it('does_not_mark_long_running_attempts_stale', async () => {
+    // bug_357: the timestamp is the attempt-OPEN time (the pull). A
+    // pull-mode pod sends nothing between the pull and the report, so
+    // a 45-minute-old attempt-open on a long compile is HEALTHY — the
+    // stream-era ">30s since last heartbeat = dead executor" highlight
+    // inverted into "every build longer than 30s screams red".
+    // Liveness is owned by the Job/pod phase + the OA2 wedge alert;
+    // the page shows plain relative age (CLI parity).
     listExecutors.mockResolvedValue({
-      executors: [mkExecutor('e-fresh', 'alive', 5), mkExecutor('e-stale', 'alive', 45)],
+      executors: [
+        mkExecutor('e-fresh', 'alive', 5),
+        mkExecutor('e-long', 'alive', 2700),
+      ],
     });
 
     render(Executors);
     await flushSvelte();
 
-    const cells = screen.getAllByTestId('heartbeat-cell');
-    // First row (5s ago) — not stale.
+    const cells = screen.getAllByTestId('pulled-cell');
     expect(cells[0]).not.toHaveClass('stale');
     expect(cells[0]).toHaveTextContent('5s ago');
-    // Second row (45s ago) — over the 30s threshold.
-    expect(cells[1]).toHaveClass('stale');
-    expect(cells[1]).toHaveTextContent('45s ago');
+    // A 45-minute-old attempt is a long build, not a dead pod — NO
+    // stale class at any age.
+    expect(cells[1]).not.toHaveClass('stale');
+    expect(cells[1]).toHaveTextContent('45m ago');
   });
 
   // r[verify dash.executors.kind-filter]

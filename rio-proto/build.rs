@@ -92,8 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for field in [
         "ClusterStatusResponse.uptime_since",
         "ExecutorInfo.resources",
-        "ExecutorInfo.last_heartbeat",
-        "ExecutorInfo.connected_since",
+        "ExecutorInfo.attempt_opened",
         "BuildInfo.submitted_at",
         "BuildInfo.started_at",
         "BuildInfo.finished_at",

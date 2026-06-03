@@ -1,13 +1,17 @@
 <script lang="ts">
   // Executors page: listExecutors poll + kind filter. The list is the
   // open-attempt view (one row per in-flight pull-mode attempt). The
-  // busy/idle pill and the >30s-stale attempt-age highlight are the two
-  // operator affordances a metrics dashboard can't give you: under
-  // one-build-per-pod the load is binary (so a pill, not a bar), and
-  // the red-timestamp is the "something's wrong with this attempt, go
-  // look at its pod" signal. Per-executor drain retired with the stream
-  // protocol — eviction is cordon + cancel/Job-delete (cluster-side),
-  // so there is no per-row action button.
+  // busy/idle pill is the one operator affordance a metrics dashboard
+  // can't give you: under one-build-per-pod the load is binary (so a
+  // pill, not a bar). The "pulled" column is plain relative attempt
+  // age (CLI parity) — NO staleness highlight: the timestamp never
+  // advances mid-build (pull-mode pods send nothing between the pull
+  // and the report), so any client-side threshold re-creates the
+  // inverted "every long build screams red" signal (bug_357); wedged
+  // pods are owned by the OA2 alert + the controller's Job census.
+  // Per-executor drain retired with the stream protocol — eviction is
+  // cordon + cancel/Job-delete (cluster-side), so there is no per-row
+  // action button.
   //
   // r[impl dash.executors.kind-filter]
   // The kind filter is the dashboard surface for the ADR-019 builder/
@@ -16,14 +20,8 @@
   import { admin } from '../api/admin';
   import Pill from '../components/Pill.svelte';
   import type { ExecutorInfo } from '../api/types';
-  import { fmtTsRel, tsToMs } from '../lib/buildInfo';
+  import { fmtTsRel } from '../lib/buildInfo';
   import { startPoll } from '../lib/poll';
-
-  // The timestamp shown is the attempt-open time (the pull); an entry
-  // sitting unchanged for a long time with status=alive is the cue to
-  // check the pod. 30s keeps the staleness highlight conservative for
-  // short builds.
-  const STALE_MS = 30_000;
 
   // ExecutorKind wire values (build_types.proto). Keyed on raw numbers
   // per the BuildStatePill pattern — proto enums are const-enum-shaped
@@ -104,10 +102,6 @@
     </thead>
     <tbody>
       {#each filtered as e (e.executorId)}
-        <!-- Absent heartbeat (executor registered but never beat) is
-             treated as stale; display reads "—" via fmtTsRel. -->
-        {@const hb = tsToMs(e.lastHeartbeat)}
-        {@const stale = hb === undefined || now - hb > STALE_MS}
         {@const sm = STATUS_META[e.status] ?? STATUS_FALLBACK}
         <tr>
           <td>{e.executorId}</td>
@@ -121,9 +115,7 @@
               data-testid="load-pill">{isBusy(e) ? 'busy' : 'idle'}</span
             >
           </td>
-          <td class:stale data-testid="heartbeat-cell"
-            >{fmtTsRel(e.lastHeartbeat, now)}</td
-          >
+          <td data-testid="pulled-cell">{fmtTsRel(e.attemptOpened, now)}</td>
         </tr>
       {/each}
     </tbody>
@@ -154,9 +146,5 @@
   .load-pill.idle {
     background: #eee;
     color: #666;
-  }
-  .stale {
-    color: #c22;
-    font-weight: bold;
   }
 </style>

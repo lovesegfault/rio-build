@@ -1293,7 +1293,7 @@ in
   # r[verify sched.admin.create-tenant]
   # r[verify sched.admin.delete-tenant]
   # r[verify sched.admin.list-tenants]
-  # r[verify sched.admin.list-executors+2]
+  # r[verify sched.admin.list-executors+3]
   # r[verify sched.admin.list-builds]
   # r[verify sched.admin.clear-poison+3]
   # r[verify cli.cmd.sla]

@@ -4,9 +4,9 @@
 //! `fod_queue_depth=2`. Corrected root cause: executors marked draining
 //! never transitioned to gone, leaving the dispatch filter rejecting on
 //! a stale flag. Signature: `ListExecutors` rows with `status=draining`
-//! and `last_heartbeat` more than ~2min ago.
+//! (the draining status is not producible on the pull surface).
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -15,8 +15,6 @@ use serde_json::Value;
 use crate::k8s::qa::{Isolation, QaCtx, Scenario, ScenarioMeta, Verdict};
 
 pub struct StaleDraining;
-
-const STALE_SECS: i64 = 120;
 
 #[async_trait]
 impl Scenario for StaleDraining {
@@ -42,20 +40,18 @@ impl Scenario for StaleDraining {
             .cloned()
             .unwrap_or_default();
 
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("post-1970")
-            .as_secs() as i64;
-
         let stuck: Vec<String> = executors
             .iter()
             .filter(|e| {
-                let draining = e.get("status").and_then(Value::as_str) == Some("draining");
-                let hb_secs = e
-                    .get("last_heartbeat")
-                    .and_then(|t| t.get("seconds"))
-                    .and_then(Value::as_i64);
-                draining && hb_secs.is_some_and(|s| now - s > STALE_SECS)
+                // The timestamp leg is gone: ExecutorInfo's Timestamp
+                // field is #[serde(skip)] in the proto-JSON surface
+                // (rio-proto/build.rs — prost Timestamps don't
+                // Serialize), so the old `.get("last_heartbeat")`
+                // conjunct never matched and the check was
+                // draining-only in practice. Keep the honest form:
+                // any draining row on this surface is stale (the
+                // status is not producible post-stream-protocol).
+                e.get("status").and_then(Value::as_str) == Some("draining")
             })
             .filter_map(|e| {
                 e.get("executor_id")
@@ -68,7 +64,7 @@ impl Scenario for StaleDraining {
             Ok(Verdict::Pass)
         } else {
             Ok(Verdict::Fail(format!(
-                "{} executor(s) draining with last_heartbeat > {STALE_SECS}s: {stuck:?}",
+                "{} executor(s) stuck draining: {stuck:?}",
                 stuck.len()
             )))
         }
