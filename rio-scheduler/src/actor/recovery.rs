@@ -713,7 +713,7 @@ impl DagActor {
             info.recovered_completed = row.completed_drvs as u32;
             info.cached_count = row.cached_drvs as u32;
             // r[impl sched.merge.displaced-failure-evidence]
-            // r[impl sched.build.failure-evidence-at-source]
+            // r[impl sched.build.failure-evidence-at-source+1]
             // Sticky first-failure evidence persisted while the build was
             // running (at-source chokepoint, or one of the eraser-path
             // backstops). Seeding it here keeps a keep_going build's
@@ -727,6 +727,9 @@ impl DagActor {
             // durable flag still false) IS re-persisted by the
             // end-of-recovery sweep.
             info.error_summary = row.error_summary;
+            // M_072 (bug_100): the pair restores TOGETHER — the
+            // terminal BuildFailed event reads both halves.
+            info.failed_derivation = row.failed_derivation;
             info.failure_evidence_durable = info.error_summary.is_some();
             // Seed submitted_at from PG so r[sched.timeout.per-build]
             // and rio_scheduler_build_duration_seconds survive failover
@@ -1049,7 +1052,7 @@ impl DagActor {
             self.check_build_completion(build_id).await;
         }
 
-        // r[impl sched.build.failure-evidence-at-source]
+        // r[impl sched.build.failure-evidence-at-source+1]
         // A failed_count-based reconstruction above is a fresh failure
         // observation: persist it durably NOW, before the new leader
         // serves any traffic, so a second failover (or an eraser path

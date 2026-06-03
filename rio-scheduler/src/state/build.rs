@@ -135,7 +135,7 @@ pub struct BuildInfo {
     pub error_summary: Option<String>,
     /// The derivation that caused the failure (if any).
     pub failed_derivation: Option<String>,
-    // r[impl sched.build.failure-evidence-at-source]
+    // r[impl sched.build.failure-evidence-at-source+1]
     /// Whether `error_summary` has been durably persisted to
     /// `builds.error_summary`. Pure write-suppression flag for the
     /// at-source persist (`record_failure_evidence`) and its tick-retry

@@ -110,10 +110,12 @@ async fn test_list_builds_denorm_counts_roundtrip() -> anyhow::Result<()> {
 
 // r[verify sched.merge.displaced-failure-evidence]
 // r[verify sched.poison.clear-failure-evidence]
-/// `persist_build_error_summary_tx` records the first failure and never
-/// overwrites an already-persisted summary (COALESCE semantics) — and the
-/// pool-level wrapper the poison-clear paths use goes through the same
-/// statement, so it inherits the first-write-wins contract.
+// r[verify sched.build.failure-evidence-at-source+1]
+/// `persist_build_error_summary_tx` records the first-failure PAIR
+/// (M_072) and never overwrites either persisted half (COALESCE on
+/// both columns); a NULL hash bind is a no-op so a backstop that only
+/// knows a reconstructed summary cannot blank an earlier at-source
+/// pair. The pool-level wrapper goes through the same statement.
 #[tokio::test]
 async fn test_persist_build_error_summary_tx_first_failure_wins() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -131,36 +133,68 @@ async fn test_persist_build_error_summary_tx_first_failure_wins() -> anyhow::Res
     .await?;
 
     let read = || async {
-        let (s,): (Option<String>,) =
-            sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
-                .bind(build_id)
-                .fetch_one(&test_db.pool)
-                .await?;
-        anyhow::Ok(s)
+        let (s, f): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT error_summary, failed_derivation FROM builds WHERE build_id = $1",
+        )
+        .bind(build_id)
+        .fetch_one(&test_db.pool)
+        .await?;
+        anyhow::Ok((s, f))
     };
-    assert_eq!(read().await?, None);
+    assert_eq!(read().await?, (None, None));
 
     let mut conn = db.pool().acquire().await?;
-    SchedulerDb::persist_build_error_summary_tx(&mut conn, build_id, "derivation a failed").await?;
-    assert_eq!(read().await?.as_deref(), Some("derivation a failed"));
+    // Backstop-shaped write first: summary only, no hash — must not
+    // plant an empty hash that would block the later at-source pair.
+    SchedulerDb::persist_build_error_summary_tx(&mut conn, build_id, "derivation a failed", None)
+        .await?;
+    let (s, f) = read().await?;
+    assert_eq!(s.as_deref(), Some("derivation a failed"));
+    assert_eq!(f, None, "NULL hash bind is a no-op, not an empty write");
 
-    // A later write does not displace the first failure.
-    SchedulerDb::persist_build_error_summary_tx(&mut conn, build_id, "derivation b failed").await?;
+    // The at-source pair lands the hash; the summary half keeps the
+    // first write.
+    SchedulerDb::persist_build_error_summary_tx(
+        &mut conn,
+        build_id,
+        "derivation b failed",
+        Some("drv-a"),
+    )
+    .await?;
+    let (s, f) = read().await?;
     assert_eq!(
-        read().await?.as_deref(),
+        s.as_deref(),
         Some("derivation a failed"),
-        "first persisted failure wins"
+        "first persisted summary wins"
+    );
+    assert_eq!(
+        f.as_deref(),
+        Some("drv-a"),
+        "hash half fills in via COALESCE"
     );
 
-    // The pool-level wrapper (poison-clear paths) hits the same COALESCE:
-    // still the first failure.
+    // Neither half is displaced by later writes.
+    SchedulerDb::persist_build_error_summary_tx(
+        &mut conn,
+        build_id,
+        "derivation c failed",
+        Some("drv-c"),
+    )
+    .await?;
+    let (s, f) = read().await?;
+    assert_eq!(s.as_deref(), Some("derivation a failed"));
+    assert_eq!(f.as_deref(), Some("drv-a"), "first persisted hash wins");
+
+    // The pool-level wrapper (poison-clear paths) hits the same COALESCE.
     drop(conn);
-    db.persist_build_error_summary(build_id, "derivation c failed")
+    db.persist_build_error_summary(build_id, "derivation d failed", Some("drv-d"))
         .await?;
+    let (s, f) = read().await?;
     assert_eq!(
-        read().await?.as_deref(),
+        s.as_deref(),
         Some("derivation a failed"),
         "pool-level wrapper preserves first-write-wins"
     );
+    assert_eq!(f.as_deref(), Some("drv-a"));
     Ok(())
 }

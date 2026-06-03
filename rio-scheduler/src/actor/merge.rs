@@ -3516,7 +3516,7 @@ impl DagActor {
 
             // r[impl sched.merge.displaced-failure-evidence]
             // DEFENSE-IN-DEPTH BACKSTOP: since the at-source persist
-            // (sched.build.failure-evidence-at-source) landed, a
+            // (sched.build.failure-evidence-at-source+1) landed, a
             // still-running keep_going build's first failure is normally
             // already durable in builds.error_summary by the time a
             // displacement prunes its link — this in-tx persist only
@@ -3540,10 +3540,15 @@ impl DagActor {
                 else {
                     continue;
                 };
+                let failed = self
+                    .builds
+                    .get(prior_build)
+                    .and_then(|b| b.failed_derivation.as_deref());
                 crate::db::SchedulerDb::persist_build_error_summary_tx(
                     &mut tx,
                     *prior_build,
                     summary,
+                    failed,
                 )
                 .await?;
             }
@@ -3558,13 +3563,13 @@ impl DagActor {
         // the row's failure state (status, poison fields), so a
         // still-running keep_going build whose only reconstructible
         // failure evidence was that row would lose it at failover. The
-        // at-source persist (sched.build.failure-evidence-at-source)
+        // at-source persist (sched.build.failure-evidence-at-source+1)
         // normally already covered it; this in-tx write is the same
         // defense-in-depth backstop as the displacement loop above —
         // flag-agnostic, idempotent (COALESCE), and fail-closed (a
         // persist error fails the merge, which cleanup_failed_merge
         // rolls back).
-        // r[impl sched.build.failure-evidence-at-source]
+        // r[impl sched.build.failure-evidence-at-source+1]
         let displaced_set: HashSet<&str> =
             merge_result.displaced.iter().map(|h| h.as_str()).collect();
         for (hash, _prior) in &merge_result.removed_retriable {
@@ -3583,10 +3588,15 @@ impl DagActor {
                 else {
                     continue;
                 };
+                let failed = self
+                    .builds
+                    .get(prior_build)
+                    .and_then(|b| b.failed_derivation.as_deref());
                 crate::db::SchedulerDb::persist_build_error_summary_tx(
                     &mut tx,
                     *prior_build,
                     summary,
+                    failed,
                 )
                 .await?;
             }

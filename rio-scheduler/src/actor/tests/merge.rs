@@ -9397,7 +9397,7 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
         "terminal squatter's persisted counts frozen at its terminal transition"
     );
     // r[verify sched.merge.displaced-failure-evidence]
-    // r[verify sched.build.failure-evidence-at-source]
+    // r[verify sched.build.failure-evidence-at-source+1]
     // The still-running keep_going joiner observed the squat's permanent
     // failure before the displacement, so its first-failure evidence is
     // durable (persisted at source) and the displacement prune must keep
@@ -10787,7 +10787,7 @@ async fn test_terminal_build_status_settled_after_displacement() -> TestResult {
 }
 
 // r[verify sched.merge.displaced-failure-evidence]
-// r[verify sched.build.failure-evidence-at-source]
+// r[verify sched.build.failure-evidence-at-source+1]
 /// Two independent layers keep a displaced failure's evidence durable:
 /// the at-source persist (fires the moment the failure is observed) and
 /// the in-transaction backstop (rides the displacing merge's link
@@ -10910,7 +10910,7 @@ async fn test_displacement_persists_prior_build_failure_evidence() -> TestResult
     Ok(())
 }
 
-// r[verify sched.build.failure-evidence-at-source]
+// r[verify sched.build.failure-evidence-at-source+1]
 /// The in-tx evidence backstop covers BOTH non-displacement destructive
 /// removals: the same-definition resubmit-reset and the authority
 /// takeover. Staging simulates a lost at-source write (NULL out the

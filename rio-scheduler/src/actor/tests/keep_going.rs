@@ -250,7 +250,7 @@ async fn test_resubmit_poisoned_node_itself_fails_fast() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.build.failure-evidence-at-source]
+// r[verify sched.build.failure-evidence-at-source+1]
 /// The at-source persist: a keep_going build's FIRST observed failure
 /// reaches `builds.error_summary` in the same actor turn it is observed
 /// — while the build is still Active, before any terminal transition,

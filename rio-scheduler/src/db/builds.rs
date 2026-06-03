@@ -246,7 +246,7 @@ impl SchedulerDb {
     /// summary, so the first write wins (mirroring the in-memory
     /// `get_or_insert_with`). Three writer tiers share this statement:
     /// the at-source chokepoint (`record_failure_evidence`,
-    /// `sched.build.failure-evidence-at-source`) persists in the same
+    /// `sched.build.failure-evidence-at-source+1`) persists in the same
     /// actor turn the failure is observed — the PRIMARY durability
     /// mechanism; the displacement / resubmit-reset path calls this
     /// inside the merge transaction
@@ -257,16 +257,28 @@ impl SchedulerDb {
     /// yet. Idempotence (COALESCE) is what lets all three coexist
     /// without coordination. Plain runtime query — no `.sqlx/` impact.
     // r[impl sched.merge.displaced-failure-evidence]
+    // r[impl sched.build.failure-evidence-at-source+1]
+    /// M_072 (round-16 bug_100): the evidence is a PAIR —
+    /// `(error_summary, failed_derivation)` — written in ONE statement
+    /// with first-write-wins on BOTH columns, mirroring the paired
+    /// in-memory `get_or_insert_with` at the chokepoint. A `None` hash
+    /// binds NULL and COALESCE makes it a no-op: a backstop writer
+    /// that only knows a reconstructed summary can never blank an
+    /// earlier at-source pair.
     pub(crate) async fn persist_build_error_summary_tx(
         conn: &mut sqlx::PgConnection,
         build_id: Uuid,
         error_summary: &str,
+        failed_derivation: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE builds SET error_summary = COALESCE(error_summary, $2) WHERE build_id = $1",
+            "UPDATE builds SET error_summary = COALESCE(error_summary, $2), \
+             failed_derivation = COALESCE(failed_derivation, $3) \
+             WHERE build_id = $1",
         )
         .bind(build_id)
         .bind(error_summary)
+        .bind(failed_derivation)
         .execute(&mut *conn)
         .await?;
         Ok(())
@@ -275,21 +287,23 @@ impl SchedulerDb {
     /// Pool-level wrapper around [`Self::persist_build_error_summary_tx`]
     /// for callers with no surrounding transaction: the at-source
     /// chokepoint and its tick-retry sweep
-    /// (`sched.build.failure-evidence-at-source`), and the poison-clear
+    /// (`sched.build.failure-evidence-at-source+1`), and the poison-clear
     /// prune paths (`AdminService.ClearPoison` and the poison-TTL sweep,
     /// `sched.poison.clear-failure-evidence`) where `clear_poison` is a
     /// single pool UPDATE and evidence-first ordering plus the
     /// idempotent COALESCE write is what makes the sticky failure
     /// durable across a failover.
     // r[impl sched.poison.clear-failure-evidence]
-    // r[impl sched.build.failure-evidence-at-source]
+    // r[impl sched.build.failure-evidence-at-source+1]
     pub(crate) async fn persist_build_error_summary(
         &self,
         build_id: Uuid,
         error_summary: &str,
+        failed_derivation: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         let mut conn = self.pool.acquire().await?;
-        Self::persist_build_error_summary_tx(&mut conn, build_id, error_summary).await
+        Self::persist_build_error_summary_tx(&mut conn, build_id, error_summary, failed_derivation)
+            .await
     }
 
     /// Update a build's status.

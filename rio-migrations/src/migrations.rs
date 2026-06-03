@@ -1461,6 +1461,25 @@ pub const M_070: () = ();
 /// never shadow an authoritative false.
 pub const M_071: () = ();
 
+/// `072_builds_failed_derivation.sql` — durable half of the sticky
+/// first-failure PAIR (round-16 bug_100; failure-evidence class).
+///
+/// `record_failure_evidence` (the at-source chokepoint,
+/// `sched.build.failure-evidence-at-source+1`) records TWO in-memory
+/// fields with first-write-wins semantics: `error_summary` and
+/// `failed_derivation`. Pre-072 only the summary had a column, so
+/// after a leader failover a keep_going build's terminal `BuildFailed`
+/// carried the restored `error_message` with `failed_derivation=""` —
+/// half of the exact empty-field symptom the evidence machinery exists
+/// to close. The pair is now persisted in ONE statement
+/// (`persist_build_error_summary_tx`: COALESCE on both columns — first
+/// failure wins durably exactly as in memory; a NULL hash bind is a
+/// no-op so backstop writers that only know a reconstructed summary
+/// can never blank an earlier at-source pair) and restored together by
+/// build recovery. Nullable: NULL = no failure recorded (or a pre-072
+/// legacy row); recovery seeds the in-memory Option directly.
+pub const M_072: () = ();
+
 /// `migrations/073_drv_modulo_orphaned_at.sql`
 ///
 /// Adds `drv_modulo_cache.orphaned_at TIMESTAMPTZ` (NULL = deriver

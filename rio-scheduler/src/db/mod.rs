@@ -198,7 +198,7 @@ pub(crate) struct RecoveryBuildRow {
     pub cached_drvs: i32,
     /// Sticky first-failure summary persisted while the build was still
     /// running. Primary writer: the at-source chokepoint
-    /// (`sched.build.failure-evidence-at-source`) in the same actor turn
+    /// (`sched.build.failure-evidence-at-source+1`) in the same actor turn
     /// the failure is observed. Backstop writers: the eraser-path
     /// persists (`sched.merge.displaced-failure-evidence` for the
     /// displacement prune and the resubmit-reset,
@@ -211,6 +211,14 @@ pub(crate) struct RecoveryBuildRow {
     /// transitions also write the column, but those rows aren't loaded
     /// here).
     pub error_summary: Option<String>,
+    /// The other half of the sticky first-failure PAIR (M_072,
+    /// round-16 bug_100): which derivation failed first. Written by
+    /// the same single-statement COALESCE as the summary; restored
+    /// together so a post-failover terminal `BuildFailed` never ships
+    /// an `error_message` with `failed_derivation=""`. NULL = no
+    /// failure recorded, a backstop-only write that had no hash, or a
+    /// pre-072 row.
+    pub failed_derivation: Option<String>,
     /// PG-side `now() - submitted_at` so the caller can reconstruct an
     /// `Instant` (same pattern as [`PoisonedDerivationRow`]). Seeds
     /// `BuildInfo::submitted_at` so `r[sched.timeout.per-build]` and

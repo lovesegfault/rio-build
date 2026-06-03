@@ -2283,7 +2283,7 @@ impl DagActor {
     /// interested build BEFORE a poison-clear prune removes `drv_hash`.
     ///
     /// DEFENSE-IN-DEPTH BACKSTOP. Since the at-source persist
-    /// (`record_failure_evidence`, sched.build.failure-evidence-at-source)
+    /// (`record_failure_evidence`, sched.build.failure-evidence-at-source+1)
     /// landed, a build's first failure is normally already durable in
     /// `builds.error_summary` by the time any eraser path runs — this
     /// pre-clear persist only matters when the at-source write failed
@@ -2319,14 +2319,15 @@ impl DagActor {
             let Some(summary) = build.error_summary.as_deref() else {
                 continue;
             };
+            let failed = build.failed_derivation.as_deref();
             self.db
-                .persist_build_error_summary(build_id, summary)
+                .persist_build_error_summary(build_id, summary, failed)
                 .await?;
         }
         Ok(())
     }
 
-    // r[impl sched.build.failure-evidence-at-source]
+    // r[impl sched.build.failure-evidence-at-source+1]
     /// THE failure-evidence chokepoint: record a build's first observed
     /// derivation failure in memory and make it durable in the SAME
     /// actor turn it is observed.
@@ -2376,9 +2377,10 @@ impl DagActor {
         let Some(summary) = build.error_summary.clone() else {
             return;
         };
+        let failed = build.failed_derivation.clone();
         match self
             .db
-            .persist_build_error_summary(build_id, &summary)
+            .persist_build_error_summary(build_id, &summary, failed.as_deref())
             .await
         {
             Ok(()) => {
@@ -2396,7 +2398,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.build.failure-evidence-at-source]
+    // r[impl sched.build.failure-evidence-at-source+1]
     /// Tick-retry sweep: re-attempt the at-source persist for every
     /// build whose in-memory failure evidence is not yet durable.
     /// Runs every housekeeping tick BEFORE the poison-TTL eraser, and
@@ -3106,7 +3108,7 @@ impl DagActor {
         self.update_build_counts(build_id).await;
 
         // r[impl sched.build.keep-going]
-        // r[impl sched.build.failure-evidence-at-source]
+        // r[impl sched.build.failure-evidence-at-source+1]
         // Record FIRST-failure summary regardless of keep_going — and
         // persist it durably in this same actor turn, through the
         // evidence chokepoint. The previous `!keep_going`-only

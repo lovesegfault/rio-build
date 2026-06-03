@@ -2382,6 +2382,120 @@ async fn test_recovery_keep_going_sticky_failure_survives_clear_poison() -> Test
     Ok(())
 }
 
+// r[verify sched.build.failure-evidence-at-source+1]
+/// Round-16 bug_100 roundtrip: the at-source chokepoint persists the
+/// first-failure PAIR (M_072) through the production writer; after a
+/// leader failover the recovered build's terminal `BuildFailed` event
+/// must carry BOTH halves — pre-fix it shipped the restored
+/// `error_message` with `failed_derivation=""` (only the summary had a
+/// column).
+#[tokio::test]
+async fn test_recovery_restores_failed_derivation_pair() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        // keep_going build, two independent drvs. X fails permanently
+        // through the worker path → handle_derivation_failure →
+        // record_failure_evidence persists the PAIR at source.
+        merge_dag(
+            &handle,
+            build_id,
+            vec![make_node("fdr-x"), make_node("fdr-y")],
+            vec![],
+            true, // keep_going
+        )
+        .await?;
+        // Both X and Y are independently Ready; dispatch order and
+        // worker placement are scheduler's choice. Fail X permanently
+        // and leave Y UNRESOLVED (its worker just never completes) so
+        // the build is still Active at failover — a terminal build
+        // would not be recovered at all.
+        let mut x_failed = false;
+        for i in 0..4 {
+            if x_failed {
+                break;
+            }
+            let wid = format!("fdr-w{i}");
+            let mut wrx = connect_executor(&handle, &wid, "x86_64-linux").await?;
+            let a = recv_assignment(&mut wrx).await;
+            if a.drv_path.contains("fdr-x") {
+                complete_failure(
+                    &handle,
+                    &wid,
+                    "fdr-x",
+                    rio_proto::types::BuildResultStatus::PermanentFailure,
+                    "boom",
+                )
+                .await?;
+                x_failed = true;
+            }
+            // Y assignment: hold it open (no completion) — the
+            // failover resets it to Ready.
+            barrier(&handle).await;
+        }
+        assert!(x_failed, "fixture premise: X permanently failed");
+        // Production writer persisted the pair at source.
+        let (s, fd): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT error_summary, failed_derivation FROM builds WHERE build_id = $1",
+        )
+        .bind(build_id)
+        .fetch_one(&pool)
+        .await?;
+        assert!(s.is_some(), "fixture premise: summary persisted at source");
+        assert_eq!(
+            fd.as_deref(),
+            Some("fdr-x"),
+            "fixture premise: the PAIR persisted at source (M_072)"
+        );
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: subscribe to the state ring, then resolve the
+    // remaining node — the terminal BuildFailed must carry the PAIR.
+    let (tx, rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::WatchBuild {
+            build_id,
+            caller_tenant: None,
+            since_sequence: 0,
+            reply: tx,
+        })
+        .await?;
+    let mut state_rx = rx.await??.0.state;
+
+    // Y was left unresolved across the failover — recovery reset it to
+    // Ready. Finish it now to drive the keep_going build terminal.
+    let mut wrx = connect_executor(&handle, "fdr-w9", "x86_64-linux").await?;
+    let a = recv_assignment(&mut wrx).await;
+    assert!(a.drv_path.contains("fdr-y"), "only Y remains");
+    complete_success(&handle, "fdr-w9", "fdr-y", &test_store_path("fdr-y-out")).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, build_id).await?.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "keep_going build with one permanent failure terminates Failed"
+    );
+
+    // Drain the state ring for the Failed event.
+    let mut failed_evt = None;
+    while let Ok(ev) = state_rx.try_recv() {
+        if let Some(rio_proto::types::build_event::Event::Failed(f)) = ev.event {
+            failed_evt = Some(f);
+        }
+    }
+    let f_evt = failed_evt.expect("BuildFailed event on the state ring");
+    assert!(
+        !f_evt.error_message.is_empty(),
+        "summary half restored across failover"
+    );
+    assert_eq!(
+        f_evt.failed_derivation, "fdr-x",
+        "failed_derivation half must survive failover (pre-M_072 this was \"\")"
+    );
+    Ok(())
+}
+
 // r[verify sched.timeout.per-build]
 /// `build_timeout` is "wall-clock since SUBMISSION" — recovery must
 /// seed `submitted_at` from PG, not reset to `Instant::now()`. Otherwise
@@ -5981,7 +6095,7 @@ async fn test_recovery_keep_going_sticky_failure_survives_pre_failover_clear_poi
     Ok(())
 }
 
-// r[verify sched.build.failure-evidence-at-source]
+// r[verify sched.build.failure-evidence-at-source+1]
 /// THE wrong-success regression for the resubmit-reset eraser (the
 /// fourth instance of the "failure evidence lost on path X" class —
 /// rounds 12/13 fixed displacement and the poison-clear paths; this
@@ -6119,7 +6233,7 @@ async fn test_recovery_keep_going_sticky_failure_survives_resubmit_reset() -> Te
     Ok(())
 }
 
-// r[verify sched.build.failure-evidence-at-source]
+// r[verify sched.build.failure-evidence-at-source+1]
 /// Recovery's failed_count fallback reconstruction is itself a fresh
 /// failure observation and must be re-persisted before the new leader
 /// serves traffic — otherwise the reconstructed evidence is exactly as

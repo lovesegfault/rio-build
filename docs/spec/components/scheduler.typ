@@ -1914,16 +1914,27 @@ Queue-level preemption is fully supported:
     or API call).
 ]
 
-#r("sched.build.failure-evidence-at-source")[
-  A build's first observed derivation failure MUST be made durable in
-  `builds.error_summary` in the same actor turn it is observed (first write
-  wins), independent of any later operation on the failed derivation's row.
-  If that persist fails, the scheduler MUST retry it on every housekeeping
+#r("sched.build.failure-evidence-at-source+1")[
+  A build's first observed derivation failure MUST be made durable as the
+  PAIR `(error_summary, failed_derivation)` in the same actor turn it is
+  observed --- one statement, first write wins on both columns,
+  independent of any later operation on the failed derivation's row. A
+  writer that knows only a reconstructed summary MUST NOT blank the
+  paired hash (a NULL bind is a no-op, never an overwrite). If that
+  persist fails, the scheduler MUST retry it on every housekeeping
   tick --- before the poison-TTL eraser runs --- until it succeeds or the
-  build terminates; recovery MUST treat PG-restored evidence as already
-  durable and MUST persist any failure summary it reconstructs from
-  still-linked failed derivations before the new leader serves traffic.
+  build terminates; recovery MUST restore the pair together and treat
+  PG-restored evidence as already durable, and MUST persist any failure
+  summary it reconstructs from still-linked failed derivations before
+  the new leader serves traffic.
 ]
+The +1 pair clause is round-16 bug_100: the chokepoint records two
+in-memory fields with first-write-wins semantics, but only the summary
+had a column --- after a failover, a `keepGoing` build's terminal
+`BuildFailed` carried the restored `error_message` with
+`failed_derivation=""`, half of the exact empty-field symptom this
+machinery exists to close (M_072 adds the column; the single-statement
+write keeps the halves from ever splitting across a failover).
 
 This rule closes a four-times-recurring bug class structurally. Rounds 12,
 13, and 14 of adversarial review each found another path that erases a
@@ -2404,7 +2415,7 @@ parent-side edges it left behind survive until a future row-level sweep.
   non-terminal build's sticky failure from that persisted value. A prior
   build with no observed failure MUST NOT be marked failed by the prune.
 ]
-This rule predates #rref("sched.build.failure-evidence-at-source") and is
+This rule predates #rref("sched.build.failure-evidence-at-source+1") and is
 retained as its defense-in-depth backstop. With evidence persisted at the
 source, the deleted `build_derivations` link is normally no longer the only
 failover-recoverable trace of the failure --- the in-transaction persist
@@ -2436,7 +2447,7 @@ the same backstop evidence per
   MUST NOT clear the poison if that persist fails, and MUST NOT mark a
   build with no observed failure as failed.
 ]
-This rule predates #rref("sched.build.failure-evidence-at-source") and is
+This rule predates #rref("sched.build.failure-evidence-at-source+1") and is
 retained as its defense-in-depth backstop on the poison-clear paths. The
 cleared row recovers as `'created'`: it contributes nothing to the
 failed-count reconstruction, so `builds.error_summary` is what survives a
