@@ -994,16 +994,35 @@ fn warn_unusable_relay_substituters(substituters: &Substituters) {
 /// a defective narinfo sidecar: refused at open for v1, where silent
 /// last-wins indexing would otherwise serve whichever member the
 /// backend listed last (a vanished supply rung, or the wrong ATerm,
-/// surfacing mid-campaign); warn-and-keep-the-first-observed for v0,
-/// whose irreplaceable recordings must stay openable — the shadowed
+/// surfacing mid-campaign); warn-and-keep-the-first-in-name-order for
+/// v0, whose irreplaceable recordings must stay openable — the shadowed
 /// member was unreachable through this map either way, the skip just
 /// makes it loud.
 fn index_store_entries(
     backend: &Backend,
     policy: RecordPolicy,
 ) -> Result<HashMap<String, WalkEntry>> {
+    index_store_listing(backend.list_dir(STORE_DIR)?.unwrap_or_default(), policy)
+}
+
+/// The fold behind [`index_store_entries`], over the raw backend
+/// listing. Entries are sorted by name BEFORE the fold — the same
+/// determinism close as the sibling enumeration `index_narinfos`
+/// (archive/mod.rs): backends promise no entry order (fs::read_dir and
+/// DwarFS image order are filesystem-state accidents; `backend.rs`'s
+/// parity test sorts before comparing for exactly that reason), so an
+/// unsorted fold would let the v0 first-wins choice — which colliding
+/// member serves `read_drv`/`dump_nar`/`has_embedded` — and the Strict
+/// error's named pair re-roll across copies and forms of the same
+/// recording. Split from the backend call so the listing-order
+/// invariance test can inject permutations directly.
+fn index_store_listing(
+    mut entries: Vec<WalkEntry>,
+    policy: RecordPolicy,
+) -> Result<HashMap<String, WalkEntry>> {
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
     let mut store_entries: HashMap<String, WalkEntry> = HashMap::new();
-    for entry in backend.list_dir(STORE_DIR)?.unwrap_or_default() {
+    for entry in entries {
         match store_entries.entry(super::hash_part(&entry.name).to_string()) {
             std::collections::hash_map::Entry::Vacant(slot) => {
                 slot.insert(entry);
@@ -2830,27 +2849,136 @@ mod tests {
     /// shadowed member was unreachable under hash-part keying anyway —
     /// what changes is that the collapse is loud and bounded to one
     /// entry per hash part instead of silently last-wins.
+    ///
+    /// WHICH member survives is part of the contract: the first in name
+    /// order, per the `RecordPolicy::WarnAndSkip` rule shared with the
+    /// sibling enumeration `index_narinfos` (archive/mod.rs). Both
+    /// directions through the real open path: one collider sorts BEFORE
+    /// the original member (it must win) and one AFTER (it must lose),
+    /// with creation order deliberately disagreeing with name order so
+    /// a creation-ordered enumeration cannot pass by accident. The
+    /// listing-order axis itself is pinned by
+    /// `store_member_winner_is_invariant_to_listing_order`, which
+    /// injects permutations directly (raw fs enumeration order is not
+    /// controllable from a test).
     #[test]
-    fn v0_colliding_store_members_warn_and_keep_one() {
+    fn v0_colliding_store_members_warn_and_keep_first_in_name_order() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("archive");
         copy_v0_fixture_to(&root);
 
-        let collider = format!("{}-src2.txt", hash_part(V0_SRC_PATH));
-        std::fs::write(root.join(STORE_DIR).join(&collider), b"foreign member\n").unwrap();
+        let hash = hash_part(V0_SRC_PATH);
+        let first_by_name = format!("{hash}-a-collider.txt");
+        let last_by_name = format!("{hash}-src2.txt");
+        std::fs::write(
+            root.join(STORE_DIR).join(&last_by_name),
+            b"foreign member\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(STORE_DIR).join(&first_by_name),
+            b"first in name order\n",
+        )
+        .unwrap();
 
         let archive =
             ReplayArchive::open(&root).expect("an irreplaceable v0 recording must stay openable");
-        let hash = hash_part(V0_SRC_PATH);
         let with_hash: Vec<String> = archive
             .embedded_store_paths()
             .into_iter()
             .filter(|path| hash_part(path) == hash)
             .collect();
         assert_eq!(
-            with_hash.len(),
+            with_hash,
+            vec![format!(
+                "{}{first_by_name}",
+                rio_nix::store_path::STORE_PREFIX
+            )],
+            "exactly one member per hash part survives, and it is the first in name order"
+        );
+    }
+
+    /// Listing-order invariance of the store-member fold, with the
+    /// order axis injected directly (`index_store_listing` exists so a
+    /// test can do this — raw fs/DwarFS enumeration order is a
+    /// filesystem-state accident no test can script). Quantification
+    /// domain: every rotation of the listing plus its reversal, over a
+    /// member set with one three-way collision and one non-colliding
+    /// member. Under WarnAndSkip every permutation must produce the
+    /// SAME index — the lex-min collider wins, the non-collider is
+    /// untouched; under Strict every permutation must refuse with the
+    /// error naming the SAME pair (the two lex-min members), so even
+    /// the refusal message cannot re-roll across copies of one
+    /// archive. Pre-sort, the reversed permutation alone makes the
+    /// last-created member win and this test fail deterministically.
+    #[test]
+    fn store_member_winner_is_invariant_to_listing_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        copy_v0_fixture_to(&root);
+        let hash = hash_part(V0_SRC_PATH);
+        for name in [
+            format!("{hash}-a-collider.txt"),
+            format!("{hash}-zz-collider.txt"),
+        ] {
+            std::fs::write(root.join(STORE_DIR).join(name), b"collider\n").unwrap();
+        }
+
+        let backend = Backend::open(&root).unwrap();
+        let listing = backend.list_dir(STORE_DIR).unwrap().unwrap_or_default();
+        assert!(
+            listing.len() >= 4,
+            "fixture + colliders give a 3-way collision plus non-colliding members"
+        );
+
+        let mut permutations: Vec<Vec<WalkEntry>> = Vec::new();
+        for rotation in 0..listing.len() {
+            let mut perm = listing.clone();
+            perm.rotate_left(rotation);
+            permutations.push(perm.clone());
+            perm.reverse();
+            permutations.push(perm);
+        }
+
+        let expected_winner = format!("{hash}-a-collider.txt");
+        let mut warn_indexes = Vec::new();
+        let mut strict_errors = Vec::new();
+        for perm in permutations {
+            let index = index_store_listing(perm.clone(), RecordPolicy::WarnAndSkip).unwrap();
+            assert_eq!(
+                index.get(hash).map(|entry| entry.name.as_str()),
+                Some(expected_winner.as_str()),
+                "the lex-min collider must win under every listing order"
+            );
+            let mut as_pairs: Vec<(String, String)> = index
+                .iter()
+                .map(|(k, v)| (k.clone(), v.name.clone()))
+                .collect();
+            as_pairs.sort();
+            warn_indexes.push(as_pairs);
+            let err = format!(
+                "{:#}",
+                index_store_listing(perm, RecordPolicy::Strict).unwrap_err()
+            );
+            strict_errors.push(err);
+        }
+        warn_indexes.dedup();
+        assert_eq!(
+            warn_indexes.len(),
             1,
-            "exactly one member per hash part survives: {with_hash:?}"
+            "one index for every permutation, not one per listing order"
+        );
+        strict_errors.dedup();
+        assert_eq!(
+            strict_errors.len(),
+            1,
+            "the Strict refusal must name the same colliding pair under every \
+             listing order: {strict_errors:?}"
+        );
+        assert!(
+            strict_errors[0].contains(&expected_winner),
+            "the refusal names the lex-min member first: {}",
+            strict_errors[0]
         );
     }
 

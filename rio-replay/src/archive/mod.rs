@@ -173,8 +173,12 @@ pub(crate) enum RecordPolicy {
     /// external recorder that never enforced these rules; one defective
     /// record must cost only itself (a bad sidecar makes one path
     /// non-uploadable, an empty request schedules nothing), never the
-    /// whole recording. For duplicate sidecar resolutions the first file
-    /// in name order wins, deterministically.
+    /// whole recording. For duplicate resolutions in BOTH backend
+    /// enumerations — sidecar files claiming one store hash
+    /// (`index_narinfos`) and store members colliding on hash part
+    /// (`index_store_entries`) — the first file in name order wins,
+    /// deterministically: backends promise no entry order, so each
+    /// enumeration sorts before its first-wins fold.
     WarnAndSkip,
 }
 
