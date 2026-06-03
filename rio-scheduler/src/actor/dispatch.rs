@@ -580,8 +580,11 @@ impl DagActor {
     /// batch). On RPC error/timeout this is the tail only — the
     /// stamped head is protected via `probed_generation`, so neither
     /// hits the per-drv fallback.
-    // r[impl sched.dispatch.fod-substitute+4]
-    async fn batch_probe_cached_ready(&mut self) -> HashSet<DrvHash> {
+    // r[impl sched.dispatch.fod-substitute+5]
+    // `pub(super)` so the window-determinism tests can drive the full
+    // candidate-construction chain (collect → sort → cap → auth mint →
+    // FMP) directly and observe the wire artifact at the mock store.
+    pub(super) async fn batch_probe_cached_ready(&mut self) -> HashSet<DrvHash> {
         let Some(store) = &self.store_client else {
             return HashSet::new();
         };
@@ -613,8 +616,25 @@ impl DagActor {
         // through to the per-drv path would be O(N) sequential 30s-
         // timeout RPCs in the actor (24h+ stall with a wide layer and
         // an unreachable store; I-139/I-140 invariant).
+        //
+        // Sorted BEFORE the cap window: `candidates` carries raw
+        // `iter_nodes()` (HashMap) order, so an unsorted truncate would
+        // make window membership — and through it the whole window's
+        // minted probe tenant and substitutable-vs-missing verdicts —
+        // a function of hasher seed, re-rolling across leader
+        // incarnations on identical DAG state
+        // (r[sched.dispatch.probe-tenant-stable] forbids exactly that:
+        // the pick must not depend on candidate enumeration order, and
+        // when the layer is wider than the cap, window membership IS
+        // enumeration order). Sorting by drv hash makes every window —
+        // head and the stamped-generation remainders probed on later
+        // passes — a pure function of DAG state. The ≤cap path needs no
+        // order: the full set is one window, and every downstream
+        // consumer (the `.min()` tenant fold, the per-path partition)
+        // is order-insensitive.
         let mut checked = HashSet::with_capacity(candidates.len());
         if candidates.len() > super::DISPATCH_PROBE_BATCH_CAP {
+            candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             for (h, _) in &candidates[super::DISPATCH_PROBE_BATCH_CAP..] {
                 checked.insert(h.clone());
             }
@@ -1857,7 +1877,7 @@ impl DagActor {
                 store.clone(),
             )
         };
-        // r[impl sched.dispatch.fod-substitute+4] — same probe-tenant
+        // r[impl sched.dispatch.fod-substitute+5] — same probe-tenant
         // wiring as batch_probe_cached_ready.
         let auth = self.probe_substitute_auth(std::iter::once(drv_hash));
         let probe = auth.mint();

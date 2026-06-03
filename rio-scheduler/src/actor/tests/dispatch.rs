@@ -1150,7 +1150,7 @@ async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.dispatch.fod-substitute+4]
+// r[verify sched.dispatch.fod-substitute+5]
 /// Dispatch-time substitution: a Ready IA derivation (FOD or non-FOD)
 /// whose output becomes substitutable AFTER merge (so merge-time
 /// `check_cached_outputs` missed it) is completed by
@@ -1453,7 +1453,7 @@ async fn batch_probe_classifies_against_live_builds_effective_wanted(
 /// dispatched to a builder (assignment sent), not routed to the
 /// substitute lane by the dispatch-time probe.
 // r[verify sched.merge.force-build-roots+2]
-// r[verify sched.dispatch.fod-substitute+4]
+// r[verify sched.dispatch.fod-substitute+5]
 #[tokio::test]
 async fn dispatch_time_force_build_root_dispatches_not_substitutes() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -1731,6 +1731,178 @@ async fn probe_tenant_ignores_lingering_terminal_builds() -> TestResult {
     assert!(
         auth.mint().is_empty(),
         "no-auth probe must mint no service/tenant headers"
+    );
+    Ok(())
+}
+
+/// Bare actor wired with BOTH a mock store client and a service signer:
+/// the window-determinism tests drive `batch_probe_cached_ready`
+/// directly — the full candidate-construction chain (`iter_nodes()` →
+/// filter → collect → sort → cap → auth mint → FMP) — and observe the
+/// wire artifact (the FMP request's path list and probe-tenant header)
+/// at the mock store boundary, where the store actually consumes it.
+async fn probe_window_actor(
+    pool: sqlx::PgPool,
+) -> anyhow::Result<(
+    rio_test_support::grpc::MockStore,
+    DagActor,
+    tokio::task::JoinHandle<()>,
+)> {
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let plumbing = DagActorPlumbing {
+        store_client: Some(store_client),
+        service_signer: Some(Arc::new(rio_auth::hmac::HmacSigner::from_key(
+            b"test-service-hmac-key-32-bytes!!".to_vec(),
+        ))),
+        ..Default::default()
+    };
+    let actor = DagActor::new(SchedulerDb::new(pool), DagActorConfig::default(), plumbing);
+    Ok((store, actor, store_task))
+}
+
+/// Inject one batch-probe-eligible Ready candidate: probeable
+/// `expected_output_paths` plus `probed_generation` reset to 0 (the
+/// inject helper stamps 1, which would hide the node from the probe).
+fn inject_probe_candidate(actor: &mut DagActor, tag: &str) {
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        expected_output_paths: vec![test_store_path(&format!("{tag}-out"))],
+        ..crate::db::RecoveryDerivationRow::test_default(tag, "x86_64-linux")
+    });
+    actor.test_set_probed_generation(tag, 0);
+}
+
+// r[verify sched.dispatch.fod-substitute+5]
+// r[verify sched.dispatch.probe-tenant-stable]
+/// Window membership of an over-cap probe batch is a pure function of
+/// DAG state — invariant to candidate enumeration order. Quantification
+/// domain: every order-sensitive transform feeding the cap, exercised
+/// end-to-end (HashMap `iter_nodes()` iteration → filter → collect →
+/// sort → truncate): two actors hold the same CAP+12 candidate CONTENT
+/// built in opposite insertion orders, with independently re-rolled
+/// hasher seeds (each `HashMap` draws its own `RandomState`). The batch
+/// FMP fails open so the DAG stays untouched, and both the deferred
+/// tail (the return value) and the probed head (the FMP request the
+/// store received, path list in window order) must be identical across
+/// the two actors AND equal to the drv-hash-sorted split. Pre-fix the
+/// truncate windowed raw hash order: the tail was 12 of 2060 hashes by
+/// hasher seed, so this assertion was a coin toss with ~zero pass
+/// probability.
+#[tokio::test]
+async fn over_cap_probe_window_is_invariant_to_enumeration_order() -> TestResult {
+    use std::sync::atomic::Ordering;
+    let db = TestDb::new(&MIGRATOR).await;
+    let n = crate::actor::DISPATCH_PROBE_BATCH_CAP + 12;
+    // Zero-padded tags: lexicographic drv-hash order == index order, so
+    // the expected window split is readable straight off the indices.
+    let tags: Vec<String> = (0..n).map(|i| format!("bpw-{i:04}")).collect();
+
+    let mut observed = Vec::new();
+    for reversed in [false, true] {
+        let (store, mut actor, _task) = probe_window_actor(db.pool.clone()).await?;
+        let mut order: Vec<&String> = tags.iter().collect();
+        if reversed {
+            order.reverse();
+        }
+        for tag in order {
+            inject_probe_candidate(&mut actor, tag);
+        }
+        store.faults.fail_find_missing.store(true, Ordering::SeqCst);
+        let checked = actor.batch_probe_cached_ready().await;
+        let fmp = store.calls.fmp_requests.read().unwrap().clone();
+        assert_eq!(fmp.len(), 1, "one batch FMP per dispatch pass");
+        let mut tail: Vec<String> = checked.iter().map(|h| h.to_string()).collect();
+        tail.sort();
+        observed.push((tail, fmp[0].0.clone()));
+    }
+
+    // Content-derived expectation (the windowing contract of
+    // r[sched.dispatch.fod-substitute+5]): head = first CAP candidates
+    // in drv-hash order, deferred tail = the rest.
+    let expected_tail: Vec<String> = tags[crate::actor::DISPATCH_PROBE_BATCH_CAP..].to_vec();
+    let expected_head_paths: Vec<String> = tags[..crate::actor::DISPATCH_PROBE_BATCH_CAP]
+        .iter()
+        .map(|tag| test_store_path(&format!("{tag}-out")))
+        .collect();
+    for (tail, head_paths) in &observed {
+        assert_eq!(
+            tail, &expected_tail,
+            "deferred tail must be the lex-greatest candidates"
+        );
+        assert_eq!(
+            head_paths, &expected_head_paths,
+            "probed head must be the lex-first CAP candidates, in window order"
+        );
+    }
+    assert_eq!(
+        observed[0], observed[1],
+        "window membership must not depend on insertion/iteration order"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.probe-tenant-stable]
+// r[verify sched.dispatch.fod-substitute+5]
+/// The minted probe tenant of an over-cap batch is decided by the
+/// DETERMINISTIC window, never by where a tenant's node lands under
+/// hash order: with CAP+1 candidates, the min tenant's ONLY live
+/// interest sits on the lexicographically-LAST drv hash — sorted
+/// windowing deterministically defers that node to the tail, so the
+/// head's `.min()` excludes it and mints the other tenant; flipped onto
+/// the lexicographically-FIRST hash, the min tenant rides the head and
+/// wins. Asserted on the wire artifact (the `x-rio-probe-tenant-id`
+/// header the mock store received) — the round-3 two-candidate rstest
+/// pins the pure `.min()` fold but structurally cannot reach the cap
+/// arm; pre-fix, both of these cases were hash-order coin tosses.
+#[rstest::rstest]
+#[case::min_tenant_in_the_tail(true)]
+#[case::min_tenant_in_the_head(false)]
+#[tokio::test]
+async fn over_cap_window_probe_tenant_is_deterministic(#[case] min_on_last: bool) -> TestResult {
+    use std::sync::atomic::Ordering;
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, mut actor, _task) = probe_window_actor(db.pool.clone()).await?;
+    let n = crate::actor::DISPATCH_PROBE_BATCH_CAP + 1;
+    let tags: Vec<String> = (0..n).map(|i| format!("bpv-{i:04}")).collect();
+    for tag in &tags {
+        inject_probe_candidate(&mut actor, tag);
+    }
+
+    let t_lo = Uuid::from_u128(0x1);
+    let t_hi = Uuid::from_u128(0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff);
+    let (b_lo, b_hi) = (Uuid::new_v4(), Uuid::new_v4());
+    actor.builds.insert(b_lo, probe_build(b_lo, t_lo));
+    actor.builds.insert(b_hi, probe_build(b_hi, t_hi));
+    // The min tenant's only interest: tail (lex-last) or head (lex-first).
+    let lo_node = if min_on_last {
+        tags.last().unwrap()
+    } else {
+        &tags[0]
+    };
+    actor
+        .dag
+        .node_mut(lo_node.as_str())
+        .unwrap()
+        .interested_builds
+        .insert(b_lo);
+    // The other tenant anchors the head either way (index 1 < CAP).
+    actor
+        .dag
+        .node_mut(tags[1].as_str())
+        .unwrap()
+        .interested_builds
+        .insert(b_hi);
+
+    store.faults.fail_find_missing.store(true, Ordering::SeqCst);
+    let _checked = actor.batch_probe_cached_ready().await;
+    let fmp = store.calls.fmp_requests.read().unwrap().clone();
+    assert_eq!(fmp.len(), 1, "one batch FMP per dispatch pass");
+    let expected = if min_on_last { t_hi } else { t_lo };
+    assert_eq!(
+        fmp[0].1.as_deref(),
+        Some(expected.to_string().as_str()),
+        "the head window's minted tenant must be a pure function of the sorted window \
+         (min_on_last={min_on_last})"
     );
     Ok(())
 }
@@ -3741,7 +3913,7 @@ async fn rollback_assignment_persists_ready_to_pg() -> TestResult {
 // I-139/I-140: batch-probe truncated tail must NOT hit per-drv FMP fallback
 // ---------------------------------------------------------------------------
 
-// r[verify sched.dispatch.fod-substitute+4]
+// r[verify sched.dispatch.fod-substitute+5]
 /// With > `DISPATCH_PROBE_BATCH_CAP` Ready leaves and the batch RPC
 /// failing-open, the truncated tail must NOT fall through to the
 /// per-drv `ready_check_or_spawn` (one inline-awaited FMP each =

@@ -94,6 +94,14 @@ pub struct MockStoreCalls {
     /// proving deferred FODs use the batch pre-pass (1 RPC) and skip
     /// the per-FOD `fod_outputs_in_store` fallback (would be N+1).
     pub find_missing_calls: Arc<AtomicU32>,
+    /// Every `find_missing_paths` request: the requested `store_paths`
+    /// in wire order plus the `x-rio-probe-tenant-id` metadata value
+    /// (`None` = header absent). Recorded on entry, before the
+    /// fail-injection check, so fault-armed tests still observe the
+    /// wire artifact — the scheduler's dispatch-probe window membership
+    /// and minted probe tenant as the store actually receives them.
+    #[allow(clippy::type_complexity)]
+    pub fmp_requests: Arc<RwLock<Vec<(Vec<String>, Option<String>)>>>,
     /// `manifest_hint` from each `get_path` call (None if unset).
     /// I-110c: lets tests assert the FUSE fetch carried the primed
     /// hint.
@@ -845,6 +853,16 @@ impl StoreService for MockStore {
         request: Request<types::FindMissingPathsRequest>,
     ) -> Result<Response<types::FindMissingPathsResponse>, Status> {
         self.calls.find_missing_calls.fetch_add(1, Ordering::SeqCst);
+        let probe_tenant = request
+            .metadata()
+            .get(rio_proto::PROBE_TENANT_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        self.calls
+            .fmp_requests
+            .write()
+            .unwrap()
+            .push((request.get_ref().store_paths.clone(), probe_tenant));
         if self.faults.fail_find_missing.load(Ordering::SeqCst) {
             return Err(Status::unavailable("mock: injected find_missing failure"));
         }

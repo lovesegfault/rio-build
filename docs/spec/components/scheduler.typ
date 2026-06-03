@@ -996,7 +996,7 @@ can be GC'd before the failover, and without the durable breadcrumb the
 surviving produced siblings would launder the clear and re-arm exactly that
 doomed dispatch.
 
-#r("sched.dispatch.fod-substitute+4")[
+#r("sched.dispatch.fod-substitute+5")[
   The dispatch-time store-check (`batch_probe_cached_ready` and the
   per-derivation `ready_check_or_spawn` fallback) MUST probe upstream
   substitutability for every Ready input-addressed derivation, not just FODs
@@ -1006,8 +1006,12 @@ doomed dispatch.
   derivation that was already in the DAG in a non-reprobe status reaches Ready
   without a merge-time verdict; dispatch-time is its remaining substitution
   opportunity. Per-tick Ready count is bounded by DAG width (the current
-  eligible layer), not DAG size, so the dispatch-time batch stays under
-  `DISPATCH_PROBE_BATCH_CAP`. Because the actor has no per-derivation JWT to
+  eligible layer), not DAG size; a layer wider than `DISPATCH_PROBE_BATCH_CAP`
+  (the warm-restart shape of a large closure) MUST be windowed
+  deterministically --- the candidate set sorted by drv hash before the cap,
+  the head probed and generation-stamped, the tail deferred to the next pass
+  --- so window membership is a pure function of DAG state, never of
+  hash-collection enumeration order. Because the actor has no per-derivation JWT to
   forward at dispatch time, the scheduler MUST mint an `x-rio-service-token`
   (`ServiceClaims { caller: "rio-scheduler" }`) and set `x-rio-probe-tenant-id`
   to the deterministically-selected probe tenant
