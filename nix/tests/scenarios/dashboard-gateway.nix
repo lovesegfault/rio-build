@@ -29,7 +29,7 @@
 }:
 let
   inherit (fixture) ns;
-  dashboardCurls = import ./dashboard.nix { inherit pkgs ns; };
+  dashboardCurls = import ./dashboard.nix { inherit pkgs ns fixture; };
 in
 pkgs.testers.runNixOSTest {
   name = "rio-dashboard";

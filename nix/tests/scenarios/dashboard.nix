@@ -26,7 +26,81 @@
 # This file is a testScript FRAGMENT — interpolated into
 # dashboard-gateway.nix when `withDashboardCurls = true` (i.e. the
 # rio-dashboard image is in the airgap set; coverage mode skips it).
-{ pkgs, ns }:
+{
+  pkgs,
+  ns,
+  # The k3s-full fixture — carries the deterministic vm-test HMAC key
+  # the (4c) live-tail subtest signs its AppendLog assignment token
+  # with, mirroring scenarios/log-service.nix.
+  fixture,
+  # The store's namespace (cross-namespace Service FQDN is the nginx
+  # upstream under test).
+  nsStore ? "rio-store",
+}:
+let
+  protoset = import ../lib/protoset.nix { inherit pkgs; };
+  grpcurl = "${pkgs.grpcurl}/bin/grpcurl";
+
+  # ── (4c) live-tail identity constants ──────────────────────────────
+  # Distinct from log-service.nix's identities (different scenario, no
+  # cross-contamination if both ever share a fixture). Valid nixbase32.
+  liveDrvHash32 = "1cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm";
+  liveDrvBasename = "${liveDrvHash32}-vmtest-dash.drv";
+  liveDrvFullPath = "/nix/store/${liveDrvBasename}";
+  liveBuilderId = "vm-dash-live-builder";
+  liveExecId = "01900000-0000-7000-8000-00000000bbbb";
+  liveDerivationId = "01900000-0000-7000-8000-00000000eeee";
+
+  # AssignmentClaims signed with the fixture's deterministic HMAC key —
+  # the exact builder shape from scenarios/log-service.nix (see the
+  # field-order/skip-serializing notes there).
+  liveAssignmentToken =
+    pkgs.runCommand "rio-dash-live-assignment-token"
+      {
+        nativeBuildInputs = [ pkgs.python3 ];
+      }
+      ''
+        python3 - ${fixture.hmacKeys}/hmac.key > $out <<'EOF'
+        import base64, hashlib, hmac, json, sys
+        key = open(sys.argv[1], "rb").read()
+        for suf in (b"\r\n", b"\n"):
+            if key.endswith(suf):
+                key = key[: -len(suf)]
+                break
+        claims = json.dumps(
+            {
+                "executor_id": "${liveBuilderId}",
+                "drv_hash": "${liveDrvBasename}",
+                "expected_outputs": [],
+                "is_ca": False,
+                "expiry_unix": 9999999999,
+            },
+            separators=(",", ":"),
+        ).encode()
+        sig = hmac.new(key, claims, hashlib.sha256).digest()
+        b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+        print(b64(claims) + "." + b64(sig))
+        EOF
+      '';
+
+  # The gRPC-Web frame for TailLogRequest{derivation: liveDrvFullPath,
+  # follow: true}: field 1 (string) + field 4 (bool varint), prefixed
+  # with the 5-byte length header. Built at nix-build time so the
+  # testScript curls a deterministic binary body.
+  liveTailRequest =
+    pkgs.runCommand "rio-dash-live-tail-request"
+      {
+        nativeBuildInputs = [ pkgs.python3 ];
+      }
+      ''
+        python3 - > $out <<'EOF'
+        import struct, sys
+        drv = b"${liveDrvFullPath}"
+        msg = b"\x0a" + bytes([len(drv)]) + drv + b"\x20\x01"
+        sys.stdout.buffer.write(b"\x00" + struct.pack(">I", len(msg)) + msg)
+        EOF
+      '';
+in
 ''
   # ── nginx Deployment Available ────────────────────────────────────
   # dashboard.yaml renders when dashboard.enabled=true (set by the
@@ -212,6 +286,147 @@
           "k3s kubectl -n ${ns} get lease rio-scheduler-leader -o jsonpath='{.spec.holderIdentity}' 2>&1"
       )[1])
       raise
+
+  # ── (4c) LIVE follow-tail via nginx: post-open lines reach the open
+  # stream. THE incremental-delivery proof the (4) comment concedes it
+  # cannot give: a short NotFound stream still yields 0x80 under
+  # buffering, but a line ingested AFTER the stream opened only reaches
+  # the open connection if nginx (proxy_buffering off, the rio_store
+  # upstream) and the store's follow path actually flush incrementally
+  # — the data plane the dashboard's follow:true LogViewer (B3) rides.
+  #
+  # Choreography (the follow contract: a stream opened with NO live
+  # ingest session ends immediately and the CLIENT re-opens — so the
+  # subtest holds ONE AppendLog session open via a FIFO and attaches
+  # the follow stream mid-session):
+  #   1. seed a running execution (the log-service scenario's rows)
+  #   2. start a long-lived AppendLog session: grpcurl reads a FIFO; a
+  #      backgrounded writer sends header+batch1 then parks on a flag
+  #      file, holding the session open
+  #   3. open TailLog{follow:true} THROUGH nginx into a capture file —
+  #      the snapshot serves batch 1 (proves attach while live)
+  #   4. touch the flag → the writer sends batch 2 on the SAME session
+  #      → the live fan-out delivers it to the ALREADY-OPEN stream
+  #      (the load-bearing post-open assertion)
+  with subtest("live tail via nginx: post-open lines reach the open stream"):
+      psql_k8s(k3s_server,
+          "INSERT INTO derivations "
+          "(derivation_id, drv_hash, drv_path, system, status) VALUES "
+          "('${liveDerivationId}', '${liveDrvBasename}', "
+          " '${liveDrvFullPath}', 'x86_64-linux', 'running')")
+      psql_k8s(k3s_server,
+          "INSERT INTO assignments "
+          "(derivation_id, builder_id, generation, status, exec_id) VALUES "
+          "('${liveDerivationId}', '${liveBuilderId}', 1, 'acknowledged', "
+          " '${liveExecId}')")
+      psql_k8s(k3s_server,
+          "INSERT INTO drv_executions "
+          "(exec_id, drv_hash, executor_id, started_at) VALUES "
+          "('${liveExecId}', '${liveDrvHash32}', '${liveBuilderId}', now())")
+
+      # Request-message files: header + batch 1 (lines 0-1), batch 2
+      # (lines 2-3). Contents are b64 of dash-live-NNNNN.
+      import base64 as _b64
+      def _line(t):
+          return _b64.b64encode(t.encode()).decode()
+      k3s_server.succeed(
+          "printf '%s\n%s\n' "
+          + "'{\"header\":{\"derivationPath\":\"${liveDrvFullPath}\","
+          + "\"execId\":\"${liveExecId}\"}}' "
+          + "'{\"batch\":{\"lines\":[\"" + _line("dash-live-00000")
+          + "\",\"" + _line("dash-live-00001") + "\"],"
+          + "\"firstLineNumber\":\"0\"}}' > /tmp/dash-b1.json"
+      )
+      k3s_server.succeed(
+          "printf '%s\n' "
+          + "'{\"batch\":{\"lines\":[\"" + _line("dash-live-00002")
+          + "\",\"" + _line("dash-live-00003") + "\"],"
+          + "\"firstLineNumber\":\"2\"}}' > /tmp/dash-b2.json"
+      )
+
+      # Long-lived store port-forward for the AppendLog session.
+      pf_open("svc/rio-store", 19510, 9002, ns="${nsStore}", tag="pf-store-live")
+      token = k3s_server.succeed("cat ${liveAssignmentToken}").strip()
+      # The session: grpcurl reads the FIFO; the writer holds it open.
+      k3s_server.succeed(
+          "mkfifo /tmp/dash-live.fifo 2>/dev/null || true; "
+          "rm -f /tmp/dash-live.go2; "
+          # Every backgrounded process FULLY redirects its fds — an
+          # inherited test-driver backdoor descriptor breaks the
+          # driver's channel ([Errno 9] Bad file descriptor).
+          "(${grpcurl} -plaintext -max-time 300 "
+          "-protoset ${protoset}/rio.protoset "
+          "-H 'x-rio-assignment-token: " + token + "' "
+          "-d @ localhost:19510 rio.store.LogService/AppendLog "
+          "< /tmp/dash-live.fifo > /tmp/dash-live-acks.log 2>&1) "
+          "& echo $! > /tmp/dash-grpcurl.pid; "
+          "(exec 3>/tmp/dash-live.fifo; cat /tmp/dash-b1.json >&3; "
+          "until [ -f /tmp/dash-live.go2 ]; do sleep 0.5; done; "
+          "cat /tmp/dash-b2.json >&3; exec 3>&-) "
+          "</dev/null >/tmp/dash-writer.log 2>&1 "
+          "& echo $! > /tmp/dash-writer.pid"
+      )
+
+      # Gate the follow-open on the session being LIVE: a one-shot
+      # TailLog (direct, the long-lived store port-forward) must serve
+      # batch 1 from the ingest buffer first. A follow stream opened
+      # before the session exists ends immediately by contract (the
+      # client re-opens) — the gate removes that race rather than
+      # looping the curl.
+      b64_line1 = "ZGFzaC1saXZlLTAwMDAx"  # b64("dash-live-00001")
+      k3s_server.wait_until_succeeds(
+          "${grpcurl} -plaintext -max-time 10 "
+          "-protoset ${protoset}/rio.protoset "
+          "-d '{\"derivation\":\"${liveDrvFullPath}\",\"follow\":false}' "
+          "localhost:19510 rio.store.LogService/TailLog "
+          "| grep -q " + b64_line1, timeout=60,
+      )
+
+      try:
+          # Open the follow stream THROUGH nginx while the session is
+          # live. -N disables curl buffering; the capture accumulates
+          # raw gRPC-Web frames (line bytes appear verbatim inside DATA
+          # frames).
+          k3s_server.succeed(
+              "curl -sN --max-time 180 -X POST "
+              "http://localhost:18081/rio.store.LogService/TailLog "
+              "-H 'content-type: application/grpc-web+proto' "
+              "-H 'x-grpc-web: 1' "
+              "--data-binary @${liveTailRequest} "
+              "</dev/null > /tmp/livetail.bin 2>/dev/null "
+              "& echo $! > /tmp/livetail.pid"
+          )
+          # The snapshot phase serves batch 1 (already in the live
+          # buffer): proves the stream attached to the live session.
+          k3s_server.wait_until_succeeds(
+              "grep -aq dash-live-00001 /tmp/livetail.bin", timeout=90
+          )
+          # Batch 2, sent on the SAME open session AFTER the stream
+          # opened: the live fan-out must deliver it to the open
+          # connection — the incremental flush through nginx that
+          # proxy_buffering off exists to allow.
+          k3s_server.succeed("touch /tmp/dash-live.go2")
+          k3s_server.wait_until_succeeds(
+              "grep -aq dash-live-00003 /tmp/livetail.bin", timeout=90
+          )
+      except Exception:
+          print("== DIAGNOSTIC: live-tail subtest ==")
+          print(k3s_server.execute(
+              "echo '-- acks:'; cat /tmp/dash-live-acks.log 2>&1; "
+              "echo '-- writer:'; cat /tmp/dash-writer.log 2>&1; "
+              "echo '-- capture:'; ${pkgs.xxd}/bin/xxd /tmp/livetail.bin 2>&1 | head -20; "
+              "echo '-- store logs:'; "
+              "k3s kubectl -n ${nsStore} logs deploy/rio-store --tail=40 2>&1"
+          )[1])
+          raise
+      finally:
+          # Teardown: the writer exits after batch 2 (closing the FIFO
+          # ends the AppendLog session); kill the follow curl + pf.
+          k3s_server.execute(
+              "kill $(cat /tmp/livetail.pid) 2>/dev/null || true; "
+              "kill $(cat /tmp/dash-grpcurl.pid) 2>/dev/null || true"
+          )
+          pf_close("pf-store-live")
 
   # ── (5) method-gate via nginx: allow-list fail-closed ────────────
   # nginx's catch-all /rio.* location (docker.nix dashboardNginxConf)

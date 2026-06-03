@@ -1336,6 +1336,12 @@ in
   # the pre-registry tip: the hand-written egress lacked the
   # scheduler:9001 edge entirely, so every SPA scheduler RPC was
   # dropped under enforcement).
+  # r[verify dash.stream.log-tail+3]
+  #   live-tail-via-nginx subtest (4c): a line ingested AFTER the
+  #   follow:true TailLog stream opened reaches the open connection
+  #   through nginx — the incremental-delivery half of the rule's
+  #   proxy_buffering-off requirement that the conf-guard alone cannot
+  #   prove (the dashboard's B3 follow-mode LogViewer rides this path).
   vm-dashboard-k3s = dashboard-gateway {
     inherit pkgs common;
     fixture = k3sFull {
