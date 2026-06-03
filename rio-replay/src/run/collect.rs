@@ -733,16 +733,32 @@ pub fn decide(
     let prior_requeues = prior.requeues;
     let relayed = batch.reasons.get(&ctx.drv_path).map(String::as_str);
     let Some(target) = target else {
-        // No in-band result for this root. An engine-cancelled batch
-        // (deadline/abort: the channel was abandoned before results
-        // arrived) re-offers within the explicit cycle budget — the
-        // cancellation is the engine's own act, but a job whose batches
-        // the engine keeps cancelling cannot converge by re-offering
-        // (see [`RequeueBudget::engine_cancelled`]); otherwise a missing
-        // result is a transport defect — one auto-retry, then an infra
-        // failure. A canary probe's missing result (the very outage the
-        // probe was sent to test) is exempt from the budget: see
+        // No in-band result for this root: every branch of this arm is
+        // infra-shaped (the engine's own cancellation, or a transport
+        // defect), so the probe carve-out gates the ARM'S ENTRY — no
+        // infra-shaped budget charge or terminal-mint exit may precede
+        // the probe check. A canary probe with no result is the probed
+        // outage answering, whatever cut the result off: charging the
+        // engine-cancel cycle budget here would grind the conscripted
+        // job to a spurious infra terminal within
+        // `max_engine_cancel_cycles` hang-shaped probe cycles (the
+        // with-result arm orders the same way for the same reason: probe
+        // before any budget consult). See
         // [`RequeueBudget::probe_carveout`].
+        if batch.probe {
+            return CollectDecision::Requeue {
+                why: RequeueReason::InfraProbe,
+                budget: RequeueBudget::probe_carveout(),
+            };
+        }
+        // An engine-cancelled batch (deadline/abort: the channel was
+        // abandoned before results arrived) re-offers within the
+        // explicit cycle budget — the cancellation is the engine's own
+        // act, but a job whose batches the engine keeps cancelling
+        // cannot converge by re-offering (see
+        // [`RequeueBudget::engine_cancelled`]); otherwise a missing
+        // result is a transport defect — one auto-retry, then an infra
+        // failure.
         if batch.engine_cancelled {
             if let Some(budget) = RequeueBudget::engine_cancelled(prior.cancel_cycles, knobs) {
                 return CollectDecision::Requeue {
@@ -759,12 +775,6 @@ pub fn decide(
                      full batch timeout)",
                     prior.cancel_cycles
                 )),
-            };
-        }
-        if batch.probe {
-            return CollectDecision::Requeue {
-                why: RequeueReason::InfraProbe,
-                budget: RequeueBudget::probe_carveout(),
             };
         }
         if let Some(budget) = RequeueBudget::auto_retry(prior_requeues, knobs) {
@@ -1005,6 +1015,19 @@ pub fn decide(
     // ([`RequeueBudget::probe_carveout`]); every NON-infra probe outcome
     // (genuine, timeout, source-rot, …) is evidence the cluster executed
     // the build and classifies normally.
+    //
+    // ORDER PIN — classification BEFORE the probe check is correct here
+    // and must stay: a with-result row proves the cluster executed the
+    // build, and the probe carve-out's contract ("can only catch infra
+    // shapes" — [`RequeueBudget::probe_carveout`], pinned by
+    // `probe_batch_exempts_infra_shapes_but_real_verdicts_still_land`)
+    // demands a probe's REAL verdicts land as evidence. The arm-entry
+    // probe rule covers infra-shaped exits only: within this arm the
+    // probe check still precedes every budget consult and terminal mint
+    // on the infra-classified leg, which is all the rule requires. Do
+    // NOT hoist the probe check above classification — that would turn
+    // a recovered cluster's first genuine verdict into an exempt requeue
+    // and the probe ladder would never score a real recovery.
     let (kind, evidence) = resolve_failure_kind(
         signal1,
         poisoned.get(&ctx.drv_path).map(Vec::as_slice),
@@ -2661,6 +2684,148 @@ mod tests {
         match decide(&c, None, &non_probe, &no_poison, prior(0), &knobs, None) {
             CollectDecision::Requeue { budget, .. } => assert!(!budget.probe_exempt()),
             other => panic!("expected a charged requeue, got {other:?}"),
+        }
+    }
+
+    /// The probe bit crossed with EVERY sibling field of [`BatchView`] —
+    /// not just the failure shapes a script happens to produce.
+    /// Quantification domain: `BatchView`'s full field list, enumerated
+    /// as data below and coupled to the struct by an exhaustive
+    /// destructuring, so adding a field refuses to compile until its
+    /// probe-cross row is decided here.
+    ///
+    /// The invariant under test is decide()'s arm-entry rule: in the
+    /// no-in-band-result arm, NO sibling state may route a probe member
+    /// into a budget charge or a terminal mint — the probe exit dominates
+    /// the arm. The load-bearing cell is probe × engine_cancelled with
+    /// the cancel-cycle budget exhausted: the engine maps a hung probe's
+    /// deadline cut to (empty results, engine_cancelled: true)
+    /// (`submitter.rs`: Timeout → "collect re-offers the members via the
+    /// engine-cancelled rule"), and before the arm-entry rule that cell
+    /// charged Counted cycles and, at exhaustion, minted a spurious
+    /// regression-tripping infra terminal on the conscripted unit — which
+    /// the probe scorer then read as SUCCESS, defeating the operator
+    /// escalation. Every other sibling row pins that no future bit can
+    /// re-open the same hole.
+    #[test]
+    fn probe_carveout_dominates_every_sibling_batch_bit_in_the_no_result_arm() {
+        let knobs = Knobs::default();
+        let c = ctx("app.x86_64-linux", T, &[], ExpectedOutcome::Built);
+        let no_poison: HashMap<String, Vec<String>> = HashMap::new();
+        // Couple the row list to the struct: a new BatchView field fails
+        // this destructuring until its probe-cross row below is decided.
+        let BatchView {
+            kind: _,
+            build_id: _,
+            results: _,
+            reasons: _,
+            stderr_tail: _,
+            engine_cancelled: _,
+            disconnect_deadline_fired: _,
+            interruption_drvs: _,
+            submitted_at: _,
+            probe: _,
+            confirmation_attempt: _,
+            import_skipped_by_root: _,
+        } = BatchView::default();
+        let probe_with = |mutate: fn(&mut BatchView)| {
+            let mut batch = BatchView {
+                probe: true,
+                ..BatchView::default()
+            };
+            mutate(&mut batch);
+            batch
+        };
+        let rows: Vec<(&str, BatchView)> = vec![
+            (
+                "kind=timed",
+                probe_with(|b| b.kind = BATCH_KIND_TIMED.to_string()),
+            ),
+            // A build id alone (no per-root results) is still the
+            // no-result shape for this member.
+            (
+                "build_id=Some",
+                probe_with(|b| b.build_id = Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".into())),
+            ),
+            // A result for ANOTHER root: this member still has none.
+            (
+                "results=other-root",
+                probe_with(|b| b.results = vec![po(OTHER, BuildStatus::Built, "")]),
+            ),
+            (
+                "reasons=non-empty",
+                probe_with(|b| {
+                    b.reasons =
+                        BTreeMap::from([(T.to_string(), "spurious relayed line".to_string())]);
+                }),
+            ),
+            (
+                "stderr_tail=Some",
+                probe_with(|b| b.stderr_tail = Some("engine submission error: x".into())),
+            ),
+            // THE bug cell: hung probe cut by the engine batch deadline.
+            (
+                "engine_cancelled",
+                probe_with(|b| b.engine_cancelled = true),
+            ),
+            (
+                "disconnect_deadline_fired",
+                probe_with(|b| {
+                    b.engine_cancelled = true;
+                    b.disconnect_deadline_fired = true;
+                }),
+            ),
+            (
+                "interruption_drvs=non-empty",
+                probe_with(|b| b.interruption_drvs = vec![T.to_string()]),
+            ),
+            (
+                "submitted_at=Some",
+                probe_with(|b| b.submitted_at = Some("2026-06-01T00:00:00Z".into())),
+            ),
+            ("probe (base)", probe_with(|_| {})),
+            (
+                "confirmation_attempt>0",
+                probe_with(|b| b.confirmation_attempt = 1),
+            ),
+            // An import-gap entry for the root: the gap retirement
+            // (`import_gap_retirements`) consumes only failure-shaped
+            // IN-BAND results, so in this arm's no-result shape the
+            // breadcrumb is inert and the carve-out still dominates —
+            // the starved canary settles through the gap retirer on a
+            // batch that produced a result, never through a budget
+            // charge here.
+            (
+                "import_skipped_by_root=non-empty",
+                probe_with(|b| {
+                    b.import_skipped_by_root = BTreeMap::from([(
+                        T.to_string(),
+                        vec!["/nix/store/dddddddddddddddddddddddddddddddd-gap.drv".to_string()],
+                    )]);
+                }),
+            ),
+        ];
+        // Budgets fully exhausted on BOTH counters: any arm that consults
+        // a budget instead of the carve-out terminalizes, failing the row.
+        let spent = PriorBudgets {
+            requeues: 5,
+            cancel_cycles: knobs.max_engine_cancel_cycles,
+        };
+        for (name, batch) in &rows {
+            assert!(batch.probe, "{name}: every row crosses WITH the probe bit");
+            match decide(&c, None, batch, &no_poison, spent, &knobs, None) {
+                CollectDecision::Requeue { why, budget } => {
+                    assert_eq!(why, RequeueReason::InfraProbe, "{name}");
+                    assert!(
+                        budget.probe_exempt(),
+                        "{name}: the carve-out's witness must carry the exemption"
+                    );
+                }
+                other => panic!(
+                    "[probe × {name}] no sibling bit may charge a budget or mint a terminal \
+                     on a probe with no in-band result; got {other:?}"
+                ),
+            }
         }
     }
 

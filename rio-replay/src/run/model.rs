@@ -212,6 +212,44 @@ impl Verdict {
         Verdict::InterruptionReplayed,
         Verdict::InterruptionNotReproduced,
     ];
+
+    /// Inverse of [`Verdict::as_str`] for reading recorded verdicts back;
+    /// `None` for a string outside the vocabulary (a record written by a
+    /// different engine version).
+    pub fn from_wire(verdict: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == verdict)
+    }
+
+    /// Whether this verdict is evidence the cluster EXECUTED (or
+    /// completed) the unit's build — the work-evidence grade
+    /// [`is_work_evidencing_terminal`] projects.
+    ///
+    /// Every comparison verdict is minted by classifying an attempt the
+    /// cluster actually resolved (a build, a substitution, a genuine
+    /// failure, an upstream fetch refusal observed ON the cluster) —
+    /// except `InfraIndeterminate`, which states the OPPOSITE: the
+    /// replayed outcome cannot be trusted because rio-side infrastructure
+    /// failed. Outage-minted exhaustion terminals (engine-cancel cycles,
+    /// engine-side submission failures) land exactly there, so treating
+    /// it as work evidence would let an outage satisfy its own probe's
+    /// success witness. Exhaustive on purpose: a new verdict refuses to
+    /// compile until its evidence grade is decided here.
+    pub fn evidences_cluster_work(self) -> bool {
+        match self {
+            Verdict::InfraIndeterminate => false,
+            Verdict::MatchBuilt
+            | Verdict::OutputDivergence
+            | Verdict::MatchFailed
+            | Verdict::UnexpectedFailure
+            | Verdict::UnexpectedDependencyFailure
+            | Verdict::UnexpectedSuccess
+            | Verdict::SourceUnavailable
+            | Verdict::TruthIndeterminate
+            | Verdict::NoTruth
+            | Verdict::InterruptionReplayed
+            | Verdict::InterruptionNotReproduced => true,
+        }
+    }
 }
 
 /// Per-unit disposition: why a workload unit was never compared (not
@@ -293,6 +331,43 @@ impl Disposition {
         Disposition::TargetSubstituted,
         Disposition::NotAttempted,
     ];
+
+    /// Inverse of [`Disposition::as_str`] for reading recorded
+    /// dispositions back; `None` for a string outside the vocabulary (a
+    /// record written by a different engine version).
+    pub fn from_wire(disposition: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|d| d.as_str() == disposition)
+    }
+
+    /// Whether this disposition is evidence the cluster EXECUTED the
+    /// unit's build — the work-evidence grade
+    /// [`is_work_evidencing_terminal`] projects: NO disposition is.
+    ///
+    /// Dispositions are non-attempt classes by construction ("why a
+    /// workload unit was never compared"): plan-time exclusions and
+    /// supply-stage retirements never reached the cluster, and even
+    /// `target-substituted` — the one attempted() disposition — records
+    /// a completion WITHOUT execution. Several are minted BY outages
+    /// (supply-failed / upload-rejected from the supply rollup during a
+    /// dead-uploads window), so admitting any of them as work evidence
+    /// would let an outage satisfy its own probe's success witness.
+    /// Deliberately an exhaustive all-false match rather than a `_`:
+    /// adding a disposition refuses to compile until its evidence grade
+    /// is decided here, keeping this projection's totality test honest.
+    pub fn evidences_cluster_work(self) -> bool {
+        match self {
+            Disposition::Filtered
+            | Disposition::EvalError
+            | Disposition::IdentityDivergent
+            | Disposition::NotAttemptable
+            | Disposition::DemotedImpure
+            | Disposition::CachedPrior
+            | Disposition::UploadRejected
+            | Disposition::SupplyFailed
+            | Disposition::TargetSubstituted
+            | Disposition::NotAttempted => false,
+        }
+    }
 
     /// Whether a unit retiring with this disposition was actually submitted
     /// to the target (produced a rio observation) — the report's
@@ -694,6 +769,13 @@ impl JobRecord {
 /// Whether a record is terminal: any verdict is terminal, and so is any
 /// disposition other than `not-attempted`; a record with neither field set
 /// has not been classified yet and is not terminal.
+///
+/// Terminality is a SCHEDULING-LIVENESS fact ("this job needs no more
+/// offers"), not an evidence grade: outage-minted classes (an
+/// infra-indeterminate budget-exhaustion verdict, a supply-failed
+/// exclusion) are terminal without the cluster ever executing anything.
+/// A consumer asking "did the cluster demonstrably do work" must use
+/// [`is_work_evidencing_terminal`] instead.
 pub fn is_terminal_class(verdict: &Option<String>, disposition: &Option<String>) -> bool {
     if verdict.is_some() {
         return true;
@@ -701,6 +783,55 @@ pub fn is_terminal_class(verdict: &Option<String>, disposition: &Option<String>)
     disposition
         .as_deref()
         .is_some_and(|d| d != Disposition::NotAttempted.as_str())
+}
+
+/// Whether a record carries a WORK-EVIDENCING terminal class: a class
+/// that can only exist because the cluster demonstrably executed (or
+/// completed) the unit's build — the canary-probe scorer's success
+/// witness, and the projection any future "did the cluster do work"
+/// consumer must use instead of [`is_terminal_class`].
+///
+/// Parse-to-enum chokepoint: the record's wire strings are parsed back
+/// through the closed [`Verdict`]/[`Disposition`] vocabularies and the
+/// judgment is an exhaustive per-member match
+/// ([`Verdict::evidences_cluster_work`] /
+/// [`Disposition::evidences_cluster_work`]) — a new class refuses to
+/// compile until its evidence grade is decided, so a new terminal
+/// producer can never silently widen a work-evidence consumer the way
+/// `is_terminal_class` consumers were widened. A string outside the
+/// vocabulary (a record written by a different engine version) is an
+/// explicit unknown: NON-evidencing, fail-closed, with a loud warning —
+/// scoring an unknown class as proof of cluster work would let an
+/// unrecognized outage-minted class defeat the very guard consuming
+/// this predicate.
+pub fn is_work_evidencing_terminal(verdict: &Option<String>, disposition: &Option<String>) -> bool {
+    if let Some(raw) = verdict.as_deref() {
+        return match Verdict::from_wire(raw) {
+            Some(v) => v.evidences_cluster_work(),
+            None => {
+                tracing::warn!(
+                    verdict = raw,
+                    "record verdict is outside the vocabulary; treating it as unknown — \
+                     NOT work-evidencing (fail-closed)"
+                );
+                false
+            }
+        };
+    }
+    if let Some(raw) = disposition.as_deref() {
+        return match Disposition::from_wire(raw) {
+            Some(d) => d.evidences_cluster_work(),
+            None => {
+                tracing::warn!(
+                    disposition = raw,
+                    "record disposition is outside the vocabulary; treating it as unknown — \
+                     NOT work-evidencing (fail-closed)"
+                );
+                false
+            }
+        };
+    }
+    false
 }
 
 /// [`SupplyEntry::source`] value for an output of a workload unit — never
@@ -2396,6 +2527,68 @@ mod tests {
         assert!(!is_terminal_class(&None, &disposition));
         // A record with neither field has not been classified yet.
         assert!(!is_terminal_class(&None, &None));
+    }
+
+    /// Work-evidence projection over the WHOLE unified vocabulary, as
+    /// data, through the wire-string chokepoint the production consumers
+    /// use. Quantification domain: `Verdict::ALL` × `Disposition::ALL` —
+    /// the same closed enums every record writer goes through — plus the
+    /// out-of-vocabulary and unclassified rows.
+    ///
+    /// Every member is asserted on BOTH evidence axes so the two
+    /// projections cannot silently merge again: terminality (scheduling
+    /// liveness) and work evidence (did the cluster execute). The
+    /// expected rows derive from the classes' own contracts:
+    /// `infra-indeterminate` states the replayed outcome cannot be
+    /// trusted (rio-side infrastructure failed — the class every
+    /// budget-exhaustion terminal mints DURING an outage), and every
+    /// disposition is a non-attempt class by construction (dispositions
+    /// answer "why was the unit never compared"; supply-failed /
+    /// upload-rejected are minted BY dead-uploads outages). A new
+    /// verdict or disposition fails the exhaustive matches behind this
+    /// test until its evidence grade is decided.
+    #[test]
+    #[tracing_test::traced_test]
+    fn work_evidence_projection_covers_the_whole_vocabulary() {
+        for verdict in Verdict::ALL {
+            let expected = verdict != Verdict::InfraIndeterminate;
+            let raw = Some(verdict.as_str().to_string());
+            assert_eq!(
+                is_work_evidencing_terminal(&raw, &None),
+                expected,
+                "{verdict:?}"
+            );
+            // Work evidence implies terminality, never the reverse.
+            assert!(is_terminal_class(&raw, &None), "{verdict:?}");
+            // The wire chokepoint round-trips the vocabulary.
+            assert_eq!(Verdict::from_wire(verdict.as_str()), Some(verdict));
+        }
+        for disposition in Disposition::ALL {
+            let raw = Some(disposition.as_str().to_string());
+            assert!(
+                !is_work_evidencing_terminal(&None, &raw),
+                "{disposition:?}: dispositions are non-attempt classes — never work evidence"
+            );
+            assert_eq!(
+                Disposition::from_wire(disposition.as_str()),
+                Some(disposition)
+            );
+        }
+        // Out-of-vocabulary strings are explicit unknowns: fail-closed
+        // (NOT evidencing) with a loud warning — an unrecognized
+        // outage-minted class must not satisfy a probe's success witness.
+        assert!(!is_work_evidencing_terminal(
+            &Some("some-future-verdict".to_string()),
+            &None
+        ));
+        assert!(logs_contain("record verdict is outside the vocabulary"));
+        assert!(!is_work_evidencing_terminal(
+            &None,
+            &Some("some-future-disposition".to_string())
+        ));
+        assert!(logs_contain("record disposition is outside the vocabulary"));
+        // An unclassified record evidences nothing.
+        assert!(!is_work_evidencing_terminal(&None, &None));
     }
 
     #[test]

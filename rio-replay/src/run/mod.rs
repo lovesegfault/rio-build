@@ -1885,13 +1885,17 @@ enum ProbeAction {
 /// converting a recoverable wedge into mass terminal retirement. The
 /// ladder is the bounded middle: while the latch holds, release ONE
 /// budget-exempt single-job probe per cycle; a probe that produces a
-/// terminal record (any class — built, genuine failure, … all prove the
-/// cluster executed work) refreshes the window and resets the ladder; a
-/// probe that comes back infra-shaped (budget-exempt requeue, no record)
-/// counts a failed cycle; after [`INFRA_PROBE_PAUSE_AFTER`] consecutive
-/// failures the ladder escalates to the operator PAUSE file. Removing the
-/// PAUSE file (the operator's "resume" signal) resets the ladder so
-/// probing restarts against the presumably-repaired infrastructure.
+/// WORK-EVIDENCING terminal record (built, genuine failure, source-rot,
+/// … — `model::is_work_evidencing_terminal`, the scorer's witness; bare
+/// terminality is not enough, because outage-minted classes like
+/// infra-indeterminate exhaustion terminals and supply-failed exclusions
+/// are terminal too) refreshes the window and resets the ladder; a probe
+/// that comes back infra-shaped (budget-exempt requeue, no record, or an
+/// outage-minted record) counts a failed cycle; after
+/// [`INFRA_PROBE_PAUSE_AFTER`] consecutive failures the ladder escalates
+/// to the operator PAUSE file. Removing the PAUSE file (the operator's
+/// "resume" signal) resets the ladder so probing restarts against the
+/// presumably-repaired infrastructure.
 ///
 /// Pure state machine: the poller feeds observations and applies the
 /// returned [`ProbeAction`], so the latch→probe→fail→escalate loop is unit
@@ -2854,10 +2858,19 @@ pub async fn run_with_backends(
                 if schedule_mode == ScheduleMode::Timeless {
                     // Score a concluded probe cycle: the released probe
                     // batch has been collected, and success means its job
-                    // now holds a terminal record (any class — the cluster
-                    // demonstrably executed work). Lock order: processed is
-                    // try-locked so a long-running collect pass can never
-                    // stall the poller tick.
+                    // now holds a WORK-EVIDENCING terminal record — a
+                    // class the cluster could only have produced by
+                    // executing the build (built, genuine failure,
+                    // source-rot, …). Bare terminality is NOT the witness:
+                    // outage-minted classes (an infra-indeterminate
+                    // budget-exhaustion terminal, a supply-failed
+                    // exclusion from the rollup) are terminal records the
+                    // OUTAGE produces on the probe job itself, and scoring
+                    // them as success resets the ladder, defeats the
+                    // operator escalation, and lets the outage retire one
+                    // workload unit per probe cycle. Lock order: processed
+                    // is try-locked so a long-running collect pass can
+                    // never stall the poller tick.
                     let concluded = match pause.probe_batch() {
                         Some((batch_id, jobs)) => match processed.try_lock() {
                             Ok(done) if done.contains(&batch_id) => {
@@ -2866,7 +2879,10 @@ pub async fn run_with_backends(
                                 let res = results.lock().await;
                                 let success = jobs.iter().any(|job| {
                                     res.get(job).is_some_and(|r| {
-                                        model::is_terminal_class(&r.verdict, &r.disposition)
+                                        model::is_work_evidencing_terminal(
+                                            &r.verdict,
+                                            &r.disposition,
+                                        )
                                     })
                                 });
                                 tracing::info!(batch_id, success, "canary probe cycle concluded");
@@ -3444,7 +3460,9 @@ struct SupplyRetirementInputs {
 /// before the batch could settle. This is the named retirer for
 /// dispatched units; never-dispatched dependents are retired by the
 /// process-start rollup once a path's settled failures reach the wired
-/// attempt floor.
+/// attempt floor. Probe batches are exempt (see the in-loop comment):
+/// a canary probe's supply outcome scores the probe cycle, it never
+/// retires the conscripted unit.
 #[allow(clippy::too_many_arguments)]
 async fn collect_pass_with(
     state: &StateDir,
@@ -3501,39 +3519,57 @@ async fn collect_pass_with(
         // whether a later attempt might still recover the path for
         // someone else.
         //
-        // supply-fold: latest_settlements — batch-settle rollup (as-of
-        // the batch's dispatch), via supply_rollup_dispositions.
-        let entries = match &supply_entries {
-            Some(entries) => entries,
-            None => supply_entries.insert(state.load_jsonl::<SupplyEntry>(StateFile::Supply)?),
+        // Probe batches are EXEMPT (the entry condition below): a canary
+        // probe is a sacrificial evidence vehicle for the probe ladder —
+        // its supply outcome scores the cycle (no work-evidencing record
+        // → failed cycle → operator escalation), it never retires the
+        // conscripted unit. Without the exemption, the
+        // uploads-fail-but-queries-work outage shape settles FAILED rows
+        // for the probe job's required paths during the probe's own
+        // pre-submission top-up, this rollup retires the member with a
+        // supply-failed exclusion before classification, the scorer sees
+        // a terminal record, and the ladder resets — one unit durably
+        // retired per probe cycle for the outage's duration with the
+        // operator PAUSE never written. The unit stays attemptable; if
+        // the path is genuinely undeliverable, the next NON-probe batch's
+        // rollup retires it through the normal channel.
+        let supply_retired = if batch.probe {
+            BTreeMap::new()
+        } else {
+            // supply-fold: latest_settlements — batch-settle rollup (as-of
+            // the batch's dispatch), via supply_rollup_dispositions.
+            let entries = match &supply_entries {
+                Some(entries) => entries,
+                None => supply_entries.insert(state.load_jsonl::<SupplyEntry>(StateFile::Supply)?),
+            };
+            let in_band_success: HashSet<&str> = batch
+                .results
+                .iter()
+                .filter(|result| {
+                    model::build_status_from_name(&result.status)
+                        .is_some_and(|status| status.is_success())
+                })
+                .map(|result| result.drv_path.as_str())
+                .collect();
+            let members: HashSet<&str> = batch
+                .jobs
+                .iter()
+                .map(String::as_str)
+                .filter(|job| !already_terminal.contains(*job))
+                .filter(|job| {
+                    !contexts
+                        .get(*job)
+                        .is_some_and(|ctx| in_band_success.contains(ctx.drv_path.as_str()))
+                })
+                .collect();
+            supply_rollup_dispositions(
+                &model::SupplyFold::collapse_as_of(entries, &batch.started_at),
+                &supply.dep_closure,
+                &members,
+                &supply.plan_dispositions,
+                1,
+            )
         };
-        let in_band_success: HashSet<&str> = batch
-            .results
-            .iter()
-            .filter(|result| {
-                model::build_status_from_name(&result.status)
-                    .is_some_and(|status| status.is_success())
-            })
-            .map(|result| result.drv_path.as_str())
-            .collect();
-        let members: HashSet<&str> = batch
-            .jobs
-            .iter()
-            .map(String::as_str)
-            .filter(|job| !already_terminal.contains(*job))
-            .filter(|job| {
-                !contexts
-                    .get(*job)
-                    .is_some_and(|ctx| in_band_success.contains(ctx.drv_path.as_str()))
-            })
-            .collect();
-        let supply_retired = supply_rollup_dispositions(
-            &model::SupplyFold::collapse_as_of(entries, &batch.started_at),
-            &supply.dep_closure,
-            &members,
-            &supply.plan_dispositions,
-            1,
-        );
         if !supply_retired.is_empty() {
             tracing::warn!(
                 batch_id = batch.batch_id,
@@ -7039,6 +7075,46 @@ mod tests {
         );
     }
 
+    /// Consumer enumeration for the results-map evidence predicates in
+    /// THIS file's production region (the file's own bytes, truncated at
+    /// this test module — the `remote_object_match` pattern).
+    /// Quantification domain: every `model::is_terminal_class(` /
+    /// `model::is_work_evidencing_terminal(` call site outside tests.
+    ///
+    /// The two predicates answer different questions and a consumer
+    /// picking the wrong one is exactly how the probe ladder was
+    /// defeated: terminality is scheduling liveness ("needs no more
+    /// offers" — the resume gate, the submit loop's terminal set, the
+    /// stall belt, the in-scope progress count), while work evidence is
+    /// the probe scorer's success witness ("did the cluster demonstrably
+    /// execute"). A NEW results-map consumer must decide its question
+    /// and join the matching count here — an unenumerated consumer fails
+    /// this test instead of silently widening either projection.
+    #[test]
+    fn results_map_evidence_predicates_feed_their_declared_consumers() {
+        let src = include_str!("mod.rs");
+        let prod = src
+            .split_once("#[cfg(test)]\nmod tests")
+            .map(|(prod, _)| prod)
+            .unwrap_or(src);
+        // Built at runtime so this test's own source cannot match.
+        let work = format!("model::{}{}", "is_work_evidencing_terminal", "(");
+        let liveness = format!("model::{}{}", "is_terminal_class", "(");
+        assert_eq!(
+            prod.matches(work.as_str()).count(),
+            1,
+            "the canary-probe scorer is the ONLY work-evidence consumer; a new consumer \
+             must justify its question and join this enumeration"
+        );
+        assert_eq!(
+            prod.matches(liveness.as_str()).count(),
+            4,
+            "liveness consumers: the inline-resume gate, the submit loop's terminal set, \
+             the stall already-terminal guard, and the in-scope progress count; a new \
+             consumer must pick its projection deliberately and join this enumeration"
+        );
+    }
+
     /// The InfraRate witness's closed-loop pin, end to end over the real
     /// submit loop, collect pass, and probe ladder: with the infra-rate
     /// latch held and the in-flight work drained, each probe cycle releases
@@ -7123,8 +7199,9 @@ mod tests {
                     pause.clear_probe();
                     let res = results.lock().await;
                     Some(probe_jobs.iter().any(|job| {
-                        res.get(job)
-                            .is_some_and(|r| model::is_terminal_class(&r.verdict, &r.disposition))
+                        res.get(job).is_some_and(|r| {
+                            model::is_work_evidencing_terminal(&r.verdict, &r.disposition)
+                        })
                     }))
                 }
                 _ => None,
@@ -7210,6 +7287,355 @@ mod tests {
         assert!(
             records.is_empty(),
             "probe failures must never write terminal records: {records:?}"
+        );
+    }
+
+    /// The ladder's closed loop under the HANG-shaped outage: every probe
+    /// submission is cut by the engine's own batch deadline and settles
+    /// `Ok(BatchOutcome { results: [], engine_cancelled: true })` — the
+    /// exact shape the submitter maps a transport timeout to ("collect
+    /// re-offers the members via the engine-cancelled rule"). The
+    /// scripted-Err e2e above cannot reach this cell: an Err outcome
+    /// settles with `engine_cancelled = false`.
+    ///
+    /// Pins the composed invariant the probe×engine_cancelled lattice
+    /// cell guards at the decide() level, here over the real submit loop,
+    /// collect pass, and ladder: a hang-shaped probe cycle is a FAILED
+    /// cycle (never a Counted engine-cancel charge, never a spurious
+    /// infra terminal that would score the cycle as success and reset
+    /// the ladder), so after INFRA_PROBE_PAUSE_AFTER cycles the operator
+    /// PAUSE lands with ZERO journal entries (the InfraProbe no-journal
+    /// invariant — every JOURNAL_BACKED_BOUNDS counter stays at its
+    /// fold-of-empty value), zero resubmissions, zero engine-cancel
+    /// cycles charged, and zero terminal records.
+    #[tokio::test(start_paused = true)]
+    async fn hang_shaped_probe_cycles_escalate_without_charges_or_terminals() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDir::new(dir.path()).unwrap());
+        let pause = Arc::new(model::PauseState::default());
+        pause.set_backpressure(true);
+        let submitter = Arc::new(FakeSubmitter::default());
+        for _ in 0..INFRA_PROBE_PAUSE_AFTER {
+            submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
+                engine_cancelled: true,
+                ..BatchOutcome::default()
+            }));
+        }
+        let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let (job_ledger, _budgets) =
+            ledger::JobLedger::from_journals((*state).clone(), watchdog).unwrap();
+        let job_ledger = Arc::new(job_ledger);
+        let jobs = ["a.x86_64-linux", "b.x86_64-linux", "c.x86_64-linux"];
+        let drv = |job: &str| format!("/nix/store/{}-{job}.drv", fake_hash(job));
+        let attemptable: Vec<batch::PendingJob> = jobs
+            .iter()
+            .map(|job| batch::PendingJob {
+                job: (*job).to_string(),
+                drv_path: drv(job),
+                dep_drvs: Vec::new(),
+            })
+            .collect();
+        let contexts: HashMap<String, JobContext> = jobs
+            .iter()
+            .map(|job| ((*job).to_string(), fold_ctx(job, &drv(job))))
+            .collect();
+        let backends = CollectBackends {
+            admin: Arc::new(NoLogsAdmin),
+            store: Arc::new(FakeStoreApi::default()),
+            artifacts: None,
+        };
+        let results: tokio::sync::Mutex<BTreeMap<String, JobRecord>> =
+            tokio::sync::Mutex::new(BTreeMap::new());
+        let mut processed: HashSet<u64> = HashSet::new();
+        let loop_handle = tokio::spawn(run_submit_loop(
+            state.clone(),
+            submitter.clone(),
+            job_ledger.clone(),
+            pause.clone(),
+            attemptable,
+            HashSet::new,
+            || false,
+            "ssh-ng://test".into(),
+            Knobs::default(),
+            Arc::new(AtomicU64::new(1)),
+            None,
+        ));
+
+        let mut ladder = InfraProbeLadder::new();
+        let mut escalated = false;
+        for _tick in 0..200 {
+            let concluded = match pause.probe_batch() {
+                Some((batch_id, probe_jobs)) if processed.contains(&batch_id) => {
+                    pause.clear_probe();
+                    let res = results.lock().await;
+                    Some(probe_jobs.iter().any(|job| {
+                        res.get(job).is_some_and(|r| {
+                            model::is_work_evidencing_terminal(&r.verdict, &r.disposition)
+                        })
+                    }))
+                }
+                _ => None,
+            };
+            let in_flight = job_ledger.tracker().in_flight.lock().await.len();
+            match ladder.on_tick(true, false, in_flight, !pause.probe_idle(), concluded) {
+                ProbeAction::Hold => {}
+                ProbeAction::Grant => pause.grant_probe(),
+                ProbeAction::EscalateToOperatorPause => {
+                    std::fs::write(state.path("PAUSE"), b"infra-rate canary probes exhausted\n")
+                        .unwrap();
+                    escalated = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            collect_pass_with(
+                &state,
+                &backends,
+                &contexts,
+                &job_ledger,
+                &results,
+                &mut processed,
+                &Knobs::default(),
+                "leaf",
+                "c-hang-probe",
+                None,
+                &no_supply_retirement(),
+            )
+            .await
+            .unwrap();
+            let mut res = results.lock().await;
+            *res = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        }
+        loop_handle.abort();
+        assert!(
+            escalated,
+            "hang-shaped probe cycles must escalate after {INFRA_PROBE_PAUSE_AFTER} failures"
+        );
+        assert!(state.path("PAUSE").exists());
+
+        // Every released batch was a single-job probe carrying the
+        // engine-cancelled bit.
+        let batches: Vec<model::BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
+        assert!(!batches.is_empty());
+        assert!(
+            batches
+                .iter()
+                .all(|b| b.probe && b.engine_cancelled && b.jobs.len() == 1),
+            "{batches:?}"
+        );
+
+        // The InfraProbe no-journal invariant holds for the
+        // engine-cancelled shape: nothing journaled, no resubmission
+        // counted, no engine-cancel cycle charged — the journal-backed
+        // bounds all fold from an empty journal on resume.
+        let journal: Vec<model::RequeueRecord> = state.load_jsonl(StateFile::Requeues).unwrap();
+        assert!(
+            journal.is_empty(),
+            "hang-shaped probe re-offers are never journaled: {journal:?}"
+        );
+        for job in &jobs {
+            assert_eq!(job_ledger.tracker().resubmission_count(job).await, 0);
+        }
+        let cancels = job_ledger.tracker().cancel_cycles.lock().await;
+        assert!(
+            cancels.values().all(|c| *c == 0),
+            "a probe's deadline cut must never consume the engine-cancel cycle budget: \
+             {cancels:?}"
+        );
+        drop(cancels);
+
+        // No spurious terminal: an exhausted engine-cancel budget would
+        // have minted a regression-tripping infra-indeterminate record
+        // here — which the scorer would then have read as probe SUCCESS,
+        // resetting the ladder instead of escalating.
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert!(
+            records.is_empty(),
+            "hang-shaped probe cycles must never terminalize the conscripted unit: {records:?}"
+        );
+    }
+
+    /// The ladder's closed loop under the UPLOADS-FAIL outage shape: the
+    /// supply journal carries settled FAILED rows for every candidate
+    /// unit's required source (the per-submission top-up settles such
+    /// rows while queries still work — S3-write outage, disk full), and
+    /// each probe submission itself settles empty. Before the rollup's
+    /// probe exemption this was the unbounded-retirement shape: the
+    /// batch-settle rollup retired the conscripted member with a
+    /// supply-failed exclusion BEFORE classification, the scorer read
+    /// that terminal record as probe success, the ladder reset — one
+    /// unit durably retired per cycle, forever, with the operator PAUSE
+    /// unreachable.
+    ///
+    /// Now: the probe is a sacrificial evidence vehicle — the rollup
+    /// skips probe batches, the cycle scores FAILED (no work-evidencing
+    /// record), and after INFRA_PROBE_PAUSE_AFTER cycles the operator
+    /// PAUSE lands with ZERO units retired, zero exclusion records,
+    /// zero journal entries, and zero resubmissions.
+    #[tokio::test(start_paused = true)]
+    async fn supply_failure_probe_cycles_escalate_without_retiring_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDir::new(dir.path()).unwrap());
+        let pause = Arc::new(model::PauseState::default());
+        pause.set_backpressure(true);
+        // Exhausted script: every probe submission settles
+        // Ok(BatchOutcome::default()) — no results, no build id (the
+        // upload outage starves the submission of everything).
+        let submitter = Arc::new(FakeSubmitter::default());
+        let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let (job_ledger, _budgets) =
+            ledger::JobLedger::from_journals((*state).clone(), watchdog).unwrap();
+        let job_ledger = Arc::new(job_ledger);
+        let jobs = ["a.x86_64-linux", "b.x86_64-linux", "c.x86_64-linux"];
+        let drv = |job: &str| format!("/nix/store/{}-{job}.drv", fake_hash(job));
+        // Every unit requires the same source path, and the top-up has
+        // already settled it FAILED on an upload mechanism — the
+        // retiring shape for the rollup's attempt floor of 1.
+        let failed_src = format!("/nix/store/{}-shared-src", "e".repeat(32));
+        state
+            .append_jsonl(
+                StateFile::Supply,
+                &SupplyEntry {
+                    path: failed_src.clone(),
+                    source: model::SUPPLY_SOURCE_EMBEDDED.to_string(),
+                    mechanism: model::SUPPLY_MECHANISM_UPLOAD_BATCH.to_string(),
+                    outcome: model::SUPPLY_OUTCOME_FAILED.to_string(),
+                    detail: None,
+                    batch_id: Some(1),
+                    bytes: None,
+                    observed_at: now_rfc3339(),
+                },
+            )
+            .unwrap();
+        let supply_inputs = SupplyRetirementInputs {
+            manifest: Arc::new(
+                jobs.iter()
+                    .map(|job| archive_input::ManifestEntry {
+                        job: (*job).to_string(),
+                        system: "x86_64-linux".into(),
+                        attr: String::new(),
+                        drv_path: drv(job),
+                        outputs: BTreeMap::new(),
+                        required_features: Vec::new(),
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            dep_closure: Arc::new(
+                jobs.iter()
+                    .map(|job| archive_input::DepClosureEntry {
+                        job: (*job).to_string(),
+                        drv_path: drv(job),
+                        deps: Vec::new(),
+                        srcs: vec![failed_src.clone()],
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            plan_dispositions: Arc::new(BTreeMap::new()),
+        };
+        let attemptable: Vec<batch::PendingJob> = jobs
+            .iter()
+            .map(|job| batch::PendingJob {
+                job: (*job).to_string(),
+                drv_path: drv(job),
+                dep_drvs: Vec::new(),
+            })
+            .collect();
+        let contexts: HashMap<String, JobContext> = jobs
+            .iter()
+            .map(|job| ((*job).to_string(), fold_ctx(job, &drv(job))))
+            .collect();
+        let backends = CollectBackends {
+            admin: Arc::new(NoLogsAdmin),
+            store: Arc::new(FakeStoreApi::default()),
+            artifacts: None,
+        };
+        let results: tokio::sync::Mutex<BTreeMap<String, JobRecord>> =
+            tokio::sync::Mutex::new(BTreeMap::new());
+        let mut processed: HashSet<u64> = HashSet::new();
+        let loop_handle = tokio::spawn(run_submit_loop(
+            state.clone(),
+            submitter.clone(),
+            job_ledger.clone(),
+            pause.clone(),
+            attemptable,
+            HashSet::new,
+            || false,
+            "ssh-ng://test".into(),
+            Knobs::default(),
+            Arc::new(AtomicU64::new(1)),
+            None,
+        ));
+
+        let mut ladder = InfraProbeLadder::new();
+        let mut escalated = false;
+        for _tick in 0..200 {
+            let concluded = match pause.probe_batch() {
+                Some((batch_id, probe_jobs)) if processed.contains(&batch_id) => {
+                    pause.clear_probe();
+                    let res = results.lock().await;
+                    Some(probe_jobs.iter().any(|job| {
+                        res.get(job).is_some_and(|r| {
+                            model::is_work_evidencing_terminal(&r.verdict, &r.disposition)
+                        })
+                    }))
+                }
+                _ => None,
+            };
+            let in_flight = job_ledger.tracker().in_flight.lock().await.len();
+            match ladder.on_tick(true, false, in_flight, !pause.probe_idle(), concluded) {
+                ProbeAction::Hold => {}
+                ProbeAction::Grant => pause.grant_probe(),
+                ProbeAction::EscalateToOperatorPause => {
+                    std::fs::write(state.path("PAUSE"), b"infra-rate canary probes exhausted\n")
+                        .unwrap();
+                    escalated = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            collect_pass_with(
+                &state,
+                &backends,
+                &contexts,
+                &job_ledger,
+                &results,
+                &mut processed,
+                &Knobs::default(),
+                "leaf",
+                "c-supply-probe",
+                None,
+                &supply_inputs,
+            )
+            .await
+            .unwrap();
+            let mut res = results.lock().await;
+            *res = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        }
+        loop_handle.abort();
+        assert!(
+            escalated,
+            "supply-failure probe cycles must escalate after {INFRA_PROBE_PAUSE_AFTER} \
+             failures (a retired-and-scored unit would reset the ladder forever)"
+        );
+        assert!(state.path("PAUSE").exists());
+
+        // ZERO retirement: the probe exemption means the outage retires
+        // nothing — no exclusion records, no terminal of any kind.
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert!(
+            records.is_empty(),
+            "the rollup must never retire a probe batch's member: {records:?}"
+        );
+        // And the probe budget invariants hold as in every other shape.
+        let journal: Vec<model::RequeueRecord> = state.load_jsonl(StateFile::Requeues).unwrap();
+        assert!(journal.is_empty(), "{journal:?}");
+        for job in &jobs {
+            assert_eq!(job_ledger.tracker().resubmission_count(job).await, 0);
+        }
+        let batches: Vec<model::BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
+        assert!(
+            batches.iter().all(|b| b.probe && b.jobs.len() == 1),
+            "{batches:?}"
         );
     }
 
