@@ -131,8 +131,11 @@ let
   #   import then dies against the partition and terminalizes.
   # batch_timeout_hours=0.012 (43s) > active_stall_hours=0.011 (40s):
   #   validation-ordered; bounds how long the partition-caught batch
-  #   lives. Post-partition submissions never get that far — their
-  #   imports die at op_timeout_secs=8 against the dropped wire.
+  #   lives (engine-cancel at the deadline). Post-partition submissions
+  #   die FASTER, at the transport's own 30s channel-setup budget
+  #   (daemon session exec+handshake against the dropped wire), as an
+  #   Err settle — op_timeout_secs=8 covers the in-channel ops behind
+  #   it. Outage cadence is therefore ~30s per failed batch.
   # infra_pause_pct=25 (default): 16 infra terminals over a 20-record
   #   window is 80%, comfortably across.
   ladderKnobs = {
