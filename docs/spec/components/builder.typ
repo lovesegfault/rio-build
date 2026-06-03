@@ -167,6 +167,29 @@ multi-ABI seccomp filter already admits the 32-bit syscall ABI.
   via the FUSE fetch path.
 ]
 
+#r("builder.nar.restore-bounds")[
+  NAR materialization bounds MUST be kernel-equivalent and typed: entry
+  names are bounded at parse to 255 bytes (Linux `NAME_MAX`) and the
+  RESTORED path --- destination root plus every joined component --- is
+  bounded at the join to 4095 bytes (`PATH_MAX - 1`), each rejection a
+  typed `NarError`, never a deferred syscall errno.
+]
+
+This is a registered divergence from the oracle, which has no
+parse-time bounds (the kernel itself rejects at materialization with
+`ENAMETOOLONG`). Rio rejects earlier because its in-process fetch
+retry ladder classifies failures by their producing statement: a
+payload that deterministically cannot be materialized must surface as
+a typed payload property (permanent for the candidate), not as an
+errno-bearing `io::Error` indistinguishable from a worker-local disk
+fault --- under the pre-bound shape such payloads re-entered the
+transient retry ladder and re-downloaded the full body per attempt
+(round-17 merged_bug_022; up to 5 attempts × the per-attempt transfer
+cap of payload movement). Per-component bounds alone do not compose:
+255-byte names at the allowed nesting depth join to a ~64 KiB path
+that every syscall rejects, hence the cumulative bound at the joined
+path, where it is first known.
+
 #r("builder.nar.canonical-mtime")[
   Regular files and directories restored from a NAR MUST have their
   modification time set to the canonical Nix store-path value of one second

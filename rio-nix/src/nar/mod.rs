@@ -53,8 +53,19 @@ pub(super) const NAR_MAGIC: &str = "nix-archive-1";
 /// not parsed into memory — this limit is intentionally conservative.
 pub(super) const MAX_CONTENT_SIZE: u64 = 256 * 1024 * 1024;
 
-/// Maximum allowed NAR entry name length.
-pub(super) const MAX_NAME_LEN: u64 = 256;
+/// Maximum allowed NAR entry name length: the Linux kernel's
+/// `NAME_MAX`. A 256-byte name parses but CANNOT be materialized — the
+/// `create`/`mkdir` syscall deterministically fails `ENAMETOOLONG`,
+/// which an errno-classifying retry ladder mistakes for a worker-local
+/// fault and re-downloads the payload on every attempt (round-17
+/// merged_bug_022). Bounding at parse converts the
+/// payload-deterministic failure into a typed reject. Registered
+/// divergence (`builder.nar.restore-bounds`): the oracle has no
+/// parse-time name bound — the kernel rejects at materialization; rio
+/// rejects at parse because its in-process retry ladder must classify
+/// payload-determinism without errno guessing.
+// r[impl builder.nar.restore-bounds]
+pub(super) const MAX_NAME_LEN: u64 = 255;
 
 /// Maximum allowed symlink target length.
 pub(super) const MAX_TARGET_LEN: u64 = 4096;
@@ -68,6 +79,17 @@ pub(super) const MAX_NAR_DEPTH: usize = 256;
 
 /// Maximum number of directory entries (DoS prevention for unbounded allocation).
 pub(super) const MAX_DIRECTORY_ENTRIES: usize = 1_048_576;
+
+/// Maximum byte length of a RESTORED path (destination root + every
+/// joined entry name): the kernel's `PATH_MAX - 1`. Per-component
+/// bounds alone do not imply a bounded path — 255-byte names at the
+/// allowed nesting depth compose to ~64 KiB, which every syscall
+/// rejects `ENAMETOOLONG` only after the payload was fully downloaded
+/// (round-17 merged_bug_022). Checked at [`fs::restore_node`] entry,
+/// where the joined path is first known; same registered-divergence
+/// rationale as [`MAX_NAME_LEN`].
+// r[impl builder.nar.restore-bounds]
+pub(super) const MAX_RESTORE_PATH_LEN: usize = 4095;
 
 /// Errors from NAR operations.
 #[derive(Debug, Error)]
@@ -107,6 +129,11 @@ pub enum NarError {
 
     #[error("directory nesting depth {0} exceeds maximum {MAX_NAR_DEPTH}")]
     NestingTooDeep(usize),
+
+    #[error(
+        "restored path would be {len} bytes (max {MAX_RESTORE_PATH_LEN}, the kernel's PATH_MAX - 1)"
+    )]
+    RestorePathTooLong { len: usize },
 
     #[error("file {0:?} has an unsupported type (not regular/symlink/directory)")]
     UnsupportedFileType(std::path::PathBuf),
