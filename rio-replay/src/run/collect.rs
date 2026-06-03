@@ -6382,21 +6382,34 @@ mod tests {
     fn engine_cancelled_batch_requeues_members_without_results() {
         let knobs = Knobs::default();
         let no_poison: HashMap<String, Vec<String>> = HashMap::new();
-        for (case, build_id, expected_why) in [
+        for (case, build_id, results, expected_why) in [
             (
                 "announced (build id observed before the cut)",
                 Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+                vec![],
+                "engine-cancelled-announced",
+            ),
+            (
+                // The acknowledgment disjunction's other producer: no
+                // build id was captured, but a batch-mate's in-band
+                // result proves the cluster saw the submission — the
+                // member without a result still rides the announced
+                // vocabulary, mirroring `cluster_acknowledged`.
+                "announced (batch-mate results, no build id)",
+                None,
+                vec![po(OTHER, BuildStatus::Built, "")],
                 "engine-cancelled-announced",
             ),
             (
                 "fully cancelled (cut before any acknowledgment)",
                 None,
+                vec![],
                 "engine-cancelled",
             ),
         ] {
             let batch = BatchView {
                 build_id,
-                results: vec![],
+                results,
                 engine_cancelled: true,
                 ..BatchView::default()
             };

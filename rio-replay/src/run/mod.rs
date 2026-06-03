@@ -9904,9 +9904,9 @@ mod tests {
         // dispatcher re-enters with nothing pending.
         run_with_backends(
             run_args(state_dir.path()),
-            spec,
+            spec.clone(),
             StateDir::new(state_dir.path()).unwrap(),
-            archive,
+            archive.clone(),
             backends(),
         )
         .await
@@ -9934,6 +9934,34 @@ mod tests {
                 .any(|flag| flag == report::FLAG_TIMING_DEGRADED),
             "{:?}",
             campaign.comparability.low_confidence
+        );
+
+        // The remaining cell of the write-site lattice: resumed, nothing
+        // pending, and NO artifact (a crash in the window between
+        // schedule drain and the first stats write). The write must
+        // happen — the report needs a timed summary — but its zeros
+        // describe none of the campaign's dispatches, so the artifact
+        // must DISCLOSE with timing_degraded rather than present
+        // fabricated 0ms percentiles as faithful cadence.
+        std::fs::remove_file(state_dir.path().join("timed-stats.json")).unwrap();
+        run_with_backends(
+            run_args(state_dir.path()),
+            spec,
+            StateDir::new(state_dir.path()).unwrap(),
+            archive,
+            backends(),
+        )
+        .await
+        .unwrap();
+        let rebuilt: timeline::TimedRunStats = state
+            .read_json("timed-stats.json")
+            .unwrap()
+            .expect("the no-artifact resume rewrites the summary");
+        assert_eq!(rebuilt.dispatched, 0, "nothing was pending to dispatch");
+        assert!(
+            rebuilt.timing_degraded,
+            "zeros that describe no campaign dispatches must be disclosed, never \
+             presented as faithful cadence: {rebuilt:?}"
         );
     }
 
