@@ -119,11 +119,14 @@ pub(super) async fn log_seed(pool: &PgPool, exec_id: Uuid) -> Result<(u64, u32),
 ///    open a stream claiming to write derivation B's log.
 /// 3. **Claimed-exec authority**: the claimed `exec_id` must be a
 ///    recorded assignment attempt of this derivation, assigned to
-///    `claims.executor_id`, whose execution kind is `build`. The
-///    builder's OWN superseded attempt stays writable (the
-///    post-completion late replay; containment is exec-keyed chunks +
-///    the durable caps + the `final_line_count` ceiling) — but another
-///    executor's execution, an in-place-rewritten attempt, and any
+///    `claims.executor_id`, whose execution lifecycle row EXISTS with
+///    kind `build` (the mint writes assignment + lifecycle row in one
+///    transaction, so a missing row is never a live appender — it is
+///    denied, never defaulted). The builder's OWN superseded attempt
+///    stays writable (the post-completion late replay; containment is
+///    exec-keyed chunks + the durable caps + the `final_line_count`
+///    ceiling) — but another executor's execution, an
+///    in-place-rewritten attempt, a row-less assignment, and any
 ///    materialization-kind execution are rejected.
 /// 4. **Completeness (the seal)**: a log whose execution is terminal,
 ///    whose `final_line_count` is known, and whose chunk manifest
@@ -195,12 +198,24 @@ pub async fn check_append_open(
     // `cargo xtask` build to a live PG (xtask transitively builds this
     // crate; the regen chicken-and-egg recorded in the wave log) — the
     // contract test is the cross-service guarantee either way.
+    //
+    // INNER JOIN on drv_executions, deliberately: the mint writes the
+    // assignment and its lifecycle row in ONE transaction
+    // (`mint_pull_attempt_fenced`), so every legitimate appender's row
+    // exists before its token can be presented. An assignments row
+    // whose execution row is absent (a post-sweep lingering assignment,
+    // or a claim fabricated around the mint) therefore yields no row
+    // here and falls into the `superseded` rejection below — absence
+    // denies. The first cut of this gate used `LEFT JOIN +
+    // COALESCE(e.attempt_kind, 'build')`, which defaulted a MISSING
+    // row to the authorized kind: absence-as-verdict in an
+    // authorization predicate (security review, 2026-06-03).
     // r[impl store.log.read-authority]
     let claimed: Option<(String, String)> = sqlx::query_as(
-        "SELECT a.builder_id, COALESCE(e.attempt_kind, 'build') \
+        "SELECT a.builder_id, e.attempt_kind \
          FROM assignments a \
          JOIN derivations d USING (derivation_id) \
-         LEFT JOIN drv_executions e ON e.exec_id = a.exec_id \
+         JOIN drv_executions e ON e.exec_id = a.exec_id \
          WHERE d.drv_hash = $1 AND a.exec_id = $2",
     )
     .bind(&claims.drv_hash)
@@ -211,9 +226,10 @@ pub async fn check_append_open(
 
     let Some((claimed_builder, claimed_kind)) = claimed else {
         // No assignment attempt of this derivation ever carried the
-        // claimed exec_id (or the row was rewritten in place). Distinct
-        // from "wrong executor" only in the message; both are the
-        // permanent `superseded` class for the uploader.
+        // claimed exec_id, the row was rewritten in place, or the
+        // execution lifecycle row is missing (the kind cannot be
+        // verified — absence is not authorization). Distinct cases,
+        // one disposition: the permanent `superseded` class.
         return Err(reject_permanent(
             "superseded",
             "AppendLog: the claimed execution is not a recorded assignment \
@@ -518,7 +534,17 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let exec = Uuid::now_v7();
         let d = seed_derivation(&db.pool, DRV).await;
+        // Production's mint writes both rows in one transaction; the
+        // fixture mirrors it (the gate now REQUIRES the lifecycle row).
         seed_assignment(&db.pool, d, "builder-0", exec, "acknowledged", 0.0).await;
+        seed_execution(
+            &db.pool,
+            exec,
+            "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm",
+            None,
+            None,
+        )
+        .await;
 
         let ok = check_append_open(
             &db.pool,
@@ -531,8 +557,8 @@ mod tests {
         assert_eq!(ok.exec_id, exec);
         // The normalized 32-char form, ready for chunk-key construction.
         assert_eq!(ok.drv_hash, "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm");
-        // No drv_executions row at all (let alone a terminal one): the
-        // session has no append ceiling yet.
+        // A non-terminal execution row: the session has no append
+        // ceiling yet.
         assert_eq!(ok.final_line_count, None);
     }
 
@@ -570,6 +596,17 @@ mod tests {
         let d = seed_derivation(&db.pool, DRV).await;
         seed_assignment(&db.pool, d, "builder-0", old_exec, "failed", 60.0).await;
         seed_assignment(&db.pool, d, "builder-1", new_exec, "acknowledged", 0.0).await;
+        // The lifecycle row exists (as production guarantees), so the
+        // rejection below is the WRONG-EXECUTOR arm, not the missing-row
+        // arm.
+        seed_execution(
+            &db.pool,
+            new_exec,
+            "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm",
+            None,
+            None,
+        )
+        .await;
 
         // builder-0 claiming builder-1's execution: rejected — the only
         // executor with write authority over an exec is the one it was
@@ -602,6 +639,14 @@ mod tests {
         let new_exec = Uuid::now_v7();
         let d = seed_derivation(&db.pool, DRV).await;
         seed_assignment(&db.pool, d, "builder-0", old_exec, "failed", 60.0).await;
+        seed_execution(
+            &db.pool,
+            old_exec,
+            "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm",
+            None,
+            None,
+        )
+        .await;
         seed_assignment(&db.pool, d, "builder-1", new_exec, "acknowledged", 0.0).await;
 
         let ok = check_append_open(
@@ -659,6 +704,42 @@ mod tests {
     }
 
     // r[verify store.log.read-authority]
+    /// Absence-as-verdict (security review, 2026-06-03): an assignments
+    /// row whose `drv_executions` row is MISSING must be rejected, not
+    /// defaulted to the authorized `build` kind. The mint writes both
+    /// rows in one transaction (`mint_pull_attempt_fenced`), so a
+    /// missing lifecycle row is never a live appender — it is a
+    /// post-sweep lingering assignment or a hand-crafted claim, and the
+    /// gate is an authorization predicate: absence denies.
+    #[tokio::test]
+    async fn rejects_assignment_without_execution_row() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let exec = Uuid::now_v7();
+        let d = seed_derivation(&db.pool, DRV).await;
+        // Assignment row only — NO drv_executions row.
+        seed_assignment(&db.pool, d, "builder-0", exec, "acknowledged", 0.0).await;
+
+        let err = check_append_open(
+            &db.pool,
+            &claims("builder-0", DRV),
+            &header(DRV_PATH, exec),
+            caps(),
+        )
+        .await
+        .expect_err(
+            "an assignment with no execution lifecycle row must be denied: \
+             the kind cannot be verified, and absence is not authorization",
+        );
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+        assert_eq!(
+            err.metadata()
+                .get(rio_proto::LOG_REJECT_METADATA_KEY)
+                .unwrap(),
+            "superseded"
+        );
+    }
+
+    // r[verify store.log.read-authority]
     #[tokio::test]
     async fn gate_rejects_materialization_exec_as_append_target() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -701,6 +782,14 @@ mod tests {
         let exec = Uuid::now_v7();
         let d = seed_derivation(&db.pool, DRV).await;
         seed_assignment(&db.pool, d, "builder-0", exec, "acknowledged", 0.0).await;
+        seed_execution(
+            &db.pool,
+            exec,
+            "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm",
+            None,
+            None,
+        )
+        .await;
         // One committed chunk holding 2 GiB of accounted bytes — over
         // the 1 GiB default cap.
         sqlx::query(
@@ -739,6 +828,14 @@ mod tests {
         let exec = Uuid::now_v7();
         let d = seed_derivation(&db.pool, DRV).await;
         seed_assignment(&db.pool, d, "builder-0", exec, "acknowledged", 0.0).await;
+        seed_execution(
+            &db.pool,
+            exec,
+            "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm",
+            None,
+            None,
+        )
+        .await;
         for seq in 0..3 {
             seed_chunk(&db.pool, exec, seq, i64::from(seq) * 5, 5).await;
         }

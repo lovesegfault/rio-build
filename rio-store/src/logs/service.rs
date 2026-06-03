@@ -2042,6 +2042,18 @@ mod tests {
             .execute(&h.db.pool)
             .await
             .unwrap();
+            // The lifecycle row, as production's atomic mint guarantees —
+            // without it the authority gate (which runs before the count
+            // cap) rejects and the test would assert the wrong arm.
+            sqlx::query(
+                "INSERT INTO drv_executions (exec_id, drv_hash, executor_id, started_at) \
+                 VALUES ($1, $2, 'builder-1', now())",
+            )
+            .bind(e)
+            .bind(rio_nix::store_path::drv_log_hash(other_drv))
+            .execute(&h.db.pool)
+            .await
+            .unwrap();
             e
         };
         let tok2 = token("builder-1", other_drv);
