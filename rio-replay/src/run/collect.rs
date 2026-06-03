@@ -16,7 +16,13 @@
 //! the doubt. A dependency-failed root is re-attributed through its own
 //! dependency closure: a failing drv inside the closure is a real blocked
 //! dependency, while a failing drv outside it means the job was merely a
-//! fail-fast batch-mate and is re-queued.
+//! fail-fast batch-mate and is re-queued. A failed root whose row carries
+//! only the scheduler's DAG-level fail-fast summary (no per-root event was
+//! ever emitted for it) recovers its trigger from OUTSIDE the row: the
+//! poison snapshot intersected with the job's dependency closure — a
+//! poisoned fixed-output member with recorded worker failures reroutes the
+//! row through the cascaded source-rot classification instead of charging
+//! the rotted dependency's fan-out to the parity headline.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -49,8 +55,9 @@ pub struct JobContext {
     pub drv_path: String,
     /// Output name → store path (from the archive's unit record).
     pub outputs: BTreeMap<String, String>,
-    /// Dependency drv closure (from the archive's closure records) — used for the
-    /// fail-fast re-attribution rule.
+    /// Dependency drv closure (from the archive's closure records) — used
+    /// for the fail-fast re-attribution rule and for the out-of-row
+    /// trigger recovery of DAG-fallback blanket rows.
     pub dep_drvs: HashSet<String>,
     pub expected_outcome: ExpectedOutcome,
     pub expected_outputs: BTreeMap<String, super::model::ExpectedOutput>,
@@ -278,6 +285,132 @@ fn fetch_signature_present(text: &str) -> bool {
     FETCH_NEEDLES.iter().any(|n| text.contains(n))
 }
 
+/// Whether `text` is the scheduler's build-level fail-fast summary — the
+/// DAG-fallback blanket a root's in-band result carries when NO per-root
+/// terminal event was ever emitted for it.
+///
+/// Producer shape, matched exactly: the scheduler records the build's
+/// first failure as `derivation {hash}-{name}.drv failed` over the failing
+/// node's hash-name key (`rio-scheduler/src/actor/completion.rs`,
+/// `handle_derivation_failure`) and emits it as the `BuildFailed` message;
+/// the gateway clones that DAG-level result onto every requested root
+/// without a recorded terminal of its own
+/// (`rio-gateway/src/handler/build.rs`, `root_evidence` /
+/// `per_root_verdict` — "Unverified blanket failure stands"). The
+/// interpolated key is a bare 32-char lowercase nix hash, `-`, the name,
+/// `.drv` — never quoted, never a `/nix/store/` path, and never followed
+/// by a `: <reason>` tail — which distinguishes it from the gateway's
+/// per-derivation relay lines (`derivation '<path>' failed: <reason>`)
+/// and from every worker/scheduler reason in the relayed vocabulary.
+fn is_dag_fallback_blanket(text: &str) -> bool {
+    let Some(node) = text
+        .trim()
+        .strip_prefix("derivation ")
+        .and_then(|rest| rest.strip_suffix(" failed"))
+    else {
+        return false;
+    };
+    let bytes = node.as_bytes();
+    bytes.len() > 33
+        && bytes[..32]
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && bytes[32] == b'-'
+        && node.ends_with(".drv")
+        && !node.contains([' ', '\'', ':'])
+}
+
+/// A cascade trigger recovered from OUTSIDE a failed row: the
+/// intersection of the batch's poison snapshot with the job's own
+/// dependency closure (target included), restricted to fixed-output
+/// derivations with recorded worker failures. See the DAG-fallback
+/// blanket arm in [`decide`] for why the row itself cannot name the
+/// trigger.
+#[derive(Debug)]
+struct RecoveredPoisonTrigger {
+    /// The deterministically picked trigger: the target itself when its
+    /// own poison row qualifies (its rot fully explains the fail-fast
+    /// and is no cascade), otherwise the first qualifying closure member
+    /// in path order. The archive's closure set carries no topological
+    /// order, so lexicographic path order is the deterministic stand-in.
+    trigger: String,
+    /// EVERY qualifying (drv, failed executors) pair, sorted by path —
+    /// all of them are recorded as evidence so a closure with several
+    /// rotted fixed-output members stays auditable whichever one the
+    /// pick names.
+    candidates: Vec<(String, Vec<String>)>,
+}
+
+impl RecoveredPoisonTrigger {
+    /// The terminal record's evidence: the recovery method and the full
+    /// poison rows it matched, so the record explains both WHY the row
+    /// was rerouted (its in-band text was the scheduler's DAG-level
+    /// fail-fast summary, which proves nothing about this root) and on
+    /// WHAT evidence (the poison rows, executors included).
+    fn evidence(&self) -> String {
+        let rows = self
+            .candidates
+            .iter()
+            .map(|(drv, executors)| format!("'{drv}' (failed executors: {})", executors.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "trigger recovered outside the row: the in-band reason is the scheduler's \
+             DAG-level fail-fast summary, and the poison snapshot intersected with this \
+             job's dependency closure names poisoned fixed-output {rows}; attributed to \
+             '{}'",
+            self.trigger
+        )
+    }
+}
+
+/// Recover the cascade trigger for a DAG-fallback blanket row from the
+/// batch's poison snapshot: the poisoned fixed-output members of the
+/// job's own dependency closure (or the target itself), each with at
+/// least one recorded worker failure.
+///
+/// Each gate is load-bearing for the conservative direction — the
+/// recovery may only ever EXCLUDE a root that provably never got an
+/// attributable attempt, never hide a failure rio executed:
+///
+/// - **fixed-output membership**: a poisoned NON-fixed-output closure
+///   member proves a dependency kept failing, but not that an upstream
+///   origin rotted — rerouting on it could excuse a real rio regression
+///   in that dependency, so such rows keep the genuine headline charge.
+/// - **worker-failure evidence** (non-empty executor list): an empty
+///   list is the scheduler's infra-poisoning shape (poison recorded
+///   without any worker failing the node — infra never inserts into
+///   `failed_builders`), which says nothing about the upstream origin.
+/// - **closure membership** (the job's own `dep_drvs`, target included):
+///   the DAG-level summary is build-wide and may name a batch-mate's
+///   trigger, so only this job's own dependency facts can justify
+///   rerouting THIS row.
+fn recover_poisoned_fod_trigger(
+    ctx: &JobContext,
+    poisoned: &HashMap<String, Vec<String>>,
+) -> Option<RecoveredPoisonTrigger> {
+    let mut candidates: Vec<(String, Vec<String>)> = poisoned
+        .iter()
+        .filter(|(drv, executors)| {
+            !executors.is_empty()
+                && ctx.fixed_output_drvs.contains(drv.as_str())
+                && (ctx.dep_drvs.contains(drv.as_str()) || **drv == ctx.drv_path)
+        })
+        .map(|(drv, executors)| (drv.clone(), executors.clone()))
+        .collect();
+    candidates.sort();
+    let trigger = candidates
+        .iter()
+        .find(|(drv, _)| *drv == ctx.drv_path)
+        .or_else(|| candidates.first())?
+        .0
+        .clone();
+    Some(RecoveredPoisonTrigger {
+        trigger,
+        candidates,
+    })
+}
+
 /// Failure-kind resolution from the two signals (+ fixed-output knowledge
 /// and a log tail). Ambiguous or contradictory evidence defaults to
 /// [`FailureKind::Genuine`] — an unexplained failure is charged to rio,
@@ -462,6 +595,12 @@ pub fn timed_interruption_for(
 /// the TRIGGER's log tail for a dependency-failed row whose fixed-output
 /// trigger failed in an earlier batch (cross-batch cascade attribution) —
 /// the two gates are disjoint, so the channel is unambiguous per row.
+///
+/// A failure row whose Signal-1 text is the scheduler's DAG-level
+/// fail-fast summary (`is_dag_fallback_blanket` — the gateway's per-root
+/// fallback when no per-root event was ever emitted) recovers its
+/// trigger from OUTSIDE the row before the two-signal rule runs: see
+/// `recover_poisoned_fod_trigger` and the blanket arm below.
 pub fn decide(
     ctx: &JobContext,
     target: Option<&PathOutcome>,
@@ -661,6 +800,46 @@ pub fn decide(
             },
             evidence,
         };
+    }
+    // DAG-fallback blanket recovery — the trigger comes from OUTSIDE the
+    // row. A root whose dependency was already terminally failed when its
+    // batch merged (e.g. a fixed-output derivation still poisoned past the
+    // scheduler's resubmit-reset budget) is fail-fasted at merge seeding,
+    // which emits NO per-root event; the gateway then falls back to the
+    // DAG-level result, so the row arrives here as the scheduler's
+    // build-level summary "derivation <hash>-<name>.drv failed" —
+    // Target-classified, no trigger reference, no fetch needle — and would
+    // otherwise land Genuine, charging a rotted dependency's whole
+    // late-campaign fan-out to the parity headline through a door that
+    // never reaches the dependency-failed cascade arm above. For exactly
+    // that row shape, the batch's poison snapshot intersected with this
+    // job's own dependency closure recovers the trigger: a poisoned
+    // fixed-output member with recorded worker failures is the sticky-rot
+    // signature, and the row reroutes through the cascade source-rot
+    // classification with the poison rows as evidence (design §7.1:
+    // source-unavailable covers "the unit (or a dependency, with
+    // cascaded: true)"). Rows carrying any other text — a worker's own
+    // builder error, scheduler retry/poison vocabulary, a dependency
+    // shape — never take this path: their in-row evidence outranks
+    // out-of-row recovery, so a still-live poison row can never excuse a
+    // failure rio actually executed.
+    if signal1.is_some_and(is_dag_fallback_blanket)
+        && let Some(recovered) = recover_poisoned_fod_trigger(ctx, poisoned)
+    {
+        let evidence = Some(recovered.evidence());
+        let rio = if recovered.trigger == ctx.drv_path {
+            // The target itself is the sticky-poisoned fixed-output
+            // derivation: its own upstream rotted; not a cascade.
+            RioOutcome::TargetFailed {
+                kind: FailureKind::SourceRot,
+            }
+        } else {
+            RioOutcome::DependencyFailed {
+                root: RootCauseKind::SourceRot,
+                failing_drv: recovered.trigger,
+            }
+        };
+        return CollectDecision::Terminal { rio, evidence };
     }
     // Every other failure status (PermanentFailure, TransientFailure,
     // TimedOut, MiscFailure, CachedFailure, LogLimitExceeded,
@@ -2451,6 +2630,508 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].verdict.as_deref(), Some("source-unavailable"));
         assert!(records[0].cascaded, "cascaded dependent must be flagged");
+    }
+
+    /// The DAG-fallback blanket detector admits exactly the scheduler's
+    /// build-level first-failure summary and nothing else from the
+    /// failure vocabulary.
+    ///
+    /// Producer contract: `rio-scheduler/src/actor/completion.rs`
+    /// `handle_derivation_failure` records `error_summary =
+    /// "derivation {hash}-{name}.drv failed"` over the failing node's
+    /// hash-name key (NOT a store path), and the gateway's DAG fallback
+    /// relays it verbatim as the per-root result for roots without their
+    /// own terminal (`rio-gateway/src/handler/build.rs` `root_evidence` /
+    /// `per_root_verdict`).
+    #[test]
+    fn dag_fallback_blanket_detector_is_producer_exact() {
+        use crate::run::stderrparse::scheduler_reason_corpus;
+        // Producer-verbatim positive: the scheduler's format string
+        // applied to the trigger's hash-name key.
+        let blanket = format!(
+            "derivation {} failed",
+            DEP.trim_start_matches("/nix/store/")
+        );
+        assert!(is_dag_fallback_blanket(&blanket), "{blanket:?}");
+        // Must-block: every other failure shape the engine can see.
+        let relay_line = format!("derivation '{DEP}' failed: builder failed with exit code 2");
+        let cascade_line = format!(
+            "dependency '{DEP}' failed: poison threshold reached after 3 distinct-worker \
+             failures"
+        );
+        let store_path_interpolation = format!("derivation {DEP} failed");
+        let trailing_reason = format!(
+            "derivation {} failed: boom",
+            DEP.trim_start_matches("/nix/store/")
+        );
+        for not_blanket in [
+            // The gateway's per-derivation relay line: quoted full path
+            // plus a `: <reason>` tail.
+            relay_line.as_str(),
+            // The scheduler's cascade shape.
+            cascade_line.as_str(),
+            // Worker text that merely mentions a derivation failing.
+            "builder failed with exit code 2: derivation x failed",
+            // No hash-name key: bare name, or hash without `.drv`.
+            "derivation foo.drv failed",
+            "derivation bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep failed",
+            // A store path is not the producer's interpolation.
+            store_path_interpolation.as_str(),
+            // A reason tail disqualifies even a real key.
+            trailing_reason.as_str(),
+            "",
+        ] {
+            assert!(!is_dag_fallback_blanket(not_blanket), "{not_blanket:?}");
+        }
+        // The blanket is not part of the relayed-reason vocabulary: no
+        // corpus string may match (the corpus is the same one that pins
+        // `classify_reason`'s totality).
+        for (reason, _) in scheduler_reason_corpus() {
+            assert!(!is_dag_fallback_blanket(reason), "{reason}");
+        }
+    }
+
+    /// THE failed-row shape lattice against poison evidence: every row
+    /// shape the gateway can deliver for one failed root, crossed with
+    /// the scheduler's poison snapshot, with the contracted
+    /// classification asserted for each cell in both directions.
+    ///
+    /// QUANTIFICATION DOMAIN (the shapes, enumerated as data below): the
+    /// per-root failure rows the gateway's single evidence-derivation
+    /// site can produce (`rio-gateway/src/handler/build.rs`
+    /// `root_evidence`: the root's own recorded terminal verbatim,
+    /// otherwise the DAG-level result — `per_root_verdict`'s "Unverified
+    /// blanket failure stands"), fed by the scheduler's terminal emission
+    /// sites (`rio-scheduler/src/actor/completion.rs`: the failing node's
+    /// own Failed event embedding the daemon's last-N-log-lines text, and
+    /// the cascade's `dependency '<drv>' failed: <text>` events;
+    /// `rio-scheduler/src/actor/build.rs` `transition_build_to_failed`:
+    /// the build-level `derivation <hash>-<name>.drv failed` summary —
+    /// the ONLY text for a root fail-fasted eventlessly at merge seeding,
+    /// `rio-scheduler/src/actor/merge.rs` `seed_initial_states`):
+    ///
+    /// 1. own-terminal DependencyFailed, same batch — the dependent's own
+    ///    message embeds the trigger's complete failure text.
+    /// 2. own-terminal DependencyFailed, cross batch — the trigger failed
+    ///    in an earlier batch; the dependent's message wraps the
+    ///    needle-free poison reason and the collector fetches the
+    ///    TRIGGER's log tail (fetch wiring proven by
+    ///    `cross_batch_fixed_output_cascade_fetches_trigger_log`).
+    /// 3. DAG-fallback blanket — no per-root event exists; the row is the
+    ///    scheduler's build-level summary with no in-row trigger
+    ///    evidence at all.
+    /// 4. generic failure — the root's OWN builder text: proof the root
+    ///    itself executed.
+    ///
+    /// Cell contracts (design §7.1: source-unavailable is "the unit (or a
+    /// dependency, with `cascaded: true`) failed only because a
+    /// fixed-output input could not be fetched from its upstream origin";
+    /// the genuine default is the module's charged-to-rio stance):
+    ///
+    /// - Must-admit: shapes 1-3 with the rotted fixed-output trigger
+    ///   poisoned in the job's closure classify cascaded source-rot —
+    ///   each through the evidence channel production fills for that
+    ///   shape (needle-bearing text for 1-2, the out-of-row poison
+    ///   recovery for 3).
+    /// - Must-block: shape 4 stays Genuine EVEN WITH the poison row
+    ///   present — in-row execution evidence outranks out-of-row
+    ///   recovery, so a still-live poison row (the trigger may have been
+    ///   substituted since it was poisoned) can never hide a failure rio
+    ///   actually executed — and EVERY shape without poison evidence
+    ///   keeps its current classification, so the recovery cannot widen
+    ///   beyond the poison signal.
+    #[test]
+    fn failed_row_shape_lattice_against_poison_evidence() {
+        use crate::run::stderrparse::parse_stderr;
+        let knobs = Knobs::default();
+        let mut c = ctx("app.x86_64-linux", T, &[DEP], ExpectedOutcome::Built);
+        c.fixed_output_drvs = std::sync::Arc::new([DEP.to_string()].into_iter().collect());
+
+        // Shape-1 evidence, producer-verbatim: the trigger's complete
+        // terminal message (daemon shape), relayed by the gateway and
+        // captured by the engine's own line-split capture.
+        let trigger_full_msg = format!(
+            "builder for '{DEP}' failed with exit code 1;\n\
+             last 10 log lines:\n\
+             > trying https://example.com/dep-1.0.tar.gz\n\
+             > curl: (22) The requested URL returned error: 404\n\
+             For full logs, run 'nix log {DEP}'."
+        );
+        let relay_payload =
+            format!("derivation '{DEP}' failed: {trigger_full_msg}\n  ↳ rio-cli logs '{DEP}'");
+        let same_batch_reasons = parse_stderr(&relay_payload).reasons;
+        assert!(
+            !fetch_signature_present(&same_batch_reasons[DEP]),
+            "producer parity: the captured relay channel must be the needle-free first line"
+        );
+        let cross_batch_msg = format!(
+            "dependency '{DEP}' failed: poison threshold reached after 3 distinct-worker \
+             failures"
+        );
+        let blanket = format!(
+            "derivation {} failed",
+            DEP.trim_start_matches("/nix/store/")
+        );
+        let own_failure = format!(
+            "builder for '{T}' failed with exit code 2;\n\
+             last 2 log lines:\n\
+             > make: *** [Makefile:12: all] Error 2"
+        );
+
+        let rot_cascade = || RioOutcome::DependencyFailed {
+            root: RootCauseKind::SourceRot,
+            failing_drv: DEP.to_string(),
+        };
+        let genuine = || RioOutcome::TargetFailed {
+            kind: FailureKind::Genuine,
+        };
+
+        struct ShapeRow {
+            name: &'static str,
+            target: PathOutcome,
+            reasons: BTreeMap<String, String>,
+            log_tail: Option<&'static str>,
+            with_poison: RioOutcome,
+            without_poison: RioOutcome,
+        }
+        let rows = [
+            ShapeRow {
+                name: "own-terminal dependency-failed, same batch",
+                target: po(
+                    T,
+                    BuildStatus::DependencyFailed,
+                    &format!("dependency '{DEP}' failed: {trigger_full_msg}"),
+                ),
+                reasons: same_batch_reasons,
+                log_tail: None,
+                with_poison: rot_cascade(),
+                without_poison: rot_cascade(),
+            },
+            ShapeRow {
+                name: "own-terminal dependency-failed, cross batch",
+                target: po(T, BuildStatus::DependencyFailed, &cross_batch_msg),
+                reasons: BTreeMap::from([(T.to_string(), cross_batch_msg.clone())]),
+                // The trigger-keyed log fetch the collector performs for
+                // this shape, fed through decide()'s log-tail channel.
+                log_tail: Some(
+                    "trying https://example.com/dep-1.0.tar.gz\n\
+                     curl: (22) The requested URL returned error: 404\n",
+                ),
+                with_poison: rot_cascade(),
+                without_poison: rot_cascade(),
+            },
+            ShapeRow {
+                name: "DAG-fallback blanket",
+                target: po(T, BuildStatus::MiscFailure, &blanket),
+                // Eventless: nothing was relayed for any drv.
+                reasons: BTreeMap::new(),
+                log_tail: None,
+                with_poison: rot_cascade(),
+                without_poison: genuine(),
+            },
+            ShapeRow {
+                name: "generic failure (the root's own execution)",
+                target: po(T, BuildStatus::PermanentFailure, &own_failure),
+                reasons: BTreeMap::new(),
+                log_tail: None,
+                with_poison: genuine(),
+                without_poison: genuine(),
+            },
+        ];
+
+        let trigger_poisoned: HashMap<String, Vec<String>> =
+            HashMap::from([(DEP.to_string(), vec!["b1".to_string(), "b2".to_string()])]);
+        let no_poison: HashMap<String, Vec<String>> = HashMap::new();
+        for row in &rows {
+            for (state, poisoned, expected) in [
+                (
+                    "poisoned-FOD-in-closure",
+                    &trigger_poisoned,
+                    &row.with_poison,
+                ),
+                ("no-poison", &no_poison, &row.without_poison),
+            ] {
+                let cell = format!("[{} × {state}]", row.name);
+                let batch = BatchView {
+                    reasons: row.reasons.clone(),
+                    ..BatchView::default()
+                };
+                match decide(
+                    &c,
+                    Some(&row.target),
+                    &batch,
+                    poisoned,
+                    prior(0),
+                    &knobs,
+                    row.log_tail,
+                ) {
+                    CollectDecision::Terminal { rio, .. } => {
+                        assert_eq!(&rio, expected, "{cell}");
+                        // Verdict-layer coupling for every cascade cell:
+                        // the classifier must turn the recovered outcome
+                        // into the cascaded source-unavailable exclusion.
+                        if matches!(
+                            rio,
+                            RioOutcome::DependencyFailed {
+                                root: RootCauseKind::SourceRot,
+                                ..
+                            }
+                        ) {
+                            let cls = classify(&ExpectedOutcome::Built, &rio, &AuxFlags::default());
+                            assert_eq!(
+                                cls.class,
+                                UnifiedClass::Verdict(Verdict::SourceUnavailable),
+                                "{cell}"
+                            );
+                            assert!(cls.cascaded, "{cell}: cascaded dependent must be flagged");
+                        }
+                    }
+                    other => panic!("{cell}: expected a terminal decision, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// Sticky-poison cascade end-to-end through
+    /// [`process_settled_batch`]: a dependent merged onto a fixed-output
+    /// derivation still poisoned past the scheduler's resubmit-reset
+    /// budget is fail-fasted at merge seeding with NO per-root event, so
+    /// its in-band row is the DAG-fallback blanket — `MiscFailure`, the
+    /// scheduler's build-level summary, no relayed reasons, no trigger
+    /// reference. The collector must intersect the batch's poison
+    /// snapshot with the job's dependency closure, recover the trigger,
+    /// and settle the record as cascaded source-unavailable carrying the
+    /// recovery method and the poison row as evidence — instead of
+    /// charging the dependent to the headline as an unexpected failure.
+    #[tokio::test]
+    async fn sticky_poison_blanket_recovers_trigger_from_poison_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let mut app = ctx("app.x86_64-linux", T, &[DEP], ExpectedOutcome::Built);
+        app.fixed_output_drvs = std::sync::Arc::new([DEP.to_string()].into_iter().collect());
+        let admin = LogAdmin {
+            // The sticky poison row: the rotted FOD kept failing on real
+            // workers, well within the scheduler's poison TTL.
+            poisoned: vec![PoisonedView {
+                drv_path: DEP.to_string(),
+                failed_executors: vec!["b1".into(), "b2".into()],
+                poisoned_secs_ago: 7200,
+            }],
+            ..LogAdmin::default()
+        };
+        let store = FakeStoreApi::default();
+        let contexts: HashMap<String, JobContext> = [("app.x86_64-linux".to_string(), app)].into();
+        let blanket = format!(
+            "derivation {} failed",
+            DEP.trim_start_matches("/nix/store/")
+        );
+        let batch = BatchView {
+            kind: BATCH_KIND_SUBMIT.to_string(),
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+            results: vec![po(T, BuildStatus::MiscFailure, &blanket)],
+            // Eventless fail-fast: the stderr stream relayed no
+            // per-derivation failure line for ANY drv.
+            reasons: BTreeMap::new(),
+            ..BatchView::default()
+        };
+        let decisions = process_settled_batch(
+            &state,
+            &admin,
+            &store,
+            None,
+            &contexts,
+            &["app.x86_64-linux".into()],
+            &batch,
+            &HashMap::new(),
+            &Knobs::default(),
+            "leaf",
+            "c1",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+
+        match &decisions["app.x86_64-linux"] {
+            CollectDecision::Terminal {
+                rio: RioOutcome::DependencyFailed { root, failing_drv },
+                evidence,
+            } => {
+                assert_eq!(*root, RootCauseKind::SourceRot);
+                assert_eq!(failing_drv, DEP);
+                let evidence = evidence.as_deref().expect("recovery must record evidence");
+                assert!(
+                    evidence.contains(DEP),
+                    "the recovered trigger is named: {evidence}"
+                );
+                assert!(
+                    evidence.contains("b1, b2"),
+                    "the poison row's executors are the evidence: {evidence}"
+                );
+                assert!(
+                    evidence.contains("poison snapshot intersected"),
+                    "the recovery method is named: {evidence}"
+                );
+            }
+            other => panic!("expected a recovered source-rot cascade, got {other:?}"),
+        }
+        // The record carries the cascaded exclusion, not a headline charge.
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].verdict.as_deref(), Some("source-unavailable"));
+        assert!(records[0].cascaded, "cascaded dependent must be flagged");
+        assert_eq!(records[0].failure_cause.as_deref(), Some("source-rot"));
+        assert_eq!(records[0].rio.failing_drv.as_deref(), Some(DEP));
+        // The poison snapshot was consulted exactly once for the batch.
+        assert_eq!(admin.poisoned_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The blanket recovery's deterministic pick and its conservative
+    /// gates, both directions at the [`decide`] level.
+    ///
+    /// Must-admit: several poisoned fixed-output closure members resolve
+    /// to ONE deterministic trigger (first in path order — the closure
+    /// set carries no topological order) with EVERY candidate recorded in
+    /// the evidence; a qualifying poison row on the target itself wins
+    /// over closure members (its own rot is no cascade) whatever the path
+    /// order says.
+    ///
+    /// Must-block (each broken gate keeps the genuine headline charge —
+    /// the conservative direction): a poisoned closure member that is not
+    /// fixed-output; a poisoned fixed-output drv outside this job's
+    /// closure (the build-wide blanket may be a batch-mate's failure); a
+    /// poison row with no recorded worker failure (the scheduler's
+    /// infra-poisoning shape).
+    #[test]
+    fn blanket_recovery_picks_deterministically_and_gates_on_rot_evidence() {
+        let knobs = Knobs::default();
+        let no_reasons = BatchView::default();
+        let blanket_for = |drv: &str| {
+            format!(
+                "derivation {} failed",
+                drv.trim_start_matches("/nix/store/")
+            )
+        };
+        let execs = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let row = po(T, BuildStatus::MiscFailure, &blanket_for(DEP));
+
+        // Two rotted fixed-output deps poisoned at once: deterministic
+        // first-in-path-order pick, both rows recorded as evidence in
+        // that same order.
+        let mut c = ctx("app.x86_64-linux", T, &[DEP, OTHER], ExpectedOutcome::Built);
+        c.fixed_output_drvs =
+            std::sync::Arc::new([DEP.to_string(), OTHER.to_string()].into_iter().collect());
+        let both: HashMap<String, Vec<String>> = HashMap::from([
+            (DEP.to_string(), execs(&["b1"])),
+            (OTHER.to_string(), execs(&["b2"])),
+        ]);
+        match decide(&c, Some(&row), &no_reasons, &both, prior(0), &knobs, None) {
+            CollectDecision::Terminal {
+                rio: RioOutcome::DependencyFailed { root, failing_drv },
+                evidence,
+            } => {
+                assert_eq!(root, RootCauseKind::SourceRot);
+                assert_eq!(failing_drv, DEP, "first poisoned FOD in path order");
+                let e = evidence.expect("evidence");
+                assert!(
+                    e.contains(DEP) && e.contains(OTHER),
+                    "ALL candidates recorded: {e}"
+                );
+                assert!(
+                    e.find(DEP).unwrap() < e.find(OTHER).unwrap(),
+                    "candidates listed in deterministic path order: {e}"
+                );
+            }
+            other => panic!("expected the deterministic source-rot pick, got {other:?}"),
+        }
+
+        // The target ITSELF is the sticky-poisoned FOD: self wins over a
+        // closure candidate that sorts earlier, and the outcome is the
+        // target's own source rot — no cascade is fabricated.
+        let mut self_ctx = ctx("other.x86_64-linux", OTHER, &[DEP], ExpectedOutcome::Built);
+        self_ctx.fixed_output_drvs =
+            std::sync::Arc::new([DEP.to_string(), OTHER.to_string()].into_iter().collect());
+        let self_row = po(OTHER, BuildStatus::MiscFailure, &blanket_for(OTHER));
+        let with_self: HashMap<String, Vec<String>> = HashMap::from([
+            (DEP.to_string(), execs(&["b1"])),
+            (OTHER.to_string(), execs(&["b3"])),
+        ]);
+        match decide(
+            &self_ctx,
+            Some(&self_row),
+            &no_reasons,
+            &with_self,
+            prior(0),
+            &knobs,
+            None,
+        ) {
+            CollectDecision::Terminal {
+                rio: RioOutcome::TargetFailed { kind },
+                evidence,
+            } => {
+                assert_eq!(kind, FailureKind::SourceRot);
+                let e = evidence.expect("evidence");
+                assert!(
+                    e.contains(OTHER) && e.contains(DEP),
+                    "self pick still records every candidate: {e}"
+                );
+            }
+            other => panic!("expected the target's own source rot, got {other:?}"),
+        }
+
+        // Must-block gates.
+        let genuine_stands = |decision: CollectDecision, gate: &str| match decision {
+            CollectDecision::Terminal {
+                rio:
+                    RioOutcome::TargetFailed {
+                        kind: FailureKind::Genuine,
+                    },
+                ..
+            } => {}
+            other => panic!("{gate}: expected the genuine charge to stand, got {other:?}"),
+        };
+        // (a) Poisoned closure member that is NOT fixed-output.
+        let non_fod = ctx("app.x86_64-linux", T, &[DEP], ExpectedOutcome::Built);
+        genuine_stands(
+            decide(
+                &non_fod,
+                Some(&row),
+                &no_reasons,
+                &HashMap::from([(DEP.to_string(), execs(&["b1"]))]),
+                prior(0),
+                &knobs,
+                None,
+            ),
+            "non-fixed-output trigger",
+        );
+        // (b) Poisoned fixed-output drv OUTSIDE this job's closure.
+        let mut outside = ctx("app.x86_64-linux", T, &[DEP], ExpectedOutcome::Built);
+        outside.fixed_output_drvs = std::sync::Arc::new([OTHER.to_string()].into_iter().collect());
+        genuine_stands(
+            decide(
+                &outside,
+                Some(&row),
+                &no_reasons,
+                &HashMap::from([(OTHER.to_string(), execs(&["b1"]))]),
+                prior(0),
+                &knobs,
+                None,
+            ),
+            "outside-closure trigger",
+        );
+        // (c) Poison row with no recorded worker failure (infra shape).
+        genuine_stands(
+            decide(
+                &c,
+                Some(&row),
+                &no_reasons,
+                &HashMap::from([(DEP.to_string(), Vec::new())]),
+                prior(0),
+                &knobs,
+                None,
+            ),
+            "no worker-failure evidence",
+        );
     }
 
     /// Signal-1 source order is binding: the root's own in-band error
