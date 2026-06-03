@@ -1047,6 +1047,32 @@ form: mintable only by the coverage branch, demanded by the only clear
 path, so an absence-of-objection upgrade is unwritable rather than merely
 unreviewed.
 
+#r("sched.evidence.seed-rank-floor")[
+  A persisted derivation row MUST NOT seed trusted-plane claims
+  verification unless its recorded definition evidence is byte-anchored
+  (`path_bound_bytes` or `verified_built`): below that floor the row's
+  recorded modular hash is a submitter echo --- `unverified_claim` is
+  the bare store-backed shape and `content_bound_claim` binds bytes to
+  themselves rather than to the declared path --- and seeding from it
+  would let a planted row convert an attacker-chosen digest into a
+  trusted input seed for another submission's verification. The floor
+  MUST be one predicate consulted by every tier that selects or admits
+  seed rows (the row query and the seed constructor), the predicate
+  MUST be exhaustive over the rank enumeration so a new rank cannot
+  ship without a seeding decision, and an undecodable persisted rank
+  MUST NOT seed.
+]
+
+The floor is round-17 bug_077: the unseeded-input read-through
+(#rref("sched.dispatch.claims-derived+5")) consulted persisted rows by
+path with no rank filter, so a hostile submission could plant a bare
+store-backed row (rank `unverified_claim`) carrying a chosen 32-byte
+digest at a path another tenant's verification would later read through
+--- the echo became the seed that "proved" or refuted the victim's
+declared hash. Rows at or above the floor carry ingress text-CA byte
+binding (`sched.merge.ingress-inline-drv-binding`), which is what makes
+their recorded input form evidence rather than echo.
+
 #r("sched.closure.witness-epoch")[
   A closure-hole witness testifies about ONE definition epoch. Any
   definition-changing transition --- an authority takeover through the
@@ -1557,7 +1583,7 @@ makes the realisation-insert skip impossible again is the staged
 follow-up F2 (`ModularHashState` lifecycle enum) — no prose in this
 spec may claim that writer exists until it does (R6).
 
-#r("sched.dispatch.claims-derived+4")[
+#r("sched.dispatch.claims-derived+5")[
   When assignment tokens are signed, the scheduler MUST NOT sign
   upload-authorization claims (`expected_outputs`, `is_ca`,
   `is_fixed_output`) or forward worker build instructions for a
@@ -1594,8 +1620,10 @@ spec may claim that writer exists until it does (R6).
   the verifier MUST first re-seed from the persisted derivation rows
   (one batched lookup of the missing inputs' recorded input-form
   hashes, under the same not-floating predicate as every other seed
-  source, performed at the shared verification chokepoint so the merge
-  and dispatch consumers get it uniformly), and only a
+  source AND the byte-anchored rank floor of
+  `sched.evidence.seed-rank-floor`, performed at the shared
+  verification chokepoint so the merge and dispatch consumers get it
+  uniformly), and only a
   POST-read-through unseeded verdict may have consequences: at
   dispatch, bounded backoff on a dedicated budget whose exhaustion
   poisons with remediation generated from the post-read-through fact
@@ -1610,6 +1638,12 @@ spec may claim that writer exists until it does (R6).
   recorded values; nodes already at `path_bound_bytes` or higher skip
   the re-fetch. Unsigned dev mode mints no claims and is exempt.
 ]
+The rank-floor clause is round-17 bug_077 (the +5 delta): the +4
+read-through admitted ANY row with a recorded hash, including
+submitter-echoed bare rows --- the floor (one predicate, both tiers)
+makes the read-through seed only byte-anchored evidence; see
+#rref("sched.evidence.seed-rank-floor") for the full population
+argument.
 The over-cap clause is round-17 bug_030 (the +4 delta): the
 dispatch-side fetch carried a private 1 MiB cap while every other
 derivation-text site admitted the shared 16 MiB class bound, so any

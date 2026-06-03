@@ -170,17 +170,32 @@ impl InputFormSeed {
     }
 
     /// Seed from PERSISTED derivation rows (the unseeded-input
-    /// read-through, `sched.dispatch.claims-derived+4`): a row's
+    /// read-through, `sched.dispatch.claims-derived+5`): a row's
     /// recorded modular hash qualifies under the same not-floating
-    /// predicate as the other constructors — the row is content-derived
-    /// state that survives reap and failover, which is exactly why the
-    /// read-through consults it before any permanence verdict. Rows
-    /// with a NULL hash or a non-32-byte blob contribute nothing
+    /// predicate as the other constructors AND the byte-anchored rank
+    /// floor (`sched.evidence.seed-rank-floor`) — the row is
+    /// content-derived state that survives reap and failover, which is
+    /// exactly why the read-through consults it before any permanence
+    /// verdict; the floor is what keeps a submitter-echoed row from
+    /// impersonating that content derivation. Rows with a NULL hash, a
+    /// non-32-byte blob, or an undecodable rank contribute nothing
     /// (absent ≠ evidence).
     pub(super) fn from_persisted_rows(rows: &[crate::db::InputFormRow]) -> Self {
         Self(
             rows.iter()
                 .filter(|r| r.is_fixed_output || !r.is_ca)
+                // r[impl sched.evidence.seed-rank-floor]
+                // Constructor tier of the seed rank floor (round-17
+                // bug_077): only byte-anchored rows seed, decided by
+                // the same predicate the SQL tier derives its list
+                // from. Fail-closed decode — an undecodable persisted
+                // rank contributes nothing (absent != evidence), it
+                // never floors into a seeding rank.
+                .filter(|r| {
+                    r.evidence_rank
+                        .parse::<crate::state::DefinitionEvidence>()
+                        .is_ok_and(|rank| rank.seeds_input_form())
+                })
                 .filter_map(|r| {
                     let h: [u8; 32] = r.ca_modular_hash.as_deref()?.try_into().ok()?;
                     Some((r.drv_path.clone(), h))
@@ -228,7 +243,7 @@ pub(super) enum SilenceReason {
     /// The unseeded-input persisted-row read-through could not run
     /// (PG error). The verification was NOT completed in either
     /// direction — permanence may not be concluded from a failed
-    /// lookup (`claims-derived+4`); retry when the database recovers.
+    /// lookup (`claims-derived+5`); retry when the database recovers.
     RowReadThrough,
 }
 
@@ -327,7 +342,7 @@ pub(super) struct VerifiedDefinition {
     /// Dispatch-resolve requirement derived from the bytes via the
     /// shared oracle predicate (`rio_nix::derivation::should_resolve`)
     /// over the resident DAG's child knowledge — never the submitter's
-    /// `needs_resolve` echo (sched.dispatch.claims-derived+4).
+    /// `needs_resolve` echo (sched.dispatch.claims-derived+5).
     pub(super) needs_resolve: bool,
     /// `Some(declared)` iff the classification stripped an
     /// unverifiable declared modular hash
@@ -366,7 +381,7 @@ pub(super) enum StoreEvidenceOutcome {
     /// PERMANENT: backoff cannot resolve it; consumers must surface
     /// it (visible poison with remediation at dispatch, refusal with
     /// remediation at merge). Instant permanence is restricted to
-    /// this variant BY TYPE (claims-derived+4).
+    /// this variant BY TYPE (claims-derived+5).
     StructurallyUnverifiable(StructuralReason),
     /// Declared-IA derivability is blocked because direct input(s)
     /// are covered by neither the seeds nor the resident DAG. NOT
@@ -376,7 +391,7 @@ pub(super) enum StoreEvidenceOutcome {
     /// chokepoint [`DagActor::check_store_evidence`] performs it and
     /// re-classifies; a post-read-through emission means the rows
     /// were consulted too) and then BOUNDED BACKOFF at dispatch
-    /// before any permanent consequence (`claims-derived+4`,
+    /// before any permanent consequence (`claims-derived+5`,
     /// bug_029). At merge the submitter is present: refusal with the
     /// post-read-through remediation is synchronous self-service.
     /// Carries ALL missing input paths (batched read-through, honest
@@ -505,7 +520,7 @@ pub(super) fn classify_store_evidence(
         .any(|o| matches!(o.kind(), rio_nix::derivation::OutputKind::InputAddressed(_)));
     let mut input_seed: Vec<rio_proto::types::DerivationNode> = Vec::new();
     if needs_ia {
-        // Collect ALL unseedable inputs (claims-derived+4): the
+        // Collect ALL unseedable inputs (claims-derived+5): the
         // read-through is batched — one PG roundtrip covers every
         // missing input — and the remediation names the full set
         // instead of leaking them one resubmit at a time.
@@ -548,7 +563,7 @@ pub(super) fn classify_store_evidence(
     // The validator treats a node's own declared hash as
     // self-certification and removes it; siblings carry the seeds.
     let claimed_modular_hash = !synth.ca_modular_hash.is_empty();
-    // r[impl sched.dispatch.claims-derived+4]
+    // r[impl sched.dispatch.claims-derived+5]
     // Byte-derived dispatch facts, computed HERE — the single site
     // that holds the verified parse — so the consumers that raise
     // rank on these bytes record the derived flag in the same motion
@@ -604,7 +619,7 @@ pub(super) fn classify_store_evidence(
 /// refusing caller — including post-read-through unseeded inputs,
 /// which at MERGE refuse synchronously (the submitter is present;
 /// the dispatch consumer of the same variant backs off instead,
-/// `claims-derived+4`).
+/// `claims-derived+5`).
 enum EvidenceVerdict {
     /// The claim verified: the hash joined the approved set.
     Approved,
@@ -633,7 +648,7 @@ fn settle_evidence_verdict(
             // The grant carries the byte-derived facts: the DAG stamps
             // them on the node it creates for this hash, so a
             // store-evidence-created node never carries the
-            // submitter's echo (sched.dispatch.claims-derived+4).
+            // submitter's echo (sched.dispatch.claims-derived+5).
             store_evidence.insert(
                 node.drv_hash.as_str().into(),
                 crate::dag::StoreEvidenceGrant {
@@ -692,7 +707,7 @@ fn settle_evidence_verdict(
             .increment(1);
             Ok(EvidenceVerdict::Unprovable(reason.remediation()))
         }
-        // r[impl sched.dispatch.claims-derived+4]
+        // r[impl sched.dispatch.claims-derived+5]
         // POST-READ-THROUGH unseeded inputs: the chokepoint already
         // consulted the persisted rows (check_store_evidence
         // re-classifies with the row seed before this variant can
@@ -829,7 +844,7 @@ impl DagActor {
                 .map(|s| s.expected_output_paths.iter().any(|p| p.is_empty()))
         };
         match classify_store_evidence(node, bytes, submission_seed, &resident, &child_unknown) {
-            // r[impl sched.dispatch.claims-derived+4]
+            // r[impl sched.dispatch.claims-derived+5]
             // Persisted-row read-through (bug_029): residency is
             // scheduler-mutated state — reap and failover both erase a
             // completed input's node without touching content — but
@@ -4602,7 +4617,7 @@ mod evidence_matrix_tests {
         let verified = dn(leaf.clone());
         match classify(&verified, leaf_aterm.as_bytes()) {
             O::Verified(def) => {
-                // r[verify sched.dispatch.claims-derived+4]
+                // r[verify sched.dispatch.claims-derived+5]
                 // Byte-derived resolve fact rides the verdict: an
                 // inputless leaf is `false` by the oracle predicate's
                 // empty-inputs clause EVEN IF a child lookup would
@@ -4729,7 +4744,7 @@ mod evidence_matrix_tests {
             ..Default::default()
         });
         match classify(&parent_node, parent_aterm.as_bytes()) {
-            // r[verify sched.dispatch.claims-derived+4]
+            // r[verify sched.dispatch.claims-derived+5]
             // Missing input identity is the typed UnseededInputs
             // outcome — NOT StructurallyUnverifiable (instant
             // permanence is restricted to content-bound reasons): the
@@ -4788,7 +4803,7 @@ mod evidence_matrix_tests {
                     fparent_aterm.as_bytes(),
                     "verified bytes ride along"
                 );
-                // r[verify sched.dispatch.claims-derived+4]
+                // r[verify sched.dispatch.claims-derived+5]
                 // Floating parent WITH an input: the type clause
                 // derives `true` from the bytes — recorded by the
                 // strip arm exactly like the Verified arm.

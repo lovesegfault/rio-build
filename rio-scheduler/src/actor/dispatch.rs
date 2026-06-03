@@ -128,7 +128,7 @@ pub(super) enum AssignmentProtoOutcome {
     /// R6) instead of livelocking through backoff.
     PermanentlyUnverifiable(String),
     /// Direct input identities are missing AFTER the persisted-row
-    /// read-through (`sched.dispatch.claims-derived+4`, bug_029):
+    /// read-through (`sched.dispatch.claims-derived+5`, bug_029):
     /// NOT instant permanence — the missing identity is a fact about
     /// CURRENT state (a deeper submission, an upload, or a mid-merge
     /// row can supply it at any time), so the caller rolls back and
@@ -2169,7 +2169,7 @@ impl DagActor {
             // (TOCTOU vs. concurrent cancel) — legacy no-rollback
             // semantics: caller defers.
             AssignmentProtoOutcome::NodeGone => return false,
-            // r[impl sched.dispatch.claims-derived+4]
+            // r[impl sched.dispatch.claims-derived+5]
             // The store could not vouch for a bare store-backed node's
             // claims — STORE SILENCE only; the cause population is the
             // `SilenceReason` enum (merge.rs), nothing else routes
@@ -2184,7 +2184,7 @@ impl DagActor {
             AssignmentProtoOutcome::Unavailable(reason) => {
                 metrics::counter!("rio_scheduler_dispatch_claims_unavailable_total").increment(1);
                 self.rollback_assignment(drv_hash, executor_id).await;
-                // r[impl sched.dispatch.claims-derived+4]
+                // r[impl sched.dispatch.claims-derived+5]
                 // Store silence is a transient verdict (post-+3 the
                 // unseeded-inputs arm below defers too, on its own
                 // budget), and it
@@ -2262,7 +2262,7 @@ impl DagActor {
                 }
                 return false;
             }
-            // r[impl sched.dispatch.claims-derived+4]
+            // r[impl sched.dispatch.claims-derived+5]
             // Structurally unverifiable: PERMANENT for retries of this
             // submission shape — surface a visible poison carrying the
             // generated remediation instead of livelocking through
@@ -2285,7 +2285,7 @@ impl DagActor {
                 }
                 return false;
             }
-            // r[impl sched.dispatch.claims-derived+4]
+            // r[impl sched.dispatch.claims-derived+5]
             // Post-read-through unseeded inputs (bug_029): bounded
             // backoff on the node's OWN budget, exactly the
             // claims-unavailable shape — because the blocking fact is
@@ -2585,8 +2585,8 @@ impl DagActor {
         executor_id: &ExecutorId,
         generation: u64,
     ) -> AssignmentProtoOutcome {
-        // === Claims derivation (sched.dispatch.claims-derived+4) ======
-        // r[impl sched.dispatch.claims-derived+4]
+        // === Claims derivation (sched.dispatch.claims-derived+5) ======
+        // r[impl sched.dispatch.claims-derived+5]
         // Decide the byte-bound source of every value the token will
         // sign and the worker will obey, BEFORE any of it is used.
         // Unsigned dev mode mints no claims — nothing to derive (the
@@ -2717,7 +2717,7 @@ impl DagActor {
                     // raise the node's standing so re-dispatch skips
                     // the re-fetch. Best-effort persist — a lost write
                     // degrades to re-derivation after failover.
-                    // r[impl sched.dispatch.claims-derived+4]
+                    // r[impl sched.dispatch.claims-derived+5]
                     // The resolve flag is recorded HERE, in the same
                     // node_mut block as the rank raise, from the
                     // byte-derived fact the classification site
@@ -2759,7 +2759,7 @@ impl DagActor {
                             .into(),
                     );
                 }
-                // r[impl sched.dispatch.claims-derived+4]
+                // r[impl sched.dispatch.claims-derived+5]
                 // Three-way permanence contract (the merged_bug_019
                 // deploy-blocker fix; fix-discipline R1 — consequences
                 // derived from the variant's typed permanence):
@@ -2774,12 +2774,12 @@ impl DagActor {
                 // Backoff cannot resolve it: pre-fix this arm
                 // livelocked (deterministic re-verification, identical
                 // result, forever). Restricted BY TYPE to content-bound
-                // reasons (claims-derived+4): missing input identity
+                // reasons (claims-derived+5): missing input identity
                 // is the UnseededInputs arm below.
                 Some(super::merge::StoreEvidenceOutcome::StructurallyUnverifiable(reason)) => {
                     return AssignmentProtoOutcome::PermanentlyUnverifiable(reason.remediation());
                 }
-                // r[impl sched.dispatch.claims-derived+4]
+                // r[impl sched.dispatch.claims-derived+5]
                 // Post-read-through unseeded inputs → BOUNDED BACKOFF
                 // (the bug_029 kill): the chokepoint already consulted
                 // the persisted rows, but residency/rows are state
@@ -2825,7 +2825,7 @@ impl DagActor {
                             state.ca.modular_hash_stripped = Some(stripped);
                         }
                         state.evidence = crate::state::DefinitionEvidence::PathBoundBytes;
-                        // r[impl sched.dispatch.claims-derived+4]
+                        // r[impl sched.dispatch.claims-derived+5]
                         // Same record-at-raise as the Verified arm:
                         // the strip raises rank on these bytes, so the
                         // byte-derived resolve flag rides the raise.
@@ -3144,7 +3144,7 @@ impl DagActor {
         Vec<(String, String)>,
     ) {
         // Gate: the RECORDED resolve flag, single-source
-        // (sched.dispatch.claims-derived+4). Every writer derived it
+        // (sched.dispatch.claims-derived+5). Every writer derived it
         // from bytes through the shared oracle predicate
         // (`rio_nix::derivation::should_resolve`): the gateway's
         // post-BFS pass for ingress-bound nodes (normalized again at

@@ -235,12 +235,12 @@ pub fn describe_metrics() {
          shapes never land here — they poison with remediation \
          (..._claims_unverifiable_total) and unverifiable declared hashes \
          strip and proceed (..._claims_stripped_total) \
-         (sched.dispatch.claims-derived+4)"
+         (sched.dispatch.claims-derived+5)"
     );
     describe_counter!(
         "rio_scheduler_dispatch_claims_unseeded_total",
         "Dispatch-time claims derivations deferred on POST-READ-THROUGH \
-         unseeded inputs (sched.dispatch.claims-derived+4, bug_029): a \
+         unseeded inputs (sched.dispatch.claims-derived+5, bug_029): a \
          direct input's identity was found in neither the resident DAG \
          nor the persisted rows. Bounded by the node's own budget \
          (max_infra_retries); exhaustion poisons with the generated \
@@ -253,7 +253,7 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_claims_row_readthrough_total",
         "Persisted-row read-throughs for unseeded claim inputs at the \
-         check_store_evidence chokepoint (sched.dispatch.claims-derived+4), \
+         check_store_evidence chokepoint (sched.dispatch.claims-derived+5), \
          labeled by result: seeded (rows re-seeded the verification — the \
          reap/failover recovery path working as designed), miss (no \
          seedable rows; the verdict stands post-read-through), error (PG \
@@ -267,7 +267,7 @@ pub fn describe_metrics() {
          STRIPPED at dispatch (an unverifiable claim is no claim — exact \
          ingress-strip parity): the node proceeds on the verified bytes at \
          path_bound_bytes with the hash cleared in memory and PG \
-         (sched.dispatch.claims-derived+4). The expected nonzero source is \
+         (sched.dispatch.claims-derived+5). The expected nonzero source is \
          warm gateway CA-chain / deferred-IA submissions."
     );
     describe_counter!(
@@ -276,7 +276,7 @@ pub fn describe_metrics() {
          impossible for CONTENT-BOUND reasons (today exactly: unparseable \
          declared drv_path): poisoned at dispatch with generated \
          remediation instead of livelocking through backoff \
-         (sched.dispatch.claims-derived+4). Missing input identity is NO \
+         (sched.dispatch.claims-derived+5). Missing input identity is NO \
          LONGER in this population — it defers through \
          ..._claims_unseeded_total with a bounded budget; dashboards keyed \
          here see the unseeded population move."

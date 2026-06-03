@@ -536,7 +536,7 @@ impl SchedulerDb {
         .await
     }
 
-    // r[impl sched.dispatch.claims-derived+4]
+    // r[impl sched.dispatch.claims-derived+5]
     /// Load the input-form columns of derivation rows by drv PATH —
     /// the unseeded-input read-through (bug_029). The rows are
     /// CONTENT-DERIVED state that survives reap and failover (the two
@@ -554,14 +554,29 @@ impl SchedulerDb {
         if drv_paths.is_empty() {
             return Ok(Vec::new());
         }
+        // r[impl sched.evidence.seed-rank-floor]
+        // The rank floor is DERIVED from
+        // `DefinitionEvidence::seeds_input_form` (one predicate, two
+        // tiers): a row whose recorded hash is a submitter echo
+        // (unverified_claim / content_bound_claim) never reaches the
+        // seed constructor, so a planted row cannot convert an
+        // attacker-chosen digest into a trusted input seed
+        // (round-17 bug_077). The constructor re-checks the returned
+        // rank — SQL narrowing here is an optimization; the predicate
+        // owns the decision.
+        let seeding: Vec<&'static str> = crate::state::DefinitionEvidence::seeding_rank_strs();
         sqlx::query_as(
             r#"
-            SELECT drv_path, ca_modular_hash, is_fixed_output, is_ca
+            SELECT drv_path, ca_modular_hash, is_fixed_output, is_ca,
+                   evidence_rank
             FROM derivations
-            WHERE drv_path = ANY($1) AND ca_modular_hash IS NOT NULL
+            WHERE drv_path = ANY($1)
+              AND ca_modular_hash IS NOT NULL
+              AND evidence_rank = ANY($2)
             "#,
         )
         .bind(drv_paths)
+        .bind(&seeding)
         .fetch_all(&self.pool)
         .await
     }
@@ -604,7 +619,7 @@ impl SchedulerDb {
     /// Persist a stripped-claim verification: the rank rises on the
     /// verified bytes AND the unverifiable declared modular hash is
     /// MOVED to the segregated preservation column in the same
-    /// statement (`sched.dispatch.claims-derived+4` — an unverifiable
+    /// statement (`sched.dispatch.claims-derived+5` — an unverifiable
     /// claim is NO claim and never stays in the live evidence column;
     /// exact ingress-strip parity, `ingress-inline-drv-binding+1`).
     /// M_070: round-15 destroyed the value here, which left

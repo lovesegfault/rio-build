@@ -474,3 +474,58 @@ async fn test_sweep_stale_assignments_repairs_torn_terminal() -> anyhow::Result<
     assert_eq!(db.sweep_stale_assignments().await?, 0);
     Ok(())
 }
+
+// r[verify sched.evidence.seed-rank-floor]
+/// Hostile-planted-row e2e (round-17 bug_077): the unseeded-input
+/// read-through query returns ONLY byte-anchored rows. A bare
+/// store-backed submission (rank `unverified_claim`) and an
+/// authoritative inline squat (rank `content_bound_claim`) both
+/// carry recorded 32-byte hashes — submitter echoes — and neither may
+/// reach the seed constructor; `path_bound_bytes` and
+/// `verified_built` rows do. The floor list is DERIVED from
+/// `DefinitionEvidence::seeds_input_form` (asserted directly here so
+/// a predicate widening is visible in this test's diff, not just in
+/// the query's behavior).
+#[tokio::test]
+async fn input_form_read_through_floors_sub_anchor_ranks() -> anyhow::Result<()> {
+    use crate::state::DefinitionEvidence as E;
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    // The derived floor is exactly the byte-anchored pair.
+    assert_eq!(
+        E::seeding_rank_strs(),
+        vec!["path_bound_bytes", "verified_built"]
+    );
+
+    let hostile_digest = [0x41u8; 32];
+    let mut paths = Vec::new();
+    for (i, rank) in E::ALL.iter().copied().enumerate() {
+        let h = format!("seedfloor-{i}");
+        insert_test_derivation(&db, &h).await?;
+        // Plant the recorded hash + rank exactly as a hostile bare
+        // submission row would carry them (raw SQL: the production
+        // writers refuse to construct this shape above the floor
+        // without byte binding — the planted row IS the attack).
+        sqlx::query(
+            "UPDATE derivations SET ca_modular_hash = $2, evidence_rank = $3 \
+             WHERE drv_hash = $1",
+        )
+        .bind(&h)
+        .bind(hostile_digest.as_slice())
+        .bind(rank.as_str())
+        .execute(&db.pool)
+        .await?;
+        paths.push(rio_test_support::fixtures::test_drv_path(&h));
+    }
+
+    let rows = db.load_input_form_rows(&paths).await?;
+    let returned: std::collections::HashSet<&str> =
+        rows.iter().map(|r| r.evidence_rank.as_str()).collect();
+    assert_eq!(
+        returned,
+        ["path_bound_bytes", "verified_built"].into_iter().collect(),
+        "sub-floor ranks must not be returned by the seed query"
+    );
+    assert_eq!(rows.len(), 2);
+    Ok(())
+}

@@ -252,7 +252,7 @@ pub(crate) struct PoisonedDerivationRow {
 }
 
 /// Input-form columns of a derivation row, loaded by drv PATH for the
-/// unseeded-input read-through (`sched.dispatch.claims-derived+4`,
+/// unseeded-input read-through (`sched.dispatch.claims-derived+5`,
 /// bug_029). Selected narrow on purpose: the consumer
 /// (`InputFormSeed::from_persisted_rows`) needs exactly the recorded
 /// hash plus the two flags its not-floating predicate reads.
@@ -262,6 +262,13 @@ pub(crate) struct InputFormRow {
     pub ca_modular_hash: Option<Vec<u8>>,
     pub is_fixed_output: bool,
     pub is_ca: bool,
+    /// Persisted definition-evidence rank, re-checked by the
+    /// constructor (`InputFormSeed::from_persisted_rows`) against
+    /// `DefinitionEvidence::seeds_input_form` — the second tier of the
+    /// seed rank floor (`sched.evidence.seed-rank-floor`); the first
+    /// is the SQL predicate in `load_input_form_rows`. Fail-closed:
+    /// an undecodable rank does not seed.
+    pub evidence_rank: String,
 }
 
 /// Identity columns of a SETTLED (`completed`/`skipped`) derivation row,

@@ -310,7 +310,7 @@ pub(crate) fn verifiable_identity_matches(
 /// hash — then `stripped_declared_hash` carries the strip): the
 /// created node displaces with `path_bound_bytes` standing, records
 /// the BYTE-DERIVED resolve flag (never the submitter's echo,
-/// `sched.dispatch.claims-derived+4`), and applies the strip with
+/// `sched.dispatch.claims-derived+5`), and applies the strip with
 /// M_070 preservation when present
 /// (`sched.merge.store-evidence-displacement+3` — one verdict, one
 /// consequence, identical at the merge and dispatch consumers).
@@ -1419,7 +1419,7 @@ impl DerivationDag {
                 // carries the verified standing, not the bare echo's
                 // shape rank. Same value the displacement verdict used.
                 state.evidence = state.evidence.max(displacer_evidence);
-                // r[impl sched.dispatch.claims-derived+4]
+                // r[impl sched.dispatch.claims-derived+5]
                 // A store-evidence-created node's resolve flag is the
                 // BYTE-DERIVED one computed at the classification site
                 // (VerifiedDefinition.needs_resolve) — the proto echo
