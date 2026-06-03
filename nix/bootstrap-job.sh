@@ -1,7 +1,61 @@
 set -euo pipefail
 : "${AWS_REGION:?}" "${CHUNK_BUCKET:?}"
 
-if aws secretsmanager describe-secret --secret-id rio/hmac >/dev/null 2>&1; then
+tmp=$(mktemp -d)
+
+# r[impl infra.bootstrap.secret-state-probe] (scannable anchor in
+# nix/docker.nix at the bootstrapScript export — .sh is outside
+# tracey's extension set; this line is documentary.)
+#
+# Fail-closed state probe for EVERY Secrets Manager existence
+# decision in this Job (bootstrap-probe-conformance pins this as the
+# script's sole describe-secret call site). The signing key is the
+# secret where a wrong "missing" verdict is DESTRUCTIVE — the
+# recovery path mints a fresh keypair, and rotating the live key
+# invalidates every narinfo `Sig:` made under the old one — but the
+# same discrimination protects every guard. Four provider states:
+#   present  — the secret exists and is live (DeletedDate unset)
+#   missing  — the API SAID ResourceNotFoundException
+#   (abort)  — scheduled for deletion: the default `delete-secret`
+#              only SCHEDULES; describe-secret keeps succeeding (with
+#              DeletedDate) for the whole 7-30 day recovery window
+#              while get/put/create all fail InvalidRequestException.
+#              "present" here wedges every Job retry until the window
+#              elapses (round-17 bug_097); "missing" would try to
+#              create and wedge identically. Neither converges — the
+#              operator holds the only two exits, so abort NAMES them.
+#   (abort)  — anything else: a throttle, an IAM hiccup, a network
+#              blip (all also exit nonzero). Refuse to guess.
+secret_state() {
+  _ss_id=$1
+  if _ss_deleted=$(aws secretsmanager describe-secret --secret-id "$_ss_id" \
+      --query DeletedDate --output text 2>"$tmp/_ss.err"); then
+    if [ "$_ss_deleted" = None ]; then
+      echo present
+    else
+      # The remediation verbs ride as printf ARGUMENTS (not literal
+      # `aws secretsmanager <verb>` text) so bootstrap-iam-parity's
+      # executed-verb extraction never reads remediation prose as a
+      # grant requirement — the operator runs these under their own
+      # credentials; the Job role must NOT hold delete/restore.
+      printf '[bootstrap] %s is scheduled for deletion (DeletedDate %s); Secrets Manager refuses reads and writes until the recovery window ends. Pick one:\n  aws secretsmanager %s --secret-id %s   # cancel the deletion, keep the value\n  aws secretsmanager %s --secret-id %s --force-delete-without-recovery   # finalize now; the next Job run regenerates\n' \
+        "$_ss_id" "$_ss_deleted" restore-secret "$_ss_id" delete-secret "$_ss_id" >&2
+      return 1
+    fi
+  elif grep -q ResourceNotFoundException "$tmp/_ss.err"; then
+    echo missing
+  else
+    printf '[bootstrap] describe-secret %s failed without ResourceNotFoundException; refusing to guess:\n' "$_ss_id" >&2
+    cat "$tmp/_ss.err" >&2
+    return 1
+  fi
+}
+
+# Assignment-then-test form everywhere: `state=$(secret_state id)` at
+# top level propagates the probe's abort through `set -e`; an
+# `if secret_state ...` guard would swallow it.
+hmac_state=$(secret_state rio/hmac)
+if [ "$hmac_state" = present ]; then
   echo "[bootstrap] rio/hmac already exists, skipping"
 else
   echo "[bootstrap] generating rio/hmac"
@@ -12,7 +66,8 @@ else
     --secret-binary fileb:///tmp/hmac
 fi
 
-if aws secretsmanager describe-secret --secret-id rio/service-hmac >/dev/null 2>&1; then
+service_hmac_state=$(secret_state rio/service-hmac)
+if [ "$service_hmac_state" = present ]; then
   echo "[bootstrap] rio/service-hmac already exists, skipping"
 else
   echo "[bootstrap] generating rio/service-hmac"
@@ -24,31 +79,13 @@ else
     --secret-binary fileb:///tmp/service-hmac
 fi
 
-# Fail-closed state probe for the signing-key pair. The signing key
-# is the one secret here where a wrong "missing" verdict is
-# DESTRUCTIVE: the recovery path mints a fresh keypair, and rotating
-# the live key invalidates every narinfo `Sig:` made under the old
-# one. So "missing" must mean the API SAID ResourceNotFoundException
-# — never a throttle, an IAM hiccup, or a network blip (all of which
-# also exit nonzero). Anything else aborts the Job; the Job retries.
-secret_state() {
-  _ss_id=$1
-  if _ss_err=$(aws secretsmanager describe-secret --secret-id "$_ss_id" 2>&1 >/dev/null); then
-    echo present
-  elif printf '%s' "$_ss_err" | grep -q ResourceNotFoundException; then
-    echo missing
-  else
-    printf '[bootstrap] describe-secret %s failed without ResourceNotFoundException; refusing to guess:\n%s\n' \
-      "$_ss_id" "$_ss_err" >&2
-    return 1
-  fi
-}
-
 # Probe BOTH halves and dispatch on the pair state. With one guard
 # and two creates, a Job retry after dying between the two creates
-# (or a rotation by deleting only the private half) left a
-# permanently mismatched pair while the Job reported success — every
-# client signature check then fails.
+# left a permanently mismatched pair while the Job reported success —
+# every client signature check then fails. A rotation by deleting
+# only one half converges THROUGH the probe's scheduled-for-deletion
+# abort: the operator finalizes (or restores) per the printed
+# remediation and the next run regenerates or re-derives.
 #
 # ALL key-byte work is delegated to rio-cli (the signing_keyfmt
 # codec): the shell never decodes, slices, or re-encodes key
@@ -59,7 +96,6 @@ secret_state() {
 # and into this Job's log (round-16 bug_023, critical).
 sec_state=$(secret_state rio/signing-key)
 pub_state=$(secret_state rio/signing-key-pub)
-tmp=$(mktemp -d)
 if [ "$sec_state" = present ]; then
   # Private half is live: NEVER regenerate. Converge the pub half to
   # the seed-derived public entry. derive-pub reads the secret on
@@ -126,11 +162,11 @@ else
   cat "$tmp/key.pub"; echo
 fi
 
-if aws secretsmanager describe-secret --secret-id rio/gateway-host-key >/dev/null 2>&1; then
+host_key_state=$(secret_state rio/gateway-host-key)
+if [ "$host_key_state" = present ]; then
   echo "[bootstrap] rio/gateway-host-key already exists, skipping"
 else
   echo "[bootstrap] generating rio/gateway-host-key"
-  tmp=$(mktemp -d)
   # OpenSSH-format ed25519 private key. -N "" (no passphrase),
   # -C "" (no comment — the comment field in a host key is unused
   # and would otherwise leak the build-time hostname). -f writes

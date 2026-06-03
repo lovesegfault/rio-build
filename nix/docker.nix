@@ -454,6 +454,16 @@ rec {
   # Exposed (not let-local) so the bootstrap-idempotent check
   # (nix/misc-checks.nix) can run it against a mocked aws CLI and
   # assert the signing-key block converges from partial state.
+  #
+  # r[impl infra.bootstrap.secret-state-probe]
+  # (The script body lives in bootstrap-job.sh — outside tracey's
+  # extension set; this export is the scannable anchor. secret_state
+  # is the sole describe-secret site, pinned by
+  # bootstrap-probe-conformance.)
+  # r[verify infra.bootstrap.secret-state-probe]
+  # (bootstrap-idempotent scenarios J-M: deletion arm per secret
+  # class + fail-closed create-only guards; bootstrap-probe-conformance:
+  # the count-pinned deny.)
   bootstrapScript = pkgs.writeShellScript "rio-bootstrap" (builtins.readFile ./bootstrap-job.sh);
   # The real rio-cli package, exported so the bootstrap-idempotent
   # check runs the genuine binary (round-16 MP4: the previous mock

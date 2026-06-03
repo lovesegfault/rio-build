@@ -928,11 +928,18 @@ in
         # payloads are dereferenced byte-exact like the real CLI.
         # describe-secret → ResourceNotFoundException (exit 254) when
         # missing — the REAL exception name, because the script
-        # discriminates on it. Failure injection: if
-        # $TMPDIR/inject-describe-fail lists this id, describe fails
-        # with ThrottlingException — same exit code as not-found, so
-        # only stderr discrimination passes. Asserts CONTROL FLOW and
-        # BYTES, not AWS semantics.
+        # discriminates on it. On success it emits what the script's
+        # `--query DeletedDate --output text` would print: "None" for
+        # a live secret, a timestamp when $TMPDIR/inject-deleted lists
+        # the id (the default delete-secret only SCHEDULES deletion —
+        # describe keeps succeeding for the 7-30 day recovery window
+        # while get/put/create fail InvalidRequestException, which the
+        # mock also reproduces so a script that wrongly proceeds past
+        # a deleting verdict still dies, just with the wrong error).
+        # Failure injection: if $TMPDIR/inject-describe-fail lists
+        # this id, describe fails with ThrottlingException — same exit
+        # code as not-found, so only stderr discrimination passes.
+        # Asserts CONTROL FLOW and BYTES, not AWS semantics.
         cat > bin/aws <<EOF
         #!$sh
         sub="\$1 \$2"; id=""; payload=""
@@ -947,6 +954,15 @@ in
           file://*) payload=\$(cat "\''${payload#file://}") ;;
           fileb://*) payload=\$(cat "\''${payload#fileb://}") ;;
         esac
+        deleted() {
+          [ -f "$TMPDIR/inject-deleted" ] && grep -qx "\$1" "$TMPDIR/inject-deleted"
+        }
+        refuse_deleted() {
+          if deleted "\$1"; then
+            echo "An error occurred (InvalidRequestException): You can't perform this operation on the secret because it was marked for deletion." >&2
+            exit 254
+          fi
+        }
         case "\$sub" in
           "secretsmanager describe-secret")
             if [ -f "$TMPDIR/inject-describe-fail" ] \
@@ -957,8 +973,14 @@ in
             [ -f "\$f" ] || {
               echo "An error occurred (ResourceNotFoundException): Secrets Manager can't find the specified secret." >&2
               exit 254
-            } ;;
+            }
+            if deleted "\$id"; then
+              echo "2026-06-03T00:00:00+00:00"
+            else
+              echo None
+            fi ;;
           "secretsmanager create-secret")
+            refuse_deleted "\$id"
             # Concurrency near-miss injection: the listed id behaves
             # as if a racing Job created it BETWEEN our describe probe
             # and this create — the exact window the create-only CAS
@@ -970,8 +992,12 @@ in
             fi
             [ -f "\$f" ] && { echo ResourceExistsException >&2; exit 254; }
             printf '%s' "\$payload" > "\$f" ;;
-          "secretsmanager put-secret-value") printf '%s' "\$payload" > "\$f" ;;
-          "secretsmanager get-secret-value") cat "\$f"; echo ;;
+          "secretsmanager put-secret-value")
+            refuse_deleted "\$id"
+            printf '%s' "\$payload" > "\$f" ;;
+          "secretsmanager get-secret-value")
+            refuse_deleted "\$id"
+            cat "\$f"; echo ;;
           *) exit 0 ;;
         esac
         EOF
@@ -1159,6 +1185,84 @@ in
           || { echo "FAIL-H: loser retry did not converge on the winner's pair" >&2; exit 1; }
         cmp secrets/rio_signing-key tmp/h.sec && cmp secrets/rio_signing-key-pub tmp/h.pub \
           || { echo "FAIL-H: loser retry mutated the winner's pair" >&2; exit 1; }
+
+        # Scenarios J-M (round-17 bug_097): the provider's FOURTH
+        # state. The default delete-secret only SCHEDULES deletion —
+        # describe succeeds (DeletedDate set) for the whole 7-30 day
+        # recovery window while every read/write fails
+        # InvalidRequestException. The probe must abort NAMING the two
+        # operator exits (restore-secret / force-delete) — never
+        # classify present (the round-17 wedge: every retry dies at
+        # get-secret-value for up to 30 days) nor missing (create
+        # would wedge identically).
+        deletion_abort() {
+          # $1 = scenario tag, $2 = stderr file
+          grep -q "scheduled for deletion" "$2" \
+            || { echo "FAIL-$1: abort did not come from the deletion arm" >&2; cat "$2" >&2; exit 1; }
+          grep -q "restore-secret" "$2" \
+            || { echo "FAIL-$1: remediation does not name restore-secret" >&2; exit 1; }
+          grep -q -- "--force-delete-without-recovery" "$2" \
+            || { echo "FAIL-$1: remediation does not name --force-delete-without-recovery" >&2; exit 1; }
+        }
+
+        # Scenario J: PRIVATE half scheduled for deletion → abort with
+        # remediation; both halves byte-untouched (no heal, no put —
+        # delete-only rotation converges through the operator exit,
+        # not through a 30-day retry wedge).
+        cp secrets/rio_signing-key tmp/j.sec
+        cp secrets/rio_signing-key-pub tmp/j.pub
+        echo rio_signing-key > $TMPDIR/inject-deleted
+        if run 2>$TMPDIR/j-stderr; then
+          echo "FAIL-J: Job exited 0 with the private half scheduled for deletion" >&2; exit 1
+        fi
+        deletion_abort J $TMPDIR/j-stderr
+        rm $TMPDIR/inject-deleted
+        cmp secrets/rio_signing-key tmp/j.sec && cmp secrets/rio_signing-key-pub tmp/j.pub \
+          || { echo "FAIL-J: deletion-window abort mutated signing-key state" >&2; exit 1; }
+
+        # Scenario K: PUB half scheduled for deletion (private live) →
+        # the pair probe aborts BEFORE any branch runs; a heal put
+        # would die InvalidRequestException with a raw AWS error
+        # instead of the remediation (deletion_abort discriminates).
+        echo rio_signing-key-pub > $TMPDIR/inject-deleted
+        if run 2>$TMPDIR/k-stderr; then
+          echo "FAIL-K: Job exited 0 with the pub half scheduled for deletion" >&2; exit 1
+        fi
+        deletion_abort K $TMPDIR/k-stderr
+        rm $TMPDIR/inject-deleted
+        cmp secrets/rio_signing-key tmp/j.sec && cmp secrets/rio_signing-key-pub tmp/j.pub \
+          || { echo "FAIL-K: pub deletion-window abort mutated signing-key state" >&2; exit 1; }
+
+        # Scenario L: a CREATE-ONLY secret (rio/hmac, the first guard)
+        # scheduled for deletion → abort with remediation before ANY
+        # later block runs; nothing anywhere is mutated.
+        cp secrets/rio_hmac tmp/l.hmac
+        echo rio_hmac > $TMPDIR/inject-deleted
+        if run 2>$TMPDIR/l-stderr; then
+          echo "FAIL-L: Job exited 0 with rio/hmac scheduled for deletion" >&2; exit 1
+        fi
+        deletion_abort L $TMPDIR/l-stderr
+        rm $TMPDIR/inject-deleted
+        cmp secrets/rio_hmac tmp/l.hmac \
+          || { echo "FAIL-L: deletion-window abort mutated rio/hmac" >&2; exit 1; }
+        cmp secrets/rio_signing-key tmp/j.sec && cmp secrets/rio_signing-key-pub tmp/j.pub \
+          || { echo "FAIL-L: hmac deletion abort reached the signing-key block" >&2; exit 1; }
+
+        # Scenario M: TRANSIENT throttle on a create-only guard. The
+        # pre-r17 raw `if aws describe-secret` guards classified ANY
+        # failure as missing — a throttled probe on a LIVE secret then
+        # attempted create (ResourceExistsException, wrong error) and
+        # a throttled probe on a missing one minted under a blip. All
+        # five guards now route through the fail-closed probe.
+        echo rio_hmac > $TMPDIR/inject-describe-fail
+        if run 2>$TMPDIR/m-stderr; then
+          echo "FAIL-M: Job exited 0 despite a transient hmac-describe failure" >&2; exit 1
+        fi
+        rm $TMPDIR/inject-describe-fail
+        grep -q "refusing to guess" $TMPDIR/m-stderr \
+          || { echo "FAIL-M: hmac guard abort did not come from the fail-closed probe" >&2; cat $TMPDIR/m-stderr >&2; exit 1; }
+        cmp secrets/rio_hmac tmp/l.hmac \
+          || { echo "FAIL-M: transient hmac-describe failure mutated rio/hmac" >&2; exit 1; }
         touch $out
       '';
 
@@ -1389,6 +1493,54 @@ in
           echo "build derived strings from hashed_mirror_url_pattern!/HASHED_MIRROR_URL_PATTERN, never a second literal" >&2
           exit 1
         fi
+        touch $out
+      '';
+
+  # Round-17 bug_097 (RC17-02 mechanism): secret_state() is the ONLY
+  # legal Secrets Manager existence probe in the bootstrap Job. Raw
+  # `if aws secretsmanager describe-secret ...` guards collapse the
+  # provider's four states to two — a throttle classifies as missing
+  # (round-15's transient class) and a secret in its 7-30 day deletion
+  # recovery window classifies as present (round-17's wedge: every
+  # retry dies at the first read/write until the window elapses).
+  # Deny-table: pattern `secretsmanager describe-secret`, count-pinned
+  # carve-out of exactly ONE site (inside secret_state). The check
+  # red-tests its own deny logic against a scratch mutation so the
+  # pattern cannot silently rot.
+  bootstrap-probe-conformance =
+    pkgs.runCommand "rio-bootstrap-probe-conformance"
+      {
+        script = ../nix/bootstrap-job.sh;
+      }
+      ''
+        count() { grep -c 'secretsmanager describe-secret' "$1" || true; }
+
+        grep -q 'secret_state()' $script || {
+          echo "FAIL: secret_state() definition missing from bootstrap-job.sh —" >&2
+          echo "      it is the sole legal existence probe (r[infra.bootstrap.secret-state-probe])." >&2
+          exit 1
+        }
+        n=$(count $script)
+        [ "$n" = 1 ] || {
+          echo "FAIL: expected exactly 1 'secretsmanager describe-secret' call site in" >&2
+          echo "      bootstrap-job.sh (the one inside secret_state); found $n." >&2
+          echo "      Every existence decision must route through secret_state() — the only" >&2
+          echo "      probe discriminating present/missing/scheduled-for-deletion/transient." >&2
+          echo "      Use the assignment-then-test form: state=\$(secret_state rio/<name>)." >&2
+          exit 1
+        }
+
+        # Self-calibration: the deny pattern must actually fire on the
+        # raw-guard form, or this gate is green over the very drift it
+        # exists to stop. (cat, not cp: the store path is read-only.)
+        cat $script > scratch.sh
+        printf '\nif aws secretsmanager describe-secret --secret-id rio/extra >/dev/null 2>&1; then :; fi\n' >> scratch.sh
+        n2=$(count scratch.sh)
+        [ "$n2" = 2 ] || {
+          echo "FAIL: self-calibration — injected raw describe-secret guard was not counted" >&2
+          echo "      (got $n2, want 2); the deny pattern has rotted." >&2
+          exit 1
+        }
         touch $out
       '';
 }

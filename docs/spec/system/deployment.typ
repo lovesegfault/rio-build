@@ -131,6 +131,11 @@ See #cross-link("/spec/system/security.typ")[Security: Secrets Management] for r
   *SSH key mounting:* On EKS deploys (`xtask k8s -p eks up`), the bootstrap Job generates `rio/gateway-host-key` in AWS Secrets Manager and ESO syncs it to the `rio-gateway-host-key` Secret; deploy sets `gateway.ssh.hostKeySecret` to that name so all replicas present the same host key across restarts. On other deployments, the chart default leaves `hostKeySecret` empty — the gateway then generates an ephemeral key per pod (fine for dev; breaks `known_hosts` on reschedule and across replicas). `gateway.ssh.authorizedKeysSecret` defaults to `rio-gateway-ssh` — create that Secret before deploy or the gateway pod blocks on the missing mount.
 ]
 
+#r("infra.bootstrap.secret-state-probe")[
+  Every Secrets Manager existence decision in the bootstrap Job MUST route through the fail-closed `secret_state` probe, which MUST distinguish all four provider states: present (live), missing (the API said `ResourceNotFoundException`), scheduled-for-deletion (`DeletedDate` set --- abort naming both `restore-secret` and `--force-delete-without-recovery`), and transient/unknown (abort, refusing to guess).
+]
+A secret in its 7--30 day deletion recovery window keeps answering `describe-secret` while refusing every read and write: classifying it `present` wedges the Job for the whole window (every retry dies at the first `get-secret-value`/`put-secret-value`), and classifying a throttle `missing` would regenerate a live key. The probe instead aborts printing the only two operator exits, so a delete-only rotation converges in minutes (operator finalizes or restores) instead of stalling for up to 30 days. The `bootstrap-probe-conformance` check pins `secret_state` as the script's sole `describe-secret` call site; `bootstrap-idempotent` scenarios J--M pin the deletion arm per secret class and the fail-closed routing of the create-only guards.
+
 = Verification
 
 After deployment:
