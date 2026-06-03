@@ -147,9 +147,19 @@ resource "aws_iam_policy" "rio_bootstrap" {
           "secretsmanager:CreateSecret",
           "secretsmanager:PutSecretValue",
           "secretsmanager:DescribeSecret",
+          # GetSecretValue: the signing-key block's steady-state
+          # pair-consistency probe and the pub re-derive/heal paths
+          # read rio/signing-key{,-pub} on every run (the derivation
+          # itself happens in rio-cli; the shell never decodes key
+          # bytes). Without this grant the re-derive branch
+          # AccessDenied-aborts fail-closed — visible, but the pair
+          # never converges. Apply terraform BEFORE helm install.
+          # Kept in lockstep with the script by the
+          # bootstrap-iam-parity check (nix/misc-checks.nix).
+          "secretsmanager:GetSecretValue",
         ]
-        # Scope to rio/* only. The bootstrap script only writes rio/hmac,
-        # rio/signing-key, rio/signing-key-pub.
+        # Scope to rio/* only. The bootstrap script only touches rio/hmac,
+        # rio/service-hmac, rio/signing-key{,-pub}, rio/gateway-host-key.
         Resource = "arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:rio/*"
       }
     ]

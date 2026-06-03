@@ -49,56 +49,81 @@ secret_state() {
 # (or a rotation by deleting only the private half) left a
 # permanently mismatched pair while the Job reported success — every
 # client signature check then fails.
+#
+# ALL key-byte work is delegated to rio-cli (the signing_keyfmt
+# codec): the shell never decodes, slices, or re-encodes key
+# material. The previous re-derive (`base64 -d | tail -c 32 |
+# base64 -w0`) assumed the 64-byte expanded payload; for a 32-byte
+# seed-only entry — a format the store's own Signer::parse accepts —
+# it published the PRIVATE SEED verbatim onto rio/signing-key-pub
+# and into this Job's log (round-16 bug_023, critical).
 sec_state=$(secret_state rio/signing-key)
 pub_state=$(secret_state rio/signing-key-pub)
-if [ "$sec_state" = present ] && [ "$pub_state" = present ]; then
-  echo "[bootstrap] rio/signing-key{,-pub} already exist, skipping"
-elif [ "$sec_state" = present ]; then
-  # Pub half missing, private half alive: the pub is DERIVED data —
-  # the tail 32 bytes of the 64-byte expanded secret (the
-  # name:base64(seed++pubkey) format; pinned by rio-cli keygen's
-  # round_trip_format test). Re-derive it; never regenerate the
-  # private half here — that would be a silent key rotation. A
-  # corrupt secret value fails the base64 pipeline and aborts
-  # (set -o pipefail), which is the correct posture: operator
-  # intervention beats minting a key that doesn't match the data.
-  echo "[bootstrap] rio/signing-key-pub missing; re-deriving from rio/signing-key"
-  sec_val=$(aws secretsmanager get-secret-value --secret-id rio/signing-key \
-    --query SecretString --output text)
-  key_name=${sec_val%%:*}
-  pub_b64=$(printf '%s' "${sec_val#*:}" | base64 -d | tail -c 32 | base64 -w0)
-  printf '%s:%s\n' "$key_name" "$pub_b64" > /tmp/signing-key-pub
-  aws secretsmanager create-secret --name rio/signing-key-pub \
-    --secret-string "file:///tmp/signing-key-pub"
-  echo "[bootstrap] public key (add to nix.conf trusted-public-keys):"
-  cat /tmp/signing-key-pub
+tmp=$(mktemp -d)
+if [ "$sec_state" = present ]; then
+  # Private half is live: NEVER regenerate. Converge the pub half to
+  # the seed-derived public entry. derive-pub reads the secret on
+  # stdin (never argv) and refuses corrupt or internally inconsistent
+  # entries with nothing published — operator intervention beats
+  # minting or advertising a key that doesn't match the data.
+  aws secretsmanager get-secret-value --secret-id rio/signing-key \
+    --query SecretString --output text > "$tmp/sec.entry"
+  rio-cli keygen derive-pub < "$tmp/sec.entry" > "$tmp/pub.derived"
+  if [ "$pub_state" = present ]; then
+    # Pair-consistency probe: every upgrade's Job log must show
+    # either "pair consistent" or a heal. cmp (byte-exact) — the
+    # canonical entries are newline-free; only the CLI transport
+    # newline from --output text is stripped.
+    aws secretsmanager get-secret-value --secret-id rio/signing-key-pub \
+      --query SecretString --output text > "$tmp/pub.stored.raw"
+    printf '%s' "$(cat "$tmp/pub.stored.raw")" > "$tmp/pub.stored"
+    if cmp -s "$tmp/pub.stored" "$tmp/pub.derived"; then
+      echo "[bootstrap] signing-key pair consistent"
+    else
+      echo "[bootstrap] rio/signing-key-pub does not match the private half; healing"
+      aws secretsmanager put-secret-value --secret-id rio/signing-key-pub \
+        --secret-string "file://$tmp/pub.derived"
+      echo "[bootstrap] public key (add to nix.conf trusted-public-keys):"
+      cat "$tmp/pub.derived"; echo
+    fi
+  else
+    echo "[bootstrap] rio/signing-key-pub missing; re-deriving from rio/signing-key"
+    aws secretsmanager create-secret --name rio/signing-key-pub \
+      --secret-string "file://$tmp/pub.derived" 2>/dev/null \
+      || aws secretsmanager put-secret-value --secret-id rio/signing-key-pub \
+        --secret-string "file://$tmp/pub.derived"
+    echo "[bootstrap] public key (add to nix.conf trusted-public-keys):"
+    cat "$tmp/pub.derived"; echo
+  fi
 else
   echo "[bootstrap] generating rio/signing-key"
-  tmp=$(mktemp -d)
   # Key name includes the bucket so narinfo `Sig:` lines identify
   # which cluster signed them. rio-cli keygen emits the same
   # name:base64(seed++pubkey) / name:base64(pubkey) pair that
   # `nix-store --generate-binary-cache-key` did, without needing the
-  # Nix closure (or its LocalStore-init-under-readOnlyRootFilesystem
-  # workaround) in the bootstrap image.
-  rio-cli keygen "rio-$CHUNK_BUCKET" "$tmp/key.sec" "$tmp/key.pub"
-  # Pub FIRST, create||put: in this branch the private half is
-  # MISSING, so a leftover pub from a half-done prior run is stale
-  # and must be overwritten. The private half is CREATE-ONLY — if
-  # it exists, the state probe was wrong, and letting create-secret
-  # fail (ResourceExistsException → set -e) is exactly the no-
-  # silent-rotation refusal rio-cli keygen applies to local files.
-  # Public half stored separately so operators can `get-secret-
-  # value` it for their nix.conf trusted-public-keys without
-  # access to the private half.
+  # Nix closure in the bootstrap image.
+  rio-cli keygen new "rio-$CHUNK_BUCKET" "$tmp/key.sec" "$tmp/key.pub"
+  # PRIVATE half FIRST, create-only: this create IS the concurrency
+  # guard. Two overlapping Jobs racing this branch both call
+  # create-secret; the loser gets ResourceExistsException → set -e
+  # aborts having written NOTHING (the pub write is sequenced after
+  # the private CAS), and its retry converges through the re-derive/
+  # heal branch above. The previous order (pub overwrite first) let
+  # the loser clobber the winner's pub with a key that was about to
+  # be discarded (round-16 merged_bug_015).
+  aws secretsmanager create-secret --name rio/signing-key \
+    --secret-string "file://$tmp/key.sec"
+  # Pub second, create||put: any pre-existing pub here is stale by
+  # definition (its private half did not exist) and must be
+  # overwritten. Stored separately so operators can get-secret-value
+  # it for nix.conf trusted-public-keys without access to the
+  # private half.
   aws secretsmanager create-secret --name rio/signing-key-pub \
     --secret-string "file://$tmp/key.pub" 2>/dev/null \
     || aws secretsmanager put-secret-value --secret-id rio/signing-key-pub \
       --secret-string "file://$tmp/key.pub"
-  aws secretsmanager create-secret --name rio/signing-key \
-    --secret-string "file://$tmp/key.sec"
   echo "[bootstrap] public key (add to nix.conf trusted-public-keys):"
-  cat "$tmp/key.pub"
+  cat "$tmp/key.pub"; echo
 fi
 
 if aws secretsmanager describe-secret --secret-id rio/gateway-host-key >/dev/null 2>&1; then

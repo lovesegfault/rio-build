@@ -455,6 +455,11 @@ rec {
   # (nix/misc-checks.nix) can run it against a mocked aws CLI and
   # assert the signing-key block converges from partial state.
   bootstrapScript = pkgs.writeShellScript "rio-bootstrap" (builtins.readFile ./bootstrap-job.sh);
+  # The real rio-cli package, exported so the bootstrap-idempotent
+  # check runs the genuine binary (round-16 MP4: the previous mock
+  # could not represent the seed-only secret population whose
+  # mishandling was bug_023; byte-faithful harnesses only).
+  rioCli = rio-crates.rio-cli;
   bootstrap = buildZstd {
     name = "rio-bootstrap";
     tag = "dev";

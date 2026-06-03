@@ -896,36 +896,43 @@ in
         touch $out
       '';
 
-  # bootstrap-job.yaml documents the script as "Idempotent". The
-  # signing-key block guarded ONE secret but created TWO; a Job retry
-  # after dying between them (or a delete-private-only rotation) left
-  # a permanently mismatched/missing pub — and the original guard
-  # treated ANY describe failure (throttle, IAM, network) as
-  # "missing", which with the put-secret-value fallback silently
-  # rotated the live key. Mock aws + rio-cli + openssl + ssh-keygen
-  # and assert convergence from partial state, preservation of a
-  # live key, and fail-closed behavior on transient describe errors.
+  # bootstrap-job.yaml documents the script as "Idempotent". Round-15
+  # made the signing-key block fail-closed; round-16 (bug_023,
+  # critical) found its pub re-derive published the PRIVATE SEED for
+  # 32-byte seed-only secrets — and the harness was green over it
+  # because the rio-cli mock could only emit the 64-byte expanded
+  # population and the aws mock was newline-blind (echo). This
+  # harness is byte-faithful: the REAL rio-cli binary, printf-exact
+  # secret storage, one transport newline on get-secret-value (what
+  # `--output text` emits), and cmp (never string compare) for every
+  # state assertion. Scenarios cover the full secret-entry population
+  # the consumer (Signer::parse) accepts, not just what keygen emits.
   bootstrap-idempotent =
     pkgs.runCommand "rio-bootstrap-idempotent"
       {
-        nativeBuildInputs = [ pkgs.bash ];
+        nativeBuildInputs = [
+          pkgs.bash
+          pkgs.diffutils
+        ];
       }
       ''
         export TMPDIR=$PWD
         mkdir -p secrets bin tmp
         sh=${pkgs.bash}/bin/bash
         # Mock aws: state in $TMPDIR/secrets/<id-with-slashes-as-_>.
+        # Byte-faithful: create/put store the payload with printf '%s'
+        # (NO added newline — the round-15 mock's `echo` hid the
+        # trailing-newline divergence merged_bug_004 found);
+        # get-secret-value emits the value plus the ONE transport
+        # newline `--output text` appends; file:// and fileb://
+        # payloads are dereferenced byte-exact like the real CLI.
         # describe-secret → ResourceNotFoundException (exit 254) when
-        # the file is missing — the REAL exception name, because the
-        # script now discriminates on it; create-secret →
-        # ResourceExistsException (exit 254) if exists, else write;
-        # put-secret-value → unconditional overwrite;
-        # get-secret-value → print stored content. file:// payloads
-        # are dereferenced like the real CLI. Failure injection: if
+        # missing — the REAL exception name, because the script
+        # discriminates on it. Failure injection: if
         # $TMPDIR/inject-describe-fail lists this id, describe fails
         # with ThrottlingException — same exit code as not-found, so
-        # only stderr discrimination passes. Minimal fidelity:
-        # asserts CONTROL FLOW, not AWS semantics.
+        # only stderr discrimination passes. Asserts CONTROL FLOW and
+        # BYTES, not AWS semantics.
         cat > bin/aws <<EOF
         #!$sh
         sub="\$1 \$2"; id=""; payload=""
@@ -936,7 +943,10 @@ in
           esac; shift
         done
         f="$TMPDIR/secrets/\$id"
-        case "\$payload" in file://*) payload=\$(cat "\''${payload#file://}") ;; esac
+        case "\$payload" in
+          file://*) payload=\$(cat "\''${payload#file://}") ;;
+          fileb://*) payload=\$(cat "\''${payload#fileb://}") ;;
+        esac
         case "\$sub" in
           "secretsmanager describe-secret")
             if [ -f "$TMPDIR/inject-describe-fail" ] \
@@ -950,27 +960,11 @@ in
             } ;;
           "secretsmanager create-secret")
             [ -f "\$f" ] && { echo ResourceExistsException >&2; exit 254; }
-            echo "\$payload" > "\$f" ;;
-          "secretsmanager put-secret-value") echo "\$payload" > "\$f" ;;
-          "secretsmanager get-secret-value") cat "\$f" ;;
+            printf '%s' "\$payload" > "\$f" ;;
+          "secretsmanager put-secret-value") printf '%s' "\$payload" > "\$f" ;;
+          "secretsmanager get-secret-value") cat "\$f"; echo ;;
           *) exit 0 ;;
         esac
-        EOF
-        # Trivial mocks: rio-cli (keygen NAME SEC PUB — same last-two-
-        # args-are-output-paths shape nix-store had) writes
-        # FORMAT-FAITHFUL name:base64 content (64-byte expanded secret
-        # whose tail 32 bytes are the pub — the real keygen contract,
-        # pinned in Rust by round_trip_format) keyed by a counter so
-        # scenarios can detect regeneration AND verify the re-derive
-        # path produces the matching pub.
-        cat > bin/rio-cli <<EOF
-        #!$sh
-        n=\$(cat $TMPDIR/gen-count 2>/dev/null || echo 0)
-        n=\$((n+1)); echo \$n > $TMPDIR/gen-count
-        eval "sec=\\\''${\$((\$#-1))}"; eval "pub=\\\''${\$#}"
-        seed=\$(printf '%-32s' "S\$n"); pubk=\$(printf '%-32s' "P\$n")
-        printf 'rio-mock:%s\n' "\$(printf '%s%s' "\$seed" "\$pubk" | base64 -w0)" > "\$sec"
-        printf 'rio-mock:%s\n' "\$(printf '%s' "\$pubk" | base64 -w0)" > "\$pub"
         EOF
         for m in openssl ssh-keygen mktemp; do
           printf '#!%s\n' "$sh" > bin/$m
@@ -983,58 +977,60 @@ in
         done
         EOF
         chmod +x bin/*
-        export PATH=$PWD/bin:${pkgs.coreutils}/bin:${pkgs.gnugrep}/bin
+        # REAL rio-cli — the byte contract under test is the binary's,
+        # not a mock's reading of it.
+        export PATH=$PWD/bin:${dockerImages.rioCli}/bin:${pkgs.coreutils}/bin:${pkgs.gnugrep}/bin:${pkgs.diffutils}/bin
         export AWS_REGION=x CHUNK_BUCKET=x
 
         run() { $sh ${dockerImages.bootstrapScript}; }
+        derive() { rio-cli keygen derive-pub; }  # stdin → stdout
 
-        # Scenario A: fresh → both halves exist.
+        # Scenario A: fresh → both halves exist, canonical, and the
+        # stored pair is self-consistent (pub == derive(sec), byte-cmp
+        # against the real binary's derivation; canonical entries are
+        # newline-free so cmp also pins the no-trailing-newline
+        # contract).
         run
         [ -f secrets/rio_signing-key ] && [ -f secrets/rio_signing-key-pub ] \
           || { echo "FAIL-A: fresh run did not create both signing-key halves" >&2; exit 1; }
+        derive < secrets/rio_signing-key > tmp/a.derived
+        cmp tmp/a.derived secrets/rio_signing-key-pub \
+          || { echo "FAIL-A: stored pub is not the canonical derivation of the stored secret" >&2; exit 1; }
 
-        # Scenario B (the bug): private exists, pub missing → must
-        # converge by RE-DERIVING the pub from the live secret —
-        # never by regenerating the pair. Preservation assertion:
-        # no run that begins with rio/signing-key present may end
-        # with different content (gen-counter unmoved + byte-equal
-        # secret + pub matches the original keygen output).
-        sec_before=$(cat secrets/rio_signing-key)
-        pub_expected=$(cat secrets/rio_signing-key-pub)
+        # Scenario B (round-15 bug): private exists, pub missing →
+        # converge by RE-DERIVING — never regenerate. Preservation:
+        # private half byte-identical; pub byte-equal to the real
+        # derivation of that exact secret.
+        cp secrets/rio_signing-key tmp/b.sec-before
         rm secrets/rio_signing-key-pub
         run
-        [ -f secrets/rio_signing-key-pub ] \
-          || { echo "FAIL-B: pub missing after retry (guard checked private only?)" >&2; exit 1; }
-        [ "$(cat $TMPDIR/gen-count)" = 1 ] \
-          || { echo "FAIL-B: keygen ran again — pub-only loss rotated the live key" >&2; exit 1; }
-        [ "$(cat secrets/rio_signing-key)" = "$sec_before" ] \
-          || { echo "FAIL-B: private half content changed on a pub-only retry" >&2; exit 1; }
-        [ "$(cat secrets/rio_signing-key-pub)" = "$pub_expected" ] \
-          || { echo "FAIL-B: re-derived pub does not match the keygen original (tail-32 derivation broken)" >&2; exit 1; }
+        cmp secrets/rio_signing-key tmp/b.sec-before \
+          || { echo "FAIL-B: pub-only retry changed the private half (rotation!)" >&2; exit 1; }
+        derive < tmp/b.sec-before > tmp/b.expected
+        cmp secrets/rio_signing-key-pub tmp/b.expected \
+          || { echo "FAIL-B: re-derived pub diverges from the codec derivation" >&2; exit 1; }
 
-        # Scenario C: pub exists with OLD content, private missing →
-        # both must regenerate (pub overwritten via put-secret-value).
-        # Old code: create-secret on existing pub → exit 254 → set -e
-        # → script aborts; next retry sees private now exists → skips
-        # → stale pub forever.
+        # Scenario C: stale pub exists, private missing → both must
+        # regenerate; pub overwritten with the NEW pair's derivation
+        # (private-half create-only lands FIRST; a stale pub can never
+        # outlive a fresh private half).
         rm secrets/rio_signing-key
-        echo OLD > secrets/rio_signing-key-pub
+        printf '%s' OLD > secrets/rio_signing-key-pub
         run
         [ -f secrets/rio_signing-key ] \
           || { echo "FAIL-C: private not recreated" >&2; exit 1; }
-        if grep -qx OLD secrets/rio_signing-key-pub; then
+        if grep -q OLD secrets/rio_signing-key-pub; then
           echo "FAIL-C: pub not overwritten (stale pair)" >&2; exit 1
         fi
+        derive < secrets/rio_signing-key > tmp/c.derived
+        cmp tmp/c.derived secrets/rio_signing-key-pub \
+          || { echo "FAIL-C: regenerated pair not self-consistent" >&2; exit 1; }
 
-        # Scenario D (fail-closed): a TRANSIENT describe failure on
-        # the live signing key (throttle — same exit code as
-        # not-found, different exception) must ABORT the Job with
-        # both halves untouched. The old guard read any nonzero
-        # describe as "missing" and rotated the key while the Job
-        # exited 0.
-        sec_before=$(cat secrets/rio_signing-key)
-        pub_before=$(cat secrets/rio_signing-key-pub)
-        gen_before=$(cat $TMPDIR/gen-count)
+        # Scenario D (fail-closed): TRANSIENT describe failure on the
+        # live PRIVATE half (throttle — same exit code as not-found,
+        # different exception) → abort, both halves byte-untouched.
+        cp secrets/rio_signing-key tmp/d.sec
+        cp secrets/rio_signing-key-pub tmp/d.pub
         echo rio_signing-key > $TMPDIR/inject-describe-fail
         if run 2>$TMPDIR/d-stderr; then
           echo "FAIL-D: Job exited 0 despite a transient describe failure" >&2; exit 1
@@ -1042,10 +1038,131 @@ in
         rm $TMPDIR/inject-describe-fail
         grep -q "refusing to guess" $TMPDIR/d-stderr \
           || { echo "FAIL-D: abort did not come from the fail-closed probe" >&2; cat $TMPDIR/d-stderr >&2; exit 1; }
-        [ "$(cat secrets/rio_signing-key)" = "$sec_before" ] \
-          && [ "$(cat secrets/rio_signing-key-pub)" = "$pub_before" ] \
-          && [ "$(cat $TMPDIR/gen-count)" = "$gen_before" ] \
-          || { echo "FAIL-D: transient describe failure mutated the signing-key state" >&2; exit 1; }
+        cmp secrets/rio_signing-key tmp/d.sec && cmp secrets/rio_signing-key-pub tmp/d.pub \
+          || { echo "FAIL-D: transient describe failure mutated signing-key state" >&2; exit 1; }
+
+        # Scenario D2: same, but the throttle hits the PUB half's
+        # describe — the pair probe must abort before ANY branch runs
+        # (the round-15 harness only injected on the private half).
+        echo rio_signing-key-pub > $TMPDIR/inject-describe-fail
+        if run 2>$TMPDIR/d2-stderr; then
+          echo "FAIL-D2: Job exited 0 despite a transient pub-describe failure" >&2; exit 1
+        fi
+        rm $TMPDIR/inject-describe-fail
+        grep -q "refusing to guess" $TMPDIR/d2-stderr \
+          || { echo "FAIL-D2: abort did not come from the fail-closed probe" >&2; exit 1; }
+        cmp secrets/rio_signing-key tmp/d.sec && cmp secrets/rio_signing-key-pub tmp/d.pub \
+          || { echo "FAIL-D2: pub-describe failure mutated signing-key state" >&2; exit 1; }
+
+        # Scenario E (bug_023, the critical arm): a 32-byte SEED-ONLY
+        # secret (BYO import — a population Signer::parse accepts and
+        # the old shell tail-surgery published verbatim). The re-derived
+        # pub must be the DERIVED public key: byte-equal to the codec
+        # derivation and never containing the seed's base64 anywhere.
+        rm secrets/rio_signing-key secrets/rio_signing-key-pub
+        seed_b64=$(head -c 32 /dev/urandom | base64 -w0)
+        printf '%s' "rio-byo:$seed_b64" > secrets/rio_signing-key
+        run > tmp/e.log
+        derive < secrets/rio_signing-key > tmp/e.expected
+        cmp secrets/rio_signing-key-pub tmp/e.expected \
+          || { echo "FAIL-E: seed-only re-derive is not the codec derivation" >&2; exit 1; }
+        if grep -qF "$seed_b64" secrets/rio_signing-key-pub; then
+          echo "FAIL-E: PRIVATE SEED published in rio/signing-key-pub (bug_023)" >&2; exit 1
+        fi
+        if grep -qF "$seed_b64" tmp/e.log; then
+          echo "FAIL-E: PRIVATE SEED leaked into the Job log (bug_023)" >&2; exit 1
+        fi
+
+        # Scenario F (the 64-byte stale-tail arm): an expanded entry
+        # whose tail is NOT derive(seed) is internally inconsistent —
+        # the re-derive must ABORT with nothing published (the old
+        # surgery published the stale tail as the "public key").
+        rm secrets/rio_signing-key secrets/rio_signing-key-pub
+        { head -c 32 /dev/urandom; head -c 32 /dev/zero | tr '\0' Z; } > tmp/f.bin
+        printf '%s' "rio-stale:$(base64 -w0 < tmp/f.bin)" > secrets/rio_signing-key
+        if run 2>$TMPDIR/f-stderr; then
+          echo "FAIL-F: Job exited 0 on an internally inconsistent secret" >&2; exit 1
+        fi
+        grep -qi "inconsistent" $TMPDIR/f-stderr \
+          || { echo "FAIL-F: abort did not name the inconsistency" >&2; cat $TMPDIR/f-stderr >&2; exit 1; }
+        [ ! -f secrets/rio_signing-key-pub ] \
+          || { echo "FAIL-F: something was published from a corrupt secret" >&2; exit 1; }
+
+        # Scenario G: corrupt secret (48 bytes — neither population
+        # member) → abort, nothing published.
+        printf '%s' "rio-bad:$(head -c 48 /dev/urandom | base64 -w0)" > secrets/rio_signing-key
+        if run 2>$TMPDIR/g-stderr; then
+          echo "FAIL-G: Job exited 0 on a malformed secret" >&2; exit 1
+        fi
+        [ ! -f secrets/rio_signing-key-pub ] \
+          || { echo "FAIL-G: something was published from a malformed secret" >&2; exit 1; }
+
+        # Scenario I: both present but MISMATCHED → self-heal converges
+        # the pub onto derive(sec) without touching the private half;
+        # then the steady state logs the pair-consistency line (the
+        # runbook's per-upgrade probe) and changes nothing.
+        rm secrets/rio_signing-key
+        run > /dev/null   # mint a fresh consistent pair
+        cp secrets/rio_signing-key tmp/i.sec
+        printf '%s' "rio-junk:AAAA" > secrets/rio_signing-key-pub
+        run > tmp/i.log
+        grep -q "healing" tmp/i.log \
+          || { echo "FAIL-I: mismatch not detected as a heal" >&2; exit 1; }
+        cmp secrets/rio_signing-key tmp/i.sec \
+          || { echo "FAIL-I: heal touched the private half" >&2; exit 1; }
+        derive < tmp/i.sec > tmp/i.expected
+        cmp secrets/rio_signing-key-pub tmp/i.expected \
+          || { echo "FAIL-I: heal did not converge pub to derive(sec)" >&2; exit 1; }
+        run > tmp/i2.log
+        grep -q "signing-key pair consistent" tmp/i2.log \
+          || { echo "FAIL-I: steady state did not log the pair-consistency probe" >&2; exit 1; }
+        grep -q "healing" tmp/i2.log \
+          && { echo "FAIL-I: consistent pair triggered a heal" >&2; exit 1; }
+        cmp secrets/rio_signing-key-pub tmp/i.expected && cmp secrets/rio_signing-key tmp/i.sec \
+          || { echo "FAIL-I: steady-state run mutated the pair" >&2; exit 1; }
+        touch $out
+      '';
+
+  # The bootstrap script's AWS verbs must be a subset of the IRSA
+  # policy in infra/eks/secrets.tf — round-16 bug_023's disclosure arm
+  # was unexecutable in EKS only because the role happened to lack
+  # GetSecretValue; now that the grant exists ON PURPOSE (pair probe +
+  # re-derive), drift in either direction must fail the gate, not be
+  # discovered as AccessDenied in a Job log (or as a silently
+  # over-privileged role).
+  bootstrap-iam-parity =
+    pkgs.runCommand "rio-bootstrap-iam-parity"
+      {
+        script = ../nix/bootstrap-job.sh;
+        policy = ../infra/eks/secrets.tf;
+      }
+      ''
+        # CLI verbs used by the script → IAM action names.
+        verbs=$(grep -oE 'aws secretsmanager [a-z-]+' $script | awk '{print $3}' | sort -u)
+        [ -n "$verbs" ] || { echo "FAIL: no aws secretsmanager verbs found in script?" >&2; exit 1; }
+        # The rio_bootstrap policy statement (between the policy
+        # resource declaration and its Resource line).
+        block=$(sed -n '/resource "aws_iam_policy" "rio_bootstrap"/,/Resource/p' $policy)
+        [ -n "$block" ] || { echo "FAIL: rio_bootstrap policy block not found in secrets.tf" >&2; exit 1; }
+        fail=0
+        for v in $verbs; do
+          action=$(echo "$v" | sed -E 's/(^|-)([a-z])/\U\2/g')
+          echo "$block" | grep -q "secretsmanager:$action" || {
+            echo "FAIL: script uses 'aws secretsmanager $v' but the rio_bootstrap IAM policy lacks secretsmanager:$action" >&2
+            fail=1
+          }
+        done
+        # Reverse direction: every granted action is used by the script
+        # (no silent over-grant).
+        granted=$(echo "$block" | grep -oE 'secretsmanager:[A-Za-z]+' | cut -d: -f2 | sort -u)
+        for a in $granted; do
+          verb=$(echo "$a" | sed -E 's/([A-Z])/-\L\1/g; s/^-//')
+          echo "$verbs" | grep -qx "$verb" || {
+            echo "FAIL: IAM grants secretsmanager:$a but the script never uses 'aws secretsmanager $verb'" >&2
+            fail=1
+          }
+        done
+        [ "$fail" = 0 ] || exit 1
         touch $out
       '';
 }

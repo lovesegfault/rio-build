@@ -18,8 +18,12 @@ metadata:
     helm.sh/hook-weight: "-1"
     helm.sh/hook-delete-policy: before-hook-creation
     {{- with $b.serviceAccount.annotations }}
-    # IRSA: secretsmanager:CreateSecret, PutSecretValue, DescribeSecret on
-    # arn:aws:secretsmanager:*:*:secret:rio/*
+    # IRSA: secretsmanager:CreateSecret, PutSecretValue, DescribeSecret,
+    # GetSecretValue on arn:aws:secretsmanager:*:*:secret:rio/* —
+    # GetSecretValue feeds the signing-key pair-consistency probe and
+    # the pub re-derive (both delegate byte work to rio-cli; the
+    # script never decodes key material). Kept in lockstep with the
+    # script by the bootstrap-iam-parity check.
     {{- toYaml . | nindent 4 }}
     {{- end }}
 automountServiceAccountToken: false
@@ -27,7 +31,10 @@ automountServiceAccountToken: false
 # Helm pre-install/pre-upgrade hook: runs BEFORE any other chart resource.
 # Idempotent — the script checks describe-secret first. On first-ever install,
 # generates rio/hmac + rio/signing-key + rio/signing-key-pub in Secrets Manager.
-# Subsequent upgrades: describe-secret returns 0, script exits 0, no-op. ESO
+# Subsequent upgrades: hmac/host-key blocks no-op; the signing-key block runs a
+# pair-consistency probe — every upgrade's Job log shows either
+# "[bootstrap] signing-key pair consistent" or a heal line (re-deriving the pub
+# from the live private half via rio-cli; never a key rotation). ESO
 # (external-secrets.yaml) then syncs them into k8s Secrets.
 #
 # before-hook-creation: Helm deletes the previous Job before creating a new
