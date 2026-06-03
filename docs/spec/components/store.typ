@@ -1446,25 +1446,69 @@ are retained on a wall-clock TTL enforced by an hourly sweep plus an S3
 lifecycle rule that collects orphans (objects whose manifest row was never
 written because the replica crashed between the PUT and the INSERT).
 
-#r("store.log.append-auth")[
+#r("store.log.append-auth+2")[
   An `AppendLog` stream MUST be authorized by the caller's HMAC assignment
   token before any batch is accepted: the header's derivation MUST normalize
-  to the token's `drv_hash`, and the claimed `exec_id` and the token's
-  `executor_id` MUST both match the derivation's most recent assignment
-  attempt. A stream whose claimed execution has been superseded by a
-  re-dispatch MUST be rejected.
+  to the token's `drv_hash`, and the claimed `exec_id` MUST name a recorded
+  assignment attempt of that derivation that was assigned to the token's
+  `executor_id` and whose execution kind is `build`. A claimed execution
+  with no matching assignment row, a different executor, or a non-`build`
+  kind MUST be rejected with the permanent `superseded` class.
 ]
 
 The token is a bearer credential --- the comparison is a token-currency check
-(is this token's attempt still the derivation's live assignment?), not a
-presenter-identity check. Matching the *latest* assignment row rather than
-only active rows deliberately admits the post-completion late replay (a
-builder draining its retransmit buffer after the build finished) while
-rejecting any executor whose derivation has since been handed to someone
-else. This is the relocated scheduler-side log-batch binding gate: a
-compromised builder spamming a fabricated `derivation_path` cannot pollute
-another execution's log, and a late batch from a timed-out executor cannot be
-attributed to the next execution.
+over the CLAIMED execution's own row, not a presenter-identity check and not
+a "latest assignment" race. An executor's own superseded attempt stays
+writable (the post-completion late replay --- a builder draining its
+retransmit buffer after the build finished, even after the derivation was
+re-probed by a materialization mint or re-dispatched): containment is
+exec-keyed chunks plus the durable caps plus the `final_line_count` ceiling,
+so a stale writer can fill its own execution's gaps but never grow another's
+log or its own past the recorded end. The one revocation path is the
+scheduler's in-place assignment rewrite (the claimed row no longer exists);
+the dropped tail in that case is disclosed by the builder's loss-disclosure
+counter rather than silently retried forever. This is the relocated
+scheduler-side log-batch binding gate: a compromised builder spamming a
+fabricated `derivation_path` cannot pollute another execution's log, and a
+late batch from a timed-out executor cannot be attributed to the next
+execution.
+
+#r("store.log.caps-durable")[
+  The per-execution log byte cap and chunk cap MUST be enforced against
+  durable per-execution aggregates: every `AppendLog` open MUST seed the
+  session's accepted-byte and chunk-attempt counters from the execution's
+  committed chunk manifest, an open for an execution at or over either cap
+  MUST be rejected with `FAILED_PRECONDITION` and the `x-rio-log-reject`
+  metadata naming the `cap` class, and a mid-stream cap trip MUST use the
+  same code and metadata. `RESOURCE_EXHAUSTED` is reserved for per-replica
+  capacity conditions that a retry on another replica can satisfy.
+]
+
+A reconnect used to zero both caps (they compared session-local counters),
+so the documented per-execution bounds were really per-session and a
+reconnecting builder could store unbounded bytes. The accounted size
+(content plus the per-line overhead, the same formula every in-memory bound
+charges) is persisted per chunk (`drv_log_chunks.accounted_bytes`,
+migration 089) and summed at open. The status-code split is what lets the
+builder classify correctly: cap exhaustion travels with the execution
+(permanent --- give up and disclose), replica capacity does not (retry
+elsewhere).
+
+#r("store.log.read-authority")[
+  Resolving a derivation to an execution for log access MUST consider only
+  `build`-kind executions: the unpinned `TailLog` resolution MUST read the
+  kind-filtered `latest_build_exec` view, and `AppendLog` write authority
+  MUST verify the claimed execution's kind is `build`, so a materialization
+  execution can neither receive nor shadow build log content.
+]
+
+A materialization attempt (the store-side substitution executor) shares the
+`drv_executions` table and mints newer `exec_id`s than the build it
+re-probes; kind-blind "latest execution" reads resolved to it and served an
+empty log for a derivation whose build log exists. The view carries the
+filter so every consumer inherits it; the `log-no-raw-latest-exec` policy
+check bans new raw `ORDER BY exec_id DESC` reads of `drv_executions` outside
+migrations.
 
 #r("store.log.completeness-gate")[
   An execution's log is complete when its lifecycle row is terminal, its

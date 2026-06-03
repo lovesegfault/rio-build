@@ -421,7 +421,8 @@ in the introducing commit's message and the checks' transcripts.
 | Invariant | Predecessor | What it checks |
 |---|---|---|
 | `noCrossExecContamination` | `noCrossExecContamination` | Execution E's manifest holds only lines E's own bound builder sent. The defense is structural (the chunk key embeds the exec_id the stream was bound to at open); the invariant is the regression guard that the cut keys its chunk by the cutting session's execution. |
-| `authGateExcludesForeignWriters` | `bindingGateExcludesForeignExecutors` | The stream-open predicate admits a claimed execution only when it is the derivation's latest assignment attempt. |
+| `authGateExcludesUnassignedWriters` | `authGateExcludesForeignWriters` (renamed at the bughunt-wave B2 re-keying) | The stream-open predicate admits a claimed execution only while its OWN assignment row exists (the v2 claimed-exec gate, `store.log.append-auth+2`): supersession alone no longer revokes write authority — only the scheduler's in-place row rewrite does. `logServiceCalibGateRow` pins that dropping the row conjunct falsifies it. |
+| `acceptedWithinCap` | — (new; bughunt-wave B2, merged_bug_207) | The durable accepted footprint (committed chunks ∪ session buffers ∪ fabricated lines) never exceeds the per-execution cap, across reconnects. Measured against durable state, not the accounting ghost, so the pre-fix per-session encoding (`logServiceCalibSessionCaps`: reconnects reset the account and the open gate has no durable check) falsifies it. The boundary is pinned reachable by `quint-log-service-witness-cap-boundary`. |
 | `noSilentLineLoss` | `noSilentLineLoss` | The four-disjunct disclosed-loss form: every line the build emitted is in the builder's retransmit buffer, in a store-side ingest buffer, covered by a manifest chunk, or the loss is disclosed (the log does not read as complete / the uploader recorded its abandonment). |
 | `ackImpliesDurable` | — (new) | The honest uploader's load-bearing refinement of the conservation law: every line below the builder's acked watermark is manifest-covered until the TTL sweep removes it. Asserted only in the regimes without the fabricating client (see the val's doc for why a client that mis-numbers its own lines forfeits the per-ack durability claim). |
 | `servedSpanExact` | `lineSpanExact` | The read path's ordered-walk-with-watermark over the manifest — including overlapping chunks from two sessions — yields exactly the union of the chunks' line ranges, each line exactly once. The fold is encoded as the code's walk, not as the union it is supposed to compute. |
@@ -442,7 +443,7 @@ conventional tests own it.
 | Original row | Old fix | Model-C verdict | Where the hazard went |
 |---|---|---|---|
 | `3a55474ac` | accounted-floor accept gate | **CHECKED**(`servedSpanExact`, resend) | The re-delivered batch after an ambiguous disconnect lands as a *manifest overlap* (a second session's chunk covering the same line range), not a span overstatement — there is no gap-merge fold to double-count it. The hazard moved to the read path's `(first_line, session_id)` ordered walk and `LineCursor` watermark (`tail.rs`), which must serve each overlapped line exactly once; `quint-log-service-witness-overlap` and `-dedup` pin the overlap and the suppressed duplicate as reachable. The within-one-session re-delivery is rejected by `high_water_line` (the monotone floor — the `accounted_below` fix built in from the start, never reset by the buffer emptying). |
-| `496e6fb14` | recv-task (executor, drv) binding gate | **CHECKED**(`authGateExcludesForeignWriters`, redispatch) | Relocated to `gate.rs::check_append_open`: HMAC token, token-vs-header derivation match, latest-assignment + builder binding. The model checks the latest-assignment half (the superseded-token rejection, pinned by `quint-log-service-witness-superseded-rejected`); the identity comparisons are pure equality on signed token fields. The content/provenance harm is still erased by the line-as-integer encoding — the same documented price the predecessor paid. |
+| `496e6fb14` | recv-task (executor, drv) binding gate | **CHECKED**(`authGateExcludesUnassignedWriters`, redispatch) | Relocated to `gate.rs::check_append_open`: HMAC token, token-vs-header derivation match, claimed-exec row + builder + kind binding (v2 at the bughunt-wave: the latest-assignment race was merged_bug_101's displacement hole — a materialization mint or re-dispatch silently revoked a terminal-but-incomplete build's late replay; authority now keys on the claimed exec's own row and the rejection moved to the in-place-rewrite arm, pinned by `quint-log-service-witness-superseded-rejected` over the rewritten row). The identity comparisons are pure equality on signed token fields. The content/provenance harm is still erased by the line-as-integer encoding — the same documented price the predecessor paid. |
 | `496e6fb14` (residual) | legacy `push()`'s `or_default()` unstamped-entry allocation | **CONSTRUCTION** | There is no entry to allocate: a stream that fails the gate never creates a session, and the per-replica stream-count and byte-budget semaphores bound the resource the unstamped entry leaked. Resource bounds, outside the model. |
 | `7beb1ca00` #1 | gateway `ForwardLogBatch` gated on the accept verdict | **CONSTRUCTION** | The live-tail fan-out happens inside `accept()` after every gate (`ingest.rs`), so a rejected batch is never fanned out. The fan-out sink itself is read-side plumbing outside the model. |
 | `7beb1ca00` #2 | `FlushRequest.exec_id` stale-drain pin | **CONSTRUCTION** | No finalizing drain exists. A cut drains the cutting session's own buffer into the cutting session's own `(exec, session)` keyspace; there is no request that names an execution other than the one the stream was bound to at open. `noCrossExecContamination` is the regression guard. |
@@ -481,3 +482,47 @@ finalize-once seal, the gap accounting, and the span arithmetic); **2
 are outside the model** in both architectures (display-stream and
 sibling-message-type gates owned by conventional tests). No row is
 exposed without a check.
+
+## Bughunt-wave B2 commit 1 — durable caps + claimed-exec authority (2026-06-03)
+
+The first B2 (log-ingest-authority) landing re-keys the model's gate and
+adds the caps axis; recorded here per the formal-delta discipline:
+
+- **Gate v2** (`store.log.append-auth+2`, merged_bug_101): `openAdmitted`
+  drops the `e == dispatched` (latest-assignment) conjunct for
+  `not(assignmentRowLost(e))` — the claimed exec's OWN row is the
+  authority; a new environment action `rewriteAssignment` models the
+  scheduler's ON-CONFLICT in-place rewrite (the one revocation path).
+  `supersededWriterRun` re-derived: both executions stay admitted after a
+  re-dispatch (the late-replay fix), the rewrite excludes exactly one.
+  The MBT projection drives the new action with a real
+  `UPDATE assignments SET exec_id = …` and the conformance replays are
+  green (7/7).
+- **Caps axis** (`store.log.caps-durable`, merged_bug_207): new const
+  `CAP` + ghost `acceptedTotal` (lifetime, never reset), the open gate's
+  check-5 conjunct, and the accept guard charging kept lines. New
+  invariant `acceptedWithinCap` (durable footprint ≤ CAP, measured
+  against chunks ∪ buffers ∪ fabricated — falsifiable, unlike the ghost
+  form) wired into `logServiceResend`; witness
+  `quint-log-service-witness-cap-boundary` pins the boundary reachable
+  (the at-least-once replay's double-charge reaches CAP = 4 exactly).
+- **Calibrations** (expect-violation, both reproduce the pre-fix bugs):
+  `logServiceCalibSessionCaps` (CAP = 2 — below the line domain so an
+  over-cap durable footprint is representable; reconnect resets the
+  account AND the open gate skips check 5, the exact pre-fix shape) and
+  `logServiceCalibGateRow` (the row conjunct ignored ⇒ a rewritten
+  execution's writer is re-admitted).
+- **Regime constants**: base/redispatch/sweep bind `CAP = 9`
+  (non-binding — their state spaces gain only the two new variables);
+  resend binds `CAP = 4` (the canonical 2-line-cut + reconnect +
+  2-line-replay trace costs 4 under the double-charge; see the binding's
+  comment). Budgets re-measured at the gate (`--checks`) per MCI-6.
+- **Unmodeled, deliberately**: the caps' BYTE granularity (one line = one
+  accounted unit here; the byte formula is pinned by
+  `byte_cap_resumes_from_durable_seed` and the gate DB tests), the
+  chunk-attempt cap (same durable-seed mechanism, same code path), and
+  the kind axis (every modeled execution is build-kind; the
+  materialization-exec rejection is `gate_rejects_materialization_exec_
+  as_append_target` + the `latest_build_exec` view's DB test — the
+  multi-population dispatch regime is the planned `logServiceKindMix`
+  extension in B2's remaining scope).

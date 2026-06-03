@@ -1915,6 +1915,40 @@ pub const M_084: () = ();
 /// after ~111s of reconnect attempts). NULL columns (pre-087 terminal
 /// rows) degrade to the old empty-payload snapshot — additive only.
 pub const M_087: () = ();
+/// `migrations/089_log_authority.sql`
+///
+/// The log-ingest authority surface goes durable (bughunt wave,
+/// merged_bug_207/bug_248/merged_bug_111; B2 log-ingest-authority):
+///
+/// - `drv_log_chunks.accounted_bytes BIGINT NOT NULL DEFAULT 0`: the
+///   cut's ACCOUNTED size — post-truncation content bytes plus
+///   `PER_LINE_OVERHEAD` (32) per line, the exact formula every ingest
+///   resource bound charges (`rio-store/src/logs/ingest.rs::
+///   accounted_len`). Written by `commit_chunk` at cut time. The
+///   per-execution byte cap and chunk-attempt cap are seeded from
+///   `SUM(accounted_bytes)` / `COUNT(*)` at every `AppendLog` open
+///   (`gate::log_seed`), so a reconnect can no longer reset either cap
+///   to zero (merged_bug_207's per-session-cap hole: the documented
+///   per-EXECUTION caps were enforced against session-local counters
+///   that every reconnect zeroed, making both caps per-session and the
+///   abuse bound unbounded). Rows cut before this migration default to
+///   0: a ≤`log_retention_days` (default 30d) under-count window for
+///   the abuse bound — pre-089 bytes age out of retention on that
+///   schedule, after which the durable account is exact. Accepted: the
+///   cap is an abuse bound, not an accounting invariant, and the
+///   alternative (backfilling from `byte_size`, the COMPRESSED size)
+///   would under-charge by the compression ratio forever.
+/// - `latest_build_exec` view + `drv_executions_build_latest_idx`
+///   partial index: THE one resolver for "the derivation's latest
+///   BUILD execution". The unpinned `TailLog` resolution used a raw
+///   `ORDER BY exec_id DESC` over all kinds, so a freshly-minted
+///   materialization execution (which never has chunks) shadowed the
+///   build whose log the caller wanted (merged_bug_111). The view is
+///   kind-filtered at the definition, every consumer inherits the
+///   filter, and the `log-no-raw-latest-exec` policy check bans new
+///   raw `ORDER BY exec_id DESC` reads of `drv_executions` outside
+///   migrations.
+pub const M_089: () = ();
 /// `migrations/090_gc_collect_state.sql`
 ///
 /// The chunk-collector's cluster state becomes a durable singleton row

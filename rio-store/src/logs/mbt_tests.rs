@@ -183,6 +183,16 @@ const EXECUTOR: &str = "mbt-builder-0";
 /// scope notes), and a same-replica reacquire never hits the Busy arm.
 const REPLICA: &str = "mbt-replica-0";
 
+/// Production-default open caps for the projection (the model does not
+/// model the caps; they are high enough that no replayed trace trips
+/// them).
+fn mbt_caps() -> gate::OpenCaps {
+    gate::OpenCaps {
+        per_exec_byte_cap: super::ingest::DEFAULT_PER_EXEC_BYTE_CAP,
+        max_chunks_per_exec: 100_000,
+    }
+}
+
 /// The TTL retention used by the `executionExpires` / `sweepChunks`
 /// arms. The driver backdates `started_at` past this to mirror the
 /// model's `expired` flag flipping.
@@ -565,7 +575,7 @@ impl MbtSystem {
     /// a known count. Mirrors `service.rs::append_log` steps 3-6.
     async fn open_session(&mut self, e: u64) -> Result<()> {
         let (claims, header) = self.gate_inputs(e)?;
-        let ok = gate::check_append_open(self.pool(), &claims, &header)
+        let ok = gate::check_append_open(self.pool(), &claims, &header, mbt_caps())
             .await
             .map_err(|status| {
                 anyhow::anyhow!(
@@ -587,16 +597,11 @@ impl MbtSystem {
         // The cut threshold is irrelevant here (the model's cut is an
         // explicit action, not a size trigger, and `cut_due` is only a
         // returned flag), so the production defaults are kept.
-        let mut session =
-            IngestSession::new(ok.exec_id, session_id, ok.drv_hash, IngestConfig::default());
-        let mut hw_at_learn = None;
-        if let Some(n) = ok.final_line_count {
-            // The handler seeds the per-append ceiling from the gate's
-            // answer for an already-terminal execution (the late
-            // replay). The learn-time high water is 0 by construction.
-            session.set_final_line_count(u64::try_from(n.max(0)).expect("count is non-negative"));
-            hw_at_learn = Some(session.high_water_line());
-        }
+        let session = IngestSession::new(&ok, session_id, IngestConfig::default());
+        // The constructor seeds the per-append ceiling from the gate's
+        // answer for an already-terminal execution (the late replay).
+        // The learn-time high water is 0 by construction.
+        let hw_at_learn = ok.final_line_count.map(|_| session.high_water_line());
         let max_sessions = self.max_sessions;
         let h = self.exec(e)?;
         ensure!(
@@ -621,12 +626,31 @@ impl MbtSystem {
     /// whose claimed execution is no longer the derivation's latest
     /// assignment. The model says PERMISSION_DENIED; anything else —
     /// including an admission — is a divergence.
+    /// `rewriteAssignment(e)`: the scheduler reuses the assignment row
+    /// for a new attempt — the claimed exec_id vanishes from the
+    /// assignments table. Mirrors the ON CONFLICT upsert the gate
+    /// observes as fetch_optional == None.
+    async fn rewrite_assignment(&mut self, e: u64) -> Result<()> {
+        let exec = self.exec(e)?.exec_id;
+        let rewritten = sqlx::query("UPDATE assignments SET exec_id = $2 WHERE exec_id = $1")
+            .bind(exec)
+            .bind(Uuid::now_v7())
+            .execute(self.pool())
+            .await?
+            .rows_affected();
+        ensure!(
+            rewritten == 1,
+            "rewriteAssignment({e}): expected exactly one assignment row, rewrote {rewritten}"
+        );
+        Ok(())
+    }
+
     async fn open_rejected_superseded(&mut self, e: u64) -> Result<()> {
         let (claims, header) = self.gate_inputs(e)?;
-        match gate::check_append_open(self.pool(), &claims, &header).await {
-            Err(status) if status.code() == tonic::Code::PermissionDenied => Ok(()),
+        match gate::check_append_open(self.pool(), &claims, &header, mbt_caps()).await {
+            Err(status) if status.code() == tonic::Code::FailedPrecondition => Ok(()),
             Err(status) => bail!(
-                "openRejectedSuperseded({e}): expected PERMISSION_DENIED, got {:?}: {}",
+                "openRejectedSuperseded({e}): expected FAILED_PRECONDITION, got {:?}: {}",
                 status.code(),
                 status.message()
             ),
@@ -642,7 +666,7 @@ impl MbtSystem {
     /// (FAILED_PRECONDITION).
     async fn open_rejected_complete(&mut self, e: u64) -> Result<()> {
         let (claims, header) = self.gate_inputs(e)?;
-        match gate::check_append_open(self.pool(), &claims, &header).await {
+        match gate::check_append_open(self.pool(), &claims, &header, mbt_caps()).await {
             Err(status) if status.code() == tonic::Code::FailedPrecondition => Ok(()),
             Err(status) => bail!(
                 "openRejectedComplete({e}): expected FAILED_PRECONDITION, got {:?}: {}",
@@ -1088,6 +1112,11 @@ enum Action {
     BuildFinishes(u64),
     RecordFinalLineCount(u64),
     OpenSession(u64),
+    /// The scheduler's ON-CONFLICT in-place rewrite: the (non-latest)
+    /// execution's assignment row is re-pointed at a fresh exec_id, so
+    /// the old executor's claimed-exec authority is permanently
+    /// revoked (the v2 gate's one revocation path).
+    RewriteAssignment(u64),
     OpenRejectedSuperseded(u64),
     AppendHonest(u64),
     AppendFabricated(u64, u64, u64),
@@ -1124,6 +1153,7 @@ impl MbtSystem {
             }
             RecordFinalLineCount(e) => self.record_final_line_count(e).await,
             OpenSession(e) => self.open_session(e).await,
+            RewriteAssignment(e) => self.rewrite_assignment(e).await,
             OpenRejectedSuperseded(e) => self.open_rejected_superseded(e).await,
             AppendHonest(e) => self.append_honest(e),
             AppendFabricated(e, lo, hi) => self.append_fabricated(e, lo, hi),
@@ -1226,10 +1256,12 @@ const MID_STREAM_CEILING: NamedRun = NamedRun {
     ],
 };
 
-/// `supersededWriterRun` (redispatch regime): execution 1's session is
-/// open and holding lines when execution 2 is dispatched; execution 1
-/// keeps cutting to its own manifest, its builder's reopen is rejected
-/// by the auth gate, and execution 2's log is untouched.
+/// `supersededWriterRun` (redispatch regime, v2): execution 1's session
+/// is open and holding lines when execution 2 is dispatched; execution
+/// 1 keeps cutting to its own manifest (supersession alone no longer
+/// revokes its authority — merged_bug_101); only the scheduler's
+/// in-place row rewrite excludes it, after which its reopen is
+/// rejected. Execution 2's log is untouched throughout.
 const SUPERSEDED_WRITER: NamedRun = NamedRun {
     run: "supersededWriterRun",
     main: "logServiceRedispatch",
@@ -1243,6 +1275,7 @@ const SUPERSEDED_WRITER: NamedRun = NamedRun {
         Dispatch,
         CutChunk(1, 1),
         BuilderDisconnects(1),
+        RewriteAssignment(1),
         OpenRejectedSuperseded(1),
     ],
 };

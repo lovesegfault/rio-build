@@ -403,6 +403,38 @@ in
   # enforcement (the rio-proto h2_throughput precedent): clippy
   # disallowed-methods cannot name tonic-generated generic methods
   # reliably.
+  # B2 log-ingest-authority (merged_bug_111): the kind-filtered
+  # `latest_build_exec` view (migration 089) is THE resolver for "the
+  # derivation's latest build execution". A new raw `ORDER BY exec_id
+  # DESC` read of drv_executions is a kind-blind copy of that
+  # resolution waiting to serve a materialization mint's empty log —
+  # ban it outside migrations (the view definition itself).
+  log-no-raw-latest-exec =
+    pkgs.runCommand "rio-log-no-raw-latest-exec"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-store/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-gateway/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-cli/src)
+          ];
+        };
+        nativeBuildInputs = [ pkgs.ripgrep ];
+      }
+      ''
+        set +o pipefail
+        hits=$(rg -n -i 'FROM drv_executions[^;]*ORDER BY exec_id DESC' --multiline           $src/rio-store/src $src/rio-scheduler/src $src/rio-gateway/src $src/rio-cli/src           || true)
+        if [[ -n "$hits" ]]; then
+          echo "FAIL: raw latest-exec resolution over drv_executions —" >&2
+          echo "read the kind-filtered latest_build_exec view instead (M_089):" >&2
+          echo "$hits" >&2
+          exit 1
+        fi
+        touch $out
+      '';
+
   transport-unary-ban =
     pkgs.runCommand "rio-transport-unary-ban"
       {

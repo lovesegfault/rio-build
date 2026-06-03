@@ -312,6 +312,11 @@ pub struct IngestSession {
     /// S3 key is ever re-PUT with a different line range (the
     /// [`super::chunks::PutOutcome::Existed`] caller contract).
     next_seq: u32,
+    /// Committed chunks the execution already had at open time (the
+    /// gate's durable seed). Added to `next_seq` by
+    /// [`Self::chunk_attempts`] so the per-execution chunk cap, like
+    /// the byte cap, survives reconnects.
+    prior_chunks: u32,
     /// The lowest acceptable `first_line_number` for the next batch:
     /// one past the last accepted line. Forward gaps are allowed
     /// (`first_line_number > high_water_line`); going backwards is not.
@@ -324,19 +329,30 @@ pub struct IngestSession {
     /// the lifecycle row terminal with a known count — until then no
     /// ceiling applies.
     final_line_count: Option<u64>,
-    /// Total post-truncation bytes accepted over the session's lifetime
-    /// (never decremented on cut). Compared against
+    /// Total accounted bytes accepted over the EXECUTION's lifetime:
+    /// seeded from the durable manifest at open
+    /// (`GateOk::prior_accounted_bytes`), grown per accepted batch,
+    /// never decremented on cut. Compared against
     /// [`IngestConfig::per_exec_byte_cap`].
     accepted_bytes: u64,
     consecutive_cut_failures: u8,
 }
 
 impl IngestSession {
-    pub fn new(exec_id: Uuid, session_id: Uuid, drv_hash: String, config: IngestConfig) -> Self {
-        Self {
-            exec_id,
+    // r[impl store.log.caps-durable]
+    /// The ONLY constructor, and it takes a [`GateOk`]: a session
+    /// cannot exist without the gate's durable-account read, so the
+    /// per-execution caps are seeded from the committed manifest —
+    /// never from zero — on every open (merged_bug_207). `next_seq`
+    /// stays session-scoped (chunk keys are
+    /// `(exec_id, session_id, chunk_seq)`); the durable chunk count
+    /// rides separately in `prior_chunks` and is added back by
+    /// [`Self::chunk_attempts`].
+    pub fn new(gate_ok: &super::gate::GateOk, session_id: Uuid, config: IngestConfig) -> Self {
+        let mut s = Self {
+            exec_id: gate_ok.exec_id,
             session_id,
-            drv_hash,
+            drv_hash: gate_ok.drv_hash.clone(),
             shared: Arc::new(Mutex::new(IngestShared {
                 buffer: Vec::new(),
                 in_flight: Vec::new(),
@@ -347,11 +363,22 @@ impl IngestSession {
             })),
             config,
             next_seq: 0,
+            prior_chunks: gate_ok.prior_chunks,
             high_water_line: 0,
             final_line_count: None,
-            accepted_bytes: 0,
+            accepted_bytes: gate_ok.prior_accounted_bytes,
             consecutive_cut_failures: 0,
+        };
+        if let Some(n) = gate_ok.final_line_count {
+            // The execution is already terminal with a recorded end
+            // (the late-replay case): the session is born knowing its
+            // append ceiling. A negative count is unrepresentable on
+            // the write side (the scheduler stores the proto's u64);
+            // clamp defensively rather than wrap.
+            // r[impl store.log.completeness-gate]
+            s.set_final_line_count(n.max(0) as u64);
         }
+        s
     }
 
     /// The per-append ceiling, if the execution's recorded end is
@@ -404,7 +431,7 @@ impl IngestSession {
     /// the per-execution object count against a builder fabricating
     /// forward gaps to force one chunk per run.
     pub fn chunk_attempts(&self) -> u32 {
-        self.next_seq
+        self.prior_chunks.saturating_add(self.next_seq)
     }
 
     /// The session's tuning knobs (the handler reads `cut_interval` for
@@ -565,16 +592,27 @@ impl IngestSession {
         // -- The per-execution accepted-bytes cap. Stream-fatal: the
         // builder gets RESOURCE_EXHAUSTED and gives up on the log (the
         // build itself is unaffected).
+        // r[impl store.log.caps-durable]
+        // Same status code + metadata class as the gate's open-time
+        // check: the cap travels with the EXECUTION, so a retry on
+        // another replica cannot succeed — FAILED_PRECONDITION (the
+        // builder classifies it permanent), never RESOURCE_EXHAUSTED
+        // (reserved for per-replica capacity).
         if self.accepted_bytes.saturating_add(batch_bytes) > self.config.per_exec_byte_cap {
             metrics::counter!(
                 "rio_store_log_ingest_rejected_total",
                 "reason" => "byte_cap"
             )
             .increment(1);
-            return Err(Status::resource_exhausted(format!(
+            let mut status = Status::failed_precondition(format!(
                 "AppendLog: execution exceeded the {}-byte log ingest cap",
                 self.config.per_exec_byte_cap
-            )));
+            ));
+            status.metadata_mut().insert(
+                rio_proto::LOG_REJECT_METADATA_KEY,
+                tonic::metadata::MetadataValue::from_static("cap"),
+            );
+            return Err(status);
         }
 
         // -- Buffer + fan out under one critical section. The fan-out
@@ -741,6 +779,16 @@ impl IngestSession {
         lines: Vec<Vec<u8>>,
     ) -> Result<(), CutError> {
         let line_count = lines.len() as i64;
+        // The durable per-execution account (`store.log.caps-durable`):
+        // the same content + PER_LINE_OVERHEAD formula every in-memory
+        // bound charges, persisted with the manifest row so the next
+        // open's gate seed resumes the cap exactly where this session
+        // left it.
+        let accounted_bytes: i64 = lines
+            .iter()
+            .map(|l| accounted_len(l))
+            .sum::<u64>()
+            .min(i64::MAX as u64) as i64;
 
         // A few MiB of zstd takes ~10-50 ms: long enough to stall a
         // tokio worker, so compress on the blocking pool.
@@ -762,8 +810,9 @@ impl IngestSession {
         // contract to enforce).
         sqlx::query(
             "INSERT INTO drv_log_chunks \
-             (exec_id, session_id, chunk_seq, first_line, line_count, byte_size, s3_key) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             (exec_id, session_id, chunk_seq, first_line, line_count, byte_size, s3_key, \
+              accounted_bytes) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT DO NOTHING",
         )
         .bind(self.exec_id)
@@ -773,6 +822,7 @@ impl IngestSession {
         .bind(line_count)
         .bind(byte_size)
         .bind(&key)
+        .bind(accounted_bytes)
         .execute(pool)
         .await
         .map_err(CutError::Manifest)?;
@@ -848,10 +898,26 @@ mod tests {
     }
 
     fn new_session(config: IngestConfig) -> IngestSession {
+        new_session_with_seed(config, 0, 0)
+    }
+
+    /// A session born from a synthetic `GateOk` carrying a durable
+    /// seed, as after a reconnect to an execution with committed
+    /// chunks.
+    fn new_session_with_seed(
+        config: IngestConfig,
+        prior_accounted_bytes: u64,
+        prior_chunks: u32,
+    ) -> IngestSession {
         IngestSession::new(
+            &super::super::gate::GateOk {
+                drv_hash: "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm".to_string(),
+                exec_id: Uuid::now_v7(),
+                final_line_count: None,
+                prior_accounted_bytes,
+                prior_chunks,
+            },
             Uuid::now_v7(),
-            Uuid::now_v7(),
-            "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm".to_string(),
             config,
         )
     }
@@ -1056,9 +1122,40 @@ mod tests {
             session.accept(sized_batch(0, 6, 100)).unwrap(),
             AcceptOutcome::Accepted { .. }
         ));
-        // 600 more would exceed 1000: the stream aborts.
+        // 600 more would exceed 1000: the stream aborts with the
+        // permanent cap class (the cap travels with the execution; a
+        // retry elsewhere cannot succeed).
         let err = session.accept(sized_batch(6, 6, 100)).unwrap_err();
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.metadata()
+                .get(rio_proto::LOG_REJECT_METADATA_KEY)
+                .unwrap(),
+            "cap"
+        );
+    }
+
+    /// `store.log.caps-durable`: a session born from a GateOk carrying
+    /// a durable seed resumes the byte account where the previous
+    /// session left it — the cap cannot be reset by reconnecting.
+    // r[verify store.log.caps-durable]
+    #[test]
+    fn byte_cap_resumes_from_durable_seed() {
+        let mut session = new_session_with_seed(
+            IngestConfig {
+                per_exec_byte_cap: 1000,
+                ..test_config()
+            },
+            // 600 accounted bytes already durable from prior sessions.
+            600,
+            1,
+        );
+        // 600 more would exceed 1000 even though THIS session has
+        // accepted nothing yet.
+        let err = session.accept(sized_batch(0, 6, 100)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        // And the chunk-attempt account includes the durable chunk.
+        assert_eq!(session.chunk_attempts(), 1);
     }
 
     // ------------------------------------------------------------------

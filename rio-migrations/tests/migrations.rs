@@ -229,6 +229,7 @@ fn migration_checksums_frozen() {
         (83, "ab24359b888bf9565682fb8a11d636dc19f44cd2f60a0ca15eef4355241f3ed9aca2cd5feb7580608c7b4f73374e35a0"),
         (84, "6c3152482ae12cc583843f9f65cdf66eabb5e6de4ceb9aed8c9e79975d98fe51927d38fc96b0de74f052c8a8d11dd20c"),
         (87, "77abeb4469311da1409b815ba37a67e1c5db4e43df7c293a728e559651080f4f61186ad9eac30a68acc01f05562f4e4d"),
+        (89, "b86bc43a0f76241cf5bcc11e794ed3104837e35558bd9817c511450d3d2281f62e635ce931dbffe4ad2acde0a4ec1fc3"),
         (90, "2cfae4d9a7ed79b10c3c0431266a59a8eba0f26efa5658935b263aebc7d81911e53598c38c0983504f2167417c1514ac"),
         (91, "d694a6fa3a0418a42954294588ae87a2e6d8c6d09f2a8b54f13e10ea2d0091f41b0df98774a212f45e4422238b8f3469"),
         (92, "a015e5b79a7fbb8d5ce18de91fe8052f8103a067f1d4a59922e8edc17b8c1474146c2ddd1058cd172da7e5539ad36dba"),
@@ -331,6 +332,11 @@ async fn cross_service_schema_contract() {
         ("drv_executions", "drv_hash",         "bpchar"),
         ("drv_executions", "status",           "text"),
         ("drv_executions", "final_line_count", "int8"),
+        // logs (089): the AppendLog write-authority gate verifies the
+        // claimed execution's kind is 'build', and the kind-filtered
+        // `latest_build_exec` view (the unpinned TailLog resolver)
+        // depends on it.
+        ("drv_executions", "attempt_kind",     "text"),
         // logs (062): the TTL sweep's expiry predicate
         // (logs/sweep.rs: WHERE started_at < now() - retention).
         ("drv_executions", "started_at",       "timestamptz"),

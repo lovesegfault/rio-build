@@ -69,6 +69,16 @@ pub const TRACE_ID_HEADER: &str = "x-rio-trace-id";
 /// base64-encoded bytes (always ASCII).
 pub const ASSIGNMENT_TOKEN_HEADER: &str = "x-rio-assignment-token";
 
+/// gRPC metadata key the store attaches to PERMANENT `AppendLog`
+/// rejections, naming the reason class: `cap` (a durable per-execution
+/// ingest cap is exhausted), `complete` (the execution's log is sealed
+/// complete), or `superseded` (the claimed execution is not an
+/// authorized assignment of this executor any more). The builder's
+/// uploader maps the value onto its loss-disclosure `AbandonReason`
+/// (`builder.log.loss-disclosure`); absent metadata falls back to the
+/// status-code mapping. Always ASCII.
+pub const LOG_REJECT_METADATA_KEY: &str = "x-rio-log-reject";
+
 /// Service-identity HMAC token. Minted by trusted control-plane callers
 /// (gateway) on `PutPath`; the store verifies it as the HMAC-bypass
 /// condition. See `rio_auth::hmac::ServiceClaims`.

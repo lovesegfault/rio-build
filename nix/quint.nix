@@ -1249,7 +1249,7 @@ in
       invariants = [
         "boundsOK"
         "noCrossExecContamination"
-        "authGateExcludesForeignWriters"
+        "authGateExcludesUnassignedWriters"
         "noSilentLineLoss"
         "servedSpanExact"
         "completeLogServesAllProduced"
@@ -1262,7 +1262,7 @@ in
     # superseded execution's still-open session keeps writing to its own
     # (old) execution's log only; the two manifests grow concurrently
     # under disjoint exec-keyed namespaces.
-    # r[verify store.log.append-auth]
+    # r[verify store.log.append-auth+2]
     # r[verify obs.log.exec-keyed+2]
     quint-log-service-redispatch = mkQuintCheck {
       name = "log-service-redispatch";
@@ -1271,7 +1271,7 @@ in
       invariants = [
         "boundsOK"
         "noCrossExecContamination"
-        "authGateExcludesForeignWriters"
+        "authGateExcludesUnassignedWriters"
         "noSilentLineLoss"
         "servedSpanExact"
         "completeLogServesAllProduced"
@@ -1293,12 +1293,13 @@ in
       invariants = [
         "boundsOK"
         "noCrossExecContamination"
-        "authGateExcludesForeignWriters"
+        "authGateExcludesUnassignedWriters"
         "noSilentLineLoss"
         "ackImpliesDurable"
         "servedSpanExact"
         "completeLogServesAllProduced"
         "completenessGate"
+        "acceptedWithinCap"
       ];
     };
 
@@ -1313,7 +1314,7 @@ in
       invariants = [
         "boundsOK"
         "noCrossExecContamination"
-        "authGateExcludesForeignWriters"
+        "authGateExcludesUnassignedWriters"
         "noSilentLineLoss"
         "ackImpliesDurable"
         "servedSpanExact"
@@ -1419,12 +1420,48 @@ in
     };
 
     # The auth gate rejects a superseded execution's reopen — the
-    # foreign-token rejection authGateExcludesForeignWriters is about.
+    # unassigned-writer rejection authGateExcludesUnassignedWriters is about.
     quint-log-service-witness-superseded-rejected = mkQuintWitnessCheck {
       name = "log-service-witness-superseded-rejected";
       spec = "logService";
       main = "logServiceRedispatch";
       witness = "noSupersededOpenRejection";
+    };
+
+    # The durable cap boundary is actually reached in the resend regime
+    # (acceptedTotal hits CAP via the at-least-once replay's
+    # double-charge) — the cap conjuncts in the gate and the accept
+    # guard are exercised, not vacuous.
+    # r[verify store.log.caps-durable]
+    quint-log-service-witness-cap-boundary = mkQuintWitnessCheck {
+      name = "log-service-witness-cap-boundary";
+      spec = "logService";
+      main = "logServiceResend";
+      witness = "noCapBoundary";
+    };
+
+    # CALIBRATION (expect-violation): the pre-fix per-SESSION cap
+    # accounting — reconnects reset the account and the open gate has
+    # no durable check — lets the durable footprint exceed the
+    # per-execution cap (merged_bug_207). Pins that acceptedWithinCap
+    # actually catches the bug class B2's durable-cap kernel fixed.
+    quint-log-service-calib-session-caps = mkQuintWitnessCheck {
+      name = "log-service-calib-session-caps";
+      spec = "logService";
+      main = "logServiceCalibSessionCaps";
+      witness = "acceptedWithinCap";
+    };
+
+    # CALIBRATION (expect-violation): the open gate without the
+    # claimed-exec assignment-row conjunct re-admits a
+    # rewritten-in-place execution's writer
+    # (authGateExcludesUnassignedWriters falsifies) — pins the v2
+    # gate's one revocation path as load-bearing in the model.
+    quint-log-service-calib-gate-row = mkQuintWitnessCheck {
+      name = "log-service-calib-gate-row";
+      spec = "logService";
+      main = "logServiceCalibGateRow";
+      witness = "authGateExcludesUnassignedWriters";
     };
 
     # Two executions' logs grow concurrently (the superseded execution's
@@ -2619,7 +2656,7 @@ in
     # its mid-stream refresh (completeness-gate), and the
     # overlapping-session manifest dedup on the read path
     # (session-keyed).
-    # r[verify store.log.append-auth]
+    # r[verify store.log.append-auth+2]
     # r[verify store.log.completeness-gate]
     # r[verify store.log.session-keyed]
     mbt-rio-logservice = mkNextestRun {

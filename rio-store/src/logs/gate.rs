@@ -50,9 +50,63 @@ pub struct GateOk {
     /// mid-stream. See `store.log.completeness-gate`: accepted lines
     /// numbered at or past this are dropped.
     pub final_line_count: Option<i64>,
+    /// The execution's durable accounted-byte total at open time:
+    /// `SUM(accounted_bytes)` over its committed `drv_log_chunks` rows
+    /// (`store.log.caps-durable`). Seeds the session's lifetime
+    /// byte-cap counter so a reconnect resumes the account instead of
+    /// zeroing it. Pre-089 chunk rows account 0 (see `M_089`).
+    pub prior_accounted_bytes: u64,
+    /// The execution's committed chunk count at open time. Seeds the
+    /// session's chunk-attempt counter (the per-execution object-count
+    /// cap) the same way.
+    pub prior_chunks: u32,
 }
 
-// r[impl store.log.append-auth]
+/// The per-execution caps the gate enforces at open time (check 5) —
+/// the same values the ingest session enforces mid-stream, so the open
+/// check and the stream check cannot drift.
+#[derive(Debug, Clone, Copy)]
+pub struct OpenCaps {
+    /// [`super::ingest::IngestConfig::per_exec_byte_cap`].
+    pub per_exec_byte_cap: u64,
+    /// The handler's `log_max_chunks_per_exec`.
+    pub max_chunks_per_exec: u32,
+}
+
+/// A permanent `AppendLog` rejection: `FAILED_PRECONDITION` plus the
+/// `x-rio-log-reject` metadata naming the reason class (`cap`,
+/// `complete`, `superseded`) so the builder's uploader can map it onto
+/// its loss-disclosure `AbandonReason` without parsing messages.
+fn reject_permanent(class: &'static str, msg: String) -> Status {
+    let mut status = Status::failed_precondition(msg);
+    status.metadata_mut().insert(
+        rio_proto::LOG_REJECT_METADATA_KEY,
+        tonic::metadata::MetadataValue::from_static(class),
+    );
+    status
+}
+
+/// The execution's durable log account: committed chunk count and
+/// accounted-byte sum. ONE query, run at every open (the gate side) —
+/// the only reader of `drv_log_chunks.accounted_bytes` besides the
+/// cut that writes it.
+pub(super) async fn log_seed(pool: &PgPool, exec_id: Uuid) -> Result<(u64, u32), Status> {
+    // Store-owned table → runtime query.
+    let row: (i64, i64) = sqlx::query_as(
+        "SELECT count(*), COALESCE(sum(accounted_bytes), 0)::BIGINT \
+         FROM drv_log_chunks WHERE exec_id = $1",
+    )
+    .bind(exec_id)
+    .fetch_one(pool)
+    .await
+    .status_internal("AppendLog gate: durable cap seed")?;
+    Ok((
+        row.1.max(0) as u64,
+        row.0.clamp(0, i64::from(u32::MAX)) as u32,
+    ))
+}
+
+// r[impl store.log.append-auth+2]
 /// May this (already HMAC-verified) token open an `AppendLog` stream
 /// for this execution?
 ///
@@ -63,22 +117,23 @@ pub struct GateOk {
 /// 2. **Identity**: `header.derivation_path` and `claims.drv_hash` must
 ///    normalize to the same derivation. A token for derivation A cannot
 ///    open a stream claiming to write derivation B's log.
-/// 3. **Latest assignment**: the claimed `exec_id` must be the
-///    derivation's most recent assignment attempt, and that attempt
-///    must have been assigned to `claims.executor_id`. Matching the
-///    *latest* row — not only active rows — deliberately admits the
-///    post-completion late replay (the builder's detached drain task
-///    reconnecting after the build finished) while rejecting any
-///    executor whose derivation has since been re-dispatched (a newer —
-///    or rewritten-in-place via the scheduler's ON CONFLICT upsert —
-///    assignment row with a different exec_id/builder_id exists; the
-///    gate handles both identically).
+/// 3. **Claimed-exec authority**: the claimed `exec_id` must be a
+///    recorded assignment attempt of this derivation, assigned to
+///    `claims.executor_id`, whose execution kind is `build`. The
+///    builder's OWN superseded attempt stays writable (the
+///    post-completion late replay; containment is exec-keyed chunks +
+///    the durable caps + the `final_line_count` ceiling) — but another
+///    executor's execution, an in-place-rewritten attempt, and any
+///    materialization-kind execution are rejected.
 /// 4. **Completeness (the seal)**: a log whose execution is terminal,
 ///    whose `final_line_count` is known, and whose chunk manifest
 ///    already covers a contiguous `[0, final_line_count)` can never be
 ///    appended to again. An *incomplete* terminal log keeps accepting
 ///    the late replay that makes it complete.
-/// 5. *(Handler's job — the single-live-session check is
+/// 5. **Durable caps**: an execution at or over its per-execution
+///    byte or chunk cap (computed from the committed manifest, not
+///    session counters) is rejected with the permanent `cap` class.
+/// 6. *(Handler's job — the single-live-session check is
 ///    [`super::sessions::acquire`].)*
 ///
 /// Error messages name the check that failed without disclosing other
@@ -88,6 +143,7 @@ pub async fn check_append_open(
     pool: &PgPool,
     claims: &AssignmentClaims,
     header: &AppendLogHeader,
+    caps: OpenCaps,
 ) -> Result<GateOk, Status> {
     // -- Check 2: the token and the header must name the same derivation.
     let header_hash = drv_log_hash(&header.derivation_path);
@@ -103,8 +159,27 @@ pub async fn check_append_open(
         .parse()
         .map_err(|_| Status::invalid_argument("AppendLog: header.exec_id is not a valid UUID"))?;
 
-    // -- Check 3: the claimed execution must be the derivation's latest
-    // assignment, assigned to this executor.
+    // -- Check 3: the claimed execution must be an assignment attempt
+    // of THIS derivation, assigned to THIS executor, with execution
+    // kind `build`.
+    //
+    // Authority is keyed on the CLAIMED exec, not on "the derivation's
+    // latest assignment": a newer attempt — most commonly a
+    // materialization mint, which can never legitimately append log
+    // lines — used to displace a terminal-but-incomplete build's late
+    // replay (merged_bug_101), silently losing the tail of every build
+    // that finished during a store outage and was then re-probed. A
+    // superseded executor writing to ITS OWN execution is contained,
+    // not contaminating: chunks are exec-keyed, the durable caps
+    // (check 5) bound its volume, and `final_line_count` bounds its
+    // range. The derivation-level "who is current" question belongs to
+    // the scheduler's assignment table, not to log admission.
+    //
+    // The in-place ON-CONFLICT rewrite (the scheduler reusing the
+    // assignment row for a new attempt) leaves the OLD exec with no
+    // matching row — that path still rejects, and the builder
+    // discloses the dropped tail loudly (`builder.log.loss-disclosure`)
+    // instead of silently retrying forever.
     //
     // `claims.drv_hash` is bound VERBATIM (not normalized): both it and
     // `derivations.drv_hash` carry the DAG key (`derivations_drv_hash_uq`
@@ -112,41 +187,74 @@ pub async fn check_append_open(
     // 32-char `drv_log_hash()` form. The two hash vocabularies never
     // join.
     //
-    // `query!` (compile-time checked) because this reads
-    // scheduler-owned tables — the `STORE_READS` entries in
-    // `cross_service_schema_contract` pin these columns and this query
-    // is the reason they exist. The `exec_id DESC NULLS LAST`
-    // tiebreaker makes same-timestamp attempts deterministic (UUIDv7 is
-    // mint-time-ordered).
-    let latest = sqlx::query!(
-        r#"
-        SELECT a.exec_id, a.builder_id
-        FROM assignments a
-        JOIN derivations d USING (derivation_id)
-        WHERE d.drv_hash = $1
-        ORDER BY a.assigned_at DESC, a.exec_id DESC NULLS LAST
-        LIMIT 1
-        "#,
-        claims.drv_hash,
+    // Runtime query over scheduler-owned tables: the `STORE_READS`
+    // entries in `cross_service_schema_contract` pin every column this
+    // reads (including `drv_executions.attempt_kind` — added with
+    // migration 089's view for the same reason). Runtime rather than
+    // `query!` because the compile-time macro would couple every
+    // `cargo xtask` build to a live PG (xtask transitively builds this
+    // crate; the regen chicken-and-egg recorded in the wave log) — the
+    // contract test is the cross-service guarantee either way.
+    // r[impl store.log.read-authority]
+    let claimed: Option<(String, String)> = sqlx::query_as(
+        "SELECT a.builder_id, COALESCE(e.attempt_kind, 'build') \
+         FROM assignments a \
+         JOIN derivations d USING (derivation_id) \
+         LEFT JOIN drv_executions e ON e.exec_id = a.exec_id \
+         WHERE d.drv_hash = $1 AND a.exec_id = $2",
     )
+    .bind(&claims.drv_hash)
+    .bind(exec_id)
     .fetch_optional(pool)
     .await
-    .status_internal("AppendLog gate: latest-assignment lookup")?;
+    .status_internal("AppendLog gate: claimed-assignment lookup")?;
 
-    let Some(latest) = latest else {
-        return Err(Status::not_found(
-            "AppendLog: no assignment recorded for this derivation",
+    let Some((claimed_builder, claimed_kind)) = claimed else {
+        // No assignment attempt of this derivation ever carried the
+        // claimed exec_id (or the row was rewritten in place). Distinct
+        // from "wrong executor" only in the message; both are the
+        // permanent `superseded` class for the uploader.
+        return Err(reject_permanent(
+            "superseded",
+            "AppendLog: the claimed execution is not a recorded assignment \
+             of this derivation (it may have been re-assigned in place)"
+                .to_string(),
         ));
     };
-    // A NULL exec_id on the latest assignment (a pre-exec_id-era row)
-    // cannot be matched against a claimed execution — fail closed.
-    if latest.exec_id != Some(exec_id) || latest.builder_id != claims.executor_id {
-        return Err(Status::permission_denied(
-            "AppendLog: this execution is not the derivation's current assignment \
-             (the derivation may have been re-assigned)",
+    if claimed_builder != claims.executor_id {
+        return Err(reject_permanent(
+            "superseded",
+            "AppendLog: this execution was not assigned to this executor".to_string(),
+        ));
+    }
+    if claimed_kind != "build" {
+        // A materialization execution has no build log; admitting one
+        // as an append target would let chunk rows shadow the real
+        // build's log under the kind-blind reader.
+        return Err(reject_permanent(
+            "superseded",
+            "AppendLog: the claimed execution is not a build attempt".to_string(),
         ));
     }
 
+    // `claims_hash`, not `header_hash`: the two are provably equal here
+    // (check 2 rejected any mismatch), but the chunk-key prefix should
+    // trace to the *signed* token input, not to the header that was
+    // checked against it.
+    finish_open(pool, claims_hash, exec_id, caps).await
+}
+
+// r[impl store.log.caps-durable]
+/// Checks 4 + 5 — the completeness seal and the durable per-execution
+/// caps — plus the seed read every admitted open carries back to its
+/// session. Shared by the token path ([`check_append_open`]) and the
+/// handler's dev-mode path so the two cannot drift.
+pub(super) async fn finish_open(
+    pool: &PgPool,
+    drv_hash: String,
+    exec_id: Uuid,
+    caps: OpenCaps,
+) -> Result<GateOk, Status> {
     // -- Check 4: the seal. A complete log accepts no more appends. The
     // recorded final line count (known here iff the execution is
     // already terminal — the late-replay case) also rides back to the
@@ -157,19 +265,49 @@ pub async fn check_append_open(
     if let Some(up_to) = final_line_count
         && manifest_covers(pool, exec_id, up_to).await?
     {
-        return Err(Status::failed_precondition(
-            "AppendLog: this execution's log is already complete",
+        return Err(reject_permanent(
+            "complete",
+            "AppendLog: this execution's log is already complete".to_string(),
         ));
     }
 
-    // `claims_hash`, not `header_hash`: the two are provably equal here
-    // (check 2 rejected any mismatch), but the chunk-key prefix should
-    // trace to the *signed* token input, not to the header that was
-    // checked against it.
+    // -- Check 5: the durable caps. Seeded from the committed manifest
+    // so a reconnect can never reset either cap (merged_bug_207); an
+    // execution at or over a cap is rejected at open with the same
+    // permanent class the mid-stream trip uses. RESOURCE_EXHAUSTED is
+    // deliberately NOT used here — that code is reserved for
+    // per-replica capacity (retry elsewhere can succeed; these caps
+    // travel with the execution).
+    let (prior_accounted_bytes, prior_chunks) = log_seed(pool, exec_id).await?;
+    if prior_accounted_bytes >= caps.per_exec_byte_cap {
+        metrics::counter!("rio_store_log_ingest_rejected_total", "reason" => "byte_cap")
+            .increment(1);
+        return Err(reject_permanent(
+            "cap",
+            format!(
+                "AppendLog: execution exceeded the {}-byte log ingest cap",
+                caps.per_exec_byte_cap
+            ),
+        ));
+    }
+    if prior_chunks >= caps.max_chunks_per_exec {
+        metrics::counter!("rio_store_log_ingest_rejected_total", "reason" => "chunk_cap")
+            .increment(1);
+        return Err(reject_permanent(
+            "cap",
+            format!(
+                "AppendLog: execution exceeded the {}-chunk cap",
+                caps.max_chunks_per_exec
+            ),
+        ));
+    }
+
     Ok(GateOk {
-        drv_hash: claims_hash,
+        drv_hash,
         exec_id,
         final_line_count,
+        prior_accounted_bytes,
+        prior_chunks,
     })
 }
 
@@ -286,6 +424,15 @@ mod tests {
         }
     }
 
+    /// Production-default caps: high enough that no fixture trips them
+    /// unless it means to.
+    fn caps() -> OpenCaps {
+        OpenCaps {
+            per_exec_byte_cap: super::super::ingest::DEFAULT_PER_EXEC_BYTE_CAP,
+            max_chunks_per_exec: 100_000,
+        }
+    }
+
     /// Seed a derivation row (idempotent on drv_hash) and return its id.
     async fn seed_derivation(pool: &PgPool, drv_hash: &str) -> Uuid {
         sqlx::query_scalar::<_, Uuid>(
@@ -373,9 +520,14 @@ mod tests {
         let d = seed_derivation(&db.pool, DRV).await;
         seed_assignment(&db.pool, d, "builder-0", exec, "acknowledged", 0.0).await;
 
-        let ok = check_append_open(&db.pool, &claims("builder-0", DRV), &header(DRV_PATH, exec))
-            .await
-            .expect("gate should accept the active assignment");
+        let ok = check_append_open(
+            &db.pool,
+            &claims("builder-0", DRV),
+            &header(DRV_PATH, exec),
+            caps(),
+        )
+        .await
+        .expect("gate should accept the active assignment");
         assert_eq!(ok.exec_id, exec);
         // The normalized 32-char form, ready for chunk-key construction.
         assert_eq!(ok.drv_hash, "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm");
@@ -384,7 +536,7 @@ mod tests {
         assert_eq!(ok.final_line_count, None);
     }
 
-    // r[verify store.log.append-auth]
+    // r[verify store.log.append-auth+2]
     #[tokio::test]
     async fn rejects_mismatched_exec_id() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -397,35 +549,221 @@ mod tests {
             &db.pool,
             &claims("builder-0", DRV),
             &header(DRV_PATH, claimed_exec),
+            caps(),
         )
         .await
-        .expect_err("a claimed exec_id that is not the latest assignment's must be rejected");
-        assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
+        .expect_err("a claimed exec_id with no recorded assignment must be rejected");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+        assert_eq!(
+            err.metadata()
+                .get(rio_proto::LOG_REJECT_METADATA_KEY)
+                .unwrap(),
+            "superseded"
+        );
     }
 
     #[tokio::test]
-    async fn rejects_mismatched_builder_id() {
+    async fn rejects_another_executors_execution() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let old_exec = Uuid::now_v7();
         let new_exec = Uuid::now_v7();
         let d = seed_derivation(&db.pool, DRV).await;
-        // builder-0's attempt is OLDER; the derivation was re-dispatched
-        // to builder-1 with a new execution. builder-0 still holds a
-        // valid token for its (now superseded) attempt.
         seed_assignment(&db.pool, d, "builder-0", old_exec, "failed", 60.0).await;
         seed_assignment(&db.pool, d, "builder-1", new_exec, "acknowledged", 0.0).await;
+
+        // builder-0 claiming builder-1's execution: rejected — the only
+        // executor with write authority over an exec is the one it was
+        // assigned to.
+        let err = check_append_open(
+            &db.pool,
+            &claims("builder-0", DRV),
+            &header(DRV_PATH, new_exec),
+            caps(),
+        )
+        .await
+        .expect_err("an executor must not write another executor's execution");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+        assert_eq!(
+            err.metadata()
+                .get(rio_proto::LOG_REJECT_METADATA_KEY)
+                .unwrap(),
+            "superseded"
+        );
+    }
+
+    /// v2 authority: the builder's OWN superseded attempt stays
+    /// writable (the late replay is keyed on the claimed exec, not on
+    /// "the derivation's latest assignment"). Containment: exec-keyed
+    /// chunks + the durable caps + the final_line_count ceiling.
+    #[tokio::test]
+    async fn admits_own_superseded_execution() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let old_exec = Uuid::now_v7();
+        let new_exec = Uuid::now_v7();
+        let d = seed_derivation(&db.pool, DRV).await;
+        seed_assignment(&db.pool, d, "builder-0", old_exec, "failed", 60.0).await;
+        seed_assignment(&db.pool, d, "builder-1", new_exec, "acknowledged", 0.0).await;
+
+        let ok = check_append_open(
+            &db.pool,
+            &claims("builder-0", DRV),
+            &header(DRV_PATH, old_exec),
+            caps(),
+        )
+        .await
+        .expect("an executor's own superseded attempt stays writable");
+        assert_eq!(ok.exec_id, old_exec);
+    }
+
+    // r[verify store.log.read-authority]
+    /// The merged_bug_101 regression: a newer materialization mint
+    /// taking the "latest assignment" slot must not displace a
+    /// terminal-but-incomplete build's late replay.
+    #[tokio::test]
+    async fn gate_admits_terminal_incomplete_build_after_materialization_mint() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let build_exec = Uuid::now_v7();
+        let mat_exec = Uuid::now_v7();
+        let d = seed_derivation(&db.pool, DRV).await;
+        seed_assignment(&db.pool, d, "builder-0", build_exec, "completed", 60.0).await;
+        seed_execution(
+            &db.pool,
+            build_exec,
+            "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm",
+            Some("succeeded"),
+            Some(100),
+        )
+        .await;
+        // Coverage [0, 50): terminal but incomplete.
+        seed_chunk(&db.pool, build_exec, 0, 0, 50).await;
+        seed_assignment(&db.pool, d, "store-0-w1", mat_exec, "acknowledged", 0.0).await;
+        sqlx::query(
+            "INSERT INTO drv_executions (exec_id, drv_hash, executor_id, started_at, attempt_kind) \
+             VALUES ($1, '0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm', 'store-0-w1', now(), 'materialization')",
+        )
+        .bind(mat_exec)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let ok = check_append_open(
+            &db.pool,
+            &claims("builder-0", DRV),
+            &header(DRV_PATH, build_exec),
+            caps(),
+        )
+        .await
+        .expect("the builder's own terminal-but-incomplete build exec must stay admittable");
+        assert_eq!(ok.final_line_count, Some(100));
+        assert_eq!(ok.prior_chunks, 1);
+    }
+
+    // r[verify store.log.read-authority]
+    #[tokio::test]
+    async fn gate_rejects_materialization_exec_as_append_target() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let mat_exec = Uuid::now_v7();
+        let d = seed_derivation(&db.pool, DRV).await;
+        seed_assignment(&db.pool, d, "store-0-w1", mat_exec, "acknowledged", 0.0).await;
+        sqlx::query(
+            "INSERT INTO drv_executions (exec_id, drv_hash, executor_id, started_at, attempt_kind) \
+             VALUES ($1, '0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm', 'store-0-w1', now(), 'materialization')",
+        )
+        .bind(mat_exec)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let err = check_append_open(
+            &db.pool,
+            &claims("store-0-w1", DRV),
+            &header(DRV_PATH, mat_exec),
+            caps(),
+        )
+        .await
+        .expect_err("a materialization execution must never be an append target");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+        assert_eq!(
+            err.metadata()
+                .get(rio_proto::LOG_REJECT_METADATA_KEY)
+                .unwrap(),
+            "superseded"
+        );
+    }
+
+    // r[verify store.log.caps-durable]
+    /// The merged_bug_207 regression: an execution whose DURABLE chunk
+    /// account already exceeds a per-execution cap is rejected at open
+    /// — a reconnect can no longer reset the caps to zero.
+    #[tokio::test]
+    async fn caps_durable_across_reconnect() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let exec = Uuid::now_v7();
+        let d = seed_derivation(&db.pool, DRV).await;
+        seed_assignment(&db.pool, d, "builder-0", exec, "acknowledged", 0.0).await;
+        // One committed chunk holding 2 GiB of accounted bytes — over
+        // the 1 GiB default cap.
+        sqlx::query(
+            "INSERT INTO drv_log_chunks \
+                 (exec_id, session_id, chunk_seq, first_line, line_count, byte_size, s3_key, \
+                  accounted_bytes) \
+             VALUES ($1, $2, 0, 0, 50, 1, 'logs/cap/x', 2147483648)",
+        )
+        .bind(exec)
+        .bind(Uuid::now_v7())
+        .execute(&db.pool)
+        .await
+        .unwrap();
 
         let err = check_append_open(
             &db.pool,
             &claims("builder-0", DRV),
-            &header(DRV_PATH, old_exec),
+            &header(DRV_PATH, exec),
+            caps(),
         )
         .await
-        .expect_err("a superseded executor must not be able to keep writing");
-        assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
+        .expect_err("an over-cap execution must be rejected at open");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+        assert_eq!(
+            err.metadata()
+                .get(rio_proto::LOG_REJECT_METADATA_KEY)
+                .unwrap(),
+            "cap"
+        );
     }
 
-    // r[verify store.log.append-auth]
+    /// The chunk-count cap is durable the same way.
+    #[tokio::test]
+    async fn chunk_cap_durable_at_open() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let exec = Uuid::now_v7();
+        let d = seed_derivation(&db.pool, DRV).await;
+        seed_assignment(&db.pool, d, "builder-0", exec, "acknowledged", 0.0).await;
+        for seq in 0..3 {
+            seed_chunk(&db.pool, exec, seq, i64::from(seq) * 5, 5).await;
+        }
+
+        let err = check_append_open(
+            &db.pool,
+            &claims("builder-0", DRV),
+            &header(DRV_PATH, exec),
+            OpenCaps {
+                per_exec_byte_cap: u64::MAX,
+                max_chunks_per_exec: 3,
+            },
+        )
+        .await
+        .expect_err("an at-chunk-cap execution must be rejected at open");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+        assert_eq!(
+            err.metadata()
+                .get(rio_proto::LOG_REJECT_METADATA_KEY)
+                .unwrap(),
+            "cap"
+        );
+    }
+
+    // r[verify store.log.append-auth+2]
     #[tokio::test]
     async fn rejects_derivation_path_not_matching_token() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -440,6 +778,7 @@ mod tests {
             &db.pool,
             &claims("builder-0", DRV),
             &header(OTHER_DRV, exec),
+            caps(),
         )
         .await
         .expect_err("a token for one derivation must not open a stream for another");
@@ -470,9 +809,14 @@ mod tests {
         // Coverage [0, 50) then a gap — lines 50..100 are missing.
         seed_chunk(&db.pool, exec, 0, 0, 50).await;
 
-        let ok = check_append_open(&db.pool, &claims("builder-0", DRV), &header(DRV_PATH, exec))
-            .await
-            .expect("a terminal-but-incomplete execution must accept the late replay");
+        let ok = check_append_open(
+            &db.pool,
+            &claims("builder-0", DRV),
+            &header(DRV_PATH, exec),
+            caps(),
+        )
+        .await
+        .expect("a terminal-but-incomplete execution must accept the late replay");
         // The admitted replay carries the recorded end with it: the
         // ingest session enforces it as the per-append ceiling so the
         // replay can fill [50, 100) but never append at or past 100.
@@ -505,10 +849,21 @@ mod tests {
         seed_chunk(&db.pool, exec, 0, 0, 60).await;
         seed_chunk(&db.pool, exec, 1, 40, 60).await;
 
-        let err = check_append_open(&db.pool, &claims("builder-0", DRV), &header(DRV_PATH, exec))
-            .await
-            .expect_err("a complete log must be sealed against further appends");
+        let err = check_append_open(
+            &db.pool,
+            &claims("builder-0", DRV),
+            &header(DRV_PATH, exec),
+            caps(),
+        )
+        .await
+        .expect_err("a complete log must be sealed against further appends");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+        assert_eq!(
+            err.metadata()
+                .get(rio_proto::LOG_REJECT_METADATA_KEY)
+                .unwrap(),
+            "complete"
+        );
     }
 
     #[tokio::test]
@@ -522,10 +877,19 @@ mod tests {
             &db.pool,
             &claims("builder-0", DRV),
             &header(DRV_PATH, Uuid::now_v7()),
+            caps(),
         )
         .await
         .expect_err("no assignment recorded means nothing to authorize against");
-        assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+        // The claimed-exec rejection class: indistinguishable from a
+        // rewritten-in-place attempt, and permanently fatal either way.
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+        assert_eq!(
+            err.metadata()
+                .get(rio_proto::LOG_REJECT_METADATA_KEY)
+                .unwrap(),
+            "superseded"
+        );
     }
 
     #[tokio::test]
@@ -538,6 +902,7 @@ mod tests {
                 derivation_path: DRV_PATH.to_string(),
                 exec_id: "not-a-uuid".to_string(),
             },
+            caps(),
         )
         .await
         .expect_err("a garbage exec_id must be rejected before any DB work");

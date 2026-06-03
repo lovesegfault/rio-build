@@ -48,10 +48,23 @@ use rio_proto::store::{
 use rio_proto::types::BuildLogBatch;
 
 use super::chunks::LogChunkStore;
-use super::gate::{self, GateOk};
+use super::gate::{self, OpenCaps};
 use super::ingest::{AbortReason, AcceptOutcome, IngestConfig, IngestSession, IngestShared};
 use super::sessions::{self, Acquire, HeartbeatOutcome};
 use super::tail::{self, LineCursor};
+
+/// One live ingest registration: the shared buffer handle a `TailLog`
+/// reader subscribes to, plus the cancel token that tears the driver
+/// down when a NEWER session for the same execution displaces it. The
+/// token (not the 15 s lease heartbeat) is what returns the displaced
+/// driver's admission permits in O(task wakeup) — without it a
+/// reconnect-heavy builder could pin `2 × cut_threshold` bytes per
+/// abandoned driver for up to a heartbeat interval each
+/// (merged_bug_207's admission-DoS half).
+pub(super) struct IngestEntry {
+    pub(super) shared: Arc<Mutex<IngestShared>>,
+    pub(super) cancel: rio_common::signal::Token,
+}
 
 /// Max bytes of `AppendLogHeader.derivation_path` accepted. Ported from
 /// the scheduler's recv-task gate (`executor_service.rs::
@@ -169,7 +182,7 @@ pub struct LogServiceImpl {
     /// reader subscribes to. Entries are inserted by `AppendLog` after
     /// the session lease is acquired and removed (identity-checked) on
     /// every stream exit path.
-    active_ingests: Arc<DashMap<Uuid, Arc<Mutex<IngestShared>>>>,
+    active_ingests: Arc<DashMap<Uuid, IngestEntry>>,
     /// This replica's pod name — the `log_ingest_sessions.replica_pod`
     /// value that routes cross-replica `TailLog` readers here.
     replica_pod: String,
@@ -263,8 +276,17 @@ impl LogServiceImpl {
     /// The live-ingest registry handle, for tests that assert an entry
     /// was cleaned up.
     #[cfg(test)]
-    fn active_ingests(&self) -> Arc<DashMap<Uuid, Arc<Mutex<IngestShared>>>> {
+    fn active_ingests(&self) -> Arc<DashMap<Uuid, IngestEntry>> {
         Arc::clone(&self.active_ingests)
+    }
+
+    /// The open-time caps the gate enforces (check 5) — derived from
+    /// the same config the session enforces mid-stream.
+    fn open_caps(&self) -> OpenCaps {
+        OpenCaps {
+            per_exec_byte_cap: self.ingest_config.per_exec_byte_cap,
+            max_chunks_per_exec: self.max_chunks_per_exec,
+        }
     }
 
     /// `AppendLog` token gate. Mirrors
@@ -376,27 +398,26 @@ impl LogService for LogServiceImpl {
 
         // -- 3. The binding + completeness gate.
         let gate_ok = match &claims {
-            Some(claims) => gate::check_append_open(&self.pool, claims, &header).await?,
+            Some(claims) => {
+                gate::check_append_open(&self.pool, claims, &header, self.open_caps()).await?
+            }
             // Dev mode (no HMAC verifier): no claims to bind against.
-            // Trust the header's identity but keep the completeness
-            // seal — a complete log must not accept appends even from a
-            // dev-mode caller — and the per-append ceiling that rides
-            // back to the session with it.
+            // Trust the header's identity but run the SAME shared
+            // finish (`gate::finish_open`) the token path runs — the
+            // completeness seal, the durable caps, and the cap seed
+            // must hold for dev-mode callers too, and a separate
+            // hand-rolled arm is exactly how they would drift.
             None => {
                 let exec_id: Uuid = header.exec_id.parse().map_err(|_| {
                     Status::invalid_argument("AppendLog: header.exec_id is not a valid UUID")
                 })?;
-                let final_line_count = gate::sealed_final_line_count(&self.pool, exec_id).await?;
-                if gate::log_is_complete(&self.pool, exec_id).await? {
-                    return Err(Status::failed_precondition(
-                        "AppendLog: this execution's log is already complete",
-                    ));
-                }
-                GateOk {
-                    drv_hash: rio_nix::store_path::drv_log_hash(&header.derivation_path),
+                gate::finish_open(
+                    &self.pool,
+                    rio_nix::store_path::drv_log_hash(&header.derivation_path),
                     exec_id,
-                    final_line_count,
-                }
+                    self.open_caps(),
+                )
+                .await?
             }
         };
         let exec_id = gate_ok.exec_id;
@@ -441,27 +462,24 @@ impl LogService for LogServiceImpl {
         }
 
         // -- 6. The session, the registry entry, and the driver task.
-        let mut session = IngestSession::new(
-            exec_id,
-            session_id,
-            gate_ok.drv_hash,
-            self.ingest_config.clone(),
-        );
-        if let Some(n) = gate_ok.final_line_count {
-            // The execution is already terminal with a recorded end
-            // (the late-replay case): the session is born knowing its
-            // append ceiling. A negative count is unrepresentable on
-            // the write side (the scheduler stores the proto's u64);
-            // clamp defensively rather than wrap.
-            // r[impl store.log.completeness-gate]
-            session.set_final_line_count(n.max(0) as u64);
-        }
+        let session = IngestSession::new(&gate_ok, session_id, self.ingest_config.clone());
         let shared = Arc::clone(session.shared());
+        let cancel = rio_common::signal::Token::new();
         // A previous session for the same execution on this replica
         // (its lease was stolen by `acquire`'s same-pod arm, or it is
         // mid-teardown) may still hold the registry slot; replace it —
-        // the new session is the one the lease row now names.
-        self.active_ingests.insert(exec_id, Arc::clone(&shared));
+        // the new session is the one the lease row now names — and
+        // CANCEL its driver so its admission permits return now, not
+        // at the next heartbeat observation of the stolen lease.
+        if let Some(displaced) = self.active_ingests.insert(
+            exec_id,
+            IngestEntry {
+                shared: Arc::clone(&shared),
+                cancel: cancel.clone(),
+            },
+        ) {
+            displaced.cancel.cancel();
+        }
         metrics::gauge!("rio_store_log_active_ingest_sessions").increment(1.0);
         info!(
             %exec_id, %session_id,
@@ -475,6 +493,7 @@ impl LogService for LogServiceImpl {
             chunk_store: Arc::clone(&self.chunk_store),
             active_ingests: Arc::clone(&self.active_ingests),
             shared,
+            cancel,
             session,
             max_chunks_per_exec: self.max_chunks_per_exec,
         };
@@ -532,7 +551,10 @@ impl LogServiceImpl {
         // that already crossed one hop) those readers get the
         // history-only view (every committed chunk, no live tail),
         // which is correct just laggier.
-        let local = self.active_ingests.get(&exec_id).map(|e| Arc::clone(&e));
+        let local = self
+            .active_ingests
+            .get(&exec_id)
+            .map(|e| Arc::clone(&e.shared));
         let subscription = match &local {
             Some(shared) => {
                 if req.follow {
@@ -753,17 +775,27 @@ enum LoopExit {
     /// anyway, but skipping the call entirely makes the intent
     /// auditable.
     LeaseLost,
+    /// A newer session for the same execution displaced this one from
+    /// the registry (the same-pod reconnect path). Same lease posture
+    /// as `LeaseLost` — the newer session owns the row.
+    Displaced,
 }
 
 /// Everything the spawned `AppendLog` driver task owns.
 struct AppendDriver {
     pool: PgPool,
     chunk_store: Arc<dyn LogChunkStore>,
-    active_ingests: Arc<DashMap<Uuid, Arc<Mutex<IngestShared>>>>,
-    /// The same handle `active_ingests[exec_id]` holds — kept here so
-    /// the deregistration can be identity-checked (a newer session for
-    /// the same execution must not be evicted by this one's teardown).
+    active_ingests: Arc<DashMap<Uuid, IngestEntry>>,
+    /// The same handle `active_ingests[exec_id].shared` holds — kept
+    /// here so the deregistration can be identity-checked (a newer
+    /// session for the same execution must not be evicted by this
+    /// one's teardown).
     shared: Arc<Mutex<IngestShared>>,
+    /// Fired by `append_log` when a newer session displaces this one
+    /// from the registry; the drive loop exits immediately so the
+    /// stream permits return in O(task wakeup) instead of at the next
+    /// lease-heartbeat observation.
+    cancel: rio_common::signal::Token,
     session: IngestSession,
     max_chunks_per_exec: u32,
 }
@@ -796,7 +828,7 @@ impl AppendDriver {
         let deregister = scopeguard::guard(
             (Arc::clone(&self.active_ingests), Arc::clone(&self.shared)),
             move |(registry, shared)| {
-                registry.remove_if(&exec_id, |_, v| Arc::ptr_eq(v, &shared));
+                registry.remove_if(&exec_id, |_, v| Arc::ptr_eq(&v.shared, &shared));
                 metrics::gauge!("rio_store_log_active_ingest_sessions").decrement(1.0);
             },
         );
@@ -825,7 +857,7 @@ impl AppendDriver {
         // (the row belongs to the new owner). `release` is
         // session-id-predicated so even a racing release is safe; the
         // explicit skip is for auditability.
-        if !matches!(exit, LoopExit::LeaseLost)
+        if !matches!(exit, LoopExit::LeaseLost | LoopExit::Displaced)
             && let Err(e) = sessions::release(&self.pool, exec_id, session_id).await
         {
             // Non-fatal: the row goes stale in 30 s and is stolen by
@@ -857,6 +889,14 @@ impl AppendDriver {
                     .send(Err(Status::aborted(
                         "AppendLog: the ingest lease for this execution was taken by \
                          another replica; reconnect and replay from the last ack",
+                    )))
+                    .await;
+            }
+            LoopExit::Displaced => {
+                let _ = ack_tx
+                    .send(Err(Status::aborted(
+                        "AppendLog: a newer ingest session for this execution displaced \
+                         this stream; replay from the last ack on the new stream",
                     )))
                     .await;
             }
@@ -931,6 +971,21 @@ impl AppendDriver {
                     if let Some(reason) = self.session.should_abort() {
                         return LoopExit::Abort(self.abort_status(reason));
                     }
+                }
+                // Displaced by a newer session for the same execution
+                // (the registry insert cancelled us). Exit now so the
+                // admission permits return immediately; the newer
+                // session owns the lease and the registry slot, and the
+                // builder behind THIS stream is told to reconnect (it
+                // is usually the same builder whose reconnect created
+                // the newer session — its old stream is dead anyway).
+                _ = self.cancel.cancelled() => {
+                    metrics::counter!(
+                        "rio_store_log_ingest_streams_aborted_total",
+                        "reason" => "displaced"
+                    )
+                    .increment(1);
+                    return LoopExit::Displaced;
                 }
                 _ = heartbeat_interval.tick() => {
                     match sessions::heartbeat(&self.pool, self.session.exec_id, self.session.session_id).await {
@@ -1356,7 +1411,7 @@ mod tests {
         db: TestDb,
         chunk_store: Arc<MemoryLogChunkStore>,
         client: LogServiceClient<tonic::transport::Channel>,
-        active: Arc<DashMap<Uuid, Arc<Mutex<IngestShared>>>>,
+        active: Arc<DashMap<Uuid, IngestEntry>>,
         _server: tokio::task::JoinHandle<()>,
     }
 
@@ -1392,7 +1447,7 @@ mod tests {
         configure: impl FnOnce(LogServiceImpl) -> LogServiceImpl,
     ) -> (
         LogServiceClient<tonic::transport::Channel>,
-        Arc<DashMap<Uuid, Arc<Mutex<IngestShared>>>>,
+        Arc<DashMap<Uuid, IngestEntry>>,
         tokio::task::JoinHandle<()>,
         String,
     ) {
@@ -1789,7 +1844,7 @@ mod tests {
         wait_for(|| {
             h.active
                 .get(&exec)
-                .map(|s| !lock_shared(&s).snapshot().is_empty())
+                .map(|s| !lock_shared(&s.shared).snapshot().is_empty())
                 .unwrap_or(false)
         })
         .await;
@@ -1860,7 +1915,7 @@ mod tests {
         wait_for(|| {
             h.active
                 .get(&exec)
-                .map(|s| !lock_shared(&s).snapshot().is_empty())
+                .map(|s| !lock_shared(&s.shared).snapshot().is_empty())
                 .unwrap_or(false)
         })
         .await;
@@ -2032,7 +2087,7 @@ mod tests {
         a_uri_override: Option<&str>,
     ) -> (
         LogServiceClient<tonic::transport::Channel>,
-        Arc<DashMap<Uuid, Arc<Mutex<IngestShared>>>>,
+        Arc<DashMap<Uuid, IngestEntry>>,
         LogServiceClient<tonic::transport::Channel>,
         Vec<tokio::task::JoinHandle<()>>,
     ) {
@@ -2067,7 +2122,7 @@ mod tests {
         wait_for(|| {
             active_a
                 .get(&exec)
-                .map(|s| !lock_shared(&s).snapshot().is_empty())
+                .map(|s| !lock_shared(&s.shared).snapshot().is_empty())
                 .unwrap_or(false)
         })
         .await;
@@ -2162,7 +2217,7 @@ mod tests {
         wait_for(|| {
             active_a
                 .get(&exec)
-                .map(|s| !lock_shared(&s).snapshot().is_empty())
+                .map(|s| !lock_shared(&s.shared).snapshot().is_empty())
                 .unwrap_or(false)
         })
         .await;

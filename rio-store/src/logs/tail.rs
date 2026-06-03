@@ -281,9 +281,12 @@ async fn stream_chunks(
 ///   chunk). The `derivation` argument is not cross-checked against a
 ///   pinned execution: exec ids are unguessable UUIDv7s and `TailLog`
 ///   is a read-only, route-gated API — the pin *is* the selector.
-/// - An empty `pinned_exec_id` resolves to the **latest** execution for
-///   the derivation: `ORDER BY exec_id DESC` over the UUIDv7 mint order
-///   (`assign_to_worker` mints exec ids with `Uuid::now_v7()`).
+/// - An empty `pinned_exec_id` resolves through the `latest_build_exec`
+///   view: the newest **build-kind** execution for the derivation
+///   (UUIDv7 mint order). The kind filter lives in the view definition
+///   (migration 089), not here — a freshly-minted materialization
+///   execution (which never has chunks) must not shadow the build whose
+///   log the caller wants (`store.log.read-authority`).
 ///
 /// The two failure modes are distinguishable `NotFound`s — "no log
 /// recorded for execution …" (the caller pinned a bad id) vs "no
@@ -329,18 +332,19 @@ pub async fn resolve_exec(
     }
 
     let drv_hash = drv_log_hash(derivation);
-    let latest = sqlx::query_scalar!(
-        r#"
-        SELECT exec_id FROM drv_executions
-        WHERE drv_hash = $1
-        ORDER BY exec_id DESC
-        LIMIT 1
-        "#,
-        drv_hash,
-    )
-    .fetch_optional(pool)
-    .await
-    .status_internal("TailLog: latest execution lookup")?;
+    // r[impl store.log.read-authority]
+    // The kind-filtered view (089) is THE unpinned resolver; the
+    // `log-no-raw-latest-exec` policy check bans new raw
+    // `ORDER BY exec_id DESC` reads of `drv_executions` so a second
+    // kind-blind copy of this resolution cannot grow back. Runtime
+    // query: the view's columns are pinned transitively by the
+    // `STORE_READS` contract (`drv_executions.attempt_kind`).
+    let latest: Option<Uuid> =
+        sqlx::query_scalar("SELECT exec_id FROM latest_build_exec WHERE drv_hash = $1")
+            .bind(&drv_hash)
+            .fetch_optional(pool)
+            .await
+            .status_internal("TailLog: latest execution lookup")?;
 
     latest.ok_or_else(|| {
         Status::not_found(format!("no executions recorded for derivation {drv_hash}"))

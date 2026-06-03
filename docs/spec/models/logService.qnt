@@ -229,6 +229,28 @@ module logService {
   /// at-least-once re-send shape). Off in the base regime so its state
   /// space stays the single-writer core.
   const ENABLE_RECONNECT: bool
+
+  /// The per-execution accepted-line cap — the model-side collapse of
+  /// the durable byte + chunk caps (`store.log.caps-durable`; one line
+  /// = one accounted unit). Bound it ABOVE the reachable accept volume
+  /// to leave a regime's exploration untouched, or AT `MAX_LINE` to
+  /// exercise the boundary (the resend regime does — that is where
+  /// reconnects could historically reset the account).
+  const CAP: int
+
+  /// CALIBRATION ONLY (`logServiceCalibSessionCaps`): re-encode the
+  /// pre-fix per-SESSION cap accounting — every `openSession` resets
+  /// the accepted account to zero, exactly merged_bug_207's reconnect
+  /// hole. Production regimes bind false; the calibration check pins
+  /// that `acceptedWithinCap` falsifies under it.
+  const CALIB_SESSION_SCOPED_CAPS: bool
+
+  /// CALIBRATION ONLY (`logServiceCalibGateRow`): drop the
+  /// assignment-row conjunct from the open gate — the pre-fix shape
+  /// where admission never consulted the claimed exec's own row.
+  /// Production regimes bind false; the calibration check pins that
+  /// `authGateExcludesUnassignedWriters` falsifies under it.
+  const CALIB_GATE_IGNORES_ROW: bool
   /// Executions can expire and the TTL sweep can run.
   const ENABLE_SWEEP: bool
 
@@ -293,6 +315,19 @@ module logService {
   /// Per execution: `started_at < now() - retention` — the TTL sweep's
   /// guard. Set by the environment, monotone.
   var expired: int -> bool
+
+  /// Has the scheduler's ON-CONFLICT in-place rewrite erased this
+  /// (non-latest) execution's assignment row? The v2 write-authority
+  /// gate keys on the claimed exec's OWN row — supersession by a newer
+  /// attempt no longer revokes it (merged_bug_101), but a rewritten
+  /// row does, permanently.
+  var assignmentRowLost: int -> bool
+
+  /// Ghost: lines accepted for the execution over its LIFETIME (all
+  /// sessions; never reset on reconnect — that is the
+  /// `store.log.caps-durable` fix). The accept guard charges it; the
+  /// open gate refuses an at-cap execution.
+  var acceptedTotal: int -> int
   /// Per execution: the current sweep pass has deleted the manifest
   /// rows and may now delete the execution row (the program counter
   /// between `sweep.rs`'s two DELETE statements; a cut can interleave).
@@ -561,21 +596,40 @@ module logService {
     chunks.get(e).forall(c =>
       chunkLines(c).subseteq(delivered(e).union(fabricated.get(e)))))
 
-  /// `BindingGateExcludesForeignWriters` (store.log.append-auth): the
-  /// stream-open predicate admits a claimed execution only when it is
-  /// the derivation's latest assignment attempt. Quantified over the
-  /// predicate's inputs rather than over a provenance ghost: the
-  /// invariant falsifies if the latest-assignment conjunct is dropped
-  /// from `openAdmitted`, which is the model-side regression the rule
-  /// guards against. A superseded execution's already-open stream is
-  /// NOT excluded — it keeps writing to its own (superseded)
-  /// execution's log until it closes, which is contained (see
-  /// noCrossExecContamination), not contaminating. The
-  /// presenter-identity and derivation-match halves of the gate are
-  /// pure equality checks on signed token fields, outside the model
-  /// (see the header's scope notes).
-  val authGateExcludesForeignWriters = EXECS.forall(e =>
-    openAdmitted(e) implies e == dispatched)
+  /// `BindingGateExcludesUnassignedWriters` (store.log.append-auth+2,
+  /// the v2 claimed-exec re-keying): the stream-open predicate admits
+  /// a claimed execution only while its OWN assignment row exists — a
+  /// rewritten-in-place attempt is permanently excluded. Supersession
+  /// alone no longer excludes (merged_bug_101: the builder's own
+  /// superseded execution stays writable; containment is exec-keyed
+  /// chunks + the durable caps + the ceiling — see
+  /// noCrossExecContamination). The invariant falsifies if the
+  /// row conjunct is dropped from `openAdmitted`
+  /// (`logServiceCalibGateRow` pins exactly that). The
+  /// presenter-identity, derivation-match, and kind halves of the gate
+  /// are equality checks on signed/scheduler-stamped fields, outside
+  /// the model (see the header's scope notes).
+  val authGateExcludesUnassignedWriters = EXECS.forall(e =>
+    openAdmitted(e) implies not(assignmentRowLost.get(e)))
+
+  /// `store.log.caps-durable`: the durable accepted footprint — every
+  /// line the store is holding or has committed for the execution,
+  /// across ALL its sessions — never exceeds the per-execution cap.
+  /// Measured against the durable state (chunks + buffers), not the
+  /// accounting ghost, so the pre-fix per-session encoding (which
+  /// resets the GHOST on reconnect; `logServiceCalibSessionCaps`)
+  /// falsifies it: a reconnect-reset account admits and accepts past
+  /// the cap, and the over-cap lines land in chunks.
+  val acceptedWithinCap = EXECS.forall(e =>
+    size(
+      chunks.get(e).fold(Set(), (acc, c) => acc.union(chunkLines(c)))
+        .union(SESSION_IDS.fold(Set(), (acc, s) => acc.union(sessBuf(e, s))))
+        .union(fabricated.get(e))
+    ) <= CAP)
+
+  /// Witness (negated): some execution actually REACHES the cap
+  /// boundary — the cap conjuncts are exercised, not vacuous.
+  val noCapBoundary = EXECS.forall(e => acceptedTotal.get(e) < CAP)
 
   /// `NoSilentLineLoss` (the conservation law), the four-disjunct
   /// disclosed-loss form from log-invariant-map.md's campaign close-out:
@@ -824,6 +878,8 @@ module logService {
     chunks' = chunks,
     fabricated' = fabricated,
     wit' = wit,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
   }
 
   /// The build emits one more stderr line into its uploader's input
@@ -849,6 +905,8 @@ module logService {
     chunks' = chunks,
     fabricated' = fabricated,
     wit' = wit,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
   }
 
   /// The build exits: no more lines, the completion report (carrying
@@ -874,6 +932,8 @@ module logService {
     chunks' = chunks,
     fabricated' = fabricated,
     wit' = wit,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
   }
 
   /// The scheduler stamps the execution's lifecycle row terminal with
@@ -916,21 +976,33 @@ module logService {
     chunks' = chunks,
     fabricated' = fabricated,
     wit' = wit,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
   }
 
   // --- 6b. the open gate -----------------------------------------------
 
   /// `gate.rs::check_append_open`'s admission predicate, restricted to
-  /// the checks with model content: the claimed execution is the
-  /// derivation's latest assignment (check 3) and its log is not
-  /// already complete (check 4). Checks 1-2 (HMAC, the token-vs-header
-  /// derivation match) are pure equality on signed fields; check 5 (the
-  /// single-live-session lease) is the `openSessionOf(e) == 0`
-  /// admission conjunct on the action itself.
+  /// the checks with model content (v2, the bughunt-wave re-keying):
+  /// the claimed execution's OWN assignment row still exists (check 3 —
+  /// supersession by a newer attempt no longer revokes write authority
+  /// over the old execution; only the in-place rewrite does), its log
+  /// is not already complete (check 4), and its durable accepted
+  /// account is under the per-execution cap (check 5,
+  /// `store.log.caps-durable`). Checks 1-2 (HMAC, the token-vs-header
+  /// derivation match) are pure equality on signed fields; the
+  /// single-live-session lease is the `openSessionOf(e) == 0`
+  /// admission conjunct on the action itself. The kind axis (a
+  /// materialization execution is never admitted) is a constant in
+  /// this model — every modeled execution is build-kind.
   def openAdmitted(e: int): bool = and {
     e <= dispatched,
-    e == dispatched,
+    CALIB_GATE_IGNORES_ROW or not(assignmentRowLost.get(e)),
     not(logIsComplete(e)),
+    // CALIBRATION: pre-fix there WAS no open-time cap check (check 5
+    // did not exist) — the per-session encoding drops this conjunct
+    // along with resetting the account.
+    CALIB_SESSION_SCOPED_CAPS or acceptedTotal.get(e) < CAP,
   }
 
   /// The builder opens (or re-opens) an `AppendLog` stream for its
@@ -968,6 +1040,10 @@ module logService {
     }))),
     sessionsOpened' = sessionsOpened.put(e, sessionsOpened.get(e) + 1),
     sentBelow' = sentBelow.put(e, ackedBelow.get(e)),
+    // CALIBRATION: the pre-fix per-session account zeroed on every
+    // open; production keeps the lifetime account.
+    acceptedTotal' = if (CALIB_SESSION_SCOPED_CAPS) acceptedTotal.put(e, 0)
+                     else acceptedTotal,
     dispatched' = dispatched,
     producedEnd' = producedEnd,
     buildFinished' = buildFinished,
@@ -980,19 +1056,22 @@ module logService {
     chunks' = chunks,
     fabricated' = fabricated,
     wit' = wit,
+    assignmentRowLost' = assignmentRowLost,
   }
 
-  /// The gate rejects a stream open whose claimed execution has been
-  /// superseded by a re-dispatch (PERMISSION_DENIED). The uploader
-  /// treats it as a permanent rejection: the retransmit buffer is
-  /// discarded and the remaining input is drained to nowhere — the
-  /// superseded execution's un-stored tail is gone, disclosed by the
-  /// rejection warn and by its log never reading complete.
-  // Mirrors: gate.rs::check_append_open (the latest-assignment
-  //          mismatch arm) + log_upload.rs::reject_permanently.
+  /// The gate rejects a stream open whose claimed execution's
+  /// assignment row was rewritten in place (FAILED_PRECONDITION, the
+  /// permanent `superseded` class). v2: mere supersession by a newer
+  /// attempt no longer rejects — only the erased row does. The
+  /// uploader treats it as a permanent rejection: the retransmit
+  /// buffer is discarded and the remaining input is drained to
+  /// nowhere — the un-stored tail is gone, disclosed by the
+  /// loss-disclosure counter and by its log never reading complete.
+  // Mirrors: gate.rs::check_append_open (the no-matching-row arm) +
+  //          log_upload.rs::reject_permanently.
   action openRejectedSuperseded(e: int): bool = all {
     e <= dispatched,
-    e != dispatched,
+    assignmentRowLost.get(e),
     uploader.get(e) == Uploading,
     openSessionOf(e) == 0,
     uploader' = uploader.put(e, Abandoned),
@@ -1010,6 +1089,38 @@ module logService {
     sessionsOpened' = sessionsOpened,
     chunks' = chunks,
     fabricated' = fabricated,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
+  }
+
+  /// ENVIRONMENT: the scheduler's ON-CONFLICT upsert rewrites a
+  /// superseded execution's assignment row in place — the one path
+  /// that permanently revokes the old executor's write authority
+  /// under the v2 claimed-exec gate. Only non-latest executions are
+  /// rewritable (the live attempt's row is what the rewrite WRITES).
+  // Mirrors: the scheduler's assignment upsert observed by
+  //          gate.rs::check_append_open as fetch_optional == None.
+  action rewriteAssignment(e: int): bool = all {
+    e <= dispatched,
+    e != dispatched,
+    not(assignmentRowLost.get(e)),
+    assignmentRowLost' = assignmentRowLost.put(e, true),
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    acceptedTotal' = acceptedTotal,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessions' = sessions,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    wit' = wit,
   }
 
   /// The gate rejects a stream open because the execution's log is
@@ -1040,6 +1151,8 @@ module logService {
     sessionsOpened' = sessionsOpened,
     chunks' = chunks,
     fabricated' = fabricated,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
   }
 
   // --- 6c. batch ingestion ---------------------------------------------
@@ -1081,19 +1194,32 @@ module logService {
     all {
       s != 0,
       lo < hi,
+      // The mid-stream cap guard (`store.log.caps-durable`): the kept
+      // lines must fit in the execution's lifetime account. The
+      // over-cap batch is the stream-fatal FAILED_PRECONDITION arm —
+      // modeled by this action being disabled (the abort itself is
+      // `sessionAborts`' nondeterminism).
+      match acceptVerdict(sessHw(e, s), sessCeiling(e, s), lo, hi) {
+        | Accept(keptHi) => acceptedTotal.get(e) + (keptHi - lo) <= CAP
+        | RejectNonMonotone => true
+        | RejectPastFinal => true
+      },
       sentBelow' = sentBelow.put(e, hi),
       match acceptVerdict(sessHw(e, s), sessCeiling(e, s), lo, hi) {
         | Accept(keptHi) => all {
             sessions' = sessions.put(e,
               sessions.get(e).put(s, sessAfterAccept(sessions.get(e).get(s), lo, keptHi))),
+            acceptedTotal' = acceptedTotal.put(e, acceptedTotal.get(e) + (keptHi - lo)),
             wit' = if (keptHi < hi) { ...wit, pastFinalRejected: true } else wit,
           }
         | RejectNonMonotone => all {
             sessions' = sessions,
+            acceptedTotal' = acceptedTotal,
             wit' = { ...wit, nonMonotoneRejected: true },
           }
         | RejectPastFinal => all {
             sessions' = sessions,
+            acceptedTotal' = acceptedTotal,
             wit' = { ...wit, pastFinalRejected: true },
           }
       },
@@ -1110,6 +1236,7 @@ module logService {
     sessionsOpened' = sessionsOpened,
     chunks' = chunks,
     fabricated' = fabricated,
+    assignmentRowLost' = assignmentRowLost,
   }
 
   /// The bound builder sends a batch that is NOT its uploader's honest
@@ -1137,11 +1264,19 @@ module logService {
     all {
       s != 0,
       lo >= sessHw(e, s),
+      // Fabricated lines are accepted (and charged) like honest ones —
+      // the cap is an accounting bound, not an honesty check.
+      match acceptVerdict(sessHw(e, s), sessCeiling(e, s), lo, hi) {
+        | Accept(keptHi) => acceptedTotal.get(e) + (keptHi - lo) <= CAP
+        | RejectNonMonotone => true
+        | RejectPastFinal => true
+      },
       match acceptVerdict(sessHw(e, s), sessCeiling(e, s), lo, hi) {
         | Accept(keptHi) => all {
             sessions' = sessions.put(e,
               sessions.get(e).put(s, sessAfterAccept(sessions.get(e).get(s), lo, keptHi))),
             fabricated' = fabricated.put(e, fabricated.get(e).union(interval(lo, keptHi))),
+            acceptedTotal' = acceptedTotal.put(e, acceptedTotal.get(e) + (keptHi - lo)),
             wit' = if (keptHi < hi) { ...wit, pastFinalRejected: true } else wit,
           }
         | RejectNonMonotone => all {
@@ -1149,11 +1284,13 @@ module logService {
             // must still assign every variable.
             sessions' = sessions,
             fabricated' = fabricated,
+            acceptedTotal' = acceptedTotal,
             wit' = wit,
           }
         | RejectPastFinal => all {
             sessions' = sessions,
             fabricated' = fabricated,
+            acceptedTotal' = acceptedTotal,
             wit' = { ...wit, pastFinalRejected: true },
           }
       },
@@ -1170,6 +1307,7 @@ module logService {
     sentBelow' = sentBelow,
     sessionsOpened' = sessionsOpened,
     chunks' = chunks,
+    assignmentRowLost' = assignmentRowLost,
   }
 
   /// A session learns the execution's recorded `final_line_count`
@@ -1216,6 +1354,8 @@ module logService {
     chunks' = chunks,
     fabricated' = fabricated,
     wit' = wit,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
   }
 
   // --- 6d. the chunk cut and the ack -----------------------------------
@@ -1264,6 +1404,8 @@ module logService {
     sessionsOpened' = sessionsOpened,
     fabricated' = fabricated,
     wit' = wit,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
   }
 
   /// The builder receives the ack for one committed chunk of its
@@ -1304,6 +1446,8 @@ module logService {
     chunks' = chunks,
     fabricated' = fabricated,
     wit' = wit,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
   }
 
   // --- 6e. disconnects, aborts, abandonment ----------------------------
@@ -1345,6 +1489,8 @@ module logService {
     chunks' = chunks,
     fabricated' = fabricated,
     wit' = wit,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
   }
 
   /// The server tears the stream down and DROPS the in-memory buffer
@@ -1381,6 +1527,8 @@ module logService {
     chunks' = chunks,
     fabricated' = fabricated,
     wit' = wit,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
   }
 
   /// The uploader gives up with lines still un-acked: the post-build
@@ -1410,6 +1558,8 @@ module logService {
     chunks' = chunks,
     fabricated' = fabricated,
     wit' = wit,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
   }
 
   // --- 6f. expiry and the TTL sweep ------------------------------------
@@ -1435,6 +1585,8 @@ module logService {
     chunks' = chunks,
     fabricated' = fabricated,
     wit' = wit,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
   }
 
   /// The TTL sweep's first DELETE for one expired execution: every
@@ -1465,6 +1617,8 @@ module logService {
     sessions' = sessions,
     sessionsOpened' = sessionsOpened,
     fabricated' = fabricated,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
   }
 
   /// The same sweep pass's last DELETE: the `drv_executions` row
@@ -1498,6 +1652,8 @@ module logService {
     chunks' = chunks,
     fabricated' = fabricated,
     wit' = wit,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
   }
 
   // --- 8. init ----------------------------------------------------------
@@ -1509,6 +1665,8 @@ module logService {
     dbFinalCount' = EXECS.mapBy(e => NoCount),
     execRowExists' = EXECS.mapBy(e => false),
     expired' = EXECS.mapBy(e => false),
+    assignmentRowLost' = EXECS.mapBy(e => false),
+    acceptedTotal' = EXECS.mapBy(e => 0),
     sweepChunksDone' = EXECS.mapBy(e => false),
     uploader' = EXECS.mapBy(e => Uploading),
     ackedBelow' = EXECS.mapBy(e => 0),
@@ -1537,6 +1695,7 @@ module logService {
   action recordFinalLineCountAny = { nondet e = EXECS.oneOf() recordFinalLineCount(e) }
   action openSessionAny = { nondet e = EXECS.oneOf() openSession(e) }
   action openRejectedSupersededAny = { nondet e = EXECS.oneOf() openRejectedSuperseded(e) }
+  action rewriteAssignmentAny = { nondet e = EXECS.oneOf() rewriteAssignment(e) }
   action openRejectedCompleteAny = { nondet e = EXECS.oneOf() openRejectedComplete(e) }
   action appendHonestAny = { nondet e = EXECS.oneOf() appendHonest(e) }
   action appendFabricatedAny = {
@@ -1574,6 +1733,7 @@ module logService {
     recordFinalLineCountAny,
     openSessionAny,
     openRejectedSupersededAny,
+    rewriteAssignmentAny,
     openRejectedCompleteAny,
     appendHonestAny,
     appendFabricatedAny,
@@ -1625,7 +1785,10 @@ module logServiceBase {
     MAX_LINE = 3,
     ENABLE_FABRICATION = true,
     ENABLE_RECONNECT = false,
-    ENABLE_SWEEP = false
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false
   ).*
 
   // --- deterministic protocol runs --------------------------------------
@@ -1727,13 +1890,18 @@ module logServiceRedispatch {
     MAX_LINE = 3,
     ENABLE_FABRICATION = false,
     ENABLE_RECONNECT = false,
-    ENABLE_SWEEP = false
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false
   ).*
 
-  /// The superseded writer: execution 1's session is open and holding
-  /// lines when execution 2 is dispatched. Execution 1's session keeps
-  /// cutting (to execution 1's manifest only); execution 1's builder is
-  /// rejected at its next open and abandons; execution 2's log is
+  /// The superseded writer, v2: execution 1's session is open and
+  /// holding lines when execution 2 is dispatched. Supersession alone
+  /// no longer revokes execution 1's write authority (it remains
+  /// admitted — its late replay is the merged_bug_101 fix); only the
+  /// scheduler's in-place row rewrite does, after which its builder is
+  /// rejected at the next open and abandons. Execution 2's log is
   /// untouched by any of it.
   run supersededWriterRun =
     init
@@ -1742,7 +1910,8 @@ module logServiceRedispatch {
       .then(openSession(1))
       .then(appendHonest(1))
       .then(dispatch)
-      .expect(not(openAdmitted(1)) and openAdmitted(2))
+      // v2: BOTH stay admitted — the old exec's own row still exists.
+      .expect(openAdmitted(1) and openAdmitted(2))
       .then(cutChunk(1, 1))
       .expect(all {
         chunks.get(1) == Set({ sess: 1, first: 0, count: 1 }),
@@ -1750,6 +1919,10 @@ module logServiceRedispatch {
         noCrossExecContamination,
       })
       .then(builderDisconnects(1))
+      // The one revocation path: the assignment row is rewritten in
+      // place; only then is the old executor excluded.
+      .then(rewriteAssignment(1))
+      .expect(not(openAdmitted(1)) and openAdmitted(2))
       .then(openRejectedSuperseded(1))
       .expect(all {
         wit.supersededOpenRejected,
@@ -1777,7 +1950,17 @@ module logServiceResend {
     MAX_LINE = 3,
     ENABLE_FABRICATION = false,
     ENABLE_RECONNECT = true,
-    ENABLE_SWEEP = false
+    ENABLE_SWEEP = false,
+    // 4, not MAX_LINE: the at-least-once replay re-charges the
+    // retransmitted lines (the durable account is seeded from committed
+    // chunks and the new session re-accepts the un-acked tail — the
+    // code's exact double-charge on overlap), so the canonical
+    // 2-line-cut + reconnect + 2-line-replay trace costs 4. The cap
+    // boundary is reached by exactly that trace (noCapBoundary's
+    // witness), making the cap conjuncts non-vacuous here.
+    CAP = 4,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false
   ).*
 
   /// The ambiguous-disconnect overlap: session 1 commits a chunk for
@@ -1830,7 +2013,10 @@ module logServiceSweep {
     MAX_LINE = 3,
     ENABLE_FABRICATION = false,
     ENABLE_RECONNECT = false,
-    ENABLE_SWEEP = true
+    ENABLE_SWEEP = true,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false
   ).*
 
   /// The TTL sweep deletes a complete log: the manifest and the
@@ -1858,4 +2044,55 @@ module logServiceSweep {
       })
       .then(sweepExecRow(1))
       .expect(not(execRowExists.get(1)))
+}
+
+// =========================================================================
+// CALIBRATION: the pre-fix per-SESSION cap accounting (merged_bug_207).
+// Every reconnect zeroes the accepted account, so the durable footprint
+// grows one cap per session — `acceptedWithinCap` (measured against the
+// durable chunks + buffers, not the resettable ghost) falsifies. The
+// expect-violation check pins that the invariant actually catches the
+// bug class this wave fixed; if a refactor makes it pass here, the
+// invariant has gone vacuous and the check fails loudly.
+// =========================================================================
+module logServiceCalibSessionCaps {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_SESSIONS = 2,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = true,
+    ENABLE_SWEEP = false,
+    // 2 < MAX_LINE: the durable footprint is a SET of line numbers
+    // (≤ MAX_LINE = 3), so the cap must sit BELOW the line domain for
+    // an over-cap footprint to be representable. Pre-fix: session 1
+    // accepts {0,1} (= CAP) and cuts; the reconnect resets the
+    // account; session 2 accepts line 2 — footprint {0,1,2} = 3 > 2.
+    // Post-fix the lifetime account blocks session 2's accept and the
+    // reopen itself.
+    CAP = 2,
+    CALIB_SESSION_SCOPED_CAPS = true,
+    CALIB_GATE_IGNORES_ROW = false
+  ).*
+}
+
+// =========================================================================
+// CALIBRATION: the open gate without the assignment-row conjunct
+// (merged_bug_101's sibling regression class — admission that consults
+// nothing about the claimed exec's own row). With the conjunct ignored,
+// a rewritten-in-place execution's builder is re-admitted —
+// `authGateExcludesUnassignedWriters` falsifies.
+// =========================================================================
+module logServiceCalibGateRow {
+  import logService(
+    MAX_EXECS = 2,
+    MAX_SESSIONS = 1,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = true,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = true
+  ).*
 }
