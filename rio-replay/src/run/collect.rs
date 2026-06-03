@@ -31,7 +31,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::Result;
-use rio_nix::protocol::build::BuildStatus;
+use rio_nix::protocol::build::{BuildResult, BuildStatus};
 
 use super::artifact::ArtifactStore;
 use super::classify::{
@@ -1028,12 +1028,42 @@ pub fn decide(
     // NOT hoist the probe check above classification — that would turn
     // a recovered cluster's first genuine verdict into an exempt requeue
     // and the probe ladder would never score a real recovery.
-    let (kind, evidence) = resolve_failure_kind(
-        signal1,
-        poisoned.get(&ctx.drv_path).map(Vec::as_slice),
-        ctx.fixed_output_drvs.contains(&ctx.drv_path),
-        log_tail,
-    );
+    // One row class is classified BEFORE the two-signal rule: the
+    // gateway's evidence-loss row
+    // ([`BuildResult::lost_terminal_unverified`]) — minted when this
+    // root's terminal event was lost under a COMPLETED DAG and the store
+    // could not positively confirm the requested outputs. It is an
+    // infrastructure claim about the evidence channel, not a build
+    // failure: the DAG completed, so nothing is known to have failed on a
+    // worker — there is no failure for the two-signal rule to excuse, and
+    // poison rows surviving from earlier attempts cannot contradict an
+    // evidence-loss report (the design's infra-indeterminate class names
+    // "evidence loss" explicitly, §7.2). Detector and producer share the
+    // message-prefix constant so the match is producer-exact and cannot
+    // drift; the match reads the IN-BAND `error_msg` (the producer's only
+    // channel — the relay never carries this row) plus the status
+    // conjunct, so no relayed scheduler line can select the arm.
+    let lost_terminal_row = status == BuildStatus::TransientFailure
+        && target
+            .error_msg
+            .starts_with(BuildResult::LOST_TERMINAL_UNVERIFIED_PREFIX);
+    let (kind, evidence) = if lost_terminal_row {
+        (
+            FailureKind::Infra,
+            Some(format!(
+                "gateway evidence-loss row (terminal lost under a completed DAG, store \
+                 presence unverified): {}",
+                target.error_msg
+            )),
+        )
+    } else {
+        resolve_failure_kind(
+            signal1,
+            poisoned.get(&ctx.drv_path).map(Vec::as_slice),
+            ctx.fixed_output_drvs.contains(&ctx.drv_path),
+            log_tail,
+        )
+    };
     if kind == FailureKind::Infra {
         if batch.probe {
             return CollectDecision::Requeue {
@@ -2566,6 +2596,224 @@ mod tests {
             } => assert_eq!(evidence.as_deref(), Some("no-inband-result")),
             other => panic!("expected terminal infra, got {other:?}"),
         }
+    }
+
+    /// Wire contract for the gateway's evidence-loss row
+    /// ([`BuildResult::lost_terminal_unverified`]): the one status the
+    /// gateway may mint with NEITHER per-root scheduler evidence NOR
+    /// store presence evidence must classify as infrastructure evidence
+    /// loss — requeue within the auto-retry budget, infra-indeterminate
+    /// at exhaustion — never as a substitution event (the row replaced
+    /// the old `Substituted` mint exactly because a force-build campaign
+    /// makes substitution definitionally impossible) and never as a
+    /// genuine target failure (the DAG completed; nothing is known to
+    /// have failed).
+    ///
+    /// Producer-mirrored fixture: the row is CONSTRUCTED via the
+    /// producer's own chain — the shared `lost_terminal_unverified()`
+    /// constructor (the same fn the gateway arm calls), serialized and
+    /// re-parsed through the production wire codec
+    /// (`write_build_result`/`read_build_result`), then mapped through
+    /// the production transport projection (`path_outcomes_from_keyed`)
+    /// — never a hand-written consumer-side string.
+    ///
+    /// Quantification domain: the detector's two conjuncts crossed with
+    /// every sibling input of the with-result arm — BatchView bits the
+    /// arm reads (`probe` × `engine_cancelled`), Signal-2 states (no
+    /// poison row / poison row WITH builders — the two-signal
+    /// contradiction deliberately does NOT defeat an evidence-loss
+    /// report), the fixed-output bit (no source-rot shadow), and the
+    /// budget axis (fresh / exhausted). Must-NOT-match direction: same
+    /// status with a different message, the needle mid-string instead of
+    /// at byte 0, a different status carrying the needle, and the needle
+    /// arriving only on the relayed-line channel.
+    #[tokio::test]
+    async fn lost_terminal_unverified_row_is_evidence_loss_not_a_substitution_or_failure()
+    -> Result<()> {
+        use crate::run::model::path_outcomes_from_keyed;
+        use rio_nix::protocol::build::{read_build_result, write_build_result};
+        use rio_nix::protocol::client::KeyedBuildResult;
+        use rio_nix::protocol::handshake::PROTOCOL_VERSION;
+
+        // ── Producer chain: constructor → wire encode → wire decode →
+        // transport projection. ──
+        let minted = BuildResult::lost_terminal_unverified();
+        let mut buf = Vec::new();
+        write_build_result(&mut buf, &minted, PROTOCOL_VERSION).await?;
+        let parsed = read_build_result(&mut std::io::Cursor::new(buf), PROTOCOL_VERSION).await?;
+        let keyed = KeyedBuildResult {
+            derived_path: format!("{T}!*"),
+            result: parsed,
+        };
+        let outcomes = path_outcomes_from_keyed(&[T.to_string()], std::slice::from_ref(&keyed));
+        let row = &outcomes[0];
+        assert_eq!(row.status, build_status_name(BuildStatus::TransientFailure));
+        assert!(
+            row.error_msg
+                .starts_with(BuildResult::LOST_TERMINAL_UNVERIFIED_PREFIX),
+            "the producer chain must deliver the detector prefix intact: {:?}",
+            row.error_msg
+        );
+
+        let knobs = Knobs::default();
+        let c = ctx("app.x86_64-linux", T, &[DEP], ExpectedOutcome::Built);
+        let no_poison: HashMap<String, Vec<String>> = HashMap::new();
+        // Stale poison rows WITH recorded builders: prior attempts failed
+        // on workers before the DAG eventually completed. The two-signal
+        // contradiction must NOT reclassify the evidence-loss row as
+        // genuine — there is no failure being excused.
+        let poisoned_with_builders: HashMap<String, Vec<String>> =
+            HashMap::from([(T.to_string(), vec!["b1".to_string()])]);
+        // Fixed-output target: the row must not be shadowed into source
+        // rot either (the detector bypasses the needle scan entirely).
+        let mut fod_ctx = ctx("app.x86_64-linux", T, &[DEP], ExpectedOutcome::Built);
+        fod_ctx.fixed_output_drvs = std::sync::Arc::new([T.to_string()].into_iter().collect());
+
+        // ── Must-admit: every (probe × engine_cancelled) cell of the
+        // with-result arm, under every Signal-2/ctx state. ──
+        for (probe, cancelled) in [(false, false), (false, true), (true, false), (true, true)] {
+            let batch = BatchView {
+                probe,
+                engine_cancelled: cancelled,
+                ..BatchView::default()
+            };
+            for (label, job_ctx, poison) in [
+                ("no poison", &c, &no_poison),
+                ("contradicting builders", &c, &poisoned_with_builders),
+                ("fixed-output target", &fod_ctx, &no_poison),
+            ] {
+                let cell = format!("probe={probe} cancelled={cancelled} {label}");
+                if probe {
+                    // Probe batches take the budget-exempt carve-out: the
+                    // evidence loss is infra-shaped, so it must not charge
+                    // the conscripted unit's budget.
+                    assert_eq!(
+                        decide(job_ctx, Some(row), &batch, poison, prior(5), &knobs, None)
+                            .requeue_why(),
+                        Some("infra-probe"),
+                        "{cell}"
+                    );
+                    continue;
+                }
+                // Fresh budget: one fair re-attempt (fresh evidence) instead
+                // of any terminal record.
+                assert_eq!(
+                    decide(job_ctx, Some(row), &batch, poison, prior(0), &knobs, None)
+                        .requeue_why(),
+                    Some("infra-auto-retry"),
+                    "{cell}"
+                );
+                // Exhausted budget: terminal infra (→ infra-indeterminate,
+                // counted against run confidence, never against the target
+                // and never as a substitution) with provenance evidence.
+                match decide(job_ctx, Some(row), &batch, poison, prior(1), &knobs, None) {
+                    CollectDecision::Terminal {
+                        rio:
+                            RioOutcome::TargetFailed {
+                                kind: FailureKind::Infra,
+                            },
+                        evidence,
+                    } => assert!(
+                        evidence.unwrap().contains("gateway evidence-loss row"),
+                        "{cell}: terminal evidence must name the row's provenance"
+                    ),
+                    other => panic!("{cell}: expected terminal infra, got {other:?}"),
+                }
+            }
+        }
+
+        // ── Must-NOT-match: the detector is producer-exact. ──
+        let batch = BatchView::default();
+        // Same status, different message (the gateway's post-ack stream
+        // synthesis): normal two-signal classification — genuine.
+        assert!(matches!(
+            decide(
+                &c,
+                Some(&po(
+                    T,
+                    BuildStatus::TransientFailure,
+                    "build stream error (reconnect exhausted): transport"
+                )),
+                &batch,
+                &no_poison,
+                prior(0),
+                &knobs,
+                None
+            ),
+            CollectDecision::Terminal {
+                rio: RioOutcome::TargetFailed {
+                    kind: FailureKind::Genuine
+                },
+                ..
+            }
+        ));
+        // Needle mid-string: the producer puts the prefix at byte 0, so a
+        // message merely CONTAINING it is not the producer's row.
+        assert!(matches!(
+            decide(
+                &c,
+                Some(&po(
+                    T,
+                    BuildStatus::TransientFailure,
+                    "context: per-root terminal lost under a completed DAG"
+                )),
+                &batch,
+                &no_poison,
+                prior(0),
+                &knobs,
+                None
+            ),
+            CollectDecision::Terminal {
+                rio: RioOutcome::TargetFailed {
+                    kind: FailureKind::Genuine
+                },
+                ..
+            }
+        ));
+        // Different status carrying the needle: the status conjunct holds
+        // (the producer only mints the row as TransientFailure).
+        assert!(matches!(
+            decide(
+                &c,
+                Some(&po(T, BuildStatus::PermanentFailure, &minted.error_msg)),
+                &batch,
+                &no_poison,
+                prior(0),
+                &knobs,
+                None
+            ),
+            CollectDecision::Terminal {
+                rio: RioOutcome::TargetFailed {
+                    kind: FailureKind::Genuine
+                },
+                ..
+            }
+        ));
+        // Needle only on the relayed-line channel (in-band error_msg
+        // empty): the detector reads the in-band message — the producer's
+        // only channel — so a relayed line cannot select the arm.
+        let relayed_only = BatchView {
+            reasons: BTreeMap::from([(T.to_string(), minted.error_msg.clone())]),
+            ..BatchView::default()
+        };
+        assert!(matches!(
+            decide(
+                &c,
+                Some(&po(T, BuildStatus::TransientFailure, "")),
+                &relayed_only,
+                &no_poison,
+                prior(0),
+                &knobs,
+                None
+            ),
+            CollectDecision::Terminal {
+                rio: RioOutcome::TargetFailed {
+                    kind: FailureKind::Genuine
+                },
+                ..
+            }
+        ));
+        Ok(())
     }
 
     /// The canary-probe carve-out, both directions. Must-exempt: a probe

@@ -1889,6 +1889,29 @@ const CONTRACT_REGISTRY: &[ContractRow] = &[
             ],
         },
     },
+    // ── Per-root status provenance: the one BuildStatus value the
+    // gateway may mint with neither per-root scheduler evidence nor
+    // store presence evidence (the lost-terminal evidence-loss row),
+    // and what the measurement consumer must do with it (auto-retry,
+    // then infra-indeterminate — never a substitution event, never a
+    // genuine failure). The consumer test builds the row via the
+    // producer's own constructor + the production wire codec, so the
+    // contract holds across the crate boundary. ──
+    ContractRow {
+        key: "wire.lost-terminal-unverified",
+        declared: (
+            "rio-nix/src/protocol/build.rs",
+            "The honest non-presence verdict",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/run/collect.rs",
+            test_fn: "lost_terminal_unverified_row_is_evidence_loss_not_a_substitution_or_failure",
+            artifact_needles: &[
+                "lost_terminal_unverified()",
+                "LOST_TERMINAL_UNVERIFIED_PREFIX",
+            ],
+        },
+    },
 ];
 
 /// Field names of one struct in `src`: the `pub <name>: <..>` lines
