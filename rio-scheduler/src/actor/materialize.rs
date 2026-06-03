@@ -781,16 +781,20 @@ impl DagActor {
     /// materialization attempt can exist otherwise) — but ALWAYS wired
     /// (design §4 "always-on regardless of flags": reports for existing
     /// attempts must drain after an ON→OFF flip).
+    /// Takes the MATERIALIZATION witness: a build attempt cannot reach
+    /// the consumption transaction — the cross-kind call no longer
+    /// typechecks (the witness twin of `close_pull_attempt_uncharged`'s
+    /// `&BuildAttempt`).
     pub(super) async fn consume_materialization_outcome(
         &mut self,
         exec_id: Uuid,
-        attempt: &crate::db::open_attempts::AttemptByExecRow,
+        attempt: &crate::db::open_attempts::MatAttempt,
         outcome: rio_proto::types::MaterializationOutcome,
     ) -> Result<(), super::pull::PullRejection> {
         use rio_proto::types::materialization_outcome::Outcome;
-        let drv_hash = DrvHash::from(attempt.drv_hash.as_str());
+        let drv_hash = DrvHash::from(attempt.core.drv_hash.as_str());
         let serving_generation = self.serving_generation();
-        let executor = ExecutorId::from(attempt.executor_id.as_str());
+        let executor = ExecutorId::from(attempt.core.executor_id.as_str());
 
         // The unresolved job this attempt executes (PG is the
         // authority; the in-memory view is a cache). The row carries
@@ -799,7 +803,7 @@ impl DagActor {
         // successor).
         let job = self
             .db
-            .unresolved_job_for_derivation(attempt.derivation_id)
+            .unresolved_job_for_derivation(attempt.core.derivation_id)
             .await
             .map_err(|e| {
                 super::pull::PullRejection::Internal(format!("materialization job lookup: {e}"))
@@ -822,7 +826,7 @@ impl DagActor {
         // 1. The live effective wanted set (the §6 join), resolved to
         //    store paths — the presence-re-check half of D7's closure.
         let mut live_wanted_paths = self
-            .live_wanted_paths_for(attempt.derivation_id, &drv_hash)
+            .live_wanted_paths_for(attempt.core.derivation_id, &drv_hash)
             .await
             .map_err(|e| super::pull::PullRejection::Internal(format!("wanted-union read: {e}")))?;
         // r[impl sched.merge.stale-substitutable+3]
@@ -911,7 +915,7 @@ impl DagActor {
                 // The charge row: kind=materialization — visible only to
                 // the materialization budget, never to build budgets.
                 let mut row = crate::db::attempts::AttemptRow::new(
-                    attempt.derivation_id,
+                    attempt.core.derivation_id,
                     crate::state::OutcomeClass::MaterializationUnobtainable,
                     crate::state::ReportingParty::Worker,
                     crate::state::AttemptKind::Materialization,
@@ -949,7 +953,7 @@ impl DagActor {
                 //    launder a verdict (the F9 hazard).
                 let durable_evidence = match self
                     .db
-                    .classify_durable_evidence(attempt.derivation_id)
+                    .classify_durable_evidence(attempt.core.derivation_id)
                     .await
                     .map_err(|e| {
                         super::pull::PullRejection::Internal(format!(
@@ -1070,7 +1074,7 @@ impl DagActor {
                 // budget and toward NOTHING else. Never fail-fasts,
                 // never routes from source (B3).
                 let mut row = crate::db::attempts::AttemptRow::new(
-                    attempt.derivation_id,
+                    attempt.core.derivation_id,
                     crate::state::OutcomeClass::MaterializationInfra,
                     crate::state::ReportingParty::Worker,
                     crate::state::AttemptKind::Materialization,

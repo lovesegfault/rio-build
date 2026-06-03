@@ -700,56 +700,61 @@ impl DagActor {
         // Token↔intent binding (per-unary, same as the pull): the
         // attested intent must be the attempt's derivation.
         if let Some(auth) = auth_intent
-            && auth != attempt.drv_hash
+            && auth != attempt.core().drv_hash
         {
             // r[impl sec.executor.identity-token+2]
             warn!(%exec_id, "ReportOutcome rejected: executor token bound to a different intent");
             return Err(PullRejection::TokenMismatch);
         }
-        // Substitution-replacement: materialization attempts route to
-        // their own consumption transaction; kind mismatch is
-        // acknowledged-and-ignored (the kindMatchesWorker rule at the
-        // report intake). Both arms are reachable FLAG-OFF from a
+        // The kind witness (A2): materialization attempts route to
+        // their own consumption transaction; the build arms below bind
+        // `&BuildAttempt`, so a cross-kind close no longer typechecks.
+        // Kind mismatch between witness and payload is acknowledged-
+        // and-ignored (the kindMatchesWorker rule at the report
+        // intake). Both arms are reachable FLAG-OFF from a
         // buggy/hostile reporter, so the warn+ack posture is a dormancy
         // guarantee, not just a flag-on routing rule.
-        if attempt.attempt_kind == crate::state::AttemptKind::Materialization.as_str() {
-            return match payload.materialization_outcome {
-                Some(outcome) => {
-                    if attempt.attempt_terminal || attempt.attempt_recorded {
-                        // Terminal-row-wins: a duplicate/late report for
-                        // an already-consumed attempt is acknowledged.
-                        debug!(%exec_id, "duplicate materialization report acknowledged-and-ignored");
-                        return Ok(());
+        let b = match &attempt {
+            crate::db::open_attempts::AttemptRef::Materialization(m) => {
+                return match payload.materialization_outcome {
+                    Some(outcome) => {
+                        if m.core.attempt_terminal || m.core.attempt_recorded {
+                            // Terminal-row-wins: a duplicate/late report for
+                            // an already-consumed attempt is acknowledged.
+                            debug!(%exec_id, "duplicate materialization report acknowledged-and-ignored");
+                            return Ok(());
+                        }
+                        self.consume_materialization_outcome(exec_id, m, outcome)
+                            .await
                     }
-                    self.consume_materialization_outcome(exec_id, &attempt, outcome)
-                        .await
-                }
-                None => {
-                    warn!(%exec_id, "build-report payload for a materialization attempt; ignoring");
-                    Ok(())
-                }
-            };
-        }
+                    None => {
+                        warn!(%exec_id, "build-report payload for a materialization attempt; ignoring");
+                        Ok(())
+                    }
+                };
+            }
+            crate::db::open_attempts::AttemptRef::Build(b) => b,
+        };
         if payload.materialization_outcome.is_some() {
             warn!(%exec_id, "materialization payload for a build attempt; acknowledged-and-ignored");
             return Ok(());
         }
         match fold_report(
-            attempt.assignment_active,
-            attempt.attempt_recorded || attempt.attempt_terminal,
+            b.core.assignment_active,
+            b.core.attempt_recorded || b.core.attempt_terminal,
         ) {
             ReportAdmission::AckIgnore => {
                 debug!(
                     %exec_id,
-                    drv_hash = %attempt.drv_hash,
-                    assignment_active = attempt.assignment_active,
+                    drv_hash = %b.core.drv_hash,
+                    assignment_active = b.core.assignment_active,
                     "duplicate/late ReportOutcome acknowledged-and-ignored"
                 );
                 Ok(())
             }
             ReportAdmission::Process => {
-                let executor_id = ExecutorId::from(attempt.executor_id.as_str());
-                // r[impl sched.attempt.synthesized-verdict]
+                let executor_id = ExecutorId::from(b.core.executor_id.as_str());
+                // r[impl sched.attempt.synthesized-verdict+2]
                 // AD5 abort charge class: a pod reporting `Cancelled`
                 // for a derivation the scheduler still wants is the
                 // SIGTERM-abort report (preemption, scale-down,
@@ -761,7 +766,7 @@ impl DagActor {
                 // completion path's Cancelled early-return and stays
                 // exactly as the cancel arm leaves it (no row, no
                 // requeue).
-                let drv_hash = DrvHash::from(attempt.drv_hash.as_str());
+                let drv_hash = DrvHash::from(b.core.drv_hash.as_str());
                 let abort_of_still_wanted = payload.result.status()
                     == rio_proto::types::BuildResultStatus::Cancelled
                     && self.dag.node(&drv_hash).is_some_and(|s| {
@@ -771,28 +776,50 @@ impl DagActor {
                         ) && s.exec_id == Some(exec_id)
                     });
                 if abort_of_still_wanted {
-                    info!(
+                    // r[impl sched.attempt.worker-abort-bounded]
+                    // bug_279: the charge-free admission is LEDGER-
+                    // BOUNDED — the worker-supplied Cancelled
+                    // discriminator is trusted only while the trailing
+                    // run of build-lane worker-abort closures is below
+                    // the kernel bound. At the bound the report falls
+                    // through to the charged unsolicited-Cancelled→
+                    // infrastructure arm of the completion path,
+                    // consuming the attempt WITH budget (exclusion and
+                    // poison advance; the loop is finite).
+                    let admission = self
+                        .dag
+                        .node(&drv_hash)
+                        .map(|s| crate::retry_policy::admit_worker_abort(s.attempt_history()))
+                        .unwrap_or(rio_retry_kernel::WorkerAbortAdmission::Uncharged);
+                    if admission == rio_retry_kernel::WorkerAbortAdmission::Uncharged {
+                        info!(
+                            %exec_id,
+                            drv_hash = %b.core.drv_hash,
+                            "pull-mode SIGTERM-abort report for still-wanted work: closing the \
+                             attempt charge-free and requeueing (AD5)"
+                        );
+                        // AD2c: node attribution comes from the
+                        // controller-authoritative binding only — never the
+                        // worker-supplied report fields.
+                        let source_node = self.pull_attempt_source_node(&drv_hash);
+                        self.close_pull_attempt_uncharged(
+                            b,
+                            exec_id,
+                            "worker_abort",
+                            crate::state::ReportingParty::Worker,
+                            source_node,
+                            "worker-abort",
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    warn!(
                         %exec_id,
-                        drv_hash = %attempt.drv_hash,
-                        "pull-mode SIGTERM-abort report for still-wanted work: closing the \
-                         attempt charge-free and requeueing (AD5)"
+                        drv_hash = %b.core.drv_hash,
+                        bound = rio_retry_kernel::WORKER_ABORT_FREE_CLOSES,
+                        "worker-abort free-close run at the bound; consuming the report as a \
+                         charged infrastructure failure (worker-protocol loop)"
                     );
-                    // AD2c: node attribution comes from the
-                    // controller-authoritative binding only — never the
-                    // worker-supplied report fields.
-                    let source_node = self.pull_attempt_source_node(&drv_hash);
-                    self.close_pull_attempt_uncharged(
-                        attempt.derivation_id,
-                        exec_id,
-                        &drv_hash,
-                        &executor_id,
-                        "worker_abort",
-                        crate::state::ReportingParty::Worker,
-                        source_node,
-                        "worker-abort",
-                    )
-                    .await;
-                    return Ok(());
                 }
                 // Same internal entry point as the stream Completion
                 // arm — classification, verdict, attempt-row append,
@@ -803,7 +830,7 @@ impl DagActor {
                 // trusted to re-route it).
                 self.handle_completion(
                     &executor_id,
-                    &attempt.drv_path,
+                    &b.core.drv_path,
                     payload.result,
                     (payload.peak_memory_bytes, payload.peak_cpu_cores),
                     (payload.node_name, payload.hw_class),
@@ -825,14 +852,14 @@ impl DagActor {
     /// the derivation if this attempt was still the in-flight one.
     /// Idempotent: a row already present for the exec (any classifier
     /// won first) makes the append a no-op and nothing else changes.
-    // r[impl sched.attempt.synthesized-verdict]
-    #[allow(clippy::too_many_arguments)]
+    // r[impl sched.attempt.synthesized-verdict+2]
+    /// Takes the BUILD witness: a materialization attempt cannot be
+    /// closed by this path — the cross-kind call no longer typechecks
+    /// (merged_bug_146's structural half).
     async fn close_pull_attempt_uncharged(
         &mut self,
-        derivation_id: Uuid,
+        attempt: &crate::db::open_attempts::BuildAttempt,
         exec_id: Uuid,
-        drv_hash: &DrvHash,
-        executor_id: &ExecutorId,
         termination_reason: &str,
         reporting_party: crate::state::ReportingParty,
         source_node: Option<String>,
@@ -841,9 +868,11 @@ impl DagActor {
         if !self.leader.is_leader() {
             return;
         }
+        let drv_hash = &DrvHash::from(attempt.core.drv_hash.as_str());
+        let executor_id = &ExecutorId::from(attempt.core.executor_id.as_str());
         let serving_generation = self.leader.generation() as i64;
         let mut row = crate::db::attempts::AttemptRow::new(
-            derivation_id,
+            attempt.core.derivation_id,
             crate::state::OutcomeClass::Disconnected,
             reporting_party,
             crate::state::AttemptKind::Build,
@@ -1035,7 +1064,29 @@ impl DagActor {
             return Ok(());
         };
 
-        if attempt.attempt_terminal {
+        // The kind witness FIRST (merged_bug_146): a controller verdict
+        // names a BUILD-lifecycle event — the controller deleting a
+        // builder Job — and never consumes a store replica's open
+        // materialization attempt. Acknowledged charge-free BEFORE the
+        // AD2c fill below, so the fill can never stamp a builder node
+        // onto a materialization exec row (the 084 CHECK makes that
+        // unrepresentable; this arm makes it unreachable) and the
+        // store's own outcome report stays the attempt's only consumer.
+        let b = match &attempt {
+            crate::db::open_attempts::AttemptRef::Materialization(_) => {
+                debug!(
+                    %exec_id,
+                    drv_hash = %attempt.core().drv_hash,
+                    ?reason,
+                    "ReportAttemptOutcome for a materialization attempt acknowledged \
+                     charge-free (controller verdicts never consume store attempts)"
+                );
+                return Ok(());
+            }
+            crate::db::open_attempts::AttemptRef::Build(b) => b,
+        };
+
+        if b.core.attempt_terminal {
             // Duplicate / already established: idempotent no-op.
             return Ok(());
         }
@@ -1054,11 +1105,11 @@ impl DagActor {
         }
 
         let label = attempt_terminal_reason_label(reason);
-        if attempt.attempt_recorded {
+        if b.core.attempt_recorded {
             // Second installment on the worker-reported row: fill the
             // termination reason only — never a reclassification, never
             // a new row, never a budget or floor change.
-            let derivation_id = attempt.derivation_id;
+            let derivation_id = b.core.derivation_id;
             let won = self
                 .db
                 .fill_termination_reason_only(
@@ -1071,7 +1122,7 @@ impl DagActor {
                 .await
                 .map_err(|e| PullRejection::Internal(format!("installment fill failed: {e}")))?
                 .applied();
-            let drv_hash = DrvHash::from(attempt.drv_hash.as_str());
+            let drv_hash = DrvHash::from(b.core.drv_hash.as_str());
             if won {
                 if let Some(state) = self.dag.node_mut(&drv_hash) {
                     state.fill_attempt_termination_reason(exec_id, label, node_name.as_deref());
@@ -1105,7 +1156,7 @@ impl DagActor {
                         "cause" => "pod-terminal"
                     )
                     .record((crate::db::attempts::epoch_now() - observed_at).max(0.0));
-                    let executor = ExecutorId::from(attempt.executor_id.as_str());
+                    let executor = ExecutorId::from(b.core.executor_id.as_str());
                     self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
                         .await;
                 }
@@ -1127,11 +1178,10 @@ impl DagActor {
         //     deadline, plain error) keep waiting: the establishment
         //     sweep stays their classifier (the 1b gate text), because
         //     the worker's own classifying report may still arrive.
-        // r[impl sched.attempt.synthesized-verdict]
+        // r[impl sched.attempt.synthesized-verdict+2]
         use rio_proto::types::AttemptTerminalReason as R;
-        if attempt.assignment_active && matches!(reason, R::Cancelled | R::Preempted | R::Reaped) {
-            let drv_hash = DrvHash::from(attempt.drv_hash.as_str());
-            let executor_id = ExecutorId::from(attempt.executor_id.as_str());
+        if b.core.assignment_active && matches!(reason, R::Cancelled | R::Preempted | R::Reaped) {
+            let drv_hash = DrvHash::from(b.core.drv_hash.as_str());
             // AD2c: prefer the controller-reported node from this very
             // report, fall back to the spawn-ack binding; never a
             // worker-supplied value.
@@ -1140,15 +1190,13 @@ impl DagActor {
                 .or_else(|| self.pull_attempt_source_node(&drv_hash));
             info!(
                 %exec_id,
-                drv_hash = %attempt.drv_hash,
+                drv_hash = %b.core.drv_hash,
                 ?reason,
                 "controller-synthesized verdict for an open pull attempt: closing charge-free"
             );
             self.close_pull_attempt_uncharged(
-                attempt.derivation_id,
+                b,
                 exec_id,
-                &drv_hash,
-                &executor_id,
                 label,
                 crate::state::ReportingParty::Controller,
                 source_node,
@@ -1159,7 +1207,7 @@ impl DagActor {
         }
         debug!(
             %exec_id,
-            drv_hash = %attempt.drv_hash,
+            drv_hash = %b.core.drv_hash,
             ?reason,
             "ReportAttemptOutcome for an unclassified open attempt acknowledged (no fill \
              target; the establishment sweep remains its classifier)"

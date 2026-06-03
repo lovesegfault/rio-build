@@ -6633,3 +6633,91 @@ async fn deposed_establishment_performs_no_rearm_or_requeue() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.attempt.synthesized-verdict+2]
+/// merged_bug_146 (A2): controller-facing attempt surfaces are
+/// kind-typed. A controller-synthesized verdict (`ReportAttemptOutcome`
+/// with reason Reaped/Cancelled/Preempted) names a BUILD-lifecycle
+/// event — the controller deleting a builder Job — and MUST NOT consume
+/// a store replica's open MATERIALIZATION attempt: the report is
+/// acknowledged charge-free, no drv_attempts row is written, the
+/// assignment stays active, the in-memory job view stays Claimed, and
+/// the store's own later outcome report consumes the attempt normally.
+/// Pre-fix the kind-blind synthesized arm closed the attempt and
+/// requeued the node out from under the still-running store fetch.
+#[tokio::test]
+async fn controller_verdict_never_consumes_materialization_attempt() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("mat-ctrlverdict-out");
+    let mut d1 = make_node("mat-ctrlverdict");
+    d1.expected_output_paths = vec![out.clone()];
+    d1.wanted_output_names = vec!["out".into()];
+    merge_dag(&handle, Uuid::new_v4(), vec![d1], vec![], false).await?;
+    barrier(&handle).await;
+    store.state.substitutable.write().unwrap().push(out.clone());
+    tick(&handle).await?;
+
+    let assignment = match claim_materialization(&handle, "mat-ctrlverdict", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+
+    // The controller's synthesized verdict for the (builder-shaped)
+    // attempt identity arrives — e.g. a reap pass that resolved the
+    // intent to this open attempt.
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::ReportAttemptOutcome {
+            identity: crate::actor::pull::AttemptIdentity {
+                intent_id: Some("mat-ctrlverdict".into()),
+                job_name: None,
+                exec_id: Some(exec_id),
+            },
+            reason: rio_proto::types::AttemptTerminalReason::Reaped,
+            node_name: None,
+            reply: reply_tx,
+        })
+        .await?;
+    reply_rx.await?.expect("verdict acked");
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_attempts WHERE exec_id = $1")
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        rows, 0,
+        "a controller verdict must write no row for a materialization attempt"
+    );
+    let active: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM assignments WHERE exec_id = $1 \
+         AND status IN ('pending', 'acknowledged')",
+    )
+    .bind(exec_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(active, 1, "the materialization attempt stays open");
+    assert_eq!(
+        expect_drv(&handle, "mat-ctrlverdict").await.status,
+        DerivationStatus::Running,
+        "the node stays Running under the open store claim"
+    );
+
+    // The store's own success report still consumes normally.
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "mat-ctrlverdict",
+        mat_success_outcome(vec![out.clone()], vec![out.clone()]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "mat-ctrlverdict").await.status,
+        DerivationStatus::Completed,
+        "the store's own report consumes the attempt normally after the ignored verdict"
+    );
+    Ok(())
+}

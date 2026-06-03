@@ -211,3 +211,36 @@ async fn mint_persists_dispatched_deadline_and_view_returns_it() -> anyhow::Resu
     assert_eq!(rows[0].source_node.as_deref(), Some("node-1"));
     Ok(())
 }
+
+/// Coordinator-flagged absence-as-verdict sibling (the B2 security
+/// sweep, wave-log §B2): `find_attempt_by_exec_id` must REQUIRE the
+/// execution lifecycle row. Pre-fix the LEFT JOIN +
+/// `COALESCE(attempt_kind,'build')` defaulted a row-less assignment to
+/// the BUILD lane — an attempt whose kind is unknowable reached the
+/// build close/completion arms. Deny-by-default: no execution row ⇒ no
+/// resolution ⇒ the report intake's existing acknowledged-and-ignored
+/// (superseded) posture.
+#[tokio::test]
+async fn attempt_resolution_requires_the_execution_row() -> anyhow::Result<()> {
+    let test_db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    let drv = super::insert_test_derivation(&db, "rowless-exec-hash").await?;
+    let exec_id = uuid::Uuid::now_v7();
+    // An assignments row WITHOUT its drv_executions row (the schema
+    // allows it: no FK binds assignments.exec_id to drv_executions).
+    db.insert_assignment(
+        drv,
+        &crate::state::ExecutorId::from("rowless-exec-hash"),
+        1,
+        exec_id,
+    )
+    .await?;
+
+    let resolved = db.find_attempt_by_exec_id(exec_id).await?;
+    assert!(
+        resolved.is_none(),
+        "a row-less assignment must not resolve to any kind (got {resolved:?})"
+    );
+    drop(test_db);
+    Ok(())
+}

@@ -720,7 +720,7 @@ async fn exec_charge_facts(
     .expect("exec charge facts")
 }
 
-// r[verify sched.attempt.synthesized-verdict]
+// r[verify sched.attempt.synthesized-verdict+2]
 // r[verify sched.reassign.no-promote-on-ephemeral-disconnect+5]
 /// A controller-synthesized Preempted verdict (intent-keyed, no exec_id
 /// — the disruption-watcher shape) for an open, never-worker-reported
@@ -798,7 +798,7 @@ async fn attempt_outcome_synthesized_preempted_closes_uncharged_and_requeues() -
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict]
+// r[verify sched.attempt.synthesized-verdict+2]
 /// The same close keyed by exec_id with reason Reaped (the
 /// synthesize-on-delete shape used by the controller's reap arms).
 #[tokio::test]
@@ -828,7 +828,7 @@ async fn attempt_outcome_synthesized_reaped_by_exec_id_closes_uncharged() -> Tes
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict]
+// r[verify sched.attempt.synthesized-verdict+2]
 /// Pod-terminal reasons that are NOT controller-synthesized verdicts
 /// (OOM, eviction, deadline, plain error) keep the as-built behavior on
 /// an unclassified open attempt: acknowledged, nothing written — the
@@ -862,7 +862,7 @@ async fn attempt_outcome_pod_terminal_reason_still_waits_for_establishment() -> 
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict]
+// r[verify sched.attempt.synthesized-verdict+2]
 /// The builder's AD5 SIGTERM-abort report (`BuildResultStatus::Cancelled`
 /// on a still-wanted derivation) resolves the pull attempt charge-free
 /// and requeues it — never an infrastructure-failure charge.
@@ -921,7 +921,7 @@ async fn report_outcome_worker_abort_still_wanted_closes_uncharged() -> TestResu
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict]
+// r[verify sched.attempt.synthesized-verdict+2]
 /// A genuinely-cancelled (no-longer-wanted) derivation keeps the cancel
 /// arm's exact shape: the worker's abort report after CancelBuild writes
 /// nothing, charges nothing, and the drv stays Cancelled (never
@@ -1368,7 +1368,7 @@ async fn report_attempt_outcome_both(
         .expect("actor alive")
 }
 
-// r[verify sched.attempt.synthesized-verdict]
+// r[verify sched.attempt.synthesized-verdict+2]
 /// The disruption-watcher shape (intent id + Job name, no exec) for a
 /// PULL-mode pod still resolves and closes the pull attempt — the
 /// stream-identity routing guard must not divert reports whose job
@@ -1396,5 +1396,51 @@ async fn attempt_outcome_pull_pod_report_with_job_name_still_closes_attempt() ->
     assert_eq!(facts[0].1.as_deref(), Some("preempted"));
     let info = expect_drv(&handle, "uni-c").await;
     assert_eq!(info.status, crate::state::DerivationStatus::Ready);
+    Ok(())
+}
+
+// r[verify sched.attempt.worker-abort-bounded]
+/// bug_279 (A2): the AD5 worker-abort uncharged close is LEDGER-BOUNDED.
+/// Three consecutive worker-abort closures on the same derivation are
+/// charge-free (the as-built AD5 posture); the FOURTH — arriving with a
+/// trailing run of `WORKER_ABORT_FREE_CLOSES` worker-abort rows — is no
+/// longer admitted uncharged: it falls through to the existing
+/// unsolicited-Cancelled→infrastructure arm, consuming the attempt with
+/// a CHARGED row that advances the infra budget. Pre-fix the worker
+/// discriminator was trusted unboundedly: a worker looping
+/// `pull → Cancelled` minted unlimited uncharged requeues and the
+/// derivation never progressed toward exclusion or poison.
+#[tokio::test]
+async fn worker_abort_uncharged_closes_are_ledger_bounded() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "syn-f", PriorityClass::Scheduled).await?;
+
+    let mut last_exec = None;
+    for round in 0..4u32 {
+        let assignment = expect_deliver(pull(&handle, "syn-f", Some("syn-f")).await);
+        let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+        last_exec = Some(exec_id);
+        report(
+            &handle,
+            exec_id,
+            Some("syn-f"),
+            rio_proto::types::BuildResultStatus::Cancelled,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("abort report {round} acked: {e:?}"));
+    }
+
+    let info = expect_drv(&handle, "syn-f").await;
+    assert_eq!(
+        info.retry.infra_count, 1,
+        "the 4th consecutive worker abort is charged as an infrastructure failure"
+    );
+    let facts = exec_charge_facts(&db.pool, last_exec.expect("4 rounds ran")).await;
+    assert_eq!(facts.len(), 1, "the 4th abort still consumes its attempt");
+    assert_eq!(
+        facts[0].0, "infra",
+        "the charged fall-through classifies as infra, not disconnected"
+    );
     Ok(())
 }

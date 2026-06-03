@@ -127,6 +127,21 @@ pub(crate) fn decide(history: &[AttemptRecord], budget: &Budget, now: AbsTime) -
     }
 }
 
+// r[impl sched.attempt.worker-abort-bounded]
+/// Admit one worker-abort report (`BuildResultStatus::Cancelled` for a
+/// still-wanted open build attempt) against the in-memory attempt
+/// history: the kernel counts the trailing run of build-lane
+/// worker-abort closures and admits the charge-free close only below
+/// [`rio_retry_kernel::WORKER_ABORT_FREE_CLOSES`]. Same projection shim
+/// shape as [`decide`].
+pub(crate) fn admit_worker_abort(
+    history: &[AttemptRecord],
+) -> rio_retry_kernel::WorkerAbortAdmission {
+    let rows: Vec<rio_retry_kernel::LedgerRow<String>> =
+        history.iter().map(record_to_row).collect();
+    rio_retry_kernel::admit_worker_abort(&rows, rio_retry_kernel::WORKER_ABORT_FREE_CLOSES)
+}
+
 /// Index where the MATERIALIZATION lane's window of `history` begins:
 /// the kernel's per-lane suffix cut
 /// ([`rio_retry_kernel::ledger_suffix_start`] over the

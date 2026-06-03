@@ -296,10 +296,11 @@ in
   # r[verify sched.dispatch.fleet-exhaust+4]
   # r[verify sched.state.poisoned-ttl]
   # r[verify sched.db.attempts-gc]
+  # r[verify sched.attempt.worker-abort-bounded]
   kani-rio-retry-kernel = mkKaniCheck {
     name = "rio-retry-kernel";
     crate = crateBuildKani.members.rio-retry-kernel;
-    expectedHarnesses = 11;
+    expectedHarnesses = 12;
   };
 
   # rio-evidence-kernel: the scheduler's closure-evidence decision kernel

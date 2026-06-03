@@ -21,7 +21,7 @@ use super::SchedulerDb;
 
 /// One attempt resolved by `exec_id` (the `ReportOutcome` lookup).
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub(crate) struct AttemptByExecRow {
+struct AttemptByExecRow {
     /// The DAG key (`derivations.derivation_id`).
     pub derivation_id: Uuid,
     /// `derivations.drv_hash` — the intent id / DAG key string.
@@ -39,10 +39,99 @@ pub(crate) struct AttemptByExecRow {
     /// (establishment or the controller's second installment).
     pub attempt_terminal: bool,
     /// Work class of the execution (`drv_executions.attempt_kind`,
-    /// COALESCE'd to 'build' — substitution-replacement). Routes the
-    /// report intake: materialization attempts go to the consumption
-    /// transaction, build attempts to the as-built completion path.
+    /// read directly — the execution row is REQUIRED by the join, so
+    /// absence is unrepresentable, never defaulted; the B2 security
+    /// sweep's absence-as-verdict class). Routes the report intake:
+    /// materialization attempts go to the consumption transaction,
+    /// build attempts to the as-built completion path.
     pub attempt_kind: String,
+}
+
+/// The kind-typed attempt witness — the ONLY attempt-resolution shape
+/// that reaches the actor (merged_bug_146 / bug_121's class). The kind
+/// is parsed exactly once, here at the row boundary; a row whose
+/// `attempt_kind` is outside the alphabet is a DECODE ERROR, never a
+/// default. Cross-kind operations are uncompilable downstream: the
+/// uncharged close takes `&BuildAttempt`, the consumption transaction
+/// takes `&MatAttempt`.
+#[derive(Debug, Clone)]
+pub(crate) enum AttemptRef {
+    Build(BuildAttempt),
+    Materialization(MatAttempt),
+}
+
+/// The kind-independent facts of one resolved attempt.
+#[derive(Debug, Clone)]
+pub(crate) struct AttemptCore {
+    /// The DAG key (`derivations.derivation_id`).
+    pub derivation_id: Uuid,
+    /// `derivations.drv_hash` — the intent id / DAG key string.
+    pub drv_hash: String,
+    /// Full `.drv` store path (what the completion path keys on).
+    pub drv_path: String,
+    /// Executor identity the attempt is bound to.
+    pub executor_id: String,
+    /// The assignment row is still active (pending/acknowledged).
+    pub assignment_active: bool,
+    /// Some `drv_attempts` row already exists for this exec.
+    pub attempt_recorded: bool,
+    /// A terminal `drv_attempts` fill exists for this exec.
+    pub attempt_terminal: bool,
+}
+
+/// A resolved BUILD-kind attempt (witness arm).
+#[derive(Debug, Clone)]
+pub(crate) struct BuildAttempt {
+    pub core: AttemptCore,
+}
+
+/// A resolved MATERIALIZATION-kind attempt (witness arm).
+#[derive(Debug, Clone)]
+pub(crate) struct MatAttempt {
+    pub core: AttemptCore,
+}
+
+impl AttemptRef {
+    /// The kind-independent facts (token binding, logging).
+    pub(crate) fn core(&self) -> &AttemptCore {
+        match self {
+            Self::Build(b) => &b.core,
+            Self::Materialization(m) => &m.core,
+        }
+    }
+
+    /// Parse one row into the witness — the single kind-parse site.
+    fn from_row(row: AttemptByExecRow) -> Result<Self, sqlx::Error> {
+        let AttemptByExecRow {
+            derivation_id,
+            drv_hash,
+            drv_path,
+            executor_id,
+            assignment_active,
+            attempt_recorded,
+            attempt_terminal,
+            attempt_kind,
+        } = row;
+        let core = AttemptCore {
+            derivation_id,
+            drv_hash,
+            drv_path,
+            executor_id,
+            assignment_active,
+            attempt_recorded,
+            attempt_terminal,
+        };
+        match attempt_kind.as_str() {
+            "build" => Ok(Self::Build(BuildAttempt { core })),
+            "materialization" => Ok(Self::Materialization(MatAttempt { core })),
+            other => Err(sqlx::Error::Decode(
+                format!(
+                    "drv_executions.attempt_kind: value {other:?} not in the rust-side alphabet"
+                )
+                .into(),
+            )),
+        }
+    }
 }
 
 /// Row shape for [`SchedulerDb::find_open_pull_attempt_by_drv_hash`]
@@ -97,7 +186,7 @@ pub(crate) struct OpenAttemptRow {
     /// but never shrink below this. `None` for rows minted before 072.
     pub deadline_secs: Option<f64>,
     /// Work class of the execution (`drv_executions.attempt_kind`,
-    /// COALESCE'd to 'build' — substitution-replacement). The
+    /// read directly — the execution row is required by the join). The
     /// establishment sweep branches on it: materialization attempts
     /// get the no-adopt materialization_infra arm.
     pub attempt_kind: String,
@@ -256,12 +345,15 @@ impl SchedulerDb {
     /// any `drv_attempts` classification already exists for it. `None`
     /// when no assignment carries the exec — never pulled, or already
     /// superseded by a newer attempt (the active-row upsert re-keyed
-    /// the row).
+    /// the row) — and equally when the assignment has NO
+    /// `drv_executions` row: an attempt whose kind is unknowable is
+    /// not resolvable (deny-by-default; pre-fix the LEFT JOIN +
+    /// COALESCE defaulted it to the build lane).
     pub(crate) async fn find_attempt_by_exec_id(
         &self,
         exec_id: Uuid,
-    ) -> Result<Option<AttemptByExecRow>, sqlx::Error> {
-        sqlx::query_as(
+    ) -> Result<Option<AttemptRef>, sqlx::Error> {
+        let row: Option<AttemptByExecRow> = sqlx::query_as(
             "SELECT d.derivation_id, d.drv_hash, d.drv_path, \
                     a.builder_id AS executor_id, \
                     (a.status IN ('pending', 'acknowledged')) AS assignment_active, \
@@ -270,17 +362,18 @@ impl SchedulerDb {
                     EXISTS (SELECT 1 FROM drv_attempts t \
                             WHERE t.exec_id = a.exec_id \
                               AND t.termination_reason IS NOT NULL) AS attempt_terminal, \
-                    COALESCE(e.attempt_kind, 'build') AS attempt_kind \
+                    e.attempt_kind \
              FROM assignments a \
              JOIN derivations d ON d.derivation_id = a.derivation_id \
-             LEFT JOIN drv_executions e ON e.exec_id = a.exec_id \
+             JOIN drv_executions e ON e.exec_id = a.exec_id \
              WHERE a.exec_id = $1 \
              ORDER BY a.assigned_at DESC \
              LIMIT 1",
         )
         .bind(exec_id)
         .fetch_optional(&self.pool)
-        .await
+        .await?;
+        row.map(AttemptRef::from_row).transpose()
     }
 
     /// Resolve the OPEN pull-mode attempt for one derivation (the
@@ -290,7 +383,7 @@ impl SchedulerDb {
     pub(crate) async fn find_open_pull_attempt_by_drv_hash(
         &self,
         drv_hash: &str,
-    ) -> Result<Option<(Uuid, AttemptByExecRow)>, sqlx::Error> {
+    ) -> Result<Option<(Uuid, AttemptRef)>, sqlx::Error> {
         let row: Option<AttemptByExecByHashRow> = sqlx::query_as(
             "SELECT a.exec_id, d.derivation_id, d.drv_hash, d.drv_path, \
                     a.builder_id AS executor_id, \
@@ -300,7 +393,7 @@ impl SchedulerDb {
                     EXISTS (SELECT 1 FROM drv_attempts t \
                             WHERE t.exec_id = a.exec_id \
                               AND t.termination_reason IS NOT NULL) AS attempt_terminal, \
-                    COALESCE(e.attempt_kind, 'build') AS attempt_kind \
+                    e.attempt_kind \
              FROM assignments a \
              JOIN derivations d ON d.derivation_id = a.derivation_id \
              JOIN drv_executions e ON e.exec_id = a.exec_id \
@@ -312,21 +405,21 @@ impl SchedulerDb {
         .bind(drv_hash)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|r| {
-            (
-                r.exec_id,
-                AttemptByExecRow {
-                    derivation_id: r.derivation_id,
-                    drv_hash: r.drv_hash,
-                    drv_path: r.drv_path,
-                    executor_id: r.executor_id,
-                    assignment_active: r.assignment_active,
-                    attempt_recorded: r.attempt_recorded,
-                    attempt_terminal: r.attempt_terminal,
-                    attempt_kind: r.attempt_kind,
-                },
-            )
-        }))
+        row.map(|r| {
+            let exec_id = r.exec_id;
+            AttemptRef::from_row(AttemptByExecRow {
+                derivation_id: r.derivation_id,
+                drv_hash: r.drv_hash,
+                drv_path: r.drv_path,
+                executor_id: r.executor_id,
+                assignment_active: r.assignment_active,
+                attempt_recorded: r.attempt_recorded,
+                attempt_terminal: r.attempt_terminal,
+                attempt_kind: r.attempt_kind,
+            })
+            .map(|a| (exec_id, a))
+        })
+        .transpose()
     }
 
     /// Every open attempt: active assignment ⋈ execution with no
@@ -340,7 +433,7 @@ impl SchedulerDb {
             "SELECT d.derivation_id, d.drv_hash, d.drv_path, d.system, d.is_fixed_output, \
                     a.exec_id, a.builder_id AS executor_id, a.generation, \
                     e.source_node, e.deadline_secs, \
-                    COALESCE(e.attempt_kind, 'build') AS attempt_kind, \
+                    e.attempt_kind, \
                     EXTRACT(EPOCH FROM a.assigned_at)::float8 AS assigned_at_epoch_secs, \
                     GREATEST(EXTRACT(EPOCH FROM (now() - a.assigned_at))::float8, 0.0) \
                         AS age_secs \

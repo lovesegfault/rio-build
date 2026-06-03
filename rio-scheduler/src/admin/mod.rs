@@ -536,8 +536,16 @@ impl AdminService for AdminServiceImpl {
                 generation: r.generation.max(0) as u64,
                 assigned_at_age_secs: r.age_secs.max(0.0) as u64,
                 // Deadline enrichment (the intent deadline) is consumer
-                // work when a consumer needs it; 0 = unknown for now.
+                // work when a consumer needs it; 0 = unknown for now
+                // (C2's co-land — enriching it alone re-arms wrongful
+                // Dead-reaps; see the wave's R3 ruling).
                 deadline_secs: 0,
+                attempt_kind: match r.attempt_kind.as_str() {
+                    "materialization" => rio_proto::types::AttemptKind::Materialization,
+                    // 'build' and anything pre-alphabet: the as-built
+                    // build fleet (UNSPECIFIED⇒build skew posture).
+                    _ => rio_proto::types::AttemptKind::Build,
+                } as i32,
             })
             .collect();
         Ok(Response::new(rio_proto::types::ListOpenAttemptsResponse {

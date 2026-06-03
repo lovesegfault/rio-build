@@ -2744,20 +2744,24 @@ This carries forward the as-built rule that never-assigned/assigned-only pod
 deaths never count (the `recently_disconnected` no-entry no-op arms), re-keyed
 onto the durable open-attempt view.
 
-#r("sched.attempt.synthesized-verdict")[
+#r("sched.attempt.synthesized-verdict+2")[
   A controller-synthesized terminal report (reason cancelled, preempted, or
-  reaped) for an open pull-mode attempt that has no worker-reported
+  reaped) for an open pull-mode BUILD attempt that has no worker-reported
   classification row MUST close that attempt charge-free in one
   generation-fenced appending transaction --- exactly one uncharged terminal
   row whose `termination_reason` carries the synthesized reason, with the
   assignment row closed --- and MUST requeue a still-wanted derivation at
   that fold, never at the establishment sweep. A worker `ReportOutcome`
-  whose result is `Cancelled` for a still-wanted open pull-mode attempt (the
-  AD5 SIGTERM-abort report) MUST resolve the same way: charge-free closure
-  and requeue, never an infrastructure-failure charge. Neither path may
-  requeue a derivation that is no longer wanted, and other pod-terminal
-  reasons without a worker classification remain the establishment sweep's
-  to classify.
+  whose result is `Cancelled` for a still-wanted open pull-mode build
+  attempt (the AD5 SIGTERM-abort report) MUST resolve the same way ---
+  charge-free closure and requeue, never an infrastructure-failure charge
+  --- subject to the worker-abort bound
+  (#rref("sched.attempt.worker-abort-bounded")). A MATERIALIZATION attempt
+  is outside both paths: a controller verdict for one MUST be acknowledged
+  charge-free with nothing written --- the consumption transaction stays
+  the attempt's only consumer. Neither close path may requeue a derivation
+  that is no longer wanted, and other pod-terminal reasons without a worker
+  classification remain the establishment sweep's to classify.
 ]
 The synthesized-verdict close is the scheduler half of the AD5/C5/C6
 successor (`ctrl.job.synthesize-on-delete`, `ctrl.drain.disruption-target`):
@@ -2767,6 +2771,25 @@ closure. Pod-initiated aborts of still-wanted work are platform terminations
 (preemption, scale-down, controller deletes), not worker faults --- charging
 them as infrastructure failures would burn the infra budget on disruptions
 the design accepts as charge-free.
+
+#r("sched.attempt.worker-abort-bounded")[
+  The worker-abort charge-free admission MUST be ledger-bounded: a worker
+  `ReportOutcome{Cancelled}` for a still-wanted open build attempt is
+  admitted charge-free only while the attempt history's trailing run of
+  consecutive build-lane worker-abort closures is strictly below
+  `WORKER_ABORT_FREE_CLOSES` (3); a report arriving at or past the bound
+  MUST be consumed as a charged infrastructure failure through the
+  existing unsolicited-Cancelled classification, advancing the exclusion
+  and poison budgets. Materialization-lane rows MUST neither extend nor
+  break the run (the kind partition); any other build-lane row breaks it.
+]
+The worker supplies the `Cancelled` discriminator, so trusting it
+unboundedly mints unlimited uncharged requeues (a compromised or looping
+builder pins its derivation forever without ever advancing exclusion or
+poison --- bug_279's class). The bound preserves the AD5 posture for every
+plausible disruption burst --- three consecutive platform terminations with
+nothing else happening to the lane --- while making the loop finite; the
+run resets on any genuine classification, reset, or controller observation.
 
 #r("sched.attempt.establishment-window+4")[
   The establishment sweep MUST visit every open attempt (active assignment ⋈

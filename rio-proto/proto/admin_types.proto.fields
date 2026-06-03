@@ -155,6 +155,7 @@ repeated string systems = 2;
 repeated string unfulfillable_cells = 2;
 repeated string values = 3;
 repeated uint32 per_dim = 1;
+rio.types.AttemptKind attempt_kind = 9;
 string assigned_executor = 5;
 string binding_constraint = 4;
 string build_id = 1;

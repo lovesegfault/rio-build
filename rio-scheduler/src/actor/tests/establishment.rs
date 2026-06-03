@@ -273,7 +273,7 @@ async fn establishment_window_anchored_to_dispatched_deadline() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.synthesized-verdict]
+// r[verify sched.attempt.synthesized-verdict+2]
 /// (f) An attempt closed charge-free by a controller-synthesized verdict
 /// is never re-established: the sweep adds no executor_crash row and no
 /// charge for that exec, even far past the window.

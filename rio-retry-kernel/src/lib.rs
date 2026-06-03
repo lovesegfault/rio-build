@@ -1794,6 +1794,67 @@ pub fn sweep_eligible<Id>(
         && now.saturating_sub(rows[index].at) > horizon_secs
 }
 
+/// How a worker-reported abort (`BuildResultStatus::Cancelled` for a
+/// still-wanted open build attempt — the AD5 SIGTERM-abort report) is
+/// admitted, given the attempt history.
+// r[impl sched.attempt.worker-abort-bounded]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerAbortAdmission {
+    /// Below the bound: close the attempt charge-free and requeue (the
+    /// as-built AD5 posture).
+    Uncharged,
+    /// The trailing run of build-lane worker-abort closures has reached
+    /// the bound: the report falls through to the charged
+    /// infrastructure classification (the unsolicited-Cancelled arm),
+    /// consuming the attempt WITH budget.
+    ChargedFallthrough,
+}
+
+/// How many CONSECUTIVE worker-abort closures are admitted charge-free
+/// before the next one is charged. Platform terminations (preemption,
+/// scale-down, controller deletes) legitimately produce short runs;
+/// a worker looping `pull → Cancelled` produces an unbounded one —
+/// bug_279's uncharged-requeue mint. Three free closes absorb any
+/// plausible disruption burst while keeping the loop finite.
+pub const WORKER_ABORT_FREE_CLOSES: u32 = 3;
+
+/// Admit one worker-abort report against the attempt history: count
+/// the TRAILING run of build-lane free-close rows
+/// (`Attempt ∧ Disconnected ∧ Worker` — exactly the row the uncharged
+/// close appends; pull-mode's only worker-party `Disconnected` writer)
+/// and admit `Uncharged` only while the run is strictly below `bound`.
+///
+/// Lane discipline (the kind partition): MATERIALIZATION-lane rows
+/// neither extend nor break the run — they are skipped exactly as
+/// [`decide`]'s fold skips them, so a store replica's interleaved
+/// charges cannot launder a worker's abort loop back under the bound.
+/// Any OTHER build-lane row (a charged classification, a controller
+/// row, a reset) breaks the run: the loop signature is consecutive
+/// worker aborts with nothing else happening to the lane.
+// r[impl sched.attempt.worker-abort-bounded]
+pub fn admit_worker_abort<Id>(rows: &[LedgerRow<Id>], bound: u32) -> WorkerAbortAdmission {
+    let mut run: u32 = 0;
+    let mut i = rows.len();
+    while i > 0 {
+        i -= 1;
+        let r = &rows[i];
+        if r.kind != AttemptKind::Build {
+            continue;
+        }
+        let is_free_close = r.event_kind == AttemptEventKind::Attempt
+            && r.outcome_class == OutcomeClass::Disconnected
+            && r.reporting_party == ReportingParty::Worker;
+        if !is_free_close {
+            break;
+        }
+        run += 1;
+        if run >= bound {
+            return WorkerAbortAdmission::ChargedFallthrough;
+        }
+    }
+    WorkerAbortAdmission::Uncharged
+}
+
 /// The floor-bump outcome as [`classify`] consumes it — a leaf-local
 /// mirror of the actor's `FloorOutcome` so this crate keeps no actor
 /// dependency. `promoted` and `at_cap` are mutually exclusive; both are
@@ -2001,6 +2062,78 @@ mod tests {
         assert_eq!(b.backoff_secs(1), 10);
         assert_eq!(b.backoff_secs(2), 20);
         assert_eq!(b.backoff_secs(10), 300, "capped at backoff_max_secs");
+    }
+
+    /// `admit_worker_abort` decision table (bug_279): the trailing
+    /// build-lane free-close run, the lane skip, and the run breakers.
+    // r[verify sched.attempt.worker-abort-bounded]
+    #[test]
+    fn worker_abort_admission_table() {
+        use WorkerAbortAdmission::{ChargedFallthrough, Uncharged};
+        let free = |at: u64| LedgerRow::<u8> {
+            event_kind: AttemptEventKind::Attempt,
+            outcome_class: OutcomeClass::Disconnected,
+            executor: None,
+            reporting_party: ReportingParty::Worker,
+            floor_promoted: false,
+            floor_at_cap: false,
+            resubmit_cycle: 0,
+            at,
+            kind: AttemptKind::Build,
+        };
+        let controller_disc = |at: u64| LedgerRow {
+            reporting_party: ReportingParty::Controller,
+            ..free(at)
+        };
+        let build_infra = |at: u64| LedgerRow {
+            outcome_class: OutcomeClass::Infra,
+            ..free(at)
+        };
+        let mat_infra = |at: u64| LedgerRow {
+            outcome_class: OutcomeClass::MaterializationInfra,
+            kind: AttemptKind::Materialization,
+            ..free(at)
+        };
+        let bound = WORKER_ABORT_FREE_CLOSES;
+
+        // Empty and short runs admit uncharged.
+        assert_eq!(admit_worker_abort::<u8>(&[], bound), Uncharged);
+        assert_eq!(admit_worker_abort(&[free(1), free(2)], bound), Uncharged);
+        // At the bound: charged fall-through.
+        assert_eq!(
+            admit_worker_abort(&[free(1), free(2), free(3)], bound),
+            ChargedFallthrough
+        );
+        // run-broken-by-controller-row: a trailing controller
+        // Disconnected breaks the run (consecutive WORKER aborts only).
+        assert_eq!(
+            admit_worker_abort(&[free(1), free(2), free(3), controller_disc(4)], bound),
+            Uncharged
+        );
+        // A charged build row breaks it too.
+        assert_eq!(
+            admit_worker_abort(&[free(1), free(2), build_infra(3), free(4)], bound),
+            Uncharged
+        );
+        // mat-row-interleaved: materialization-lane rows neither extend
+        // nor break the run — the partition holds at this gate exactly
+        // as it does in decide()'s fold.
+        assert_eq!(
+            admit_worker_abort(
+                &[free(1), mat_infra(2), free(3), mat_infra(4), free(5)],
+                bound
+            ),
+            ChargedFallthrough
+        );
+        // Build reset breaks the run (a fresh cycle starts clean).
+        let reset = LedgerRow {
+            event_kind: AttemptEventKind::Reset,
+            ..free(6)
+        };
+        assert_eq!(
+            admit_worker_abort(&[free(1), free(2), reset, free(4)], bound),
+            Uncharged
+        );
     }
 
     #[test]
@@ -3281,5 +3414,56 @@ mod proofs {
             materialization_decide(&view[..m], u32::from(k)),
             materialization_decide(&rows[..n], u32::from(k)),
         );
+    }
+
+    /// sched.attempt.worker-abort-bounded (bug_279): for EVERY bounded
+    /// history, `admit_worker_abort` answers `Uncharged` iff the
+    /// trailing build-lane free-close run is strictly below the bound
+    /// (the spec-side recount below is a forward scan — a structurally
+    /// different fold from the production reverse-break loop); and the
+    /// uncharged close the admission authorizes (appending exactly the
+    /// free-close row pull-mode writes) STRICTLY grows that run — so
+    /// consecutive uncharged admissions are bounded at
+    /// `WORKER_ABORT_FREE_CLOSES` by induction.
+    // r[verify sched.attempt.worker-abort-bounded]
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn check_worker_abort_bounded() {
+        const MAX: usize = 4;
+
+        /// Forward-scan recount: reset on any non-free build-lane row,
+        /// skip materialization-lane rows.
+        fn trailing_free_run(rows: &[LedgerRow<u8>]) -> u32 {
+            let mut run: u32 = 0;
+            let mut i = 0;
+            while i < rows.len() {
+                let r = &rows[i];
+                if r.kind == AttemptKind::Build {
+                    let is_free = r.event_kind == AttemptEventKind::Attempt
+                        && r.outcome_class == OutcomeClass::Disconnected
+                        && r.reporting_party == ReportingParty::Worker;
+                    run = if is_free { run + 1 } else { 0 };
+                }
+                i += 1;
+            }
+            run
+        }
+
+        let (mut rows, n) = any_history::<MAX>();
+        kani::assume(n < MAX); // room for the appended close
+
+        let admit = admit_worker_abort(&rows[..n], WORKER_ABORT_FREE_CLOSES);
+        let run = trailing_free_run(&rows[..n]);
+        assert!((admit == WorkerAbortAdmission::Uncharged) == (run < WORKER_ABORT_FREE_CLOSES));
+
+        // Growth lemma: the authorized close appends a free-close row
+        // (arbitrary time/cycle/floor metadata — only the four
+        // discriminant fields are pinned, exactly what the uncharged
+        // close writes).
+        rows[n].kind = AttemptKind::Build;
+        rows[n].event_kind = AttemptEventKind::Attempt;
+        rows[n].outcome_class = OutcomeClass::Disconnected;
+        rows[n].reporting_party = ReportingParty::Worker;
+        assert!(trailing_free_run(&rows[..n + 1]) == run + 1);
     }
 }

@@ -641,39 +641,48 @@ impl ExecutorService for SchedulerGrpc {
                  (a store-service credential is required)",
             ));
         }
-        let has_report = req.report.is_some();
-        let report = req.report.unwrap_or_default();
-        // The exec_id names the attempt; the report's drv_path is not
-        // used for routing (and is therefore not length-gated here —
-        // it is dropped before the actor sees it). Payload fields get
-        // the same bound-don't-reject treatment as the stream arm.
-        let mut result = report.result.unwrap_or_else(|| {
-            warn!(exec_id = %req.exec_id, "ReportOutcome with no result, synthesizing InfrastructureFailure");
-            rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
-                error_msg: "pod sent ReportOutcome with no result".into(),
-                ..Default::default()
+        // bug_121: the payload class is parsed at the boundary, BEFORE
+        // any defaulting — the contractual materialization wire shape
+        // (report unset, materialization_outcome set) never synthesizes
+        // a phantom InfrastructureFailure BuildResult and never logs
+        // the no-result warn. (Some, Some) is malformed; (None, None)
+        // is the legacy no-result build report, synthesized exactly as
+        // before (the warn is genuine there).
+        let payload = match parse_report_payload(req.report, req.materialization_outcome)? {
+            ParsedReportPayload::Materialization(m) => crate::actor::pull::PullReportPayload {
+                // Never read on the materialization arm (the witness
+                // dispatch routes on the outcome, not the result).
+                result: rio_proto::types::BuildResult::default(),
+                peak_memory_bytes: 0,
+                peak_cpu_cores: 0.0,
+                node_name: None,
+                hw_class: None,
+                final_resources: None,
+                final_line_count: 0,
+                materialization_outcome: Some(m),
+            },
+            ParsedReportPayload::Build(report) => {
+                let mut result = report.result.unwrap_or_else(|| {
+                    warn!(exec_id = %req.exec_id, "ReportOutcome with no result, synthesizing InfrastructureFailure");
+                    rio_proto::types::BuildResult {
+                        status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+                        error_msg: "pod sent ReportOutcome with no result".into(),
+                        ..Default::default()
+                    }
+                });
+                // r[impl sched.executor.input-bounds+2]
+                rio_common::grpc::truncate_utf8(&mut result.error_msg, MAX_ERROR_MSG_LEN);
+                crate::actor::pull::PullReportPayload {
+                    result,
+                    peak_memory_bytes: report.peak_memory_bytes,
+                    peak_cpu_cores: report.peak_cpu_cores,
+                    node_name: report.node_name.filter(|s| s.len() <= MAX_IDENT_LEN),
+                    hw_class: report.hw_class.filter(|s| s.len() <= MAX_IDENT_LEN),
+                    final_resources: report.final_resources,
+                    final_line_count: report.final_line_count,
+                    materialization_outcome: None,
+                }
             }
-        });
-        // r[impl sched.executor.input-bounds+2]
-        rio_common::grpc::truncate_utf8(&mut result.error_msg, MAX_ERROR_MSG_LEN);
-        // Substitution-replacement: a request carrying BOTH a build
-        // report and a materialization outcome is malformed (the proto
-        // documents them as mutually exclusive).
-        if req.materialization_outcome.is_some() && has_report {
-            return Err(Status::invalid_argument(
-                "report and materialization_outcome are mutually exclusive",
-            ));
-        }
-        let payload = crate::actor::pull::PullReportPayload {
-            result,
-            peak_memory_bytes: report.peak_memory_bytes,
-            peak_cpu_cores: report.peak_cpu_cores,
-            node_name: report.node_name.filter(|s| s.len() <= MAX_IDENT_LEN),
-            hw_class: report.hw_class.filter(|s| s.len() <= MAX_IDENT_LEN),
-            final_resources: report.final_resources,
-            final_line_count: report.final_line_count,
-            materialization_outcome: req.materialization_outcome,
         };
 
         // send_unchecked: a dropped report would strand the attempt
@@ -858,7 +867,7 @@ impl ExecutorService for SchedulerGrpc {
             let mut upstream_uri = req.upstream_uri;
             rio_common::grpc::truncate_utf8(&mut upstream_uri, MAX_IDENT_LEN);
             let _ = self.actor.try_send(ActorCommand::SubstituteProgress {
-                drv_hash: attempt.drv_hash.into(),
+                drv_hash: attempt.core().drv_hash.clone().into(),
                 bytes_done: req.bytes_done,
                 bytes_expected: req.bytes_expected,
                 upstream_uri,
@@ -874,5 +883,78 @@ impl ExecutorService for SchedulerGrpc {
         Ok(Response::new(
             rio_proto::types::ReportMaterializationProgressResponse {},
         ))
+    }
+}
+
+/// One `ReportOutcomeRequest` payload, classified at the wire boundary
+/// (bug_121): the class is decided from FIELD PRESENCE before any
+/// defaulting, so a contractual materialization report never grows a
+/// synthesized build result.
+#[derive(Debug)]
+pub(super) enum ParsedReportPayload {
+    /// A build report (the `report` field; `None` inside means the
+    /// legacy no-result shape, synthesized by the caller WITH the warn).
+    /// Boxed: the report dwarfs the materialization arm
+    /// (clippy::large_enum_variant) and is unboxed exactly once.
+    Build(Box<rio_proto::types::CompletionReport>),
+    /// A materialization outcome (`materialization_outcome` set,
+    /// `report` unset — the contractual store-client wire shape).
+    Materialization(rio_proto::types::MaterializationOutcome),
+}
+
+/// Classify the mutually-exclusive payload pair. Pure; the unit table
+/// below is its contract.
+pub(super) fn parse_report_payload(
+    report: Option<rio_proto::types::CompletionReport>,
+    materialization_outcome: Option<rio_proto::types::MaterializationOutcome>,
+) -> Result<ParsedReportPayload, Status> {
+    match (report, materialization_outcome) {
+        (Some(_), Some(_)) => Err(Status::invalid_argument(
+            "report and materialization_outcome are mutually exclusive",
+        )),
+        (None, Some(m)) => Ok(ParsedReportPayload::Materialization(m)),
+        (report, None) => Ok(ParsedReportPayload::Build(Box::new(
+            report.unwrap_or_default(),
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+
+    /// bug_121's table: the materialization wire shape parses as
+    /// Materialization with NO synthesized BuildResult; both-set is
+    /// malformed; the legacy no-result shape stays a Build whose inner
+    /// result is None (the caller synthesizes + warns there, and only
+    /// there).
+    #[test]
+    fn report_payload_parse_table() {
+        let mat = rio_proto::types::MaterializationOutcome::default();
+        let report = rio_proto::types::CompletionReport::default();
+
+        match parse_report_payload(None, Some(mat.clone())) {
+            Ok(ParsedReportPayload::Materialization(_)) => {}
+            other => panic!("(None, Some) must be Materialization, got {other:?}"),
+        }
+        assert_eq!(
+            parse_report_payload(Some(report.clone()), Some(mat))
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        match parse_report_payload(Some(report), None) {
+            Ok(ParsedReportPayload::Build(r)) => assert!(r.result.is_none() || r.result.is_some()),
+            other => panic!("(Some, None) must be Build, got {other:?}"),
+        }
+        match parse_report_payload(None, None) {
+            Ok(ParsedReportPayload::Build(r)) => {
+                assert!(
+                    r.result.is_none(),
+                    "legacy shape keeps result=None for the caller's synthesis"
+                )
+            }
+            other => panic!("(None, None) must be the legacy Build shape, got {other:?}"),
+        }
     }
 }

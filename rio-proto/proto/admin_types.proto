@@ -238,6 +238,15 @@ message OpenAttempt {
   // The intent deadline (activeDeadlineSeconds basis) in seconds, when
   // known to the scheduler; 0 = unknown.
   uint64 deadline_secs = 8;
+  // Work class of the attempt's execution row
+  // (drv_executions.attempt_kind) — the kind partition's controller-
+  // facing backstop (merged_bug_146): consumers that synthesize
+  // build-lifecycle verdicts filter on it. Rolling-skew posture:
+  // ATTEMPT_KIND_UNSPECIFIED (an older scheduler that predates the
+  // field) MUST be read as BUILD — the wire default matches the
+  // as-built all-build fleet; the scheduler deploys before the
+  // controller.
+  rio.types.AttemptKind attempt_kind = 9;
 }
 
 message ListOpenAttemptsResponse {
