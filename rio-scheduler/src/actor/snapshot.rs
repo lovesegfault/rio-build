@@ -393,6 +393,7 @@ impl DagActor {
          -> rio_proto::types::SpawnIntent {
             let kind = crate::state::kind_for_drv(state.is_fixed_output);
             rio_proto::types::SpawnIntent {
+                resubmit_cycle: 0,
                 intent_id: drv_hash.to_string(),
                 cores: intent.cores,
                 mem_bytes: intent.mem_bytes,

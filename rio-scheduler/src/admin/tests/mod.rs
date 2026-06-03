@@ -320,6 +320,7 @@ async fn mutating_rpcs_require_service_token() {
         "ReportAttemptOutcome",
         svc.report_attempt_outcome(Request::new(
             rio_proto::types::ReportAttemptOutcomeRequest {
+                resubmit_cycle: 0,
                 intent_id: "victim-drv".into(),
                 job_name: String::new(),
                 exec_id: String::new(),
@@ -331,6 +332,7 @@ async fn mutating_rpcs_require_service_token() {
     assert_gated!(
         "AckSpawnedIntents",
         svc.ack_spawned_intents(Request::new(AckSpawnedIntentsRequest {
+            binding_snapshot: None,
             spawned: vec![],
             unfulfillable_cells: vec![],
             registered_cells: vec![],

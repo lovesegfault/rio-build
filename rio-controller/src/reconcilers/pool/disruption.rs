@@ -197,6 +197,7 @@ pub(super) fn preemption_for_pod(pod: &Pod, pod_name: &str) -> PullPreemption {
 async fn preempt_disrupted_pod(client: &Client, admin: &mut AdminClient, p: &PullPreemption) {
     match admin_call(
         admin.report_attempt_outcome(rio_proto::types::ReportAttemptOutcomeRequest {
+            resubmit_cycle: 0,
             intent_id: p.intent_id.clone(),
             job_name: p.job_name.clone().unwrap_or_else(|| p.pod_name.clone()),
             exec_id: String::new(),

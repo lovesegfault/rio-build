@@ -339,3 +339,39 @@ enum E {
         ]
     );
 }
+
+/// C2/285: the binding-snapshot wrapper's ABSENCE must stay
+/// distinguishable — a pre-C2 controller's AckSpawnedIntentsRequest
+/// (no field 6 on the wire) decodes with `binding_snapshot == None`
+/// (scheduler keeps its map), never as `Some(empty)` (which clears it).
+#[test]
+fn ack_spawned_intents_decodes_without_binding_snapshot() {
+    use prost::Message;
+    // Legacy wire image: just one unfulfillable cell (field 2).
+    let legacy_bytes: &[u8] = &[
+        0x12, 0x04, b'h', b':', b'o', b'd', // unfulfillable_cells = ["h:od"]
+    ];
+    let decoded = rio_proto::types::AckSpawnedIntentsRequest::decode(legacy_bytes).unwrap();
+    assert_eq!(decoded.unfulfillable_cells, vec!["h:od".to_string()]);
+    assert_eq!(
+        decoded.binding_snapshot, None,
+        "absence must decode as None (legacy rebuild arm), not Some(empty) (clear)"
+    );
+
+    // Encode half: present-and-empty is a DIFFERENT wire image than
+    // absent — the whole point of the wrapper.
+    let with_empty = rio_proto::types::AckSpawnedIntentsRequest {
+        unfulfillable_cells: vec!["h:od".into()],
+        binding_snapshot: Some(rio_proto::types::BindingSnapshot { bound: vec![] }),
+        ..Default::default()
+    };
+    let absent = rio_proto::types::AckSpawnedIntentsRequest {
+        unfulfillable_cells: vec!["h:od".into()],
+        ..Default::default()
+    };
+    assert_ne!(
+        with_empty.encode_to_vec(),
+        absent.encode_to_vec(),
+        "Some(empty) and None must differ on the wire"
+    );
+}

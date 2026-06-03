@@ -208,6 +208,14 @@ message ReportAttemptOutcomeRequest {
   // kube-authoritative spec.nodeName the pod ran on, when known.
   // Persisted as the attempt's source attribution (AD2c).
   string node_name = 5;
+  // C2/124: echo of `SpawnIntent.resubmit_cycle` the verdict was
+  // computed against (synthesized verdicts only; pod-reported outcomes
+  // ride ReportOutcome). On mismatch with the derivation's current
+  // cycle the scheduler acks WITHOUT poisoning — the verdict is stale.
+  // 0 is both "first cycle" and "pre-C2 controller": during skew a
+  // pre-C2 controller under-poisons (mismatch on cycles >0), the
+  // conservative direction.
+  uint64 resubmit_cycle = 6;
 }
 
 // Empty ack: the report is recorded (or was already recorded / matched
@@ -254,6 +262,34 @@ message ListOpenAttemptsResponse {
   // Seconds since this replica acquired leadership — same fail-closed
   // input shape as ListExecutorsResponse.leader_for_secs.
   uint64 leader_for_secs = 2;
+  // C2/120: attempts that reached a terminal status inside the recent
+  // window (120 s), with their close cause. The controller's
+  // cancelled-Job teardown selects ONLY `CLOSE_CAUSE_CANCELLED`
+  // entries — closed-ness alone stopped being a verdict (a normal
+  // completion in the Job-status propagation lag window is
+  // untouchable by type).
+  repeated ClosedAttempt recently_closed = 3;
+}
+
+// C2/120: why a recently-closed attempt closed. Mirrors the terminal
+// `assignments.status` values — the cause travels WITH the close
+// instead of being re-inferred from absence.
+enum CloseCause {
+  CLOSE_CAUSE_UNSPECIFIED = 0;
+  CLOSE_CAUSE_COMPLETED = 1;
+  CLOSE_CAUSE_FAILED = 2;
+  CLOSE_CAUSE_CANCELLED = 3;
+}
+
+// One recently-terminal attempt (see
+// `ListOpenAttemptsResponse.recently_closed`).
+message ClosedAttempt {
+  // Intent id == drv hash (same key as `OpenAttempt.intent_id`).
+  string intent_id = 1;
+  string exec_id = 2;
+  CloseCause cause = 3;
+  // Seconds since the attempt reached its terminal status (PG clock).
+  uint64 closed_age_secs = 4;
 }
 
 message ClearPoisonRequest {
@@ -496,6 +532,13 @@ message SpawnIntent {
   // as scheduling constraints); `repeated`, so absence == empty == no
   // exclusions and no back-compat decode distinction is needed.
   repeated string excluded_nodes = 16;
+  // C2/124: the derivation's resubmit-cycle count at intent compute
+  // time. The controller echoes it back on
+  // `ReportAttemptOutcomeRequest.resubmit_cycle` for synthesized
+  // verdicts (NoEligibleSource) so the scheduler can drop verdicts
+  // computed against a stale cycle. 0 = first cycle (and the pre-C2
+  // wire default — see the echo field's skew note).
+  uint64 resubmit_cycle = 17;
 }
 
 // One conjunction of node-match requirements. Mirrors k8s core/v1
@@ -603,6 +646,22 @@ message AckSpawnedIntentsRequest {
   // node_name would let 2 colluding tenants reap an arbitrary
   // NodeClaim). Full set every tick — ~1 entry per active build.
   repeated BoundIntent bound_intents = 5;
+  // C2/285: explicit presence wrapper for the binding set. `optional`
+  // because ABSENCE is consumer-distinguishable: a sender that did not
+  // compute bindings this tick (per-pool reconcilers) leaves it unset
+  // and the scheduler keeps its map; the nodeclaim-pool reconciler
+  // ALWAYS attaches it — present-and-empty correctly CLEARS the
+  // scheduler's `authoritative_binding` map (scale-to-zero). Field 5
+  // stays as the legacy non-empty-only rebuild path for rolling skew
+  // (read-side back-compat arm; never dual-written by a C2 sender).
+  optional BindingSnapshot binding_snapshot = 6;
+}
+
+// C2/285: the full `intent_id → spec.nodeName` binding set for one
+// tick. Wrapper message so empty-set and not-sent are distinct on the
+// wire (proto3 repeated fields cannot distinguish them).
+message BindingSnapshot {
+  repeated BoundIntent bound = 1;
 }
 
 message BoundIntent {

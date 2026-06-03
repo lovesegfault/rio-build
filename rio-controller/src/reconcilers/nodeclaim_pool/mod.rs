@@ -1999,6 +1999,9 @@ impl NodeClaimPoolReconciler {
                 .collect()
         };
         let req = AckSpawnedIntentsRequest {
+            // C2/285: attached by the dedicated snapshot path (commit E); the
+            // mechanical None here is the pre-snapshot legacy shape.
+            binding_snapshot: None,
             spawned: vec![],
             unfulfillable_cells: dedup(ice_cells),
             registered_cells: dedup(registered_cells),

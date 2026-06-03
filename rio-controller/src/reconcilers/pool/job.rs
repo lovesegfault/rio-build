@@ -565,6 +565,7 @@ pub(super) fn synthesized_report_for_job(
         .iter()
         .find(|a| intent.is_some_and(|i| !i.is_empty() && a.intent_id == i))?;
     Some(rio_proto::types::ReportAttemptOutcomeRequest {
+        resubmit_cycle: 0,
         intent_id: attempt.intent_id.clone(),
         job_name: job.metadata.name.clone().unwrap_or_default(),
         exec_id: attempt.exec_id.clone(),
@@ -1515,6 +1516,7 @@ pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
             .unwrap_or_default();
         match admin_call(admin.report_attempt_outcome(
             rio_proto::types::ReportAttemptOutcomeRequest {
+                resubmit_cycle: 0,
                 intent_id,
                 job_name: name.to_owned(),
                 exec_id: String::new(),
@@ -1607,6 +1609,7 @@ pub(super) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
         // (`report_intent_id_for_job`).
         match admin_call(admin.report_attempt_outcome(
             rio_proto::types::ReportAttemptOutcomeRequest {
+                resubmit_cycle: 0,
                 intent_id: report_intent_id_for_job(job),
                 job_name: name.to_owned(),
                 exec_id: String::new(),

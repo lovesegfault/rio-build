@@ -536,6 +536,7 @@ impl AdminService for AdminServiceImpl {
             .map(open_attempt_row_to_proto)
             .collect();
         Ok(Response::new(rio_proto::types::ListOpenAttemptsResponse {
+            recently_closed: vec![],
             attempts,
             leader_for_secs: self.leader.leader_for().map_or(0, |d| d.as_secs()),
         }))

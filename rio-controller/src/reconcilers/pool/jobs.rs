@@ -422,6 +422,7 @@ pub(super) async fn report_no_eligible_source(
     for intent in gated {
         match admin_call(ctx.admin.clone().report_attempt_outcome(
             rio_proto::types::ReportAttemptOutcomeRequest {
+                resubmit_cycle: 0,
                 intent_id: intent.intent_id.clone(),
                 job_name: String::new(),
                 exec_id: String::new(),
@@ -765,6 +766,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     } else {
         if let Err(e) = admin_call(ctx.admin.clone().ack_spawned_intents(
             rio_proto::types::AckSpawnedIntentsRequest {
+                binding_snapshot: None,
                 spawned: to_ack,
                 // §13b NodeClaim watcher (A18) populates both: cells
                 // with `Registered=True` edges → `registered_cells`

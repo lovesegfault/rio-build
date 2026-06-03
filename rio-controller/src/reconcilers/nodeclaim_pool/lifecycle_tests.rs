@@ -353,6 +353,7 @@ impl Lab {
     /// Program the open-attempt ledger view (the OA2 wedge input).
     fn set_open_attempts(&self, attempts: Vec<OpenAttempt>) {
         *self.admin.open_attempts.write().unwrap() = ListOpenAttemptsResponse {
+            recently_closed: vec![],
             attempts,
             leader_for_secs: 3600,
         };
