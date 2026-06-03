@@ -675,24 +675,56 @@ pub async fn execute(
                     .await);
             }
         };
-    if let Some(cgroup) = &request.limits.cgroup
-        && let Err(e) = std::fs::write(
-            cgroup.join(BUILD_SUBCGROUP).join("cgroup.procs"),
-            format!("{principal_pid}\n"),
-        )
-        && !placement_attach_tolerable(&e)
-    {
-        // A tolerable failure means the principal already exited (its
-        // status is en route through the relay); anything else means
-        // the kill scope could not be established — do not run.
-        return Err(sandbox
-            .abort(
-                e,
-                "place the build principal in the build sub-cgroup",
-                &bind_targets,
-                &special_targets,
-            )
-            .await);
+    if let Some(cgroup) = &request.limits.cgroup {
+        match corroborate_placement(&principal_pidfd, principal_pid, cgroup) {
+            Ok(PlacementDisposition::Placed) => {}
+            Ok(PlacementDisposition::AlreadyExited) => {
+                // Nothing to scope; the relay forwards (or its death
+                // EOFs the status pipe and the abort path runs).
+                tracing::debug!("principal exited before placement; status en route");
+            }
+            Ok(PlacementDisposition::EvictedImpostor) => {
+                // The pid recycled across the attach (relay reaped the
+                // principal, then the kernel reused the number). The
+                // stranger is back outside every kill path (witnessed
+                // by the destination readback); our principal is dead
+                // and its status is en route — or lost with the relay,
+                // in which case the release write / status EOF below
+                // surfaces the abort.
+                tracing::warn!(
+                    pid = principal_pid,
+                    "placement attached a recycled pid; evicted the impostor un-killed"
+                );
+            }
+            Ok(PlacementDisposition::EvictionFailed) => {
+                // A stranger is in the kill scope and could not be
+                // demonstrably removed — not a runnable state.
+                return Err(sandbox
+                    .abort(
+                        std::io::Error::other(
+                            "a recycled pid was attached to the build kill scope and \
+                             could not be evicted; refusing to run with an unrelated \
+                             process in the blast radius",
+                        ),
+                        "evict an impostor from the build kill scope",
+                        &bind_targets,
+                        &special_targets,
+                    )
+                    .await);
+            }
+            Err(e) => {
+                // The sub-cgroup itself is broken: the kill scope
+                // could not be established — do not run.
+                return Err(sandbox
+                    .abort(
+                        e,
+                        "place the build principal in the build sub-cgroup",
+                        &bind_targets,
+                        &special_targets,
+                    )
+                    .await);
+            }
+        }
     }
     tree.place_principal(principal_pidfd);
     if let Err(e) = nix::unistd::write(&go_w, &[1u8])
@@ -1750,12 +1782,15 @@ const PLACEMENT_MSG_LEN: usize = std::mem::size_of::<libc::pid_t>();
 /// child and send `(pid, pidfd)` to the parent over the placement
 /// socket.
 ///
-/// The pid datum alone would be a recycle hazard everywhere EXCEPT
-/// here: this process is the child's parent and has not reaped it, so
-/// the kernel cannot recycle the pid while the message is in flight —
-/// dead or alive, the child holds it (zombies pin their pid). The
-/// pidfd is what the *parent* keeps long-term; the raw pid is only
-/// used for the immediate sub-cgroup attach.
+/// The pid datum is recycle-guarded only while THIS process holds the
+/// un-reaped child — and this process's next act is exactly to reap it
+/// (`relay_wait_and_forward`). A principal that exits immediately can
+/// be reaped — and its pid recycled — before the parent's attach
+/// lands; the parent therefore corroborates the attach against the
+/// pidfd on both sides of the write (`corroborate_placement`,
+/// round-17 merged_bug_053) instead of trusting the number. The pidfd
+/// is what the *parent* keeps long-term; the raw pid is only used for
+/// the immediate sub-cgroup attach, under that corroboration.
 ///
 /// Async-signal-safe: raw syscalls over stack buffers only.
 fn send_placement(sock: RawFd, pid: libc::pid_t) -> Result<(), SetupError> {
@@ -1880,14 +1915,162 @@ fn create_build_subcgroup(cgroup: &Path) -> std::io::Result<()> {
     }
 }
 
+/// What [`corroborate_placement`] established about the principal's
+/// cgroup attach (round-17 merged_bug_053). Closed set — every arm is
+/// handled at the call site; there is no "assume it worked" default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlacementDisposition {
+    /// The pidfd was alive AFTER the attach: the process the write
+    /// moved is OUR principal (a live, un-reaped process genuinely
+    /// holds its pid — liveness across the attach is the corroboration).
+    Placed,
+    /// The principal exited before (or across) the attach with no
+    /// stranger involved: nothing to scope; the relay forwards the
+    /// real status.
+    AlreadyExited,
+    /// The pidfd died across the attach window AND a process with the
+    /// attached pid sat in the sub-cgroup afterwards: the relay
+    /// reaped the principal and the kernel recycled the pid before
+    /// our write — the write moved a STRANGER into the kill scope.
+    /// The stranger was evicted to the parent cgroup, NEVER killed
+    /// (it is not ours; `evict-not-kill` is the only sound move on
+    /// somebody else's process). This arm is WITNESS-BACKED: it is
+    /// returned only after the destination `cgroup.procs` readback
+    /// shows the pid (a successful migration write is necessary but
+    /// the readback is the witness).
+    EvictedImpostor,
+    /// An impostor was detected but could NOT be evicted (the parent
+    /// `cgroup.procs` write failed or the readback did not list the
+    /// pid). The kill scope contains a process that is not ours and
+    /// cannot be released — NOT a runnable state: the call site MUST
+    /// abort the execution rather than run with a stranger in the
+    /// blast radius.
+    EvictionFailed,
+}
+
+/// Has this pidfd's process exited? (`poll(2)` readability, zero
+/// timeout — pidfds become readable exactly at exit.)
+fn pidfd_exited(pidfd: &OwnedFd) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll over one valid fd, zero timeout.
+    let rc = unsafe { libc::poll(&raw mut pfd, 1, 0) };
+    rc == 1 && (pfd.revents & libc::POLLIN) != 0
+}
+
+/// Attach the principal to `<cg>/build` with LIVENESS CORROBORATION
+/// across the write (round-17 merged_bug_053).
+///
+/// The raw pid in the placement message is only recycle-proof while
+/// the relay holds the un-reaped child — and the relay's next act
+/// after sending placement is exactly to reap it
+/// ([`relay_wait_and_forward`]). A principal that exits immediately
+/// can therefore be reaped — and its pid recycled by the kernel —
+/// before the parent's `cgroup.procs` write lands, which would yank
+/// an unrelated host process into the build's kill scope. The pidfd
+/// (which names the process INSTANCE, never the number) is polled on
+/// both sides of the write:
+///
+/// - dead BEFORE the write → don't write at all ([`PlacementDisposition::AlreadyExited`]);
+/// - alive AFTER the write → the moved process is provably ours
+///   ([`PlacementDisposition::Placed`]);
+/// - died ACROSS the write → read `<cg>/build/cgroup.procs` back; a
+///   live process with that pid in there is an impostor — write its
+///   pid to the PARENT cgroup's `cgroup.procs` (eviction, out of
+///   every kill path) and report
+///   [`PlacementDisposition::EvictedImpostor`]. The impostor is never
+///   signaled.
+///
+/// The kernel-native close of the whole window is `CLONE_INTO_CGROUP`
+/// (atomic placement at clone time, no pid-carrying message at all) —
+/// see [`CLONE_INTO_CGROUP_TAIL`].
+// r[impl builder.exec.kill-targets-principal]
+fn corroborate_placement(
+    pidfd: &OwnedFd,
+    pid: libc::pid_t,
+    cgroup: &Path,
+) -> std::io::Result<PlacementDisposition> {
+    let build_procs = cgroup.join(BUILD_SUBCGROUP).join("cgroup.procs");
+    if pidfd_exited(pidfd) {
+        return Ok(PlacementDisposition::AlreadyExited);
+    }
+    match std::fs::write(&build_procs, format!("{pid}\n")) {
+        Ok(()) => {}
+        Err(e) if placement_attach_tolerable(&e) => {
+            return Ok(PlacementDisposition::AlreadyExited);
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(settle_attach(pidfd, pid, cgroup))
+}
+
+/// The post-attach half of [`corroborate_placement`]: poll the pidfd
+/// AFTER the `cgroup.procs` write and dispose of what the write moved.
+/// Factored so the relay-reaps-then-dies near-miss can drive the
+/// production post-window code deterministically (R3: the harness
+/// reuses the production function, never a re-model).
+fn settle_attach(pidfd: &OwnedFd, pid: libc::pid_t, cgroup: &Path) -> PlacementDisposition {
+    if !pidfd_exited(pidfd) {
+        return PlacementDisposition::Placed;
+    }
+    // Died across the write. Anyone live in the sub-cgroup with that
+    // pid is not our principal.
+    let build_procs = cgroup.join(BUILD_SUBCGROUP).join("cgroup.procs");
+    let listed = std::fs::read_to_string(&build_procs)
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.trim() == pid.to_string());
+    if listed {
+        // Evict, then WITNESS the eviction: the destination readback
+        // listing the pid is the proof the migration happened (in
+        // cgroupfs a successful cgroup.procs write IS the move; the
+        // readback converts "write returned Ok" into observed state).
+        // A failed or unwitnessed eviction is NOT EvictedImpostor —
+        // claiming a security control that didn't demonstrably act is
+        // the exact evidence-discipline violation this module exists
+        // to prevent.
+        let evicted = cgroup.parent().is_some_and(|parent| {
+            let dest = parent.join("cgroup.procs");
+            std::fs::write(&dest, format!("{pid}\n")).is_ok()
+                && std::fs::read_to_string(&dest)
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|l| l.trim() == pid.to_string())
+        });
+        return if evicted {
+            PlacementDisposition::EvictedImpostor
+        } else {
+            PlacementDisposition::EvictionFailed
+        };
+    }
+    PlacementDisposition::AlreadyExited
+}
+
+/// Symbol-named tail (amended R1(c)): the placement window above is
+/// DETECTED and neutralized, not deleted. Deleting it means
+/// `CLONE_INTO_CGROUP` — the relay clones the principal directly into
+/// `<cg>/build` (atomic kernel-side placement; no pid travels at all).
+/// Wiring that requires the relay to receive the build sub-cgroup fd
+/// pre-fork; tracked as the kill-corroboration family's kernel-native
+/// close.
+#[expect(dead_code)]
+const CLONE_INTO_CGROUP_TAIL: &str = "relay clones principal into <cg>/build via CLONE_INTO_CGROUP";
+
 /// Is a `cgroup.procs` write failure tolerable at placement time?
 ///
-/// `ESRCH`/`EINVAL` mean the principal already exited (its zombie pins
-/// the pid but is no longer attachable) — the build is over and the
-/// relay is about to forward its true status, so placement has nothing
-/// left to scope. Anything else (`EACCES`, `ENOENT`, `EBUSY`, …) means
-/// the sub-cgroup itself is broken and limit kills could not target
-/// the principal: fail the execution rather than run unsupervised.
+/// `ESRCH`/`EINVAL` mean the principal already exited and was reaped
+/// to the point of unattachability — the build is over and the relay
+/// is about to forward its true status (or already died trying), so
+/// placement has nothing left to scope. NOTE these errnos do NOT
+/// guarantee the pid still names our process (the relay may have
+/// reaped it; see [`corroborate_placement`] for the liveness story) —
+/// they only mean the WRITE moved nothing. Anything else (`EACCES`,
+/// `ENOENT`, `EBUSY`, …) means the sub-cgroup itself is broken and
+/// limit kills could not target the principal: fail the execution
+/// rather than run unsupervised.
 fn placement_attach_tolerable(err: &std::io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc::ESRCH) | Some(libc::EINVAL))
 }
@@ -2493,6 +2676,170 @@ mod tests {
             .expect("spawn sleeper");
         let pid = nix::unistd::Pid::from_raw(child.id() as i32);
         (child, pid)
+    }
+
+    /// Open a pidfd for a direct child (test-side mirror of the
+    /// production placement open).
+    fn open_pidfd(pid: nix::unistd::Pid) -> OwnedFd {
+        use std::os::fd::FromRawFd as _;
+        // SAFETY: pidfd_open for our own child.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.as_raw(), 0u32) };
+        assert!(fd >= 0, "pidfd_open failed");
+        // SAFETY: fresh fd from the syscall above.
+        unsafe { OwnedFd::from_raw_fd(fd as RawFd) }
+    }
+
+    /// The relay-reaps-then-dies near-miss (round-17 merged_bug_053,
+    /// constructed per R3): the placement pid recycles after the relay
+    /// reaps the principal, and the parent's attach moves a STRANGER.
+    /// corroborate_placement must detect the dead pidfd across the
+    /// attach, evict the stranger to the parent cgroup, and never
+    /// signal it. Production topology: this drives the PRODUCTION
+    /// corroborate_placement against the same fake-cgroupfs layout the
+    /// other supervision tests use (tempdir; cgroup.procs as files).
+    // r[verify builder.exec.kill-targets-principal]
+    #[test]
+    fn placement_evicts_impostor_when_pidfd_dies_across_attach() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cg = tmp.path().join("build-cg");
+        std::fs::create_dir_all(cg.join(BUILD_SUBCGROUP)).unwrap();
+        // cgroup.procs files exist (fake cgroupfs).
+        std::fs::write(cg.join("cgroup.procs"), "").unwrap();
+        std::fs::write(cg.join(BUILD_SUBCGROUP).join("cgroup.procs"), "").unwrap();
+
+        // The "principal": spawn, take its pidfd, then reap it — the
+        // pid is now recyclable (the relay-reaped state).
+        let (mut principal, principal_pid) = spawn_sleeper();
+        let pidfd = open_pidfd(principal_pid);
+        principal.kill().unwrap();
+        principal.wait().unwrap(); // REAPED — zombie gone, pid free.
+
+        // The "impostor": a live process that (in the real race) would
+        // have been handed the recycled number. The attach has already
+        // happened (stage 1's write put the placement pid into
+        // build/cgroup.procs — exactly what the kernel would list had
+        // a stranger with that pid been moved); the principal was
+        // reaped ACROSS that window, so the post-attach settle runs
+        // with a dead pidfd and a listed pid.
+        let (mut impostor, impostor_pid) = spawn_sleeper();
+        std::fs::write(
+            cg.join(BUILD_SUBCGROUP).join("cgroup.procs"),
+            format!("{}\n", principal_pid.as_raw()),
+        )
+        .unwrap();
+
+        let disposition = settle_attach(&pidfd, principal_pid.as_raw(), &cg);
+        assert_eq!(
+            disposition,
+            PlacementDisposition::EvictedImpostor,
+            "dead pidfd across the attach + pid listed = impostor"
+        );
+        // Evicted AND witnessed: the parent cgroup.procs readback
+        // lists the pid — the disposition is returned only on this
+        // witness (placement_eviction_failure_is_typed pins the
+        // failure arm).
+        let parent_procs =
+            std::fs::read_to_string(tmp.path().join("cgroup.procs")).unwrap_or_default();
+        assert!(
+            parent_procs.contains(&principal_pid.as_raw().to_string()),
+            "the impostor's pid must be written to the PARENT cgroup.procs (eviction)"
+        );
+        // Never killed: no kill file was touched in the fake tree, and
+        // the live stand-in process is still alive.
+        assert!(!cg.join(BUILD_SUBCGROUP).join("cgroup.kill").exists());
+        assert!(!cg.join("cgroup.kill").exists());
+        assert_eq!(
+            pid_state(impostor_pid),
+            "running-or-zombie",
+            "evict, NEVER kill (an un-reaped live child reports running-or-zombie)"
+        );
+        impostor.kill().ok();
+        impostor.wait().ok();
+    }
+
+    /// Eviction failure is TYPED, never silently claimed (round-17
+    /// security-review finding on this commit): when the parent
+    /// `cgroup.procs` write cannot land — here the parent directory is
+    /// read-only — the disposition is EvictionFailed (the call site
+    /// aborts), NOT EvictedImpostor.
+    // r[verify builder.exec.kill-targets-principal]
+    #[test]
+    fn placement_eviction_failure_is_typed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cg = tmp.path().join("ro-parent").join("build-cg");
+        std::fs::create_dir_all(cg.join(BUILD_SUBCGROUP)).unwrap();
+        std::fs::write(cg.join(BUILD_SUBCGROUP).join("cgroup.procs"), "").unwrap();
+
+        let (mut principal, principal_pid) = spawn_sleeper();
+        let pidfd = open_pidfd(principal_pid);
+        principal.kill().unwrap();
+        principal.wait().unwrap();
+        std::fs::write(
+            cg.join(BUILD_SUBCGROUP).join("cgroup.procs"),
+            format!("{}\n", principal_pid.as_raw()),
+        )
+        .unwrap();
+        // Make the parent unwritable so the eviction write fails.
+        let orig = std::fs::metadata(cg.parent().unwrap())
+            .unwrap()
+            .permissions();
+        let mut ro_perm = orig.clone();
+        ro_perm.set_readonly(true);
+        std::fs::set_permissions(cg.parent().unwrap(), ro_perm).unwrap();
+
+        let disposition = settle_attach(&pidfd, principal_pid.as_raw(), &cg);
+
+        // Restore so the tempdir can clean up.
+        std::fs::set_permissions(cg.parent().unwrap(), orig).unwrap();
+        assert_eq!(
+            disposition,
+            PlacementDisposition::EvictionFailed,
+            "an unwitnessed eviction must be typed as failure, not claimed"
+        );
+    }
+
+    /// Pre-attach death: the pidfd is dead before the write — no
+    /// attach happens at all (the pid may already be a stranger's).
+    // r[verify builder.exec.kill-targets-principal]
+    #[test]
+    fn placement_skips_attach_when_principal_already_exited() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cg = tmp.path().join("build-cg");
+        std::fs::create_dir_all(cg.join(BUILD_SUBCGROUP)).unwrap();
+        std::fs::write(cg.join(BUILD_SUBCGROUP).join("cgroup.procs"), "").unwrap();
+
+        let (mut principal, principal_pid) = spawn_sleeper();
+        let pidfd = open_pidfd(principal_pid);
+        principal.kill().unwrap();
+        principal.wait().unwrap();
+
+        let disposition =
+            corroborate_placement(&pidfd, principal_pid.as_raw(), &cg).expect("corroboration io");
+        assert_eq!(disposition, PlacementDisposition::AlreadyExited);
+        let build_procs =
+            std::fs::read_to_string(cg.join(BUILD_SUBCGROUP).join("cgroup.procs")).unwrap();
+        assert!(
+            !build_procs.contains(&principal_pid.as_raw().to_string()),
+            "no attach may happen on a dead pidfd (the pid is not provably ours)"
+        );
+    }
+
+    /// Live principal: attach corroborated, Placed.
+    // r[verify builder.exec.kill-targets-principal]
+    #[test]
+    fn placement_corroborates_live_principal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cg = tmp.path().join("build-cg");
+        std::fs::create_dir_all(cg.join(BUILD_SUBCGROUP)).unwrap();
+        std::fs::write(cg.join(BUILD_SUBCGROUP).join("cgroup.procs"), "").unwrap();
+
+        let (mut principal, principal_pid) = spawn_sleeper();
+        let pidfd = open_pidfd(principal_pid);
+        let disposition =
+            corroborate_placement(&pidfd, principal_pid.as_raw(), &cg).expect("corroboration io");
+        assert_eq!(disposition, PlacementDisposition::Placed);
+        principal.kill().ok();
+        principal.wait().ok();
     }
 
     /// waitpid(WNOHANG) classification for assertions.
