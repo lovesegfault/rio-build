@@ -121,6 +121,17 @@ pub const MAX_DAG_NODES: usize = 1_048_576;
 /// pathological submission (1M nodes = 10^12 edges).
 pub const MAX_DAG_EDGES: usize = 5_242_880;
 
+/// AD5 (P8): `terminationGracePeriodSeconds` for every executor pod —
+/// THE single source for the pull-mode grace. The controller stamps it
+/// on the pod spec (`PULL_MODE_TGPS_SECS` is a cast of this constant)
+/// and the builder partitions the same number into its abort-drain +
+/// reserved-report slices ([`crate::transport::GraceBudget`]); the
+/// 45 s/45 s agreement between the two crates is a compile-time
+/// identity, not prose. SIGTERM in pull mode is an abort, not a drain:
+/// the grace covers cgroup-kill + drain-the-completion + one bounded
+/// report attempt + slack, never the stream era's 2 h drain default.
+pub const PULL_MODE_TERMINATION_GRACE_SECS: u64 = 45;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -45,15 +45,17 @@ pub(super) const KVM_FEATURE: &str = "kvm";
 /// keys the toleration set on it.
 const KVM_NODE_LABEL: &str = "rio.build/kvm";
 
-/// AD5 (P8): `terminationGracePeriodSeconds` for every executor pod.
-/// SIGTERM is an abort (cgroup-kill + one bounded report attempt + log
-/// finalization), not a drain, so the grace is sized to "kill + one
-/// 10 s report attempt + slack" inside the design's 30–60 s band —
-/// never the stream era's 2 h drain default. Pull is the only dispatch
-/// protocol (the `dispatchMode` knob is retired), so this value is
-/// unconditional: there is no spec override and no per-kind drain
-/// grace left.
-pub(super) const PULL_MODE_TGPS_SECS: i64 = 45;
+/// AD5 (P8): `terminationGracePeriodSeconds` for every executor pod —
+/// a cast of the single-source grace constant the builder partitions
+/// into its abort-drain + reserved-report slices
+/// (`rio_common::transport::GraceBudget`). SIGTERM is an abort
+/// (cgroup-kill + one bounded report attempt + log finalization), not
+/// a drain. Pull is the only dispatch protocol (the `dispatchMode`
+/// knob is retired), so this value is unconditional: there is no spec
+/// override and no per-kind drain grace left.
+#[allow(clippy::cast_possible_wrap)] // 45 ≪ i64::MAX
+pub(super) const PULL_MODE_TGPS_SECS: i64 =
+    rio_common::limits::PULL_MODE_TERMINATION_GRACE_SECS as i64;
 
 /// Pod label carrying the executor role. Scheduler routing, network
 /// policies, and `kubectl get pods -l rio.build/role=fetcher` all

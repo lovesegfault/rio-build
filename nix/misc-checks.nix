@@ -347,6 +347,44 @@ in
     touch $out
   '';
 
+  # B1 bounded-await-transport: the four ExecutorService unaries may be
+  # called directly ONLY inside the two transport impls
+  # (AuthedPullTransport in rio-builder/src/runtime/pull.rs;
+  # SchedulerTransport in rio-store/src/materialize/client.rs). Every
+  # other call site must go through the transport trait so the loop
+  # consumes `rio_common::transport::bounded` outcomes — a bare
+  # `.pull_assignment(req).await` in a loop is exactly the
+  # accepted-never-answered hang class (merged_bug_167/189). Source-grep
+  # enforcement (the rio-proto h2_throughput precedent): clippy
+  # disallowed-methods cannot name tonic-generated generic methods
+  # reliably.
+  transport-unary-ban =
+    pkgs.runCommand "rio-transport-unary-ban"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-builder/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-store/src)
+          ];
+        };
+        nativeBuildInputs = [ pkgs.ripgrep ];
+      }
+      ''
+        set +o pipefail
+        hits=$(rg -n '\.(pull_assignment|report_outcome|list_materialization_jobs|report_materialization_progress)\(' \
+          $src/rio-builder/src $src/rio-store/src \
+          | grep -v 'rio-builder/src/runtime/pull\.rs' \
+          | grep -v 'rio-store/src/materialize/client\.rs' || true)
+        if [[ -n "$hits" ]]; then
+          echo "FAIL: direct ExecutorService unary call outside the two transport impls —" >&2
+          echo "route it through the transport trait (rio_common::transport::bounded):" >&2
+          echo "$hits" >&2
+          exit 1
+        fi
+        touch $out
+      '';
+
   # CRD drift: crdgen output (one file per CRD) must equal the
   # committed infra/helm/crds/. Catches the "Rust CRD struct
   # changed but nobody ran cargo xtask regen crds" drift — the committed

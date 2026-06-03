@@ -21,6 +21,7 @@ pub mod task;
 pub mod tenant;
 #[cfg(test)]
 pub(crate) mod test_jail;
+pub mod transport;
 pub mod wanted_outputs;
 
 /// Default bind address for a service port. Used in config defaults.

@@ -1,0 +1,291 @@
+//! Bounded, cancellable unary-RPC awaits — the transport discipline
+//! every pull/report/claim loop builds on.
+//!
+//! The class this module closes by construction: a loop `await`s a
+//! generated unary bare, so an accepted-never-answered request (a
+//! black-holed peer, a half-open connection, a hung middlebox) pins
+//! the task forever — SIGTERM is observed only between awaits, retry
+//! budgets are enforced only on `Err` arms, and the process rides to
+//! SIGKILL. [`bounded`] makes the three outcomes of any unary await
+//! explicit and exhaustive: the answer arrived, shutdown won the race,
+//! or the bound elapsed. Consumers match all three — the compiler
+//! forces the SIGTERM and timeout arms to exist.
+//!
+//! [`AttemptBudget`] is the per-phase retry budget measured from phase
+//! entry: `attempt_bound` clamps each attempt's bound to the remaining
+//! budget so a sequence of timed-out attempts exhausts the budget
+//! instead of resetting it (the "budget enforced only on Err" gap).
+//!
+//! [`GraceBudget`] partitions a pod's termination grace
+//! ([`crate::limits::PULL_MODE_TERMINATION_GRACE_SECS`]) into an
+//! abort-drain slice (waiting for a killed build/walk to surface its
+//! completion) and a reserved report slice — reserving the report
+//! window at the type level is what guarantees the final best-effort
+//! report always has wire time before the kubelet's SIGKILL.
+
+use std::future::Future;
+use std::time::Duration;
+
+use tokio_util::sync::CancellationToken;
+
+/// One final best-effort RPC attempt after SIGTERM: bound per decision
+/// P5, inside the AD5 grace. Shared by the builder report loop, the
+/// store materialization report loop, and any future SIGTERM arm.
+pub const SIGTERM_FINAL_ATTEMPT: Duration = Duration::from_secs(10);
+
+/// The three outcomes of a bounded unary await. `#[must_use]` plus
+/// exhaustive matching is the point: every consumer writes a `Shutdown`
+/// arm and a `TimedOut` arm or does not compile.
+#[must_use = "a bounded await's Shutdown/TimedOut outcomes carry control flow"]
+#[derive(Debug)]
+pub enum BoundedOutcome<T> {
+    /// The peer answered (with the RPC's own success or error).
+    Resolved(Result<T, tonic::Status>),
+    /// The shutdown token fired while the RPC was in flight. The
+    /// in-flight request is dropped (tonic cancels the HTTP/2 stream).
+    Shutdown,
+    /// The bound elapsed with no answer. The in-flight request is
+    /// dropped; `after` is the bound that elapsed (for logging).
+    TimedOut {
+        /// The bound that elapsed.
+        after: Duration,
+    },
+}
+
+impl<T> BoundedOutcome<T> {
+    /// True iff the await resolved with `Ok`.
+    pub fn is_ok(&self) -> bool {
+        matches!(self, BoundedOutcome::Resolved(Ok(_)))
+    }
+}
+
+/// Await one unary RPC, racing it (biased, in order) against shutdown
+/// and a deadline. The only sanctioned way to await a generated unary
+/// in a retry loop — see the `transport-unary-ban` policy check.
+pub async fn bounded<T>(
+    shutdown: &CancellationToken,
+    bound: Duration,
+    rpc: impl Future<Output = Result<T, tonic::Status>>,
+) -> BoundedOutcome<T> {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => BoundedOutcome::Shutdown,
+        resolved = tokio::time::timeout(bound, rpc) => match resolved {
+            Ok(result) => BoundedOutcome::Resolved(result),
+            Err(_elapsed) => BoundedOutcome::TimedOut { after: bound },
+        },
+    }
+}
+
+/// A phase-scoped retry budget: started at phase entry, spent by both
+/// answered failures AND unanswered (timed-out) attempts.
+#[derive(Debug)]
+pub struct AttemptBudget {
+    started: tokio::time::Instant,
+    total: Duration,
+}
+
+impl AttemptBudget {
+    /// Start the budget clock now (tokio time, so paused-clock tests
+    /// drive it deterministically).
+    pub fn new(total: Duration) -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            total,
+        }
+    }
+
+    /// Budget left, saturating at zero.
+    pub fn remaining(&self) -> Duration {
+        self.total.saturating_sub(self.started.elapsed())
+    }
+
+    /// True once the budget is fully spent.
+    pub fn expired(&self) -> bool {
+        self.remaining() == Duration::ZERO
+    }
+
+    /// The bound for the next attempt: the per-attempt cap clamped to
+    /// the remaining budget, floored at 1 ms so an almost-spent budget
+    /// still makes a non-degenerate final attempt (and `expired()` is
+    /// what actually terminates the loop).
+    pub fn attempt_bound(&self, cap: Duration) -> Duration {
+        self.remaining().min(cap).max(Duration::from_millis(1))
+    }
+}
+
+/// The pod termination grace, partitioned: `abort_drain` is how long
+/// the SIGTERM path may wait for an aborted build/walk to surface its
+/// completion; `report` is the reserved tail for the final best-effort
+/// report. `new` is const so the partition is checked at compile time
+/// wherever the budget is a const.
+#[derive(Debug, Clone, Copy)]
+pub struct GraceBudget {
+    total: Duration,
+    report_reserve: Duration,
+}
+
+impl GraceBudget {
+    /// Partition `total` with `report_reserve` held back for the final
+    /// report.
+    ///
+    /// # Panics
+    ///
+    /// Panics (at compile time in const contexts) if the reserve does
+    /// not leave a non-empty drain slice.
+    pub const fn new(total: Duration, report_reserve: Duration) -> Self {
+        assert!(
+            report_reserve.as_millis() < total.as_millis(),
+            "GraceBudget: the report reserve must leave a non-empty abort-drain slice"
+        );
+        Self {
+            total,
+            report_reserve,
+        }
+    }
+
+    /// The abort-drain slice: total minus the report reserve.
+    pub const fn abort_drain(&self) -> Duration {
+        // const-safe subtraction: new() guarantees reserve < total.
+        Duration::from_millis((self.total.as_millis() - self.report_reserve.as_millis()) as u64)
+    }
+
+    /// The reserved report slice.
+    pub const fn report(&self) -> Duration {
+        self.report_reserve
+    }
+
+    /// The whole grace.
+    pub const fn total(&self) -> Duration {
+        self.total
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token() -> CancellationToken {
+        CancellationToken::new()
+    }
+
+    async fn answer_after(d: Duration) -> Result<u32, tonic::Status> {
+        tokio::time::sleep(d).await;
+        Ok(7)
+    }
+
+    /// The happy path: an answered RPC resolves with its own result.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_resolves_an_answered_rpc() {
+        let shutdown = token();
+        let out = bounded(
+            &shutdown,
+            Duration::from_secs(30),
+            answer_after(Duration::from_secs(1)),
+        )
+        .await;
+        assert!(matches!(out, BoundedOutcome::Resolved(Ok(7))));
+        assert!(out.is_ok());
+    }
+
+    /// A black-holed RPC (never answers) resolves `TimedOut` at the
+    /// bound instead of pinning the caller.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_times_out_a_black_hole() {
+        let shutdown = token();
+        let started = tokio::time::Instant::now();
+        let out = bounded(&shutdown, Duration::from_secs(30), async {
+            std::future::pending::<Result<(), tonic::Status>>().await
+        })
+        .await;
+        assert!(
+            matches!(out, BoundedOutcome::TimedOut { after } if after == Duration::from_secs(30))
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+    }
+
+    /// Shutdown wins the race against an in-flight RPC — biased, so a
+    /// pre-cancelled token never even polls the RPC.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_yields_to_shutdown_biased() {
+        let shutdown = token();
+        shutdown.cancel();
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        let out = bounded(&shutdown, Duration::from_secs(30), async {
+            polled.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<Result<(), tonic::Status>>().await
+        })
+        .await;
+        assert!(matches!(out, BoundedOutcome::Shutdown));
+        assert!(
+            !polled.load(std::sync::atomic::Ordering::SeqCst),
+            "biased select: a cancelled token short-circuits the RPC"
+        );
+    }
+
+    /// Shutdown mid-flight interrupts the await.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_shutdown_interrupts_in_flight() {
+        let shutdown = token();
+        let shutdown_for_task = shutdown.clone();
+        let task = tokio::spawn(async move {
+            bounded(&shutdown_for_task, Duration::from_secs(600), async {
+                std::future::pending::<Result<(), tonic::Status>>().await
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        shutdown.cancel();
+        let out = task.await.expect("not panicked");
+        assert!(matches!(out, BoundedOutcome::Shutdown));
+    }
+
+    /// Budget arithmetic: remaining decays, attempt_bound clamps to
+    /// remaining, expired flips exactly at exhaustion, and the floor
+    /// keeps the final attempt non-degenerate.
+    #[tokio::test(start_paused = true)]
+    async fn attempt_budget_arithmetic() {
+        let budget = AttemptBudget::new(Duration::from_secs(100));
+        assert!(!budget.expired());
+        assert_eq!(
+            budget.attempt_bound(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+
+        tokio::time::advance(Duration::from_secs(80)).await;
+        assert_eq!(budget.remaining(), Duration::from_secs(20));
+        assert_eq!(
+            budget.attempt_bound(Duration::from_secs(30)),
+            Duration::from_secs(20),
+            "the last attempt is clamped to the remaining budget"
+        );
+
+        tokio::time::advance(Duration::from_secs(25)).await;
+        assert!(budget.expired());
+        assert_eq!(
+            budget.attempt_bound(Duration::from_secs(30)),
+            Duration::from_millis(1),
+            "the floor keeps a post-expiry bound non-degenerate (expired() terminates the loop)"
+        );
+    }
+
+    /// The grace partition: const-constructible, drain + report == total.
+    #[test]
+    fn grace_budget_partitions() {
+        const GRACE: GraceBudget =
+            GraceBudget::new(Duration::from_secs(45), Duration::from_secs(15));
+        assert_eq!(GRACE.abort_drain(), Duration::from_secs(30));
+        assert_eq!(GRACE.report(), Duration::from_secs(15));
+        assert_eq!(GRACE.total(), Duration::from_secs(45));
+        // The report slice always covers the SIGTERM final attempt.
+        assert!(GRACE.report() >= SIGTERM_FINAL_ATTEMPT);
+    }
+
+    /// An inverted partition (reserve >= total) is a compile-time error
+    /// in const contexts and a panic at runtime.
+    #[test]
+    #[should_panic(expected = "non-empty abort-drain slice")]
+    fn grace_budget_rejects_inverted_partition() {
+        let _ = GraceBudget::new(Duration::from_secs(10), Duration::from_secs(10));
+    }
+}
