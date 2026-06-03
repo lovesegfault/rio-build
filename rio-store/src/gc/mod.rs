@@ -353,13 +353,33 @@ pub async fn run_gc(
     Ok(Some(stats))
 }
 
-/// Batched delete of `drv_modulo_cache` rows that have no narinfo (the
-/// deriver `.drv` was GC'd) AND are older than
-/// [`DRV_MODULO_ORPHAN_TTL_DAYS`]. Resident derivers' rows and young
-/// orphans are spared (the continuity guard: a worker mid-flight on an
-/// output of a just-GC'd deriver keeps its proof). Each batch is its
-/// own statement; terminates when a batch deletes fewer rows than the
-/// batch size (and checks the shutdown token between batches).
+/// Mark-then-sweep reclaim of orphaned `drv_modulo_cache` rows
+/// (round-16 merged_bug_001; M_073). The TTL clock is the STAMPED
+/// ORPHANING TRANSITION (`orphaned_at`), never row age:
+///
+/// Pre-fix the predicate was `created_at < now() - TTL` — creation
+/// time — so a row that had been RESIDENT-WITH-DERIVER for longer
+/// than the TTL was reclaimed the moment its deriver was swept
+/// (pre-orphaning residency zeroed the grace), breaking the written
+/// continuity guard ("a worker mid-flight on an output of a just-GC'd
+/// deriver keeps its proof") for exactly the long-lived derivers most
+/// likely to have mid-flight consumers.
+///
+/// Three passes per GC tail, each batched and shutdown-checked:
+/// 1. UN-MARK resurrection: rows with `orphaned_at` set whose deriver
+///    is resident again (re-upload routes that skip
+///    `populate_on_ingest`'s conflict-clear, e.g. the AlreadyComplete
+///    fast path) get `orphaned_at = NULL` — residency always wins.
+/// 2. MARK: rows with no narinfo and `orphaned_at IS NULL` are
+///    stamped `now()` — the transition this GC run OBSERVED.
+/// 3. SWEEP: rows whose stamp is older than
+///    [`DRV_MODULO_ORPHAN_TTL_DAYS`] are deleted — with a re-check
+///    that the deriver is STILL absent (belt-and-suspenders against a
+///    resurrection landing between passes 1 and 3; the partial index
+///    `drv_modulo_cache_orphaned_idx` carries this scan).
+///
+/// A row therefore survives at least one full TTL measured from the
+/// first GC run that saw it orphaned, regardless of prior residency.
 ///
 /// [`DRV_MODULO_ORPHAN_TTL_DAYS`]: crate::metadata::per_path::DRV_MODULO_ORPHAN_TTL_DAYS
 async fn reclaim_orphan_drv_modulo(
@@ -369,6 +389,49 @@ async fn reclaim_orphan_drv_modulo(
     use crate::metadata::per_path::DRV_MODULO_ORPHAN_TTL_DAYS;
     const BATCH: i64 = 1_000;
 
+    // Pass 1: un-mark resurrected rows (deriver resident again).
+    sqlx::query(
+        r#"
+        UPDATE drv_modulo_cache c
+           SET orphaned_at = NULL
+          FROM narinfo n
+         WHERE n.store_path_hash = c.drv_path_hash
+           AND c.orphaned_at IS NOT NULL
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Pass 2: stamp newly-observed orphans. now() per batch is fine —
+    // a stamp delayed by batching only EXTENDS the row's grace.
+    loop {
+        if shutdown.is_cancelled() {
+            return Ok(0);
+        }
+        let marked = sqlx::query(
+            r#"
+            UPDATE drv_modulo_cache
+               SET orphaned_at = now()
+             WHERE drv_path_hash IN (
+               SELECT c.drv_path_hash
+                 FROM drv_modulo_cache c
+                 LEFT JOIN narinfo n ON n.store_path_hash = c.drv_path_hash
+                WHERE n.store_path_hash IS NULL
+                  AND c.orphaned_at IS NULL
+                LIMIT $1
+             )
+            "#,
+        )
+        .bind(BATCH)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if marked < BATCH as u64 {
+            break;
+        }
+    }
+
+    // Pass 3: reclaim expired stamps, re-checking absence.
     let mut total = 0u64;
     loop {
         if shutdown.is_cancelled() {
@@ -382,7 +445,8 @@ async fn reclaim_orphan_drv_modulo(
                  FROM drv_modulo_cache c
                  LEFT JOIN narinfo n ON n.store_path_hash = c.drv_path_hash
                 WHERE n.store_path_hash IS NULL
-                  AND c.created_at < now() - make_interval(days => $1::int)
+                  AND c.orphaned_at IS NOT NULL
+                  AND c.orphaned_at < now() - make_interval(days => $1::int)
                 LIMIT $2
              )
             "#,
@@ -990,11 +1054,19 @@ mod tests {
     /// before re-check" from "P_i committed after Q_i's DELETE"
     /// (the latter is a legitimate post-GC dangling ref, not a bug).
     // r[verify store.db.per-path-registry+2]
-    /// The GC-tail orphan reclaim: orphans older than the TTL are
-    /// deleted; YOUNG orphans and RESIDENT derivers' rows are spared
-    /// (the continuity guard — a worker mid-flight on an output of a
-    /// just-GC'd deriver keeps its proof), and the batch loop
-    /// terminates on a partial batch.
+    /// The GC-tail orphan reclaim on the M_073 STAMPED clock
+    /// (merged_bug_001): the TTL measures from the orphaning
+    /// TRANSITION (`orphaned_at`), never row age. Cells:
+    /// - expired stamp → reclaimed;
+    /// - young stamp → spared;
+    /// - resident, ancient created_at → spared AND never stamped;
+    /// - THE missing cell: ancient created_at, orphaned TODAY →
+    ///   stamped (not reclaimed) on the first run — pre-fix the
+    ///   created_at clock reclaimed it immediately, zeroing the
+    ///   continuity grace for exactly the long-resident derivers most
+    ///   likely to have mid-flight consumers;
+    /// - resurrection: a stamped row whose deriver is resident again
+    ///   is un-stamped by pass 1.
     #[tokio::test]
     async fn orphan_drv_modulo_reclaim_spares_young_and_resident() {
         use crate::metadata::per_path::DRV_MODULO_ORPHAN_TTL_DAYS;
@@ -1023,16 +1095,37 @@ mod tests {
             (path, hash)
         };
 
-        // Old orphan: no narinfo, older than the TTL → reclaimed.
+        let stamp = |pool: sqlx::PgPool, hash: Vec<u8>, days_ago: i64| async move {
+            sqlx::query(
+                "UPDATE drv_modulo_cache \
+                 SET orphaned_at = now() - make_interval(days => $2::int) \
+                 WHERE drv_path_hash = $1",
+            )
+            .bind(&hash)
+            .bind(days_ago)
+            .execute(&pool)
+            .await
+            .unwrap();
+        };
+
+        // Expired stamp: orphaned_at older than the TTL → reclaimed.
         let (_old_path, old_hash) = seed(
             db.pool.clone(),
             "old-orphan.drv",
+            DRV_MODULO_ORPHAN_TTL_DAYS * 2,
+        )
+        .await;
+        stamp(
+            db.pool.clone(),
+            old_hash.clone(),
             DRV_MODULO_ORPHAN_TTL_DAYS + 1,
         )
         .await;
-        // Young orphan: no narinfo, INSIDE the TTL → spared.
+        // Young stamp: orphaned_at inside the TTL → spared.
         let (_young_path, young_hash) = seed(db.pool.clone(), "young-orphan.drv", 1).await;
-        // Resident: narinfo present, ancient → spared regardless of age.
+        stamp(db.pool.clone(), young_hash.clone(), 1).await;
+        // Resident: narinfo present, ancient created_at → spared, and
+        // never stamped.
         let (resident_path, resident_hash) = seed(
             db.pool.clone(),
             "resident.drv",
@@ -1040,23 +1133,98 @@ mod tests {
         )
         .await;
         StoreSeed::raw_path(&resident_path).seed(&db.pool).await;
+        // THE MISSING CELL (merged_bug_001): ancient created_at,
+        // orphaned TODAY (no narinfo, no stamp yet). Pre-fix the
+        // created_at clock reclaimed it on this very run.
+        let (_fresh_path, fresh_orphan_hash) = seed(
+            db.pool.clone(),
+            "ancient-row-fresh-orphan.drv",
+            DRV_MODULO_ORPHAN_TTL_DAYS * 3,
+        )
+        .await;
+        // Resurrection: stamped long ago, but deriver is RESIDENT again.
+        let (res_path, res_hash) = seed(db.pool.clone(), "resurrected.drv", 1).await;
+        stamp(
+            db.pool.clone(),
+            res_hash.clone(),
+            DRV_MODULO_ORPHAN_TTL_DAYS + 5,
+        )
+        .await;
+        StoreSeed::raw_path(&res_path).seed(&db.pool).await;
 
         let token = rio_common::signal::Token::new();
         let reclaimed = reclaim_orphan_drv_modulo(&db.pool, &token).await.unwrap();
-        assert_eq!(reclaimed, 1, "exactly the old orphan");
+        assert_eq!(reclaimed, 1, "exactly the expired-stamp orphan");
 
         let survivors: Vec<Vec<u8>> =
             sqlx::query_scalar("SELECT drv_path_hash FROM drv_modulo_cache ORDER BY drv_path")
                 .fetch_all(&db.pool)
                 .await
                 .unwrap();
-        assert!(!survivors.contains(&old_hash), "old orphan reclaimed");
-        assert!(survivors.contains(&young_hash), "young orphan spared");
+        assert!(!survivors.contains(&old_hash), "expired stamp reclaimed");
+        assert!(survivors.contains(&young_hash), "young stamp spared");
         assert!(survivors.contains(&resident_hash), "resident spared");
+        assert!(
+            survivors.contains(&fresh_orphan_hash),
+            "MISSING CELL: ancient row orphaned today must survive its \
+             first GC run (stamped, not reclaimed) — the created_at \
+             clock reclaimed it here"
+        );
+        assert!(survivors.contains(&res_hash), "resurrected row spared");
 
-        // Termination: a second pass has nothing to do.
+        // Clock state after the run: fresh orphan stamped ~now;
+        // resident never stamped; resurrected un-stamped (pass 1).
+        let stamped_now: bool = sqlx::query_scalar(
+            "SELECT orphaned_at > now() - interval '1 hour' \
+             FROM drv_modulo_cache WHERE drv_path_hash = $1",
+        )
+        .bind(&fresh_orphan_hash)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(stamped_now, "fresh orphan carries a fresh stamp");
+        for (h, label) in [(&resident_hash, "resident"), (&res_hash, "resurrected")] {
+            let unstamped: bool = sqlx::query_scalar(
+                "SELECT orphaned_at IS NULL FROM drv_modulo_cache WHERE drv_path_hash = $1",
+            )
+            .bind(h)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert!(unstamped, "{label} row must carry NO stamp");
+        }
+
+        // Termination + the full-grace property: a second immediate
+        // run reclaims nothing (the fresh orphan's TTL has not begun
+        // to elapse, let alone expire).
         let reclaimed = reclaim_orphan_drv_modulo(&db.pool, &token).await.unwrap();
-        assert_eq!(reclaimed, 0, "idempotent / terminates on empty batch");
+        assert_eq!(reclaimed, 0, "idempotent; stamped rows wait their full TTL");
+    }
+
+    /// The populate-route resurrection clear: a re-populated row
+    /// (upsert ON CONFLICT) drops its orphan stamp without the GC
+    /// tail running — residency evidence wins immediately.
+    #[tokio::test]
+    async fn upsert_clears_orphan_stamp_on_repopulate() {
+        use crate::metadata::drv_modulo::{DrvModuloRow, upsert_drv_modulo};
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let path = "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-resur.drv";
+        let row = DrvModuloRow {
+            modulo_hash: [9u8; 32],
+            ia_output_paths: std::collections::HashMap::new(),
+            deferred: false,
+        };
+        upsert_drv_modulo(&db.pool, path, &row).await.unwrap();
+        sqlx::query("UPDATE drv_modulo_cache SET orphaned_at = now()")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        upsert_drv_modulo(&db.pool, path, &row).await.unwrap();
+        let cleared: bool = sqlx::query_scalar("SELECT orphaned_at IS NULL FROM drv_modulo_cache")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert!(cleared, "re-populate must clear the orphan stamp");
     }
 
     #[tokio::test(flavor = "multi_thread")]

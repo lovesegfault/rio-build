@@ -1353,11 +1353,14 @@ pub const M_067: () = ();
 /// deriver `.drv` ages out) and deleted on exactly two paths: operator
 /// `InvalidatePath` (`store.admin.invalidate-total`, path-scoped,
 /// unconditional) and the GC-tail orphan reclaim (no narinfo for the
-/// deriver AND `created_at` older than `DRV_MODULO_ORPHAN_TTL_DAYS` =
-/// 90 — bounds growth at roughly churn x TTL x ~1 KiB/row). The policy
-/// triple lives in `rio-store/src/metadata/per_path.rs`
-/// (`store.db.per-path-registry`); editing THIS shipped .sql is never
-/// the mechanism.
+/// deriver AND — since M_073, round-16 merged_bug_001 — an
+/// `orphaned_at` STAMP older than `DRV_MODULO_ORPHAN_TTL_DAYS` = 90;
+/// the original `created_at` clock zeroed the grace for any row that
+/// had been resident longer than the TTL before its deriver was
+/// swept. Growth stays bounded at roughly churn x TTL x ~1 KiB/row).
+/// The policy triple lives in `rio-store/src/metadata/per_path.rs`
+/// (`store.db.per-path-registry+2`); editing THIS shipped .sql is
+/// never the mechanism.
 pub const M_068: () = ();
 
 /// `069_derivation_closure_missing.sql` — the closure-hole WITNESS
@@ -1426,6 +1429,36 @@ pub const M_069: () = ();
 /// COALESCE(EXCLUDED.stripped, old stripped). No writer ever copies
 /// stripped → live.
 pub const M_070: () = ();
+
+/// `migrations/073_drv_modulo_orphaned_at.sql`
+///
+/// Adds `drv_modulo_cache.orphaned_at TIMESTAMPTZ` (NULL = deriver
+/// resident at last reconciliation) + a partial index over stamped
+/// rows, the M_073 lifecycle clock (round-16 merged_bug_001).
+///
+/// ## Why a stamped transition, not row age
+///
+/// The orphan-reclaim TTL existed to give consumers of a just-GC'd
+/// deriver a grace window ("a worker mid-flight on an output of a
+/// just-GC'd deriver keeps its proof"). Measuring it from
+/// `created_at` made the window `TTL - prior residency`: any row
+/// resident longer than the TTL had ZERO grace the moment its deriver
+/// was swept — exactly the long-lived derivers most likely to have
+/// mid-flight consumers. `orphaned_at` is stamped by the first GC
+/// tail that OBSERVES the deriver missing (mark pass), cleared when
+/// residency returns (GC un-mark pass; `populate_on_ingest`'s
+/// conflict-clear), and the reclaim deletes only stamps older than
+/// the TTL with a residency re-check. Every row therefore gets the
+/// full TTL measured from observed orphaning.
+///
+/// ## No backfill, by policy
+///
+/// Wipe-deploy: pre-existing rows ship with `orphaned_at = NULL` and
+/// are stamped by their first GC run — equivalent to "orphaned no
+/// earlier than deploy", which only EXTENDS grace. No
+/// `UPDATE ... SET orphaned_at = created_at` backfill (that would
+/// re-import the bug for the deploy's inherited rows).
+pub const M_073: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,

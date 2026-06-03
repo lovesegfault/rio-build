@@ -203,10 +203,16 @@ pub(crate) async fn upsert_drv_modulo(
             .collect(),
     );
     sqlx::query(
+        // ON CONFLICT: rows are content-derived immutable facts, so
+        // the value columns never update — but a re-populate IS
+        // residency evidence, so it clears the orphan stamp (M_073
+        // lifecycle clock; the WHERE guard keeps the no-op case
+        // write-free for fixpoint re-passes).
         "INSERT INTO drv_modulo_cache \
          (drv_path_hash, drv_path, modulo_hash, ia_output_paths, deferred) \
          VALUES ($1, $2, $3, $4, $5) \
-         ON CONFLICT (drv_path_hash) DO NOTHING",
+         ON CONFLICT (drv_path_hash) DO UPDATE SET orphaned_at = NULL \
+         WHERE drv_modulo_cache.orphaned_at IS NOT NULL",
     )
     .bind(drv_path_hash(drv_path))
     .bind(drv_path)
