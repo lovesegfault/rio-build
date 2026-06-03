@@ -110,6 +110,25 @@ impl DagActor {
         drv_hashes: &[DrvHash],
         lost_worker: Option<&ExecutorId>,
     ) {
+        self.requeue_after_attempt(drv_hashes, crate::state::AttemptKind::Build, lost_worker)
+            .await;
+    }
+
+    /// The kinded requeue chokepoint (A2.5, merged_bug_318): the
+    /// release mirror of the kinded mint. Build releases keep the
+    /// as-built `reassign_derivations` frame byte-identically (reset
+    /// to `Ready`, push to the ready set); materialization releases
+    /// return the node to its DEP-DERIVED status — `Ready` iff deps
+    /// completed, else `Queued` — so a dep-racing (Queued-origin)
+    /// claim can never surface as from-source dispatchable against
+    /// unbuilt inputs. Every materialize.rs requeue routes here with
+    /// its kind.
+    pub(super) async fn requeue_after_attempt(
+        &mut self,
+        drv_hashes: &[DrvHash],
+        kind: crate::state::AttemptKind,
+        lost_worker: Option<&ExecutorId>,
+    ) {
         // r[impl sched.lease.standby-drops-writes+3]
         // Same defense-in-depth as the ProcessCompletion/CancelBuild arm
         // gates (mod.rs). A deposed leader processing a stale loss
@@ -168,18 +187,26 @@ impl DagActor {
             // A requeue does NOT bump `resource_floor` — only the
             // explicit OOM/disk-pressure classifications are sizing
             // signals, and they promote at their own call sites.
+            let deps_completed = self.dag.all_deps_completed(drv_hash.as_str());
             if let Some(state) = self.dag.node_mut(drv_hash) {
-                if let Err(e) = state.reset_to_ready() {
-                    warn!(
-                        drv_hash = %drv_hash, error = %e,
-                        "invalid state for reassignment, skipping"
-                    );
-                    continue;
-                }
-                self.persist_status(drv_hash, DerivationStatus::Ready, None)
-                    .await;
+                let released_to = match state.reset_after_attempt(kind, deps_completed) {
+                    Ok(to) => to,
+                    Err(e) => {
+                        warn!(
+                            drv_hash = %drv_hash, error = %e,
+                            "invalid state for reassignment, skipping"
+                        );
+                        continue;
+                    }
+                };
+                self.persist_status(drv_hash, released_to, None).await;
                 affected.extend(self.get_interested_builds(drv_hash));
-                self.push_ready(drv_hash.clone());
+                // Only a Ready release is dispatch-armed; a Queued
+                // release re-arms when its deps complete (the normal
+                // dep-cascade promotion).
+                if released_to == DerivationStatus::Ready {
+                    self.push_ready(drv_hash.clone());
+                }
             }
         }
         // Dashboard: running count dropped; assigned_executors lost

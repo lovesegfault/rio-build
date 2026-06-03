@@ -664,9 +664,17 @@ impl DagActor {
             .dag
             .iter_nodes()
             .filter(|(_, s)| {
+                // A2.5 rider (merged_bug_318): Ready joins the
+                // recompute set. compute_initial_states maps
+                // deps-completed → Ready and deps-pending → Queued, so
+                // a CORRECT Ready is a fixpoint (zero behavior change)
+                // and a corrupted one — a pre-fix forced-Ready release
+                // persisted with unbuilt deps — self-heals to Queued at
+                // failover instead of dispatching from-source against
+                // missing inputs (the documented wrong-Ready chain).
                 let status_matches = matches!(
                     s.status(),
-                    DerivationStatus::Created | DerivationStatus::Queued
+                    DerivationStatus::Created | DerivationStatus::Queued | DerivationStatus::Ready
                 );
                 if status_matches && s.interested_builds.is_empty() {
                     orphans_skipped += 1;

@@ -3060,3 +3060,54 @@ async fn phase1b_recovery_enforces_at_budget_verdict() -> TestResult {
     );
     Ok(())
 }
+
+/// A2.5 recovery rider (merged_bug_318): a CORRUPTED `Ready` — a
+/// pre-fix kinded-release bug forced a dep-blocked node to Ready and
+/// persisted it — self-heals to its dep-derived status at failover.
+/// `to_recompute` now includes Ready nodes: `compute_initial_states`
+/// maps deps-completed → Ready (a correct Ready is a fixpoint, zero
+/// behavior change) and deps-pending → Queued (the heal). Pre-rider,
+/// recovery skipped Ready nodes entirely and the wrong-Ready chain
+/// (from-source dispatch against missing inputs → infra-failure →
+/// wrong-reason poison) survived every failover.
+#[tokio::test]
+async fn test_recovery_heals_corrupted_ready() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let f = RecoveryFixture::run(async |handle, pool| {
+        merge_chain(
+            &handle,
+            build_id,
+            &["heal-child", "heal-parent"],
+            PriorityClass::Scheduled,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        // Corrupt: parent (dep-blocked behind the unbuilt child) is
+        // forced to 'ready' in PG — the persisted artifact of the
+        // pre-fix forced-Ready release.
+        sqlx::query("UPDATE derivations SET status = 'ready' WHERE drv_hash = 'heal-parent'")
+            .bind(build_id)
+            .execute(&pool)
+            .await
+            .map(|_| ())?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    let child = expect_drv(&handle, "heal-child").await;
+    assert_eq!(
+        child.status,
+        DerivationStatus::Ready,
+        "the correct Ready (no deps) is a recompute fixpoint"
+    );
+    let parent = expect_drv(&handle, "heal-parent").await;
+    assert_eq!(
+        parent.status,
+        DerivationStatus::Queued,
+        "the corrupted Ready (deps unbuilt) self-heals to Queued at failover \
+         (pre-rider: recovery skipped Ready and the wrong-Ready survived)"
+    );
+    Ok(())
+}

@@ -906,8 +906,12 @@ impl DagActor {
                     // Running by closed-attempt bookkeeping) and the
                     // re-arm is a wedge, not an armed action.
                     self.rearm_materialization_job(&drv_hash, &executor).await;
-                    self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
-                        .await;
+                    self.requeue_after_attempt(
+                        std::slice::from_ref(&drv_hash),
+                        crate::state::AttemptKind::Materialization,
+                        Some(&executor),
+                    )
+                    .await;
                 }
                 Ok(())
             }
@@ -1037,8 +1041,9 @@ impl DagActor {
                         if self.materialization_jobs.remove_settled(&drv_hash, d) {
                             // The node returns to its dep-derived status
                             // (the normal Ready path) — requeue it.
-                            self.reassign_derivations(
+                            self.requeue_after_attempt(
                                 std::slice::from_ref(&drv_hash),
+                                crate::state::AttemptKind::Materialization,
                                 Some(&executor),
                             )
                             .await;
@@ -1114,8 +1119,12 @@ impl DagActor {
                 // Either way the node itself returns to the queue
                 // (claimable again / from-source dispatchable per the
                 // admission table).
-                self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
-                    .await;
+                self.requeue_after_attempt(
+                    std::slice::from_ref(&drv_hash),
+                    crate::state::AttemptKind::Materialization,
+                    Some(&executor),
+                )
+                .await;
                 Ok(())
             }
             Some(Outcome::Aborted(a)) => {
@@ -1148,8 +1157,12 @@ impl DagActor {
                     .await;
                 if close_d.settled() {
                     self.rearm_materialization_job(&drv_hash, &executor).await;
-                    self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
-                        .await;
+                    self.requeue_after_attempt(
+                        std::slice::from_ref(&drv_hash),
+                        crate::state::AttemptKind::Materialization,
+                        Some(&executor),
+                    )
+                    .await;
                 }
                 Ok(())
             }
@@ -1596,8 +1609,12 @@ impl DagActor {
         // The claim is gone; the job stays pending (claimable again).
         self.rearm_materialization_job(&drv_hash, &executor).await;
         // The node returns to its dispatchable status.
-        self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
-            .await;
+        self.requeue_after_attempt(
+            std::slice::from_ref(&drv_hash),
+            crate::state::AttemptKind::Materialization,
+            Some(&executor),
+        )
+        .await;
         tracing::info!(
             drv_hash = %drv_hash,
             exec_id = %attempt.exec_id,
@@ -1767,8 +1784,12 @@ impl DagActor {
                     )
                     .increment(1);
                 }
-                self.reassign_derivations(std::slice::from_ref(&drv_hash), None)
-                    .await;
+                self.requeue_after_attempt(
+                    std::slice::from_ref(&drv_hash),
+                    crate::state::AttemptKind::Materialization,
+                    None,
+                )
+                .await;
                 still_parked -= 1;
                 tracing::info!(
                     drv_hash = %drv_hash,

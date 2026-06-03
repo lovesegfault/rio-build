@@ -4232,14 +4232,54 @@ async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
     .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
     barrier(&handle).await;
 
-    // The SAME pull now mints: with the job resolved, the refusal
-    // predicate no longer holds (the unresolved job was the only
-    // never-from-source gate).
+    // The job refusal no longer holds — but the root is now genuinely
+    // DEP-BLOCKED (build_c full-merged root→dep and nofs-dep is
+    // unbuilt), so the kinded release returned it to Queued (A2.5,
+    // merged_bug_318) and the pull answers NotYetReady on STATUS, not
+    // on the job. Pre-A2.5 the requeue forced Ready and this pull
+    // minted a from-source build against an input that was never
+    // produced.
+    let pull = try_pull_attempt(&handle, "nofs-root").await;
+    assert!(
+        matches!(pull, Ok(PullOutcome::NotYetReady { .. })),
+        "the resolved-but-dep-blocked root waits on its dep (status gate, \
+         not the job refusal), got {pull:?}"
+    );
+    assert_eq!(
+        expect_drv(&handle, "nofs-root").await.status,
+        DerivationStatus::Queued,
+        "dep-derived release status (deps unbuilt)"
+    );
+
+    // Build the dep; the root promotes and the pull mints — proving
+    // the refusal did not outlive the job (the original property).
+    let dep_assignment = pull_attempt(&handle, "nofs-dep").await;
+    let dep_exec: Uuid = dep_assignment.exec_id.parse()?;
+    let dep_out = test_store_path("nofs-dep-out");
+    handle
+        .query_unchecked(|reply| ActorCommand::ReportPullOutcome {
+            exec_id: dep_exec,
+            auth_intent: Some("nofs-dep".into()),
+            payload: pull_payload(rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: dep_out,
+                    output_hash: vec![0u8; 32],
+                }],
+                ..Default::default()
+            }),
+            reply,
+        })
+        .await
+        .expect("actor alive")
+        .map_err(|e| anyhow::anyhow!("dep success report rejected: {e:?}"))?;
+    barrier(&handle).await;
     let pull = try_pull_attempt(&handle, "nofs-root").await;
     assert!(
         matches!(pull, Ok(PullOutcome::Deliver(_))),
-        "after from-source resolution the BUILD pull must mint (no refusal \
-         outlives the job), got {pull:?}"
+        "with the dep built, the BUILD pull mints — no refusal outlives the \
+         resolved job, got {pull:?}"
     );
     Ok(())
 }
@@ -6910,6 +6950,79 @@ async fn cluster_snapshot_executors_exclude_materialization_claims() -> TestResu
         (1, 1),
         "the executor view counts the builder pod only — a store claim \
          holds no builder slot (pre-fix: M+N)"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.routing+3]
+/// merged_bug_318 (A2.5 kinded release edge): requeueing a DEP-RACING
+/// (Queued-origin) materialization claim must return the node to its
+/// DEP-DERIVED status — Queued while its deps are unbuilt — never
+/// force Ready. Pre-fix every requeue path went through the build
+/// reset (`reset_to_ready`), so an infra-failed store claim on a
+/// dep-blocked node surfaced as Ready: from-source dispatchable
+/// against inputs that do not exist (InfrastructureFailure → wasted
+/// retries → wrong-reason Poisoned, the same chain the recovery
+/// cascade gate closes).
+#[tokio::test]
+async fn requeued_dep_racing_claim_returns_to_queued() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // root → mid → leaf; only MID substitutable (the dep-racing shape:
+    // mid sits Queued behind the unproduced leaf, its job claimable).
+    let mid_out = test_store_path("rq318-mid-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(mid_out.clone());
+    let root = make_node("rq318-root");
+    let mut mid = make_node("rq318-mid");
+    mid.expected_output_paths = vec![mid_out.clone()];
+    let leaf = make_node("rq318-leaf");
+    merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![root, mid, leaf],
+        vec![
+            make_test_edge("rq318-root", "rq318-mid"),
+            make_test_edge("rq318-mid", "rq318-leaf"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "rq318-mid").await.status,
+        DerivationStatus::Queued,
+        "precondition: mid is dep-blocked"
+    );
+
+    let assignment = match claim_materialization(&handle, "rq318-mid", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("dep-racing claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+
+    // Infra failure under budget → consumption re-arms the job and
+    // requeues the node.
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "rq318-mid",
+        mat_infra_outcome("upstream wedged"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        expect_drv(&handle, "rq318-mid").await.status,
+        DerivationStatus::Queued,
+        "the requeued dep-racing claim returns to its dep-derived status \
+         (deps unbuilt => Queued; pre-fix: forced Ready, from-source \
+         dispatchable against missing inputs)"
     );
     Ok(())
 }

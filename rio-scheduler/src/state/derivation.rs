@@ -452,6 +452,28 @@ impl DerivationStatus {
         }
         self.validate_transition(to)
     }
+
+    /// The RELEASE mirror of [`Self::validate_transition_for_mint`]
+    /// (A2.5, merged_bug_318): a materialization claim admitted from
+    /// `Queued` (the PD-6 dep-racing edge) must be able to RETURN to
+    /// `Queued` when the attempt closes with deps still unbuilt.
+    /// Exactly ONE kinded delta cell — `Assigned → Queued` for the
+    /// materialization kind (the mint edge's inverse); the
+    /// worker-lost path's `Running → Failed → Queued` second step is
+    /// already legal in the kind-blind table (the resubmit edge).
+    /// Build releases keep the as-built table byte-identically: the
+    /// mint admits builds from `Ready` alone, so a build release
+    /// never has a dep-blocked target.
+    pub fn validate_transition_for_release(
+        self,
+        to: Self,
+        kind: AttemptKind,
+    ) -> Result<(), TransitionError> {
+        if kind == AttemptKind::Materialization && self == Self::Assigned && to == Self::Queued {
+            return Ok(());
+        }
+        self.validate_transition(to)
+    }
 }
 
 /// Retry / failure-tracking sub-state of a [`DerivationState`].
@@ -1644,6 +1666,63 @@ impl DerivationState {
         Ok(())
     }
 
+    /// Kinded attempt-release reset (A2.5, merged_bug_318): the
+    /// chokepoint every requeue-after-attempt goes through.
+    ///
+    /// - `Build` delegates to [`Self::reset_to_ready`] BYTE-IDENTICALLY
+    ///   (build mints admit from `Ready` alone, so `Ready` is always
+    ///   the correct release target).
+    /// - `Materialization` targets the DEP-DERIVED status the node
+    ///   promises everywhere else: `Ready` iff `deps_completed`, else
+    ///   `Queued` (the PD-6 dep-racing claim was admitted from
+    ///   `Queued`; forcing `Ready` made the node from-source
+    ///   dispatchable against inputs that do not exist).
+    ///
+    /// Returns the released-to status for the caller's persist.
+    pub fn reset_after_attempt(
+        &mut self,
+        kind: AttemptKind,
+        deps_completed: bool,
+    ) -> Result<DerivationStatus, TransitionError> {
+        if kind == AttemptKind::Build {
+            self.reset_to_ready()?;
+            return Ok(DerivationStatus::Ready);
+        }
+        let target = if deps_completed {
+            DerivationStatus::Ready
+        } else {
+            DerivationStatus::Queued
+        };
+        fn step(
+            this: &mut DerivationState,
+            to: DerivationStatus,
+            kind: AttemptKind,
+        ) -> Result<(), TransitionError> {
+            let from = this.status;
+            from.validate_transition_for_release(to, kind)?;
+            this.apply_validated_transition(from, to);
+            Ok(())
+        }
+        match self.status {
+            DerivationStatus::Assigned => step(self, target, kind)?,
+            DerivationStatus::Running => {
+                step(self, DerivationStatus::Failed, kind)?;
+                step(self, target, kind)?;
+            }
+            _ => {
+                return Err(TransitionError::Invalid {
+                    from: self.status,
+                    to: target,
+                    reason: "reset_after_attempt only valid from Assigned or Running",
+                });
+            }
+        }
+        self.assigned_executor = None;
+        self.exec_id = None;
+        self.open_attempt_kind = None;
+        Ok(target)
+    }
+
     /// If Assigned, transition to Running (intermediate step — the
     /// state machine requires Running before Completed/Poisoned/
     /// Failed; Assigned→X directly is invalid for those). No-op if
@@ -2781,6 +2860,85 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // r[verify sched.state.machine+2]
+    /// The RELEASE mirror of the mint table (A2.5, merged_bug_318):
+    /// exhaustive (from, to, kind) product — the kinded release agrees
+    /// with the kind-blind table on EVERY cell except exactly one,
+    /// (Assigned, Queued, Materialization): the dep-racing claim's
+    /// return edge (Failed → Queued is already blind-legal — the
+    /// resubmit edge). A build release never has a dep-blocked target
+    /// (build mints admit from Ready alone), so the build column is
+    /// byte-identical everywhere.
+    #[test]
+    fn validate_transition_for_release_exhaustive() {
+        use DerivationStatus as S;
+        for &from in S::ALL {
+            for &to in S::ALL {
+                let blind = from.validate_transition(to).is_ok();
+                for kind in [AttemptKind::Build, AttemptKind::Materialization] {
+                    let kinded = from.validate_transition_for_release(to, kind).is_ok();
+                    let is_delta_cell = from == S::Assigned
+                        && to == S::Queued
+                        && kind == AttemptKind::Materialization;
+                    if is_delta_cell {
+                        assert!(
+                            kinded,
+                            "(Assigned, Queued, Materialization) is the ONE legal kinded release delta"
+                        );
+                        assert!(
+                            !blind,
+                            "the kind-blind table must keep rejecting Assigned -> Queued"
+                        );
+                    } else {
+                        assert_eq!(
+                            kinded, blind,
+                            "release({from} -> {to}, {kind:?}) must agree with the kind-blind                              table everywhere except the two delta cells"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `reset_after_attempt` decision table (A2.5): Build delegates to
+    /// `reset_to_ready` byte-identically; Materialization targets the
+    /// dep-derived status — Ready iff deps completed, else Queued —
+    /// from both Assigned and Running (via Failed), clearing the
+    /// attempt bookkeeping either way.
+    #[test]
+    fn reset_after_attempt_table() {
+        use DerivationStatus as S;
+        let mk = |status: S| {
+            let mut st = DerivationState::try_from_node(&dummy_node()).expect("dummy node");
+            st.set_status_for_test(status);
+            st.assigned_executor = Some("w".into());
+            st.exec_id = Some(uuid::Uuid::now_v7());
+            st.open_attempt_kind = Some(AttemptKind::Build);
+            st
+        };
+        for (from, kind, deps, want) in [
+            (S::Assigned, AttemptKind::Build, false, S::Ready),
+            (S::Assigned, AttemptKind::Build, true, S::Ready),
+            (S::Running, AttemptKind::Build, false, S::Ready),
+            (S::Assigned, AttemptKind::Materialization, true, S::Ready),
+            (S::Assigned, AttemptKind::Materialization, false, S::Queued),
+            (S::Running, AttemptKind::Materialization, true, S::Ready),
+            (S::Running, AttemptKind::Materialization, false, S::Queued),
+        ] {
+            let mut st = mk(from);
+            let got = st.reset_after_attempt(kind, deps).expect("legal release");
+            assert_eq!(got, want, "({from}, {kind:?}, deps={deps})");
+            assert_eq!(st.status(), want);
+            assert!(st.assigned_executor.is_none() && st.exec_id.is_none());
+            assert!(st.open_attempt_kind.is_none());
+        }
+        // Illegal sources reject for both kinds.
+        for kind in [AttemptKind::Build, AttemptKind::Materialization] {
+            assert!(mk(S::Ready).reset_after_attempt(kind, true).is_err());
+            assert!(mk(S::Completed).reset_after_attempt(kind, true).is_err());
         }
     }
 
