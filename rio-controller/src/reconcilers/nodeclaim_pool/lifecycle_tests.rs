@@ -1037,3 +1037,54 @@ async fn bot_tick_makes_exactly_two_lists_no_effects() {
     assert!(lab.ack_calls().is_empty(), "no ack attempted");
     assert_eq!(lab.r.consecutive_bot_ticks, 1);
 }
+
+// r[verify sched.snapshot.binding-presence]
+/// bug_285 controller half: `report_unfulfillable` ALWAYS attaches the
+/// binding snapshot — even on the all-empty tick (pre-fix: the
+/// all-four-empty early return suppressed exactly the scale-to-zero
+/// tick, so the scheduler never heard "zero bound pods" and kept its
+/// stale map for the whole idle window). The legacy field 5 is never
+/// dual-written (R9).
+#[tokio::test(flavor = "multi_thread")]
+async fn report_unfulfillable_always_ships_the_snapshot() {
+    let lab = Lab::new().await;
+
+    // The scale-to-zero shape: nothing ICE'd, nothing registered, no
+    // observations, zero bound pods.
+    lab.r
+        .report_unfulfillable(&[], &[], vec![], vec![])
+        .await
+        .expect("ack sent");
+
+    let acks = lab.ack_calls();
+    assert_eq!(acks.len(), 1, "the all-empty tick still Acks");
+    let snap = acks[0]
+        .binding_snapshot
+        .as_ref()
+        .expect("the snapshot is PRESENT (empty ≠ absent)");
+    assert!(snap.bound.is_empty(), "present-and-empty = clear");
+    assert!(
+        acks[0].bound_intents.is_empty(),
+        "legacy field 5 is never dual-written (R9)"
+    );
+
+    // A bound pod travels inside the snapshot, not field 5.
+    lab.r
+        .report_unfulfillable(
+            &[],
+            &[],
+            vec![],
+            vec![rio_proto::types::BoundIntent {
+                intent_id: "drv-285".into(),
+                node_name: "node-1".into(),
+                deadline_secs: 0,
+            }],
+        )
+        .await
+        .expect("ack sent");
+    let acks = lab.ack_calls();
+    let snap = acks[1].binding_snapshot.as_ref().expect("present");
+    assert_eq!(snap.bound.len(), 1);
+    assert_eq!(snap.bound[0].intent_id, "drv-285");
+    assert!(acks[1].bound_intents.is_empty());
+}

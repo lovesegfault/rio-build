@@ -6862,6 +6862,7 @@ async fn materialization_mint_leaves_ice_mask_untouched() -> TestResult {
             registered_cells: vec![],
             observed_instance_types: vec![],
             bound_intents: vec![],
+            binding_snapshot: None,
         })
         .await?;
     barrier(&handle).await;

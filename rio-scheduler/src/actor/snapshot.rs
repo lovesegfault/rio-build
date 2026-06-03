@@ -836,16 +836,21 @@ impl DagActor {
         registered_cells: &[String],
         observed_instance_types: &[rio_proto::types::ObservedInstanceType],
         bound_intents: &[rio_proto::types::BoundIntent],
+        binding_snapshot: Option<&[rio_proto::types::BoundIntent]>,
     ) {
         // Kube-authoritative `intent_id (== drv_hash) → (spec.nodeName,
         // tenant)`. The nodeclaim_pool reconciler ships the FULL set
-        // every tick, so wholesale-rebuild is correct (entries for
-        // deleted pods drop naturally; no separate sweep). The per-pool
-        // reconciler (`pool/jobs.rs`) sends `bound_intents=[]` — it
-        // only arms `dispatched_cells` — so empty = "this Ack carries
-        // no binding snapshot" = no-op (mb_012/⛔2: an unconditional
-        // `mem::take` here would discard every captured `tenant` on
-        // every per-pool reconcile).
+        // every tick as an EXPLICIT snapshot (`binding_snapshot`,
+        // C2/285): `Some(set)` — even empty — wholesale-rebuilds
+        // (present-and-empty correctly CLEARS the map: the
+        // scale-to-zero tick has zero bound pods and says so); `None`
+        // = "this Ack carries no snapshot" (per-pool reconcilers, and
+        // pre-upgrade controllers on the legacy field-5 arm below) =
+        // no-op (mb_012/⛔2: an unconditional `mem::take` here would
+        // discard every captured `tenant` on every per-pool
+        // reconcile). The legacy arm keeps the OLD semantics —
+        // non-empty `bound_intents` rebuilds — for rolling skew (R9:
+        // read-side back-compat only, never dual-written).
         //
         // `tenant` is captured from the DAG when present, else carried
         // forward from the existing entry — once DAG-absent the last
@@ -866,9 +871,15 @@ impl DagActor {
             self.acked_spawned
                 .retain(|_, t| now - *t < 2.0 * crate::actor::pull::ACKED_SPAWNED_DEFER_SECS);
         }
-        if !bound_intents.is_empty() {
+        // r[impl sched.snapshot.binding-presence]
+        let snapshot: Option<&[rio_proto::types::BoundIntent]> = match binding_snapshot {
+            Some(snap) => Some(snap),
+            None if !bound_intents.is_empty() => Some(bound_intents),
+            None => None,
+        };
+        if let Some(snap) = snapshot {
             let prev = std::mem::take(&mut self.authoritative_binding);
-            for b in bound_intents {
+            for b in snap {
                 let h: DrvHash = b.intent_id.as_str().into();
                 let tenant = self
                     .dag

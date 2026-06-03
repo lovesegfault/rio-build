@@ -1977,13 +1977,14 @@ impl NodeClaimPoolReconciler {
         observed_types: Vec<rio_proto::types::ObservedInstanceType>,
         bound_intents: Vec<rio_proto::types::BoundIntent>,
     ) -> anyhow::Result<()> {
-        if ice_cells.is_empty()
-            && registered_cells.is_empty()
-            && observed_types.is_empty()
-            && bound_intents.is_empty()
-        {
-            return Ok(());
-        }
+        // C2/285: NO empty-tick suppression — this reconciler ALWAYS
+        // attaches the binding snapshot (even empty), because
+        // present-and-empty is load-bearing: the scale-to-zero tick
+        // has zero bound pods and must SAY so or the scheduler's
+        // `authoritative_binding` keeps stale entries for the whole
+        // idle window (and mis-attributes the next re-dispatch). One
+        // Ack per tick is the cost; the old all-empty early-return
+        // suppressed exactly the tick that mattered.
         // r[impl ctrl.nodeclaim.ice-mark-clear]
         // BTreeSet dedup: `health::reap_unhealthy`/`detect_vanished`
         // push one entry per ICE'd CLAIM (up to 8/cell/tick); the
@@ -1999,14 +2000,18 @@ impl NodeClaimPoolReconciler {
                 .collect()
         };
         let req = AckSpawnedIntentsRequest {
-            // C2/285: attached by the dedicated snapshot path (commit E); the
-            // mechanical None here is the pre-snapshot legacy shape.
-            binding_snapshot: None,
+            // The explicit per-tick snapshot (always present from this
+            // reconciler; empty = clear). R9: the legacy field 5 is
+            // NEVER dual-written — old schedulers simply keep their
+            // map until the fleet rolls (bounded skew, accepted).
+            binding_snapshot: Some(rio_proto::types::BindingSnapshot {
+                bound: bound_intents,
+            }),
             spawned: vec![],
             unfulfillable_cells: dedup(ice_cells),
             registered_cells: dedup(registered_cells),
             observed_instance_types: observed_types,
-            bound_intents,
+            bound_intents: vec![],
         };
         if let Err(e) = admin_call(self.admin.clone().ack_spawned_intents(req)).await {
             warn!(error = %e, "ack_spawned_intents (unfulfillable/registered) failed");

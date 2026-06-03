@@ -1214,6 +1214,7 @@ pub(crate) async fn bind_intent_node(
 ) -> anyhow::Result<()> {
     handle
         .send_unchecked(ActorCommand::AckSpawnedIntents {
+            binding_snapshot: None,
             spawned: vec![],
             unfulfillable_cells: vec![],
             registered_cells: vec![],

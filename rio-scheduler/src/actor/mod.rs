@@ -250,16 +250,21 @@ pub struct DagActor {
     /// last DAG-present value sticks (mb_012: both projections come off
     /// one entry so they structurally cannot diverge).
     ///
-    /// Wholesale-rebuilt on Acks THAT CARRY `bound_intents` (~10s; the
-    /// nodeclaim_pool reconciler ships the full set) — entries for
-    /// deleted pods drop naturally; no separate sweep. The per-pool
-    /// reconciler sends `bound_intents=[]` (it only arms
-    /// `dispatched_cells`); empty = "this Ack carries no binding
-    /// snapshot" = no-op on this map. nodeclaim_pool with 0 bound pods
-    /// also sends `[]` (only the all-four-empty case is suppressed at
-    /// `report_unfulfillable`); that case is also no-op'd — bounded
-    /// stale entries until the next non-empty Ack, unread (no matching
-    /// executor once the pod is gone).
+    /// Wholesale-rebuilt on Acks whose `binding_snapshot` is PRESENT
+    /// (~10s; the nodeclaim_pool reconciler attaches the full set
+    /// every tick — present-and-EMPTY clears the map: scale-to-zero,
+    /// C2/285) — entries for deleted pods drop naturally; no separate
+    /// sweep. The per-pool reconciler sends no snapshot (it only arms
+    /// `dispatched_cells`); absent = "this Ack carries no binding
+    /// snapshot" = no-op on this map (and the legacy non-empty
+    /// `bound_intents` arm keeps pre-upgrade controllers working —
+    /// R9 read-side back-compat, never dual-written). READ by: the
+    /// pull mint (`pull.rs` AD2c source-node attribution + the
+    /// rendered-deadline floor), the completion fold
+    /// (`completion.rs`), and the establishment sweep
+    /// (`housekeeping.rs`) — the entries are live attribution inputs,
+    /// which is exactly why a stale scale-to-zero map mis-attributed
+    /// the next re-dispatch (bug_285).
     pub(crate) authoritative_binding: HashMap<DrvHash, AuthBinding>,
     /// 124(d): `drv_hash → epoch_secs` of the most recent controller
     /// `AckSpawnedIntents{spawned}` covering that intent — the "a Job
@@ -1289,6 +1294,7 @@ impl DagActor {
                     registered_cells,
                     observed_instance_types,
                     bound_intents,
+                    binding_snapshot,
                 } => {
                     // r[impl sched.lease.standby-drops-writes+3] —
                     // ICE state is lease-holder only.
@@ -1299,6 +1305,7 @@ impl DagActor {
                             &registered_cells,
                             &observed_instance_types,
                             &bound_intents,
+                            binding_snapshot.as_deref(),
                         );
                     }
                 }

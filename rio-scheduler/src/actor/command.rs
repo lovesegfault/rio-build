@@ -218,7 +218,15 @@ pub enum ActorCommand {
         /// `r[sched.admin.hung-node-detector+3]`: kube-authoritative
         /// `intent_id → spec.nodeName` from the controller's pod
         /// informer. Replaces worker-supplied node_name (untrusted).
+        /// LEGACY field-5 read arm (rolling skew, R9): consulted only
+        /// when `binding_snapshot` is None.
         bound_intents: Vec<rio_proto::types::BoundIntent>,
+        /// C2/285 (`r[sched.snapshot.binding-presence]`): the explicit
+        /// per-tick binding snapshot. `Some(set)` — even empty —
+        /// wholesale-rebuilds `authoritative_binding` (present-and-
+        /// empty CLEARS: scale-to-zero); `None` = "this Ack carries no
+        /// snapshot" (per-pool reconcilers, pre-upgrade controllers).
+        binding_snapshot: Option<Vec<rio_proto::types::BoundIntent>>,
     },
 
     /// Periodic tick for housekeeping (timeouts, poison TTL expiry).

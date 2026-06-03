@@ -721,6 +721,9 @@ impl AdminService for AdminServiceImpl {
                 registered_cells: req.registered_cells,
                 observed_instance_types: req.observed_instance_types,
                 bound_intents: req.bound_intents,
+                // C2/285: optional wrapper → presence-preserving
+                // Option (absent ≠ empty on this wire by design).
+                binding_snapshot: req.binding_snapshot.map(|s| s.bound),
             })
             .await
             .map_err(|e| Status::internal(e.to_string()))?;

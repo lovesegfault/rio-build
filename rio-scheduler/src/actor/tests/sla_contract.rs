@@ -456,6 +456,7 @@ async fn contract_ice_step_doubles_then_clears_on_registered() {
             &[],
             &[],
             &[],
+            None,
         );
     }
     assert_eq!(
@@ -477,7 +478,7 @@ async fn contract_ice_step_doubles_then_clears_on_registered() {
         "spawned-ack arms dispatched_cells from the wire form"
     );
 
-    actor.handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()], &[], &[]);
+    actor.handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()], &[], &[], None);
     assert_eq!(
         actor.ice.step(&cell),
         None,
@@ -527,6 +528,7 @@ async fn ack_observed_instance_types_folds_into_cost_table() {
             },
         ],
         &[],
+        None,
     );
 
     let ct = actor.cost_table.read();
@@ -544,11 +546,13 @@ async fn ack_observed_instance_types_folds_into_cost_table() {
 /// `intent_id` is the controller's `INTENT_ID_ANNOTATION` value
 /// (= drv_hash); `node_name` is kube `spec.nodeName`.
 ///
-/// Also pins the wholesale-rebuild invariant (mb_012): a NON-empty
-/// `bound_intents` is the authoritative snapshot — entries absent from
-/// it are dropped (replaces the old per-tick `.retain(dag.node…)`
-/// sweep). An EMPTY `bound_intents` is the per-pool reconciler's "no
-/// snapshot in this Ack" signal → no-op on the map.
+/// Also pins the wholesale-rebuild invariant (mb_012) on the LEGACY
+/// field-5 arm (R9 read-side back-compat — pre-snapshot controllers):
+/// a NON-empty `bound_intents` is the authoritative snapshot — entries
+/// absent from it are dropped. An EMPTY `bound_intents` with NO
+/// `binding_snapshot` is "no snapshot in this Ack" → no-op on the map.
+/// (Presence semantics for snapshot-capable senders:
+/// [`ack_binding_snapshot_presence_semantics`].)
 #[tokio::test]
 async fn ack_bound_intents_populates_authoritative_binding() {
     use rio_proto::types::BoundIntent;
@@ -574,6 +578,7 @@ async fn ack_bound_intents_populates_authoritative_binding() {
             bi("abc123", "ip-10-0-1-5.ec2.internal"),
             bi("def456", "ip-10-0-1-6.ec2.internal"),
         ],
+        None,
     );
 
     assert_eq!(
@@ -603,6 +608,7 @@ async fn ack_bound_intents_populates_authoritative_binding() {
         &[],
         &[],
         &[bi("abc123", "ip-10-0-1-5.ec2.internal")],
+        None,
     );
     assert_eq!(actor.authoritative_binding.len(), 1);
     assert!(!actor.authoritative_binding.contains_key(&def));
@@ -611,13 +617,53 @@ async fn ack_bound_intents_populates_authoritative_binding() {
     // Empty `bound_intents` = "this Ack carries no binding snapshot"
     // (per-pool reconciler at pool/jobs.rs sends `vec![]`; the
     // nodeclaim_pool reconciler owns the stream) → map unchanged.
-    actor.handle_ack_spawned_intents(&[], &[], &[], &[], &[]);
+    actor.handle_ack_spawned_intents(&[], &[], &[], &[], &[], None);
     assert_eq!(
         actor.authoritative_binding.len(),
         1,
         "empty bound_intents must be a no-op (per-pool ack), not a wipe"
     );
     assert!(actor.authoritative_binding.contains_key(&abc));
+}
+
+// r[verify sched.snapshot.binding-presence]
+/// bug_285's presence semantics, exhaustively: `Some(non-empty)`
+/// rebuilds; `Some(EMPTY)` CLEARS (the scale-to-zero tick — the
+/// pre-fix behavior kept the stale map: the old pin literally asserted
+/// "empty → no-op" for the only wire shape that existed); `None`
+/// leaves the map untouched (per-pool Acks, pre-upgrade controllers).
+#[tokio::test]
+async fn ack_binding_snapshot_presence_semantics() {
+    use rio_proto::types::BoundIntent;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    let bi = |id: &str, node: &str| BoundIntent {
+        intent_id: id.into(),
+        node_name: node.into(),
+        deadline_secs: 0,
+    };
+    let abc = crate::state::DrvHash::from("abc285");
+
+    // Some(non-empty) rebuilds.
+    actor.handle_ack_spawned_intents(&[], &[], &[], &[], &[], Some(&[bi("abc285", "node-1")]));
+    assert_eq!(actor.authoritative_binding.len(), 1);
+    assert!(actor.authoritative_binding.contains_key(&abc));
+
+    // None leaves the map untouched (per-pool Ack shape).
+    actor.handle_ack_spawned_intents(&[], &[], &[], &[], &[], None);
+    assert_eq!(
+        actor.authoritative_binding.len(),
+        1,
+        "an Ack without a snapshot never clears captured bindings"
+    );
+
+    // Some(EMPTY) clears — scale-to-zero says so explicitly.
+    actor.handle_ack_spawned_intents(&[], &[], &[], &[], &[], Some(&[]));
+    assert!(
+        actor.authoritative_binding.is_empty(),
+        "present-and-empty is load-bearing: zero bound pods clears the map"
+    );
 }
 
 /// `observe_instance_types` is gated on the shared `cost_was_leader`
@@ -646,7 +692,7 @@ async fn ack_observed_instance_types_gated_on_cost_was_leader() {
     actor
         .cost_was_leader
         .store(false, std::sync::atomic::Ordering::Relaxed);
-    actor.handle_ack_spawned_intents(&[], &[], &[], &observed, &[]);
+    actor.handle_ack_spawned_intents(&[], &[], &[], &observed, &[], None);
     assert!(
         actor.cost_table.read().menu(&spot).is_empty(),
         "observation must NOT land on pre-reload table"
@@ -657,7 +703,7 @@ async fn ack_observed_instance_types_gated_on_cost_was_leader() {
     actor
         .cost_was_leader
         .store(true, std::sync::atomic::Ordering::Relaxed);
-    actor.handle_ack_spawned_intents(&[], &[], &[], &observed, &[]);
+    actor.handle_ack_spawned_intents(&[], &[], &[], &observed, &[], None);
     assert_eq!(actor.cost_table.read().menu(&spot).len(), 1);
 }
 
@@ -696,7 +742,7 @@ async fn contract_ack_spawned_records_full_a_prime() {
         ..Default::default()
     };
 
-    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[]);
+    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None);
 
     let got: std::collections::HashSet<Cell> = actor
         .dispatched_cells
@@ -3553,6 +3599,7 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
         &[],
         &[],
         &[],
+        None,
     );
     // Arm + mark the waiter's intent the same way (hand-built echo with
     // the same cell — the ack handler arms from the wire form alone).
@@ -3562,7 +3609,14 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
         node_affinity: intent.node_affinity.clone(),
         ..Default::default()
     };
-    actor.handle_ack_spawned_intents(std::slice::from_ref(&waiter_intent), &[], &[], &[], &[]);
+    actor.handle_ack_spawned_intents(
+        std::slice::from_ref(&waiter_intent),
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+    );
     assert!(actor.ice.is_masked(&cell), "precondition: cell ICE-masked");
     assert!(actor.dispatched_cells.contains_key("ice-pull-a"));
     assert!(actor.dispatched_cells.contains_key("ice-pull-b"));

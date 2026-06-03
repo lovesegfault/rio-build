@@ -864,6 +864,22 @@ two-tenant floor, the per-tick reap cap, and a fail-closed skip when the
 open-attempt view cannot be read. `nodeclaim_pool::reap_unhealthy` consumes
 that signal as `ReapReason::Dead` exactly as it consumed `dead_nodes`.
 
+#r("sched.snapshot.binding-presence")[
+  `AckSpawnedIntents.binding_snapshot` is presence-preserving: when the
+  field is PRESENT the scheduler MUST wholesale-rebuild
+  `authoritative_binding` from it --- present-and-empty CLEARS the map (the
+  scale-to-zero tick has zero bound pods and says so) --- and when ABSENT
+  the scheduler MUST leave the map untouched. The nodeclaim-pool reconciler
+  attaches the snapshot on every Ack it sends; per-pool reconcilers never
+  do. The legacy non-empty `bound_intents` rebuild remains as a read-side
+  back-compat arm for pre-upgrade controllers and is never dual-written by
+  a snapshot-capable sender.
+]
+A bounded rolling-skew window is accepted (new controller + old scheduler:
+binding updates pause until both roll); the alternative --- dual-writing
+field 5 --- would create a removal obligation later, which the wave's
+no-followups directive forbids.
+
 #r("sched.dispatch.soft-features+2")[
   The scheduler MUST strip every feature listed in `soft_features`
   (scheduler.toml) from each derivation's `requiredSystemFeatures` at
