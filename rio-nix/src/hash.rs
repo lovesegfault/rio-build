@@ -285,6 +285,33 @@ impl NixHash {
         Self::new(algo, digest)
     }
 
+    /// Parse a PREFIXED hash in any oracle encoding: `<algo>:<digest>`
+    /// with the digest length-discriminated as base16 / nixbase32 /
+    /// base64, or SRI `<algo>-<base64>`. A bare digest (no type
+    /// prefix) is rejected — the type must come from the string.
+    ///
+    /// This is CppNix `Hash::parseAnyPrefixed` (`hash.cc:225-238`):
+    /// `parseAnyHelper` (`hash.cc:188-223`) splits one `:` prefix
+    /// (else one `-` prefix → SRI, always base64), REQUIRES a parsed
+    /// algo, and for the colon form picks the encoding via
+    /// `baseFromSize` (`hash.cc:123-138`) — within one algorithm the
+    /// three encoded lengths are pairwise distinct, so the
+    /// discrimination is unambiguous. The narinfo `NarHash:` /
+    /// `FileHash:` fields parse through exactly this function
+    /// upstream (`nar-info.cc:23-29`).
+    pub fn parse_any_prefixed(s: &str) -> Result<Self, HashError> {
+        if let Some((algo_str, rest)) = s.split_once(':') {
+            let algo = algo_str.parse::<HashAlgo>()?;
+            Self::parse_nonsri_unprefixed(algo, rest)
+        } else if s.contains('-') {
+            Self::parse_sri(s)
+        } else {
+            Err(HashError::InvalidFormat(format!(
+                "hash {s:?} does not include a type"
+            )))
+        }
+    }
+
     /// Render as lowercase hex digest (no algorithm prefix).
     ///
     /// This is the format used by nix-daemon on the wire for `wopQueryPathInfo`.
@@ -329,6 +356,52 @@ impl std::fmt::Display for NixHash {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `parse_any_prefixed` mirrors the oracle's `Hash::parseAnyPrefixed`
+    /// (`hash.cc:225-238`): a type prefix is REQUIRED; the colon form
+    /// length-discriminates base16/nixbase32/base64 (`baseFromSize`,
+    /// `hash.cc:123-138`); the dash form is SRI (always base64). All
+    /// spellings of one digest decode to the same value.
+    #[test]
+    fn parse_any_prefixed_accepts_all_oracle_encodings() -> anyhow::Result<()> {
+        use base64::Engine as _;
+        let raw: [u8; 32] = *b"0123456789abcdef0123456789abcdef";
+        let want = NixHash::new(HashAlgo::SHA256, raw.to_vec())?;
+
+        let b16 = format!("sha256:{}", hex::encode(raw));
+        let b32 = format!("sha256:{}", nixbase32::encode(&raw));
+        let b64 = format!(
+            "sha256:{}",
+            base64::engine::general_purpose::STANDARD.encode(raw)
+        );
+        let sri = format!(
+            "sha256-{}",
+            base64::engine::general_purpose::STANDARD.encode(raw)
+        );
+        for s in [&b16, &b32, &b64, &sri] {
+            assert_eq!(
+                NixHash::parse_any_prefixed(s)?,
+                want,
+                "spelling {s:?} must decode to the same digest"
+            );
+        }
+
+        // sha512 colon form, base16 (128 chars) — algo honored.
+        let raw512 = [7u8; 64];
+        let h = NixHash::parse_any_prefixed(&format!("sha512:{}", hex::encode(raw512)))?;
+        assert_eq!(h.algo(), HashAlgo::SHA512);
+        assert_eq!(h.digest(), raw512);
+
+        // Bare digest (no type): rejected — the type must come from
+        // the string (`parseAnyPrefixed` throws "does not include a
+        // type").
+        assert!(NixHash::parse_any_prefixed(&hex::encode(raw)).is_err());
+        // Length matching no encoding of the algo: rejected.
+        assert!(NixHash::parse_any_prefixed("sha256:abcd").is_err());
+        // Unknown algo prefix: rejected.
+        assert!(NixHash::parse_any_prefixed("md5:aabbccdd").is_err());
+        Ok(())
+    }
 
     #[test]
     fn test_algo_parse() -> anyhow::Result<()> {

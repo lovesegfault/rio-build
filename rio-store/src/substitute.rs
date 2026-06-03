@@ -1601,11 +1601,30 @@ async fn bounded_text(
     String::from_utf8(buf).map_err(|e| SubstituteError::NarInfo(format!("{what} not UTF-8: {e}")))
 }
 
-/// Parse a narinfo `NarHash:` value (`sha256:nixbase32...`) into raw
-/// 32 bytes.
+/// Parse a narinfo `NarHash:` value into raw 32 bytes.
+///
+/// Accepts every oracle encoding — the upstream narinfo reader parses
+/// `NarHash:` with `Hash::parseAnyPrefixed` (`nar-info.cc:23-29`,
+/// `hash.cc:225-238`), which length-discriminates base16 / nixbase32 /
+/// base64 after the `sha256:` prefix and also takes SRI. cache.nixos.org
+/// serves nixbase32, but base16/base64 narinfo producers are
+/// oracle-legal and previously fell out of the substitution (and
+/// therefore the modulo-population) path entirely.
+///
+/// Non-sha256 algorithms are rejected — registered divergence
+/// `nix.divergence.narinfo-sha256-only` (the oracle parses any algo
+/// but asserts sha256 on every narinfo it WRITES, `nar-info.cc:117`;
+/// rio's pipeline is `[u8; 32]` SHA-256 throughout).
 fn parse_nar_hash(s: &str) -> Result<[u8; 32], SubstituteError> {
-    let h = rio_nix::hash::NixHash::parse_colon(s)
+    let h = rio_nix::hash::NixHash::parse_any_prefixed(s)
         .map_err(|e| SubstituteError::NarInfo(format!("NarHash {s:?}: {e}")))?;
+    // r[impl nix.divergence.narinfo-sha256-only]
+    if h.algo() != rio_nix::hash::HashAlgo::SHA256 {
+        return Err(SubstituteError::NarInfo(format!(
+            "NarHash {s:?}: algorithm {} is not sha256 (rio's narinfo pipeline is sha256-only)",
+            h.algo()
+        )));
+    }
     h.digest()
         .try_into()
         .map_err(|_| SubstituteError::NarInfo(format!("NarHash {s:?}: not 32 bytes")))
@@ -1896,6 +1915,38 @@ mod tests {
         let path = rio_test_support::fixtures::test_store_path("substituted");
         let (nar, _hash) = rio_test_support::fixtures::make_nar(b"hi");
         (path, nar)
+    }
+
+    /// `parse_nar_hash` accepts every oracle `NarHash:` encoding
+    /// (base16/nixbase32/base64 behind `sha256:`, plus SRI) and
+    /// rejects non-sha256 algorithms.
+    // r[verify nix.divergence.narinfo-sha256-only]
+    #[test]
+    fn parse_nar_hash_oracle_encodings() {
+        use base64::Engine as _;
+        let raw: [u8; 32] = *b"0123456789abcdef0123456789abcdef";
+        let b16 = format!("sha256:{}", hex::encode(raw));
+        let b32 = format!("sha256:{}", rio_nix::store_path::nixbase32::encode(&raw));
+        let b64 = format!(
+            "sha256:{}",
+            base64::engine::general_purpose::STANDARD.encode(raw)
+        );
+        for s in [&b16, &b32, &b64] {
+            assert_eq!(
+                parse_nar_hash(s).unwrap(),
+                raw,
+                "spelling {s:?} must decode"
+            );
+        }
+        // sha512 decodes upstream but is the registered sha256-only
+        // divergence here: refused before download.
+        let sha512 = format!("sha512:{}", hex::encode([0u8; 64]));
+        assert!(matches!(
+            parse_nar_hash(&sha512),
+            Err(SubstituteError::NarInfo(m)) if m.contains("sha256-only")
+        ));
+        // No type prefix: rejected.
+        assert!(parse_nar_hash(&hex::encode(raw)).is_err());
     }
 
     // r[verify store.substitute.upstream]

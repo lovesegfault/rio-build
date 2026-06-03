@@ -169,8 +169,12 @@ Notable edges:
     )[A declared `hash` without a `hashAlgo` MUST be rejected at the parse boundary where the oracle silently drops the orphan hash on unparse (`derivations.cc:346` reads the pair only under a non-empty algo): byte-faithful round-trips are load-bearing in rio, and no honest producer emits the shape.]
 
     #r(
-      "nix.narinfo.verify-sig",
-    )[`NarInfo::verify_sig` checks each `Sig:` line against a list of trusted `name:base64(ed25519-pubkey)` keys. The fingerprint is reconstructed from `store_path`/`nar_hash`/`nar_size`/`references` (basenames re-prefixed with the store dir, sorted). Malformed keys or sigs are treated as non-matching, never errors. Returns the first matching key name or `None`.]
+      "nix.narinfo.verify-sig+1",
+    )[`NarInfo::verify_sig` checks each `Sig:` line against a list of trusted `name:base64(ed25519-pubkey)` keys. The `NarHash:` value MUST be accepted in any oracle encoding --- `Hash::parseAnyPrefixed` (`hash.cc:225-238`) length-discriminates base16/nixbase32/base64 after the algo prefix and also accepts SRI; the oracle's narinfo reader parses through exactly that function (`nar-info.cc:23-29`) --- and the fingerprint MUST canonically re-encode the hash as `sha256:<nixbase32>` per `ValidPathInfo::fingerprint` (`path-info.cc:43-50`), never echo the narinfo's own spelling: signatures always cover the canonical form, so echoing a base16 spelling would mis-verify honest upstreams. The rest of the fingerprint is reconstructed from `store_path`/`nar_size`/`references` (basenames re-prefixed with the store dir, sorted). Malformed keys, sigs, or an undecodable `NarHash` are treated as non-matching, never errors. Returns the first matching key name or `None`.]
+
+    #r(
+      "nix.divergence.narinfo-sha256-only",
+    )[A narinfo `NarHash` whose algorithm is not sha256 MUST be rejected (signature verification returns no match; the substituter refuses the narinfo before download) where the oracle's PARSER accepts any algorithm: rio's NarHash storage, fingerprint, and ingest pipeline are `[u8; 32]` SHA-256 throughout, and the oracle itself asserts sha256 on every narinfo it writes (`nar-info.cc:117` --- `assert(narHash.algo == HashAlgorithm::SHA256)`), so no compliant producer emits one. Fail-closed: a non-sha256 NarHash is refused, never coerced.]
 
     #r(
       "nix.client.set-options",
