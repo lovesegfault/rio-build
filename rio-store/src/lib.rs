@@ -260,6 +260,11 @@ pub fn describe_metrics() {
         "moka chunk cache misses"
     );
     describe_counter!(
+        "rio_store_chunk_cache_corrupt_hits_total",
+        "LRU hits whose bytes failed BLAKE3 verification (process-local corruption; \
+         the entry is invalidated and the request falls through to the backend)"
+    );
+    describe_counter!(
         "rio_store_gc_path_resurrected_total",
         "Paths skipped by sweep because a new referrer appeared between mark and sweep (race window)"
     );

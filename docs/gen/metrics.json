@@ -186,6 +186,7 @@
     "rio_scheduler_worker_disconnects_total",
     "rio_scheduler_workers_active",
     "rio_store_check_available_duration_seconds",
+    "rio_store_chunk_cache_corrupt_hits_total",
     "rio_store_chunk_cache_hits_total",
     "rio_store_chunk_cache_misses_total",
     "rio_store_chunk_dedup_ratio",
@@ -1171,6 +1172,11 @@
         "name": "rio_store_check_available_duration_seconds",
         "kind": "histogram",
         "help": "check_available wall-clock (HEAD-probe phase of FindMissingPaths). ⌈N_uncached/128⌉ × RTT plus any 429 retry sleeps. p99 informs the scheduler's MERGE_FMP_TIMEOUT."
+      },
+      {
+        "name": "rio_store_chunk_cache_corrupt_hits_total",
+        "kind": "counter",
+        "help": "LRU hits whose bytes failed BLAKE3 verification (process-local corruption; the entry is invalidated and the request falls through to the backend)"
       },
       {
         "name": "rio_store_chunk_cache_hits_total",

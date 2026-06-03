@@ -814,6 +814,13 @@
     },
     {
       "enum": "NarError",
+      "name": "RestorePathTooLong",
+      "crate": "rio-nix",
+      "msg": "restored path would be {len} bytes (max {MAX_RESTORE_PATH_LEN}, the kernel's PATH_MAX - 1)",
+      "doc": ""
+    },
+    {
+      "enum": "NarError",
       "name": "TargetTooLong",
       "crate": "rio-nix",
       "msg": "target length {0} exceeds maximum {MAX_TARGET_LEN}",
@@ -1363,7 +1370,7 @@
       "name": "Corrupt",
       "crate": "rio-store",
       "msg": "chunk {} failed BLAKE3 verification (corrupt; expected {}, got {})",
-      "doc": "BLAKE3 of the fetched bytes doesn't match the requested hash. S3 bitrot, memory corruption, or a backend bug. The corrupt bytes are NOT cached (we verify before insert)."
+      "doc": "BLAKE3 of the AUTHORITATIVE (backend) bytes doesn't match the requested hash: S3 bitrot or a backend bug — truthfully terminal (DATA_LOSS) at every reader. Process-local LRU corruption is NOT a producer: a corrupt cache hit invalidates and falls through to the backend in-request (round-17 bug_105), so this variant only ever describes the authoritative copy. The corrupt bytes are NOT cached (we verify before insert)."
     },
     {
       "enum": "ChunkError",

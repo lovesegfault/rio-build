@@ -623,9 +623,13 @@ pub enum ChunkError {
     #[error("chunk {} not found in backend (data loss if manifest claims it exists)", hex::encode(.0))]
     NotFound([u8; 32]),
 
-    /// BLAKE3 of the fetched bytes doesn't match the requested hash.
-    /// S3 bitrot, memory corruption, or a backend bug. The corrupt
-    /// bytes are NOT cached (we verify before insert).
+    /// BLAKE3 of the AUTHORITATIVE (backend) bytes doesn't match the
+    /// requested hash: S3 bitrot or a backend bug — truthfully
+    /// terminal (DATA_LOSS) at every reader. Process-local LRU
+    /// corruption is NOT a producer: a corrupt cache hit invalidates
+    /// and falls through to the backend in-request (round-17 bug_105),
+    /// so this variant only ever describes the authoritative copy.
+    /// The corrupt bytes are NOT cached (we verify before insert).
     #[error("chunk {} failed BLAKE3 verification (corrupt; expected {}, got {})",
         hex::encode(.expected), hex::encode(.expected), hex::encode(.actual))]
     Corrupt {
@@ -704,25 +708,36 @@ impl ChunkCache {
             // the cache unconditionally — means a single bit-flip
             // propagates to every subsequent GetPath until restart.
             //
-            // If verify fails, INVALIDATE the LRU entry. Otherwise corrupt
-            // bytes would stick in the cache forever — every subsequent
-            // get_verified for this hash would return the same error.
-            // Invalidating forces the next call to re-fetch from the
-            // backend (which might have intact bytes).
+            // If verify fails: INVALIDATE the entry and FALL THROUGH to
+            // the backend fetch below, in THIS request. The one failure
+            // mode this arm exists for is a process-local bit-flip in
+            // the cached copy — the designed recovery is a re-fetch
+            // (verify-on-get: "corrupt chunks are re-fetched from S3 on
+            // cache corruption"), and the backend fetch is right here.
+            // The old shape returned `Corrupt` (DATA_LOSS-class,
+            // documented "retrying is pointless" at every reader) after
+            // performing the invalidation FOR the retry it then told
+            // callers not to make (round-17 bug_105). A genuinely
+            // corrupt BACKEND object still surfaces as `Corrupt` from
+            // the Layer-3 verify below — `Corrupt` now truthfully means
+            // "the authoritative copy is bad", terminal at every
+            // producer.
+            // r[impl store.integrity.verify-on-get]
             match Self::verify(hash, bytes) {
                 Ok(v) => return Ok(v),
                 Err(e) => {
+                    metrics::counter!("rio_store_chunk_cache_corrupt_hits_total").increment(1);
                     tracing::warn!(
                         hash = %hex::encode(hash),
                         error = %e,
-                        "LRU hit failed verification — invalidating entry"
+                        "LRU hit failed verification — invalidating and re-fetching from backend"
                     );
                     self.lru.invalidate(hash).await;
-                    return Err(e);
                 }
             }
+        } else {
+            metrics::counter!("rio_store_chunk_cache_misses_total").increment(1);
         }
-        metrics::counter!("rio_store_chunk_cache_misses_total").increment(1);
 
         // --- Layer 2: Singleflight ---
         let fetched = self.singleflight_fetch(hash).await?;
@@ -1126,12 +1141,17 @@ mod cache_tests {
         assert!(matches!(second, Err(ChunkError::NotFound(_))));
     }
 
-    /// Corrupt bytes in the LRU must be INVALIDATED on verify failure.
-    /// Otherwise a bit-flip in cached bytes would stick forever — every
-    /// subsequent get_verified would return the same error. Invalidating
-    /// forces a re-fetch from the backend.
+    /// Process-local LRU corruption is recovered IN-REQUEST: the
+    /// corrupt entry is invalidated and the SAME call falls through to
+    /// the backend, whose intact bytes are served and re-cached. The
+    /// pre-fix shape returned `Corrupt` (DATA_LOSS-class, "retrying is
+    /// pointless" at every reader) after invalidating FOR the retry it
+    /// told callers not to make — a bit-flip terminally failed a
+    /// servable request (round-17 bug_105; the spec's verify-on-get
+    /// already mandated the re-fetch).
+    // r[verify store.integrity.verify-on-get]
     #[tokio::test]
-    async fn lru_invalidated_on_corrupt_hit() {
+    async fn lru_corrupt_hit_recovers_in_request() {
         let (backend, cache) = make_cache();
         let (hash, good_data) = sample_chunk();
 
@@ -1148,24 +1168,56 @@ mod cache_tests {
             .await;
         cache.lru.run_pending_tasks().await;
 
-        // First call: LRU hit → verify fails → Err(Corrupt). This
-        // ALSO invalidates the entry.
-        let first = cache.get_verified(&hash).await;
-        assert!(
-            matches!(first, Err(ChunkError::Corrupt { .. })),
-            "first call should fail verification (corrupt LRU bytes)"
+        // THE KEY ASSERTION (inverted from the pre-fix pin): the FIRST
+        // call already succeeds — invalidate, fall through, serve the
+        // backend's intact bytes.
+        let first = cache.get_verified(&hash).await.expect(
+            "the corrupt-hit request itself must recover via the \
+             backend fall-through",
         );
+        assert_eq!(first, good_data, "served bytes are the backend's");
 
-        // THE KEY ASSERTION: second call should SUCCEED (entry was
-        // invalidated → cache miss → re-fetch from backend → good
-        // data). Without invalidation, this would return the SAME error.
-        let second = cache.get_verified(&hash).await.expect(
-            "second call should succeed — LRU entry should have \
-             been invalidated on the first verify failure",
-        );
-        assert_eq!(
-            second, good_data,
-            "second call should fetch fresh good data from backend"
+        // And the recovery re-cached the good bytes: a second call is
+        // a clean LRU hit (corrupting the backend afterwards proves
+        // the second call never re-fetches — a re-fetch would fail
+        // layer-3 verification).
+        backend.corrupt_for_test(&hash, Bytes::from_static(b"DELETED"));
+        let second = cache
+            .get_verified(&hash)
+            .await
+            .expect("second call is a clean LRU hit of the re-cached bytes");
+        assert_eq!(second, good_data);
+    }
+
+    /// `Corrupt` is now truthfully terminal at every producer: when
+    /// the AUTHORITATIVE (backend) copy is corrupt, the in-request
+    /// fall-through still ends in `Corrupt` from the layer-3 verify —
+    /// the LRU recovery path cannot launder backend corruption.
+    // r[verify store.integrity.verify-on-get]
+    #[tokio::test]
+    async fn backend_corruption_still_terminal_after_lru_fallthrough() {
+        let (backend, cache) = make_cache();
+        let (hash, good_data) = sample_chunk();
+
+        // Backend holds CORRUPT bytes for this hash.
+        backend
+            .put(&hash, Bytes::from_static(b"authoritative copy is bad"))
+            .await
+            .unwrap();
+        let _ = good_data;
+
+        // LRU also corrupt: the fall-through reaches the backend and
+        // must STILL fail closed.
+        cache
+            .lru
+            .insert(hash, Bytes::from_static(b"bit-flipped garbage"))
+            .await;
+        cache.lru.run_pending_tasks().await;
+
+        let err = cache.get_verified(&hash).await.unwrap_err();
+        assert!(
+            matches!(err, ChunkError::Corrupt { .. }),
+            "backend corruption surfaces as Corrupt from the layer-3 verify: {err:?}"
         );
     }
 
