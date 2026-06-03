@@ -503,7 +503,28 @@ the only one among the failure classes (infra, timeout, disconnect, and
 backstop requeues are immediate) --- the asymmetry is recorded in the
 invariant map as a Phase-1 policy decision, not specified away here.
 
-#r("sched.retry.attempts-bounded+2")[
+#r("sched.retry.store-degraded-uncharged")[
+  An infrastructure failure carrying the builder's
+  `BuildResult.store_degraded` flag
+  (#rref("builder.outcome.store-degraded")) MUST be recorded with the
+  dedicated `store_degraded` outcome class and MUST be uncharged: the
+  fold advances no transient/infra/timeout/poison counter, records no
+  `failed_builders` exclusion, and never produces a poison verdict from
+  such rows; the verdict MUST be a requeue paced by the derivation
+  backoff curve computed from the consecutive run of store-degraded
+  rows (`backoff_until = at + backoff(run)`, run reset by any other
+  folded event), so a correlated store outage is waited out at the
+  backoff cap instead of draining budgets fleet-wide or excluding
+  healthy nodes.
+] The class is attributable to the STORE, not to the build or the node:
+charging any per-derivation or per-executor budget would convert a long
+store outage into poison verdicts and fleet-wide exclusion churn — the
+exact amplification the heartbeat-era capacity flag absorbed and the 1d
+collapse traded away (see the builder spec's retired-block note). The
+pacing bound (#rref("sched.retry.attempts-bounded+3")'s carve-out) is
+the breaker's own evidence threshold compounded with the backoff cap.
+
+#r("sched.retry.attempts-bounded+3")[
   Every failure-driven retry loop MUST be bounded: every counted attempt
   charges at least one of the named budgets --- the per-cycle transient
   count (`max_retries`), the non-exempt infrastructure count
@@ -513,7 +534,12 @@ invariant map as a Phase-1 policy decision, not specified away here.
   resubmit count (`POISON_RESUBMIT_RETRY_LIMIT`) --- every budget has a
   finite cap whose exhaustion produces a terminal state (`Poisoned` or
   `Cancelled`), no single attempt charges the same budget more than once,
-  and an attempt exempted from one budget MUST be charged to another.
+  and an attempt exempted from one budget MUST be charged to another,
+  with exactly one carve-out: a `store_degraded` attempt
+  (#rref("sched.retry.store-degraded-uncharged")) charges no count
+  budget BY DESIGN and is bounded by pacing instead --- the backoff
+  curve over its consecutive run, capped at `backoff_max_secs`, behind
+  the breaker's own evidence threshold.
 ]
 The budget values are configuration (`[retry]` / `[poison]` tables above),
 not normative numbers. The two clauses that bite: an attempt charged to no

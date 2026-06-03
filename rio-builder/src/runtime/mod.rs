@@ -152,6 +152,13 @@ pub struct BuildSpawnContext {
     /// `Arc<Mutex<Option<..>>>` so the struct stays `Clone` (shared
     /// slot; second `take()` on any clone sees `None`).
     pub hw_bench: HwBenchHandle,
+    /// The FUSE fetch circuit breaker (same `Arc` `NixStoreFs` holds).
+    /// Read-only here: `spawn_build_task` snapshots `trip_count()` at
+    /// build start and the completion stamp marks the report
+    /// store-degraded when the breaker is open at completion OR
+    /// tripped during the build (bug_408 — the mid-build signal a
+    /// one-shot pod's fresh-closed breaker would otherwise hide).
+    pub fuse_circuit: Arc<crate::fuse::circuit::CircuitBreaker>,
 }
 
 impl BuildSpawnContext {
@@ -172,7 +179,11 @@ impl BuildSpawnContext {
     /// dir is gone and `dqb_curspace` ≈ 0. `None` on the Err path
     /// (no `ExecutionResult`); `final_sample` then returns `prev`'s
     /// reporter-loop value, which is the best available.
-    fn completion_stamp(&self, peak_disk_bytes: Option<u64>) -> result::CompletionStamp {
+    fn completion_stamp(
+        &self,
+        peak_disk_bytes: Option<u64>,
+        circuit_trips_at_spawn: u64,
+    ) -> result::CompletionStamp {
         let prev = *self.resources.read().unwrap_or_else(|e| e.into_inner());
         result::CompletionStamp {
             node_name: self.node_name.clone(),
@@ -186,6 +197,14 @@ impl BuildSpawnContext {
                 peak_disk_bytes,
                 prev,
             )),
+            // bug_408: degraded = open RIGHT NOW (the build very likely
+            // failed on EIO from the open breaker) OR tripped during
+            // this build (open-then-auto-closed — the 30s auto-close
+            // beats most build durations, so the point-in-time check
+            // alone under-reports). The stamp is advisory data; the
+            // assembly fns apply it only to InfrastructureFailure.
+            store_degraded: self.fuse_circuit.is_open()
+                || self.fuse_circuit.trip_count() > circuit_trips_at_spawn,
         }
     }
 }
@@ -295,6 +314,8 @@ pub async fn spawn_build_task(
     let drv_path = assignment.drv_path.clone();
     let assignment_token = assignment.assignment_token.clone();
     let traceparent = assignment.traceparent.clone();
+    // bug_408: window the breaker's trip counter to THIS build.
+    let circuit_trips_at_spawn = ctx.fuse_circuit.trip_count();
 
     // ADR-023 phase-10: now that we have an assignment token, harvest
     // the resolve→bench task (spawned at init, runs concurrently with
@@ -376,6 +397,7 @@ pub async fn spawn_build_task(
     let panic_node_name = ctx.node_name.clone();
     let panic_hw_class = Arc::clone(&ctx.hw_class);
     let panic_resources = Arc::clone(&ctx.resources);
+    let panic_circuit = Arc::clone(&ctx.fuse_circuit);
 
     // The spawned task needs 'static; clone the whole context once and
     // move it in. ExecutorEnv is built INSIDE the task from the owned
@@ -652,7 +674,7 @@ pub async fn spawn_build_task(
             }
         }
 
-        let stamp = ctx.completion_stamp(peak_disk_bytes);
+        let stamp = ctx.completion_stamp(peak_disk_bytes, circuit_trips_at_spawn);
         let mut completion = match result {
             Ok(exec_result) => ok_completion(exec_result, stamp),
             Err(e) => err_completion(
@@ -704,6 +726,8 @@ pub async fn spawn_build_task(
                         node_name: panic_node_name,
                         hw_class,
                         final_resources,
+                        store_degraded: panic_circuit.is_open()
+                            || panic_circuit.trip_count() > circuit_trips_at_spawn,
                     },
                 ),
             )

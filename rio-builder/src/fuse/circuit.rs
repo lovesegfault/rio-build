@@ -30,7 +30,7 @@
 use std::sync::Mutex;
 
 use crate::IgnorePoison;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fuser::Errno;
@@ -107,6 +107,17 @@ pub struct CircuitBreaker<C: Clock = SystemClock> {
     /// the store). Flips to `Some` on first `record(true)`.
     last_success: Mutex<Option<Instant>>,
 
+    /// Monotonic count of OPEN transitions (both trip conditions:
+    /// the consecutive-failure threshold in `record()` and the
+    /// wall-clock trip in `check()`). Never reset — consumers diff it
+    /// across a window: `spawn_build_task` snapshots it at build start
+    /// and the completion stamp compares (`trip_count() > at_spawn` =
+    /// "the store degraded DURING this build"), which catches the
+    /// open-then-auto-closed window a point-in-time `is_open()` misses
+    /// (bug_408: a fresh-closed breaker on a one-shot pod defeats a
+    /// pre-pull check).
+    trips: AtomicU64,
+
     threshold: u32,
     auto_close_after: Duration,
     wall_clock_trip: Duration,
@@ -135,6 +146,7 @@ impl<C: Clock> CircuitBreaker<C> {
             consecutive_failures: AtomicU32::new(0),
             open: Mutex::new(OpenState::default()),
             last_success: Mutex::new(None),
+            trips: AtomicU64::new(0),
             threshold,
             auto_close_after,
             wall_clock_trip,
@@ -194,6 +206,7 @@ impl<C: Clock> CircuitBreaker<C> {
             // Re-check under lock: another thread may have opened.
             if guard.since.is_none() {
                 guard.since = Some(now);
+                self.trips.fetch_add(1, Ordering::Relaxed);
                 metrics::gauge!("rio_builder_fuse_circuit_open").set(1.0);
                 tracing::warn!(
                     since_last_success = ?now.duration_since(t),
@@ -276,6 +289,7 @@ impl<C: Clock> CircuitBreaker<C> {
                     .is_some_and(|t| now.duration_since(t) < self.auto_close_after);
                 guard.since = Some(now);
                 if !already_open {
+                    self.trips.fetch_add(1, Ordering::Relaxed);
                     metrics::gauge!("rio_builder_fuse_circuit_open").set(1.0);
                     tracing::warn!(
                         consecutive_failures = n,
@@ -294,6 +308,13 @@ impl<C: Clock> CircuitBreaker<C> {
     ///
     /// Doesn't mutate — the stale `open_since` is cleaned up lazily on
     /// the next `record(true)`.
+    /// Monotonic count of open transitions since process start (both
+    /// trip conditions). See the field doc — consumers diff across a
+    /// window rather than reading the instantaneous state.
+    pub fn trip_count(&self) -> u64 {
+        self.trips.load(Ordering::Relaxed)
+    }
+
     pub fn is_open(&self) -> bool {
         self.open
             .lock()
@@ -337,6 +358,36 @@ mod tests {
             DEFAULT_WALL_CLOCK_TRIP,
             MockClock::new(),
         )
+    }
+
+    /// bug_408: `trip_count()` is monotonic across open transitions —
+    /// both trip conditions — and never resets, so a build window can
+    /// detect an open-then-auto-closed breaker by diffing. Pre-fix red:
+    /// compile-level (no `trip_count` existed; the only observable was
+    /// the point-in-time `is_open()`, which under-reports by design).
+    #[test]
+    fn trip_count_rises_on_every_open_transition() {
+        let b = breaker();
+        assert_eq!(b.trip_count(), 0);
+        // Threshold open.
+        for _ in 0..5 {
+            b.record(false);
+        }
+        assert!(b.is_open());
+        assert_eq!(b.trip_count(), 1);
+        // Failures while open refresh the timer, NOT the count.
+        b.record(false);
+        assert_eq!(b.trip_count(), 1);
+        // Recover, then wall-clock trip (b): success, idle past the
+        // trip with one failure since.
+        b.record(true);
+        assert_eq!(b.trip_count(), 1, "close is not a trip");
+        b.clock
+            .advance(DEFAULT_WALL_CLOCK_TRIP + Duration::from_secs(1));
+        b.record(false); // one failure since last success (the gate)
+        assert_eq!(b.trip_count(), 1, "single failure below threshold");
+        assert!(b.check().is_err(), "wall-clock trip opens");
+        assert_eq!(b.trip_count(), 2);
     }
 
     // ── Trip condition (a): consecutive-failure threshold ─────────────

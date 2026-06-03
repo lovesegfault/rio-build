@@ -284,7 +284,7 @@ pub(crate) fn classify(event: &ObservedFailure<'_>, floor: FloorOutcomeView) -> 
 }
 
 // r[verify sched.retry.transient-budget+2]
-// r[verify sched.retry.attempts-bounded+2]
+// r[verify sched.retry.attempts-bounded+3]
 // r[verify sched.retry.counters-refine-history+2]
 #[cfg(test)]
 mod tests {

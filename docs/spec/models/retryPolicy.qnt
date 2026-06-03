@@ -412,7 +412,7 @@ module retryPolicy {
   const MAX_TIME: int
   /// Ceiling on physical attempts (action precondition on dispatch).
   const MAX_ATTEMPTS: int
-  /// The bound the boundedness clause of sched.retry.attempts-bounded+2
+  /// The bound the boundedness clause of sched.retry.attempts-bounded+3
   /// justifies for the regime's enabled alphabet (only consulted by
   /// attemptsBoundedGlobal). Post-collapse this is a HOLD bound in the
   /// crash regime: budget-justified charges plus the bounded
@@ -442,7 +442,7 @@ module retryPolicy {
   const ENABLE_MATERIALIZATION: bool
 
   // Scaled budget (the production values are configuration, not
-  // normative numbers -- sched.retry.attempts-bounded+2). The scaling
+  // normative numbers -- sched.retry.attempts-bounded+3). The scaling
   // keeps every cap reachable in a small state space; the witnesses
   // prove each scaled cap is still reached.
   pure val MAX_RETRIES = 2          // RetryPolicy.max_retries
@@ -832,7 +832,7 @@ module retryPolicy {
     dStatus == DCancelled implies specVerdict == VCancel,
   }
 
-  /// sched.retry.attempts-bounded+2, the per-event clauses: a single
+  /// sched.retry.attempts-bounded+3, the per-event clauses: a single
   /// accounting observation never charges the same budget twice, and the
   /// charge-or-terminal discipline is total over the post-collapse event
   /// alphabet (the Stage-B clause-coverage audit's narrowing is closed):
@@ -854,7 +854,7 @@ module retryPolicy {
     (last.kind == OE5) implies not(last.chargedAny),
   }
 
-  /// sched.retry.attempts-bounded+2, the boundedness clause: the number
+  /// sched.retry.attempts-bounded+3, the boundedness clause: the number
   /// of physical attempts is bounded by what the enabled budgets
   /// justify (ATTEMPT_BOUND is a regime constant). Post-collapse this
   /// HOLDS in the crash regime: every crash is established and charged

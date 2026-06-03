@@ -353,6 +353,13 @@ message BuildResult {
   google.protobuf.Timestamp start_time = 4;
   google.protobuf.Timestamp stop_time = 5;
   repeated BuiltOutput built_outputs = 6;  // Realized output paths with hashes
+  // bug_408: set (with status=INFRASTRUCTURE_FAILURE only) when the
+  // builder's FUSE store breaker was open at completion or tripped
+  // during the build — "the store was degraded; wait it out, don't
+  // charge the build". Absent/false = an ordinary infra failure.
+  // proto3 bool: absence is indistinguishable from false BY DESIGN —
+  // an old builder simply never claims the exemption (safe default).
+  bool store_degraded = 7;
 }
 
 // A single realized output from a build.

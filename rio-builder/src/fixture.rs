@@ -102,6 +102,7 @@ pub fn scripted_result(
             built_outputs: Vec::new(),
             start_time: Some(start.into()),
             stop_time: Some(stop.into()),
+            store_degraded: false,
         },
         assignment_token: assignment_token.to_string(),
         peak_memory_bytes: o.peak_mem,

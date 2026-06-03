@@ -339,7 +339,25 @@ establishment sweep (#rref("sched.attempt.establishment-window")), and there
 is no scheduler-side capacity state left for a degraded-store flag to gate —
 the FUSE circuit breaker (#rref("builder.fuse.circuit-breaker+3")) still
 fails the affected build fast, and the resulting infra-classed outcome
-reaches the scheduler through the normal report/retry path.
+reaches the scheduler through the normal report/retry path. The retirement
+traded away "wait out the outage": a correlated store outage turned every
+affected build into an ordinary chargeable infra failure, draining retry
+budgets fleet-wide and, at the infra-window edge, reaching poison — the
+fleet-amplification trade-off the heartbeat-era flag had absorbed. The
+successor restores the signal AT CLASSIFICATION instead of as capacity
+state (bug_408): the breaker's verdict rides the completion report.
+
+#r("builder.outcome.store-degraded")[
+  A `CompletionReport` whose status is `INFRASTRUCTURE_FAILURE` MUST carry
+  `BuildResult.store_degraded = true` when the FUSE circuit breaker is
+  open at completion time or its monotonic trip count rose during the
+  build, and MUST NOT carry the flag for any other status or for an
+  infra failure with no breaker evidence.
+] The during-the-build half (trip-count delta, not a point-in-time
+`is_open()`) is what catches the open-then-auto-closed window: the 30s
+auto-close beats most build durations, and a one-shot pod's breaker is
+always fresh-closed at spawn. The scheduler routes the flagged class to
+an uncharged backoff requeue (#rref("sched.retry.store-degraded-uncharged")).
 
 - `open`: Open the already-materialized local file (fast path, since `lookup`
   fetched the tree). Falls back to `ensure_cached()` on ENOENT. With

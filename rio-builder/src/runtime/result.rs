@@ -25,6 +25,23 @@ pub(super) struct CompletionStamp {
     /// Cgroup-poll snapshot at completion time. `None` only if the
     /// caller has no `ResourceSnapshotHandle` (panic-catcher fallback).
     pub final_resources: Option<ResourceUsage>,
+    /// bug_408: the FUSE breaker's verdict for THIS build (open at
+    /// completion, or tripped during the build). Advisory — the
+    /// assembly fns stamp `BuildResult.store_degraded` from it ONLY
+    /// when the status is `InfrastructureFailure`: the flag is a
+    /// classification refinement of an infra failure ("the store was
+    /// degraded, wait it out"), never a verdict of its own.
+    pub store_degraded: bool,
+}
+
+// r[impl builder.outcome.store-degraded]
+/// bug_408: stamp `store_degraded` onto an assembled `ProtoBuildResult`
+/// iff the status is `InfrastructureFailure`. The single chokepoint all
+/// three assembly paths (ok/err/panic) route through, so a status added
+/// later cannot silently carry the flag.
+fn apply_store_degraded(result: &mut ProtoBuildResult, stamp_degraded: bool) {
+    result.store_degraded =
+        stamp_degraded && result.status == i32::from(BuildResultStatus::InfrastructureFailure);
 }
 
 /// Map a successful `ExecutionResult` to its `CompletionReport`. Resource
@@ -32,9 +49,11 @@ pub(super) struct CompletionStamp {
 /// `r.fixture_resources` (test-fixtures only) overrides the cgroup-poll
 /// snapshot so scripted builds can inject `cpu_limit_cores`/`cpu_seconds`.
 pub(super) fn ok_completion(r: ExecutionResult, stamp: CompletionStamp) -> CompletionReport {
+    let mut result = r.result;
+    apply_store_degraded(&mut result, stamp.store_degraded);
     CompletionReport {
         drv_path: r.drv_path,
-        result: Some(r.result),
+        result: Some(result),
         assignment_token: r.assignment_token,
         peak_memory_bytes: r.peak_memory_bytes,
         peak_cpu_cores: r.peak_cpu_cores,
@@ -92,17 +111,19 @@ pub(super) fn err_completion(
         tracing::error!(drv_path = %drv_path, error = %e, "build execution failed");
         BuildResultStatus::InfrastructureFailure
     };
+    let mut result = ProtoBuildResult {
+        status: status.into(),
+        error_msg: if was_cancelled {
+            "cancelled by scheduler".into()
+        } else {
+            e.to_string()
+        },
+        ..Default::default()
+    };
+    apply_store_degraded(&mut result, stamp.store_degraded);
     CompletionReport {
         drv_path,
-        result: Some(ProtoBuildResult {
-            status: status.into(),
-            error_msg: if was_cancelled {
-                "cancelled by scheduler".into()
-            } else {
-                e.to_string()
-            },
-            ..Default::default()
-        }),
+        result: Some(result),
         assignment_token,
         // r[impl builder.cgroup.memory-peak+2]
         // 0 only for pre-cgroup setup errors (drv parse, WrongKind,
@@ -131,13 +152,15 @@ pub(super) fn panic_completion(
     assignment_token: String,
     stamp: CompletionStamp,
 ) -> CompletionReport {
+    let mut result = ProtoBuildResult {
+        status: BuildResultStatus::InfrastructureFailure.into(),
+        error_msg: "worker build task panicked".into(),
+        ..Default::default()
+    };
+    apply_store_degraded(&mut result, stamp.store_degraded);
     CompletionReport {
         drv_path,
-        result: Some(ProtoBuildResult {
-            status: BuildResultStatus::InfrastructureFailure.into(),
-            error_msg: "worker build task panicked".into(),
-            ..Default::default()
-        }),
+        result: Some(result),
         assignment_token,
         // Panic = no telemetry path (panic-catcher has no ExecuteOutcome
         // in scope; the build task's stack is gone). 0 = no-signal.
@@ -248,7 +271,68 @@ mod tests {
             node_name: None,
             hw_class: None,
             final_resources: None,
+            store_degraded: false,
         }
+    }
+
+    fn degraded_stamp() -> CompletionStamp {
+        CompletionStamp {
+            store_degraded: true,
+            ..stamp()
+        }
+    }
+
+    // r[verify builder.outcome.store-degraded]
+    /// The stamp chokepoint marks `store_degraded` iff the status is
+    /// `InfrastructureFailure` AND the breaker verdict was set: a
+    /// transient (build-ran) failure with an open breaker stays false
+    /// (the build's own exit is attributable), and an infra failure
+    /// with a healthy breaker stays false (no degraded-store evidence).
+    /// Pre-fix red: compile-level — neither `BuildResult.store_degraded`
+    /// nor `CompletionStamp::store_degraded` existed, so the misclass
+    /// (degraded-store EIO folded as chargeable WorkerInfra) was the
+    /// only expressible shape.
+    #[test]
+    fn store_degraded_stamps_infra_failures_only() {
+        let cases = [
+            (BuildResultStatus::InfrastructureFailure, true, true),
+            (BuildResultStatus::InfrastructureFailure, false, false),
+            (BuildResultStatus::TransientFailure, true, false),
+            (BuildResultStatus::Built, true, false),
+            (BuildResultStatus::Cancelled, true, false),
+        ];
+        for (status, degraded, want) in cases {
+            let mut result = ProtoBuildResult {
+                status: status.into(),
+                ..Default::default()
+            };
+            apply_store_degraded(&mut result, degraded);
+            assert_eq!(
+                result.store_degraded, want,
+                "status={status:?} degraded={degraded}"
+            );
+        }
+    }
+
+    /// `err_completion` routes through the chokepoint: a non-permanent
+    /// executor error under a degraded-store stamp carries the flag.
+    #[test]
+    fn err_completion_carries_store_degraded() {
+        let report = err_completion(
+            &ExecutorError::CgroupOom,
+            "/nix/store/x.drv".into(),
+            "tok".into(),
+            false,
+            degraded_stamp(),
+            0,
+            0.0,
+        );
+        let result = report.result.unwrap();
+        assert_eq!(
+            result.status,
+            i32::from(BuildResultStatus::InfrastructureFailure)
+        );
+        assert!(result.store_degraded);
     }
 
     /// r[verify builder.cgroup.memory-peak+2]

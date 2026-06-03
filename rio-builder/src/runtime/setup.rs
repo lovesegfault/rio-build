@@ -165,7 +165,7 @@ pub async fn setup(
         }
     }
 
-    let (fuse_session, _fuse_circuit) = crate::fuse::mount_fuse_background(
+    let (fuse_session, fuse_circuit) = crate::fuse::mount_fuse_background(
         &cfg.fuse_mount_point,
         cache,
         store_clients.clone(),
@@ -238,6 +238,9 @@ pub async fn setup(
         // task if the bench is still running). Before then, `None` —
         // the documented "unknown hw" semantics.
         hw_class: Arc::new(std::sync::Mutex::new(None)),
+        // bug_408: same Arc as the FUSE mount — completion stamps read
+        // is_open()/trip_count() to mark store-degraded infra failures.
+        fuse_circuit,
         // Completion reads the snapshot the cgroup poller has been
         // maintaining.
         resources: resource_snapshot,

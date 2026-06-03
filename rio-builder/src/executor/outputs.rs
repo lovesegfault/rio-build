@@ -276,6 +276,9 @@ pub(super) async fn collect_outputs(
                     start_time: to_proto_ts(build_result.start_time),
                     stop_time: to_proto_ts(build_result.stop_time),
                     built_outputs,
+                    // Built is never store-degraded; the stamp chokepoint
+                    // (`apply_store_degraded`) only marks infra failures.
+                    store_degraded: false,
                 },
             })
         }

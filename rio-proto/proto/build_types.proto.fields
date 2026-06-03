@@ -43,6 +43,7 @@ WorkAssignment assignment = 1;
 bool cancelled = 1;
 bool is_fixed_output = 8;
 bool keep_going = 8;
+bool store_degraded = 7;
 bytes drv_content = 2;
 bytes output_hash = 3;
 double peak_cpu_cores = 6;
