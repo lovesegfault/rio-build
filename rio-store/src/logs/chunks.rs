@@ -413,7 +413,7 @@ pub struct FilesystemLogChunkStore {
 
 impl FilesystemLogChunkStore {
     /// Create the root directory (and parents) if absent, and fsync it
-    /// so the dirent chain of every later [`durable_put`] ends at a
+    /// so the dirent chain of every later `durable_put` ends at a
     /// durable directory.
     // r[impl store.log.chunk-dirent-durable]
     pub fn new(root: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {

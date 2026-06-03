@@ -1,19 +1,23 @@
-# Builder/fetcher → store L7 allow-list (bug_290): untrusted build
-# pods may call exactly the data-plane RPCs a build needs on
-# rio-store:9002 — and TailLog (tenant log reads) is deliberately
-# ABSENT from the list, so build-log content is unreachable from
-# builder pods even with a leaked tenant token.
+# Builder/fetcher → store edge posture (bug_290): build-log READS are
+# unreachable from untrusted build pods. The enforcing control is the
+# store's per-method credential-class layer — TailLog requires
+# verified tenant claims (rio-store/src/authz.rs,
+# store.log.method-credential), and worker pods hold assignment
+# tokens, not tenant tokens.
+#
+# The network leg is L4 endpoint scoping ONLY, deliberately: an L7
+# HTTP allow-list on this edge redirects the worker's gRPC data plane
+# through Cilium's embedded-envoy proxy, which breaks uploads in the
+# supported k3s/Cilium configuration (vm-fetcher-split-k3s pinned the
+# regression: FOD upload starves, dispatch never progresses).
 #
 # (documentary — .sh is not tracey-scanned; the normative rule is
 # store.log.method-credential. This fragment is the merge-gate render
-# proof of the rule's chart half: the L7 rules exist, AppendLog is
-# present, TailLog is not.)
-#
-# Cilium enforces gRPC at L7 as HTTP/2 POSTs to /pkg.Service/Method;
-# adding `rules.http` to the store toPorts entry switches that edge to
-# the L7 proxy. The render assertions below pin both directions:
-# losing the rules block entirely (silent L4 fallback = TailLog
-# reachable again) AND accidentally allow-listing TailLog both fail.
+# proof of the chart half: the builder/fetcher → store:9002 edge
+# exists, is endpoint-scoped, and carries NO L7 rules — the silent
+# reintroduction of an L7 block (which would re-break the data plane)
+# and the loss of the edge entirely (which would break builds at L4)
+# both fail here.)
 
 out=$TMPDIR/builder-l7.yaml
 helm template rio . --set global.image.tag=test >"$out"
@@ -25,24 +29,22 @@ for policy in builder-egress fetcher-egress; do
     exit 1
   }
 
-  # The store:9002 egress entry must carry an L7 http rules block.
-  l7=$(echo "$doc" | yq -N '.spec.egress[] | select(.toPorts[0].ports[0].port=="9002" and (.toEndpoints[0].matchLabels["k8s:app.kubernetes.io/name"]=="rio-store")) | .toPorts[0].rules.http')
-  if [ -z "$l7" ] || [ "$l7" = "null" ]; then
-    echo "FAIL: $policy store:9002 entry has no L7 http rules — TailLog is reachable at L4" >&2
+  # The store:9002 egress entry must exist (endpoint-scoped to rio-store).
+  edge=$(echo "$doc" | yq -N '.spec.egress[] | select(.toPorts[0].ports[0].port=="9002" and (.toEndpoints[0].matchLabels["k8s:app.kubernetes.io/name"]=="rio-store"))')
+  if [ -z "$edge" ] || [ "$edge" = "null" ]; then
+    echo "FAIL: $policy lost its store:9002 edge — builds cannot upload" >&2
     exit 1
   fi
 
-  # AppendLog present (builds must still upload logs).
-  echo "$l7" | grep -q '/rio.store.LogService/AppendLog' || {
-    echo "FAIL: $policy L7 list is missing AppendLog — builds could not upload logs" >&2
-    exit 1
-  }
-
-  # TailLog absent — THE property this fragment exists to pin.
-  if echo "$l7" | grep -q '/rio.store.LogService/TailLog'; then
-    echo "FAIL: $policy L7 list allow-lists TailLog — builder pods could read build logs" >&2
+  # The edge must NOT carry an L7 rules block (the embedded-envoy
+  # data-plane breakage class; see the header).
+  l7=$(echo "$edge" | yq -N '.toPorts[0].rules')
+  if [ -n "$l7" ] && [ "$l7" != "null" ]; then
+    echo "FAIL: $policy store:9002 edge carries L7 rules — this broke the" >&2
+    echo "      gRPC data plane under embedded-envoy (vm-fetcher-split-k3s);" >&2
+    echo "      TailLog denial belongs to the authz layer, not netpol" >&2
     exit 1
   fi
 done
 
-echo "OK: builder/fetcher store L7 allow-lists carry AppendLog and exclude TailLog"
+echo "PASS: builder/fetcher store:9002 edges are L4 endpoint-scoped, no L7 rules"

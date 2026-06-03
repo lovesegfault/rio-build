@@ -69,34 +69,22 @@ spec:
             k8s:app.kubernetes.io/name: rio-scheduler
       toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
     # Store: GetPath inputs, PutPath outputs, AppendLog log ingest.
-    # L7 allow-list (bug_290): untrusted builders may call exactly the
-    # data-plane RPCs a build needs — TailLog is deliberately ABSENT,
-    # so build-log reads are unreachable from builder pods even with a
-    # leaked token. Pinned by nix/tests/helm/29-builder-l7-log-allowlist.sh.
+    # L4 scoping only, DELIBERATELY (bug_290): an L7 HTTP allow-list on
+    # this edge redirects the worker's gRPC data plane through Cilium's
+    # embedded-envoy proxy, which breaks uploads in the supported
+    # k3s/Cilium configuration (vm-fetcher-split-k3s is the regression
+    # pin: FOD upload starves, dispatch never progresses). Build-log
+    # READS are still unreachable from builder pods: TailLog's
+    # credential class is verified-tenant-JWT (rio-store/src/authz.rs,
+    # store.log.method-credential) and worker pods hold assignment
+    # tokens, not tenant tokens — the authorization layer, not the
+    # network layer, is the enforcing control. Pinned by
+    # nix/tests/helm/29-builder-l7-log-allowlist.sh.
     - toEndpoints:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
             k8s:app.kubernetes.io/name: rio-store
-      toPorts:
-        - ports: [{port: "9002", protocol: TCP}]
-          rules:
-            http:
-              - method: "POST"
-                path: "/rio.store.StoreService/PutPath"
-              - method: "POST"
-                path: "/rio.store.StoreService/PutPathBatch"
-              - method: "POST"
-                path: "/rio.store.StoreService/GetPath"
-              - method: "POST"
-                path: "/rio.store.StoreService/QueryPathInfo"
-              - method: "POST"
-                path: "/rio.store.StoreService/BatchQueryPathInfo"
-              - method: "POST"
-                path: "/rio.store.StoreService/BatchGetManifest"
-              - method: "POST"
-                path: "/rio.store.StoreService/FindMissingPaths"
-              - method: "POST"
-                path: "/rio.store.LogService/AppendLog"
+      toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
     {{- with .Values.networkPolicy.builderS3Cidr }}
     # S3 VPC endpoint CIDR — builder reads chunks via presigned URL.
     # toCIDR (not toEndpoints) — S3 endpoint is outside the cluster.
@@ -150,31 +138,14 @@ spec:
             k8s:io.kubernetes.pod.namespace: {{ $ns.system.name }}
             k8s:app.kubernetes.io/name: rio-scheduler
       toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
-    # Same L7 allow-list as the builder copy above (TailLog absent).
+    # Same L4-only posture as the builder copy above (see that
+    # comment: TailLog denial is the authz layer's job; L7 here breaks
+    # the gRPC data plane under embedded-envoy).
     - toEndpoints:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
             k8s:app.kubernetes.io/name: rio-store
-      toPorts:
-        - ports: [{port: "9002", protocol: TCP}]
-          rules:
-            http:
-              - method: "POST"
-                path: "/rio.store.StoreService/PutPath"
-              - method: "POST"
-                path: "/rio.store.StoreService/PutPathBatch"
-              - method: "POST"
-                path: "/rio.store.StoreService/GetPath"
-              - method: "POST"
-                path: "/rio.store.StoreService/QueryPathInfo"
-              - method: "POST"
-                path: "/rio.store.StoreService/BatchQueryPathInfo"
-              - method: "POST"
-                path: "/rio.store.StoreService/BatchGetManifest"
-              - method: "POST"
-                path: "/rio.store.StoreService/FindMissingPaths"
-              - method: "POST"
-                path: "/rio.store.LogService/AppendLog"
+      toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
     # Public internet on 80/443. `world` entity = any non-cluster IP.
     - toEntities: [world]
       toPorts:

@@ -159,6 +159,13 @@ controller:
   # and overriding one without the other is a valid dev-test pattern.
   schedulerAddr: rio-scheduler.rio-system:9001
   storeAddr: rio-store.rio-store:9002
+  # drv_executions lifecycle-row retention (days) for the
+  # scheduler-owned execution-row GC (store.log.sweep-ownership).
+  # Keep >= store.logRetentionDays: the row must not die before the
+  # log chunks it anchors (a reclaimed row reads the log incomplete
+  # even while chunks remain). Rows are reclaimed only when terminal,
+  # assignment-closed, and unreferenced by the attempt ledger.
+  execRetentionDays: 30
   # Balanced-channel config also passed through to workers. Workers
   # DNS-resolve the headless Service, health-probe pod IPs, route to leader.
   # Empty → workers fall back to single-channel (VM tests don't set this).
@@ -453,6 +460,13 @@ scheduler:
   # always-leader mode, WRONG with replicas>1).
   leaseName: rio-scheduler-leader
   storeAddr: rio-store.rio-store:9002
+  # drv_executions lifecycle-row retention (days) for the
+  # scheduler-owned execution-row GC (store.log.sweep-ownership).
+  # Keep >= store.logRetentionDays: the row must not die before the
+  # log chunks it anchors (a reclaimed row reads the log incomplete
+  # even while chunks remain). Rows are reclaimed only when terminal,
+  # assignment-closed, and unreferenced by the attempt ledger.
+  execRetentionDays: 30
   # I-204: requiredSystemFeatures values that are CAPABILITY HINTS, not
   # hardware gates. Stripped at DAG-insert so spawn/dispatch ignore them.
   # nixpkgs convention: big-parallel = "uses many cores", benchmark =
@@ -936,6 +950,13 @@ gateway:
   machineName: ""
   schedulerAddr: rio-scheduler.rio-system:9001
   storeAddr: rio-store.rio-store:9002
+  # drv_executions lifecycle-row retention (days) for the
+  # scheduler-owned execution-row GC (store.log.sweep-ownership).
+  # Keep >= store.logRetentionDays: the row must not die before the
+  # log chunks it anchors (a reclaimed row reads the log incomplete
+  # even while chunks remain). Rows are reclaimed only when terminal,
+  # assignment-closed, and unreferenced by the attempt ledger.
+  execRetentionDays: 30
   # Balanced-channel: gateway DNS-resolves headless to pod IPs, probes
   # grpc.health.v1 on each, routes to leader.
   schedulerBalanceHost: rio-scheduler-headless

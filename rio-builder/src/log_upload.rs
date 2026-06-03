@@ -111,7 +111,7 @@ pub struct Progress {
 }
 
 /// Why an upload ended with lines still un-acked. Every variant names a
-/// distinct disposition of those lines; [`lost_lines`] is computed FROM
+/// distinct disposition of those lines; `lost_lines` is computed FROM
 /// the variant, so "is this loss?" is a property of the type, not a
 /// judgment call repeated at call sites (`builder.log.loss-disclosure`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,7 +134,7 @@ pub enum AbandonReason {
     /// deliberately discarded — but it is still loss, and it is
     /// disclosed as such.
     CapExhausted,
-    /// The upload task panicked mid-flight (counted by [`LossGuard`]
+    /// The upload task panicked mid-flight (counted by `LossGuard`
     /// during unwind, so even a never-awaited detached task
     /// discloses).
     Panicked,
@@ -252,7 +252,7 @@ pub enum DrainStatus {
     },
     /// The upload ended with lines still un-acked. Whether that is loss
     /// — and whether the loss counter fired — is decided by `reason`
-    /// (see [`lost_lines`]); the disclosure itself happened at the
+    /// (see `lost_lines`); the disclosure itself happened at the
     /// task's single [`disclose`] site before this status was returned.
     Abandoned {
         last_acked_line: Option<u64>,
@@ -269,7 +269,7 @@ pub struct LogUploader {
     tx: Option<mpsc::Sender<BuildLogBatch>>,
     /// The monitored task handle. Held for liveness only — the terminal
     /// status arrives on `status`, and a panic is disclosed by the
-    /// task's own [`LossGuard`] (plus `spawn_monitored`'s `error!`),
+    /// task's own `LossGuard` (plus `spawn_monitored`'s `error!`),
     /// not by awaiting this.
     _handle: JoinHandle<()>,
     /// One-shot carrying the task's terminal [`DrainStatus`]. Dropped
@@ -795,7 +795,7 @@ impl UploadTask {
     /// stderr loop never blocks on a log the store will not take.
     ///
     /// `reason` carries WHICH permanent class fired; whether the
-    /// discarded lines count as loss is [`lost_lines`]'s decision at
+    /// discarded lines count as loss is `lost_lines`'s decision at
     /// the single [`disclose`] site (CompleteLog: no — the store
     /// provably holds the finished log; Superseded/CapExhausted: yes).
     async fn reject_permanently(&mut self, reason: AbandonReason) -> DrainStatus {
@@ -1196,11 +1196,16 @@ mod tests {
         }
     }
 
-    /// Poll `cond` every 10 ms until it returns true or ~2 s elapse.
+    /// Poll `cond` every 10 ms until it returns true or ~30 s elapse.
     /// The established shape for "wait for a fire-and-forget task to land"
-    /// in this workspace's test suites.
+    /// in this workspace's test suites. The budget is deliberately wide:
+    /// green runs return in milliseconds (the poll exits on the first
+    /// true), and the panic-unwind + Drop disclosure path has timed out
+    /// at a 2 s budget under full-gate builder contention (documented
+    /// wall-clock-under-load flake class) — the wide bound buys tail
+    /// headroom without slowing anything that works.
     async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
-        for _ in 0..200 {
+        for _ in 0..3000 {
             if cond() {
                 return;
             }

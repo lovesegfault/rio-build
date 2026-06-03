@@ -3051,7 +3051,7 @@ mod tests {
     /// without a live LogService.
     fn lazy_tails() -> (LogTailSet, tokio::sync::mpsc::Receiver<TaggedLogChunk>) {
         let chan = tonic::transport::Endpoint::from_static("http://127.0.0.1:9").connect_lazy();
-        LogTailSet::new(rio_proto::LogServiceClient::new(chan))
+        LogTailSet::new(rio_proto::LogServiceClient::new(chan), None)
     }
 
     fn snap_running(entries: &[(&str, &str, types::AttemptKind)]) -> types::BuildSnapshot {

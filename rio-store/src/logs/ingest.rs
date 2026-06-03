@@ -340,7 +340,7 @@ pub struct IngestSession {
 
 impl IngestSession {
     // r[impl store.log.caps-durable]
-    /// The ONLY constructor, and it takes a [`GateOk`]: a session
+    /// The ONLY constructor, and it takes a `GateOk`: a session
     /// cannot exist without the gate's durable-account read, so the
     /// per-execution caps are seeded from the committed manifest —
     /// never from zero — on every open (merged_bug_207). `next_seq`
