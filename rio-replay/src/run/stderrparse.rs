@@ -9,6 +9,65 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 use rio_nix::protocol::build::BuildResult;
+use rio_nix::protocol::client::STDERR_BUDGET_NODE_MULTIPLIER_CAP;
+
+/// Cardinality cap on the per-batch `reasons` map: one entry per distinct
+/// drv, at most the largest closure the stderr drain budget itself
+/// recognizes for one op ([`STDERR_BUDGET_NODE_MULTIPLIER_CAP`] — the
+/// node-multiplier clamp, >4× a chromium/texlive-class closure).
+///
+/// Trust provenance: the keys come from the relayed stderr channel, which
+/// also carries WORKER-CONTROLLED build-log text (a build printing
+/// `derivation '<x>.drv' failed: …` lines mints entries — the documented
+/// spoof surface of this parser). The genuine producer emits one terminal
+/// failure line per drv of the submitted DAG, so legitimate cardinality is
+/// bounded by the op's merged-closure node count — which the drain budget
+/// clamps at exactly this constant. Beyond it, only a flood of fabricated
+/// keys is possible: under the raised drain budget (10M messages per root,
+/// scaling with the closure estimate) an unbounded map grows multi-GiB
+/// resident AND is persisted wholesale to batches.jsonl, then reloaded and
+/// re-synced on every collect pass. Entries past the cap are dropped (the
+/// capped raw tail still carries the lines as stream evidence), counted in
+/// [`ParsedStderr::reasons_dropped`], and warned about once per stream.
+///
+/// Worst-case resident cost, named: 65,536 entries × (≤4 KiB value +
+/// ~130 B key) ≈ 270 MiB — reachable only by a hostile worker printing
+/// tens of thousands of distinct fabricated failure lines, survivable by
+/// the engine pod, and loud (the drop warning names the cap).
+pub(crate) const MAX_CAPTURED_REASONS: usize = STDERR_BUDGET_NODE_MULTIPLIER_CAP;
+
+/// Per-value byte cap on a captured failure reason: 4 KiB, mirroring the
+/// gateway's own retained-evidence posture (`RETAINED_ERROR_MSG_CAP` in
+/// rio-gateway's build handler — the cap it applies to the per-root
+/// `BuildResult` messages it RETAINS, while relaying the full text only
+/// as stream traffic). This map is likewise retained state — persisted to
+/// batches.jsonl and reloaded every pass — so it takes the retained cap,
+/// and the full line remains available as stream evidence in the capped
+/// stderr tail whenever it was among the last 200 lines.
+///
+/// Cost on genuine evidence, named: a genuine relayed reason can reach
+/// ~16 KiB (the scheduler truncates worker `error_message`s at its
+/// 16 KiB ingress cap, `MAX_ERROR_MSG_LEN`, and the gateway relays that
+/// body verbatim; the cascade composition prefixes it once, never
+/// recursively). Truncation at 4 KiB loses the tail of such a reason in
+/// the RETAINED copy only. Every classification consumer reads prefixes
+/// (`classify_reason`'s `starts_with` vocabulary, the dependency
+/// trigger's quoted drv, `signature_for`'s 60-char slug), so
+/// classification is unaffected; a needle scan over the retained value
+/// could miss a needle past 4 KiB, exactly as it already does for the
+/// gateway-retained in-band result messages capped at the same constant.
+pub(crate) const MAX_CAPTURED_REASON_BYTES: usize = 4 * 1024;
+
+/// Cardinality cap on the per-batch `lost_terminals` set — same
+/// provenance and envelope as [`MAX_CAPTURED_REASONS`]: the genuine
+/// producer (the gateway's lost-terminal relay marker) emits at most one
+/// marker per root of the submitted DAG, the marker parser is byte-0
+/// anchored but worker text can still reach byte 0 via the plain
+/// `STDERR_NEXT` fallback (see the trust-bound doc on
+/// `BuildResult::lost_terminal_relay_drv`), and each distinct spoofed
+/// line otherwise grows the uncapped set. Keys are drv paths (~130 B), so
+/// the capped worst case is ~8 MiB.
+pub(crate) const MAX_CAPTURED_LOST_TERMINALS: usize = STDERR_BUDGET_NODE_MULTIPLIER_CAP;
 
 /// `rio: build <uuid>` — emitted once per accepted build by the gateway
 /// (`rio-gateway/src/handler/build.rs`). The optional ` (trace <hex>)`
@@ -57,6 +116,15 @@ pub struct ParsedStderr {
     /// substitution event. Parsed by the shared producer-exact pair in
     /// rio-nix, the same discipline as the in-band evidence-loss prefix.
     pub lost_terminals: BTreeSet<String>,
+    /// Distinct NEW `reasons` keys dropped because the map was at
+    /// `MAX_CAPTURED_REASONS` (crate-private, see its doc) —
+    /// observability for the cardinality clamp, never persisted (the
+    /// capped tail still carries the dropped lines as stream evidence).
+    pub reasons_dropped: usize,
+    /// Distinct NEW marker drvs dropped at
+    /// `MAX_CAPTURED_LOST_TERMINALS` (crate-private) — same role as
+    /// [`reasons_dropped`](Self::reasons_dropped).
+    pub lost_terminals_dropped: usize,
 }
 
 /// Feed one stderr line into `parsed` (streaming form, used by the
@@ -83,17 +151,52 @@ pub fn parse_line(parsed: &mut ParsedStderr, line: &str) {
         }
     }
     if let Some(c) = DRV_FAILED_RE.captures(line) {
-        parsed
-            .reasons
-            .entry(c[1].to_string())
-            .or_insert_with(|| c[2].trim().to_string());
+        // First occurrence wins for keys already present (unchanged);
+        // NEW keys are admitted only under the cardinality cap, and a
+        // kept value is truncated to the retained-evidence byte cap —
+        // see the two constants' docs for provenance and the named
+        // costs. `contains_key` first so a re-occurrence of an in-map
+        // key is never miscounted as a drop at the boundary.
+        if parsed.reasons.contains_key(&c[1]) {
+            // First-wins: later occurrences never displace the value.
+        } else if parsed.reasons.len() < MAX_CAPTURED_REASONS {
+            let mut reason = c[2].trim().to_string();
+            rio_common::grpc::truncate_utf8(&mut reason, MAX_CAPTURED_REASON_BYTES);
+            parsed.reasons.insert(c[1].to_string(), reason);
+        } else {
+            if parsed.reasons_dropped == 0 {
+                tracing::warn!(
+                    cap = MAX_CAPTURED_REASONS,
+                    dropped_drv = &c[1],
+                    "stderr failure-reason capture is at its cardinality cap; dropping new \
+                     entries (the capped stderr tail still carries the lines)"
+                );
+            }
+            parsed.reasons_dropped += 1;
+        }
     }
     // The gateway's lost-terminal relay marker, matched by the shared
     // producer-exact parser (byte-0 anchored, whole-line — see its doc
     // for why this vocabulary does not inherit the progress-prefix
-    // tolerance of the regexes above).
+    // tolerance of the regexes above). Same cardinality clamp as the
+    // reasons map: re-occurrences of an in-set drv are no-ops at any
+    // size, new drvs past the cap are dropped and counted.
     if let Some(drv) = BuildResult::lost_terminal_relay_drv(line) {
-        parsed.lost_terminals.insert(drv.to_string());
+        if !parsed.lost_terminals.contains(drv)
+            && parsed.lost_terminals.len() >= MAX_CAPTURED_LOST_TERMINALS
+        {
+            if parsed.lost_terminals_dropped == 0 {
+                tracing::warn!(
+                    cap = MAX_CAPTURED_LOST_TERMINALS,
+                    dropped_drv = drv,
+                    "lost-terminal marker capture is at its cardinality cap; dropping new \
+                     entries (the capped stderr tail still carries the lines)"
+                );
+            }
+            parsed.lost_terminals_dropped += 1;
+        } else {
+            parsed.lost_terminals.insert(drv.to_string());
+        }
     }
 }
 
@@ -479,6 +582,190 @@ mod tests {
         parse_line(&mut p, &format!("derivation '{drv}' failed: second reason"));
         assert_eq!(p.reasons.len(), 1);
         assert_eq!(p.reasons[drv], "first reason");
+    }
+
+    /// Synthesizes the i-th distinct drv path (fixed-width hash part, so
+    /// every path is regex-shaped and unique).
+    fn drv_path(i: usize) -> String {
+        format!("/nix/store/{:032x}-pkg-{i}.drv", i)
+    }
+
+    /// THE accumulation-sink universe of the stderr observer, as one
+    /// standing test: every field of [`ParsedStderr`] is destructured
+    /// WITHOUT `..`, so adding a new sink fails compilation here until
+    /// its bound is declared and asserted alongside the others. The
+    /// channel feeding these sinks carries worker-controlled text under
+    /// a drain budget of millions of messages per op — bounded COUNT
+    /// does not bound ACCUMULATION, so each sink must hold its own
+    /// bound: `build_id` first-wins (1), `reasons` capped in cardinality
+    /// and value bytes, `lost_terminals` capped in cardinality, and the
+    /// two drop counters are plain integers.
+    #[test]
+    fn observed_sink_universe_is_bounded() {
+        let mut p = ParsedStderr::default();
+        // Two distinct build ids; over-cap distinct reason keys with
+        // oversized values; over-cap distinct marker drvs.
+        parse_line(&mut p, "rio: build 0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a");
+        parse_line(&mut p, "rio: build ffffffff-ffff-ffff-ffff-ffffffffffff");
+        let big_reason = "x".repeat(MAX_CAPTURED_REASON_BYTES + 1);
+        for i in 0..MAX_CAPTURED_REASONS + 2 {
+            parse_line(
+                &mut p,
+                &format!("derivation '{}' failed: {big_reason}", drv_path(i)),
+            );
+        }
+        for i in 0..MAX_CAPTURED_LOST_TERMINALS + 2 {
+            parse_line(&mut p, &BuildResult::lost_terminal_relay_line(&drv_path(i)));
+        }
+
+        let ParsedStderr {
+            build_id,
+            reasons,
+            lost_terminals,
+            reasons_dropped,
+            lost_terminals_dropped,
+        } = p;
+        // build_id: first id wins, exactly one retained.
+        assert_eq!(
+            build_id.as_deref(),
+            Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a")
+        );
+        // reasons: cardinality clamped AT the cap (never one past it),
+        // overflow counted, every retained value within the byte cap.
+        assert_eq!(reasons.len(), MAX_CAPTURED_REASONS);
+        assert_eq!(reasons_dropped, 2);
+        assert!(
+            reasons
+                .values()
+                .all(|v| v.len() <= MAX_CAPTURED_REASON_BYTES),
+            "a retained reason exceeds the value cap"
+        );
+        // lost_terminals: same clamp shape.
+        assert_eq!(lost_terminals.len(), MAX_CAPTURED_LOST_TERMINALS);
+        assert_eq!(lost_terminals_dropped, 2);
+    }
+
+    /// Both sides of every conjunct the cardinality clamp adds, at the
+    /// exact boundary: one under the cap admits, AT the cap a NEW key is
+    /// dropped (and counted) while a RE-OCCURRENCE of an in-map key is
+    /// not a drop — first-wins semantics are byte-identical to the
+    /// uncapped behavior for everything the cap retains. Same rows for
+    /// the marker set, where an in-set re-occurrence at the cap stays a
+    /// no-op success.
+    #[test]
+    fn cardinality_cap_boundary_rows_in_both_directions() {
+        // reasons: fill to cap-1, admit one more (reaches cap), then
+        // cross.
+        let mut p = ParsedStderr::default();
+        for i in 0..MAX_CAPTURED_REASONS - 1 {
+            parse_line(
+                &mut p,
+                &format!("derivation '{}' failed: r{i}", drv_path(i)),
+            );
+        }
+        assert_eq!(
+            (p.reasons.len(), p.reasons_dropped),
+            (MAX_CAPTURED_REASONS - 1, 0)
+        );
+        let last_admitted = drv_path(MAX_CAPTURED_REASONS - 1);
+        parse_line(
+            &mut p,
+            &format!("derivation '{last_admitted}' failed: at-cap"),
+        );
+        assert_eq!(
+            (p.reasons.len(), p.reasons_dropped),
+            (MAX_CAPTURED_REASONS, 0)
+        );
+        // New key at the cap: dropped and counted.
+        parse_line(
+            &mut p,
+            &format!(
+                "derivation '{}' failed: over",
+                drv_path(MAX_CAPTURED_REASONS)
+            ),
+        );
+        assert_eq!(
+            (p.reasons.len(), p.reasons_dropped),
+            (MAX_CAPTURED_REASONS, 1)
+        );
+        // Re-occurrence of an in-map key at the cap: first-wins no-op,
+        // NOT a drop.
+        parse_line(
+            &mut p,
+            &format!("derivation '{last_admitted}' failed: displaced?"),
+        );
+        assert_eq!(
+            (p.reasons.len(), p.reasons_dropped),
+            (MAX_CAPTURED_REASONS, 1)
+        );
+        assert_eq!(p.reasons[&last_admitted], "at-cap");
+
+        // lost_terminals: same boundary walk through the marker parser.
+        let mut p = ParsedStderr::default();
+        for i in 0..MAX_CAPTURED_LOST_TERMINALS {
+            parse_line(&mut p, &BuildResult::lost_terminal_relay_line(&drv_path(i)));
+        }
+        assert_eq!(
+            (p.lost_terminals.len(), p.lost_terminals_dropped),
+            (MAX_CAPTURED_LOST_TERMINALS, 0)
+        );
+        parse_line(
+            &mut p,
+            &BuildResult::lost_terminal_relay_line(&drv_path(MAX_CAPTURED_LOST_TERMINALS)),
+        );
+        assert_eq!(
+            (p.lost_terminals.len(), p.lost_terminals_dropped),
+            (MAX_CAPTURED_LOST_TERMINALS, 1)
+        );
+        // In-set re-occurrence at the cap: still a no-op success.
+        parse_line(&mut p, &BuildResult::lost_terminal_relay_line(&drv_path(0)));
+        assert_eq!(
+            (p.lost_terminals.len(), p.lost_terminals_dropped),
+            (MAX_CAPTURED_LOST_TERMINALS, 1)
+        );
+        assert!(p.lost_terminals.contains(&drv_path(0)));
+    }
+
+    /// Hostile-magnitude rows for the value cap, asserting CLAMP vs
+    /// SCALE explicitly: a worker-shaped 1 MiB single-line reason is
+    /// clamped to the retained-evidence byte cap (never scales the
+    /// retained map with the input), the clamp cuts at a char boundary
+    /// (a multi-byte char straddling the cap backs off, keeping the
+    /// String valid), and — the other side — a reason of exactly the cap
+    /// is retained whole, as is every genuine scheduler-corpus reason
+    /// (all far under the cap; the corpus is the producer vocabulary).
+    #[test]
+    fn reason_values_clamp_at_the_retained_byte_cap() {
+        let drv = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv";
+
+        // Hostile magnitude: 1 MiB line → clamped, not scaled.
+        let mut p = ParsedStderr::default();
+        let huge = "y".repeat(1024 * 1024);
+        parse_line(&mut p, &format!("derivation '{drv}' failed: {huge}"));
+        assert_eq!(p.reasons[drv].len(), MAX_CAPTURED_REASON_BYTES);
+
+        // Char-boundary clamp: a 3-byte char straddling the cap backs
+        // off to the boundary before it.
+        let mut p = ParsedStderr::default();
+        let straddling = format!("{}€tail", "z".repeat(MAX_CAPTURED_REASON_BYTES - 1));
+        parse_line(&mut p, &format!("derivation '{drv}' failed: {straddling}"));
+        assert_eq!(p.reasons[drv].len(), MAX_CAPTURED_REASON_BYTES - 1);
+        assert!(p.reasons[drv].chars().all(|c| c == 'z'));
+
+        // At the cap exactly: retained whole.
+        let mut p = ParsedStderr::default();
+        let at_cap = "w".repeat(MAX_CAPTURED_REASON_BYTES);
+        parse_line(&mut p, &format!("derivation '{drv}' failed: {at_cap}"));
+        assert_eq!(p.reasons[drv], at_cap);
+
+        // Every genuine producer reason (the shared scheduler corpus) is
+        // far under the cap and retained verbatim — the clamp never
+        // touches legitimate single-line evidence.
+        for (reason, _) in scheduler_reason_corpus() {
+            let mut p = ParsedStderr::default();
+            parse_line(&mut p, &format!("derivation '{drv}' failed: {reason}"));
+            assert_eq!(p.reasons[drv], reason.trim(), "corpus reason mangled");
+        }
     }
 
     /// Every scheduler terminal-failure reason string in the shared corpus
