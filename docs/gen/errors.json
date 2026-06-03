@@ -1346,6 +1346,13 @@
     },
     {
       "enum": "ChunkError",
+      "name": "Backend",
+      "crate": "rio-store",
+      "msg": "chunk {} backend fetch failed (transient): {message}",
+      "doc": "The backend ERRORED (S3 5xx/timeout/connect failure) or the fetch task panicked — nothing is known about the object's existence. Transient: retry. MUST NOT be read as data loss (the round-16 bug_027 conflation: this used to surface as `NotFound`)."
+    },
+    {
+      "enum": "ChunkError",
       "name": "Corrupt",
       "crate": "rio-store",
       "msg": "chunk {} failed BLAKE3 verification (corrupt; expected {}, got {})",
@@ -1356,7 +1363,7 @@
       "name": "NotFound",
       "crate": "rio-store",
       "msg": "chunk {} not found in backend (data loss if manifest claims it exists)",
-      "doc": "Backend returned None — chunk not in S3. If the manifest says this hash exists, this is data loss. Caller should propagate as a hard error (not retry — retrying NotFound is pointless)."
+      "doc": "Backend AUTHORITATIVELY returned None — the object is not in S3. If the manifest says this hash exists, this is data loss. Caller should propagate as a hard error (not retry — retrying NotFound is pointless)."
     },
     {
       "enum": "ManifestError",
@@ -1388,6 +1395,13 @@
     },
     {
       "enum": "MetadataError",
+      "name": "ChunkBackend",
+      "crate": "rio-store",
+      "msg": "chunk backend unavailable: {0}",
+      "doc": "The chunk BACKEND failed transiently (S3 5xx/timeout/connect) while serving a metadata-layer read (e.g. proof-walk `.drv` reassembly). Nothing is known about the data's existence — retriable. Maps to `unavailable`. Split from data-integrity verdicts in round-16 bug_027: this variant MUST NOT be read as corruption or data loss."
+    },
+    {
+      "enum": "MetadataError",
       "name": "Conflict",
       "crate": "rio-store",
       "msg": "conflict: {0}",
@@ -1406,6 +1420,13 @@
       "crate": "rio-store",
       "msg": "corrupt manifest_data for {store_path}: {source}",
       "doc": "A `manifest_data.chunk_list` blob failed to deserialize. Written by us, read by us — if it doesn't round-trip, either the write was torn or the format version is wrong. NOT retriable. Maps to `data_loss`."
+    },
+    {
+      "enum": "MetadataError",
+      "name": "DataLoss",
+      "crate": "rio-store",
+      "msg": "data loss: {0}",
+      "doc": "Stored data is verifiably lost or corrupt: a manifest references a chunk the backend authoritatively lacks, or fetched bytes fail content verification. NOT retriable. Maps to `data_loss`."
     },
     {
       "enum": "MetadataError",
@@ -1742,7 +1763,7 @@
     {
       "name": "ChunkError",
       "crate": "rio-store",
-      "doc": "Error from `ChunkCache::get_verified`."
+      "doc": "Error from `ChunkCache::get_verified`. Three variants, three wire codes (round-16 bug_027; pattern R1 — an error variant whose producers span transient and permanent causes is split, with the code DERIVED from the variant): `NotFound`/`Corrupt` are data-integrity verdicts (`DATA_LOSS`-class, retrying is pointless); `Backend` is transient infrastructure (`UNAVAILABLE`-class, retry)."
     },
     {
       "name": "ManifestError",

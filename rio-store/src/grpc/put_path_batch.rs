@@ -273,6 +273,16 @@ impl StoreServiceImpl {
                 }
             }
             if !progressed || next.is_empty() {
+                // Fixpoint exhausted: record the TERMINAL
+                // skipped_missing_input event ONCE per still-missing
+                // .drv (bug_085 -- per-attempt emission inside
+                // populate_on_ingest inflated the counter
+                // quadratically in reverse-topological batches; the
+                // metric means ".drv left unpopulated by this
+                // ingestion", an event per .drv, not per pass).
+                for (drv_path, _) in &next {
+                    crate::metadata::drv_modulo::record_missing_input(drv_path);
+                }
                 break;
             }
             pending = next;

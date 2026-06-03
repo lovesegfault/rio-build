@@ -20645,6 +20645,10 @@
           "packageId": "config"
         },
         {
+          "name": "metrics-util",
+          "packageId": "metrics-util"
+        },
+        {
           "name": "proptest",
           "packageId": "proptest"
         },

@@ -233,9 +233,36 @@ pub(crate) enum PopulateOutcome {
     Skipped,
 }
 
+/// Record the TERMINAL `skipped_missing_input` event for one `.drv`
+/// (round-16 bug_085; pattern R1(f) cadence): callers that retry
+/// population (the batch fixpoint) call this ONCE per still-missing
+/// `.drv` at fixpoint exit, never per attempt — the metric's
+/// documented meaning is "this ingestion left the row unpopulated
+/// pending later inputs", an event per `.drv`, not per pass.
+pub(crate) fn record_missing_input(drv_path: &str) {
+    metrics::counter!(
+        "rio_store_drv_modulo_cache_total",
+        "event" => "skipped_missing_input"
+    )
+    .increment(1);
+    debug!(
+        drv_path,
+        "drv modulo population skipped: input rows absent (out-of-order upload; \
+         healed by the in-batch fixpoint, the already-complete re-upload hook, \
+         or the proof-time read-through)"
+    );
+}
+
 /// Best-effort ingestion hook: parse the just-persisted `.drv` bytes,
 /// seed input hashes from existing cache rows, compute, upsert. NEVER
-/// fails the upload — every outcome is a counter.
+/// fails the upload — every outcome is a counter, with ONE exception
+/// per R1(f) cadence (bug_085): the `MissingInput` outcome is
+/// RETURNED, not counted, because the batch caller retries it inside
+/// its fixpoint — emission per ATTEMPT inflated the counter
+/// quadratically in reverse-topological batches (a 120-output batch
+/// could emit ~7k increments for ~119 actual events). Every caller
+/// records the terminal event via [`record_missing_input`] exactly
+/// once when its retry scope is exhausted.
 pub(crate) async fn populate_on_ingest(
     pool: &PgPool,
     drv_path: &str,
@@ -306,20 +333,9 @@ pub(crate) async fn populate_on_ingest(
             .increment(1);
             PopulateOutcome::Skipped
         }
-        Err(SkipReason::MissingInput) => {
-            metrics::counter!(
-                "rio_store_drv_modulo_cache_total",
-                "event" => "skipped_missing_input"
-            )
-            .increment(1);
-            debug!(
-                drv_path,
-                "drv modulo population skipped: input rows absent (out-of-order upload; \
-                 healed by the in-batch fixpoint, the already-complete re-upload hook, \
-                 or the proof-time read-through)"
-            );
-            PopulateOutcome::MissingInput
-        }
+        // NOT counted here (bug_085): the caller owns the terminal
+        // decision — see [`record_missing_input`].
+        Err(SkipReason::MissingInput) => PopulateOutcome::MissingInput,
     }
 }
 
@@ -377,9 +393,16 @@ pub(crate) async fn heal_if_missing(
     };
     let mut budget = WorkBudget::new(PROOF_WALK_WORK_MAX, PROOF_WALK_ARENA_BYTES_MAX);
     let healed = match own_drv_bytes(pool, chunks, drv_path, &mut budget).await {
-        Ok(FetchedDrv::Bytes(bytes)) => {
-            populate_on_ingest(pool, drv_path, &bytes).await == PopulateOutcome::Populated
-        }
+        Ok(FetchedDrv::Bytes(bytes)) => match populate_on_ingest(pool, drv_path, &bytes).await {
+            PopulateOutcome::Populated => true,
+            PopulateOutcome::MissingInput => {
+                // The heal is its own (single-attempt) retry scope —
+                // terminal here, so record (bug_085 cadence contract).
+                record_missing_input(drv_path);
+                false
+            }
+            PopulateOutcome::Skipped => false,
+        },
         Ok(_) => false,
         Err(e) => {
             warn!(drv_path, error = %e, "modulo-cache heal fetch failed (best-effort)");
@@ -1311,6 +1334,65 @@ mod tests {
                 .is_none(),
             "expired memo + present row: probe must clear the entry"
         );
+    }
+
+    /// Cadence pin (bug_085; R1(f)): `populate_on_ingest` RETURNS the
+    /// MissingInput outcome without counting it — the terminal
+    /// `skipped_missing_input` event is the caller's to record exactly
+    /// once per `.drv` when its retry scope (fixpoint pass set, single
+    /// shot, heal) is exhausted. Pre-fix, the batch fixpoint emitted
+    /// one increment PER PASS per still-missing `.drv` (quadratic in
+    /// reverse-topological batches).
+    #[tokio::test]
+    async fn missing_input_outcome_is_returned_not_counted() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let ghost = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ghost.drv";
+        let consumer = format!(
+            r#"Derive([("out","/nix/store/cccccccccccccccccccccccccccccccc-consumer","","")],[("{ghost}",["out"])],[],"x86_64-linux","/bin/sh",["-c","x"],[("name","consumer"),("out","/nix/store/cccccccccccccccccccccccccccccccc-consumer")])"#
+        );
+        let path = "/nix/store/dddddddddddddddddddddddddddddddd-consumer.drv";
+
+        let rec = DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let count_missing = |snapshot: metrics_util::debugging::Snapshot| -> u64 {
+            snapshot
+                .into_vec()
+                .into_iter()
+                .filter_map(|(key, _, _, val)| {
+                    let (kind, key) = key.into_parts();
+                    (kind == metrics_util::MetricKind::Counter
+                        && key.name() == "rio_store_drv_modulo_cache_total"
+                        && key
+                            .labels()
+                            .any(|l| l.key() == "event" && l.value() == "skipped_missing_input"))
+                    .then_some(match val {
+                        DebugValue::Counter(c) => c,
+                        _ => 0,
+                    })
+                })
+                .sum()
+        };
+
+        // Three retried attempts (the fixpoint shape): ZERO increments.
+        let _g = metrics::set_default_local_recorder(&rec);
+        for _ in 0..3 {
+            let outcome = populate_on_ingest(&db.pool, path, consumer.as_bytes()).await;
+            assert_eq!(outcome, PopulateOutcome::MissingInput);
+        }
+        assert_eq!(
+            count_missing(snap.snapshot()),
+            0,
+            "per-attempt emission is the bug_085 regression"
+        );
+        // ONE terminal record at retry-scope exhaustion.
+        record_missing_input(path);
+        assert_eq!(
+            count_missing(snap.snapshot()),
+            1,
+            "terminal event counted once"
+        );
+        drop(_g);
     }
 
     /// FOD base-case pin (bug_083; oracle derivations.cc:864-874): a

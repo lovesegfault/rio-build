@@ -204,10 +204,12 @@ pub fn describe_metrics() {
         "Store-side derivation modulo-cache population events at .drv \
          ingestion (store.ingest.drv-modulo-cache+2), labeled by event: \
          populated | skipped_missing_input (out-of-order upload; \
-         proof-time read-through completes it) | parse_failed \
-         (text-CA-valid bytes that are not a derivation) | \
-         seed_load_failed (database error loading input rows — an \
-         infrastructure failure, NOT an out-of-order upload)"
+         proof-time read-through completes it; TERMINAL — recorded \
+         once per .drv when its ingestion's retry scope is exhausted, \
+         never per fixpoint pass) | parse_failed (text-CA-valid bytes \
+         that are not a derivation) | seed_load_failed (database error \
+         loading input rows — an infrastructure failure, NOT an \
+         out-of-order upload)"
     );
     describe_counter!(
         "rio_store_drv_modulo_orphans_reclaimed_total",

@@ -6431,6 +6431,7 @@ dependencies = [
  "hex",
  "httpdate",
  "metrics",
+ "metrics-util",
  "moka",
  "proptest",
  "reqwest",

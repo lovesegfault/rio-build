@@ -1321,9 +1321,14 @@ impl StoreServiceImpl {
         // r[impl store.ingest.drv-modulo-cache+2]
         // Best-effort, AFTER the text-CA gate (verify_drv_text_path ran
         // before this finalize) and AFTER the NAR is durable — a
-        // population failure never fails the upload.
-        if let Some(bytes) = drv_bytes_for_cache {
-            metadata::drv_modulo::populate_on_ingest(&self.pool, &info.store_path, &bytes).await;
+        // population failure never fails the upload. Single-shot: a
+        // MissingInput outcome is terminal for THIS upload (no retry
+        // scope), so it records immediately (bug_085 cadence contract).
+        if let Some(bytes) = drv_bytes_for_cache
+            && metadata::drv_modulo::populate_on_ingest(&self.pool, &info.store_path, &bytes).await
+                == metadata::drv_modulo::PopulateOutcome::MissingInput
+        {
+            metadata::drv_modulo::record_missing_input(&info.store_path);
         }
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
         metrics::counter!("rio_store_put_path_bytes_total").increment(info.nar_size);

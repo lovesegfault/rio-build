@@ -1178,7 +1178,7 @@
       {
         "name": "rio_store_drv_modulo_cache_total",
         "kind": "counter",
-        "help": "Store-side derivation modulo-cache population events at .drv ingestion (store.ingest.drv-modulo-cache+2), labeled by event: populated | skipped_missing_input (out-of-order upload; proof-time read-through completes it) | parse_failed (text-CA-valid bytes that are not a derivation) | seed_load_failed (database error loading input rows — an infrastructure failure, NOT an out-of-order upload)"
+        "help": "Store-side derivation modulo-cache population events at .drv ingestion (store.ingest.drv-modulo-cache+2), labeled by event: populated | skipped_missing_input (out-of-order upload; proof-time read-through completes it; TERMINAL — recorded once per .drv when its ingestion's retry scope is exhausted, never per fixpoint pass) | parse_failed (text-CA-valid bytes that are not a derivation) | seed_load_failed (database error loading input rows — an infrastructure failure, NOT an out-of-order upload)"
       },
       {
         "name": "rio_store_drv_modulo_orphans_reclaimed_total",
@@ -1258,7 +1258,7 @@
       {
         "name": "rio_store_ia_proof_total",
         "kind": "counter",
-        "help": "IA deriver-proof gate outcomes on descriptor-less input-addressed uploads (store.put.ia-deriver-proof+3). Gate-level results: ok | rejected (claimed path is not store-derived from the named deriver) | deferred_exempt (deriver's own paths come from realisations; membership-only). Walk-level results: proven | not_resident (a closure .drv has no complete manifest) | unparseable (resident but unusable bytes) | cycle (no derivation order) | over_budget (work cap hit; proven rows persisted, retry resumes)"
+        "help": "IA deriver-proof gate outcomes on descriptor-less input-addressed uploads (store.put.ia-deriver-proof+4). Gate-level results: ok | rejected (claimed path is not store-derived from the named deriver) | deferred_exempt (deriver's own paths come from realisations; membership-only). Walk-level results: proven | not_resident (a closure .drv has no complete manifest) | unparseable (resident but unusable bytes) | cycle (no derivation order) | over_budget (work cap hit; proven rows persisted, retry resumes)"
       },
       {
         "name": "rio_store_ia_proof_work_units",
