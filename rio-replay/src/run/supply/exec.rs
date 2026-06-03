@@ -1410,6 +1410,7 @@ async fn upload_stream_one(env: &UploadEnv<'_>, item: &UploadItem) -> Result<()>
                 }
                 wire_death = Some(message);
             }
+            // r[impl replay.supply.relay-payload-neutral]
             Err(SupplyTransportError::PayloadSource(detail)) => {
                 // The RELAY's byte stream died mid-body, not the
                 // gateway's channel: settle FAILED per path like the
@@ -3777,6 +3778,7 @@ mod tests {
     /// threshold. The mechanism is asserted on the settled rows, so a
     /// routing-knob mistake cannot silently collapse both iterations
     /// into the batch lane.
+    // r[verify replay.supply.relay-payload-neutral]
     #[tokio::test]
     async fn payload_source_failures_never_charge_the_breaker() {
         use super::test_support::ScriptedReply::{PayloadDeath, WireDeath};

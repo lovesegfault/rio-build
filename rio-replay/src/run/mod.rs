@@ -2079,6 +2079,7 @@ enum ProbeAction {
 /// Pure state machine: the poller feeds observations and applies the
 /// returned [`ProbeAction`], so the latch→probe→fail→escalate loop is unit
 /// testable without a live poller.
+// r[impl replay.probe.escalate-pause]
 struct InfraProbeLadder {
     failed_cycles: u32,
     prev_manual: bool,
@@ -3193,6 +3194,7 @@ pub async fn run_with_backends(
                     // workload unit per probe cycle. Lock order: processed
                     // is try-locked so a long-running collect pass can
                     // never stall the poller tick.
+                    // r[impl replay.probe.work-evidence]
                     let concluded = match pause.probe_batch() {
                         Some((batch_id, jobs)) => match processed.try_lock() {
                             Ok(done) if done.contains(&batch_id) => {
@@ -8144,6 +8146,7 @@ mod tests {
     /// level: latch → grant → fail × INFRA_PROBE_PAUSE_AFTER → escalate;
     /// a successful probe resets the failure run; the operator removing
     /// the PAUSE file re-arms probing; latch release forgets the outage.
+    // r[verify replay.probe.escalate-pause]
     #[test]
     fn infra_probe_ladder_grants_scores_and_escalates() {
         let mut ladder = InfraProbeLadder::new();
@@ -8287,6 +8290,7 @@ mod tests {
     /// INFRA_PROBE_PAUSE_AFTER consecutive failed cycles the campaign lands
     /// in the operator PAUSE (the prefetch-shortfall arm's mechanics), not
     /// in retirement.
+    // r[verify replay.probe.single-job]
     #[tokio::test(start_paused = true)]
     async fn infra_pause_canary_probes_then_escalates_without_draining_budgets() {
         let dir = tempfile::tempdir().unwrap();
@@ -8827,6 +8831,7 @@ mod tests {
     /// failures post-reset); without it (the substituted cycle scored as
     /// failure number three), escalation would land after probe THREE —
     /// the batch count is the discriminating witness.
+    // r[verify replay.probe.work-evidence]
     #[tokio::test(start_paused = true)]
     async fn substituting_probe_scores_success_and_resets_the_ladder() -> Result<()> {
         use rio_nix::protocol::build::{BuildResult, read_build_result, write_build_result};

@@ -59,6 +59,7 @@ specs (
           rio-common/src/**/*.rs
           rio-auth/src/**/*.rs
           rio-cli/src/**/*.rs
+          rio-replay/src/**/*.rs
           rio-test-support/src/**/*.rs
           xtask/src/**/*.rs
           nix/nixos-node/**/*.nix

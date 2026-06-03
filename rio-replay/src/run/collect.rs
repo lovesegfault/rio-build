@@ -811,6 +811,7 @@ pub fn decide(
         // with-result arm orders the same way for the same reason: probe
         // before any budget consult). See
         // [`RequeueBudget::probe_carveout`].
+        // r[impl replay.probe.single-job]
         if batch.probe {
             return CollectDecision::Requeue {
                 why: RequeueReason::InfraProbe,

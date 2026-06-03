@@ -399,6 +399,7 @@ pub async fn run_submit_loop(
             // cost of exactly one batch per probe cycle. A redeemed token
             // that finds no offerable job aborts the cycle so the poller
             // can grant again later.
+            // r[impl replay.probe.single-job]
             let probe = pause.take_probe().then(|| {
                 attemptable
                     .iter()
