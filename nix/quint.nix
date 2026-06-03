@@ -1092,6 +1092,95 @@ in
       main = "leaderElectionShutdown";
     };
 
+    # The leader-marks reconciliation model (NEW, bughunt-wave F1
+    # merged_bug_138): the deletion-cost/label machinery as a
+    # level-triggered protocol — edge writers, the single-flight
+    # reconcile, the holder-aware sweep (captured-holder skip), the
+    # external falsifier (a strip no edge writer sees), and the
+    # bounded-cadence verify pass. Headline marksDivergenceBounded:
+    # OUR pod's marks divergence is discovered (dirty/in-flight) or
+    # younger than the verify cadence — the contract
+    # sched.lease.marks-verify states. The wrongSince stamp is one
+    # derived helper applied in EVERY action (no enumerated writer
+    # list), which is what keeps the green verdict non-vacuous; the
+    # paired pin is quint-lease-calib-138-edge-only (the verify pass
+    # removed must falsify). The holder-aware sweep half is encoded
+    # structurally (reconcileComplete) and pinned at the production
+    # level by peer_sweep_spares_current_lease_holder — see the model
+    # comment for why a model invariant there would be decorative
+    # (the spawn-to-complete TOCTOU is a real, verify-bounded
+    # residual).
+    # r[verify sched.lease.marks-verify]
+    # r[verify sched.lease.deletion-cost+3]
+    quint-leader-marks = mkQuintCheck {
+      name = "leader-marks";
+      spec = "leaderMarks";
+      main = "leaderMarksBase";
+      invariants = [
+        "boundsOK"
+        "marksDivergenceBounded"
+      ];
+    };
+
+    # Non-vacuity witness: the external strip actually fires in the
+    # explored space.
+    quint-leader-marks-witness-strip = mkQuintWitnessCheck {
+      name = "leader-marks-witness-strip";
+      spec = "leaderMarks";
+      main = "leaderMarksBase";
+      witness = "noStrip";
+    };
+
+    # Deterministic named-run replay (verifyConvergesRun: strip →
+    # cadence-forced verify → re-discovery → re-assert).
+    quint-leader-marks-runs = mkQuintRunCheck {
+      name = "leader-marks-runs";
+      spec = "leaderMarks";
+      main = "leaderMarksBase";
+    };
+
+    # ---- F1 calibration pins (expect-violation; the pre-fix
+    # behaviors frozen as permanent regression evidence — the vacuity
+    # guards for the three green lease checks above) ------------------
+
+    # bug_096 pre-fix: RESPONSE-anchored blind window. The straddled
+    # believer resumes with a fresh fence and a spent snapshot — no
+    # discovery path armed — and boundedDualLeadership falls. The
+    # violation needs the full straddle interleaving (deeper than a
+    # gate-budget sim hunt), so this pin runs the exhaustive backend
+    # like the regime check it guards.
+    quint-lease-calib-096-response-anchor = mkQuintWitnessCheck {
+      name = "lease-calib-096-response-anchor";
+      spec = "calibration/lease-096-response-anchor";
+      main = "leaseCalib096ResponseAnchor";
+      witness = "boundedDualLeadership";
+      step = "calibStep";
+      extraSpecs = [ "leaderElection" ];
+    };
+
+    # bug_387 pre-fix: BELIEF-gated release. Fence-then-SIGTERM skips
+    # the release the hold gate owes; gracefulHandover falls.
+    quint-lease-calib-387-belief-gate = mkQuintWitnessCheck {
+      name = "lease-calib-387-belief-gate";
+      spec = "calibration/lease-387-belief-gate";
+      main = "leaseCalib387BeliefGate";
+      witness = "gracefulHandover";
+      step = "calibStep";
+      extraSpecs = [ "leaderElection" ];
+    };
+
+    # merged_bug_138 pre-fix: edge-only marks (verify pass removed, no
+    # cadence obligation). An external strip ages unboundedly;
+    # marksDivergenceBounded falls.
+    quint-lease-calib-138-edge-only = mkQuintWitnessCheck {
+      name = "lease-calib-138-edge-only";
+      spec = "calibration/lease-138-edge-only";
+      main = "leaseCalib138EdgeOnly";
+      witness = "marksDivergenceBounded";
+      step = "calibStep";
+      extraSpecs = [ "leaderMarks" ];
+    };
+
     # ------------------------------------------------------------------
     # rio-store's LogService: the build-log session/chunk/dedup protocol
     # (model C of the log-formal campaign — the successor to the retired
