@@ -2494,9 +2494,6 @@ fn bounded_io_marker_annotates(lines: &[&str], marker_idx: usize) -> bool {
     false
 }
 
-/// Recursive `.rs` walk via `std` (no `walkdir` dep). Follows symlinks
-/// — under the nix flake check, the corpus dirs are staged into a
-/// store-path source tree and may be symlinked.
 /// Marker prefix for [`supply_fold_owner`] call-site annotations.
 const SUPPLY_FOLD_MARKER: &str = "supply-fold:";
 
@@ -2900,6 +2897,9 @@ fn replay_transition_ops() -> Result<()> {
     Ok(())
 }
 
+/// Recursive `.rs` walk via `std` (no `walkdir` dep). Follows symlinks
+/// — under the nix flake check, the corpus dirs are staged into a
+/// store-path source tree and may be symlinked.
 fn walk_rs(dir: &Path, f: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {
     walk_ext(dir, "rs", f)
 }
