@@ -905,8 +905,9 @@ impl DagActor {
             // the fail-fast's PG clear is mark-only — so the stamp's
             // position relative to the loop no longer changes the
             // outcome: the persisted hole stays set either way until a
-            // later full merge re-declares the parent's edges and has
-            // every one of them accepted (healed_parents). That
+            // later full merge HEALS the parent (`healed_parents`:
+            // accepted trigger ∧ witness coverage — see its defining
+            // field doc on `MergeResult`). That
             // persistence is intended — the directed resubmit the
             // fail-fast solicits re-prunes, and its stamp gates need the
             // breadcrumb so the produced survivors cannot pass for

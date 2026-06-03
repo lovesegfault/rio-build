@@ -486,8 +486,8 @@ pub(crate) struct DerivationRow {
     /// Cleared together with `topdown_pruned` by the batched
     /// Vouched-keyed `clear_topdown_pruned_by_hashes` helper and on
     /// its own by the merge-time heal (`clear_closure_hole_by_hashes`,
-    /// keyed on `MergeResult::healed_parents` — only parents whose
-    /// every declared edge the merge accepted are healed);
+    /// keyed on `MergeResult::healed_parents` — accepted trigger ∧
+    /// witness coverage; see its defining field doc);
     /// the single-row `clear_topdown_pruned_by_hash` is mark-only, so
     /// the topdown fail-fast retains the hole it leaves behind.
     pub closure_hole: bool,

@@ -187,8 +187,8 @@ impl SchedulerDb {
         // evidence through the upsert. The only merge-side clear is
         // the explicit heal in `handle_merge_dag`
         // (`clear_closure_hole_by_hashes`, keyed on
-        // `MergeResult::healed_parents` — parents whose every declared
-        // edge the merge ACCEPTED); the batched mark-clear helper below drops it
+        // `MergeResult::healed_parents` — accepted trigger ∧ witness
+        // coverage; see its defining field doc); the batched mark-clear helper below drops it
         // together with `topdown_pruned`, while the single-row
         // `clear_topdown_pruned_by_hash` is mark-only (the fail-fast
         // retains the breadcrumb for the directed resubmit).
@@ -812,13 +812,16 @@ impl SchedulerDb {
 
     /// Best-effort batched `closure_hole` clear keyed by `drv_hash`, on
     /// the pool (outside any transaction). Sole caller: the merge-time
-    /// heal in `handle_merge_dag`, for EVERY edge parent of a full
-    /// merge (the heal clears the hole even when the `topdown_pruned`
+    /// heal in `handle_merge_dag`, for the coverage-HEALED parents of a
+    /// full merge only (`MergeResult::healed_parents` — accepted
+    /// trigger ∧ witness coverage; see its defining field doc). The
+    /// heal clears the hole even when the `topdown_pruned`
     /// mark stays, so it cannot ride the mark-clear helpers above; it
-    /// is total — not keyed on the in-memory bit — because the
+    /// is total over that healed set — not keyed on the in-memory bit —
+    /// because the
     /// persisted copy can be stale when the in-memory one was cleared
     /// elsewhere or lost, and the `AND closure_hole` WHERE keeps the
-    /// statement a no-op for clean rows). Returns the number of rows
+    /// statement a no-op for clean rows. Returns the number of rows
     /// actually cleared. The caller warns and continues on error — a
     /// stale persisted hole errs toward the bounded fail-fast after a
     /// later failover, never the doomed from-source dispatch.

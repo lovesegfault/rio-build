@@ -4179,10 +4179,13 @@ async fn test_failover_keeps_topdown_pruned_when_produced_children_belong_to_ter
 /// right after recovery (before any merge) the debug surface must show
 /// the in-memory breadcrumb true — that is `from_recovery_row` carrying
 /// the persisted column into the restored state. The heal half is then
-/// pinned on the persisted column: a post-failover full merge
-/// re-declares the node's edges and the persisted breadcrumb flips
-/// true→false while the still-unvouched mark stays. The heal is TOTAL —
-/// it pushes the PG clear for every edge parent it re-declares, keyed
+/// pinned on the persisted column: a post-failover full merge HEALS
+/// the node (accepted trigger ∧ witness coverage — the defining doc is
+/// `MergeResult::healed_parents`; this staging covers the witness set)
+/// and the persisted breadcrumb flips
+/// true→false while the still-unvouched mark stays. The heal is TOTAL
+/// over the healed set —
+/// it pushes the PG clear for every healed parent, keyed
 /// on the persisted column only, never on the pre-clear in-memory value
 /// (the heal-totality test in merge.rs stages exactly that divergence) —
 /// so the column flip pins the heal + persistence round-trip, not the

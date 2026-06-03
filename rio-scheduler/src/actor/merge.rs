@@ -888,14 +888,16 @@ impl DagActor {
         // as the walk-failure backstop).
         //
         // r[impl sched.merge.heal-accepted-edges+1]
-        // Closure-hole healing comes FIRST: a full merge that
-        // re-declares a node's edges AND has every one of them accepted
-        // re-supplies its inputDrvs, so its child set is representative
-        // of its closure again — drop the `closure_hole` breadcrumb for
-        // every HEALED parent (`merge_result.healed_parents`: declared
-        // minus vetoed, computed by the admission loop itself) before
-        // judging the clear. This is deliberately NOT the raw request
-        // edge list: a parent with even one gate-skipped or unresolvable
+        // Closure-hole healing comes FIRST: drop the `closure_hole`
+        // breadcrumb for every HEALED parent before judging the clear.
+        // `merge_result.healed_parents` = accepted trigger ∧ positive
+        // re-supply coverage (every recorded missing child among the
+        // post-insert children) — see its defining field doc on
+        // `MergeResult`; acceptance alone does NOT imply re-supply (a
+        // subset re-declaration of the surviving children satisfies
+        // the trigger without covering the truncation). This is
+        // deliberately NOT the raw request edge list: a parent with
+        // even one gate-skipped or unresolvable
         // declared edge keeps its breadcrumb, so reap-truncation
         // evidence can never be laundered into Vouched closure evidence
         // by a join the gate refused (the Broken→Vouched flip that

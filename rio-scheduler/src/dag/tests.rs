@@ -4173,9 +4173,12 @@ fn test_healed_parents_excludes_gate_skipped_parent() -> anyhow::Result<()> {
 
 // r[verify sched.merge.heal-accepted-edges+1]
 /// A joining submission whose declared edges are ALL exact
-/// re-declarations of existing edges IS healed: its declared set and the
-/// DAG's child set agree, which is exactly the "child set is
-/// representative again" condition the heal exists for.
+/// re-declarations of existing edges IS healed HERE because the parent
+/// is un-holed — coverage is trivially satisfied over the empty witness
+/// set (the defining doc is `MergeResult::healed_parents`). For a HOLED
+/// parent the same shape would NOT heal unless the re-declaration also
+/// covered every recorded missing child: acceptance alone is only the
+/// trigger, not the heal.
 #[test]
 fn test_healed_parents_includes_already_present_redeclaration() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();

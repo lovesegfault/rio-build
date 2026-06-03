@@ -3876,7 +3876,9 @@ async fn test_gate_skipped_edge_does_not_heal_closure_hole() -> TestResult {
 ///
 /// Phase B (the heal): B4 full-merges app2→R→dep2, re-declaring R's
 /// real edge set. The post-reconciliation pass in `handle_merge_dag`
-/// heals the breadcrumb (R's child set is representative again) and,
+/// heals the breadcrumb (accepted trigger ∧ witness coverage — dep2,
+/// the recorded missing child, is re-attached; the defining doc is
+/// `MergeResult::healed_parents`) and,
 /// with dep2 produced, clears the mark in memory and PG — no fail-fast
 /// or resubmit needed once a full merge has re-supplied the closure.
 #[tokio::test]
@@ -5374,7 +5376,9 @@ async fn test_poison_clear_paths_stamp_closure_hole_on_surviving_parent(
 
 // r[verify sched.merge.substitute-topdown+12]
 /// The merge-time heal must clear the PERSISTED closure-hole breadcrumb
-/// for every edge parent it re-declares, even when the in-memory copy
+/// for every parent it HEALS (accepted trigger ∧ witness coverage —
+/// the defining doc is `MergeResult::healed_parents`; this staging
+/// covers the witness set), even when the in-memory copy
 /// of the breadcrumb is GONE (bughunter round-21 merged_bug_001;
 /// staging hardened in round-22 bug_012). Staging: same reap shape as
 /// above (B1's prune stamps R; BC produces dep2; B2 full-merges

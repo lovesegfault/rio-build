@@ -1250,10 +1250,10 @@ pub struct DerivationState {
     /// keeps the truncated edges without re-declaring them, so the
     /// breadcrumb rides along with the other carried fields); a
     /// `rollback_merge` restores the prior state wholesale. Cleared
-    /// explicitly (memory + PG) only when a later full merge
-    /// re-declares the node's edges AND the merge ACCEPTS every one of
-    /// them (`MergeResult::healed_parents` — its child set is
-    /// representative again; a gate-skipped declared edge vetoes the
+    /// explicitly (memory + PG) only when a later full merge HEALS the
+    /// node (`MergeResult::healed_parents` — accepted trigger ∧ witness
+    /// coverage, every recorded missing child re-attached; see its
+    /// defining field doc; a gate-skipped declared edge vetoes the
     /// heal, sched.merge.heal-accepted-edges+1) and when a Vouched-keyed
     /// clear pass consumes the
     /// `topdown_pruned` mark it qualifies (the batched
