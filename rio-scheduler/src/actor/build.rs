@@ -453,7 +453,18 @@ impl DagActor {
             .map(|(_, s)| types::RunningDerivation {
                 derivation_path: s.drv_path().to_string(),
                 exec_id: s.exec_id.map(|e| e.to_string()).unwrap_or_default(),
-                kind: 0,
+                // r[impl sched.pull.kinded-running-surface]
+                // Wire projection of the open attempt's work class.
+                // None (no open attempt — Assigned without a mint yet)
+                // degrades to UNSPECIFIED == the build display, exactly
+                // the pre-kind behavior.
+                kind: match s.open_attempt_kind {
+                    Some(crate::state::AttemptKind::Build) => types::AttemptKind::Build as i32,
+                    Some(crate::state::AttemptKind::Materialization) => {
+                        types::AttemptKind::Materialization as i32
+                    }
+                    None => types::AttemptKind::Unspecified as i32,
+                },
             })
             .collect();
         // Deterministic wire order (iter_nodes is HashMap-ordered).

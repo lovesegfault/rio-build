@@ -477,6 +477,32 @@ pub enum PullKind {
     Materialization,
 }
 
+/// Which display family a running attempt belongs to — the SINGLE
+/// projection from work class to display surface, shared by the mint
+/// display match and the WatchBuild snapshot's running-set mapper
+/// (bug_144). A consumer that pattern-matches `PullKind` directly for
+/// display purposes is a review error; route through this so the two
+/// surfaces cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplaySurface {
+    /// Builder treatment: per-drv build activity + log tail.
+    Build,
+    /// Substitution treatment: substitute activity pair, NO tail.
+    Substitution,
+}
+
+/// Total projection `PullKind -> DisplaySurface`. Pure and exhaustive:
+/// adding a `PullKind` variant fails compilation here, and the kani
+/// sweep pins that a materialization claim NEVER receives the build
+/// display surface.
+// r[impl sched.pull.kinded-running-surface]
+pub fn display_class(kind: PullKind) -> DisplaySurface {
+    match kind {
+        PullKind::Build => DisplaySurface::Build,
+        PullKind::Materialization => DisplaySurface::Substitution,
+    }
+}
+
 /// The node's materialization-job state, as pull admission needs it.
 /// Projected by the scheduler from its in-memory job view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -924,6 +950,32 @@ mod kinded_tests {
             },
         );
         assert_eq!(got, PullAdmission::NotYetReady);
+    }
+}
+
+#[cfg(kani)]
+mod display_proofs {
+    //! Exhaustive sweep of the display projection (bug_144): a
+    //! materialization claim NEVER receives the build display surface,
+    //! and the projection is total (no panic on any variant).
+
+    use super::*;
+
+    // r[verify sched.pull.kinded-running-surface]
+    #[kani::proof]
+    fn check_materialization_never_build_surface() {
+        let kind = if kani::any() {
+            PullKind::Build
+        } else {
+            PullKind::Materialization
+        };
+        let surface = display_class(kind);
+        match kind {
+            PullKind::Build => assert_eq!(surface, DisplaySurface::Build),
+            PullKind::Materialization => {
+                assert_eq!(surface, DisplaySurface::Substitution);
+            }
+        }
     }
 }
 

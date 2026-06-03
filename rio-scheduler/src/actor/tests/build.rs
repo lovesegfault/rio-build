@@ -1068,3 +1068,46 @@ async fn test_settled_snapshot_equals_live_emit(#[case] how: Terminalize) -> Tes
     assert!(snap.running.is_empty());
     Ok(())
 }
+
+// r[verify sched.pull.kinded-running-surface]
+/// bug_144 + owner decision Q10: the snapshot's running set is kinded
+/// (a build pull yields ATTEMPT_KIND_BUILD on the wire) and the running
+/// COUNT counts build-class work. Pre-fix this is a compile-level red:
+/// `open_attempt_kind` did not exist and the wire kind was hardcoded 0.
+#[tokio::test]
+async fn test_running_surface_kinded_for_build_pull() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let build_id = Uuid::new_v4();
+    let _events =
+        merge_single_node(&handle, build_id, "kinded-run", PriorityClass::Scheduled).await?;
+    barrier(&handle).await;
+
+    // Claim via the pull surface: the mint stamps exec_id AND kind.
+    let _assignment = pull_attempt(&handle, "kinded-run").await;
+    barrier(&handle).await;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::WatchBuild {
+            build_id,
+            caller_tenant: None,
+            reply: reply_tx,
+        })
+        .await?;
+    let (_rx, snapshot) = reply_rx.await??;
+    let Some(Event::Snapshot(snap)) = snapshot.event else {
+        panic!("WatchBuild reply must carry a Snapshot");
+    };
+    assert_eq!(snap.running.len(), 1, "one running derivation listed");
+    assert_eq!(
+        snap.running[0].kind,
+        rio_proto::types::AttemptKind::Build as i32,
+        "a build-class claim is kinded BUILD on the wire (not UNSPECIFIED)"
+    );
+    assert_eq!(
+        snap.running_derivations, 1,
+        "build-class work counts toward the running aggregate (Q10)"
+    );
+    Ok(())
+}

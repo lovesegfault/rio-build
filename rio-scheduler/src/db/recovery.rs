@@ -114,11 +114,13 @@ impl SchedulerDb {
                    d.expected_output_paths, d.output_names,
                    d.is_fixed_output, d.is_ca,
                    d.floor_mem_bytes, d.floor_disk_bytes, d.floor_deadline_secs,
-                   a.exec_id
+                   a.exec_id,
+                   e.attempt_kind
             FROM derivations d
             LEFT JOIN assignments a ON a.derivation_id = d.derivation_id
                                    AND a.status IN ('pending', 'acknowledged')
                                    AND d.assigned_builder_id IS NOT NULL
+            LEFT JOIN drv_executions e ON e.exec_id = a.exec_id
             WHERE d.status NOT IN "
         ))
         .fetch_all(&self.pool)

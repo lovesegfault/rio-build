@@ -1423,7 +1423,18 @@ impl DerivationDag {
                 // accounting (check_build_completion) sees it as done.
                 DerivationStatus::Completed | DerivationStatus::Skipped => summary.completed += 1,
                 DerivationStatus::Running | DerivationStatus::Assigned => {
-                    summary.running += 1;
+                    // r[impl sched.pull.kinded-running-surface]
+                    // Owner decision Q10 (2026-06-03): the running-count
+                    // aggregates (BuildSnapshot/BuildProgress/BuildStatus
+                    // all read this summary) count BUILD work only — a
+                    // materialization-claimed node is upstream-fetch
+                    // activity, not a running build. The per-drv running
+                    // LIST still carries it, kinded, so the gateway
+                    // renders the substitution surface.
+                    if state.open_attempt_kind != Some(crate::state::AttemptKind::Materialization)
+                    {
+                        summary.running += 1;
+                    }
                     // assigned_executor is Some exactly in these two
                     // states (cleared on every terminal transition +
                     // reset_to_ready). Defensive if_let anyway.

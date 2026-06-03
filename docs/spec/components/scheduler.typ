@@ -2074,6 +2074,21 @@ an empty payload with the correct state. This deliberately upgrades the old
 in-memory-only failure-trio posture: post-cleanup and post-failover
 watchers get the recorded verdict instead of the gateway's
 reconnect-exhaustion fabrication.
+
+#r("sched.pull.kinded-running-surface")[
+  The running surface MUST be kinded: the work class of every open
+  attempt is captured at the single mint site (with the execution id,
+  cleared in lockstep with it, recovered across failover from the
+  execution row), the per-derivation running set carries it on the wire,
+  display routing for both the live mint event and the snapshot running
+  set MUST go through the single kind-to-surface projection, and the
+  aggregate running counts MUST count build-class work only.
+]
+A materialization-claimed node is upstream-fetch activity: listing it as a
+running build gave re-attaching watchers phantom builds (and tail
+subscriptions against executions that never log). The wire field degrades
+to the build display for senders that predate it; the count exclusion is
+the owner's display contract (decision Q10, 2026-06-03).
 Terminal builds stay resident --- and re-subscribable via `WatchBuild` ---
 for the terminal-cleanup window while the global DAG keeps evolving for
 other builds that share their nodes (a stale-Completed reset, a re-dispatch,

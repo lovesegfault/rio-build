@@ -1052,6 +1052,16 @@ pub struct DerivationState {
     /// `pending` assignments row cannot re-stamp this field on the new
     /// leader.
     pub exec_id: Option<Uuid>,
+    /// Work class of the OPEN attempt (set with `exec_id` at the mint
+    /// bookkeeping, cleared in lockstep with it at every clear site,
+    /// recovered from the `drv_executions.attempt_kind` join riding the
+    /// same assignment-row guard). The display projection
+    /// (`rio_evidence_kernel::pull::display_class`) keys the kinded
+    /// running surface on this: BUILD entries get the builder display
+    /// (log tail + build activity), MATERIALIZATION entries get the
+    /// substitution display, and the running-count aggregates exclude
+    /// materialization-claimed nodes (owner decision Q10, bug_144).
+    pub open_attempt_kind: Option<AttemptKind>,
     /// Scheduling hints (estimator outputs, resource_floor, critical-path priority).
     pub sched: SchedHint,
     /// ATerm-serialized .drv content, inlined by the gateway for
@@ -1186,6 +1196,7 @@ impl DerivationState {
             interested_builds: HashSet::new(),
             assigned_executor: None,
             exec_id: None,
+            open_attempt_kind: None,
             // est_duration/priority: placeholders — merge.rs sets them
             // via critical_path::compute_initial right after
             // try_from_node (SLA cache not in scope here). 0.0 is a
@@ -1275,6 +1286,10 @@ impl DerivationState {
             // NULL for a drv whose dispatch was reset, so recovery
             // preserves `reset_to_ready()`'s clear.
             exec_id: row.exec_id,
+            open_attempt_kind: row
+                .attempt_kind
+                .as_deref()
+                .and_then(|k| k.parse::<AttemptKind>().ok()),
             sched: SchedHint {
                 // M_044: persisted reactive floor. PG bigint → i64;
                 // negatives (impossible by DEFAULT 0 + only-ever-doubled
@@ -1382,6 +1397,7 @@ impl DerivationState {
             interested_builds: HashSet::new(),
             assigned_executor: None,
             exec_id: None,
+            open_attempt_kind: None,
             sched: SchedHint::default(),
             drv_content: Vec::new(),
             input_srcs: Vec::new(),
@@ -1593,6 +1609,7 @@ impl DerivationState {
         // uncalled Poisoned → Created one).
         if from.is_terminal() && !to.is_terminal() {
             self.exec_id = None;
+            self.open_attempt_kind = None;
         }
 
         from
@@ -1623,6 +1640,7 @@ impl DerivationState {
         }
         self.assigned_executor = None;
         self.exec_id = None;
+        self.open_attempt_kind = None;
         Ok(())
     }
 
@@ -2560,6 +2578,7 @@ mod tests {
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,
             exec_id: None,
+            attempt_kind: None,
         };
         let state = DerivationState::from_recovery_row(row, DerivationStatus::Queued).unwrap();
         assert!(state.ca.is_ca, "precondition: recovered as CA");

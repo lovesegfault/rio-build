@@ -2512,3 +2512,42 @@ fn test_remove_node_scrubs_only_neighbors() -> anyhow::Result<()> {
     assert_eq!(dag.parents["c"], HashSet::from(["a".into()]));
     Ok(())
 }
+
+// r[verify sched.pull.kinded-running-surface]
+/// Owner decision Q10: build_summary's running count excludes
+/// materialization-claimed nodes — they are upstream-fetch activity,
+/// not running builds. (BuildSnapshot / BuildProgress / BuildStatus
+/// all read this summary, so one filter covers all three aggregate
+/// surfaces.) Pre-fix this is a compile-level red: `open_attempt_kind`
+/// did not exist on DerivationState.
+#[test]
+fn build_summary_running_excludes_materialization_claims() -> anyhow::Result<()> {
+    use crate::state::AttemptKind;
+
+    let mut dag = DerivationDag::new();
+    let build_id = Uuid::new_v4();
+    let nodes = vec![
+        make_node("q10-build", "x86_64-linux"),
+        make_node("q10-mat", "x86_64-linux"),
+    ];
+    dag.merge(build_id, &nodes, &[], "")?;
+
+    for (tag, kind) in [
+        ("q10-build", AttemptKind::Build),
+        ("q10-mat", AttemptKind::Materialization),
+    ] {
+        let s = dag.node_mut(tag).expect("merged node");
+        s.transition(DerivationStatus::Queued)?;
+        s.transition(DerivationStatus::Ready)?;
+        s.transition(DerivationStatus::Assigned)?;
+        s.open_attempt_kind = Some(kind);
+    }
+
+    let summary = dag.build_summary(build_id);
+    assert_eq!(summary.total, 2);
+    assert_eq!(
+        summary.running, 1,
+        "the materialization-claimed node must not count as a running build (Q10)"
+    );
+    Ok(())
+}

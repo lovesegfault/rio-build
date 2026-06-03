@@ -364,6 +364,6 @@ in
   kani-rio-evidence-kernel = mkKaniCheck {
     name = "rio-evidence-kernel";
     crate = crateBuildKani.members.rio-evidence-kernel;
-    expectedHarnesses = 9;
+    expectedHarnesses = 10;
   };
 }

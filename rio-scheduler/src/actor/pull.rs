@@ -445,6 +445,10 @@ impl DagActor {
             state.retry.backoff_until = None;
             state.assigned_executor = Some(pulling_identity.clone());
             state.exec_id = Some(exec_id);
+            // r[impl sched.pull.kinded-running-surface]
+            // Captured at the single mint site for BOTH work classes,
+            // cleared in lockstep with exec_id (bug_144).
+            state.open_attempt_kind = Some(attempt_kind);
             if let Err(e) = state.transition(DerivationStatus::Running) {
                 warn!(drv_hash = %drv_hash, error = %e,
                       "pull-minted attempt could not enter Running (left Assigned)");
@@ -484,12 +488,17 @@ impl DagActor {
         // SUBSTITUTING (BC-4 — the wire-retained kind whose emission
         // moves from walk-spawn to claim intake; STARTED would stop the
         // gateway's actSubstitute/actCopyPath pair the instant it opened).
-        match attempt_kind {
-            crate::state::AttemptKind::Build => {
+        match rio_evidence_kernel::pull::display_class(match attempt_kind {
+            crate::state::AttemptKind::Build => rio_evidence_kernel::pull::PullKind::Build,
+            crate::state::AttemptKind::Materialization => {
+                rio_evidence_kernel::pull::PullKind::Materialization
+            }
+        }) {
+            rio_evidence_kernel::pull::DisplaySurface::Build => {
                 self.emit_assignment_started(drv_hash, pulling_identity);
             }
             // r[impl sched.materialize.job+2]
-            crate::state::AttemptKind::Materialization => {
+            rio_evidence_kernel::pull::DisplaySurface::Substitution => {
                 self.emit_materialization_claimed(drv_hash);
             }
         }

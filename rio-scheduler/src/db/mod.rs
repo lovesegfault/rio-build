@@ -271,6 +271,12 @@ pub(crate) struct RecoveryDerivationRow {
     /// "has a live execution"; the JOIN filters on the builder column to
     /// preserve `reset_to_ready()`'s exec_id clear across failover.
     pub exec_id: Option<Uuid>,
+    /// Work class of the open execution (`drv_executions.attempt_kind`,
+    /// joined on the SAME guarded exec_id), recovering the kinded
+    /// running surface across failover. `None` exactly when `exec_id`
+    /// is `None` — the join rides the assignment row's guard, so the
+    /// reset-clear is preserved for the kind too.
+    pub attempt_kind: Option<String>,
 }
 
 #[cfg(test)]
@@ -295,6 +301,7 @@ impl RecoveryDerivationRow {
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,
             exec_id: None,
+            attempt_kind: None,
         }
     }
 }
