@@ -123,6 +123,20 @@ pub enum Lint {
     /// live reservations — that the chokepoints close. Catches the new
     /// consumer at introduction instead of at the next audit.
     ReplayTransitionOps,
+    /// The replay engine's `BuildPathsWithResults` issuances are
+    /// enumerable: every call of the transport's
+    /// `build_paths_with_results[_observed]` lives in a sanctioned file
+    /// — the submitter chokepoint, which derives the realized-closure
+    /// workload estimate that keys the op's stderr drain budget, or the
+    /// supply prefetch arm, whose `closure_nodes = 0` opt-out (the
+    /// roots-scaled budget floor) is deliberate and shape-checked here.
+    /// A new direct caller would silently choose its own budget keying;
+    /// under-keying re-opens the healthy-log-heavy-batch cap trip
+    /// (Wire error → channel abandonment → every in-flight build in the
+    /// DAG cancelled) that workload keying closed. Catches the new
+    /// caller — and any widening of the prefetch opt-out — at
+    /// introduction instead of at the next audit.
+    ReplayBuildOpCallers,
 }
 
 impl Lint {
@@ -147,6 +161,7 @@ impl Lint {
             Lint::SupplyFoldOwner,
             Lint::SpecRuleCitations,
             Lint::ReplayTransitionOps,
+            Lint::ReplayBuildOpCallers,
         ]
     }
 }
@@ -165,6 +180,7 @@ pub fn run(lint: &Lint) -> Result<()> {
         Lint::SupplyFoldOwner => supply_fold_owner(),
         Lint::SpecRuleCitations => spec_rule_citations(),
         Lint::ReplayTransitionOps => replay_transition_ops(),
+        Lint::ReplayBuildOpCallers => replay_build_op_callers(),
     }
 }
 
@@ -2930,6 +2946,138 @@ fn replay_transition_ops() -> Result<()> {
         );
     }
     tracing::info!(phase_sites, in_flight_sites, "replay-transition-ops ok");
+    Ok(())
+}
+
+/// Standing enumeration of the replay engine's `BuildPathsWithResults`
+/// callers (see [`Lint::ReplayBuildOpCallers`]). The budget-keying rule
+/// this enforces lives at `DaemonChannel::build_paths_with_results`
+/// (rio-replay/src/run/transport.rs): `closure_nodes` keys the op's
+/// stderr drain budget to its workload, and the submitter chokepoint is
+/// the one place that derives a real estimate (the realized import
+/// closure: order + skipped). The accepted divergence this pins: the
+/// prefetch arm calls the transport DIRECTLY with `closure_nodes = 0`
+/// (no closure-union estimate exists for prefetch plans, and prefetch
+/// resolves via target-side substitution whose activity traffic sits far
+/// below build-log volume — the roots-scaled floor is deliberate). That
+/// opt-out stays acceptable only while it is the lone direct caller and
+/// keeps its `0`; widening either axis must re-derive the budget keying
+/// here, consciously, instead of inheriting the floor by accident.
+fn replay_build_op_callers() -> Result<()> {
+    // A call through a receiver (`channel.build_paths_with_results(`)
+    // or a UFCS forward (`DaemonChannel::build_paths_with_results_observed(`)
+    // — `fn` definitions and the `client_`-prefixed protocol functions
+    // do not match.
+    let call_re = regex::Regex::new(r"(\.|::)build_paths_with_results(_observed)?\s*\(").unwrap();
+    // The sanctioned shape of the prefetch opt-out: the literal `0`
+    // estimate in argument position. Spread over two lines by rustfmt it
+    // still matches — the needle is applied to the joined statement
+    // window below.
+    let opt_out_re = regex::Regex::new(r"\.build_paths_with_results\s*\([^)]*,\s*0\s*\)").unwrap();
+    const SANCTIONED: &[(&str, &str)] = &[
+        (
+            "rio-replay/src/run/submitter.rs",
+            "the submission chokepoint: the SubmitChannel seam whose production impl forwards \
+             to the transport with the chokepoint-derived workload estimate",
+        ),
+        (
+            "rio-replay/src/run/supply/exec.rs",
+            "the prefetch arm's documented closure_nodes=0 opt-out (roots-scaled budget floor)",
+        ),
+    ];
+
+    let root = repo_root();
+    let scan_root = root.join("rio-replay/src");
+    ensure!(
+        scan_root.is_dir(),
+        "replay-build-op-callers scan root {} not found",
+        scan_root.display()
+    );
+    let mut sites: Vec<(String, usize, String)> = Vec::new();
+    let mut violations: Vec<String> = Vec::new();
+    walk_rs(&scan_root, &mut |path| {
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        // The transport module OWNS the methods; its `fn` definitions and
+        // intra-doc links are not call sites, and the `(\.|::)` anchor
+        // plus comment stripping below already exclude them — but keep
+        // the owner scanned so a self-call would surface too.
+        let src =
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let lines: Vec<&str> = src.lines().collect();
+        let prod_end = lines
+            .iter()
+            .position(|line| line.trim() == "#[cfg(test)]")
+            .unwrap_or(lines.len());
+        let sanctioned = SANCTIONED.iter().any(|(f, _)| *f == rel);
+        for (i, line) in lines[..prod_end].iter().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let code = strip_line_comment(line);
+            if !call_re.is_match(code) {
+                continue;
+            }
+            // Join a small forward window so an argument list rustfmt
+            // wrapped across lines is still shape-checkable.
+            let window = lines[i..(i + 4).min(prod_end)].join(" ");
+            sites.push((rel.clone(), i + 1, window));
+            if !sanctioned {
+                violations.push(format!(
+                    "{rel}:{}: direct BuildPathsWithResults caller outside the sanctioned \
+                     files — every issuance must key its stderr drain budget: route the \
+                     submission through the submitter chokepoint (which derives the \
+                     realized-closure estimate), or — for a genuinely new op family — extend \
+                     the sanctioned table in xtask/src/lint.rs with the rationale AND the \
+                     budget derivation",
+                    i + 1
+                ));
+            }
+        }
+        Ok(())
+    })?;
+    // Exact-shape checks on the sanctioned universe. Counts are exact,
+    // not floors: this universe is two sites today, and a third site in
+    // a sanctioned FILE must still be looked at (the file sanction names
+    // one call's rationale, not a blanket).
+    let in_file = |file: &str| sites.iter().filter(|(rel, _, _)| rel == file).count();
+    ensure!(
+        in_file("rio-replay/src/run/submitter.rs") == 2,
+        "replay-build-op-callers: expected exactly 2 sites in submitter.rs (the SubmitChannel \
+         seam's production forward + the chokepoint's one issuance with the derived workload \
+         estimate), found {} — a new call site in the chokepoint file still needs its budget \
+         keying re-derived and this count re-pinned",
+        in_file("rio-replay/src/run/submitter.rs"),
+    );
+    ensure!(
+        in_file("rio-replay/src/run/supply/exec.rs") == 1,
+        "replay-build-op-callers: expected exactly 1 prefetch call in supply/exec.rs, found \
+         {} — the closure_nodes=0 opt-out is sanctioned for the lone prefetch arm only",
+        in_file("rio-replay/src/run/supply/exec.rs"),
+    );
+    let prefetch_window = sites
+        .iter()
+        .find(|(rel, _, _)| rel == "rio-replay/src/run/supply/exec.rs")
+        .map(|(_, _, window)| window.as_str())
+        .unwrap_or_default();
+    ensure!(
+        opt_out_re.is_match(prefetch_window),
+        "replay-build-op-callers: the prefetch arm's call no longer passes the literal \
+         closure_nodes=0 opt-out — if it now derives a real estimate, move it behind the \
+         submitter chokepoint's derivation (or update this lint's sanctioned shape with the \
+         new keying's rationale); a non-zero ad-hoc estimate must not bypass the chokepoint",
+    );
+    if !violations.is_empty() {
+        bail!(
+            "{} replay-build-op-callers violation(s):\n    {}",
+            violations.len(),
+            violations.join("\n    "),
+        );
+    }
+    tracing::info!(sites = sites.len(), "replay-build-op-callers ok");
     Ok(())
 }
 
