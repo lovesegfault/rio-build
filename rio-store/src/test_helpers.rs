@@ -503,8 +503,11 @@ pub struct ProofWalkReport {
     /// Verdict label for absent outcomes
     /// (`not_resident|unparseable|over_budget|cycle`).
     pub reason: Option<&'static str>,
-    /// Rows persisted by THIS attempt's monotone exit (over-budget arm
-    /// only; other arms report 0 here — count rows via SQL).
+    /// TOTAL rows this attempt made durable (eager computes + exit
+    /// drain — both route through the walk owner's sole persist
+    /// chokepoint, so this equals the SQL row delta; round-16
+    /// merged_bug_086). Surfaced on the over-budget arm; other arms
+    /// report 0 here — count rows via SQL.
     pub persisted: usize,
     /// Work units consumed.
     pub work_used: usize,

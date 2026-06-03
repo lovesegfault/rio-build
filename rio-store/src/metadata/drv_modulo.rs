@@ -677,13 +677,13 @@ pub(crate) enum AbsentReason {
     NotResident { path: String },
     /// A `.drv` in the closure is resident but cannot be used.
     Unparseable { path: String, why: String },
-    /// The walk exhausted its work budget. `persisted` counts the rows
-    /// the EXIT DRAIN proved and upserted (`complete_partial_arena`);
-    /// rows the walk upserted eagerly mid-flight are durable too but
-    /// are NOT included in this count (round-16 merged_bug_086) — so
-    /// treat it as "additional rows proven at exit", not "total rows
-    /// this attempt made durable". Either way the cache strictly grew
-    /// and a retry resumes from it.
+    /// The walk exhausted its budget (work units or arena bytes).
+    /// `persisted` is the TOTAL rows this attempt made durable — eager
+    /// mid-flight computes and the exit drain both route through the
+    /// walk owner's sole [`ProofWalk::persist`] chokepoint, so the
+    /// count equals the SQL row delta by construction (round-16
+    /// merged_bug_086; pinned by the row-delta test). A retry resumes
+    /// from those rows.
     OverBudget { persisted: usize, work_used: usize },
     /// The input metadata forms a cycle: no topological order exists,
     /// so no row in the cyclic remainder is derivable. Fail-closed
@@ -779,48 +779,250 @@ async fn own_drv_bytes(
     }
 }
 
-/// Persist every arena node whose input closure is fully seeded —
-/// bottom-up passes until a pass makes no progress. Returns the number
-/// of rows persisted. Runs on every TYPED-VERDICT walk exit (monotone
-/// progress, R4); the `Err` propagation paths in `prove_inner`
-/// currently bypass this drain (round-16 bug_084 — "every exit" is the
-/// goal the proof-walk owner type will enforce, not the shipped
-/// behavior; an infra error today loses the un-drained arena, costing
-/// re-derivation on retry, never correctness). Persistence of
-/// already-discovered work is exempt from the budget by
-/// design (see [`PROOF_WALK_WORK_MAX`]).
-async fn complete_partial_arena(
-    pool: &PgPool,
-    arena: &mut HashMap<String, (Vec<u8>, Vec<String>)>,
-    seeds: &mut HashMap<String, [u8; 32]>,
-) -> Result<usize, super::MetadataError> {
-    let mut persisted = 0usize;
-    loop {
-        let ready: Vec<String> = arena
-            .iter()
-            .filter(|(_, (_, inputs))| inputs.iter().all(|i| seeds.contains_key(i)))
-            .map(|(p, _)| p.clone())
-            .collect();
-        if ready.is_empty() {
-            return Ok(persisted);
+/// The proof-walk OWNER (round-16 bug_084 + merged_bug_086; the MP1
+/// contract-owner paydown — a remedy that introduces a contract
+/// introduces, same commit, the type that owns its transitions):
+///
+/// - [`Self::persist`] is the SOLE row-upsert site of the walk: eager
+///   mid-flight computes and the exit drain both route through it, so
+///   `persisted` equals the SQL row delta BY CONSTRUCTION — a persist
+///   the count doesn't see is unwritable (merged_bug_086's
+///   dual-persist-site drift class dies here).
+/// - [`Self::finish`] and [`Self::fail`] CONSUME the walk and BOTH run
+///   the exit [`Self::drain`], and they are the only ways out of
+///   [`prove_inner`]'s routing match: a `?` inside [`Self::discover`]
+///   propagates to that match, which routes it through `fail` — so an
+///   infrastructure `Err` can no longer skip the monotone-persistence
+///   obligation (bug_084), and a NEW exit class cannot be written that
+///   bypasses it (R4 EXIT CLASSES, structural form).
+struct ProofWalk<'a> {
+    pool: &'a PgPool,
+    chunks: Option<&'a crate::cas::ChunkCache>,
+    budget: &'a mut WorkBudget,
+    /// Fetched-but-uncomputed nodes: path → (bytes, input list).
+    arena: HashMap<String, (Vec<u8>, Vec<String>)>,
+    /// Proven input-form hashes.
+    seeds: HashMap<String, [u8; 32]>,
+    /// Dedup-on-push frontier ledger.
+    queued: std::collections::HashSet<String>,
+    /// Rows made durable by THIS walk — incremented only inside
+    /// [`Self::persist`].
+    persisted: usize,
+}
+
+impl<'a> ProofWalk<'a> {
+    fn new(
+        pool: &'a PgPool,
+        chunks: Option<&'a crate::cas::ChunkCache>,
+        budget: &'a mut WorkBudget,
+    ) -> Self {
+        ProofWalk {
+            pool,
+            chunks,
+            budget,
+            arena: HashMap::new(),
+            seeds: HashMap::new(),
+            queued: std::collections::HashSet::new(),
+            persisted: 0,
         }
-        for path in ready {
-            let (bytes, _inputs) = arena.remove(&path).expect("selected from arena");
-            match compute_drv_modulo(&bytes, &path, seeds) {
-                Ok(c) => {
-                    seeds.insert(path.clone(), c.row.modulo_hash);
-                    upsert_drv_modulo(pool, &path, &c.row).await?;
-                    persisted += 1;
-                }
-                Err(_) => {
-                    // Inputs all seeded yet the walk failed: ill-formed
-                    // bytes slipped past the parse (defensive). Leave it
-                    // un-persisted; the caller's verdict logic treats an
-                    // underivable target as Cycle/Unparseable.
-                    debug!(path, "arena node failed to compute despite seeded inputs");
+    }
+
+    /// THE persist chokepoint: upsert + seed + count, in one place.
+    /// Every row this walk makes durable goes through here.
+    async fn persist(
+        &mut self,
+        path: &str,
+        row: &DrvModuloRow,
+    ) -> Result<(), super::MetadataError> {
+        upsert_drv_modulo(self.pool, path, row).await?;
+        self.seeds.insert(path.to_string(), row.modulo_hash);
+        self.persisted += 1;
+        Ok(())
+    }
+
+    /// Exit drain: persist every arena node whose input closure is
+    /// fully seeded — bottom-up passes until a pass makes no progress.
+    /// Runs on EVERY walk exit (typed verdict via [`Self::finish`],
+    /// `Err` propagation via [`Self::fail`]) — monotone progress, R4.
+    /// Persistence of already-discovered work is deliberately exempt
+    /// from the budget (see [`PROOF_WALK_WORK_MAX`]).
+    async fn drain(&mut self) -> Result<(), super::MetadataError> {
+        loop {
+            let ready: Vec<String> = self
+                .arena
+                .iter()
+                .filter(|(_, (_, inputs))| inputs.iter().all(|i| self.seeds.contains_key(i)))
+                .map(|(p, _)| p.clone())
+                .collect();
+            if ready.is_empty() {
+                return Ok(());
+            }
+            for path in ready {
+                let (bytes, _inputs) = self.arena.remove(&path).expect("selected from arena");
+                match compute_drv_modulo(&bytes, &path, &mut self.seeds) {
+                    Ok(c) => {
+                        self.persist(&path, &c.row).await?;
+                    }
+                    Err(_) => {
+                        // Inputs all seeded yet the walk failed:
+                        // ill-formed bytes slipped past the parse
+                        // (defensive). Leave it un-persisted; the
+                        // verdict logic treats an underivable target
+                        // as Cycle/Unparseable.
+                        debug!(path, "arena node failed to compute despite seeded inputs");
+                    }
                 }
             }
         }
+    }
+
+    /// Typed-verdict exit: drain, then derive the outcome. Consumes
+    /// the walk.
+    async fn finish(
+        mut self,
+        target: &str,
+        exit: Option<AbsentReason>,
+    ) -> Result<ProofOutcome, super::MetadataError> {
+        self.drain().await?;
+        match exit {
+            Some(AbsentReason::OverBudget { work_used, .. }) => {
+                Ok(ProofOutcome::Absent(AbsentReason::OverBudget {
+                    persisted: self.persisted,
+                    work_used,
+                }))
+            }
+            Some(reason) => Ok(ProofOutcome::Absent(reason)),
+            None => match load_drv_modulo(self.pool, target).await? {
+                Some(row) => Ok(ProofOutcome::Proven(row)),
+                // Discovery completed, the arena drained as far as it
+                // could, and the target is still underivable: the
+                // remainder is cyclic (acyclic closures always
+                // topo-complete).
+                None => Ok(ProofOutcome::Absent(AbsentReason::Cycle)),
+            },
+        }
+    }
+
+    /// `Err`-propagation exit: drain best-effort (a drain failure is
+    /// logged and swallowed — the PRIMARY error is what the caller
+    /// must see), then hand the error back. Consumes the walk.
+    /// Closes round-16 bug_084: pre-owner, `?` paths dropped the
+    /// arena, losing every drain-eligible subtree on infra errors.
+    async fn fail(mut self, err: super::MetadataError) -> super::MetadataError {
+        if let Err(e2) = self.drain().await {
+            debug!(
+                error = %e2,
+                "proof-walk exit drain failed during error propagation \
+                 (best-effort; primary error preserved)"
+            );
+        }
+        err
+    }
+
+    /// Discovery: DFS from `target`. `Ok(Some(reason))` = typed absent
+    /// exit; `Ok(None)` = clean completion (verdict derived by
+    /// [`Self::finish`]); `Err` = infrastructure failure (routed
+    /// through [`Self::fail`] by the caller's match).
+    async fn discover(
+        &mut self,
+        target: &str,
+    ) -> Result<Option<AbsentReason>, super::MetadataError> {
+        let mut stack: Vec<String> = vec![target.to_string()];
+
+        while let Some(path) = stack.pop() {
+            if self.seeds.contains_key(&path) || self.arena.contains_key(&path) {
+                continue;
+            }
+            let bytes = match own_drv_bytes(self.pool, self.chunks, &path, self.budget).await? {
+                FetchedDrv::Bytes(b) => b,
+                FetchedDrv::Absent => {
+                    return Ok(Some(AbsentReason::NotResident { path }));
+                }
+                FetchedDrv::Unreadable(why) => {
+                    return Ok(Some(AbsentReason::Unparseable { path, why }));
+                }
+                FetchedDrv::OverBudget => {
+                    return Ok(Some(AbsentReason::OverBudget {
+                        persisted: 0,
+                        work_used: self.budget.used(),
+                    }));
+                }
+            };
+            let inputs: Vec<String> = match std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|t| rio_nix::derivation::Derivation::parse(t).ok())
+            {
+                Some(d) => d.input_drvs().keys().cloned().collect(),
+                None => {
+                    return Ok(Some(AbsentReason::Unparseable {
+                        path,
+                        why: "bytes do not parse as a derivation".into(),
+                    }));
+                }
+            };
+
+            // ONE batched probe for every not-yet-seen input of this
+            // node (bug_007: the per-path probe inside the old loop was
+            // an unmetered query per frontier entry).
+            let unseen: Vec<String> = inputs
+                .iter()
+                .filter(|i| {
+                    !self.seeds.contains_key(*i)
+                        && !self.arena.contains_key(*i)
+                        && !self.queued.contains(*i)
+                })
+                .cloned()
+                .collect();
+            if !unseen.is_empty() {
+                if self.budget.charge(1).is_err() {
+                    return Ok(Some(AbsentReason::OverBudget {
+                        persisted: 0,
+                        work_used: self.budget.used(),
+                    }));
+                }
+                let found = load_drv_modulo_batch(self.pool, &unseen).await?;
+                for (p, h) in &found {
+                    self.seeds.insert(p.clone(), *h);
+                }
+                for p in unseen {
+                    if !self.seeds.contains_key(&p) {
+                        self.queued.insert(p.clone());
+                        stack.push(p);
+                    }
+                }
+            }
+
+            // Eager leaf-first: compute immediately when every input is
+            // already seeded (leaves and probe-satisfied nodes) — keeps
+            // the arena small and persists progress as early as
+            // possible; the row routes through the persist chokepoint.
+            if inputs.iter().all(|i| self.seeds.contains_key(i)) {
+                match compute_drv_modulo(&bytes, &path, &mut self.seeds) {
+                    Ok(c) => {
+                        self.persist(&path, &c.row).await?;
+                        continue;
+                    }
+                    Err(_) => {
+                        // Fall through to retention (defensive: parse
+                        // succeeded but the walk failed; drain retries).
+                    }
+                }
+            }
+            // Retention is charged BEFORE the insert (bug_079):
+            // over-cap bytes are never resident.
+            if self
+                .budget
+                .charge_arena(arena_charge(&path, &bytes, &inputs))
+                .is_err()
+            {
+                return Ok(Some(AbsentReason::OverBudget {
+                    persisted: 0,
+                    work_used: self.budget.used(),
+                }));
+            }
+            self.arena.insert(path, (bytes, inputs));
+        }
+        Ok(None)
     }
 }
 
@@ -908,6 +1110,12 @@ async fn prove_admitted(
     prove_inner(pool, chunks, drv_path, budget).await
 }
 
+/// EVERY exit persists what it proved (monotone progress): the routing
+/// match below is the walk's ONLY exit surface — typed verdicts and
+/// clean completions route through [`ProofWalk::finish`], `Err`s
+/// through [`ProofWalk::fail`], and both drain. Adding an exit that
+/// bypasses the obligation requires bypassing this match (round-16
+/// bug_084's structural close).
 async fn prove_inner(
     pool: &PgPool,
     chunks: Option<&crate::cas::ChunkCache>,
@@ -926,142 +1134,10 @@ async fn prove_inner(
         return Ok(ProofOutcome::Proven(row));
     }
 
-    // Discovery: DFS from the target. arena = fetched-but-uncomputed
-    // nodes (bytes + input list); seeds = proven input-form hashes;
-    // queued = dedup-on-push.
-    let mut arena: HashMap<String, (Vec<u8>, Vec<String>)> = HashMap::new();
-    let mut seeds: HashMap<String, [u8; 32]> = HashMap::new();
-    let mut queued: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut stack: Vec<String> = vec![drv_path.to_string()];
-    let mut exit: Option<AbsentReason> = None;
-
-    while let Some(path) = stack.pop() {
-        if seeds.contains_key(&path) || arena.contains_key(&path) {
-            continue;
-        }
-        let bytes = match own_drv_bytes(pool, chunks, &path, budget).await? {
-            FetchedDrv::Bytes(b) => b,
-            FetchedDrv::Absent => {
-                exit = Some(AbsentReason::NotResident { path });
-                break;
-            }
-            FetchedDrv::Unreadable(why) => {
-                exit = Some(AbsentReason::Unparseable { path, why });
-                break;
-            }
-            FetchedDrv::OverBudget => {
-                exit = Some(AbsentReason::OverBudget {
-                    persisted: 0,
-                    work_used: budget.used(),
-                });
-                break;
-            }
-        };
-        let inputs: Vec<String> = match std::str::from_utf8(&bytes)
-            .ok()
-            .and_then(|t| rio_nix::derivation::Derivation::parse(t).ok())
-        {
-            Some(d) => d.input_drvs().keys().cloned().collect(),
-            None => {
-                exit = Some(AbsentReason::Unparseable {
-                    path,
-                    why: "bytes do not parse as a derivation".into(),
-                });
-                break;
-            }
-        };
-
-        // ONE batched probe for every not-yet-seen input of this node
-        // (bug_007: the per-path probe inside the old loop was an
-        // unmetered query per frontier entry).
-        let unseen: Vec<String> = inputs
-            .iter()
-            .filter(|i| !seeds.contains_key(*i) && !arena.contains_key(*i) && !queued.contains(*i))
-            .cloned()
-            .collect();
-        if !unseen.is_empty() {
-            if budget.charge(1).is_err() {
-                exit = Some(AbsentReason::OverBudget {
-                    persisted: 0,
-                    work_used: budget.used(),
-                });
-                break;
-            }
-            let found = load_drv_modulo_batch(pool, &unseen).await?;
-            for (p, h) in &found {
-                seeds.insert(p.clone(), *h);
-            }
-            for p in unseen {
-                if !seeds.contains_key(&p) {
-                    queued.insert(p.clone());
-                    stack.push(p);
-                }
-            }
-        }
-
-        // Eager leaf-first: compute immediately when every input is
-        // already seeded (leaves and probe-satisfied nodes) — keeps the
-        // arena small and persists progress as early as possible.
-        if inputs.iter().all(|i| seeds.contains_key(i)) {
-            let mut local_seeds = std::mem::take(&mut seeds);
-            match compute_drv_modulo(&bytes, &path, &mut local_seeds) {
-                Ok(c) => {
-                    local_seeds.insert(path.clone(), c.row.modulo_hash);
-                    upsert_drv_modulo(pool, &path, &c.row).await?;
-                }
-                Err(_) => {
-                    seeds = local_seeds;
-                    // Retention is charged BEFORE the insert (bug_079):
-                    // over-cap bytes are never resident.
-                    if budget
-                        .charge_arena(arena_charge(&path, &bytes, &inputs))
-                        .is_err()
-                    {
-                        exit = Some(AbsentReason::OverBudget {
-                            persisted: 0,
-                            work_used: budget.used(),
-                        });
-                        break;
-                    }
-                    arena.insert(path, (bytes, inputs));
-                    continue;
-                }
-            }
-            seeds = local_seeds;
-        } else {
-            // Retention is charged BEFORE the insert (bug_079).
-            if budget
-                .charge_arena(arena_charge(&path, &bytes, &inputs))
-                .is_err()
-            {
-                exit = Some(AbsentReason::OverBudget {
-                    persisted: 0,
-                    work_used: budget.used(),
-                });
-                break;
-            }
-            arena.insert(path, (bytes, inputs));
-        }
-    }
-
-    // EVERY exit persists what it proved (monotone progress).
-    let persisted = complete_partial_arena(pool, &mut arena, &mut seeds).await?;
-
-    match exit {
-        Some(AbsentReason::OverBudget { work_used, .. }) => {
-            Ok(ProofOutcome::Absent(AbsentReason::OverBudget {
-                persisted,
-                work_used,
-            }))
-        }
-        Some(reason) => Ok(ProofOutcome::Absent(reason)),
-        None => match load_drv_modulo(pool, drv_path).await? {
-            Some(row) => Ok(ProofOutcome::Proven(row)),
-            // Discovery completed, the arena drained as far as it
-            // could, and the target is still underivable: the remainder
-            // is cyclic (acyclic closures always topo-complete).
-            None => Ok(ProofOutcome::Absent(AbsentReason::Cycle)),
-        },
+    let mut walk = ProofWalk::new(pool, chunks, budget);
+    match walk.discover(drv_path).await {
+        Ok(exit) => walk.finish(drv_path, exit).await,
+        Err(e) => Err(walk.fail(e).await),
     }
 }
 

@@ -754,6 +754,17 @@ mod proof_walk {
                 "every over-budget attempt must persist NEW progress \
                  (attempt {attempts}: {last_rows} -> {rows})"
             );
+            // merged_bug_086 pin: the reported count IS the SQL row
+            // delta — eager computes and the exit drain both route
+            // through the owner's sole persist chokepoint.
+            assert_eq!(
+                report.persisted as i64,
+                rows - last_rows,
+                "persisted must equal the SQL row delta \
+                 (attempt {attempts}: reported {}, delta {})",
+                report.persisted,
+                rows - last_rows
+            );
             last_rows = rows;
             assert!(attempts < 10, "must converge, not livelock");
         }
@@ -761,6 +772,120 @@ mod proof_walk {
         assert!(
             attempts >= 2,
             "fixture must actually exercise resumption (got {attempts} attempts)"
+        );
+        Ok(())
+    }
+
+    // r[verify store.put.ia-deriver-proof+3]
+    /// THE bug_084 exit-class witness: an INFRASTRUCTURE error
+    /// mid-discovery must still drain the arena — every subtree whose
+    /// inputs completed before the error is persisted on the `Err`
+    /// path, exactly as on typed-verdict exits.
+    ///
+    /// Shape: root{mid_a, mid_b}; each mid has its own leaf. The mid
+    /// whose path sorts GREATER pops first (inputs push in BTreeMap
+    /// ascending order; the DFS stack pops the last push), so its
+    /// branch completes (leaf eager-persisted; mid retained,
+    /// drain-eligible) before the OTHER mid is fetched. That other mid
+    /// is staged with a CORRUPT inline NAR → own_drv_bytes returns
+    /// Err(InvariantViolation) — deterministic, no chunk backend.
+    /// Pre-owner-type, the `?` dropped the arena: the completed mid's
+    /// row was lost and a retry re-derived it. Post-fix, fail() drains:
+    /// the completed mid's row EXISTS after the erroring walk.
+    #[tokio::test]
+    async fn err_exit_drains_completed_subtrees() -> TestResult {
+        let s = StoreSession::new().await?;
+        let mut minted = HashMap::new();
+        let mut dc = HashMap::new();
+        let leaf_a = mint_node("errleaf-a", &[], &mut minted, &mut dc);
+        let mid_a = mint_node("errmid-a", &[leaf_a], &mut minted, &mut dc);
+        let leaf_b = mint_node("errleaf-b", &[], &mut minted, &mut dc);
+        let mid_b = mint_node("errmid-b", &[leaf_b], &mut minted, &mut dc);
+        let root = mint_node(
+            "err-root",
+            &[mid_a.clone(), mid_b.clone()],
+            &mut minted,
+            &mut dc,
+        );
+
+        // Role assignment by SORT ORDER (text-CA path hashes are not
+        // name-controllable): the greater path pops FIRST and is the
+        // GOOD branch; the lesser pops second and is CORRUPT.
+        let (good_mid, corrupt_mid) = if mid_a > mid_b {
+            (mid_a.clone(), mid_b.clone())
+        } else {
+            (mid_b.clone(), mid_a.clone())
+        };
+        let good_leaf = minted[&good_mid]
+            .1
+            .input_drvs()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+
+        for (path, (text, _)) in &minted {
+            if *path == corrupt_mid {
+                continue;
+            }
+            stage_drv_sql(&s.db.pool, path, text).await?;
+        }
+        // Stage the corrupt mid: complete manifest whose inline blob is
+        // NOT a NAR → extraction fails → Err (row corruption class).
+        let key = StorePath::parse(&corrupt_mid)?.sha256_digest();
+        sqlx::query(
+            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(key.as_slice())
+        .bind(&corrupt_mid)
+        .bind([0u8; 32].as_slice())
+        .bind(16i64)
+        .execute(&s.db.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO manifests (store_path_hash, status, inline_blob) \
+             VALUES ($1, 'complete', $2)",
+        )
+        .bind(key.as_slice())
+        .bind(b"not a nar at all".as_slice())
+        .execute(&s.db.pool)
+        .await?;
+
+        let err = proof_walk_for_tests(&s.db.pool, None, &root, PROOF_WALK_WORK_MAX_FOR_TESTS)
+            .await
+            .expect_err("corrupt resident NAR is an infrastructure Err, not a verdict");
+        assert!(
+            err.to_string().contains("invariant violation"),
+            "row-corruption class carried: {err}"
+        );
+
+        // THE PIN: the completed branch survived the Err exit.
+        let good_leaf_present: i64 =
+            sqlx::query_scalar("SELECT count(*)::bigint FROM drv_modulo_cache WHERE drv_path = $1")
+                .bind(&good_leaf)
+                .fetch_one(&s.db.pool)
+                .await?;
+        let good_mid_present: i64 =
+            sqlx::query_scalar("SELECT count(*)::bigint FROM drv_modulo_cache WHERE drv_path = $1")
+                .bind(&good_mid)
+                .fetch_one(&s.db.pool)
+                .await?;
+        assert_eq!(
+            good_leaf_present, 1,
+            "eager leaf persisted before the error"
+        );
+        assert_eq!(
+            good_mid_present, 1,
+            "DRAIN-ONLY row: the completed mid must be persisted by the \
+             Err-path drain (bug_084 — pre-fix this row was dropped \
+             with the arena)"
+        );
+        assert_eq!(
+            cache_rows(&s.db.pool).await,
+            2,
+            "exactly the completed branch persists; the corrupt branch \
+             and the blocked root do not"
         );
         Ok(())
     }
