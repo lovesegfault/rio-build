@@ -105,8 +105,18 @@ pub(crate) fn prepare_fetchurl(
         .iter()
         .find(|o| o.name() == output.name)
         .expect("planned output exists in derivation");
-    let algo = drv_output.hash_algo();
-    let flat = !algo.starts_with("r:") && !algo.is_empty();
+    let raw_algo = drv_output.hash_algo();
+    // Shared FodAlgo constructor — validate_fixed_output_declarations
+    // (which runs before any builtin planning) parses the same string
+    // with the same constructor, so `parsed` cannot be None here in
+    // production; the None arm below is the registered raw fallback
+    // (defensive, never panicking).
+    // r[impl nix.hash.algos+1]
+    let parsed = rio_nix::hash::OutputHashAlgo::parse(raw_algo).ok();
+    let flat = match parsed {
+        Some(p) => !p.recursive,
+        None => !raw_algo.starts_with("r:") && !raw_algo.is_empty(),
+    };
 
     let mut env: Vec<(OsString, OsString)> = vec![
         (env_vars::URL.into(), url.into()),
@@ -129,7 +139,19 @@ pub(crate) fn prepare_fetchurl(
             env_vars::MIRRORS.into(),
             opts.hashed_mirrors.join(" ").into(),
         ));
-        env.push((env_vars::HASH_ALGO.into(), algo.into()));
+        // Canonical algo spelling from the PARSED declaration, not the
+        // raw string (merged_bug_048's second half: the hash sibling
+        // was canonicalized while the raw algo went into the env, so a
+        // declaration the lax gate admitted produced a garbage
+        // `<mirror>/SHA256/<hex>` URL). With the case-exact constructor
+        // a successful parse implies the raw spelling was already
+        // canonical — deriving the env from the parse makes that a
+        // property of the construction rather than of the gate's mood.
+        let canonical_algo: OsString = match parsed {
+            Some(p) => p.algo.as_str().into(),
+            None => raw_algo.into(),
+        };
+        env.push((env_vars::HASH_ALGO.into(), canonical_algo));
         // Canonical lowercase base16 — the oracle builds hashed-mirror URLs
         // from `dof->ca.hash.to_string(HashFormat::Base16, false)`
         // (fetchurl.cc), so a nixbase32- or base64-declared hash must be
@@ -139,11 +161,9 @@ pub(crate) fn prepare_fetchurl(
         // fall back to the raw string defensively rather than panicking.
         // r[impl nix.hash.fod-decode+1]
         // r[impl nix.divergence.fod-fallback-fingerprint+1]
-        let canonical_b16 = algo
-            .parse::<rio_nix::hash::HashAlgo>()
-            .ok()
-            .and_then(|a| {
-                rio_nix::hash::NixHash::parse_nonsri_unprefixed(a, drv_output.hash()).ok()
+        let canonical_b16 = parsed
+            .and_then(|p| {
+                rio_nix::hash::NixHash::parse_nonsri_unprefixed(p.algo, drv_output.hash()).ok()
             })
             .map(|h| h.to_hex())
             .unwrap_or_else(|| drv_output.hash().to_owned());
@@ -473,6 +493,22 @@ mod tests {
         assert_eq!(
             hash_b16, canonical_hex,
             "nixbase32-declared hash must be re-encoded to canonical base16"
+        );
+        // The algo sibling carries the canonical spelling derived from
+        // the PARSED declaration (merged_bug_048: the hash component
+        // was canonicalized while the raw algo string went into the
+        // env).
+        // r[verify nix.hash.algos+1]
+        let hash_algo = pb
+            .request
+            .env
+            .iter()
+            .find(|(k, _)| k == &OsString::from(env_vars::HASH_ALGO))
+            .map(|(_, v)| v.to_str().expect("utf-8 env value").to_owned())
+            .expect("HASH_ALGO env present for flat FOD with mirrors");
+        assert_eq!(
+            hash_algo, "sha256",
+            "mirror env algo must be the canonical parsed spelling"
         );
     }
 

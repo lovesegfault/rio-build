@@ -89,22 +89,18 @@ impl FloatingCaSpec {
             let OutputKind::Floating { hash_algo: raw } = o.kind() else {
                 continue;
             };
-            let (recursive, algo_str) = match raw.strip_prefix("r:") {
-                Some(rest) => (true, rest),
-                None => (false, raw),
-            };
-            let algo = match algo_str {
-                "sha1" => HashAlgo::SHA1,
-                "sha256" => HashAlgo::SHA256,
-                "sha512" => HashAlgo::SHA512,
-                _ => {
-                    return Err(OutputRejection::CaUnsupportedAlgo {
-                        output: o.name().to_owned(),
-                        algo: raw.to_owned(),
-                    });
+            // Shared FodAlgo constructor — same case-exact parse and
+            // prefix handling as every other gate, so a floating-CA
+            // declaration cannot be read differently here than the
+            // request glue / gateway read it.
+            // r[impl nix.hash.algos+1]
+            let parsed = rio_nix::hash::OutputHashAlgo::parse(raw).map_err(|_| {
+                OutputRejection::CaUnsupportedAlgo {
+                    output: o.name().to_owned(),
+                    algo: raw.to_owned(),
                 }
-            };
-            methods.insert(o.name().to_owned(), (recursive, algo));
+            })?;
+            methods.insert(o.name().to_owned(), (parsed.recursive, parsed.algo));
         }
         Ok(Self { methods })
     }

@@ -590,19 +590,24 @@ fn validate_fixed_output_declarations(
         .filter(|o| matches!(o.kind(), OutputKind::Fixed { .. }))
     {
         let raw_algo = o.hash_algo();
-        let (recursive, algo_str) = match raw_algo.strip_prefix("r:") {
-            Some(rest) => (true, rest),
-            None => (false, raw_algo),
-        };
-        let algo: HashAlgo = algo_str
-            .parse()
-            .map_err(|_| GlueError::FixedOutputHashInvalid {
+        // Shared FodAlgo constructor — case-exact algo, one
+        // case-sensitive `r:` strip — so this gate cannot accept a
+        // spelling any other gate rejects (merged_bug_048: a local
+        // case-folding parse here admitted "SHA256" past a gate the
+        // gateway and the verify pipeline both enforce exactly).
+        // r[impl nix.hash.algos+1]
+        let parsed = rio_nix::hash::OutputHashAlgo::parse(raw_algo).map_err(|_| {
+            GlueError::FixedOutputHashInvalid {
                 output: o.name().to_owned(),
                 message: format!("unsupported outputHashAlgo '{raw_algo}'"),
-            })?;
+            }
+        })?;
+        let (recursive, algo): (bool, HashAlgo) = (parsed.recursive, parsed.algo);
         // Length-discriminated decode (base16 / nixbase32 / base64) — the
         // shared CppNix-parity parser. Defense-in-depth: the gateway gate
-        // already decoded the same declaration with the same function.
+        // decodes the same declaration with the same function AND parses
+        // the algo with the same constructor (a gateway-bypass submitter
+        // is the reason this gate re-checks at all).
         // r[impl nix.hash.fod-decode+1]
         let hash = NixHash::parse_nonsri_unprefixed(algo, o.hash()).map_err(|e| {
             GlueError::FixedOutputHashInvalid {
@@ -1101,6 +1106,39 @@ mod tests {
             matches!(err, GlueError::FixedOutputHashInvalid { .. }),
             "got: {err}"
         );
+    }
+
+    /// merged_bug_048 pin: the FOD declaration gate parses the algo
+    /// case-exactly through the shared constructor — a spelling the
+    /// gateway and the verify pipeline reject can no longer slip past
+    /// THIS gate into a network-enabled sandbox via a gateway-bypass
+    /// submission.
+    // r[verify nix.hash.algos+1]
+    #[test]
+    fn fixed_output_with_case_variant_algo_is_rejected() {
+        let zeros = "00".repeat(32);
+        for bad_algo in ["SHA256", "Sha256", "r:SHA256", "R:sha256", "sHa1"] {
+            let out = fod_path("sha256", &zeros);
+            let drv = mk_drv(
+                vec![DerivationOutput::new("out", out.as_str(), bad_algo, zeros.as_str()).unwrap()],
+                &[("name", "demo"), ("out", out.as_str())],
+            );
+            let (input_paths, input_meta) = closure();
+            let err = derivation_into_request(
+                DRV,
+                &drv,
+                &input_paths,
+                &input_meta,
+                &drv_table(),
+                &paths(),
+                &opts(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GlueError::FixedOutputHashInvalid { .. }),
+                "algo {bad_algo:?} must be rejected, got: {err}"
+            );
+        }
     }
 
     #[test]

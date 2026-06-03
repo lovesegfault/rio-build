@@ -52,8 +52,12 @@ pub mod env_vars {
     pub const EXECUTABLE: &str = "RIO_FETCHURL_EXECUTABLE";
     /// Space-separated hashed-mirror base URLs (may be empty/unset).
     pub const MIRRORS: &str = "RIO_FETCHURL_MIRRORS";
-    /// Lower-case hash algorithm (`sha256`, …) for mirror URL
-    /// construction only.
+    /// Canonical algorithm spelling (`sha256`, …) for mirror URL
+    /// construction only. The planner derives it from the PARSED
+    /// declaration (`OutputHashAlgo::parse`), never the raw string —
+    /// the raw spelling appears here only via the registered
+    /// undecodable-algo fallback (`nix.divergence.fod-fallback-fingerprint+1`),
+    /// which is unreachable behind the glue's declaration gate.
     pub const HASH_ALGO: &str = "RIO_FETCHURL_HASH_ALGO";
     /// Base16 content hash for mirror URL construction only.
     pub const HASH_B16: &str = "RIO_FETCHURL_HASH_B16";

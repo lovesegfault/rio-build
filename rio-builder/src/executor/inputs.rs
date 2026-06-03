@@ -12,9 +12,12 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use super::ExecutorError;
 
-/// Hash algorithm for FOD output verification. Maps from Nix's
-/// `outputHashAlgo` string (sha1, sha256, sha512; recursive variants
-/// prefixed "r:").
+/// Hash algorithm for FOD output verification — the digest-dispatch
+/// twin of `rio_nix::hash::HashAlgo`. Constructed only FROM a parsed
+/// declaration (`OutputHashAlgo::parse`, the system-wide FodAlgo
+/// constructor), never from a raw string, so this module cannot
+/// develop its own opinion about spellings or prefixes.
+// r[impl nix.hash.algos+1]
 #[derive(Debug, Clone, Copy)]
 enum FodHashAlgo {
     Sha1,
@@ -22,28 +25,17 @@ enum FodHashAlgo {
     Sha512,
 }
 
-impl FodHashAlgo {
-    /// Parse from Nix's outputHashAlgo. Strips the "r:" recursive
-    /// prefix (the prefix determines hash MODE not ALGO).
-    ///
-    /// Returns None for unknown algos — the caller (`verify_fod_hashes`)
-    /// fails closed and rejects the output rather than shipping
-    /// unverified content; the gateway pre-screens the same algorithm
-    /// set at submission (`fod_algo_verifiable`), so a None here in
-    /// production means that gate was bypassed or has drifted — or that
-    /// the derivation was admitted under the gateway's realized-outputs
-    /// exemption and its outputs were lost (e.g. GC'd) between the
-    /// submission-time probe and dispatch, in which case failing the
-    /// build here is exactly the intended fail-closed behavior.
-    fn from_nix_str(s: &str) -> Option<Self> {
-        match s.strip_prefix("r:").unwrap_or(s) {
-            "sha1" => Some(Self::Sha1),
-            "sha256" => Some(Self::Sha256),
-            "sha512" => Some(Self::Sha512),
-            _ => None,
+impl From<rio_nix::hash::HashAlgo> for FodHashAlgo {
+    fn from(algo: rio_nix::hash::HashAlgo) -> Self {
+        match algo {
+            rio_nix::hash::HashAlgo::SHA1 => Self::Sha1,
+            rio_nix::hash::HashAlgo::SHA256 => Self::Sha256,
+            rio_nix::hash::HashAlgo::SHA512 => Self::Sha512,
         }
     }
+}
 
+impl FodHashAlgo {
     /// The corresponding `rio_nix::hash::HashAlgo` — used to decode the
     /// DECLARED hash with the shared length-discriminated parser, while
     /// this enum drives the local hash COMPUTATION.
@@ -151,14 +143,22 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
             continue;
         };
 
-        // Dispatch on outputHashAlgo. Unknown algo → reject. This gate
-        // is the only content verification between an egress-open
-        // fetcher and the signed cache; an algorithm we cannot verify
-        // (md5, or garbage in a hand-written .drv) must fail the build
-        // rather than ship unverified content. The gateway additionally
-        // rejects such derivations at submission so the failure lands on
-        // the client instead of burning a fetcher pod.
-        let Some(algo) = FodHashAlgo::from_nix_str(output.hash_algo()) else {
+        // Dispatch on outputHashAlgo via the shared constructor —
+        // unknown algo (or spelling, or prefix) → reject. This gate is
+        // the only content verification between an egress-open fetcher
+        // and the signed cache; an algorithm we cannot verify (md5, or
+        // garbage in a hand-written .drv) must fail the build rather
+        // than ship unverified content. The gateway pre-screens with
+        // the SAME constructor at submission (`fod_algo_verifiable`) so
+        // the failure normally lands on the client instead of burning a
+        // fetcher pod; a rejection here means that gate was bypassed —
+        // or the derivation was admitted under the gateway's
+        // realized-outputs exemption and its outputs were lost (e.g.
+        // GC'd) between the submission-time probe and dispatch, in
+        // which case failing the build is exactly the intended
+        // fail-closed behavior.
+        // r[impl nix.hash.algos+1]
+        let Ok(parsed) = rio_nix::hash::OutputHashAlgo::parse(output.hash_algo()) else {
             bail!(
                 "FOD output '{}' declares unsupported hash algorithm '{}' \
                  (supported: sha1, sha256, sha512, each optionally prefixed 'r:'); \
@@ -167,6 +167,7 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
                 output.hash_algo(),
             );
         };
+        let algo = FodHashAlgo::from(parsed.algo);
 
         // Decode the declared hash with the shared length-discriminated
         // parser (base16 / nixbase32 / base64) — the same function every
@@ -184,7 +185,7 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
                 .digest()
                 .to_vec();
 
-        let is_recursive = output.hash_algo().starts_with("r:");
+        let is_recursive = parsed.recursive;
 
         // The basename comes from the TYPED declared path — no free
         // string re-derivation over a declared output path remains.
