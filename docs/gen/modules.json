@@ -1780,9 +1780,9 @@
       "doc": "I-043: input ENOENT just after dependency upload."
     },
     {
-      "path": "k8s/qa/scenarios/i046_drain_reaches_leader.rs",
+      "path": "k8s/qa/scenarios/i046_graceful_delete_settles.rs",
       "depth": 3,
-      "doc": "I-046/I-091: builder's `DrainExecutor` RPC must reach the LEADER,"
+      "doc": "I-046/I-091 (re-pointed by bug_389): a GRACEFUL builder pod delete"
     },
     {
       "path": "k8s/qa/scenarios/i047_missing_input_redispatch.rs",
