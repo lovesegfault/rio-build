@@ -41,6 +41,7 @@ use crate::upload;
 
 // Native-executor request glue: Derivation → rio_exec::ExecutionRequest
 // + the `@nix` log filter.
+pub(crate) mod dropped;
 pub(crate) mod glue;
 mod inputs;
 mod monitors;
@@ -1047,8 +1048,8 @@ struct NativeLifecycleArgs<'a> {
     input_paths: &'a [String],
     input_metadata: &'a [ValidatedPathInfo],
     /// Resolve-time residency gaps (see `ResolvedInputs::dropped_inputs`)
-    /// — consulted by the glue-rejection arbitration.
-    dropped_inputs: &'a std::collections::BTreeSet<String>,
+    /// — consulted by every [`dropped::VerdictArm`].
+    dropped_inputs: &'a dropped::DroppedInputs,
     opts: BuildOpts,
     is_fod: bool,
     log_tx: &'a crate::log_stream::SheddingLogSender,
@@ -1837,12 +1838,12 @@ struct ResolvedInputs {
     input_metadata: Vec<ValidatedPathInfo>,
     /// Closure members whose `BatchQueryPathInfo` came back not-found
     /// at resolve time (store read lag, GC race) — dropped from the
-    /// JIT allowlist, but RECORDED: the glue-rejection arbitration
-    /// consults this set so a residency gap surfaces as a re-dispatch
-    /// (`MetadataFetch` infra) instead of laundering into a permanent
-    /// `InputRejected` when exportReferencesGraph demands the path.
+    /// JIT allowlist, but RECORDED as typed evidence consulted by
+    /// every verdict-producing arm ([`dropped::VerdictArm`]'s closed
+    /// table) so a residency gap surfaces as a re-dispatch instead of
+    /// laundering into a permanent verdict at any of them.
     // r[impl builder.result.input-materialization-is-infra+5]
-    dropped_inputs: std::collections::BTreeSet<String>,
+    dropped_inputs: dropped::DroppedInputs,
     /// ATerm text for the main `.drv` plus the declaration-demanded
     /// graph `.drv`s: the request glue's only source of derivation
     /// bytes (`builder.glue.pure` — the glue holds no filesystem
@@ -1996,8 +1997,9 @@ async fn resolve_inputs(
     // via stdenv-the-output) never reached.
     let inputs::ResolvedClosure {
         metadata: input_metadata,
-        dropped: dropped_inputs,
+        dropped: dropped_set,
     } = compute_input_closure(store_client, drv, drv_path, &resolved_input_srcs).await?;
+    let dropped_inputs = dropped::DroppedInputs::from_resolve(dropped_set);
     if !dropped_inputs.is_empty() {
         // Evidence, not noise: these are exactly the paths a later
         // glue ExportRefsMissingMetadata rejection arbitrates against.
@@ -2075,19 +2077,19 @@ async fn resolve_inputs(
 /// (`builder.glue.pure` — the glue holds no I/O capability, so no
 /// transient class originates inside it).
 // r[impl builder.result.input-materialization-is-infra+5]
+// VerdictArm::GlueRejection consults dropped
 fn arbitrate_glue_rejection(
     e: glue::GlueError,
-    dropped_inputs: &std::collections::BTreeSet<String>,
+    dropped_inputs: &dropped::DroppedInputs,
 ) -> ExecutorError {
     let dropped_hit = match &e {
         glue::GlueError::ExportRefsMissingMetadata { path }
         | glue::GlueError::ExportRefsDrvOutputMissing { path, .. } => {
             dropped_inputs.contains(path).then(|| path.clone())
         }
-        glue::GlueError::ExportRefsOutsideClosure { path } => dropped_inputs
-            .iter()
-            .find(|p| path == *p || path.starts_with(&format!("{p}/")))
-            .cloned(),
+        glue::GlueError::ExportRefsOutsideClosure { path } => {
+            dropped_inputs.covering_member(path).map(String::from)
+        }
         _ => None,
     };
     match dropped_hit {
@@ -2187,10 +2189,11 @@ mod tests {
     // r[verify builder.result.input-materialization-is-infra+5]
     #[test]
     fn glue_rejection_arbitrated_against_dropped_set() {
-        let dropped: std::collections::BTreeSet<String> =
+        let dropped = dropped::DroppedInputs::from_resolve(
             ["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gone".to_string()]
                 .into_iter()
-                .collect();
+                .collect(),
+        );
 
         // Closure-walk miss on a dropped member: residency gap → infra.
         let e = glue::GlueError::ExportRefsMissingMetadata {
