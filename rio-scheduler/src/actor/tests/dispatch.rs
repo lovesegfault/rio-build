@@ -2152,3 +2152,113 @@ async fn test_terminal_build_frozen_on_dispatch_store_hit() -> TestResult {
     );
     Ok(())
 }
+
+/// bug_282 (the produced-but-unenforced backoff): after a transient
+/// failure arms `backoff_until`, an immediate re-pull answers
+/// NotYetReady — the kernel's fresh-mint arm holds the window — and
+/// the next pull AFTER the window delivers.
+///
+/// RED (pre-fix): the immediate re-pull answered Deliver — the backoff
+/// was set by handle_transient_failure and read by NOTHING in the pull
+/// architecture (the dispatch-time defer died with the queue).
+#[tokio::test]
+async fn transient_retry_not_redispatched_inside_backoff() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        // A real, short window: base 2s, no jitter — long enough that
+        // the immediate re-pull is deterministically inside it, short
+        // enough to wait out for the post-window half.
+        c.retry_policy.backoff_base_secs = 2.0;
+        c.retry_policy.backoff_multiplier = 2.0;
+        c.retry_policy.backoff_max_secs = 4.0;
+        c.retry_policy.jitter_fraction = 0.0;
+    });
+    let drv = "backoff-gate";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+
+    pull_complete_failure(
+        &handle,
+        drv,
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        "flaky",
+    )
+    .await?;
+    barrier(&handle).await;
+    let info = expect_drv(&handle, drv).await;
+    assert_eq!(
+        info.status,
+        DerivationStatus::Ready,
+        "requeued, not poisoned"
+    );
+    assert!(
+        info.retry.backoff_until.is_some(),
+        "precondition: the transient arm armed the backoff"
+    );
+
+    // Inside the window: the fresh mint is held.
+    let inside = try_pull_attempt(&handle, drv).await;
+    assert!(
+        matches!(inside, Ok(PullOutcome::NotYetReady { .. })),
+        "a pull inside the backoff window answers NotYetReady \
+         (RED pre-fix: Deliver — the window was enforced nowhere); got {inside:?}"
+    );
+
+    // Past the window: the mint proceeds (and clears the backoff).
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    let after = try_pull_attempt(&handle, drv).await;
+    assert!(
+        matches!(after, Ok(PullOutcome::Deliver(_))),
+        "a pull after the window delivers; got {after:?}"
+    );
+    Ok(())
+}
+
+/// bug_282, the spawn-intent half: a Ready node inside its backoff
+/// window is excluded from spawn intents (a pod spawned for it would
+/// loop on NotYetReady until the window lapses), and re-enters the
+/// candidate set once the window passes.
+///
+/// RED (pre-fix): the node was emitted — controllers spawned pods
+/// against a guaranteed-refusing mint.
+#[tokio::test]
+async fn spawn_intents_exclude_backoff_window() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            sla: test_sla_config(),
+            ..Default::default()
+        },
+    );
+    actor.test_inject_ready("backoff-spawn", None, "x86_64-linux", false);
+    actor.test_inject_ready("backoff-free", None, "x86_64-linux", false);
+    if let Some(state) = actor.dag.node_mut("backoff-spawn") {
+        state.retry.backoff_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+
+    let snap = actor.compute_spawn_intents(&Default::default());
+    assert_eq!(
+        snap.intents.len(),
+        1,
+        "the in-backoff node is not spawn-intent demand; got {:?}",
+        snap.intents
+            .iter()
+            .map(|i| i.intent_id.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(snap.intents[0].intent_id, "backoff-free");
+
+    // The window lapses → candidacy restored.
+    if let Some(state) = actor.dag.node_mut("backoff-spawn") {
+        state.retry.backoff_until =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    }
+    let snap = actor.compute_spawn_intents(&Default::default());
+    assert_eq!(
+        snap.intents.len(),
+        2,
+        "an expired window restores candidacy"
+    );
+    Ok(())
+}

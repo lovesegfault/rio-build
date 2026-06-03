@@ -745,7 +745,7 @@ pub fn exhausts_fleet<Id: Ord>(failed_builders: &IdSet<Id>, fleet: &FleetView<Id
 }
 
 // r[impl sched.retry.counters-refine-history+2]
-// r[impl sched.retry.transient-budget]
+// r[impl sched.retry.transient-budget+2]
 // r[impl sched.retry.attempts-bounded+2]
 // r[impl sched.retry.verdict-channel-invariant]
 /// Fold an observed failure-event history into the ten retry counters and

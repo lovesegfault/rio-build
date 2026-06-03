@@ -7814,3 +7814,188 @@ async fn flag_on_parked_jobs_leave_substituting_bucket() -> TestResult {
     );
     Ok(())
 }
+
+/// merged_bug_020 (020b, the one-shot half): the Unobtainable re-probe
+/// one-shot is PER JOB — a successor job's first Unobtainable re-arms
+/// (the one-shot is fresh inside its 085 window) instead of resolving
+/// from source through the predecessor's consumed one-shot.
+///
+/// RED (pre-085): the flat drv-level history counted job 1's
+/// Unobtainable, so job 2's FIRST Unobtainable read as "re-probe
+/// already spent" and went straight to from-source.
+#[tokio::test]
+async fn one_shot_fresh_for_second_job() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+            cfg.materialization.max_attempts = 3;
+            cfg.materialization.park_backoff_base_secs = 600;
+        });
+    let _tasks = (store_task, actor_task);
+
+    let out = test_store_path("oneshot-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("oneshot");
+    n.expected_output_paths = vec![out.clone()];
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(&handle, b1, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Job 1: one Unobtainable (spends ITS one-shot → ReArm), then
+    // resolution via build-cancel + the zero-interest closer.
+    let a1 = match claim_materialization(&handle, "oneshot", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("job-1 claim must deliver, got {other:?}"),
+    };
+    let exec1: Uuid = a1.exec_id.parse()?;
+    report_materialization_outcome(
+        &handle,
+        exec1,
+        "oneshot",
+        mat_unobtainable_outcome(vec![out.clone()], vec![], "upstream 404"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("job-1 unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    cancel_build(&handle, b1).await?;
+    barrier(&handle).await;
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    // Job 2: a fresh build re-creates the job.
+    let b2 = Uuid::new_v4();
+    let mut n2 = make_node("oneshot");
+    n2.expected_output_paths = vec![out.clone()];
+    let _ev2 = merge_dag(&handle, b2, vec![n2], vec![], false).await?;
+    barrier(&handle).await;
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    // Job 2's FIRST Unobtainable: the one-shot is fresh → ReArm (the
+    // job stays pending, claimable again), NOT resolved_from_source.
+    let a2 = match claim_materialization(&handle, "oneshot", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("job-2 claim must deliver, got {other:?}"),
+    };
+    let exec2: Uuid = a2.exec_id.parse()?;
+    report_materialization_outcome(
+        &handle,
+        exec2,
+        "oneshot",
+        mat_unobtainable_outcome(vec![out.clone()], vec![], "upstream 404"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("job-2 unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    let job2_state: String = sqlx::query_scalar(
+        "SELECT state FROM materialization_jobs WHERE drv_hash = 'oneshot' \
+          AND state != 'cancelled' ORDER BY job_id DESC LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        job2_state, "pending",
+        "job 2's first Unobtainable re-arms (its own one-shot, fresh in its \
+         085 window) — RED pre-085: resolved_from_source through job 1's \
+         consumed one-shot"
+    );
+    let reclaim = claim_materialization(&handle, "oneshot", "store-test-1").await;
+    assert!(
+        matches!(reclaim, Ok(PullOutcome::Deliver(_))),
+        "the re-armed job is claimable again, got {reclaim:?}"
+    );
+    Ok(())
+}
+
+/// merged_bug_020 (020c, the failover twin): the per-job window
+/// computed from the LOADED suffix (post-failover) yields the same
+/// verdict as the in-memory fold — one pre-failover charge still
+/// counts (claim delivers at 1 < max 2; the next charge parks at 2).
+#[tokio::test]
+async fn failover_preserves_job_budget_window() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+
+    // Phase 1: one charge against max_attempts=2, then failover.
+    {
+        let (handle, task) =
+            setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |cfg, _| {
+                cfg.materialization.max_attempts = 2;
+                cfg.materialization.park_backoff_base_secs = 600;
+            });
+        let out = test_store_path("fo-window-out");
+        store.state.substitutable.write().unwrap().push(out.clone());
+        let mut n = make_node("fo-window");
+        n.expected_output_paths = vec![out];
+        let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+        barrier(&handle).await;
+        let a = match claim_materialization(&handle, "fo-window", "store-test-0").await {
+            Ok(PullOutcome::Deliver(a)) => *a,
+            other => panic!("phase-1 claim must deliver, got {other:?}"),
+        };
+        let exec: Uuid = a.exec_id.parse()?;
+        report_materialization_outcome(
+            &handle,
+            exec,
+            "fo-window",
+            mat_infra_outcome("upstream 503"),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("phase-1 infra report rejected: {e:?}"))?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Phase 2: the successor recovers; the loaded suffix carries the
+    // one charge.
+    let leader = crate::lease::LeaderState::always_leader(std::sync::Arc::new(
+        std::sync::atomic::AtomicU64::new(1),
+    ));
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let phase2_leader = leader.clone();
+    let (handle, _task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), move |cfg, p| {
+            cfg.materialization.max_attempts = 2;
+            cfg.materialization.park_backoff_base_secs = 600;
+            p.leader = phase2_leader;
+        });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // 1 < 2: still claimable on the recovered leader (the loaded
+    // window matches the in-memory fold's verdict).
+    let a = match claim_materialization(&handle, "fo-window", "store-test-1").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("post-failover claim must deliver at 1 < max 2, got {other:?}"),
+    };
+    let exec: Uuid = a.exec_id.parse()?;
+    report_materialization_outcome(
+        &handle,
+        exec,
+        "fo-window",
+        mat_infra_outcome("upstream 503"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("phase-2 infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // 2 >= 2: the second charge parks — the identical verdict the
+    // no-failover history produces.
+    let park: Option<f64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM park_until)::float8 FROM materialization_jobs \
+          WHERE drv_hash = 'fo-window' AND state = 'pending'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        park.is_some_and(|s| s > 0.0),
+        "the post-failover second charge parks at the budget — the loaded \
+         suffix and the live fold agree (020c)"
+    );
+    Ok(())
+}

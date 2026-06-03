@@ -2633,7 +2633,7 @@ impl DagActor {
         true
     }
 
-    // r[impl sched.retry.transient-budget]
+    // r[impl sched.retry.transient-budget+2]
     /// E1, collapsed onto `decide()` (Phase 1b): the threshold /
     /// per-cycle-cap / retry verdict comes from the fold over the
     /// appended attempt suffix inside the appending transaction. (The

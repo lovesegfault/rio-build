@@ -442,6 +442,7 @@ impl DagActor {
             }
         };
 
+        let spawn_now = std::time::Instant::now();
         for (drv_hash, state) in self.dag.iter_nodes() {
             if state.status() != DerivationStatus::Ready {
                 continue;
@@ -458,6 +459,15 @@ impl DagActor {
             // jobs' nodes are Assigned/Running and already excluded by
             // the status check above.
             if self.has_pending_unclaimed_job(drv_hash) {
+                continue;
+            }
+            // bug_282: a Ready node inside its transient-retry backoff
+            // window is not spawn-intent demand — the kernel's pull
+            // admission would refuse the mint anyway (the
+            // build_backoff_expired conjunct), so spawning a pod for
+            // it just burns a pod-start against a guaranteed
+            // NotYetReady loop until the window lapses.
+            if state.retry.backoff_until.is_some_and(|t| t > spawn_now) {
                 continue;
             }
             // Per-system aggregate: counted BEFORE the kind/feature

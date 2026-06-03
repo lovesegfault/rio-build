@@ -155,6 +155,10 @@ pub(crate) struct PullInputs<'a> {
     /// The node's materialization-job state, projected from the actor's
     /// in-memory job view.
     pub job_view: rio_evidence_kernel::pull::JobView,
+    /// Whether the node's transient-retry backoff has expired (`true`
+    /// when none is set) — bug_282: gates the fresh from-source mint
+    /// in the kernel's `(Build, JobView::None)` arm.
+    pub build_backoff_expired: bool,
 }
 
 // r[impl sched.executor.pull-gone]
@@ -184,6 +188,7 @@ pub(crate) fn admit_pull(inputs: &PullInputs<'_>) -> PullDecision {
             status: inputs.status.map(pull_node_status),
             open_attempt: inputs.open_attempt,
             pulling_identity: inputs.pulling_identity,
+            build_backoff_expired: inputs.build_backoff_expired,
         },
         rio_evidence_kernel::pull::MaterializationInputs {
             kind: inputs.pull_kind,
@@ -277,8 +282,8 @@ impl DagActor {
             _ => ExecutorId::from(intent_id),
         };
 
-        let (status, open_attempt) = match self.dag.node(&drv_hash) {
-            None => (None, None),
+        let (status, open_attempt, build_backoff_expired) = match self.dag.node(&drv_hash) {
+            None => (None, None, true),
             Some(state) => (
                 Some(state.status()),
                 state
@@ -286,6 +291,14 @@ impl DagActor {
                     .as_ref()
                     .zip(state.exec_id)
                     .map(|(executor, exec_id)| (executor.clone(), exec_id)),
+                // bug_282: the transient-retry backoff produced by
+                // handle_transient_failure, finally consumed — the
+                // kernel's (Build, None) arm holds the fresh mint
+                // until the window lapses.
+                state
+                    .retry
+                    .backoff_until
+                    .is_none_or(|t| t <= std::time::Instant::now()),
             ),
         };
         let decision = admit_pull(&PullInputs {
@@ -297,6 +310,7 @@ impl DagActor {
             serving_generation,
             generation_floor,
             pull_kind: kind,
+            build_backoff_expired,
             // The job view: projected from the actor's in-memory job map
             // (Unavailable projects Pending{parked:true} — fail-closed).
             job_view: self.materialization_job_view(&drv_hash, &pulling_identity),
@@ -651,7 +665,47 @@ mod kernel_tests {
             generation_floor: Some(3),
             pull_kind: rio_evidence_kernel::pull::PullKind::Build,
             job_view: rio_evidence_kernel::pull::JobView::None,
+            build_backoff_expired: true,
         }
+    }
+
+    /// bug_282 kernel rows: an unexpired backoff downgrades ONLY the
+    /// fresh DeliverNew; re-delivery, refusals, and rejections pass
+    /// through.
+    #[test]
+    fn admit_pull_backoff_table() {
+        let pulling = ExecutorId::from("intent-a");
+        // Ready + unexpired backoff → NotYetReady (RED pre-fix:
+        // DeliverNew — the produced-but-unenforced window).
+        let mut inputs = base_inputs(Some(DerivationStatus::Ready), &pulling, None);
+        inputs.build_backoff_expired = false;
+        assert_eq!(admit_pull(&inputs), PullDecision::NotYetReady);
+        // Ready + expired → DeliverNew (the normal mint).
+        let mut inputs = base_inputs(Some(DerivationStatus::Ready), &pulling, None);
+        inputs.build_backoff_expired = true;
+        assert_eq!(admit_pull(&inputs), PullDecision::DeliverNew);
+        // Re-delivery to the bound identity is untouched by the
+        // backoff (the attempt already exists).
+        let exec = Uuid::new_v4();
+        let mut inputs = base_inputs(
+            Some(DerivationStatus::Assigned),
+            &pulling,
+            Some((&pulling, exec)),
+        );
+        inputs.build_backoff_expired = false;
+        assert_eq!(
+            admit_pull(&inputs),
+            PullDecision::DeliverExisting { exec_id: exec }
+        );
+        // Refusals/rejections unaffected: a queued node refuses either
+        // way; a mis-bound token rejects either way.
+        let mut inputs = base_inputs(Some(DerivationStatus::Queued), &pulling, None);
+        inputs.build_backoff_expired = false;
+        assert_eq!(admit_pull(&inputs), PullDecision::NotYetReady);
+        let mut inputs = base_inputs(Some(DerivationStatus::Ready), &pulling, None);
+        inputs.auth_intent = Some("other-drv");
+        inputs.build_backoff_expired = false;
+        assert_eq!(admit_pull(&inputs), PullDecision::RejectToken);
     }
 
     /// Exhaustive status → decision table for the no-open-attempt case.

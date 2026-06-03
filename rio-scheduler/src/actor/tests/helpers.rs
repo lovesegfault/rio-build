@@ -164,6 +164,15 @@ pub(crate) fn setup_actor_configured(
     let db = SchedulerDb::new(pool);
     let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
     let mut cfg = DagActorConfig::default();
+    // Test default: ZERO transient-retry backoff. The bug_282
+    // pull-admission gate holds fresh mints for the real window;
+    // dozens of tests drive back-to-back failure→re-pull cycles whose
+    // subject is row accounting / poison thresholds, not timing.
+    // Tests exercising the window itself (the 282 battery) configure a
+    // real backoff explicitly in their `configure` closure (which runs
+    // AFTER this default and overrides it).
+    cfg.retry_policy.backoff_base_secs = 0.0;
+    cfg.retry_policy.jitter_fraction = 0.0;
     let mut plumbing = DagActorPlumbing {
         store_client,
         ..Default::default()

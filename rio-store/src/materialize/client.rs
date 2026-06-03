@@ -108,8 +108,18 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     if available_slots == 0 {
         return Vec::new();
     }
+    // bug_385: the listing window is DECOUPLED from the claim budget.
+    // With limit == slots, a refused head — raced to another replica,
+    // resolved between list and claim, or freshly parked — hides every
+    // younger claimable job for the whole pass; at slots=1 the loop
+    // starves behind one such head until it leaves the listing.
+    // Listing is cheap (descriptors only); the claim loop below still
+    // stops at the slot budget.
+    const LISTING_WINDOW_MIN: usize = 16;
+    const LISTING_WINDOW_PER_SLOT: usize = 8;
+    let window = LISTING_WINDOW_MIN.max(available_slots.saturating_mul(LISTING_WINDOW_PER_SLOT));
     // Saturating u32 cast: slots are single-digit in practice.
-    let limit = u32::try_from(available_slots).unwrap_or(u32::MAX);
+    let limit = u32::try_from(window).unwrap_or(u32::MAX);
     let list_req = ListMaterializationJobsRequest {
         // The credential rides the x-rio-service-token metadata
         // (attached by the transport); the body field stays empty.
@@ -145,7 +155,14 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     };
 
     let mut claimed = Vec::new();
-    for descriptor in listed.into_iter().take(available_slots) {
+    for descriptor in listed {
+        // The claim budget: stop once `available_slots` claims
+        // SUCCEEDED — refusals (Gone/NotYetReady/timeout) do not
+        // consume slots, they just advance past the head (bug_385's
+        // in-pass skip).
+        if claimed.len() >= available_slots {
+            break;
+        }
         // bug_233 (parse-don't-validate): refuse the claim BEFORE the
         // pull when the descriptor's job_id does not parse. Claiming an
         // attempt we cannot attribute to a job would strand it (the
@@ -557,6 +574,7 @@ mod tests {
         pull_calls: u32,
         report_calls: u32,
         seen_pull_requests: Vec<PullAssignmentRequest>,
+        seen_list_limits: Vec<u32>,
     }
 
     impl MockTransport {
@@ -573,6 +591,7 @@ mod tests {
                 pull_calls: 0,
                 report_calls: 0,
                 seen_pull_requests: Vec::new(),
+                seen_list_limits: Vec::new(),
             }
         }
     }
@@ -580,9 +599,10 @@ mod tests {
     impl MaterializeTransport for MockTransport {
         async fn list_jobs(
             &mut self,
-            _req: ListMaterializationJobsRequest,
+            req: ListMaterializationJobsRequest,
         ) -> Result<ListMaterializationJobsResponse, tonic::Status> {
             self.list_calls += 1;
+            self.seen_list_limits.push(req.limit);
             match self.listings.len() {
                 0 => Err(tonic::Status::unavailable("script exhausted")),
                 1 => self.listings[0].clone(),
@@ -651,6 +671,14 @@ mod tests {
         }
     }
 
+    fn gone() -> PullAssignmentResponse {
+        PullAssignmentResponse {
+            outcome: Some(pull_assignment_response::Outcome::Gone(
+                rio_proto::types::Gone {},
+            )),
+        }
+    }
+
     fn not_yet_ready() -> PullAssignmentResponse {
         PullAssignmentResponse {
             outcome: Some(pull_assignment_response::Outcome::NotYetReady(
@@ -689,6 +717,68 @@ mod tests {
         );
         assert_eq!(t.list_calls, 1);
         assert_eq!(t.pull_calls, 2);
+    }
+
+    /// bug_385 (the head-starvation fix): a refused head — Gone, the
+    /// job resolved or was raced to another replica — must NOT hide
+    /// younger claimable jobs in the same pass. With budget 1 and the
+    /// head refusing, the SECOND listed job is claimed in the SAME
+    /// pass.
+    ///
+    /// RED (pre-fix): `limit = available_slots` listed only the head
+    /// (LIMIT-1 oldest-first); the pass claimed nothing, every pass —
+    /// the younger job starved behind the refused head until the head
+    /// left the listing.
+    // r[verify store.materialize.executor+3]
+    #[tokio::test]
+    async fn refused_head_does_not_hide_younger_jobs() {
+        let head = descriptor(1);
+        let younger = descriptor(2);
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![head.clone(), younger.clone()]))],
+            vec![Ok(gone()), Ok(deliver("exec-2", "/nix/store/bbb-two.drv"))],
+            vec![],
+        );
+        // Budget 1: the head refuses, the younger job must fill the
+        // slot in the same pass.
+        let claimed = poll_and_claim(&mut t, "store-replica-0", 1, &token()).await;
+        assert_eq!(
+            claimed.len(),
+            1,
+            "the refused head does not consume the slot; the younger job claims"
+        );
+        assert_eq!(claimed[0].drv_hash, younger.drv_hash);
+        assert_eq!(claimed[0].exec_id, "exec-2");
+        assert_eq!(t.list_calls, 1, "one pass");
+        assert_eq!(t.pull_calls, 2, "head attempted, then the younger job");
+        // The listing window is decoupled from the budget: even at
+        // budget 1 the request asks for at least the minimum window.
+        assert!(
+            t.seen_list_limits[0] >= 16,
+            "the listing window is independent of the claim budget; got limit {}",
+            t.seen_list_limits[0]
+        );
+    }
+
+    /// bug_385, the budget side: refusals do not consume slots, but
+    /// successful claims do — the pass stops at the budget even with
+    /// more claimable jobs listed.
+    #[tokio::test]
+    async fn claim_budget_stops_at_slots() {
+        let d1 = descriptor(1);
+        let d2 = descriptor(2);
+        let d3 = descriptor(3);
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![d1.clone(), d2.clone(), d3.clone()]))],
+            vec![
+                Ok(deliver("exec-1", "/nix/store/aaa-one.drv")),
+                Ok(deliver("exec-2", "/nix/store/bbb-two.drv")),
+            ],
+            vec![],
+        );
+        let claimed = poll_and_claim(&mut t, "store-replica-0", 2, &token()).await;
+        assert_eq!(claimed.len(), 2, "the budget caps successful claims");
+        assert_eq!(t.pull_calls, 2, "no claim attempted past the budget");
     }
 
     /// bug_233 (bughunt wave): a descriptor whose job_id does not parse

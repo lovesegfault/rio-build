@@ -287,6 +287,14 @@ fn test_valid_config() -> Config {
 // multiplier < 1.0 → shrinking backoff (attempt 2 waits LESS than 1).
 #[case::sub_one_multiplier(|c: &mut Config| c.retry.backoff_multiplier = 0.5, &["backoff_multiplier", ">= 1.0"])]
 #[case::nan_multiplier(|c: &mut Config| c.retry.backoff_multiplier = f64::NAN, &[])]
+// dwell == cap → the PD-20 dwell gate is unreachable (a visited job's
+// clock truncates below the cap) → conversion silently never fires
+// (bug_088: the boundary is cap - 1, shared via
+// MaterializationConfig::max_satisfiable_dwell_secs).
+#[case::dwell_equal_to_cap(|c: &mut Config| {
+    c.materialization.park_backoff_cap_secs = 900;
+    c.materialization.conversion_min_park_dwell_secs = 900;
+}, &["park_backoff_cap_secs - 1", "900"])]
 // max < base → every backoff clamps to max, defeating the exponential.
 #[case::max_below_base(
     |c: &mut Config| { c.retry.backoff_base_secs = 10.0; c.retry.backoff_max_secs = 5.0; },
@@ -838,4 +846,18 @@ fn dashboard_loads_from_toml_and_splits_origins() {
     // dashboard CORS contract, bug_355) WITH its contract tests; this
     // test keeps only the config-merge assertion above. The layer
     // builder here is a one-line delegation.
+}
+
+/// bug_088, the accept side: `cap - 1` is the largest satisfiable
+/// dwell and must pass validation; the helper IS the boundary the
+/// validator consumes (one boundary, two readers).
+#[test]
+fn dwell_cap_minus_one_accepted() {
+    use rio_common::config::ValidateConfig as _;
+    let mut cfg = test_valid_config();
+    cfg.materialization.park_backoff_cap_secs = 900;
+    cfg.materialization.conversion_min_park_dwell_secs = 899;
+    cfg.validate()
+        .expect("dwell == cap - 1 is the largest satisfiable value");
+    assert_eq!(cfg.materialization.max_satisfiable_dwell_secs(), 899);
 }

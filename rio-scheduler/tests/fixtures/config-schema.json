@@ -313,7 +313,7 @@
             "default": false
           },
           "conversion_min_park_dwell_secs": {
-            "description": "Item T conversion-strictness, dwell half: minimum seconds since\nthe job's MOST RECENT park began (re-park restarts the clock;\ndurable `materialization_jobs.park_began_at`, failover-exact)\nbefore PD-20 may convert. `0` = off (knob disabled — the\nshipped default). The re-evaluation only runs inside the park\nwindow, so a dwell beyond `park_backoff_cap_secs` could never\nconvert via PD-20 — rejected at config validation.",
+            "description": "Item T conversion-strictness, dwell half: minimum seconds since\nthe job's MOST RECENT park began (re-park restarts the clock;\ndurable `materialization_jobs.park_began_at`, failover-exact)\nbefore PD-20 may convert. `0` = off (knob disabled — the\nshipped default). The re-evaluation only runs inside the park\nwindow, so the largest satisfiable dwell is\n[`MaterializationConfig::max_satisfiable_dwell_secs`]\n(`park_backoff_cap_secs - 1`): a visited job has\n`parked_until > now`, hence `elapsed < window <= cap`, hence\n`elapsed.as_secs() <= cap - 1` — dwell == cap (bug_088's\noff-by-one) or beyond can never be met and is rejected at\nconfig validation.",
             "type": "integer",
             "format": "uint64",
             "minimum": 0,

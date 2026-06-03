@@ -283,7 +283,7 @@ pub(crate) fn classify(event: &ObservedFailure<'_>, floor: FloorOutcomeView) -> 
     db_outcome_class(rio_retry_kernel::classify(event, floor))
 }
 
-// r[verify sched.retry.transient-budget]
+// r[verify sched.retry.transient-budget+2]
 // r[verify sched.retry.attempts-bounded+2]
 // r[verify sched.retry.counters-refine-history+2]
 #[cfg(test)]

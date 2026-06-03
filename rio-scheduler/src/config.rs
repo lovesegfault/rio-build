@@ -186,8 +186,13 @@ pub struct MaterializationConfig {
     /// durable `materialization_jobs.park_began_at`, failover-exact)
     /// before PD-20 may convert. `0` = off (knob disabled — the
     /// shipped default). The re-evaluation only runs inside the park
-    /// window, so a dwell beyond `park_backoff_cap_secs` could never
-    /// convert via PD-20 — rejected at config validation.
+    /// window, so the largest satisfiable dwell is
+    /// [`MaterializationConfig::max_satisfiable_dwell_secs`]
+    /// (`park_backoff_cap_secs - 1`): a visited job has
+    /// `parked_until > now`, hence `elapsed < window <= cap`, hence
+    /// `elapsed.as_secs() <= cap - 1` — dwell == cap (bug_088's
+    /// off-by-one) or beyond can never be met and is rejected at
+    /// config validation.
     pub conversion_min_park_dwell_secs: u64,
     /// The deadline a MATERIALIZATION attempt is minted under
     /// (seconds): the establishment sweep establishes an unreported
@@ -199,6 +204,20 @@ pub struct MaterializationConfig {
     /// need this raised per-deployment. Must be ≥ 1 — `0` would
     /// establish every claim on its first sweep tick.
     pub attempt_deadline_secs: u64,
+}
+
+impl MaterializationConfig {
+    /// The largest `conversion_min_park_dwell_secs` a PD-20
+    /// re-evaluation can ever satisfy (bug_088). Derivation: the
+    /// re-evaluation only visits jobs whose park is still open
+    /// (`parked_until > now`), so the dwell clock reads
+    /// `elapsed < window <= park_backoff_cap_secs`, and
+    /// `elapsed.as_secs()` (truncating) is at most `cap - 1`. The
+    /// validator and the gate site both consume THIS helper — one
+    /// boundary, two readers, no drift.
+    pub fn max_satisfiable_dwell_secs(&self) -> u64 {
+        self.park_backoff_cap_secs.saturating_sub(1)
+    }
 }
 
 impl Default for MaterializationConfig {
@@ -383,15 +402,19 @@ impl rio_common::config::ValidateConfig for Config {
         // dwell knob would be a silent conversion-never, which is not
         // a posture the Item T record orders (the record's dwell is a
         // MINIMUM, implying eventual conversion). Fail fast at load.
+        // bug_088: the boundary is cap - 1, not cap — a visited job's
+        // dwell clock truncates below the cap (see
+        // MaterializationConfig::max_satisfiable_dwell_secs, the one
+        // shared boundary).
         anyhow::ensure!(
             cfg.materialization.conversion_min_park_dwell_secs
-                <= cfg.materialization.park_backoff_cap_secs,
+                <= cfg.materialization.max_satisfiable_dwell_secs(),
             "materialization.conversion_min_park_dwell_secs must be <= \
-         park_backoff_cap_secs (got dwell={}, cap={}); a dwell beyond the \
-         park cap can never be met at a PD-20 re-evaluation and silently \
-         disables conversion entirely",
+         park_backoff_cap_secs - 1 (got dwell={}, max satisfiable={}); a \
+         dwell at or beyond the park cap can never be met at a PD-20 \
+         re-evaluation and silently disables conversion entirely",
             cfg.materialization.conversion_min_park_dwell_secs,
-            cfg.materialization.park_backoff_cap_secs
+            cfg.materialization.max_satisfiable_dwell_secs()
         );
         // attempt_deadline_secs = 0 would establish every store claim
         // on its first sweep visit (deadline already past at mint) —

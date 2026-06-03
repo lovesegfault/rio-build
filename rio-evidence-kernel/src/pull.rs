@@ -111,6 +111,15 @@ pub struct PullRequest<'a, IntentId: ?Sized, ExecutorIdent: ?Sized, ExecId> {
     pub open_attempt: Option<(&'a ExecutorIdent, ExecId)>,
     /// The identity this pull would bind a fresh attempt to.
     pub pulling_identity: &'a ExecutorIdent,
+    /// Whether the derivation's transient-retry backoff has expired
+    /// (`true` when no backoff is set). Consumed ONLY by the
+    /// `(Build, JobView::None)` arm: a fresh from-source mint inside
+    /// the backoff window downgrades DeliverNew to NotYetReady —
+    /// bug_282's enforcement point (the backoff was produced by
+    /// `handle_transient_failure` but enforced nowhere in the pull
+    /// architecture). Re-deliveries (`DeliverExisting`) are untouched:
+    /// the attempt already exists, the backoff gates NEW work only.
+    pub build_backoff_expired: bool,
 }
 
 // r[impl sched.lease.generation-fence+3]
@@ -197,6 +206,7 @@ mod tests {
             status,
             open_attempt: open,
             pulling_identity: pulling,
+            build_backoff_expired: true,
         }
     }
 
@@ -307,6 +317,7 @@ mod proofs {
         status: Option<PullNodeStatus>,
         open: Option<(u8, u8)>,
         pulling: u8,
+        backoff_expired: bool,
     }
 
     fn any_status() -> Option<PullNodeStatus> {
@@ -341,6 +352,7 @@ mod proofs {
                 None
             },
             pulling: kani::any(),
+            backoff_expired: kani::any(),
         }
     }
 
@@ -355,6 +367,7 @@ mod proofs {
                 status: inputs.status,
                 open_attempt: inputs.open.as_ref().map(|(e, x)| (e, *x)),
                 pulling_identity: &inputs.pulling,
+                build_backoff_expired: inputs.backoff_expired,
             },
             MaterializationInputs {
                 kind: PullKind::Build,
@@ -395,7 +408,10 @@ mod proofs {
                     S::Completed | S::Cancelled | S::Skipped | S::Poisoned | S::DependencyFailed,
                 ) => PullAdmission::Gone,
                 Some(S::Created | S::Queued | S::Failed) => PullAdmission::NotYetReady,
-                Some(S::Ready) => PullAdmission::DeliverNew,
+                // bug_282: the fresh mint waits out the transient-retry
+                // backoff; only the Ready/DeliverNew cell is gated.
+                Some(S::Ready) if inputs.backoff_expired => PullAdmission::DeliverNew,
+                Some(S::Ready) => PullAdmission::NotYetReady,
                 Some(S::Assigned | S::Running) => match inputs.open {
                     Some((executor, exec_id)) if executor == inputs.pulling => {
                         PullAdmission::DeliverExisting { exec_id }
@@ -591,7 +607,18 @@ where
                 | PullAdmission::NotYetReady => PullAdmission::NotYetReady,
             }
         }
-        (PullKind::Build, JobView::None) => base_admission(request),
+        (PullKind::Build, JobView::None) => {
+            // bug_282: the transient-retry backoff gates the FRESH
+            // from-source mint. The base table's other outcomes —
+            // token/fence rejections, Gone, NotYetReady, and
+            // DeliverExisting (a re-delivery to the bound identity;
+            // the attempt already exists) — pass through untouched.
+            let backoff_expired = request.build_backoff_expired;
+            match base_admission(request) {
+                PullAdmission::DeliverNew if !backoff_expired => PullAdmission::NotYetReady,
+                other => other,
+            }
+        }
         (PullKind::Materialization, JobView::None) => {
             // Token/fence still dominate; then Gone.
             match base_admission(request) {
@@ -695,6 +722,7 @@ mod kinded_tests {
             status,
             open_attempt: open,
             pulling_identity: pulling,
+            build_backoff_expired: true,
         }
     }
 
@@ -1027,6 +1055,7 @@ mod kinded_proofs {
         status: Option<PullNodeStatus>,
         open: Option<(u8, u8)>,
         pulling: u8,
+        backoff_expired: bool,
     }
 
     fn any_status() -> Option<PullNodeStatus> {
@@ -1061,6 +1090,7 @@ mod kinded_proofs {
                 None
             },
             pulling: kani::any(),
+            backoff_expired: kani::any(),
         }
     }
 
@@ -1090,6 +1120,7 @@ mod kinded_proofs {
                 status: inputs.status,
                 open_attempt: inputs.open.as_ref().map(|(e, x)| (e, *x)),
                 pulling_identity: &inputs.pulling,
+                build_backoff_expired: inputs.backoff_expired,
             },
             mat,
         )

@@ -2007,6 +2007,10 @@ impl DagActor {
                 }
             }
             if dwell_secs > 0 {
+                // Boundary: dwell_secs ≤ max_satisfiable_dwell_secs()
+                // (= cap - 1) by config validation — a visited job's
+                // clock truncates below the cap, so the gate is
+                // reachable for every accepted dwell (bug_088).
                 let dwell_met = self
                     .materialization_jobs
                     .get(&drv_hash)

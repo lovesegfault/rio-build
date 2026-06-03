@@ -292,7 +292,7 @@ in
   #     full history (under the pre-084 any-kind cut, a trailing build
   #     reset emptied the view and flipped parked verdicts back to
   #     Claimable: merged_bug_011's resurrection class).
-  # r[verify sched.retry.transient-budget]
+  # r[verify sched.retry.transient-budget+2]
   # r[verify sched.retry.attempts-bounded+2]
   # r[verify sched.retry.exempt-infra-cap]
   # r[verify sched.retry.per-executor-budget+4]

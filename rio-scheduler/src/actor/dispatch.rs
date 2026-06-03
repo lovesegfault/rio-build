@@ -978,15 +978,17 @@ impl DagActor {
                 // including `Db` (transient PG blip). Rationale:
                 // the unresolved dispatch → worker fails on the
                 // placeholder path → retry-with-backoff fires →
-                // next dispatch re-runs resolve. For
+                // the next attempt's mint re-runs resolve (the
+                // pull admission holds the fresh mint until
+                // `backoff_until` lapses — bug_282). For
                 // `RealisationMissing`, the backoff gives the
                 // input's `wopRegisterDrvOutput` time to land
                 // (race). For `Db`, the backoff IS the retry-PG
                 // mechanism — the wasted worker cycle (~seconds
                 // to fail on ENOENT) is acceptable vs adding a
-                // defer-and-requeue path here (would need a timer
-                // to re-dispatch, which `backoff_until` already
-                // provides on the FAILURE path). Slot-wasteful
+                // defer-and-requeue path here (the pull-admission
+                // gate already provides the timing on the FAILURE
+                // path). Slot-wasteful
                 // but correct; profiling can drive a `Db → defer`
                 // split if the waste proves measurable.
                 warn!(

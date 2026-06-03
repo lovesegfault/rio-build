@@ -481,7 +481,7 @@ arithmetic is the reference fold in `rio-scheduler/src/retry_policy.rs`,
 and the per-site ↔ per-rule cross-reference is
 `docs/spec/models/retry-invariant-map.md`.
 
-#r("sched.retry.transient-budget")[
+#r("sched.retry.transient-budget+2")[
   A worker-reported `TransientFailure` (the build ran and exited non-zero;
   an `Unspecified` result status is treated identically) MUST record the
   reporting executor into `failed_builders`, increment `failure_count`, and
@@ -491,8 +491,10 @@ and the per-site ↔ per-rule cross-reference is
   the derivation is poisoned; otherwise, while the per-cycle transient
   count is below `RetryPolicy.max_retries`, the derivation MUST be requeued
   with an exponential backoff (`backoff_until = now + backoff(count)`,
-  applied as a dispatch-time defer, cleared on successful dispatch) and the
-  count incremented; at or above `max_retries` the derivation is poisoned.
+  enforced at pull admission --- the kernel's fresh-mint arm answers
+  `NotYetReady` until the window lapses, and spawn intents exclude the
+  node --- cleared when the next attempt mints) and the count incremented;
+  at or above `max_retries` the derivation is poisoned.
 ]
 The transient budget is per poison cycle: a resubmit reset
 (#rref("sched.merge.poisoned-resubmit-bounded")) restores the full

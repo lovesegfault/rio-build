@@ -566,8 +566,11 @@ pub struct RetryState {
     pub poisoned_at: Option<crate::state::RecoveredInstant>,
     /// Earliest time this derivation may be dispatched. Set by
     /// handle_transient_failure to implement the retry backoff —
-    /// the derivation is Ready and in the queue, but dispatch_ready
-    /// defers it if `Instant::now() < backoff_until`.
+    /// the derivation stays Ready, but the pull admission's
+    /// fresh-mint arm answers NotYetReady and spawn intents exclude
+    /// the node until the window lapses (bug_282: enforced at the
+    /// kernel's `(Build, JobView::None)` arm via
+    /// `build_backoff_expired`; cleared when the next attempt mints).
     ///
     /// Why not a timer-based requeue: timers need a scheduled task
     /// per deferred derivation + cleanup if the derivation
