@@ -4072,6 +4072,76 @@ async fn collect_pass_with(
     Ok(requeued)
 }
 
+/// Test-only source walker for the crate's grep-shaped consumer lints
+/// (the fresh-workload-split, wired-hook, and float-to-Duration site
+/// enumerations): every `.rs` file under `rio-replay/src`, discovered by
+/// a recursive directory walk at test time and returned as
+/// (manifest-relative path, full text) pairs — so a NEW source file
+/// anywhere in the crate joins the scanned universe automatically, with
+/// no fixed include list to forget.
+///
+/// Full text deliberately, not a pre-truncated "production half": each
+/// consuming lint splits at the file's FIRST `#[cfg(test)]` marker itself
+/// and pins BOTH zones' counts per file. The prefix is the
+/// production-policy zone; the tail is test code, free to use the
+/// audited names but still counted — five files at the time of writing
+/// (lib.rs, run/archive_input.rs, run/artifact.rs, run/stderrparse.rs,
+/// run/watchdog.rs) carry production code AFTER a mid-file test-gated
+/// item, so an occurrence landing there bumps the tail count and forces
+/// the same audit instead of silently passing, and a swap that moves a
+/// counted test occurrence out while a production one sneaks in cannot
+/// keep the books balanced across the two zones.
+#[cfg(test)]
+pub(crate) fn crate_sources() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("crate source dir is readable") {
+            let path = entry.expect("crate source entry is readable").path();
+            if path.is_dir() {
+                walk(&path, files);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    walk(&manifest_dir.join("src"), &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .map(|path| {
+            let rel = path
+                .strip_prefix(manifest_dir)
+                .expect("walked file lives under the manifest dir")
+                .to_str()
+                .expect("crate source paths are UTF-8")
+                .to_owned();
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            (rel, text)
+        })
+        .collect()
+}
+
+/// Split one [`crate_sources`] text into its (production-policy zone,
+/// test zone) halves at the first LINE that is a `#[cfg(test)]` attribute
+/// (leading whitespace allowed — interior gated items count too, so code
+/// after them lands in the audited tail zone rather than being silently
+/// skipped). Anchoring on lines keeps doc prose that merely mentions the
+/// marker from splitting a file early. A marker-less file is all
+/// production.
+#[cfg(test)]
+pub(crate) fn lint_zones(text: &str) -> (&str, &str) {
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with("#[cfg(test)]") {
+            return (&text[..offset], &text[offset..]);
+        }
+        offset += line.len();
+    }
+    (text, "")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4307,85 +4377,121 @@ mod tests {
         );
     }
 
+    /// Run one grep-shaped consumer lint over the WHOLE crate: every `.rs`
+    /// file under rio-replay/src ([`crate_sources`] — a directory walk at
+    /// test time, so a NEW file joins the universe automatically), each
+    /// split into its production-policy zone and its test zone
+    /// ([`lint_zones`]) with BOTH zones' needle counts pinned per file.
+    /// The prefix counts are the policy (the allowed production sites);
+    /// the tail counts are an audit trail — test code may use the audited
+    /// names freely, but an occurrence landing after a mid-file test-gated
+    /// item (five files carry production code there today) or a
+    /// production/test count swap still moves a pinned number and forces
+    /// review. Files absent from the allowlist must count (0, 0), and
+    /// every allowlisted file must exist, so rows cannot go stale.
+    fn assert_consumer_counts(
+        needle: &str,
+        allowed: &BTreeMap<&str, (usize, usize)>,
+        violation: &str,
+    ) {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for (file, text) in crate_sources() {
+            let (prod, tail) = lint_zones(&text);
+            let expected = allowed.get(file.as_str()).copied().unwrap_or((0, 0));
+            assert_eq!(
+                (prod.matches(needle).count(), tail.matches(needle).count()),
+                expected,
+                "{file} (production zone, test zone): {violation}"
+            );
+            seen.insert(file);
+        }
+        for file in allowed.keys() {
+            assert!(
+                seen.contains(*file),
+                "{file} is enumerated but no longer exists; drop or move its row"
+            );
+        }
+    }
+
     /// Consumer enumeration for the wired-hook decision feeding the supply
-    /// attempt floor: `topup_wired` is consulted exactly once (the hoisted
-    /// decision both supply arms share), the hook is constructed at
-    /// exactly two sites (the fresh stage's wiring and the resume
-    /// rebuild's, both gated on that one decision), and `wiring.topup` has
-    /// no other production reader — so a new wiring arm cannot reach a
-    /// different floor than its siblings without failing these counts.
-    /// Domain: the production half (pre-`#[cfg(test)]`) of mod.rs.
+    /// attempt floor: `topup_wired` is consulted exactly once in
+    /// production (the hoisted decision both supply arms share), the hook
+    /// is constructed at exactly two sites (the fresh stage's wiring and
+    /// the resume rebuild's, both gated on that one decision), and the
+    /// wiring's raw topup-role field has no other production reader — so
+    /// a new wiring arm anywhere in the crate (child modules can name the
+    /// helper via `super::`) cannot reach a different floor than its
+    /// siblings without failing these counts. Universe and zone rules:
+    /// see `assert_consumer_counts`.
     #[test]
     fn wired_hook_decision_consumers_are_enumerated() {
-        let src = include_str!("mod.rs");
-        let prod = src
-            .split_once("#[cfg(test)]")
-            .map(|(prod, _)| prod.to_string())
-            .unwrap_or_else(|| src.to_string());
-        // Built at runtime so this test's own strings cannot match.
-        let wired_calls = format!("{}{}", "topup_wired", "(");
-        assert_eq!(
-            prod.matches(&wired_calls).count(),
-            2,
-            "the definition plus its single hoisted call — a new topup_wired caller \
-             must share the hoisted decision, not re-derive it"
+        // Needles built at runtime so this test's own strings cannot match.
+        assert_consumer_counts(
+            &format!("{}{}", "topup_wired", "("),
+            &[("src/run/mod.rs", (2, 1))].into_iter().collect(),
+            "the definition, its single hoisted production call, and the lattice \
+             test — a new caller must share the hoisted decision, not re-derive it",
         );
-        let hook_sites = format!("supply_topup = {}", "Some(");
-        assert_eq!(
-            prod.matches(&hook_sites).count(),
-            2,
+        assert_consumer_counts(
+            &format!("supply_topup = {}", "Some("),
+            &[("src/run/mod.rs", (2, 0))].into_iter().collect(),
             "the fresh stage and the resume rebuild are the only hook constructors; \
-             a new one must be gated on the same wire_topup decision and join this count"
+             a new one must be gated on the same wire_topup decision and join this count",
         );
-        let role_reads = format!("wiring{}", ".topup");
-        assert_eq!(
-            prod.matches(&role_reads).count(),
-            1,
-            "the topup role reaches production code only through topup_wired"
+        assert_consumer_counts(
+            &format!("wiring{}", ".topup"),
+            &[("src/run/mod.rs", (1, 0))].into_iter().collect(),
+            "the raw topup-role field reaches production code only through topup_wired",
         );
     }
 
-    /// Consumer enumeration for the fresh `workload_set` derivation: the
+    /// Consumer enumeration for the fresh workload-split derivation: the
     /// demotion decision is pinned at first plan and resolved through
-    /// `resolve_demoted_impure`, so production code may consult the fresh
-    /// archive split only where no pinned decision can exist. Exactly
-    /// these call sites are allowed (per file, production halves only —
-    /// the same include_str! shape as the `remote_object_match` lint in
-    /// archive/s3.rs); a new caller fails this count until it is routed
-    /// through the pin (or argued into this list):
+    /// `resolve_demoted_impure`, so production code may call
+    /// `supply::workload_set` only where no pinned decision can exist.
+    /// The scanned universe is every `.rs` file in the crate, walked at
+    /// test time — a consumer in any other or any NEW production file
+    /// fails this lint until it is routed through the pin or argued into
+    /// the allowlist (zone rules: see `assert_consumer_counts`). Allowed
+    /// production sites:
     ///
-    /// - supply.rs: 2 — the definition, and `demoted_impure_jobs` (the
-    ///   re-derivation chokepoint `resolve_demoted_impure` itself calls
-    ///   for pre-pin campaign records);
-    /// - timeline.rs: 1 — the offline dry-run planner, which runs without
-    ///   a campaign record (nothing pinned to read);
-    /// - mod.rs: 1 — the timed wiring's FALLBACK feed into
+    /// - src/run/supply.rs: 2 — the definition, and `demoted_impure_jobs`
+    ///   (the re-derivation chokepoint `resolve_demoted_impure` itself
+    ///   calls for pre-pin campaign records);
+    /// - src/run/timeline.rs: 1 — the offline dry-run planner, which runs
+    ///   without a campaign record (nothing pinned to read);
+    /// - src/run/mod.rs: 1 — the timed wiring's FALLBACK feed into
     ///   `pinned_workload_member`, which consults it only for targets
-    ///   outside the pinned scope;
-    /// - supply/exec.rs: 0.
+    ///   outside the pinned scope.
+    ///
+    /// Test-zone occurrences (counted, unconstrained by the policy):
+    /// supply.rs partition test 1; mod.rs dry-run/live parity tests 3 plus
+    /// one prose mention 1; archive/reader.rs capability flip test 2.
+    ///
+    /// Out of scope, disclosed: this is a textual call-site lint — it
+    /// cannot see a consumer that reuses an already-counted call's RESULT
+    /// (the timed arm's `workload` binding). That binding flows only into
+    /// `pinned_workload_member`, whose signature and doc own the
+    /// pin-override contract.
     #[test]
     fn fresh_workload_set_consumers_are_enumerated() {
-        let prod_half = |src: &str| -> String {
-            src.split_once("#[cfg(test)]")
-                .map(|(prod, _)| prod.to_string())
-                .unwrap_or_else(|| src.to_string())
-        };
         // Built at runtime so this test's own strings cannot match.
         let needle = format!("{}{}", "workload_set", "(");
-        for (file, src, expected) in [
-            ("supply.rs", include_str!("supply.rs"), 2),
-            ("timeline.rs", include_str!("timeline.rs"), 1),
-            ("mod.rs", include_str!("mod.rs"), 1),
-            ("supply/exec.rs", include_str!("supply/exec.rs"), 0),
-        ] {
-            assert_eq!(
-                prod_half(src).matches(&needle).count(),
-                expected,
-                "{file}: a new fresh-derivation consumer of workload_set must route \
-                 through the demotion pin (resolve_demoted_impure / \
-                 pinned_workload_member) or be argued into this enumeration"
-            );
-        }
+        let allowed: BTreeMap<&str, (usize, usize)> = [
+            ("src/run/supply.rs", (2, 1)),
+            ("src/run/timeline.rs", (1, 0)),
+            ("src/run/mod.rs", (1, 4)),
+            ("src/archive/reader.rs", (0, 2)),
+        ]
+        .into_iter()
+        .collect();
+        assert_consumer_counts(
+            &needle,
+            &allowed,
+            "a new fresh-derivation consumer of the workload split must route \
+             through the demotion pin (resolve_demoted_impure / \
+             pinned_workload_member) or be argued into this enumeration",
+        );
     }
 
     struct HealthyCluster;

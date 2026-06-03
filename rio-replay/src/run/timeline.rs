@@ -1526,60 +1526,58 @@ mod tests {
     }
 
     /// Site enumeration for the float→Duration conversion family: every
-    /// production `Duration::from_secs_f64(` call in the run module's
-    /// schedule/conversion files is counted here, with the bound that
-    /// keeps it total. A new bare site fails the count until it is either
-    /// converted to `try_from_secs_f64` (the totalized shape `from_knobs`
-    /// uses) or audited into this list with its bound. Domain: the
-    /// production half (pre-`#[cfg(test)]`) of each named file — the same
-    /// shape as the `remote_object_match` consumer lint in archive/s3.rs.
-    /// The knob-side half of the audit is
+    /// `.rs` file in the crate is scanned for bare panicking conversion
+    /// sites — the universe is a directory walk at test time
+    /// (`crate::run::crate_sources`), so a new site in any other or any
+    /// NEW file fails this lint until it is either converted to
+    /// `try_from_secs_f64` (the totalized shape `from_knobs` uses) or
+    /// audited here with its bound. Each file pins both its
+    /// production-zone and its test-zone count (`crate::run::lint_zones`;
+    /// zone semantics documented on `run::tests::assert_consumer_counts`),
+    /// so a conversion landing after a mid-file test-gated item cannot
+    /// pass silently either. The knob-side half of the audit is
     /// `spec::tests::every_float_knob_is_classified_against_the_duration_conversion_family`.
+    ///
+    /// The four audited production sites, all in this file:
+    ///  1. the due time `offset / speedup` (offset clamped to
+    ///     MAX_RECORDED_OFFSET_S by recorded_request_from; the speedup
+    ///     quotient bound in validate() makes the worst case
+    ///     representable);
+    ///  2. the recorded disconnect gap `(stop - offset).max(0) /
+    ///     speedup` (stop bounded by the recorded-timing domain filter,
+    ///     same quotient bound);
+    ///  3. the default disconnect gap `DEFAULT_DISCONNECT_DELAY_S /
+    ///     speedup` (constant numerator below the offset cap, same
+    ///     quotient bound);
+    ///  4. build_timeout_for's `(2 * duration).min(cap)` (duration
+    ///     bounded by the recorded-timing domain filter AND capped by
+    ///     an admitted — hence representable — cap before converting).
+    ///
+    /// The three test-zone occurrences are the cap-composition test's
+    /// expected-value math (`schedule_offsets_at_the_cap_…`) above.
     #[test]
     fn duration_from_secs_f64_sites_are_enumerated() {
-        let prod_half = |src: &str| -> String {
-            src.split_once("#[cfg(test)]")
-                .map(|(prod, _)| prod.to_string())
-                .unwrap_or_else(|| src.to_string())
-        };
         // Built at runtime so this test's own strings cannot match it.
         let needle = format!("Duration::{}{}", "from_secs_f64", "(");
-        // timeline.rs: exactly the four audited sites —
-        //  1. the due time `offset / speedup` (offset clamped to
-        //     MAX_RECORDED_OFFSET_S by recorded_request_from; the speedup
-        //     quotient bound in validate() makes the worst case
-        //     representable);
-        //  2. the recorded disconnect gap `(stop - offset).max(0) /
-        //     speedup` (stop bounded by the recorded-timing domain filter,
-        //     same quotient bound);
-        //  3. the default disconnect gap `DEFAULT_DISCONNECT_DELAY_S /
-        //     speedup` (constant numerator below the offset cap, same
-        //     quotient bound);
-        //  4. build_timeout_for's `(2 * duration).min(cap)` (duration
-        //     bounded by the recorded-timing domain filter AND capped by
-        //     an admitted — hence representable — cap before converting).
-        assert_eq!(
-            prod_half(include_str!("timeline.rs"))
-                .matches(&needle)
-                .count(),
-            4,
-            "a new bare Duration::from_secs_f64 site in timeline.rs must be audited \
-             here (or use try_from_secs_f64)"
-        );
-        // The sibling files of the family hold no bare sites at all: the
-        // sanitizers in mod.rs only filter/clamp, spec.rs only validates
-        // (try_from_secs_f64), and submit.rs converts via a saturating
-        // integer cast.
-        for (file, src) in [
-            ("mod.rs", include_str!("mod.rs")),
-            ("spec.rs", include_str!("spec.rs")),
-            ("submit.rs", include_str!("submit.rs")),
-        ] {
+        let allowed: BTreeMap<&str, (usize, usize)> =
+            [("src/run/timeline.rs", (4, 3))].into_iter().collect();
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (file, text) in crate::run::crate_sources() {
+            let (prod, tail) = crate::run::lint_zones(&text);
+            let expected = allowed.get(file.as_str()).copied().unwrap_or((0, 0));
             assert_eq!(
-                prod_half(src).matches(&needle).count(),
-                0,
-                "{file} gained a bare Duration::from_secs_f64 site; route it through \
-                 try_from_secs_f64 or audit it in this test"
+                (prod.matches(&needle).count(), tail.matches(&needle).count()),
+                expected,
+                "{file} (production zone, test zone): a new bare float→Duration \
+                 conversion site must use try_from_secs_f64 or be audited into this \
+                 enumeration with its bound"
+            );
+            seen.insert(file);
+        }
+        for file in allowed.keys() {
+            assert!(
+                seen.contains(*file),
+                "{file} is enumerated but no longer exists; drop or move its row"
             );
         }
     }
