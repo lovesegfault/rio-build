@@ -751,13 +751,29 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
     only on the derivation's fixed attributes)
 ]
 
-#r("sched.merge.dep-failed-transitive")[
+#r("sched.merge.dep-failed-transitive+2")[
   When a newly-merged node transitively depends on a node already in a
   failure-terminal state (`Poisoned`/`DependencyFailed`/`Cancelled`), it is
   seeded directly to `DependencyFailed` --- at any depth, not just immediate
   children. Under `keepGoing=true` this is the only path that resolves such
-  nodes; without it the build hangs Active.
+  nodes; without it the build hangs Active. Each seeded node MUST emit a
+  `DerivationFailed` event (`DEPENDENCY_FAILED`, message in the shared
+  dependency-failed summary shape naming a terminally-failed dependency) to
+  every interested build's stream --- merge-time resolution is a terminal
+  transition like any other, and an event-less one leaves the gateway's
+  per-root relay terminal-less, inheriting the DAG-level blanket and
+  mis-attributing a sibling's failure downstream.
 ]
+
+A pre-existing node that stays `Poisoned` across the merge because it is at
+the poison resubmit limit (not reset by
+#rref("sched.merge.poisoned-resubmit-bounded+2")) likewise emits to the NEW
+build's stream --- `DerivationFailed` with `CACHED_FAILURE` (the failure is
+remembered from an earlier attempt, not re-executed), mirroring the
+pre-existing `Completed`/`Skipped` → `DerivationCached` arm of
+#rref("sched.event.derivation-terminal"). The original failure's events went
+only to the builds interested at the time; without the merge-time emission
+the resubmitting build's relay records no terminal for the node.
 
 #r("sched.merge.shared-priority-max")[
   Each derivation node tracks a set of interested builds. Shared derivations

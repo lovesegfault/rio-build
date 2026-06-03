@@ -1492,12 +1492,67 @@ impl DagActor {
                     // sequential PG awaits in the actor loop here.
                     preexisting_completed.push(node.drv_hash.as_str().into());
                 }
-                DerivationStatus::Poisoned | DerivationStatus::DependencyFailed => {
+                // r[impl sched.event.derivation-terminal]
+                // Pre-existing failed is a terminal failed-equivalent
+                // for THIS build's WatchBuild — emit so the relay
+                // records a per-root terminal instead of leaving the
+                // node event-less in the new build's stream (the exact
+                // mirror of the Completed/Skipped→DerivationCached arm
+                // above; the original failure's events went only to the
+                // builds interested at the time). Targeted at THIS
+                // build only — re-emitting to prior builds would
+                // double-report a failure they already saw.
+                DerivationStatus::Poisoned => {
                     first_failed.get_or_insert_with(|| node.drv_hash.as_str().into());
                     debug!(
                         drv_hash = %node.drv_hash,
                         status = ?state.status(),
                         "pre-existing node already failed; build will fail fast"
+                    );
+                    // CACHED_FAILURE: the failure is remembered from an
+                    // earlier attempt, not re-executed. Reachable only
+                    // at the poison resubmit limit — an under-limit
+                    // Poisoned node is reset by `dag.merge`
+                    // (`is_retriable_on_resubmit`) and re-enters
+                    // through `compute_initial_states` instead.
+                    self.events.emit(
+                        ingest.build_id,
+                        rio_proto::types::build_event::Event::Derivation(
+                            rio_proto::types::DerivationEvent::failed(
+                                node.drv_path.clone(),
+                                "previously failed and still poisoned (resubmit retry \
+                                 limit reached; clears via poison TTL or admin \
+                                 clear-poison)"
+                                    .to_string(),
+                                rio_proto::types::BuildResultStatus::CachedFailure,
+                            ),
+                        ),
+                    );
+                }
+                DerivationStatus::DependencyFailed => {
+                    first_failed.get_or_insert_with(|| node.drv_hash.as_str().into());
+                    debug!(
+                        drv_hash = %node.drv_hash,
+                        status = ?state.status(),
+                        "pre-existing node already failed; build will fail fast"
+                    );
+                    // Defensive leg: a SUBMITTED DependencyFailed node
+                    // is reset by `dag.merge` (`is_retriable_on_resubmit`
+                    // is unconditional for DependencyFailed) and lands
+                    // in `newly_inserted`, so today this arm is only
+                    // reachable if that reset contract changes. Kept
+                    // emission-symmetric with the seeded path so the
+                    // event totality does not silently regress with it.
+                    let msg = self.merge_seed_failure_message(node.drv_hash.as_str());
+                    self.events.emit(
+                        ingest.build_id,
+                        rio_proto::types::build_event::Event::Derivation(
+                            rio_proto::types::DerivationEvent::failed(
+                                node.drv_path.clone(),
+                                msg,
+                                rio_proto::types::BuildResultStatus::DependencyFailed,
+                            ),
+                        ),
                     );
                 }
                 _ => {}
@@ -1515,7 +1570,10 @@ impl DagActor {
 
     /// Compute initial Ready/Queued/DependencyFailed for `remaining_new`
     /// (newly-inserted minus cache-hits), transition + push_ready in
-    /// memory, then persist as three batched ANY($1::text[]) updates.
+    /// memory, then persist as three batched ANY($1::text[]) updates,
+    /// then emit one `DerivationFailed{DEPENDENCY_FAILED}` per seeded
+    /// node (transition → persist → emit, the same order as the runtime
+    /// cascade in `terminal_failure_epilogue`).
     /// Returns the first DependencyFailed hash (if any) so the caller
     /// can fail-fast / handle_derivation_failure.
     ///
@@ -1595,7 +1653,94 @@ impl DagActor {
                 );
             }
         }
+        // r[impl sched.event.derivation-terminal]
+        // r[impl sched.merge.dep-failed-transitive+2]
+        // A seeded node reached a terminal without the runtime cascade —
+        // emit its own DerivationFailed, or the gateway's per-root relay
+        // never records a terminal for it: the root then inherits the
+        // DAG-level blanket and the replay engine charges it a SIBLING's
+        // failure text (the false-regression shape) instead of routing
+        // the named trigger through the dependency-attribution arm.
+        // Emission here is exactly-once with the runtime cascade: the
+        // cascade's filter only transitions Queued/Ready/Created, so a
+        // node seeded DependencyFailed in this loop is structurally
+        // skipped by every later cascade walk (pinned by
+        // `test_merge_seeded_node_not_reemitted_by_later_cascade`).
+        // Runs AFTER the loop above so the `will_fail` topological leg
+        // is visible: a parent seeded against a sibling seeded in this
+        // same call scans that sibling as already DependencyFailed.
+        // Volume: one event per seeded node, the same order as the
+        // per-ancestor cascade emissions and the per-node DerivationCached
+        // merge emissions; the 4096-slot state ring's documented
+        // Lagged degradation applies unchanged.
+        for drv_hash in &by_status[2] {
+            let msg = self.merge_seed_failure_message(drv_hash);
+            let drv_path = self.dag.path_or_hash_fallback(drv_hash);
+            for build_id in self.get_interested_builds(drv_hash) {
+                self.events.emit(
+                    build_id,
+                    rio_proto::types::build_event::Event::Derivation(
+                        rio_proto::types::DerivationEvent::failed(
+                            drv_path.clone(),
+                            msg.clone(),
+                            rio_proto::types::BuildResultStatus::DependencyFailed,
+                        ),
+                    ),
+                );
+            }
+        }
         first_dep_failed
+    }
+
+    /// Failure message for a node resolved `DependencyFailed` at merge
+    /// time: the shared `rio_proto::dependency_failed_summary` naming
+    /// the terminally-failed dependency that doomed it, with a tail
+    /// describing the dependency's state when this build merged (no
+    /// runtime failure text exists — the dependency failed before, or
+    /// outside, this build's lifetime; the replay engine recovers the
+    /// underlying cause through the trigger-keyed channels its
+    /// dependency-failed arm already consults: the poison snapshot and
+    /// the trigger's own log tail).
+    ///
+    /// Trigger choice is deterministic: the highest-precedence failed
+    /// child (`Poisoned` > `Cancelled` > `DependencyFailed` — name the
+    /// root cause, not a fellow casualty), ties broken by hash order.
+    /// The scanned set matches `any_dep_terminally_failed` plus the
+    /// just-seeded siblings of `compute_initial_states`' `will_fail`
+    /// leg (already transitioned by the time this runs). The defensive
+    /// no-trigger fallback (a child reaped between seeding and this
+    /// scan) names no derivation — the replay engine's
+    /// no-identifiable-trigger arm handles that shape with a bounded
+    /// re-offer instead of a misattributed charge.
+    fn merge_seed_failure_message(&self, drv_hash: &str) -> String {
+        let mut best: Option<(u8, DrvHash, &'static str)> = None;
+        for child in self.dag.get_children(drv_hash) {
+            let Some(state) = self.dag.node(&child) else {
+                continue;
+            };
+            let (rank, tail) = match state.status() {
+                DerivationStatus::Poisoned => (0, "already poisoned when this build merged"),
+                DerivationStatus::Cancelled => (1, "already cancelled when this build merged"),
+                DerivationStatus::DependencyFailed => (
+                    2,
+                    "its own dependency already failed when this build merged",
+                ),
+                _ => continue,
+            };
+            let better = match &best {
+                None => true,
+                Some((r, h, _)) => rank < *r || (rank == *r && child.as_str() < h.as_str()),
+            };
+            if better {
+                best = Some((rank, child, tail));
+            }
+        }
+        match best {
+            Some((_, child, tail)) => {
+                rio_proto::dependency_failed_summary(&self.dag.path_or_hash_fallback(&child), tail)
+            }
+            None => "a dependency already failed when this build merged".to_string(),
+        }
     }
 
     /// Verify that pre-existing `Completed` nodes' outputs still exist

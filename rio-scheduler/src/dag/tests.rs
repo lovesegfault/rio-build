@@ -2581,7 +2581,7 @@ fn test_cyclic_merge_reverts_traceparent_upgrade() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.dep-failed-transitive]
+// r[verify sched.merge.dep-failed-transitive+2]
 /// bug_051: `compute_initial_states` decided every node against the
 /// pre-call snapshot. For chain A→B→X with X already Poisoned
 /// (non-retriable) and A,B newly inserted: B sees X→DepFailed; A sees

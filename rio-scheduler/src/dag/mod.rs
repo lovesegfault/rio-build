@@ -1463,7 +1463,7 @@ impl DerivationDag {
     /// directly to DependencyFailed (pre-poisoned detection).
     ///
     /// Returns lists of (drv_hash, new_status) transitions.
-    // r[impl sched.merge.dep-failed-transitive]
+    // r[impl sched.merge.dep-failed-transitive+2]
     pub fn compute_initial_states(
         &self,
         newly_inserted: &HashSet<DrvHash>,

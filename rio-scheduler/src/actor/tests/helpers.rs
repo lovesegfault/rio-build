@@ -496,6 +496,34 @@ pub(crate) async fn merge_dag_req(
     Ok(reply_rx.await??.state)
 }
 
+/// Drain every state event currently buffered on `rx`, returning the
+/// `DerivationEvent`s of kind `Failed` in emission order.
+///
+/// Non-blocking by design: actor commands are processed to completion
+/// before their reply resolves, so every event a preceding awaited
+/// helper caused is already in the broadcast ring when this runs. A
+/// `Lagged` skip is tolerated (ring capacity is 4096; tests stay far
+/// below it) so a drain never wedges on an overflow.
+pub(crate) fn drain_failed_derivation_events(
+    rx: &mut broadcast::Receiver<rio_proto::types::BuildEvent>,
+) -> Vec<rio_proto::types::DerivationEvent> {
+    let mut out = Vec::new();
+    loop {
+        match rx.try_recv() {
+            Ok(ev) => {
+                if let Some(rio_proto::types::build_event::Event::Derivation(d)) = ev.event
+                    && d.kind() == rio_proto::types::DerivationEventKind::Failed
+                {
+                    out.push(d);
+                }
+            }
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(_) => break,
+        }
+    }
+    out
+}
+
 /// Connect a worker (stream + heartbeat) so it becomes fully registered.
 /// Returns the mpsc::Receiver for scheduler→worker messages.
 pub(crate) async fn connect_executor(

@@ -2016,7 +2016,11 @@ impl DagActor {
         // merged build the trigger does NOT). Without this, WatchBuild
         // clients see cascaded derivations frozen at Queued under
         // keep_going while the build moves on.
-        let dep_msg = format!("dependency '{trigger_path}' failed: {error_msg}");
+        // Shared formatter, never an inline string: the replay engine's
+        // classifier (`classify_reason`) parses this exact shape to
+        // recover the trigger; the merge-time seeding sites emit the
+        // same shape through the same function.
+        let dep_msg = rio_proto::dependency_failed_summary(&trigger_path, error_msg);
         for cascaded_hash in &cascaded {
             let interested = self.get_interested_builds(cascaded_hash);
             // A cascaded ancestor that was dispatched, reset_to_ready()'d

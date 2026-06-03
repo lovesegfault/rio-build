@@ -63,6 +63,40 @@ pub fn dag_first_failure_summary(drv_key: &str) -> String {
     format!("derivation {drv_key} failed")
 }
 
+/// The scheduler's per-derivation dependency-failure message: the
+/// `error_message` of every `DerivationFailed` event whose
+/// `failure_status` is `DEPENDENCY_FAILED`, naming the failed dependency
+/// that doomed the derivation.
+///
+/// This is a wire-format contract with multiple producers and a
+/// text-shape consumer, kept as one function so none of them can drift:
+///
+/// - **Producers** (all rio-scheduler): the runtime cascade
+///   (`terminal_failure_epilogue`'s cascaded-ancestor loop,
+///   actor/completion.rs) where `reason` is the trigger's full failure
+///   text, and the merge-time seeding sites (actor/merge.rs:
+///   `seed_initial_states` for a newly-merged node whose dependency is
+///   already terminally failed, and the pre-existing reconciliation arm
+///   for an at-poison-limit node joining a new build) where `reason`
+///   describes the dependency's state at merge.
+/// - **Content**: `failing_drv_key` is the scheduler DAG's node key for
+///   the failed dependency — the full derivation store path (see
+///   [`dag_first_failure_summary`]'s content note). The replay engine
+///   checks it for membership in the dependent's recorded closure, so
+///   it must be the dependency's path, never the dependent's own.
+/// - **Format**: this function is the only producer of the shape.
+/// - **Consumer**: the replay engine's reason classifier
+///   (`classify_reason` in rio-replay/src/run/stderrparse.rs) parses
+///   exactly this shape into `ReasonClass::Dependency { failing_drv }`,
+///   which drives closure-membership checks, trigger-keyed log-tail
+///   fetches, and source-rot attribution in run/collect.rs.
+///   Classifier fixtures MUST be built through this function — a
+///   hand-written consumer-side fixture can encode a producer shape
+///   production never emits and certify a dead recovery arm green.
+pub fn dependency_failed_summary(failing_drv_key: &str, reason: &str) -> String {
+    format!("dependency '{failing_drv_key}' failed: {reason}")
+}
+
 pub mod client;
 pub mod interceptor;
 // Trait impls (`From<NixStatus> for BuildResultStatus` and inverse) are
