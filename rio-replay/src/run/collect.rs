@@ -3807,12 +3807,15 @@ mod tests {
 
     /// The canary-probe carve-out, both directions. Must-exempt: a probe
     /// batch's infra-shaped failures (missing in-band result, two-signal
-    /// infra) re-offer with the budget-exempt witness even with the
-    /// auto-retry budget long exhausted — a probe failure is evidence about
-    /// the outage, never charged to the job. Must-still-classify: a probe
-    /// whose build actually executed (genuine failure, success) produces
-    /// its normal terminal decision — the probe carve-out can only catch
-    /// infra shapes, so a recovered cluster's verdicts land as evidence.
+    /// infra, a marked lost-terminal row — including in a TIMED probe
+    /// batch, where the carve-out outranks the timed-mode immediate
+    /// terminalization) re-offer with the budget-exempt witness even with
+    /// the auto-retry budget long exhausted — a probe failure is evidence
+    /// about the outage, never charged to the job. Must-still-classify: a
+    /// probe whose build actually executed (genuine failure, success)
+    /// produces its normal terminal decision — the probe carve-out can
+    /// only catch infra shapes, so a recovered cluster's verdicts land as
+    /// evidence.
     #[test]
     fn probe_batch_exempts_infra_shapes_but_real_verdicts_still_land() {
         let knobs = Knobs::default();
@@ -3861,6 +3864,40 @@ mod tests {
                 assert!(budget.probe_exempt());
             }
             other => panic!("expected an exempt probe requeue, got {other:?}"),
+        }
+
+        // Marked lost-terminal row (relay marker × Substituted) in a batch
+        // that is BOTH timed AND a probe. Producer-impossible today — the
+        // timed dispatcher never sets `probe` on its submissions — pinned
+        // anyway per the precedence discipline: the marker arm consults
+        // the probe carve-out BEFORE the timed-mode immediate
+        // terminalization, so the probed outage answers budget-exempt
+        // instead of minting the §7.2 evidence-loss terminal.
+        let marked_timed_probe = BatchView {
+            probe: true,
+            kind: BATCH_KIND_TIMED.to_string(),
+            lost_terminals: BTreeSet::from([T.to_string()]),
+            ..BatchView::default()
+        };
+        match decide(
+            &c,
+            Some(&po(T, BuildStatus::Substituted, "")),
+            &marked_timed_probe,
+            &no_poison,
+            prior(5),
+            &knobs,
+            None,
+        ) {
+            CollectDecision::Requeue { why, budget } => {
+                assert_eq!(why, RequeueReason::InfraProbe);
+                assert!(
+                    budget.probe_exempt(),
+                    "probe wins over timed for a marked row"
+                );
+            }
+            other => panic!(
+                "expected the probe carve-out to outrank the timed terminalization, got {other:?}"
+            ),
         }
 
         // Genuine failure on a probe: the cluster executed the build — a
