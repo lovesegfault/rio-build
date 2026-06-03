@@ -1215,12 +1215,23 @@ pub struct BatchRecord {
     #[serde(default)]
     pub interruption_drvs: Vec<String>,
     /// Interior input derivations the import walk skipped because the
-    /// archive does not embed them (the thin-archive gap set, sorted).
-    /// When a root of this batch later fails on a missing input, this
-    /// field is the breadcrumb attributing the failure to the archive.
-    /// Defaults to empty on records written before the field existed.
+    /// archive does not embed them (a non-conforming archive's
+    /// import-gap set, sorted): the operator-facing union view — the
+    /// per-root attribution collect consumes is
+    /// `import_skipped_by_root`. Defaults to empty on records written
+    /// before the field existed.
     #[serde(default)]
     pub import_skipped_drvs: Vec<String>,
+    /// Per-root attribution of the import-gap set (root drv → the gaps
+    /// reachable in ITS embedded-text closure): the breadcrumb collect
+    /// CONSUMES — a failed root whose entry here is non-empty retires
+    /// under the supply-failed disposition before two-signal
+    /// classification, attributing the failure to the archive instead
+    /// of charging the unit a regression. Defaults to empty on records
+    /// written before the field existed: their skips predate the
+    /// attribution path and their members are not re-classified.
+    #[serde(default)]
+    pub import_skipped_by_root: BTreeMap<String, Vec<String>>,
     /// True when this batch is a canary probe released by the submit loop
     /// while the infra-rate backpressure pause held: a single job sent to
     /// test whether the infrastructure recovered, whose infra-shaped
@@ -2187,6 +2198,7 @@ mod tests {
             disconnect_deadline_fired: false,
             interruption_drvs: Vec::new(),
             import_skipped_drvs: Vec::new(),
+            import_skipped_by_root: BTreeMap::new(),
             probe: false,
             confirmation_attempt: 0,
             topup_delivered: true,
@@ -2222,8 +2234,12 @@ mod tests {
         assert!(parsed.interruption_drvs.is_empty());
         assert!(!parsed.disconnect_deadline_fired);
         // Lines written before the import-skip breadcrumb existed lack
-        // `importSkippedDrvs` the same way (defaults to empty).
+        // `importSkippedDrvs` the same way (defaults to empty), and lines
+        // written before the per-root attribution existed lack
+        // `importSkippedByRoot` (defaults to empty: their skips predate
+        // the attribution path and their members are not re-classified).
         assert!(parsed.import_skipped_drvs.is_empty());
+        assert!(parsed.import_skipped_by_root.is_empty());
         assert!(!parsed.probe);
         assert_eq!(parsed.confirmation_attempt, 0);
         assert!(!parsed.topup_delivered);

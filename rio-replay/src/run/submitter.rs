@@ -111,11 +111,17 @@ pub struct BatchOutcome {
     /// failures and re-offered, never classified against the deadline.
     pub engine_cancelled: bool,
     /// Interior input derivations the import walk reached but the archive
-    /// does not embed (the thin-archive gap set, sorted): recorded on the
-    /// batch record so a downstream per-root failure over a missing input
-    /// is attributable to the archive instead of read as a unit
-    /// regression. Empty for submitters that import nothing.
+    /// does not embed (a non-conforming archive's import-gap set,
+    /// sorted): recorded on the batch record as the operator-facing
+    /// union view. Empty for submitters that import nothing.
     pub import_skipped_drvs: Vec<String>,
+    /// Per-root attribution of `import_skipped_drvs` (root drv → the
+    /// gaps ITS text closure reaches): the form collect consumes — a
+    /// failed root retires as supply-failed exactly when its own
+    /// closure carried a gap, so the failure is attributed to the
+    /// archive instead of read as a unit regression, and an unrelated
+    /// batch-mate's genuine failure is never excused.
+    pub import_skipped_by_root: BTreeMap<String, Vec<String>>,
 }
 
 /// One batch-submission backend. The submit loop only ever talks to this
@@ -390,6 +396,7 @@ impl Submitter for ClientOpsSubmitter {
             reasons: parsed.reasons,
             stderr_tail: Vec::from(tail).join("\n"),
             import_skipped_drvs: closure.skipped,
+            import_skipped_by_root: closure.skipped_for,
             engine_cancelled,
         })
     }

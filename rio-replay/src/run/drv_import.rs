@@ -7,7 +7,7 @@
 //! worker-protocol upload entry, so derivation texts are imported over
 //! `AddMultipleToStore` without a local Nix store or a `nix` binary.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -38,9 +38,24 @@ pub struct DrvClosure {
     /// deduplicated across roots).
     pub order: Vec<String>,
     /// Interior input derivations the walk reached but the archive does
-    /// not embed (sorted, deduplicated): the thin-archive gap set, skipped
-    /// per the offer policy and surfaced on the batch record.
+    /// not embed (sorted, deduplicated): the import-gap set of a
+    /// NON-CONFORMING archive (the format requires the full requisite
+    /// `.drv` closure of every workload unit to be embedded — design doc
+    /// §"Archive format v1"), skipped per the offer policy and surfaced
+    /// on the batch record.
     pub skipped: Vec<String>,
+    /// Root drv → the subset of [`DrvClosure::skipped`] reachable in
+    /// THAT root's embedded-text closure (sorted; roots with no gap are
+    /// absent). This is the attribution view collect consumes: a failed
+    /// root retires as supply-failed exactly when ITS OWN closure
+    /// carried a gap, so one damaged root never excuses an unrelated
+    /// batch-mate's genuine failure. Attribution must come from the
+    /// TEXT walk: every drv in a unit's plan-time RECORD closure is
+    /// plan-verified embedded (`archive_input::load_closures`), so a
+    /// record-closure intersection with the gap set is empty by
+    /// construction — the records-vs-texts disagreement that produces a
+    /// skip is precisely what the record graph cannot see.
+    pub skipped_for: BTreeMap<String, Vec<String>>,
 }
 
 impl DrvArchive {
@@ -61,19 +76,22 @@ impl DrvArchive {
     /// Walk the derivation closure of `roots` over the archive's embedded
     /// ATerms: every derivation appears after all of its in-archive input
     /// derivations (post-order), deduplicated across roots, plus the set
-    /// of interior inputs the archive does not embed.
+    /// of interior inputs the archive does not embed and its per-root
+    /// attribution view.
     ///
     /// This walk answers "what can the archive OFFER", not closure truth,
     /// so gaps go through the shared policy's offer arm
-    /// (`run::closure_gap`): a non-embedded interior
-    /// input is the thin-archive shape — the target resolves it itself —
-    /// skipped at `warn!` and returned in [`DrvClosure::skipped`] so the
-    /// submitter can surface it on the batch record (when the target
-    /// CANNOT resolve it, the per-root failure must be attributable to
-    /// the archive instead of charged to the unit). A ROOT missing from
-    /// the archive is an error naming the path: batches are planned from
-    /// this archive's workload units, so a missing root means the archive
-    /// is incomplete or corrupted.
+    /// (`run::closure_gap`): a non-embedded interior input is a
+    /// NON-CONFORMING archive's damage tolerated mid-campaign — the
+    /// target may still resolve it from its own store — skipped at
+    /// `warn!` and returned in [`DrvClosure::skipped`] /
+    /// [`DrvClosure::skipped_for`] so the submitter surfaces it on the
+    /// batch record and collect retires the roots it actually starves
+    /// (when the target cannot resolve it, the per-root failure is
+    /// attributed to the archive's supply, never charged to the unit).
+    /// A ROOT missing from the archive is an error naming the path:
+    /// batches are planned from this archive's workload units, so a
+    /// missing root means the archive is incomplete or corrupted.
     pub fn closure(&self, roots: &[String]) -> Result<DrvClosure> {
         /// Explicit DFS frame: visit parses the ATerm and queues input
         /// derivations, emit appends the path once everything it references
@@ -126,7 +144,69 @@ impl DrvArchive {
             }
         }
         skipped.sort();
-        Ok(DrvClosure { order, skipped })
+        let skipped_for = self.attribute_skips(roots, &embedded, &skipped)?;
+        Ok(DrvClosure {
+            order,
+            skipped,
+            skipped_for,
+        })
+    }
+
+    /// Per-root attribution of an import gap: which of `skipped` each
+    /// root's OWN embedded-text closure reaches. The aggregate walk
+    /// deduplicates across roots (a node entered via one root is never
+    /// re-visited via another), so it cannot say WHOSE closure a gap
+    /// sits in; this second pass walks each root independently. It runs
+    /// only when a gap exists — conforming archives (the steady state)
+    /// pay nothing — and re-parses only tiny derivation texts on the
+    /// damaged path.
+    fn attribute_skips(
+        &self,
+        roots: &[String],
+        embedded: &HashSet<String>,
+        skipped: &[String],
+    ) -> Result<BTreeMap<String, Vec<String>>> {
+        let mut skipped_for: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        if skipped.is_empty() {
+            return Ok(skipped_for);
+        }
+        let gap_set: HashSet<&str> = skipped.iter().map(String::as_str).collect();
+        for root in roots {
+            if skipped_for.contains_key(root) {
+                continue;
+            }
+            let mut reached: Vec<String> = Vec::new();
+            let mut entered: HashSet<String> = HashSet::new();
+            let mut stack: Vec<String> = vec![root.clone()];
+            while let Some(path) = stack.pop() {
+                if !entered.insert(path.clone()) {
+                    continue;
+                }
+                if gap_set.contains(path.as_str()) {
+                    reached.push(path);
+                    continue;
+                }
+                if !embedded.contains(&path) {
+                    // Non-embedded but not in the gap set: unreachable —
+                    // the aggregate walk visited every text-reachable
+                    // node and classified exactly these as skipped (a
+                    // missing ROOT already errored there). Defensive
+                    // skip rather than a panic in a tolerance path.
+                    continue;
+                }
+                let (_, parsed) = self.derivation(&path)?;
+                for input in parsed.input_drvs().keys() {
+                    if !entered.contains(input) {
+                        stack.push(input.clone());
+                    }
+                }
+            }
+            if !reached.is_empty() {
+                reached.sort();
+                skipped_for.insert(root.clone(), reached);
+            }
+        }
+        Ok(skipped_for)
     }
 
     /// Materialize one embedded derivation as a worker-protocol upload
@@ -226,13 +306,14 @@ mod tests {
 
         // appB reaches stdenv only through libA; references come out before
         // their referrers so uploads register dependencies first. A fully
-        // embedded closure has nothing to skip.
+        // embedded closure has nothing to skip — and nothing to attribute.
         let closure = drv_archive.closure(std::slice::from_ref(&app_b)).unwrap();
         assert_eq!(
             closure.order,
             vec![stdenv.clone(), lib_a.clone(), app_b.clone()]
         );
         assert!(closure.skipped.is_empty(), "{:?}", closure.skipped);
+        assert!(closure.skipped_for.is_empty(), "{:?}", closure.skipped_for);
         // Multiple roots and already-reached roots dedup.
         let closure_both = drv_archive
             .closure(&[app_b.clone(), lib_a.clone()])
@@ -369,6 +450,30 @@ mod tests {
              reported, not swallowed (the input source is not a derivation \
              and is never walked)"
         );
+        assert_eq!(
+            closure.skipped_for,
+            BTreeMap::from([(extra_drv.clone(), vec![absent_drv.to_string()])]),
+            "the gap is attributed to the root whose text closure reaches it"
+        );
+
+        // Per-root attribution under a MULTI-root batch: the aggregate
+        // walk dedups across roots, so attribution comes from the
+        // independent per-root pass — the gapped root carries the gap
+        // whatever the seeding order put first, and the conforming
+        // batch-mate carries nothing (its later failure must never be
+        // excused by a neighbor's damage).
+        for roots in [
+            vec![extra_drv.clone(), base_drv.clone()],
+            vec![base_drv.clone(), extra_drv.clone()],
+        ] {
+            let closure = drv_archive.closure(&roots).unwrap();
+            assert_eq!(closure.skipped, vec![absent_drv.to_string()], "{roots:?}");
+            assert_eq!(
+                closure.skipped_for,
+                BTreeMap::from([(extra_drv.clone(), vec![absent_drv.to_string()])]),
+                "only the root that needs the gap is attributed: {roots:?}"
+            );
+        }
 
         let entry = drv_archive.entry(&extra_drv).unwrap();
         let mut want_refs = vec![base_drv, absent_drv.to_string(), src.to_string()];

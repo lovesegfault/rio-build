@@ -1809,12 +1809,33 @@ const CONTRACT_REGISTRY: &[ContractRow] = &[
         key: "drv-closure.import-skip",
         declared: (
             "rio-replay/src/run/drv_import.rs",
-            "returned in [`DrvClosure::skipped`] so the",
+            "so the submitter surfaces it on the",
         ),
         enforcement: Enforcement::Test {
             file: "rio-replay/src/run/drv_import.rs",
             test_fn: "closure_skips_inputs_the_archive_does_not_embed",
-            artifact_needles: &["reported, not swallowed"],
+            artifact_needles: &[
+                "reported, not swallowed",
+                "attributed to the root whose text closure reaches it",
+            ],
+        },
+    },
+    // ── …and the breadcrumb's CONSUMER: recording a skip is half the
+    // contract — the batch-settle retirement is what makes a starved
+    // root's failure archive-attributed instead of a regression charge.
+    // (The skip field spent a round write-only: producers landed with
+    // the doc-promise, no reader existed, and failed roots classified
+    // Genuine — this row demands the reader stays wired.) ──
+    ContractRow {
+        key: "drv-closure.import-skip-consumed",
+        declared: (
+            "rio-replay/src/run/closure_gap.rs",
+            "retires a failed root whose own text closure carried a gap",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/run/mod.rs",
+            test_fn: "import_gap_starved_failures_retire_as_supply_failed",
+            artifact_needles: &["only the transport member is re-offered", "import-gap"],
         },
     },
     // ── Plan-time demotion pin (resume classification stability). ──

@@ -535,6 +535,66 @@ pub struct BatchView {
     /// SUCCESS result from such a batch passes the already-terminal belt
     /// as a sanctioned superseding write.
     pub confirmation_attempt: u32,
+    /// Root drv → input derivations the batch's import walk skipped from
+    /// THAT root's text closure because the archive does not embed them
+    /// (from the batch record): the import-gap breadcrumb the collect
+    /// pass consumes — a failed root with an entry here retires as
+    /// supply-failed instead of being charged a regression.
+    pub import_skipped_by_root: BTreeMap<String, Vec<String>>,
+}
+
+impl BatchView {
+    /// THE batch-record → batch-view projection. Deliberately an
+    /// exhaustive destructuring with no `..` rest pattern: a new
+    /// `BatchRecord` field refuses to compile until this constructor
+    /// DECIDES whether classification consumes it — the import-skip
+    /// breadcrumb was once recorded faithfully and then dropped exactly
+    /// here, by a hand-copied view that listed every field except it,
+    /// leaving the archive-damage evidence write-only while failed
+    /// roots were charged as regressions.
+    pub fn of_record(record: &super::model::BatchRecord) -> Self {
+        let super::model::BatchRecord {
+            // Correlation/bookkeeping keys the caller drives the pass
+            // with — not per-job classification evidence.
+            batch_id: _,
+            jobs: _,
+            root_drvs: _,
+            est_nodes: _,
+            finished_at: _,
+            // The operator-facing union view of the import gaps; the
+            // per-root attribution below is the consumable form.
+            import_skipped_drvs: _,
+            // The inline-resume gate's delivery proof (read by the
+            // resume path over raw records), not classification's.
+            topup_delivered: _,
+            kind,
+            build_id,
+            started_at,
+            results,
+            reasons,
+            stderr_tail,
+            engine_cancelled,
+            disconnect_deadline_fired,
+            interruption_drvs,
+            import_skipped_by_root,
+            probe,
+            confirmation_attempt,
+        } = record;
+        BatchView {
+            kind: kind.clone(),
+            build_id: build_id.clone(),
+            results: results.clone(),
+            reasons: reasons.clone(),
+            stderr_tail: stderr_tail.clone(),
+            engine_cancelled: *engine_cancelled,
+            disconnect_deadline_fired: *disconnect_deadline_fired,
+            interruption_drvs: interruption_drvs.clone(),
+            submitted_at: Some(started_at.clone()),
+            probe: *probe,
+            confirmation_attempt: *confirmation_attempt,
+            import_skipped_by_root: import_skipped_by_root.clone(),
+        }
+    }
 }
 
 /// Derive the timed-interruption flag for one root of a settled batch:
@@ -1604,6 +1664,57 @@ mod tests {
             plan_snapshot_valid: false,
             fixed_output_drvs: std::sync::Arc::new(HashSet::new()),
         }
+    }
+
+    /// [`BatchView::of_record`] carries every classification-relevant
+    /// batch-record field — pinned over a record whose every field holds
+    /// a distinct non-default value, so a projection that quietly drops
+    /// one (the import-skip breadcrumb spent a round recorded-but-
+    /// dropped exactly here) cannot pass. The constructor's exhaustive
+    /// destructuring already compile-forces a DECISION for new fields;
+    /// this pins the decisions made for the existing ones.
+    #[test]
+    fn batch_view_of_record_carries_every_classification_field() {
+        let record = super::super::model::BatchRecord {
+            batch_id: 11,
+            kind: "timed".to_string(),
+            jobs: vec!["j.x86_64-linux".into()],
+            root_drvs: vec!["/nix/store/r.drv".into()],
+            est_nodes: 3,
+            build_id: Some("b-77".into()),
+            started_at: "2026-06-01T00:00:00Z".into(),
+            finished_at: Some("2026-06-01T00:10:00Z".into()),
+            results: vec![po("/nix/store/r.drv", BuildStatus::Built, "")],
+            reasons: BTreeMap::from([("/nix/store/r.drv".to_string(), "reason".to_string())]),
+            stderr_tail: Some("tail".into()),
+            engine_cancelled: true,
+            disconnect_deadline_fired: true,
+            interruption_drvs: vec!["/nix/store/r.drv".into()],
+            import_skipped_drvs: vec!["/nix/store/m.drv".into()],
+            import_skipped_by_root: BTreeMap::from([(
+                "/nix/store/r.drv".to_string(),
+                vec!["/nix/store/m.drv".to_string()],
+            )]),
+            probe: true,
+            confirmation_attempt: 2,
+            topup_delivered: true,
+        };
+        let view = BatchView::of_record(&record);
+        assert_eq!(view.kind, record.kind);
+        assert_eq!(view.build_id, record.build_id);
+        assert_eq!(view.results.len(), 1);
+        assert_eq!(view.reasons, record.reasons);
+        assert_eq!(view.stderr_tail, record.stderr_tail);
+        assert!(view.engine_cancelled);
+        assert!(view.disconnect_deadline_fired);
+        assert_eq!(view.interruption_drvs, record.interruption_drvs);
+        assert_eq!(
+            view.submitted_at.as_deref(),
+            Some(record.started_at.as_str())
+        );
+        assert!(view.probe);
+        assert_eq!(view.confirmation_attempt, 2);
+        assert_eq!(view.import_skipped_by_root, record.import_skipped_by_root);
     }
 
     fn po(drv: &str, status: BuildStatus, error: &str) -> PathOutcome {
@@ -4453,6 +4564,7 @@ mod tests {
         let batch = BatchView {
             kind: BATCH_KIND_SUBMIT.to_string(),
             build_id: Some(build_id.to_string()),
+            import_skipped_by_root: BTreeMap::new(),
             results: vec![
                 po(T, BuildStatus::Built, ""),
                 po(

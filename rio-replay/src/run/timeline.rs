@@ -2066,19 +2066,7 @@ mod tests {
         record: &BatchRecord,
         contexts: &HashMap<String, JobContext>,
     ) {
-        let view = BatchView {
-            kind: record.kind.clone(),
-            build_id: record.build_id.clone(),
-            results: record.results.clone(),
-            reasons: record.reasons.clone(),
-            stderr_tail: record.stderr_tail.clone(),
-            engine_cancelled: record.engine_cancelled,
-            disconnect_deadline_fired: record.disconnect_deadline_fired,
-            interruption_drvs: record.interruption_drvs.clone(),
-            submitted_at: Some(record.started_at.clone()),
-            probe: record.probe,
-            confirmation_attempt: record.confirmation_attempt,
-        };
+        let view = BatchView::of_record(record);
         let decisions = process_settled_batch(
             state,
             &NoEvidenceAdmin,

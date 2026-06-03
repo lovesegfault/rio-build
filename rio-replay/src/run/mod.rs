@@ -1001,13 +1001,17 @@ fn supply_rollup_dispositions(
 /// precedence the classifier already settled ([`plan_time_dispositions`] /
 /// [`supply_rollup_dispositions`]). Jobs with an existing record keep it
 /// (resume idempotence). Both fields are written via
-/// [`Disposition::as_str`] (never hand-typed literals).
+/// [`Disposition::as_str`] (never hand-typed literals). `evidence`
+/// carries optional per-job attribution text retained verbatim on the
+/// record (the import-gap retirement names the missing derivations
+/// there); jobs without an entry record no evidence, exactly as before.
 fn write_exclusion_records(
     state: &StateDir,
     manifest: &[archive_input::ManifestEntry],
     dispositions: &BTreeMap<String, Disposition>,
     mode: &str,
     existing: &BTreeMap<String, JobRecord>,
+    evidence: &BTreeMap<String, String>,
 ) -> Result<()> {
     let by_job: HashMap<&str, &archive_input::ManifestEntry> =
         manifest.iter().map(|m| (m.job.as_str(), m)).collect();
@@ -1044,12 +1048,90 @@ fn write_exclusion_records(
                 signature: None,
                 log_key: None,
                 repro: String::new(),
-                evidence: None,
+                evidence: evidence.get(job).cloned(),
                 updated_at: now_rfc3339(),
             },
         )?;
     }
     Ok(())
+}
+
+/// Failed members of one settled batch starved by an IMPORT GAP: jobs
+/// whose in-band result is failure-shaped and whose own root carries a
+/// non-empty entry in the batch's per-root import-skip attribution
+/// (`BatchView::import_skipped_by_root` — the submitter could not offer
+/// a required input derivation the archive does not embed). Returns
+/// job → evidence text naming the missing derivations.
+///
+/// Such a member never got a fair attempt under the campaign's supply
+/// contract, so it retires under the supply-failed disposition BEFORE
+/// two-signal classification can charge the failure to the parity
+/// headline or the regression gate — the attribution the skip
+/// breadcrumb is recorded for. The discriminators, each load-bearing:
+///
+/// - per-ROOT attribution, not batch-level: an unrelated batch-mate's
+///   genuine failure is never excused by a neighbor's damage;
+/// - failure-shaped in-band results only (an unrecognized status string
+///   reads as failure, mirroring `collect::decide`'s defensive arm): a
+///   root that SUCCEEDED is judged on its success — the target resolved
+///   the input from its own store — and a member with NO in-band result
+///   keeps its transport/engine-cancel requeue paths (a re-ride of the
+///   deterministic gap settles here on its next batch);
+/// - already-terminal members (including the timed dispatcher's
+///   confirmation re-checks, whose initial verdict already stands) are
+///   never touched.
+///
+/// Conservative cost, disclosed: a skip-affected root whose failure was
+/// actually an unrelated transient retires here instead of consuming an
+/// auto-retry — under-measuring a damaged archive (the unit lands in
+/// the supply-failed run-confidence bucket, loud in the report), never
+/// mis-charging the target. Probe batches are not exempt: a canary
+/// whose root is starved by the archive cannot answer the outage
+/// question either way, so it settles here and the pause ladder picks
+/// its next canary from intact members.
+fn import_gap_retirements(
+    view: &BatchView,
+    jobs: &[String],
+    contexts: &HashMap<String, JobContext>,
+    already_terminal: &HashSet<String>,
+) -> BTreeMap<String, String> {
+    let mut starved = BTreeMap::new();
+    if view.import_skipped_by_root.is_empty() {
+        return starved;
+    }
+    for job in jobs {
+        if already_terminal.contains(job) {
+            continue;
+        }
+        let Some(ctx) = contexts.get(job) else {
+            continue;
+        };
+        let Some(gaps) = view
+            .import_skipped_by_root
+            .get(&ctx.drv_path)
+            .filter(|gaps| !gaps.is_empty())
+        else {
+            continue;
+        };
+        let Some(target) = view.results.iter().find(|r| r.drv_path == ctx.drv_path) else {
+            continue;
+        };
+        let failure_shaped = match model::build_status_from_name(&target.status) {
+            Some(status) => !status.is_success(),
+            None => true,
+        };
+        if !failure_shaped {
+            continue;
+        }
+        starved.insert(
+            job.clone(),
+            format!(
+                "import-gap: required input derivation(s) not embedded in the archive: {}",
+                gaps.join(", ")
+            ),
+        );
+    }
+    starved
 }
 
 /// Record-completeness backfill, run unconditionally before every report:
@@ -2115,6 +2197,7 @@ pub async fn run_with_backends(
             &plan_dispositions,
             spec.mode.as_str(),
             &existing_records,
+            &BTreeMap::new(),
         )?;
         state.set_marker("plan")?;
     }
@@ -2421,6 +2504,7 @@ pub async fn run_with_backends(
             &supply_retired,
             spec.mode.as_str(),
             &existing,
+            &BTreeMap::new(),
         )?;
     }
 
@@ -3408,25 +3492,69 @@ async fn collect_pass_with(
                  supply-failed dispositions instead of a parity verdict"
             );
             let existing = results.lock().await.clone();
-            write_exclusion_records(state, &supply.manifest, &supply_retired, mode, &existing)?;
+            write_exclusion_records(
+                state,
+                &supply.manifest,
+                &supply_retired,
+                mode,
+                &existing,
+                &BTreeMap::new(),
+            )?;
             for job in supply_retired.keys() {
                 already_terminal.insert(job.clone());
                 ledger.retire(job).await;
             }
         }
-        let view = BatchView {
-            kind: batch.kind.clone(),
-            build_id: batch.build_id.clone(),
-            results: batch.results.clone(),
-            reasons: batch.reasons.clone(),
-            stderr_tail: batch.stderr_tail.clone(),
-            engine_cancelled: batch.engine_cancelled,
-            disconnect_deadline_fired: batch.disconnect_deadline_fired,
-            interruption_drvs: batch.interruption_drvs.clone(),
-            submitted_at: Some(batch.started_at.clone()),
-            probe: batch.probe,
-            confirmation_attempt: batch.confirmation_attempt,
-        };
+        let view = BatchView::of_record(&batch);
+        // Import-gap rollup, sibling of the supply rollup above: retire
+        // failed members whose own root the batch's import walk could
+        // not fully supply (a required input drv the archive does not
+        // embed — records-vs-texts damage the plan-time gates
+        // structurally cannot see, since every drv in a unit's RECORD
+        // closure is plan-verified embedded). The disposition is derived
+        // through the classifier exactly like the supply rollup's, and
+        // the retirement happens BEFORE classification so the failure is
+        // attributed to the archive's supply instead of charged to the
+        // unit; see [`import_gap_retirements`] for the discriminators.
+        let gap_evidence = import_gap_retirements(&view, &batch.jobs, contexts, &already_terminal);
+        if !gap_evidence.is_empty() {
+            let class = classify(
+                &model::ExpectedOutcome::Unknown,
+                &RioOutcome::NotAttempted,
+                &AuxFlags {
+                    supply_failed: true,
+                    ..AuxFlags::default()
+                },
+            );
+            let disposition = class
+                .class
+                .disposition()
+                .expect("an undeliverable-supply unit always classifies into a disposition");
+            let gap_retired: BTreeMap<String, Disposition> = gap_evidence
+                .keys()
+                .map(|job| (job.clone(), disposition))
+                .collect();
+            tracing::warn!(
+                batch_id = batch.batch_id,
+                units = gap_retired.len(),
+                "retiring failed batch members starved by an archive import gap; recorded \
+                 under the supply-failed disposition with the missing derivations as \
+                 evidence, never charged to the target"
+            );
+            let existing = results.lock().await.clone();
+            write_exclusion_records(
+                state,
+                &supply.manifest,
+                &gap_retired,
+                mode,
+                &existing,
+                &gap_evidence,
+            )?;
+            for job in gap_retired.keys() {
+                already_terminal.insert(job.clone());
+                ledger.retire(job).await;
+            }
+        }
         // prior_budgets carries each job's consumed budgets so far: total
         // engine resubmissions (any prior requeue consumes the single
         // infra auto-retry budget — see `collect::decide`) and the
@@ -4038,6 +4166,7 @@ mod tests {
             disconnect_deadline_fired: false,
             interruption_drvs: Vec::new(),
             import_skipped_drvs: Vec::new(),
+            import_skipped_by_root: BTreeMap::new(),
             probe: false,
             confirmation_attempt: 0,
             topup_delivered,
@@ -5188,6 +5317,7 @@ mod tests {
                     disconnect_deadline_fired: true,
                     interruption_drvs: vec![drv.clone()],
                     import_skipped_drvs: Vec::new(),
+                    import_skipped_by_root: BTreeMap::new(),
                     probe: false,
                     confirmation_attempt: 0,
                     topup_delivered: false,
@@ -5251,6 +5381,277 @@ mod tests {
         );
     }
 
+    /// [`import_gap_retirements`] is structurally independent of the
+    /// batch's WRITER-INTENT sibling bits: a starved failed root retires
+    /// whether the batch was a full wave, a canary probe (the canary
+    /// cannot answer the outage question either way — see the helper
+    /// doc), or the timed dispatcher's, and whether or not a disconnect
+    /// deadline fired. The bits are crossed explicitly so a future
+    /// carve-out (e.g. a probe exemption) must flip a pinned row here
+    /// and own the decision, instead of drifting in unobserved.
+    #[test]
+    fn import_gap_retirement_is_writer_intent_independent() {
+        let root = format!("/nix/store/{}-starved.drv", "a".repeat(32));
+        let missing = format!("/nix/store/{}-missing.drv", "e".repeat(32));
+        let job = "starved.x86_64-linux";
+        let contexts: HashMap<String, JobContext> = HashMap::from([(
+            job.to_string(),
+            JobContext {
+                job: job.to_string(),
+                system: "x86_64-linux".into(),
+                drv_path: root.clone(),
+                outputs: BTreeMap::new(),
+                dep_drvs: HashSet::new(),
+                expected_outcome: ExpectedOutcome::Built,
+                expected_outputs: BTreeMap::new(),
+                plan_not_attemptable: false,
+                plan_snapshot_valid: false,
+                fixed_output_drvs: Arc::new(HashSet::new()),
+            },
+        )]);
+        for kind in [BATCH_KIND_SUBMIT, BATCH_KIND_TIMED] {
+            for probe in [false, true] {
+                for disconnect_deadline_fired in [false, true] {
+                    let view = BatchView {
+                        kind: kind.to_string(),
+                        results: vec![model::PathOutcome {
+                            drv_path: root.clone(),
+                            status: build_status_name(
+                                rio_nix::protocol::build::BuildStatus::PermanentFailure,
+                            )
+                            .to_string(),
+                            error_msg: "missing input".into(),
+                            start_time: 1,
+                            stop_time: 2,
+                        }],
+                        probe,
+                        disconnect_deadline_fired,
+                        import_skipped_by_root: BTreeMap::from([(
+                            root.clone(),
+                            vec![missing.clone()],
+                        )]),
+                        ..BatchView::default()
+                    };
+                    let starved = import_gap_retirements(
+                        &view,
+                        &[job.to_string()],
+                        &contexts,
+                        &HashSet::new(),
+                    );
+                    assert_eq!(
+                        starved.keys().collect::<Vec<_>>(),
+                        vec![job],
+                        "kind={kind} probe={probe} ddf={disconnect_deadline_fired}"
+                    );
+                    assert!(starved[job].contains(&missing));
+                }
+            }
+        }
+    }
+
+    /// The import-gap retirement at batch settle, across the discriminator
+    /// axes (the consumer half of the import-skip breadcrumb contract:
+    /// closure_gap's offer arm promises a starved root's failure is
+    /// "attributed to the archive's supply, never charged to the unit").
+    /// One settled batch carries a per-root gap attribution; its members
+    /// cross (gap on own root?) x (in-band result: failed / succeeded /
+    /// missing) x (already terminal?):
+    ///
+    /// - starved (failed, gap):   retired supply-failed, evidence names
+    ///   the missing derivation, never classified;
+    /// - resolved (succeeded, gap): judged on its success — match-built;
+    /// - genuine (failed, NO gap): charged normally — the gap of a
+    ///   batch-mate excuses nothing (the must-still-charge direction);
+    /// - transport (no result, gap): keeps the requeue path — the gap is
+    ///   deterministic and settles on its next batch;
+    /// - settled (failed, gap, already terminal): untouched — its
+    ///   existing verdict stands.
+    #[tokio::test]
+    async fn import_gap_starved_failures_retire_as_supply_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let drv =
+            |c: char, name: &str| format!("/nix/store/{}-{name}.drv", c.to_string().repeat(32));
+        let missing = drv('e', "missing-input");
+        let cases = [
+            ("starved.x86_64-linux", drv('a', "starved")),
+            ("resolved.x86_64-linux", drv('b', "resolved")),
+            ("genuine.x86_64-linux", drv('c', "genuine")),
+            ("transport.x86_64-linux", drv('d', "transport")),
+            ("settled.x86_64-linux", drv('f', "settled")),
+        ];
+        let outcome = |drv_path: &str, status: BuildStatus, msg: &str| model::PathOutcome {
+            drv_path: drv_path.to_string(),
+            status: build_status_name(status).to_string(),
+            error_msg: msg.to_string(),
+            start_time: 1,
+            stop_time: 2,
+        };
+        state
+            .append_jsonl(
+                StateFile::Batches,
+                &model::BatchRecord {
+                    batch_id: 9,
+                    kind: BATCH_KIND_SUBMIT.to_string(),
+                    jobs: cases.iter().map(|(job, _)| job.to_string()).collect(),
+                    root_drvs: cases.iter().map(|(_, d)| d.clone()).collect(),
+                    est_nodes: 5,
+                    build_id: Some("b-gap".into()),
+                    started_at: now_rfc3339(),
+                    finished_at: Some(now_rfc3339()),
+                    // No in-band entry for transport (the missing-result
+                    // transport rule must keep owning it).
+                    results: vec![
+                        outcome(
+                            &cases[0].1,
+                            BuildStatus::PermanentFailure,
+                            "builder for the starved root failed: missing input",
+                        ),
+                        outcome(&cases[1].1, BuildStatus::Built, ""),
+                        outcome(
+                            &cases[2].1,
+                            BuildStatus::PermanentFailure,
+                            "builder failed with exit code 1",
+                        ),
+                        outcome(
+                            &cases[4].1,
+                            BuildStatus::PermanentFailure,
+                            "builder failed with exit code 1",
+                        ),
+                    ],
+                    reasons: BTreeMap::new(),
+                    stderr_tail: None,
+                    engine_cancelled: false,
+                    disconnect_deadline_fired: false,
+                    interruption_drvs: Vec::new(),
+                    import_skipped_drvs: vec![missing.clone()],
+                    import_skipped_by_root: BTreeMap::from([
+                        (cases[0].1.clone(), vec![missing.clone()]),
+                        (cases[1].1.clone(), vec![missing.clone()]),
+                        (cases[3].1.clone(), vec![missing.clone()]),
+                        (cases[4].1.clone(), vec![missing.clone()]),
+                    ]),
+                    probe: false,
+                    confirmation_attempt: 0,
+                    topup_delivered: false,
+                },
+            )
+            .unwrap();
+        let contexts: HashMap<String, JobContext> = cases
+            .iter()
+            .map(|(job, drv_path)| {
+                (
+                    job.to_string(),
+                    JobContext {
+                        job: job.to_string(),
+                        system: "x86_64-linux".into(),
+                        drv_path: drv_path.clone(),
+                        outputs: BTreeMap::from([(
+                            "out".to_string(),
+                            format!("{}-out", drv_path.trim_end_matches(".drv")),
+                        )]),
+                        dep_drvs: HashSet::new(),
+                        expected_outcome: ExpectedOutcome::Built,
+                        expected_outputs: BTreeMap::new(),
+                        plan_not_attemptable: false,
+                        plan_snapshot_valid: false,
+                        fixed_output_drvs: Arc::new(HashSet::new()),
+                    },
+                )
+            })
+            .collect();
+        // The retirement writes exclusion records through the manifest, so
+        // the supply inputs must cover the batch's jobs (production loads
+        // the full unit manifest here).
+        let manifest: Vec<archive_input::ManifestEntry> = cases
+            .iter()
+            .map(|(job, drv_path)| archive_input::ManifestEntry {
+                job: job.to_string(),
+                system: "x86_64-linux".into(),
+                attr: String::new(),
+                drv_path: drv_path.clone(),
+                outputs: BTreeMap::new(),
+                required_features: Vec::new(),
+            })
+            .collect();
+        let supply = SupplyRetirementInputs {
+            manifest: Arc::new(manifest),
+            dep_closure: Arc::new(Vec::new()),
+            plan_dispositions: Arc::new(BTreeMap::new()),
+        };
+        let backends = CollectBackends {
+            admin: Arc::new(NoLogsAdmin),
+            store: Arc::new(FakeStoreApi::default()),
+            artifacts: None,
+        };
+        let job_ledger = ledger::JobLedger::new(
+            state.clone(),
+            Arc::new(SubmitTracker::default()),
+            Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default()))),
+        );
+        // settled already holds a terminal verdict (a prior batch's
+        // unexpected-failure): the belt must keep the retirement away.
+        let mut prior = demoted_record(cases[4].0);
+        prior.disposition = None;
+        prior.verdict = Some(Verdict::UnexpectedFailure.as_str().to_string());
+        let results = tokio::sync::Mutex::new(BTreeMap::from([(cases[4].0.to_string(), prior)]));
+        let mut processed = HashSet::new();
+        let requeued = collect_pass_with(
+            &state,
+            &backends,
+            &contexts,
+            &job_ledger,
+            &results,
+            &mut processed,
+            &Knobs::default(),
+            "leaf",
+            "c-gap",
+            None,
+            &supply,
+        )
+        .await
+        .unwrap();
+        assert_eq!(requeued, 1, "only the transport member is re-offered");
+        assert!(processed.contains(&9));
+
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        // Starved: retired to the supply-failed disposition BEFORE
+        // classification, with the gap as evidence — never a parity
+        // verdict, never a regression charge.
+        let starved = &records[cases[0].0];
+        assert_eq!(
+            starved.disposition.as_deref(),
+            Some(Disposition::SupplyFailed.as_str())
+        );
+        assert_eq!(starved.verdict, None);
+        assert_eq!(
+            starved.rio.outcome,
+            Disposition::SupplyFailed.as_str(),
+            "exclusion-record shape: the disposition is the rio outcome"
+        );
+        let evidence = starved.evidence.as_deref().unwrap_or_default();
+        assert!(evidence.contains("import-gap"), "{evidence}");
+        assert!(evidence.contains(&missing), "{evidence}");
+        // Resolved: the target supplied the input itself — its success is
+        // a real measurement and stands.
+        assert_eq!(
+            records[cases[1].0].verdict.as_deref(),
+            Some(Verdict::MatchBuilt.as_str())
+        );
+        // Genuine: a batch-mate's gap excuses nothing — the failure is
+        // charged exactly as before.
+        assert_eq!(
+            records[cases[2].0].verdict.as_deref(),
+            Some(Verdict::UnexpectedFailure.as_str())
+        );
+        // Transport: no record yet; its requeue (counted above) re-rides
+        // and the deterministic gap settles it on a later batch.
+        assert!(!records.contains_key(cases[3].0));
+        // Settled: the file gained no record for it (its in-memory
+        // terminal verdict stands; the belt dropped the duplicate).
+        assert!(!records.contains_key(cases[4].0));
+    }
+
     /// The collect pass applies its decisions through the ledger at the
     /// transition site: a settled batch's re-queued member is observed
     /// Queued (so its pending wait is charged to the queued clock instead
@@ -5296,6 +5697,7 @@ mod tests {
                     disconnect_deadline_fired: false,
                     interruption_drvs: Vec::new(),
                     import_skipped_drvs: Vec::new(),
+                    import_skipped_by_root: BTreeMap::new(),
                     probe: false,
                     confirmation_attempt: 0,
                     topup_delivered: false,
@@ -5409,6 +5811,7 @@ mod tests {
                     disconnect_deadline_fired: false,
                     interruption_drvs: Vec::new(),
                     import_skipped_drvs: Vec::new(),
+                    import_skipped_by_root: BTreeMap::new(),
                     probe: false,
                     confirmation_attempt: 0,
                     topup_delivered: false,
@@ -5600,6 +6003,7 @@ mod tests {
                     disconnect_deadline_fired: false,
                     interruption_drvs: Vec::new(),
                     import_skipped_drvs: Vec::new(),
+                    import_skipped_by_root: BTreeMap::new(),
                     probe: false,
                     confirmation_attempt: 0,
                     topup_delivered: false,
@@ -7911,6 +8315,7 @@ mod tests {
             disconnect_deadline_fired: false,
             interruption_drvs: Vec::new(),
             import_skipped_drvs: Vec::new(),
+            import_skipped_by_root: BTreeMap::new(),
             probe: false,
             confirmation_attempt: 0,
             topup_delivered: false,
@@ -8216,8 +8621,15 @@ mod tests {
             Some(Disposition::NotAttemptable),
             "not-attemptable outranks cached-prior in the documented precedence"
         );
-        write_exclusion_records(&state, &manifest, &dispositions, "leaf", &BTreeMap::new())
-            .unwrap();
+        write_exclusion_records(
+            &state,
+            &manifest,
+            &dispositions,
+            "leaf",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1, "exactly one record per excluded job");
         assert_eq!(
@@ -8256,8 +8668,15 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path()).unwrap();
-        write_exclusion_records(&state, &manifest, &dispositions, "leaf", &BTreeMap::new())
-            .unwrap();
+        write_exclusion_records(
+            &state,
+            &manifest,
+            &dispositions,
+            "leaf",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
         for job in &demoted {
             assert_eq!(

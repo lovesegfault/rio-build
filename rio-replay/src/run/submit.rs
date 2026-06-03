@@ -230,6 +230,7 @@ pub async fn submit_one_batch(
         disconnect_deadline_fired: false,
         interruption_drvs,
         import_skipped_drvs: Vec::new(),
+        import_skipped_by_root: BTreeMap::new(),
         probe: intent.probe,
         confirmation_attempt: intent.confirmation_attempt,
         topup_delivered: intent.topup_delivered,
@@ -242,6 +243,7 @@ pub async fn submit_one_batch(
             record.stderr_tail = Some(o.stderr_tail);
             record.engine_cancelled = o.engine_cancelled;
             record.import_skipped_drvs = o.import_skipped_drvs;
+            record.import_skipped_by_root = o.import_skipped_by_root;
             // The submitter has exactly one cancellation source: the
             // deadline it was handed. Which logical deadline that was is
             // this call's knowledge, so the cause bit is derived here, at
@@ -627,6 +629,7 @@ mod tests {
             stderr_tail: "tail".into(),
             engine_cancelled: false,
             import_skipped_drvs: Vec::new(),
+            import_skipped_by_root: BTreeMap::new(),
         }));
         let batch = Batch {
             jobs: vec!["x.x86_64-linux".into()],

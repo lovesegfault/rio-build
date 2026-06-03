@@ -28,16 +28,25 @@
 //!   missing derivation and the root that needed it.
 //!
 //! - **Import offer** — "which embedded derivation texts can this archive
-//!   offer the target?" Thin archives legitimately embed "only content no
-//!   configured substituter can provide" (same doc, §"Thin archive"), so
-//!   a non-embedded interior input is an expected condition: the target
-//!   resolves it from its own store or substituters. The walk skips it —
-//!   loudly (`warn!`), and callers surface the skipped set in their batch
-//!   records — because when the target CANNOT resolve it, the resulting
-//!   per-root build failure must be attributable to the archive, not
-//!   charged to the unit as a regression. A missing ROOT is still an
-//!   error: roots come from this archive's own workload, so absence is
-//!   archive damage, never thinness.
+//!   offer the target?" A non-embedded interior input is ALWAYS an
+//!   archive contract violation here too: thin-ness exempts only non-drv
+//!   store paths ("a thin archive embeds the `.drv` closure PLUS only
+//!   those store paths that no configured substituter can provide" —
+//!   same doc, §"Archive format v1"), never derivation texts. The offer
+//!   walk still tolerates the gap, because it runs mid-campaign against
+//!   damage the plan-time gates structurally cannot see (the records-vs-
+//!   texts disagreement window: plan verifies the RECORD graph's members
+//!   are embedded, while this walk follows the embedded TEXTS) and a
+//!   hard error here would burn every completed build over one defective
+//!   interior input the target may well resolve from its own store. The
+//!   tolerance is loud and consumed: the walk `warn!`s, callers surface
+//!   the skipped set — per root — on their batch records, and collect
+//!   retires a failed root whose own text closure carried a gap under
+//!   the supply-failed disposition, so the failure is attributed to the
+//!   archive's supply instead of charged to the unit as a regression. A
+//!   missing ROOT is still an error: roots come from this archive's own
+//!   workload, so absence is archive damage no tolerance can route
+//!   around.
 
 use anyhow::{Result, bail};
 
@@ -50,8 +59,11 @@ pub(crate) enum ClosureGapPolicy<'a> {
     /// contract violation and aborts the walk, naming `root` (the
     /// workload root whose closure was being answered).
     Truth { root: &'a str },
-    /// The walk enumerates importable bytes: a non-root gap is the thin
-    /// archive shape, skipped at `warn!`; a root gap is archive damage.
+    /// The walk enumerates importable bytes: a non-root gap is a
+    /// non-conforming archive's damage tolerated mid-campaign — skipped
+    /// at `warn!`, surfaced per root on the batch record, and retired by
+    /// collect when the root fails; a root gap is unroutable archive
+    /// damage and errors.
     Offer { is_root: bool },
 }
 
@@ -83,9 +95,11 @@ pub(crate) fn closure_gap(
         ClosureGapPolicy::Offer { is_root: false } => {
             tracing::warn!(
                 path = %missing_drv,
-                "input derivation not embedded in the archive; skipping (a thin archive only \
-                 offers what it embeds — the target must resolve this input itself, and the \
-                 skip is surfaced on the batch record)"
+                "input derivation not embedded in the archive (a non-conforming archive: the \
+                 format requires the full requisite drv closure); skipping — the target must \
+                 resolve this input itself, the skip is surfaced per root on the batch \
+                 record, and a root it starves retires as supply-failed instead of being \
+                 charged a regression"
             );
             Ok(())
         }
@@ -121,7 +135,7 @@ mod tests {
             "/nix/store/m-missing.drv",
             "is not embedded in the archive",
         )
-        .expect("a non-root gap is the thin-archive shape");
+        .expect("a non-root gap is tolerated damage: skipped, surfaced, retired on failure");
 
         let err = format!(
             "{:#}",
