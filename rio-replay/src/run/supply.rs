@@ -900,9 +900,31 @@ impl UploadClaims {
         }
     }
 
+    /// Whether `path` currently has a PENDING claim: someone won the
+    /// upload and has neither completed nor released it. The settlement
+    /// chokepoint reads this at the journal-append instant — a settled
+    /// refused/failed row must be appended while its uploader still holds
+    /// the claim, because release hands the claim (and with it the right
+    /// to mint the path's next settlement) to a parked sibling.
+    pub fn is_pending(&self, path: &str) -> bool {
+        matches!(self.lock().get(path), Some(ClaimState::Pending(_)))
+    }
+
+    /// Whether `path`'s claim completed (the upload landed). The
+    /// settlement chokepoint's counterpart check for `delivered` rows:
+    /// completion precedes the append, so a sibling waking on the claim
+    /// can never observe a landed path whose delivered row is missing.
+    pub fn is_done(&self, path: &str) -> bool {
+        matches!(self.lock().get(path), Some(ClaimState::Done))
+    }
+
     /// Release a claim that will never complete (the upload failed) so
     /// another request can retry it. Wakes every waiter; a completed claim
     /// stays completed and an unclaimed path is a no-op.
+    ///
+    /// Ordering contract for callers settling the path: append the
+    /// refused/failed journal row FIRST, then release — see
+    /// `record_settlement` in the exec module, which asserts it.
     pub fn release(&self, path: &str) {
         let mut claims = self.lock();
         if !matches!(claims.get(path), Some(ClaimState::Pending(_))) {

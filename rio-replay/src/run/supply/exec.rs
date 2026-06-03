@@ -781,6 +781,27 @@ fn entry_source(item: &UploadItem) -> &'static str {
 /// resolved here (the claim holder, a later top-up, or a re-run settles
 /// it), so pre-failing its referrers would mint settled `failed` rows for
 /// paths nothing actually attempted.
+///
+/// Resolution/append ordering: settled rows are minted only by the path's
+/// claim winner, and the append must happen while the claim resolution
+/// that authorizes the row is still in force — asserted here, at the one
+/// chokepoint every upload-arm row passes through, so the ordering is a
+/// checked invariant instead of a per-call-site convention:
+///
+/// - refused/failed: the claim must still be PENDING. Releasing first
+///   would wake a parked sibling that can re-claim, upload, and append
+///   its `delivered` row before this failure lands — the journal would
+///   read delivered-then-failed and the last-settlement-wins rollup would
+///   falsely retire a delivered path's dependents (the exact inversion
+///   the claims-first contract above [`upload_stream_one`] forbids).
+/// - delivered: the claim must already be DONE ([`UploadClaims::complete`]
+///   precedes the append), so a sibling waking on the completed claim can
+///   never observe a landed path with no delivered row.
+/// - skipped rows carry no claim authority either way: a held-claim skip
+///   is recorded while a SIBLING holds the claim, a breaker skip after
+///   this invocation released its own, and bookkeeping rows can neither
+///   retire dependents nor displace a settlement under the journal's
+///   folds.
 fn record_settlement(
     env: &UploadEnv<'_>,
     item: &UploadItem,
@@ -790,6 +811,20 @@ fn record_settlement(
     batch_id: u64,
     bytes: Option<u64>,
 ) -> Result<()> {
+    match outcome {
+        SUPPLY_OUTCOME_REFUSED | SUPPLY_OUTCOME_FAILED => debug_assert!(
+            env.claims.is_pending(&item.store_path),
+            "settled {outcome} row for {} appended without its upload claim held: \
+             release the claim only AFTER the row is recorded",
+            item.store_path
+        ),
+        SUPPLY_OUTCOME_DELIVERED => debug_assert!(
+            env.claims.is_done(&item.store_path),
+            "settled delivered row for {} appended before its claim completed",
+            item.store_path
+        ),
+        _ => {}
+    }
     env.state.append_jsonl(
         StateFile::Supply,
         &SupplyEntry {
@@ -1007,6 +1042,14 @@ async fn materialize_stream_payload(
 /// retire every dependent on the next rollup. Settled rows are minted only
 /// through claim resolution; skips (breaker open, claim held) record
 /// `skipped` bookkeeping rows that settle nothing.
+///
+/// The contract has an ordering half on the failure arms: the
+/// refused/failed row is appended BEFORE the claim is released. Release
+/// wakes any sibling parked on the claim; if it preceded the append, that
+/// sibling could re-claim, upload, and append its `delivered` row first —
+/// writing the same forbidden delivered-then-failed sequence through the
+/// timing side door. [`record_settlement`] asserts the ordering at the
+/// append chokepoint.
 async fn upload_stream_one(env: &UploadEnv<'_>, item: &UploadItem) -> Result<()> {
     let batch_id = env.sub_batch_ids.fetch_add(1, Ordering::SeqCst);
     let mechanism = SUPPLY_MECHANISM_UPLOAD_STREAM;
@@ -1061,8 +1104,10 @@ async fn upload_stream_one(env: &UploadEnv<'_>, item: &UploadItem) -> Result<()>
         );
     }
     if let Some(reference) = failed_reference_of(env, item) {
-        env.claims.release(&item.store_path);
-        return record_settlement(
+        // Row first, then release (on append success and failure alike,
+        // so an append error never leaks the claim) — see
+        // [`record_settlement`]'s ordering contract.
+        let recorded = record_settlement(
             env,
             item,
             mechanism,
@@ -1073,6 +1118,8 @@ async fn upload_stream_one(env: &UploadEnv<'_>, item: &UploadItem) -> Result<()>
             batch_id,
             None,
         );
+        env.claims.release(&item.store_path);
+        return recorded;
     }
 
     // First attempt, then exactly one retry when the daemon refused (the
@@ -1083,8 +1130,8 @@ async fn upload_stream_one(env: &UploadEnv<'_>, item: &UploadItem) -> Result<()>
         let payload = match materialize_stream_payload(env, item).await {
             Ok(payload) => payload,
             Err(detail) => {
-                env.claims.release(&item.store_path);
-                return record_settlement(
+                // Row first, then release — record_settlement's contract.
+                let recorded = record_settlement(
                     env,
                     item,
                     mechanism,
@@ -1093,6 +1140,8 @@ async fn upload_stream_one(env: &UploadEnv<'_>, item: &UploadItem) -> Result<()>
                     batch_id,
                     None,
                 );
+                env.claims.release(&item.store_path);
+                return recorded;
             }
         };
         let entry = PreparedEntry {
@@ -1132,8 +1181,8 @@ async fn upload_stream_one(env: &UploadEnv<'_>, item: &UploadItem) -> Result<()>
             }
             Err(SupplyTransportError::Other(err)) => {
                 env.breaker.record_failure();
-                env.claims.release(&item.store_path);
-                return record_settlement(
+                // Row first, then release — record_settlement's contract.
+                let recorded = record_settlement(
                     env,
                     item,
                     mechanism,
@@ -1142,11 +1191,13 @@ async fn upload_stream_one(env: &UploadEnv<'_>, item: &UploadItem) -> Result<()>
                     batch_id,
                     None,
                 );
+                env.claims.release(&item.store_path);
+                return recorded;
             }
         }
     }
-    env.claims.release(&item.store_path);
-    record_settlement(
+    // Refused after the retry: row first, then release.
+    let recorded = record_settlement(
         env,
         item,
         mechanism,
@@ -1154,7 +1205,9 @@ async fn upload_stream_one(env: &UploadEnv<'_>, item: &UploadItem) -> Result<()>
         refused,
         batch_id,
         None,
-    )
+    );
+    env.claims.release(&item.store_path);
+    recorded
 }
 
 /// Result of one wire attempt of a batch upload.
@@ -1214,8 +1267,8 @@ async fn attempt_batch<'a>(
                 });
             }
             Err(detail) => {
-                env.claims.release(&item.store_path);
-                record_settlement(
+                // Row first, then release — record_settlement's contract.
+                let recorded = record_settlement(
                     env,
                     item,
                     SUPPLY_MECHANISM_UPLOAD_BATCH,
@@ -1223,7 +1276,9 @@ async fn attempt_batch<'a>(
                     Some(detail),
                     batch_id,
                     None,
-                )?;
+                );
+                env.claims.release(&item.store_path);
+                recorded?;
             }
         }
     }
@@ -1278,7 +1333,10 @@ async fn settle_batch_delivered(
 }
 
 /// Record a non-delivered settlement for every item of a failed or refused
-/// batch attempt, releasing their claims.
+/// batch attempt, then release their claims — per-item row first, release
+/// second ([`record_settlement`]'s ordering contract): while the claim is
+/// pending no sibling can upload the path, so its `delivered` row can
+/// never precede this settled failure in the journal.
 fn settle_batch_undelivered(
     env: &UploadEnv<'_>,
     items: &[&UploadItem],
@@ -1287,8 +1345,7 @@ fn settle_batch_undelivered(
     batch_id: u64,
 ) -> Result<()> {
     for item in items {
-        env.claims.release(&item.store_path);
-        record_settlement(
+        let recorded = record_settlement(
             env,
             item,
             SUPPLY_MECHANISM_UPLOAD_BATCH,
@@ -1296,7 +1353,11 @@ fn settle_batch_undelivered(
             Some(detail.to_string()),
             batch_id,
             None,
-        )?;
+        );
+        // Released on append success and failure alike: an append error
+        // aborts the invocation but must not leak this item's claim.
+        env.claims.release(&item.store_path);
+        recorded?;
     }
     Ok(())
 }
@@ -1371,8 +1432,8 @@ async fn upload_sub_batch(env: &UploadEnv<'_>, items: Vec<&UploadItem>) -> Resul
     for item in kept {
         match failed_reference_of(env, item) {
             Some(reference) => {
-                env.claims.release(&item.store_path);
-                record_settlement(
+                // Row first, then release — record_settlement's contract.
+                let recorded = record_settlement(
                     env,
                     item,
                     SUPPLY_MECHANISM_UPLOAD_BATCH,
@@ -1382,7 +1443,9 @@ async fn upload_sub_batch(env: &UploadEnv<'_>, items: Vec<&UploadItem>) -> Resul
                     )),
                     batch_id,
                     None,
-                )?;
+                );
+                env.claims.release(&item.store_path);
+                recorded?;
             }
             None => to_send.push(item),
         }
@@ -2497,6 +2560,12 @@ pub(crate) mod test_support {
         /// When set, every upload fails with [`SupplyTransportError::Other`]
         /// (the shape of a channel-open failure).
         pub fail_uploads: AtomicBool,
+        /// Paths whose every upload fails with
+        /// [`SupplyTransportError::Other`] (a per-path hard transport
+        /// failure, without the run-wide collapse `fail_uploads` scripts —
+        /// lets a test settle ONE path `failed` while its siblings deliver
+        /// and the breaker stays closed).
+        pub fail_paths: Mutex<BTreeSet<String>>,
         /// Total upload calls (batch + streamed), accepted or not.
         pub upload_calls: AtomicUsize,
         /// Per-path upload attempts (batch + streamed), accepted or not.
@@ -2534,6 +2603,14 @@ pub(crate) mod test_support {
                 return Err(SupplyTransportError::Other(anyhow!(
                     "scripted transport failure"
                 )));
+            }
+            {
+                let fail_paths = self.fail_paths.lock().unwrap();
+                if let Some(path) = paths.iter().find(|path| fail_paths.contains(*path)) {
+                    return Err(SupplyTransportError::Other(anyhow!(
+                        "scripted per-path transport failure for {path}"
+                    )));
+                }
             }
             if let Some(refusal) = self.refusal_for(paths) {
                 return Err(SupplyTransportError::Refused(refusal));
@@ -3062,16 +3139,25 @@ mod tests {
     /// no row at all, and skips (breaker open, claim held) record `skipped`
     /// bookkeeping rows.
     ///
-    /// Quantification domain: every (arm × claim-state × breaker-state)
-    /// cell — arm ∈ {stream, batch} from the two upload entry points,
-    /// claim-state ∈ {free, done-elsewhere, held-elsewhere} from
-    /// [`ClaimOutcome`]'s three variants, breaker ∈ {closed, open} — with
-    /// the path corpus of each cell spanning every [`UploadPayload`] family
-    /// (via [`item_per_payload_family`]'s compile-time tripwire). The
-    /// binding cross-component invariant of the supply rollup ("the
-    /// journal's last settlement per path is its truth") is asserted over
-    /// the union journal: no settled refused/failed row may exist for any
-    /// path the claims table says landed.
+    /// Quantification domain: every (arm × claim-state × settlement-flavor
+    /// × breaker-state) cell — arm ∈ {stream, batch} from the two upload
+    /// entry points, claim-state ∈ {free, done-elsewhere, held-elsewhere}
+    /// from [`ClaimOutcome`]'s three variants, settlement-flavor for the
+    /// claim-free corpus ∈ {delivers, refused-by-daemon, transport-failed},
+    /// breaker ∈ {closed, open} — with the path corpus of each cell
+    /// spanning every [`UploadPayload`] family (via
+    /// [`item_per_payload_family`]'s compile-time tripwire). The binding
+    /// cross-component invariant of the supply rollup ("the journal's last
+    /// settlement per path is its truth") is asserted over the union
+    /// journal: no settled refused/failed row may exist for any path the
+    /// claims table says landed.
+    ///
+    /// Release-ordering axis: every settled refused/failed row is appended
+    /// while its claim is still held — [`record_settlement`] asserts it at
+    /// the chokepoint, and every refused/failed cell here drives that
+    /// assert — and the claim is released afterwards (re-claimable below),
+    /// so there is no window in which a sibling can win the claim while
+    /// the failure is unrecorded, and no leaked claim either.
     #[tokio::test]
     async fn upload_arms_never_contradict_the_claims_table() {
         for arm in ["stream", "batch"] {
@@ -3109,10 +3195,32 @@ mod tests {
                     Vec::new()
                 };
 
-                // Cell corpus: one item per payload family per claim state.
+                // Cell corpus: one item per payload family per claim state,
+                // plus the two settled-undelivered flavors of the claim-free
+                // state. Only the DrvText member of those reaches the wire
+                // (the relay member fails at materialization — no admitted
+                // substituter — and the archive member has no archive
+                // here), so the daemon-refusal/transport-failure flavor is
+                // pinned on the DrvText member and the others settle as
+                // materialization failures.
                 let free = item_per_payload_family("free");
+                let refused_corpus = item_per_payload_family("refused");
+                let failed_corpus = item_per_payload_family("failed");
                 let done = item_per_payload_family("done");
                 let held = item_per_payload_family("held");
+                {
+                    // Two refusals per path: the first attempt and the one
+                    // fresh-channel retry both refused → a settled
+                    // `refused` row.
+                    let mut refusals = fake.refusals.lock().unwrap();
+                    for member in &refused_corpus {
+                        refusals.insert(member.store_path.clone(), 2);
+                    }
+                    let mut fail_paths = fake.fail_paths.lock().unwrap();
+                    for member in &failed_corpus {
+                        fail_paths.insert(member.store_path.clone());
+                    }
+                }
                 // A sibling request already delivered the `done` paths and
                 // still holds the `held` paths.
                 for member in &done {
@@ -3125,6 +3233,8 @@ mod tests {
 
                 let mut all: Vec<UploadItem> = trip_items;
                 all.extend(free.iter().cloned());
+                all.extend(refused_corpus.iter().cloned());
+                all.extend(failed_corpus.iter().cloned());
                 all.extend(done.iter().cloned());
                 all.extend(held.iter().cloned());
                 let plan = match arm {
@@ -3183,6 +3293,40 @@ mod tests {
                         );
                     }
                 }
+                // Settled-undelivered flavors (claim-free corpus): under a
+                // closed breaker every member settles refused/failed, with
+                // the wire flavor pinned on the DrvText member; the row was
+                // appended while the claim was held (record_settlement's
+                // assert ran in this very cell) and the claim is released
+                // AFTERWARDS — re-claimable now, so the failure is durable
+                // before any sibling can win the path, and nothing leaks.
+                // Under an open breaker they are skipped like any free path.
+                for (corpus, wire_outcome) in [
+                    (&refused_corpus, SUPPLY_OUTCOME_REFUSED),
+                    (&failed_corpus, SUPPLY_OUTCOME_FAILED),
+                ] {
+                    for member in corpus {
+                        let row = entry_for(&journal, &member.store_path);
+                        if breaker_open {
+                            assert_eq!(row.outcome, SUPPLY_OUTCOME_SKIPPED, "{cell}");
+                        } else {
+                            assert!(
+                                row.outcome == SUPPLY_OUTCOME_REFUSED
+                                    || row.outcome == SUPPLY_OUTCOME_FAILED,
+                                "{cell}: must settle undelivered: {row:?}"
+                            );
+                            if matches!(member.payload, UploadPayload::DrvText(_)) {
+                                assert_eq!(row.outcome, wire_outcome, "{cell}: {row:?}");
+                            }
+                        }
+                        assert_eq!(
+                            claims.claim(&member.store_path),
+                            ClaimOutcome::Won,
+                            "{cell}: the settled-undelivered claim must be released \
+                             (after the row), never leaked"
+                        );
+                    }
+                }
 
                 // The binding invariant, over the whole cell journal: no
                 // settled undelivered row contradicts a landed path, and
@@ -3197,6 +3341,67 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// The failed-reference pre-skip arms (stream and batch) settle the
+    /// dependent `failed` naming the culprit reference, under the same
+    /// resolution/append ordering as every other settled-undelivered row:
+    /// the row is appended while the dependent's claim is held
+    /// ([`record_settlement`]'s assert runs on these arms too) and the
+    /// claim is released afterwards — re-claimable, never leaked. These
+    /// two sites are the only settled-row mints the claims lattice's
+    /// reference-free corpus cannot reach.
+    #[tokio::test]
+    async fn failed_reference_arms_settle_dependents_after_recording() {
+        for arm in ["stream", "batch"] {
+            let (_dir, state) = state();
+            let fake = FakeSupplyTransport::default();
+            let ctx = SupplyContext::new(SupplyDependencies::Substituters);
+            let claims = UploadClaims::new();
+            let knobs = Knobs {
+                upload_workers: 1,
+                upload_batch_max_entries: 1,
+                claim_wait_mins: 0,
+                ..Knobs::default()
+            };
+            let culprit = format!("/nix/store/{:0>32}-culprit", 1);
+            let dependent = format!("/nix/store/{:0>32}-dependent", 2);
+            fake.fail_paths.lock().unwrap().insert(culprit.clone());
+            let items = vec![
+                item(&culprit, vec![3u8; 8], &[]),
+                item(&dependent, vec![4u8; 8], &[culprit.as_str()]),
+            ];
+            let plan = match arm {
+                "stream" => UploadPlan {
+                    large: items,
+                    batch: Vec::new(),
+                    skipped: Vec::new(),
+                },
+                _ => batch_plan(items),
+            };
+            prewarm_uploads(&fake, None, &ctx, &plan, &knobs, &state, &claims)
+                .await
+                .unwrap();
+            let journal = entries(&state);
+            assert_eq!(
+                entry_for(&journal, &culprit).outcome,
+                SUPPLY_OUTCOME_FAILED,
+                "{arm}: {journal:?}"
+            );
+            let row = entry_for(&journal, &dependent);
+            assert_eq!(row.outcome, SUPPLY_OUTCOME_FAILED, "{arm}: {journal:?}");
+            assert!(
+                row.detail.as_deref().unwrap_or_default().contains(&culprit),
+                "{arm}: the dependent's row must name the failed reference: {row:?}"
+            );
+            for path in [&culprit, &dependent] {
+                assert_eq!(
+                    claims.claim(path),
+                    ClaimOutcome::Won,
+                    "{arm}: settled-undelivered claims are released after their rows"
+                );
             }
         }
     }
