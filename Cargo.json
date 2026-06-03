@@ -19439,6 +19439,10 @@
       ],
       "crateBin": [
         {
+          "name": "fsbench",
+          "path": "src/bin/fsbench/main.rs"
+        },
+        {
           "name": "rio-builder",
           "path": "src/main.rs"
         },

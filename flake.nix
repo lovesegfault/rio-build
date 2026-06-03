@@ -787,6 +787,15 @@
                 });
               dockerImages = mkDockerImages { inherit rio-crates; };
 
+              # fsbench (P0594): seed-keyed dataset + bench-run drvs.
+              # The bins are rio-builder's member-bin set — the same
+              # drv exposed as packages.fsbench-bin, so xtask's local
+              # prebuild and these drvs share one closure.
+              fsbenchPkgs = import ./nix/fsbench {
+                inherit pkgs;
+                fsbenchBins = crateBuild.memberBins.rio-builder;
+              };
+
               # Instrumented-image set for the coverage VM tests. A named
               # binding (rather than an inline call at the vmTestsCov use
               # site) so anything else that needs the cov images reuses
@@ -1226,6 +1235,15 @@
                 default = rio-workspace;
                 workspace = rio-workspace;
                 dashboard = rioDashboard;
+                # fsbench (P0594): xtask pre-builds fsbench-bin locally
+                # so the ssh-ng submission copies the already-valid bin
+                # closure instead of remote-building the rio-builder
+                # crate graph under --max-jobs 0. The dataset/run drvs
+                # are seed-keyed via FSBENCH_SEED (pure eval =
+                # "UNSEEDED", harmless); deliberately NOT in checks.* or
+                # any CI matrix kind — fsbench is operator tooling.
+                fsbench-bin = crateBuild.memberBins.rio-builder;
+                inherit (fsbenchPkgs) fsbench-dataset fsbench-run;
                 # nix/pins.toml rendered as *.auto.tfvars.json. snake_case
                 # keys in pins.toml → direct toJSON passthrough, no mapping
                 # layer. Regenerate the committed copy:

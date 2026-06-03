@@ -69,5 +69,6 @@ mutants.out*/
 .data/
 *.qcow2
 .stress-test/
+.fsbench/
 docs/dist/
 _apalache-out/

@@ -34,6 +34,16 @@ path = "src/bin/spike_mountd_client.rs"
 name = "xfstests_runner"
 path = "src/bin/xfstests_runner/main.rs"
 
+# castore-FUSE micro-benchmark, run AS A BUILD on the cluster through
+# the production mount path (P0594). `gen` re-roots a real closure
+# under a seeded layout and stamps unique-chunk honesty references;
+# `run` measures cold/warm read/open/randread plus a jq compile against
+# a same-pod local baseline and emits PHASE/PERF lines that
+# `cargo xtask k8s fsbench` parses. NOT production code.
+[[bin]]
+name = "fsbench"
+path = "src/bin/fsbench/main.rs"
+
 [features]
 # RIO_BUILDER_SCRIPT fixture intercept (sla-sizing VM scenario): skips
 # the daemon lifecycle and reports scripted (wall, peak_mem, peak_cpu,
