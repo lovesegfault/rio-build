@@ -2206,6 +2206,7 @@ pub const POISON_TTL: std::time::Duration = std::time::Duration::from_millis(100
 #[cfg(test)]
 mod tests {
 
+    // r[verify sched.closure.witness-epoch]
     /// The witness-epoch boundary in the type: a same-definition carry
     /// keeps the witness verbatim; an authority takeover drops it (the
     /// new definition's closure owes nothing to the dead epoch's

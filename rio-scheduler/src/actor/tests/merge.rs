@@ -9915,6 +9915,101 @@ async fn test_matching_retriable_takeover_resets_row_accounting() -> TestResult 
     Ok(())
 }
 
+// r[verify sched.closure.witness-epoch]
+/// Round-16 bug_011 (durable arm): the creation upsert binds
+/// `closure_hole` with OR semantics, so without the merge transaction's
+/// definition-change clear a taken-over or displaced row keeps the dead
+/// epoch's flag and 069 witness rows in PG — and recovery would
+/// resurrect a witness about a definition that no longer exists,
+/// permanently heal-refusing the genuine one. Both definition-change
+/// classes reachable from a node-bearing merge are exercised: an
+/// authority takeover (squat retriable under budget) and a
+/// match-displacement (squat poison-locked at the limit).
+#[tokio::test]
+async fn test_definition_change_clears_persisted_closure_witness() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let (db, handle, _task) = setup().await;
+
+    let stage_hole = async |tag: &str| -> TestResult {
+        sqlx::query("UPDATE derivations SET closure_hole = true WHERE drv_hash = $1")
+            .bind(tag)
+            .execute(&db.pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO derivation_closure_missing (drv_hash, missing_child)
+             VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(tag)
+        .bind(format!("{tag}-junk-child"))
+        .execute(&db.pool)
+        .await?;
+        Ok(())
+    };
+    let witness_state = async |tag: &str| -> anyhow::Result<(bool, i64)> {
+        let flag: bool =
+            sqlx::query_scalar("SELECT closure_hole FROM derivations WHERE drv_hash = $1")
+                .bind(tag)
+                .fetch_one(&db.pool)
+                .await?;
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM derivation_closure_missing WHERE drv_hash = $1",
+        )
+        .bind(tag)
+        .fetch_one(&db.pool)
+        .await?;
+        Ok((flag, rows))
+    };
+
+    // Arm 1: authority takeover (resubmit-reset, squat under budget).
+    let out_c = test_store_path("weTakeC-out");
+    let mut squat = make_node("weTakeC");
+    squat.drv_content = b"Derive-weTakeC".to_vec();
+    squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![out_c.clone()];
+    merge_dag(&handle, Uuid::new_v4(), vec![squat], vec![], false).await?;
+    barrier(&handle).await;
+    stage_hole("weTakeC").await?;
+    assert!(handle.debug_force_poisoned("weTakeC", 1).await?);
+    assert_eq!(witness_state("weTakeC").await?, (true, 1), "staged");
+
+    let mut victim_node = make_node("weTakeC");
+    victim_node.expected_output_paths = vec![out_c.clone()];
+    merge_dag(&handle, Uuid::new_v4(), vec![victim_node], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        witness_state("weTakeC").await?,
+        (false, 0),
+        "takeover must clear the dead epoch's flag AND witness rows in the merge tx"
+    );
+
+    // Arm 2: match-displacement (squat poison-locked at the limit).
+    let out_d = test_store_path("weDispD-out");
+    let mut squat = make_node("weDispD");
+    squat.drv_content = b"Derive-weDispD".to_vec();
+    squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![out_d.clone()];
+    merge_dag(&handle, Uuid::new_v4(), vec![squat], vec![], false).await?;
+    barrier(&handle).await;
+    stage_hole("weDispD").await?;
+    assert!(
+        handle
+            .debug_force_poisoned("weDispD", POISON_RESUBMIT_RETRY_LIMIT)
+            .await?
+    );
+    assert_eq!(witness_state("weDispD").await?, (true, 1), "staged");
+
+    let mut victim_node = make_node("weDispD");
+    victim_node.expected_output_paths = vec![out_d.clone()];
+    merge_dag(&handle, Uuid::new_v4(), vec![victim_node], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        witness_state("weDispD").await?,
+        (false, 0),
+        "displacement must clear the dead epoch's flag AND witness rows in the merge tx"
+    );
+    Ok(())
+}
+
 // r[verify sched.merge.displaced-edge-scrub+2]
 /// End-to-end displaced-edge scrub: a poison-locked authoritative squat
 /// carries an attacker-attached dependency edge onto a junk node that can

@@ -3607,6 +3607,30 @@ impl DagActor {
         )
         .await?;
 
+        // Batch 1a: definition-change clear of the closure witness
+        // (r[impl sched.closure.witness-epoch]). Displaced nodes,
+        // authority takeovers, and row-only store-evidence
+        // displacements replace the definition the witness testified
+        // about; the in-memory side already dropped or rebuilt the
+        // hole (fresh node / `ClosureHole::carry_across`), but Batch
+        // 1's upsert binds `closure_hole` with OR semantics, so the
+        // dead epoch's flag and 069 witness rows would survive in PG
+        // and rehydrate on failover (round-16 bug_011's durable arm).
+        // Clearing here — after the upsert, BEFORE the born-holed
+        // stamp (Batch 1b) — means a re-creation that is itself a
+        // pruned stamping parent ends the transaction with its OWN
+        // epoch's witness, never a union of eras.
+        let definition_changed: Vec<String> = merge_result
+            .displaced
+            .iter()
+            .chain(merge_result.authority_takeovers.iter())
+            .map(|h| h.to_string())
+            .chain(settled_evidence_displaced.iter().cloned())
+            .collect();
+        if !definition_changed.is_empty() {
+            crate::db::SchedulerDb::clear_closure_holes_tx(&mut tx, &definition_changed).await?;
+        }
+
         // Batch 1b: persist the topdown_pruned stamp for kept nodes this
         // merge merely JOINED. Batch 1 is creation-scoped
         // (sched.persist.creation-scoped), so a pruned merge that keeps a

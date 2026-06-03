@@ -3823,6 +3823,89 @@ fn authority_takeover_scrubs_inherited_dependency_edges(
     Ok(())
 }
 
+// r[verify sched.closure.witness-epoch]
+/// Round-16 bug_011: an authority takeover must NOT inherit the squat's
+/// closure-hole witness. The witness records children removed from the
+/// SQUAT's declared closure; the genuine definition's real inputDrvs can
+/// never contain those (possibly attacker-chosen) hashes, so a carried
+/// witness would heal-refuse every honest re-declaration and route the
+/// node to the bounded fail-fast permanently. A same-definition
+/// resubmit (no authority flip) keeps carrying the witness — the epoch
+/// continues.
+#[test]
+fn closure_witness_dies_at_takeover_and_rides_same_definition_resubmit() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+
+    // Arm 1: authority takeover drops the witness.
+    dag.merge(
+        Uuid::new_v4(),
+        &[authoritative_node("we-squat", b"Derive-we")],
+        &[],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("we-squat").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = 1; // under budget → resubmit-reset path
+        n.closure_hole.stamp([DrvHash::from("we-squat-junk-child")]);
+        assert!(n.closure_hole.is_holed());
+    }
+    let mut takeover = make_node("we-squat", "x86_64-linux");
+    takeover.is_content_addressed = true;
+    takeover.ca_modular_hash = Some([0xAB; 32]);
+    let res = dag.merge(Uuid::new_v4(), &[takeover], &[], "")?;
+    assert!(
+        res.authority_takeovers
+            .iter()
+            .any(|h| h.as_str() == "we-squat"),
+        "staging must produce an authority takeover"
+    );
+    assert!(
+        !dag.node("we-squat").unwrap().closure_hole.is_holed(),
+        "the taken-over definition must not inherit the squat's witness"
+    );
+
+    // Arm 2: same-definition resubmit carries the witness verbatim.
+    dag.merge(
+        Uuid::new_v4(),
+        &[make_node("we-bare", "x86_64-linux")],
+        &[],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("we-bare").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = 1;
+        n.closure_hole.stamp([DrvHash::from("we-bare-lost-child")]);
+    }
+    let res = dag.merge(
+        Uuid::new_v4(),
+        &[make_node("we-bare", "x86_64-linux")],
+        &[],
+        "",
+    )?;
+    assert!(
+        res.reset_on_resubmit
+            .iter()
+            .any(|h| h.as_str() == "we-bare"),
+        "staging must go through the resubmit-reset"
+    );
+    assert!(
+        res.authority_takeovers.is_empty(),
+        "same-definition resubmit is not a takeover"
+    );
+    let carried = &dag.node("we-bare").unwrap().closure_hole;
+    assert!(
+        carried.is_holed()
+            && carried
+                .missing()
+                .iter()
+                .any(|h| h.as_str() == "we-bare-lost-child"),
+        "a same-definition resubmit must carry the witness verbatim"
+    );
+    Ok(())
+}
+
 // r[verify sched.merge.displaced-edge-scrub+2]
 /// A merge that takes over a parked authoritative claim (scrubbing its
 /// dependency edges) but fails on a LATER node in the same submission

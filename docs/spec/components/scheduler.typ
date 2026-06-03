@@ -1025,6 +1025,33 @@ form: mintable only by the coverage branch, demanded by the only clear
 path, so an absence-of-objection upgrade is unwritable rather than merely
 unreviewed.
 
+#r("sched.closure.witness-epoch")[
+  A closure-hole witness testifies about ONE definition epoch. Any
+  definition-changing transition --- an authority takeover through the
+  resubmit-reset, a displacement, or a row-only store-evidence
+  displacement --- MUST drop the carried witness in memory and clear the
+  persisted flag and witness rows in the same transaction that commits
+  the new definition. A witness MUST NOT survive onto a definition it
+  does not testify about.
+]
+
+The witness records children a truncation removed FROM A SPECIFIC
+DECLARED CLOSURE; the heal demands the new submission cover exactly that
+set (#rref("sched.merge.heal-accepted-edges+1")). A definition change
+replaces the closure the witness was recorded against: the new
+definition's real `inputDrvs` can never contain a squat's junk children,
+so a carried-over witness would refuse every honest re-declaration and
+route the node to the bounded fail-fast permanently (round-16 bug_011 ---
+the in-memory carry rode `authority_flip` unconditionally while the
+upsert's OR semantics preserved the dead epoch's flag and rows for
+recovery to resurrect). The mechanical form is
+`ClosureHole::carry_across(DefinitionTransition)` (the only way to move a
+witness across the resubmit carry) paired with the merge transaction's
+definition-change clear, which runs after the creation upsert and before
+the born-holed stamp so a re-creating submission that is itself a pruned
+stamping parent ends the transaction with its own epoch's witness, never
+a union of eras.
+
 #r("sched.merge.dep-failed-transitive")[
   When a newly-merged node transitively depends on a node already in a
   failure-terminal state (`Poisoned`/`DependencyFailed`/`Cancelled`), it is

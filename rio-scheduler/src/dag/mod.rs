@@ -1487,7 +1487,25 @@ impl DerivationDag {
                     for (b, w) in prior_contributions {
                         state.wanted_by_build.entry(b).or_insert(w);
                     }
-                    state.closure_hole = prior_closure_hole;
+                    // r[impl sched.closure.witness-epoch]
+                    // The witness rides a same-definition resubmit and
+                    // dies at an authority takeover — the same boundary
+                    // that already scrubbed the squat's edges and reset
+                    // its poison budget above. Carrying it across would
+                    // demand the genuine definition "re-supply" the
+                    // squat's junk children, which its real inputDrvs
+                    // can never contain: every re-declaration would be
+                    // heal-refused and the node permanently
+                    // fail-fast-routed (round-16 bug_011). The durable
+                    // half (PG flag+rows, kept alive by the upsert's
+                    // OR semantics) is cleared by the merge
+                    // transaction's definition-change clear in
+                    // `persist_merge_to_db`.
+                    state.closure_hole = prior_closure_hole.carry_across(if authority_flip {
+                        crate::state::DefinitionTransition::AuthorityTakeover
+                    } else {
+                        crate::state::DefinitionTransition::SameDefinition
+                    });
                     reset_on_resubmit.push(drv_hash.clone());
                 }
                 state.traceparent = submitter_traceparent.to_string();
