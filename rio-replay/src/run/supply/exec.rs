@@ -64,8 +64,8 @@ use crate::run::model::{
     SUPPLY_OUTCOME_DELEGATED, SUPPLY_OUTCOME_DELIVERED, SUPPLY_OUTCOME_FAILED,
     SUPPLY_OUTCOME_REFUSED, SUPPLY_OUTCOME_SKIPPED, SUPPLY_OUTCOME_UNAVAILABLE,
     SUPPLY_SOURCE_EMBEDDED, SUPPLY_SOURCE_NONE, SUPPLY_SOURCE_RELAY,
-    SUPPLY_SOURCE_TARGET_SUBSTITUTER, SupplyEntry, build_status_from_name, now_rfc3339,
-    path_outcomes_from_keyed, supply_outcome_is_settlement,
+    SUPPLY_SOURCE_TARGET_SUBSTITUTER, SupplyEntry, SupplyFold, build_status_from_name, now_rfc3339,
+    path_outcomes_from_keyed,
 };
 use crate::run::spec::{Knobs, SupplyDelivery, SupplyDependencies};
 use crate::run::state::{StateDir, StateFile};
@@ -2463,37 +2463,25 @@ async fn pause_campaign(
 /// The journal legitimately carries more than one row for a path — the
 /// upstream-coverage probe records `unavailable` before the supply stage
 /// runs, and a path one arm could not provide can be delivered by a later
-/// arm or a top-up — so counting raw rows would double-count. The last
-/// settlement row per path is its settled disposition; bookkeeping rows
+/// arm or a top-up — so counting raw rows would double-count. The fold
+/// owner's report projection ([`SupplyFold::report_outcomes`]) collapses
+/// to the settled disposition per path, with bookkeeping rows
 /// (`unavailable`, `skipped` — see [`supply_outcome_is_settlement`])
-/// count only for paths that never settled, because they assert nothing
-/// about delivery: a skip-held row appended after the claim holder's
-/// `delivered` row must leave the path counted delivered, and a breaker
-/// skip after a real failure must leave it counted failed. Throughput,
-/// prefetch-shortfall (including the prefetch-scoped unavailable tally —
-/// the journal cannot distinguish prefetch-wanted unavailability from
-/// ordinary ladder unavailability), and probe-error figures are not
-/// per-path counts and stay as the stage reported them. An empty journal
-/// leaves the report untouched.
+/// counting only for paths that never settled, because they assert
+/// nothing about delivery: a skip-held row appended after the claim
+/// holder's `delivered` row must leave the path counted delivered, and a
+/// breaker skip after a real failure must leave it counted failed.
+/// Throughput, prefetch-shortfall (including the prefetch-scoped
+/// unavailable tally — the journal cannot distinguish prefetch-wanted
+/// unavailability from ordinary ladder unavailability), and probe-error
+/// figures are not per-path counts and stay as the stage reported them.
+/// An empty journal leaves the report untouched.
 pub fn refresh_outcome_counts(report: &mut SupplyStageReport, entries: &[SupplyEntry]) {
     if entries.is_empty() {
         return;
     }
-    let mut latest: BTreeMap<&str, &str> = BTreeMap::new();
-    for entry in entries {
-        let outcome = entry.outcome.as_str();
-        latest
-            .entry(entry.path.as_str())
-            .and_modify(|current| {
-                // A settlement always supersedes; bookkeeping supersedes
-                // only bookkeeping.
-                if supply_outcome_is_settlement(outcome) || !supply_outcome_is_settlement(current) {
-                    *current = outcome;
-                }
-            })
-            .or_insert(outcome);
-    }
-    let count = |outcome: &str| latest.values().filter(|got| **got == outcome).count();
+    let outcomes = SupplyFold::collapse(entries).report_outcomes();
+    let count = |outcome: &str| outcomes.values().filter(|got| **got == outcome).count();
     report.delivered = count(SUPPLY_OUTCOME_DELIVERED);
     report.delegated = count(SUPPLY_OUTCOME_DELEGATED);
     report.already_present = count(SUPPLY_OUTCOME_ALREADY_PRESENT);
@@ -2692,7 +2680,7 @@ mod tests {
 
     use super::test_support::FakeSupplyTransport;
     use super::*;
-    use crate::run::model::build_status_name;
+    use crate::run::model::{build_status_name, supply_outcome_is_settlement};
     use rio_nix::protocol::build::BuildResult;
     use rio_nix::protocol::client::KeyedBuildResult;
 

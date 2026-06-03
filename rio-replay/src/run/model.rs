@@ -841,6 +841,205 @@ pub struct SupplyEntry {
     pub observed_at: String,
 }
 
+/// Per-path collapse of the supply journal under the settlement contract —
+/// the fold OWNER. Every consumer that needs "the journal's truth for a
+/// path" routes through one of these projections; none re-implements
+/// latest-row-wins over raw rows, so the contract pinned by
+/// [`supply_outcome_is_settlement`] ("a bookkeeping row appended after a
+/// settlement must never displace the settled outcome") holds in EVERY
+/// reader by construction instead of by per-consumer discipline. The
+/// xtask `supply-fold-owner` lint enforces the routing: a production
+/// load of supply.jsonl must name the projection it folds through.
+///
+/// One journal pass builds all three projections:
+///
+/// - [`Self::latest_settlements`]: the last SETTLEMENT row per path plus
+///   its settled undelivered upload-attempt count — the supply rollup's
+///   question. Bookkeeping rows are invisible here.
+/// - [`Self::outstanding_inline_deferrals`]: paths still owed to the
+///   per-submission inline top-up — the inline-resume gate's trigger
+///   evidence. Only settlements and deferral rows participate; other
+///   bookkeeping (a breaker/held `skipped`, a plain `unavailable`) can
+///   neither redeem a deferral nor displace it.
+/// - [`Self::report_outcomes`]: per-path display outcome for the stage
+///   report — the settled outcome where one exists, else the latest
+///   bookkeeping row, so a never-settled path still shows as
+///   unavailable/skipped and a settled one is counted exactly once.
+///
+/// Temporal scope: [`Self::collapse`] folds the whole journal (the
+/// forward question — what is settled NOW); [`Self::collapse_as_of`]
+/// folds only rows observed at or before a cutoff (the backward question
+/// — what WAS settled when a batch dispatched). Unknown future outcome
+/// vocabulary classifies as bookkeeping ([`supply_outcome_is_settlement`]),
+/// so it can neither retire units nor displace a settled truth in any
+/// projection.
+#[derive(Debug, Default)]
+pub struct SupplyFold<'a> {
+    /// Latest settlement row per path + settled undelivered attempt count.
+    settled: BTreeMap<&'a str, SettledSupplyPath<'a>>,
+    /// Latest settlement-or-deferral row per path (the deferral-evidence
+    /// lattice: a deferral is owed until a settlement supersedes it, and a
+    /// re-run stage's fresh deferral re-marks a settled path as owed).
+    deferral_evidence: BTreeMap<&'a str, &'a SupplyEntry>,
+    /// Latest bookkeeping row per path (report fallback for paths that
+    /// never settled).
+    bookkeeping: BTreeMap<&'a str, &'a SupplyEntry>,
+}
+
+/// One path's settled truth under [`SupplyFold::latest_settlements`].
+#[derive(Debug)]
+pub struct SettledSupplyPath<'a> {
+    /// The path's last settlement row (its settled outcome and mechanism).
+    pub entry: &'a SupplyEntry,
+    /// How many settled refused/failed rows the path accumulated on the
+    /// engine upload mechanisms — each one a claim-resolved delivery
+    /// attempt. The supply rollup's attempt floor counts these; skipped
+    /// bookkeeping rows are not attempts and never reach this fold.
+    pub undelivered_upload_attempts: usize,
+}
+
+impl<'a> SupplyFold<'a> {
+    /// Collapse the whole journal: the forward question ("what is settled
+    /// NOW"), used by the process-start rollup, the inline-resume gate,
+    /// and the report counts.
+    pub fn collapse(entries: &'a [SupplyEntry]) -> Self {
+        Self::fold(entries, None)
+    }
+
+    /// Collapse only rows observed at or before `cutoff_rfc3339`: the
+    /// backward question ("what WAS settled then"), used by the collect
+    /// pass's batch-settle rollup with the batch's `started_at` — claims
+    /// are released on refusal/failure precisely so a LATER top-up can
+    /// re-claim and deliver, and that later delivery must not rewrite
+    /// what a batch dispatched without.
+    ///
+    /// Malformed timestamps degrade to visibility, never to silent
+    /// dropping: an unparseable cutoff disables the scoping (whole-journal
+    /// fold, with a warning) and a row with an unparseable `observed_at`
+    /// stays visible — both are the pre-scoping behavior, and hiding a
+    /// settlement over a corrupt timestamp would un-retire real
+    /// starvation.
+    pub fn collapse_as_of(entries: &'a [SupplyEntry], cutoff_rfc3339: &str) -> Self {
+        match cutoff_rfc3339.parse::<jiff::Timestamp>() {
+            Ok(cutoff) => Self::fold(entries, Some(cutoff)),
+            Err(error) => {
+                tracing::warn!(
+                    cutoff = cutoff_rfc3339,
+                    %error,
+                    "unparseable as-of cutoff for the supply-journal fold; \
+                     folding the whole journal instead"
+                );
+                Self::fold(entries, None)
+            }
+        }
+    }
+
+    fn fold(entries: &'a [SupplyEntry], cutoff: Option<jiff::Timestamp>) -> Self {
+        let mut collapsed = Self::default();
+        let mut unparseable_rows = 0usize;
+        for entry in entries {
+            if let Some(cutoff) = cutoff {
+                match entry.observed_at.parse::<jiff::Timestamp>() {
+                    // The cutoff is inclusive: a batch's own top-up rows
+                    // are appended before its started_at is anchored, so
+                    // <= keeps them in scope.
+                    Ok(observed) if observed > cutoff => continue,
+                    Ok(_) => {}
+                    Err(_) => unparseable_rows += 1,
+                }
+            }
+            let path = entry.path.as_str();
+            let outcome = entry.outcome.as_str();
+            if supply_outcome_is_settlement(outcome) {
+                let is_undelivered_upload_attempt = (entry.mechanism
+                    == SUPPLY_MECHANISM_UPLOAD_BATCH
+                    || entry.mechanism == SUPPLY_MECHANISM_UPLOAD_STREAM)
+                    && (outcome == SUPPLY_OUTCOME_REFUSED || outcome == SUPPLY_OUTCOME_FAILED);
+                collapsed
+                    .settled
+                    .entry(path)
+                    .and_modify(|settled| {
+                        settled.entry = entry;
+                        settled.undelivered_upload_attempts +=
+                            usize::from(is_undelivered_upload_attempt);
+                    })
+                    .or_insert(SettledSupplyPath {
+                        entry,
+                        undelivered_upload_attempts: usize::from(is_undelivered_upload_attempt),
+                    });
+                collapsed.deferral_evidence.insert(path, entry);
+            } else {
+                collapsed.bookkeeping.insert(path, entry);
+                if entry.detail.as_deref() == Some(SUPPLY_DETAIL_DEFERRED_INLINE) {
+                    collapsed.deferral_evidence.insert(path, entry);
+                }
+            }
+        }
+        if unparseable_rows > 0 {
+            tracing::warn!(
+                rows = unparseable_rows,
+                "supply rows with unparseable observedAt under an as-of fold are kept visible"
+            );
+        }
+        collapsed
+    }
+
+    /// The last settlement row per path (bookkeeping rows invisible by
+    /// construction), with the path's settled undelivered upload-attempt
+    /// count alongside.
+    pub fn latest_settlements(&self) -> &BTreeMap<&'a str, SettledSupplyPath<'a>> {
+        &self.settled
+    }
+
+    /// Store paths whose latest deferral-evidence row is the
+    /// inline-delivery deferral ([`SUPPLY_DETAIL_DEFERRED_INLINE`]):
+    /// planned uploads a completed supply stage handed to the
+    /// per-submission top-up that no settlement has superseded. A top-up
+    /// that later delivered, refused, or failed the path — or a re-run
+    /// stage that found it already present — clears the deferral; a
+    /// breaker/held `skipped` row or a plain `unavailable` row asserts
+    /// nothing about the promise and leaves the path owed (fail-closed:
+    /// a gateway outage that skip-stamps the outstanding paths must not
+    /// erase the resume gate's trigger evidence). Sorted (BTreeMap order)
+    /// for stable error messages.
+    ///
+    /// This is the inline-resume gate's trigger evidence precisely
+    /// because it is durable and substrate-independent: the current
+    /// spec's wiring says what THIS process would do, while the journal
+    /// says what the completed stage actually left undelivered — a spec
+    /// switched from inline to prewarm between processes changes the
+    /// former but not the latter.
+    pub fn outstanding_inline_deferrals(&self) -> Vec<&'a str> {
+        self.deferral_evidence
+            .iter()
+            .filter(|(_, entry)| {
+                entry.detail.as_deref() == Some(SUPPLY_DETAIL_DEFERRED_INLINE)
+                    && !supply_outcome_is_settlement(&entry.outcome)
+            })
+            .map(|(path, _)| *path)
+            .collect()
+    }
+
+    /// Per-path display outcome for the stage report: the settled outcome
+    /// where one exists (a settlement supersedes bookkeeping regardless of
+    /// row order), else the latest bookkeeping row. Equivalently: a
+    /// skip-held row appended after the claim holder's `delivered` leaves
+    /// the path counted delivered, a breaker skip after a real failure
+    /// leaves it counted failed, and a path nothing ever settled counts
+    /// under its latest bookkeeping outcome.
+    pub fn report_outcomes(&self) -> BTreeMap<&'a str, &'a str> {
+        let mut outcomes: BTreeMap<&'a str, &'a str> = self
+            .bookkeeping
+            .iter()
+            .map(|(path, entry)| (*path, entry.outcome.as_str()))
+            .collect();
+        for (path, settled) in &self.settled {
+            outcomes.insert(path, settled.entry.outcome.as_str());
+        }
+        outcomes
+    }
+}
+
 /// One line of dispatch.jsonl — per recorded request, written by the timed dispatcher.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1538,6 +1737,305 @@ mod tests {
         // Forward-compatibility direction: vocabulary this build does not
         // know falls through as bookkeeping.
         assert!(!supply_outcome_is_settlement("some-future-outcome"));
+    }
+
+    /// Journal row for the fold-owner tests. `observed_at` comes from the
+    /// production clock helper unless a test pins it for as-of scoping.
+    fn fold_row(path: &str, mechanism: &str, outcome: &str, detail: Option<&str>) -> SupplyEntry {
+        SupplyEntry {
+            path: path.to_string(),
+            source: SUPPLY_SOURCE_EMBEDDED.to_string(),
+            mechanism: mechanism.to_string(),
+            outcome: outcome.to_string(),
+            detail: detail.map(str::to_string),
+            batch_id: None,
+            bytes: None,
+            observed_at: now_rfc3339(),
+        }
+    }
+
+    /// The fold owner's displacement law, quantified over the FULL outcome
+    /// vocabulary: for every member of [`SUPPLY_OUTCOMES`] (the closed
+    /// class-as-data array — a new outcome constant joins this test by
+    /// joining the array) appended AFTER an inline-deferral row, the
+    /// projections must agree with [`supply_outcome_is_settlement`]:
+    ///
+    /// - the five settlements clear the deferral (the promise was
+    ///   resolved) and become the path's settled truth;
+    /// - the two bookkeeping outcomes (and any unknown future outcome)
+    ///   leave the deferral OWED and stay invisible to
+    ///   `latest_settlements` — a breaker-open `skipped` stamp on every
+    ///   outstanding path must not erase the inline-resume gate's trigger
+    ///   evidence (the fold this owner replaced kept raw latest-row-wins
+    ///   and failed open exactly there).
+    ///
+    /// Both directions on the deferral lattice: a settlement clears the
+    /// deferral, and a FRESH deferral row appended after a settlement (a
+    /// re-run stage deferring the path again) re-marks it owed.
+    #[test]
+    fn supply_fold_projections_decide_every_outcome_against_a_deferral() {
+        for outcome in SUPPLY_OUTCOMES {
+            let path = "/nix/store/owed";
+            let entries = vec![
+                fold_row(
+                    path,
+                    SUPPLY_MECHANISM_NONE,
+                    SUPPLY_OUTCOME_UNAVAILABLE,
+                    Some(SUPPLY_DETAIL_DEFERRED_INLINE),
+                ),
+                fold_row(path, SUPPLY_MECHANISM_UPLOAD_BATCH, outcome, None),
+            ];
+            let fold = SupplyFold::collapse(&entries);
+            let settles = supply_outcome_is_settlement(outcome);
+            assert_eq!(
+                fold.outstanding_inline_deferrals().is_empty(),
+                settles,
+                "{outcome}: a deferral is cleared by settlements only"
+            );
+            assert_eq!(
+                fold.latest_settlements()
+                    .get(path)
+                    .map(|settled| settled.entry.outcome.as_str()),
+                settles.then_some(outcome),
+                "{outcome}: only settlements are visible as settled truth"
+            );
+            // The report projection sees every row class — the settled
+            // outcome where one exists, else the latest bookkeeping row —
+            // and in this two-row corpus both readings name the displacer.
+            assert_eq!(
+                fold.report_outcomes().get(path).copied(),
+                Some(outcome),
+                "{outcome}"
+            );
+        }
+        // Unknown FUTURE vocabulary (a newer engine's journal read by this
+        // build): bookkeeping in every projection — keeps the deferral
+        // owed, invisible to settled truth.
+        let path = "/nix/store/owed";
+        let future = vec![
+            fold_row(
+                path,
+                SUPPLY_MECHANISM_NONE,
+                SUPPLY_OUTCOME_UNAVAILABLE,
+                Some(SUPPLY_DETAIL_DEFERRED_INLINE),
+            ),
+            fold_row(
+                path,
+                SUPPLY_MECHANISM_UPLOAD_BATCH,
+                "some-future-outcome",
+                None,
+            ),
+        ];
+        let fold = SupplyFold::collapse(&future);
+        assert_eq!(fold.outstanding_inline_deferrals(), vec![path]);
+        assert!(fold.latest_settlements().is_empty());
+        // Re-deferral direction: deferred → delivered → deferred again
+        // (a re-run stage re-promising the path) is owed again.
+        let redeferred = vec![
+            fold_row(
+                path,
+                SUPPLY_MECHANISM_NONE,
+                SUPPLY_OUTCOME_UNAVAILABLE,
+                Some(SUPPLY_DETAIL_DEFERRED_INLINE),
+            ),
+            fold_row(
+                path,
+                SUPPLY_MECHANISM_UPLOAD_BATCH,
+                SUPPLY_OUTCOME_DELIVERED,
+                None,
+            ),
+            fold_row(
+                path,
+                SUPPLY_MECHANISM_NONE,
+                SUPPLY_OUTCOME_UNAVAILABLE,
+                Some(SUPPLY_DETAIL_DEFERRED_INLINE),
+            ),
+        ];
+        assert_eq!(
+            SupplyFold::collapse(&redeferred).outstanding_inline_deferrals(),
+            vec![path],
+            "a fresh deferral after a settlement re-marks the path owed"
+        );
+        // Empty journal: every projection is empty.
+        let empty = SupplyFold::collapse(&[]);
+        assert!(empty.outstanding_inline_deferrals().is_empty());
+        assert!(empty.latest_settlements().is_empty());
+        assert!(empty.report_outcomes().is_empty());
+    }
+
+    /// The settled undelivered-attempt count: refused/failed rows on the
+    /// engine upload mechanisms each count one claim-resolved attempt —
+    /// regardless of which row ends up latest — while delivered rows,
+    /// non-upload mechanisms (a prefetch `failed` is not an upload
+    /// attempt), and bookkeeping rows never count.
+    #[test]
+    fn supply_fold_counts_undelivered_upload_attempts_per_path() {
+        let path = "/nix/store/retried";
+        let entries = vec![
+            fold_row(
+                path,
+                SUPPLY_MECHANISM_UPLOAD_BATCH,
+                SUPPLY_OUTCOME_FAILED,
+                None,
+            ),
+            fold_row(
+                path,
+                SUPPLY_MECHANISM_UPLOAD_STREAM,
+                SUPPLY_OUTCOME_REFUSED,
+                None,
+            ),
+            fold_row(path, SUPPLY_MECHANISM_DELEGATE, SUPPLY_OUTCOME_FAILED, None),
+            fold_row(
+                path,
+                SUPPLY_MECHANISM_UPLOAD_BATCH,
+                SUPPLY_OUTCOME_SKIPPED,
+                None,
+            ),
+            fold_row(
+                path,
+                SUPPLY_MECHANISM_UPLOAD_BATCH,
+                SUPPLY_OUTCOME_DELIVERED,
+                None,
+            ),
+        ];
+        let fold = SupplyFold::collapse(&entries);
+        let settled = &fold.latest_settlements()[path];
+        assert_eq!(settled.undelivered_upload_attempts, 2);
+        assert_eq!(settled.entry.outcome, SUPPLY_OUTCOME_DELIVERED);
+    }
+
+    /// The as-of scope: rows observed after the cutoff are invisible to
+    /// EVERY projection (settled truth, deferral evidence, report counts)
+    /// — the backward question reads the journal as it stood — while the
+    /// cutoff itself is inclusive (a batch's own top-up rows precede its
+    /// started_at). Malformed timestamps degrade to visibility, never to
+    /// silent dropping: an unparseable row stays visible and an
+    /// unparseable cutoff disables the scoping — both are the pre-scoping
+    /// whole-journal behavior.
+    #[test]
+    fn supply_fold_as_of_scopes_every_projection() {
+        let early = "2026-06-03T10:00:00Z";
+        let cutoff = "2026-06-03T10:05:00Z";
+        let late = "2026-06-03T10:10:00Z";
+        let at = |mut row: SupplyEntry, observed: &str| {
+            row.observed_at = observed.to_string();
+            row
+        };
+        let entries = vec![
+            at(
+                fold_row(
+                    "/nix/store/masked",
+                    SUPPLY_MECHANISM_UPLOAD_BATCH,
+                    SUPPLY_OUTCOME_FAILED,
+                    None,
+                ),
+                early,
+            ),
+            // A later delivery (a sibling batch's re-claimed top-up) must
+            // not rewrite what stood at the cutoff.
+            at(
+                fold_row(
+                    "/nix/store/masked",
+                    SUPPLY_MECHANISM_UPLOAD_BATCH,
+                    SUPPLY_OUTCOME_DELIVERED,
+                    None,
+                ),
+                late,
+            ),
+            // Inclusive boundary: a row AT the cutoff is in scope.
+            at(
+                fold_row(
+                    "/nix/store/boundary",
+                    SUPPLY_MECHANISM_UPLOAD_BATCH,
+                    SUPPLY_OUTCOME_DELIVERED,
+                    None,
+                ),
+                cutoff,
+            ),
+            // A path that exists only after the cutoff: invisible.
+            at(
+                fold_row(
+                    "/nix/store/later-only",
+                    SUPPLY_MECHANISM_UPLOAD_BATCH,
+                    SUPPLY_OUTCOME_DELIVERED,
+                    None,
+                ),
+                late,
+            ),
+            at(
+                fold_row(
+                    "/nix/store/later-deferral",
+                    SUPPLY_MECHANISM_NONE,
+                    SUPPLY_OUTCOME_UNAVAILABLE,
+                    Some(SUPPLY_DETAIL_DEFERRED_INLINE),
+                ),
+                late,
+            ),
+            // Unparseable observed_at: kept visible (degrade documented on
+            // collapse_as_of).
+            at(
+                fold_row(
+                    "/nix/store/unparseable",
+                    SUPPLY_MECHANISM_UPLOAD_BATCH,
+                    SUPPLY_OUTCOME_REFUSED,
+                    None,
+                ),
+                "not-a-timestamp",
+            ),
+        ];
+        let fold = SupplyFold::collapse_as_of(&entries, cutoff);
+        let settled = fold.latest_settlements();
+        assert_eq!(
+            settled["/nix/store/masked"].entry.outcome, SUPPLY_OUTCOME_FAILED,
+            "a post-cutoff delivery must not mask the at-cutoff failure"
+        );
+        assert_eq!(
+            settled["/nix/store/boundary"].entry.outcome,
+            SUPPLY_OUTCOME_DELIVERED
+        );
+        assert!(!settled.contains_key("/nix/store/later-only"));
+        assert_eq!(
+            settled["/nix/store/unparseable"].entry.outcome,
+            SUPPLY_OUTCOME_REFUSED
+        );
+        assert!(
+            fold.outstanding_inline_deferrals().is_empty(),
+            "a post-cutoff deferral is invisible to the as-of fold"
+        );
+        assert!(!fold.report_outcomes().contains_key("/nix/store/later-only"));
+        // Whole-journal fold over the same rows: the later rows ARE
+        // visible (the forward question) — the two constructors answer
+        // different questions over one journal.
+        let unscoped = SupplyFold::collapse(&entries);
+        assert_eq!(
+            unscoped.latest_settlements()["/nix/store/masked"]
+                .entry
+                .outcome,
+            SUPPLY_OUTCOME_DELIVERED
+        );
+        assert_eq!(
+            unscoped.outstanding_inline_deferrals(),
+            vec!["/nix/store/later-deferral"]
+        );
+        // Unparseable cutoff: scoping disabled, whole-journal semantics.
+        let unparseable_cutoff = SupplyFold::collapse_as_of(&entries, "garbage");
+        assert_eq!(
+            unparseable_cutoff.latest_settlements()["/nix/store/masked"]
+                .entry
+                .outcome,
+            SUPPLY_OUTCOME_DELIVERED
+        );
+        // Producer-format tie: the cutoff/row format this fold parses is
+        // exactly what the production clock helper emits.
+        let now_row = fold_row(
+            "/nix/store/now",
+            SUPPLY_MECHANISM_UPLOAD_BATCH,
+            SUPPLY_OUTCOME_DELIVERED,
+            None,
+        );
+        let now_entries = vec![now_row];
+        let now_fold = SupplyFold::collapse_as_of(&now_entries, &now_rfc3339());
+        assert!(now_fold.latest_settlements().contains_key("/nix/store/now"));
     }
 
     #[test]

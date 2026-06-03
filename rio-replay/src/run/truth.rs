@@ -229,6 +229,9 @@ pub async fn probe_warm_upstream_coverage(
     concurrency: usize,
     max_attempts: u32,
 ) -> Result<WarmCoverage> {
+    // supply-fold: exempt — presence-only read (which paths carry ANY
+    // row, for resume idempotence of the pre-classification appends); no
+    // per-path truth is folded, so no SupplyFold projection applies.
     let already_classified: HashSet<String> = state
         .load_jsonl::<SupplyEntry>(StateFile::Supply)?
         .into_iter()

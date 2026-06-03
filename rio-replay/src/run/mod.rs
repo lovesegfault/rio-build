@@ -66,7 +66,7 @@ use self::collect::{BatchView, JobContext, process_settled_batch};
 use self::grpc::{AdminApi, ClusterApi, GrpcAdminApi, GrpcStoreApi, StoreApi};
 use self::model::{
     BATCH_KIND_SUBMIT, BATCH_KIND_TIMED, Disposition, FailureKind, JobRecord, PauseState,
-    RioOutcome, SUPPLY_DETAIL_DEFERRED_INLINE, SupplyEntry, Verdict, now_rfc3339, rfc3339_to_unix,
+    RioOutcome, SupplyEntry, Verdict, now_rfc3339, rfc3339_to_unix,
 };
 use self::spec::{
     CampaignRecord, CampaignSpec, Knobs, Mode, PLAN_COUNT_RSS_BEFORE, PLAN_COUNT_RSS_PEAK,
@@ -460,36 +460,6 @@ fn jobs_awaiting_first_delivered_submission<'a>(
         .collect();
     jobs.sort_unstable();
     jobs
-}
-
-/// Store paths whose LATEST supply-journal row is the inline-delivery
-/// deferral ([`SUPPLY_DETAIL_DEFERRED_INLINE`]): planned uploads a
-/// completed supply stage handed to the per-submission top-up that no
-/// later arm has superseded. The journal is read latest-row-per-path
-/// (the same fold `refresh_outcome_counts` uses): a top-up that later
-/// delivered, refused, or failed the path — or a re-run stage that found
-/// it already present — overwrites the deferral, so the count converges
-/// to what is genuinely still owed. The residual conservatism is a path
-/// that became valid on the target through some other channel after the
-/// stage planned it (the live top-up skips valid paths without
-/// journaling); a resume then refuses until a supply re-run records it
-/// `already-present` — fail-closed, never fail-open.
-///
-/// This is the inline-resume gate's trigger evidence precisely because it
-/// is durable and substrate-independent: the current spec's wiring says
-/// what THIS process would do, while the journal says what the completed
-/// stage actually left undelivered — a spec switched from inline to
-/// prewarm between processes changes the former but not the latter.
-fn undelivered_inline_deferrals(entries: &[SupplyEntry]) -> Vec<&str> {
-    let mut latest: BTreeMap<&str, &SupplyEntry> = BTreeMap::new();
-    for entry in entries {
-        latest.insert(entry.path.as_str(), entry);
-    }
-    latest
-        .into_values()
-        .filter(|entry| entry.detail.as_deref() == Some(SUPPLY_DETAIL_DEFERRED_INLINE))
-        .map(|entry| entry.path.as_str())
-        .collect()
 }
 
 /// Resolve the SSH host-key policy every gateway pool the engine dials uses:
@@ -918,11 +888,15 @@ fn plan_time_dispositions(
 /// Scope is deliberately the engine's own upload mechanisms: prefetch
 /// (delegate) failures stay with the prefetch-shortfall gate, and inline
 /// delivery's policy-deferred rows are recorded unavailable, not failures.
-/// The journal's last SETTLEMENT row per path is its settled outcome
-/// ([`model::supply_outcome_is_settlement`]): a path a later arm or
-/// top-up delivered never retires anyone, and bookkeeping rows
-/// (`unavailable`, breaker/held `skipped`) neither retire nor displace —
-/// a skip is not a delivery attempt.
+/// The journal's truth comes pre-collapsed by the fold owner
+/// ([`model::SupplyFold`]): the last settlement row per path is its
+/// settled outcome, bookkeeping rows (`unavailable`, breaker/held
+/// `skipped`) neither retire nor displace — a skip is not a delivery
+/// attempt — and the CALLER chooses the temporal scope by how it builds
+/// the fold: whole-journal at process start (a path a later arm or top-up
+/// delivered never retires anyone going forward), as-of-dispatch at batch
+/// settle (a later delivery never rewrites what a batch dispatched
+/// without).
 ///
 /// `attempt_floor` is the bounded supply-attempt count a path must reach
 /// before its settled refusal/failure becomes retiring: each settled
@@ -946,48 +920,35 @@ fn plan_time_dispositions(
 /// Precedence between the two dispositions is the classifier's, like
 /// every other disposition.
 fn supply_rollup_dispositions(
-    entries: &[SupplyEntry],
+    fold: &model::SupplyFold<'_>,
     dep_closure: &[archive_input::DepClosureEntry],
     in_scope: &HashSet<&str>,
     already_excluded: &BTreeMap<String, Disposition>,
     attempt_floor: usize,
 ) -> BTreeMap<String, Disposition> {
-    // Last settlement row per path, plus the per-path count of settled
-    // undelivered upload attempts (refused/failed rows on the upload
-    // mechanisms — each one a claim-resolved transport attempt).
-    let mut last_settlement: HashMap<&str, (&str, &str)> = HashMap::new();
-    let mut undelivered_attempts: HashMap<&str, usize> = HashMap::new();
-    for entry in entries {
-        let outcome = entry.outcome.as_str();
-        if !model::supply_outcome_is_settlement(outcome) {
-            continue;
-        }
-        last_settlement.insert(entry.path.as_str(), (entry.mechanism.as_str(), outcome));
-        let upload_mechanism = entry.mechanism == model::SUPPLY_MECHANISM_UPLOAD_BATCH
-            || entry.mechanism == model::SUPPLY_MECHANISM_UPLOAD_STREAM;
-        if upload_mechanism
-            && (outcome == model::SUPPLY_OUTCOME_REFUSED || outcome == model::SUPPLY_OUTCOME_FAILED)
-        {
-            *undelivered_attempts.entry(entry.path.as_str()).or_default() += 1;
-        }
-    }
+    // The fold owner already collapsed the journal: last settlement row
+    // per path plus the per-path count of settled undelivered upload
+    // attempts (refused/failed rows on the upload mechanisms — each one a
+    // claim-resolved transport attempt). Bookkeeping rows never reach
+    // this loop by construction.
     let mut refused: HashSet<&str> = HashSet::new();
     let mut failed: HashSet<&str> = HashSet::new();
-    for (path, (mechanism, outcome)) in last_settlement {
+    for (path, settled) in fold.latest_settlements() {
+        let mechanism = settled.entry.mechanism.as_str();
         if mechanism != model::SUPPLY_MECHANISM_UPLOAD_BATCH
             && mechanism != model::SUPPLY_MECHANISM_UPLOAD_STREAM
         {
             continue;
         }
-        if undelivered_attempts.get(path).copied().unwrap_or(0) < attempt_floor {
+        if settled.undelivered_upload_attempts < attempt_floor {
             continue;
         }
-        match outcome {
+        match settled.entry.outcome.as_str() {
             model::SUPPLY_OUTCOME_REFUSED => {
-                refused.insert(path);
+                refused.insert(*path);
             }
             model::SUPPLY_OUTCOME_FAILED => {
-                failed.insert(path);
+                failed.insert(*path);
             }
             _ => {}
         }
@@ -2324,8 +2285,17 @@ pub async fn run_with_backends(
         // deferral rows. A spec switched from inline to prewarm between
         // processes changes the wiring, but never what the completed stage
         // left undelivered.
+        // supply-fold: outstanding_inline_deferrals — the gate's trigger
+        // evidence is the owner's deferral projection: settlements redeem
+        // a deferral, bookkeeping (a breaker-open `skipped` stamp) cannot
+        // displace it, so an outage that skip-stamps the outstanding
+        // paths leaves the refusal armed (fail-closed). The residual
+        // conservatism is a path that became valid on the target through
+        // some other channel after the stage planned it (the live top-up
+        // skips valid paths without journaling); a resume then refuses
+        // until a supply re-run records it `already-present`.
         let supply_journal: Vec<SupplyEntry> = state.load_jsonl(StateFile::Supply)?;
-        let deferred = undelivered_inline_deferrals(&supply_journal);
+        let deferred = model::SupplyFold::collapse(&supply_journal).outstanding_inline_deferrals();
         if !deferred.is_empty() {
             // Jobs already covered by an earlier process are safe: a job in
             // a batch whose pre-submission top-up succeeded had its gap
@@ -2428,8 +2398,12 @@ pub async fn run_with_backends(
     // dispatched anyway are retired by the collect pass's batch-settle
     // rollup the moment their batch settles.
     let supply_attempt_floor = if supply_topup.is_some() { 2 } else { 1 };
+    // supply-fold: latest_settlements — process-start rollup over the
+    // whole journal (the forward question: what is settled NOW), via
+    // supply_rollup_dispositions.
+    let supply_journal_at_start: Vec<SupplyEntry> = state.load_jsonl(StateFile::Supply)?;
     let supply_retired = supply_rollup_dispositions(
-        &state.load_jsonl::<SupplyEntry>(StateFile::Supply)?,
+        &model::SupplyFold::collapse(&supply_journal_at_start),
         &dep_closure,
         &in_scope,
         &plan_dispositions,
@@ -3273,6 +3247,8 @@ fn load_supply_summary(state: &StateDir) -> Result<Option<SupplyStageReport>> {
     let Some(mut report) = state.read_json::<SupplyStageReport>("supply-report.json")? else {
         return Ok(None);
     };
+    // supply-fold: report_outcomes — per-path display counts, via
+    // refresh_outcome_counts.
     let entries: Vec<SupplyEntry> = state.load_jsonl(StateFile::Supply)?;
     refresh_outcome_counts(&mut report, &entries);
     Ok(Some(report))
@@ -3361,6 +3337,9 @@ async fn collect_pass_with(
         // 1 — the question here is whether the member's required supply WAS
         // settled-undelivered when it ran, not whether a later attempt
         // might still recover the path for someone else.
+        //
+        // supply-fold: latest_settlements — batch-settle rollup, via
+        // supply_rollup_dispositions.
         let entries = match &supply_entries {
             Some(entries) => entries,
             None => supply_entries.insert(state.load_jsonl::<SupplyEntry>(StateFile::Supply)?),
@@ -3372,7 +3351,7 @@ async fn collect_pass_with(
             .filter(|job| !already_terminal.contains(*job))
             .collect();
         let supply_retired = supply_rollup_dispositions(
-            entries,
+            &model::SupplyFold::collapse(entries),
             &supply.dep_closure,
             &members,
             &supply.plan_dispositions,
@@ -4063,55 +4042,11 @@ mod tests {
         );
     }
 
-    /// The inline-resume gate's trigger evidence: a path's LATEST supply
-    /// journal row decides — a deferral row alone is owed, a deferral
-    /// superseded by a later top-up delivery (or a re-run stage's
-    /// already-present) is settled, and rows that never were deferrals
-    /// (prewarm deliveries, genuine unavailability) never trigger. The
-    /// detail string is the producer's own constant
-    /// ([`SUPPLY_DETAIL_DEFERRED_INLINE`]), not a re-typed literal.
-    #[test]
-    fn undelivered_inline_deferrals_reads_latest_row_per_path() {
-        let entry = |path: &str, outcome: &str, detail: Option<&str>| SupplyEntry {
-            path: path.to_string(),
-            source: "embedded".into(),
-            mechanism: "none".into(),
-            outcome: outcome.to_string(),
-            detail: detail.map(str::to_string),
-            batch_id: None,
-            bytes: None,
-            observed_at: now_rfc3339(),
-        };
-        let entries = vec![
-            // Deferred and never redeemed: owed.
-            entry(
-                "/nix/store/owed",
-                SUPPLY_OUTCOME_UNAVAILABLE,
-                Some(SUPPLY_DETAIL_DEFERRED_INLINE),
-            ),
-            // Deferred, then delivered by a per-batch top-up: settled.
-            entry(
-                "/nix/store/redeemed",
-                SUPPLY_OUTCOME_UNAVAILABLE,
-                Some(SUPPLY_DETAIL_DEFERRED_INLINE),
-            ),
-            entry("/nix/store/redeemed", SUPPLY_OUTCOME_DELIVERED, None),
-            // Prewarm delivery and genuine unavailability: never deferrals.
-            entry("/nix/store/prewarmed", SUPPLY_OUTCOME_DELIVERED, None),
-            entry(
-                "/nix/store/missing",
-                SUPPLY_OUTCOME_UNAVAILABLE,
-                Some(
-                    "no target substituter, archive member, or relay substituter can provide this path",
-                ),
-            ),
-        ];
-        assert_eq!(
-            undelivered_inline_deferrals(&entries),
-            vec!["/nix/store/owed"]
-        );
-        assert!(undelivered_inline_deferrals(&[]).is_empty());
-    }
+    // The inline-resume gate's trigger evidence is the fold owner's
+    // deferral projection; its displacement law — quantified over the
+    // full SUPPLY_OUTCOMES vocabulary, both directions — is pinned at the
+    // owner: see model.rs's
+    // `supply_fold_projections_decide_every_outcome_against_a_deferral`.
 
     #[test]
     fn malformed_deadline_is_rejected_naming_the_value() {
@@ -4585,7 +4520,9 @@ mod tests {
         assert!(state.marker_done("supply"), "the supply stage completed");
         let journal = state.load_jsonl::<SupplyEntry>(StateFile::Supply).unwrap();
         assert!(
-            !undelivered_inline_deferrals(&journal).is_empty(),
+            !model::SupplyFold::collapse(&journal)
+                .outstanding_inline_deferrals()
+                .is_empty(),
             "inline delivery deferred the planned uploads"
         );
 
@@ -5163,7 +5100,9 @@ mod tests {
             .load_jsonl::<SupplyEntry>(StateFile::Supply)
             .unwrap();
         assert!(
-            undelivered_inline_deferrals(&journal).is_empty(),
+            model::SupplyFold::collapse(&journal)
+                .outstanding_inline_deferrals()
+                .is_empty(),
             "the re-run stage and its per-batch top-ups redeemed every deferral"
         );
         artifact::assert_state_dir_files_classified(&state_c);
@@ -8355,8 +8294,13 @@ mod tests {
             BTreeMap::from([("excluded.x".to_string(), Disposition::NotAttemptable)]);
         // Attempt floor 1: nothing will re-attempt these paths (no top-up
         // wired), so a single settled refusal/failure retires.
-        let rollup =
-            supply_rollup_dispositions(&entries, &closures, &in_scope, &already_excluded, 1);
+        let rollup = supply_rollup_dispositions(
+            &model::SupplyFold::collapse(&entries),
+            &closures,
+            &in_scope,
+            &already_excluded,
+            1,
+        );
         assert_eq!(
             rollup,
             BTreeMap::from([
@@ -8440,8 +8384,13 @@ mod tests {
         ];
         let in_scope: HashSet<&str> = closures.iter().map(|c| c.job.as_str()).collect();
 
-        let floor2 =
-            supply_rollup_dispositions(&entries, &closures, &in_scope, &BTreeMap::new(), 2);
+        let floor2 = supply_rollup_dispositions(
+            &model::SupplyFold::collapse(&entries),
+            &closures,
+            &in_scope,
+            &BTreeMap::new(),
+            2,
+        );
         assert_eq!(
             floor2,
             BTreeMap::from([
@@ -8455,8 +8404,13 @@ mod tests {
         // Floor 1 (no top-up wired / batch-settle attribution): the single
         // settled failure retires, the laundering skip still does not save
         // its path, and the breaker collapse still retires nobody.
-        let floor1 =
-            supply_rollup_dispositions(&entries, &closures, &in_scope, &BTreeMap::new(), 1);
+        let floor1 = supply_rollup_dispositions(
+            &model::SupplyFold::collapse(&entries),
+            &closures,
+            &in_scope,
+            &BTreeMap::new(),
+            1,
+        );
         assert_eq!(
             floor1,
             BTreeMap::from([
@@ -8606,8 +8560,13 @@ mod tests {
             }];
             let closures = vec![closure.clone()];
             let in_scope: HashSet<&str> = closures.iter().map(|c| c.job.as_str()).collect();
-            let rollup =
-                supply_rollup_dispositions(&entries, &closures, &in_scope, &BTreeMap::new(), 1);
+            let rollup = supply_rollup_dispositions(
+                &model::SupplyFold::collapse(&entries),
+                &closures,
+                &in_scope,
+                &BTreeMap::new(),
+                1,
+            );
             assert_eq!(
                 rollup,
                 BTreeMap::from([(closure.job.clone(), Disposition::UploadRejected)]),

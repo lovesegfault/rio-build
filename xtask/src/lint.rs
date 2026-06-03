@@ -83,6 +83,19 @@ pub enum Lint {
     /// noticed, sibling arms left exposed) that produced the relay
     /// header-wait wedge and the unbounded narinfo collect.
     BoundedIo,
+    /// Every production load of the supply journal (`StateFile::Supply`
+    /// via `load_jsonl`) in rio-replay carries an adjacent
+    /// `// supply-fold: <projection>` marker naming the
+    /// `model::SupplyFold` projection the loaded rows fold through (or
+    /// `exempt — <reason>` for non-fold reads), the named projection
+    /// exists on the owner, and every marker annotates a real load.
+    /// The projection vocabulary is parsed from the owner impl at scan
+    /// time, so it can't drift. Catches a new journal consumer
+    /// hand-rolling latest-row-wins over raw rows — the shape that let
+    /// bookkeeping `skipped` rows displace the inline-resume gate's
+    /// deferral evidence while the settlement-aware sibling folds read
+    /// the same journal correctly.
+    SupplyFoldOwner,
 }
 
 impl Lint {
@@ -104,6 +117,7 @@ impl Lint {
             Lint::StructuredAttrReads,
             Lint::ContractRegistry,
             Lint::BoundedIo,
+            Lint::SupplyFoldOwner,
         ]
     }
 }
@@ -119,6 +133,7 @@ pub fn run(lint: &Lint) -> Result<()> {
         Lint::StructuredAttrReads => structured_attr_reads(),
         Lint::ContractRegistry => contract_registry(),
         Lint::BoundedIo => bounded_io(),
+        Lint::SupplyFoldOwner => supply_fold_owner(),
     }
 }
 
@@ -2000,6 +2015,264 @@ fn bounded_io_marker_annotates(lines: &[&str], marker_idx: usize) -> bool {
 /// Recursive `.rs` walk via `std` (no `walkdir` dep). Follows symlinks
 /// — under the nix flake check, the corpus dirs are staged into a
 /// store-path source tree and may be symlinked.
+/// Marker prefix for [`supply_fold_owner`] call-site annotations.
+const SUPPLY_FOLD_MARKER: &str = "supply-fold:";
+
+/// Supply-journal fold-owner discipline: every PRODUCTION read of
+/// supply.jsonl in rio-replay routes through a named `model::SupplyFold`
+/// projection.
+///
+/// The journal's settlement contract (bookkeeping rows never displace a
+/// settled truth, deferral evidence is redeemed by settlements only) is
+/// enforced INSIDE the fold owner — but only for consumers that use it. A
+/// new `load_jsonl(StateFile::Supply)` that hand-rolls latest-row-wins
+/// over the raw rows silently re-derives weaker semantics; that exact
+/// shape shipped the fail-open inline-resume gate (an unfiltered fold let
+/// breaker `skipped` rows erase the gate's deferral evidence) while two
+/// settlement-aware sibling folds read the same journal correctly.
+///
+/// Mechanics, two-directional like [`bookkeeping_marker`]:
+///
+/// - every `StateFile::Supply` use in rio-replay production code (the
+///   region before the file's first `#[cfg(test)]`) is classified by its
+///   call: `append_jsonl` = writer (the producer side, no marker),
+///   `load_jsonl` = consumer — which must carry an adjacent
+///   `// supply-fold: <projection>` marker within the preceding
+///   [`SUPPLY_FOLD_WINDOW`] lines, naming the owner projection the rows
+///   fold through, or `exempt — <reason>` for reads that fold no per-path
+///   truth (e.g. the coverage probe's "which paths have ANY row"
+///   presence set). Anything else fails loud: a new access shape must be
+///   classified here before it ships.
+/// - every marker must have a `StateFile::Supply` load within the
+///   following [`SUPPLY_FOLD_WINDOW`] lines, so a justification cannot
+///   outlive the load it vouches for.
+///
+/// The projection vocabulary is parsed from the `impl<'a> SupplyFold<'a>`
+/// block in rio-replay's model.rs at scan time (its `pub fn` names), so a
+/// renamed or removed projection invalidates the markers that name it
+/// instead of letting them rot. `state.rs` is skipped: it owns the
+/// `StateFile` enum (file-name table, sync manifest), not journal
+/// semantics.
+fn supply_fold_owner() -> Result<()> {
+    let root = repo_root();
+    let model_rel = "rio-replay/src/run/model.rs";
+    let model_src =
+        fs::read_to_string(root.join(model_rel)).with_context(|| format!("reading {model_rel}"))?;
+    let projections = extract_supply_fold_projections(&model_src);
+    ensure!(
+        projections.len() >= 4,
+        "only {} `pub fn` projection(s) found in {model_rel}'s SupplyFold impl — the owner \
+         moved or the extraction regressed: {projections:?}",
+        projections.len(),
+    );
+
+    let scan_root = root.join("rio-replay/src");
+    ensure!(scan_root.is_dir(), "supply-fold scan root not found");
+    let mut loads = 0usize;
+    let mut writes = 0usize;
+    let mut violations: Vec<String> = Vec::new();
+    walk_rs(&scan_root, &mut |path: &Path| -> Result<()> {
+        if path.ends_with("run/state.rs") {
+            return Ok(());
+        }
+        let src =
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        let (file_loads, file_writes) =
+            check_supply_fold_file(&src, &rel, &projections, &mut violations);
+        loads += file_loads;
+        writes += file_writes;
+        Ok(())
+    })?;
+
+    // Floor guards: 4 production loads (gate, two rollup call sites, the
+    // report refresh) + the coverage probe's exempt read, and at least
+    // the upload-arm + probe + deferral writers, exist today. A collapse
+    // means the detection regressed, not that the journal went unread.
+    ensure!(
+        loads >= 4,
+        "supply-fold scan found only {loads} production load(s) of StateFile::Supply — \
+         suspiciously few; the detection has regressed",
+    );
+    ensure!(
+        writes >= 3,
+        "supply-fold scan found only {writes} production append(s) of StateFile::Supply — \
+         suspiciously few; the detection has regressed",
+    );
+    if !violations.is_empty() {
+        bail!(
+            "{} supply-fold violation(s):\n    {}\n  every production load of supply.jsonl \
+             must carry an adjacent `// {SUPPLY_FOLD_MARKER} <projection>` naming the \
+             model::SupplyFold projection it folds through (one of {projections:?}, or \
+             `exempt — <reason>` for non-fold reads), and every marker must annotate a load",
+            violations.len(),
+            violations.join("\n    "),
+        );
+    }
+    tracing::info!(loads, writes, ?projections, "supply-fold-owner ok");
+    Ok(())
+}
+
+/// `pub fn` names inside the `impl<'a> SupplyFold<'a>` block — the legal
+/// marker vocabulary for [`supply_fold_owner`].
+fn extract_supply_fold_projections(model_src: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut in_impl = false;
+    for line in model_src.lines() {
+        if line.starts_with("impl<'a> SupplyFold<'a>") {
+            in_impl = true;
+            continue;
+        }
+        if in_impl {
+            // The impl block closes at the first column-0 brace.
+            if line.starts_with('}') {
+                break;
+            }
+            if let Some(rest) = line.trim_start().strip_prefix("pub fn ")
+                && let Some(name) = rest.split('(').next()
+            {
+                names.insert(name.trim().to_string());
+            }
+        }
+    }
+    names
+}
+
+/// How far (in lines) a `// supply-fold:` marker may sit above its load,
+/// and a load below its marker — wide enough for a rationale paragraph
+/// between them, narrow enough that a marker cannot vouch across
+/// unrelated statements.
+const SUPPLY_FOLD_WINDOW: usize = 12;
+
+/// Scan one file for [`supply_fold_owner`]; returns `(loads, writes)`
+/// found in the production region, pushing violations for unmarked or
+/// misnamed loads, unclassifiable uses, and stale markers.
+fn check_supply_fold_file(
+    src: &str,
+    rel: &str,
+    projections: &BTreeSet<String>,
+    violations: &mut Vec<String>,
+) -> (usize, usize) {
+    let lines: Vec<&str> = src.lines().collect();
+    let prod_end = lines
+        .iter()
+        .position(|line| line.trim() == "#[cfg(test)]")
+        .unwrap_or(lines.len());
+    let lines = &lines[..prod_end];
+    let mut loads = 0usize;
+    let mut writes = 0usize;
+    for i in 0..lines.len() {
+        let trimmed = lines[i].trim_start();
+        if lines[i].contains("StateFile::Supply") && !trimmed.starts_with("//") {
+            // Classify by the owning call, which may sit up to two lines
+            // above (`state.append_jsonl(\n StateFile::Supply, ...`).
+            let window_start = i.saturating_sub(2);
+            let call_window = lines[window_start..=i].join("\n");
+            if call_window.contains("append_jsonl") {
+                writes += 1;
+            } else if call_window.contains("load_jsonl") {
+                loads += 1;
+                match supply_fold_marker_above(lines, i) {
+                    None => violations.push(format!(
+                        "{rel}:{}: supply.jsonl load without an adjacent \
+                         `// {SUPPLY_FOLD_MARKER} <projection>` marker",
+                        i + 1,
+                    )),
+                    Some(SupplyFoldMarker { name, has_reason })
+                        if name == "exempt" && !has_reason =>
+                    {
+                        violations.push(format!(
+                            "{rel}:{}: `{SUPPLY_FOLD_MARKER} exempt` needs a reason \
+                             (`exempt — <why no per-path truth is folded>`)",
+                            i + 1,
+                        ));
+                    }
+                    Some(SupplyFoldMarker { name, .. })
+                        if name != "exempt" && !projections.contains(&name) =>
+                    {
+                        violations.push(format!(
+                            "{rel}:{}: supply-fold marker names `{name}`, which is not a \
+                             SupplyFold projection ({projections:?}) or `exempt`",
+                            i + 1,
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            } else {
+                violations.push(format!(
+                    "{rel}:{}: unclassifiable StateFile::Supply use (neither append_jsonl \
+                     nor load_jsonl in reach) — classify the new access shape in this lint",
+                    i + 1,
+                ));
+            }
+        }
+        // Staleness: a non-doc marker must annotate a load below it.
+        if lines[i].contains(SUPPLY_FOLD_MARKER)
+            && trimmed.starts_with("//")
+            && !trimmed.starts_with("///")
+            && !trimmed.starts_with("//!")
+        {
+            let below_end = (i + 1 + SUPPLY_FOLD_WINDOW).min(lines.len());
+            let annotates = lines[i + 1..below_end]
+                .iter()
+                .any(|line| line.contains("StateFile::Supply"));
+            if !annotates {
+                violations.push(format!(
+                    "{rel}:{}: stale `// {SUPPLY_FOLD_MARKER}` marker — no StateFile::Supply \
+                     load within the next {SUPPLY_FOLD_WINDOW} lines",
+                    i + 1,
+                ));
+            }
+        }
+    }
+    (loads, writes)
+}
+
+/// A parsed `// supply-fold: <name> [— reason]` marker.
+struct SupplyFoldMarker {
+    /// The named projection (or `exempt`).
+    name: String,
+    /// Whether an em-dash reason follows the name.
+    has_reason: bool,
+}
+
+/// The nearest `// supply-fold: <name> [— reason]` marker within
+/// [`SUPPLY_FOLD_WINDOW`] lines above `load_idx`, if any. The scan walks
+/// through the load's own statement lines and rationale comments — the
+/// window bound and the marker-staleness direction keep it from
+/// over-matching across unrelated statements.
+fn supply_fold_marker_above(lines: &[&str], load_idx: usize) -> Option<SupplyFoldMarker> {
+    let start = load_idx.saturating_sub(SUPPLY_FOLD_WINDOW);
+    for i in (start..load_idx).rev() {
+        let trimmed = lines[i].trim_start();
+        if !trimmed.starts_with("//") {
+            continue;
+        }
+        if let Some(rest) = trimmed
+            .trim_start_matches('/')
+            .trim_start()
+            .strip_prefix(SUPPLY_FOLD_MARKER)
+        {
+            let rest = rest.trim_start();
+            let name = rest
+                .split([' ', '\u{2014}'])
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches(['.', ','])
+                .to_string();
+            return (!name.is_empty()).then_some(SupplyFoldMarker {
+                name,
+                has_reason: rest.contains('\u{2014}'),
+            });
+        }
+    }
+    None
+}
+
 fn walk_rs(dir: &Path, f: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {
     for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
@@ -2200,6 +2473,118 @@ mod tests {
             Lint::all().len(),
             clap_variants.len(),
         );
+    }
+
+    /// Run [`check_supply_fold_file`] over a synthetic source against a
+    /// fixed projection vocabulary; returns `(loads, writes, violations)`.
+    fn sf(src: &str) -> (usize, usize, Vec<String>) {
+        let projections: BTreeSet<String> = ["latest_settlements", "report_outcomes"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let mut violations = Vec::new();
+        let (loads, writes) = check_supply_fold_file(src, "f.rs", &projections, &mut violations);
+        (loads, writes, violations)
+    }
+
+    /// The supply-fold scanner's classification table: appends pass with
+    /// no marker (writers are the producer side), a load with a
+    /// projection-naming marker passes, an exempt-with-reason passes,
+    /// and the violation classes — unmarked load, unknown projection
+    /// name, reasonless exempt, unclassifiable access shape, stale
+    /// marker — each trip. Test code after `#[cfg(test)]` is invisible.
+    #[test]
+    fn supply_fold_scanner_classifies_loads_writes_and_markers() {
+        // Writers: no marker needed, counted as writes.
+        let (loads, writes, violations) =
+            sf("    state.append_jsonl(\n        StateFile::Supply,\n        &row,\n    )?;\n");
+        assert_eq!((loads, writes), (0, 1));
+        assert!(violations.is_empty(), "{violations:?}");
+
+        // Marked load with a legal projection: clean.
+        let (loads, _, violations) = sf(
+            "    // supply-fold: latest_settlements — rollup input.\n    let rows = state.load_jsonl::<SupplyEntry>(StateFile::Supply)?;\n",
+        );
+        assert_eq!(loads, 1);
+        assert!(violations.is_empty(), "{violations:?}");
+
+        // Exempt with a reason: clean. Without one: violation.
+        let (_, _, violations) = sf(
+            "    // supply-fold: exempt — presence set only.\n    let rows = state.load_jsonl::<SupplyEntry>(StateFile::Supply)?;\n",
+        );
+        assert!(violations.is_empty(), "{violations:?}");
+        let (_, _, violations) = sf(
+            "    // supply-fold: exempt\n    let rows = state.load_jsonl::<SupplyEntry>(StateFile::Supply)?;\n",
+        );
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("needs a reason"), "{violations:?}");
+
+        // Unmarked load: violation.
+        let (_, _, violations) =
+            sf("    let rows = state.load_jsonl::<SupplyEntry>(StateFile::Supply)?;\n");
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("without an adjacent"),
+            "{violations:?}"
+        );
+
+        // Marker naming a non-projection: violation.
+        let (_, _, violations) = sf(
+            "    // supply-fold: hand_rolled_fold\n    let rows = state.load_jsonl::<SupplyEntry>(StateFile::Supply)?;\n",
+        );
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("hand_rolled_fold"), "{violations:?}");
+
+        // Unclassifiable access shape: violation demanding lint extension.
+        let (_, _, violations) = sf("    let f = StateFile::Supply;\n");
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("unclassifiable"), "{violations:?}");
+
+        // Stale marker (no load below): violation.
+        let (_, _, violations) = sf("    // supply-fold: latest_settlements\n    let x = 1;\n");
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("stale"), "{violations:?}");
+
+        // Test region is invisible: an unmarked load after #[cfg(test)]
+        // neither counts nor violates.
+        let (loads, writes, violations) = sf(
+            "#[cfg(test)]\nmod tests {\n    let rows = state.load_jsonl::<SupplyEntry>(StateFile::Supply)?;\n}\n",
+        );
+        assert_eq!((loads, writes), (0, 0));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    /// The projection vocabulary comes from the owner impl in model.rs
+    /// source — `pub fn` names inside `impl<'a> SupplyFold<'a>`, nothing
+    /// outside it.
+    #[test]
+    fn supply_fold_projection_extraction_reads_the_owner_impl() {
+        let src = "\
+pub struct SupplyFold;\n\
+impl<'a> SupplyFold<'a> {\n\
+    pub fn collapse(entries: &[SupplyEntry]) -> Self { todo!() }\n\
+    fn fold(&self) {}\n\
+    pub fn latest_settlements(&self) -> usize { 0 }\n\
+}\n\
+impl Other {\n\
+    pub fn not_a_projection(&self) {}\n\
+}\n";
+        let names = extract_supply_fold_projections(src);
+        assert_eq!(
+            names,
+            ["collapse", "latest_settlements"]
+                .into_iter()
+                .map(String::from)
+                .collect::<BTreeSet<String>>()
+        );
+    }
+
+    /// The real tree passes the supply-fold lint: every production load
+    /// is marked with a live projection (or a reasoned exemption), and
+    /// the floor guards see the expected population.
+    #[test]
+    fn supply_fold_owner_passes_on_the_real_tree() {
+        supply_fold_owner().unwrap();
     }
 
     fn scan(sql: &str) -> Result<BTreeSet<String>> {
