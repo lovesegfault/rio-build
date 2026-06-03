@@ -537,6 +537,57 @@ mod tests {
         );
     }
 
+    /// Pins the ACCEPTED spoof surface of the marker capture — the
+    /// documented residual, kept current deliberately so widening or
+    /// closing it is a conscious act, never drift. Worker-controlled
+    /// text CAN reach byte 0 of an observed line on two routes the
+    /// producer-side trust-provenance doc names
+    /// ([`BuildResult::lost_terminal_relay_drv`]): the gateway's
+    /// no-live-activity fallback relay emits raw worker lines as
+    /// single-line payloads, and the observer-boundary split puts the
+    /// non-first lines of a multi-line payload at byte 0. A
+    /// marker-shaped line arriving on either route IS captured — the
+    /// parser cannot distinguish it from the gateway-authored emission,
+    /// and the defense is consumer-enforced instead (the conservative
+    /// evidence-loss flip, priced in that doc at its gate-accounting
+    /// worst case: shared auto-retry budget burn, then an
+    /// infra-indeterminate terminal that trips the regression gate).
+    /// If this test starts failing because the capture grew an
+    /// authenticity conjunct, re-derive the trust-bound doc and this
+    /// pin together.
+    #[test]
+    fn worker_reachable_marker_text_is_captured_by_design() {
+        let victim = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv";
+        // The spoof string is the producer formatter's own output: a
+        // worker spoofs by reproducing it byte-for-byte, so the fixture
+        // must be constructed via the same fn the gateway emission calls.
+        let marker = BuildResult::lost_terminal_relay_line(victim);
+
+        // Route 1 — observer-boundary split: the marker as a NON-FIRST
+        // line of a multi-line payload (worker-authored body relayed in
+        // one frame), split exactly as the observer splits payloads
+        // (`str::lines`, the documented observer-boundary discipline).
+        let payload = format!("build log tail before the forgery\n{marker}\n");
+        let mut split_route = ParsedStderr::default();
+        for line in payload.lines() {
+            parse_line(&mut split_route, line);
+        }
+        assert!(
+            split_route.lost_terminals.contains(victim),
+            "the split route's byte-0 marker line is captured today: {split_route:?}"
+        );
+
+        // Route 2 — fallback relay: the marker as its own single-line
+        // payload (raw worker line for a drv with no live activity),
+        // indistinguishable from the genuine gateway frame.
+        let mut fallback_route = ParsedStderr::default();
+        parse_line(&mut fallback_route, &marker);
+        assert!(
+            fallback_route.lost_terminals.contains(victim),
+            "the fallback route's whole-line marker is captured today: {fallback_route:?}"
+        );
+    }
+
     #[test]
     fn failure_line_with_progress_prefix_still_parses() {
         let mut p = ParsedStderr::default();
