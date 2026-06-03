@@ -2938,17 +2938,19 @@ mod tests {
     /// stale poison rows WITH builders — successes never consult poison,
     /// and a poison row must not flip an evidence-loss report), the
     /// fixed-output bit (no source-rot shadow), and the budget axis
-    /// (fresh / exhausted). The timed-batch and confirmation-belt
-    /// crossings live in `process_settled_batch` (membership decisions,
-    /// not outcome decisions) and are pinned by
+    /// (fresh / exhausted). The timed-batch, armed-interruption, and
+    /// confirmation-belt crossings live in `process_settled_batch`
+    /// (membership decisions and step-0 classification precedence, not
+    /// outcome decisions) and are pinned by
     /// `lost_terminal_marker_rows_settle_as_evidence_loss_end_to_end`.
     /// Must-NOT-match: no marker (the genuine-substitution leg, asserted
     /// all the way to the `target-substituted` disposition), marker for a
     /// DIFFERENT drv, marker × executed `Built` (an own terminal is
-    /// strictly stronger evidence), marker × `AlreadyValid` (the status
-    /// conjunct — the producer pairs the marker with `Substituted` only),
-    /// marker × failure rows (the failure path is untouched), and the
-    /// marker text arriving in-band instead of on the relay channel.
+    /// strictly stronger evidence), marker × `AlreadyValid` /
+    /// `ResolvesToAlreadyValid` (the status conjunct — the producer pairs
+    /// the marker with `Substituted` only), marker × failure rows (the
+    /// failure path is untouched), and the marker text arriving in-band
+    /// instead of on the relay channel.
     #[tokio::test]
     async fn lost_terminal_marker_substituted_row_is_evidence_loss_not_target_substituted()
     -> Result<()> {
@@ -3109,23 +3111,33 @@ mod tests {
                 ..
             }
         ));
-        // Marker × AlreadyValid: the status conjunct holds — the producer
-        // pairs the marker with Substituted only.
-        assert!(matches!(
-            decide(
-                &c,
-                Some(&po(T, BuildStatus::AlreadyValid, "")),
-                &marked(false, false),
-                &no_poison,
-                prior(0),
-                &knobs,
-                None
-            ),
-            CollectDecision::Terminal {
-                rio: RioOutcome::Built { executed: false },
-                ..
-            }
-        ));
+        // Marker × AlreadyValid / ResolvesToAlreadyValid: the status
+        // conjunct holds — the producer pairs the marker with
+        // Substituted only; the other completed-without-execution words
+        // come from validity paths, not the lost-terminal mint.
+        for valid_shaped in [
+            BuildStatus::AlreadyValid,
+            BuildStatus::ResolvesToAlreadyValid,
+        ] {
+            assert!(
+                matches!(
+                    decide(
+                        &c,
+                        Some(&po(T, valid_shaped, "")),
+                        &marked(false, false),
+                        &no_poison,
+                        prior(0),
+                        &knobs,
+                        None
+                    ),
+                    CollectDecision::Terminal {
+                        rio: RioOutcome::Built { executed: false },
+                        ..
+                    }
+                ),
+                "marker × {valid_shaped:?} must keep the unexecuted-success leg"
+            );
+        }
         // Marker × a failure row: the failure path is untouched — the
         // marker disambiguates success words only, and the in-band
         // failure (here a genuine worker message) classifies normally.
@@ -3187,6 +3199,13 @@ mod tests {
     /// - timed batch (marker × `kind=timed`): the requeue-shaped decision
     ///   defers to the timed dispatcher — never re-offered to the
     ///   timeless pool, no terminal record minted;
+    /// - armed interruption (marker × `kind=timed` ×
+    ///   `interruption_drvs`), BOTH budget states: fresh budget defers
+    ///   exactly like the unarmed timed cell (the marker arm's requeue
+    ///   shape — not an immediate interruption record); exhausted budget
+    ///   records verdict `interruption-not-reproduced` carrying the
+    ///   marker arm's infra evidence — the deliberately pinned
+    ///   precedence choice (see the cell's comment);
     /// - confirmation belt (marker × `confirmation_attempt` ×
     ///   already-terminal): a marked `Substituted` retry is
     ///   presence-shaped, not an executed build, so it cannot supersede
@@ -3329,6 +3348,126 @@ mod tests {
         );
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert!(records.is_empty(), "{records:?}");
+
+        // ── Armed interruption × marker, fresh budget: the marker arm's
+        // requeue shape defers like the unarmed timed cell — a CHANGE
+        // from the pre-marker behavior, where the success-shaped row
+        // terminalized immediately and the armed unit recorded
+        // interruption-not-reproduced on the spot. Deferring is correct:
+        // the evidence channel was lost, and the timed dispatcher's
+        // confirmation retry is the designed re-attempt that produces a
+        // real terminal to answer the interruption question with.
+        // (`timed_interruption_for(batch, drv, None)` is consulted on
+        // the requeue path and only short-circuits for a FIRED
+        // disconnect-replay deadline, which a with-results batch cannot
+        // carry.) ──
+        let armed = |confirmation_attempt: u32| {
+            let mut batch = marked_batch(BATCH_KIND_TIMED, confirmation_attempt);
+            batch.interruption_drvs = vec![T.to_string()];
+            batch
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let decisions = process_settled_batch(
+            &state,
+            &LogAdmin::default(),
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &[job.to_string()],
+            &armed(0),
+            &HashMap::new(),
+            &Knobs::default(),
+            "timed",
+            "c1",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            decisions[job],
+            CollectDecision::Defer {
+                reason: "infra-auto-retry"
+            },
+            "an armed interruption does not turn the marker's re-attempt into an \
+             immediate interruption record"
+        );
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert!(records.is_empty(), "{records:?}");
+
+        // ── Armed interruption × marker, budget exhausted: the marker
+        // arm terminalizes TargetFailed{Infra} with its provenance
+        // evidence, and classification then applies step-0 precedence —
+        // `classify` consults `AuxFlags::timed_interruption` before any
+        // other rule, and `timed_interruption_for(batch, drv,
+        // in_band_success)` derives `Some(NotReproduced)` from the RAW
+        // success-shaped in-band row (armed, deadline did not fire, the
+        // submission settled in band). The verdict is therefore
+        // interruption-not-reproduced, NOT infra-indeterminate.
+        //
+        // PINNED DELIBERATELY: the armed-interruption question — "did
+        // the recorded interruption replay?" — is answered by the
+        // in-band settle itself (the build out-raced the abandon
+        // deadline; nothing about the recording was reproduced), and
+        // that observation outranks the row's evidence QUALITY, which is
+        // what the marker degrades. The marker arm's infra evidence
+        // still rides the record, so the lost channel stays auditable
+        // under the interruption verdict. Re-routing this cell to
+        // infra-indeterminate would be a behavior change to the timed
+        // fidelity vocabulary and needs its own justification — this
+        // assertion is where that decision would surface. ──
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let decisions = process_settled_batch(
+            &state,
+            &LogAdmin::default(),
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &[job.to_string()],
+            &armed(0),
+            &exhausted,
+            &Knobs::default(),
+            "timed",
+            "c1",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                decisions[job],
+                CollectDecision::Terminal {
+                    rio: RioOutcome::TargetFailed {
+                        kind: FailureKind::Infra
+                    },
+                    ..
+                }
+            ),
+            "{:?}",
+            decisions[job]
+        );
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].verdict.as_deref(),
+            Some("interruption-not-reproduced"),
+            "classify step-0 precedence: the timed-interruption flag outranks the \
+             marker arm's infra rio outcome"
+        );
+        assert_eq!(records[0].disposition, None);
+        assert!(
+            records[0]
+                .evidence
+                .as_deref()
+                .unwrap()
+                .contains("gateway lost-terminal relay marker"),
+            "the marker arm's provenance evidence must ride the interruption \
+             verdict: {:?}",
+            records[0].evidence
+        );
 
         // ── Confirmation belt: a marked Substituted retry is
         // presence-shaped — it cannot supersede the recorded verdict
