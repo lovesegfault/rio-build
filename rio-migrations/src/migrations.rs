@@ -1938,6 +1938,24 @@ pub const M_085: () = ();
 /// after ~111s of reconnect attempts). NULL columns (pre-087 terminal
 /// rows) degrade to the old empty-payload snapshot — additive only.
 pub const M_087: () = ();
+/// `migrations/088_store_degraded_outcome_class.sql`
+///
+/// The `store_degraded` outcome class joins the attempt-ledger alphabet
+/// (bughunt fix wave B1 bounded-await-transport, bug_408; spec rules
+/// `builder.outcome.store-degraded` /
+/// `sched.retry.store-degraded-uncharged`). Re-creates
+/// `drv_attempts_outcome_class_check` as 085's seventeen-minus-one set
+/// plus `'store_degraded'`: an infrastructure failure the builder
+/// stamped `BuildResult.store_degraded` (FUSE breaker open at
+/// completion, or tripped during the build). The class is pure pacing
+/// in the kernel fold — it advances no count budget, mints no
+/// exclusion key, and can never reach a poison verdict (there is no
+/// `AttemptEvent` for it; `decide()` folds it as backoff-only from
+/// the consecutive run) — restoring the heartbeat-era
+/// "wait out the outage" disposition the 1d collapse traded away,
+/// without per-node capacity state. Rows carry `source_node = NULL`
+/// (the failure is the STORE's, not the node's).
+pub const M_088: () = ();
 /// `migrations/089_log_authority.sql`
 ///
 /// The log-ingest authority surface goes durable (bughunt wave,

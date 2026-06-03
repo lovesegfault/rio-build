@@ -160,6 +160,11 @@ pub struct BuildResult {
     pub start_time: Option<SystemTime>,
     pub stop_time: Option<SystemTime>,
     pub built_outputs: Vec<BuiltOutput>,
+    /// bug_408: the builder's FUSE breaker attributed an
+    /// `InfrastructureFailure` to a degraded store
+    /// (`builder.outcome.store-degraded`). Routes the report to the
+    /// uncharged pacing class at the completion intake.
+    pub store_degraded: bool,
 }
 
 impl From<proto::BuildResult> for BuildResult {
@@ -177,6 +182,7 @@ impl From<proto::BuildResult> for BuildResult {
             start_time: r.start_time.and_then(to_system_time),
             stop_time: r.stop_time.and_then(to_system_time),
             built_outputs: r.built_outputs.into_iter().map(Into::into).collect(),
+            store_degraded: r.store_degraded,
         }
     }
 }

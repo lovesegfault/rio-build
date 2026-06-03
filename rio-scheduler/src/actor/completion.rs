@@ -58,6 +58,13 @@ pub(super) struct FailureReportCtx<'a> {
     pub(super) final_line_count: Option<i64>,
     /// Worker-provided error message (may be empty).
     pub(super) error_msg: &'a str,
+    /// bug_408: `BuildResult.store_degraded` — the builder's FUSE
+    /// breaker attributed this infrastructure failure to a degraded
+    /// store. Routes the report to the uncharged `store_degraded`
+    /// class (`sched.retry.store-degraded-uncharged`). Only the
+    /// InfrastructureFailure dispatch arm sets it; every other path
+    /// leaves it `false`.
+    pub(super) store_degraded: bool,
 }
 
 /// Whether a Phase-1b-collapsed failure handler completed its appending
@@ -1148,6 +1155,7 @@ impl DagActor {
                         FailureReportCtx {
                             final_line_count: report_line_count,
                             error_msg: &result.error_msg,
+                            store_degraded: false,
                         },
                     )
                     .await;
@@ -1178,6 +1186,7 @@ impl DagActor {
                         FailureReportCtx {
                             final_line_count: report_line_count,
                             error_msg: &result.error_msg,
+                            store_degraded: result.store_degraded,
                         },
                     )
                     .await;
@@ -1215,6 +1224,7 @@ impl DagActor {
                         FailureReportCtx {
                             final_line_count: report_line_count,
                             error_msg: &result.error_msg,
+                            store_degraded: result.store_degraded,
                         },
                     )
                     .await;
@@ -1247,6 +1257,7 @@ impl DagActor {
                         FailureReportCtx {
                             final_line_count: report_line_count,
                             error_msg: &result.error_msg,
+                            store_degraded: false,
                         },
                     )
                     .await;
@@ -1286,6 +1297,7 @@ impl DagActor {
                         FailureReportCtx {
                             final_line_count: report_line_count,
                             error_msg: "worker reported Cancelled without scheduler-initiated cancel",
+                            store_degraded: false,
                         },
                     )
                     .await;
@@ -1321,6 +1333,7 @@ impl DagActor {
                         FailureReportCtx {
                             final_line_count: report_line_count,
                             error_msg: &result.error_msg,
+                            store_degraded: false,
                         },
                     )
                     .await;
@@ -2943,16 +2956,21 @@ impl DagActor {
         // contract can't drift between the `#[error]` attr (pinned by
         // rio-builder's `cgroup_oom_display_contains_proto_constant`
         // test) and this consumer match site.
-        let floor_outcome = if error_msg.contains(rio_proto::CGROUP_OOM_MSG) {
-            self.bump_resource_floor(
-                drv_hash,
-                rio_proto::types::TerminationReason::OomKilled,
-                "cgroup_oom",
-            )
-            .await
-        } else {
-            super::floor::FloorOutcome::default()
-        };
+        // bug_408: a store-degraded failure is never a sizing signal —
+        // the breaker fired on store fetches, not on the build's
+        // memory — so the floor bump is skipped even if the message
+        // happens to contain the OOM marker.
+        let floor_outcome =
+            if !report.store_degraded && error_msg.contains(rio_proto::CGROUP_OOM_MSG) {
+                self.bump_resource_floor(
+                    drv_hash,
+                    rio_proto::types::TerminationReason::OomKilled,
+                    "cgroup_oom",
+                )
+                .await
+            } else {
+                super::floor::FloorOutcome::default()
+            };
 
         if self.dag.node(drv_hash).is_none() {
             return FailureHandling::Handled;
@@ -2979,8 +2997,19 @@ impl DagActor {
         // The exemption predicate (promoted-or-CONCURRENT_PUTPATH) lives
         // in `classify()` — the single append-time classifier — so the
         // row's class is what the fold charges.
+        // r[impl sched.retry.store-degraded-uncharged]
+        // bug_408: the flagged report classifies as the dedicated
+        // pacing class — the kernel fold advances only the derivation
+        // backoff (no count budget, no exclusion, never poison), so
+        // the verdict below is a paced Requeue for as long as the
+        // outage lasts.
+        let event = if report.store_degraded {
+            crate::retry_policy::ObservedFailure::WorkerStoreDegraded
+        } else {
+            crate::retry_policy::ObservedFailure::WorkerInfra { error_msg }
+        };
         let class = crate::retry_policy::classify(
-            &crate::retry_policy::ObservedFailure::WorkerInfra { error_msg },
+            &event,
             crate::retry_policy::FloorOutcomeView {
                 promoted: floor_outcome.promoted,
                 at_cap: floor_outcome.at_cap,
@@ -3140,14 +3169,41 @@ impl DagActor {
                           "infrastructure failure: reset_to_ready failed, skipping");
                     return FailureHandling::Handled;
                 }
-                info!(
-                    drv_hash = %drv_hash,
-                    executor_id = %executor_id,
-                    infra_retry_count = state.retry.infra_count,
-                    exempt_from_cap,
-                    error_msg,
-                    "infrastructure failure — retry without poison count"
-                );
+                // r[impl sched.retry.store-degraded-uncharged]
+                // bug_408: the flagged class is the ONE infra shape
+                // that does NOT requeue immediately — the fold computed
+                // the pacing deadline from the consecutive run; write
+                // it through the live backoff carve-out (the refresh
+                // above deliberately preserves the actor-managed value,
+                // same convention as the transient site). Epoch→Instant
+                // mirrors `rebuild_retry_view_from_ledger`.
+                if report.store_degraded
+                    && let Some(t) = decision.counters.backoff_until
+                {
+                    let now_epoch =
+                        crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime;
+                    let deadline = if t > now_epoch {
+                        Instant::now() + std::time::Duration::from_secs(t - now_epoch)
+                    } else {
+                        Instant::now()
+                    };
+                    state.retry.backoff_until = Some(deadline);
+                    info!(
+                        drv_hash = %drv_hash,
+                        executor_id = %executor_id,
+                        backoff_secs = t.saturating_sub(now_epoch),
+                        "store-degraded failure — uncharged requeue, paced backoff"
+                    );
+                } else {
+                    info!(
+                        drv_hash = %drv_hash,
+                        executor_id = %executor_id,
+                        infra_retry_count = state.retry.infra_count,
+                        exempt_from_cap,
+                        error_msg,
+                        "infrastructure failure — retry without poison count"
+                    );
+                }
                 self.requeue_after_recorded_retry(drv_hash);
                 metrics::histogram!(
                     "rio_scheduler_attempt_requeue_seconds",

@@ -305,8 +305,10 @@ in
     crate = crateBuildKani.members.rio-retry-kernel;
     # A2's 12 (kind-partition restatements + worker-abort bound) +
     # B2's check_exec_row_sweep_guards (store.log.sweep-ownership) +
-    # A3's check_materialization_counters_window (the per-job budget window).
-    expectedHarnesses = 14;
+    # A3's check_materialization_counters_window (the per-job budget window) +
+    # B1-s2's check_store_degraded_uncharged_requeue (the pacing class
+    # charges nothing — sched.retry.store-degraded-uncharged).
+    expectedHarnesses = 15;
   };
 
   # rio-evidence-kernel: the scheduler's closure-evidence decision kernel

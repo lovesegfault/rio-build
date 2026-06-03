@@ -1471,6 +1471,62 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.retry.store-degraded-uncharged]
+/// bug_408: an infra failure carrying the builder's `store_degraded`
+/// flag is UNCHARGED — driven past `max_infra_retries` (10) it never
+/// poisons, never advances `infra_count`, never excludes the node;
+/// only the derivation backoff advances (the requeue is paced, not
+/// counted: wait out the outage). RED (recorded, pre-fix): the intake
+/// ignored the flag and folded the report as `WorkerInfra` —
+/// `infra_count` reached 10 by the boundary and the 11th report
+/// poisoned, exactly the fleet-amplification this class exists to
+/// prevent (`left: Poisoned` / `right: not-poisoned`,
+/// `left: 10 / right: 0`).
+#[tokio::test]
+async fn test_store_degraded_infra_uncharged_waits_out_the_outage() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let build_id = Uuid::new_v4();
+    let drv_hash = "store-degraded-drv";
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+
+    // 11 store-degraded infra failures: one past the infra cap.
+    for attempt in 0..11 {
+        pull_complete_failure_result(
+            &handle,
+            drv_hash,
+            rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+                error_msg: format!("FUSE EIO: store unreachable (attempt {attempt})"),
+                store_degraded: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+
+    let s = expect_drv(&handle, drv_hash).await;
+    assert_ne!(
+        s.status,
+        DerivationStatus::Poisoned,
+        "store-degraded failures never reach poison (the class is uncharged)"
+    );
+    assert_eq!(s.retry.infra_count, 0, "no infra budget draw");
+    assert_eq!(s.retry.count, 0, "no transient budget draw");
+    assert_eq!(s.retry.exempt_infra_count, 0, "not exempt-infra either");
+    assert_eq!(s.retry.failure_count, 0, "no flat failure count");
+    assert!(
+        s.retry.failed_builders.is_empty(),
+        "the store's failure mints no node exclusion"
+    );
+    assert!(
+        s.retry.backoff_until.is_some(),
+        "the requeue is paced by the derivation backoff"
+    );
+    Ok(())
+}
+
 /// InfrastructureFailure hits `max_infra_retries` → poison. The cap
 /// exists to convert a misclassified permanent failure (e.g. S3 auth
 /// error reported as infra) into a visible poison instead of a hot

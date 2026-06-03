@@ -673,6 +673,13 @@ db_str_enum! {
         /// the build lane (the cut is `(attempt_kind, event_kind)`;
         /// this class is row data, never the cut predicate).
         MaterializationReset = "materialization_reset",
+        /// bug_408 (migration 088): an infrastructure failure the
+        /// builder stamped `BuildResult.store_degraded` (FUSE breaker
+        /// open at completion or tripped during the build). Pure
+        /// pacing in the fold (`sched.retry.store-degraded-uncharged`):
+        /// no count budget, no exclusion key, never poison — only the
+        /// derivation backoff advances from the consecutive run.
+        StoreDegraded = "store_degraded",
     }
     parse_err(_s) = &'static str:
         "invalid outcome class (not in the migration-066 alphabet)";

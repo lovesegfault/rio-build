@@ -228,6 +228,7 @@ fn kernel_outcome_class(class: OutcomeClass) -> rio_retry_kernel::OutcomeClass {
         OutcomeClass::ExecutorCrash => rio_retry_kernel::OutcomeClass::ExecutorCrash,
         OutcomeClass::FleetExhaust => rio_retry_kernel::OutcomeClass::FleetExhaust,
         OutcomeClass::ResubmitReset => rio_retry_kernel::OutcomeClass::ResubmitReset,
+        OutcomeClass::StoreDegraded => rio_retry_kernel::OutcomeClass::StoreDegraded,
         OutcomeClass::CacheHitClear => rio_retry_kernel::OutcomeClass::CacheHitClear,
         OutcomeClass::PoisonCleared => rio_retry_kernel::OutcomeClass::PoisonCleared,
         OutcomeClass::MaterializationUnobtainable => {
@@ -269,6 +270,7 @@ fn db_outcome_class(class: rio_retry_kernel::OutcomeClass) -> OutcomeClass {
         }
         rio_retry_kernel::OutcomeClass::MaterializationInfra => OutcomeClass::MaterializationInfra,
         rio_retry_kernel::OutcomeClass::MaterializationReset => OutcomeClass::MaterializationReset,
+        rio_retry_kernel::OutcomeClass::StoreDegraded => OutcomeClass::StoreDegraded,
     }
 }
 
@@ -783,6 +785,70 @@ mod tests {
 
     fn worker_rec(class: OutcomeClass, executor: &str, at: u64) -> AttemptRecord {
         rec(class, ReportingParty::Worker, executor, at)
+    }
+
+    // r[verify sched.retry.store-degraded-uncharged]
+    /// bug_408 fold battery: N store-degraded rows ⇒ Requeue, every
+    /// count counter zero, exclusion empty, never Poison; the backoff
+    /// deadline follows the curve over the consecutive run
+    /// (base·multᵃ capped), computed from the LAST row's timestamp.
+    #[test]
+    fn store_degraded_battery_uncharged_paced_requeue() {
+        let b = Budget::default(); // base 5, mult 2, cap 300
+        // 12 consecutive degraded rows, 10s apart — past every cap.
+        let history: Vec<AttemptRecord> = (0..12)
+            .map(|i| worker_rec(OutcomeClass::StoreDegraded, "w1", 1_000 + i * 10))
+            .collect();
+        let d = decide(&history, &b, 2_000);
+        assert_eq!(d.verdict, Verdict::Requeue, "never poisons");
+        assert!(d.exclusion.is_empty(), "no exclusion key");
+        assert_eq!(d.counters.count, 0);
+        assert_eq!(d.counters.infra_count, 0);
+        assert_eq!(d.counters.timeout_count, 0);
+        assert_eq!(d.counters.exempt_infra_count, 0);
+        assert_eq!(d.counters.failure_count, 0);
+        assert_eq!(d.counters.poisoned_at, None);
+        // Run index 11 ⇒ 5·2¹¹ ≫ 300 ⇒ capped: last row at 1110 + 300.
+        assert_eq!(d.backoff_until, Some(1_110 + 300));
+    }
+
+    /// The consecutive run resets on any other folded event: the
+    /// degraded row AFTER a transient charge restarts the curve at
+    /// `base` (the pacing is per-outage, not per-derivation-lifetime).
+    #[test]
+    fn store_degraded_run_resets_on_other_events() {
+        let b = Budget::default();
+        let history = vec![
+            worker_rec(OutcomeClass::StoreDegraded, "w1", 1_000), // run 0: +5
+            worker_rec(OutcomeClass::StoreDegraded, "w1", 1_010), // run 1: +10
+            worker_rec(OutcomeClass::Transient, "w1", 1_020),     // breaks the run
+            worker_rec(OutcomeClass::StoreDegraded, "w1", 1_030), // run 0 again: +5
+        ];
+        let d = decide(&history, &b, 1_031);
+        // The transient charged normally...
+        assert_eq!(d.counters.count, 1);
+        assert_eq!(d.counters.failure_count, 1);
+        // ...and the post-break degraded row paced from base again,
+        // exceeding the transient's own (count-1=0 ⇒ base) deadline.
+        assert_eq!(d.backoff_until, Some(1_030 + 5));
+    }
+
+    /// Classify maps the flagged event to the dedicated class with no
+    /// floor sensitivity (the disposition IS the class).
+    #[test]
+    fn store_degraded_classifies_floor_blind() {
+        for promoted in [false, true] {
+            assert_eq!(
+                rio_retry_kernel::classify(
+                    &ObservedFailure::WorkerStoreDegraded,
+                    FloorOutcomeView {
+                        promoted,
+                        at_cap: false
+                    },
+                ),
+                rio_retry_kernel::OutcomeClass::StoreDegraded,
+            );
+        }
     }
 
     fn decide_default(history: &[AttemptRecord], now: AbsTime) -> Decision {

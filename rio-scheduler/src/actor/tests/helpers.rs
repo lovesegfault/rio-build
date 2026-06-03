@@ -1210,6 +1210,17 @@ pub(crate) async fn pull_complete_failure(
     .await
 }
 
+/// [`pull_complete_failure`] with a caller-built `BuildResult` — for
+/// reports that carry more than (status, error_msg), e.g. bug_408's
+/// `store_degraded` flag.
+pub(crate) async fn pull_complete_failure_result(
+    handle: &ActorHandle,
+    drv_hash: &str,
+    result: rio_proto::types::BuildResult,
+) -> anyhow::Result<()> {
+    pull_report(handle, drv_hash, pull_payload(result)).await
+}
+
 /// Record the controller-authoritative pod→node binding for `intent`
 /// (`AckSpawnedIntents.bound_intents` — the same Model J surface the
 /// controller drives). Subsequent attempt rows for the intent carry

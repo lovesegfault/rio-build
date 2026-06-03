@@ -1206,6 +1206,17 @@ pub enum OutcomeClass {
     /// `(kind, event_kind)`; this class is row DATA, never the cut).
     /// Invisible to every build budget (the kind partition).
     MaterializationReset,
+    /// bug_408 (migration 088): an infrastructure failure the builder
+    /// stamped `BuildResult.store_degraded` — the FUSE breaker was
+    /// open at completion or tripped during the build. Attributable to
+    /// the STORE, not the build or the node: the fold treats these
+    /// rows as pure pacing (`sched.retry.store-degraded-uncharged`) —
+    /// no count budget, no exclusion key, never poison; only
+    /// `backoff_until` advances, from the consecutive run. There is
+    /// deliberately NO `AttemptEvent` for this class: the charging
+    /// alphabet cannot represent it, so a future `apply()` arm cannot
+    /// charge it by accident.
+    StoreDegraded,
 }
 
 /// Which party observed/reported the event behind an attempt-ledger
@@ -1526,6 +1537,12 @@ pub fn decide<Id: Ord + Clone>(
     let fleet = FleetView::default();
     let mut counters = initial;
     let mut verdict = Verdict::Requeue;
+    // r[impl sched.retry.store-degraded-uncharged]
+    // bug_408: the consecutive run of store-degraded rows. Pure
+    // pacing — drives ONLY the backoff curve; reset by any other
+    // folded event. Fold-local by design: not one of the ten
+    // RetryState counters, never persisted.
+    let mut store_degraded_run: u32 = 0;
     for row in history {
         // The kind partition (design §2.5): materialization-kind rows
         // are invisible to every build budget — they never charge
@@ -1536,7 +1553,27 @@ pub fn decide<Id: Ord + Clone>(
         if row.kind == AttemptKind::Materialization {
             continue;
         }
+        // bug_408: store-degraded rows are pacing, not charges. No
+        // `AttemptEvent` exists for the class (`row_to_event` answers
+        // `None`), so `apply()` structurally cannot charge it; the
+        // verdict stays whatever the charged history decided, and only
+        // the backoff advances — wait out the outage at the curve's
+        // cap (`sched.retry.attempts-bounded+3`'s pacing carve-out).
+        if row.event_kind == AttemptEventKind::Attempt
+            && row.outcome_class == OutcomeClass::StoreDegraded
+        {
+            let until = row
+                .at
+                .saturating_add(budget.backoff_secs(store_degraded_run));
+            counters.backoff_until = Some(match counters.backoff_until {
+                Some(b) if b > until => b,
+                _ => until,
+            });
+            store_degraded_run = store_degraded_run.saturating_add(1);
+            continue;
+        }
         if let Some(ev) = row_to_event(row) {
+            store_degraded_run = 0;
             verdict = apply(&mut counters, &ev, budget, &fleet);
         }
     }
@@ -1622,6 +1659,14 @@ fn row_to_event<Id: Clone>(row: &LedgerRow<Id>) -> Option<AttemptEvent<Id>> {
         // the threshold/exclusion budget.
         OutcomeClass::ExecutorCrash => Some(AttemptEvent::EstablishedCrash { at, executor }),
         OutcomeClass::Cascade | OutcomeClass::FleetExhaust => None,
+        // bug_408: pacing class — handled by `decide()`'s own
+        // backoff-only arm BEFORE this map runs; answering `None` here
+        // means any other consumer of the event alphabet (the
+        // worker-abort run counter, the divergence oracles) sees
+        // store-degraded rows as the no-ops they are. There is no
+        // `AttemptEvent` for the class: unrepresentable, not merely
+        // unhandled.
+        OutcomeClass::StoreDegraded => None,
         // Reset classes only ever ride on `event_kind = 'reset'` rows
         // (handled above); an attempt-kind row carrying one is malformed
         // — fold it as a no-op rather than guess.
@@ -1976,6 +2021,11 @@ pub enum ObservedFailure<'a> {
     /// The correlation-TTL sweep (or backstop) established a disconnect
     /// whose classifying report never arrived.
     UnreportedCrash,
+    /// bug_408 — worker `CompletionReport{InfrastructureFailure}` with
+    /// `BuildResult.store_degraded` set: the builder's FUSE breaker
+    /// attributes the failure to a degraded store. Never consults the
+    /// floor and never exempts — the class IS the disposition.
+    WorkerStoreDegraded,
 }
 
 // r[impl sched.retry.exempt-infra-cap]
@@ -2027,6 +2077,7 @@ pub enum ObservedFailure<'a> {
         ObservedFailure::ControllerDeadlineExceeded => *c == OutcomeClass::Timeout,
         ObservedFailure::BackstopTimeout => *c == OutcomeClass::Backstop,
         ObservedFailure::UnreportedCrash => *c == OutcomeClass::ExecutorCrash,
+        ObservedFailure::WorkerStoreDegraded => *c == OutcomeClass::StoreDegraded,
     }
 }))]
 pub fn classify(event: &ObservedFailure<'_>, floor: FloorOutcomeView) -> OutcomeClass {
@@ -2052,6 +2103,8 @@ pub fn classify(event: &ObservedFailure<'_>, floor: FloorOutcomeView) -> Outcome
         ObservedFailure::ControllerDeadlineExceeded => OutcomeClass::Timeout,
         ObservedFailure::BackstopTimeout => OutcomeClass::Backstop,
         ObservedFailure::UnreportedCrash => OutcomeClass::ExecutorCrash,
+        // r[impl sched.retry.store-degraded-uncharged]
+        ObservedFailure::WorkerStoreDegraded => OutcomeClass::StoreDegraded,
     }
 }
 
@@ -2936,14 +2989,15 @@ mod proofs {
     }
 
     /// Every outcome class, including the two materialization classes
-    /// (the full 15-literal alphabet): the row domain stays a strict
+    /// and the store-degraded pacing class (the full 16-literal
+    /// alphabet): the row domain stays a strict
     /// superset of what any appending site can write, so kind/class
     /// combinations that are malformed by writer discipline (e.g. a
     /// build-kind row carrying a materialization class) are inside the
     /// proven domain and covered by the fold's no-op arms.
     fn any_outcome_class() -> OutcomeClass {
         let i: u8 = kani::any();
-        kani::assume(i < 16);
+        kani::assume(i < 17);
         match i {
             0 => OutcomeClass::Transient,
             1 => OutcomeClass::Infra,
@@ -2960,7 +3014,8 @@ mod proofs {
             12 => OutcomeClass::PoisonCleared,
             13 => OutcomeClass::MaterializationUnobtainable,
             14 => OutcomeClass::MaterializationInfra,
-            _ => OutcomeClass::MaterializationReset,
+            15 => OutcomeClass::MaterializationReset,
+            _ => OutcomeClass::StoreDegraded,
         }
     }
 
@@ -3168,6 +3223,53 @@ mod proofs {
     /// the four messages (52 bytes) plus the 28-byte marker; without an
     /// explicit bound CBMC keeps unwinding the search/compare loops far
     /// past anything the concrete messages can reach.
+    // r[verify sched.retry.store-degraded-uncharged]
+    /// bug_408: a history whose ATTEMPT rows are all build-lane
+    /// store-degraded (reset rows and materialization-kind rows may
+    /// interleave freely) charges nothing — every count counter zero,
+    /// exclusion empty, never a poison verdict — and the charging
+    /// alphabet cannot even represent the class (`row_to_event`
+    /// answers `None`). Bounded at MAX=4 / unwind 7 per the crate's
+    /// harness conventions.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn check_store_degraded_uncharged_requeue() {
+        const MAX: usize = 4;
+        let (mut rows, n) = any_history::<MAX>();
+        for row in &mut rows {
+            if row.event_kind == AttemptEventKind::Attempt && row.kind == AttemptKind::Build {
+                row.outcome_class = OutcomeClass::StoreDegraded;
+            }
+        }
+        for row in &rows[..n] {
+            if row.event_kind == AttemptEventKind::Attempt
+                && row.outcome_class == OutcomeClass::StoreDegraded
+            {
+                kani::assert(
+                    row_to_event(row).is_none(),
+                    "store-degraded is unrepresentable in the charging alphabet",
+                );
+            }
+        }
+        let budget = any_small_budget();
+        let now = small_time(8);
+        let d = decide(&rows[..n], &budget, now);
+        kani::assert(
+            !matches!(d.verdict, Verdict::Poison(_)),
+            "store-degraded rows never poison",
+        );
+        kani::assert(d.exclusion.is_empty(), "no exclusion key is ever minted");
+        kani::assert(
+            d.counters.count == 0
+                && d.counters.infra_count == 0
+                && d.counters.timeout_count == 0
+                && d.counters.exempt_infra_count == 0
+                && d.counters.failure_count == 0
+                && d.counters.poisoned_at.is_none(),
+            "no count budget advances",
+        );
+    }
+
     #[kani::proof_for_contract(classify)]
     #[kani::unwind(64)]
     fn check_classify_contract() {
@@ -3184,7 +3286,7 @@ mod proofs {
             _ => "remote: concurrent PutPath in progress (path locked)",
         };
         let ev_sel: u8 = kani::any();
-        kani::assume(ev_sel < 9);
+        kani::assume(ev_sel < 10);
         let event = match ev_sel {
             0 => ObservedFailure::WorkerTransient,
             1 => ObservedFailure::WorkerInfra { error_msg },
@@ -3194,7 +3296,8 @@ mod proofs {
             5 => ObservedFailure::ControllerResourceTermination,
             6 => ObservedFailure::ControllerDeadlineExceeded,
             7 => ObservedFailure::BackstopTimeout,
-            _ => ObservedFailure::UnreportedCrash,
+            8 => ObservedFailure::UnreportedCrash,
+            _ => ObservedFailure::WorkerStoreDegraded,
         };
         let _ = classify(&event, floor);
     }
