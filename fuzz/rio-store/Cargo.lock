@@ -3997,6 +3997,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio-evidence-kernel"
+version = "0.1.0"
+
+[[package]]
 name = "rio-log-kernel"
 version = "0.1.0"
 
@@ -4076,6 +4080,7 @@ dependencies = [
  "reqwest",
  "rio-auth",
  "rio-common",
+ "rio-evidence-kernel",
  "rio-log-kernel",
  "rio-migrations",
  "rio-nix",

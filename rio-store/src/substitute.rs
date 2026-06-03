@@ -134,7 +134,14 @@ const SUBSTITUTE_NAR_DECOMPRESSED_CAP: u64 = 64 * 1024;
 /// for a hot stream; the scheduler-side aggregate is debounced further
 /// (one `SubstituteProgress` BuildEvent per callback, routed via the
 /// log broadcast ring so a Lagged drop is harmless).
+///
+/// Test override mirrors [`SUBSTITUTE_NAR_DECOMPRESSED_CAP`]'s: the
+/// in-flight tick path (expected leading done — merged_bug_195's pin)
+/// must be exercisable under the 64 KiB test NAR cap.
+#[cfg(not(test))]
 pub const SUBSTITUTE_PROGRESS_INTERVAL_BYTES: u64 = 1024 * 1024;
+#[cfg(test)]
+pub const SUBSTITUTE_PROGRESS_INTERVAL_BYTES: u64 = 16 * 1024;
 
 /// Progress callback signature for `r[store.substitute.progress-stream]`:
 /// `(bytes_done, bytes_expected, upstream_base_uri)`. Called from
@@ -512,7 +519,7 @@ impl Substituter {
     /// **One path, one answer.** The store does NOT walk
     /// `info.references` here; closure completeness is the caller's
     /// responsibility (the materialization executor's own walk,
-    /// `r[store.materialize.executor+3]`; the nix client for the
+    /// `r[store.materialize.executor+4]`; the nix client for the
     /// gateway). Matches upstream
     /// Nix's `BinaryCacheStore::queryPathInfo` contract.
     #[instrument(skip(self), fields(tenant = %tenant_id, path = store_path))]

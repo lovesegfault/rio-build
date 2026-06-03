@@ -6549,6 +6549,7 @@ dependencies = [
  "reqwest",
  "rio-auth",
  "rio-common",
+ "rio-evidence-kernel",
  "rio-log-kernel",
  "rio-migrations",
  "rio-nix",

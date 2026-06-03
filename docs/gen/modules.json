@@ -553,9 +553,19 @@
       "doc": "Pure closure-evidence decision kernel."
     },
     {
+      "path": "outcome.rs",
+      "depth": 0,
+      "doc": "Substitute-failure classification — the dependency-free truth table"
+    },
+    {
       "path": "pull.rs",
       "depth": 0,
       "doc": "The pull-admission decision kernel: [`admit_pull`]."
+    },
+    {
+      "path": "routing.rs",
+      "depth": 0,
+      "doc": "The four-arm Unobtainable consumption routing — PURE (no IO, no"
     }
   ],
   "rio-gateway": [

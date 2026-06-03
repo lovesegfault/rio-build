@@ -559,7 +559,7 @@ in
   #   of 4 substitutable nodes creates exactly 4 cache_opportunity jobs in
   #   the merge transaction; all resolve resolved_success; the
   #   jobs-created metric moves by 4 while the walk-spawn metric stays 0.
-  # r[verify sched.materialize.routing+3]
+  # r[verify sched.materialize.routing+4]
   #   substitute-scheduler-owned + materialization-active: every job's
   #   Success outcome is consumed — nodes complete, the build succeeds,
   #   no unresolved jobs remain (all-resolved assertion).
@@ -628,7 +628,7 @@ in
   # success paths never reach. One mode-switched fake upstream drives
   # every arm (per-path 404/503/head-only narinfo answers).
   #
-  # r[verify sched.materialize.routing+3]
+  # r[verify sched.materialize.routing+4]
   #   routing-fail-fast: a topdown-pruned root whose output is confirmed
   #   missing upstream fails every interested build with the
   #   resubmit-directing error (arm 3: Unobtainable → consumption

@@ -1381,13 +1381,22 @@ is the successor of the walk-era must-substitute pull interlock (kind-aware:
 materialization-kind claims are the one exception,
 #rref("sched.state.machine")).
 
-#r("sched.materialize.routing+3")[
+#r("sched.materialize.routing+4")[
   A materialization outcome MUST be consumed in exactly one fenced transaction
   keyed by its exec_id, and that transaction MUST re-read live interest and the
   live effective wanted set before acting: a Success outcome completes the node
   only when the reported paths cover the re-read live wanted set (else the job
-  re-arms); an Unobtainable outcome MUST route through, in order: the
-  moot-failure arm (no live-wanted path is missing → never fail-fast), the
+  re-arms); a RetryLater outcome (raced placeholder / upstream rate-limit)
+  MUST close the attempt with no ledger row of any class and defer the job's
+  next claim through a view-only deferral that pull admission reads but the
+  park decision, the park re-evaluation, and the stalled gauge never do — a
+  rate-limit wave must not walk a healthy job toward the from-source
+  settlement; an Unobtainable outcome MUST route through, in order: the
+  moot-failure arm (no live-wanted path is missing AND no reference path is
+  confirmed missing → never fail-fast; a confirmed reference miss is a
+  closure hole and never completes — reports from executors predating the
+  reference cell partition unattributable missing entries, those outside the
+  expected ∪ carried ∪ live-wanted sets, into it), the
   durable-Vouched arm (declared closure produced → from-source), the
   durable-Pending arm (deps still buildable → from-source via normal gating),
   and only then --- after a same-transaction store re-probe of the live wanted

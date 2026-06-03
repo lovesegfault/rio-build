@@ -680,6 +680,7 @@ async fn spawn_intents_excludes_job_pending_nodes() -> TestResult {
             claimed_by: None,
             carried_realized_paths: None,
             parked_at: None,
+            defer_until: None,
         },
     );
 

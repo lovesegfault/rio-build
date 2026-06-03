@@ -556,16 +556,46 @@ message MaterializationOutcome {
     repeated string verified_paths = 2;
   }
   message Unobtainable {
-    // Paths confirmed absent upstream after the full per-path retry ladder.
+    // LIVE-WANTED paths confirmed absent upstream after the full
+    // per-path retry ladder (walk seeds — never closure references).
     repeated string missing_paths = 1;
     repeated string verified_paths = 2;
     // Human-readable cause (the demotion-reason taxonomy successor).
     string cause = 3;
+    // REFERENCE paths (narinfo closure extensions) confirmed absent
+    // upstream — a confirmed closure hole (merged_bug_193). Kept
+    // separate from missing_paths so the scheduler's moot-completion
+    // arm can require BOTH empty: a covered live-wanted root over a
+    // punctured closure must never complete. Absent (old store)
+    // decodes as empty; the scheduler additionally partitions
+    // old-store missing_paths entries outside expected∪carried∪live
+    // into this cell (bounded skew, scheduler-before-store rollout).
+    repeated string missing_reference_paths = 4;
   }
   message InfraFailure {
     // upstream 5xx/timeout/store-internal/no-tenant-context — nothing
     // is confirmed; never routes from-source, never fail-fasts (B3).
     string detail = 1;
+  }
+  message RetryLater {
+    // Transient, UNCHARGED retry (merged_bug_178): the substituter's
+    // own contract says this attempt proves nothing about upstream
+    // content or store health — another uploader holds the placeholder
+    // slot (`raced`), or an upstream rate-limited the fetch
+    // (`rate_limited`, with the parsed Retry-After below). The
+    // scheduler closes the attempt with NO ledger row of any class and
+    // defers the job's next claim (view-only; failover loses at most
+    // one uncharged deferral window) — a 429 wave can never walk a
+    // healthy job into park→PD-20→from-source.
+    // Deploy order: scheduler before store (an old scheduler answers
+    // this variant with InvalidArgument; the establishment sweep
+    // closes the attempt — bounded skew, same posture as Aborted).
+    string detail = 1;
+    // Parsed Retry-After (0 = none supplied; scheduler uses its
+    // default deferral).
+    uint64 retry_after_secs = 2;
+    // The failure class ("raced" | "rate_limited") — observability.
+    string class = 3;
   }
   message Aborted {
     // The walk was aborted by the worker (SIGTERM during a store
@@ -583,7 +613,7 @@ message MaterializationOutcome {
     Success success = 1;
     Unobtainable unobtainable = 2;
     InfraFailure infra_failure = 3;
-    // 4 reserved for RetryLater (A4, this wave).
+    RetryLater retry_later = 4;
     Aborted aborted = 5;
   }
 }

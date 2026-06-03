@@ -8,7 +8,7 @@
 //! the admission gate). The store substitutes ONE path per
 //! `try_substitute` call (no closure walk — that is its documented
 //! contract), so this module owns closure completeness.
-// r[impl store.materialize.executor+3]
+// r[impl store.materialize.executor+4]
 
 use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
@@ -17,9 +17,12 @@ use sqlx::PgPool;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use rio_evidence_kernel::outcome::{
+    FailureDisposition, SubstituteFailureClass, classify_substitute_failure,
+};
 use rio_proto::types::{MaterializationOutcome, materialization_outcome};
 
-use crate::substitute::Substituter;
+use crate::substitute::{SubstituteError, Substituter};
 
 use super::client::ClaimedJob;
 
@@ -63,7 +66,7 @@ pub struct ExecutorContext {
 /// 4. **Final verification pass**: the wanted set is RE-READ after the
 ///    walk; growth re-enters the walk (the loop), so the reported
 ///    coverage is against execution-end live wanted, not a snapshot.
-// r[impl store.materialize.executor+3]
+// r[impl store.materialize.executor+4]
 // r[impl sched.materialize.pinning]
 pub async fn execute_job(ctx: &ExecutorContext, claimed: &ClaimedJob) -> MaterializationOutcome {
     execute_job_with_progress(ctx, claimed, |_, _, _| {}).await
@@ -79,12 +82,12 @@ pub async fn execute_job(ctx: &ExecutorContext, claimed: &ClaimedJob) -> Materia
 /// the whole closure. Display-only and droppable: the callback must be
 /// cheap and non-blocking (it runs on the walk); the caller forwards it
 /// to `ReportMaterializationProgress` fire-and-forget.
-// r[impl store.materialize.executor+3]
+// r[impl store.materialize.executor+4]
 // r[impl obs.metric.store]
 pub async fn execute_job_with_progress(
     ctx: &ExecutorContext,
     claimed: &ClaimedJob,
-    on_progress: impl Fn(u64, u64, &str) + Send + Sync,
+    on_progress: impl Fn(u64, u64, &str) + Send + Sync + 'static,
 ) -> MaterializationOutcome {
     let outcome = execute_job_inner(ctx, claimed, on_progress).await;
     // T-6.2 lifecycle counter: one increment per finished execution,
@@ -100,6 +103,10 @@ pub async fn execute_job_with_progress(
         // walk itself — but counted here like every other outcome so
         // the chokepoint stays total over the alphabet.
         Some(materialization_outcome::Outcome::Aborted(_)) => "aborted",
+        // Transient, uncharged retry (merged_bug_178): raced placeholder
+        // or upstream 429 — counted so the dashboard sees deferral
+        // rates next to the charged classes.
+        Some(materialization_outcome::Outcome::RetryLater(_)) => "retry_later",
     };
     metrics::counter!("rio_store_materialization_executions_total", "outcome" => label)
         .increment(1);
@@ -111,8 +118,12 @@ pub async fn execute_job_with_progress(
 async fn execute_job_inner(
     ctx: &ExecutorContext,
     claimed: &ClaimedJob,
-    on_progress: impl Fn(u64, u64, &str) + Send + Sync,
+    on_progress: impl Fn(u64, u64, &str) + Send + Sync + 'static,
 ) -> MaterializationOutcome {
+    // `SubstProgressFn` is `dyn Fn + 'static` (type-alias default
+    // lifetime), so the per-path adapters below must OWN their handle
+    // to the job-level callback — one Arc, cloned per path.
+    let on_progress = std::sync::Arc::new(on_progress);
     // ── 1. Tenant re-resolution (AS-4, live-interest-first) ──────────
     let tenant_id = match resolve_tenant(ctx, claimed).await {
         Ok(Some(t)) => t,
@@ -136,12 +147,21 @@ async fn execute_job_inner(
     let mut visited: HashSet<String> = HashSet::new();
     let mut ingested: Vec<String> = Vec::new();
     let mut verified: Vec<String> = Vec::new();
-    let mut missing: Vec<String> = Vec::new();
+    // merged_bug_193: wanted-miss vs closure-reference-miss are
+    // DIFFERENT verdicts at the consumer (a covered root over a
+    // punctured closure must never complete) — track the cell per
+    // frontier entry.
+    let mut missing_wanted: Vec<String> = Vec::new();
+    let mut missing_references: Vec<String> = Vec::new();
     // BC-4 cumulative progress accounting: bytes of fully-processed
     // paths. The per-path fetch callback adds the in-flight path's
-    // streamed bytes on top, so reports are cumulative across the
-    // closure, monotone in done, and done ≤ expected at every call.
+    // streamed bytes on top of `completed_bytes`, with the declared
+    // NarSize as the path's expected — so reports are cumulative
+    // across the closure, monotone in done, and expected genuinely
+    // leads done mid-fetch (merged_bug_195; the narinfo/local-row read
+    // precedes the body fetch).
     let mut completed_bytes: u64 = 0;
+    let mut first_iteration = true;
 
     loop {
         // The live wanted read: first iteration = the at-claim read;
@@ -151,6 +171,20 @@ async fn execute_job_inner(
             Ok(w) => w,
             Err(e) => return infra_failure(format!("wanted-set query failed: {e}")),
         };
+        // merged_bug_194 (store leg): a FIRST iteration with no
+        // verifiable wanted path can never produce a meaningful
+        // Success — "Success with nothing verified" is exactly the
+        // vacuous completion the LiveWanted witness forbids scheduler-
+        // side. Report infra (the scheduler re-arms; interest may
+        // still be materializing) instead of walking nothing.
+        if first_iteration && wanted.is_empty() {
+            return infra_failure(format!(
+                "no-verifiable-wanted-paths: live interest for {} resolves to no \
+                 verifiable store path (floating-CA placeholders or no live build)",
+                claimed.drv_hash
+            ));
+        }
+        first_iteration = false;
         let new_seeds: Vec<String> = wanted
             .into_iter()
             .filter(|p| !visited.contains(p))
@@ -161,8 +195,13 @@ async fn execute_job_inner(
             break;
         }
 
-        let mut frontier: VecDeque<String> = new_seeds.into();
-        while let Some(path) = frontier.pop_front() {
+        // Frontier entries carry their CELL: live-wanted seeds vs
+        // narinfo reference extensions (merged_bug_193).
+        let mut frontier: VecDeque<(String, PathCell)> = new_seeds
+            .into_iter()
+            .map(|p| (p, PathCell::Wanted))
+            .collect();
+        while let Some((path, cell)) = frontier.pop_front() {
             if !visited.insert(path.clone()) {
                 continue;
             }
@@ -172,16 +211,61 @@ async fn execute_job_inner(
                      (hostile upstream reference chain?)"
                 ));
             }
-            // Present-before-substitution probe: distinguishes
-            // "verified already-present" from "ingested" in the
-            // Success coverage report.
-            let already_present = crate::metadata::query_path_info(&ctx.pool, &path)
-                .await
-                .ok()
-                .flatten()
-                .is_some();
+            // bug_042: the local-presence probe is a VERDICT input, so
+            // its error PROPAGATES (the pre-fix `.ok().flatten()`
+            // mapped a PG blip to "absent" and dragged a locally-
+            // present path through upstream substitution — all-404
+            // upstreams then produced Unobtainable for a path we
+            // already have). `LocalMiss` is the only way to construct
+            // a `ConfirmedAbsent` verdict below: upstream absence
+            // alone is uncompilable as a missing-path verdict.
+            let local_witness = match probe_local(ctx, &path).await {
+                Ok(LocalPresence::Present(info)) => {
+                    // Locally present with a complete manifest: pin it,
+                    // count it verified, and extend the frontier from
+                    // the LOCAL row's references — the closure-
+                    // completeness obligation holds without touching
+                    // any upstream.
+                    if let Err(e) = pin_materialized_path(ctx, claimed, &path).await {
+                        return infra_failure(format!("pin-at-ingest failed for {path}: {e}"));
+                    }
+                    verified.push(path.clone());
+                    completed_bytes = completed_bytes.saturating_add(info.nar_size);
+                    on_progress(completed_bytes, completed_bytes, "");
+                    for reference in &info.references {
+                        let r = reference.as_str().to_string();
+                        if r != path && !visited.contains(&r) {
+                            frontier.push_back((r, PathCell::Reference));
+                        }
+                    }
+                    continue;
+                }
+                Ok(LocalPresence::Absent(w)) => w,
+                Err(e) => {
+                    return infra_failure(format!("local presence probe failed for {path}: {e}"));
+                }
+            };
 
-            match ctx.substituter.try_substitute(tenant_id, &path).await {
+            // merged_bug_195: per-path progress through the substitute
+            // body fetch — `expected` = completed + the declared
+            // NarSize (known before the body), `done` = completed +
+            // streamed-so-far, `uri` = the serving upstream.
+            let base = completed_bytes;
+            let per_path_progress = {
+                let on_progress = on_progress.clone();
+                move |done: u64, expected: u64, uri: &str| {
+                    on_progress(
+                        base.saturating_add(done),
+                        base.saturating_add(expected),
+                        uri,
+                    );
+                }
+            };
+            match ctx
+                .substituter
+                .try_substitute_with_progress(tenant_id, &path, &per_path_progress)
+                .await
+            {
                 Ok(Some(path_info)) => {
                     // r[impl sched.materialize.pinning]
                     // Pin-at-ingest (design §5.1): the pin lands BEFORE
@@ -193,19 +277,13 @@ async fn execute_job_inner(
                     if let Err(e) = pin_materialized_path(ctx, claimed, &path).await {
                         return infra_failure(format!("pin-at-ingest failed for {path}: {e}"));
                     }
-                    if already_present {
-                        verified.push(path.clone());
-                    } else {
-                        ingested.push(path.clone());
-                    }
+                    ingested.push(path.clone());
                     // BC-4: the path is fully processed — fold its NAR
-                    // size into the cumulative total and fire one
-                    // progress tick per path ingest (the plan's
-                    // "cumulative bytes per path" granularity: monotone
-                    // non-decreasing done, done ≤ expected, the final
-                    // tick covering the whole closure). Empty upstream
-                    // URI: the gateway omits the "from <uri>" suffix
-                    // when the field is empty.
+                    // size into the cumulative total and fire the
+                    // final per-path tick (done == expected for the
+                    // completed prefix). Empty upstream URI: the
+                    // gateway omits the "from <uri>" suffix when the
+                    // field is empty.
                     completed_bytes = completed_bytes.saturating_add(path_info.nar_size);
                     on_progress(completed_bytes, completed_bytes, "");
                     // Extend the frontier with the narinfo references —
@@ -213,7 +291,7 @@ async fn execute_job_inner(
                     for reference in &path_info.references {
                         let r = reference.as_str().to_string();
                         if r != path && !visited.contains(&r) {
-                            frontier.push_back(r);
+                            frontier.push_back((r, PathCell::Reference));
                         }
                     }
                 }
@@ -224,11 +302,16 @@ async fn execute_job_inner(
                     // distinction — confirmed-absent routes
                     // Unobtainable, infrastructure trouble routes
                     // InfraFailure — so classify the miss with the
-                    // HEAD-probe machinery.
-                    match classify_miss(ctx, tenant_id, &path).await {
-                        MissClass::ConfirmedAbsent => {
-                            debug!(path = %path, "wanted path confirmed absent upstream");
-                            missing.push(path.clone());
+                    // HEAD-probe machinery, carrying the local-miss
+                    // witness (bug_042).
+                    match classify_miss(ctx, tenant_id, &path, local_witness).await {
+                        MissClass::ConfirmedAbsent(_w) => {
+                            debug!(path = %path, cell = ?cell,
+                                   "path confirmed absent upstream (and locally)");
+                            match cell {
+                                PathCell::Wanted => missing_wanted.push(path.clone()),
+                                PathCell::Reference => missing_references.push(path.clone()),
+                            }
                         }
                         MissClass::Infra(detail) => {
                             return infra_failure(format!(
@@ -238,17 +321,51 @@ async fn execute_job_inner(
                     }
                 }
                 Err(e) => {
-                    // B3: upstream 5xx/timeout/store-internal — nothing
-                    // is confirmed; never routes from-source, never
-                    // fail-fasts.
-                    return infra_failure(format!("substitution of {path} failed: {e}"));
+                    // merged_bug_178: total classification through the
+                    // kernel truth table — no catch-all (a future
+                    // SubstituteError variant fails this match AND the
+                    // class table). Raced/RateLimited are transient by
+                    // the substituter's own contract: report
+                    // RetryLater so the scheduler closes UNCHARGED and
+                    // defers (a 429 wave must never park a healthy
+                    // job). Everything else keeps the B3 infra
+                    // posture: nothing is confirmed; never routes
+                    // from-source, never fail-fasts.
+                    let class = substitute_failure_class(&e);
+                    match classify_substitute_failure(class) {
+                        FailureDisposition::RetryUncharged => {
+                            let (label, retry_after_secs) = match &e {
+                                SubstituteError::RateLimited { retry_after } => (
+                                    "rate_limited",
+                                    retry_after.map(|d| d.as_secs()).unwrap_or(0),
+                                ),
+                                _ => ("raced", 0),
+                            };
+                            info!(path = %path, class = label,
+                                  "transient substitute failure; reporting retry-later");
+                            return MaterializationOutcome {
+                                outcome: Some(materialization_outcome::Outcome::RetryLater(
+                                    materialization_outcome::RetryLater {
+                                        detail: format!("substitution of {path}: {e}"),
+                                        retry_after_secs,
+                                        class: label.to_string(),
+                                    },
+                                )),
+                            };
+                        }
+                        FailureDisposition::ChargeInfra => {
+                            return infra_failure(format!(
+                                "substitution of {path} failed ({class:?}): {e}"
+                            ));
+                        }
+                    }
                 }
             }
         }
     }
 
     // ── 5. Outcome ────────────────────────────────────────────────────
-    if missing.is_empty() {
+    if missing_wanted.is_empty() && missing_references.is_empty() {
         info!(
             drv_hash = %claimed.drv_hash,
             ingested = ingested.len(),
@@ -264,29 +381,90 @@ async fn execute_job_inner(
             )),
         }
     } else {
-        // Confirmed-404 wanted paths: the Unobtainable verdict carries
-        // both the missing set and what WAS obtained (the scheduler's
-        // routing consumes both).
+        // Confirmed-404 paths: the Unobtainable verdict carries the
+        // missing WANTED cell, the missing REFERENCE cell
+        // (merged_bug_193 — the consumer's moot arm requires both
+        // empty), and what WAS obtained.
         let mut covered = ingested;
         covered.extend(verified);
         warn!(
             drv_hash = %claimed.drv_hash,
-            missing = missing.len(),
+            missing_wanted = missing_wanted.len(),
+            missing_references = missing_references.len(),
             covered = covered.len(),
-            "materialization job unobtainable (confirmed-absent wanted paths)"
+            "materialization job unobtainable (confirmed-absent paths)"
         );
         MaterializationOutcome {
             outcome: Some(materialization_outcome::Outcome::Unobtainable(
                 materialization_outcome::Unobtainable {
                     cause: format!(
-                        "{} wanted path(s) confirmed absent at every configured upstream",
-                        missing.len()
+                        "{} wanted / {} reference path(s) confirmed absent at every \
+                         configured upstream",
+                        missing_wanted.len(),
+                        missing_references.len()
                     ),
-                    missing_paths: missing,
+                    missing_paths: missing_wanted,
                     verified_paths: covered,
+                    missing_reference_paths: missing_references,
                 },
             )),
         }
+    }
+}
+
+/// Which cell a frontier path belongs to (merged_bug_193): a
+/// live-wanted SEED routes a confirmed miss to
+/// `Unobtainable.missing_paths`; a narinfo/local-row REFERENCE
+/// extension routes to `missing_reference_paths` — the consumer's
+/// moot-completion arm requires both empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathCell {
+    Wanted,
+    Reference,
+}
+
+/// Witness that the LOCAL presence probe ran and answered "absent"
+/// (bug_042). Not constructible outside [`probe_local`] — a
+/// `MissClass::ConfirmedAbsent` verdict therefore PROVES the path is
+/// neither local nor upstream; upstream absence alone no longer
+/// typechecks as a missing-path verdict.
+struct LocalMiss(());
+
+/// The local-presence answer for one walk path.
+enum LocalPresence {
+    /// A complete local manifest exists — the full row (references,
+    /// nar_size) drives pin + frontier extension without upstream.
+    Present(Box<rio_proto::validated::ValidatedPathInfo>),
+    /// No complete local manifest.
+    Absent(LocalMiss),
+}
+
+/// The walk's local-presence probe. The error PROPAGATES (bug_042):
+/// a PG blip is infrastructure trouble, never evidence of absence.
+async fn probe_local(
+    ctx: &ExecutorContext,
+    store_path: &str,
+) -> Result<LocalPresence, crate::metadata::MetadataError> {
+    match crate::metadata::query_path_info(&ctx.pool, store_path).await? {
+        Some(info) => Ok(LocalPresence::Present(Box::new(info))),
+        None => Ok(LocalPresence::Absent(LocalMiss(()))),
+    }
+}
+
+/// Exhaustive `SubstituteError` → kernel class mapping
+/// (merged_bug_178): NO catch-all — adding a variant breaks this
+/// build and the kernel table together.
+fn substitute_failure_class(e: &SubstituteError) -> SubstituteFailureClass {
+    match e {
+        SubstituteError::Raced => SubstituteFailureClass::Raced,
+        SubstituteError::RateLimited { .. } => SubstituteFailureClass::RateLimited,
+        SubstituteError::Stalled { .. } => SubstituteFailureClass::Stalled,
+        SubstituteError::Admission(_) => SubstituteFailureClass::AdmissionSaturated,
+        SubstituteError::Fetch(_) | SubstituteError::NarInfo(_) => SubstituteFailureClass::Fetch,
+        SubstituteError::HashMismatch { .. }
+        | SubstituteError::SizeMismatch { .. }
+        | SubstituteError::TooLarge { .. } => SubstituteFailureClass::Integrity,
+        SubstituteError::Ingest(_) => SubstituteFailureClass::Ingest,
     }
 }
 
@@ -449,8 +627,9 @@ async fn pin_materialized_path(
 /// half).
 enum MissClass {
     /// Every configured upstream definitively answered "not present"
-    /// → the Unobtainable route.
-    ConfirmedAbsent,
+    /// AND the local probe answered absent (the witness — bug_042) →
+    /// the Unobtainable route.
+    ConfirmedAbsent(LocalMiss),
     /// At least one upstream could not be classified (5xx / timeout /
     /// 429), or the probe itself failed → the InfraFailure route
     /// (nothing is confirmed).
@@ -462,8 +641,15 @@ enum MissClass {
 /// ([`Substituter::check_available`]): a path in `indeterminate` could
 /// not be classified (infra); a path in `hits` is present upstream but
 /// substitution did not ingest it (also infra — something is wrong on
-/// our side); a path in neither set is a confirmed miss.
-async fn classify_miss(ctx: &ExecutorContext, tenant_id: Uuid, store_path: &str) -> MissClass {
+/// our side); a path in neither set is a confirmed miss. The
+/// `ConfirmedAbsent` cell carries the caller's [`LocalMiss`] witness:
+/// only a path proven absent LOCALLY can be missing at all (bug_042).
+async fn classify_miss(
+    ctx: &ExecutorContext,
+    tenant_id: Uuid,
+    store_path: &str,
+    local_witness: LocalMiss,
+) -> MissClass {
     let deadline = tokio::time::Instant::now() + MISS_PROBE_DEADLINE;
     let paths = [store_path.to_string()];
     match ctx
@@ -482,7 +668,7 @@ async fn classify_miss(ctx: &ExecutorContext, tenant_id: Uuid, store_path: &str)
                         .to_string(),
                 )
             } else {
-                MissClass::ConfirmedAbsent
+                MissClass::ConfirmedAbsent(local_witness)
             }
         }
         Err(e) => MissClass::Infra(format!("availability probe failed: {e}")),
@@ -783,7 +969,7 @@ mod tests {
 
     // ── The battery ───────────────────────────────────────────────────
 
-    // r[verify store.materialize.executor+3]
+    // r[verify store.materialize.executor+4]
     // r[verify sched.materialize.pinning]
     /// (1) The walk: BFS over narinfo references from the wanted seed
     /// path; every closure member try_substitute'd in-process; every
@@ -869,7 +1055,7 @@ mod tests {
         }
     }
 
-    // r[verify store.materialize.executor+3]
+    // r[verify store.materialize.executor+4]
     /// (2) The wanted set is read at execution time and RE-READ at the
     // r[verify sched.merge.stale-substitutable+3]
     /// Floating-CA stale-reset carrier (migration 082): a job whose
@@ -1014,7 +1200,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+3]
+    // r[verify store.materialize.executor+4]
     /// (3) Tenant resolution (AS-4): job tenant NULL + no live
     /// interested build with a tenant → InfraFailure{no-tenant-context}.
     /// Never Unobtainable, never silent success.
@@ -1052,7 +1238,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+3]
+    // r[verify store.materialize.executor+4]
     /// (4) Stale recorded tenant (PDQ-8): the creating build is
     /// TERMINAL (its recorded tenant no longer carries live interest)
     /// while a live interested build with a DIFFERENT tenant remains →
@@ -1126,7 +1312,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+3]
+    // r[verify store.materialize.executor+4]
     /// (5) A confirmed-404 wanted path (every upstream definitively
     /// answers "not present") → Unobtainable{missing_paths=[it]},
     /// with whatever WAS obtained in verified_paths.
@@ -1174,7 +1360,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+3]
+    // r[verify store.materialize.executor+4]
     // r[verify store.substitute.stall-abort]
     /// (6b) A WEDGED upstream download (headers, then no body bytes)
     /// is ended by the substituter's owner-side stall abort and
@@ -1296,7 +1482,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+3]
+    // r[verify store.materialize.executor+4]
     /// (6) Upstream 5xx → InfraFailure (B3's executor half): nothing is
     /// confirmed, so the verdict must be infrastructure trouble — never
     /// Unobtainable (which would route from-source), never Success.
@@ -1336,7 +1522,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+3]
+    // r[verify store.materialize.executor+4]
     /// (7) T-1.2 / BC-4: the executor reports cumulative, monotone byte
     /// progress through the callback while walking a multi-path closure.
     /// Every call satisfies done ≤ expected; done never decreases; the
@@ -1350,7 +1536,14 @@ mod tests {
         // different sizes so the cumulative accounting is visible).
         let root = store_path(10, "mat-progress-root");
         let dep = store_path(11, "mat-progress-dep");
-        let (root_nar, _) = rio_test_support::fixtures::make_nar(b"root contents with some bytes");
+        // The root NAR spans several progress intervals (but stays
+        // under the cfg(test) decompressed cap) so IN-FLIGHT ticks
+        // fire (merged_bug_195: the strengthened pin below requires a
+        // tick where expected leads done, with the serving upstream
+        // named).
+        let big =
+            vec![0x5au8; (crate::substitute::SUBSTITUTE_PROGRESS_INTERVAL_BYTES * 3) as usize];
+        let (root_nar, _) = rio_test_support::fixtures::make_nar(&big);
         let (dep_nar, _) = rio_test_support::fixtures::make_nar(b"dep");
         let total_nar_bytes = (root_nar.len() + dep_nar.len()) as u64;
         let upstream = spawn_multi_upstream(
@@ -1374,21 +1567,32 @@ mod tests {
         .await;
 
         let ctx = make_ctx(db.pool.clone());
-        let calls: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
-        let outcome = execute_job_with_progress(&ctx, &seeded.claimed, |done, expected, _| {
-            calls.lock().unwrap().push((done, expected));
-        })
-        .await;
+        // The callback is `'static` now (the per-path adapters own a
+        // handle, merged_bug_195) — Arc the collector.
+        let calls: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_cb = calls.clone();
+        let outcome =
+            execute_job_with_progress(&ctx, &seeded.claimed, move |done, expected, uri| {
+                calls_cb
+                    .lock()
+                    .unwrap()
+                    .push((done, expected, uri.to_string()));
+            })
+            .await;
 
         outcome_success(&outcome).unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
 
-        let calls = calls.into_inner().unwrap();
+        let calls = std::sync::Arc::try_unwrap(calls)
+            .expect("walk done; no other handle")
+            .into_inner()
+            .unwrap();
         assert!(
             !calls.is_empty(),
             "the walk must report progress through the callback (BC-4 relay source)"
         );
         let mut prev_done = 0u64;
-        for (done, expected) in &calls {
+        for (done, expected, _) in &calls {
             assert!(
                 *done >= prev_done,
                 "bytes_done must be monotone non-decreasing: {prev_done} then {done} in {calls:?}"
@@ -1399,7 +1603,18 @@ mod tests {
             );
             prev_done = *done;
         }
-        let (final_done, final_expected) = calls.last().expect("non-empty");
+        // merged_bug_195 (strengthened): the in-flight layer is WIRED —
+        // at least one mid-fetch tick has expected genuinely leading
+        // done (the declared NarSize precedes the body) and names the
+        // serving upstream. Pre-fix every tick was the degenerate
+        // (done == expected, "") pair.
+        assert!(
+            calls
+                .iter()
+                .any(|(done, expected, uri)| done < expected && !uri.is_empty()),
+            "an in-flight tick must lead done and name the upstream: {calls:?}"
+        );
+        let (final_done, final_expected, _) = calls.last().expect("non-empty");
         assert_eq!(
             *final_done, total_nar_bytes,
             "the final report's done covers the whole closure ({calls:?})"
@@ -1411,7 +1626,7 @@ mod tests {
     }
 
     // r[verify obs.metric.store]
-    // r[verify store.materialize.executor+3]
+    // r[verify store.materialize.executor+4]
     /// T-6.2 (red-first): the execution-outcome and pin counters the
     /// dashboards consume —
     ///
@@ -1569,6 +1784,335 @@ mod tests {
             paths,
             vec!["/nix/store/aaa-rowless".to_string()],
             "row-less live interest saturates the wanted width to all declared"
+        );
+    }
+
+    fn outcome_retry_later(
+        o: &MaterializationOutcome,
+    ) -> Option<&materialization_outcome::RetryLater> {
+        match &o.outcome {
+            Some(materialization_outcome::Outcome::RetryLater(r)) => Some(r),
+            _ => None,
+        }
+    }
+
+    // r[verify store.materialize.executor+4]
+    /// merged_bug_193 (193a): a REFERENCE dep that 404s everywhere
+    /// lands in `missing_reference_paths`, NOT `missing_paths` — the
+    /// wanted root itself was obtained and rides `verified_paths`.
+    /// RED (pre-fix): the field did not exist; the reference miss was
+    /// lumped into `missing_paths` and the consumer's moot arm could
+    /// complete over the punctured closure.
+    #[tokio::test]
+    async fn unobtainable_reference_miss_lands_in_reference_cell() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-refmiss").await;
+
+        let root = store_path(20, "refmiss-root");
+        let dep = store_path(21, "refmiss-dep");
+        let (root_nar, _) = rio_test_support::fixtures::make_nar(b"refmiss-root");
+        // Upstream serves the ROOT (whose narinfo references dep) but
+        // 404s the dep itself.
+        let upstream = spawn_multi_upstream(
+            vec![(root.clone(), root_nar, vec![dep.clone()])],
+            "cache.refmiss",
+        )
+        .await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+
+        let seeded = seed_job(
+            &db.pool,
+            "mat-refmiss-drv",
+            &[("out", root.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+
+        let ctx = make_ctx(db.pool.clone());
+        let outcome = execute_job(&ctx, &seeded.claimed).await;
+
+        let unobtainable = outcome_unobtainable(&outcome)
+            .unwrap_or_else(|| panic!("expected Unobtainable, got {outcome:?}"));
+        assert_eq!(
+            unobtainable.missing_paths,
+            Vec::<String>::new(),
+            "no WANTED path is missing — the root was obtained"
+        );
+        assert_eq!(
+            unobtainable.missing_reference_paths,
+            vec![dep.clone()],
+            "the confirmed-absent reference rides its own cell"
+        );
+        assert!(
+            unobtainable.verified_paths.contains(&root),
+            "the obtained root rides verified_paths"
+        );
+    }
+
+    // r[verify store.materialize.executor+4]
+    /// bug_042: paths LOCALLY present (complete manifests) verify and
+    /// extend the walk from the LOCAL row's references — upstream
+    /// absence is irrelevant. RED (pre-fix): all-404 upstreams turned
+    /// a locally-present closure into Unobtainable (the local probe
+    /// was only a verified-vs-ingested label, never a verdict input).
+    #[tokio::test]
+    async fn locally_present_upstream_absent_verifies_and_walks_local_refs() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-local").await;
+
+        let parent = store_path(22, "local-parent");
+        let child = store_path(23, "local-child");
+        let (parent_nar, _) = rio_test_support::fixtures::make_nar(b"local-parent");
+        let (child_nar, _) = rio_test_support::fixtures::make_nar(b"local-child");
+
+        // Phase 1: ingest both via a temporary upstream (parent
+        // references child) so complete LOCAL manifests exist.
+        let upstream = spawn_multi_upstream(
+            vec![
+                (parent.clone(), parent_nar, vec![child.clone()]),
+                (child.clone(), child_nar, vec![]),
+            ],
+            "cache.local-seed",
+        )
+        .await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+        let seeded1 = seed_job(
+            &db.pool,
+            "mat-local-seed-drv",
+            &[("out", parent.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+        let ctx = make_ctx(db.pool.clone());
+        let first = execute_job(&ctx, &seeded1.claimed).await;
+        assert!(
+            outcome_success(&first).is_some(),
+            "phase-1 ingest must succeed, got {first:?}"
+        );
+
+        // Phase 2: a FRESH tenant whose only upstream 404s everything
+        // (fresh tenant = fresh substitute-cache key, so phase 1's
+        // ingest cannot leak through moka); the job must verify from
+        // the LOCAL rows alone.
+        let tenant2 = seed_tenant(&db.pool, "mat-local-2").await;
+        let dead = spawn_status_upstream(axum::http::StatusCode::NOT_FOUND).await;
+        wire_upstream(&db.pool, tenant2, &dead).await;
+
+        let seeded2 = seed_job(
+            &db.pool,
+            "mat-local-verify-drv",
+            &[("out", parent.as_str())],
+            Some(tenant2),
+            Some(tenant2),
+            &[],
+        )
+        .await;
+        let outcome = execute_job(&ctx, &seeded2.claimed).await;
+        let success = outcome_success(&outcome)
+            .unwrap_or_else(|| panic!("expected Success from local presence, got {outcome:?}"));
+        assert!(
+            success.verified_paths.contains(&parent) && success.verified_paths.contains(&child),
+            "both locally-present paths verify (parent walked to child via the \
+             LOCAL row's references): {success:?}"
+        );
+        assert!(success.ingested_paths.is_empty(), "nothing was fetched");
+        assert_eq!(
+            pin_count(&db.pool, "mat-local-verify-drv", "materialization").await,
+            2,
+            "both verified paths are pinned"
+        );
+    }
+
+    /// bug_042 (error leg): a failing local-presence probe is
+    /// INFRASTRUCTURE trouble, never evidence of absence. RED
+    /// (pre-fix): `.ok().flatten()` mapped the probe error to
+    /// "absent" and the walk pressed on toward an absence verdict.
+    #[tokio::test]
+    async fn local_probe_error_is_infra_failure() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-probe-err").await;
+        let path = store_path(24, "probe-err");
+        let (nar, _) = rio_test_support::fixtures::make_nar(b"probe-err");
+        let upstream =
+            spawn_multi_upstream(vec![(path.clone(), nar, vec![])], "cache.probe-err").await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+        let seeded = seed_job(
+            &db.pool,
+            "mat-probe-err-drv",
+            &[("out", path.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+        // Break the local-probe surface specifically: narinfo is read
+        // by `query_path_info` but by neither the wanted-set join nor
+        // the substituter's claim path... it IS read by ingest.
+        // Renaming the table makes the probe the first failure point.
+        sqlx::query("ALTER TABLE narinfo RENAME TO narinfo_broken")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let ctx = make_ctx(db.pool.clone());
+        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let infra = outcome_infra(&outcome)
+            .unwrap_or_else(|| panic!("expected InfraFailure, got {outcome:?}"));
+        assert!(
+            infra.detail.contains("local presence probe failed"),
+            "the probe error names itself: {}",
+            infra.detail
+        );
+    }
+
+    // r[verify store.materialize.executor+4]
+    /// merged_bug_178 (178a): an upstream 429 with Retry-After is a
+    /// transient, UNCHARGED RetryLater — class and parsed delay ride
+    /// the outcome. RED (pre-fix): `Err(RateLimited)` fell into the
+    /// blanket infra arm and charged the materialization budget.
+    #[tokio::test]
+    async fn rate_limited_reports_retry_later_with_retry_after() {
+        use axum::{Router, routing::get};
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-429").await;
+        let path = store_path(25, "ratelimited");
+
+        // An upstream that 429s every narinfo GET with Retry-After: 42.
+        let app = Router::new()
+            .route(
+                "/nix-cache-info",
+                get(|| async { "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n" }),
+            )
+            .fallback(get(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [(axum::http::header::RETRY_AFTER, "42")],
+                    "slow down",
+                )
+            }));
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        sqlx::query(
+            "INSERT INTO tenant_upstreams (tenant_id, url, priority, trusted_keys, sig_mode) \
+             VALUES ($1, $2, 50, $3, 'keep')",
+        )
+        .bind(tenant)
+        .bind(format!("http://{addr}"))
+        .bind(vec!["cache.429:AAAA".to_string()])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let seeded = seed_job(
+            &db.pool,
+            "mat-429-drv",
+            &[("out", path.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+        let ctx = make_ctx(db.pool.clone());
+        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let retry = outcome_retry_later(&outcome)
+            .unwrap_or_else(|| panic!("expected RetryLater, got {outcome:?}"));
+        assert_eq!(retry.class, "rate_limited");
+        assert_eq!(
+            retry.retry_after_secs, 42,
+            "parsed Retry-After rides the outcome"
+        );
+    }
+
+    // r[verify store.materialize.executor+4]
+    /// merged_bug_178 (178a): a placeholder race (another uploader
+    /// holds the slot) is RetryLater too — the in-flight upload will
+    /// land; charging would burn budget on our own concurrency. RED
+    /// (pre-fix): `Err(Raced)` charged infra.
+    #[tokio::test]
+    async fn raced_placeholder_reports_retry_later() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-raced").await;
+        let path = store_path(26, "raced");
+        let (nar, _) = rio_test_support::fixtures::make_nar(b"raced");
+        let upstream = spawn_multi_upstream(vec![(path.clone(), nar, vec![])], "cache.raced").await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+
+        // A YOUNG 'uploading' placeholder held by a concurrent
+        // uploader → claim_placeholder answers Concurrent → Raced.
+        let sp = StorePath::parse(&path).unwrap();
+        let hash = sp.sha256_digest();
+        crate::metadata::insert_manifest_uploading(&db.pool, &hash, &path, &[])
+            .await
+            .unwrap();
+
+        let seeded = seed_job(
+            &db.pool,
+            "mat-raced-drv",
+            &[("out", path.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+        let ctx = make_ctx(db.pool.clone());
+        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let retry = outcome_retry_later(&outcome)
+            .unwrap_or_else(|| panic!("expected RetryLater, got {outcome:?}"));
+        assert_eq!(retry.class, "raced");
+    }
+
+    /// GREEN PIN (merged_bug_178 scope narrowing): a stalled download
+    /// STAYS InfraFailure — `stalled_download_reports_infra_failure`
+    /// above is the pin; this test documents the table row.
+    #[test]
+    fn stalled_and_admission_stay_charging() {
+        use rio_evidence_kernel::outcome::*;
+        assert_eq!(
+            classify_substitute_failure(SubstituteFailureClass::Stalled),
+            FailureDisposition::ChargeInfra
+        );
+        assert_eq!(
+            classify_substitute_failure(SubstituteFailureClass::AdmissionSaturated),
+            FailureDisposition::ChargeInfra
+        );
+    }
+
+    // r[verify store.materialize.executor+4]
+    /// merged_bug_194 (store leg): a FIRST iteration that resolves no
+    /// verifiable wanted path reports infra — never "Success with
+    /// nothing verified". RED (pre-fix): the empty-seed break produced
+    /// a vacuous Success.
+    #[tokio::test]
+    async fn first_iteration_empty_wanted_reports_infra_not_success() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-vacuous").await;
+        // Floating-CA shape: the expected output path is the [""]
+        // placeholder, no carrier on the job → zero verifiable paths.
+        let seeded = seed_job(
+            &db.pool,
+            "mat-vacuous-drv",
+            &[("out", "")],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+        let ctx = make_ctx(db.pool.clone());
+        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let infra = outcome_infra(&outcome)
+            .unwrap_or_else(|| panic!("expected InfraFailure, got {outcome:?}"));
+        assert!(
+            infra.detail.contains("no-verifiable-wanted-paths"),
+            "the vacuous shape names itself: {}",
+            infra.detail
         );
     }
 }

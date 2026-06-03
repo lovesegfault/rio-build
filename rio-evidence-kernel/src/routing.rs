@@ -67,6 +67,14 @@ impl LiveWanted {
 pub struct RoutingInputs<'a> {
     /// Paths the executor confirmed absent upstream.
     pub missing_paths: &'a [String],
+    /// REFERENCE paths (narinfo closure extensions, never live-wanted
+    /// seeds) the executor confirmed absent upstream (merged_bug_193:
+    /// the walk's wanted-miss vs closure-reference-miss distinction —
+    /// proto `Unobtainable.missing_reference_paths`, plus the consumer-
+    /// side skew partition for old-store reports). A non-empty set is
+    /// a CONFIRMED CLOSURE HOLE: the moot arm must never complete over
+    /// it, whatever the live-wanted coverage says.
+    pub missing_references: &'a [String],
     /// Paths the executor verified present (and pinned).
     pub verified_paths: &'a [String],
     /// The live effective wanted PATHS (the §6 join, resolved to store
@@ -96,7 +104,7 @@ pub struct RoutingInputs<'a> {
     pub pruned_origin: bool,
 }
 
-// r[impl sched.materialize.routing+3]
+// r[impl sched.materialize.routing+4]
 /// The four-arm routing core. PURE (no IO, no clocks); the FMP
 /// re-probe answer is an input.
 ///
@@ -111,7 +119,14 @@ pub fn route_unobtainable(inputs: &RoutingInputs<'_>) -> UnobtainableRouting {
         .any(|p| inputs.live_wanted_paths.contains(p));
     // Arm 0 — moot-failure (the C3 arm). The witness type guarantees
     // the wanted set is non-empty, so `covered` cannot be vacuous.
-    if !missing_live {
+    // merged_bug_193: arm 0 additionally requires NO confirmed
+    // reference miss — a hole in the dependency closure is never moot,
+    // even when every live-wanted root is itself covered (the covered
+    // root's closure is exactly what the reference miss punctured).
+    // With a reference miss the decision falls through to arms 1–3,
+    // where Vouched/Pending route from-source and the leaf/holed arm
+    // settles on the origin discriminator.
+    if !missing_live && inputs.missing_references.is_empty() {
         let covered = inputs
             .live_wanted_paths
             .paths()
@@ -158,7 +173,7 @@ pub fn route_unobtainable(inputs: &RoutingInputs<'_>) -> UnobtainableRouting {
 /// Success-consumption coverage check (the CE-17 closer): the live
 /// wanted set is covered by what the execution ingested or verified.
 /// The witness type makes the check non-vacuous by construction.
-// r[impl sched.materialize.routing+3]
+// r[impl sched.materialize.routing+4]
 pub fn success_covers_live_wanted(
     ingested_paths: &[String],
     verified_paths: &[String],
@@ -202,6 +217,7 @@ mod tests {
         for evidence in [ClosureEvidence::ChildlessLeaf, ClosureEvidence::Holed] {
             let routing = route_unobtainable(&RoutingInputs {
                 missing_paths: &["/nix/store/a".into()],
+                missing_references: &[],
                 verified_paths: &[],
                 live_wanted_paths: &lw(&["/nix/store/a"]),
                 durable_evidence: evidence,
@@ -212,6 +228,7 @@ mod tests {
             assert_eq!(routing, UnobtainableRouting::FailFast);
             let routing = route_unobtainable(&RoutingInputs {
                 missing_paths: &["/nix/store/a".into()],
+                missing_references: &[],
                 verified_paths: &[],
                 live_wanted_paths: &lw(&["/nix/store/a"]),
                 durable_evidence: evidence,
@@ -221,5 +238,64 @@ mod tests {
             });
             assert_eq!(routing, UnobtainableRouting::ResolveFromSource);
         }
+    }
+
+    /// merged_bug_193 (kernel half): a confirmed REFERENCE miss can
+    /// never take the moot-completion arm, even with every live-wanted
+    /// root verified. Pre-fix the inputs could not express the
+    /// distinction (`missing_paths` lumped both): the covered check
+    /// completed over a punctured closure.
+    #[test]
+    fn routing_reference_miss_never_completes() {
+        // Covered live-wanted + a reference hole: arms 1/2 (Vouched/
+        // Pending) route from-source; leaf/holed falls to arm 3.
+        for (evidence, want) in [
+            (
+                ClosureEvidence::Vouched,
+                UnobtainableRouting::ResolveFromSource,
+            ),
+            (
+                ClosureEvidence::Pending,
+                UnobtainableRouting::ResolveFromSource,
+            ),
+        ] {
+            let routing = route_unobtainable(&RoutingInputs {
+                missing_paths: &[],
+                missing_references: &["/nix/store/dep".into()],
+                verified_paths: &["/nix/store/a".into()],
+                live_wanted_paths: &lw(&["/nix/store/a"]),
+                durable_evidence: evidence,
+                prior_unobtainable_count: 0,
+                reprobe: None,
+                pruned_origin: false,
+            });
+            assert_ne!(routing, UnobtainableRouting::CompleteForLiveInterest);
+            assert_eq!(routing, want);
+        }
+        // Same shape, leaf evidence + spent one-shot + pruned origin:
+        // the hole fail-fasts instead of completing.
+        let routing = route_unobtainable(&RoutingInputs {
+            missing_paths: &[],
+            missing_references: &["/nix/store/dep".into()],
+            verified_paths: &["/nix/store/a".into()],
+            live_wanted_paths: &lw(&["/nix/store/a"]),
+            durable_evidence: ClosureEvidence::ChildlessLeaf,
+            prior_unobtainable_count: 1,
+            reprobe: Some(ReprobeAnswer::ConfirmedMissing),
+            pruned_origin: true,
+        });
+        assert_eq!(routing, UnobtainableRouting::FailFast);
+        // And the no-hole twin still completes (the moot arm survives).
+        let routing = route_unobtainable(&RoutingInputs {
+            missing_paths: &[],
+            missing_references: &[],
+            verified_paths: &["/nix/store/a".into()],
+            live_wanted_paths: &lw(&["/nix/store/a"]),
+            durable_evidence: ClosureEvidence::Vouched,
+            prior_unobtainable_count: 0,
+            reprobe: None,
+            pruned_origin: false,
+        });
+        assert_eq!(routing, UnobtainableRouting::CompleteForLiveInterest);
     }
 }

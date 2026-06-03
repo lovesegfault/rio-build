@@ -20863,6 +20863,10 @@
           "packageId": "rio-common"
         },
         {
+          "name": "rio-evidence-kernel",
+          "packageId": "rio-evidence-kernel"
+        },
+        {
           "name": "rio-log-kernel",
           "packageId": "rio-log-kernel"
         },

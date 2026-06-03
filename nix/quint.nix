@@ -3867,7 +3867,7 @@ in
     # partition invariants: the pre-existing invariants are re-proven
     # over materialization interleavings (a materialization action
     # between any two build events must not perturb any of them).
-    # r[verify sched.materialize.routing+3]
+    # r[verify sched.materialize.routing+4]
     quint-retry-policy-pull-materialization = mkQuintCheck {
       name = "retry-policy-pull-materialization";
       spec = "retryPolicy";
@@ -3984,7 +3984,7 @@ in
     # + the marked-claim / post-failover-claim witnesses (the B1/B3
     # liveness flips).
     # r[verify sched.materialize.job+2]
-    # r[verify sched.materialize.routing+3]
+    # r[verify sched.materialize.routing+4]
     quint-materialization-holds-base = mkQuintSimHoldsCheck {
       name = "materialization-holds-base";
       spec = "materializationJob";
@@ -3993,7 +3993,7 @@ in
       maxSamples = 2000000;
       maxSteps = 15;
     };
-    # r[verify store.materialize.executor+3]
+    # r[verify store.materialize.executor+4]
     # r[verify sched.materialize.settlement]
     quint-materialization-holds-failover = mkQuintSimHoldsCheck {
       name = "materialization-holds-failover";

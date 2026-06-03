@@ -26,6 +26,7 @@ server = [
   "dep:rio-common",
   "dep:rio-auth",
   "dep:rio-nix",
+  "dep:rio-evidence-kernel",
   "dep:rio-proto",
   "dep:rio-log-kernel",
   "dep:tokio",
@@ -89,6 +90,9 @@ rio-common = { workspace = true, features = ["aws"], optional = true }
 rio-auth = { workspace = true, optional = true }
 rio-nix = { workspace = true, optional = true }
 rio-proto = { workspace = true, optional = true }
+# The walk's substitute-failure truth table + reprobe fold (A4,
+# merged_bug_178/028) — std-only, server-gated like rio-log-kernel.
+rio-evidence-kernel = { workspace = true, optional = true }
 # The pure log decision kernels (logs/kernel re-export). `logs` is
 # server-gated, and the lean `schema` feature stays kernel-free.
 rio-log-kernel = { workspace = true, optional = true }

@@ -1106,7 +1106,7 @@ local NAR-bytes budget is exempt as durable data --- the owner stamps
   indicates under-sized fetcher pods (I-207/I-208).
 ]
 
-#r("store.materialize.executor+3")[
+#r("store.materialize.executor+4")[
   Whenever a scheduler address is configured, each store replica
   MUST execute materialization jobs as a pull-protocol client: discover jobs by
   polling the scheduler, claim exactly one open attempt per job through
@@ -1119,7 +1119,22 @@ local NAR-bytes budget is exempt as durable data --- the owner stamps
   creating-build tenant is honored only while a live interested build carries
   it) before fetching: a job whose tenant cannot be resolved or has no
   configured upstreams MUST be reported as InfraFailure, never as Unobtainable
-  and never silently completed. Job discovery and outcome reporting MUST
+  and never silently completed. The walk MUST classify its verdicts through
+  total, witness-carrying cells: a missing-path verdict requires a local-
+  presence miss (a path with a complete local manifest verifies, is pinned,
+  and extends the walk from the LOCAL row's references — upstream absence
+  alone is never a miss; a failing local probe is InfraFailure); confirmed
+  misses are partitioned by cell — live-wanted seeds into the wanted-missing
+  set, narinfo reference extensions into the reference-missing set — and a
+  first walk iteration that resolves no verifiable wanted path is
+  InfraFailure, never an empty Success; substitute failures MUST be classified
+  through a total table with no catch-all arm: a raced placeholder slot and an
+  upstream rate-limit are reported RetryLater (transient, to be closed
+  uncharged) while download stalls and admission saturation deliberately
+  remain InfraFailure (capacity and stall evidence must reach the charge
+  ladder). Per-path fetch progress MUST be relayed with the declared NAR size
+  leading the streamed bytes and the serving upstream named. Job discovery
+  and outcome reporting MUST
   survive scheduler replica replacement: a transport connection whose peer
   answers the not-leader rejection MUST be abandoned and re-dialed rather than
   retried indefinitely, so that polls and reports converge on the serving

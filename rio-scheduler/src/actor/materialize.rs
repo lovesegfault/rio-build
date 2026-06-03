@@ -39,6 +39,14 @@ impl JobDescriptor {
     }
 }
 
+/// Transient-retry deferral bounds (merged_bug_178). The default
+/// covers `raced` (no Retry-After exists) and a 429 with no header;
+/// the cap bounds a hostile/buggy store's `retry_after_secs` — the
+/// deferral is view-only pacing, never park semantics, so the cap is
+/// a denial-of-pacing bound, not a correctness edge.
+pub(super) const RETRY_LATER_DEFAULT_DEFER_SECS: u64 = 5;
+pub(super) const RETRY_LATER_MAX_DEFER_SECS: u64 = 300;
+
 /// The in-memory job view entry (droppable, never written back —
 /// design handoff input 1's "derived droppable view"). Authority lives
 /// in PG: creation dedup is the partial-unique index; consumption is
@@ -68,6 +76,18 @@ pub(crate) struct JobViewEntry {
     /// = never parked (or parked pre-083 — the dwell gate treats it as
     /// unmet, conservatively).
     pub parked_at: Option<crate::state::RecoveredInstant>,
+    /// Transient-retry deferral (merged_bug_178): set by the
+    /// RetryLater consumption arm (raced placeholder / upstream 429 —
+    /// closed UNCHARGED), read by pull admission ONLY. Deliberately
+    /// VIEW-ONLY: no durable column, no park semantics — PD-20's
+    /// re-evaluation filter and the stalled gauge stay keyed on
+    /// `parked_until`/`parked_at` exclusively, so a 429 wave can never
+    /// walk a healthy job into park→PD-20→from-source, and a failover
+    /// loses at most one uncharged deferral window (the new leader's
+    /// view rebuild leaves it `None` — the job is immediately
+    /// claimable again, which is the conservative direction for an
+    /// uncharged transient).
+    pub defer_until: Option<std::time::Instant>,
 }
 
 /// `#[must_use]` actor-side disposition of a fenced durable write —
@@ -559,6 +579,9 @@ impl DagActor {
                 .park_began_secs_ago
                 .filter(|secs| *secs >= 0.0)
                 .map(crate::state::RecoveredInstant::from_age_secs),
+            // View-only by design (merged_bug_178): a rebuild loses at
+            // most one uncharged transient deferral window.
+            defer_until: None,
         }
     }
 
@@ -597,6 +620,7 @@ impl DagActor {
                         claimed_by: None,
                         carried_realized_paths: None,
                         parked_at: None,
+                        defer_until: None,
                     },
                 );
             }
@@ -729,11 +753,19 @@ impl DagActor {
                 Some(holder) => JobView::Claimed {
                     held_by_puller: holder == pulling_identity,
                 },
-                None => JobView::Pending {
-                    parked: entry
-                        .parked_until
-                        .is_some_and(|until| until > std::time::Instant::now()),
-                },
+                None => {
+                    let now = std::time::Instant::now();
+                    JobView::Pending {
+                        // Admission treats an active transient deferral
+                        // (merged_bug_178, view-only) like a park: the
+                        // claim is refused with NotYetReady until the
+                        // deferral lapses. PD-20 and the stalled gauge
+                        // do NOT read this field — defer is pacing for
+                        // the NEXT claim, never park evidence.
+                        parked: entry.parked_until.is_some_and(|until| until > now)
+                            || entry.defer_until.is_some_and(|until| until > now),
+                    }
+                }
             },
         }
     }
@@ -848,7 +880,13 @@ impl DagActor {
         self.materialization_jobs
             .get(drv_hash)
             .is_some_and(|entry| {
-                entry.claimed_by.is_none() && entry.parked_until.is_none_or(|until| until <= now)
+                entry.claimed_by.is_none()
+                    && entry.parked_until.is_none_or(|until| until <= now)
+                    // An active transient deferral (merged_bug_178) is
+                    // not claimable demand either — admission refuses
+                    // it, so advertising it would scale the store
+                    // against refusals.
+                    && entry.defer_until.is_none_or(|until| until <= now)
             })
     }
 
@@ -917,7 +955,7 @@ pub(crate) use rio_evidence_kernel::routing::{
 };
 
 impl DagActor {
-    // r[impl sched.materialize.routing+3]
+    // r[impl sched.materialize.routing+4]
     /// Consume one materialization outcome (the §2.4 consumption
     /// transaction). Reachable only flag-on in practice (no
     /// materialization attempt can exist otherwise) — but ALWAYS wired
@@ -1095,10 +1133,35 @@ impl DagActor {
                 // job's origin — `pruned_origin` was read from the job
                 // row above (T-D2.1: the durable fact, not the
                 // in-memory column).
-                let needs_probe = u
-                    .missing_paths
+                // merged_bug_193: the wanted-miss vs reference-miss
+                // partition. New stores report references in their own
+                // cell; an OLD store (bounded skew, scheduler-before-
+                // store rollout) lumps them into missing_paths — the
+                // consumer partitions: a missing entry outside
+                // expected ∪ carried ∪ live-wanted cannot be a wanted
+                // miss (wanted paths are drawn from exactly those
+                // sets), so it is a reference miss.
+                let expected_paths: Vec<String> = self
+                    .dag
+                    .node(&drv_hash)
+                    .map(|st| st.expected_output_paths.clone())
+                    .unwrap_or_default();
+                let (missing_wanted, skew_references): (Vec<String>, Vec<String>) =
+                    u.missing_paths.iter().cloned().partition(|p| {
+                        live_wanted_paths.contains(p.as_str())
+                            || carried_paths.contains(p)
+                            || expected_paths.contains(p)
+                    });
+                let mut missing_references = u.missing_reference_paths.clone();
+                missing_references.extend(skew_references);
+                // The arm-3 probe is needed exactly when arm 0 cannot
+                // apply (a live-wanted miss OR a confirmed closure
+                // hole) and the evidence is leaf/holed (arms 1/2
+                // decide without it).
+                let needs_probe = (missing_wanted
                     .iter()
                     .any(|p| live_wanted_paths.contains(p.as_str()))
+                    || !missing_references.is_empty())
                     && matches!(
                         durable_evidence,
                         rio_evidence_kernel::ClosureEvidence::ChildlessLeaf
@@ -1123,7 +1186,8 @@ impl DagActor {
                     None
                 };
                 let routing = route_unobtainable(&RoutingInputs {
-                    missing_paths: &u.missing_paths,
+                    missing_paths: &missing_wanted,
+                    missing_references: &missing_references,
                     verified_paths: &u.verified_paths,
                     live_wanted_paths: &live_wanted_paths,
                     durable_evidence,
@@ -1224,6 +1288,40 @@ impl DagActor {
                         serving_generation,
                     )
                     .await;
+                Ok(())
+            }
+            Some(Outcome::RetryLater(r)) => {
+                // merged_bug_178: transient by the substituter's own
+                // contract (raced placeholder slot / upstream 429) —
+                // the attempt proves nothing about upstream content or
+                // store health. Close UNCHARGED (no ledger row of any
+                // class: a 429 wave must never burn the park budget),
+                // defer the job's next claim (VIEW-ONLY — PD-20 and
+                // the stalled gauge never read it), and re-arm
+                // atomically (the InfraFailure posture: re-arm without
+                // the reassign is the documented wedge).
+                let retry_after = std::time::Duration::from_secs(
+                    r.retry_after_secs
+                        .clamp(0, RETRY_LATER_MAX_DEFER_SECS)
+                        .max(RETRY_LATER_DEFAULT_DEFER_SECS),
+                );
+                tracing::info!(
+                    %exec_id,
+                    drv_hash = %drv_hash,
+                    class = %r.class,
+                    detail = %r.detail,
+                    defer_secs = retry_after.as_secs(),
+                    "transient materialization failure; closing uncharged and deferring"
+                );
+                let close_d = self
+                    .close_materialization_attempt(exec_id, &drv_hash, None, serving_generation)
+                    .await;
+                if close_d.settled() {
+                    if let Some(entry) = self.materialization_jobs.get_mut(&drv_hash) {
+                        entry.defer_until = Some(std::time::Instant::now() + retry_after);
+                    }
+                    self.release_claim(&drv_hash, Some(&executor)).await;
+                }
                 Ok(())
             }
             Some(Outcome::Aborted(a)) => {
@@ -1329,7 +1427,7 @@ impl DagActor {
     /// channel without the decision no longer exists. Park backs off
     /// the job durably (and the node is requeued either way: claimable
     /// again / from-source dispatchable per the admission table).
-    // r[impl sched.materialize.routing+3]
+    // r[impl sched.materialize.routing+4]
     #[allow(clippy::too_many_arguments)]
     async fn charge_materialization_infra(
         &mut self,
@@ -1769,7 +1867,7 @@ impl DagActor {
     /// mid-walk crash leaves outputs present but the closure
     /// incomplete) and never `executor_crash` (BC-2: the charge feeds
     /// the materialization budget and nothing else).
-    // r[impl sched.materialize.routing+3]
+    // r[impl sched.materialize.routing+4]
     pub(super) async fn establish_materialization_attempt(
         &mut self,
         attempt: &crate::db::open_attempts::OpenAttemptRow,
@@ -1809,7 +1907,7 @@ impl DagActor {
     }
 
     // r[impl obs.metric.materialization-stalled+2]
-    // r[impl sched.materialize.routing+3]
+    // r[impl sched.materialize.routing+4]
     /// PD-20 (design §2.5, Phase B T-6.1): the parked-job housekeeping
     /// arm. Every tick, flag-on, leader-only:
     ///
