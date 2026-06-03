@@ -187,7 +187,7 @@ JSON logger), so a slow `fetchurl` never trips its silence handling.
 rio's fetch runs inside the same sandbox contract as any build
 (#rref("fetcher.fetchurl.sandboxed")), so the equivalent signal is
 plain stderr lines feeding the activity watch
-(#rref("builder.exec.limits-isolated+1")). Transfers alive but slower
+(#rref("builder.exec.limits-isolated+2")). Transfers alive but slower
 than the cadence floor are deliberately treated as silent: at that
 rate a 100 MiB source takes over an hour, and the operator's
 max-silent policy --- not the fetcher --- owns that call.

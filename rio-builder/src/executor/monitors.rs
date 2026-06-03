@@ -239,20 +239,33 @@ pub(super) async fn drain_build_cgroup(build_cgroup: crate::cgroup::BuildCgroup)
         tracing::warn!(error = %e, "build_cgroup.kill() failed");
     }
     // cgroup.kill is async: write returns before procs are gone. Poll
-    // cgroup.procs until empty or 2s elapsed (SIGKILL → exit is ~ms,
-    // so 2s is vast headroom for a zombie-reparented
-    // tree). Sync read on blocking pool — 200 iterations of a single-line
-    // procfs read, negligible.
+    // until empty or 2s elapsed (SIGKILL → exit is ~ms, so 2s is vast
+    // headroom for a zombie-reparented tree). Sync read on blocking
+    // pool — 200 iterations of single-line procfs reads, negligible.
+    //
+    // BOTH levels must drain: `cgroup.procs` lists only DIRECT
+    // members, and the build's processes live one level down in
+    // rio-exec's `build/` sub-cgroup (the relay is the only direct
+    // member). Polling the parent alone would report drained the
+    // moment the relay exits, while build processes still pin
+    // `build/` — and the Drop-time rmdir of the sub-cgroup would
+    // EBUSY-leak the pair.
     let cgroup_path_for_poll = build_cgroup.path().to_path_buf();
     let drained = tokio::task::spawn_blocking(move || {
-        for _ in 0..200 {
-            match std::fs::read_to_string(cgroup_path_for_poll.join("cgroup.procs")) {
-                Ok(s) if s.trim().is_empty() => return true,
-                Ok(_) => std::thread::sleep(Duration::from_millis(10)),
-                // ENOENT: cgroup already gone (shouldn't happen — we
-                // hold the BuildCgroup — but treat as drained).
-                Err(_) => return true,
+        let level_empty = |path: &std::path::Path| -> bool {
+            match std::fs::read_to_string(path.join("cgroup.procs")) {
+                Ok(s) => s.trim().is_empty(),
+                // ENOENT: that level is already gone (the sub-cgroup
+                // is never created for aborted spawns) — drained.
+                Err(_) => true,
             }
+        };
+        let build_level = cgroup_path_for_poll.join("build");
+        for _ in 0..200 {
+            if level_empty(&cgroup_path_for_poll) && level_empty(&build_level) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
         false
     })

@@ -114,6 +114,16 @@ use crate::{ExecError, skeleton};
 /// stalled; EOF and channel capacity normally arrive well before this.
 const FINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a principal-targeted kill waits for the relay to forward
+/// the killed build's status before escalating to a whole-tree kill.
+/// The relay's remaining work at that point is one `waitpid` wake-up
+/// plus an `_exit` — microseconds; the grace absorbs scheduler
+/// pathology on starved nodes. Generous is fine: the escalation is a
+/// backstop against a stuck relay (a supervision failure), not part
+/// of any normal path, and the wait runs concurrently with the
+/// supervision loop's own reap of the same exit.
+const RELAY_ESCALATION_GRACE: Duration = Duration::from_secs(5);
+
 /// Capacity of the internal raw-chunk channel between the blocking
 /// pipe/pty readers and the async line splitter. Bounded so a build
 /// that outputs faster than the caller consumes applies backpressure
@@ -213,7 +223,7 @@ impl PendingEvents {
 
 /// Why the executor killed the process tree before it finished on its
 /// own. Takes precedence over the raw exit status when mapping the
-/// final [`ExitOutcome`].
+/// final [`ExitOutcome`] — if the wait status corroborates it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KillReason {
     Timeout,
@@ -229,6 +239,31 @@ impl From<KillReason> for ExitOutcome {
             KillReason::LogLimit => ExitOutcome::LogLimitExceeded,
         }
     }
+}
+
+/// What a kill that *acted* was aimed at. Decides which wait statuses
+/// can corroborate the recorded claim — the two targets produce
+/// disjoint relay statuses by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillTarget {
+    /// The build principal only: `<cg>/build/cgroup.kill` plus the
+    /// placed pidfd. The relay is never signaled, so it always
+    /// survives to forward the principal's true status — the only
+    /// status such a kill can produce is the forwarded `128+9`.
+    Principal,
+    /// The whole tree, relay included (pre-placement: no principal
+    /// handle exists yet, and no tenant instruction has run — the
+    /// release gate is still closed).
+    Tree,
+}
+
+/// A recorded limit kill: the *claim* layer of the verdict contract.
+/// [`map_exit`] honors it only when the wait status is one the kill,
+/// as targeted, could actually have produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KillClaim {
+    reason: KillReason,
+    target: KillTarget,
 }
 
 /// What the setup-status pipe reported.
@@ -285,7 +320,7 @@ impl ActivityMeter {
     }
 
     /// Record `n` freshly read bytes and wake the watchdog.
-    // r[impl builder.exec.limits-isolated+1]
+    // r[impl builder.exec.limits-isolated+2]
     fn record(&self, n: usize) {
         let total = self.bytes.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
         self.tick.send_replace(total);
@@ -309,18 +344,18 @@ struct LimitWatchdog {
     started: Instant,
     activity: watch::Receiver<u64>,
     bytes: Arc<AtomicU64>,
-    /// Why the watchdog killed, if it did and the kill acted on a tree
-    /// the phase machine still believed live. A *claim*, not a
-    /// verdict: `execute()` reads it after the reap and [`map_exit`]
-    /// honors it only when the wait status corroborates death by the
-    /// executor's own SIGKILL.
-    reason: Arc<std::sync::Mutex<Option<KillReason>>>,
+    /// Why (and at what target) the watchdog killed, if it did and
+    /// the kill acted on a tree the phase machine still believed
+    /// live. A *claim*, not a verdict: `execute()` reads it after the
+    /// reap and [`map_exit`] honors it only when the wait status is
+    /// one the kill, as targeted, could actually have produced.
+    claim: Arc<std::sync::Mutex<Option<KillClaim>>>,
 }
 
 impl LimitWatchdog {
     /// Enforce until a limit fires (kill, then return) or nothing can
     /// ever fire again (return without killing).
-    // r[impl builder.exec.limits-isolated+1]
+    // r[impl builder.exec.limits-isolated+2]
     async fn run(mut self) {
         // Tokio instants throughout: identical to the monotonic clock
         // in production, virtualizable under `start_paused` tests.
@@ -351,7 +386,7 @@ impl LimitWatchdog {
                                 .max_log_bytes
                                 .is_some_and(|max| self.bytes.load(Ordering::Relaxed) > max)
                             {
-                                self.kill(KillReason::LogLimit);
+                                self.kill_and_escalate(KillReason::LogLimit).await;
                                 return;
                             }
                         }
@@ -371,7 +406,7 @@ impl LimitWatchdog {
                     }
                 }
                 () = sleep_until_opt(timeout_at), if timeout_at.is_some() => {
-                    self.kill(KillReason::Timeout);
+                    self.kill_and_escalate(KillReason::Timeout).await;
                     return;
                 }
                 // A second implementation site for the silence kill: the
@@ -379,31 +414,56 @@ impl LimitWatchdog {
                 // of classification and delivery.
                 // r[impl builder.silence.timeout-kill+3]
                 () = sleep_until_opt(silent_at), if silent_at.is_some() => {
-                    self.kill(KillReason::Silent);
+                    self.kill_and_escalate(KillReason::Silent).await;
                     return;
                 }
             }
         }
     }
 
-    /// Kill the tree and record why — but only when the kill actually
-    /// acted on a tree the state machine still believed live.
+    /// Kill the build and record why — but only when the kill
+    /// actually acted on a tree the state machine still believed
+    /// live — then, for a principal-targeted kill, backstop the
+    /// relay's forward with a claim-free escalation.
     ///
     /// This is the *narrowing* layer of the two-layer verdict contract
     /// (see [`map_exit`] for the deciding layer). Kill-under-the-
-    /// reason-mutex: the kill happens while the reason slot is locked,
+    /// claim-mutex: the kill happens while the claim slot is locked,
     /// so the exit it causes cannot be mapped before the slot is
     /// consistent; a deadline that fires after the tree settled is a
     /// no-op that records nothing. The state machine necessarily lags
     /// the kernel by the [exit observed, phase flipped] window, so a
-    /// recorded reason alone is a *claim*, not a verdict — `map_exit`
-    /// honors it only when the wait status corroborates death by our
-    /// own SIGKILL.
-    // r[impl builder.exec.limits-isolated+1]
-    fn kill(&self, reason: KillReason) {
-        let mut slot = self.reason.lock().unwrap_or_else(|e| e.into_inner());
-        if self.tree.kill_tree() && slot.is_none() {
-            *slot = Some(reason);
+    /// recorded claim alone is not a verdict — `map_exit` honors it
+    /// only when the wait status is one the kill, as targeted, could
+    /// actually have produced.
+    ///
+    /// A principal kill leaves the relay alive on purpose (it is the
+    /// carrier of the corroborating status). Its one job is bounded:
+    /// if the relay has not been reaped within
+    /// [`RELAY_ESCALATION_GRACE`] of the kill, [`TreeState::
+    /// escalate_relay`] takes the whole tree down with **no claim
+    /// mutation** — the resulting `signaled(SIGKILL)` relay status
+    /// does not corroborate a `Principal` claim, so the verdict
+    /// degrades to the honest `Signaled(9)` rather than a
+    /// manufactured limit verdict.
+    // r[impl builder.exec.limits-isolated+2]
+    // r[impl builder.exec.kill-targets-principal]
+    async fn kill_and_escalate(&self, reason: KillReason) {
+        let target = {
+            let mut slot = self.claim.lock().unwrap_or_else(|e| e.into_inner());
+            let target = self.tree.kill_tree();
+            if let Some(target) = target
+                && slot.is_none()
+            {
+                *slot = Some(KillClaim { reason, target });
+            }
+            target
+        };
+        if target == Some(KillTarget::Principal) {
+            tokio::time::sleep(RELAY_ESCALATION_GRACE).await;
+            if !self.tree.is_settled() {
+                self.tree.escalate_relay();
+            }
         }
     }
 }
@@ -635,7 +695,14 @@ pub async fn execute(
             .await);
     }
     tree.place_principal(principal_pidfd);
-    if let Err(e) = nix::unistd::write(&go_w, &[1u8]) {
+    if let Err(e) = nix::unistd::write(&go_w, &[1u8])
+        && !(e == Errno::EPIPE && tree.was_killed())
+    {
+        // EPIPE with a kill already recorded is the benign race — a
+        // deadline fired inside [placement, release] and the kill took
+        // the gated child (the pipe's only remaining read end) with
+        // it. The relay is about to forward the verdict; fall through
+        // to supervision instead of aborting it away.
         return Err(sandbox
             .abort(
                 std::io::Error::from(e),
@@ -671,7 +738,7 @@ pub async fn execute(
     // nothing else. It performs no channel sends, so no consumer
     // behavior (a stalled events receiver, a full chunk channel) can
     // delay a limit kill.
-    let limit_reason: Arc<std::sync::Mutex<Option<KillReason>>> =
+    let limit_claim: Arc<std::sync::Mutex<Option<KillClaim>>> =
         Arc::new(std::sync::Mutex::new(None));
     let watchdog = tokio::spawn(
         LimitWatchdog {
@@ -682,7 +749,7 @@ pub async fn execute(
             started,
             activity: activity_rx,
             bytes: meter_bytes,
-            reason: Arc::clone(&limit_reason),
+            claim: Arc::clone(&limit_claim),
         }
         .run(),
     );
@@ -704,7 +771,7 @@ pub async fn execute(
             // `reserve()` is its own arm, so the loop never parks on
             // the receiver: no capacity simply means this arm stays
             // pending while the others keep running.
-            // r[impl builder.exec.limits-isolated+1]
+            // r[impl builder.exec.limits-isolated+2]
             permit = events.reserve(), if events_open && !pending.is_empty() => {
                 match permit {
                     Ok(permit) => {
@@ -779,8 +846,11 @@ pub async fn execute(
 
     // Enforcement is over: stop the watchdog before any drain work so
     // a deadline cannot fire mid-drain. A kill already in flight
-    // completes (kills are synchronous under the reason mutex) and
-    // no-ops against the reaped tree without recording a reason.
+    // completes (kills are synchronous under the claim mutex) and
+    // no-ops against the reaped tree without recording a claim. An
+    // escalation grace pending for a principal kill is cancelled with
+    // the task — the tree settled, which is exactly the condition the
+    // escalation exists to force.
     watchdog.abort();
 
     // The status report normally resolved long ago; give a straggler
@@ -854,11 +924,11 @@ pub async fn execute(
         Err(e) => return Err(ExecError::Spawn(e)),
     };
 
-    // Read the watchdog's verdict after the abort: the lock serializes
-    // with a kill in flight, and a reason exists only when the kill
+    // Read the watchdog's claim after the abort: the lock serializes
+    // with a kill in flight, and a claim exists only when the kill
     // actually acted on the live tree.
-    let kill_reason = *limit_reason.lock().unwrap_or_else(|e| e.into_inner());
-    let exit = map_exit(raw_status, kill_reason);
+    let kill_claim = *limit_claim.lock().unwrap_or_else(|e| e.into_inner());
+    let exit = map_exit(raw_status, kill_claim);
     let outputs = {
         let request = request.clone();
         tokio::task::spawn_blocking(move || collect_outputs(&request))
@@ -968,30 +1038,53 @@ fn intermediate_main(
             unsafe {
                 libc::syscall(libc::SYS_close_range, 3u32, libc::c_uint::MAX, 0u32);
             }
-            let mut status: libc::c_int = 0;
-            loop {
-                // SAFETY: waitpid into a stack buffer for a direct child.
-                let rc = unsafe { libc::waitpid(grandchild, &raw mut status, 0) };
-                if rc == grandchild {
-                    break;
-                }
-                if rc == -1 && Errno::last() != Errno::EINTR {
-                    // Cannot learn the child's fate; 124 is this
-                    // executor's "supervision failed" convention and is
-                    // mapped to a plain exit code by the parent.
-                    child::exit_immediately(124);
-                }
-            }
-            let code = if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status)
-            } else if libc::WIFSIGNALED(status) {
-                // Forward a fatal signal as the conventional 128+N.
-                128 + libc::WTERMSIG(status)
-            } else {
-                124
-            };
-            child::exit_immediately(code);
+            relay_wait_and_forward(grandchild);
         }
+    }
+}
+
+/// THE relay loop: wait for the principal, forward its status, never
+/// return. Async-signal-safe (raw syscalls over a stack buffer).
+///
+/// This exact function is the production relay
+/// ([`intermediate_main`]'s tail) *and* the relay of the two-level
+/// test harness — factored so the harness cannot drift from
+/// production. The kill-corroboration race fixed by the principal
+/// split lived precisely in this loop's [principal exit, forward]
+/// window, and its three prior fixes were each validated against
+/// single-process harnesses that could not express that window; the
+/// shared loop makes the production topology the topology under test.
+// r[impl builder.exec.kill-targets-principal]
+fn relay_wait_and_forward(principal: libc::pid_t) -> ! {
+    let mut status: libc::c_int = 0;
+    loop {
+        // SAFETY: waitpid into a stack buffer for a direct child.
+        let rc = unsafe { libc::waitpid(principal, &raw mut status, 0) };
+        if rc == principal {
+            break;
+        }
+        if rc == -1 && Errno::last() != Errno::EINTR {
+            // Cannot learn the principal's fate; 124 is this
+            // executor's "supervision failed" convention and is
+            // mapped to a plain exit code by the parent.
+            child::exit_immediately(124);
+        }
+    }
+    child::exit_immediately(relay_forward_code(status));
+}
+
+/// The relay's forwarding convention, as a pure function of the
+/// principal's wait status: plain exit codes pass through, fatal
+/// signals become `128 + signo`, anything else is the supervision-
+/// failure 124.
+fn relay_forward_code(status: libc::c_int) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        // Forward a fatal signal as the conventional 128+N.
+        128 + libc::WTERMSIG(status)
+    } else {
+        124
     }
 }
 
@@ -1047,13 +1140,18 @@ struct CallerGone;
 struct TreeState {
     phase: std::sync::Mutex<TreePhase>,
     cgroup: Option<PathBuf>,
+    /// `<cgroup>/build` — the principal's kill scope, derived once so
+    /// every kill path scopes identically.
+    build_cgroup: Option<PathBuf>,
 }
 
 impl TreeState {
     fn new(cgroup: Option<PathBuf>) -> Arc<TreeState> {
+        let build_cgroup = cgroup.as_ref().map(|c| c.join(BUILD_SUBCGROUP));
         Arc::new(TreeState {
             phase: std::sync::Mutex::new(TreePhase::Armed),
             cgroup,
+            build_cgroup,
         })
     }
 
@@ -1072,6 +1170,13 @@ impl TreeState {
     /// reaped, or never adopted because the caller vanished first?
     fn is_settled(&self) -> bool {
         matches!(*self.lock(), TreePhase::Reaped | TreePhase::Dead)
+    }
+
+    /// Has a kill already acted on the adopted tree? (Used to
+    /// recognize the benign release-EPIPE race: the kill destroyed
+    /// the gated child holding the pipe's only read end.)
+    fn was_killed(&self) -> bool {
+        matches!(*self.lock(), TreePhase::Adopted { killed: true, .. })
     }
 
     /// Publish a freshly forked pid. **The only path by which a pid
@@ -1159,40 +1264,81 @@ impl TreeState {
         }
     }
 
-    /// Kill the adopted process tree, once, and never after it was
-    /// reaped. Returns whether the kill *acted* — the tree was live
-    /// (adopted, not yet killed, not yet reaped) and the signal was
-    /// sent. Callers attributing an exit outcome to their kill (the
-    /// [`LimitWatchdog`]) record their reason only on `true`: a kill
-    /// that no-opped on an already-settled tree must not override the
-    /// natural exit.
+    /// Kill the build, once, and never after the tree was reaped.
+    /// Returns the target the kill *acted* on — `None` when the tree
+    /// was already settled or killed. Callers attributing an exit
+    /// outcome to their kill (the [`LimitWatchdog`]) record their
+    /// claim only on `Some`, tagged with the returned target: a kill
+    /// that no-opped must not override the natural exit, and the
+    /// target decides which wait statuses can corroborate the claim.
     ///
-    /// Writes `cgroup.kill` when a cgroup was given (kills every
-    /// process in the cgroup, including fork bombs the parent has
-    /// never heard of) and then always SIGKILLs the intermediate
-    /// directly: the tree may not be in the cgroup at all — the
-    /// `cgroup.procs` attach is itself a step that can fail, and its
-    /// abort path runs through here — and a cgroup the executor cannot
-    /// write to must not leak the tree either. The intermediate's
-    /// death SIGKILLs the sandbox child through `PR_SET_PDEATHSIG`
-    /// (armed from the sandbox child's first setup instruction; see
-    /// `child::setup`), and the sandbox child is pid 1 of the PID
-    /// namespace, so the kernel then kills everything else in it.
+    /// **Post-placement** ([`KillTarget::Principal`]): write
+    /// `<cg>/build/cgroup.kill` (the principal's whole subtree,
+    /// including fork bombs) and `pidfd_send_signal` the principal —
+    /// and *never* signal the relay. The relay survives by
+    /// construction, reaps the principal, and forwards its true
+    /// status: `128+9` if our kill won, the natural status if the
+    /// principal had already exited. The kill machinery can no longer
+    /// destroy the evidence it is judged by (merged_bug_046's window
+    /// is unexpressible, not narrowed). A relay that then fails to
+    /// forward within the escalation grace is taken down by
+    /// [`TreeState::escalate_relay`], claim-free.
+    ///
+    /// **Pre-placement** ([`KillTarget::Tree`]): the legacy whole-tree
+    /// kill — `<cg>/cgroup.kill` (recursive, so it covers a
+    /// just-populated `<cg>/build` too) plus a direct SIGKILL of the
+    /// relay, whose death cascades to a mid-setup sandbox child via
+    /// `PR_SET_PDEATHSIG`. Safe to aim at the relay here because the
+    /// release gate is still closed: no tenant instruction has run,
+    /// so no completed build exists to misattribute.
     // r[impl builder.exec.tree-ownership]
-    fn kill_tree(&self) -> bool {
+    // r[impl builder.exec.kill-targets-principal]
+    fn kill_tree(&self) -> Option<KillTarget> {
         let mut phase = self.lock();
-        if let TreePhase::Adopted { pid, killed, .. } = &mut *phase
+        if let TreePhase::Adopted {
+            pid,
+            killed,
+            principal,
+            ..
+        } = &mut *phase
             && !*killed
         {
             *killed = true;
             let pid = *pid;
-            // The kill happens under the lock: cheap (a cgroupfs write
-            // and a kill(2)), and it means mark_reaped can never
+            // The kill happens under the lock: cheap (cgroupfs writes
+            // and a signal), and it means mark_reaped can never
             // interleave between the killed=true flip and the signal.
-            kill_pid_and_cgroup(self.cgroup.as_deref(), pid);
-            true
+            if let Some(pidfd) = principal {
+                if let Some(build_cgroup) = self.build_cgroup.as_deref() {
+                    let _ = std::fs::write(build_cgroup.join("cgroup.kill"), "1");
+                }
+                pidfd_kill(pidfd);
+                Some(KillTarget::Principal)
+            } else {
+                kill_pid_and_cgroup(self.cgroup.as_deref(), pid);
+                Some(KillTarget::Tree)
+            }
         } else {
-            false
+            None
+        }
+    }
+
+    /// Escalation backstop for a placed kill: the relay had one job —
+    /// reap the killed principal and forward `137` — and has not done
+    /// it within the grace period. Take the whole tree down (relay
+    /// included) so the execution terminates.
+    ///
+    /// Deliberately **claim-free**: this path records nothing, and the
+    /// `signaled(SIGKILL)` relay status it produces does not
+    /// corroborate a `Principal` claim — the verdict honestly degrades
+    /// to `Signaled(9)` instead of a manufactured `TimedOut`/`Silent`.
+    /// (A relay stuck past the grace is a supervision failure, not
+    /// evidence about the build.)
+    // r[impl builder.exec.kill-targets-principal]
+    fn escalate_relay(&self) {
+        let phase = self.lock();
+        if let TreePhase::Adopted { pid, .. } = &*phase {
+            kill_pid_and_cgroup(self.cgroup.as_deref(), *pid);
         }
     }
 }
@@ -1350,7 +1496,7 @@ fn wait_for(pid: nix::unistd::Pid) -> Result<i32, std::io::Error> {
 /// back to the legacy reap-then-mark order: a tree must never be
 /// marked `Reaped` while the process may still be alive (the mark is
 /// what disarms every kill path).
-// r[impl builder.exec.limits-isolated+1]
+// r[impl builder.exec.limits-isolated+2]
 fn observe_then_reap(tree: &TreeState, pid: nix::unistd::Pid) -> Result<i32, std::io::Error> {
     loop {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -1383,40 +1529,95 @@ fn observe_then_reap(tree: &TreeState, pid: nix::unistd::Pid) -> Result<i32, std
     }
 }
 
-/// SIGKILL-consistent wait statuses: death by `SIGKILL` directly, or
-/// the intermediate's forwarding convention for a SIGKILLed sandbox
-/// child (`128 + 9`). These are the only statuses the executor's own
-/// kill machinery can produce.
-fn sigkill_consistent(raw_status: i32) -> bool {
-    (libc::WIFSIGNALED(raw_status) && libc::WTERMSIG(raw_status) == libc::SIGKILL)
-        || (libc::WIFEXITED(raw_status) && libc::WEXITSTATUS(raw_status) == 128 + libc::SIGKILL)
+/// Can `raw_status` — the *relay's* wait status — have been produced
+/// by the executor's own kill, given what that kill targeted?
+///
+/// [`KillTarget::Principal`]: the kill signaled only the build
+/// principal and its sub-cgroup; the relay survived by construction
+/// and forwarded what the principal died of. Our SIGKILL therefore
+/// produces exactly the forwarded `128 + 9` — and nothing else. A
+/// relay that itself died of `SIGKILL` was killed by something that
+/// was NOT this kill (external interference, the OOM killer, or our
+/// own claim-free escalation), so the claim is not corroborated and
+/// the natural mapping applies. This is the closure of
+/// merged_bug_046: the kill machinery cannot manufacture its own
+/// corroborating evidence, because the one status that corroborates
+/// can only be produced *through* the surviving relay.
+///
+/// [`KillTarget::Tree`]: the legacy pre-placement kill signals the
+/// relay (and everything below it via cgroup/pdeathsig cascade), so
+/// both shapes corroborate — direct `SIGKILL` death or the forwarded
+/// `128 + 9`. Safe precisely because the release gate was still
+/// closed when such a kill acted: no tenant instruction had run, so
+/// there is no completed build to misattribute.
+// r[impl builder.exec.limits-isolated+2]
+// r[impl builder.exec.kill-targets-principal]
+fn corroborates(target: KillTarget, raw_status: i32) -> bool {
+    let forwarded_sigkill =
+        libc::WIFEXITED(raw_status) && libc::WEXITSTATUS(raw_status) == 128 + libc::SIGKILL;
+    match target {
+        KillTarget::Principal => forwarded_sigkill,
+        KillTarget::Tree => {
+            forwarded_sigkill
+                || (libc::WIFSIGNALED(raw_status) && libc::WTERMSIG(raw_status) == libc::SIGKILL)
+        }
+    }
 }
 
-/// Map the intermediate's raw wait status (plus any kill reason the
-/// executor recorded) to the caller-facing [`ExitOutcome`].
+/// Map the relay's raw wait status (plus any kill claim the executor
+/// recorded) to the caller-facing [`ExitOutcome`].
 ///
-/// Two-layer verdict contract, deciding layer. A recorded kill reason
-/// is a *claim* — the watchdog issued a kill against a tree the phase
-/// machine still believed live, but the phase machine necessarily lags
-/// the kernel's exit event. The claim is honored only when the wait
-/// status corroborates it: the tree actually died of the executor's
-/// own `SIGKILL` ([`sigkill_consistent`]). Any other status means the
-/// kill lost the race to a natural exit, and the natural exit wins —
-/// a clean `exit(0)` can never be relabeled `TimedOut`/`Silent`/
-/// `LogLimitExceeded` by a deadline that fired into the
-/// [exit observed, phase flipped] window.
+/// Two-layer verdict contract, deciding layer. A recorded kill claim
+/// exists only because the watchdog issued a kill against a tree the
+/// phase machine still believed live — but the phase machine
+/// necessarily lags the kernel's exit event, so the claim is honored
+/// only when the wait status is one the kill, as targeted, could
+/// actually have produced ([`corroborates`]). Any other status means
+/// the kill lost the race to a natural exit, and the natural exit
+/// wins — a clean `exit(0)` can never be relabeled `TimedOut`/
+/// `Silent`/`LogLimitExceeded` by a deadline that fired into the
+/// [exit observed, phase flipped] window, **including** when the
+/// deadline fired inside the [principal exit, relay forward] window:
+/// a post-placement kill never signals the relay, so the relay always
+/// survives to deliver the natural status that defeats the stale
+/// claim (merged_bug_046's third window, closed structurally).
 ///
-/// Otherwise the intermediate's forwarding convention applies: exit
-/// codes `129..=192` are fatal signals forwarded as `128 + signo` (a
-/// process that genuinely exits with such a code is indistinguishable,
-/// which is the cost of the convention), everything else is a plain
-/// exit code.
-// r[impl builder.exec.limits-isolated+1]
-fn map_exit(raw_status: i32, kill: Option<KillReason>) -> ExitOutcome {
+/// Otherwise the relay's forwarding convention applies: exit codes
+/// `129..=192` are fatal signals forwarded as `128 + signo`,
+/// everything else is a plain exit code.
+///
+/// # Residual states (final enumeration)
+///
+/// 1. **Natural 137.** A build that genuinely exits with code `137`
+///    (or is SIGKILLed by something else inside the sandbox, e.g. its
+///    own watchdog) while an executor kill raced it is attributed to
+///    the executor's kill — the forwarded status is bit-identical.
+///    Cost of the forwarding convention; bounded by the canary metric
+///    `rio_builder_kill_verdict_outputs_present_total` (a kill verdict
+///    whose declared outputs all materialized is the coincidence
+///    signature). Irreducible at the wait level: distinguishing "our
+///    pidfd SIGKILL" from "any other SIGKILL of the principal in the
+///    same instant" requires kernel-level exit-reason attribution
+///    (who sent the signal), which `waitpid`/`waitid` do not expose.
+/// 2. **Relay stuck past grace.** A relay that fails to forward
+///    within [`RELAY_ESCALATION_GRACE`] is taken down claim-free; its
+///    `signaled(SIGKILL)` status does not corroborate the `Principal`
+///    claim, so the verdict degrades to `Signaled(9)` — the claim is
+///    DROPPED, never honored on manufactured evidence. A stuck relay
+///    is a supervision failure and is reported as one, not as a
+///    limit verdict.
+/// 3. **External SIGKILL of the relay.** Same shape as (2) from
+///    outside (node OOM killer, operator): the forwarded status is
+///    lost with the relay, and the outcome is the honest
+///    `Signaled(9)`. Irreducible without exit-reason attribution —
+///    and biased the safe way: uncertainty degrades toward "relay
+///    died", never toward relabeling a build.
+// r[impl builder.exec.limits-isolated+2]
+fn map_exit(raw_status: i32, kill: Option<KillClaim>) -> ExitOutcome {
     if let Some(kill) = kill
-        && sigkill_consistent(raw_status)
+        && corroborates(kill.target, raw_status)
     {
-        return kill.into();
+        return kill.reason.into();
     }
     if libc::WIFEXITED(raw_status) {
         let code = libc::WEXITSTATUS(raw_status);
@@ -1925,7 +2126,7 @@ fn spawn_log_readers(
                 match nix::unistd::read(&fd, &mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        // r[impl builder.exec.limits-isolated+1]
+                        // r[impl builder.exec.limits-isolated+2]
                         meter.record(n);
                         let chunk = LogChunk {
                             stream,
@@ -2091,23 +2292,69 @@ mod tests {
         assert_eq!(map_exit(signaled(9), None), ExitOutcome::Signaled(9));
     }
 
-    /// A recorded kill reason decides the outcome when — and only
-    /// when — the wait status corroborates death by our own SIGKILL
-    /// (direct, or forwarded as 137).
-    // r[verify builder.exec.limits-isolated+1]
+    /// Shorthand claims for the corroboration matrix.
+    fn principal(reason: KillReason) -> Option<KillClaim> {
+        Some(KillClaim {
+            reason,
+            target: KillTarget::Principal,
+        })
+    }
+
+    fn tree_claim(reason: KillReason) -> Option<KillClaim> {
+        Some(KillClaim {
+            reason,
+            target: KillTarget::Tree,
+        })
+    }
+
+    /// A recorded kill claim decides the outcome when — and only when
+    /// — the wait status is one the kill, as targeted, could have
+    /// produced. A principal kill produces only the forwarded 137
+    /// (the relay survives by construction); a pre-placement tree
+    /// kill produces either shape.
+    // r[verify builder.exec.limits-isolated+2]
+    // r[verify builder.exec.kill-targets-principal]
     #[test]
-    fn map_exit_kill_reason_wins_when_corroborated() {
+    fn map_exit_kill_claim_wins_when_corroborated() {
         assert_eq!(
-            map_exit(exited(137), Some(KillReason::Timeout)),
+            map_exit(exited(137), principal(KillReason::Timeout)),
             ExitOutcome::TimedOut
         );
         assert_eq!(
-            map_exit(signaled(9), Some(KillReason::Silent)),
-            ExitOutcome::Silent
+            map_exit(exited(137), principal(KillReason::LogLimit)),
+            ExitOutcome::LogLimitExceeded
         );
         assert_eq!(
-            map_exit(exited(137), Some(KillReason::LogLimit)),
-            ExitOutcome::LogLimitExceeded
+            map_exit(exited(137), tree_claim(KillReason::Timeout)),
+            ExitOutcome::TimedOut
+        );
+        assert_eq!(
+            map_exit(signaled(9), tree_claim(KillReason::Silent)),
+            ExitOutcome::Silent,
+            "a tree kill signals the relay directly; pre-placement no \
+             tenant code ran, so the direct shape stays corroborating"
+        );
+    }
+
+    /// THE merged_bug_046/074 pin: a `Principal` claim over a relay
+    /// that died of SIGKILL is NOT corroborated — a principal kill
+    /// never signals the relay, so that status was manufactured by
+    /// something else (external interference or our own claim-free
+    /// escalation) and must not relabel the build.
+    // r[verify builder.exec.limits-isolated+2]
+    // r[verify builder.exec.kill-targets-principal]
+    #[test]
+    fn map_exit_principal_claim_rejects_relay_sigkill() {
+        assert_eq!(
+            map_exit(signaled(9), principal(KillReason::Timeout)),
+            ExitOutcome::Signaled(9),
+            "a SIGKILLed relay cannot corroborate a principal kill — \
+             the verdict degrades honestly instead of manufacturing \
+             TimedOut"
+        );
+        assert_eq!(
+            map_exit(signaled(9), principal(KillReason::Silent)),
+            ExitOutcome::Signaled(9)
         );
     }
 
@@ -2115,28 +2362,38 @@ mod tests {
     /// pinning): a kill claim over a wait status our SIGKILL cannot
     /// have produced is discarded — the natural exit wins. The clean
     /// `exit(0)` case is exactly the [exit observed, phase flipped]
-    /// window the shadow state machine cannot see.
-    // r[verify builder.exec.limits-isolated+1]
+    /// window the shadow state machine cannot see — and for a
+    /// `Principal` claim it is also the [principal exit, relay
+    /// forward] window of merged_bug_046, which the surviving relay
+    /// now reports truthfully.
+    // r[verify builder.exec.limits-isolated+2]
+    // r[verify builder.exec.kill-targets-principal]
     #[test]
     fn map_exit_uncorroborated_kill_yields_to_natural_exit() {
         assert_eq!(
-            map_exit(exited(0), Some(KillReason::LogLimit)),
+            map_exit(exited(0), principal(KillReason::Silent)),
+            ExitOutcome::Exited(0),
+            "a completed build whose exit was relayed after the kill \
+             keeps its clean outcome — the bug_046 window"
+        );
+        assert_eq!(
+            map_exit(exited(0), tree_claim(KillReason::LogLimit)),
             ExitOutcome::Exited(0),
             "a clean exit can never be relabeled as a limit kill"
         );
         assert_eq!(
-            map_exit(exited(7), Some(KillReason::Timeout)),
+            map_exit(exited(7), principal(KillReason::Timeout)),
             ExitOutcome::Exited(7)
         );
         assert_eq!(
-            map_exit(signaled(15), Some(KillReason::Timeout)),
+            map_exit(signaled(15), tree_claim(KillReason::Timeout)),
             ExitOutcome::Signaled(15),
             "a SIGTERM death is not ours; the kill claim is discarded"
         );
         assert_eq!(
-            map_exit(exited(143), Some(KillReason::Silent)),
+            map_exit(exited(143), principal(KillReason::Silent)),
             ExitOutcome::Signaled(15),
-            "forwarded SIGTERM is not SIGKILL-consistent either"
+            "forwarded SIGTERM corroborates neither target"
         );
     }
 
@@ -2498,10 +2755,10 @@ mod tests {
     ) -> (
         Arc<ActivityMeter>,
         LimitWatchdog,
-        Arc<std::sync::Mutex<Option<KillReason>>>,
+        Arc<std::sync::Mutex<Option<KillClaim>>>,
     ) {
         let (meter, bytes, activity) = ActivityMeter::new();
-        let reason = Arc::new(std::sync::Mutex::new(None));
+        let claim = Arc::new(std::sync::Mutex::new(None));
         let watchdog = LimitWatchdog {
             tree: Arc::clone(tree),
             timeout,
@@ -2510,20 +2767,22 @@ mod tests {
             started: Instant::now(),
             activity,
             bytes,
-            reason: Arc::clone(&reason),
+            claim: Arc::clone(&claim),
         };
-        (meter, watchdog, reason)
+        (meter, watchdog, claim)
     }
 
-    fn reason_of(slot: &std::sync::Mutex<Option<KillReason>>) -> Option<KillReason> {
-        *slot.lock().unwrap_or_else(|e| e.into_inner())
+    fn reason_of(slot: &std::sync::Mutex<Option<KillClaim>>) -> Option<KillReason> {
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|c| c.reason)
     }
 
     /// The merged_bug_019 executor pin at the unit level: the timeout
     /// kill fires with ZERO event consumers anywhere — no chunk
     /// channel, no events receiver, nothing draining. Enforcement
     /// owns no send path to park on.
-    // r[verify builder.exec.limits-isolated+1]
+    // r[verify builder.exec.limits-isolated+2]
     #[tokio::test(start_paused = true)]
     async fn watchdog_timeout_kills_with_zero_consumers() {
         let tree = TreeState::new(None);
@@ -2551,7 +2810,7 @@ mod tests {
 
     /// Activity recorded by the meter resets the silence clock; its
     /// absence fires the silence kill.
-    // r[verify builder.exec.limits-isolated+1]
+    // r[verify builder.exec.limits-isolated+2]
     // r[verify builder.silence.timeout-kill+3]
     #[tokio::test(start_paused = true)]
     async fn watchdog_silence_resets_on_activity() {
@@ -2589,7 +2848,7 @@ mod tests {
     }
 
     /// The byte cap is checked against the meter's raw-read total.
-    // r[verify builder.exec.limits-isolated+1]
+    // r[verify builder.exec.limits-isolated+2]
     #[tokio::test(start_paused = true)]
     async fn watchdog_log_cap_kills_at_threshold() {
         let tree = TreeState::new(None);
@@ -2617,7 +2876,7 @@ mod tests {
     /// THE misattribution pin: a deadline that fires after the tree
     /// was reaped records no reason — the natural exit status wins
     /// structurally, not by luck of timer ordering.
-    // r[verify builder.exec.limits-isolated+1]
+    // r[verify builder.exec.limits-isolated+2]
     #[tokio::test(start_paused = true)]
     async fn watchdog_records_reason_only_when_kill_acted() {
         let tree = TreeState::new(None);
@@ -2684,7 +2943,7 @@ mod tests {
     /// records its claim) and the corroboration layer then discards
     /// the claim because the wait status is a clean exit our SIGKILL
     /// cannot have produced.
-    // r[verify builder.exec.limits-isolated+1]
+    // r[verify builder.exec.limits-isolated+2]
     #[test]
     fn zombie_window_kill_claim_is_discarded() {
         let tree = TreeState::new(None);
@@ -2695,8 +2954,9 @@ mod tests {
         // Deterministically reach the window: exit observed by the
         // kernel, status not yet consumed, phase not yet flipped.
         observe_exit_nowait(pid);
-        assert!(
+        assert_eq!(
             tree.kill_tree(),
+            Some(KillTarget::Tree),
             "the kill acts on the shadow-live zombie (the racy window)"
         );
 
@@ -2705,7 +2965,7 @@ mod tests {
         let status = wait_for(pid).expect("zombie stays reapable");
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
         assert_eq!(
-            map_exit(status, Some(KillReason::Timeout)),
+            map_exit(status, tree_claim(KillReason::Timeout)),
             ExitOutcome::Exited(0),
             "the uncorroborated claim must not relabel the clean exit"
         );
@@ -2825,7 +3085,11 @@ mod tests {
         let tree = TreeState::new(None);
         let (_child2, pid2) = spawn_exiting(0);
         tree.adopt(pid2).expect("adopt");
-        assert!(tree.kill_tree(), "kill acts on the live tree");
+        assert_eq!(
+            tree.kill_tree(),
+            Some(KillTarget::Tree),
+            "kill acts on the live (unplaced) tree"
+        );
         tree.place_principal(dummy_fd());
         assert!(
             matches!(
@@ -2840,10 +3104,252 @@ mod tests {
         );
     }
 
+    // -- the two-level production-topology harness ---------------------------
+
+    /// A real relay + principal pair in the production shape: the
+    /// relay runs [`relay_wait_and_forward`] — the *same function* as
+    /// [`intermediate_main`]'s tail — and hands the principal over
+    /// with the production [`send_placement`]. The principal parks
+    /// until the test releases it (one byte → `_exit(0)`) or kills
+    /// it. Every kill-corroboration property is pinned against this
+    /// topology; a single-process harness cannot express the
+    /// [principal exit, relay forward] window this class of bug lives
+    /// in.
+    struct TwoLevelHarness {
+        relay: nix::unistd::Pid,
+        /// The test's own duplicate of the principal pidfd (the tree
+        /// holds the placed original).
+        principal_pidfd: OwnedFd,
+        /// Write a byte to make the principal `_exit(0)`.
+        release_w: OwnedFd,
+    }
+
+    fn spawn_two_level(tree: &TreeState) -> TwoLevelHarness {
+        let (sock_r, sock_w) = make_placement_socketpair().expect("socketpair");
+        let (release_r, release_w) = make_pipe().expect("release pipe");
+        // SAFETY: both forked branches only call async-signal-safe
+        // code (fork, read, the functions under test, _exit).
+        let relay = match unsafe { libc::fork() } {
+            -1 => panic!("fork failed: {}", std::io::Error::last_os_error()),
+            0 => {
+                match unsafe { libc::fork() } {
+                    -1 => unsafe { libc::_exit(120) },
+                    0 => {
+                        // The principal: park until released, then
+                        // complete cleanly.
+                        let mut b = [0u8; 1];
+                        loop {
+                            let n = unsafe {
+                                libc::read(release_r.as_raw_fd(), b.as_mut_ptr().cast(), 1)
+                            };
+                            match n {
+                                1 => unsafe { libc::_exit(0) },
+                                0 => unsafe { libc::_exit(121) },
+                                _ if Errno::last() == Errno::EINTR => {}
+                                _ => unsafe { libc::_exit(122) },
+                            }
+                        }
+                    }
+                    principal => {
+                        if send_placement(sock_w.as_raw_fd(), principal).is_err() {
+                            unsafe { libc::_exit(123) };
+                        }
+                        // THE production relay loop.
+                        relay_wait_and_forward(principal);
+                    }
+                }
+            }
+            pid => nix::unistd::Pid::from_raw(pid),
+        };
+        drop(sock_w);
+        let (_pid, pidfd) = recv_placement(sock_r).expect("placement message");
+        let principal_pidfd = pidfd.try_clone().expect("dup pidfd");
+        tree.adopt(relay).expect("adopt");
+        tree.attach_reaper();
+        tree.place_principal(pidfd);
+        TwoLevelHarness {
+            relay,
+            principal_pidfd,
+            release_w,
+        }
+    }
+
+    /// Block until `pid` is stopped (`T`/`t` in `/proc/<pid>/stat`) so
+    /// SIGSTOP-staged windows are deterministic, with a deadline.
+    fn wait_until_stopped(pid: nix::unistd::Pid) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .expect("read /proc/<pid>/stat");
+            // State is the field after the parenthesized comm.
+            let state = stat
+                .rsplit(") ")
+                .next()
+                .and_then(|rest| rest.chars().next())
+                .expect("parse stat state");
+            if state == 'T' || state == 't' {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "process {pid} never stopped (state {state})"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Block until the principal behind `pidfd` has exited (pidfd
+    /// polls readable), with a deadline.
+    fn wait_until_principal_dead(pidfd: &OwnedFd) {
+        let mut pfd = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll over one stack pollfd.
+        let rc = unsafe { libc::poll(&raw mut pfd, 1, 10_000) };
+        assert_eq!(rc, 1, "principal did not exit within the deadline");
+    }
+
+    /// THE merged_bug_046/074 closure, staged deterministically on the
+    /// production topology: the principal completes cleanly while the
+    /// relay is descheduled (SIGSTOP stands in for scheduler delay),
+    /// a limit kill fires inside that [principal exit, relay forward]
+    /// window — and the completed build keeps its clean outcome,
+    /// because the kill targeted the principal and the surviving
+    /// relay forwarded the truth. Under the pre-split design this
+    /// exact staging SIGKILLed the stopped relay and manufactured a
+    /// corroborated `TimedOut`.
+    // r[verify builder.exec.kill-targets-principal]
+    // r[verify builder.exec.limits-isolated+2]
+    #[test]
+    fn principal_kill_loses_to_a_completed_build_across_a_stopped_relay() {
+        let tree = TreeState::new(None);
+        let h = spawn_two_level(&tree);
+
+        // Park the relay BEFORE the principal exits: its waitpid
+        // wake-up cannot run, so the forward is provably pending.
+        nix::sys::signal::kill(h.relay, nix::sys::signal::Signal::SIGSTOP).expect("SIGSTOP");
+        wait_until_stopped(h.relay);
+
+        // The principal completes its build and exits 0; the relay,
+        // stopped, holds it as an unforwarded zombie.
+        nix::unistd::write(&h.release_w, &[1u8]).expect("release the principal");
+        wait_until_principal_dead(&h.principal_pidfd);
+
+        // The deadline fires into the window. The kill targets the
+        // principal (already a zombie — no-op) and NEVER the relay.
+        assert_eq!(
+            tree.kill_tree(),
+            Some(KillTarget::Principal),
+            "a placed tree must be killed at the principal"
+        );
+        let claim = Some(KillClaim {
+            reason: KillReason::Silent,
+            target: KillTarget::Principal,
+        });
+
+        // The relay resumes, reaps the principal, forwards 0.
+        nix::sys::signal::kill(h.relay, nix::sys::signal::Signal::SIGCONT).expect("SIGCONT");
+        let status = observe_then_reap(&tree, h.relay).expect("relay status");
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the surviving relay must forward the natural exit (status {status})"
+        );
+        assert_eq!(
+            map_exit(status, claim),
+            ExitOutcome::Exited(0),
+            "a completed build must never be relabeled by a kill that \
+             raced its relay forward — merged_bug_046's window"
+        );
+    }
+
+    /// The inverse staging: the principal is still running when the
+    /// kill fires. The pidfd SIGKILL terminates it, the (live) relay
+    /// reaps and forwards 137, and the claim is corroborated — the
+    /// limit verdict stands.
+    // r[verify builder.exec.kill-targets-principal]
+    // r[verify builder.exec.limits-isolated+2]
+    #[test]
+    fn principal_kill_terminates_a_live_build_and_corroborates() {
+        let tree = TreeState::new(None);
+        let h = spawn_two_level(&tree);
+
+        assert_eq!(
+            tree.kill_tree(),
+            Some(KillTarget::Principal),
+            "a placed tree must be killed at the principal"
+        );
+        let claim = Some(KillClaim {
+            reason: KillReason::Timeout,
+            target: KillTarget::Principal,
+        });
+
+        let status = observe_then_reap(&tree, h.relay).expect("relay status");
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 137,
+            "the relay must forward our SIGKILL as 137 (status {status})"
+        );
+        assert_eq!(map_exit(status, claim), ExitOutcome::TimedOut);
+    }
+
+    /// Residual 2, pinned end to end through the watchdog: a relay
+    /// stuck past the escalation grace is taken down claim-free — the
+    /// recorded `Principal` claim survives but its corroboration
+    /// fails on the escalated relay's `signaled(SIGKILL)`, so the
+    /// verdict degrades to the honest `Signaled(9)` instead of a
+    /// manufactured limit verdict.
+    // r[verify builder.exec.kill-targets-principal]
+    // r[verify builder.exec.limits-isolated+2]
+    #[tokio::test(start_paused = true)]
+    async fn relay_stuck_past_grace_is_escalated_claim_free() {
+        let tree = TreeState::new(None);
+        let h = spawn_two_level(&tree);
+        let (_meter, watchdog, claim_slot) = watchdog_parts(&tree, None, None, None);
+
+        // Wedge the relay past any plausible forward.
+        nix::sys::signal::kill(h.relay, nix::sys::signal::Signal::SIGSTOP).expect("SIGSTOP");
+        wait_until_stopped(h.relay);
+
+        // The full watchdog path: principal kill, grace (virtual
+        // time), claim-free escalation of the still-unsettled tree.
+        watchdog.kill_and_escalate(KillReason::Timeout).await;
+        assert_eq!(
+            *claim_slot.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(KillClaim {
+                reason: KillReason::Timeout,
+                target: KillTarget::Principal,
+            }),
+            "the principal kill must record its claim"
+        );
+
+        let status = tokio::task::spawn_blocking({
+            let tree = Arc::clone(&tree);
+            let relay = h.relay;
+            move || observe_then_reap(&tree, relay)
+        })
+        .await
+        .expect("join")
+        .expect("relay status");
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+            "the escalation must have taken the relay down (status {status})"
+        );
+        assert_eq!(
+            map_exit(
+                status,
+                *claim_slot.lock().unwrap_or_else(|e| e.into_inner())
+            ),
+            ExitOutcome::Signaled(9),
+            "the dropped claim must degrade honestly, never to a \
+             manufactured limit verdict"
+        );
+    }
+
     /// `observe_then_reap`: the WNOWAIT observation leaves the child
     /// reapable (the real reap still returns the full status) and the
     /// phase is `Reaped` by return.
-    // r[verify builder.exec.limits-isolated+1]
+    // r[verify builder.exec.limits-isolated+2]
     #[test]
     fn observe_then_reap_preserves_status_and_flips_phase() {
         let tree = TreeState::new(None);
@@ -2863,7 +3369,7 @@ mod tests {
     /// a late deadline's `kill_tree()` no-ops (returns false, signals
     /// nothing) — the structural guarantee that a recycled pid can
     /// never be targeted.
-    // r[verify builder.exec.limits-isolated+1]
+    // r[verify builder.exec.limits-isolated+2]
     #[test]
     fn late_kill_after_observe_then_reap_is_inert() {
         let tree = TreeState::new(None);
@@ -2872,8 +3378,9 @@ mod tests {
         tree.attach_reaper();
 
         observe_then_reap(&tree, pid).expect("status");
-        assert!(
-            !tree.kill_tree(),
+        assert_eq!(
+            tree.kill_tree(),
+            None,
             "a reaped tree is unkillable; no signal may chase the pid"
         );
     }

@@ -695,12 +695,14 @@ in
   # is standalone + a proxy systemd unit on control; see fixtures/
   # toxiproxy.nix for why not a separate VM (scheduler connect_store
   # boot race). ~4-5min.
-  # r[verify builder.exec.limits-isolated+1]
+  # r[verify builder.exec.limits-isolated+2]
   #   sched-stall-timeout-still-fires: the build-timeout kill lands
   #   DURING a 75s scheduler SIGSTOP — no process in the build cgroup
   #   10s past the deadline, while the scheduler link is still frozen —
   #   proving enforcement owns no channel path a stalled consumer could
-  #   park.
+  #   park. With the principal split this same gate also exercises the
+  #   <cg>/build scope: the emptiness probe reads the parent cgroup, so
+  #   it passes only if the principal kill cleared the sub-tree.
   # r[verify builder.relay.log-shed]
   #   sched-stall-build-survives: a chatty build keeps consuming CPU
   #   through a 60s scheduler SIGSTOP (cgroup cpu.stat advances
@@ -768,6 +770,11 @@ in
       "cancel-cgroup-kill"
       # r[verify builder.cgroup.kill-on-teardown]
       # r[verify builder.timeout.no-reassign]
+      # r[verify builder.exec.kill-targets-principal]
+      #   build-timeout: the deadline kill on a real k3s worker now
+      #   travels the principal path (build sub-cgroup + pidfd, relay
+      #   spared); the subtest's TimedOut completion proves the
+      #   forwarded-137 corroboration end to end.
       "build-timeout"
       # r[verify ctrl.pool.reconcile]
       # r[verify ctrl.crd.pool]

@@ -33,10 +33,20 @@
 //! /sys/fs/cgroup/<worker-slice>/          ← delegated_root() finds this
 //!   cgroup.subtree_control                ← enable_subtree_controllers writes +memory +cpu
 //!   <drv-hash>/                           ← BuildCgroup::create makes this per build
-//!     cgroup.procs                        ← rio-exec attaches the build child PID here
+//!     cgroup.procs                        ← rio-exec attaches its relay process here
 //!     memory.peak                         ← kernel-tracked tree peak, read at build end
 //!     cpu.stat                            ← usage_usec, polled 1Hz for peak-cores
+//!     build/                              ← rio-exec's principal kill scope: the
+//!       cgroup.procs                        sandboxed build's root PID lives HERE
 //! ```
+//!
+//! The `build/` level is rio-exec's: limit kills target it (and a
+//! pidfd) so the relay — the carrier of the build's exit status — is
+//! never signaled by a racing deadline. No controllers are delegated
+//! into it (`<drv-hash>/cgroup.subtree_control` stays empty), so
+//! `memory.peak`/`cpu.stat` at `<drv-hash>/` keep aggregating the
+//! whole tree hierarchically and the no-internal-process rule is not
+//! violated by the relay living at `<drv-hash>/` directly.
 //!
 //! The `<drv-hash>` subdirectory name: derivation hashes are
 //! nixbase32-encoded (alphabet `[0-9a-df-np-sv-z]`) so they're valid

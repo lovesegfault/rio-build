@@ -813,16 +813,22 @@ executor rejects concurrent executions" (the rustdoc fiction this rule
 replaces) would now be a tracey-visible broken reference instead of prose
 nobody can falsify.
 
-#r("builder.exec.limits-isolated+1")[
+#r("builder.exec.limits-isolated+2")[
   The executor's limit enforcement --- the wall-clock timeout, the
   max-silent deadline, and the log-volume cap --- MUST execute in a
   dedicated watchdog task that performs no channel sends and owns only
   the kill handle, its deadline timers, and an activity watch fed at
   raw-read time by the capture readers. No event-consumer behavior may
   delay a limit kill. A recorded limit kill MUST be attributed to the
-  exit outcome only when the wait status corroborates death by the
-  executor's own `SIGKILL`; a natural exit MUST win over a kill that
-  raced it. The exit MUST be observed (`waitid` + `WNOWAIT`) and the
+  exit outcome only when the wait status is one the kill, *as
+  targeted*, could have produced: a post-placement principal kill is
+  corroborated only by the relay's forwarded `128+9` (the relay
+  survives such a kill by construction, so a relay that itself died of
+  `SIGKILL` does not corroborate); a pre-placement tree kill is
+  corroborated by either the direct `SIGKILL` death or the forwarded
+  form. A natural exit MUST win over a kill that raced it --- including
+  a kill that fired between the principal's exit and the relay's
+  forward. The exit MUST be observed (`waitid` + `WNOWAIT`) and the
   tree marked settled before the wait status is consumed, so no kill
   path can ever signal a recycled pid.
 ]
@@ -837,34 +843,51 @@ a stalled receiver (scheduler-link backpressure filling the worker's
 channels --- merged_bug_019) suspended every kill with it.
 
 Verdicts derive from the authoritative event, in two layers. The
-watchdog's recorded reason is the *narrowing* layer --- it exists only
+watchdog's recorded claim is the *narrowing* layer --- it exists only
 when a kill was issued against a tree the executor's phase machine
-still believed live (kill-under-the-reason-mutex; a deadline firing
-after the tree settled records nothing). But the phase machine
-necessarily lags the kernel by the window between the exit happening
-and the supervisor observing it, so the recorded reason alone is a
-claim. The wait status is the *deciding* layer: the claim is honored
-only for SIGKILL-consistent statuses (death by `SIGKILL`, or its
-forwarded `128+9`), the only statuses the executor's kill machinery can
-produce --- a clean `exit(0)` racing a deadline keeps its natural
-outcome. Reap ordering closes the recycled-pid hazard from the same
-window: the exit is observed without being consumed, the phase flips to
-settled, and only then is the status reaped, so by the instant the
+still believed live (kill-under-the-claim-mutex; a deadline firing
+after the tree settled records nothing), and it carries the kill's
+target. But the phase machine necessarily lags the kernel by the
+window between the exit happening and the supervisor observing it, so
+the recorded claim alone is not a verdict. The wait status is the
+*deciding* layer, and what corroborates depends on the target. A
+principal kill (#rref("builder.exec.kill-targets-principal")) never
+signals the relay, so the relay always survives to forward what the
+principal actually died of: our `SIGKILL` arrives as the forwarded
+`128+9` and nothing else --- the kill machinery structurally cannot
+manufacture its own corroboration by destroying the status carrier,
+which is exactly the third-window failure (a deadline firing between
+the principal's `_exit(0)` and the relay's forward relabeled a
+completed build) that two rounds of single-process corroboration
+hardening could not close. A pre-placement tree kill still accepts
+both SIGKILL shapes; it is safe against the same window because the
+release gate guarantees no tenant instruction --- hence no completed
+build --- existed when it acted. Reap ordering closes the recycled-pid
+hazard: the exit is observed without being consumed, the phase flips
+to settled, and only then is the status reaped, so by the instant the
 kernel may recycle the pid every kill path is already disarmed.
 
-Two residuals remain, accepted and documented at `map_exit`: a build
-that genuinely exits with code `137` (or is SIGKILLed by something
-else, e.g. the kernel OOM killer) while an executor kill raced it is
-attributed to the executor's kill --- indistinguishable at the wait
-level, the cost of the forwarding convention; and a genuine kill that
-loses the delivery race to a completing `_exit(0)` yields to the
-natural exit by design --- the bias is always toward never relabeling
-a clean completion. One residual semantics shift from the FU1
-restructure also stands: a build whose *writes* are blocked by a
-worker-internal stalled consumer can be silence-killed where it
-previously froze alongside its enforcement --- reaching that state
-requires a worker bug, since the worker's own consumer is structurally
-non-stalling (#rref("builder.relay.log-shed")).
+Three residuals remain, accepted and enumerated at `map_exit`. (1) A
+build that genuinely exits `137` (or is SIGKILLed by something else
+*inside* the kill scope) while an executor kill raced it is attributed
+to the executor's kill --- bit-identical at the wait level, the cost
+of the forwarding convention; bounded operationally by the canary
+metric `rio_builder_kill_verdict_outputs_present_total` (kill verdict
++ fully materialized declared outputs = the coincidence signature),
+and irreducible without kernel-level exit-reason attribution, which
+`waitid` does not expose. (2) A relay stuck past the escalation grace
+after a principal kill is taken down claim-free; its `signaled(9)`
+status fails corroboration, so the verdict degrades to the honest
+`Signaled(9)` --- the claim is dropped, never honored on manufactured
+evidence. (3) An external `SIGKILL` of the relay itself (node OOM
+killer, operator) loses the forwarded status with the relay and
+likewise lands on `Signaled(9)` --- uncertainty degrades toward
+"supervision failed", never toward relabeling a build. One residual
+semantics shift from the FU1 restructure also stands: a build whose
+*writes* are blocked by a worker-internal stalled consumer can be
+silence-killed where it previously froze alongside its enforcement ---
+reaching that state requires a worker bug, since the worker's own
+consumer is structurally non-stalling (#rref("builder.relay.log-shed")).
 
 #r("builder.exec.kill-targets-principal")[
   The executor MUST supervise the build principal --- the sandbox
@@ -1730,7 +1753,7 @@ construction site goes through it --- the log loop's five sends and
 `send_banner_batch` with both its callers (the executor header, the runtime
 footer) --- so a degraded scheduler link degrades the *display* stream only:
 builds keep running, limit kills keep firing
-(#rref("builder.exec.limits-isolated+1")), completions keep their guaranteed
+(#rref("builder.exec.limits-isolated+2")), completions keep their guaranteed
 delivery. The marker clause holds by construction, not by delivery-site
 discipline: the shed tally is drained inside the batcher's `flush()`, so
 every assembled batch --- batch-full, tick, phase boundary, terminal

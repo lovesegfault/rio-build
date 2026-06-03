@@ -551,10 +551,15 @@ pkgs.testers.runNixOSTest {
             # stall+55s, still 20s inside the stall: the build cgroup
             # must hold no processes (or be torn down entirely) — the
             # discriminator between "killed on time" and "frozen".
+            # The sweep is recursive: the build's processes live in
+            # the executor's build/ sub-level (the principal kill
+            # scope), and cgroup.procs lists only direct members — a
+            # parent-only read would miss a surviving build entirely.
             time.sleep(55)
             worker.fail(
                 "for d in $(find /sys/fs/cgroup -type d "
-                "-name '*chaos6forevermark*'); do cat $d/cgroup.procs; "
+                "-name '*chaos6forevermark*'); do "
+                "find $d -name cgroup.procs -exec cat {} + ; "
                 "done | grep -q ."
             )
         finally:

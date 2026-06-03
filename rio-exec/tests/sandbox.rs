@@ -620,7 +620,7 @@ async fn missing_program_surfaces_as_an_exec_setup_failure() {
 /// supervision loop parked on the awaited event send the moment the
 /// channel filled, and the deadline arms parked with it — this test
 /// hung until the harness gave up.
-// r[verify builder.exec.limits-isolated+1]
+// r[verify builder.exec.limits-isolated+2]
 #[tokio::test]
 #[ignore = "requires root + CAP_SYS_ADMIN; run via the privileged test harness"]
 async fn timeout_fires_with_stalled_receiver() {
@@ -655,7 +655,7 @@ async fn timeout_fires_with_stalled_receiver() {
 /// on undelivered events past the drain budget. (This is the bound
 /// the round-14 drain commit deferred to a non-vacuous staging: the
 /// build here produces real queued output, unlike a SetupFailed run.)
-// r[verify builder.exec.limits-isolated+1]
+// r[verify builder.exec.limits-isolated+2]
 #[tokio::test]
 #[ignore = "requires root + CAP_SYS_ADMIN; run via the privileged test harness"]
 async fn drain_bound_holds_with_stalled_receiver_at_exit() {
