@@ -1041,7 +1041,7 @@ what it attached). Prior art in the same shape: the displacement
 primitive's evidence ranks (#rref("sched.merge.store-evidence-displacement+2"))
 refuse re-definition unless the incoming claim PROVES rank over the
 recorded row, and the born-holed prune stamp
-(#rref("sched.merge.substitute-topdown+13")) records the dropped closure
+(#rref("sched.merge.substitute-topdown+14")) records the dropped closure
 at the only site that knows it. The `HealWitness` token is the mechanical
 form: mintable only by the coverage branch, demanded by the only clear
 path, so an absence-of-objection upgrade is unwritable rather than merely
@@ -1181,7 +1181,7 @@ submitted after the failover record contributions as usual).
   origin URL.
 ]
 
-#r("sched.merge.substitute-topdown+13")[
+#r("sched.merge.substitute-topdown+14")[
   Before merging a submission's full DAG, the scheduler MUST first check
   whether the submission's *demand set* --- its structural roots (nodes with
   no parent edge in the submission) ∪ every node the client explicitly
@@ -1216,7 +1216,10 @@ submitted after the failover record contributions as usual).
   dropped only when a later full merge re-declares its edges, *the merge
   accepts every one of them*, and the re-supply covers the recorded
   witness set --- a skipped edge, an unresolvable child, or an uncovered
-  missing child vetoes the heal,
+  missing child vetoes the heal; a reap that removes an un-produced
+  child MUST record the FULL removed child set on the witness ---
+  produced and un-produced alike --- so the coverage requirement cannot
+  be satisfied by an under-representative subset,
   #rref("sched.merge.heal-accepted-edges+1")), or
   when the fail-fast below consumes it --- a merge that gives it only
   unbuilt children leaves the mark in place. The scheduler MUST
@@ -1260,6 +1263,17 @@ un-holed, enrolled it as a mark-clear candidate, and re-armed exactly the
 doomed from-source dispatch the born-holed witness suppresses. One paired
 writer (`set_closure_holes_tx`) makes the two populations congruent by
 construction (fix-discipline R2-PAIRED-WRITERS).
+The +14 full-removed-set clause is round-16 bug_076: the reap recorded
+only UN-PRODUCED removals on the witness, so any submission could
+re-declare just those (publicly reconstructible) hashes, clear the
+hole, and --- once the witness children produced --- have the parent
+judged Vouched over a child set that silently omitted the
+produced-but-reaped inputs; the cleared mark re-armed exactly the
+from-source dispatch the breadcrumb suppresses, ENOENTing on whichever
+omitted input had been GC'd. Recording the full removed set makes any
+healing re-declaration --- owner or foreign --- supply the complete
+closure, which is also why the heal stays interest-unscoped: a foreign
+full re-declaration is functionally an honest top-up.
 The own-selector resolvability guard covers the fallback corner where no
 prior interested build is live and post-merge classification degrades to
 exactly this submission's (possibly bogus) selector. The `topdown_pruned`

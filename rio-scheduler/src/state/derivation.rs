@@ -1337,7 +1337,7 @@ pub struct DerivationState {
     /// hook, the walk-failure gate, and all clear sites) judges the
     /// same `ClosureEvidence`, treating a closure-holed survivor as
     /// childless-equivalent.
-    /// r[sched.merge.substitute-topdown+13]. Persisted (`migrations/063`,
+    /// r[sched.merge.substitute-topdown+14]. Persisted (`migrations/063`,
     /// stamped in the pruned merge's own transaction, OR-on-conflict,
     /// cleared only on a `Vouched` verdict — ≥1 child, all produced,
     /// no closure hole, and at recovery additionally a still-live

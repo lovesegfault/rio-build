@@ -532,13 +532,18 @@ pub struct ReapOutcome {
     pub surviving_parents: Vec<DrvHash>,
     /// The subset of `surviving_parents` that lost at least one
     /// UN-PRODUCED child to this reap — exactly the nodes whose
-    /// in-memory `closure_hole` breadcrumb this reap just set. Reported
-    /// separately so the leader-gated survivor hook can persist the
-    /// breadcrumb (`migrations/064`+`069`, `set_closure_holes`)
-    /// without re-deriving "holed by THIS reap" from node state (which
-    /// would also re-fire for holes set by earlier reaps and miss
-    /// survivors the hook's verdict loop skips as terminal /
-    /// zero-interest).
+    /// in-memory `closure_hole` breadcrumb this reap just set. The
+    /// witness vec carries the FULL removed child set (produced and
+    /// un-produced alike, round-16 bug_076 /
+    /// `sched.merge.substitute-topdown+14`): the heal's coverage check
+    /// judges against it, so an under-representative re-declaration
+    /// (just the un-produced subset) can no longer clear the hole and
+    /// later pass the parent off as Vouched. Reported separately so
+    /// the leader-gated survivor hook can persist the breadcrumb
+    /// (`migrations/064`+`069`, `set_closure_holes`) without
+    /// re-deriving "holed by THIS reap" from node state (which would
+    /// also re-fire for holes set by earlier reaps and miss survivors
+    /// the hook's verdict loop skips as terminal / zero-interest).
     pub holed_parents: Vec<(DrvHash, Vec<DrvHash>)>,
 }
 
@@ -2405,23 +2410,60 @@ impl DerivationDag {
         }
 
         let mut surviving_parents: BTreeSet<DrvHash> = BTreeSet::new();
-        let mut holed_parents: std::collections::BTreeMap<DrvHash, Vec<DrvHash>> =
+        // r[impl sched.merge.substitute-topdown+14]
+        // Hole trigger: at least one UN-PRODUCED child removed (a
+        // produced-only reap leaves outputs in the store — the
+        // pre-existing posture). Witness CONTENT: the FULL removed set,
+        // produced and un-produced alike (round-16 bug_076). The heal's
+        // coverage check is `missing ⊆ re-declared`; recording only the
+        // un-produced subset let ANY submission re-declare just those
+        // reconstructible hashes, get the hole healed, and — once the
+        // witness children produced — have the parent judged Vouched
+        // over an under-representative child set: topdown_pruned
+        // cleared, from-source dispatch re-armed, ENOENT on whichever
+        // produced-but-reaped input had been GC'd in the interim. With
+        // the full set on the witness, ANY healing submission (owner or
+        // foreign) must re-supply every removed child — a foreign full
+        // re-declaration is functionally an honest top-up, which is why
+        // interest-scoping the heal was rejected (it would break the
+        // designed no-recreation top-up for pruned roots).
+        //
+        // PERF SHAPE (the I-140 reap-all bound): the trigger set is
+        // computed FIRST from un-produced removals only, and the
+        // full-set capture runs ONLY for triggered parents. A sole-
+        // build completion reap (every child produced — the 150k-node
+        // hot path) takes the empty-trigger fast path and does exactly
+        // the pre-+14 work; the naive per-edge accumulation regressed
+        // reap-all past its 2000ms budget.
+        let mut hole_trigger: BTreeSet<DrvHash> = BTreeSet::new();
+        for (hash, _, unproduced) in &to_reap {
+            if *unproduced && let Some(ps) = self.parents.get(hash) {
+                hole_trigger.extend(ps.iter().cloned());
+            }
+        }
+        let mut removed_children: std::collections::BTreeMap<DrvHash, Vec<DrvHash>> =
             std::collections::BTreeMap::new();
+        if !hole_trigger.is_empty() {
+            for (hash, _, _) in &to_reap {
+                if let Some(ps) = self.parents.get(hash) {
+                    for p in ps {
+                        if hole_trigger.contains(p) {
+                            removed_children
+                                .entry(p.clone())
+                                .or_default()
+                                .push(hash.clone());
+                        }
+                    }
+                }
+            }
+        }
         let mut reaped_paths = Vec::with_capacity(to_reap.len());
-        for (hash, path, unproduced) in to_reap {
+        for (hash, path, _) in to_reap {
             // Capture the parents BEFORE `remove_node` scrubs the edge maps —
             // afterwards neither the reaped hash nor its former parents are
             // recoverable from the DAG.
             if let Some(ps) = self.parents.get(&hash) {
                 surviving_parents.extend(ps.iter().cloned());
-                if unproduced {
-                    for p in ps {
-                        holed_parents
-                            .entry(p.clone())
-                            .or_default()
-                            .push(hash.clone());
-                    }
-                }
             }
             self.remove_node(&hash);
             reaped_paths.push(path);
@@ -2429,16 +2471,15 @@ impl DerivationDag {
         // Drop entries that were themselves reaped (or otherwise no longer
         // exist) so only true survivors are reported.
         surviving_parents.retain(|p| self.nodes.contains_key(p));
-        holed_parents.retain(|p, _| self.nodes.contains_key(p));
-        // Breadcrumb the survivors whose reaped children include an
-        // un-produced one — recording WHICH children went missing
-        // (round-15 C6c1): their child set is no longer representative
-        // of their input closure, and the witness set is what a later
-        // heal must positively cover (sched.evidence.positive-witness).
-        for (parent, missing) in &holed_parents {
-            if let Some(state) = self.nodes.get_mut(parent) {
+        let mut holed_parents: Vec<(DrvHash, Vec<DrvHash>)> = Vec::new();
+        for (parent, missing) in removed_children {
+            if !self.nodes.contains_key(&parent) {
+                continue;
+            }
+            if let Some(state) = self.nodes.get_mut(&parent) {
                 state.closure_hole.stamp(missing.iter().cloned());
             }
+            holed_parents.push((parent, missing));
         }
         ReapOutcome {
             reaped_paths,

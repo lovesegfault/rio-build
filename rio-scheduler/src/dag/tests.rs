@@ -4375,6 +4375,125 @@ fn test_subset_redeclaration_does_not_heal_closure_hole() -> anyhow::Result<()> 
     Ok(())
 }
 
+// r[verify sched.merge.substitute-topdown+14]
+/// Round-16 bug_076: the reap stamps the FULL removed child set on the
+/// witness — produced and un-produced alike. Pre-fix only the
+/// un-produced child landed there, so re-declaring just that
+/// (publicly reconstructible) hash covered the witness, healed the
+/// hole, and — once it produced — the parent was judged Vouched over a
+/// child set silently missing the produced-but-reaped input. The heal
+/// must now demand the complete removed set.
+#[test]
+fn reap_witness_records_full_removed_set_and_heal_demands_it() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build_a = Uuid::new_v4();
+    let build_b = Uuid::new_v4();
+
+    // Build A: P → {C1, C2}. Build B holds interest in P only, so P
+    // survives A's reap.
+    dag.merge(
+        build_a,
+        &[
+            make_node("frw-p", "x86_64-linux"),
+            make_node("frw-c1", "x86_64-linux"),
+            make_node("frw-c2", "x86_64-linux"),
+        ],
+        &[make_edge("frw-p", "frw-c1"), make_edge("frw-p", "frw-c2")],
+        "",
+    )?;
+    dag.merge(build_b, &[make_node("frw-p", "x86_64-linux")], &[], "")?;
+
+    // C1 PRODUCED, C2 terminal-unproduced; A goes terminal and reaps
+    // both children out from under P.
+    dag.nodes
+        .get_mut("frw-c1")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+    dag.nodes
+        .get_mut("frw-c2")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Cancelled);
+    let reap = dag.remove_build_interest_and_reap(build_a);
+
+    let (holed, witness) = reap
+        .holed_parents
+        .iter()
+        .find(|(p, _)| p.as_str() == "frw-p")
+        .expect("P is holed (an un-produced child was removed)");
+    assert_eq!(holed.as_str(), "frw-p");
+    let mut w: Vec<&str> = witness.iter().map(|h| h.as_str()).collect();
+    w.sort_unstable();
+    assert_eq!(
+        w,
+        vec!["frw-c1", "frw-c2"],
+        "the witness records the FULL removed set — the produced C1 too \
+         (pre-fix: only the un-produced C2)"
+    );
+    let hole = &dag.nodes.get("frw-p").unwrap().closure_hole;
+    assert!(hole.is_holed());
+    assert_eq!(hole.missing().len(), 2, "in-memory witness matches");
+
+    // bug_076's harm population: topdown-pruned holed parents — the
+    // parent_creation_scoped carve-out accepts heal edges from ANY
+    // submission for them (the designed no-recreation top-up).
+    dag.nodes.get_mut("frw-p").unwrap().topdown_pruned = true;
+
+    // Under-representative heal attempt: re-declare ONLY the
+    // un-produced child. Pre-fix the witness held just C2, so this
+    // covered the whole witness and healed; now it must be refused.
+    let res = dag.merge(
+        Uuid::new_v4(),
+        &[
+            make_node("frw-p", "x86_64-linux"),
+            make_node("frw-c2", "x86_64-linux"),
+        ],
+        &[make_edge("frw-p", "frw-c2")],
+        "",
+    )?;
+    assert!(
+        !res.healed_parents
+            .iter()
+            .any(|(h, _)| h.as_str() == "frw-p"),
+        "re-declaring only the un-produced subset must NOT heal"
+    );
+    assert!(
+        res.heal_refused_parents
+            .iter()
+            .any(|h| h.as_str() == "frw-p"),
+        "the refusal is surfaced"
+    );
+    assert!(dag.nodes.get("frw-p").unwrap().closure_hole.is_holed());
+
+    // Full re-declaration covers the witness: healed.
+    let res = dag.merge(
+        Uuid::new_v4(),
+        &[
+            make_node("frw-p", "x86_64-linux"),
+            make_node("frw-c1", "x86_64-linux"),
+            make_node("frw-c2", "x86_64-linux"),
+        ],
+        &[make_edge("frw-p", "frw-c1"), make_edge("frw-p", "frw-c2")],
+        "",
+    )?;
+    assert!(
+        res.healed_parents
+            .iter()
+            .any(|(h, _)| h.as_str() == "frw-p"),
+        "the complete removed set heals"
+    );
+    assert!(
+        !res.heal_refused_parents
+            .iter()
+            .any(|h| h.as_str() == "frw-p"),
+        "no refusal alongside the heal"
+    );
+    // Tier note: dag.merge REPORTS the heal; the in-memory drop
+    // (ClosureHole::clear_for_heal) and the PG clear are the actor's
+    // consumption of healed_parents — pinned by the actor-level heal
+    // tests (gate-skip veto, recovery-roundtrip-heal).
+    Ok(())
+}
+
 // r[verify sched.merge.heal-accepted-edges+1]
 /// Junk top-up refused: re-supplying SOMETHING is not re-supplying the
 /// MISSING thing. A re-creation that attaches a brand-new child while
