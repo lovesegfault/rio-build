@@ -51,6 +51,125 @@ pub const NIX_SSHOPTS_BASE: &str = "-o StrictHostKeyChecking=no -o UserKnownHost
      -o ControlMaster=no -o ControlPath=none \
      -o IdentityAgent=none -o IdentitiesOnly=yes";
 
+/// I-161: warm the eval cache so a subsequent ssh-ng build's
+/// connection doesn't sit idle during cold `--impure` eval. nix opens
+/// the connection on first remote query, then evaluates locally; over
+/// SSM port-forward, server-originated keepalive replies don't
+/// reliably round-trip when there's zero client→server data, so the
+/// gateway drops the session at 120s while nix is still evaluating.
+/// Pre-evaluating shrinks the connect→submit window to <5s.
+///
+/// `envs` is set on the nix process — fsbench threads `FSBENCH_SEED`
+/// through both this pre-eval and the build itself so both instantiate
+/// the same drv (a mismatch would cold-eval on the build's connection,
+/// re-opening the I-161 window).
+///
+/// Returns the instantiated .drv path on success: fsbench matches it
+/// against `DebugExecutorState.running_build` for build→node
+/// attribution. Failure is non-fatal (warn + `None`) — the build can
+/// still succeed on a cold eval, it just risks the idle-window drop.
+pub fn pre_eval_installable(installable: &str, envs: &[(&str, &str)]) -> Option<String> {
+    tracing::info!("pre-evaluating {installable} (cold-eval can take ~2min)");
+    let mut cmd = std::process::Command::new("nix");
+    cmd.args(["path-info", "--derivation", "--impure", installable]);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let pre_eval = match cmd.output() {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::warn!("pre-eval spawn failed (continuing): {e}");
+            return None;
+        }
+    };
+    if !pre_eval.status.success() {
+        tracing::warn!(
+            "pre-eval failed (continuing): {}",
+            std::str::from_utf8(&pre_eval.stderr)
+                .unwrap_or("<non-utf8 stderr>")
+                .trim()
+        );
+        return None;
+    }
+    std::str::from_utf8(&pre_eval.stdout)
+        .ok()?
+        .lines()
+        .find(|l| l.trim_end().ends_with(".drv"))
+        .map(|l| l.trim().to_owned())
+}
+
+/// One remote ssh-ng build riding its own SSM tunnel. Both halves are
+/// drop-guarded: the tunnel is a [`ProcessGuard`] (killpg on drop), the
+/// nix child is `kill_on_drop` — holding this struct is what keeps the
+/// build alive.
+pub struct RemoteBuild {
+    /// Local port the tunnel actually bound (differs from the request
+    /// when 0/ephemeral was passed).
+    pub port: u16,
+    pub tunnel: ProcessGuard,
+    pub child: tokio::process::Child,
+}
+
+/// Establish a gateway tunnel and spawn `nix build --store ssh-ng://…`
+/// for `installable`, logging to `log_path`. Extracted from the stress
+/// harness so fsbench submits through the identical path (I-149/I-161
+/// SSH options, eval-store auto, --max-jobs 0). `port_req` 0 = the
+/// tunnel binds an ephemeral port; a fixed port gets its stale
+/// listeners reaped first.
+pub async fn spawn_remote_nix_build(
+    p: &dyn super::provider::Provider,
+    port_req: u16,
+    cfg: &XtaskConfig,
+    installable: &str,
+    log_path: &std::path::Path,
+    envs: &[(&str, &str)],
+) -> Result<RemoteBuild> {
+    use std::process::Stdio;
+
+    let key = crate::ssh::privkey_path(cfg)?;
+    if port_req != 0 {
+        kill_port_listeners(port_req);
+    }
+    let (port, tunnel) = p.tunnel(port_req).await?;
+
+    let log_file = std::fs::File::create(log_path)?;
+    let log_err = log_file.try_clone()?;
+    let store = format!(
+        "ssh-ng://rio@localhost:{port}?compress=true&ssh-key={}",
+        key.display()
+    );
+
+    let mut cmd = tokio::process::Command::new("nix");
+    cmd.args(["build", "--store", &store, "--eval-store", "auto"])
+        .arg(installable)
+        // -L: stream build logs to stderr. Without it, redirected
+        // stderr stays empty until the first `copying path` line —
+        // ~2.5min of silence on cold-cache eval (I-051).
+        .args(["--impure", "--no-link", "-L", "--max-jobs", "0"])
+        // I-149/I-161: see [`NIX_SSHOPTS_BASE`].
+        .env("NIX_SSHOPTS", NIX_SSHOPTS_BASE)
+        .stdin(Stdio::null())
+        .stdout(log_file)
+        .stderr(log_err)
+        .kill_on_drop(true);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("spawn nix build (installable: {installable})"))?;
+    tracing::info!(
+        "build[{port}]: pid={} → {}",
+        child.id().unwrap_or(0),
+        log_path.display()
+    );
+    Ok(RemoteBuild {
+        port,
+        tunnel,
+        child,
+    })
+}
+
 /// Subcharts listed in Chart.yaml's `dependencies:`. Helm validates
 /// charts/ against Chart.yaml BEFORE evaluating `condition: *.enabled`,
 /// so every entry must be symlinked even when disabled for a given
