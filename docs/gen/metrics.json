@@ -106,6 +106,7 @@
     "rio_scheduler_lease_acquired_total",
     "rio_scheduler_lease_lost_total",
     "rio_scheduler_malformed_built_output_total",
+    "rio_scheduler_materialization_carrier_dropped_total",
     "rio_scheduler_materialization_claims_total",
     "rio_scheduler_materialization_converted_total",
     "rio_scheduler_materialization_jobs_created_total",
@@ -113,6 +114,7 @@
     "rio_scheduler_materialization_jobs_origin_upgraded_total",
     "rio_scheduler_materialization_jobs_resolved_total",
     "rio_scheduler_materialization_stalled",
+    "rio_scheduler_materialization_view_node_skew_total",
     "rio_scheduler_merge_phase_seconds",
     "rio_scheduler_open_attempts",
     "rio_scheduler_open_materialization_attempts",
@@ -761,6 +763,11 @@
         "help": "Worker-supplied BuiltOutput.output_path that failed StorePath::parse (dropped at handle_completion boundary); alert if rate > 0"
       },
       {
+        "name": "rio_scheduler_materialization_carrier_dropped_total",
+        "kind": "counter",
+        "help": "Realized-path carriers dropped from the leader-scoped retry stash because the node went terminal/gone before the stale-reset job row applied (merged_bug_257). The carrier had no consumer left; the paths are reproducible from source if interest returns."
+      },
+      {
         "name": "rio_scheduler_materialization_claims_total",
         "kind": "counter",
         "help": "Materialization claims delivered to store replicas (one per minted open attempt). Pairs with jobs_created_total (supply) and jobs_resolved_total (drain) for the lifecycle rates: created-vs-claimed divergence means store executors are not keeping up (or are partitioned from the leader); claimed-vs-resolved divergence means executions are failing or reports are not landing."
@@ -794,6 +801,11 @@
         "name": "rio_scheduler_materialization_stalled",
         "kind": "gauge",
         "help": "Parked materialization jobs (infra budget exhausted; waiting on upstream recovery or park-backoff expiry). Leader-published every housekeeping tick from ground truth. Jobs whose nodes have buildable dependency closures are re-evaluated and resolved from-source instead of staying parked (PD-20), so a sustained nonzero value means a dead/misconfigured upstream is stalling work that has NO from-source fallback — the operator signal to check upstream cache health and tenant upstream configuration."
+      },
+      {
+        "name": "rio_scheduler_materialization_view_node_skew_total",
+        "kind": "counter",
+        "help": "Split-release wedge tripwire (merged_bug_307 rider): a pending-unclaimed materialization job whose node is still Assigned/Running with no open assignment — release_claim should have requeued the node in the same step that dropped the claim. Always zero in a healthy fleet; any increment is a re-introduced split release (fatal under debug builds)."
       },
       {
         "name": "rio_scheduler_merge_phase_seconds",

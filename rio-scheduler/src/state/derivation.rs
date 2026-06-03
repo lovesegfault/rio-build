@@ -1167,7 +1167,52 @@ pub struct DerivationState {
     pub probed_generation: u64,
 }
 
+/// The realized output paths a stale-Completed reset is about to
+/// destroy — captured AT the destruction site as a `#[must_use]`
+/// carrier so no reset arm can drop them silently (merged_bug_257:
+/// the `!deps_ok` exit lost the floating-CA carrier and the node
+/// later re-dispatched from source). The only producer is
+/// [`DerivationState::take_realized_paths`]; consumers either route
+/// the paths onto a materialization job or discard them EXPLICITLY
+/// for the from-source lane.
+#[must_use = "the realized paths were just destroyed in memory — route them onto a \
+              materialization job or call discard_for_from_source() explicitly"]
+pub struct RealizedPathCarrier {
+    paths: Vec<String>,
+}
+
+impl RealizedPathCarrier {
+    /// Consume the carrier into its paths (the job-creation lane).
+    pub fn into_paths(self) -> Vec<String> {
+        self.paths
+    }
+
+    /// Explicit discard: the reset routes from-source (not every
+    /// wanted missing path is substitutable), where the re-dispatch
+    /// itself reproduces the outputs — the carrier has no consumer.
+    pub fn discard_for_from_source(self) {}
+}
+
 impl DerivationState {
+    /// THE stale-reset destruction site (merged_bug_257): clear
+    /// `output_paths`, returning the non-empty, still-wanted realized
+    /// paths as a carrier the caller MUST route or explicitly discard.
+    /// Replaces the bare `output_paths.clear()` so capture and
+    /// destruction are one step.
+    pub fn take_realized_paths(
+        &mut self,
+        unwanted: &std::collections::HashSet<String>,
+    ) -> RealizedPathCarrier {
+        let paths = self
+            .output_paths
+            .iter()
+            .filter(|p| !p.is_empty() && !unwanted.contains(p.as_str()))
+            .cloned()
+            .collect();
+        self.output_paths.clear();
+        RealizedPathCarrier { paths }
+    }
+
     /// Create a new derivation state from a proto DerivationNode.
     ///
     /// Validates `node.drv_path` parses as a well-formed `StorePath`. The

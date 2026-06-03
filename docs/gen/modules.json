@@ -1149,11 +1149,6 @@
       "doc": "rio-scheduler binary entry point."
     },
     {
-      "path": "queue.rs",
-      "depth": 0,
-      "doc": "Priority ready queue for derivation dispatch."
-    },
-    {
       "path": "retry_policy.rs",
       "depth": 0,
       "doc": "The retry/poison decision surface, as the scheduler consumes it."

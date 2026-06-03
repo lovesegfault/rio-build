@@ -574,7 +574,21 @@ where
                 PullAdmission::RejectToken => PullAdmission::RejectToken,
                 PullAdmission::RejectStaleGeneration => PullAdmission::RejectStaleGeneration,
                 PullAdmission::Gone => PullAdmission::Gone,
-                _ => PullAdmission::NotYetReady,
+                // The NAMED refusal cells (merged_bug_307
+                // documented-rationale): a base-table delivery while
+                // the job is unresolved is REFUSED deliberately —
+                // DeliverNew (a fresh from-source mint would race the
+                // job's store-side fetch) and DeliverExisting
+                // (re-delivering a build attempt under an unresolved
+                // job re-opens the dual-execution window) both map to
+                // NotYetReady, pinned by
+                // `check_kinded_no_build_delivery_while_job_unresolved`
+                // and `check_kinded_one_winner_arbitration`. A
+                // pass-through here would fail both proofs and
+                // `noFromSourceWhileJobUnresolved`.
+                PullAdmission::DeliverNew
+                | PullAdmission::DeliverExisting { .. }
+                | PullAdmission::NotYetReady => PullAdmission::NotYetReady,
             }
         }
         (PullKind::Build, JobView::None) => base_admission(request),
@@ -622,7 +636,15 @@ where
                 {
                     PullAdmission::DeliverNew
                 }
-                _ => PullAdmission::NotYetReady,
+                // Named cells: a parked job answers NotYetReady to
+                // every delivery shape — including a base-table
+                // DeliverExisting (an Assigned/Running attempt
+                // surviving into a Pending job is the establishment
+                // crash window: the re-delivery must wait for the
+                // job's own arbitration, merged_bug_307's rationale).
+                PullAdmission::DeliverNew
+                | PullAdmission::DeliverExisting { .. }
+                | PullAdmission::NotYetReady => PullAdmission::NotYetReady,
             }
         }
         (PullKind::Materialization, JobView::Claimed { held_by_puller }) => {
@@ -644,7 +666,13 @@ where
                 PullAdmission::DeliverExisting { exec_id } if held_by_puller => {
                     PullAdmission::DeliverExisting { exec_id }
                 }
-                _ => PullAdmission::NotYetReady,
+                // Named cells: DeliverExisting to a NON-holder is the
+                // one-winner arbiter's refusal (BC-1); DeliverNew
+                // under a claimed job is the dual-claim window. Both
+                // deliberately NotYetReady (merged_bug_307).
+                PullAdmission::DeliverNew
+                | PullAdmission::DeliverExisting { .. }
+                | PullAdmission::NotYetReady => PullAdmission::NotYetReady,
             }
         }
     }

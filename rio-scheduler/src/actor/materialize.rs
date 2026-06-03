@@ -248,6 +248,8 @@ impl DagActor {
     /// Returns whether an unresolved job exists for the node after the
     /// call (created now or found by the dedup).
     // r[impl sched.materialize.job+2]
+    #[must_use = "a false return means the job row did NOT apply — a caller holding a \
+                  realized-path carrier must stash it for the housekeeping retry"]
     pub(super) async fn create_materialization_job(
         &mut self,
         drv_hash: &DrvHash,
@@ -885,41 +887,18 @@ impl DagActor {
                     &s.verified_paths,
                     &live_wanted_paths,
                 ) {
-                    let d = match job_id {
-                        Some(job_id) => {
-                            self.resolve_materialization_job(
-                                job_id,
-                                Some(exec_id),
-                                crate::state::JobState::ResolvedSuccess,
-                                serving_generation,
-                            )
-                            .await
-                        }
-                        // No durable row: the job settled earlier (PG
-                        // is the authority) — removing the stale view
-                        // entry is reconciliation, not a decision.
-                        None => WriteDisposition::AlreadyResolved,
-                    };
-                    if self.materialization_jobs.remove_settled(&drv_hash, d) {
-                        // Stamp the carried realized path(s) BEFORE the
-                        // completion chokepoint: its non-destructive guard
-                        // keeps a known path, so the floating-CA node
-                        // re-completes with the realized path instead of
-                        // the [""] placeholder (GC retention + the
-                        // client-visible path restored).
-                        if !carried_paths.is_empty()
-                            && let Some(state) = self.dag.node_mut(&drv_hash)
-                            && state.output_paths.is_empty()
-                        {
-                            state.output_paths = carried_paths.clone();
-                        }
-                        // The build-success path: outputs are present and
-                        // verified in the store; complete the node for live
-                        // interest through the same chokepoint the
-                        // dispatch-time store short-circuit uses.
-                        self.complete_ready_from_store_batch(std::slice::from_ref(&drv_hash))
-                            .await;
-                    }
+                    // The build-success path: outputs are present and
+                    // verified in the store; one chokepoint resolves,
+                    // settles the view, stamps the carrier, and
+                    // completes for live interest.
+                    self.complete_materialization_for_live_interest(
+                        &drv_hash,
+                        job_id,
+                        exec_id,
+                        &carried_paths,
+                        serving_generation,
+                    )
+                    .await;
                 } else {
                     // Coverage failed — interest grew between execution
                     // and consumption, or the report did not cover the
@@ -932,13 +911,7 @@ impl DagActor {
                     // job is pending-unclaimed but the node is held
                     // Running by closed-attempt bookkeeping) and the
                     // re-arm is a wedge, not an armed action.
-                    self.rearm_materialization_job(&drv_hash, &executor).await;
-                    self.requeue_after_attempt(
-                        std::slice::from_ref(&drv_hash),
-                        crate::state::AttemptKind::Materialization,
-                        Some(&executor),
-                    )
-                    .await;
+                    self.release_claim(&drv_hash, Some(&executor)).await;
                 }
                 Ok(())
             }
@@ -1010,7 +983,9 @@ impl DagActor {
                         None => {
                             // B3: the re-probe RPC itself failed — an
                             // indeterminate answer never fail-fasts.
-                            self.rearm_materialization_job(&drv_hash, &executor).await;
+                            // Atomic release (merged_bug_015): the
+                            // bare re-arm here was the wedge.
+                            self.release_claim(&drv_hash, Some(&executor)).await;
                             return Ok(());
                         }
                     }
@@ -1029,25 +1004,25 @@ impl DagActor {
                 // 3. Execute the routing.
                 match routing {
                     UnobtainableRouting::CompleteForLiveInterest => {
-                        let d = match job_id {
-                            Some(job_id) => {
-                                self.resolve_materialization_job(
-                                    job_id,
-                                    Some(exec_id),
-                                    crate::state::JobState::ResolvedSuccess,
-                                    serving_generation,
-                                )
-                                .await
-                            }
-                            None => WriteDisposition::AlreadyResolved,
-                        };
-                        if self.materialization_jobs.remove_settled(&drv_hash, d) {
-                            self.complete_ready_from_store_batch(std::slice::from_ref(&drv_hash))
-                                .await;
-                        }
+                        // The moot arm completes through the SAME
+                        // chokepoint as Success — the carrier stamp
+                        // cannot be skipped by arm choice
+                        // (merged_bug_055: this arm completed with the
+                        // [""] placeholder pre-fix).
+                        self.complete_materialization_for_live_interest(
+                            &drv_hash,
+                            job_id,
+                            exec_id,
+                            &carried_paths,
+                            serving_generation,
+                        )
+                        .await;
                     }
                     UnobtainableRouting::ReArm => {
-                        self.rearm_materialization_job(&drv_hash, &executor).await;
+                        // Atomic release (merged_bug_015): re-arm +
+                        // requeue in ONE step — the bare re-arm here
+                        // held the node Running with no armed action.
+                        self.release_claim(&drv_hash, Some(&executor)).await;
                     }
                     UnobtainableRouting::ResolveFromSource => {
                         let d = match job_id {
@@ -1150,13 +1125,7 @@ impl DagActor {
                     .close_materialization_attempt(exec_id, &drv_hash, None, serving_generation)
                     .await;
                 if close_d.settled() {
-                    self.rearm_materialization_job(&drv_hash, &executor).await;
-                    self.requeue_after_attempt(
-                        std::slice::from_ref(&drv_hash),
-                        crate::state::AttemptKind::Materialization,
-                        Some(&executor),
-                    )
-                    .await;
+                    self.release_claim(&drv_hash, Some(&executor)).await;
                 }
                 Ok(())
             }
@@ -1275,25 +1244,66 @@ impl DagActor {
         let counters = self.mat_counters(drv_hash);
         let job_id = job_id.or_else(|| self.materialization_jobs.get(drv_hash).map(|e| e.job_id));
         if counters.infra_since_reset >= self.materialization_cfg.max_attempts {
+            // Park ends with its own requeue companion — the node
+            // returns from-source dispatchable per the admission table.
             self.park_materialization_job(
                 drv_hash,
                 job_id,
                 counters.infra_since_reset,
+                Some(executor),
                 serving_generation,
             )
             .await;
         } else {
-            self.rearm_materialization_job(drv_hash, executor).await;
+            // Under budget: the atomic claim release (re-arm + requeue
+            // in ONE step — the node is claimable again immediately).
+            self.release_claim(drv_hash, Some(executor)).await;
         }
-        // Either way the node itself returns to the queue (claimable
-        // again / from-source dispatchable per the admission table).
-        self.requeue_after_attempt(
-            std::slice::from_ref(drv_hash),
-            crate::state::AttemptKind::Materialization,
-            Some(executor),
-        )
-        .await;
         close_d
+    }
+
+    /// THE success-for-live-interest completion chokepoint
+    /// (merged_bug_055): resolve the job, settle the view, stamp the
+    /// carried realized paths, and complete the node — in ONE helper,
+    /// so no consuming arm (Success coverage, the Unobtainable moot
+    /// arm, or any future arm) can skip the carrier stamp. The stamp
+    /// runs BEFORE `complete_ready_from_store_batch`: its
+    /// non-destructive guard keeps a known path, so the floating-CA
+    /// node re-completes with the realized path instead of the `[""]`
+    /// placeholder (GC retention + the client-visible path restored).
+    async fn complete_materialization_for_live_interest(
+        &mut self,
+        drv_hash: &DrvHash,
+        job_id: Option<Uuid>,
+        exec_id: Uuid,
+        carried_paths: &[String],
+        serving_generation: i64,
+    ) {
+        let d = match job_id {
+            Some(job_id) => {
+                self.resolve_materialization_job(
+                    job_id,
+                    Some(exec_id),
+                    crate::state::JobState::ResolvedSuccess,
+                    serving_generation,
+                )
+                .await
+            }
+            // No durable row: the job settled earlier (PG is the
+            // authority) — removing the stale view entry is
+            // reconciliation, not a decision.
+            None => WriteDisposition::AlreadyResolved,
+        };
+        if self.materialization_jobs.remove_settled(drv_hash, d) {
+            if !carried_paths.is_empty()
+                && let Some(state) = self.dag.node_mut(drv_hash)
+                && state.output_paths.is_empty()
+            {
+                state.output_paths = carried_paths.to_vec();
+            }
+            self.complete_ready_from_store_batch(std::slice::from_ref(drv_hash))
+                .await;
+        }
     }
 
     /// Close the open materialization attempt (assignment row) and
@@ -1476,13 +1486,30 @@ impl DagActor {
         }
     }
 
-    /// Re-arm the job: it stays pending (claimable); the in-memory view
-    /// drops the claim so the next pull's one-winner arbitration sees
-    /// Pending again.
-    async fn rearm_materialization_job(&mut self, drv_hash: &DrvHash, _executor: &ExecutorId) {
+    /// THE claim-drop chokepoint (merged_bug_015 / merged_bug_307 legs
+    /// a+b): re-arm the job — the in-memory view drops the claim so
+    /// the next pull's one-winner arbitration sees Pending — AND
+    /// requeue the node off the mint's Assigned/Running bookkeeping in
+    /// the SAME call, the code twin of the model's single-step
+    /// `consumeUnobtainable`. A claim drop without the requeue is the
+    /// documented wedge: pending-unclaimed job + node held Running ⇒
+    /// the admission table answers NotYetReady to EVERY identity and
+    /// no armed action remains (the skew the housekeeping tripwire
+    /// counts). B1's Aborted intake routes through here too.
+    pub(super) async fn release_claim(
+        &mut self,
+        drv_hash: &DrvHash,
+        executor: Option<&ExecutorId>,
+    ) {
         if let Some(entry) = self.materialization_jobs.get_mut(drv_hash) {
             entry.claimed_by = None;
         }
+        self.requeue_after_attempt(
+            std::slice::from_ref(drv_hash),
+            crate::state::AttemptKind::Materialization,
+            executor,
+        )
+        .await;
     }
 
     /// Park the job (infra-budget exhaustion, design §2.5): durable
@@ -1492,6 +1519,7 @@ impl DagActor {
         drv_hash: &DrvHash,
         job_id: Option<Uuid>,
         infra_count: u32,
+        executor: Option<&ExecutorId>,
         serving_generation: i64,
     ) {
         let base = self.materialization_cfg.park_backoff_base_secs;
@@ -1537,6 +1565,16 @@ impl DagActor {
             // most recent — re-park restarts the clock by design.
             entry.parked_at = Some(std::time::Instant::now());
         }
+        // The park's requeue companion (merged_bug_015's park half):
+        // the node leaves the mint's Assigned/Running bookkeeping
+        // either way — parked means "not claimable until the backoff
+        // lapses", never "wedged Running with no armed action".
+        self.requeue_after_attempt(
+            std::slice::from_ref(drv_hash),
+            crate::state::AttemptKind::Materialization,
+            executor,
+        )
+        .await;
     }
 
     /// The arm-3 FMP re-probe over the live wanted paths. `None` = the

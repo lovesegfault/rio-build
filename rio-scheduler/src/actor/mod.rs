@@ -322,6 +322,16 @@ pub struct DagActor {
     /// leadership loss (the new leader's recovery + the charge-free
     /// establishment arm own the rows).
     status_outbox: std::collections::VecDeque<StatusBatch>,
+    /// Realized-path carriers whose stale-reset job creation came back
+    /// fenced/failed (merged_bug_257), retried by the housekeeping
+    /// tick until the row applies or the node goes terminal/gone.
+    /// Leader-scoped IN-MEMORY by design (do not durable-table this):
+    /// a leadership-loss drop is the PG-authority class — any APPLIED
+    /// creation already persisted the carrier on the job row, and the
+    /// successor re-derives from durable state; only the
+    /// never-applied window is lost, counted by
+    /// `rio_scheduler_materialization_carrier_dropped_total`.
+    pending_carriers: Vec<(crate::state::DrvHash, Vec<String>)>,
     /// Database handle.
     db: SchedulerDb,
     /// Store service client for scheduler-side cache checks. `None` in tests
@@ -769,6 +779,7 @@ impl DagActor {
             exec_retention_days: cfg.exec_retention_days,
             materialization_cfg: cfg.materialization,
             materialization_jobs: materialize::JobView::default(),
+            pending_carriers: Vec::new(),
             status_outbox: std::collections::VecDeque::new(),
             db,
             store_client: plumbing.store_client,
@@ -889,6 +900,7 @@ impl DagActor {
             acked_spawned,
             dag_authoritative,
             materialization_jobs,
+            pending_carriers,
             status_outbox,
             // Retained: rationale below.
             retry_policy: _,
@@ -980,6 +992,10 @@ impl DagActor {
         // re-populates it from its own creation paths. Stale entries
         // would project job state for a DAG this wipe just discarded.
         materialization_jobs.wipe();
+        // Leader-scoped carrier stash: a deposed leader's pending
+        // creates are fenced anyway; the dropped-carrier accounting is
+        // the PG-authority class documented on the field.
+        pending_carriers.clear();
         // r[impl sched.attempt.cancel-close-driven]
         // The outbox is leader-scoped: a deposed leader must not
         // re-drive status writes (they would be fenced anyway); the

@@ -1534,6 +1534,10 @@ impl DagActor {
         let check_paths: Vec<String> = candidates
             .iter()
             .flat_map(|(_, paths, _)| paths.iter().cloned())
+            // A floating-CA placeholder (`""`) must never reach the
+            // FindMissingPaths batch — the :probe-set sibling filters
+            // it the same way (merged_bug_055 rider).
+            .filter(|p| !p.is_empty())
             .collect();
 
         let mut req = tonic::Request::new(FindMissingPathsRequest {
@@ -1677,7 +1681,11 @@ impl DagActor {
                       "stale-completed verify: reset transition rejected; skipping");
                 continue;
             }
-            state.output_paths.clear();
+            // Capture-at-destruction (merged_bug_257): the realized
+            // paths the reset destroys ride a #[must_use] carrier —
+            // routed onto a job below or discarded explicitly for the
+            // from-source lane; no arm can silently drop them.
+            let carrier = state.take_realized_paths(&unwanted);
             // This reset is the moment a NEW substitution chain begins
             // r[impl sched.merge.stale-completed-verify+5]
             // Pre-existing Ready parents of this reset node were Ready
@@ -1718,18 +1726,16 @@ impl DagActor {
                             (build is Active; continuing)");
                 }
             }
-            if !deps_ok {
-                // Queued: not spawn-armed — find_newly_ready
-                // promotes it when its reset dep re-completes.
-                // DependencyFailed: terminal — the build's completion
-                // check (later in handle_merge) handles it.
-                reset.insert(drv_hash);
-                continue;
-            }
             // Substitutable subset: route to a materialization job
-            // instead of arming a from-source dispatch. The metric above
-            // stays — output WAS gone, even if upstream can re-provide
-            // it.
+            // instead of arming a from-source dispatch — for the
+            // !deps_ok arm TOO (merged_bug_257): job creation has no
+            // Ready precondition and PD-6 Queued claims make the job
+            // executable while deps settle, so the carrier is routed
+            // at the destruction pass instead of dropped with the
+            // Queued continue (pre-fix the parent of a chain reset
+            // lost its realized paths and re-dispatched from source).
+            // The metric above stays — output WAS gone, even if
+            // upstream can re-provide it.
             //
             // r[impl sched.merge.wanted-outputs+3]
             // Like the reset decision above, the routing forgives
@@ -1750,15 +1756,22 @@ impl DagActor {
             }) {
                 metrics::counter!("rio_scheduler_stale_completed_substituted_total").increment(1);
                 // Carrier (migration 082): the realized paths this
-                // reset just destroyed in memory, minus unwanted and
-                // placeholder-empty entries — the stale_reset job's
-                // fetch targets and coverage obligation.
-                let carried: Vec<String> = output_paths
-                    .iter()
-                    .filter(|p| !p.is_empty() && !unwanted.contains(p.as_str()))
-                    .cloned()
-                    .collect();
-                to_spawn.push((drv_hash_k, carried));
+                // reset just destroyed — the stale_reset job's fetch
+                // targets and coverage obligation.
+                to_spawn.push((drv_hash_k, carrier.into_paths()));
+            } else {
+                // From-source lane: the re-dispatch reproduces the
+                // outputs; the carrier has no consumer here.
+                carrier.discard_for_from_source();
+            }
+            if !deps_ok {
+                // Queued: not spawn-armed — find_newly_ready promotes
+                // it when its reset dep re-completes (the job above,
+                // if any, is claimable meanwhile per PD-6).
+                // DependencyFailed: terminal — the build's completion
+                // check (later in handle_merge) handles it.
+                reset.insert(drv_hash);
+                continue;
             }
             reset.insert(drv_hash);
         }
@@ -1835,14 +1848,22 @@ impl DagActor {
                 // and the consumption coverage read the same column,
                 // so the floating-CA empty-expected shape fetches the
                 // realized path instead of vacuously succeeding.
-                let carried = (!carried.is_empty()).then_some(carried);
-                self.create_materialization_job(
-                    &drv_hash,
-                    crate::state::JobOrigin::StaleReset,
-                    None,
-                    carried,
-                )
-                .await;
+                let carried_opt = (!carried.is_empty()).then(|| carried.clone());
+                if !self
+                    .create_materialization_job(
+                        &drv_hash,
+                        crate::state::JobOrigin::StaleReset,
+                        None,
+                        carried_opt,
+                    )
+                    .await
+                {
+                    // Fenced/failed creation (merged_bug_257): the
+                    // carrier survives in the leader-scoped stash and
+                    // the housekeeping tick retries until the job row
+                    // applies or the node goes terminal/gone.
+                    self.pending_carriers.push((drv_hash, carried));
+                }
             }
         }
 

@@ -134,6 +134,7 @@ impl DagActor {
         // from-source) and publish the stalled gauge from ground truth.
         self.tick_cancel_zero_interest_materialization().await;
         self.tick_reevaluate_parked_materialization_jobs().await;
+        self.tick_retry_pending_carriers().await;
 
         // Advance probe_generation here (1/s) — NOT per
         // `sweep_ready_cached` call — so a Ready node is FMP-probed at
@@ -438,6 +439,45 @@ impl DagActor {
         self.reevaluate_removal_survivors(&surviving_parents).await;
     }
 
+    /// Retry the leader-scoped realized-path carrier stash
+    /// (merged_bug_257): re-attempt the stale-reset job creation until
+    /// the row applies; drop — counted and warned — once the node is
+    /// terminal/gone (the carrier has no consumer left).
+    async fn tick_retry_pending_carriers(&mut self) {
+        if self.pending_carriers.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_carriers);
+        for (drv_hash, carried) in pending {
+            let alive = self
+                .dag
+                .node(&drv_hash)
+                .is_some_and(|s| !s.status().is_terminal());
+            if !alive {
+                metrics::counter!("rio_scheduler_materialization_carrier_dropped_total")
+                    .increment(1);
+                warn!(
+                    drv_hash = %drv_hash,
+                    "carried realized paths dropped: node terminal/gone before \
+                     the stale-reset job row applied"
+                );
+                continue;
+            }
+            let carried_opt = (!carried.is_empty()).then(|| carried.clone());
+            if !self
+                .create_materialization_job(
+                    &drv_hash,
+                    crate::state::JobOrigin::StaleReset,
+                    None,
+                    carried_opt,
+                )
+                .await
+            {
+                self.pending_carriers.push((drv_hash, carried));
+            }
+        }
+    }
+
     /// DAG-state sweep for `dispatched_cells`. The arm-on-ack write
     /// (`handle_ack_spawned_intents`) can't fire for a drv that was
     /// acked then cancelled / substituted / dependency-failed before
@@ -703,6 +743,40 @@ impl DagActor {
         metrics::gauge!("rio_scheduler_open_attempts").set(opens.build.len() as f64);
         metrics::gauge!("rio_scheduler_open_materialization_attempts")
             .set(opens.materialization.len() as f64);
+        // Skew tripwire (merged_bug_307 rider): a pending-unclaimed
+        // view entry whose node is still Assigned/Running with NO open
+        // materialization assignment is the released-claim wedge shape
+        // — `release_claim` should have requeued the node in the same
+        // step that dropped the claim. Counted (and fatal under debug
+        // builds) so a re-introduced split release is observable
+        // instead of a silent NotYetReady-forever.
+        {
+            use crate::state::DerivationStatus::{Assigned, Running};
+            let mat_open: std::collections::HashSet<&str> = opens
+                .materialization
+                .iter()
+                .map(|a| a.drv_hash.as_str())
+                .collect();
+            for (drv_hash, entry) in self.materialization_jobs.iter() {
+                if entry.claimed_by.is_some() {
+                    continue;
+                }
+                let wedged = self
+                    .dag
+                    .node(drv_hash.as_str())
+                    .is_some_and(|s| matches!(s.status(), Assigned | Running))
+                    && !mat_open.contains(drv_hash.as_str());
+                if wedged {
+                    metrics::counter!("rio_scheduler_materialization_view_node_skew_total")
+                        .increment(1);
+                    debug_assert!(
+                        false,
+                        "pending-unclaimed materialization job for {drv_hash} with node \
+                         Assigned/Running and no open assignment (split-release wedge)"
+                    );
+                }
+            }
+        }
         if opens.build.is_empty() && opens.materialization.is_empty() {
             return;
         }

@@ -7245,3 +7245,304 @@ async fn second_job_budget_window_starts_fresh() -> TestResult {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// A3 commit 3 [B,C]: atomic release_claim + the carrier chokepoints
+// (merged_bug_015 / merged_bug_307 a+b / merged_bug_055 / merged_bug_257).
+// ---------------------------------------------------------------------------
+
+// r[verify sched.materialize.routing+3]
+/// merged_bug_015 / merged_bug_307(a)(b): an uncovered arm-0 ReArm
+/// consumption must RELEASE the claim — view re-armed AND the node
+/// requeued off the mint's Assigned/Running bookkeeping — so a SECOND
+/// replica's claim is deliverable. Pre-fix the ReArm arm only cleared
+/// `claimed_by`: the node stayed Running under closed-attempt
+/// bookkeeping, the admission table answered NotYetReady to EVERY
+/// identity, and the pending-unclaimed job wedged with no armed action.
+#[tokio::test]
+async fn unobtainable_uncovered_rearm_releases_claim_for_second_replica() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let out1 = test_store_path("rearm-out1");
+    {
+        store
+            .state
+            .substitutable
+            .write()
+            .unwrap()
+            .push(out1.clone());
+    }
+    let mut n = make_node("mat-rearm");
+    n.expected_output_paths = vec![out1.clone()];
+    merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    let assignment = match claim_materialization(&handle, "mat-rearm", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("first claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+
+    // Arm 0, uncovered: nothing missing-and-live-wanted, but the live
+    // wanted set (out1) is NOT covered by the verified set → ReArm.
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "mat-rearm",
+        mat_unobtainable_outcome(vec![], vec![], "transient upstream noise"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // The re-armed job must be deliverable to ANOTHER replica: a claim
+    // drop without the requeue is the documented wedge (NotYetReady
+    // forever — pending-unclaimed job, node held Running).
+    match claim_materialization(&handle, "mat-rearm", "store-test-1").await {
+        Ok(PullOutcome::Deliver(_)) => {}
+        other => panic!(
+            "the re-armed job must be deliverable to a second replica \
+             (release_claim = re-arm + requeue in ONE step); got {other:?}"
+        ),
+    }
+    Ok(())
+}
+
+// r[verify sched.materialize.routing+3]
+// r[verify sched.merge.stale-substitutable+3]
+/// merged_bug_055: the CompleteForLiveInterest arm must stamp the
+/// carried realized paths through the SAME completion chokepoint the
+/// Success arm uses. Floating-CA stale-reset shape: the node's
+/// expected paths are placeholder-empty, so the live wanted set is
+/// the carried realized path (unioned into the wanted set, the 194
+/// closure); an Unobtainable report whose missing paths are all moot
+/// and whose verified set covers the carrier
+/// completes-for-live-interest. Pre-fix that arm skipped the carrier
+/// stamp: the node re-completed with `[""]` (GC retention dropped and
+/// the placeholder emitted to clients).
+#[tokio::test]
+async fn complete_for_live_interest_stamps_carried_paths() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let realized = test_store_path("cfli-realized");
+    {
+        store
+            .state
+            .substitutable
+            .write()
+            .unwrap()
+            .push(realized.clone());
+    }
+    // Floating-CA: the expected output path is placeholder-empty.
+    let mut n = make_node("cfli-a");
+    n.expected_output_paths = vec![String::new()];
+    merge_dag(&handle, Uuid::new_v4(), vec![n.clone()], vec![], false).await?;
+    handle
+        .debug_force_status("cfli-a", DerivationStatus::Completed)
+        .await?;
+    handle
+        .debug_set_output_paths("cfli-a", vec![realized.clone()])
+        .await?;
+    barrier(&handle).await;
+
+    // Re-merge: the realized output is gone from the store and
+    // substitutable → stale-completed reset + a carried stale_reset job.
+    merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+    barrier(&handle).await;
+    let carried: Option<Vec<String>> = sqlx::query_scalar(
+        "SELECT carried_realized_paths FROM materialization_jobs WHERE state = 'pending'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        carried.as_deref(),
+        Some(std::slice::from_ref(&realized)),
+        "the stale_reset job carries the realized path (migration 082)"
+    );
+
+    let assignment = match claim_materialization(&handle, "cfli-a", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    // Missing paths are all moot (nothing live-wanted: the floating-CA
+    // wanted set resolves empty) → arm 0 covered → CompleteForLiveInterest.
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "cfli-a",
+        mat_unobtainable_outcome(
+            vec![test_store_path("cfli-unrelated")],
+            vec![realized.clone()],
+            "upstream 404 on an unwanted path; the carried path verified present",
+        ),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    let info = expect_drv(&handle, "cfli-a").await;
+    assert_eq!(info.status, DerivationStatus::Completed);
+    assert_eq!(
+        info.output_paths,
+        vec![realized],
+        "the completion chokepoint stamps the carried realized path — \
+         never the [\"\"] placeholder"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.stale-substitutable+3]
+/// merged_bug_257: a floating-CA chain reset (A depends on B, both
+/// stale-reset in one pass) must give the !deps_ok PARENT a carried
+/// stale_reset job too — the carrier is captured at the moment the
+/// reset destroys the realized paths, and the job is claimable while
+/// deps settle (PD-6: Queued claims are legal). Pre-fix the !deps_ok
+/// arm dropped the carrier on the floor: A lost its realized paths
+/// and later re-dispatched from source.
+#[tokio::test]
+async fn chain_reset_parent_gets_carrier_job() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let ra = test_store_path("chain-a-realized");
+    let rb = test_store_path("chain-b-realized");
+    {
+        let mut subs = store.state.substitutable.write().unwrap();
+        subs.push(ra.clone());
+        subs.push(rb.clone());
+    }
+    // Floating-CA chain: A depends on B; both expected placeholder-empty.
+    let mk = |tag: &str| {
+        let mut n = make_node(tag);
+        n.expected_output_paths = vec![String::new()];
+        n
+    };
+    merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![mk("chain-a"), mk("chain-b")],
+        vec![make_test_edge("chain-a", "chain-b")],
+        false,
+    )
+    .await?;
+    for (tag, path) in [("chain-a", &ra), ("chain-b", &rb)] {
+        handle
+            .debug_force_status(tag, DerivationStatus::Completed)
+            .await?;
+        handle
+            .debug_set_output_paths(tag, vec![path.clone()])
+            .await?;
+    }
+    barrier(&handle).await;
+
+    // Re-merge: both outputs gone-and-substitutable → both reset. B
+    // (leaf) goes Ready; A sees its child in the reset set → Queued
+    // (!deps_ok).
+    merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![mk("chain-a"), mk("chain-b")],
+        vec![make_test_edge("chain-a", "chain-b")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "chain-a").await.status,
+        DerivationStatus::Queued,
+        "A's reset lands Queued (its dep B reset in the same pass)"
+    );
+
+    let a_carried: Option<Option<Vec<String>>> = sqlx::query_scalar(
+        "SELECT carried_realized_paths FROM materialization_jobs \
+          WHERE drv_hash = 'chain-a' AND state = 'pending'",
+    )
+    .fetch_optional(&db.pool)
+    .await?;
+    let a_carried = a_carried.unwrap_or_else(|| {
+        panic!(
+            "the !deps_ok parent must get a stale_reset job too — the \
+             carrier is captured at destruction, not dropped with the \
+             Queued continue"
+        )
+    });
+    assert_eq!(
+        a_carried.as_deref(),
+        Some(std::slice::from_ref(&ra)),
+        "A's job carries A's realized path"
+    );
+
+    // PD-6: the Queued-origin job is claimable while deps settle.
+    match claim_materialization(&handle, "chain-a", "store-test-0").await {
+        Ok(PullOutcome::Deliver(_)) => {}
+        other => panic!("the Queued carrier job must be claimable (PD-6), got {other:?}"),
+    }
+    Ok(())
+}
+
+// r[verify sched.merge.stale-substitutable+3]
+/// merged_bug_257(b): a fenced/failed stale-reset job creation must
+/// not drop the carrier — it survives in the leader-scoped stash and
+/// the housekeeping tick retries until the row applies. Driven by an
+/// external PG fault (the table hidden for one merge — the post-tx
+/// standalone create errors), then healed and ticked.
+#[tokio::test]
+async fn failed_fenced_job_create_retries_via_stash() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let realized = test_store_path("stash-realized");
+    {
+        store
+            .state
+            .substitutable
+            .write()
+            .unwrap()
+            .push(realized.clone());
+    }
+    let mut n = make_node("stash-a");
+    n.expected_output_paths = vec![String::new()];
+    merge_dag(&handle, Uuid::new_v4(), vec![n.clone()], vec![], false).await?;
+    handle
+        .debug_force_status("stash-a", DerivationStatus::Completed)
+        .await?;
+    handle
+        .debug_set_output_paths("stash-a", vec![realized.clone()])
+        .await?;
+    barrier(&handle).await;
+
+    // External fault injection: hide the table so the standalone
+    // fenced create ERRORS (the merge transaction itself committed
+    // long before this post-tx site runs — design §2.1 row 4's
+    // standalone-helper posture is exactly what makes the fault
+    // injectable here).
+    sqlx::query("ALTER TABLE materialization_jobs RENAME TO materialization_jobs_hidden")
+        .execute(&db.pool)
+        .await?;
+
+    // The re-merge resets the node and tries to create the carried
+    // job — the create FAILS; the carrier must land in the stash,
+    // not on the floor.
+    merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    // The table heals and the housekeeping tick retries the stash.
+    sqlx::query("ALTER TABLE materialization_jobs_hidden RENAME TO materialization_jobs")
+        .execute(&db.pool)
+        .await?;
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM materialization_jobs WHERE drv_hash = 'stash-a'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(jobs, 0, "the failed create wrote no job row");
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+
+    let carried: Option<Vec<String>> = sqlx::query_scalar(
+        "SELECT carried_realized_paths FROM materialization_jobs \
+          WHERE drv_hash = 'stash-a' AND state = 'pending'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        carried.as_deref(),
+        Some(std::slice::from_ref(&realized)),
+        "the stash retry created the job WITH the carrier intact"
+    );
+    Ok(())
+}

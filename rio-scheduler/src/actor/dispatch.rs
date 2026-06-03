@@ -241,13 +241,16 @@ impl DagActor {
         // The probe-partition creation site — the standalone fenced
         // helper, no enclosing transaction (design §2.1 row 3).
         for drv_hash in &to_create_job {
-            self.create_materialization_job(
-                drv_hash,
-                crate::state::JobOrigin::CacheOpportunity,
-                None,
-                None,
-            )
-            .await;
+            // No carrier at stake on this lane: a fenced/failed create
+            // is re-probed by the next dispatch pass (self-healing).
+            let _retried_by_next_probe = self
+                .create_materialization_job(
+                    drv_hash,
+                    crate::state::JobOrigin::CacheOpportunity,
+                    None,
+                    None,
+                )
+                .await;
         }
         checked
     }
