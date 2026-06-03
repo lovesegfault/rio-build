@@ -1871,7 +1871,7 @@ mod tests {
                 Some(&infra_needle),
                 &batch,
                 &poisoned_no_builders,
-                0,
+                prior(0),
                 &knobs,
                 None
             )
@@ -1886,7 +1886,7 @@ mod tests {
                 Some(&infra_needle),
                 &batch,
                 &poisoned_no_builders,
-                1,
+                prior(1),
                 &knobs,
                 None
             ),
