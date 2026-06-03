@@ -447,6 +447,15 @@ impl FailOn {
             FailOn::Divergence => "divergence",
         }
     }
+
+    /// Every trip condition, in spec order — the iteration surface for
+    /// consumer-side sweeps over the `fail_on` axis (the gate document
+    /// is wire data, so each variant's wire string must be exercised at
+    /// the consumption point, not just the one a fixture happened to
+    /// pin). Completeness is compile-forced by `fail_on_all_is_total`:
+    /// a new variant breaks its match until indexed, and the index
+    /// range breaks until the variant joins this list.
+    pub const ALL: [FailOn; 3] = [FailOn::None, FailOn::Regression, FailOn::Divergence];
 }
 
 /// Report-policy block of the campaign spec: which aggregation policies the
@@ -797,6 +806,27 @@ impl CampaignSpec {
                 || self.report.policies.contains(&ReportPolicy::RegressionGate),
             "report.fail_on requires the regression-gate policy to be requested"
         );
+        // The converse combination — regression-gate requested with
+        // fail_on "none" — stays representable: it records an
+        // accounting-only gate document (counts can never populate, the
+        // coverage witness still accrues), and specs persisted by
+        // pre-acknowledgment launches carry it, so a hard refusal here
+        // would brick their resumes. It is still the silent-inert trap
+        // the rationale above exists for — the gate's trip predicate is
+        // the constant false — so it is called out loudly: launch
+        // demands an explicit `--fail-on none` acknowledgment for new
+        // campaigns, and `report --check` (the design-named single CI
+        // consumption point, §7.3) treats the resulting pass as vacuous.
+        if self.report.policies.contains(&ReportPolicy::RegressionGate)
+            && self.report.fail_on == FailOn::None
+        {
+            tracing::warn!(
+                "campaign spec requests the regression-gate report policy with fail_on \
+                 \"none\": the recorded gate can never trip, so a `report --check` pass \
+                 verifies nothing (use fail_on \"regression\" or \"divergence\" for a gate \
+                 that can fire)"
+            );
+        }
         Ok(())
     }
 }
@@ -1399,6 +1429,46 @@ mod tests {
         assert!(err.contains("regression-gate"), "{err}");
         bad.report.policies.push(ReportPolicy::RegressionGate);
         bad.validate().unwrap();
+
+        // The converse — regression-gate with fail_on "none" — VALIDATES
+        // (warn-only): specs persisted by launches that predate the
+        // explicit-acknowledgment flow carry exactly this block, and a
+        // resume re-validates the persisted spec, so a hard refusal here
+        // would brick old campaigns. The vacuity is enforced where it is
+        // consumed: launch demands the acknowledgment for new campaigns,
+        // and report --check calls the pass vacuous.
+        let mut observational = valid_spec();
+        observational.report = ReportBlock {
+            policies: vec![ReportPolicy::Parity, ReportPolicy::RegressionGate],
+            fail_on: FailOn::None,
+        };
+        observational.validate().unwrap();
+    }
+
+    /// `FailOn::ALL` is total: a new variant breaks the index match
+    /// below until it is indexed, and the index range breaks until the
+    /// variant joins `ALL` — so consumer-side sweeps over the wire axis
+    /// (the report --check fixtures) cannot silently miss one.
+    #[test]
+    fn fail_on_all_is_total() {
+        let index = |f: FailOn| -> usize {
+            match f {
+                FailOn::None => 0,
+                FailOn::Regression => 1,
+                FailOn::Divergence => 2,
+            }
+        };
+        let mut seen: Vec<usize> = FailOn::ALL.iter().map(|f| index(*f)).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..FailOn::ALL.len()).collect::<Vec<_>>());
+        // The wire strings are the serde forms verbatim — the consumer
+        // sweeps key on them.
+        for f in FailOn::ALL {
+            assert_eq!(
+                serde_json::to_value(f).unwrap(),
+                serde_json::json!(f.as_str())
+            );
+        }
     }
 
     #[test]

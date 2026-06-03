@@ -1724,6 +1724,23 @@ const CONTRACT_REGISTRY: &[ContractRow] = &[
             artifact_needles: &["backfill must not mint coverage"],
         },
     },
+    // ── …and the witness's sibling conjunct, the trip CONDITION: a pass
+    // is meaningful only when the gate could have tripped at all. Under
+    // fail_on "none" the trip predicate is the constant false, so the
+    // consumption point must refuse to read the structural untripped
+    // pass as verification. ──
+    ContractRow {
+        key: "gate.trippable-consumed",
+        declared: (
+            "docs/dev/2026-05-28-build-replay-design.md",
+            "could have tripped at all",
+        ),
+        enforcement: Enforcement::Test {
+            file: "xtask/src/replay/report.rs",
+            test_fn: "check_gate_demands_a_trippable_gate_across_the_wire",
+            artifact_needles: &["\"fail_on\":\"none\",\"tripped\":false,\"checked\":120"],
+        },
+    },
     ContractRow {
         key: "gate.trip-table",
         declared: (

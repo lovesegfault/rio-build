@@ -98,12 +98,18 @@ pub struct LaunchArgs {
     /// code.
     #[arg(long = "report-policy", value_enum, default_values_t = [ReportPolicyArg::Parity])]
     pub report_policy: Vec<ReportPolicyArg>,
-    /// Regression-gate trip condition recorded in the spec. Requires
-    /// --report-policy regression-gate (the engine's spec validation
-    /// enforces it); never an engine exit-code knob — the gate is consumed
-    /// by `replay report --check`.
-    #[arg(long, value_enum, default_value_t = FailOnArg::None)]
-    pub fail_on: FailOnArg,
+    /// Regression-gate trip condition recorded in the spec. REQUIRED
+    /// whenever --report-policy regression-gate is requested: pass
+    /// `regression` or `divergence` for a gate that can fire, or an
+    /// explicit `none` to deliberately launch an accounting-only
+    /// (observational) gate — `report --check` calls a none-gate pass
+    /// vacuous, so omitting the flag must not silently select it.
+    /// Without the regression-gate policy the condition defaults to
+    /// `none` and must not be set otherwise (the engine's spec
+    /// validation enforces it). Never an engine exit-code knob — the
+    /// gate is consumed by `replay report --check`.
+    #[arg(long, value_enum)]
+    pub fail_on: Option<FailOnArg>,
     /// When submissions happen: timeless = queue-driven dispatch ignoring
     /// recorded timing; timed = recorded request offsets divided by
     /// --speedup. Timed scheduling requires an archive recorded with the
@@ -239,6 +245,51 @@ impl std::fmt::Display for FailOnArg {
             .expect("no skipped variants")
             .get_name()
             .fmt(f)
+    }
+}
+
+/// Resolve the launch's regression-gate trip condition, refusing the
+/// silent-inert default.
+///
+/// Under the engine's `FailOn::None` the gate's trip predicate is the
+/// constant false — `accounting_trips` returns false for every class —
+/// so a regression-gate campaign whose `--fail-on` was merely OMITTED
+/// would record a gate that `report --check` (the design-named single
+/// CI consumption point) can pass forever on a fully regressed target.
+/// A clap default selecting the inert variant of an enforcement enum
+/// turns flag omission into silent guard death, so the combination is
+/// refused up front: a regression-gate launch must STATE its trip
+/// condition. `--fail-on none` remains expressible as the deliberate
+/// acknowledgment of an accounting-only (observational) gate; it is
+/// acknowledged loudly here, warned about by the engine's spec
+/// validation, and called a vacuous pass by `report --check`.
+///
+/// The inverse direction — a trip condition without the regression-gate
+/// policy — is the engine spec validation's refusal
+/// (`report.fail_on requires the regression-gate policy`), reached via
+/// the local `spec.validate()` before any cluster mutation; this
+/// resolver deliberately does not duplicate it.
+fn resolve_fail_on(
+    report_policy: &[ReportPolicyArg],
+    fail_on: Option<FailOnArg>,
+) -> Result<FailOn> {
+    let gate_requested = report_policy.contains(&ReportPolicyArg::RegressionGate);
+    match (gate_requested, fail_on) {
+        (true, None) => anyhow::bail!(
+            "--report-policy regression-gate requires an explicit --fail-on: pass \
+             `--fail-on regression` or `--fail-on divergence` for a gate that can fire, or \
+             `--fail-on none` to deliberately record an accounting-only gate that never \
+             trips (report --check treats a none-gate pass as vacuous)"
+        ),
+        (true, Some(FailOnArg::None)) => {
+            tracing::warn!(
+                "accounting-only regression gate acknowledged: --fail-on none records a gate \
+                 that can never trip, and `report --check` will call its pass vacuous"
+            );
+            Ok(FailOn::None)
+        }
+        (_, Some(arg)) => Ok(arg.engine()),
+        (false, None) => Ok(FailOn::None),
     }
 }
 
@@ -650,10 +701,13 @@ fn build_campaign_spec(
         },
         // Report policies chosen at launch; the engine's spec validation
         // (run below) rejects a fail-on condition without the
-        // regression-gate policy.
+        // regression-gate policy. An ABSENT --fail-on maps to the engine
+        // default `none` — legal here only because [`run`] already
+        // refused the absent-flag + regression-gate combination through
+        // [`resolve_fail_on`] before building the spec.
         report: ReportBlock {
             policies: a.report_policy.iter().map(|p| p.engine()).collect(),
-            fail_on: a.fail_on.engine(),
+            fail_on: a.fail_on.map_or(FailOn::None, FailOnArg::engine),
         },
         // Deployed image versions verified by the pre-flight, recorded
         // verbatim.
@@ -675,6 +729,10 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     if let Some(id) = &a.campaign_id {
         validate_campaign_id(id)?;
     }
+    // A regression-gate launch must state its trip condition before any
+    // AWS or cluster traffic: an omitted --fail-on would otherwise
+    // silently record a gate that can never trip (see [`resolve_fail_on`]).
+    resolve_fail_on(&a.report_policy, a.fail_on)?;
     // Classify the --eval/--archive flags before anything else: a missing
     // or contradictory input combination needs no AWS or cluster traffic
     // to be refused.
@@ -2140,7 +2198,7 @@ mod tests {
             deadline: None,
             restart_gateway: false,
             report_policy: vec![ReportPolicyArg::Parity],
-            fail_on: FailOnArg::None,
+            fail_on: None,
             schedule: Schedule::Timeless,
             speedup: 1.0,
             log_level: "info".into(),
@@ -2755,7 +2813,7 @@ mod tests {
         // engine validation launch always runs accepts it.
         let mut a = args(Mode::Leaf);
         a.report_policy = vec![ReportPolicyArg::RegressionGate];
-        a.fail_on = FailOnArg::Regression;
+        a.fail_on = Some(FailOnArg::Regression);
         let spec = build_campaign_spec(
             &a,
             "replay-leaf-20260601-ab12",
@@ -2773,7 +2831,7 @@ mod tests {
         // Both policies may be requested for one campaign (repeatable flag).
         let mut a = args(Mode::Leaf);
         a.report_policy = vec![ReportPolicyArg::Parity, ReportPolicyArg::RegressionGate];
-        a.fail_on = FailOnArg::Divergence;
+        a.fail_on = Some(FailOnArg::Divergence);
         let spec = build_campaign_spec(
             &a,
             "replay-leaf-20260601-ab12",
@@ -2795,7 +2853,7 @@ mod tests {
         // by the engine's own spec validation, which launch runs before
         // touching the cluster — no launch-side duplicate of that rule.
         let mut a = args(Mode::Leaf);
-        a.fail_on = FailOnArg::Regression;
+        a.fail_on = Some(FailOnArg::Regression);
         let spec = build_campaign_spec(
             &a,
             "replay-leaf-20260601-ab12",
@@ -2828,6 +2886,62 @@ mod tests {
             assert_eq!(arg.to_string(), engine.as_str());
             assert_eq!(arg.engine(), engine);
         }
+    }
+
+    /// The full (report-policy × --fail-on) launch grid for the trip
+    /// condition resolver. The DEFAULT configuration axis is the one
+    /// that mattered: a regression-gate launch with the flag simply
+    /// omitted previously inherited a clap default of `none` and
+    /// recorded a gate whose trip predicate is the constant false
+    /// (`accounting_trips` under `FailOn::None` — rio-replay
+    /// `run/report.rs`), so the refusal row is pinned alongside every
+    /// sibling combination, including the explicit `--fail-on none`
+    /// acknowledgment path that keeps accounting-only gates launchable.
+    #[test]
+    fn fail_on_resolution_covers_the_policy_flag_grid() {
+        let policy_axes: [&[ReportPolicyArg]; 3] = [
+            &[ReportPolicyArg::Parity],
+            &[ReportPolicyArg::Parity, ReportPolicyArg::RegressionGate],
+            &[ReportPolicyArg::RegressionGate],
+        ];
+        let flag_axis = [
+            None,
+            Some(FailOnArg::None),
+            Some(FailOnArg::Regression),
+            Some(FailOnArg::Divergence),
+        ];
+        for policies in policy_axes {
+            let gate = policies.contains(&ReportPolicyArg::RegressionGate);
+            for flag in flag_axis {
+                let resolved = resolve_fail_on(policies, flag);
+                match (gate, flag) {
+                    // The trap: regression-gate requested, flag omitted.
+                    // Refused, and the message names BOTH ways out — the
+                    // trippable conditions and the explicit
+                    // acknowledgment.
+                    (true, None) => {
+                        let err = resolved.unwrap_err().to_string();
+                        assert!(err.contains("--fail-on regression"), "{err}");
+                        assert!(err.contains("--fail-on divergence"), "{err}");
+                        assert!(err.contains("--fail-on none"), "{err}");
+                        assert!(err.contains("vacuous"), "{err}");
+                    }
+                    // Every explicit flag resolves to its engine value —
+                    // including the deliberate accounting-only gate.
+                    (_, Some(arg)) => {
+                        assert_eq!(resolved.unwrap(), arg.engine(), "{policies:?} {flag:?}");
+                    }
+                    // No gate requested, no flag: the engine default.
+                    (false, None) => {
+                        assert_eq!(resolved.unwrap(), FailOn::None, "{policies:?}");
+                    }
+                }
+            }
+        }
+        // A trippable flag WITHOUT the gate policy resolves here but is
+        // refused by the engine spec validation launch always runs before
+        // cluster mutation (pinned in report_policy_flags_populate_the_
+        // spec_report_block) — the resolver does not duplicate that rule.
     }
 
     #[test]
