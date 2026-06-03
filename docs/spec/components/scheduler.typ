@@ -3291,15 +3291,21 @@ generation its fenced transactions persist on the rows they write. Non-K8s
 single-scheduler deployments construct `LeaderState` with recovery already
 complete, so the ordering is trivially satisfied there.
 
-#r("sched.lease.graceful-release")[
-  On graceful shutdown (SIGTERM), if the lease loop was leading, it calls
-  `step_down()` to clear `holderIdentity` before the process exits. This is an
+#r("sched.lease.graceful-release+2")[
+  On graceful shutdown (SIGTERM), if the lease loop ever acquired the lease
+  and has not since observed another holder (a completed election round
+  resolving not-leading), it calls `step_down()` to clear `holderIdentity`
+  before the process exits; the local self-fence does NOT clear this gate ---
+  fencing is a local belief change that writes nothing to the apiserver, so a
+  fence-then-SIGTERM sequence MUST still release the possibly-still-ours
+  lease. This is an
   optimization, not a correctness requirement: without it, the next replica
   waits up to `STEAL_AFTER` (19s) for observed-record expiry. With it, the
   next replica's `decide()` sees an empty holder and steals on its next poll
-  tick (one `RENEW_INTERVAL`, 5s). The `step_down()` call is a
-  resourceVersion-guarded PUT (409 →
-  someone already stole, treated as success); `main()` awaits the lease-loop's
+  tick (one `RENEW_INTERVAL`, 5s). The `step_down()` call is itself
+  holder-guarded and resourceVersion-guarded (404/409 →
+  someone already stole or vacated, treated as success), so a stale gate costs
+  one harmless round-trip; `main()` awaits the lease-loop's
   `JoinHandle` after `serve_with_shutdown` returns, ensuring the PUT lands
   before process exit. If `step_down()` fails (apiserver unreachable), the loop
   logs a warning and observed-record expiry is the fallback.

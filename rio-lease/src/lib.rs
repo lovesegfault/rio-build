@@ -973,7 +973,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
         "lease loop starting"
     );
 
-    let mut was_leading = false;
+    let mut standing = LeaseStanding::new();
     // Level-triggered pod-marks reconciliation. `true` means "this
     // pod's leader marks (deletion-cost annotation + optional leader
     // label) may not match its actual leadership — re-patch on the
@@ -1028,7 +1028,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
         // latency is at most one tick, and this call is what delivers it.
         if maybe_self_fence(
             &state,
-            &mut was_leading,
+            &mut standing,
             &marks_dirty,
             blind.blind_for(fence_now()),
         ) {
@@ -1074,7 +1074,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 // "acquired without a transition count to derive the
                 // generation from" unrepresentable — the arm cannot
                 // execute without a value to hand to on_acquire.
-                match (leading_transitions, was_leading) {
+                match (leading_transitions, standing.believes()) {
                     (Some(transitions), false) => {
                         // ---- Acquire transition ----
                         // on_acquire: write the generation FIRST, then
@@ -1211,7 +1211,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                     (None, false) => {}
                 }
 
-                was_leading = now_leading;
+                standing.on_observed(now_leading);
                 // r[impl sched.recovery.bump-confirm+3]
                 // Confirm AFTER the edge-detection match: when an
                 // acquire edge and a confirmation land in the same
@@ -1292,7 +1292,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 // round-trip stamps nothing and the window keeps aging.
                 if maybe_self_fence(
                     &state,
-                    &mut was_leading,
+                    &mut standing,
                     &marks_dirty,
                     blind.blind_for(fence_now()),
                 ) {
@@ -1304,14 +1304,21 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
         }
     }
 
-    // r[impl sched.lease.graceful-release]
+    // r[impl sched.lease.graceful-release+2]
     // Graceful release: on shutdown, release the lease so the next
     // replica acquires on its next poll tick (one RENEW_INTERVAL, 5s)
-    // instead of waiting out the steal threshold (19s). Gate on
-    // was_leading to skip the apiserver round-trip when we were
-    // standby all along. Any error is non-fatal: we're shutting down
+    // instead of waiting out the steal threshold (19s). Gate on the
+    // HOLD — acquired and not since observed superseded — never on
+    // belief: a local self-fence clears belief while the Lease may
+    // still name us at the apiserver, and fence-then-SIGTERM is
+    // precisely when the release matters most (without it the
+    // successor waits out the full steal threshold). step_down()
+    // itself is holder-guarded and 409/404-tolerant, so a stale hold
+    // costs one harmless round-trip. The skip remains for "standby
+    // all along" and "supersession already observed" (on_observed
+    // clears the hold). Any error is non-fatal: we're shutting down
     // regardless, and the steal threshold is the fallback.
-    if was_leading {
+    if standing.should_release_on_shutdown() {
         let deadline = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
         match tokio::time::timeout(deadline, election.step_down()).await {
             Ok(Ok(())) => info!("released lease on shutdown"),
@@ -1328,6 +1335,146 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
         }
     }
     debug!("lease loop exited");
+}
+
+/// The two leadership facts the lease loop used to conflate in one
+/// `was_leading` bool, split so each consumer reads the fact it
+/// actually means (bug_387's class — a gate reading belief where it
+/// needs the hold — is unrepresentable: the fields are private, the
+/// fence path has no API that touches the hold, and the release gate
+/// has no API that reads belief):
+///
+/// - **believes** — "do I currently think I lead". The edge-detection
+///   input. Cleared by the local self-fence, which writes NOTHING to
+///   the apiserver.
+/// - **held_unsuperseded** — "did I acquire this lease, and have I not
+///   since observed a completed round resolving not-leading". The
+///   graceful-release gate. NOT cleared by the self-fence: fencing is
+///   a local belief change and the Lease may still name us at the
+///   apiserver — exactly the case the shutdown release exists for
+///   (fence during an outage, then SIGTERM: without the release the
+///   successor waits out the full steal threshold).
+struct LeaseStanding {
+    believes: bool,
+    held_unsuperseded: bool,
+}
+
+impl LeaseStanding {
+    /// Loop start: never led, never held.
+    fn new() -> Self {
+        Self {
+            believes: false,
+            held_unsuperseded: false,
+        }
+    }
+
+    /// The edge-detection read (`run_lease_loop`'s old `was_leading`).
+    fn believes(&self) -> bool {
+        self.believes
+    }
+
+    /// A COMPLETED election round resolved with this leadership
+    /// polarity. Leading sets both facts; not-leading clears both —
+    /// including the stale hold of a fenced-then-superseded sequence,
+    /// which preserves the legitimate release skip (an observed
+    /// supersession means there is nothing of ours to release).
+    fn on_observed(&mut self, now_leading: bool) {
+        self.believes = now_leading;
+        self.held_unsuperseded = now_leading;
+    }
+
+    /// Local self-fence: stop believing. The apiserver state is
+    /// UNKNOWN — that is what fencing means — so the hold is untouched
+    /// (deliberately no API to clear it from this path).
+    fn on_self_fence(&mut self) {
+        self.believes = false;
+    }
+
+    /// The shutdown release gate: release iff we acquired and never
+    /// observed our supersession. Reads ONLY the hold — belief has no
+    /// API here.
+    fn should_release_on_shutdown(&self) -> bool {
+        self.held_unsuperseded
+    }
+}
+
+/// The standing algebra under CBMC: over every event sequence (bounded
+/// length, the production loop's only two mutators), the self-fence
+/// never changes the hold, and the release gate is exactly "the last
+/// completed round resolved leading". Joins the `decide_pure` pattern
+/// (election.rs): pure bools, no loops in the functions under proof,
+/// bounded driver loop.
+#[cfg(kani)]
+mod lease_standing_proofs {
+    use super::LeaseStanding;
+
+    const MAX_EVENTS: usize = 8;
+
+    /// r[verify sched.lease.graceful-release+2]
+    /// Fence events are invisible to the hold: folding any sequence
+    /// with its SelfFence events removed yields the same
+    /// `should_release_on_shutdown` verdict.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn lease_standing_fence_never_clears_held() {
+        let observed: [Option<bool>; MAX_EVENTS] = kani::any();
+        let fence_at: [bool; MAX_EVENTS] = kani::any();
+
+        let mut with_fences = LeaseStanding::new();
+        let mut without_fences = LeaseStanding::new();
+        let mut i = 0;
+        while i < MAX_EVENTS {
+            if let Some(now_leading) = observed[i] {
+                with_fences.on_observed(now_leading);
+                without_fences.on_observed(now_leading);
+            }
+            if fence_at[i] {
+                with_fences.on_self_fence();
+                // without_fences: the fence removed.
+            }
+            i += 1;
+        }
+        assert!(
+            with_fences.should_release_on_shutdown() == without_fences.should_release_on_shutdown(),
+            "a local self-fence must never change the release verdict"
+        );
+    }
+
+    /// r[verify sched.lease.graceful-release+2]
+    /// The release gate is exactly "acquired and not since observed
+    /// superseded": it equals the polarity of the LAST completed round
+    /// (false when no round ever completed), regardless of interleaved
+    /// fences; and belief never exceeds the hold (a believer is always
+    /// a holder, never the reverse... the fence opens exactly the
+    /// holder-not-believer gap the release exists for).
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn lease_standing_release_gate_iff_acquired_unsuperseded() {
+        let observed: [Option<bool>; MAX_EVENTS] = kani::any();
+        let fence_at: [bool; MAX_EVENTS] = kani::any();
+
+        let mut standing = LeaseStanding::new();
+        let mut last_round: Option<bool> = None;
+        let mut i = 0;
+        while i < MAX_EVENTS {
+            if let Some(now_leading) = observed[i] {
+                standing.on_observed(now_leading);
+                last_round = Some(now_leading);
+            }
+            if fence_at[i] {
+                standing.on_self_fence();
+            }
+            i += 1;
+        }
+        assert!(
+            standing.should_release_on_shutdown() == last_round.unwrap_or(false),
+            "release iff the last completed round resolved leading"
+        );
+        assert!(
+            !standing.believes() || standing.should_release_on_shutdown(),
+            "belief never exceeds the hold"
+        );
+    }
 }
 
 /// A blind-window anchor minted at the START of a renew attempt — on
@@ -1400,22 +1547,26 @@ impl BlindClock {
 /// tested without spawning the full loop (paused time + real TCP
 /// mocks cause spurious deadline-exceeded; see lang-gotchas).
 ///
+/// Takes the full [`LeaseStanding`] but can only clear BELIEF —
+/// [`LeaseStanding::on_self_fence`] is the sole mutation it has an API
+/// for; the graceful-release hold is structurally out of reach.
+///
 /// Returns `true` if the fence fired (for test assertions).
 // r[impl sched.lease.self-fence+2]
 fn maybe_self_fence(
     state: &LeaderState,
-    was_leading: &mut bool,
+    standing: &mut LeaseStanding,
     marks_dirty: &AtomicBool,
     blind_for: Duration,
 ) -> bool {
-    if *was_leading && blind_for > SELF_FENCE_AFTER {
+    if standing.believes() && blind_for > SELF_FENCE_AFTER {
         warn!(
             blind_for = ?blind_for,
             self_fence_after_secs = SELF_FENCE_AFTER.as_secs(),
             "LOCAL SELF-FENCE: no successful renew in > SELF_FENCE_AFTER, stepping down locally"
         );
         state.on_lose();
-        *was_leading = false;
+        standing.on_self_fence();
         // No spawn_patch_leader_marks here: the apiserver is
         // unreachable. Mark the pod's leader marks dirty so the FIRST
         // reachable round-trip in run_lease_loop's Ok arm reconciles
@@ -2187,7 +2338,7 @@ mod tests {
     /// hold the verifier without `.run()` so the GET pends forever.
     /// Without the timeout wrapper at `run_lease_loop`'s shutdown
     /// branch, `main.rs`'s `h.await` would block until SIGKILL.
-    // r[verify sched.lease.graceful-release]
+    // r[verify sched.lease.graceful-release+2]
     #[tokio::test]
     async fn step_down_timeout_fires_on_hung_apiserver() {
         let (client, _verifier) = ApiServerVerifier::new();
@@ -2221,13 +2372,14 @@ mod tests {
         state.is_leader.store(true, Ordering::Relaxed);
         state.set_recovery_complete(state.acquired_transitions());
 
-        let mut was_leading = true;
+        let mut standing = LeaseStanding::new();
+        standing.on_observed(true);
         let marks_dirty = AtomicBool::new(false);
         // 20s blind > SELF_FENCE_AFTER (11s). The predicate is clock-free
         // (takes the blind duration directly) since the boottime move.
         let blind_for = Duration::from_secs(20);
 
-        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, blind_for);
+        let fired = maybe_self_fence(&state, &mut standing, &marks_dirty, blind_for);
 
         assert!(fired, "self-fence should fire past SELF_FENCE_AFTER");
         assert!(
@@ -2239,8 +2391,12 @@ mod tests {
             "self-fence should clear recovery_complete (re-acquire re-runs recovery)"
         );
         assert!(
-            !was_leading,
-            "was_leading should flip so next tick is edge-free"
+            !standing.believes(),
+            "belief should flip so next tick is edge-free"
+        );
+        assert!(
+            standing.should_release_on_shutdown(),
+            "the fence is local: the hold survives for the shutdown release"
         );
     }
 
@@ -2255,13 +2411,14 @@ mod tests {
         state.is_leader.store(true, Ordering::Relaxed);
         state.set_recovery_complete(state.acquired_transitions());
 
-        let mut was_leading = true;
+        let mut standing = LeaseStanding::new();
+        standing.on_observed(true);
         let marks_dirty = AtomicBool::new(false);
         // 10s blind < SELF_FENCE_AFTER (11s). Two failed ticks, lease
         // still validly held as far as we know.
         let blind_for = Duration::from_secs(10);
 
-        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, blind_for);
+        let fired = maybe_self_fence(&state, &mut standing, &marks_dirty, blind_for);
 
         assert!(!fired, "within SELF_FENCE_AFTER → no self-fence");
         assert!(
@@ -2269,7 +2426,7 @@ mod tests {
             "within SELF_FENCE_AFTER → still leader (transient blip)"
         );
         assert!(state.recovery_complete());
-        assert!(was_leading);
+        assert!(standing.believes());
     }
 
     /// The fence predicate is strict `>`: blind-time EXACTLY at
@@ -2282,17 +2439,18 @@ mod tests {
         state.is_leader.store(true, Ordering::Relaxed);
         state.set_recovery_complete(state.acquired_transitions());
 
-        let mut was_leading = true;
+        let mut standing = LeaseStanding::new();
+        standing.on_observed(true);
         let marks_dirty = AtomicBool::new(false);
 
-        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, SELF_FENCE_AFTER);
+        let fired = maybe_self_fence(&state, &mut standing, &marks_dirty, SELF_FENCE_AFTER);
 
         assert!(
             !fired,
             "blind_for == SELF_FENCE_AFTER must NOT fire (strict >)"
         );
         assert!(state.is_leader.load(Ordering::Relaxed));
-        assert!(was_leading);
+        assert!(standing.believes());
     }
 
     /// Self-fence is gated on `was_leading`. A standby that has
@@ -2304,15 +2462,15 @@ mod tests {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
         // is_leader already false, recovery_complete already false.
 
-        let mut was_leading = false;
+        let mut standing = LeaseStanding::new();
         let marks_dirty = AtomicBool::new(false);
         let blind_for = Duration::from_secs(20);
 
-        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, blind_for);
+        let fired = maybe_self_fence(&state, &mut standing, &marks_dirty, blind_for);
 
         assert!(!fired, "not leading → no fence even past TTL");
         assert!(!state.is_leader.load(Ordering::Relaxed));
-        assert!(!was_leading);
+        assert!(!standing.believes());
     }
 
     /// Self-fence sets `marks_dirty` so the lease loop's next reachable
@@ -2333,11 +2491,12 @@ mod tests {
         state.is_leader.store(true, Ordering::Relaxed);
         state.set_recovery_complete(state.acquired_transitions());
 
-        let mut was_leading = true;
+        let mut standing = LeaseStanding::new();
+        standing.on_observed(true);
         let marks_dirty = AtomicBool::new(false);
         let blind_for = Duration::from_secs(20);
 
-        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, blind_for);
+        let fired = maybe_self_fence(&state, &mut standing, &marks_dirty, blind_for);
         assert!(fired);
         assert!(
             marks_dirty.load(Ordering::SeqCst),
@@ -2348,11 +2507,11 @@ mod tests {
         // No-fire path leaves the flag untouched (a standby that never
         // led has no marks to reconcile).
         let standby = LeaderState::pending(Arc::new(AtomicU64::new(1)));
-        let mut was_leading = false;
+        let mut standing = LeaseStanding::new();
         let marks_dirty = AtomicBool::new(false);
         let fired = maybe_self_fence(
             &standby,
-            &mut was_leading,
+            &mut standing,
             &marks_dirty,
             Duration::from_secs(20),
         );
@@ -3118,6 +3277,147 @@ mod tests {
 
         shutdown.cancel();
         loop_task.await.expect("lease loop task exits cleanly");
+    }
+
+    /// The release-gate half of bug_387: a self-fence is a LOCAL belief
+    /// change — the apiserver may still name us holder — so a fence
+    /// followed by SIGTERM must still release the lease gracefully.
+    /// Pre-fix, the gate read the belief bool the fence had cleared and
+    /// skipped step_down exactly when it mattered most.
+    // r[verify sched.lease.graceful-release+2]
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_after_self_fence_still_releases_lease() {
+        let (client, mock) = MockApiServer::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // t=0: acquire healthily.
+        settle().await;
+        assert!(state.is_leader.load(Ordering::Relaxed), "t=0 acquire");
+        assert_eq!(mock.holder().as_deref(), Some("us"));
+
+        // Outage: fail fast until the self-fence fires (+15s tick:
+        // blind 15s > SELF_FENCE_AFTER 11s).
+        mock.set_behavior(MockBehavior::FailFast);
+        for _ in 0..3 {
+            tokio::time::advance(RENEW_INTERVAL).await;
+            settle().await;
+        }
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "the self-fence must have fired during the outage"
+        );
+        assert!(!state.is_leader.load(Ordering::Relaxed));
+        assert_eq!(
+            mock.holder().as_deref(),
+            Some("us"),
+            "the fence is local: the apiserver still names us"
+        );
+
+        // Recovery + SIGTERM with NO further election round (no tick):
+        // the graceful release must still run — we acquired and never
+        // observed our supersession.
+        mock.set_behavior(MockBehavior::Healthy);
+        shutdown.cancel();
+        loop_task.await.expect("lease loop task exits cleanly");
+        assert_eq!(
+            mock.holder(),
+            None,
+            "shutdown after a self-fence must still release the lease \
+             (the local fence does not un-hold it at the apiserver)"
+        );
+    }
+
+    /// The legitimate-skip half of the same gate: once a completed
+    /// round OBSERVES our supersession (Standby resolution while
+    /// another replica holds), the hold is genuinely gone and shutdown
+    /// must NOT touch the lease.
+    // r[verify sched.lease.graceful-release+2]
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_after_observed_supersession_skips_release() {
+        let (client, mock) = MockApiServer::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        settle().await;
+        assert!(state.is_leader.load(Ordering::Relaxed), "t=0 acquire");
+
+        // Fence during an outage...
+        mock.set_behavior(MockBehavior::FailFast);
+        for _ in 0..3 {
+            tokio::time::advance(RENEW_INTERVAL).await;
+            settle().await;
+        }
+        assert_eq!(hooks.loses.lock().expect("loses lock").len(), 1);
+
+        // ...meanwhile the standby stole the lease (out-of-band write,
+        // rv above anything we have seen)...
+        mock.seed(serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "rio-sched", "namespace": "default",
+                          "resourceVersion": "50" },
+            "spec": { "holderIdentity": "other", "leaseTransitions": 3 },
+        }));
+
+        // ...and one healthy round OBSERVES the supersession (Standby).
+        mock.set_behavior(MockBehavior::Healthy);
+        tokio::time::advance(RENEW_INTERVAL).await;
+        settle().await;
+        assert!(!state.is_leader.load(Ordering::Relaxed));
+
+        let requests_before_shutdown = mock.requests().len();
+        shutdown.cancel();
+        loop_task.await.expect("lease loop task exits cleanly");
+        assert_eq!(
+            mock.holder().as_deref(),
+            Some("other"),
+            "an observed supersession means nothing of ours to release"
+        );
+        let tail = mock.requests().split_off(requests_before_shutdown);
+        assert!(
+            !tail
+                .iter()
+                .any(|(m, p)| *m == http::Method::PUT && p.contains("/leases/")),
+            "no lease PUT after shutdown: the release is skipped, got {tail:?}"
+        );
     }
 
     /// The in-flight-straddle half of the suspend-blindness class

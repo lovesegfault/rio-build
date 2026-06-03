@@ -117,7 +117,7 @@ use rio_test_support::kube_mock::MockApiServer;
 use serde::Deserialize;
 
 use crate::election::{ElectionResult, FetchOutcome, LeaderElection};
-use crate::{LEASE_TTL, LeaderState, STEAL_AFTER, decide, maybe_self_fence};
+use crate::{LEASE_TTL, LeaderState, LeaseStanding, STEAL_AFTER, decide, maybe_self_fence};
 
 /// One model tick, in implementation time. See the module header for the
 /// derivation; the `const` assertions pin the constraint so neither the
@@ -247,10 +247,11 @@ struct NodeHarness {
     /// The model's `fence[n]`: the tick of the last completed write
     /// round-trip. Feeds `maybe_self_fence`'s `last_successful_renew`.
     fence_tick: u64,
-    /// `run_lease_loop`'s edge-detection state. Mirrors
-    /// `state.is_leader()` exactly (as it does in the production loop);
-    /// kept separate because `maybe_self_fence` takes `&mut bool`.
-    was_leading: bool,
+    /// `run_lease_loop`'s edge-detection + release-gate state
+    /// (belief/hold split). Belief mirrors `state.is_leader()` exactly
+    /// (as it does in the production loop); kept separate because
+    /// `maybe_self_fence` takes `&mut LeaseStanding`.
+    standing: LeaseStanding,
 }
 
 /// The whole replicated system: the shared mock apiserver plus one
@@ -316,7 +317,7 @@ impl MbtSystem {
             stash: None,
             ticks: 0,
             fence_tick: 0,
-            was_leading: false,
+            standing: LeaseStanding::new(),
         }
     }
 
@@ -408,16 +409,16 @@ impl MbtSystem {
         h.fence_tick = h.ticks;
         match result {
             ElectionResult::Leading { transitions } => {
-                if !h.was_leading {
+                if !h.standing.believes() {
                     h.state.on_acquire(transitions);
                 }
-                h.was_leading = true;
+                h.standing.on_observed(true);
             }
             ElectionResult::Standby | ElectionResult::Conflict => {
-                if h.was_leading {
+                if h.standing.believes() {
                     h.state.on_lose();
                 }
-                h.was_leading = false;
+                h.standing.on_observed(false);
             }
         }
         Ok(())
@@ -436,7 +437,7 @@ impl MbtSystem {
         // through — no synthetic-instant fabrication.
         let blind_for = TICK * u32::try_from(h.ticks - h.fence_tick).expect("tick delta fits u32");
         let marks_dirty = std::sync::atomic::AtomicBool::new(false);
-        let fired = maybe_self_fence(&h.state, &mut h.was_leading, &marks_dirty, blind_for);
+        let fired = maybe_self_fence(&h.state, &mut h.standing, &marks_dirty, blind_for);
         // The model's selfFence precondition is `leading[n] ∧ deadline
         // passed`; the tick mapping guarantees the implementation agrees
         // the deadline passed. A non-firing fence here is a driver or

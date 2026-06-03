@@ -1244,7 +1244,7 @@ in
       "lease-acquired"
       # r[verify sched.lease.k8s-lease+2]
       "stable-leadership"
-      # r[verify sched.lease.graceful-release]
+      # r[verify sched.lease.graceful-release+2]
       # r[verify sched.lease.deletion-cost+2]
       "graceful-release"
       "failover"
