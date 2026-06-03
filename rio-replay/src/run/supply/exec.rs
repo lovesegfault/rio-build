@@ -2803,6 +2803,10 @@ pub(crate) mod test_support {
         Refuse,
         /// A mid-upload wire death ([`SupplyTransportError::MaybeRefused`]).
         WireDeath,
+        /// A hard transport failure ([`SupplyTransportError::Other`] —
+        /// the channel-open / protocol-failure shape, which the upload
+        /// arms settle immediately with no retry).
+        Other,
     }
 
     /// See the module-level doc: a fully scripted, in-memory transport.
@@ -2869,6 +2873,9 @@ pub(crate) mod test_support {
                         }
                         ScriptedReply::WireDeath => SupplyTransportError::MaybeRefused(format!(
                             "scripted mid-upload wire death for {path} (connection reset)"
+                        )),
+                        ScriptedReply::Other => SupplyTransportError::Other(anyhow!(
+                            "scripted hard transport failure for {path}"
                         )),
                     });
                 }
@@ -3111,12 +3118,16 @@ mod tests {
     ///
     /// QUANTIFICATION DOMAIN: the per-attempt outcomes of
     /// [`SupplyTransportError`] {Refused, MaybeRefused, Other} plus
-    /// acceptance, sequenced over an arm's two attempts (`Refused` and
-    /// `MaybeRefused` each get the single retry; `Other` settles
-    /// immediately, pinned by its own cells below) — the producing enum
-    /// is matched exhaustively in `attempt_batch`/`upload_stream_one`,
-    /// so a new variant fails compilation there before this corpus can
-    /// lag.
+    /// acceptance, as the FULL first × retry matrix: a first-attempt
+    /// `Refused` or `MaybeRefused` is granted the single fresh-channel
+    /// retry, whose own outcome ranges over all four shapes — eight
+    /// cells, every one enumerated below — and a first-attempt `Other`
+    /// settles immediately with no retry (its own column at the end).
+    /// The producing enum is matched exhaustively in
+    /// `attempt_batch`/`upload_stream_one`, so a new variant fails
+    /// compilation there before this corpus can lag; the breaker's
+    /// per-attempt accounting is pinned observably through the trip
+    /// threshold at the end of the test.
     ///
     /// The settlement rule (design §8.4): REFUSED requires at least one
     /// CLEAN daemon refusal across the attempts — the wire op completed
@@ -3125,12 +3136,14 @@ mod tests {
     /// is retried like a refusal (the teardown-race salvage: a genuine
     /// refusal re-presents cleanly on the fresh channel) but NEVER
     /// settles as one: wire-death-only exhaustion is FAILED
-    /// (supply-failed, gate-excluded). Both directions are pinned —
-    /// must-settle-refused cells carry daemon evidence, must-settle-
-    /// failed cells carry none.
+    /// (supply-failed, gate-excluded), and a retry that dies hard
+    /// settles FAILED whatever preceded it carried — a first-attempt
+    /// wire death contributes no daemon evidence for the pair. Both
+    /// directions are pinned — must-settle-refused cells carry daemon
+    /// evidence, must-settle-failed cells carry none.
     #[tokio::test]
     async fn upload_settlement_requires_daemon_evidence_for_refused() {
-        use super::test_support::ScriptedReply::{self, Refuse, WireDeath};
+        use super::test_support::ScriptedReply::{self, Other, Refuse, WireDeath};
         struct Cell {
             name: &'static str,
             script: &'static [ScriptedReply],
@@ -3154,6 +3167,13 @@ mod tests {
                 detail_contains: Some("scripted refusal"),
             },
             Cell {
+                name: "wire-death x hard-failure",
+                script: &[WireDeath, Other],
+                outcome: SUPPLY_OUTCOME_FAILED,
+                attempts: 2,
+                detail_contains: Some("scripted hard transport failure"),
+            },
+            Cell {
                 name: "clean-refusal x wire-death",
                 script: &[Refuse, WireDeath],
                 outcome: SUPPLY_OUTCOME_REFUSED,
@@ -3168,6 +3188,17 @@ mod tests {
                 outcome: SUPPLY_OUTCOME_REFUSED,
                 attempts: 2,
                 detail_contains: Some("scripted refusal"),
+            },
+            Cell {
+                // The hard-dying retry settles FAILED even though the
+                // first attempt was a clean refusal: the retry exists to
+                // confirm-or-recover, and a channel-level death on it is
+                // settled transport evidence, not a second daemon answer.
+                name: "clean-refusal x hard-failure",
+                script: &[Refuse, Other],
+                outcome: SUPPLY_OUTCOME_FAILED,
+                attempts: 2,
+                detail_contains: Some("scripted hard transport failure"),
             },
             Cell {
                 name: "wire-death x accepted (transient blip recovers)",
@@ -3264,6 +3295,83 @@ mod tests {
             );
             assert_eq!(fake.attempts.lock().unwrap()[PATH_A], 1, "{case}");
         }
+
+        // Breaker accounting per ATTEMPT, observable through the trip
+        // threshold (serial knobs: threshold max(2 × 1, 6) = 6). Three
+        // (wire-death x hard-failure) paths are six consecutive failure
+        // records — BOTH attempts of every pair must count, so the
+        // breaker trips on exactly the third pair; six (clean-refusal x
+        // hard-failure) paths never trip, the clean refusal resetting
+        // the count between hard failures (success evidence on attempt
+        // one of every pair caps the streak at one).
+        let serial = Knobs {
+            upload_workers: 1,
+            upload_batch_max_entries: 1,
+            ..Knobs::default()
+        };
+        let path_for = |index: usize| format!("/nix/store/{:032}-evidence-{index}", index);
+        // Must-trip: (WireDeath, Other) x 3 → 6 failure records.
+        let (_dir, state) = state();
+        let fake = FakeSupplyTransport::default();
+        let trip_items: Vec<UploadItem> = (0..3)
+            .map(|index| item(&path_for(index), vec![1u8; 8], &[]))
+            .collect();
+        {
+            let mut scripted = fake.scripted.lock().unwrap();
+            for index in 0..3 {
+                scripted.insert(path_for(index), [WireDeath, Other].into_iter().collect());
+            }
+        }
+        let ctx = SupplyContext::new(SupplyDependencies::Substituters);
+        let claims = UploadClaims::new();
+        let report = prewarm_uploads(
+            &fake,
+            None,
+            &ctx,
+            &batch_plan(trip_items),
+            &serial,
+            &state,
+            &claims,
+        )
+        .await
+        .unwrap();
+        assert!(
+            report.upload_collapsed,
+            "wire-death and hard-failure attempts are ALL breaker failure evidence: {report:?}"
+        );
+        assert_eq!(report.failed, 3, "{report:?}");
+        assert_eq!(report.refused, 0, "{report:?}");
+        // Must-not-trip: (Refuse, Other) x 6 — the clean refusal between
+        // hard failures resets the count every pair.
+        let (_dir2, state2) = state2();
+        let fake2 = FakeSupplyTransport::default();
+        let no_trip_items: Vec<UploadItem> = (0..6)
+            .map(|index| item(&path_for(index), vec![1u8; 8], &[]))
+            .collect();
+        {
+            let mut scripted = fake2.scripted.lock().unwrap();
+            for index in 0..6 {
+                scripted.insert(path_for(index), [Refuse, Other].into_iter().collect());
+            }
+        }
+        let ctx2 = SupplyContext::new(SupplyDependencies::Substituters);
+        let claims2 = UploadClaims::new();
+        let report = prewarm_uploads(
+            &fake2,
+            None,
+            &ctx2,
+            &batch_plan(no_trip_items),
+            &serial,
+            &state2,
+            &claims2,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !report.upload_collapsed,
+            "a clean refusal resets the breaker between hard failures: {report:?}"
+        );
+        assert_eq!(report.failed, 6, "{report:?}");
     }
 
     /// Standing enumeration of this module's settlement-evidence sites
