@@ -480,9 +480,11 @@ pub async fn persist_nar(
 }
 
 /// Heartbeat cadence for [`PlaceholderGuard`]. Matches
-/// `cas::HEARTBEAT_TIME_INTERVAL` (the chunk-upload heartbeat) and is
-/// ≪ `SUBSTITUTE_STALE_THRESHOLD` (300s), so a live owner survives ≥9
-/// missed heartbeats before stale-reclaim takes it.
+/// `cas::HEARTBEAT_TIME_INTERVAL` (the chunk-upload heartbeat); the
+/// stale-reclaim threshold is 3× this (90s), so a live owner survives
+/// 3 missed heartbeats before stale-reclaim takes it — and `reap_one`
+/// re-checks staleness inside its tx, so even a race with the third
+/// beat cannot collect a live owner.
 ///
 /// UN-cfg'd (merged_bug_082): this is the PRODUCTION granularity that
 /// `Config::validate`'s `substitute_stall >= 2×` floor references — a
@@ -628,16 +630,41 @@ impl Drop for PlaceholderGuard {
         let pool = self.pool.clone();
         let store_path_hash = std::mem::take(&mut self.store_path_hash);
         let claim = self.claim;
+        // Every outcome logs. Run 5's lesson: the reap is the only
+        // thing standing between an aborted upload and a placeholder
+        // that blocks every retry until the stale threshold — when it
+        // no-ops (claim mismatch, row already gone) or never runs
+        // (fire-and-forget task lost to a restart), total silence made
+        // the difference between "cleaned up" and "wedged for minutes"
+        // invisible. Success is info (one line per aborted upload);
+        // a no-op is WARN with the claim id so a wedged retry loop has
+        // a thread to pull.
         rio_common::task::spawn_monitored("put-path-placeholder-reap", async move {
-            if let Err(e) =
-                crate::gc::orphan::reap_one_consulted(&pool, &store_path_hash, ReapBy::Claim(claim))
-                    .await
+            match crate::gc::orphan::reap_one_consulted(
+                &pool,
+                &store_path_hash,
+                ReapBy::Claim(claim),
+            )
+            .await
             {
-                warn!(
+                Ok(true) => tracing::info!(
                     store_path_hash = %hex::encode(&store_path_hash),
+                    claim = %claim,
+                    "drop-path placeholder reaped (upload aborted before completion)",
+                ),
+                Ok(false) => warn!(
+                    store_path_hash = %hex::encode(&store_path_hash),
+                    claim = %claim,
+                    "drop-path placeholder reap matched nothing (row gone, completed, \
+                     or claim superseded); if the 'uploading' row persists, the \
+                     stale-reclaim threshold is the backstop",
+                ),
+                Err(e) => warn!(
+                    store_path_hash = %hex::encode(&store_path_hash),
+                    claim = %claim,
                     error = %e,
-                    "drop-path placeholder cleanup failed; orphan scanner will reclaim",
-                );
+                    "drop-path placeholder cleanup failed; stale-reclaim will recover",
+                ),
             }
         });
     }

@@ -590,7 +590,7 @@ mod tests {
         (chunk_hash, claim)
     }
 
-    // r[verify store.substitute.stale-reclaim+3]
+    // r[verify store.substitute.stale-reclaim+4]
     /// `reap_one` on a CHUNKED placeholder is a pure path-row janitor:
     /// the placeholder rows go (narinfo CASCADE → manifests /
     /// manifest_data) and the chunk rows are left exactly as they

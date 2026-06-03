@@ -56,13 +56,23 @@ const SUBSTITUTE_HOOKS: IngestHooks = IngestHooks {
 /// / env `RIO_SUBSTITUTE_STALL_SECS`.
 pub const DEFAULT_SUBSTITUTE_STALL_WINDOW: Duration = Duration::from_secs(180);
 
-/// How old an `'uploading'` placeholder must be before the
-/// substitution ingest path reclaims it instead of returning a miss.
+/// How old an `'uploading'` placeholder must be before the shared
+/// ingest claim path (`claim_placeholder` — PutPath, PutPathChunked,
+/// PutPathBatch, and substitution) reclaims it instead of treating it
+/// as a live concurrent uploader.
 ///
-/// 5 minutes: long enough that a real concurrent substitution (even a
-/// multi-GB NAR over a slow link) finishes first; short enough that an
-/// rsb retry loop doesn't wait for the orphan scanner's 15-minute sweep.
-pub const SUBSTITUTE_STALE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
+/// 90 s = 3× the 30 s placeholder heartbeat: a LIVE owner is never
+/// more than ~30 s stale (every owner holds a heartbeating
+/// `PlaceholderGuard`), so three consecutive missed beats means the
+/// owning future is gone. The previous 5-minute value predates the
+/// heartbeat and was duration-based ("long enough for a slow upload
+/// to finish") — with heartbeats, upload duration is irrelevant and
+/// the long threshold only prolonged the wedge after an aborted
+/// upload whose drop-reap was lost. Safe to tighten because
+/// `reap_one` re-checks staleness inside its transaction (FOR
+/// UPDATE plus the EXISTS guard), so a fresh re-upload racing the
+/// reap is never collected.
+pub const SUBSTITUTE_STALE_THRESHOLD: Duration = Duration::from_secs(90);
 
 /// Fallback re-poll interval for a raced waiter parked on the
 /// placeholder-event subscription (live_055(b),
@@ -1213,7 +1223,7 @@ impl Substituter {
             chunk_backend,
             http,
             signer: None,
-            // r[impl store.substitute.singleflight+3]
+            // r[impl store.substitute.singleflight+4]
             // Short TTL + small cap: this is a singleflight coalescer,
             // not a PathInfo cache. The narinfo table IS the cache.
             // 30s is long enough to coalesce a burst of GetPaths for
@@ -5794,7 +5804,7 @@ mod tests {
         .unwrap();
     }
 
-    // r[verify store.substitute.stale-reclaim+3]
+    // r[verify store.substitute.stale-reclaim+4]
     /// A stale 'uploading' placeholder (crashed prior substitution)
     /// must NOT block a fresh try_substitute. Reclaim → re-insert →
     /// fetch completes.
@@ -5833,7 +5843,7 @@ mod tests {
         assert_eq!(stored.nar_size, nar.len() as u64);
     }
 
-    // r[verify store.substitute.singleflight+3]
+    // r[verify store.substitute.singleflight+4]
     /// A young 'uploading' placeholder means a live concurrent
     /// uploader — do NOT reclaim, return `Err(Raced)` (NOT a cached
     /// `Ok(None)`). Once the placeholder completes, a retry MUST reach
@@ -6873,7 +6883,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.singleflight+3]
+    // r[verify store.substitute.singleflight+4]
     /// merged_bug_199 / bug_327: a transient narinfo 503 propagates as
     /// `Err` and is NOT cached — the immediate retry succeeds.
     #[tokio::test]

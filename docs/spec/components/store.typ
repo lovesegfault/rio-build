@@ -1358,7 +1358,7 @@ Identity honored, never identity attached.
   consume permits, so a wide fan-out on one cold path cannot pin the cap.
 ]
 
-#r("store.substitute.singleflight+3")[
+#r("store.substitute.singleflight+4")[
   `try_substitute` is wrapped in a moka `Cache<(tenant_id, store_path),
   Option<Arc<ValidatedPathInfo>>>` with 30s TTL and 10 000-entry cap. moka's
   `try_get_with` coalesces N concurrent callers for the same key into one
@@ -1372,7 +1372,7 @@ Identity honored, never identity attached.
   `AlreadyComplete`. The narinfo/`nix-cache-info`/HEAD requests have a 30s
   per-request timeout so a hung upstream can't wedge the singleflight slot
   forever; the NAR GET is bounded only by the `MAX_NAR_SIZE` decompressed cap
-  and the 5-minute stale-reclaim.
+  and the stale-reclaim threshold (#rref("store.substitute.stale-reclaim")).
 ]
 
 #r("store.substitute.raced-subscribe")[
@@ -1528,14 +1528,17 @@ cache TTL, silently degrading those paths to build-from-source (the
 2026-05-23 incident class). Recording the error axis makes the clean-miss
 cache contract real for the first time.
 
-#r("store.substitute.stale-reclaim+3")[
+#r("store.substitute.stale-reclaim+4")[
   When a claim attempt finds an existing `'uploading'` placeholder for the
   requested path, `claim_placeholder` MUST apply three takeover arms in
   precedence order. (1) A **released-in-place** row (`claim_id` IS NULL ---
   what #rref("store.substitute.stall-abort") leaves behind) is claimable
   immediately by any caller, with no staleness threshold and `stall_count`
   preserved. (2) **Heartbeat death**: a placeholder older than
-  `SUBSTITUTE_STALE_THRESHOLD` (5 minutes) is reclaimed by DELETE + re-INSERT
+  `SUBSTITUTE_STALE_THRESHOLD` (90 seconds --- 3× the 30 s placeholder
+  heartbeat, so a live owner is never collected; `reap_one` re-checks the
+  threshold inside its transaction as the race guard) is reclaimed by
+  DELETE + re-INSERT
   --- benign churn (deploys, scale-in, crashes) resets stall evidence and
   never accrues strikes; this arm precedes the stall arm so a dead owner is
   reaped, not striked, when both predicates hold. (3) **Download-stalled**
