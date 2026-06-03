@@ -1022,12 +1022,24 @@ pub fn decide(
     // shapes" — [`RequeueBudget::probe_carveout`], pinned by
     // `probe_batch_exempts_infra_shapes_but_real_verdicts_still_land`)
     // demands a probe's REAL verdicts land as evidence. The arm-entry
-    // probe rule covers infra-shaped exits only: within this arm the
-    // probe check still precedes every budget consult and terminal mint
-    // on the infra-classified leg, which is all the rule requires. Do
-    // NOT hoist the probe check above classification — that would turn
-    // a recovered cluster's first genuine verdict into an exempt requeue
-    // and the probe ladder would never score a real recovery.
+    // probe rule covers infra-shaped exits only; its scope here is
+    // exact, not arm-wide:
+    //
+    // - on THIS leg (the two-signal statuses), the probe check precedes
+    //   the infra auto-retry's budget consult and the infra terminal
+    //   mint — the carve-out's whole jurisdiction;
+    // - the DependencyFailed sub-arms ABOVE this pin consult the
+    //   UNFAIR-ATTEMPT budget and, at exhaustion, mint
+    //   infra-indeterminate terminals with no probe check — deliberate,
+    //   not exempt-by-omission: those sub-arms ride with-result rows
+    //   (the cluster answered; a probe's dependency-failed verdict is
+    //   outage evidence the scorer must see), and the budget they
+    //   consume is the unfair-attempt budget, which the carve-out's
+    //   contract never covered.
+    //
+    // Do NOT hoist the probe check above classification — that would
+    // turn a recovered cluster's first genuine verdict into an exempt
+    // requeue and the probe ladder would never score a real recovery.
     // One row class is classified BEFORE the two-signal rule: the
     // gateway's evidence-loss row
     // ([`BuildResult::lost_terminal_unverified`]) — minted when this
