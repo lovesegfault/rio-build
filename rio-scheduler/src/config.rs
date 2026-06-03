@@ -310,6 +310,21 @@ impl rio_common::config::ValidateConfig for Config {
             "exec_retention_days must be >= 1 (got {})",
             cfg.exec_retention_days
         );
+        // r[impl sched.config.slack-floor]
+        // Cross-component timing contract (C2/077 gap 3): the
+        // controller's wedge clustering needs expired attempts
+        // observable in the open view for its grace + two ticks before
+        // the establishment sweep removes them. The controller
+        // const-asserts its side against the same shared constant.
+        anyhow::ensure!(
+            cfg.establishment_report_slack.as_secs()
+                >= rio_common::limits::MIN_ESTABLISHMENT_REPORT_SLACK_SECS,
+            "establishment_report_slack_secs must be >= {} \
+             (rio_common::limits::MIN_ESTABLISHMENT_REPORT_SLACK_SECS — the controller's \
+             wedge observation grace + two reconcile ticks must fit inside the slack, \
+             or node-wedge clustering goes blind)",
+            rio_common::limits::MIN_ESTABLISHMENT_REPORT_SLACK_SECS
+        );
         // r[impl sched.retry.per-executor-budget+4]
         // `RetryPolicy::backoff_duration` computes
         // `random_range(-jf..=jf)` — rand panics if low > high, so jf < 0
@@ -451,3 +466,44 @@ impl rio_common::config::ValidateConfig for Config {
 }
 
 rio_common::impl_has_common_config!(Config);
+
+#[cfg(test)]
+mod tests {
+    /// C2/077 gap 3: the controller's wedge observation grace + two
+    /// reconcile ticks must fit inside the establishment report slack —
+    /// otherwise the sweep removes expired attempts from the open view
+    /// before the wedge clustering can observe them. The floor is the
+    /// shared constant; a config below it must fail load (and the
+    /// boundary value must not).
+    // r[verify sched.config.slack-floor]
+    #[test]
+    fn establishment_slack_below_shared_floor_fails_validation() {
+        use rio_common::config::ValidateConfig;
+        // Satisfy the ensures ordered before the slack floor so the
+        // first failure (if any) is the one under test.
+        let mut cfg = super::Config {
+            database_url: "postgres://test".into(),
+            ..Default::default()
+        };
+        cfg.store.addr = "store:9002".into();
+        cfg.establishment_report_slack = std::time::Duration::from_secs(30);
+        let err = cfg
+            .validate()
+            .expect_err("slack below the shared floor must fail fast at load")
+            .to_string();
+        assert!(
+            err.contains("establishment_report_slack_secs must be >="),
+            "the failure must be the slack floor, got: {err}"
+        );
+        // Boundary: exactly the floor passes the slack check (later,
+        // unrelated ensures may still reject the skeletal fixture).
+        cfg.establishment_report_slack =
+            std::time::Duration::from_secs(rio_common::limits::MIN_ESTABLISHMENT_REPORT_SLACK_SECS);
+        if let Err(e) = cfg.validate() {
+            assert!(
+                !e.to_string().contains("establishment_report_slack_secs"),
+                "the floor boundary must pass the slack check, got: {e:#}"
+            );
+        }
+    }
+}

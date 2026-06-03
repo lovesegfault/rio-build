@@ -38,7 +38,7 @@ fn log_hash(tag: &str) -> String {
     format!("{tag:0>32}")
 }
 
-// r[verify sched.admin.list-open-attempts+2]
+// r[verify sched.admin.list-open-attempts+3]
 /// The open-attempt view returns exactly the open attempt — not the
 /// terminal-filled one, and not an assignment that never got its
 /// execution row (the join requires the pull-minted pair).
@@ -209,6 +209,20 @@ async fn mint_persists_dispatched_deadline_and_view_returns_it() -> anyhow::Resu
         "the dispatched deadline round-trips through the view"
     );
     assert_eq!(rows[0].source_node.as_deref(), Some("node-1"));
+
+    // C2/008: the wire mapping carries the dispatched deadline and the
+    // work class — pinned against this REALLY-MINTED row so the
+    // consumer-fixture vacuity (wedge tests inventing deadline_secs the
+    // producer never sent) cannot recur.
+    let proto = crate::admin::open_attempt_row_to_proto(rows.into_iter().next().unwrap());
+    assert_eq!(
+        proto.deadline_secs, 1234,
+        "ListOpenAttempts must carry the dispatched deadline (the OA2 wedge consumer skips 0)"
+    );
+    assert_eq!(
+        proto.attempt_kind,
+        rio_proto::types::AttemptKind::Build as i32
+    );
     Ok(())
 }
 

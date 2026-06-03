@@ -1167,22 +1167,39 @@ fleet-wide learning.
   during an outage are clear-free (`registered_cells` discarded).
 ]
 
-#r("ctrl.nodeclaim.wedge-cluster")[
+#r("ctrl.nodeclaim.wedge-cluster+1")[
   On every full reconcile tick the NodeClaim-pool reconciler MUST compute a
   per-node clustering of pull-mode attempt-deadline expiries from the
-  open-attempt ledger view (`AdminService.ListOpenAttempts`): an open attempt
-  whose age exceeds its known intent deadline by the observation grace
-  contributes its derivation as evidence against the node it is bound to ---
-  the ledger's `source_node`, falling back to the controller's own
-  kube-authoritative intent→node binding; an attempt with no node attribution
-  or no known deadline contributes nothing. A node accumulating evidence for
-  at least 2 distinct derivations inside the 30-minute window MUST be treated
-  as Dead-equivalent: unioned with the scheduler-reported `dead_nodes` and
-  consumed by the unhealthy reap's `Dead` arm under the same per-tick
-  dead-reap cap. One derivation expiring repeatedly MUST NOT mark a node by
-  itself; an open-attempt RPC failure MUST only skip that tick's observation
-  (previously accumulated evidence is retained, and no node is marked from
-  data the controller did not observe).
+  open-attempt ledger view (`AdminService.ListOpenAttempts`): an open
+  build-class attempt whose age exceeds its known intent deadline by the
+  observation grace contributes its derivation as evidence against the
+  ledger's `source_node` ONLY --- an attempt with no ledger node attribution,
+  no known deadline, or a non-build work class contributes nothing (a
+  materialization attempt is a store-side fetch whose stamped binding is the
+  stale builder pod). Each (node, derivation) evidence entry MUST anchor its
+  window at the derivation's FIRST observation --- a stuck-open attempt
+  re-observed every tick does not slide the window. A node accumulating
+  evidence for at least 2 distinct derivations inside the 30-minute window
+  MUST be treated as Dead-equivalent: unioned with the scheduler-reported
+  `dead_nodes` and consumed by the unhealthy reap's `Dead` arm under the same
+  per-tick dead-reap cap. One derivation expiring repeatedly MUST NOT mark a
+  node by itself; an open-attempt RPC failure MUST only skip that tick's
+  observation (previously accumulated evidence is retained, and no node is
+  marked from data the controller did not observe).
+]
+
+#r("ctrl.nodeclaim.wedge-two-axis")[
+  The wedge clustering's verdict MUST be two-axis: when more than half of
+  the tick's attributed build fleet (distinct `source_node`s across healthy
+  and expired build attempts) is past the cluster threshold and at least two
+  nodes are affected, the verdict is SYSTEMIC --- the reconciler MUST mark
+  no node, MUST increment the suppression counter
+  (`rio_controller_wedge_systemic_suppressed_total`), and the unhealthy
+  reap's `Dead` arm MUST NOT receive any wedge-derived input that tick. Only
+  a per-node (non-systemic) verdict may feed the `Dead` arm. The wedge
+  observation grace plus two reconcile ticks MUST fit inside the scheduler's
+  establishment report slack, enforced from one shared constant on both
+  sides (controller compile-time, scheduler config-load).
 ]
 
 This is the OA2 successor to the retired heartbeat-fed scheduler-side
@@ -1195,9 +1212,13 @@ deletion and is now the only node-wedge signal: the scheduler-side detector
 is gone and `GetSpawnIntents.dead_nodes` is always empty (the field stays in
 the proto, and the union arm stays a no-op, until the 1d sweep). The
 #(refs.metric)("rio_controller_node_wedge_marked_total") counter records each
-not-wedged→wedged transition; the `RioSchedulerAttemptEstablishmentCluster`
+not-wedged→wedged transition and
+#(refs.metric)("rio_controller_wedge_systemic_suppressed_total") each tick the
+systemic guard refused to mark; the `RioSchedulerAttemptEstablishmentCluster`
 alert and the manual-reap runbook remain the independent operator-facing
-tripwire and confirmation procedure.
+tripwire and confirmation procedure --- the automation now applies the
+runbook's systemic-vs-per-node discrimination itself before feeding the Dead
+arm.
 
 = Build CRD (removed)
 

@@ -2809,6 +2809,17 @@ run resets on any genuine classification, reset, or controller observation.
   establishing transaction MUST apply the same generation-floor fence as
   the pull transaction.
 ]
+
+#r("sched.config.slack-floor")[
+  `establishment_report_slack_secs` MUST be validated at config load against
+  the shared floor `rio_common::limits::MIN_ESTABLISHMENT_REPORT_SLACK_SECS`:
+  a value below the floor MUST fail scheduler startup. The floor exists for
+  the controller's wedge clustering --- its observation grace plus two
+  reconcile ticks must fit inside the slack so deadline-expired attempts
+  remain observable in the open view before the sweep establishes them; the
+  controller compile-time-asserts the same inequality against the same
+  constant.
+]
 The sweep reads durable rows --- not an in-memory claim a one-shot timer can
 forget --- so the post-failover "deferred claim forgotten" defect class is
 closed structurally. Anchoring the window to the dispatched deadline (072's
@@ -2840,13 +2851,16 @@ charge-free arm, the sweep then established it as `executor_crash` ---
 seeding the exclusion ledger and the OA2 wedge clustering with verdicts
 about work nobody wanted.
 
-#r("sched.admin.list-open-attempts+2")[
+#r("sched.admin.list-open-attempts+3")[
   `AdminService.ListOpenAttempts` MUST return every open attempt --- an
   active `assignments` row joined to its `drv_executions` row with no
   terminal `drv_attempts` fill. Each entry carries the intent id (drv
   hash), derivation path, `exec_id`, executor identity, source node when
-  known, the assignment's generation, and its age; the response carries
-  `leader_for_secs` with the same fail-closed freshness semantics as
+  known, the assignment's generation, its age, its work class
+  (`attempt_kind`; the unspecified value reads as build for rolling skew),
+  and the dispatched deadline persisted by the pull mint (`deadline_secs`;
+  0 = unknown, and consumers MUST treat 0 as not-expirable); the response
+  carries `leader_for_secs` with the same fail-closed freshness semantics as
   #rref("sched.admin.list-executors-leader-age+2"). The RPC is leader-served.
 ]
 The same view feeds the #(refs.metric)("rio_scheduler_open_attempts") gauge

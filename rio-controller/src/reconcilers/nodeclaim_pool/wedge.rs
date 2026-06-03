@@ -14,17 +14,31 @@
 //!   means nothing on the node reported anything — the establishment
 //!   sweep will charge it after the report slack). Evidence is keyed on
 //!   the attempt's derivation (`intent_id`) and attributed to the
-//!   ledger's `source_node` (the kube-authoritative spawn-ack binding
-//!   persisted by the pull transaction), falling back to the
-//!   controller's own in-memory `intent_id → node` binding when the
-//!   ledger column is empty. Unattributable evidence is dropped — the
-//!   runbook's "a cluster of NULLs is not a node signal" rule.
+//!   ledger's `source_node` ONLY (the kube-authoritative spawn-ack
+//!   binding persisted by the pull transaction). Build-lane attempts
+//!   only: a materialization attempt is a store-side fetch whose
+//!   stamped node binding is the stale builder pod — never pod-on-node
+//!   evidence. Unattributable evidence is dropped — the runbook's
+//!   "a cluster of NULLs is not a node signal" rule; the in-memory
+//!   newest-pod-wins intent→node fallback is gone (it attributed an
+//!   old attempt's expiry to the replacement pod's healthy node).
 //! - **Cluster** = a node accumulating evidence for at least
 //!   [`WEDGE_CLUSTER_MIN_DISTINCT_DRVS`] *distinct derivations* inside
-//!   the [`WEDGE_CLUSTER_WINDOW_SECS`] window. One derivation expiring
-//!   repeatedly is a build problem (its retries/establishments are
-//!   handled by the retry fold), not a node problem — same
-//!   discrimination the manual runbook query makes.
+//!   the [`WEDGE_CLUSTER_WINDOW_SECS`] window, anchored at each
+//!   derivation's FIRST observation (a stuck attempt re-observed every
+//!   tick does not slide its window — expiries genuinely hours apart
+//!   never cluster). One derivation expiring repeatedly is a build
+//!   problem (its retries/establishments are handled by the retry
+//!   fold), not a node problem — same discrimination the manual
+//!   runbook query makes.
+//! - **Systemic guard** = when more than
+//!   [`WEDGE_SYSTEMIC_FRACTION`] of the attributed fleet is past the
+//!   cluster threshold in one tick the cause is shared
+//!   (scheduler/report-path outage, store brownout), not per-node
+//!   wedges: the verdict is [`WedgeVerdict::Systemic`], nothing is
+//!   marked, and the runbook's manual discrimination applies — the
+//!   automation refuses to roll Dead-reaps across the fleet at
+//!   `dead_reap_cap`.
 //!
 //! Clustered nodes are fed to [`super::health::reap_unhealthy`] as the
 //! Dead-node input (the only such signal — the scheduler's stream-era
@@ -61,15 +75,45 @@ pub(super) const WEDGE_CLUSTER_MIN_DISTINCT_DRVS: usize = 2;
 /// sweep removes them.
 pub(super) const WEDGE_DEADLINE_GRACE_SECS: u64 = 30;
 
+/// Fraction of the tick's attributed build fleet past the cluster
+/// threshold above which the verdict is systemic (shared cause), not
+/// per-node. Strictly-greater comparison; also requires at least two
+/// affected nodes (a two-node fleet with one wedge is 0.5, not
+/// systemic).
+pub(super) const WEDGE_SYSTEMIC_FRACTION: f64 = 0.5;
+
+// C2/077 gap 3, compile-time half: the wedge must be able to observe an
+// expired attempt for its grace plus two full reconcile ticks before
+// the establishment sweep may remove it from the open view. The
+// scheduler validates the other half (`establishment_report_slack >=
+// floor`) at config load — one shared constant, two enforced sides.
+const _: () = assert!(
+    WEDGE_DEADLINE_GRACE_SECS + 2 * super::TICK.as_secs()
+        <= rio_common::limits::MIN_ESTABLISHMENT_REPORT_SLACK_SECS
+);
+
+/// One tick's wedge verdict: per-node Dead-equivalents, or a systemic
+/// pattern that marks nothing.
+#[derive(Debug)]
+pub(super) enum WedgeVerdict {
+    /// Nodes past the cluster threshold — the only permitted feed of
+    /// `health::reap_unhealthy`'s Dead arm.
+    NodeWedged(Vec<String>),
+    /// More than [`WEDGE_SYSTEMIC_FRACTION`] of the attributed fleet is
+    /// past the threshold: shared cause, nothing marked.
+    Systemic { affected: usize, of: usize },
+}
+
 /// Per-node deadline-expiry evidence with window pruning. One instance
 /// lives on the NodeClaim-pool reconciler; `update` is called once per
 /// healthy tick with that tick's open-attempt view.
 #[derive(Default)]
 pub(super) struct WedgeTracker {
-    /// node → (derivation/intent id → epoch-secs the expiry was last
-    /// observed). Values refresh while the expired attempt stays open;
-    /// entries age out of the window after the attempt is established
-    /// (or the node recovers and stops producing new evidence).
+    /// node → (derivation/intent id → epoch-secs the expiry was FIRST
+    /// observed — the window anchor). Entries age out of the window
+    /// even while the attempt stays open (re-anchoring fresh on the
+    /// next observation), so two expiries genuinely far apart never
+    /// cluster.
     evidence: HashMap<String, HashMap<String, f64>>,
     /// Nodes currently past the cluster threshold — tracked so the
     /// `rio_controller_node_wedge_marked_total` counter increments once
@@ -83,16 +127,35 @@ impl WedgeTracker {
     /// cluster threshold (sorted, deduplicated). Increments
     /// `rio_controller_node_wedge_marked_total` for nodes newly entering
     /// the wedged set.
-    // r[impl ctrl.nodeclaim.wedge-cluster]
-    pub(super) fn update(
-        &mut self,
-        open_attempts: &[OpenAttempt],
-        bound_intents: &HashMap<String, String>,
-        now_secs: f64,
-    ) -> Vec<String> {
-        self.observe(open_attempts, bound_intents, now_secs);
+    // r[impl ctrl.nodeclaim.wedge-cluster+1]
+    // r[impl ctrl.nodeclaim.wedge-two-axis]
+    pub(super) fn update(&mut self, open_attempts: &[OpenAttempt], now_secs: f64) -> WedgeVerdict {
+        let fleet = self.observe(open_attempts, now_secs);
         self.prune(now_secs);
         let wedged = self.wedged_nodes(now_secs);
+        // Two-axis discrimination: most-of-fleet expiring is a shared
+        // cause. Computed against THIS tick's attributed build fleet so
+        // an observation outage (empty view) cannot flip a prior
+        // verdict — with no fleet observed, retained evidence still
+        // resolves per-node.
+        if wedged.len() >= 2
+            && !fleet.is_empty()
+            && (wedged.len() as f64 / fleet.len() as f64) > WEDGE_SYSTEMIC_FRACTION
+        {
+            metrics::counter!("rio_controller_wedge_systemic_suppressed_total").increment(1);
+            tracing::warn!(
+                affected = wedged.len(),
+                of = fleet.len(),
+                "wedge clustering suppressed: >{WEDGE_SYSTEMIC_FRACTION} of the attributed \
+                 fleet is past the expiry threshold — systemic cause (report-path outage, \
+                 store brownout), not per-node wedges; marking nothing (see the hung-node \
+                 runbook's systemic discrimination)"
+            );
+            return WedgeVerdict::Systemic {
+                affected: wedged.len(),
+                of: fleet.len(),
+            };
+        }
         for node in &wedged {
             if self.marked.insert(node.clone()) {
                 metrics::counter!("rio_controller_node_wedge_marked_total").increment(1);
@@ -106,19 +169,33 @@ impl WedgeTracker {
         // Nodes that fell back under the threshold (evidence aged out)
         // leave `marked` so a later re-wedge counts as a new transition.
         self.marked.retain(|n| wedged.contains(n));
-        wedged
+        WedgeVerdict::NodeWedged(wedged)
     }
 
     /// Fold one tick's open-attempt view into the evidence map. Only
-    /// attempts past `deadline + grace` with a known deadline and a
-    /// node attribution contribute.
-    fn observe(
-        &mut self,
-        open_attempts: &[OpenAttempt],
-        bound_intents: &HashMap<String, String>,
-        now_secs: f64,
-    ) {
+    /// BUILD attempts past `deadline + grace` with a known deadline and
+    /// a ledger node attribution contribute; each (node, derivation)
+    /// pair anchors at its first observation. Returns the tick's
+    /// attributed build fleet (distinct source nodes across healthy AND
+    /// expired attempts) — the systemic-guard denominator.
+    fn observe(&mut self, open_attempts: &[OpenAttempt], now_secs: f64) -> HashSet<String> {
+        let mut fleet: HashSet<String> = HashSet::new();
         for a in open_attempts {
+            if a.attempt_kind != rio_proto::types::AttemptKind::Build as i32 {
+                // Materialization (store fetch): the stamped node is the
+                // stale builder binding — never pod-on-node evidence.
+                // UNSPECIFIED (rolling-skew producer) is skipped too:
+                // under-detecting for the skew window is the safe
+                // direction.
+                continue;
+            }
+            if a.source_node.is_empty() {
+                // Not ledger-attributable: never evidence against any
+                // node (and not fleet either — an unattributed attempt
+                // says nothing about node breadth).
+                continue;
+            }
+            fleet.insert(a.source_node.clone());
             if a.deadline_secs == 0 {
                 // Deadline unknown to the scheduler — can't call it expired.
                 continue;
@@ -127,20 +204,19 @@ impl WedgeTracker {
                 // Healthy (or still inside the abort-report grace).
                 continue;
             }
-            let node = if a.source_node.is_empty() {
-                match bound_intents.get(&a.intent_id) {
-                    Some(n) => n.clone(),
-                    // Not node-attributable: never evidence against any node.
-                    None => continue,
-                }
-            } else {
-                a.source_node.clone()
-            };
             self.evidence
-                .entry(node)
+                .entry(a.source_node.clone())
                 .or_default()
-                .insert(a.intent_id.clone(), now_secs);
+                .entry(a.intent_id.clone())
+                // First-observation anchor: a stuck-open attempt
+                // re-observed every tick does not slide its window. (An
+                // entry that ages out while the attempt stays open
+                // re-anchors fresh on the next observation — a
+                // derivation stuck for a full window AND a second
+                // expiry is the runbook's genuine signature.)
+                .or_insert(now_secs);
         }
+        fleet
     }
 
     /// Drop evidence older than the window and nodes left without any.
@@ -191,10 +267,20 @@ mod tests {
             generation: 1,
             assigned_at_age_secs: 100 + WEDGE_DEADLINE_GRACE_SECS + over_secs,
             deadline_secs: 100,
-            // Compile-forced by `OpenAttempt.attempt_kind` (A2): the
-            // wedge's kind-aware consumption is C2's co-land (§4.R3);
-            // UNSPECIFIED is the documented skew posture (⇒ build).
-            attempt_kind: 0,
+            // The wedge consumes BUILD evidence only (C2/222);
+            // UNSPECIFIED (skew) and MATERIALIZATION are skipped.
+            attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+        }
+    }
+
+    /// Unwrap the per-node verdict (panics on a systemic verdict —
+    /// tests that expect suppression match on it directly).
+    fn nodes(v: WedgeVerdict) -> Vec<String> {
+        match v {
+            WedgeVerdict::NodeWedged(n) => n,
+            WedgeVerdict::Systemic { affected, of } => {
+                panic!("unexpected systemic verdict ({affected}/{of})")
+            }
         }
     }
 
@@ -210,20 +296,19 @@ mod tests {
     /// inside the window → that node (and only it) is Dead-equivalent,
     /// and `classify` consumes the union exactly as it consumes
     /// scheduler-reported `dead_nodes` today.
-    // r[verify ctrl.nodeclaim.wedge-cluster]
+    // r[verify ctrl.nodeclaim.wedge-cluster+1]
     #[test]
     fn two_expired_drvs_on_one_node_mark_it_dead_equivalent() {
         let mut tracker = WedgeTracker::default();
-        let wedged = tracker.update(
+        let wedged = nodes(tracker.update(
             &[
                 expired("drv-a", "node-1", 5),
                 expired("drv-b", "node-1", 5),
                 expired("drv-c", "node-2", 5),
                 healthy("drv-d", "node-3"),
             ],
-            &HashMap::new(),
             10_000.0,
-        );
+        ));
         assert_eq!(wedged, vec!["node-1".to_string()]);
 
         // The wedge list flows into `classify` as the Dead input: the
@@ -262,20 +347,19 @@ mod tests {
 
     /// One derivation expiring (even repeatedly observed) never marks a
     /// node, and healthy pulls contribute nothing.
-    // r[verify ctrl.nodeclaim.wedge-cluster]
+    // r[verify ctrl.nodeclaim.wedge-cluster+1]
     #[test]
     fn single_expired_drv_or_healthy_pulls_do_not_mark() {
         let mut tracker = WedgeTracker::default();
         // Same single derivation observed expired on three consecutive ticks.
         for tick in 0u64..3 {
-            let wedged = tracker.update(
+            let wedged = nodes(tracker.update(
                 &[
                     expired("drv-a", "node-1", 5 + tick),
                     healthy("drv-b", "node-1"),
                 ],
-                &HashMap::new(),
                 10_000.0 + (tick as f64) * 10.0,
-            );
+            ));
             assert!(wedged.is_empty(), "tick {tick}: {wedged:?}");
         }
     }
@@ -283,58 +367,28 @@ mod tests {
     /// Evidence ages out of the 30-minute window: two expiries observed
     /// far apart never coexist inside one window, so the node is not
     /// marked; once both are inside the window it is.
-    // r[verify ctrl.nodeclaim.wedge-cluster]
+    // r[verify ctrl.nodeclaim.wedge-cluster+1]
     #[test]
     fn evidence_outside_the_window_does_not_count() {
         let mut tracker = WedgeTracker::default();
         let t0 = 10_000.0;
-        assert!(
-            tracker
-                .update(&[expired("drv-a", "node-1", 5)], &HashMap::new(), t0)
-                .is_empty()
-        );
+        assert!(nodes(tracker.update(&[expired("drv-a", "node-1", 5)], t0)).is_empty());
         // Second distinct expiry observed after the first aged out.
         let late = t0 + WEDGE_CLUSTER_WINDOW_SECS + 1.0;
         assert!(
-            tracker
-                .update(&[expired("drv-b", "node-1", 5)], &HashMap::new(), late)
-                .is_empty(),
+            nodes(tracker.update(&[expired("drv-b", "node-1", 5)], late)).is_empty(),
             "the drv-a evidence aged out; one in-window expiry must not mark"
         );
         // Both inside one window → marked.
-        let wedged = tracker.update(
-            &[expired("drv-a", "node-1", 5)],
-            &HashMap::new(),
+        let wedged = nodes(tracker.update(
+            &[expired("drv-a", "node-1", 5), expired("drv-b", "node-1", 5)],
             late + 5.0,
-        );
+        ));
         assert_eq!(wedged, vec!["node-1".to_string()]);
     }
 
-    /// Node attribution: the ledger's source_node wins; an empty
-    /// source_node falls back to the controller's bound-intent map; an
-    /// attempt with neither is never evidence against any node.
-    // r[verify ctrl.nodeclaim.wedge-cluster]
-    #[test]
-    fn attribution_falls_back_to_bound_intents_and_skips_unknown() {
-        let mut tracker = WedgeTracker::default();
-        let mut no_node_a = expired("drv-a", "", 5);
-        no_node_a.source_node = String::new();
-        let mut no_node_b = expired("drv-b", "", 5);
-        no_node_b.source_node = String::new();
-        let mut no_node_c = expired("drv-c", "", 5);
-        no_node_c.source_node = String::new();
-        let bound: HashMap<String, String> = [
-            ("drv-a".to_string(), "node-9".to_string()),
-            ("drv-b".to_string(), "node-9".to_string()),
-            // drv-c has no binding anywhere → dropped.
-        ]
-        .into();
-        let wedged = tracker.update(&[no_node_a, no_node_b, no_node_c], &bound, 10_000.0);
-        assert_eq!(wedged, vec!["node-9".to_string()]);
-    }
-
     /// Attempts with an unknown deadline (0) are never evidence.
-    // r[verify ctrl.nodeclaim.wedge-cluster]
+    // r[verify ctrl.nodeclaim.wedge-cluster+1]
     #[test]
     fn unknown_deadline_is_not_evidence() {
         let mut tracker = WedgeTracker::default();
@@ -342,10 +396,105 @@ mod tests {
         a.deadline_secs = 0;
         let mut b = expired("drv-b", "node-1", 5);
         b.deadline_secs = 0;
+        assert!(nodes(tracker.update(&[a, b], 10_000.0)).is_empty());
+    }
+
+    /// C2/222 leg 1: materialization attempts are store-side fetches —
+    /// their deadline expiry says nothing about a *node* (the stamped
+    /// source_node is the stale builder binding). They are never wedge
+    /// evidence.
+    // r[verify ctrl.nodeclaim.wedge-two-axis]
+    #[test]
+    fn materialization_attempts_are_never_wedge_evidence() {
+        let mut tracker = WedgeTracker::default();
+        let mut a = expired("drv-a", "node-1", 5);
+        a.attempt_kind = rio_proto::types::AttemptKind::Materialization as i32;
+        let mut b = expired("drv-b", "node-1", 5);
+        b.attempt_kind = rio_proto::types::AttemptKind::Materialization as i32;
+        let wedged = nodes(tracker.update(&[a, b], 10_000.0));
         assert!(
-            tracker
-                .update(&[a, b], &HashMap::new(), 10_000.0)
-                .is_empty()
+            wedged.is_empty(),
+            "two expired MATERIALIZATION attempts on one node must not mark it: {wedged:?}"
+        );
+    }
+
+    /// C2/222 leg 2: an attempt the ledger cannot attribute to a node
+    /// (empty source_node) is never evidence — the newest-pod-wins
+    /// in-memory binding attributes an old attempt's expiry to the
+    /// *replacement* pod's healthy node.
+    // r[verify ctrl.nodeclaim.wedge-two-axis]
+    #[test]
+    fn empty_source_node_never_attributes() {
+        let mut tracker = WedgeTracker::default();
+        let mut a = expired("drv-a", "", 5);
+        a.source_node = String::new();
+        let mut b = expired("drv-b", "", 5);
+        b.source_node = String::new();
+        let wedged = nodes(tracker.update(&[a, b], 10_000.0));
+        assert!(
+            wedged.is_empty(),
+            "ledger-unattributable expiries must never mark any node: {wedged:?}"
+        );
+    }
+
+    /// C2/077 gap 2: the cluster window anchors at FIRST observation.
+    /// One stuck derivation re-observed every tick for over a window,
+    /// plus a second derivation expiring at the very end, must not
+    /// mark: the two expiries are hours apart even though both were
+    /// "recently observed".
+    // r[verify ctrl.nodeclaim.wedge-two-axis]
+    #[test]
+    fn evidence_window_anchors_at_first_observation() {
+        let mut tracker = WedgeTracker::default();
+        let t0 = 10_000.0;
+        // drv-a stays expired-and-open, re-observed every 600s well past
+        // the 1800s window.
+        let mut t = t0;
+        while t < t0 + WEDGE_CLUSTER_WINDOW_SECS + 600.0 {
+            let wedged = nodes(tracker.update(&[expired("drv-a", "node-1", 5)], t));
+            assert!(wedged.is_empty(), "single drv must never mark: {wedged:?}");
+            t += 600.0;
+        }
+        // drv-b expires now — drv-a's FIRST observation is > window ago.
+        let wedged = tracker.update(
+            &[expired("drv-a", "node-1", 5), expired("drv-b", "node-1", 5)],
+            t,
+        );
+        let wedged = match wedged {
+            WedgeVerdict::NodeWedged(n) => n,
+            // A 1-node attributed fleet with 1 clustered node is not
+            // systemic by the >=2 affected guard; reaching here means
+            // the anchor regressed.
+            WedgeVerdict::Systemic { affected, of } => {
+                panic!("unexpected systemic verdict ({affected}/{of})")
+            }
+        };
+        assert!(
+            wedged.is_empty(),
+            "expiries first observed > window apart must not cluster: {wedged:?}"
+        );
+    }
+
+    /// C2/077 gap 1: when MOST attributed nodes are accumulating
+    /// expiries the cause is systemic (scheduler/report-path outage,
+    /// store brownout), not per-node wedges — marking nothing beats
+    /// rolling Dead-reaps across the fleet at dead_reap_cap.
+    // r[verify ctrl.nodeclaim.wedge-two-axis]
+    #[test]
+    fn fleet_wide_expiry_is_systemic_and_marks_nothing() {
+        let mut tracker = WedgeTracker::default();
+        let view: Vec<OpenAttempt> = (0..4)
+            .flat_map(|n| {
+                vec![
+                    expired(&format!("drv-{n}-x"), &format!("node-{n}"), 5),
+                    expired(&format!("drv-{n}-y"), &format!("node-{n}"), 5),
+                ]
+            })
+            .collect();
+        let verdict = tracker.update(&view, 10_000.0);
+        assert!(
+            matches!(verdict, WedgeVerdict::Systemic { affected: 4, of: 4 }),
+            "all-nodes-expiring is systemic; the Dead input must be empty: {verdict:?}"
         );
     }
 }

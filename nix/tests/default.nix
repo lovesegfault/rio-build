@@ -990,7 +990,7 @@ in
       # r[verify sched.executor.pull-transaction+2]
       # r[verify builder.pull.exit-codes]
       # r[verify sched.attempt.no-attempt-no-op]
-      # r[verify sched.admin.list-open-attempts+2]
+      # r[verify sched.admin.list-open-attempts+3]
       #   pull-mode: ~360s — never-pulled kill + respawned pull build
       #   (30s sleep) + report + killed-mid-build arm (45s sleep +
       #   force-kill + requeue + 45s rebuild to a delivered store

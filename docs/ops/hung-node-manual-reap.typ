@@ -29,6 +29,18 @@ either a genuinely wedged node (the OA2 signature) or a systemic cause
 (scheduler unable to serve `ReportOutcome`, store outage failing every build
 at once).
 
+The controller's automated clustering now applies this discrimination
+itself (#rref("ctrl.nodeclaim.wedge-two-axis")): when more than half of the
+attributed build fleet is past the expiry threshold in one tick it marks
+NOTHING and increments
+#(refs.metric)("rio_controller_wedge_systemic_suppressed_total") instead of
+rolling Dead-reaps across the fleet. A non-zero suppression counter is the
+automation telling you to run THIS runbook's systemic triage; per-node
+wedges keep flowing to the Dead arm without operator action. Evidence is
+also build-class only and anchored at first observation, so store-side
+materialization fetches and one stuck derivation re-observed for hours no
+longer pollute the per-node signal.
+
 + Confirm the burst is real: the alert value is the count over the window;
   #(refs.metric)("rio_scheduler_open_attempts") shows how many attempts are
   still open right now.

@@ -503,7 +503,7 @@ impl AdminService for AdminServiceImpl {
     /// pull transaction (the only execution writer left). Leader-read
     /// with the same `ensure_leader` discipline as `ListExecutors`;
     /// `leader_for_secs` carries the same fail-closed freshness input.
-    // r[impl sched.admin.list-open-attempts+2]
+    // r[impl sched.admin.list-open-attempts+3]
     #[instrument(skip(self, request), fields(rpc = "ListOpenAttempts"))]
     async fn list_open_attempts(
         &self,
@@ -533,26 +533,7 @@ impl AdminService for AdminServiceImpl {
             .build
             .into_iter()
             .chain(rows.materialization)
-            .map(|r| rio_proto::types::OpenAttempt {
-                intent_id: r.drv_hash,
-                derivation: r.drv_path,
-                exec_id: r.exec_id.to_string(),
-                executor_id: r.executor_id,
-                source_node: r.source_node.unwrap_or_default(),
-                generation: r.generation.max(0) as u64,
-                assigned_at_age_secs: r.age_secs.max(0.0) as u64,
-                // Deadline enrichment (the intent deadline) is consumer
-                // work when a consumer needs it; 0 = unknown for now
-                // (C2's co-land — enriching it alone re-arms wrongful
-                // Dead-reaps; see the wave's R3 ruling).
-                deadline_secs: 0,
-                attempt_kind: match r.attempt_kind.as_str() {
-                    "materialization" => rio_proto::types::AttemptKind::Materialization,
-                    // 'build' and anything pre-alphabet: the as-built
-                    // build fleet (UNSPECIFIED⇒build skew posture).
-                    _ => rio_proto::types::AttemptKind::Build,
-                } as i32,
-            })
+            .map(open_attempt_row_to_proto)
             .collect();
         Ok(Response::new(rio_proto::types::ListOpenAttemptsResponse {
             attempts,
@@ -1267,3 +1248,36 @@ impl AdminService for AdminServiceImpl {
 
 #[cfg(test)]
 mod tests;
+
+/// Map one open-attempt ledger row to its wire form ([`rio_proto::types::OpenAttempt`]).
+///
+/// Extracted from the `ListOpenAttempts` handler so the postgres-backed
+/// cross-boundary test pins the mapping against a *really minted* row —
+/// the same-value-vacuity trap of pure-fixture tests (consumer fixtures
+/// inventing the field the producer never sent) cannot recur.
+pub(crate) fn open_attempt_row_to_proto(
+    r: crate::db::open_attempts::OpenAttemptRow,
+) -> rio_proto::types::OpenAttempt {
+    rio_proto::types::OpenAttempt {
+        intent_id: r.drv_hash,
+        derivation: r.drv_path,
+        exec_id: r.exec_id.to_string(),
+        executor_id: r.executor_id,
+        source_node: r.source_node.unwrap_or_default(),
+        generation: r.generation.max(0) as u64,
+        assigned_at_age_secs: r.age_secs.max(0.0) as u64,
+        // The dispatched deadline persisted by the pull mint (072).
+        // 0 = unknown (pre-072 rows and NULLs) — the OA2 wedge
+        // consumer skips 0. Enriched in the same change set as the
+        // consumer's kind gate + first-observation anchor + systemic
+        // guard (the C2 co-land: enriching alone re-arms wrongful
+        // Dead-reaps).
+        deadline_secs: r.deadline_secs.map_or(0, |d| d.max(0.0) as u64),
+        attempt_kind: match r.attempt_kind.as_str() {
+            "materialization" => rio_proto::types::AttemptKind::Materialization,
+            // 'build' and anything pre-alphabet: the as-built
+            // build fleet (UNSPECIFIED⇒build skew posture).
+            _ => rio_proto::types::AttemptKind::Build,
+        } as i32,
+    }
+}

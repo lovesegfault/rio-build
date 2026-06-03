@@ -132,6 +132,18 @@ pub const MAX_DAG_EDGES: usize = 5_242_880;
 /// report attempt + slack, never the stream era's 2 h drain default.
 pub const PULL_MODE_TERMINATION_GRACE_SECS: u64 = 45;
 
+/// Floor for the scheduler's `establishment_report_slack_secs` config —
+/// the single source for a cross-component timing contract: the
+/// controller's wedge clustering observes deadline-expired attempts in
+/// the open view for `WEDGE_DEADLINE_GRACE_SECS + 2 ticks` before the
+/// establishment sweep may remove them. The controller const-asserts
+/// its side (`grace + 2*TICK <= floor`); the scheduler validates its
+/// side (`slack >= floor`) at config load. Raising the controller
+/// numbers past the floor becomes a compile error; lowering the
+/// scheduler slack past it becomes a load error — the comment-only
+/// invariant is gone.
+pub const MIN_ESTABLISHMENT_REPORT_SLACK_SECS: u64 = 60;
+
 #[cfg(test)]
 mod tests {
     use super::*;

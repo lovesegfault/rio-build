@@ -56,6 +56,7 @@
     "rio_controller_reconcile_errors_total",
     "rio_controller_scaling_decisions_total",
     "rio_controller_sketches_reload_pending",
+    "rio_controller_wedge_systemic_suppressed_total",
     "rio_gateway_auth_degraded_total",
     "rio_gateway_bytes_total",
     "rio_gateway_channels_active",
@@ -503,6 +504,11 @@
         "name": "rio_controller_sketches_reload_pending",
         "kind": "gauge",
         "help": "1 while the lease-acquire CellSketches reload from PG is pending (load() not yet succeeded since on_acquire); 0 once latched. While 1, persist() is gated off so a stale standby-startup snapshot doesn't overwrite the previous leader's PG rows. Stuck at 1 = PG unreachable from controller; reconcile runs degraded."
+      },
+      {
+        "name": "rio_controller_wedge_systemic_suppressed_total",
+        "kind": "counter",
+        "help": "Ticks the OA2 wedge clustering refused to mark anything because more than half of the attributed build fleet (and >=2 nodes) was past the expiry threshold - a systemic cause (report-path outage, store brownout), not per-node wedges. Non-zero = run the hung-node runbook's systemic triage; the Dead arm received no wedge input those ticks."
       }
     ],
     "gateway": [

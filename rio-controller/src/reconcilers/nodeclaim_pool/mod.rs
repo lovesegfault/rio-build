@@ -1324,7 +1324,7 @@ impl NodeClaimPoolReconciler {
         // source node). RPC failure is fail-open for observation
         // only: the tick skips new evidence, previously accumulated
         // evidence stays, and no node is marked from stale data.
-        // r[impl ctrl.nodeclaim.wedge-cluster]
+        // r[impl ctrl.nodeclaim.wedge-cluster+1]
         let open_attempts = match admin_call(
             self.admin
                 .clone()
@@ -1338,7 +1338,20 @@ impl NodeClaimPoolReconciler {
                 Vec::new()
             }
         };
-        let dead_input = self.wedge.update(&open_attempts, bound, now);
+        // r[impl ctrl.nodeclaim.wedge-two-axis]
+        // Only per-node verdicts may feed the Dead arm; a systemic
+        // pattern marks nothing (the warn + suppression counter fired
+        // inside the classifier fold).
+        let dead_input = match self.wedge.update(&open_attempts, now) {
+            wedge::WedgeVerdict::NodeWedged(nodes) => nodes,
+            wedge::WedgeVerdict::Systemic { affected, of } => {
+                debug!(
+                    affected,
+                    of, "wedge verdict systemic; Dead arm receives no wedge input this tick"
+                );
+                Vec::new()
+            }
+        };
 
         // Reap unhealthy/ICE BEFORE cover_deficit so cells that just
         // hit ICE this tick are masked in the same tick's cover (don't

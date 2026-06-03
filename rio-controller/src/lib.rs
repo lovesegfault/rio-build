@@ -202,6 +202,15 @@ pub fn describe_metrics() {
          hung-node runbook."
     );
     describe_counter!(
+        "rio_controller_wedge_systemic_suppressed_total",
+        "Ticks the OA2 wedge clustering refused to mark anything because \
+         more than half of the attributed build fleet (and >=2 nodes) was \
+         past the expiry threshold - a systemic cause (report-path outage, \
+         store brownout), not per-node wedges. Non-zero = run the hung-node \
+         runbook's systemic triage; the Dead arm received no wedge input \
+         those ticks."
+    );
+    describe_counter!(
         "rio_controller_nodeclaim_intent_dropped_total",
         "nodeclaim_pool intents dropped by `reason`. \
          reason=no_pool_covers: no configured Builder or Fetcher Pool \

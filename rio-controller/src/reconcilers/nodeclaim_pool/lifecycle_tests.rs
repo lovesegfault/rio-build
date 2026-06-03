@@ -824,6 +824,7 @@ async fn wedge_evidence_survives_acquire() {
             source_node: "node-c-w".into(),
             deadline_secs: 60,
             assigned_at_age_secs: 120,
+            attempt_kind: rio_proto::types::AttemptKind::Build as i32,
             ..Default::default()
         },
         OpenAttempt {
@@ -831,6 +832,7 @@ async fn wedge_evidence_survives_acquire() {
             source_node: "node-c-w".into(),
             deadline_secs: 60,
             assigned_at_age_secs: 120,
+            attempt_kind: rio_proto::types::AttemptKind::Build as i32,
             ..Default::default()
         },
     ]);
