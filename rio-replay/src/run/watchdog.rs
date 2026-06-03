@@ -342,7 +342,7 @@ pub struct TickOutcome {
     /// recent FRESH ClusterStatus poll read `queued_derivations` above
     /// `knobs.pause_queue_depth`, held across a first failed poll and
     /// lapsing with the cluster feed's staleness threshold
-    /// ([`CLUSTER_STALE_AFTER_FAILED_POLLS`]) — the same hold-then-lapse
+    /// (`CLUSTER_STALE_AFTER_FAILED_POLLS`) — the same hold-then-lapse
     /// discipline the idle/dispatch streaks get from this feed. The run
     /// loop ORs it into the submission pause as
     /// `BackpressureSource::QueueDepth`; it is not a suspension component
