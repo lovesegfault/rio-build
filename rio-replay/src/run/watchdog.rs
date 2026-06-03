@@ -157,6 +157,15 @@ struct JobClock {
 /// producers) and is handled by the canary-probe ladder behind
 /// `BackpressureSource::InfraRate`'s self-clearing witness, not by this
 /// type.
+///
+/// Consumption discipline: the type deliberately exposes NO accessor that
+/// collapses `Failed`/`NotPolled` back into `Option` — that one-call
+/// escape hatch is exactly the `.ok()` shape this type replaces, and any
+/// assertion derived through it would move on non-evidence. Every
+/// assertion derived from a polled feed lives inside the [`Watchdog`]
+/// (which owns the per-feed failure streaks and applies the shared
+/// hold-then-lapse) and is read from [`TickOutcome`]; the consumer set is
+/// pinned by `tests::polled_feed_consumers_are_enumerated`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum Polled<T> {
     /// No poll was attempted this tick (by-design cadence gap): the last
@@ -174,16 +183,6 @@ pub enum Polled<T> {
     /// The poll succeeded: this observation replaces the latched one and
     /// resets the feed's failure streak.
     Fresh(T),
-}
-
-impl<T> Polled<T> {
-    /// The fresh observation, when this tick carries one.
-    pub fn fresh(&self) -> Option<&T> {
-        match self {
-            Polled::Fresh(value) => Some(value),
-            Polled::Failed | Polled::NotPolled => None,
-        }
-    }
 }
 
 /// Spawn-intents (capacity) observation carried by one [`PollTick`].
@@ -300,6 +299,19 @@ pub struct Watchdog {
     /// streaks stop asserting their components — the streak values are
     /// retained, only their authority lapses.
     cluster_failed_polls: u32,
+    /// Queue-depth backpressure observation latched from the most recent
+    /// FRESH ClusterStatus poll: `queued_derivations` above
+    /// `knobs.pause_queue_depth` (always false while the knob is unset).
+    /// The bit moves only on poll EVIDENCE — a failed poll says nothing
+    /// about the queue, so the latched observation holds through it,
+    /// exactly like the idle/dispatch streaks on the same feed — and its
+    /// ASSERTION lapses (without the value being zeroed) once the feed
+    /// goes stale at [`CLUSTER_STALE_AFTER_FAILED_POLLS`]: a de-assert
+    /// needs either a fresh below-threshold poll (the queue really
+    /// drained) or the staleness lapse, never a single transient blip —
+    /// which would release a wave of submissions onto the very scheduler
+    /// whose overload asserted the pause, on no evidence at all.
+    queue_depth_latched: bool,
     /// Last seen capacity snapshot — sticky between the (less frequent)
     /// spawn-intent polls, but only allowed to assert [`COMPONENT_ICE`]
     /// while fresh: see [`ICE_STALE_AFTER_FAILED_POLLS`].
@@ -326,6 +338,16 @@ pub struct TickOutcome {
     /// True when the dispatch-gap component is active — the run loop also
     /// pauses submission on it, not just the clocks.
     pub dispatch_pause: bool,
+    /// True when the queue-depth backpressure bit is asserted: the most
+    /// recent FRESH ClusterStatus poll read `queued_derivations` above
+    /// `knobs.pause_queue_depth`, held across a first failed poll and
+    /// lapsing with the cluster feed's staleness threshold
+    /// ([`CLUSTER_STALE_AFTER_FAILED_POLLS`]) — the same hold-then-lapse
+    /// discipline the idle/dispatch streaks get from this feed. The run
+    /// loop ORs it into the submission pause as
+    /// `BackpressureSource::QueueDepth`; it is not a suspension component
+    /// (it gates new submissions, never the stall clocks).
+    pub queue_depth_pause: bool,
     /// The suspension window that ended on this tick, if one did (already
     /// recorded in the summary). Exposed so the run loop can act on window
     /// edges without edge-detecting `suspended` across ticks itself.
@@ -341,6 +363,7 @@ impl Watchdog {
             idle_streak: 0,
             dispatch_streak: 0,
             cluster_failed_polls: 0,
+            queue_depth_latched: false,
             last_ice: IceSnapshot::default(),
             ice_failed_polls: 0,
             last_tick_unix: None,
@@ -446,6 +469,14 @@ impl Watchdog {
             Polled::NotPolled => {}
         }
         if let Polled::Fresh(cluster) = &tick.cluster {
+            // Queue-depth backpressure observation, re-read from every
+            // fresh poll (and ONLY from fresh polls — the latch holds
+            // through failed ones; the assertion gate below applies the
+            // shared staleness lapse).
+            self.queue_depth_latched = self
+                .knobs
+                .pause_queue_depth
+                .is_some_and(|limit| cluster.queued_derivations > limit);
             if cluster.queued_derivations > 0 && cluster.occupied_derivations() == 0 {
                 self.idle_streak += 1;
             } else {
@@ -559,6 +590,15 @@ impl Watchdog {
         let components = self.evaluate_components(tick);
         let suspended = !components.is_empty();
         let dispatch_pause = components.contains(&COMPONENT_DISPATCH);
+        // Queue-depth assertion under the same stale-evidence gate as the
+        // idle/dispatch streaks (`evaluate_components` just updated both
+        // the latch and the failure streak): the latched bit asserts
+        // while the feed is fresh enough, holds through one failed poll,
+        // and lapses — without being zeroed — from the second, so the
+        // first fresh poll that still reads over-threshold re-asserts
+        // immediately.
+        let queue_depth_pause = self.queue_depth_latched
+            && self.cluster_failed_polls < CLUSTER_STALE_AFTER_FAILED_POLLS;
 
         // Suspension-window bookkeeping.
         let mut closed_window = None;
@@ -658,6 +698,7 @@ impl Watchdog {
             components,
             stalled,
             dispatch_pause,
+            queue_depth_pause,
             closed_window,
         }
     }
@@ -1387,5 +1428,186 @@ mod tests {
         assert!(json.get("totalSecsByComponent").is_some(), "{json}");
         let back: SuspensionSummary = serde_json::from_value(json).unwrap();
         assert_eq!(back, summary);
+    }
+
+    /// QueueDepth's closed loop under the cluster feed's one staleness
+    /// discipline (the same hold-1/lapse-2 the idle/dispatch streaks get
+    /// — `cluster_failed_polls_age_out_idle_and_dispatch_assertions`):
+    /// assert on a fresh over-threshold poll; HOLD through one failed
+    /// poll (a leader-failover blip during genuine overload must not
+    /// release a wave of submissions onto the overloaded scheduler — the
+    /// bit may only move on poll evidence); LAPSE from the second
+    /// consecutive failure (the assertion now rests on evidence the
+    /// engine cannot confirm); clear immediately on a fresh
+    /// below-threshold poll (the queue really drained — the
+    /// self-clearing law's witness for `BackpressureSource::QueueDepth`);
+    /// re-assert immediately on a fresh over-threshold poll (the latch
+    /// survived the lapse). NotPolled ticks are cadence gaps and change
+    /// nothing; an unset knob never asserts.
+    #[test]
+    fn queue_depth_pause_holds_one_failed_poll_then_lapses() {
+        let mut wd = Watchdog::new(Knobs {
+            pause_queue_depth: Some(100),
+            ..knobs()
+        });
+        let failed = |at: i64| PollTick {
+            at_unix: at,
+            cluster: Polled::Failed,
+            ice: IcePoll::NotPolled,
+            engine_paused: false,
+        };
+        let not_polled = |at: i64| PollTick {
+            at_unix: at,
+            cluster: Polled::NotPolled,
+            ice: IcePoll::NotPolled,
+            engine_paused: false,
+        };
+        // Busy executors (running > 0, small gap): the queue-depth bit is
+        // the lone assertion in play, as in the canonical overload.
+        let over = cluster(101, 4, 0, 8);
+        let under = cluster(100, 4, 0, 8);
+
+        // Threshold is strictly-greater: at the limit, no assertion.
+        let o = wd.on_tick(&tick(0, under.clone()));
+        assert!(!o.queue_depth_pause, "queued == limit must not assert");
+        // Fresh over-threshold poll asserts.
+        let o = wd.on_tick(&tick(60, over.clone()));
+        assert!(o.queue_depth_pause);
+        assert!(
+            !o.suspended && o.components.is_empty(),
+            "queue depth pauses submission only — never a suspension component"
+        );
+        // ONE failed poll: the bit holds — the failure said nothing about
+        // the queue, and a one-tick release would leak a submission wave.
+        let o = wd.on_tick(&failed(120));
+        assert!(o.queue_depth_pause, "one failure holds the prior assertion");
+        // A cadence gap holds it too (no poll was even attempted).
+        let o = wd.on_tick(&not_polled(150));
+        assert!(o.queue_depth_pause);
+        // Second consecutive failure: the assertion lapses with the rest
+        // of the cluster feed's authority.
+        let o = wd.on_tick(&failed(180));
+        assert!(!o.queue_depth_pause, "stale evidence stops asserting");
+        let o = wd.on_tick(&failed(240));
+        assert!(!o.queue_depth_pause);
+        // The latch survived the lapse: the first fresh poll still over
+        // threshold re-asserts on that very tick.
+        let o = wd.on_tick(&tick(300, over));
+        assert!(
+            o.queue_depth_pause,
+            "retained bit re-arms on fresh evidence"
+        );
+        // And a fresh below-threshold poll clears immediately — the
+        // cluster worked the queue down while submission was paused.
+        let o = wd.on_tick(&tick(360, under));
+        assert!(!o.queue_depth_pause, "fresh drain evidence clears the bit");
+        // Cleared is also held across failures (no flap in either
+        // direction): a blip after the drain must not re-assert.
+        let o = wd.on_tick(&failed(420));
+        assert!(!o.queue_depth_pause);
+
+        // Knob unset: never asserts, whatever the depth reads.
+        let mut unset = Watchdog::new(knobs());
+        let o = unset.on_tick(&tick(0, cluster(10_000, 4, 0, 8)));
+        assert!(!o.queue_depth_pause);
+    }
+
+    /// Standing consumer enumeration for the polled RPC feeds: the
+    /// staleness policy ships WITH the feed, so the watchdog (this file)
+    /// is the only place allowed to read `Polled`'s arms into an
+    /// assertion — every other appearance of the feed vocabulary in
+    /// rio-replay/src/run non-test code must be one of the enumerated
+    /// CONSTRUCTION lines at the run loop's single poll site.
+    ///
+    /// QUANTIFICATION DOMAIN: every line containing `Polled`, `IcePoll`,
+    /// or `PollTick` in every `.rs` file under rio-replay/src/run
+    /// (recursively), outside the file-level `#[cfg(test)]` region and
+    /// excluding this owner file. A new consumer — a match, a
+    /// destructuring read, a fresh construction site — fails here until
+    /// its staleness handling is reviewed and its line is enumerated.
+    /// The collapsing-accessor shape (a `fresh()`-style method — the
+    /// `Option`/`.ok()` twin `Polled` replaced, whose lone caller
+    /// recomputed the queue-depth pause from a failed poll) is forbidden
+    /// everywhere, including this file.
+    #[test]
+    fn polled_feed_consumers_are_enumerated() {
+        // (file relative to src/run, trimmed line) — the complete allowed
+        // consumer set: mod.rs's poll loop CONSTRUCTS the feed once per
+        // tick and hands it to `Watchdog::on_tick`; nothing else touches
+        // the vocabulary.
+        const ALLOWED: &[(&str, &str)] = &[
+            (
+                "mod.rs",
+                "COMPONENT_DISPATCH, COMPONENT_PAUSE, IcePoll, PollTick, StallKind, StallVerdict, Watchdog,",
+            ),
+            ("mod.rs", "Ok(counts) => watchdog::Polled::Fresh(counts),"),
+            ("mod.rs", "watchdog::Polled::Failed"),
+            ("mod.rs", "Ok(snapshot) => IcePoll::Fresh(snapshot),"),
+            ("mod.rs", "IcePoll::Failed"),
+            ("mod.rs", "IcePoll::NotPolled"),
+            ("mod.rs", "let tick = PollTick {"),
+        ];
+        let run_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/run");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let mut pending = vec![run_dir.clone()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src/run") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        assert!(files.len() > 10, "src/run scan looks wrong: {files:?}");
+        let mut found: Vec<(String, String)> = Vec::new();
+        for path in &files {
+            let text = std::fs::read_to_string(path).expect("read source file");
+            let rel = path
+                .strip_prefix(&run_dir)
+                .expect("under src/run")
+                .to_str()
+                .expect("source paths are valid UTF-8")
+                .to_string();
+            // The collapsing accessor stays dead everywhere, the owner
+            // included. (The needle is assembled at runtime so this
+            // test's own message strings cannot satisfy it.)
+            let dead_accessor = format!("fn {}", "fresh");
+            assert!(
+                !text.contains(&dead_accessor),
+                "{rel}: a Polled-collapsing accessor ({dead_accessor:?}) must not come back \
+                 — assertions derived through it move on non-evidence"
+            );
+            if rel == "watchdog.rs" {
+                continue; // the owner: arms are read here, under the streak gates.
+            }
+            // Non-test region only: split at the file-level (column-0)
+            // test marker.
+            let non_test = text.split("\n#[cfg(test)]").next().unwrap_or(&text);
+            for line in non_test.lines() {
+                if ["Polled", "IcePoll", "PollTick"]
+                    .iter()
+                    .any(|token| line.contains(token))
+                {
+                    found.push((rel.clone(), line.trim().to_string()));
+                }
+            }
+        }
+        for (file, line) in &found {
+            assert!(
+                ALLOWED.contains(&(file.as_str(), line.as_str())),
+                "unenumerated polled-feed consumer in {file}: {line:?} — route the read \
+                 through the watchdog's staleness discipline (or enumerate the new \
+                 construction line here after review)"
+            );
+        }
+        for (file, line) in ALLOWED {
+            assert!(
+                found.iter().any(|(f, l)| f == file && l == line),
+                "enumerated consumer no longer present: {file}: {line:?} — keep this list \
+                 in lockstep with the poll site"
+            );
+        }
     }
 }

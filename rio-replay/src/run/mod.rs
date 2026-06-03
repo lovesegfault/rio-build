@@ -1818,9 +1818,11 @@ impl BackpressureSource {
                  watchdog::tests::dispatch_pause_lifts_when_the_queue_drains"
             }
             BackpressureSource::QueueDepth => {
-                "the cluster works the queue down while paused submission adds nothing; each \
-                 fresh ClusterStatus poll re-reads the depth — pinned by \
-                 tests::queue_depth_pause_clears_on_a_fresh_below_threshold_poll"
+                "the cluster works the queue down while paused submission adds nothing; the bit \
+                 moves only on FRESH ClusterStatus polls (a failed poll holds it once, then the \
+                 assertion ages out with the cluster feed's staleness threshold, exactly like \
+                 the dispatch-gap streaks) — pinned by \
+                 watchdog::tests::queue_depth_pause_holds_one_failed_poll_then_lapses"
             }
             BackpressureSource::InfraRate => {
                 "the rolling terminal-record window, refreshed by canary-probe verdicts: the \
@@ -1830,17 +1832,6 @@ impl BackpressureSource {
                  tests::infra_pause_canary_probes_then_escalates_without_draining_budgets"
             }
         }
-    }
-}
-
-/// Queue-depth backpressure bit: queued derivations above the configured
-/// threshold on a fresh poll. Stateless by design — there is nothing to
-/// latch: each fresh poll re-reads the depth, and a failed poll reads as
-/// not-exceeded rather than holding a stale assertion.
-fn queue_depth_exceeded(limit: Option<u32>, counts: Option<&grpc::ClusterCounts>) -> bool {
-    match (limit, counts) {
-        (Some(limit), Some(c)) => c.queued_derivations > limit,
-        _ => false,
     }
 }
 
@@ -2778,10 +2769,13 @@ pub async fn run_with_backends(
                 // the pending pool), and a clock keyed on anything but the
                 // job's own transitions could start before its first offer.
                 let outcome = watchdog.lock().await.on_tick(&tick);
-                // Backpressure: dispatch-gap pause, queue-depth threshold,
-                // rolling infra-failure rate.
-                let queue_depth_pause =
-                    queue_depth_exceeded(knobs.pause_queue_depth, cluster_counts.fresh());
+                // Backpressure: dispatch-gap pause and queue-depth
+                // threshold both come from the watchdog's tick outcome —
+                // the cluster feed's assertions share its one staleness
+                // discipline (fresh-poll movement, one-failure hold,
+                // lapse at the feed's threshold) — plus the rolling
+                // infra-failure rate computed below.
+                let queue_depth_pause = outcome.queue_depth_pause;
                 let (terminal_in_scope, infra_rate_pct) = {
                     let res = results.lock().await;
                     let mut terminal: Vec<&JobRecord> = res
@@ -6888,29 +6882,6 @@ mod tests {
             );
         }
         assert_eq!(BackpressureSource::ALL.len(), 3);
-    }
-
-    /// QueueDepth's self-clearing witness: the bit re-derives from each
-    /// fresh poll (no latching state), so the cluster working the queue
-    /// below the threshold clears the pause on the next poll, and a failed
-    /// poll reads as not-exceeded instead of holding a stale assertion.
-    #[test]
-    fn queue_depth_pause_clears_on_a_fresh_below_threshold_poll() {
-        let counts = |queued: u32| grpc::ClusterCounts {
-            active_executors: 8,
-            queued_derivations: queued,
-            running_derivations: 4,
-            substituting_derivations: 0,
-        };
-        assert!(queue_depth_exceeded(Some(100), Some(&counts(101))));
-        // The cluster worked the queue down while submission was paused:
-        // the very next fresh poll clears the bit.
-        assert!(!queue_depth_exceeded(Some(100), Some(&counts(100))));
-        assert!(!queue_depth_exceeded(Some(100), Some(&counts(0))));
-        // A failed poll cannot hold the pause (no stale assertion).
-        assert!(!queue_depth_exceeded(Some(100), None));
-        // No threshold configured: never asserts.
-        assert!(!queue_depth_exceeded(None, Some(&counts(10_000))));
     }
 
     /// The canary-probe ladder's full closed loop at the state-machine
