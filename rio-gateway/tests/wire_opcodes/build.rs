@@ -2827,16 +2827,19 @@ const NOCHROOT_PRESENT_DRV: &str = "/nix/store/00000000000000000000000000000555-
 const NOCHROOT_PRESENT_ATERM: &str = r#"Derive([("out","/nix/store/cccccccccccccccccccccccccccccccc-nochroot-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("__noChroot","1"),("out","/nix/store/cccccccccccccccccccccccccccccccc-nochroot-out")])"#;
 
 // r[verify gw.opcode.build-results-honest+2]
-/// Event-loss shape: the scheduler completes the DAG but THIS root's
-/// terminal event never arrives (state-channel Lagged, a leader-failover
-/// reconnect gap, dispatch-vs-completion path-key mismatch — all
-/// documented loss modes). The DAG-level `Completed` is an execution
-/// claim about the batch, not about this root: with its outputs present
-/// the root must report `Substituted`/`timesBuilt = 0` (presence under a
-/// completed DAG), never inherit the DAG's executed `Built`/
-/// `timesBuilt = 1`. Replay tooling maps `Built` → executed, so the
-/// inherited claim would inflate execution metrics for builds that were
-/// substituted or cache-hit.
+/// Event-loss shape, confirmed-present cell: the scheduler completes the
+/// DAG but THIS root's terminal event never arrives (state-channel
+/// Lagged, a leader-failover reconnect gap, dispatch-vs-completion
+/// path-key mismatch — all documented loss modes). The DAG-level
+/// `Completed` is an execution claim about the batch, not about this
+/// root: with its outputs CONFIRMED present the root must report
+/// `Substituted`/`timesBuilt = 0` (presence under a completed DAG),
+/// never inherit the DAG's executed `Built`/`timesBuilt = 1`. Replay
+/// tooling maps `Built` → executed, so the inherited claim would inflate
+/// execution metrics for builds that were substituted or cache-hit.
+/// Positive presence is the LOAD-BEARING trigger: the sibling tests pin
+/// the missing cell (demotion naming the DAG-level basis) and the
+/// unverifiable cell (the evidence-loss row, never a presence claim).
 #[tokio::test]
 async fn test_build_paths_with_results_eventless_completed_reports_substituted()
 -> anyhow::Result<()> {
@@ -2891,6 +2894,137 @@ async fn test_build_paths_with_results_eventless_completed_reports_substituted()
         "presence-derived success still carries builtOutputs: {result:?}"
     );
     assert_eq!(result.built_outputs[0].out_path, HONEST_A_OUT);
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.build-results-honest+2]
+/// Event-loss shape, missing cell: a Completed DAG with this root's
+/// terminal lost AND the store positively reporting the wanted output
+/// absent. The demotion must name the DAG-level basis — "DAG completed
+/// but requested outputs are not in the store" — never "build
+/// completed": whether THIS root executed is unknown, and the old
+/// wording sent wrong-success triage after worker-upload failures that
+/// may never have happened.
+#[tokio::test]
+async fn test_build_paths_with_results_eventless_completed_missing_demotes_with_dag_basis()
+-> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 1,
+            cached_derivations: 0,
+        })),
+        ev(build_event::Event::Completed(types::BuildCompleted {
+            output_paths: vec![HONEST_B_OUT.into()],
+        })),
+    ]));
+
+    // .drv resolvable; its declared output is NOT in the store.
+    h.store
+        .seed_with_content(HONEST_B_DRV, HONEST_B_ATERM.as_bytes());
+
+    let path_b = format!("{HONEST_B_DRV}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: std::slice::from_ref(&path_b),
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1);
+
+    let (echoed, result) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(echoed, path_b);
+    assert_eq!(
+        result.status,
+        BuildStatus::MiscFailure,
+        "positively-missing outputs under a completed DAG demote: {result:?}"
+    );
+    assert!(
+        result
+            .error_msg
+            .starts_with("DAG completed but requested outputs are not in the store"),
+        "the demotion basis must be the DAG-level word (this root's execution is \
+         unknown), got: {:?}",
+        result.error_msg
+    );
+    assert!(
+        result.error_msg.contains(HONEST_B_OUT),
+        "the demotion must name the missing path, got: {:?}",
+        result.error_msg
+    );
+    assert!(result.built_outputs.is_empty(), "{result:?}");
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.build-results-honest+2]
+/// Event-loss shape, unverifiable cell: a Completed DAG with this root's
+/// terminal lost and a wanted output the store cannot be asked about
+/// (unparseable declared path — `TEST_DRV_ATERM`'s `/nix/store/zzz-output`).
+/// There is NO presence evidence, so the root must NOT be reported
+/// `Substituted` (a presence claim, and downstream a recorded
+/// substitution event that force-build replay policies make
+/// definitionally impossible). It reports the evidence-loss row instead:
+/// `TransientFailure` carrying `BuildResult::lost_terminal_unverified()`'s
+/// message byte-for-byte, which measurement consumers classify as
+/// infrastructure evidence loss and stock clients treat as a retryable
+/// failure.
+#[tokio::test]
+async fn test_build_paths_with_results_eventless_completed_unverifiable_reports_evidence_loss()
+-> anyhow::Result<()> {
+    use rio_nix::protocol::build::BuildResult as NixBuildResult;
+
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 1,
+            cached_derivations: 0,
+        })),
+        ev(build_event::Event::Completed(types::BuildCompleted {
+            output_paths: vec![],
+        })),
+    ]));
+
+    let drv_path = seed_minimal_drv(&h);
+
+    let derived_path = format!("{drv_path}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: std::slice::from_ref(&derived_path),
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1);
+
+    let (echoed, result) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(echoed, derived_path);
+    assert!(
+        !result.status.is_success(),
+        "no per-root terminal + no presence evidence must not read as success: {result:?}"
+    );
+    assert_eq!(
+        result.status,
+        BuildStatus::TransientFailure,
+        "the evidence-loss row is retryable, not a permanent verdict: {result:?}"
+    );
+    assert_eq!(
+        result.error_msg,
+        NixBuildResult::lost_terminal_unverified().error_msg,
+        "the wire carries the shared constructor's message byte-for-byte (the \
+         measurement consumer's detector matches its prefix)"
+    );
+    assert_eq!(result.times_built, 0, "{result:?}");
+    assert!(
+        result.built_outputs.is_empty(),
+        "no fabricated builtOutputs without presence evidence: {result:?}"
+    );
 
     h.finish().await;
     Ok(())

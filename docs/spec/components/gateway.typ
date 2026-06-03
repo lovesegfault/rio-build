@@ -706,12 +706,22 @@ evidence first: a target whose own recorded terminal is a failure keeps it —
 status and error message — no matter what the store holds, because presence
 proves only that the outputs exist (a concurrent batch, another tenant, or
 an earlier substitution may have landed them), not that this target's build
-succeeded. Only a target with no recorded terminal of its own —
-blanket-failed by the DAG-level fallback — is rescued, on positive store
-evidence for every requested output, and the rescue reports `Substituted`
-with `timesBuilt = 0` (outputs present without execution), never an
-executed `Built`. Outputs that cannot be mapped to a queryable store path
-leave the scheduler's outcome authoritative.
+succeeded. A target with no recorded terminal of its own — its event lost
+under a completed DAG, or blanket-failed by the DAG-level fallback — may
+report `Substituted` with `timesBuilt = 0` (outputs present without
+execution), never an executed `Built`, and only on POSITIVE store evidence
+for every requested output: one uniform presence floor for both DAG-level
+words. The DAG-level `Completed` alone is never success evidence for such a
+target — when the store can confirm nothing either way (an unverifiable
+output path), the lost-terminal target reports the evidence-loss failure
+(`TransientFailure`, the shared `lost_terminal_unverified` message that
+measurement consumers classify as evidence loss rather than a substitution
+event or genuine failure), and a wrong-success demotion's message derives
+its basis from the evidence ("build completed" only over an own executed
+terminal, "substituted" over an own `Cached` terminal, "DAG completed" when
+the target's own terminal was lost). For a target WITH its own success
+terminal, outputs that cannot be mapped to a queryable store path leave
+that terminal authoritative.
 
 `wopBuildDerivation` (the build-hook path) is a single-target reply, so the
 batch-aggregation hazards above do not apply, but the client-crash one does:

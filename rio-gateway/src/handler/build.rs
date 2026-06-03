@@ -1048,34 +1048,51 @@ enum RootEvidence {
 /// - An executed `Built` (`timesBuilt` ≥ 1) is reported only from the
 ///   root's OWN success terminal — the DAG-level Completed is an
 ///   execution claim about the batch, never about a root whose terminal
-///   was not captured. Such a root reports `Substituted` (presence
-///   under a completed DAG), so a lost `Cached`/`Completed` event can
-///   inflate nothing.
+///   was not captured.
 /// - A root's own recorded failure stands verbatim; store presence
 ///   proves the outputs exist somehow, never that THIS build succeeded.
 /// - Any success-shaped basis is demoted when the store is missing
-///   wanted outputs (wrong-success).
-/// - The presence rescue (blanket DAG failure refined to `Substituted`
-///   by positive store evidence) requires an ACKNOWLEDGED batch: for an
+///   wanted outputs (wrong-success), and the demotion's message derives
+///   from the evidence basis — "build completed" only over an own
+///   executed terminal, "substituted" over an own Cached terminal,
+///   "DAG completed" when this root's own terminal was lost — so the
+///   diagnosis never fabricates an execution (or substitution) claim
+///   the evidence does not back.
+/// - `Substituted` without an own terminal is a PRESENCE claim and
+///   requires the store's positive evidence (`confirmed_present`) —
+///   one uniform floor for every cell that mints the claim, whether
+///   the DAG-level word was success (terminal lost) or failure (the
+///   blanket rescue). `missing.is_empty()` is NOT presence evidence:
+///   it includes the unverifiable state, where the store said nothing.
+/// - A lost-terminal root under a completed DAG with NO presence
+///   evidence reports the honest evidence-loss failure
+///   ([`BuildResult::lost_terminal_unverified`]) — never a fabricated
+///   presence claim, and never the DAG's executed word. A re-attempt
+///   can succeed; measurement consumers classify the row as evidence
+///   loss, not as a substitution event or a genuine build failure.
+/// - The presence rescue requires an ACKNOWLEDGED batch: for an
 ///   unsubmitted stand-in the synthesized refusal/transport failure is
 ///   reported verbatim, whatever the store holds — rescuing would
 ///   convert the gateway's own refusal or a scheduler outage into a
-///   success observation.
+///   success observation. Unsubmitted verdicts are check-INVARIANT
+///   (identical under every store state), which is what licenses the
+///   caller to skip the store verification for unsubmitted batches.
 fn per_root_verdict(
     evidence: RootEvidence,
     check: &TargetOutputsCheck,
     drv_path: &str,
 ) -> RootVerdict {
-    let demoted = |missing: &[String]| {
+    let demoted = |basis: &str, missing: &[String]| {
         warn!(
             drv = %drv_path,
+            basis,
             missing = ?missing,
             "demoting successful wopBuildPathsWithResults entry: outputs not in store"
         );
         RootVerdict::Verbatim(BuildResult::failure(
             BuildStatus::MiscFailure,
             format!(
-                "build completed but requested outputs are not in the store: {}",
+                "{basis} but requested outputs are not in the store: {}",
                 missing.join("; ")
             ),
         ))
@@ -1094,7 +1111,17 @@ fn per_root_verdict(
                 // builtOutputs.
                 RootVerdict::Success(own)
             } else {
-                demoted(&check.missing)
+                // The wrong-success diagnosis names what the evidence
+                // actually claims: the relay records own success
+                // terminals as executed Built (Completed) or Substituted
+                // (Cached) only; the catch-all keeps the message total
+                // over defensive shapes without fabricating either claim.
+                let basis = match own.status {
+                    BuildStatus::Built => "build completed",
+                    BuildStatus::Substituted => "substituted",
+                    _ => "success reported",
+                };
+                demoted(basis, &check.missing)
             }
         }
         RootEvidence::DagFallback {
@@ -1123,13 +1150,30 @@ fn per_root_verdict(
                 // Completed DAG, no terminal for THIS root (event lost,
                 // Lagged window, leader-failover reconnect gap, path-key
                 // mismatch): the scheduler settled every node, but which
-                // terminal this root reached is unknown. Report presence
-                // honestly — Substituted, timesBuilt = 0 — never the
-                // DAG-level executed Built.
-                if check.missing.is_empty() {
+                // terminal this root reached is unknown — the DAG-level
+                // Completed is an execution claim about the batch, never
+                // about this root.
+                if check.confirmed_present {
+                    // Positive presence for every wanted output: report
+                    // presence honestly — Substituted, timesBuilt = 0 —
+                    // the same evidence floor as the blanket-failure
+                    // rescue below.
                     RootVerdict::Success(BuildResult::substituted())
+                } else if !check.missing.is_empty() {
+                    // The store positively reports wanted outputs absent
+                    // under a completed DAG — wrong-success shape; the
+                    // basis names the DAG-level word, since whether THIS
+                    // root executed is unknown.
+                    demoted("DAG completed", &check.missing)
                 } else {
-                    demoted(&check.missing)
+                    // No evidence in either direction (unverifiable
+                    // outputs, or nothing checkable): an honest
+                    // evidence-loss failure. Minting Substituted here
+                    // would be a presence claim with zero presence
+                    // evidence — and downstream a recorded substitution
+                    // event that force-build measurement policies make
+                    // definitionally impossible.
+                    RootVerdict::Verbatim(BuildResult::lost_terminal_unverified())
                 }
             } else if check.confirmed_present {
                 // Partial outcome: this root was blanket-failed by the
@@ -2371,9 +2415,16 @@ mod tests {
     use rio_nix::protocol::stderr::{STDERR_RESULT, STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY};
 
     // r[verify gw.opcode.build-results-honest+2]
-    /// Lattice totality for [`per_root_verdict`]: every (evidence ×
-    /// store-state) cell, with the honesty invariants asserted
-    /// machine-checked per cell instead of sampling scenarios.
+    /// Lattice VALUE audit for [`per_root_verdict`]: every (evidence ×
+    /// store-state) cell carries an expected OUTPUT — status,
+    /// `timesBuilt`, message shape — checked against the chokepoint's
+    /// stated honesty invariants, not merely populated. (The prior
+    /// totality form checked invariants an output could satisfy while
+    /// still being semantically wrong: the unverifiable lost-terminal
+    /// cell minted a presence claim with zero presence evidence and
+    /// every invariant held, because the invariant itself encoded the
+    /// flaw.) The cross-cell invariants below still run over all cells;
+    /// the per-cell table is what makes a wrong VALUE unrepresentable.
     ///
     /// Quantification domain: evidence enumerates every constructor shape
     /// of [`RootEvidence`] reachable from the handler — own terminals in
@@ -2390,25 +2441,37 @@ mod tests {
     /// [`TargetOutputsCheck`] verdict classes: confirmed-present,
     /// missing, unverifiable.
     ///
-    /// Invariants, checked at every cell:
+    /// Cross-cell invariants, checked at every cell on top of the table:
     ///  1. execution honesty — `timesBuilt ≥ 1` is reported only from the
     ///     root's own executed-success terminal;
     ///  2. success provenance — any success requires either an own
-    ///     success terminal or an acknowledged batch with presence/
-    ///     completed-DAG evidence;
+    ///     success terminal or an acknowledged batch with POSITIVE store
+    ///     presence (`confirmed_present`); a completed DAG alone is
+    ///     never success evidence for a root without its own terminal;
     ///  3. unsubmitted batches report their synthesized failure verbatim
     ///     (no store state upgrades them, success-shaped stand-ins are
-    ///     demoted);
+    ///     demoted) — and their verdicts are check-INVARIANT (identical
+    ///     under every store state), the standing license for the
+    ///     handler to skip the store verification on unsubmitted
+    ///     batches: a new unsubmitted arm that reads the check fails
+    ///     this audit before it can ship a dead (or abort-only) feed;
     ///  4. an own failure is verbatim under every store state;
     ///  5. wrong-success demotion — a success basis with missing outputs
-    ///     is demoted to a failure naming them;
-    ///  6. rescue shape — a rescued or evidence-less success is always
-    ///     `Substituted`/`timesBuilt = 0`, never an executed `Built`.
+    ///     is demoted to a failure naming them, with the message basis
+    ///     derived from the evidence ("build completed" only over an
+    ///     own executed terminal);
+    ///  6. claim-uniform evidence floor — every cell minting
+    ///     `Substituted` without an own terminal has
+    ///     `confirmed_present`, the SAME minimum evidence in both
+    ///     minting arms (lost-terminal and blanket rescue); and such a
+    ///     mint is always `Substituted`/`timesBuilt = 0`, never an
+    ///     executed `Built`.
     #[test]
     fn per_root_verdict_lattice_totality() {
         const CONFIRMED: usize = 0;
         const MISSING: usize = 1;
         const UNVERIFIABLE: usize = 2;
+        const STATE_NAMES: [&str; 3] = ["confirmed-present", "missing", "unverifiable"];
         let check = |state: usize| -> TargetOutputsCheck {
             match state {
                 CONFIRMED => TargetOutputsCheck {
@@ -2439,40 +2502,90 @@ mod tests {
             }
         };
 
+        /// Expected message of one cell's output, by provenance.
+        enum Msg {
+            /// Empty message (successes).
+            Empty,
+            /// Byte-for-byte the given text (verbatim relays and
+            /// synthesized stand-ins).
+            Exact(&'static str),
+            /// A wrong-success demotion: `"<basis> but requested outputs
+            /// are not in the store: …"` naming the missing output.
+            DemotedWithBasis(&'static str),
+            /// The evidence-loss row, byte-for-byte the shared
+            /// constructor's output.
+            LostTerminalUnverified,
+        }
+        /// Expected OUTPUT of one (evidence × store-state) cell.
+        struct Expected {
+            /// `RootVerdict::Success` (true) vs `Verbatim` (false).
+            enriched: bool,
+            status: BuildStatus,
+            times_built: u64,
+            msg: Msg,
+        }
+        fn exp(enriched: bool, status: BuildStatus, times_built: u64, msg: Msg) -> Expected {
+            Expected {
+                enriched,
+                status,
+                times_built,
+                msg,
+            }
+        }
+
         struct Cell {
             label: &'static str,
             own_success: bool,
             own_failure: Option<(BuildStatus, &'static str)>,
-            dag_success: bool,
             submitted: Option<bool>,
         }
-        let evidence_shapes: Vec<(Cell, fn() -> RootEvidence)> = vec![
+        type ExpectFn = fn(usize) -> Expected;
+        let evidence_shapes: Vec<(Cell, fn() -> RootEvidence, ExpectFn)> = vec![
             (
                 Cell {
                     label: "own Completed terminal",
                     own_success: true,
                     own_failure: None,
-                    dag_success: false,
                     submitted: None,
                 },
                 || RootEvidence::OwnTerminal(BuildResult::success()),
+                // Unverifiable defers to the own terminal; only positive
+                // missing evidence demotes, naming the executed basis.
+                |state| match state {
+                    MISSING => exp(
+                        false,
+                        BuildStatus::MiscFailure,
+                        0,
+                        Msg::DemotedWithBasis("build completed"),
+                    ),
+                    _ => exp(true, BuildStatus::Built, 1, Msg::Empty),
+                },
             ),
             (
                 Cell {
                     label: "own Cached terminal",
                     own_success: true,
                     own_failure: None,
-                    dag_success: false,
                     submitted: None,
                 },
                 || RootEvidence::OwnTerminal(BuildResult::substituted()),
+                // Same shape, but the demotion basis must say what the
+                // evidence says — substituted, not "build completed".
+                |state| match state {
+                    MISSING => exp(
+                        false,
+                        BuildStatus::MiscFailure,
+                        0,
+                        Msg::DemotedWithBasis("substituted"),
+                    ),
+                    _ => exp(true, BuildStatus::Substituted, 0, Msg::Empty),
+                },
             ),
             (
                 Cell {
                     label: "own Failed terminal",
                     own_success: false,
                     own_failure: Some((BuildStatus::PermanentFailure, "builder exit 1")),
-                    dag_success: false,
                     submitted: None,
                 },
                 || {
@@ -2481,18 +2594,46 @@ mod tests {
                         "builder exit 1",
                     ))
                 },
+                // Verbatim under EVERY store state.
+                |_| {
+                    exp(
+                        false,
+                        BuildStatus::PermanentFailure,
+                        0,
+                        Msg::Exact("builder exit 1"),
+                    )
+                },
             ),
             (
                 Cell {
                     label: "Completed DAG, terminal lost",
                     own_success: false,
                     own_failure: None,
-                    dag_success: true,
                     submitted: Some(true),
                 },
                 || RootEvidence::DagFallback {
                     dag: BuildResult::success(),
                     submitted: true,
+                },
+                // THE round-introduced cells: presence claim only on
+                // positive presence; positive absence demotes naming the
+                // DAG-level basis (this root's execution is unknown); no
+                // evidence either way is an honest evidence-loss row,
+                // never a fabricated substitution.
+                |state| match state {
+                    CONFIRMED => exp(true, BuildStatus::Substituted, 0, Msg::Empty),
+                    MISSING => exp(
+                        false,
+                        BuildStatus::MiscFailure,
+                        0,
+                        Msg::DemotedWithBasis("DAG completed"),
+                    ),
+                    _ => exp(
+                        false,
+                        BuildStatus::TransientFailure,
+                        0,
+                        Msg::LostTerminalUnverified,
+                    ),
                 },
             ),
             (
@@ -2500,7 +2641,6 @@ mod tests {
                     label: "blanket DAG failure",
                     own_success: false,
                     own_failure: None,
-                    dag_success: false,
                     submitted: Some(true),
                 },
                 || RootEvidence::DagFallback {
@@ -2510,13 +2650,23 @@ mod tests {
                     ),
                     submitted: true,
                 },
+                // Rescued ONLY by positive presence; otherwise the
+                // blanket failure stands verbatim.
+                |state| match state {
+                    CONFIRMED => exp(true, BuildStatus::Substituted, 0, Msg::Empty),
+                    _ => exp(
+                        false,
+                        BuildStatus::PermanentFailure,
+                        0,
+                        Msg::Exact("derivation '/nix/store/x.drv' failed: boom"),
+                    ),
+                },
             ),
             (
                 Cell {
                     label: "post-ack stream death (reconnect exhausted)",
                     own_success: false,
                     own_failure: None,
-                    dag_success: false,
                     submitted: Some(true),
                 },
                 || RootEvidence::DagFallback {
@@ -2526,13 +2676,21 @@ mod tests {
                     ),
                     submitted: true,
                 },
+                |state| match state {
+                    CONFIRMED => exp(true, BuildStatus::Substituted, 0, Msg::Empty),
+                    _ => exp(
+                        false,
+                        BuildStatus::TransientFailure,
+                        0,
+                        Msg::Exact("build stream error (reconnect exhausted): transport"),
+                    ),
+                },
             ),
             (
                 Cell {
                     label: "validation rejection (never submitted)",
                     own_success: false,
                     own_failure: None,
-                    dag_success: false,
                     submitted: Some(false),
                 },
                 || RootEvidence::DagFallback {
@@ -2542,13 +2700,22 @@ mod tests {
                     ),
                     submitted: false,
                 },
+                // Check-invariant: the same verbatim refusal under every
+                // store state (also asserted structurally below).
+                |_| {
+                    exp(
+                        false,
+                        BuildStatus::InputRejected,
+                        0,
+                        Msg::Exact("DAG validation failed: __noChroot"),
+                    )
+                },
             ),
             (
                 Cell {
                     label: "pre-ack submit error (never submitted)",
                     own_success: false,
                     own_failure: None,
-                    dag_success: false,
                     submitted: Some(false),
                 },
                 || RootEvidence::DagFallback {
@@ -2558,23 +2725,43 @@ mod tests {
                     ),
                     submitted: false,
                 },
+                |_| {
+                    exp(
+                        false,
+                        BuildStatus::TransientFailure,
+                        0,
+                        Msg::Exact("scheduler error: connect refused"),
+                    )
+                },
             ),
             (
                 Cell {
                     label: "success-shaped unsubmitted stand-in (defensive)",
                     own_success: false,
                     own_failure: None,
-                    dag_success: true,
                     submitted: Some(false),
                 },
                 || RootEvidence::DagFallback {
                     dag: BuildResult::success(),
                     submitted: false,
                 },
+                |_| {
+                    exp(
+                        false,
+                        BuildStatus::MiscFailure,
+                        0,
+                        Msg::Exact(
+                            "internal: success result for a batch the scheduler never accepted",
+                        ),
+                    )
+                },
             ),
         ];
 
-        for (cell, make) in &evidence_shapes {
+        for (cell, make, expect) in &evidence_shapes {
+            // Per-evidence verdict collection for the check-invariance
+            // audit (invariant 3's second half).
+            let mut outputs: Vec<(bool, BuildResult)> = Vec::new();
             for state in [CONFIRMED, MISSING, UNVERIFIABLE] {
                 let chk = check(state);
                 let verdict = per_root_verdict(make(), &chk, "/nix/store/under-test.drv");
@@ -2582,8 +2769,50 @@ mod tests {
                     RootVerdict::Success(r) => (r, true),
                     RootVerdict::Verbatim(r) => (r, false),
                 };
-                let ctx = format!("evidence: {}, store state: {state}", cell.label);
+                let ctx = format!(
+                    "evidence: {}, store state: {}",
+                    cell.label, STATE_NAMES[state]
+                );
 
+                // ── The value table: this cell's exact expected output. ──
+                let want = expect(state);
+                assert_eq!(enriched, want.enriched, "{ctx}: verdict arm: {result:?}");
+                assert_eq!(result.status, want.status, "{ctx}: status: {result:?}");
+                assert_eq!(
+                    result.times_built, want.times_built,
+                    "{ctx}: timesBuilt: {result:?}"
+                );
+                match want.msg {
+                    Msg::Empty => {
+                        assert!(result.error_msg.is_empty(), "{ctx}: {:?}", result.error_msg);
+                    }
+                    Msg::Exact(text) => assert_eq!(result.error_msg, text, "{ctx}"),
+                    Msg::DemotedWithBasis(basis) => {
+                        assert!(
+                            result
+                                .error_msg
+                                .starts_with(&format!("{basis} but requested outputs are ")),
+                            "{ctx}: demotion basis must match the evidence, got: {:?}",
+                            result.error_msg
+                        );
+                        assert!(
+                            result.error_msg.contains("not in the store")
+                                && result.error_msg.contains("output 'out'"),
+                            "{ctx}: demotion must name the missing output: {}",
+                            result.error_msg
+                        );
+                    }
+                    Msg::LostTerminalUnverified => {
+                        assert_eq!(
+                            result.error_msg,
+                            BuildResult::lost_terminal_unverified().error_msg,
+                            "{ctx}: the evidence-loss row is the shared constructor's, \
+                             byte-for-byte (measurement consumers match its prefix)"
+                        );
+                    }
+                }
+
+                // ── Cross-cell honesty invariants. ──
                 // 1. Execution honesty: timesBuilt ≥ 1 only from an own
                 //    executed-success terminal.
                 if result.times_built >= 1 {
@@ -2592,14 +2821,15 @@ mod tests {
                         "{ctx}: execution claim without an own executed terminal: {result:?}"
                     );
                 }
-                // 2. Success provenance.
+                // 2. Success provenance: own terminal, or acknowledged
+                //    batch with POSITIVE presence. A completed DAG alone
+                //    is never success evidence for a terminal-less root.
                 if result.status.is_success() {
                     let own_ok = cell.own_success && chk.missing.is_empty();
-                    let dag_ok = cell.submitted == Some(true)
-                        && ((cell.dag_success && chk.missing.is_empty()) || chk.confirmed_present);
+                    let dag_ok = cell.submitted == Some(true) && chk.confirmed_present;
                     assert!(
                         own_ok || dag_ok,
-                        "{ctx}: success without per-root or acknowledged-batch evidence: \
+                        "{ctx}: success without per-root or positive-presence evidence: \
                          {result:?}"
                     );
                     assert!(
@@ -2609,43 +2839,30 @@ mod tests {
                 } else {
                     assert!(!enriched, "{ctx}: failures are never enriched");
                 }
-                // 3. Unsubmitted stand-ins are verbatim failures.
+                // 3 (first half). Unsubmitted stand-ins are verbatim
+                //    failures under every store state.
                 if cell.submitted == Some(false) {
                     assert!(
                         !result.status.is_success(),
                         "{ctx}: a batch the scheduler never accepted reported success: \
                          {result:?}"
                     );
-                    if !cell.dag_success {
-                        let RootEvidence::DagFallback { dag, .. } = make() else {
-                            unreachable!()
-                        };
-                        assert_eq!(result.status, dag.status, "{ctx}: stand-in not verbatim");
-                        assert_eq!(
-                            result.error_msg, dag.error_msg,
-                            "{ctx}: stand-in message not verbatim"
-                        );
-                    }
                 }
                 // 4. Own failures stand verbatim under every store state.
                 if let Some((status, msg)) = cell.own_failure {
                     assert_eq!(result.status, status, "{ctx}: own failure overridden");
                     assert_eq!(result.error_msg, msg, "{ctx}: own failure message changed");
                 }
-                // 5. Wrong-success demotion names the missing outputs.
-                let success_basis =
-                    cell.own_success || (cell.submitted == Some(true) && cell.dag_success);
-                if success_basis && state == MISSING {
-                    assert_eq!(result.status, BuildStatus::MiscFailure, "{ctx}");
-                    assert!(
-                        result.error_msg.contains("not in the store")
-                            && result.error_msg.contains("output 'out'"),
-                        "{ctx}: demotion must name the missing output: {}",
-                        result.error_msg
-                    );
-                }
-                // 6. Evidence-less successes are presence claims.
+                // 6. Claim-uniform evidence floor: a Substituted mint
+                //    without an own terminal requires confirmed_present —
+                //    the same minimum evidence in BOTH minting arms — and
+                //    is always a presence shape, never an executed Built.
                 if result.status.is_success() && !cell.own_success {
+                    assert!(
+                        chk.confirmed_present,
+                        "{ctx}: presence claim minted without positive presence evidence: \
+                         {result:?}"
+                    );
                     assert_eq!(
                         result.status,
                         BuildStatus::Substituted,
@@ -2653,6 +2870,19 @@ mod tests {
                     );
                     assert_eq!(result.times_built, 0, "{ctx}");
                 }
+                outputs.push((enriched, result));
+            }
+            // 3 (second half). Check-invariance: an unsubmitted batch's
+            // verdict is identical under every store state — the standing
+            // audit that licenses the handler to skip the store
+            // verification (and its abort path) for unsubmitted batches.
+            if cell.submitted == Some(false) {
+                assert!(
+                    outputs.windows(2).all(|w| w[0] == w[1]),
+                    "evidence: {}: unsubmitted verdicts must not depend on store state \
+                     (what licenses the handler to skip the store check for them): {outputs:?}",
+                    cell.label
+                );
             }
         }
     }
