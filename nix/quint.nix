@@ -128,6 +128,14 @@ let
     "materializationCrashChargedOnce"
     "crossBuildWantedIsolation"
     "materializationPinHasJob"
+    # A2 kind-partition (bughunt wave): the Claimed-view/open-attempt
+    # lockstep with the kind conjunct (146; single owner A2 — A3
+    # preserves through the re-derivation, §4.F13), the kind-scoped
+    # recovery holder (266), and the kinded release edge (318).
+    # Calibration pairs: quint-materialization-calib-{146,266,318}-*.
+    "claimedImpliesOpenAttempt"
+    "claimedByOnlyMatHolders"
+    "readyImpliesDepsProducedOnRequeue"
   ];
 
   # The leader-election model as its own single-file store path (the
@@ -2700,6 +2708,7 @@ in
         "degradedPolarity"
         "gateFailClosed"
         "freedSlotsSpendable"
+        "establishedOnlyPastRenderedDeadline"
       ];
     };
 
@@ -2721,6 +2730,7 @@ in
         "degradedPolarity"
         "gateFailClosed"
         "freedSlotsSpendable"
+        "establishedOnlyPastRenderedDeadline"
       ];
     };
 
@@ -2743,6 +2753,7 @@ in
         "degradedPolarity"
         "gateFailClosed"
         "freedSlotsSpendable"
+        "establishedOnlyPastRenderedDeadline"
       ];
     };
 
@@ -2765,6 +2776,7 @@ in
         "degradedPolarity"
         "gateFailClosed"
         "freedSlotsSpendable"
+        "establishedOnlyPastRenderedDeadline"
       ];
     };
 
@@ -2786,6 +2798,7 @@ in
         "degradedPolarity"
         "gateFailClosed"
         "freedSlotsSpendable"
+        "establishedOnlyPastRenderedDeadline"
       ];
     };
 
@@ -2805,6 +2818,7 @@ in
         "degradedPolarity"
         "gateFailClosed"
         "freedSlotsSpendable"
+        "establishedOnlyPastRenderedDeadline"
       ];
     };
 
@@ -3463,6 +3477,11 @@ in
         "clearedPoisonClearsDurably"
         "clearedPoisonScrubsExclusions"
         "recoveryPreservesPoisonStatus"
+        # A2 (bug_279): the uncharged worker-abort run never exceeds
+        # the kernel bound (admit_worker_abort's gate; witness
+        # quint-retry-policy-pull-witness-free-close-bound keeps the
+        # contended edge reachable).
+        "boundedFreeRequeues"
       ];
     };
 
@@ -3510,6 +3529,16 @@ in
       main = "retryPolicyPull";
       step = "pullStep";
       witness = "noAtCapTermination";
+    };
+    # A2 (bug_279): the free-close run actually reaches the kernel
+    # bound — boundedFreeRequeues' contended edge is reachable (three
+    # consecutive uncharged worker aborts).
+    quint-retry-policy-pull-witness-free-close-bound = mkQuintWitnessCheck {
+      name = "retry-policy-pull-witness-free-close-bound";
+      spec = "retryPolicy";
+      main = "retryPolicyPull";
+      step = "pullStep";
+      witness = "canReachFreeCloseBound";
     };
 
     # ------------------------------------------------------------------
@@ -3662,7 +3691,7 @@ in
     #
     # Paired falsifiability pins (the constructor's vacuity rule —
     # every invariant in the list has at least one pin or witness
-    # below): quint-materialization-calib-* (19 expect-violation pins)
+    # below): quint-materialization-calib-* (22 expect-violation pins)
     # + the marked-claim / post-failover-claim witnesses (the B1/B3
     # liveness flips).
     # r[verify sched.materialize.job+2]
@@ -4091,6 +4120,37 @@ in
       step = "calibStep";
       witness = "chargeFreeCancellation";
     };
+    # A2 kind-partition calibrations (bughunt wave). 146: the kind-blind
+    # controller-verdict close leaves a Claimed view with no attempt
+    # (the 307 wedge mirror's controller half).
+    quint-materialization-calib-146-cross-kind-close = mkQuintWitnessCheck {
+      name = "materialization-calib-146-cross-kind-close";
+      spec = "calibration/mat-146-controller-cross-kind-close";
+      main = "matCalib146ControllerCrossKindClose";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "claimedImpliesOpenAttempt";
+    };
+    # 266: the kind-blind recovery claimed_by join projects a BUILD
+    # attempt's builder as a pending job's holder.
+    quint-materialization-calib-266-kindblind-holder = mkQuintWitnessCheck {
+      name = "materialization-calib-266-kindblind-holder";
+      spec = "calibration/mat-266-kindblind-recovery-holder";
+      main = "matCalib266KindblindRecoveryHolder";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "claimedByOnlyMatHolders";
+    };
+    # 318: the forced-Ready release upgrades a Queued-origin
+    # (dep-racing) claim.
+    quint-materialization-calib-318-requeue-forces-ready = mkQuintWitnessCheck {
+      name = "materialization-calib-318-requeue-forces-ready";
+      spec = "calibration/mat-318-requeue-forces-ready";
+      main = "matCalib318RequeueForcesReady";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "readyImpliesDepsProducedOnRequeue";
+    };
 
     # ------------------------------------------------------------------
     # A1 fenced-write-discipline — the fence over interleaved
@@ -4169,6 +4229,7 @@ in
         "degradedPolarity"
         "gateFailClosed"
         "freedSlotsSpendable"
+        "establishedOnlyPastRenderedDeadline"
         "matJobFilteredFromIntents"
       ];
     };
@@ -4180,6 +4241,37 @@ in
       spec = "spawnCoherence";
       main = "spawnCoherenceMatJobs";
       witness = "canReachMatJobFiltered";
+    };
+
+    # Bughunt-wave A2 regime (bug_106): the rendered-deadline carry —
+    # execGetsWork carries the spawn-rendered deadline into the binding
+    # and the establishment sweep anchors to it (never a shrunk
+    # mint-time re-solve). Axis-gated per §4.F16: every other regime
+    # binds ENABLE_RENDERED_DEADLINE = false and is state-space
+    # identical.
+    quint-spawn-coherence-rendered-deadline = mkQuintCheck {
+      name = "spawn-coherence-rendered-deadline";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceRenderedDeadline";
+      invariants = [
+        "ceilingRespected"
+        "reapSafety"
+        "orphanRemoved"
+        "ackSoundness"
+        "ackCoversPending"
+        "degradedPolarity"
+        "gateFailClosed"
+        "freedSlotsSpendable"
+        "establishedOnlyPastRenderedDeadline"
+      ];
+    };
+    # The establishment actually fires under the rendered-deadline
+    # regime — establishedOnlyPastRenderedDeadline's non-vacuity.
+    quint-spawn-coherence-witness-established = mkQuintWitnessCheck {
+      name = "spawn-coherence-witness-established";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceRenderedDeadline";
+      witness = "canReachEstablished";
     };
 
     # ------------------------------------------------------------------

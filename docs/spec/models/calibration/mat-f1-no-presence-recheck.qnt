@@ -99,6 +99,8 @@ module matCalibF1NoPresenceRecheck {
     fsReportSoundAll' = fsReportSoundAll, covAtResolveAll' = covAtResolveAll,
     covLiveOnlyAll' = covLiveOnlyAll,
     chargedAfterCancel' = chargedAfterCancel,
+    claimOrigin' = claimOrigin,
+    requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
   }
 
   /// Witness: a covered-creation job exists (every job under this

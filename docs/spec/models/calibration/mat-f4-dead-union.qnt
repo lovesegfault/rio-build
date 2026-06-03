@@ -85,6 +85,8 @@ module matCalibF4DeadUnion {
     fsReportSoundAll' = fsReportSoundAll,
     creationResolvableAll' = creationResolvableAll,
     chargedAfterCancel' = chargedAfterCancel,
+    claimOrigin' = claimOrigin,
+    requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
   }
 
   action calibStep = {

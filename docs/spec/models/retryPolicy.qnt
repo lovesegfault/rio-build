@@ -705,7 +705,21 @@ module retryPolicy {
   /// invariants to the post-failover state.
   var justFailedOver: bool
 
+  /// Bughunt wave A2 (bug_279): the TRAILING run of build-lane
+  /// worker-abort free-close rows — admit_worker_abort's counted
+  /// prefix (rio-retry-kernel/src/lib.rs: Attempt + Disconnected +
+  /// Worker, build lane only). Every other build-lane row append
+  /// resets it (the kernel's run break); materialization actions skip
+  /// it (matLeavesBuildUntouched — the lane discipline). The uncharged
+  /// worker-abort close (pullWorkerAbort) is admitted only strictly
+  /// below the bound, so the run never exceeds it.
+  var freeCloseRun: int
+
   // --- 5. derived state ---------------------------------------------------
+
+  /// Mirror of rio-retry-kernel's WORKER_ABORT_FREE_CLOSES (lib.rs);
+  /// keep in lockstep with the kernel constant.
+  pure val WORKER_ABORT_FREE_CLOSES: int = 3
 
   /// The eligible fleet as the fleet-exhaust check sees it: registered,
   /// non-draining slots (static eligibility -- kind/system/features --
@@ -1013,6 +1027,19 @@ module retryPolicy {
   val noCacheHitClear = not(last.kind == OCacheHit)
   /// Violated when the dependent is cascaded.
   val noCascade = not(depStatus == DepFailed)
+
+  /// Bughunt wave A2 (bug_279): the trailing run of uncharged
+  /// worker-abort closes never exceeds the kernel bound — a worker
+  /// looping pull -> Cancelled cannot mint unlimited uncharged
+  /// requeues; the bound-th consecutive abort can only take the
+  /// charged fall-through (the existing report classes). Maintained by
+  /// pullWorkerAbort's admission guard, exactly as admit_worker_abort
+  /// gates the production intake.
+  val boundedFreeRequeues = freeCloseRun <= WORKER_ABORT_FREE_CLOSES
+  /// Violated when the free-close run actually reaches the bound (the
+  /// admission gate's contended edge is reachable — non-vacuity for
+  /// boundedFreeRequeues).
+  val canReachFreeCloseBound = not(freeCloseRun == WORKER_ABORT_FREE_CLOSES)
   /// Violated when a leader failover happens with a non-empty,
   /// under-budget recovered history (the failover-budget contention is
   /// reachable).
@@ -1058,6 +1085,7 @@ module retryPolicy {
   /// timer side effect of the clock; attempts are resolved by a
   /// classifying report or by establishment, never silently dropped.)
   action tick = all {
+    freeCloseRun' = freeCloseRun,
     now < MAX_TIME,
     now' = now + 1,
     execs' = execs,
@@ -1079,6 +1107,7 @@ module retryPolicy {
   /// the same time the worker got its TimedOut report out) -- the
   /// dual-observation shape sched.retry.no-double-count is about.
   action buildEndsReported(w: str, class: ReportClass, dual: bool): bool = all {
+    freeCloseRun' = 0,
     ENABLE_WORKER,
     attempt == Running(w),
     dual implies (class == RcTimeout and ENABLE_PODDEATH),
@@ -1102,6 +1131,7 @@ module retryPolicy {
   /// death is a non-resource crash the controller has nothing useful to
   /// say about (the C2 shape -- its charge arrives at establishment).
   action buildEndsPodDeath(w: str, kind: DeathKind): bool = all {
+    freeCloseRun' = 0,
     attempt == Running(w),
     match kind {
       | DkOom => ENABLE_PODDEATH
@@ -1193,6 +1223,7 @@ module retryPolicy {
   /// entry is still pending, the establishment (the TTL sweep) becomes
   /// its classifier and charge vehicle.
   action ctrlReportLost(w: str): bool = all {
+    freeCloseRun' = freeCloseRun,
     execs.get(w).ctrl != NoCtrl,
     execs' = execs.put(w, { ...execs.get(w), ctrl: NoCtrl }),
     now' = now, dStatus' = dStatus, live' = live, poisonSrc' = poisonSrc,
@@ -1220,6 +1251,7 @@ module retryPolicy {
   // Mirrors: completion.rs append_and_decide_in_tx error arm +
   //          requeue_failure_completion.
   action attemptTxFails(w: str): bool = all {
+    freeCloseRun' = freeCloseRun,
     txFaultsLeft > 0,
     match attempt { | Reported(r) => r.exec == w | _ => false },
     dStatus == DRunning,
@@ -1245,6 +1277,7 @@ module retryPolicy {
   // Mirrors: dag/mod.rs (the resubmit-reset arm, reset_row_for) +
   //          merge.rs + derivation.rs::is_retriable_on_resubmit.
   action resubmitReset = all {
+    freeCloseRun' = 0,
     ENABLE_RESETS,
     or {
       dStatus == DCancelled,
@@ -1278,6 +1311,7 @@ module retryPolicy {
   // Mirrors: merge.rs::apply_cached_hits / dispatch.rs spawn_substitute
   //          reprobe lane (the Poisoned arm).
   action cacheHitClear = all {
+    freeCloseRun' = 0,
     ENABLE_RESETS,
     dStatus == DPoisoned,
     val applied = specApply(spec, FCacheHitClear(now), eligibleFleet)
@@ -1308,6 +1342,7 @@ module retryPolicy {
   // Mirrors: housekeeping.rs::tick_process_expired_poisons +
   //          db::clear_poison (the full reset).
   action poisonTtlExpires = all {
+    freeCloseRun' = freeCloseRun,
     ENABLE_RESETS,
     dStatus == DPoisoned,
     poisonTtlElapsed,
@@ -1352,6 +1387,7 @@ module retryPolicy {
     lastPoisonReason' = RThreshold,
     justFailedOver' = false,
     everFailedBuilders' = Set(),
+    freeCloseRun' = 0,
     // The materialization attempt class (substitution-replacement Phase A).
     matInfraCount' = 0,
     matSchedulerInfraCount' = 0,
@@ -1534,6 +1570,7 @@ module retryPolicy {
   //          transaction; the AD2 spawn-gate exclusion stands in for
   //          hard_filter.
   action pullOpensAttempt(n: str): bool = all {
+    freeCloseRun' = freeCloseRun,
     dStatus == DReady,
     backoffElapsed,
     physAttempts < MAX_ATTEMPTS,
@@ -1574,6 +1611,7 @@ module retryPolicy {
   //          completion.rs handle_* per class through
   //          append_and_decide_in_tx (charging semantics unchanged).
   action pullReportOutcome(n: str, class: ReportClass, dual: bool, promoted: bool, atCap: bool): bool = all {
+    freeCloseRun' = 0,
     attempt == Reported({ exec: n, class: class, dual: dual }),
     // the floor oracle, exactly as for the stream-path intake
     promoted implies (class == RcInfraOom and promotionsLeft > 0),
@@ -1722,6 +1760,7 @@ module retryPolicy {
   //          unification, WHERE termination_reason IS NULL) for
   //          OOMKilled / EvictedDiskPressure.
   action pullAttemptOutcomeOom(n: str, promoted: bool, atCap: bool): bool = all {
+    freeCloseRun' = 0,
     match attempt { | PodDead(p) => p.exec == n and p.kind == DkOom | _ => false },
     execs.get(n).ctrl == CtrlOom,
     promoted implies promotionsLeft > 0,
@@ -1789,6 +1828,7 @@ module retryPolicy {
   // Mirrors: admin ReportAttemptOutcome -> the scheduler fill for
   //          DeadlineExceeded.
   action pullAttemptOutcomeDeadline(n: str): bool = all {
+    freeCloseRun' = 0,
     match attempt { | PodDead(p) => p.exec == n and p.kind == DkDeadline | _ => false },
     execs.get(n).ctrl == CtrlDeadline,
     val e = execs.get(n)
@@ -1846,6 +1886,7 @@ module retryPolicy {
   // Mirrors: the ReportAttemptOutcome no-attempt / already-filled arms
   //          (sched.attempt.no-attempt-no-op).
   action pullAttemptOutcomeNoOp(n: str): bool = all {
+    freeCloseRun' = freeCloseRun,
     execs.get(n).ctrl != NoCtrl,
     // the pending report's own attempt is no longer open: anything but a
     // PodDead attempt on this source means the row it targets is closed
@@ -1862,6 +1903,36 @@ module retryPolicy {
     justFailedOver' = false, everFailedBuilders' = everFailedBuilders,
   }
 
+  /// Bughunt wave A2 (bug_279): the worker-supplied Cancelled report
+  /// (the AD5 unsolicited abort) admitted UNCHARGED by the kernel —
+  /// the attempt closes charge-free (a build-lane Disconnected/Worker
+  /// row that no budget fold counts) and the derivation requeues.
+  /// Admission is the kernel's trailing-run gate: strictly below
+  /// WORKER_ABORT_FREE_CLOSES; at the bound this action's guard closes
+  /// and the worker's next abort can only take the charged report
+  /// classes (the fall-through).
+  // Mirrors: rio-retry-kernel admit_worker_abort (lib.rs) consumed by
+  //          the report intake's witness-first AD5 arm
+  //          (r[impl sched.attempt.worker-abort-bounded] sites).
+  action pullWorkerAbort(n: str): bool = all {
+    attempt == Running(n),
+    dStatus == DRunning,
+    freeCloseRun < WORKER_ABORT_FREE_CLOSES,
+    attempt' = NoAttempt,
+    dStatus' = DReady,
+    execs' = execs.put(n, { ...execs.get(n), runningOurs: false }),
+    freeCloseRun' = freeCloseRun + 1,
+    // charge-free: no fold event, no counter movement, no backoff.
+    spec' = spec, specVerdict' = specVerdict, live' = live,
+    pg' = pg, last' = noObs,
+    now' = now, poisonSrc' = poisonSrc,
+    depStatus' = depStatus, everFailureTerminal' = everFailureTerminal,
+    promotionsLeft' = promotionsLeft, physAttempts' = physAttempts,
+    failoversLeft' = failoversLeft, txFaultsLeft' = txFaultsLeft,
+    lastPoisonReason' = lastPoisonReason, justFailedOver' = false,
+    everFailedBuilders' = everFailedBuilders,
+  }
+
   /// The establishment sweep: an open attempt whose deadline +
   /// report-slack elapsed with no terminal row is established as
   /// executor_crash/unreported and charged (failed_builders[source] +
@@ -1875,6 +1946,7 @@ module retryPolicy {
   //          pull-mode attempts (sched.attempt.establishment-window's
   //          charge half; the window timing itself is not modeled).
   action pullEstablish(n: str): bool = all {
+    freeCloseRun' = 0,
     match attempt {
       | NoAttempt => false
       | Running(w) => w == n
@@ -1947,6 +2019,7 @@ module retryPolicy {
   //          ReportAttemptOutcome(NoEligibleSource)) -> actor/pull.rs
   //          fleet-exhaust mapping (still-Ready only).
   action spawnGateExhaust = all {
+    freeCloseRun' = freeCloseRun,
     dStatus == DReady,
     backoffElapsed,
     attempt == NoAttempt,
@@ -1974,6 +2047,7 @@ module retryPolicy {
   /// hosting our open attempt leaves here — the node dying under a
   /// running build is the pod-death event, already modeled.
   action sourceLeavesPool(n: str): bool = all {
+    freeCloseRun' = freeCloseRun,
     execs.get(n).registered,
     not(execs.get(n).runningOurs),
     execs' = execs.put(n, { ...execs.get(n), registered: false }),
@@ -2003,6 +2077,7 @@ module retryPolicy {
   //          untouched and the establishment sweep is their only
   //          time-based repair (sched.attempt.establishment-window+3).
   action pullLeaderFailover = all {
+    freeCloseRun' = freeCloseRun,
     failoversLeft > 0,
     val gone = dStatus == DAbsent or dStatus == DCompleted
     val expiredInDowntime = and {
@@ -2080,6 +2155,7 @@ module retryPolicy {
   }
   action pullAttemptOutcomeDeadlineAny = { nondet n = EXECUTORS.oneOf() pullAttemptOutcomeDeadline(n) }
   action pullAttemptOutcomeNoOpAny = { nondet n = EXECUTORS.oneOf() pullAttemptOutcomeNoOp(n) }
+  action pullWorkerAbortAny = { nondet n = EXECUTORS.oneOf() pullWorkerAbort(n) }
   action pullEstablishAny = { nondet n = EXECUTORS.oneOf() pullEstablish(n) }
   action sourceLeavesPoolAny = { nondet n = EXECUTORS.oneOf() sourceLeavesPool(n) }
 
@@ -2273,6 +2349,7 @@ module retryPolicy {
   /// recovery-invariant scoping and the per-event ghosts must read
   /// exactly as if it had not happened.
   action matLeavesBuildUntouched = all {
+    freeCloseRun' = freeCloseRun,
     now' = now,
     dStatus' = dStatus,
     live' = live,
@@ -2374,6 +2451,7 @@ module retryPolicy {
     all { pullAttemptOutcomeOomAny, buildLeavesMatUntouched },
     all { pullAttemptOutcomeDeadlineAny, buildLeavesMatUntouched },
     all { pullAttemptOutcomeNoOpAny, buildLeavesMatUntouched },
+    all { pullWorkerAbortAny, buildLeavesMatUntouched },
     all { ctrlReportLostAny, buildLeavesMatUntouched },
     all { pullEstablishAny, buildLeavesMatUntouched },
     all { sourceLeavesPoolAny, buildLeavesMatUntouched },

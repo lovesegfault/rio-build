@@ -449,6 +449,20 @@ module materializationJob {
   /// with wanted rows at creation commit (delta 2b — the B4 backfill).
   var creationResolvableAll: bool
 
+  /// GHOST (bughunt wave, A2/318): the node status AT CLAIM TIME — the
+  /// model image of `reset_after_attempt`'s deps_completed input (a
+  /// Queued-origin claim is the dep-racing window; a release must not
+  /// upgrade it). Written only by claimJob; read only by the release
+  /// latch below.
+  var claimOrigin: str -> NodeStatus
+  /// GHOST LATCH (bughunt wave, A2/318): every release edge that set
+  /// the node Ready did so on a Ready-origin claim (deps were produced
+  /// at claim time). Constant-true under the as-built edges — every
+  /// main-model release restores NQueued (the conservative arm of
+  /// validate_transition_for_release); the mat-318 calibration's
+  /// forced-Ready requeue reaches the violation.
+  var requeueReadyJustifiedAll: bool
+
   // --- 5. derived state -------------------------------------------------------
 
   /// In-memory interest (the DAG's interested_builds x liveness):
@@ -617,6 +631,48 @@ module materializationJob {
   /// (merged_bug_276). The mat-276-dag-absent-cancel override (the
   /// pre-fix split cancel) is its falsifiability pair.
   val chargeFreeCancellation = not(chargedAfterCancel)
+
+  /// A2 kind-partition (bughunt wave, merged_bug_146 / the 307 wedge
+  /// mirror): a Claimed job view always has the open MATERIALIZATION
+  /// attempt that drives it, held by the claimed holder. projView is
+  /// deliberately kind-blind (the production join was); this invariant
+  /// adds the kind conjunct the AttemptRef witness enforces at intake —
+  /// a kind-blind controller-verdict close (closing the mat attempt
+  /// while the view stays Claimed) breaks it. Falsifiability pair:
+  /// mat-146-controller-cross-kind-close. SINGLE OWNER: A2 lands this
+  /// definition; A3 preserves it through the contract re-derivation and
+  /// extends only its calibration set (§4.F13).
+  val claimedImpliesOpenAttempt = DRVS.forall(d =>
+    match view.get(d) {
+      | VClaimed(h) => match attempts.get(d) {
+          | OpenAttempt(a) => a.kind == KMaterialization and a.instance == h
+          | NoAttempt => false
+        }
+      | _ => true
+    }
+  )
+
+  /// A2 kind-partition (bughunt wave, bug_266): every Claimed-view
+  /// holder is a store replica — the recovery view rebuild derives
+  /// holders only from materialization-kind attempts (the kind-scoped
+  /// claimed_by join). The kind-blind rebuild could attach a BUILD
+  /// assignment's builder as the holder of a pending job's view.
+  /// Falsifiability pair: mat-266-kindblind-recovery-holder.
+  val claimedByOnlyMatHolders = DRVS.forall(d =>
+    match view.get(d) {
+      | VClaimed(h) => REPLICAS.contains(h)
+      | _ => true
+    }
+  )
+
+  /// A2 kinded release (bughunt wave, merged_bug_318): no release edge
+  /// upgrades a Queued-origin (dep-racing) claim to Ready — the
+  /// validate_transition_for_release / reset_after_attempt(kind,
+  /// deps_completed) contract. Latch-backed: the as-built edges all
+  /// restore NQueued; the forced-Ready requeue (the pre-fix
+  /// Assigned->Ready release) is the calibration arm. Falsifiability
+  /// pair: mat-318-requeue-forces-ready.
+  val readyImpliesDepsProducedOnRequeue = requeueReadyJustifiedAll
 
   /// §3.6: the attempt kind matches the worker class.
   val kindMatchesWorker = DRVS.forall(d =>
@@ -868,6 +924,8 @@ module materializationJob {
     covLiveOnlyAll' = covLiveOnlyAll,
     creationResolvableAll' = creationResolvableAll,
     chargedAfterCancel' = chargedAfterCancel,
+    claimOrigin' = claimOrigin,
+    requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
   }
   /// Job-core vars unchanged.
   action jobCoreUnchanged = all {
@@ -980,6 +1038,8 @@ module materializationJob {
     fsReportSoundAll' = fsReportSoundAll, covAtResolveAll' = covAtResolveAll,
     covLiveOnlyAll' = covLiveOnlyAll,
     chargedAfterCancel' = chargedAfterCancel,
+    claimOrigin' = claimOrigin,
+    requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
   }
 
   /// Delta 5: the dispatch-probe dedup re-encounters an existing
@@ -1065,6 +1125,10 @@ module materializationJob {
       nodeStatus' = nodeStatus.put(d, NRunning),
       execsMinted' = newExec,
       claimAfterFailover' = or { claimAfterFailover, failedOver },
+      // A2/318 ghost: record the claim-origin status (the
+      // deps_completed input of the release contract) BEFORE the
+      // NRunning overwrite above.
+      claimOrigin' = claimOrigin.put(d, nodeStatus.get(d)),
     },
     dupJob' = dupJob, topdownPruned' = topdownPruned,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
@@ -1072,7 +1136,13 @@ module materializationJob {
     staleJobWriteApplied' = staleJobWriteApplied,
     channelStale' = channelStale, failedOver' = failedOver,
     failoverDroppedJobs' = failoverDroppedJobs,
-    ghostsUnchanged,
+    failFastCount' = failFastCount,
+    ffJustifiedAll' = ffJustifiedAll, fsJustifiedAll' = fsJustifiedAll,
+    fsReportSoundAll' = fsReportSoundAll, covAtResolveAll' = covAtResolveAll,
+    covLiveOnlyAll' = covLiveOnlyAll,
+    creationResolvableAll' = creationResolvableAll,
+    chargedAfterCancel' = chargedAfterCancel,
+    requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
   }
 
   /// §2.2 item 3 / §5: the claiming replica ingests one
@@ -1132,6 +1202,8 @@ module materializationJob {
     fsReportSoundAll' = fsReportSoundAll,
     creationResolvableAll' = creationResolvableAll,
     chargedAfterCancel' = chargedAfterCancel,
+    claimOrigin' = claimOrigin,
+    requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
   }
 
   /// §2.4: the executor's Unobtainable report + the four-arm
@@ -1245,6 +1317,8 @@ module materializationJob {
     tenureUnchanged,
     creationResolvableAll' = creationResolvableAll,
     chargedAfterCancel' = chargedAfterCancel,
+    claimOrigin' = claimOrigin,
+    requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
   }
 
   /// §2.5: the executor's InfraFailure report — the charge rides the
@@ -1342,6 +1416,11 @@ module materializationJob {
         | OpenAttempt(a) => a.kind == KMaterialization and not(hasUnresolvedJob(d))
       },
     },
+    claimOrigin' = claimOrigin,
+    // A2/318: establishment releases restore NQueued (the line above
+    // sets nodeStatus NQueued) — the latch formula is preserved-true
+    // structurally, not merely framed.
+    requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
   }
 
   /// §2.4 / BC-2: zero live in-memory interest cancels the job and
@@ -1459,6 +1538,8 @@ module materializationJob {
     covLiveOnlyAll' = covLiveOnlyAll,
     creationResolvableAll' = creationResolvableAll,
     chargedAfterCancel' = chargedAfterCancel,
+    claimOrigin' = claimOrigin,
+    requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
   }
 
   /// Delta 3 arm 2: the durable backoff lapses — the job un-parks for
@@ -1721,6 +1802,8 @@ module materializationJob {
     covAtResolveAll' = true,
     covLiveOnlyAll' = true,
     creationResolvableAll' = true,
+    claimOrigin' = DRVS.mapBy(d => NQueued),
+    requeueReadyJustifiedAll' = true,
   }
 
   // --- 10. step --------------------------------------------------------------------

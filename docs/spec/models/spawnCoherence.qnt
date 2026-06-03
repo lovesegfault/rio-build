@@ -173,6 +173,7 @@ module spawnCoherence {
     | EAcked
     | EExcessSuppressed
     | EMatJobFiltered
+    | EEstablished
 
   /// Violation latches. Each invariant below is `not(contains(...))`;
   /// in a correct model every latch stays unset forever, so these add
@@ -187,6 +188,7 @@ module spawnCoherence {
     | VGate
     | VFreedSlotUnused
     | VMatJobServed
+    | VEstablishedEarly
 
   // ------------------------------------------------------------------
   // 2. Constants (regime modules instantiate these)
@@ -219,6 +221,14 @@ module spawnCoherence {
   /// job — builds with no substitutable nodes (PD-D8: the six
   /// job-free regimes keep verifying that subspace).
   const ENABLE_MAT_JOBS: bool
+  /// Bughunt wave A2 axis (bug_106; §4.F16 — axis-gated default-false,
+  /// existing regimes state-space-identical): the spawn-rendered
+  /// deadline is CARRIED into the executor binding (the
+  /// jobs.rs annotation -> pods.rs winner tuple -> BoundIntent ->
+  /// AuthBinding chain) and the establishment window anchors to it —
+  /// never to a shrunk mint-time re-solve. C2's four axes follow this
+  /// same gating (announced in the wave log).
+  const ENABLE_RENDERED_DEADLINE: bool
 
   pure val INTENTS: Set[IntentId] = Set("i1", "i2")
 
@@ -281,6 +291,12 @@ module spawnCoherence {
   /// job (driven by the matJobOpens/matJobResolves environment;
   /// constant-false unless ENABLE_MAT_JOBS).
   var matJob: IntentId -> bool
+  /// A2/106: the rendered (spawn-time) deadline rode the binding into
+  /// the mint — set at execGetsWork when the axis is on; the
+  /// establishment window below anchors to it (AgePastOrphan = the far
+  /// rendered threshold; the pre-fix shrunk re-solve would have fired
+  /// at AgePastPending).
+  var renderedFarDl: IntentId -> bool
 
   // ------------------------------------------------------------------
   // 5. Invariants
@@ -316,6 +332,12 @@ module spawnCoherence {
   /// PD-7: the job filter actually filters (a queued, job-carrying
   /// intent existed at a successful fresh poll).
   val canReachMatJobFiltered = not(effects.contains(EMatJobFiltered))
+  /// A2/106: no establishment ever fired before the RENDERED (carried)
+  /// deadline passed (the latch stays unset).
+  val establishedOnlyPastRenderedDeadline = not(violations.contains(VEstablishedEarly))
+  /// Violated when an establishment actually happens (the rendered-
+  /// deadline regime's contended edge is reachable — non-vacuity).
+  val canReachEstablished = not(effects.contains(EEstablished))
 
   // ------------------------------------------------------------------
   // 6. The tick (one action; helper pure defs first)
@@ -580,6 +602,7 @@ module spawnCoherence {
       leaderOld' = leaderOld,
       gate' = gate,
       matJob' = matJob,
+      renderedFarDl' = renderedFarDl,
     }
   }
 
@@ -594,6 +617,7 @@ module spawnCoherence {
     violations' = violations,
     prevQueuedSnap' = prevQueuedSnap,
     matJob' = matJob,
+    renderedFarDl' = renderedFarDl,
   }
 
   /// A drv becomes Ready: the intent (re-)appears in the queue.
@@ -710,9 +734,16 @@ module spawnCoherence {
   action execGetsWork(i: IntentId): bool = all {
     execr.get(i) == ExecIdle,
     execr' = execr.set(i, ExecBusy),
+    // A2/106: the rendered deadline rides the binding into the mint
+    // (identity off-axis: the map stays all-false).
+    renderedFarDl' = if (ENABLE_RENDERED_DEADLINE)
+      renderedFarDl.set(i, true)
+    else renderedFarDl,
     queued' = queued, intentFp' = intentFp, job' = job,
     leaderOld' = leaderOld, gate' = gate,
-    bookkeepingUnchanged,
+    dispatched' = dispatched, effects' = effects,
+    violations' = violations, prevQueuedSnap' = prevQueuedSnap,
+    matJob' = matJob,
   }
 
   /// The build finishes but the pod lingers (idle past its self-exit).
@@ -753,6 +784,9 @@ module spawnCoherence {
     queued' = queued, intentFp' = intentFp, job' = job, gate' = gate,
     effects' = effects, violations' = violations, prevQueuedSnap' = prevQueuedSnap,
     matJob' = matJob,
+    // A2/106: the carried deadline is durable (AuthBinding) — restart
+    // does not lose it.
+    renderedFarDl' = renderedFarDl,
   }
 
   /// A dispatched_cells entry is consumed scheduler-side (heartbeat
@@ -764,6 +798,7 @@ module spawnCoherence {
     leaderOld' = leaderOld, gate' = gate,
     effects' = effects, violations' = violations, prevQueuedSnap' = prevQueuedSnap,
     matJob' = matJob,
+    renderedFarDl' = renderedFarDl,
   }
 
   /// The L10 producer publishes a placeable set (assume-guarantee: any
@@ -788,6 +823,7 @@ module spawnCoherence {
     leaderOld' = leaderOld, gate' = gate,
     dispatched' = dispatched, effects' = effects, violations' = violations,
     prevQueuedSnap' = prevQueuedSnap,
+    renderedFarDl' = renderedFarDl,
   }
 
   /// PD-7: the job resolves (success / from-source / cancelled) — the
@@ -800,6 +836,7 @@ module spawnCoherence {
     leaderOld' = leaderOld, gate' = gate,
     dispatched' = dispatched, effects' = effects, violations' = violations,
     prevQueuedSnap' = prevQueuedSnap,
+    renderedFarDl' = renderedFarDl,
   }
 
   /// The producer loses its lease (or restarts): the gate is unarmed
@@ -812,6 +849,33 @@ module spawnCoherence {
     queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
     leaderOld' = leaderOld,
     bookkeepingUnchanged,
+  }
+
+  /// Bughunt wave A2 (bug_106): the establishment sweep closes a
+  /// vanished executor's outstanding work — and its window anchors to
+  /// the RENDERED deadline the binding carried (renderedFarDl; the far
+  /// threshold = AgePastOrphan), never to a shrunk mint-time re-solve
+  /// (which would have fired at AgePastPending). The VEstablishedEarly
+  /// latch records an establishment that beat the rendered deadline;
+  /// with the carry in place the guard makes it unreachable.
+  action establishExpired(i: IntentId): bool = all {
+    ENABLE_RENDERED_DEADLINE,
+    execr.get(i) == ExecAbsent,
+    censusActive(job.get(i)),
+    // the fixed window: the carried (far) rendered deadline has passed.
+    renderedFarDl.get(i) implies job.get(i).age == AgePastOrphan,
+    // fire only past SOME deadline at all (the near threshold is the
+    // earliest any establishment can believe itself due).
+    job.get(i).age != AgeFresh,
+    effects' = effects.union(Set(EEstablished)),
+    violations' = if (renderedFarDl.get(i) and job.get(i).age != AgePastOrphan)
+      violations.union(Set(VEstablishedEarly))
+    else violations,
+    queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
+    leaderOld' = leaderOld, gate' = gate,
+    dispatched' = dispatched, prevQueuedSnap' = prevQueuedSnap,
+    matJob' = matJob,
+    renderedFarDl' = renderedFarDl,
   }
 
   // ------------------------------------------------------------------
@@ -829,6 +893,7 @@ module spawnCoherence {
     effects' = Set(),
     violations' = Set(),
     matJob' = INTENTS.mapBy(i => false),
+    renderedFarDl' = INTENTS.mapBy(i => false),
   }
 
   action step = {
@@ -856,6 +921,7 @@ module spawnCoherence {
       gateUnarms,
       matJobOpens(i),
       matJobResolves(i),
+      establishExpired(i),
     }
   }
 }
@@ -875,7 +941,8 @@ module spawnCoherenceBase {
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = false,
-    ENABLE_MAT_JOBS = false
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false
   ).*
 }
 
@@ -889,7 +956,8 @@ module spawnCoherenceFaultRpc {
     ENABLE_RPC_FAULT = true,
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = false,
-    ENABLE_MAT_JOBS = false
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false
   ).*
 }
 
@@ -904,7 +972,8 @@ module spawnCoherenceFaultLease {
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = true,
     ENABLE_STALE_POLL = false,
-    ENABLE_MAT_JOBS = false
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false
   ).*
 }
 
@@ -919,7 +988,8 @@ module spawnCoherenceFaultStale {
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = true,
-    ENABLE_MAT_JOBS = false
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false
   ).*
 }
 
@@ -934,7 +1004,8 @@ module spawnCoherenceCrdAbsent {
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = false,
-    ENABLE_MAT_JOBS = false
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false
   ).*
 }
 
@@ -948,7 +1019,8 @@ module spawnCoherenceFetcher {
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = false,
-    ENABLE_MAT_JOBS = false
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false
   ).*
 }
 
@@ -966,6 +1038,27 @@ module spawnCoherenceMatJobs {
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = false,
-    ENABLE_MAT_JOBS = true
+    ENABLE_MAT_JOBS = true,
+    ENABLE_RENDERED_DEADLINE = false
+  ).*
+}
+
+/// Bughunt-wave A2 regime (bug_106): the rendered-deadline carry under
+/// the healthy Builder configuration — execGetsWork carries the
+/// spawn-rendered deadline into the binding and the establishment
+/// sweep anchors to it. establishedOnlyPastRenderedDeadline is the
+/// headline; canReachEstablished keeps it non-vacuous. C2's four axes
+/// extend this module family per §4.F16 (axis vars announced in the
+/// wave log).
+module spawnCoherenceRenderedDeadline {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = true
   ).*
 }

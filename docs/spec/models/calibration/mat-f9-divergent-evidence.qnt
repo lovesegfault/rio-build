@@ -103,6 +103,8 @@ module matCalibF9DivergentEvidence {
     failFastCount' = failFastCount, ffJustifiedAll' = ffJustifiedAll,
     creationResolvableAll' = creationResolvableAll,
     chargedAfterCancel' = chargedAfterCancel,
+    claimOrigin' = claimOrigin,
+    requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
   }
 
   action calibStep = {
