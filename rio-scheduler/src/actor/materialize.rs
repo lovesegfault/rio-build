@@ -1132,11 +1132,21 @@ impl DagActor {
                     detail = %a.detail,
                     "materialization walk aborted by the worker; closing charge-free"
                 );
-                self.close_materialization_attempt(exec_id, &drv_hash, None, serving_generation)
+                // view-settlement gate (sched.materialize.view-settlement):
+                // the rearm + requeue companions run only when the
+                // charge-free close SETTLED — a deposed believer's fenced
+                // Aborted close mutates nothing it no longer owns, and a
+                // failed close leaves the establishment sweep as the
+                // armed action (the same composition as every other
+                // consumption arm).
+                let close_d = self
+                    .close_materialization_attempt(exec_id, &drv_hash, None, serving_generation)
                     .await;
-                self.rearm_materialization_job(&drv_hash, &executor).await;
-                self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
-                    .await;
+                if close_d.settled() {
+                    self.rearm_materialization_job(&drv_hash, &executor).await;
+                    self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
+                        .await;
+                }
                 Ok(())
             }
             None => {

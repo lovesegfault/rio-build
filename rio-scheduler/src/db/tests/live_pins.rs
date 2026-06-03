@@ -275,13 +275,19 @@ async fn pin_kinds_are_disjoint_rows() -> anyhow::Result<()> {
 
     // Independent release: the job resolves with no live interest, the
     // §5.3 release deletes ONLY the materialization row.
-    db.resolve_materialization_job_fenced(
-        job_id,
-        Some(Uuid::now_v7()),
-        JobState::ResolvedSuccess,
-        1,
-    )
-    .await?;
+    let resolved = db
+        .resolve_materialization_job_fenced(
+            job_id,
+            Some(Uuid::now_v7()),
+            JobState::ResolvedSuccess,
+            1,
+        )
+        .await?;
+    assert_eq!(
+        resolved,
+        crate::db::FencedOutcome::Applied(1),
+        "the live leader's resolve applies (must_use discipline)"
+    );
     let released = db.release_materialization_pins_for_resolved_jobs().await?;
     assert_eq!(released, 1, "only the materialization pin is released");
     assert_eq!(
