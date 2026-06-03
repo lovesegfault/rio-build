@@ -232,6 +232,62 @@
       "doc": ""
     },
     {
+      "enum": "KeyFmtError",
+      "name": "Base64",
+      "crate": "rio-common",
+      "msg": "key payload is not valid base64: {0}",
+      "doc": "The part after `:` is not valid standard-alphabet base64."
+    },
+    {
+      "enum": "KeyFmtError",
+      "name": "EmptyName",
+      "crate": "rio-common",
+      "msg": "key name must not be empty",
+      "doc": "Empty key name."
+    },
+    {
+      "enum": "KeyFmtError",
+      "name": "InvalidCurvePoint",
+      "crate": "rio-common",
+      "msg": "public key bytes are not a valid ed25519 curve point",
+      "doc": "Public-entry payload is 32 bytes but not a valid ed25519 point."
+    },
+    {
+      "enum": "KeyFmtError",
+      "name": "KeyLength",
+      "crate": "rio-common",
+      "msg": "secret key must be {SEED_LEN} or {EXPANDED_LEN} bytes, got {0}",
+      "doc": "Decoded payload is neither 32 (seed) nor 64 (expanded) bytes."
+    },
+    {
+      "enum": "KeyFmtError",
+      "name": "MissingSeparator",
+      "crate": "rio-common",
+      "msg": "missing ':' separator (expected name:base64)",
+      "doc": "Entry has no `:` separator."
+    },
+    {
+      "enum": "KeyFmtError",
+      "name": "NameContainsColon",
+      "crate": "rio-common",
+      "msg": "key name must not contain ':' (it separates name from key material)",
+      "doc": "Key name contains `:` (would corrupt the `name:base64` framing)."
+    },
+    {
+      "enum": "KeyFmtError",
+      "name": "PubKeyLength",
+      "crate": "rio-common",
+      "msg": "public key must be {SEED_LEN} bytes, got {0}",
+      "doc": "Public-entry payload decoded but is not 32 bytes."
+    },
+    {
+      "enum": "KeyFmtError",
+      "name": "StaleTail",
+      "crate": "rio-common",
+      "msg": "expanded secret entry is internally inconsistent: trailing {SEED_LEN} bytes do not equal the seed-derived public key (refusing to derive from a corrupt entry)",
+      "doc": "Expanded entry whose trailing 32 bytes are NOT the seed-derived public key. The entry is internally inconsistent (corrupt or hand-assembled); refusing beats publishing a verification key that matches no signature."
+    },
+    {
       "enum": "NameError",
       "name": "Empty",
       "crate": "rio-common",
@@ -1437,6 +1493,13 @@
     },
     {
       "enum": "SignerError",
+      "name": "InconsistentEntry",
+      "crate": "rio-store",
+      "msg": "secret key entry is internally inconsistent (expanded tail does not match the seed-derived public key); refusing to load a corrupt signing key",
+      "doc": "64-byte entry whose trailing 32 bytes are not the seed-derived public key (corrupt or hand-assembled file). Refused at load: signing with the seed while the redundant pub half disagrees would produce signatures the published key never verifies."
+    },
+    {
+      "enum": "SignerError",
       "name": "Io",
       "crate": "rio-store",
       "msg": "key file I/O: {0}",
@@ -1550,6 +1613,11 @@
       "name": "UploadError",
       "crate": "rio-builder",
       "doc": "Errors from upload operations. NAR serialization happens inside the retry loop (each retry is a fresh disk read), so NAR errors surface as `UploadExhausted` wrapping a `tonic::Status::internal(\"NAR serialization failed...\")`."
+    },
+    {
+      "name": "KeyFmtError",
+      "crate": "rio-common",
+      "doc": "Errors from parsing/encoding signing-key entries. Deliberately carries NO key material (no payload bytes, no decoded windows) — these errors land in bootstrap Job logs."
     },
     {
       "name": "NameError",

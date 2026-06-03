@@ -407,6 +407,11 @@
       "doc": "Graceful shutdown signal handling."
     },
     {
+      "path": "signing_keyfmt.rs",
+      "depth": 0,
+      "doc": "Signing-key entry codec — the single owner of the `name:base64`"
+    },
+    {
       "path": "task.rs",
       "depth": 0,
       "doc": "Task spawning utilities with panic logging."

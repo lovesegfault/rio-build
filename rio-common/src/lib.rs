@@ -17,6 +17,8 @@ pub mod observability;
 pub mod s3;
 pub mod server;
 pub mod signal;
+#[cfg(feature = "signing-keyfmt")]
+pub mod signing_keyfmt;
 pub mod task;
 pub mod tenant;
 #[cfg(test)]

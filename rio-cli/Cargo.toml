@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 rio-auth = { workspace = true }
-rio-common = { workspace = true }
+rio-common = { workspace = true, features = ["signing-keyfmt"] }
 rio-proto = { workspace = true }
 # CRD types only (Pool, ComponentScaler) — NOT rio-controller.
 # rio-crds was extracted specifically so rio-cli can import CRD

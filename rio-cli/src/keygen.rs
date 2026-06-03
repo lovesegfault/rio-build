@@ -24,10 +24,9 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
-use base64::Engine as _;
 use clap::Args;
-use ed25519_dalek::SigningKey;
 use rand::Rng as _;
+use rio_common::signing_keyfmt::SecretEntry;
 
 #[derive(Args, Clone)]
 pub(crate) struct KeygenArgs {
@@ -65,7 +64,7 @@ pub(crate) fn run(args: KeygenArgs) -> anyhow::Result<()> {
     let mut seed = [0u8; 32];
     rand::rng().fill_bytes(&mut seed);
 
-    let (secret_entry, public_entry) = encode_keypair(&args.name, &seed);
+    let (secret_entry, public_entry) = encode_keypair(&args.name, &seed)?;
 
     // Secret first, with create_new: the "already exists" refusal is
     // atomic (no stat-then-write TOCTOU) and happens before anything
@@ -84,28 +83,14 @@ pub(crate) fn run(args: KeygenArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Derive the keypair from `seed` and render both file bodies.
-/// Pure — keeps the format encoding separate from the I/O and the
-/// entropy read.
-fn encode_keypair(name: &str, seed: &[u8; 32]) -> (String, String) {
-    let key = SigningKey::from_bytes(seed);
-    let pubkey = key.verifying_key().to_bytes();
-
-    // Nix's secret-key file stores the 64-byte expanded form:
-    // seed || pubkey. `Signer::parse` only needs the first 32 bytes
-    // but accepts (and `nix store sign` expects) the full 64.
-    let mut expanded = [0u8; 64];
-    expanded[..32].copy_from_slice(seed);
-    expanded[32..].copy_from_slice(&pubkey);
-
-    // STANDARD (not URL_SAFE), with padding: Nix's nix-base64.cc uses
-    // the RFC 4648 standard alphabet. See the matching decode comment
-    // in rio-store/src/signing.rs::Signer::parse.
-    let b64 = base64::engine::general_purpose::STANDARD;
-    (
-        format!("{name}:{}", b64.encode(expanded)),
-        format!("{name}:{}", b64.encode(pubkey)),
-    )
+/// Derive the keypair from `seed` and render both file bodies via the
+/// shared codec (`rio_common::signing_keyfmt` — the single owner of
+/// the name:base64 byte contract; canonical encodings, no trailing
+/// newline). Pure — keeps the format encoding separate from the I/O
+/// and the entropy read.
+fn encode_keypair(name: &str, seed: &[u8; 32]) -> anyhow::Result<(String, String)> {
+    let entry = SecretEntry::from_seed(name, seed)?;
+    Ok((entry.encode(), entry.derive_pub().encode()))
 }
 
 /// Create `path` with mode 0600 and write `contents`. Fails if the
@@ -133,7 +118,7 @@ fn write_secret(path: &Path, contents: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use base64::Engine as _;
-    use ed25519_dalek::{Signer as _, Verifier as _, VerifyingKey};
+    use ed25519_dalek::{Signer as _, SigningKey, Verifier as _, VerifyingKey};
 
     use super::*;
 

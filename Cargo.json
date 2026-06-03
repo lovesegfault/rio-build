@@ -19362,6 +19362,10 @@
           "packageId": "config"
         },
         {
+          "name": "ed25519-dalek",
+          "packageId": "ed25519-dalek"
+        },
+        {
           "name": "futures-util",
           "packageId": "futures-util"
         },
@@ -19465,7 +19469,8 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "aws"
+        "aws",
+        "signing-keyfmt"
       ],
       "libCrateTypes": [
         "lib"

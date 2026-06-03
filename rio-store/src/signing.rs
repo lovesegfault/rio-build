@@ -23,6 +23,19 @@
 //! seed (the actual secret) + 32 bytes of public key. Nix stores both
 //! together; we only need the seed for signing, but we accept the full
 //! 64-byte format for compatibility.
+//!
+//! Parsing delegates to `rio_common::signing_keyfmt` — the single
+//! owner of the entry byte contract, shared with the producer
+//! (`rio-cli keygen`) and the bootstrap re-derive path so the accepted
+//! population cannot drift between crates (round-16 bug_023: the
+//! bootstrap shell guessed this population and published a 32-byte
+//! seed verbatim as the "public" half). One DELIBERATE tightening
+//! rides the delegation: a 64-byte entry whose trailing 32 bytes do
+//! not equal the seed-derived public key is now refused at load
+//! ([`SignerError::InconsistentEntry`]) instead of silently signing
+//! with the seed — an internally inconsistent key file means the
+//! published pub may match no signature, and failing at startup beats
+//! discovering that one narinfo at a time.
 
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
@@ -160,6 +173,16 @@ pub enum SignerError {
     #[error("secret key must be 32 or 64 bytes, got {0}")]
     KeyLength(usize),
 
+    /// 64-byte entry whose trailing 32 bytes are not the seed-derived
+    /// public key (corrupt or hand-assembled file). Refused at load:
+    /// signing with the seed while the redundant pub half disagrees
+    /// would produce signatures the published key never verifies.
+    #[error(
+        "secret key entry is internally inconsistent (expanded tail does not match the \
+         seed-derived public key); refusing to load a corrupt signing key"
+    )]
+    InconsistentEntry,
+
     /// DB lookup of a tenant's signing key failed. Stringified
     /// `MetadataError` — `metadata` is `pub(crate)`, so we can't put
     /// the typed error on a `pub` signature. The distinction between
@@ -191,39 +214,27 @@ impl Signer {
 
     /// Parse a key string (`name:base64`). Extracted from `load` so
     /// tests can construct a Signer without touching the filesystem.
+    ///
+    /// Delegates to the shared codec
+    /// (`rio_common::signing_keyfmt::SecretEntry::parse`) so the
+    /// accepted population (32-byte seed-only / 64-byte expanded with
+    /// a CONSISTENT tail) is compile-shared with the producer and the
+    /// bootstrap derive path. See the module doc for the deliberate
+    /// stale-tail tightening.
     pub fn parse(content: &str) -> Result<Self, SignerError> {
-        // split_once: exactly one ':'. A key name CAN contain dashes
-        // and dots (e.g., `cache.example.org-1`) but not colons — the
-        // colon is THE separator.
-        let (name, b64) = content
-            .split_once(':')
-            .ok_or_else(|| SignerError::Format(content.matches(':').count() + 1))?;
-
-        if name.is_empty() {
-            return Err(SignerError::EmptyName);
-        }
-
-        // STANDARD (not URL_SAFE): Nix's nix-base64.cc uses the RFC
-        // 4648 standard alphabet with '+' and '/', not '-' and '_'.
-        // Getting this wrong means every real key file fails to load
-        // with "invalid byte" on the first '+' or '/'.
-        let key_bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
-
-        // Nix stores seed + pubkey (64 bytes). We only need the seed.
-        // Accept both formats: 64 bytes (take first 32) or 32 bytes
-        // (use as-is). ed25519-dalek derives the pubkey from the seed
-        // anyway, so the stored pubkey is redundant for us.
-        let seed: [u8; 32] = match key_bytes.len() {
-            64 => key_bytes[..32]
-                .try_into()
-                .expect("slice of len-64 at [..32] is 32 bytes"),
-            32 => key_bytes.as_slice().try_into().expect("checked len == 32"),
-            other => return Err(SignerError::KeyLength(other)),
-        };
-
+        use rio_common::signing_keyfmt::{KeyFmtError, SecretEntry};
+        let entry = SecretEntry::parse(content).map_err(|e| match e {
+            KeyFmtError::MissingSeparator => SignerError::Format(content.matches(':').count() + 1),
+            KeyFmtError::EmptyName | KeyFmtError::NameContainsColon => SignerError::EmptyName,
+            KeyFmtError::Base64(b) => SignerError::Base64(b),
+            KeyFmtError::KeyLength(n) | KeyFmtError::PubKeyLength(n) => SignerError::KeyLength(n),
+            KeyFmtError::StaleTail | KeyFmtError::InvalidCurvePoint => {
+                SignerError::InconsistentEntry
+            }
+        })?;
         Ok(Self {
-            key_name: name.to_string(),
-            key: SigningKey::from_bytes(&seed),
+            key_name: entry.name().to_string(),
+            key: SigningKey::from_bytes(entry.seed()),
         })
     }
 
@@ -525,31 +536,47 @@ mod tests {
 
     #[test]
     fn parse_64_byte_nix_format() {
-        // Nix's format: seed (32) + pubkey (32) = 64 bytes.
-        // We should take the first 32 (seed) and ignore the pubkey.
+        // Nix's format: seed (32) + pubkey (32) = 64 bytes, with the
+        // tail equal to the seed-derived public key (the only form any
+        // honest producer emits — `rio-cli keygen`, `nix-store
+        // --generate-binary-cache-key`).
         let seed = [0x11u8; 32];
-        // The pubkey bytes can be anything — we derive our own.
-        let fake_pubkey = [0xFFu8; 32];
+        let pubkey = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
         let mut combined = Vec::from(seed);
-        combined.extend_from_slice(&fake_pubkey);
+        combined.extend_from_slice(&pubkey);
 
         let b64 = base64::engine::general_purpose::STANDARD.encode(&combined);
         let signer = Signer::parse(&format!("my-key:{b64}")).unwrap();
         assert_eq!(signer.key_name(), "my-key");
 
-        // Verify the seed was extracted correctly by signing something
-        // and checking it verifies against the CORRECT derived pubkey
-        // (not the fake one we stored).
-        let expected_pubkey = SigningKey::from_bytes(&seed).verifying_key();
         let sig_str = signer.sign("test");
         let (_, sig_b64) = sig_str.split_once(':').unwrap();
         let sig_bytes = base64::engine::general_purpose::STANDARD
             .decode(sig_b64)
             .unwrap();
         let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().unwrap();
-        expected_pubkey
+        SigningKey::from_bytes(&seed)
+            .verifying_key()
             .verify(b"test", &Signature::from_bytes(&sig_arr))
-            .expect("should verify against pubkey derived from seed, not stored fake");
+            .expect("signature verifies against the seed-derived public key");
+    }
+
+    /// RESTAGED (round-16 bug_023 stale-tail arm): the previous form of
+    /// `parse_64_byte_nix_format` pinned the LAX behavior — a 64-byte
+    /// entry with an arbitrary fake tail parsed fine and signed with
+    /// the seed, which is exactly the internally-inconsistent state
+    /// whose tail the bootstrap re-derive used to publish. That entry
+    /// is now a typed load-time refusal.
+    #[test]
+    fn parse_rejects_inconsistent_expanded_tail() {
+        let seed = [0x11u8; 32];
+        let mut combined = Vec::from(seed);
+        combined.extend_from_slice(&[0xFFu8; 32]); // NOT derive(seed)
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&combined);
+        let Err(err) = Signer::parse(&format!("my-key:{b64}")) else {
+            panic!("inconsistent expanded tail must be refused");
+        };
+        assert!(matches!(err, SignerError::InconsistentEntry), "got {err:?}");
     }
 
     #[test]

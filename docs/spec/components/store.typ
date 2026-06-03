@@ -743,6 +743,27 @@ unique chunks.
   - Multi-tenant: each tenant can have their own signing key for their paths
 ]
 
+#r("store.signing.entry-codec")[
+  The signing-key secret-entry byte contract (`name:base64`; 32-byte
+  seed-only or 64-byte expanded `seed ++ pubkey` payload; RFC 4648
+  standard alphabet; canonical encodings carry no trailing newline)
+  MUST be owned by a single codec (`rio_common::signing_keyfmt`).
+  Every secret-to-public derivation MUST go through the codec's
+  seed-derived mapping --- no consumer may slice payload byte windows
+  --- and an expanded entry whose trailing 32 bytes do not equal the
+  seed-derived public key MUST be refused, never published or loaded.
+]
+
+The bootstrap Job's shell previously re-implemented the derivation as
+`base64 -d | tail -c 32 | base64 -w0`: for a 32-byte seed-only entry
+(accepted by the store's own `Signer::parse`) that published the
+private seed verbatim onto the lower-privileged `rio/signing-key-pub`
+secret and into the Job log (round-16 bug_023, critical). The codec is
+the population chokepoint: producer (`rio-cli keygen`), consumer
+(`Signer::parse` delegation), and the bootstrap re-derive
+(`rio-cli keygen derive-pub`) compile against one format enum, so the
+populations cannot drift again.
+
 #r("store.signing.empty-refs-warn")[
   When signing a non-CA path with zero references, the store MUST emit a
   warning. Non-leaf derivations with empty references indicate the executor's

@@ -6142,6 +6142,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "config",
+ "ed25519-dalek",
  "futures-util",
  "libc",
  "metrics-exporter-prometheus",
