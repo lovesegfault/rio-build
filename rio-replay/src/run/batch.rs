@@ -28,7 +28,14 @@ pub struct PendingJob {
 /// the same expression.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BatchRoot {
-    /// Store path of the root derivation.
+    /// Store path of the root derivation. Same ARCHIVE provenance as
+    /// `outputs` (a recorded request target or a workload unit's drv
+    /// path), but unlike `outputs` it is not clamped by
+    /// [`derived_path`](Self::derived_path): a corrupt path formats
+    /// verbatim into the demand string and the gateway's
+    /// `DerivedPath::parse` rejects THAT root (`InputRejected`) —
+    /// per-root containment, never an engine-side guess at what the
+    /// recording meant.
     pub drv: String,
     /// Recorded output names; `[]` and `["*"]` both mean every output.
     /// ARCHIVE-controlled (recorded request input, possibly foreign or
@@ -365,6 +372,19 @@ mod tests {
         let formatted = root(at_cap_refs).derived_path();
         assert_eq!(formatted, naive(at_cap_refs));
         assert_eq!(parsed_spec(&formatted), names(at_cap_refs));
+
+        // ── Dedupe runs BEFORE the cap: a raw list far over the cap that
+        // collapses to a tiny distinct set formats EXACTLY (300 raw / 2
+        // distinct here), while the 257-DISTINCT sibling above clamps —
+        // the cap charges distinct names, never raw length, so a
+        // recording that sloppily repeats an honest selection is not
+        // widened to `!*` by its repetition.
+        let raw300: Vec<&str> = (0..300)
+            .map(|i| if i % 2 == 0 { "out" } else { "dev" })
+            .collect();
+        let formatted = root(&raw300).derived_path();
+        assert_eq!(formatted, format!("{drv}!out,dev"));
+        assert_eq!(parsed_spec(&formatted), names(&["out", "dev"]));
     }
 
     /// Standing enumeration of [`Batch`] est_nodes producers: every `.rs`
@@ -401,6 +421,13 @@ mod tests {
     /// (incl. the under-/over-keyed chokepoint fixtures and the
     /// recorded-output-selection wire-conformance rows), submit.rs
     /// chokepoint records, mod.rs stage harnesses.
+    ///
+    /// Outside the audited set, named so the census stays honest about
+    /// its universe: the supply prefetch arm's `prefetch_build`
+    /// (`run/supply/exec.rs`) formats a constant `{drv}!*` demand per
+    /// root without constructing a `Batch`, so the needle structurally
+    /// cannot see it — by design, since the prefetch arm asks the target
+    /// to substitute everything and carries no recorded selection.
     #[test]
     fn batch_construction_sites_are_enumerated() {
         // Built at runtime so this test's own strings cannot match it.
