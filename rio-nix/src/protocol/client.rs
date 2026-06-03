@@ -275,9 +275,16 @@ pub const STDERR_BUDGET_ROOT_MULTIPLIER_CAP: usize = 256;
 /// clamped to `1..=`[`STDERR_BUDGET_ROOT_MULTIPLIER_CAP`].
 ///
 /// This bounds MESSAGE COUNT only — wall-clock liveness remains the
-/// caller's per-op deadline (a count cap cannot protect against a silently
-/// stalled peer), and the drain never buffers the messages it counts, so
-/// the budget does not change memory bounds for any consumer.
+/// caller's per-op deadline (a count cap cannot protect against a
+/// silently stalled peer). The no-buffering claim is scoped to the DRAIN
+/// itself: it never buffers the messages it counts, so the budget changes
+/// no memory bound inside this module — but an observer fed by
+/// [`drain_stderr_with_observer`] sees up to the full budget of lines,
+/// and what it RETAINS per line is that consumer's own bound to declare
+/// and enforce, not a property this budget grants. (The replay engine's
+/// build observer, the one production observer today, caps its retained
+/// captures — evidence-tail line count, capture-map cardinality and value
+/// bytes — at its own parse boundary for exactly this reason.)
 ///
 /// Root count is the workload's ARITY, not its size: build-op log volume
 /// scales with the merged-closure node count (one frame per build-log line
