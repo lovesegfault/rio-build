@@ -1284,12 +1284,14 @@ fn per_root_verdict(
                 //   event-loss shape as the completed-DAG cell above.
                 //   Marking a merge-seeded root that happens to be
                 //   present is the conservative polarity: the marker
-                //   only flips that drv's row to evidence-loss
-                //   exclusion, never minting a success or a violation
-                //   (rio-nix's consumer-enforced trust bound), while
-                //   leaving it unmarked records a substitution event
-                //   that force-build measurement tenants make
-                //   definitionally impossible.
+                //   only flips that drv's row onto the evidence-loss
+                //   leg — a bounded, gate-visible cost (auto-retry
+                //   burn, then infra-indeterminate, a regression-gate
+                //   trip; rio-nix's consumer-enforced trust bound
+                //   prices it), never minting a success or a
+                //   violation — while leaving it unmarked records a
+                //   substitution event that force-build measurement
+                //   tenants make definitionally impossible.
                 // - Synthesized (`synthesized`): the failure word is
                 //   this gateway's own reconnect-exhausted stand-in —
                 //   the gateway KNOWS the evidence channel died and

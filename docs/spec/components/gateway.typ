@@ -771,9 +771,11 @@ disambiguated — a terminal-less root may also be a merge-seeded
 `DependencyFailed` node, which the scheduler resolves without emitting any
 event — but marking is the conservative polarity there: the consumer-side
 trust bound (rio-nix's relay-marker doc) caps a marker's effect at flipping
-that drv's same-batch `Substituted` row to evidence-loss exclusion, never
-minting a success or a violation, and the evidence-loss route's re-attempt
-produces fresh evidence either way. The unverifiable sibling cell of the
+that drv's same-batch `Substituted` row onto the evidence-loss leg — a
+bounded, gate-visible cost (it burns the drv's shared auto-retry budget and
+at exhaustion mints `infra-indeterminate`, a regression-gate trip; timed
+campaigns terminalize immediately), never minting a success or a violation —
+and the evidence-loss route's re-attempt produces fresh evidence either way. The unverifiable sibling cell of the
 failed keep-going DAG keeps the verbatim blanket failure for the same
 seeding ambiguity in the opposite direction: the blanket text is what the
 measurement consumer's poison-recovery arm matches on, and resolving that
