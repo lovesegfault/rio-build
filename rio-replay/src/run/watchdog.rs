@@ -83,7 +83,10 @@ pub const COMPONENT_ICE: &str = "ice";
 
 /// Suspension-component value for the dispatch-gap condition: idle
 /// executors while work is queued and substitution is quiescent, sustained
-/// for `dispatch_gap_polls` consecutive polls. Also pauses submission.
+/// for `dispatch_gap_polls` consecutive polls. Also pauses submission in
+/// the timeless run loop; timed dispatch fires through it (like the
+/// operator pause) and discloses the overlap via `timing_degraded`
+/// instead — see [`SuspensionSummary::degrades_timing`].
 pub const COMPONENT_DISPATCH: &str = "dispatch";
 
 /// Registry of every suspension-component value `Watchdog::on_tick` can
@@ -306,15 +309,23 @@ impl SuspensionSummary {
     ///   schedule drain counts even though it never produced a close
     ///   event — and a window that closes after the read was open at the
     ///   read and counts identically.
-    /// - Component membership: exactly the components that suspend the
-    ///   engine's own submission path qualify — [`COMPONENT_PAUSE`] (the
-    ///   operator told the engine not to submit) and
-    ///   [`COMPONENT_DISPATCH`] (the run loop pauses submission on the
-    ///   dispatch gap). The capacity components ([`COMPONENT_IDLE`],
+    /// - Component membership: exactly the conditions the engine HALTS
+    ///   submission on in timeless mode and deliberately fires through
+    ///   in timed mode qualify — [`COMPONENT_PAUSE`] (the operator told
+    ///   the engine not to submit; advisory in timed mode) and
+    ///   [`COMPONENT_DISPATCH`] (the dispatcher-indicting gap the
+    ///   timeless run loop pauses submission on). Timed dispatch fires
+    ///   through both by design (the engine never silently warps the
+    ///   clock), which is exactly why the timed report must DISCLOSE
+    ///   their overlap: a paused or wedged cluster degrades what the run
+    ///   measures — interruption reproduction depends on units
+    ///   completing before recorded offsets — even when every request
+    ///   fired on time. The capacity components ([`COMPONENT_IDLE`],
     ///   [`COMPONENT_ICE`]) freeze stall clocks only and never gate
-    ///   submission, so they do not indict the dispatcher's cadence; the
-    ///   recorded run was equally exposed to cluster-capacity weather.
-    ///   Pinned against [`ALL_COMPONENTS`] by test.
+    ///   submission in either mode, so they do not indict the
+    ///   dispatcher's cadence; the recorded run was equally exposed to
+    ///   cluster-capacity weather. Pinned against [`ALL_COMPONENTS`] by
+    ///   test.
     /// - Granularity: window edges are poller-tick observations and a
     ///   window's component list is its lifetime union, so boundary
     ///   touches and mixed windows count whole. Both inclusions err
@@ -411,8 +422,9 @@ pub struct TickOutcome {
     pub components: Vec<&'static str>,
     /// Jobs whose stall clocks crossed a threshold this tick.
     pub stalled: Vec<StallVerdict>,
-    /// True when the dispatch-gap component is active — the run loop also
-    /// pauses submission on it, not just the clocks.
+    /// True when the dispatch-gap component is active — the timeless run
+    /// loop also pauses submission on it, not just the clocks (timed
+    /// dispatch fires through and discloses instead).
     pub dispatch_pause: bool,
     /// True when the queue-depth backpressure bit is asserted: the most
     /// recent FRESH ClusterStatus poll read `queued_derivations` above
