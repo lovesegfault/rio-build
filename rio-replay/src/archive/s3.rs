@@ -306,16 +306,47 @@ impl ArchiveStore {
         }
     }
 
-    /// The refusal raised when an object this publish already verified (or
-    /// uploaded) vanished from the prefix before the upload could finish:
-    /// a concurrent `replay delete` swept the prefix mid-publish. Nothing
-    /// of this publish remains claimed, so the recovery is simply to
-    /// re-run it.
+    /// The refusal raised when an object this publish itself uploaded (and
+    /// the pre-marker re-observation then found ABSENT) vanished from the
+    /// prefix: at that site absence entails existed-then-vanished, and a
+    /// concurrent `replay delete` sweep is the only writer that removes
+    /// objects, so the diagnosis is affirmative. Only sound where the
+    /// observation proves the object WAS there — an absence after a lost
+    /// conditional PUT must use [`Self::absent_after_lost_conditional`]
+    /// instead, because a 409 entry never proves the key was occupied.
     fn swept_mid_publish(&self, archive_id_short: &str, object: &str) -> anyhow::Error {
         anyhow::anyhow!(
-            "archive prefix s3://{}/{} was swept mid-publish ({object} is gone — a concurrent \
-             `replay delete` raced this upload); nothing of this publish remains claimed — \
-             re-run the publish",
+            "archive prefix s3://{}/{} was swept mid-publish ({object} is gone after this \
+             publish uploaded it — a concurrent `replay delete` raced this upload, and its \
+             sweep converges until the prefix is empty); re-run the publish once the sweep \
+             finishes",
+            self.bucket,
+            self.prefix(archive_id_short)
+        )
+    }
+
+    /// The refusal raised when a PUT lost its write-once conditional and
+    /// the follow-up probe finds NOTHING at the key. Two preimages reach
+    /// this arm, because [`put_lost_conditional`] folds S3's two
+    /// documented conditional-write rejections into one bool: after a 412
+    /// (`PreconditionFailed`) the object existed at PUT time and absence
+    /// means it was deleted — a concurrent `replay delete` sweep; after a
+    /// 409 (`ConditionalRequestConflict`) a concurrent conditional write
+    /// was merely IN FLIGHT, and absence means the rival's write has not
+    /// (yet) materialized — it may still be uploading for as long as its
+    /// PUT takes, or it failed mid-body — and nothing was deleted. The
+    /// message enumerates both causes rather than asserting one (and
+    /// makes no claim that the prefix is clear: in the 409 interleaving
+    /// this publish's other objects are still claimed). Refusal is the
+    /// outcome either way; on the re-run the write-once conditionals
+    /// settle the claim.
+    fn absent_after_lost_conditional(&self, archive_id_short: &str, object: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "archive prefix s3://{}/{} was swept mid-publish or lost a still-settling \
+             write-once race ({object} is absent: either a concurrent `replay delete` swept \
+             the prefix, or a racing publisher's conditional write on this key has not (yet) \
+             materialized); wait briefly, then re-run the publish — the write-once \
+             conditionals settle the claim either way",
             self.bucket,
             self.prefix(archive_id_short)
         )
@@ -433,9 +464,15 @@ impl ArchiveStore {
             }
             (ObservationSite::PreMarkerReObserve, RemoteObjectMatch::Identical) => Ok(()),
             (ObservationSite::LostDataConditional, RemoteObjectMatch::Absent) => {
-                Err(self.swept_mid_publish(archive_id_short, object))
+                // The lost conditional may have been a 409 whose rival
+                // never materialized — absence does not entail a delete
+                // here, so the refusal enumerates both preimages.
+                Err(self.absent_after_lost_conditional(archive_id_short, object))
             }
             (ObservationSite::PreMarkerReObserve, RemoteObjectMatch::Absent) => {
+                // This publish uploaded the object earlier in this very
+                // run, so absence proves existed-then-vanished: the
+                // affirmative sweep diagnosis is sound at this site.
                 Err(self.swept_mid_publish(archive_id_short, object))
             }
             (ObservationSite::LostDataConditional, RemoteObjectMatch::Foreign(detail)) => Err(self
@@ -702,9 +739,14 @@ impl ArchiveStore {
                             .await);
                     }
                     None => {
-                        return Err(
-                            self.swept_mid_publish(&archive_id_short, ARCHIVE_MANIFEST_OBJECT)
-                        );
+                        // A 409 entry can land here with no winner ever
+                        // materializing (and this publish's image still
+                        // claimed at the prefix), so no affirmative
+                        // sweep diagnosis: enumerate both preimages.
+                        return Err(self.absent_after_lost_conditional(
+                            &archive_id_short,
+                            ARCHIVE_MANIFEST_OBJECT,
+                        ));
                     }
                 }
             }
@@ -827,13 +869,16 @@ impl ArchiveStore {
                             ),
                         }
                     }
-                    // The marker the conditional collided with is already
-                    // gone again: a concurrent delete is sweeping the
-                    // prefix.
+                    // The marker the conditional collided with is not
+                    // there: either a concurrent delete swept it, or
+                    // (409 entry) the rival marker PUT this one lost to
+                    // never materialized — the lost conditional does not
+                    // say which, so the refusal enumerates both.
                     None => {
-                        return Err(
-                            self.swept_mid_publish(&archive_id_short, ARCHIVE_COMPLETE_OBJECT)
-                        );
+                        return Err(self.absent_after_lost_conditional(
+                            &archive_id_short,
+                            ARCHIVE_COMPLETE_OBJECT,
+                        ));
                     }
                 }
             }
@@ -2192,9 +2237,11 @@ mod tests {
         let (image, manifest_bytes) = packed_tiny_archive(dir.path());
 
         // The image PUT loses its conditional, but by the time the
-        // self-write probe looks the object is GONE: a concurrent
-        // `replay delete` is sweeping the prefix. The error must name the
-        // sweep and the recovery (re-run), not accuse a publisher.
+        // self-write probe looks the object is GONE. A 412 entry entails
+        // the object existed at PUT time, but `put_lost_conditional`
+        // erases the 412/409 distinction, so the refusal must enumerate
+        // both reachable causes (sweep, or a rival's write that never
+        // materialized) rather than asserting either one.
         let head_404_precheck = mock!(aws_sdk_s3::Client::head_object)
             .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
         let put_image_412 = mock!(aws_sdk_s3::Client::put_object).then_error(|| {
@@ -2217,6 +2264,64 @@ mod tests {
         assert!(
             message.contains("swept mid-publish"),
             "the sweep is named: {message}"
+        );
+        assert!(message.contains("re-run"), "recovery named: {message}");
+    }
+
+    #[tokio::test]
+    async fn publish_enumerates_both_causes_when_a_409_loser_finds_no_winner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+
+        // The 409 interleaving: the image PUT loses
+        // ConditionalRequestConflict to a concurrent conditional write,
+        // and the self-write probe finds NOTHING at the key — the rival's
+        // write has not (yet) materialized (a multi-GiB rival PUT holds
+        // this state for its whole upload, and a rival that failed
+        // mid-body leaves it permanently). No delete ran, and this
+        // publish's other objects may still sit at the prefix, so the
+        // refusal must enumerate both reachable causes instead of
+        // affirmatively blaming a `replay delete` and must not claim the
+        // publish holds nothing at the prefix.
+        let head_404_precheck = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let put_image_409 = mock!(aws_sdk_s3::Client::put_object).then_error(|| {
+            PutObjectError::generic(
+                ErrorMetadata::builder()
+                    .code("ConditionalRequestConflict")
+                    .build(),
+            )
+        });
+        let head_image_404 = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[&head_404_precheck, &put_image_409, &head_image_404]
+        );
+
+        let store = ArchiveStore::new("rio-chunks", "replay");
+        let err = store
+            .publish(&client, &image, &manifest_bytes, "rio-replay/test")
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("swept mid-publish"),
+            "the sweep preimage is still named: {message}"
+        );
+        assert!(
+            message.contains("replay delete"),
+            "the sweep cause names the tool: {message}"
+        );
+        assert!(
+            message.contains("racing publisher") && message.contains("materialized"),
+            "the no-winner-yet preimage is named alongside the sweep: {message}"
+        );
+        assert!(
+            !message.contains("nothing of this publish remains claimed"),
+            "must not claim the prefix is clear — the 409 rival race leaves this publish's \
+             other objects claimed: {message}"
         );
         assert!(message.contains("re-run"), "recovery named: {message}");
     }
