@@ -106,6 +106,13 @@ bootstrap:
     # IRSA role annotation; the grant set lives ONLY in
     # infra/eks/secrets.tf (aws_iam_policy.rio_bootstrap).
     annotations: {}
+  # Extra container env for the bootstrap Job. Production leaves this
+  # empty (IRSA injects credentials via the EKS pod identity webhook;
+  # endpoints resolve normally). The prod-parity VM fixture points
+  # AWS_ENDPOINT_URL at an in-VM Secrets Manager mock plus dummy
+  # creds so the Job exercises the real awscli2 against genuine
+  # not-found/create wire semantics (k3s-prod-parity.nix).
+  extraEnv: []
 
 podDisruptionBudget:
   enabled: true

@@ -1273,19 +1273,22 @@ in
   # root cause: VM tests use minimal config; prod uses bootstrap.
   # enabled=true. The bootstrap Job never rendered in CI. This fixture
   # flips it on so the PSA-restricted exec path (readOnlyRootFilesystem
-  # + HOME=/tmp for awscli2 cache) runs at merge-gate. The Job will
-  # FAIL (aws secretsmanager unreachable in the airgapped VM) —
-  # expected; bootstrap-job-ran asserts no-EROFS + script-progress,
-  # not completion. ~5min (k3s bring-up + bootstrap Job backoff).
+  # + HOME=/tmp for awscli2 cache) runs at merge-gate. The Job runs the
+  # real awscli2 against an in-VM Secrets Manager mock
+  # (k3s-prod-parity.nix) and COMPLETES — bootstrap-job-ran asserts
+  # no-EROFS + genuine not-found classification + full convergence
+  # (which also pins the image tool envelope: round 17 found grep/cmp
+  # missing from the production image while the old credential-less
+  # fixture masked everything). ~5min (k3s bring-up + Job).
   vm-lifecycle-prod-parity-k3s = lifecycleProdParityMod.mkTest {
     name = "prod-parity";
     subtests = [
       # r[verify sec.psa.control-plane-restricted]
       #   bootstrap-job-ran: Job's pod-template has
-      #   readOnlyRootFilesystem=true + HOME=/tmp, logs show
-      #   "[bootstrap] generating rio/hmac" (past env-check +
-      #   awscli2 init), logs DON'T contain "Read-only file
-      #   system". The a28e4b65 regression signature.
+      #   readOnlyRootFilesystem=true + HOME=/tmp, the Job reaches
+      #   condition=Complete against the in-VM mock (genuine
+      #   not-found → openssl → creates → keygen), logs DON'T
+      #   contain "Read-only file system" (a28e4b65 signature).
       #   vm-security-nonpriv-k3s above verifies PSA on the
       #   builder side; this verifies it on control-plane Jobs.
       "bootstrap-job-ran"

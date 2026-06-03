@@ -490,6 +490,14 @@ rec {
         rio-crates.rio-cli
         pkgs.bash
         pkgs.coreutils
+        # cmp — the pair-consistency probe (r16) byte-compares the
+        # stored pub against the derivation. Absent until round-17's
+        # tool-envelope audit: the steady-state probe (both halves
+        # present, i.e. every upgrade after the first install) would
+        # have died 'cmp: command not found' in the real pod. The
+        # bootstrap-idempotent harness now confines run() to exactly
+        # this PATH so a script tool the image lacks fails CI.
+        pkgs.diffutils
       ];
     config = {
       Entrypoint = [ "${bootstrapScript}" ];
@@ -507,6 +515,7 @@ rec {
             pkgs.openssh
             rio-crates.rio-cli
             pkgs.coreutils
+            pkgs.diffutils
           ]
         }"
       ];

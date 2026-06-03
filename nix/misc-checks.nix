@@ -954,8 +954,12 @@ in
           file://*) payload=\$(cat "\''${payload#file://}") ;;
           fileb://*) payload=\$(cat "\''${payload#fileb://}") ;;
         esac
+        # Mock-internal matching uses ABSOLUTE store paths: the mock
+        # executes under run()'s image-confined PATH (no gnugrep), but
+        # the mock is harness infrastructure — pinning its tools must
+        # not widen the PATH the script under test sees.
         deleted() {
-          [ -f "$TMPDIR/inject-deleted" ] && grep -qx "\$1" "$TMPDIR/inject-deleted"
+          [ -f "$TMPDIR/inject-deleted" ] && ${pkgs.gnugrep}/bin/grep -qx "\$1" "$TMPDIR/inject-deleted"
         }
         refuse_deleted() {
           if deleted "\$1"; then
@@ -966,7 +970,7 @@ in
         case "\$sub" in
           "secretsmanager describe-secret")
             if [ -f "$TMPDIR/inject-describe-fail" ] \
-              && grep -qx "\$id" "$TMPDIR/inject-describe-fail"; then
+              && ${pkgs.gnugrep}/bin/grep -qx "\$id" "$TMPDIR/inject-describe-fail"; then
               echo "An error occurred (ThrottlingException): Rate exceeded" >&2
               exit 254
             fi
@@ -986,7 +990,7 @@ in
             # and this create — the exact window the create-only CAS
             # guards. Fails without writing, like the real API.
             if [ -f "$TMPDIR/inject-create-exists" ] \
-              && grep -qx "\$id" "$TMPDIR/inject-create-exists"; then
+              && ${pkgs.gnugrep}/bin/grep -qx "\$id" "$TMPDIR/inject-create-exists"; then
               echo "An error occurred (ResourceExistsException): The operation failed because the secret rio/signing-key already exists." >&2
               exit 254
             fi
@@ -1017,7 +1021,20 @@ in
         export PATH=$PWD/bin:${dockerImages.rioCli}/bin:${pkgs.coreutils}/bin:${pkgs.gnugrep}/bin:${pkgs.diffutils}/bin
         export AWS_REGION=x CHUNK_BUCKET=x
 
-        run() { $sh ${dockerImages.bootstrapScript}; }
+        # The SCRIPT runs under the production image's tool envelope
+        # (nix/docker.nix bootstrap makeBinPath: awscli2/openssl/
+        # openssh → mocked in $PWD/bin, rio-cli, coreutils, diffutils
+        # — and NOTHING else; notably no gnugrep). Round-17
+        # composition bug: this harness PATH was tool-richer than the
+        # image, so a grep inside secret_state passed every scenario
+        # here and died 'grep: command not found' in the real pod
+        # (vm-lifecycle-prod-parity-k3s). The harness's own ASSERTIONS
+        # keep the wide PATH above; only run() is confined. Keep this
+        # list in lockstep with the image's makeBinPath.
+        run() {
+          PATH=$PWD/bin:${dockerImages.rioCli}/bin:${pkgs.coreutils}/bin:${pkgs.diffutils}/bin \
+            $sh ${dockerImages.bootstrapScript}
+        }
         derive() { rio-cli keygen derive-pub; }  # stdin → stdout
 
         # Scenario A: fresh → both halves exist, canonical, and the

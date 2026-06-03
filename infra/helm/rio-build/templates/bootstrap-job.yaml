@@ -81,6 +81,9 @@ spec:
             # under readOnlyRootFilesystem. Point HOME at the /tmp emptyDir.
             - name: HOME
               value: /tmp
+            {{- with $b.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           # readOnlyRootFilesystem=true (rio.containerSecurityContext) makes
           # the in-image /tmp read-only. Script writes /tmp/hmac + mktemp -d
           # → needs a writable mount. emptyDir inherits the pod's fsGroup

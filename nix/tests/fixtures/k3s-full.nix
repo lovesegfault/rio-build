@@ -149,6 +149,12 @@ in
   # + KWOK Stage rules here so the §13b nodeclaim_pool reconciler can
   # be exercised without EC2.
   extraManifests ? { },
+  # Extra NixOS module merged into the k3s-server node. The
+  # prod-parity overlay runs an in-VM Secrets Manager mock here so
+  # the bootstrap Job's awscli2 has a faithful endpoint (genuine
+  # ResourceNotFoundException → create → converge) instead of
+  # credential-less failures.
+  extraServerModule ? { },
 }:
 let
   ciliumRender = mkCiliumRender gatewayEnabled;
@@ -515,6 +521,7 @@ let
       imports = [
         k3sBase
         k3sV6Only
+        extraServerModule
       ];
       networking.hostName = "k3s-server";
 

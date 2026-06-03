@@ -42,12 +42,26 @@ secret_state() {
         "$_ss_id" "$_ss_deleted" restore-secret "$_ss_id" delete-secret "$_ss_id" >&2
       return 1
     fi
-  elif grep -q ResourceNotFoundException "$tmp/_ss.err"; then
-    echo missing
   else
-    printf '[bootstrap] describe-secret %s failed without ResourceNotFoundException; refusing to guess:\n' "$_ss_id" >&2
-    cat "$tmp/_ss.err" >&2
-    return 1
+    # Pure-POSIX exception discrimination: the production image's
+    # PATH is awscli2/openssl/openssh/rio-cli/coreutils/diffutils —
+    # no grep (round-17 composition bug: a grep here passed the
+    # harness, whose PATH was tool-richer than the image, and died
+    # 'command not found' in the real pod). Substring match via
+    # case is a shell builtin and needs nothing from PATH. Command
+    # substitution is fine HERE — this is error-text classification,
+    # not the byte-compared pub operands the R6 ban covers.
+    _ss_err=$(cat "$tmp/_ss.err")
+    case "$_ss_err" in
+      *ResourceNotFoundException*)
+        echo missing
+        ;;
+      *)
+        printf '[bootstrap] describe-secret %s failed without ResourceNotFoundException; refusing to guess:\n%s\n' \
+          "$_ss_id" "$_ss_err" >&2
+        return 1
+        ;;
+    esac
   fi
 }
 
