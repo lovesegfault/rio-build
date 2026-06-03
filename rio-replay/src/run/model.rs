@@ -868,6 +868,19 @@ pub struct BatchRecord {
     /// pre-probe batches were all full-wave submissions.
     #[serde(default)]
     pub probe: bool,
+    /// 1-based confirmation-retry index when this batch is one of the
+    /// timed dispatcher's sanctioned re-confirmation submissions (an
+    /// expected-built unit whose replayed result was a failure, re-checked
+    /// on a fresh batch); 0 for every other writer. Collect's
+    /// already-terminal belt admits a SUCCESS result from such a batch as
+    /// a designed superseding write — the retry's verdict replaces the
+    /// initial failure under latest-record-per-job semantics, with
+    /// `attempts = confirmation_attempt + 1` carrying the flakiness on
+    /// the verdict. Defaults to 0 on records written before the field
+    /// existed: their retry successes were dropped by the belt (the
+    /// defect this field exists to fix), and they are not re-classified.
+    #[serde(default)]
+    pub confirmation_attempt: u32,
 }
 
 /// Writer intent for one submission, recorded verbatim onto the
@@ -882,12 +895,27 @@ pub struct BatchIntent {
     /// Canary probe released while the infra-rate pause held (see
     /// [`BatchRecord::probe`]).
     pub probe: bool,
+    /// 1-based confirmation-retry index for the timed dispatcher's
+    /// re-confirmation submissions; 0 for every other writer (see
+    /// [`BatchRecord::confirmation_attempt`]).
+    pub confirmation_attempt: u32,
 }
 
 impl BatchIntent {
     /// A canary-probe submission.
     pub fn probe() -> Self {
-        Self { probe: true }
+        Self {
+            probe: true,
+            ..Self::default()
+        }
+    }
+
+    /// The timed dispatcher's `attempt`-th confirmation retry (1-based).
+    pub fn confirmation(attempt: u32) -> Self {
+        Self {
+            confirmation_attempt: attempt,
+            ..Self::default()
+        }
     }
 }
 
@@ -1439,6 +1467,7 @@ mod tests {
             interruption_drvs: Vec::new(),
             import_skipped_drvs: Vec::new(),
             probe: false,
+            confirmation_attempt: 0,
         };
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains(r#""results":[{"drvPath":"#), "{json}");
@@ -1454,9 +1483,11 @@ mod tests {
         // written before timed scheduling existed lack `interruptionDrvs`
         // the same way (defaults to empty), lines written before the
         // deadline-cause bit existed lack `disconnectDeadlineFired`
-        // (defaults to false), and lines written before canary probing
+        // (defaults to false), lines written before canary probing
         // existed lack `probe` (defaults to false — they were all
-        // full-wave submissions).
+        // full-wave submissions), and lines written before confirmation
+        // intent existed lack `confirmationAttempt` (defaults to 0 —
+        // their retry successes were belt-dropped and stay that way).
         let old = r#"{"batchId":3,"kind":"submit","jobs":["x.x86_64-linux"],"rootDrvs":["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv"],"estNodes":1,"buildId":null,"startedAt":"2026-05-26T00:00:00Z","finishedAt":null,"exitCode":1,"reasons":{},"stderrTail":"tail","engineCancelled":false}"#;
         let parsed: BatchRecord = serde_json::from_str(old).unwrap();
         assert!(parsed.results.is_empty());
@@ -1466,6 +1497,7 @@ mod tests {
         // `importSkippedDrvs` the same way (defaults to empty).
         assert!(parsed.import_skipped_drvs.is_empty());
         assert!(!parsed.probe);
+        assert_eq!(parsed.confirmation_attempt, 0);
         assert_eq!(parsed.batch_id, 3);
         assert_eq!(parsed.stderr_tail.as_deref(), Some("tail"));
     }

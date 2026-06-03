@@ -16,10 +16,12 @@
 //! cannot change scheduling state without the watchdog hearing it —
 //!
 //! - [`JobLedger::commit_batch`]: a batch is committed for submission — its
-//!   members become in-flight and are observed `Active`. This is the ONLY
-//!   place a watchdog clock is created, so a clock can never start before
-//!   the job's first offer (a never-submitted job is simply not tracked,
-//!   and queued time before first submission is never charged).
+//!   members become in-flight (keyed to the owning batch id, so a stale
+//!   settle cannot release a successor's reservation) and are observed
+//!   `Active`. This is the ONLY place a watchdog clock is created, so a
+//!   clock can never start before the job's first offer (a never-submitted
+//!   job is simply not tracked, and queued time before first submission is
+//!   never charged).
 //! - [`JobLedger::requeue_collected`]: collect re-offers a settled batch's
 //!   member — the resubmission is counted and the job is observed `Queued`
 //!   (the phase change resets its stall clock, routing the wait to the
@@ -286,15 +288,18 @@ impl JobLedger {
         self.tracker.clone()
     }
 
-    /// Commit a batch for submission: reserve its jobs in-flight and
-    /// observe them `Active`. The first commit of a job is what creates its
-    /// watchdog clock — queued time before the first offer is never
-    /// charged.
-    pub async fn commit_batch(&self, jobs: &[String]) {
+    /// Commit a batch for submission: reserve its jobs in-flight under the
+    /// owning `batch_id` and observe them `Active`. The first commit of a
+    /// job is what creates its watchdog clock — queued time before the
+    /// first offer is never charged. Re-committing a job a stale batch
+    /// still nominally holds simply transfers ownership to the new id —
+    /// the newer commitment is the live one by construction (only the
+    /// stall auto-retry re-offers a held job, and it releases first).
+    pub async fn commit_batch(&self, batch_id: u64, jobs: &[String]) {
         {
             let mut in_flight = self.tracker.in_flight.lock().await;
             for job in jobs {
-                in_flight.insert(job.clone());
+                in_flight.insert(job.clone(), batch_id);
             }
         }
         let mut wd = self.watchdog.lock().await;
@@ -434,7 +439,7 @@ mod tests {
     async fn never_submitted_jobs_are_not_tracked() {
         let (_dir, ledger, _tracker, watchdog) = ledger();
         // Another job IS committed, so the watchdog has work to do.
-        ledger.commit_batch(&["active.x".to_string()]).await;
+        ledger.commit_batch(1, &["active.x".to_string()]).await;
         let mut wd = watchdog.lock().await;
         wd.on_tick(&tick(0));
         // 100 unsuspended hours: enough to trip every threshold many times.
@@ -451,18 +456,18 @@ mod tests {
     #[tokio::test]
     async fn commit_and_retire_are_uniform() {
         let (_dir, ledger, tracker, watchdog) = ledger();
-        ledger.commit_batch(&["a.x".to_string()]).await;
-        assert!(tracker.in_flight.lock().await.contains("a.x"));
+        ledger.commit_batch(1, &["a.x".to_string()]).await;
+        assert!(tracker.in_flight.lock().await.contains_key("a.x"));
         assert_eq!(
             watchdog.lock().await.phase_of("a.x"),
             Some(JobPhase::Active)
         );
         ledger.retire("a.x").await;
-        assert!(!tracker.in_flight.lock().await.contains("a.x"));
+        assert!(!tracker.in_flight.lock().await.contains_key("a.x"));
         assert_eq!(watchdog.lock().await.phase_of("a.x"), None);
         // Retiring a job whose reservation was already released at settle
         // is the collect-terminal shape: still a no-op-safe removal.
-        ledger.commit_batch(&["b.x".to_string()]).await;
+        ledger.commit_batch(1, &["b.x".to_string()]).await;
         tracker.in_flight.lock().await.remove("b.x");
         ledger.retire("b.x").await;
         assert_eq!(watchdog.lock().await.phase_of("b.x"), None);
@@ -476,7 +481,7 @@ mod tests {
     #[tokio::test]
     async fn requeue_transitions_to_queued_and_resets_the_clock() {
         let (_dir, ledger, tracker, watchdog) = ledger();
-        ledger.commit_batch(&["job.x".to_string()]).await;
+        ledger.commit_batch(1, &["job.x".to_string()]).await;
         {
             let mut wd = watchdog.lock().await;
             wd.on_tick(&tick(0));
@@ -485,7 +490,7 @@ mod tests {
         }
         // The batch settles and collect decides to re-offer the job.
         tracker
-            .release_after_settle(&["job.x".to_string()], std::time::Duration::ZERO)
+            .release_after_settle(1, &["job.x".to_string()], std::time::Duration::ZERO)
             .await;
         ledger
             .requeue_collected("job.x", RequeueReason::InfraAutoRetry)
@@ -507,7 +512,7 @@ mod tests {
             assert_eq!(outcome.stalled[0].kind, StallKind::QueuedRequeue);
         }
         // Resubmission flips the job back to Active.
-        ledger.commit_batch(&["job.x".to_string()]).await;
+        ledger.commit_batch(1, &["job.x".to_string()]).await;
         assert_eq!(
             watchdog.lock().await.phase_of("job.x"),
             Some(JobPhase::Active)
@@ -519,9 +524,9 @@ mod tests {
     #[tokio::test]
     async fn stall_requeue_releases_and_observes_queued() {
         let (_dir, ledger, tracker, watchdog) = ledger();
-        ledger.commit_batch(&["stuck.x".to_string()]).await;
+        ledger.commit_batch(1, &["stuck.x".to_string()]).await;
         ledger.requeue_stalled("stuck.x").await.unwrap();
-        assert!(!tracker.in_flight.lock().await.contains("stuck.x"));
+        assert!(!tracker.in_flight.lock().await.contains_key("stuck.x"));
         assert_eq!(ledger.tracker().resubmission_count("stuck.x").await, 1);
         assert_eq!(
             watchdog.lock().await.phase_of("stuck.x"),
@@ -645,7 +650,7 @@ mod tests {
             .requeue_collected("a.x", RequeueReason::EngineCancelled)
             .await
             .unwrap();
-        ledger.commit_batch(&["b.x".to_string()]).await;
+        ledger.commit_batch(1, &["b.x".to_string()]).await;
         ledger.requeue_stalled("b.x").await.unwrap();
 
         // "Pod restart": rebuild from the same state dir.
@@ -675,6 +680,60 @@ mod tests {
         assert!(legacy_stalls.is_empty());
     }
 
+    /// The ABA the stall auto-retry deliberately sets up, closed by
+    /// owner-keyed reservations: requeue_stalled releases B1's reservation
+    /// and re-offers the job while B1 keeps running; once the job is
+    /// committed to B2, B1's LATE settle (engine-cancel at its deadline)
+    /// must not strip B2's reservation — the job stays blocked from a
+    /// third concurrent submission, its watchdog phase stays Active for
+    /// B2, and only B2's own settle releases it.
+    #[tokio::test]
+    async fn stale_settle_cannot_release_a_newer_batches_reservation() {
+        let (_dir, ledger, tracker, watchdog) = ledger();
+        let job = "overlap.x".to_string();
+
+        // B1 reserves the job; the active-stall auto-retry releases it
+        // (the owner-initiated release) and re-offers.
+        ledger.commit_batch(1, std::slice::from_ref(&job)).await;
+        ledger.requeue_stalled(&job).await.unwrap();
+        assert!(!tracker.in_flight.lock().await.contains_key(&job));
+
+        // The re-offer lands in B2: the job is live in TWO batches now
+        // (B1 still running on the cluster, B2 owning the reservation).
+        ledger.commit_batch(2, std::slice::from_ref(&job)).await;
+        assert_eq!(tracker.in_flight.lock().await.get(&job), Some(&2));
+        assert_eq!(watchdog.lock().await.phase_of(&job), Some(JobPhase::Active));
+
+        // B1 settles late: its release has no authority over B2's
+        // reservation — nothing moves, and the wave still sees the job
+        // blocked (no third submission can be assembled).
+        tracker
+            .release_after_settle(1, std::slice::from_ref(&job), std::time::Duration::ZERO)
+            .await;
+        assert_eq!(
+            tracker.in_flight.lock().await.get(&job),
+            Some(&2),
+            "a stale settle must not strip the successor's reservation"
+        );
+        assert_eq!(
+            watchdog.lock().await.phase_of(&job),
+            Some(JobPhase::Active),
+            "the live batch's clock keeps its Active phase"
+        );
+        let blocked: std::collections::HashSet<String> =
+            tracker.in_flight.lock().await.keys().cloned().collect();
+        assert!(
+            blocked.contains(&job),
+            "the wave's blocked view still covers the job - no third commit"
+        );
+
+        // B2's own settle is the owner: it releases.
+        tracker
+            .release_after_settle(2, std::slice::from_ref(&job), std::time::Duration::ZERO)
+            .await;
+        assert!(!tracker.in_flight.lock().await.contains_key(&job));
+    }
+
     /// FF over [`JOURNAL_BACKED_BOUNDS`]: the bound list is data, and this
     /// test iterates it — every listed bound must have a rehydration
     /// assertion arm here, and an entry without one panics in the
@@ -696,9 +755,9 @@ mod tests {
             .requeue_collected("resub.x", RequeueReason::EngineCancelled)
             .await
             .unwrap();
-        ledger.commit_batch(&["resub.x".to_string()]).await;
+        ledger.commit_batch(1, &["resub.x".to_string()]).await;
         ledger.requeue_stalled("resub.x").await.unwrap();
-        ledger.commit_batch(&["starved.x".to_string()]).await;
+        ledger.commit_batch(1, &["starved.x".to_string()]).await;
         ledger
             .requeue_collected("starved.x", RequeueReason::InfraAutoRetry)
             .await
@@ -756,7 +815,7 @@ mod tests {
                     // Behavioral pin: with the seed applied, the restarted
                     // job's FIRST queued crossing escalates instead of
                     // being re-granted the full ladder.
-                    resumed.commit_batch(&["starved.x".to_string()]).await;
+                    resumed.commit_batch(1, &["starved.x".to_string()]).await;
                     resumed
                         .requeue_collected("starved.x", RequeueReason::InfraAutoRetry)
                         .await

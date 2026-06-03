@@ -313,6 +313,11 @@ pub struct BatchView {
     /// budget-exempt probe carve-out instead of consuming the auto-retry
     /// budget.
     pub probe: bool,
+    /// 1-based confirmation-retry index for the timed dispatcher's
+    /// re-confirmation batches, 0 otherwise (from the batch record): a
+    /// SUCCESS result from such a batch passes the already-terminal belt
+    /// as a sanctioned superseding write.
+    pub confirmation_attempt: u32,
 }
 
 /// Derive the timed-interruption flag for one root of a settled batch:
@@ -938,14 +943,36 @@ pub async fn process_settled_batch(
             tracing::warn!(job, "batch member has no job context; skipping");
             continue;
         };
+        let target = results_by_drv.get(ctx.drv_path.as_str()).copied();
         if already_terminal.contains(job) {
+            // Duplicate-batch belt with a writer-legitimacy carve-out.
+            // Legitimacy is a property of the WRITING batch, not of the
+            // job's state: a confirmation-retry batch is the timed
+            // dispatcher's DESIGNED post-terminal superseding writer (an
+            // expected-built unit whose first replayed result failed is
+            // re-confirmed before unexpected-failure may stand), so its
+            // SUCCESS results pass the belt and supersede the initial
+            // failure under latest-record-per-job semantics. Everything
+            // else — duplicate plain submissions, and retry results that
+            // merely re-confirm the failure — is dropped, so a duplicate
+            // can never overwrite the job's real verdict.
+            let confirmation_supersede = batch.confirmation_attempt > 0
+                && target
+                    .and_then(|t| build_status_from_name(&t.status))
+                    .is_some_and(|status| status.is_success());
+            if !confirmation_supersede {
+                tracing::info!(
+                    job,
+                    "settled-batch member already has a terminal record; dropping"
+                );
+                continue;
+            }
             tracing::info!(
                 job,
-                "settled-batch member already has a terminal record; dropping"
+                attempt = batch.confirmation_attempt,
+                "sanctioned confirmation retry succeeded; superseding the terminal record"
             );
-            continue;
         }
-        let target = results_by_drv.get(ctx.drv_path.as_str()).copied();
         let prior = prior_requeues.get(job).copied().unwrap_or(0);
         // Evidence-age gate: when a failed root carries neither an in-band
         // error message nor a relayed reason (Signal 1) and has no
@@ -1034,6 +1061,17 @@ pub async fn process_settled_batch(
                 }
             }
             CollectDecision::Terminal { rio, evidence } => {
+                // Attempts accounting: a confirmation-retry batch carries
+                // its 1-based attempt index, so the surviving record
+                // reports initial + retries (flakiness then surfaces on
+                // the verdict); every other batch derives attempts from
+                // the journal's cluster-attempt projection
+                // ([`stamped_attempts`] over [`measured_attempt_requeues`]).
+                let attempts = if batch.confirmation_attempt > 0 {
+                    batch.confirmation_attempt + 1
+                } else {
+                    stamped_attempts(prior_attempts.get(job).copied().unwrap_or(0), true)
+                };
                 // Evidence capture: NAR hashes for successes, log tail for
                 // failures.
                 let mut log_key = None;
@@ -1114,7 +1152,7 @@ pub async fn process_settled_batch(
                     &rio_paths,
                     mode,
                     campaign_id,
-                    stamped_attempts(prior_attempts.get(job).copied().unwrap_or(0), true),
+                    attempts,
                     log_key,
                     first_active.get(job).cloned(),
                     captured_tail.as_deref(),
@@ -2664,6 +2702,132 @@ mod tests {
         assert_eq!(records[0].verdict.as_deref(), Some("match-built"));
     }
 
+    /// The belt's two directions, pinned together against the design
+    /// contract for timed confirmation retries (design doc section 9.2:
+    /// an expected-built unit whose replayed result is a failure is
+    /// re-submitted up to confirm_attempts before unexpected-failure is
+    /// recorded, with attempts and flakiness carried on the verdict).
+    ///
+    /// Must-admit: the initial timed batch records the genuine-classified
+    /// failure; the dispatcher's confirmation retry (confirmation_attempt
+    /// > 0) succeeds, passes the already-terminal belt as the sanctioned
+    /// superseding writer, and the surviving record is flaky match-built
+    /// with attempts = confirmation_attempt + 1. Must-block: a plain
+    /// duplicate success (confirmation_attempt == 0) is still dropped, and
+    /// a confirmation retry whose result is another FAILURE adds nothing —
+    /// the initial record stands.
+    #[tokio::test]
+    async fn confirmation_retry_success_supersedes_but_duplicates_still_cannot() {
+        let job = "flaky.x86_64-linux";
+        let contexts: HashMap<String, JobContext> =
+            [(job.to_string(), ctx(job, T, &[], ExpectedOutcome::Built))].into();
+        let initial_failure = BatchView {
+            kind: BATCH_KIND_TIMED.to_string(),
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+            results: vec![po(T, BuildStatus::PermanentFailure, "exit code 2")],
+            ..BatchView::default()
+        };
+        let confirmation_success = BatchView {
+            kind: BATCH_KIND_TIMED.to_string(),
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-2f2e3d4c5b6b".to_string()),
+            results: vec![po(T, BuildStatus::Built, "")],
+            confirmation_attempt: 1,
+            ..BatchView::default()
+        };
+        let confirmation_failure = BatchView {
+            kind: BATCH_KIND_TIMED.to_string(),
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-3f2e3d4c5b6c".to_string()),
+            results: vec![po(T, BuildStatus::PermanentFailure, "exit code 2")],
+            confirmation_attempt: 2,
+            ..BatchView::default()
+        };
+        let plain_duplicate_success = BatchView {
+            kind: BATCH_KIND_TIMED.to_string(),
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-4f2e3d4c5b6d".to_string()),
+            results: vec![po(T, BuildStatus::Built, "")],
+            ..BatchView::default()
+        };
+        let run_batch =
+            async |state: &StateDir, batch: &BatchView, already_terminal: &HashSet<String>| {
+                process_settled_batch(
+                    state,
+                    &LogAdmin::default(),
+                    &FakeStoreApi::default(),
+                    None,
+                    &contexts,
+                    &[job.to_string()],
+                    batch,
+                    &HashMap::new(),
+                    &Knobs::default(),
+                    "leaf",
+                    "c-confirm",
+                    &HashMap::new(),
+                    already_terminal,
+                )
+                .await
+                .unwrap()
+            };
+
+        // Must-admit leg: initial failure, then confirmation success.
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let mut already_terminal: HashSet<String> = HashSet::new();
+        let decisions = run_batch(&state, &initial_failure, &already_terminal).await;
+        assert!(matches!(decisions[job], CollectDecision::Terminal { .. }));
+        already_terminal.insert(job.to_string());
+        let decisions = run_batch(&state, &confirmation_success, &already_terminal).await;
+        assert!(
+            matches!(decisions[job], CollectDecision::Terminal { .. }),
+            "the sanctioned retry's success must land: {decisions:?}"
+        );
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 2, "initial + superseding: {records:?}");
+        let surviving = &records[1];
+        assert_eq!(
+            surviving.verdict.as_deref(),
+            Some("match-built"),
+            "latest-record-per-job semantics flip the verdict"
+        );
+        assert_eq!(
+            surviving.attempts, 2,
+            "attempts = confirmation_attempt + 1 (initial + one retry)"
+        );
+        assert!(
+            surviving.flaky,
+            "a success on attempt 2 carries flakiness on the verdict"
+        );
+
+        // Must-block leg 1: a plain duplicate success cannot clobber.
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let mut already_terminal: HashSet<String> = HashSet::new();
+        run_batch(&state, &initial_failure, &already_terminal).await;
+        already_terminal.insert(job.to_string());
+        let decisions = run_batch(&state, &plain_duplicate_success, &already_terminal).await;
+        assert!(
+            decisions.is_empty(),
+            "an unsanctioned duplicate is dropped: {decisions:?}"
+        );
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 1, "{records:?}");
+
+        // Must-block leg 2: a confirmation retry that FAILS again adds
+        // nothing — the initial record stands (the failure is confirmed,
+        // not superseded).
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let mut already_terminal: HashSet<String> = HashSet::new();
+        run_batch(&state, &initial_failure, &already_terminal).await;
+        already_terminal.insert(job.to_string());
+        let decisions = run_batch(&state, &confirmation_failure, &already_terminal).await;
+        assert!(
+            decisions.is_empty(),
+            "a re-confirmed failure is dropped: {decisions:?}"
+        );
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 1, "{records:?}");
+    }
+
     /// The engine-cancelled carve-out survives the submission-failure
     /// budget: a non-timed batch the engine itself cancelled (deadline,
     /// abort) that settled with no results and no build id re-offers every
@@ -2773,6 +2937,7 @@ mod tests {
             interruption_drvs: Vec::new(),
             submitted_at: Some("2026-05-26T01:00:00Z".into()),
             probe: false,
+            confirmation_attempt: 0,
         };
         let decisions = process_settled_batch(
             &state,

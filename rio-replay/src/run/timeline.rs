@@ -1022,8 +1022,8 @@ async fn dispatch_one_request(
     // watchdog's Active observation land together, so the poller sees this
     // request as Active while it runs; submit_one_batch releases the
     // reservation when the batch settles.
-    shared.ledger.commit_batch(&jobs).await;
     let batch_id = shared.batch_seq.fetch_add(1, Ordering::SeqCst);
+    shared.ledger.commit_batch(batch_id, &jobs).await;
     tracing::info!(
         request = scheduled.index,
         session = scheduled.session,
@@ -1115,8 +1115,8 @@ async fn dispatch_one_request(
                 .iter()
                 .map(|target| target.job_key().to_string())
                 .collect();
-            shared.ledger.commit_batch(&retry_jobs).await;
             let retry_id = shared.batch_seq.fetch_add(1, Ordering::SeqCst);
+            shared.ledger.commit_batch(retry_id, &retry_jobs).await;
             tracing::info!(
                 request = scheduled.index,
                 batch_id = retry_id,
@@ -1141,7 +1141,11 @@ async fn dispatch_one_request(
                 BatchDeadline::Build(tokio::time::Instant::now() + build_deadline),
                 shared.cooldown,
                 Vec::new(),
-                BatchIntent::default(),
+                // Writer intent travels on the batch record: collect's
+                // already-terminal belt admits this batch's successes as
+                // sanctioned superseding confirmation writes (attempt N
+                // of the confirm budget; total attempts = N + 1).
+                BatchIntent::confirmation(attempts),
             )
             .await?;
             attempts += 1;
@@ -2040,6 +2044,7 @@ mod tests {
             interruption_drvs: record.interruption_drvs.clone(),
             submitted_at: Some(record.started_at.clone()),
             probe: record.probe,
+            confirmation_attempt: record.confirmation_attempt,
         };
         let decisions = process_settled_batch(
             state,

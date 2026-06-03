@@ -2864,6 +2864,7 @@ async fn collect_pass_with(
             interruption_drvs: batch.interruption_drvs.clone(),
             submitted_at: Some(batch.started_at.clone()),
             probe: batch.probe,
+            confirmation_attempt: batch.confirmation_attempt,
         };
         // prior_requeues carries each job's TOTAL engine resubmission count
         // so far — any prior requeue consumes the single infra auto-retry
@@ -2908,6 +2909,24 @@ async fn collect_pass_with(
         for (job, decision) in &decisions {
             match decision {
                 collect::CollectDecision::Requeue { why, budget } => {
+                    // Stale-owner guard, the requeue arm's mirror of the
+                    // already-terminal belt: a member currently reserved
+                    // in-flight is committed to a NEWER batch (this
+                    // settled batch's own reservation was released at its
+                    // settle), so this requeue decision has no authority —
+                    // applying it would journal a phantom resubmission and
+                    // flip the live batch's Active clock to Queued, where
+                    // the queued ladder would terminalize an actively
+                    // building job.
+                    if ledger.tracker().in_flight.lock().await.contains_key(job) {
+                        tracing::info!(
+                            job,
+                            why = why.as_str(),
+                            "settled batch's requeue is stale (a newer batch owns the job); \
+                             skipping"
+                        );
+                        continue;
+                    }
                     if budget.probe_exempt() {
                         // Canary-probe re-offer: budget-exempt by the
                         // carve-out's contract — no journal entry, no
@@ -3296,6 +3315,7 @@ mod tests {
             interruption_drvs: Vec::new(),
             import_skipped_drvs: Vec::new(),
             probe: false,
+            confirmation_attempt: 0,
         }];
         let got = jobs_awaiting_first_submission(
             [
@@ -4011,6 +4031,7 @@ mod tests {
                     interruption_drvs: vec![drv.clone()],
                     import_skipped_drvs: Vec::new(),
                     probe: false,
+                    confirmation_attempt: 0,
                 },
             )
             .unwrap();
@@ -4116,6 +4137,7 @@ mod tests {
                     interruption_drvs: Vec::new(),
                     import_skipped_drvs: Vec::new(),
                     probe: false,
+                    confirmation_attempt: 0,
                 },
             )
             .unwrap();
@@ -4146,10 +4168,11 @@ mod tests {
         // Both jobs were committed (Active) and the batch settled
         // (reservations released) — the state collect finds them in.
         job_ledger
-            .commit_batch(&[done_job.to_string(), lost_job.to_string()])
+            .commit_batch(7, &[done_job.to_string(), lost_job.to_string()])
             .await;
         tracker
             .release_after_settle(
+                7,
                 &[done_job.to_string(), lost_job.to_string()],
                 Duration::ZERO,
             )
@@ -4186,6 +4209,94 @@ mod tests {
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
         assert_eq!(records[done_job].verdict.as_deref(), Some("match-built"));
         assert!(!records.contains_key(lost_job), "requeue writes no record");
+    }
+
+    /// The requeue arm's stale-owner guard at the decision consumer: a
+    /// stall-abandoned batch settles late (engine-cancelled at its
+    /// deadline) AFTER its member was re-offered and committed to a newer
+    /// batch. The stale batch's Requeue decision must be skipped — no
+    /// journal entry, no resubmission counted, and the live batch's
+    /// watchdog phase stays Active (applying it would observe Queued on an
+    /// actively building job and start the queued ladder against it).
+    #[tokio::test]
+    async fn stale_batches_requeue_decision_is_skipped_for_a_reowned_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let job = "overlap.x86_64-linux";
+        let drv = format!("/nix/store/{}-overlap.drv", fake_hash("overlap"));
+        let contexts: HashMap<String, JobContext> = [(job.to_string(), fold_ctx(job, &drv))].into();
+        // B1 (id 10): the stall-abandoned batch, settling late as an
+        // engine cancellation — its members normally take the
+        // engine-cancelled requeue carve-out.
+        state
+            .append_jsonl(
+                StateFile::Batches,
+                &model::BatchRecord {
+                    batch_id: 10,
+                    kind: BATCH_KIND_SUBMIT.to_string(),
+                    jobs: vec![job.to_string()],
+                    root_drvs: vec![drv.clone()],
+                    est_nodes: 1,
+                    build_id: None,
+                    started_at: now_rfc3339(),
+                    finished_at: Some(now_rfc3339()),
+                    results: Vec::new(),
+                    reasons: BTreeMap::new(),
+                    stderr_tail: None,
+                    engine_cancelled: true,
+                    disconnect_deadline_fired: false,
+                    interruption_drvs: Vec::new(),
+                    import_skipped_drvs: Vec::new(),
+                    probe: false,
+                    confirmation_attempt: 0,
+                },
+            )
+            .unwrap();
+        let backends = CollectBackends {
+            admin: Arc::new(NoLogsAdmin),
+            store: Arc::new(FakeStoreApi::default()),
+            artifacts: None,
+        };
+        let tracker = Arc::new(SubmitTracker::default());
+        let wd = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let job_ledger = ledger::JobLedger::new(state.clone(), tracker.clone(), wd.clone());
+        // The job is currently committed to B2 (id 11) — the stall
+        // auto-retry's fresh batch, still running.
+        job_ledger.commit_batch(11, &[job.to_string()]).await;
+
+        let results = tokio::sync::Mutex::new(BTreeMap::new());
+        let mut processed = HashSet::new();
+        let requeued = collect_pass_with(
+            &state,
+            &backends,
+            &contexts,
+            &job_ledger,
+            &results,
+            &mut processed,
+            &Knobs::default(),
+            "leaf",
+            "c-stale",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(requeued, 0, "the stale requeue must not be applied");
+        assert_eq!(
+            tracker.resubmission_count(job).await,
+            0,
+            "no phantom resubmission is counted"
+        );
+        let journal: Vec<model::RequeueRecord> = state.load_jsonl(StateFile::Requeues).unwrap();
+        assert!(journal.is_empty(), "nothing journaled: {journal:?}");
+        assert_eq!(
+            wd.lock().await.phase_of(job),
+            Some(watchdog::JobPhase::Active),
+            "the live batch's clock keeps its Active phase"
+        );
+        assert!(
+            processed.contains(&10),
+            "the stale batch is still marked processed (never re-examined)"
+        );
     }
 
     /// Job context with an empty closure for the journal-fold tests.
@@ -4362,7 +4473,7 @@ mod tests {
 
         // The watchdog's stall auto-retry, applied through the production
         // stall path (journal + increment + gate update together).
-        live.commit_batch(&[jc.to_string()]).await;
+        live.commit_batch(1, &[jc.to_string()]).await;
         apply_stall_actions(
             &state,
             &live,
@@ -5788,7 +5899,7 @@ mod tests {
             .in_flight
             .lock()
             .await
-            .insert(active_job.to_string());
+            .insert(active_job.to_string(), 1);
 
         let healthy = ClusterCounts {
             active_executors: 8,
@@ -5830,7 +5941,7 @@ mod tests {
         .await;
         // Auto-retry effects: reservation released, resubmission counted, no
         // terminal record yet.
-        assert!(!tracker.in_flight.lock().await.contains(active_job));
+        assert!(!tracker.in_flight.lock().await.contains_key(active_job));
         assert_eq!(tracker.resubmission_count(active_job).await, 1);
         assert!(
             state
@@ -5845,7 +5956,7 @@ mod tests {
             .in_flight
             .lock()
             .await
-            .insert(active_job.to_string());
+            .insert(active_job.to_string(), 1);
         let second = {
             let mut wd = wd.lock().await;
             wd.observe_job(active_job, watchdog::JobPhase::Active);
@@ -5888,7 +5999,7 @@ mod tests {
             results.lock().await.contains_key(active_job),
             "in-memory results updated"
         );
-        assert!(!tracker.in_flight.lock().await.contains(active_job));
+        assert!(!tracker.in_flight.lock().await.contains_key(active_job));
 
         // QueuedEscalate goes terminal immediately with the stalled-queued
         // signature.

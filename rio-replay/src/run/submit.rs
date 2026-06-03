@@ -45,8 +45,15 @@ const IN_FLIGHT_POLL: Duration = Duration::from_secs(1);
 /// internal retry cycles.
 #[derive(Debug, Default)]
 pub struct SubmitTracker {
-    /// Jobs reserved by a batch that has been started and has not settled.
-    pub in_flight: Mutex<HashSet<String>>,
+    /// Jobs reserved by a batch that has been started and has not settled,
+    /// keyed to the OWNING batch id. Ownership is what makes settlement
+    /// releases safe against the deliberate live-overlap the stall
+    /// auto-retry creates (the stuck batch keeps running while its member
+    /// is re-offered into a fresh batch): a settle can only release the
+    /// reservations its own batch id still owns, so a superseded batch's
+    /// late settle cannot strip its successor's reservation and re-open
+    /// the job to a third concurrent submission.
+    pub in_flight: Mutex<HashMap<String, u64>>,
     /// Job → number of engine-initiated resubmissions so far. Incremented
     /// by the collect pass when it re-queues a job from a settled batch
     /// (and by the stall watchdog when it requeues a stalled job); the
@@ -64,7 +71,13 @@ impl SubmitTracker {
     }
 
     /// Release a settled batch's in-flight reservations and start the
-    /// post-settlement cool-down for each of its jobs.
+    /// post-settlement cool-down for each of its jobs — but only the
+    /// reservations `batch_id` still OWNS. A member re-reserved by a newer
+    /// batch (the stall auto-retry released this batch's reservation and
+    /// re-offered the job while this batch kept running) is left alone:
+    /// the stale settle has no authority over the successor's reservation,
+    /// and stripping it would re-open the job to a third concurrent
+    /// submission on the next wave.
     ///
     /// Re-offer damper: a job whose batch settled without a terminal record
     /// stays un-offerable for `cooldown` (the submit loop passes one collect
@@ -78,17 +91,28 @@ impl SubmitTracker {
     /// counts as a resubmission. The cool-down entry is written before the
     /// in-flight reservation is dropped so there is no instant in which the
     /// job is offerable between the two updates.
-    pub async fn release_after_settle(&self, jobs: &[String], cooldown: Duration) {
+    pub async fn release_after_settle(&self, batch_id: u64, jobs: &[String], cooldown: Duration) {
         let until = tokio::time::Instant::now() + cooldown;
+        let owned: Vec<&String> = {
+            let in_flight = self.in_flight.lock().await;
+            jobs.iter()
+                .filter(|job| in_flight.get(*job) == Some(&batch_id))
+                .collect()
+        };
         {
             let mut cooling = self.cooldown_until.lock().await;
-            for job in jobs {
-                cooling.insert(job.clone(), until);
+            for job in &owned {
+                cooling.insert((*job).clone(), until);
             }
         }
         let mut in_flight = self.in_flight.lock().await;
-        for job in jobs {
-            in_flight.remove(job);
+        for job in &owned {
+            // Re-checked under the lock: ownership cannot have moved to
+            // this batch id in between (ids are unique per submission),
+            // so a non-matching entry simply stays.
+            if in_flight.get(*job) == Some(&batch_id) {
+                in_flight.remove(*job);
+            }
         }
     }
 
@@ -193,6 +217,7 @@ pub async fn submit_one_batch(
         interruption_drvs,
         import_skipped_drvs: Vec::new(),
         probe: intent.probe,
+        confirmation_attempt: intent.confirmation_attempt,
     };
     match outcome {
         Ok(o) => {
@@ -228,7 +253,9 @@ pub async fn submit_one_batch(
             record.stderr_tail = Some(format!("engine submission error: {e:#}"));
         }
     }
-    tracker.release_after_settle(&batch.jobs, cooldown).await;
+    tracker
+        .release_after_settle(batch_id, &batch.jobs, cooldown)
+        .await;
     state.append_jsonl(StateFile::Batches, &record)?;
     Ok(record)
 }
@@ -301,7 +328,14 @@ pub async fn run_submit_loop(
         let terminal = terminal_jobs();
         let (in_flight_snapshot, resubs) = {
             (
-                ledger.tracker().in_flight.lock().await.clone(),
+                ledger
+                    .tracker()
+                    .in_flight
+                    .lock()
+                    .await
+                    .keys()
+                    .cloned()
+                    .collect::<HashSet<String>>(),
                 ledger.tracker().resubmissions.lock().await.clone(),
             )
         };
@@ -419,8 +453,8 @@ pub async fn run_submit_loop(
             drop(permit);
             continue;
         }
-        ledger.commit_batch(&batch.jobs).await;
         let batch_id = batch_seq.fetch_add(1, Ordering::SeqCst);
+        ledger.commit_batch(batch_id, &batch.jobs).await;
         if intent.probe {
             // Report the released probe so the poller can score the cycle
             // once collect classifies the batch.
@@ -563,7 +597,7 @@ mod tests {
             .in_flight
             .lock()
             .await
-            .insert("x.x86_64-linux".into());
+            .insert("x.x86_64-linux".into(), 7);
         let rec = submit_one_batch(
             &state,
             &submitter,
@@ -586,7 +620,13 @@ mod tests {
         );
         // The submitter's in-band per-root results ride the batch record.
         assert_eq!(rec.results, vec![scripted_result.clone()]);
-        assert!(!tracker.in_flight.lock().await.contains("x.x86_64-linux"));
+        assert!(
+            !tracker
+                .in_flight
+                .lock()
+                .await
+                .contains_key("x.x86_64-linux")
+        );
         // The settled job enters the post-settlement cool-down.
         assert!(tracker.cooling_jobs().await.contains("x.x86_64-linux"));
         let on_disk: Vec<BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
@@ -619,7 +659,7 @@ mod tests {
             .in_flight
             .lock()
             .await
-            .insert("x.x86_64-linux".into());
+            .insert("x.x86_64-linux".into(), 1);
         let deadline = BatchDeadline::Build(tokio::time::Instant::now() + Duration::from_secs(60));
         let rec = submit_one_batch(
             &state,
@@ -645,7 +685,13 @@ mod tests {
                 .contains("ssh handshake failed"),
             "{rec:?}"
         );
-        assert!(!tracker.in_flight.lock().await.contains("x.x86_64-linux"));
+        assert!(
+            !tracker
+                .in_flight
+                .lock()
+                .await
+                .contains_key("x.x86_64-linux")
+        );
         let on_disk: Vec<BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
         assert_eq!(on_disk.len(), 1);
         assert_eq!(submitter.submitted.lock().unwrap()[0].2, deadline);
@@ -981,11 +1027,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn tracker_cooldown_blocks_then_expires() {
         let tracker = SubmitTracker::default();
-        tracker.in_flight.lock().await.insert("a".into());
+        tracker.in_flight.lock().await.insert("a".into(), 3);
         tracker
-            .release_after_settle(&["a".to_string()], Duration::from_secs(60))
+            .release_after_settle(3, &["a".to_string()], Duration::from_secs(60))
             .await;
-        assert!(!tracker.in_flight.lock().await.contains("a"));
+        assert!(!tracker.in_flight.lock().await.contains_key("a"));
         assert_eq!(tracker.cooling_jobs().await, ["a".to_string()].into());
         tokio::time::advance(Duration::from_secs(61)).await;
         assert!(tracker.cooling_jobs().await.is_empty());
