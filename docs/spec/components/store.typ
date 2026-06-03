@@ -1726,7 +1726,7 @@ garbage output that also suppressed the genuine successor lines via the
 advanced watermark; an under-length object was a silent hole presented as
 complete. Both are corruption-grade (the row and object are written from
 the same slice in the same call), so both count toward
-`rio_store_log_read_data_loss_total`, but only the short direction is
+#(refs.metric)("rio_store_log_read_data_loss_total"), but only the short direction is
 unrecoverable and surfaces as an error.
 
 = PostgreSQL Schema

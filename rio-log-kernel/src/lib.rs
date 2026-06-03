@@ -240,8 +240,9 @@ pub fn visit_chunk(next_line: u64, first_line: u64, n_lines: u64) -> ChunkVisit 
 
 /// Why one connected `TailLog` stream stopped yielding messages, as
 /// the relay's loop observed it. The conflations this enum forbids are
-/// the merged_bug_076 class: an `Err` is always [`TransportErr`] and a
-/// clean `None` is always [`NaturalEnd`] — neither means "drained"
+/// the merged_bug_076 class: an `Err` is always
+/// [`TransportErr`](TailStopCause::TransportErr) and a clean `None` is
+/// always [`NaturalEnd`](TailStopCause::NaturalEnd) — neither means "drained"
 /// on its own; only [`tail_next`] decides that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TailStopCause {

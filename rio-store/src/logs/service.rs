@@ -284,7 +284,7 @@ impl LogServiceImpl {
     /// Set the `{pod}` → URI template the cross-replica `TailLog` proxy
     /// dials peers with. See `Config::log_peer_url_template`.
     /// Override the per-subscriber fan-out queue capacity (test knob;
-    /// production uses [`TAIL_SUBSCRIBER_QUEUE`]).
+    /// production uses `TAIL_SUBSCRIBER_QUEUE`, a private const).
     pub fn with_tail_subscriber_queue(mut self, n: usize) -> Self {
         self.tail_subscriber_queue = n.max(1);
         self
@@ -1420,26 +1420,38 @@ async fn serve_tail(
                 // a served follow stream is gapless by construction
                 // modulo genuine holes the store never accepted.
                 metrics::counter!("rio_store_log_tail_fanout_recovered_total").increment(1);
-                // (a) Everything cut to chunks since the cursor.
+                // (a) The live buffer FIRST — `in_flight ++ buffer` in
+                // one critical section, per the IngestShared coverage
+                // contract (ingest.rs): a line leaves that view only
+                // once its cut has COMMITTED, so the manifest read
+                // below is then guaranteed to hold it. Reading the
+                // manifest first opens a commit-window hole: a cut
+                // staged at the SQL read and committed before the
+                // snapshot is in NEITHER view (observed as an interior
+                // missing pair at a cut boundary under load). Overlap
+                // in this order is harmless — the cursor walk dedups.
+                // The session may have ended between the drop and now
+                // — then the manifest walk holds everything.
+                let snap: Vec<(u64, Vec<u8>)> = match shared.upgrade() {
+                    Some(shared) => lock_shared(&shared).snapshot(),
+                    None => Vec::new(),
+                };
+                // (b) Everything cut to chunks since the cursor.
                 let refs = tail::read_manifest_range(&pool, exec_id, cursor.next_line()).await?;
                 for chunk in &refs {
                     let lines = tail::read_chunk(store.as_ref(), chunk, &mut cursor).await?;
                     send_lines(tx, &exec_str, lines, false).await?;
                 }
-                // (b) The live buffer (accepted, not yet cut). The
-                // session may have ended between the drop and now —
-                // then the manifest walk above already held everything.
-                if let Some(shared) = shared.upgrade() {
-                    let snap: Vec<(u64, Vec<u8>)> = lock_shared(&shared)
-                        .snapshot()
-                        .into_iter()
-                        .filter(|(n, _)| *n >= cursor.next_line())
-                        .collect();
-                    let end = snap.last().map(|(n, _)| *n);
-                    send_lines(tx, &exec_str, snap, false).await?;
-                    if let Some(end) = end {
-                        cursor.advance_to(end + 1);
-                    }
+                // (c-pre) The snapshot, deduplicated through the
+                // post-manifest cursor.
+                let snap: Vec<(u64, Vec<u8>)> = snap
+                    .into_iter()
+                    .filter(|(n, _)| *n >= cursor.next_line())
+                    .collect();
+                let end = snap.last().map(|(n, _)| *n);
+                send_lines(tx, &exec_str, snap, false).await?;
+                if let Some(end) = end {
+                    cursor.advance_to(end + 1);
                 }
                 // (c) The triggering batch through the (advanced)
                 // cursor — usually fully deduplicated by (b), which
@@ -1466,20 +1478,27 @@ async fn serve_tail(
     // drop on the LAST batches must not become a missing tail the
     // final message advertises past.
     let mut recovered = false;
+    // Snapshot FIRST, manifest second — the same coverage-contract
+    // ordering as the in-stream backfill above (a cut committing
+    // between a manifest-first read and the snapshot would hide its
+    // lines from both views).
+    let snap: Vec<(u64, Vec<u8>)> = match shared.upgrade() {
+        Some(shared) => lock_shared(&shared).snapshot(),
+        None => Vec::new(),
+    };
     let refs = tail::read_manifest_range(&pool, exec_id, cursor.next_line()).await?;
     for chunk in &refs {
         let lines = tail::read_chunk(store.as_ref(), chunk, &mut cursor).await?;
         recovered |= !lines.is_empty();
         send_lines(tx, &exec_str, lines, false).await?;
     }
-    if let Some(shared) = shared.upgrade() {
-        let snap: Vec<(u64, Vec<u8>)> = lock_shared(&shared)
-            .snapshot()
-            .into_iter()
-            .filter(|(n, _)| *n >= cursor.next_line())
-            .collect();
+    let snap: Vec<(u64, Vec<u8>)> = snap
+        .into_iter()
+        .filter(|(n, _)| *n >= cursor.next_line())
+        .collect();
+    if !snap.is_empty() {
         let end = snap.last().map(|(n, _)| *n);
-        recovered |= !snap.is_empty();
+        recovered = true;
         send_lines(tx, &exec_str, snap, false).await?;
         if let Some(end) = end {
             cursor.advance_to(end + 1);
