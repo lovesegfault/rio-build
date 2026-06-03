@@ -166,8 +166,8 @@ pub enum Polled<T> {
     /// A poll was attempted and the RPC failed. The prior state holds for
     /// the first failure (a transient blip must not flap a suspension, and
     /// the stall clocks with it); from the per-feed staleness threshold
-    /// ([`ICE_STALE_AFTER_FAILED_POLLS`] /
-    /// [`CLUSTER_STALE_AFTER_FAILED_POLLS`]) consecutive failures the
+    /// (`ICE_STALE_AFTER_FAILED_POLLS` /
+    /// `CLUSTER_STALE_AFTER_FAILED_POLLS`) consecutive failures the
     /// latched state stops asserting its components until a poll succeeds
     /// again.
     Failed,
@@ -201,7 +201,7 @@ pub struct PollTick {
     /// ticks that only exercise the clocks); a failed poll arrives as
     /// [`Polled::Failed`] — the idle and dispatch streaks then stay
     /// unchanged (missing evidence is not an observation), and from
-    /// [`CLUSTER_STALE_AFTER_FAILED_POLLS`] consecutive failures the
+    /// `CLUSTER_STALE_AFTER_FAILED_POLLS` consecutive failures the
     /// saturated streaks stop asserting their components.
     pub cluster: Polled<ClusterCounts>,
     /// Spawn-intents poll outcome for this tick.
