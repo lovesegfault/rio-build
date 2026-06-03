@@ -1300,7 +1300,12 @@ async fn test_gc_exec_rows_spares_referenced_and_live() -> anyhow::Result<()> {
     .await?;
 
     // C's ledger reference.
-    let mut row = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let mut row = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Transient,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
     row.exec_id = Some(exec_c);
     append_committed(&db, &[row]).await?;
 
