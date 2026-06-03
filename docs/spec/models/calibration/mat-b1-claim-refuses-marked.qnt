@@ -42,7 +42,8 @@ module matCalibB1ClaimRefusesMarked {
     ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// PRE-FIX claim: the A11 refusal applies to the materialization

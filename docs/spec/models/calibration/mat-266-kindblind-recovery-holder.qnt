@@ -46,7 +46,8 @@ module matCalib266KindblindRecoveryHolder {
     ENABLE_GC = true,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// The kind-blind claimed_by projection: ANY open attempt's instance

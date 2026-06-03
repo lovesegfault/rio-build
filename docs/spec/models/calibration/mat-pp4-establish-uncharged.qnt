@@ -40,7 +40,8 @@ module matCalibPp4EstablishUncharged {
     ENABLE_GC = false,
     ENABLE_CRASH = true,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// PRE-FIX establishment: charge-free for the materialization kind.

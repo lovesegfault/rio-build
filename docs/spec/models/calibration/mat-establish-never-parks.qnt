@@ -44,7 +44,8 @@ module matCalibEstablishNeverParks {
     ENABLE_GC = false,
     ENABLE_CRASH = true,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// PRE-FIX establishment: the materialization charge with NO park
@@ -82,6 +83,7 @@ module matCalibEstablishNeverParks {
         (match jobs.get(d) { | NoJob => false | SomeJob(j) => j.parked })
           == (newCount >= MAT_BUDGET),
       },
+      abortChargeFree' = abortChargeFree,
     },
     dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, envUnchanged,

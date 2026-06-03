@@ -37,7 +37,8 @@ module matCalibF7UnkeyedResolve {
     ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// PRE-FIX resolution: un-keyed — resolves without any attempt.

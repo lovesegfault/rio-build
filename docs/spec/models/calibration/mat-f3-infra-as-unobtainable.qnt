@@ -42,7 +42,8 @@ module matCalibF3InfraAsUnobtainable {
     ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// PRE-FIX InfraFailure consumption: charged as unobtainable, routed
@@ -131,6 +132,7 @@ module matCalibF3InfraAsUnobtainable {
     claimOrigin' = claimOrigin,
     carried' = carried,
     budgetSoundAll' = budgetSoundAll,
+    abortChargeFree' = abortChargeFree,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
   }
 

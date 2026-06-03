@@ -2661,3 +2661,62 @@ establishment-written — executes the park verdict through the single
 `charge_materialization_infra` chokepoint (bug_067, the owner-signed
 Q5 reversal of residual (a): party-blind parking; see the
 substitution-replacement map's superseded residual block).
+
+## Cross-campaign addendum — the store-degraded pacing class (bughunt wave, B1 bounded-await-transport)
+
+`OutcomeClass::StoreDegraded` (migration 088; the 17th alphabet
+literal) is **pacing, not evidence** — the outcome the FUSE breaker
+stamps when the worker's own store connectivity degraded mid-build
+(`BuildResult.store_degraded`, both open transitions counted by the
+breaker's monotonic `trips`). The kernel's fold answers `row_to_event
+→ None`, so `apply()` structurally cannot charge the class: no counter
+moves, no exclusion key is minted, no poison threshold sees it, and
+the verdict stays whatever the charged history decided. The only
+effect is the fold-local consecutive-run backoff
+(`store_degraded_run`, never persisted, reset by any folded event) —
+the derivation **waits out the outage at the curve's cap** instead of
+marching to the poison threshold. Recorded red (bug_408): eleven
+flagged reports left `left: Poisoned` — a store outage poisoned the
+derivation and excluded every builder that honestly reported it.
+
+The rule (`sched.retry.store-degraded-uncharged`) carve-out amended
+`sched.retry.attempts-bounded` to **+3**: an uncharged store-degraded
+close is bounded by TIME (the backoff curve), not by count — the
+pacing carve-out is the boundedness argument for the class, exactly as
+the worker-abort carve-out is count-bounded at
+`WORKER_ABORT_FREE_CLOSES`. Intake side: the scheduler's report path
+skips the floor bump for the class and writes the fold's deadline
+through the live-backoff carve-out (B1-s2 commit 2).
+
+**Proof surface.** Kani: `check_store_degraded_uncharged_requeue`
+(decide over N store-degraded rows ⇒ Requeue, all counters zero,
+exclusion empty, never Poison; the classify iff-clause pins
+`WorkerStoreDegraded ↔ StoreDegraded`). Quint
+(`docs/spec/models/retryPolicy.qnt`): the contract triple
+`storeDegradedNeverPoisons` / `storeDegradedDrawsNoBudget` /
+`storeDegradedMintsNoExclusion` holds exhaustively in the
+`retryPolicyPullStoreDegraded` regime (every other regime binds
+`ENABLE_STORE_DEGRADED = false` and stays bit-identical — the dormancy
+discipline); the falsifiability pair is the `retry-408-sd-as-infra`
+calibration (the pre-fix class-blind fold: budget drawn and exclusion
+minted on the first report, poisoned at the cap), and the
+fleet-correlated reachability pin is `correlatedStoreOutageRun` (three
+consecutive store-degraded closes across both workers leave the
+derivation requeued, all counters zero, exclusion empty). The curve
+arithmetic itself is below the model's untimed-backoff floor, the same
+posture as the establishment window's timing.
+
+**None-sensible record (B1's two formal-delta omissions, per the §2
+formal delta items 5–6).** (a) `IdleClock` (the builder's
+outage-excluding idle-exit clock, merged_bug_209): kani is
+none-sensible — `rio-builder` is a bin crate (`nix/kani.nix`'s
+bin-crate exclusion) and the clock is ~30 lines of pure told-time
+arithmetic; the proof surface is the proptest
+(`idle_for == Σ min(gap, 2·prev_suggested)` over answer-adjacent
+pairs; errors never advance) plus the unit battery. (b)
+`bounded()`/`GraceBudget` (the transport primitive): none-sensible for
+quint — a local two-arm race primitive whose model would restate
+tokio `select` semantics; correctness is type-level (`#[must_use]
+BoundedOutcome`), the `transport-unary-ban` policy check, and the unit
+battery (biased shutdown, timeout, budget arithmetic, `GraceBudget`
+const-asserts).

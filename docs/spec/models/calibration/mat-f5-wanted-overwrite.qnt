@@ -41,7 +41,8 @@ module matCalibF5WantedOverwrite {
     ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// PRE-FIX relation write: replaces ALL builds' rows for d (the

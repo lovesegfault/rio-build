@@ -42,7 +42,8 @@ module matCalibChainResetDropsCarrier {
     ENABLE_GC = true,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// PRE-FIX stale-reset creation: origin pinned OStaleReset, carrier
@@ -106,6 +107,7 @@ module matCalibChainResetDropsCarrier {
     // realized paths and the creation carries NOTHING.
     carried' = carried,
     budgetSoundAll' = budgetSoundAll,
+    abortChargeFree' = abortChargeFree,
   }
 
   action calibStep = {
@@ -171,7 +173,8 @@ module matCalibChainResetDropsCarrierEx {
     ENABLE_GC = true,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// PRE-FIX stale-reset creation: origin pinned OStaleReset, carrier
@@ -235,6 +238,7 @@ module matCalibChainResetDropsCarrierEx {
     // realized paths and the creation carries NOTHING.
     carried' = carried,
     budgetSoundAll' = budgetSoundAll,
+    abortChargeFree' = abortChargeFree,
   }
 
   action calibStep = {

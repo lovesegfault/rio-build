@@ -635,6 +635,31 @@ clock). B1 owns the recorded none-sensible rationale for the timed
 axis (the parked-cut + paced-multirun test pair is merged_bug_119's
 pin); no bughunt-wave workstream models time, per ruling R8.
 
+### §4.R8 — the timed axis: B1's owning rationale (merged_bug_119)
+
+The wave-wide ruling (`§4.R8`) and its owning record: **no workstream
+models the timed axis of the log service in this wave**, and
+`logService.qnt` stays deliberately UNTIMED — cuts are atomic, there
+is no drain-deadline clock and no heartbeat-staleness clock in the
+model's alphabet. Three reasons, priced once here. (1) The defects the
+timed axis would catch were closed STRUCTURALLY, below the timer:
+merged_bug_119's StaleBuffer mis-fire was a predicate bug (multi-run
+buffers conflated; the backstop now gates on `failures > 0`), not a
+timing bug — its pin is the deterministic test pair
+`parked_cut_does_not_starve_abort` (a BlockingPutStore park must not
+starve the abort past ~3-4 cut intervals, heartbeat observed running)
++ `paced_multirun_drain_never_trips_stale_buffer` (the recorded red:
+fired on tick 2-3 pre-fix). (2) A timed model re-derives tokio/timer
+semantics rather than protocol content — the same restatement trap as
+modeling `bounded()` (B1's transport none-sensible record, retry map).
+(3) The B3 fork's gate-caught snapshot-ordering race sits BELOW even
+the cut-atomicity floor — the honest net for sub-atomic interleavings
+is the unit suite, recorded there. Re-open trigger: if a future
+defect's mechanism is irreducibly a clock interleaving (not a
+predicate over observed state), the timed axis graduates from
+none-sensible to a funded model extension; until then every timer
+behavior is pinned by deterministic tests with paused time.
+
 ### The security-rider meta-class (coordinator-mandated record)
 
 The three security findings folded into this workstream's commits are

@@ -151,6 +151,12 @@ let
     "pendingUnclaimedImpliesClaimableNode"
     "carrierConservation"
     "completionRecordsRealizedPaths"
+    # B1 bounded-await-transport (bughunt wave, merged_bug_189 / owner
+    # Q3): the SIGTERM-aborted walk closes charge-free through
+    # release_claim (workerAborted is regime-gated default-false; the
+    # holds evidence is quint-materialization-holds-worker-abort).
+    # Calibration pair: quint-materialization-calib-189-abort-charges.
+    "abortNeverCharges"
   ];
 
   # The leader-election model as its own single-file store path (the
@@ -3759,6 +3765,63 @@ in
     };
 
     # ------------------------------------------------------------------
+    # B1 bounded-await-transport (bughunt wave, bug_408): the
+    # store-degraded paced-requeue class
+    # (sched.retry.store-degraded-uncharged; the attempts-bounded+3
+    # pacing carve-out). The contract triple — never a poison input,
+    # never a budget draw, never an exclusion key — holds exhaustively
+    # with the action enabled; every other regime binds
+    # ENABLE_STORE_DEGRADED = false and stays bit-identical. The
+    # falsifiability pair is the retry-408-sd-as-infra calibration (the
+    # pre-fix class-blind fold: the recorded red marched 11 flagged
+    # reports to Poisoned); the reachability pin is
+    # correlatedStoreOutageRun (the fleet-correlated outage).
+    # ------------------------------------------------------------------
+    # r[verify sched.retry.store-degraded-uncharged]
+    quint-retry-policy-pull-store-degraded = mkQuintCheck {
+      name = "retry-policy-pull-store-degraded";
+      spec = "retryPolicy";
+      main = "retryPolicyPullStoreDegraded";
+      step = "pullStep";
+      invariants = [
+        "boundsOK"
+        "attemptsChargedOnce"
+        "countersRefineHistory"
+        "verdictMatchesFold"
+        "durableMirrorsCharges"
+        "noDoubleCount"
+        "poisonIsTerminalUntilCleared"
+        "cascadeReachesExactlyTheDependents"
+        "failoverPreservesHistory"
+        "recoveryNeverFabricatesFailures"
+        "placementSound"
+        "clearedPoisonClearsDurably"
+        "clearedPoisonScrubsExclusions"
+        "recoveryPreservesPoisonStatus"
+        "boundedFreeRequeues"
+        "storeDegradedNeverPoisons"
+        "storeDegradedDrawsNoBudget"
+        "storeDegradedMintsNoExclusion"
+      ];
+    };
+    quint-retry-policy-pull-runs-store-outage = mkQuintRunCheck {
+      name = "retry-policy-pull-runs-store-outage";
+      spec = "retryPolicy";
+      main = "retryPolicyPullStoreDegraded";
+      match = "correlatedStoreOutageRun";
+    };
+    # The pre-fix fold (TLC, first-violation; no tracey markers on
+    # calibration checks).
+    quint-retry-policy-calib-408-sd-as-infra = mkQuintWitnessCheck {
+      name = "retry-policy-calib-408-sd-as-infra";
+      spec = "calibration/retry-408-sd-as-infra";
+      main = "retryCalibSdAsInfra";
+      extraSpecs = [ "retryPolicy" ];
+      step = "calibStep";
+      witness = "storeDegradedDrawsNoBudget";
+    };
+
+    # ------------------------------------------------------------------
     # Substitution-replacement Phase A (T-5.1/T-5.2): the materialization
     # attempt class — the kind partition the campaign adds to the attempt
     # ledger (design §2.5/§9.2, OQ1 amendments 1-2). Two invariants:
@@ -3968,6 +4031,19 @@ in
       name = "materialization-holds-crash-loop";
       spec = "materializationJob";
       main = "materializationJobCrashLoop";
+      invariants = matJobInvariants;
+      maxSamples = 2000000;
+      maxSteps = 15;
+    };
+    # B1 (merged_bug_189 / owner Q3): the worker-abort regime — the
+    # base alphabet plus the SIGTERM-aborted charge-free close; the
+    # full conjunction including abortNeverCharges holds with the
+    # action enabled. Falsifiability pair:
+    # quint-materialization-calib-189-abort-charges.
+    quint-materialization-holds-worker-abort = mkQuintSimHoldsCheck {
+      name = "materialization-holds-worker-abort";
+      spec = "materializationJob";
+      main = "materializationJobWorkerAbort";
       invariants = matJobInvariants;
       maxSamples = 2000000;
       maxSteps = 15;
@@ -4472,6 +4548,27 @@ in
       extraSpecs = [ "materializationJob" ];
       step = "calibStep";
       witness = "unresolvedJobAlwaysArmed";
+    };
+    # B1 (merged_bug_189): the pre-fix Err->infra flatten — a
+    # SIGTERM-aborted walk drew the materialization budget.
+    quint-materialization-calib-189-abort-charges = mkQuintWitnessCheck {
+      name = "materialization-calib-189-abort-charges";
+      spec = "calibration/mat-189-abort-charges";
+      main = "matCalibAbortCharges";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "abortNeverCharges";
+    };
+    # B1 (merged_bug_158): the pre-fix token-blind re-delivery — two
+    # workers behind one identity hold the same open attempt; the
+    # §2.2 arbiter's worker-class identity clause falsifies.
+    quint-materialization-calib-158-colliding-identity = mkQuintWitnessCheck {
+      name = "materialization-calib-158-colliding-identity";
+      spec = "calibration/mat-158-colliding-identity";
+      main = "matCalibCollidingIdentity";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "atMostOneClaimWinner";
     };
 
     # ------------------------------------------------------------------

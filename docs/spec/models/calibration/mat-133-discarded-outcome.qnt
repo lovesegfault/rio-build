@@ -37,7 +37,8 @@ module matCalib133DiscardedOutcome {
     ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = true
+    ENABLE_RESOLVE_FAULTS = true,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// PRE-FIX: the fenced/errored resolve's view discard — the durable

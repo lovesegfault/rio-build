@@ -41,7 +41,8 @@ module matCalibCe17SkipCoverage {
     ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// PRE-FIX success consumption: no coverage re-check — always
@@ -77,6 +78,7 @@ module matCalibCe17SkipCoverage {
     claimOrigin' = claimOrigin,
     carried' = carried,
     budgetSoundAll' = budgetSoundAll,
+    abortChargeFree' = abortChargeFree,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
   }
 

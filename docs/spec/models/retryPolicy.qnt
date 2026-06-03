@@ -387,6 +387,8 @@ module retryPolicy {
   type ObsKind =
     | ONone | OE1 | OE2 | OE3 | OE4 | OE5 | OE6 | OE7 | OE8 | OEstablish
     | OE9Dispatch | OResubmit | OCacheHit | OPoisonClear | OTtlExpire | OFailover
+    // Bughunt wave B1 (bug_408): the store-degraded paced requeue.
+    | OStoreDegraded
   type LastObs = {
     kind: ObsKind,
     chargedAny: bool,       // some budget counter was charged by this event
@@ -399,6 +401,7 @@ module retryPolicy {
     raceAhead: bool,        // controller report used the still-live executor
     terminal: bool,         // the event produced a terminal state
     dropped: bool,          // the status guard dropped the observation (already terminal)
+    exclusionMinted: bool,  // B1/bug_408: this event added the worker to the exclusion set
   }
 
   // --- 2. constants (const = overridable per regime) --------------------
@@ -441,6 +444,17 @@ module retryPolicy {
   /// alphabet (the kind-partition invariants' regime).
   const ENABLE_MATERIALIZATION: bool
 
+  /// Bughunt wave B1 (bug_408): the store-degraded paced-requeue class.
+  /// false = the action is disabled and the regime's reachable state
+  /// space is bit-identical to the pre-B1 one (the dormancy
+  /// discipline); true = a running worker may report a store-degraded
+  /// infrastructure failure (the FUSE-breaker stamp) and the intake
+  /// closes it as pure pacing -- no fold event, no counter movement,
+  /// no exclusion key, never a poison input
+  /// (sched.retry.store-degraded-uncharged; the attempts-bounded+3
+  /// pacing carve-out).
+  const ENABLE_STORE_DEGRADED: bool
+
   // Scaled budget (the production values are configuration, not
   // normative numbers -- sched.retry.attempts-bounded+3). The scaling
   // keeps every cap reachable in a small state space; the witnesses
@@ -482,6 +496,7 @@ module retryPolicy {
     kind: ONone, chargedAny: false, doubleCharge: false, windowReset: false,
     exemptFallthrough: false, promoted: false, atCap: false,
     lateInstallment: false, raceAhead: false, terminal: false, dropped: false,
+    exclusionMinted: false,
   }
 
   /// RetryPolicy::backoff_duration without the jitter: min(base*mult^n, cap).
@@ -1036,6 +1051,23 @@ module retryPolicy {
   /// pullWorkerAbort's admission guard, exactly as admit_worker_abort
   /// gates the production intake.
   val boundedFreeRequeues = freeCloseRun <= WORKER_ABORT_FREE_CLOSES
+
+  /// Bughunt wave B1 (bug_408), the store-degraded contract triple
+  /// (sched.retry.store-degraded-uncharged): a store-degraded report is
+  /// pacing, not evidence. The pre-fix behavior -- the class-blind fold
+  /// that charged it as plain Infra -- is preserved as the
+  /// retry-408-sd-as-infra calibration, which must violate these.
+  /// (1) Never a poison input: the step that observes a store-degraded
+  /// report never lands the derivation poisoned.
+  val storeDegradedNeverPoisons =
+    (last.kind == OStoreDegraded) implies (dStatus != DPoisoned)
+  /// (2) Never a budget draw: no counter is charged by the event.
+  val storeDegradedDrawsNoBudget =
+    (last.kind == OStoreDegraded) implies not(last.chargedAny)
+  /// (3) Never an exclusion key: the reporting worker is not added to
+  /// the placement exclusion set by the event.
+  val storeDegradedMintsNoExclusion =
+    (last.kind == OStoreDegraded) implies not(last.exclusionMinted)
   /// Violated when the free-close run actually reaches the bound (the
   /// admission gate's contended edge is reachable — non-vacuity for
   /// boundedFreeRequeues).
@@ -1933,6 +1965,45 @@ module retryPolicy {
     everFailedBuilders' = everFailedBuilders,
   }
 
+  /// Bughunt wave B1 (bug_408): the worker's CompletionReport arrives
+  /// with the FUSE-breaker store-degraded stamp
+  /// (`BuildResult.store_degraded`); the report and its intake are
+  /// fused into one step (the pullWorkerAbort precedent). The class is
+  /// PURE PACING: the ledger row it writes is invisible to the charging
+  /// fold (`row_to_event` answers None), so no fold event is applied,
+  /// no counter moves, no exclusion key is minted and the verdict
+  /// stays whatever the charged history decided -- the derivation
+  /// requeues and waits out the outage at the backoff curve's cap.
+  /// The curve arithmetic itself (the kernel's fold-local
+  /// store_degraded_run) is below this model's untimed-backoff floor,
+  /// exactly as the establishment window's timing is. A store-degraded
+  /// row DOES intervene in the ledger suffix, so the worker-abort
+  /// trailing run resets (admit_worker_abort counts consecutive worker
+  /// aborts only).
+  // Mirrors: rio-retry-kernel decide()'s store-degraded fold arm
+  //          (r[impl sched.retry.store-degraded-uncharged]) behind the
+  //          scheduler intake's floor-bump skip.
+  action pullStoreDegraded(n: str): bool = all {
+    ENABLE_STORE_DEGRADED,
+    attempt == Running(n),
+    dStatus == DRunning,
+    attempt' = NoAttempt,
+    dStatus' = DReady,
+    execs' = execs.put(n, { ...execs.get(n), runningOurs: false }),
+    // a non-abort row breaks the worker-abort trailing run
+    freeCloseRun' = 0,
+    // pacing, not charges: no fold event, nothing moves.
+    spec' = spec, specVerdict' = specVerdict, live' = live,
+    pg' = pg,
+    last' = { ...noObs, kind: OStoreDegraded },
+    now' = now, poisonSrc' = poisonSrc,
+    depStatus' = depStatus, everFailureTerminal' = everFailureTerminal,
+    promotionsLeft' = promotionsLeft, physAttempts' = physAttempts,
+    failoversLeft' = failoversLeft, txFaultsLeft' = txFaultsLeft,
+    lastPoisonReason' = lastPoisonReason, justFailedOver' = false,
+    everFailedBuilders' = everFailedBuilders,
+  }
+
   /// The establishment sweep: an open attempt whose deadline +
   /// report-slack elapsed with no terminal row is established as
   /// executor_crash/unreported and charged (failed_builders[source] +
@@ -2156,6 +2227,7 @@ module retryPolicy {
   action pullAttemptOutcomeDeadlineAny = { nondet n = EXECUTORS.oneOf() pullAttemptOutcomeDeadline(n) }
   action pullAttemptOutcomeNoOpAny = { nondet n = EXECUTORS.oneOf() pullAttemptOutcomeNoOp(n) }
   action pullWorkerAbortAny = { nondet n = EXECUTORS.oneOf() pullWorkerAbort(n) }
+  action pullStoreDegradedAny = { nondet n = EXECUTORS.oneOf() pullStoreDegraded(n) }
   action pullEstablishAny = { nondet n = EXECUTORS.oneOf() pullEstablish(n) }
   action sourceLeavesPoolAny = { nondet n = EXECUTORS.oneOf() sourceLeavesPool(n) }
 
@@ -2452,6 +2524,7 @@ module retryPolicy {
     all { pullAttemptOutcomeDeadlineAny, buildLeavesMatUntouched },
     all { pullAttemptOutcomeNoOpAny, buildLeavesMatUntouched },
     all { pullWorkerAbortAny, buildLeavesMatUntouched },
+    all { pullStoreDegradedAny, buildLeavesMatUntouched },
     all { ctrlReportLostAny, buildLeavesMatUntouched },
     all { pullEstablishAny, buildLeavesMatUntouched },
     all { sourceLeavesPoolAny, buildLeavesMatUntouched },
@@ -2465,6 +2538,7 @@ module retryPolicy {
     materializationReportInfra,
     establishMaterializationCrash,
   }
+
 }
 
 // ===========================================================================
@@ -2496,7 +2570,8 @@ module retryPolicyPull {
     ENABLE_CRASH = true,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = true,
-    ENABLE_MATERIALIZATION = false
+    ENABLE_MATERIALIZATION = false,
+    ENABLE_STORE_DEGRADED = false
   ).*
 }
 
@@ -2529,6 +2604,72 @@ module retryPolicyPullMat {
     ENABLE_CRASH = true,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = false,
-    ENABLE_MATERIALIZATION = true
+    ENABLE_MATERIALIZATION = true,
+    ENABLE_STORE_DEGRADED = false
   ).*
+}
+
+/// Bughunt wave B1 (bug_408): the store-degraded paced-requeue regime —
+/// the pull regime's alphabet plus pullStoreDegraded. Holds the full
+/// invariant list plus the store-degraded contract triple
+/// (storeDegradedNeverPoisons / storeDegradedDrawsNoBudget /
+/// storeDegradedMintsNoExclusion); the falsifiability pair is the
+/// retry-408-sd-as-infra calibration (the pre-fix class-blind fold) and
+/// the reachability pin is correlatedStoreOutageRun. With
+/// ENABLE_STORE_DEGRADED = false everywhere else, every other regime's
+/// state space is bit-identical to its pre-B1 one.
+module retryPolicyPullStoreDegraded {
+  import retryPolicy(
+    EXECUTORS = Set("n1", "n2"),
+    MAX_TIME = 3,
+    MAX_ATTEMPTS = 6,
+    ATTEMPT_BOUND = 6,
+    MAX_FAILOVERS = 1,
+    TX_FAULTS = 0,
+    ENABLE_WORKER = true,
+    ENABLE_PODDEATH = true,
+    ENABLE_CRASH = true,
+    ENABLE_WEDGE = false,
+    ENABLE_RESETS = true,
+    ENABLE_MATERIALIZATION = false,
+    ENABLE_STORE_DEGRADED = true
+  ).*
+
+  // Deterministic scenario pin (regime-local: the run binds this
+  // regime's concrete workers; keeping it OUT of the abstract module
+  // also keeps the cross-file calibration import convertible -- the
+  // Apalache server answers INTERNAL on a cross-file import whose
+  // abstract module carries a run, while in-file mains convert).
+  /// Bughunt wave B1 (bug_408), the correlated store outage: the whole
+  /// fleet's reports come back store-degraded, repeatedly (the recorded
+  /// red: 11 flagged reports POISONED the derivation pre-fix). Three
+  /// consecutive store-degraded closes across BOTH workers leave the
+  /// derivation requeued and untouched: no counter movement, no
+  /// exclusion key, no poison -- the derivation waits out the outage.
+  run correlatedStoreOutageRun = {
+    init
+      .then(all { pullOpensAttempt("n1"), buildLeavesMatUntouched })
+      .then(all { pullStoreDegraded("n1"), buildLeavesMatUntouched })
+      .then(all { pullOpensAttempt("n1"), buildLeavesMatUntouched })
+      .then(all { pullStoreDegraded("n1"), buildLeavesMatUntouched })
+      .then(all { pullOpensAttempt("n2"), buildLeavesMatUntouched })
+      .then(all { pullStoreDegraded("n2"), buildLeavesMatUntouched })
+      .expect(and {
+        dStatus == DReady,
+        live.infraCount == 0,
+        live.failureCount == 0,
+        live.timeoutCount == 0,
+        live.exemptInfraCount == 0,
+        live.failedBuilders == Set(),
+        everFailedBuilders == Set(),
+        last.kind == OStoreDegraded,
+        not(last.chargedAny),
+        not(last.exclusionMinted),
+      })
+  }
+
+  /// Warmup alias (see the calibration file's note): lets the
+  /// Apalache-server warm-up convert this module under quint's default
+  /// step name.
+  action step = pullStep
 }

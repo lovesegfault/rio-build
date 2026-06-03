@@ -42,7 +42,8 @@ module matCalibUnscopedCount {
     ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// PRE-FIX consumption: the drv-level one-shot read (everything
@@ -111,6 +112,7 @@ module matCalibUnscopedCount {
       // A3/020: the one-shot routing consulted the job's OWN window —
       // the mat-unscoped-count override records false on divergence.
       budgetSoundAll' = and { budgetSoundAll, oneShotSpent == ownShotSpent },
+      abortChargeFree' = abortChargeFree,
       failFastCount' = if (arm3fail) failFastCount.put(d, failFastCount.get(d) + 1) else failFastCount,
       // delta 1: the four-conjunct justification, at decision time.
       // marked/Broken/missing-live are structural at the arm3fail

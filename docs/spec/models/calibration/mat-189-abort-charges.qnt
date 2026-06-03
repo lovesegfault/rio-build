@@ -1,32 +1,31 @@
 // -*- mode: Bluespec; -*-
 //
-// Bughunt-wave A2 calibration override, the merged_bug_318 shape: the
-// release edge after a materialization attempt FORCED the node Ready —
-// a Queued-origin (dep-racing) claim came back Ready with unbuilt
-// deps, and the spawn machinery dispatched a build whose inputs did
-// not exist. The production fix is validate_transition_for_release +
-// reset_after_attempt(kind, deps_completed): a release never upgrades
-// the claim-origin status. The main model's release edges all restore
-// NQueued (the conservative arm); claimOrigin records the origin and
-// the requeueReadyJustifiedAll latch pins that any Ready-setting
-// release had a Ready origin.
+// Bughunt-wave B1 calibration override, the abort-charges shape
+// (merged_bug_189's pre-fix transport half): before
+// MaterializationOutcome::Aborted existed, a SIGTERM-aborted store
+// walk surfaced through the class-blind `Err(e) => infra_failure(...)`
+// arm — every routine rollout charged the materialization budget
+// exactly like a dead upstream, and a rolling restart could march a
+// healthy job into the park. The production fix is the Aborted wire
+// variant + the charge-free intake through release_claim (owner Q3,
+// charge-free settlement recorded in the T-0e.6 extension block).
 //
-// PRE-FIX behavior modeled: calibRequeueForcesReady is reportInfra's
-// re-arm with the forced NReady — the latch records the upgrade of a
-// Queued-origin claim.
+// PRE-FIX behavior modeled: calibAbortCharges replaces workerAborted —
+// same trigger (SIGTERM mid-walk on a claimed materialization
+// attempt), but the close charges the per-job infra window (the
+// reportInfra edge) and latches abortChargeFree false.
 //
-// PREDICTED: readyImpliesDepsProducedOnRequeue falsifies — a re-armed
-// release sets Ready on a claim whose origin status was NQueued.
+// PREDICTED: abortNeverCharges falsifies on the first override step.
 //
 // Run (falsification):
-//   quint verify --backend=tlc --main=matCalib318RequeueForcesReady \
-//     --step=calibStep --invariant=readyImpliesDepsProducedOnRequeue \
-//     docs/spec/models/calibration/mat-318-requeue-forces-ready.qnt
-// Baseline (as-built step, must HOLD):
-//   quint verify --backend=tlc --main=matCalib318RequeueForcesReady \
-//     --invariant=readyImpliesDepsProducedOnRequeue \
-//     docs/spec/models/calibration/mat-318-requeue-forces-ready.qnt
-module matCalib318RequeueForcesReady {
+//   quint verify --backend=tlc --main=matCalibAbortCharges \
+//     --step=calibStep --invariant=abortNeverCharges \
+//     docs/spec/models/calibration/mat-189-abort-charges.qnt
+// Baseline (the as-shipped step, must HOLD):
+//   quint verify --backend=tlc --main=matCalibAbortCharges \
+//     --step=step --invariant=abortNeverCharges \
+//     docs/spec/models/calibration/mat-189-abort-charges.qnt
+module matCalibAbortCharges {
   import materializationJob(
     BUILDS = Set("b1", "b2"),
     DRVS = Set("d1"),
@@ -36,23 +35,23 @@ module matCalib318RequeueForcesReady {
     MAT_BUDGET = 2,
     MAX_EXECS = 4,
     MAX_GEN = 0,
-    MAX_UPSTREAM_FLIPS = 4,
+    MAX_UPSTREAM_FLIPS = 2,
     MAX_LEGACY = 0,
     ENABLE_FAILOVER = false,
-    ENABLE_GC = true,
+    ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
-    ENABLE_WORKER_ABORTED = false
+    ENABLE_WORKER_ABORTED = true
   ).* from "../materializationJob"
 
-  /// PRE-FIX release: the InfraFailure re-arm that FORCES the node
-  /// Ready regardless of the claim's origin status (reportInfra with
-  /// the upgraded release; everything else verbatim).
-  action calibRequeueForcesReady(d: str): bool = all {
+  /// PRE-FIX abort intake: the SIGTERM-aborted walk charges the
+  /// per-job infra window (reportInfra's edge, verbatim) and the
+  /// abortChargeFree latch records the violation.
+  action calibAbortCharges(d: str): bool = all {
     match attempts.get(d) {
       | NoAttempt => false
-      | OpenAttempt(a) => a.kind == KMaterialization and not(channelStale.get(a.instance))
+      | OpenAttempt(a) => a.kind == KMaterialization
     },
     match jobs.get(d) {
       | NoJob => false
@@ -66,15 +65,12 @@ module matCalib318RequeueForcesReady {
         | SomeJob(j) => SomeJob({ ...j, state: JPending, parked: parks, matInfraCount: newCount })
       }),
       view' = view.put(d, VPending(parks)),
+      budgetSoundAll' = and { budgetSoundAll, parks == (newCount >= MAT_BUDGET) },
+      // THE BUG: the abort drew the budget.
+      abortChargeFree' = false,
     },
     attempts' = attempts.put(d, NoAttempt),
-    // THE BUG: forced Ready — the latch records the unjustified
-    // upgrade when the claim came from NQueued.
-    nodeStatus' = nodeStatus.put(d, NReady),
-    requeueReadyJustifiedAll' = and {
-      requeueReadyJustifiedAll,
-      claimOrigin.get(d) == NReady,
-    },
+    nodeStatus' = nodeStatus.put(d, NQueued),
     matInfraLedger' = matInfraLedger.put(d, matInfraLedger.get(d) + 1),
     dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, envUnchanged,
@@ -90,9 +86,8 @@ module matCalib318RequeueForcesReady {
     creationResolvableAll' = creationResolvableAll,
     chargedAfterCancel' = chargedAfterCancel,
     claimOrigin' = claimOrigin,
+    requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
     carried' = carried,
-    budgetSoundAll' = budgetSoundAll,
-    abortChargeFree' = abortChargeFree,
   }
 
   action calibStep = {
@@ -110,13 +105,18 @@ module matCalib318RequeueForcesReady {
       legacyBuildArrives(b, d),
       createJob(d, origin, b),
       dedupRefeed(d),
+      dedupPrunedUpgrade(d, b),
       claimJob(d, replica),
       executeStep(d, o),
       consumeSuccess(d),
       consumeUnobtainable(d, missing),
+      calibAbortCharges(d),
       reportInfra(d),
       establishCrashedAttempt(d),
       cancelOnZeroInterest(d),
+      resolveApplied(d),
+      resolveFenced(d),
+      resolveErr(d),
       obsoleteOnProduced(d),
       parkReevaluate(d),
       parkBackoffExpires(d),
@@ -131,7 +131,6 @@ module matCalib318RequeueForcesReady {
       storeGc(d, o),
       upstreamChange(d, o),
       durableRelationChange(d, rel),
-      calibRequeueForcesReady(d),
     }
   }
 }

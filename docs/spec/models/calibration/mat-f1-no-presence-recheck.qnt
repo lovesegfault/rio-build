@@ -44,7 +44,8 @@ module matCalibF1NoPresenceRecheck {
     ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// The pre-fix-only delta: creation on a COVERED node (the state the
@@ -102,6 +103,7 @@ module matCalibF1NoPresenceRecheck {
     claimOrigin' = claimOrigin,
     carried' = carried,
     budgetSoundAll' = budgetSoundAll,
+    abortChargeFree' = abortChargeFree,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
   }
 

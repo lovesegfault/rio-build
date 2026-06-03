@@ -271,6 +271,12 @@ module materializationJob {
   /// view-settlement gate is checkable. Default false — every
   /// pre-existing regime is state-space-identical.
   const ENABLE_RESOLVE_FAULTS: bool
+  /// B1 bounded-await-transport (bughunt wave, merged_bug_189 / owner
+  /// Q3): expose the SIGTERM-aborted walk's charge-free close
+  /// (MaterializationOutcome::Aborted -> release_claim) as a step.
+  /// Default false — every pre-existing regime is
+  /// state-space-identical.
+  const ENABLE_WORKER_ABORTED: bool
 
   // --- 3. pure defs ---------------------------------------------------------
 
@@ -490,6 +496,15 @@ module materializationJob {
   /// mat-establish-never-parks and mat-unscoped-count calibrations
   /// reach the violations.
   var budgetSoundAll: bool
+  /// GHOST LATCH (bughunt wave, B1/merged_bug_189 + owner Q3): a
+  /// SIGTERM-aborted materialization walk closes CHARGE-FREE — the
+  /// Aborted intake routes through release_claim and writes no
+  /// materialization_infra row, no budget fold event, nothing in the
+  /// 085 window. Constant-true under the as-built workerAborted; the
+  /// mat-189-abort-charges calibration re-introduces the pre-fix
+  /// class-blind flatten (Err -> infra_failure) and reaches the
+  /// violation.
+  var abortChargeFree: bool
 
   // --- 5. derived state -------------------------------------------------------
 
@@ -712,6 +727,13 @@ module materializationJob {
   /// preserve the removed as-built encodings and reach the
   /// violations.
   val budgetSoundness = budgetSoundAll
+
+  /// B1 (merged_bug_189 / owner Q3): the SIGTERM-aborted walk's close
+  /// is charge-free — the abort is a routine rollout artifact, not
+  /// evidence about the derivation or the replica. The
+  /// mat-189-abort-charges calibration (the pre-fix Err->infra flatten)
+  /// must violate this.
+  val abortNeverCharges = abortChargeFree
 
   /// A3/015+307 (bughunt wave): a pending unparked job with no open
   /// attempt never strands its node Running — release_claim is
@@ -1010,6 +1032,7 @@ module materializationJob {
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
     carried' = carried,
     budgetSoundAll' = budgetSoundAll,
+    abortChargeFree' = abortChargeFree,
   }
   /// Job-core vars unchanged.
   action jobCoreUnchanged = all {
@@ -1132,6 +1155,7 @@ module materializationJob {
     // pre-fix drop.
     carried' = if (origin == OStaleReset) carried.put(d, true) else carried,
     budgetSoundAll' = budgetSoundAll,
+    abortChargeFree' = abortChargeFree,
   }
 
   /// Delta 5: the dispatch-probe dedup re-encounters an existing
@@ -1237,6 +1261,7 @@ module materializationJob {
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
     carried' = carried,
     budgetSoundAll' = budgetSoundAll,
+    abortChargeFree' = abortChargeFree,
   }
 
   /// §2.2 item 3 / §5: the claiming replica ingests one
@@ -1300,6 +1325,7 @@ module materializationJob {
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
     carried' = carried,
     budgetSoundAll' = budgetSoundAll,
+    abortChargeFree' = abortChargeFree,
   }
 
   /// §2.4: the executor's Unobtainable report + the four-arm
@@ -1382,6 +1408,7 @@ module materializationJob {
       // A3/020: the one-shot routing consulted the job's OWN window —
       // the mat-unscoped-count override records false on divergence.
       budgetSoundAll' = and { budgetSoundAll, oneShotSpent == ownShotSpent },
+      abortChargeFree' = abortChargeFree,
       failFastCount' = if (arm3fail) failFastCount.put(d, failFastCount.get(d) + 1) else failFastCount,
       // delta 1: the four-conjunct justification, at decision time.
       // marked/Broken/missing-live are structural at the arm3fail
@@ -1449,6 +1476,7 @@ module materializationJob {
       view' = view.put(d, VPending(parks)),
       // A3/067: the budget-soundness contract at this charge edge.
       budgetSoundAll' = and { budgetSoundAll, parks == (newCount >= MAT_BUDGET) },
+      abortChargeFree' = abortChargeFree,
     },
     attempts' = attempts.put(d, NoAttempt),
     nodeStatus' = nodeStatus.put(d, NQueued),
@@ -1528,6 +1556,7 @@ module materializationJob {
         budgetSoundAll,
         isMat implies (parks == (newCount >= MAT_BUDGET)),
       },
+      abortChargeFree' = abortChargeFree,
     },
     dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, envUnchanged,
@@ -1640,6 +1669,37 @@ module materializationJob {
     tenureUnchanged, ghostsUnchanged,
   }
 
+  /// B1 bounded-await-transport (merged_bug_189 / owner Q3): the store
+  /// replica's SIGTERM-aborted walk reports
+  /// MaterializationOutcome::Aborted and the intake closes the attempt
+  /// CHARGE-FREE through release_claim -- claim dropped, job back to
+  /// JPending (claimable; the abort is a routine rollout artifact, not
+  /// evidence), the node re-armed exactly as the claim found it (the
+  /// A2/318 release contract over the claimOrigin witness), and the
+  /// LEDGER UNTOUCHED: no materialization_infra row, no budget fold
+  /// event, the 085 window unmoved.
+  // Mirrors: scheduler Aborted intake (charge-free close + rearm,
+  //          landed B1-s1) -> rio-scheduler release_claim (A3).
+  action workerAborted(d: str): bool = all {
+    ENABLE_WORKER_ABORTED,
+    match attempts.get(d) {
+      | NoAttempt => false
+      | OpenAttempt(a) => a.kind == KMaterialization
+    },
+    match jobs.get(d) { | NoJob => false | SomeJob(j) => j.state == JClaimed },
+    jobs' = jobs.put(d, match jobs.get(d) {
+      | NoJob => NoJob
+      | SomeJob(j) => SomeJob({ ...j, state: JPending })
+    }),
+    view' = view.put(d, VPending(false)),
+    attempts' = attempts.put(d, NoAttempt),
+    nodeStatus' = nodeStatus.put(d, claimOrigin.get(d)),
+    topdownPruned' = topdownPruned,
+    dupJob' = dupJob, execsMinted' = execsMinted,
+    relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged, ghostsUnchanged,
+  }
+
   /// Delta 3 arm 1: the per-tick park RE-EVALUATION
   /// (tick_reevaluate_parked_materialization_jobs): a parked job whose
   /// durable evidence is Vouched/Pending resolves from_source NOW (no
@@ -1677,6 +1737,7 @@ module materializationJob {
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
     carried' = carried,
     budgetSoundAll' = budgetSoundAll,
+    abortChargeFree' = abortChargeFree,
   }
 
   /// Delta 3 arm 2: the durable backoff lapses — the job un-parks for
@@ -1925,6 +1986,7 @@ module materializationJob {
     chargedAfterCancel' = false,
     carried' = DRVS.mapBy(d => false),
     budgetSoundAll' = true,
+    abortChargeFree' = true,
     channelStale' = REPLICAS.mapBy(r => false),
     failedOver' = false,
     claimAfterFailover' = false,
@@ -1967,6 +2029,7 @@ module materializationJob {
       executeStep(d, o),
       consumeSuccess(d),
       consumeUnobtainable(d, missing),
+      workerAborted(d),
       reportInfra(d),
       establishCrashedAttempt(d),
       cancelOnZeroInterest(d),
@@ -2319,7 +2382,8 @@ module materializationJobBase {
     ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).*
 }
 
@@ -2341,7 +2405,8 @@ module materializationJobBaseEx {
     ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).*
 }
 
@@ -2363,7 +2428,8 @@ module materializationJobFailover {
     ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).*
 }
 
@@ -2384,7 +2450,8 @@ module materializationJobFailoverEx {
     ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).*
 }
 
@@ -2406,7 +2473,8 @@ module materializationJobAdversarialStore {
     ENABLE_GC = true,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).*
 }
 
@@ -2427,7 +2495,8 @@ module materializationJobAdversarialStoreEx {
     ENABLE_GC = true,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).*
 }
 
@@ -2450,7 +2519,8 @@ module materializationJobStaleTenure {
     ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = true,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).*
 }
 
@@ -2471,7 +2541,8 @@ module materializationJobStaleTenureEx {
     ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = true,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).*
 }
 
@@ -2498,7 +2569,8 @@ module materializationJobCrashLoop {
     ENABLE_GC = false,
     ENABLE_CRASH = true,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).*
 }
 
@@ -2519,7 +2591,8 @@ module materializationJobCrashLoopEx {
     ENABLE_GC = false,
     ENABLE_CRASH = true,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).*
 }
 
@@ -2545,6 +2618,35 @@ module materializationJobResolveFaults {
     ENABLE_GC = false,
     ENABLE_CRASH = true,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = true
+    ENABLE_RESOLVE_FAULTS = true,
+    ENABLE_WORKER_ABORTED = false
+  ).*
+}
+
+/// B1 bounded-await-transport (merged_bug_189 / owner Q3): the
+/// worker-abort regime — the base alphabet plus the SIGTERM-aborted
+/// charge-free close. Holds the full conjunction including
+/// abortNeverCharges; the falsifiability pair is the
+/// mat-189-abort-charges calibration (the pre-fix Err->infra flatten)
+/// and the colliding-identity admission pin is
+/// mat-158-colliding-identity (atMostOneClaimWinner).
+module materializationJobWorkerAbort {
+  import materializationJob(
+    BUILDS = Set("b1", "b2"),
+    DRVS = Set("d1", "d2"),
+    OUTPUTS = Set("o1", "o2"),
+    REPLICAS = Set("r1", "r2"),
+    BUILDERS = Set("w1"),
+    MAT_BUDGET = 2,
+    MAX_EXECS = 4,
+    MAX_GEN = 0,
+    MAX_UPSTREAM_FLIPS = 2,
+    MAX_LEGACY = 1,
+    ENABLE_FAILOVER = false,
+    ENABLE_GC = false,
+    ENABLE_CRASH = false,
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = true
   ).*
 }

@@ -44,7 +44,8 @@ module matCalibSplitRearm {
     ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// PRE-FIX release: the InfraFailure re-arm splits — claim dropped,
@@ -74,6 +75,7 @@ module matCalibSplitRearm {
       }),
       view' = view.put(d, VPending(parks)),
       budgetSoundAll' = and { budgetSoundAll, parks == (newCount >= MAT_BUDGET) },
+      abortChargeFree' = abortChargeFree,
     },
     attempts' = attempts.put(d, NoAttempt),
     // THE BUG: nodeStatus untouched — stays NRunning from the claim.

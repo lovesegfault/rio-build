@@ -41,7 +41,8 @@ module matCalibChargeOnCancel {
     ENABLE_GC = false,
     ENABLE_CRASH = true,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// PRE-FIX cancel: the job resolves cancelled, the view clears, but

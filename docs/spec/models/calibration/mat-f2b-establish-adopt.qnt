@@ -38,7 +38,8 @@ module matCalibF2bEstablishAdopt {
     ENABLE_GC = false,
     ENABLE_CRASH = true,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// PRE-FIX establishment: adopt-on-presence for the materialization
@@ -86,6 +87,7 @@ module matCalibF2bEstablishAdopt {
     claimOrigin' = claimOrigin,
     carried' = carried,
     budgetSoundAll' = budgetSoundAll,
+    abortChargeFree' = abortChargeFree,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
   }
 

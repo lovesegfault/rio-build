@@ -41,7 +41,8 @@ module matCalibHeadStarvation {
     ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// The PRE-FIX LIMIT-1 oldest-first admission predicate for a claim

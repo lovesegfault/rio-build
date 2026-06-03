@@ -37,7 +37,8 @@ module matCalibF3pUnsoundReport {
     ENABLE_GC = false,
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
-    ENABLE_RESOLVE_FAULTS = false
+    ENABLE_RESOLVE_FAULTS = false,
+    ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
   /// PRE-FIX Unobtainable consumption: the report's missing paths are
@@ -128,6 +129,7 @@ module matCalibF3pUnsoundReport {
     claimOrigin' = claimOrigin,
     carried' = carried,
     budgetSoundAll' = budgetSoundAll,
+    abortChargeFree' = abortChargeFree,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
   }
 

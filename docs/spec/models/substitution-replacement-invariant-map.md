@@ -1922,6 +1922,16 @@ canonical contract record is the T-0e.6 addendum extension's rule-4
 amendment (executor-invariant-map.md, PENDING owner counter-signature
 per §4.4 item 7).
 
+*Model leg landed (2026-06-03, B1-s2 commit 4):* the pre-fix admission
+is preserved as the `mat-158-colliding-identity` calibration
+(token-blind re-delivery leaves the open attempt's holder identity
+naming no unique registered replica — `atMostOneClaimWinner`
+falsifies; baseline holds under the as-shipped step), and the Q3
+charge-free abort settlement is modeled as `workerAborted` +
+`abortNeverCharges` (regime `materializationJobWorkerAbort` holds the
+full conjunction; the pre-fix Err→infra flatten is the
+`mat-189-abort-charges` calibration — merged_bug_189's kernel half).
+
 ### The A3 model re-derivation — invariants, calibrations, measurements
 
 `materializationJob.qnt` is re-derived FROM CONTRACTS (the encoding
