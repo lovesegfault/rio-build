@@ -297,21 +297,26 @@ let
   };
 
   # query! macros read .sqlx/query-*.json instead of connecting to PG at
-  # compile time. sqlx-macros-core 0.9.x finds the cache by (in order,
-  # short-circuiting — query/mod.rs:97-117 @ 0.9.0):
+  # compile time. sqlx-macros-core 0.9.0 resolves the cache PER QUERY at
+  # the FILE level: query/mod.rs:97-101 builds the candidate list
   #   1. SQLX_OFFLINE_DIR — real env var (or a `.env` at
   #      $CARGO_MANIFEST_DIR when the env var is unset)
   #   2. $CARGO_MANIFEST_DIR/.sqlx
   #   3. workspace_root().join(".sqlx") — spawns `$CARGO metadata`
-  # buildRustCrate calls rustc directly (no cargo, no CARGO env var, no
-  # workspace Cargo.lock), so (3) would need a fake `cargo` shim. (1) is
-  # checked first and short-circuits — set it as a plain derivation env
-  # var. This is also THE single-channel contract for rio-buildhash's
-  # build scripts (rio-{store,scheduler,controller}/build.rs): both the
-  # macros and the RIO_SQLX_HASH tracker read exactly this variable, so
-  # they can never disagree about which cache is in play. (The previous
-  # postUnpack-written `.env` carried the same value; the env var
-  # replaced it so the in-repo tracker needs no dotenv parser.)
+  # and :107-108 joins query-<hash>.json onto each candidate, taking the
+  # first FILE that exists — an earlier dir does NOT mask later ones for
+  # files it lacks. buildRustCrate calls rustc directly (no cargo, no
+  # CARGO env var, no workspace Cargo.lock), so (3) would need a fake
+  # `cargo` shim; in the sandbox the fallthrough is structurally
+  # impossible anyway — per-crate sources stage no .sqlx, so (2)/(3)
+  # don't exist. Set (1) as a plain derivation env var. This is also THE
+  # single-channel contract for rio-buildhash's build scripts
+  # (rio-{store,scheduler,controller}/build.rs): both the macros and the
+  # RIO_SQLX_HASH tracker read exactly this variable, and the tracker
+  # unkeys any context where a divergent fallthrough cache DOES exist,
+  # so they can never disagree about which cache is in play. (The
+  # previous postUnpack-written `.env` carried the same value; the env
+  # var replaced it so the in-repo tracker needs no dotenv parser.)
   # Applied to every crate with `query!()`/`query_as!()` callsites.
   sqlxOffline = {
     SQLX_OFFLINE = "true";

@@ -51,6 +51,15 @@
 //! cost is deliberate — supported contexts always set the variable, and a
 //! cache key must never claim to cover an input it cannot observe.
 //!
+//! The same per-query fallthrough cuts the other way in the Track arm:
+//! resolving `SQLX_OFFLINE_DIR` to *a* directory does not make it the
+//! *only* directory the macros can read. A replayable settled hash is
+//! emitted only when the tracked dir is provably the only cache the
+//! macros can read — when a fallthrough candidate (`<manifest>/.sqlx` or
+//! the workspace root's `.sqlx`) exists with diverging macro-visible
+//! content, the build is unkeyed exactly like the degraded arms (see
+//! `divergent_fallthrough`).
+//!
 //! Hashing covers exactly the macro-visible sets — top-level
 //! `query-*.json` for the offline cache, top-level `<i64>_*.sql` for
 //! migrations (`sqlx::migrate!` parses the version with `i64::from_str`,
@@ -121,7 +130,27 @@ pub fn track_sqlx() {
         )),
         SqlxResolution::Track(dir) => {
             println!("cargo:rerun-if-changed={}", dir.display());
-            settled_hash(&dir, is_sqlx_query_file)
+            // Package root, the same assumption track_migrations relies
+            // on for its cwd fallback: cargo and buildRustCrate both set
+            // CARGO_MANIFEST_DIR and run the script from the package dir.
+            let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+                .map(PathBuf::from)
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_default();
+            match divergent_fallthrough(&dir, &manifest_dir) {
+                Some(twin) => unkeyed(&format!(
+                    "SQLX_OFFLINE_DIR={} diverges from the fallthrough cache at {} — \
+                     sqlx-macros resolve each query-<hash>.json independently \
+                     (find-first-existing), so a json missing under the tracked dir \
+                     silently loads from the fallthrough copy this hash never saw; \
+                     keying this build uniquely (uncacheable); re-point \
+                     SQLX_OFFLINE_DIR at the cache you mean, or remove the divergent \
+                     copy",
+                    dir.display(),
+                    twin.display()
+                )),
+                None => settled_hash(&dir, is_sqlx_query_file),
+            }
         }
     };
     println!("cargo:rustc-env=RIO_SQLX_HASH={value}");
@@ -174,6 +203,92 @@ fn sqlx_resolution(var: Option<PathBuf>) -> SqlxResolution {
         Some(dir) if dir.is_dir() => SqlxResolution::Track(dir),
         Some(dir) => SqlxResolution::Absent(dir),
     }
+}
+
+/// A fallthrough `.sqlx` candidate that exists, is not the tracked dir,
+/// and whose macro-visible content differs from it — `Some(path)` means
+/// the Track arm must NOT emit a replayable key.
+///
+/// Why: sqlx-macros-core 0.9.0 resolves the offline cache PER QUERY at
+/// the FILE level — `src/query/mod.rs:97-101` builds the candidate list
+/// `[SQLX_OFFLINE_DIR, <manifest>/.sqlx, workspace_root()/.sqlx]` and
+/// `:107-108` does `.map(|path| path.join(&filename))
+/// .find(|path| path.exists())`. Each `query-<hash>.json` is looked up
+/// independently, so a json missing under the tracked dir silently loads
+/// from a later candidate this tracker never hashed — a replayable key
+/// over an unobserved input, the staleness class this crate exists to
+/// close. The Track arm therefore emits a settled hash only when the
+/// tracked dir is provably the only cache the macros can read.
+///
+/// Candidates probed: `<manifest>/.sqlx` (sqlx candidate 2, exact in
+/// every layout) and `<manifest>/../.sqlx` (proxy for sqlx candidate 3 —
+/// sqlx resolves the workspace root lazily by spawning `$CARGO metadata`,
+/// `src/query/metadata.rs:29,:35,:38`, which a build script must not
+/// replicate and buildRustCrate cannot: it never exports CARGO). The
+/// `..` proxy is exact ONLY while the workspace stays flat — every
+/// member directly under the root, true today for all 17 members. A
+/// future nested member (e.g. `crates/foo`) silently stops probing the
+/// real workspace root for that crate: move this probe with the layout.
+/// Fuzz workspaces need no extra candidate — the tracker crates in any
+/// fuzz tree are path deps whose manifest dirs are the real workspace
+/// member dirs (never under `fuzz/<ws>/`) in the dev shell, and isolated
+/// single-crate sources in the sandbox.
+///
+/// Per candidate: canonicalize NotFound => skip (an absent dir serves no
+/// file — sqlx's `exists()` runs on the joined FILE path);
+/// canonicalize-equal to the tracked dir => skip (it IS the tracked dir,
+/// the devshell shape; canonical comparison is robust to symlinks);
+/// non-directory => skip (nothing joins under it); any other probe
+/// error => divergent (never claim replayability on a partial
+/// observation). A surviving foreign candidate is watched with
+/// `rerun-if-changed` (a later edit to it must re-run this script —
+/// cargo re-runs only on watched-path/env changes, never on emitted env
+/// VALUES) and compared by macro-visible content hash: both passes
+/// `Hash` and equal => benign (identical bytes cannot leak anything the
+/// tracked hash does not cover); anything else => divergent. Whole-set
+/// equality deliberately over-fires when the divergence is confined to
+/// files the tracked dir also contains (per-query masking means those
+/// bytes cannot leak) — precision there would only buy cacheability
+/// inside an already-misconfigured state, and the over-fire is loud and
+/// self-heals once the twin is removed.
+///
+/// Returns `None` when `tracked` itself fails to canonicalize (vanished
+/// after the `is_dir` check) — `settled_hash`'s double-pass then reports
+/// the vanish with the churn wording.
+///
+/// Accepted residual: a twin CREATED after a settled compile is unseen
+/// until a watched input changes — watching a not-yet-existing path IS
+/// the always-stale primitive (`ALWAYS_RERUN_SENTINEL`) and would defeat
+/// caching entirely. Same residual class as the in-rustc re-read window
+/// in the module docs; the motivating stale-sibling case has the twin
+/// existing at script time and is caught.
+fn divergent_fallthrough(tracked: &Path, manifest_dir: &Path) -> Option<PathBuf> {
+    let tracked_canon = match tracked.canonicalize() {
+        Ok(canon) => canon,
+        Err(_) => return None,
+    };
+    let candidates = [
+        manifest_dir.join(".sqlx"),
+        manifest_dir.join("..").join(".sqlx"),
+    ];
+    for candidate in candidates {
+        let canon = match candidate.canonicalize() {
+            Ok(canon) => canon,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Some(candidate),
+        };
+        if canon == tracked_canon || !canon.is_dir() {
+            continue;
+        }
+        println!("cargo:rerun-if-changed={}", canon.display());
+        let tracked_hash = hash_matching_files(tracked, is_sqlx_query_file);
+        let candidate_hash = hash_matching_files(&canon, is_sqlx_query_file);
+        match (tracked_hash, candidate_hash) {
+            (DirHash::Hash(a), DirHash::Hash(b)) if a == b => {}
+            _ => return Some(canon),
+        }
+    }
+    None
 }
 
 /// Degraded-state emission: warn, force a re-run on every build, and key
@@ -236,7 +351,7 @@ fn is_migration_file(name: &str) -> bool {
 enum DirHash {
     Hash(String),
     DirVanished,
-    FileVanished,
+    FileVanished(PathBuf),
 }
 
 /// Hash the matching set twice; any disagreement, vanish, or partial read
@@ -249,15 +364,39 @@ fn settled_hash(dir: &Path, pred: fn(&str) -> bool) -> String {
     let second = hash_matching_files(dir, pred);
     match (first, second) {
         (DirHash::Hash(a), DirHash::Hash(b)) if a == b => a,
-        _ => {
+        (first, second) => {
             println!(
-                "cargo:warning=rio-buildhash: {} changed while hashing — keying this \
-                 build uniquely (uncacheable); the next build re-hashes the settled state",
-                dir.display()
+                "cargo:warning=rio-buildhash: {}",
+                churn_warning(dir, &first, &second)
             );
             emit_always_rerun();
             unique_value("churn")
         }
+    }
+}
+
+/// Diagnostic for a double-pass disagreement. BOTH passes failing on the
+/// SAME listed-but-unreadable path is not transient churn: only
+/// `ErrorKind::NotFound` reaches `FileVanished` (other read errors panic
+/// in `hash_matching_files`, so "permission denied" is never this arm),
+/// and a NotFound that holds across two passes is a persistent dangling
+/// entry — typically a broken symlink. The transient wording's "the next
+/// build re-hashes the settled state" would be a misdiagnosis there:
+/// nothing settles until the entry is removed. Every other combination
+/// keeps the transient-churn wording.
+fn churn_warning(dir: &Path, first: &DirHash, second: &DirHash) -> String {
+    match (first, second) {
+        (DirHash::FileVanished(a), DirHash::FileVanished(b)) if a == b => format!(
+            "{} is listed but absent on read in both hashing passes — a persistent \
+             dangling entry (broken symlink?), not transient churn; keying this build \
+             uniquely (uncacheable) on every build until the entry is removed",
+            a.display()
+        ),
+        _ => format!(
+            "{} changed while hashing — keying this build uniquely (uncacheable); the \
+             next build re-hashes the settled state",
+            dir.display()
+        ),
     }
 }
 
@@ -298,7 +437,12 @@ fn hash_matching_files(dir: &Path, pred: fn(&str) -> bool) -> DirHash {
             Ok(c) => c,
             // Listed but unreadable: deleted (or a dangling symlink)
             // between listing and read — a churn signal, never a skip.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DirHash::FileVanished,
+            // Carries the path so the caller can tell a persistent
+            // dangling entry (same path both passes) from transient
+            // churn.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return DirHash::FileVanished(path);
+            }
             Err(e) => panic!("rio-buildhash: read({}) failed: {e}", path.display()),
         };
         state = fnv1a(state, name.as_bytes());
@@ -314,8 +458,8 @@ fn hash_matching_files(dir: &Path, pred: fn(&str) -> bool) -> DirHash {
 #[cfg(test)]
 mod tests {
     use super::{
-        DirHash, SqlxResolution, hash_matching_files, is_migration_file, is_sqlx_query_file,
-        settled_hash, sqlx_resolution, unique_value,
+        DirHash, SqlxResolution, churn_warning, divergent_fallthrough, hash_matching_files,
+        is_migration_file, is_sqlx_query_file, settled_hash, sqlx_resolution, unique_value,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -417,17 +561,62 @@ mod tests {
     fn vanished_file_routes_to_churn() {
         // A listed-but-unreadable file (dangling symlink stands in for the
         // delete-between-list-and-read race) must NOT silently alias the
-        // hash of the smaller set — it is churn, keyed uniquely.
+        // hash of the smaller set — it is churn, keyed uniquely. The
+        // variant carries the offending path for the persistent-entry
+        // diagnostic.
         let dir = setup();
         std::os::unix::fs::symlink("nonexistent", dir.path().join("query-dd.json")).unwrap();
         assert_eq!(
             hash_matching_files(dir.path(), is_sqlx_query_file),
-            DirHash::FileVanished
+            DirHash::FileVanished(dir.path().join("query-dd.json"))
         );
         let churned = settled_hash(dir.path(), is_sqlx_query_file);
         assert!(churned.starts_with("churn-"), "{churned}");
         // And it is unique per call, never replayable.
         assert_ne!(churned, settled_hash(dir.path(), is_sqlx_query_file));
+    }
+
+    #[test]
+    fn churn_warning_same_path_double_vanish_is_persistent() {
+        let dir = PathBuf::from("/cache/.sqlx");
+        let gone = dir.join("query-dd.json");
+        let msg = churn_warning(
+            &dir,
+            &DirHash::FileVanished(gone.clone()),
+            &DirHash::FileVanished(gone.clone()),
+        );
+        // Names the dangling entry itself and diagnoses persistence.
+        assert!(msg.contains("/cache/.sqlx/query-dd.json"), "{msg}");
+        assert!(msg.contains("persistent dangling entry"), "{msg}");
+        assert!(msg.contains("until the entry is removed"), "{msg}");
+        assert!(!msg.contains("changed while hashing"), "{msg}");
+    }
+
+    #[test]
+    fn churn_warning_mixed_pair_is_transient() {
+        let dir = PathBuf::from("/cache/.sqlx");
+        for (first, second) in [
+            // Vanish in one pass only — transient.
+            (
+                DirHash::FileVanished(dir.join("query-dd.json")),
+                DirHash::Hash("abc".into()),
+            ),
+            // Different paths across passes — concurrent rewrite, not a
+            // single persistent entry.
+            (
+                DirHash::FileVanished(dir.join("query-dd.json")),
+                DirHash::FileVanished(dir.join("query-ee.json")),
+            ),
+            // Plain hash disagreement.
+            (DirHash::Hash("abc".into()), DirHash::Hash("def".into())),
+            // Whole directory vanished.
+            (DirHash::DirVanished, DirHash::DirVanished),
+        ] {
+            let msg = churn_warning(&dir, &first, &second);
+            assert!(msg.contains("changed while hashing"), "{msg}");
+            assert!(msg.contains("/cache/.sqlx"), "{msg}");
+            assert!(!msg.contains("persistent"), "{msg}");
+        }
     }
 
     #[test]
@@ -459,6 +648,129 @@ mod tests {
         let d2 = tempfile::tempdir().unwrap();
         fs::write(d2.path().join("query-a.json"), b"b.jsonc").unwrap();
         assert_ne!(sqlx_hash(d1.path()), sqlx_hash(d2.path()));
+    }
+
+    /// A two-file macro-visible query set; `tag` differentiates content
+    /// generations (v1 vs v2) without changing the name set.
+    fn write_queries(dir: &std::path::Path, tag: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("query-aa.json"), format!("{{\"q\": \"{tag}-1\"}}")).unwrap();
+        fs::write(dir.join("query-bb.json"), format!("{{\"q\": \"{tag}-2\"}}")).unwrap();
+    }
+
+    #[test]
+    fn divergence_absent_candidates_benign() {
+        // The crate2nix sandbox shape: neither <manifest>/.sqlx nor
+        // <manifest>/../.sqlx exists — nothing to fall through to.
+        let root = tempfile::tempdir().unwrap();
+        let tracked = root.path().join("tracked-cache");
+        write_queries(&tracked, "v1");
+        let manifest = root.path().join("crate");
+        fs::create_dir(&manifest).unwrap();
+        assert_eq!(divergent_fallthrough(&tracked, &manifest), None);
+    }
+
+    #[test]
+    fn divergence_manifest_dotsqlx_identical_benign() {
+        // A byte-identical manifest/.sqlx serves nothing the tracked
+        // hash does not already cover.
+        let root = tempfile::tempdir().unwrap();
+        let tracked = root.path().join("tracked-cache");
+        write_queries(&tracked, "v1");
+        let manifest = root.path().join("crate");
+        write_queries(&manifest.join(".sqlx"), "v1");
+        assert_eq!(divergent_fallthrough(&tracked, &manifest), None);
+    }
+
+    #[test]
+    fn divergence_workspace_self_benign() {
+        // The devshell no-op in unit form: tracked IS the workspace
+        // root's .sqlx, reached via the manifest/../.sqlx probe.
+        let root = tempfile::tempdir().unwrap();
+        let tracked = root.path().join(".sqlx");
+        write_queries(&tracked, "v1");
+        let manifest = root.path().join("crate");
+        fs::create_dir(&manifest).unwrap();
+        assert_eq!(divergent_fallthrough(&tracked, &manifest), None);
+    }
+
+    #[test]
+    fn divergence_symlinked_tracked_benign() {
+        // Same-dir detection must survive symlinks: manifest/.sqlx is a
+        // symlink TO the tracked dir, not a second cache.
+        let root = tempfile::tempdir().unwrap();
+        let tracked = root.path().join("real-cache");
+        write_queries(&tracked, "v1");
+        let manifest = root.path().join("crate");
+        fs::create_dir(&manifest).unwrap();
+        std::os::unix::fs::symlink(&tracked, manifest.join(".sqlx")).unwrap();
+        assert_eq!(divergent_fallthrough(&tracked, &manifest), None);
+    }
+
+    #[test]
+    fn divergence_manifest_extra_query_fires() {
+        // One query json present in the fallthrough but not in the
+        // tracked dir: sqlx would load it, the hash never saw it.
+        let root = tempfile::tempdir().unwrap();
+        let tracked = root.path().join("tracked-cache");
+        write_queries(&tracked, "v1");
+        let manifest = root.path().join("crate");
+        let twin = manifest.join(".sqlx");
+        write_queries(&twin, "v1");
+        fs::write(twin.join("query-cc.json"), b"{\"q\": \"extra\"}").unwrap();
+        assert_eq!(
+            divergent_fallthrough(&tracked, &manifest),
+            Some(twin.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn divergence_stale_sibling_fires() {
+        // The motivating case: SQLX_OFFLINE_DIR points at a stale
+        // sibling worktree's .sqlx while building in THIS worktree —
+        // a json missing under the tracked sibling silently loads from
+        // this worktree's root .sqlx.
+        let sibling = tempfile::tempdir().unwrap();
+        let this_worktree = tempfile::tempdir().unwrap();
+        let tracked = sibling.path().join(".sqlx");
+        write_queries(&tracked, "v1");
+        fs::remove_file(tracked.join("query-bb.json")).unwrap();
+        let workspace_sqlx = this_worktree.path().join(".sqlx");
+        write_queries(&workspace_sqlx, "v2");
+        let manifest = this_worktree.path().join("crate");
+        fs::create_dir(&manifest).unwrap();
+        assert_eq!(
+            divergent_fallthrough(&tracked, &manifest),
+            Some(workspace_sqlx.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn divergence_non_macro_files_benign() {
+        // Only the macro-visible set matters: a fallthrough dir with an
+        // identical query set plus editor noise is not divergent.
+        let root = tempfile::tempdir().unwrap();
+        let tracked = root.path().join("tracked-cache");
+        write_queries(&tracked, "v1");
+        let manifest = root.path().join("crate");
+        let twin = manifest.join(".sqlx");
+        write_queries(&twin, "v1");
+        fs::write(twin.join("README.md"), b"docs").unwrap();
+        fs::write(twin.join(".query-aa.json.swp"), b"vim").unwrap();
+        assert_eq!(divergent_fallthrough(&tracked, &manifest), None);
+    }
+
+    #[test]
+    fn divergence_non_dir_candidate_benign() {
+        // A regular FILE named .sqlx serves no query json (sqlx joins
+        // filenames under it and exists() fails) — skip, don't hash it.
+        let root = tempfile::tempdir().unwrap();
+        let tracked = root.path().join("tracked-cache");
+        write_queries(&tracked, "v1");
+        let manifest = root.path().join("crate");
+        fs::create_dir(&manifest).unwrap();
+        fs::write(manifest.join(".sqlx"), b"not a directory").unwrap();
+        assert_eq!(divergent_fallthrough(&tracked, &manifest), None);
     }
 
     #[test]
