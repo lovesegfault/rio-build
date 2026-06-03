@@ -256,9 +256,18 @@ fn workload_entry(
 /// `dependency_closures` capability; otherwise it is recovered by walking
 /// and parsing the embedded derivation ATerms — the documented fallback
 /// for recorders that skip the ATerm pass, and the only construction v0
-/// archives (which never carry `closures.jsonl`) can use. A derivation the
-/// fallback walk needs but the archive does not embed is a hard error
-/// naming it and the unit that needed it.
+/// archives (which never carry `closures.jsonl`) can use.
+///
+/// Either way the answer is closure TRUTH (it feeds warm sets,
+/// closure-overlap dispositions, and the supply rollup), so every gap
+/// goes through the shared policy (`run::closure_gap`):
+/// a unit or reachable dependency without an adjacency record, a
+/// derivation the fallback walk cannot read, and — under the capability —
+/// a walked derivation whose ATerm member the archive does not embed
+/// (the format requires the full requisite drv closure of every workload
+/// unit to be embedded, and the submit-time import can only offer
+/// embedded texts) are all hard errors naming the derivation and the
+/// unit that needed it, never a silently shallower closure.
 pub fn load_closures(
     archive: &ReplayArchive,
     units: &[ManifestEntry],
@@ -276,24 +285,50 @@ pub fn load_closures(
         .iter()
         .map(|record| (record.drv.as_str(), record))
         .collect();
+    // Embedded-membership cross-check, capability arm only: the fallback
+    // arm READ every walked derivation to build its records, so membership
+    // is established by construction there; adjacency records assert
+    // nothing about the members, and the submit-time import silently
+    // offers only what is embedded — making plan time the last point
+    // where a missing member can surface as an archive defect instead of
+    // a misattributed per-unit build failure.
+    let embedded: Option<std::collections::HashSet<String>> = Capability::DependencyClosures
+        .enabled_in(archive.capabilities())
+        .then(|| archive.embedded_drvs().into_iter().collect());
+    let require_embedded = |drv: &str, root: &str| -> Result<()> {
+        if let Some(embedded) = &embedded
+            && !embedded.contains(drv)
+        {
+            super::closure_gap::closure_gap(
+                super::closure_gap::ClosureGapPolicy::Truth { root },
+                drv,
+                "is not embedded in the archive",
+            )?;
+        }
+        Ok(())
+    };
 
     let mut entries = Vec::with_capacity(units.len());
     for unit in units {
         // Breadth-first walk over direct inputs; the visited set keeps a
         // cyclic or duplicated edge from looping, and the unit itself never
         // counts as its own dependency. Input sources accumulate from the
-        // unit's own record and every visited dependency record (a
-        // dependency without a record contributes none — it has nothing
-        // to declare).
+        // unit's own record and every visited dependency record.
         let mut deps: BTreeSet<&str> = BTreeSet::new();
         let mut srcs: BTreeSet<&str> = BTreeSet::new();
-        let unit_record = adjacency.get(unit.drv_path.as_str());
-        if let Some(record) = unit_record {
-            srcs.extend(record.srcs.iter().map(String::as_str));
-        }
-        let mut queue: VecDeque<&str> = unit_record
-            .map(|record| record.inputs.iter().map(String::as_str).collect())
-            .unwrap_or_default();
+        let root = unit.drv_path.as_str();
+        require_embedded(root, root)?;
+        let Some(unit_record) = adjacency.get(root) else {
+            super::closure_gap::closure_gap(
+                super::closure_gap::ClosureGapPolicy::Truth { root },
+                root,
+                "has no dependency-closure record in the archive",
+            )?;
+            unreachable!("the truth policy never tolerates a closure gap");
+        };
+        srcs.extend(unit_record.srcs.iter().map(String::as_str));
+        let mut queue: VecDeque<&str> = unit_record.inputs.iter().map(String::as_str).collect();
+        let mut dep_records: Vec<(&str, &ClosureRecord)> = Vec::new();
         while let Some(drv) = queue.pop_front() {
             if drv == unit.drv_path {
                 continue;
@@ -301,26 +336,29 @@ pub fn load_closures(
             if !deps.insert(drv) {
                 continue;
             }
-            if let Some(record) = adjacency.get(drv) {
-                srcs.extend(record.srcs.iter().map(String::as_str));
-                for input in &record.inputs {
-                    if !deps.contains(input.as_str()) {
-                        queue.push_back(input);
-                    }
+            require_embedded(drv, root)?;
+            let Some(record) = adjacency.get(drv) else {
+                super::closure_gap::closure_gap(
+                    super::closure_gap::ClosureGapPolicy::Truth { root },
+                    drv,
+                    "has no dependency-closure record in the archive",
+                )?;
+                unreachable!("the truth policy never tolerates a closure gap");
+            };
+            dep_records.push((drv, record));
+            srcs.extend(record.srcs.iter().map(String::as_str));
+            for input in &record.inputs {
+                if !deps.contains(input.as_str()) {
+                    queue.push_back(input);
                 }
             }
         }
-        let deps = deps
+        dep_records.sort_by_key(|(drv, _)| *drv);
+        let deps = dep_records
             .into_iter()
-            .map(|drv| DepDrvOutputs {
+            .map(|(drv, record)| DepDrvOutputs {
                 drv_path: drv.to_string(),
-                // A dependency without an adjacency record contributes no
-                // declared outputs; it still appears so closure-overlap
-                // accounting sees the derivation.
-                output_paths: adjacency
-                    .get(drv)
-                    .map(|record| record.outputs.values().filter_map(Clone::clone).collect())
-                    .unwrap_or_default(),
+                output_paths: record.outputs.values().filter_map(Clone::clone).collect(),
             })
             .collect();
         entries.push(DepClosureEntry {
@@ -1912,6 +1950,173 @@ mod tests {
         assert_eq!(app.deps.len(), 1);
         assert_eq!(app.deps[0].drv_path, lib_c_drv);
         assert_eq!(app.deps[0].output_paths, vec![lib_c_out]);
+    }
+
+    /// Capability-archive staging shared by the gap-policy tests below:
+    /// one workload unit (app) depending on libC per `closures.jsonl`,
+    /// with the staged record set and the staged drv members chosen by
+    /// the caller. `dependency_closures` is declared, so `load_closures`
+    /// consumes the records, never the ATerms.
+    fn write_capability_gap_archive(
+        dir: &std::path::Path,
+        records_for: &[&str],
+        embed_lib_c: bool,
+    ) -> (String, String) {
+        use crate::archive::schema::{
+            Capabilities, ExpectedOutcome, OutcomeRecord, RequestRecord, RequestTarget,
+            Substituters,
+        };
+        use crate::archive::writer::{ArchiveWriter, ManifestSeed};
+
+        let app_drv = format!("/nix/store/{}-app-5.0.drv", fake_hash("gap-app-drv"));
+        let app_out = format!("/nix/store/{}-app-5.0", fake_hash("gap-app-out"));
+        let lib_c_drv = format!("/nix/store/{}-libC-5.0.drv", fake_hash("gap-libC-drv"));
+        let lib_c_out = format!("/nix/store/{}-libC-5.0", fake_hash("gap-libC-out"));
+
+        let writer = ArchiveWriter::create(dir).unwrap();
+        // The app ATerm declares NO inputs: the writer's finalize walk
+        // (over ATerms) stays satisfied regardless of what closures.jsonl
+        // claims, which is exactly the foreign-recorder divergence these
+        // tests exercise.
+        writer
+            .add_drv(
+                &app_drv,
+                &synth_aterm(&[("out", app_out.as_str())], &[], "x86_64-linux"),
+            )
+            .unwrap();
+        if embed_lib_c {
+            writer
+                .add_drv(
+                    &lib_c_drv,
+                    &synth_aterm(&[("out", lib_c_out.as_str())], &[], "x86_64-linux"),
+                )
+                .unwrap();
+        }
+        let records: Vec<ClosureRecord> = records_for
+            .iter()
+            .map(|name| match *name {
+                "app" => ClosureRecord {
+                    drv: app_drv.clone(),
+                    inputs: vec![lib_c_drv.clone()],
+                    srcs: Vec::new(),
+                    outputs: BTreeMap::from([("out".to_string(), Some(app_out.clone()))]),
+                },
+                "libC" => ClosureRecord {
+                    drv: lib_c_drv.clone(),
+                    inputs: Vec::new(),
+                    srcs: Vec::new(),
+                    outputs: BTreeMap::from([("out".to_string(), Some(lib_c_out.clone()))]),
+                },
+                other => panic!("unknown record fixture {other}"),
+            })
+            .collect();
+        writer.write_closures(&records).unwrap();
+        writer
+            .write_requests(&[RequestRecord {
+                session: 0,
+                offset_s: 0.0,
+                targets: vec![RequestTarget {
+                    drv: app_drv.clone(),
+                    outputs: vec!["*".to_string()],
+                }],
+            }])
+            .unwrap();
+        writer
+            .write_outcomes(&[OutcomeRecord {
+                session: None,
+                drv: app_drv.clone(),
+                outcome: ExpectedOutcome::Built,
+                detail: None,
+                duration_s: None,
+                stop_offset_s: None,
+                outputs: BTreeMap::new(),
+            }])
+            .unwrap();
+        let stamp: jiff::Timestamp = "2026-05-28T00:00:00Z".parse().unwrap();
+        writer
+            .finalize(ManifestSeed {
+                created_at: stamp,
+                from: stamp,
+                to: stamp,
+                capabilities: Capabilities {
+                    timed: false,
+                    expected_outcomes: true,
+                    output_hashes: false,
+                    embedded_store_paths: false,
+                    impure_env: false,
+                    dependency_closures: true,
+                },
+                substituters: Substituters::default(),
+                fat: false,
+                provenance: serde_json::Map::new(),
+            })
+            .unwrap();
+        (app_drv, lib_c_drv)
+    }
+
+    #[test]
+    fn load_closures_refuses_a_unit_without_an_adjacency_record() {
+        // The dependency_closures capability claims coverage of the whole
+        // workload union closure, units included. A unit with no record
+        // previously walked an empty queue into a silently empty closure
+        // — warm sets and overlap dispositions were then computed over
+        // nothing while the supply stage aborted one stage later. The gap
+        // is now the same named error every closure-truth walk raises.
+        let tmp = tempfile::tempdir().unwrap();
+        let (app_drv, _) = write_capability_gap_archive(tmp.path(), &["libC"], true);
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let units = load_units(&archive).unwrap();
+        let err = format!("{:#}", load_closures(&archive, &units).unwrap_err());
+        assert!(
+            err.contains("has no dependency-closure record"),
+            "got: {err}"
+        );
+        assert!(err.contains(&app_drv), "the error names the unit: {err}");
+    }
+
+    #[test]
+    fn load_closures_refuses_a_dependency_without_an_adjacency_record() {
+        // An edge naming a derivation that has no record of its own
+        // previously just stopped the transitive walk there — a silently
+        // shallower closure. Same contract, same named error.
+        let tmp = tempfile::tempdir().unwrap();
+        let (app_drv, lib_c_drv) = write_capability_gap_archive(tmp.path(), &["app"], true);
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let units = load_units(&archive).unwrap();
+        let err = format!("{:#}", load_closures(&archive, &units).unwrap_err());
+        assert!(
+            err.contains("has no dependency-closure record"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains(&lib_c_drv),
+            "the error names the dependency: {err}"
+        );
+        assert!(err.contains(&app_drv), "the error names the root: {err}");
+    }
+
+    #[test]
+    fn load_closures_refuses_a_walked_drv_the_archive_does_not_embed() {
+        // Complete adjacency, missing interior MEMBER — the post-finalize
+        // damage / non-conforming foreign producer shape. The format
+        // requires the full requisite drv closure of every workload unit
+        // to be embedded; without this check the gap survives plan and
+        // supply untouched (closures come from records, never the texts),
+        // the submitter silently offers what it has, and the root fails
+        // downstream charged to the unit as a build failure. Plan time is
+        // where it becomes a named archive-integrity error instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let (app_drv, lib_c_drv) =
+            write_capability_gap_archive(tmp.path(), &["app", "libC"], false);
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let units = load_units(&archive).unwrap();
+        let err = format!("{:#}", load_closures(&archive, &units).unwrap_err());
+        assert!(err.contains("is not embedded in the archive"), "got: {err}");
+        assert!(
+            err.contains(&lib_c_drv),
+            "the error names the member: {err}"
+        );
+        assert!(err.contains(&app_drv), "the error names the root: {err}");
     }
 
     #[test]

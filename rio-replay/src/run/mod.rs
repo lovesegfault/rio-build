@@ -22,6 +22,7 @@ pub mod archive_input;
 pub mod artifact;
 pub mod batch;
 pub mod classify;
+pub(crate) mod closure_gap;
 pub mod collect;
 pub mod drv_import;
 pub mod glob;
@@ -2902,6 +2903,7 @@ mod tests {
             engine_cancelled: false,
             disconnect_deadline_fired: false,
             interruption_drvs: Vec::new(),
+            import_skipped_drvs: Vec::new(),
         }];
         let got = jobs_awaiting_first_submission(
             [
@@ -3611,6 +3613,7 @@ mod tests {
                     engine_cancelled: true,
                     disconnect_deadline_fired: true,
                     interruption_drvs: vec![drv.clone()],
+                    import_skipped_drvs: Vec::new(),
                 },
             )
             .unwrap();
@@ -3714,6 +3717,7 @@ mod tests {
                     engine_cancelled: false,
                     disconnect_deadline_fired: false,
                     interruption_drvs: Vec::new(),
+                    import_skipped_drvs: Vec::new(),
                 },
             )
             .unwrap();

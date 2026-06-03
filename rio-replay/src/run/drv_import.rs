@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 use rio_nix::derivation::Derivation;
 use rio_nix::nar::NarNode;
 use rio_nix::protocol::client::{NarPayload, StoreEntry};
@@ -30,6 +30,19 @@ pub struct DrvArchive {
     archive: Arc<ReplayArchive>,
 }
 
+/// Result of [`DrvArchive::closure`]: what the archive can offer for a
+/// batch, and what it cannot.
+#[derive(Debug)]
+pub struct DrvClosure {
+    /// Importable derivations in reference order (post-order,
+    /// deduplicated across roots).
+    pub order: Vec<String>,
+    /// Interior input derivations the walk reached but the archive does
+    /// not embed (sorted, deduplicated): the thin-archive gap set, skipped
+    /// per the offer policy and surfaced on the batch record.
+    pub skipped: Vec<String>,
+}
+
 impl DrvArchive {
     /// Wrap an open replay archive. Every `.drv` member the archive embeds
     /// becomes importable; nothing else is.
@@ -46,18 +59,22 @@ impl DrvArchive {
     }
 
     /// Walk the derivation closure of `roots` over the archive's embedded
-    /// ATerms and return it in reference order: every derivation appears
-    /// after all of its in-archive input derivations (post-order),
-    /// deduplicated across roots.
+    /// ATerms: every derivation appears after all of its in-archive input
+    /// derivations (post-order), deduplicated across roots, plus the set
+    /// of interior inputs the archive does not embed.
     ///
-    /// Input sources and input derivations not embedded in the archive are
-    /// skipped with a debug log — a thin archive only carries derivation
-    /// texts, so anything else is either already on the target or not
-    /// importable from here. A ROOT missing from the archive is an error
-    /// naming the path: batches are planned from this archive's workload
-    /// units, so a missing root means the archive is incomplete or
-    /// corrupted.
-    pub fn closure(&self, roots: &[String]) -> Result<Vec<String>> {
+    /// This walk answers "what can the archive OFFER", not closure truth,
+    /// so gaps go through the shared policy's offer arm
+    /// (`run::closure_gap`): a non-embedded interior
+    /// input is the thin-archive shape — the target resolves it itself —
+    /// skipped at `warn!` and returned in [`DrvClosure::skipped`] so the
+    /// submitter can surface it on the batch record (when the target
+    /// CANNOT resolve it, the per-root failure must be attributable to
+    /// the archive instead of charged to the unit). A ROOT missing from
+    /// the archive is an error naming the path: batches are planned from
+    /// this archive's workload units, so a missing root means the archive
+    /// is incomplete or corrupted.
+    pub fn closure(&self, roots: &[String]) -> Result<DrvClosure> {
         /// Explicit DFS frame: visit parses the ATerm and queues input
         /// derivations, emit appends the path once everything it references
         /// is out.
@@ -72,6 +89,7 @@ impl DrvArchive {
         // archive cannot loop the walk.
         let mut entered: HashSet<String> = HashSet::new();
         let mut order: Vec<String> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
         // Roots are seeded in reverse so the LIFO stack walks them (and each
         // derivation's input list) in their given order.
         let mut stack: Vec<Frame> = roots
@@ -86,17 +104,14 @@ impl DrvArchive {
                         continue;
                     }
                     if !embedded.contains(&path) {
-                        if root_set.contains(path.as_str()) {
-                            bail!(
-                                "root {path} is not embedded in the replay archive (incomplete or \
-                                 corrupted archive)"
-                            );
-                        }
-                        tracing::debug!(
-                            %path,
-                            "input derivation not embedded in the archive; skipping (not \
-                             importable from here)"
-                        );
+                        super::closure_gap::closure_gap(
+                            super::closure_gap::ClosureGapPolicy::Offer {
+                                is_root: root_set.contains(path.as_str()),
+                            },
+                            &path,
+                            "is not embedded in the archive",
+                        )?;
+                        skipped.push(path);
                         continue;
                     }
                     let (_, parsed) = self.derivation(&path)?;
@@ -110,7 +125,8 @@ impl DrvArchive {
                 Frame::Emit(path) => order.push(path),
             }
         }
-        Ok(order)
+        skipped.sort();
+        Ok(DrvClosure { order, skipped })
     }
 
     /// Materialize one embedded derivation as a worker-protocol upload
@@ -209,15 +225,20 @@ mod tests {
         let drv_archive = DrvArchive::new(archive.clone());
 
         // appB reaches stdenv only through libA; references come out before
-        // their referrers so uploads register dependencies first.
+        // their referrers so uploads register dependencies first. A fully
+        // embedded closure has nothing to skip.
         let closure = drv_archive.closure(std::slice::from_ref(&app_b)).unwrap();
-        assert_eq!(closure, vec![stdenv.clone(), lib_a.clone(), app_b.clone()]);
+        assert_eq!(
+            closure.order,
+            vec![stdenv.clone(), lib_a.clone(), app_b.clone()]
+        );
+        assert!(closure.skipped.is_empty());
         // Multiple roots and already-reached roots dedup.
         let closure_both = drv_archive
             .closure(&[app_b.clone(), lib_a.clone()])
             .unwrap();
         assert_eq!(
-            closure_both,
+            closure_both.order,
             vec![stdenv.clone(), lib_a.clone(), app_b.clone()]
         );
 
@@ -333,7 +354,14 @@ mod tests {
         let closure = drv_archive
             .closure(std::slice::from_ref(&extra_drv))
             .unwrap();
-        assert_eq!(closure, vec![base_drv.clone(), extra_drv.clone()]);
+        assert_eq!(closure.order, vec![base_drv.clone(), extra_drv.clone()]);
+        assert_eq!(
+            closure.skipped,
+            vec![absent_drv.to_string()],
+            "the offered set names what it could not offer — the gap is \
+             reported, not swallowed (the input source is not a derivation \
+             and is never walked)"
+        );
 
         let entry = drv_archive.entry(&extra_drv).unwrap();
         let mut want_refs = vec![base_drv, absent_drv.to_string(), src.to_string()];

@@ -110,6 +110,12 @@ pub struct BatchOutcome {
     /// [`Submitter::submit_batch`]: recorded as engine-side submission
     /// failures and re-offered, never classified against the deadline.
     pub engine_cancelled: bool,
+    /// Interior input derivations the import walk reached but the archive
+    /// does not embed (the thin-archive gap set, sorted): recorded on the
+    /// batch record so a downstream per-root failure over a missing input
+    /// is attributable to the archive instead of read as a unit
+    /// regression. Empty for submitters that import nothing.
+    pub import_skipped_drvs: Vec<String>,
 }
 
 /// One batch-submission backend. The submit loop only ever talks to this
@@ -304,7 +310,7 @@ impl Submitter for ClientOpsSubmitter {
         // ── Import: the batch's drv closure from the replay archive ────────
         let closure = self.archive.closure(&batch.root_drvs)?;
         let mut valid: BTreeSet<String> = BTreeSet::new();
-        for chunk in closure.chunks(self.probe_chunk.max(1)) {
+        for chunk in closure.order.chunks(self.probe_chunk.max(1)) {
             match chan.query_valid_paths(chunk, self.op_timeout).await {
                 Ok(present) => valid.extend(present),
                 Err(err) => {
@@ -320,6 +326,7 @@ impl Submitter for ClientOpsSubmitter {
         // reference order — the archive's only ordering guarantee — so every
         // reference is registered before its referrers.
         let missing: Vec<String> = closure
+            .order
             .iter()
             .filter(|path| !valid.contains(*path))
             .cloned()
@@ -378,6 +385,7 @@ impl Submitter for ClientOpsSubmitter {
             results,
             reasons: parsed.reasons,
             stderr_tail: Vec::from(tail).join("\n"),
+            import_skipped_drvs: closure.skipped,
             engine_cancelled,
         })
     }

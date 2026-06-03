@@ -817,6 +817,13 @@ pub struct BatchRecord {
     /// dispatcher. Empty for every non-timed batch.
     #[serde(default)]
     pub interruption_drvs: Vec<String>,
+    /// Interior input derivations the import walk skipped because the
+    /// archive does not embed them (the thin-archive gap set, sorted).
+    /// When a root of this batch later fails on a missing input, this
+    /// field is the breadcrumb attributing the failure to the archive.
+    /// Defaults to empty on records written before the field existed.
+    #[serde(default)]
+    pub import_skipped_drvs: Vec<String>,
 }
 
 /// [`RequeueRecord::source`] value for collect-pass re-offers (a settled
@@ -1133,6 +1140,7 @@ mod tests {
             engine_cancelled: false,
             disconnect_deadline_fired: false,
             interruption_drvs: Vec::new(),
+            import_skipped_drvs: Vec::new(),
         };
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains(r#""results":[{"drvPath":"#), "{json}");
@@ -1154,6 +1162,9 @@ mod tests {
         assert!(parsed.results.is_empty());
         assert!(parsed.interruption_drvs.is_empty());
         assert!(!parsed.disconnect_deadline_fired);
+        // Lines written before the import-skip breadcrumb existed lack
+        // `importSkippedDrvs` the same way (defaults to empty).
+        assert!(parsed.import_skipped_drvs.is_empty());
         assert_eq!(parsed.batch_id, 3);
         assert_eq!(parsed.stderr_tail.as_deref(), Some("tail"));
     }

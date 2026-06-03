@@ -186,6 +186,7 @@ pub async fn submit_one_batch(
         engine_cancelled: false,
         disconnect_deadline_fired: false,
         interruption_drvs,
+        import_skipped_drvs: Vec::new(),
     };
     match outcome {
         Ok(o) => {
@@ -194,6 +195,7 @@ pub async fn submit_one_batch(
             record.reasons = o.reasons;
             record.stderr_tail = Some(o.stderr_tail);
             record.engine_cancelled = o.engine_cancelled;
+            record.import_skipped_drvs = o.import_skipped_drvs;
             // The submitter has exactly one cancellation source: the
             // deadline it was handed. Which logical deadline that was is
             // this call's knowledge, so the cause bit is derived here, at
@@ -485,6 +487,7 @@ mod tests {
             )]),
             stderr_tail: "tail".into(),
             engine_cancelled: false,
+            import_skipped_drvs: Vec::new(),
         }));
         let batch = Batch {
             jobs: vec!["x.x86_64-linux".into()],

@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use rio_nix::derivation::Derivation;
 use rio_nix::nar::{self, NarNode};
 use rio_nix::narinfo::NarInfo;
@@ -209,8 +209,21 @@ pub fn walk_closure(archive: &ReplayArchive, roots: &[String]) -> Result<Closure
 /// each derivation the walk reaches. Crate-visible because the plan-stage
 /// closure loader reuses it as the capability-less fallback (see
 /// `run::archive_input::load_closures`).
+///
+/// This walk is closure TRUTH, so a derivation the archive does not embed
+/// aborts it through the shared gap policy
+/// (`run::closure_gap`) — the same decision the
+/// adjacency construction and the plan-stage expansion apply.
 pub(crate) fn closure_from_drv_texts(archive: &ReplayArchive, roots: &[String]) -> Result<Closure> {
+    let embedded: HashSet<String> = archive.embedded_drvs().into_iter().collect();
     walk_from(roots, |drv_path, root| {
+        if !embedded.contains(drv_path) {
+            super::closure_gap::closure_gap(
+                super::closure_gap::ClosureGapPolicy::Truth { root },
+                drv_path,
+                "is not embedded in the archive",
+            )?;
+        }
         let text = archive
             .read_drv(drv_path)
             .with_context(|| format!("walking the closure of replay root {root}"))?;
@@ -238,18 +251,24 @@ pub(crate) fn closure_from_drv_texts(archive: &ReplayArchive, roots: &[String]) 
 
 /// Closure construction over recorded adjacency records (drv → direct
 /// inputs / sources / declared outputs): no derivation text is touched.
+///
+/// Closure TRUTH, like the ATerm construction: a derivation without an
+/// adjacency record aborts the walk through the shared gap policy
+/// (`run::closure_gap`).
 fn closure_from_adjacency(records: &[ClosureRecord], roots: &[String]) -> Result<Closure> {
     let by_drv: HashMap<&str, &ClosureRecord> = records
         .iter()
         .map(|record| (record.drv.as_str(), record))
         .collect();
     walk_from(roots, |drv_path, root| {
-        let record = by_drv.get(drv_path).ok_or_else(|| {
-            anyhow!(
-                "derivation {drv_path} has no dependency-closure record in the archive \
-                 (closure of replay root {root})"
-            )
-        })?;
+        let Some(record) = by_drv.get(drv_path) else {
+            super::closure_gap::closure_gap(
+                super::closure_gap::ClosureGapPolicy::Truth { root },
+                drv_path,
+                "has no dependency-closure record in the archive",
+            )?;
+            unreachable!("the truth policy never tolerates a closure gap");
+        };
         Ok(ClosureNode {
             drv_path: record.drv.clone(),
             outputs: record
