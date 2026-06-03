@@ -142,8 +142,13 @@ pub async fn stage_archive(dir: &Path, inputs: &StageInputs<'_>) -> anyhow::Resu
             drv: record.drv_path.clone(),
             label: Some(record.job.clone()),
             system: Some(record.system.clone()),
-            outputs: record.outputs.clone(),
-            required_features: record.required_features.clone().unwrap_or_default(),
+            outputs: Some(record.outputs.clone()),
+            // The manifest's None means the closure pass never determined
+            // the features for this unit; keep it None so the archive
+            // says "recorder said nothing" and the engine recovers from
+            // the embedded ATerm, instead of flattening it into a false
+            // "no features" claim.
+            required_features: record.required_features.clone(),
             identity_divergent: divergent_jobs.contains(record.job.as_str()),
         })
         .collect();
@@ -692,8 +697,15 @@ mod tests {
         let app_a = &units[APP_A_DRV];
         assert_eq!(app_a.label.as_deref(), Some("appA.x86_64-linux"));
         assert_eq!(app_a.system.as_deref(), Some("x86_64-linux"));
-        assert_eq!(app_a.outputs["out"], APP_A_OUT);
-        assert_eq!(app_a.required_features, vec!["big-parallel".to_string()]);
+        assert_eq!(
+            app_a.outputs.as_ref().expect("recorder writes outputs")["out"],
+            APP_A_OUT
+        );
+        assert_eq!(
+            app_a.required_features,
+            Some(vec!["big-parallel".to_string()]),
+            "a backfilled feature list is a positive claim, not an absent field"
+        );
         assert!(!app_a.identity_divergent);
         // closures: one record per closure drv, adjacency form
         assert_eq!(archive.closures().len(), 3);

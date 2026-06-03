@@ -79,12 +79,16 @@ pub struct DepDrvOutputs {
 /// union of all request targets, per the archive contract); the optional
 /// `units.jsonl` member only enriches entries. A workload derivation with
 /// a unit record takes `job`/`attr` from the record's label (drv basename
-/// without the `.drv` suffix when the label is absent), `system` (empty
-/// string when absent), declared outputs, and required features. A
-/// workload derivation without one has the same fields recovered from its
-/// embedded derivation ATerm (see `workload_entry`) — so an archive
-/// without `units.jsonl` (or with one covering only part of the workload)
-/// still plans its full workload instead of silently shrinking it.
+/// without the `.drv` suffix when the label is absent) and every field
+/// the record actually carries; fields the record OMITS (`system`,
+/// `outputs`, `required_features` are all optional in the schema) are
+/// recovered per-field from the unit's embedded derivation ATerm, exactly
+/// like a record-less unit — a sparse record from a partial recorder
+/// enriches what it knows instead of silently zeroing the rest. A
+/// workload derivation without a record has all fields recovered (see
+/// `workload_entry`) — so an archive without `units.jsonl` (or with one
+/// covering only part of the workload) still plans its full workload
+/// instead of silently shrinking it.
 ///
 /// The returned entries are sorted by job then drv path so plan-time
 /// iteration order is deterministic.
@@ -98,72 +102,142 @@ pub fn load_units(archive: &ReplayArchive) -> Result<Vec<ManifestEntry>> {
     Ok(entries)
 }
 
-/// One workload unit's manifest entry: metadata from its `units.jsonl`
-/// record when the recorder wrote one, recovered from the unit's embedded
-/// derivation ATerm otherwise.
+/// One workload unit's manifest entry: every field the `units.jsonl`
+/// record carries is taken verbatim; fields the record omits — and all
+/// fields, for a unit with no record — are recovered from the unit's
+/// embedded derivation ATerm.
 ///
 /// The recovery parses the real derivation rather than synthesizing an
 /// entry from the request target alone: the entry's `outputs` feed the
 /// warm-set computation, cached-prior detection, and NAR comparison, so an
 /// empty-outputs placeholder would not fail — it would silently degrade
-/// exactly those comparisons for the synthesized units. A workload
-/// derivation whose ATerm is missing from the archive is therefore a hard
-/// per-unit error (the archive cannot say what the unit produces), never a
-/// silent skip.
+/// exactly those comparisons for the synthesized units. The same
+/// granularity applies WITHIN a record: the schema's optional fields
+/// distinguish "the recorder said nothing" (absent → recover) from "the
+/// recorder said empty" (present → verbatim), so a sparse record from a
+/// partial recorder cannot smuggle in the very placeholders the
+/// record-less recovery exists to prevent (`system: ""` silently skipping
+/// the unit under a systems filter, empty `outputs` discarding its
+/// per-output truth, empty `required_features` bypassing the feature
+/// filter). A unit whose ATerm is missing while any field still needs
+/// recovery is a hard per-unit error naming the fields, never a silent
+/// skip; a unit with a complete record deliberately needs no readable
+/// derivation at all.
 fn workload_entry(
     archive: &ReplayArchive,
     drv: &str,
     record: Option<&UnitRecord>,
 ) -> Result<ManifestEntry> {
-    if let Some(record) = record {
-        let job = unit_job(record);
+    /// The ATerm-recovered view of one unit (shared by full and per-field
+    /// recovery).
+    struct Recovered {
+        system: String,
+        outputs: BTreeMap<String, String>,
+        required_features: Vec<String>,
+    }
+    let recover = |missing_fields: &str| -> Result<Recovered> {
+        let text = archive.read_drv(drv).with_context(|| {
+            format!(
+                "workload unit {drv} has no readable derivation in the archive to recover \
+                 {missing_fields} from"
+            )
+        })?;
+        let derivation = Derivation::parse(&text)
+            .with_context(|| format!("parsing the embedded derivation of workload unit {drv}"))?;
+        // Statically declared output paths only, mirroring what recorders
+        // put in units.jsonl: floating content-addressed outputs have no
+        // path until they are built, so they cannot enter path-keyed
+        // planning.
+        let outputs: BTreeMap<String, String> = derivation
+            .outputs()
+            .iter()
+            .filter(|output| !output.path().is_empty())
+            .map(|output| (output.name().to_string(), output.path().to_string()))
+            .collect();
+        // `requiredSystemFeatures` through THE canonical structured-
+        // payload-first read (rio_nix::derivation::structured_attrs): for
+        // `__structuredAttrs` derivations the user attrs live solely in
+        // the env's `__json` payload, so a flat-env-only read recovers no
+        // features and the plan-stage exclusion filter structurally cannot
+        // fire — the unit then fails on the cluster and retires as a false
+        // regression. Sharing the one rule (not a parallel
+        // reimplementation) is what keeps this extraction equal to the
+        // recorder's units.jsonl backfill and the gateway's submit-time
+        // read by construction.
+        let required_features = structured_attrs::string_list_attr(
+            &structured_attrs::AtermEnv::new(derivation.env()),
+            structured_attrs::REQUIRED_SYSTEM_FEATURES_ATTR,
+        );
+        Ok(Recovered {
+            system: derivation.platform().to_string(),
+            outputs,
+            required_features,
+        })
+    };
+
+    let Some(record) = record else {
+        let job = drv_basename_job(drv);
+        let recovered = recover("its metadata (it has no units.jsonl record)")?;
         return Ok(ManifestEntry {
             job: job.clone(),
-            system: record.system.clone().unwrap_or_default(),
+            system: recovered.system,
             attr: job,
-            drv_path: record.drv.clone(),
-            outputs: record.outputs.clone(),
-            required_features: record.required_features.clone(),
+            drv_path: drv.to_string(),
+            outputs: recovered.outputs,
+            required_features: recovered.required_features,
         });
+    };
+
+    // Per-field recovery: parse the ATerm at most once, and only when the
+    // record actually omitted something — a complete record (the in-tree
+    // recorders always write one) keeps planning independent of the
+    // embedded derivation being readable.
+    let mut absent: Vec<&str> = Vec::new();
+    if record.system.is_none() {
+        absent.push("system");
     }
-    let text = archive.read_drv(drv).with_context(|| {
-        format!(
-            "workload unit {drv} has no units.jsonl record and no readable derivation in the \
-             archive to recover its outputs from"
-        )
-    })?;
-    let derivation = Derivation::parse(&text)
-        .with_context(|| format!("parsing the embedded derivation of workload unit {drv}"))?;
-    // Statically declared output paths only, mirroring what recorders put
-    // in units.jsonl: floating content-addressed outputs have no path until
-    // they are built, so they cannot enter path-keyed planning.
-    let outputs: BTreeMap<String, String> = derivation
-        .outputs()
-        .iter()
-        .filter(|output| !output.path().is_empty())
-        .map(|output| (output.name().to_string(), output.path().to_string()))
-        .collect();
-    // `requiredSystemFeatures` through THE canonical structured-payload-
-    // first read (rio_nix::derivation::structured_attrs): for
-    // `__structuredAttrs` derivations the user attrs live solely in the
-    // env's `__json` payload, so a flat-env-only read recovers no features
-    // and the plan-stage exclusion filter structurally cannot fire — the
-    // unit then fails on the cluster and retires as a false regression.
-    // Sharing the one rule (not a parallel reimplementation) is what keeps
-    // this extraction equal to the recorder's units.jsonl backfill and the
-    // gateway's submit-time read by construction.
-    let required_features = structured_attrs::string_list_attr(
-        &structured_attrs::AtermEnv::new(derivation.env()),
-        structured_attrs::REQUIRED_SYSTEM_FEATURES_ATTR,
-    );
-    let job = drv_basename_job(drv);
+    if record.outputs.is_none() {
+        absent.push("outputs");
+    }
+    if record.required_features.is_none() {
+        absent.push("required features");
+    }
+    let recovered = if absent.is_empty() {
+        None
+    } else {
+        Some(recover(&absent.join(", "))?)
+    };
+    // `recovered` is Some exactly when some field below needs it (absent
+    // is non-empty), so the expects are unreachable by construction.
+    let job = unit_job(record);
     Ok(ManifestEntry {
         job: job.clone(),
-        system: derivation.platform().to_string(),
+        system: match &record.system {
+            Some(system) => system.clone(),
+            None => recovered
+                .as_ref()
+                .expect("recovered when system is absent")
+                .system
+                .clone(),
+        },
         attr: job,
-        drv_path: drv.to_string(),
-        outputs,
-        required_features,
+        drv_path: record.drv.clone(),
+        outputs: match &record.outputs {
+            Some(outputs) => outputs.clone(),
+            None => recovered
+                .as_ref()
+                .expect("recovered when outputs are absent")
+                .outputs
+                .clone(),
+        },
+        required_features: match &record.required_features {
+            Some(features) => features.clone(),
+            None => recovered
+                .as_ref()
+                .expect("recovered when required features are absent")
+                .required_features
+                .clone(),
+        },
     })
 }
 
@@ -525,43 +599,46 @@ pub(crate) fn write_mini_archive(dir: &std::path::Path) -> MiniArchive {
                 drv: app_a_drv.clone(),
                 label: Some("appA.x86_64-linux".to_string()),
                 system: Some("x86_64-linux".to_string()),
-                outputs: BTreeMap::from([("out".to_string(), app_a_out.clone())]),
-                required_features: Vec::new(),
+                outputs: Some(BTreeMap::from([("out".to_string(), app_a_out.clone())])),
+                required_features: Some(Vec::new()),
                 identity_divergent: false,
             },
             UnitRecord {
                 drv: app_b_drv.clone(),
                 label: Some("appB.x86_64-linux".to_string()),
                 system: Some("x86_64-linux".to_string()),
-                outputs: BTreeMap::from([
+                outputs: Some(BTreeMap::from([
                     ("out".to_string(), app_b_out.clone()),
                     ("dev".to_string(), app_b_dev.clone()),
-                ]),
-                required_features: Vec::new(),
+                ])),
+                required_features: Some(Vec::new()),
                 identity_divergent: false,
             },
             UnitRecord {
                 drv: divergent_c_drv.clone(),
                 label: Some("divergentC.x86_64-linux".to_string()),
                 system: Some("x86_64-linux".to_string()),
-                outputs: BTreeMap::from([("out".to_string(), divergent_c_out.clone())]),
-                required_features: Vec::new(),
+                outputs: Some(BTreeMap::from([(
+                    "out".to_string(),
+                    divergent_c_out.clone(),
+                )])),
+                required_features: Some(Vec::new()),
                 identity_divergent: true,
             },
             UnitRecord {
                 drv: kvm_test_drv.clone(),
                 label: Some("kvmTest.x86_64-linux".to_string()),
                 system: Some("x86_64-linux".to_string()),
-                outputs: BTreeMap::from([("out".to_string(), kvm_test_out.clone())]),
-                required_features: vec!["kvm".to_string()],
+                outputs: Some(BTreeMap::from([("out".to_string(), kvm_test_out.clone())])),
+                required_features: Some(vec!["kvm".to_string()]),
                 identity_divergent: false,
             },
             UnitRecord {
                 drv: lib_a_arm_drv.clone(),
                 label: Some("libA.aarch64-linux".to_string()),
                 system: Some("aarch64-linux".to_string()),
-                outputs: BTreeMap::from([("out".to_string(), lib_a_arm_out.clone())]),
-                required_features: Vec::new(),
+                outputs: Some(BTreeMap::from([("out".to_string(), lib_a_arm_out.clone())])),
+                required_features: Some(Vec::new()),
                 identity_divergent: false,
             },
         ])
@@ -810,16 +887,16 @@ pub(crate) fn write_mini_timed_archive(dir: &std::path::Path, spec: MiniTimedSpe
                 drv: app_a_drv.clone(),
                 label: Some("appA.x86_64-linux".to_string()),
                 system: Some("x86_64-linux".to_string()),
-                outputs: BTreeMap::from([("out".to_string(), app_a_out.clone())]),
-                required_features: Vec::new(),
+                outputs: Some(BTreeMap::from([("out".to_string(), app_a_out.clone())])),
+                required_features: Some(Vec::new()),
                 identity_divergent: false,
             },
             UnitRecord {
                 drv: app_b_drv.clone(),
                 label: Some("appB.x86_64-linux".to_string()),
                 system: Some("x86_64-linux".to_string()),
-                outputs: BTreeMap::from([("out".to_string(), app_b_out.clone())]),
-                required_features: Vec::new(),
+                outputs: Some(BTreeMap::from([("out".to_string(), app_b_out.clone())])),
+                required_features: Some(Vec::new()),
                 identity_divergent: false,
             },
         ])
@@ -1024,24 +1101,24 @@ pub(crate) fn write_mini_impure_archive(dir: &std::path::Path) -> MiniArchive {
                 drv: pure_drv.clone(),
                 label: Some("pureApp.x86_64-linux".to_string()),
                 system: Some("x86_64-linux".to_string()),
-                outputs: BTreeMap::from([("out".to_string(), pure_out.clone())]),
-                required_features: Vec::new(),
+                outputs: Some(BTreeMap::from([("out".to_string(), pure_out.clone())])),
+                required_features: Some(Vec::new()),
                 identity_divergent: false,
             },
             UnitRecord {
                 drv: impure_drv.clone(),
                 label: Some("impureApp.x86_64-linux".to_string()),
                 system: Some("x86_64-linux".to_string()),
-                outputs: BTreeMap::from([("out".to_string(), impure_out.clone())]),
-                required_features: Vec::new(),
+                outputs: Some(BTreeMap::from([("out".to_string(), impure_out.clone())])),
+                required_features: Some(Vec::new()),
                 identity_divergent: false,
             },
             UnitRecord {
                 drv: fod_drv.clone(),
                 label: Some("fetchSrc.x86_64-linux".to_string()),
                 system: Some("x86_64-linux".to_string()),
-                outputs: BTreeMap::from([("out".to_string(), fod_out.clone())]),
-                required_features: Vec::new(),
+                outputs: Some(BTreeMap::from([("out".to_string(), fod_out.clone())])),
+                required_features: Some(Vec::new()),
                 identity_divergent: false,
             },
         ])
@@ -1263,8 +1340,8 @@ mod tests {
                         drv: app_a_drv.clone(),
                         label: Some("appA.x86_64-linux".to_string()),
                         system: Some("x86_64-linux".to_string()),
-                        outputs: BTreeMap::from([("out".to_string(), app_a_out.clone())]),
-                        required_features: Vec::new(),
+                        outputs: Some(BTreeMap::from([("out".to_string(), app_a_out.clone())])),
+                        required_features: Some(Vec::new()),
                         identity_divergent: false,
                     },
                     other => panic!("unknown unit fixture {other}"),
@@ -1382,6 +1459,131 @@ mod tests {
         let lib_b = units.iter().find(|u| u.job.contains("libB")).unwrap();
         assert_eq!(lib_b.system, "aarch64-linux");
         assert!(!lib_b.outputs.is_empty());
+    }
+
+    #[test]
+    fn sparse_unit_records_recover_omitted_fields_from_the_aterm() {
+        // A record carrying only what a partial foreign recorder knew
+        // (drv + label) enriches the entry with its label while every
+        // omitted field — system, outputs, required features — is
+        // recovered from the embedded derivation, exactly like a
+        // record-less unit. Without per-field recovery the schema-legal
+        // sparse record yielded system="" (silently skipped under a
+        // systems filter), outputs={} (per-output truth discarded), and
+        // required_features=[] (feature filter bypassed) — the very
+        // placeholders the record-less recovery exists to prevent.
+        use crate::archive::schema::{Capabilities, RequestRecord, RequestTarget, Substituters};
+        use crate::archive::writer::{ArchiveWriter, ManifestSeed};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let drv = format!("/nix/store/{}-libS-1.0.drv", fake_hash("sparse-libS-drv"));
+        let out = format!("/nix/store/{}-libS-1.0", fake_hash("sparse-libS-out"));
+        let writer = ArchiveWriter::create(tmp.path()).unwrap();
+        writer
+            .add_drv(
+                &drv,
+                &synth_aterm_with_env(
+                    &[("out", out.as_str())],
+                    &[],
+                    "aarch64-linux",
+                    &[("requiredSystemFeatures", "kvm big-parallel")],
+                ),
+            )
+            .unwrap();
+        writer
+            .write_units(&[UnitRecord {
+                drv: drv.clone(),
+                label: Some("libS.aarch64-linux".to_string()),
+                system: None,
+                outputs: None,
+                required_features: None,
+                identity_divergent: false,
+            }])
+            .unwrap();
+        writer
+            .write_requests(&[RequestRecord {
+                session: 0,
+                offset_s: 0.0,
+                targets: vec![RequestTarget {
+                    drv: drv.clone(),
+                    outputs: vec!["*".to_string()],
+                }],
+            }])
+            .unwrap();
+        let stamp: jiff::Timestamp = "2026-05-28T00:00:00Z".parse().unwrap();
+        writer
+            .finalize(ManifestSeed {
+                created_at: stamp,
+                from: stamp,
+                to: stamp,
+                capabilities: Capabilities::default(),
+                substituters: Substituters::default(),
+                fat: false,
+                provenance: serde_json::Map::new(),
+            })
+            .unwrap();
+
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let units = load_units(&archive).unwrap();
+        assert_eq!(units.len(), 1);
+        let unit = &units[0];
+        assert_eq!(unit.job, "libS.aarch64-linux", "the record's label is kept");
+        assert_eq!(
+            unit.system, "aarch64-linux",
+            "system recovered from the ATerm"
+        );
+        assert_eq!(
+            unit.outputs,
+            BTreeMap::from([("out".to_string(), out.clone())]),
+            "outputs recovered from the ATerm"
+        );
+        assert_eq!(
+            unit.required_features,
+            vec!["kvm".to_string(), "big-parallel".to_string()],
+            "features recovered from the ATerm"
+        );
+
+        // The sparse record needs the embedded derivation; with it gone
+        // the per-unit error names the unrecoverable fields and the drv —
+        // never a placeholder entry.
+        std::fs::remove_file(
+            tmp.path()
+                .join("nix/store")
+                .join(format!("{}-libS-1.0.drv", fake_hash("sparse-libS-drv"))),
+        )
+        .unwrap();
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let err = format!("{:#}", load_units(&archive).unwrap_err());
+        assert!(err.contains("no readable derivation"), "got: {err}");
+        assert!(
+            err.contains("system") && err.contains("outputs") && err.contains("required features"),
+            "the error names every field that needed recovery: {err}"
+        );
+    }
+
+    #[test]
+    fn complete_unit_records_do_not_require_a_readable_derivation() {
+        // The structural counterpart of per-field recovery: a record that
+        // carries every field — explicit empties included (the common
+        // `required_features: []` claim) — must plan without touching the
+        // embedded derivation at all. Pinned by deleting the drv member:
+        // if any field were recovered despite the complete record, this
+        // load would error instead of planning.
+        let tmp = tempfile::tempdir().unwrap();
+        write_mini_archive(tmp.path());
+        let app_a_drv_name = format!("{}-appA-1.0.drv", fake_hash("appA-1.0-drv"));
+        std::fs::remove_file(tmp.path().join("nix/store").join(&app_a_drv_name)).unwrap();
+
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let units = load_units(&archive).unwrap();
+        let app_a = units.iter().find(|u| u.job == "appA.x86_64-linux").unwrap();
+        assert_eq!(app_a.system, "x86_64-linux");
+        assert!(!app_a.outputs.is_empty());
+        assert_eq!(
+            app_a.required_features,
+            Vec::<String>::new(),
+            "the record's explicit empty feature list is taken verbatim"
+        );
     }
 
     #[test]

@@ -571,8 +571,8 @@ mod tests {
                 drv: app_drv.clone(),
                 label: Some("app.x86_64-linux".to_string()),
                 system: Some("x86_64-linux".to_string()),
-                outputs: BTreeMap::from([("out".to_string(), app_out.clone())]),
-                required_features: Vec::new(),
+                outputs: Some(BTreeMap::from([("out".to_string(), app_out.clone())])),
+                required_features: Some(Vec::new()),
                 identity_divergent: false,
             }])
             .unwrap();

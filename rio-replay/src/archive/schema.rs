@@ -355,10 +355,21 @@ pub struct UnitRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
     /// Statically declared output paths (output name → store path).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub outputs: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required_features: Vec<String>,
+    ///
+    /// `None` (absent on the wire) means the recorder said nothing — the
+    /// engine recovers the field from the unit's embedded derivation.
+    /// `Some({})` is a positive claim of no statically declared outputs
+    /// (an all-floating-CA unit) and is taken verbatim. Records written
+    /// before the distinction existed omitted empty maps, so they load as
+    /// `None` and recover — same values for conformant recorders, at one
+    /// ATerm parse per sparse field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<BTreeMap<String, String>>,
+    /// Same absent-vs-empty contract as `outputs`: `None` recovers from
+    /// the embedded derivation, `Some([])` is the (common) positive claim
+    /// of no required features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_features: Option<Vec<String>>,
     /// Set by the recorder when its fidelity gate found this unit's
     /// derivation identity divergent from the recorded source.
     #[serde(default)]
@@ -579,6 +590,54 @@ mod tests {
             assert_eq!(parsed, variant, "parse of {wire:?}");
             assert_eq!(variant.as_str(), wire, "as_str of {variant:?}");
         }
+    }
+
+    #[test]
+    fn unit_record_distinguishes_absent_from_empty_and_reads_old_lines() {
+        // Old-artifact line: records written before the absent-vs-empty
+        // distinction (skip_serializing_if dropped empty maps/lists, so
+        // omission was the ONLY spelling). They must keep parsing — as
+        // None, i.e. "the recorder said nothing", which the engine
+        // recovers per-field from the embedded derivation.
+        let old_line = r#"{"drv":"/nix/store/d1111111111111111111111111111111-dep.drv","label":"pkgs.dep.x86_64-linux","system":"x86_64-linux","outputs":{"out":"/nix/store/f1111111111111111111111111111111-dep"},"identity_divergent":false}"#;
+        let record: UnitRecord = serde_json::from_str(old_line).unwrap();
+        assert_eq!(
+            record.outputs,
+            Some(BTreeMap::from([(
+                "out".to_string(),
+                "/nix/store/f1111111111111111111111111111111-dep".to_string()
+            )]))
+        );
+        assert_eq!(
+            record.required_features, None,
+            "an omitted field is an absent field, not an empty one"
+        );
+
+        // A drv-only sparse record (a foreign partial recorder's minimum)
+        // is schema-legal and all-absent.
+        let sparse: UnitRecord = serde_json::from_str(r#"{"drv":"/nix/store/x-a.drv"}"#).unwrap();
+        assert_eq!(sparse.system, None);
+        assert_eq!(sparse.outputs, None);
+        assert_eq!(sparse.required_features, None);
+
+        // Explicit empties survive a round trip as positive claims: the
+        // writer serializes them (`"required_features":[]`), and they
+        // parse back as Some — never collapsing into the absent spelling.
+        let explicit = UnitRecord {
+            drv: "/nix/store/x-a.drv".to_string(),
+            label: None,
+            system: Some("x86_64-linux".to_string()),
+            outputs: Some(BTreeMap::new()),
+            required_features: Some(Vec::new()),
+            identity_divergent: false,
+        };
+        let line = serde_json::to_string(&explicit).unwrap();
+        assert!(
+            line.contains(r#""outputs":{}"#) && line.contains(r#""required_features":[]"#),
+            "explicit empties must be spelled out on the wire: {line}"
+        );
+        let reparsed: UnitRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(reparsed, explicit);
     }
 
     #[test]

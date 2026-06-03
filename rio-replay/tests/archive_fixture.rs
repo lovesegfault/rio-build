@@ -27,7 +27,7 @@ use rio_replay::archive::{MANIFEST_MEMBER, NARINFO_DIR, identity};
 /// fixture with `regenerate_v1_basic_fixture`, review the diff deliberately,
 /// and only then update the pin.
 const V1_BASIC_ARCHIVE_ID: &str =
-    "9fbf07bcc90bd64d3f29ea098ea7412a74c05208985afd48b4b6c57d225f0dee";
+    "92114882201d30b37b0701496e412032166ba287c8f45a49493b277e6846b249";
 
 /// Store paths of the fixture archive. Deliberately restated here instead of
 /// reusing `crate::archive::writer::test_support` (which carries the same
@@ -189,24 +189,24 @@ fn generate_v1_basic(root: &Path) -> FinalizedArchive {
                 drv: DEP_DRV.to_string(),
                 label: Some("pkgs.dep.x86_64-linux".to_string()),
                 system: Some("x86_64-linux".to_string()),
-                outputs: BTreeMap::from([("out".to_string(), DEP_OUT.to_string())]),
-                required_features: Vec::new(),
+                outputs: Some(BTreeMap::from([("out".to_string(), DEP_OUT.to_string())])),
+                required_features: Some(Vec::new()),
                 identity_divergent: false,
             },
             UnitRecord {
                 drv: APP_DRV.to_string(),
                 label: Some("pkgs.app.x86_64-linux".to_string()),
                 system: Some("x86_64-linux".to_string()),
-                outputs: BTreeMap::from([("out".to_string(), APP_OUT.to_string())]),
-                required_features: Vec::new(),
+                outputs: Some(BTreeMap::from([("out".to_string(), APP_OUT.to_string())])),
+                required_features: Some(Vec::new()),
                 identity_divergent: false,
             },
             UnitRecord {
                 drv: OOM_DRV.to_string(),
                 label: Some("pkgs.oom.x86_64-linux".to_string()),
                 system: Some("x86_64-linux".to_string()),
-                outputs: BTreeMap::from([("out".to_string(), OOM_OUT.to_string())]),
-                required_features: vec!["big-parallel".to_string()],
+                outputs: Some(BTreeMap::from([("out".to_string(), OOM_OUT.to_string())])),
+                required_features: Some(vec!["big-parallel".to_string()]),
                 identity_divergent: false,
             },
         ])

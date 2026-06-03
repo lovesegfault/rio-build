@@ -728,8 +728,8 @@ mod tests {
                 drv: drv.clone(),
                 label: Some("solo.x86_64-linux".to_string()),
                 system: Some("x86_64-linux".to_string()),
-                outputs: BTreeMap::from([("out".to_string(), out.clone())]),
-                required_features: Vec::new(),
+                outputs: Some(BTreeMap::from([("out".to_string(), out.clone())])),
+                required_features: Some(Vec::new()),
                 identity_divergent: false,
             }])
             .unwrap();
