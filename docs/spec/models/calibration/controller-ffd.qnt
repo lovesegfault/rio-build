@@ -34,7 +34,13 @@ module ffdCalibNoClassClamp {
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
     ENABLE_KARPENTER_FAULT = false,
-    START_CEILINGS_KNOWN = true
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false
   ).* from "../nodeclaimLifecycle"
 
   /// The as-built full tick with ONE change: the cellA cover allowance
@@ -159,6 +165,10 @@ module ffdCalibNoClassClamp {
         configuredCells' = configuredCells,
         ceilingsKnown' = ceilingsKnown,
         hadAcquire' = hadAcquire,
+        // C2 vars: constant under the calibration regimes (axes off).
+        edgeClearDone' = edgeClearDone,
+        pendingClear' = pendingClear,
+        schedBinding' = schedBinding,
         effects' = Set(EPublished)
           .union(if (createdA + createdB > 0) Set(ECreateOk) else Set())
           .union(if (createAttempted and createFails) Set(ECreateFailed) else Set())

@@ -371,6 +371,13 @@ scope: with scope; ''
       pc_wait_open("pc-preempt", 1, 300, "preempt arm")
       preempt_pod, preempt_node, preempt_vm = pc_running_pod()
       preempt_job = pc_owning_job(preempt_pod)
+      # The requeued drv respawns a SAME-NAME Job (deterministic name);
+      # "the preempted Job is gone" must therefore compare instances,
+      # not names — capture the UID before the patch.
+      preempt_job_uid = k3s_server.succeed(
+          f"k3s kubectl -n ${nsBuilders} get job {preempt_job} "
+          "-o jsonpath='{.metadata.uid}'"
+      ).strip()
       preempt_exec = pc_open_exec("pc-preempt")
       pc_wait_build_cgroup(preempt_vm, "pc-preempt")
       # One reconcile tick of open evidence (the cancel-successor arm
@@ -392,10 +399,18 @@ scope: with scope; ''
             f"(node {preempt_node}, exec {preempt_exec})")
 
       # The controller must do the deletion (report-then-delete): pod
-      # and owning Job gone within the same 90s composite bound.
+      # and owning Job INSTANCE gone within the same 90s composite
+      # bound. By-UID, not by-name: the report fold requeues the
+      # still-wanted drv and the spawn pass recreates a Job with the
+      # SAME deterministic name within ~1 s of the finalizer — a
+      # same-name successor is the drv being NOT lost (this arm's
+      # other half), never a failure of the preempt deletion. The
+      # by-name form raced that ~1 s window against a 2 s poll and
+      # then waited on the successor's whole build instead.
       k3s_server.wait_until_succeeds(
           f"! k3s kubectl -n ${nsBuilders} get pod {preempt_pod} 2>/dev/null && "
-          f"! k3s kubectl -n ${nsBuilders} get job {preempt_job} 2>/dev/null",
+          f"[ \"$(k3s kubectl -n ${nsBuilders} get job {preempt_job} "
+          f"-o jsonpath='{{.metadata.uid}}' 2>/dev/null)\" != '{preempt_job_uid}' ]",
           timeout=90,
       )
       # The original attempt must be closed at the report fold — gone

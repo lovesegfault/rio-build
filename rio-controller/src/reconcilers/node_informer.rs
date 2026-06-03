@@ -501,7 +501,7 @@ fn flush_spot_exposure(
 /// per-need GET cannot resolve — the COMMON interrupt case is the node
 /// disappearing moments after the event, which silently dropped the
 /// numerator sample and biased λ LOW (toward spot) exactly when spot
-/// was reclaiming. Pruned past [`HW_FALLBACK_TTL_SECS`] (2× the 3600 s
+/// was reclaiming. Pruned past `HW_FALLBACK_TTL_SECS` (2× the 3600 s
 /// Event TTL bound — entries older than any Event that could still
 /// reference them).
 pub type HwClassFallback = std::sync::Arc<std::sync::RwLock<HashMap<String, (String, f64)>>>;

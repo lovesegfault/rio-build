@@ -196,7 +196,7 @@ pub struct Ctx {
     /// fleet exhaustion for that intent (`pool/jobs` gate block). The
     /// NoEligibleSource report — the verdict that POISONS the
     /// derivation scheduler-side — fires only at
-    /// [`pool::candidate::NO_ELIGIBLE_SOURCE_PERSIST_TICKS`]; a
+    /// `pool::candidate::NO_ELIGIBLE_SOURCE_PERSIST_TICKS`; a
     /// single-tick exhaustion (node restart, informer lag) withholds
     /// the spawn but never poisons. In-process only: a controller
     /// restart restarts streaks (delays a genuine poison by ≤3 ticks —

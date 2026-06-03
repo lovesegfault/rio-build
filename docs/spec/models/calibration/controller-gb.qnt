@@ -28,7 +28,14 @@ module gbCalibAckAttempted {
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = false,
     ENABLE_MAT_JOBS = false,
-    ENABLE_RENDERED_DEADLINE = false
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the ack covers the attempted
@@ -208,6 +215,13 @@ module gbCalibAckAttempted {
       gate' = gate,
       matJob' = matJob,
       renderedFarDl' = renderedFarDl,
+      // C2 vars: constant under the calibration regimes (axes off).
+      closedCause' = closedCause,
+      seenOpen' = seenOpen,
+      exhausted' = exhausted,
+      streak' = streak,
+      pendingClose' = pendingClose,
+      obsLive' = obsLive,
     }
   }
 
@@ -259,7 +273,14 @@ module gbCalibAckOnlyNew {
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = false,
     ENABLE_MAT_JOBS = false,
-    ENABLE_RENDERED_DEADLINE = false
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: only the spawned-this-tick set is
@@ -439,6 +460,13 @@ module gbCalibAckOnlyNew {
       gate' = gate,
       matJob' = matJob,
       renderedFarDl' = renderedFarDl,
+      // C2 vars: constant under the calibration regimes (axes off).
+      closedCause' = closedCause,
+      seenOpen' = seenOpen,
+      exhausted' = exhausted,
+      streak' = streak,
+      pendingClose' = pendingClose,
+      obsLive' = obsLive,
     }
   }
 

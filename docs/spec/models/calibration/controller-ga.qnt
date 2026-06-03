@@ -33,7 +33,14 @@ module gaCalibNoLiveRecheck {
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = false,
     ENABLE_MAT_JOBS = false,
-    ENABLE_RENDERED_DEADLINE = false
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the live pod-phase re-check is
@@ -214,6 +221,13 @@ module gaCalibNoLiveRecheck {
       gate' = gate,
       matJob' = matJob,
       renderedFarDl' = renderedFarDl,
+      // C2 vars: constant under the calibration regimes (axes off).
+      closedCause' = closedCause,
+      seenOpen' = seenOpen,
+      exhausted' = exhausted,
+      streak' = streak,
+      pendingClose' = pendingClose,
+      obsLive' = obsLive,
     }
   }
 
@@ -264,7 +278,14 @@ module gaCalibOrphanGateEmptyOk {
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = false,
     ENABLE_MAT_JOBS = false,
-    ENABLE_RENDERED_DEADLINE = false
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the orphan-reap decision uses a
@@ -451,6 +472,13 @@ module gaCalibOrphanGateEmptyOk {
       gate' = gate,
       matJob' = matJob,
       renderedFarDl' = renderedFarDl,
+      // C2 vars: constant under the calibration regimes (axes off).
+      closedCause' = closedCause,
+      seenOpen' = seenOpen,
+      exhausted' = exhausted,
+      streak' = streak,
+      pendingClose' = pendingClose,
+      obsLive' = obsLive,
     }
   }
 
@@ -501,7 +529,14 @@ module gaCalibCrdAbsentArmed {
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = false,
     ENABLE_MAT_JOBS = false,
-    ENABLE_RENDERED_DEADLINE = false
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
   ).* from "../spawnCoherence"
 
   /// PRE-FIX gate retain: the crd-absent arm arms the gate (pass-through
@@ -699,6 +734,13 @@ module gaCalibCrdAbsentArmed {
       gate' = gate,
       matJob' = matJob,
       renderedFarDl' = renderedFarDl,
+      // C2 vars: constant under the calibration regimes (axes off).
+      closedCause' = closedCause,
+      seenOpen' = seenOpen,
+      exhausted' = exhausted,
+      streak' = streak,
+      pendingClose' = pendingClose,
+      obsLive' = obsLive,
     }
   }
 

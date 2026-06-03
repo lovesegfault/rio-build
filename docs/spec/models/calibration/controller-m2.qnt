@@ -30,7 +30,13 @@ module m2CalibNoConsolidatePrune {
     ENABLE_RPC_FAULT = true,
     ENABLE_LEASE_FAULT = false,
     ENABLE_KARPENTER_FAULT = false,
-    START_CEILINGS_KNOWN = false
+    START_CEILINGS_KNOWN = false,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false
   ).* from "../nodeclaimLifecycle"
 
   /// The as-built consolidate-only tick with the inflight_created prune
@@ -81,6 +87,10 @@ module m2CalibNoConsolidatePrune {
         configuredCells' = configuredCells,
         ceilingsKnown' = ceilingsKnown,
         hadAcquire' = hadAcquire,
+        // C2 vars: constant under the calibration regimes (axes off).
+        edgeClearDone' = edgeClearDone,
+        pendingClear' = pendingClear,
+        schedBinding' = schedBinding,
         effects' = Set()
           .union(if (idleReaped.size() > 0) Set(EIdleReap, EConsolidateOnlyReap) else Set())
           .union(if (stuckReaped.size() > 0) Set(EStuckReap, EConsolidateOnlyReap) else Set())
@@ -165,7 +175,13 @@ module m2CalibInflightDropOnSight {
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
     ENABLE_KARPENTER_FAULT = false,
-    START_CEILINGS_KNOWN = true
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false
   ).* from "../nodeclaimLifecycle"
 
   /// The structural conservation property the KEEP arm protects. Scoped
@@ -298,6 +314,10 @@ module m2CalibInflightDropOnSight {
         configuredCells' = configuredCells,
         ceilingsKnown' = ceilingsKnown,
         hadAcquire' = hadAcquire,
+        // C2 vars: constant under the calibration regimes (axes off).
+        edgeClearDone' = edgeClearDone,
+        pendingClear' = pendingClear,
+        schedBinding' = schedBinding,
         effects' = Set(EPublished)
           .union(if (createdA + createdB > 0) Set(ECreateOk) else Set())
           .union(if (createAttempted and createFails) Set(ECreateFailed) else Set())
