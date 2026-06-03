@@ -2387,9 +2387,10 @@ pub async fn run_with_backends(
             // back in.
             record.comparability.excluded = recorder_excluded.clone();
             record.comparability.exclusions_recorded = archive_input::exclusions_recorded(&archive);
-            // Units whose cross-session truth disagreement the reader's
-            // collapse resolves by informativeness rank: recorded next to
-            // the exclusion counts so collapse-shaped truth travels with
+            // Units whose cross-session records disagree on the consumed
+            // truth (outcome or recorded output hashes), resolved by the
+            // reader's rank-or-content collapse: recorded next to the
+            // exclusion counts so collapse-shaped truth travels with
             // every report, not only engine logs. The reader withholds the
             // count (None) when the archive does not claim
             // expected_outcomes — no truth is collapse-resolved on a

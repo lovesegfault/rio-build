@@ -906,16 +906,19 @@ pub struct ComparabilityBlock {
     /// an empty exclusion set.
     pub exclusions_recorded: Option<usize>,
     /// Workload units whose session-scoped truth records disagree on the
-    /// outcome with no session-less record to supersede them — the units
-    /// whose one truth slot the reader's cross-session collapse resolved
-    /// by informativeness rank, discarding recorded information (see
-    /// `ReplayArchive::truth_collapse_conflicts`). Part of comparability
-    /// because the headline's truth for these units is a policy choice,
-    /// not a plain recording. `None` means NOT MEASURED: a campaign
-    /// record written before the field existed, or an archive without
-    /// the `expected_outcomes` capability — the reader withholds the
-    /// count there, since no truth is collapse-resolved when the
-    /// recorder vouched for no outcomes (every unit's truth is Unknown).
+    /// CONSUMED truth — the outcome, or the recorded output hashes of
+    /// outcome-equal records — with no session-less record to supersede
+    /// them: the units whose one truth slot the reader's cross-session
+    /// collapse resolved by informativeness rank or, within a rank
+    /// class, by record content order, discarding recorded information
+    /// (see `ReplayArchive::truth_collapse_conflicts`). Part of
+    /// comparability because the headline's truth for these units is a
+    /// policy choice, not a plain recording. `None` means NOT MEASURED:
+    /// a campaign record written before the field existed, or an
+    /// archive without the `expected_outcomes` capability — the reader
+    /// withholds the count there, since no truth is collapse-resolved
+    /// when the recorder vouched for no outcomes (every unit's truth is
+    /// Unknown).
     pub truth_collapse_conflicts: Option<usize>,
     /// The supply stage's planned-but-missing prefetch percentage, recorded
     /// even when it stayed below the pause threshold (any nonzero shortfall

@@ -368,10 +368,14 @@ fn unknown_truth(unit: &ManifestEntry) -> UnitTruth {
 /// no outbound queries. Each unit's record is resolved by derivation alone
 /// through the reader's canonical collapse over sessions — the session-less
 /// record when one exists, otherwise the scoped record of the highest
-/// informativeness rank with sessions breaking ties only within a rank
-/// class (see `ReplayArchive::expected_outcome_across_sessions`) — so
-/// truth a recorder scoped to specific sessions is never invisible here,
-/// and a built record cannot lose to a concurrent session's disconnect.
+/// informativeness rank, with ties within a rank class resolved by
+/// consumed-truth content order (outcome, then recorded output hashes)
+/// and the highest-numbered session deciding only between records whose
+/// consumed truth is identical (see
+/// `ReplayArchive::expected_outcome_across_sessions`, the rule's owner
+/// doc) — so truth a recorder scoped to specific sessions is never
+/// invisible here, and a built record cannot lose to a concurrent
+/// session's disconnect.
 /// The recorded outcome is carried through verbatim in the archive's
 /// neutral vocabulary; how each value compares is the classifier's
 /// business.

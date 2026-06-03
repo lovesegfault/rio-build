@@ -576,9 +576,11 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
     }
     // Conflict-resolved truth is comparability context like the exclusion
     // counts: nonzero means some units' expected outcomes were chosen by
-    // the collapse rank, not plainly recorded. `Some(0)` renders nothing
-    // (no conflicts to disclose); `None` is a campaign from before the
-    // count existed.
+    // the collapse's rank-or-content order (consumed-truth conflicts —
+    // outcome or recorded output hashes — see
+    // `ReplayArchive::truth_collapse_conflicts`), not plainly recorded.
+    // `Some(0)` renders nothing (no conflicts to disclose); `None` is a
+    // campaign from before the count existed.
     if let Some(count) = block.truth_collapse_conflicts
         && count > 0
     {
