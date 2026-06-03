@@ -474,7 +474,7 @@ tracey rule or phase deferral.
       text-CA-verified `.drv` bytes --- never signed from submitter
       echoes (#rref("sched.dispatch.claims-derived")), and settled
       conflicts are arbitrated against those bytes
-      (#rref("sched.merge.store-evidence-displacement+1")). Store:
+      (#rref("sched.merge.store-evidence-displacement+2")). Store:
       HMAC assignment tokens gate registration ---
       `x-rio-assignment-token` metadata on PutPath, `store_path ∈
       claims.expected_outputs` --- and content-addressed or fixed-output

@@ -89,7 +89,7 @@ fn test_actor_error_to_status_all_arms() {
             "settled",
         ),
         (
-            // r[verify sched.merge.store-evidence-displacement+1]
+            // r[verify sched.merge.store-evidence-displacement+2]
             // Wire codes derived per variant: silence is transient and
             // must surface UNAVAILABLE (bug_055's inversion, merge
             // form) ...
@@ -101,7 +101,7 @@ fn test_actor_error_to_status_all_arms() {
             "retry when the store recovers",
         ),
         (
-            // r[verify sched.merge.store-evidence-displacement+1]
+            // r[verify sched.merge.store-evidence-displacement+2]
             // ... and budget exhaustion is load-shaped, never the
             // conflict's permanent FAILED_PRECONDITION.
             ActorError::SettledConflictEvidenceBudget {
@@ -111,7 +111,7 @@ fn test_actor_error_to_status_all_arms() {
             "split the submission",
         ),
         (
-            // r[verify sched.merge.store-evidence-displacement+1]
+            // r[verify sched.merge.store-evidence-displacement+2]
             ActorError::StoreEvidenceContradicts {
                 drv_path: "/nix/store/x".into(),
             },

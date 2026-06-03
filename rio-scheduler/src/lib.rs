@@ -185,15 +185,20 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_merge_store_evidence_total",
         "Merge-time store-evidence checks for settled identity conflicts \
-         (sched.merge.store-evidence-displacement+1), labeled by result: \
-         displaced (claim verified — by ingress-byte-bound rank or against \
-         the store's text-CA .drv bytes — and the settled squat erased), \
-         mismatch (the store derivation contradicts the claim; submission \
-         rejected FAILED_PRECONDITION), unavailable (store silent — fetch \
-         failed, path absent, or bytes unverifiable — surfaced UNAVAILABLE; \
-         or permanently unprovable as submitted — refused with generated \
-         remediation), over_budget (per-merge fetch budget exhausted; merge \
-         fails RESOURCE_EXHAUSTED, nothing displaced)"
+         (sched.merge.store-evidence-displacement+2), labeled by result: \
+         displaced (claim fully verified — by ingress-byte-bound rank or \
+         against the store's text-CA .drv bytes — and the settled squat \
+         erased), stripped (verified EXCEPT an unverifiable declared \
+         modular hash: declaration stripped with M_070 preservation and \
+         the displacement approved on the verified bytes — dispatch-strip \
+         parity; pre-+2 this population surfaced as unavailable, so \
+         dashboards keyed on result=unavailable see it move), mismatch \
+         (the store derivation contradicts the claim; submission rejected \
+         FAILED_PRECONDITION), unavailable (store silent — fetch failed, \
+         path absent, or bytes unverifiable — surfaced UNAVAILABLE; or \
+         permanently unprovable as submitted — refused with generated \
+         remediation), over_budget (per-merge fetch budget exhausted; \
+         merge fails RESOURCE_EXHAUSTED, nothing displaced)"
     );
     describe_counter!(
         "rio_scheduler_merge_stripped_rejoin_total",
@@ -686,7 +691,8 @@ pub fn describe_metrics() {
          clients cannot resolve outputs by derivation), cutoff_compare / \
          cutoff_skipped_copy (early-cutoff lost), realisation_deps (build \
          trace not recorded). Nonzero realisation_insert is the bug_048 \
-         signature; the staged re-establisher (follow-up F2) drives this \
+         signature; the staged re-establisher (follow-up F2, \
+         reestablish_stripped_modular_hash) drives this \
          to zero."
     );
     describe_counter!(

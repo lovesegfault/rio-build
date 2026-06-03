@@ -1763,7 +1763,7 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+1]
+// r[verify sched.merge.store-evidence-displacement+2]
 // r[verify sched.persist.settled-identity-freeze+2]
 /// The settled-row WHERE guard's evidence carve-out: a conflicting
 /// re-creation whose hash is in the per-merge approved array (the

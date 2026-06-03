@@ -3177,7 +3177,7 @@ impl DagActor {
     ///
     /// Shared by the dispatch-time CA resolve (this module) and the
     /// merge-time store-evidence check
-    /// (`sched.merge.store-evidence-displacement+1`) — hence the
+    /// (`sched.merge.store-evidence-displacement+2`) — hence the
     /// path-taking signature: the merge-side caller verifies
     /// non-resident settled rows, which have no `DerivationState`.
     pub(super) async fn fetch_drv_content_from_store(

@@ -17,7 +17,7 @@ mod scheduler_service;
 // The merge-time store-evidence check (actor/merge.rs) runs fetched
 // `.drv` bytes through the SAME identity validator SubmitBuild ingress
 // applies to inline content, so the two rules cannot drift
-// (sched.merge.store-evidence-displacement+1).
+// (sched.merge.store-evidence-displacement+2).
 pub(crate) use scheduler_service::validate_inline_drv_content;
 
 use std::sync::Arc;

@@ -48,7 +48,7 @@ impl SchedulerDb {
     /// SpawnIntent re-uses probe defaults and re-OOMs every run.
     ///
     /// `evidence_displaced` is the merge-time store-evidence verdict
-    /// (`sched.merge.store-evidence-displacement+1`): hashes whose
+    /// (`sched.merge.store-evidence-displacement+2`): hashes whose
     /// conflicting re-creation of a SETTLED row was approved by the
     /// actor's pre-merge check (ingress-byte-bound rank, or the store's
     /// own text-CA `.drv` bytes deriving the claimed identity). Only
@@ -371,11 +371,11 @@ impl SchedulerDb {
             -- guard only matters if that check is bypassed (bug) or a
             -- racing writer settles the row between check and upsert.
             --
-            -- r[impl sched.merge.store-evidence-displacement+1]
+            -- r[impl sched.merge.store-evidence-displacement+2]
             -- The $18 carve-out is the SAME pre-merge check approving a
             -- conflicting re-creation it verified — by ingress-byte-bound
             -- rank or against the store's own text-CA .drv bytes
-            -- (sched.merge.store-evidence-displacement+1). The hash list is
+            -- (sched.merge.store-evidence-displacement+2). The hash list is
             -- per-merge and threaded through the one transaction, so the
             -- guard stays unconditional for every other writer.
             WHERE derivations.drv_hash = ANY($18)

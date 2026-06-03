@@ -76,7 +76,7 @@ pub enum DagError {
     /// bare-resubmission claimant hitting this against a settled squat
     /// is self-service: upload the genuine `.drv` to the store and
     /// resubmit — the merge-time store-evidence check
-    /// (`sched.merge.store-evidence-displacement+1`) verifies the claim
+    /// (`sched.merge.store-evidence-displacement+2`) verifies the claim
     /// against the store's text-CA-bound bytes and raises it past the
     /// squat's rank.
     #[error(
@@ -241,6 +241,28 @@ pub(crate) fn verifiable_identity_matches(
         }
     }
     path_evidence || hash_evidence == ModularHashEvidence::Match
+}
+
+/// Per-hash grant minted by the actor's merge-time store-evidence
+/// verification (Steps 0.5/0.6) and consumed by
+/// [`DerivationDag::merge_with_evidence`] at node creation. A grant
+/// means the store's text-CA-bound bytes verified the submission's
+/// claimed identity (possibly MODULO an unverifiable declared modular
+/// hash — then `stripped_declared_hash` carries the strip): the
+/// created node displaces with `path_bound_bytes` standing, records
+/// the BYTE-DERIVED resolve flag (never the submitter's echo,
+/// `sched.dispatch.claims-derived+2`), and applies the strip with
+/// M_070 preservation when present
+/// (`sched.merge.store-evidence-displacement+2` — one verdict, one
+/// consequence, identical at the merge and dispatch consumers).
+#[derive(Debug, Clone, Copy)]
+pub struct StoreEvidenceGrant {
+    /// Dispatch-resolve requirement derived from the verified bytes.
+    pub needs_resolve: bool,
+    /// `Some(declared)` iff the verdict was
+    /// `VerifiedExceptDeclaredHash`: the created node's live hash is
+    /// cleared and the declared value preserved out-of-band (M_070).
+    pub stripped_declared_hash: Option<[u8; 32]>,
 }
 
 /// Result of a successful `merge()` operation. Surfaces all the rollback
@@ -792,10 +814,12 @@ impl DerivationDag {
     /// [`Self::merge`] with merge-time STORE evidence: hashes in
     /// `store_evidence` were verified by the actor against the store's
     /// own text-CA-enforced `.drv` bytes
-    /// (`sched.merge.store-evidence-displacement+1`), so their incoming
+    /// (`sched.merge.store-evidence-displacement+2`), so their incoming
     /// nodes displace with `PathBoundBytes` standing instead of their
     /// bare ingress shape rank. The set only ever RAISES a displacer's
     /// rank — victims' protection ranks are read from their own state.
+    /// Each grant additionally carries the byte-derived facts the
+    /// created node must record ([`StoreEvidenceGrant`]).
     // r[impl sched.merge.poisoned-resubmit-bounded+2]
     // r[impl sched.merge.evidence-ranked-displacement]
     pub fn merge_with_evidence(
@@ -804,7 +828,7 @@ impl DerivationDag {
         nodes: &[crate::domain::DerivationNode],
         edges: &[crate::domain::DerivationEdge],
         submitter_traceparent: &str,
-        store_evidence: &HashMap<DrvHash, bool>,
+        store_evidence: &HashMap<DrvHash, StoreEvidenceGrant>,
     ) -> Result<MergeResult, DagError> {
         let mut newly_inserted = HashSet::new();
         let mut reset_on_resubmit = Vec::new();
@@ -917,7 +941,7 @@ impl DerivationDag {
             // Per-node displacer standing: the ingress shape rank,
             // raised to PathBoundBytes when the actor verified this
             // hash against the store's own text-CA-enforced bytes
-            // (sched.merge.store-evidence-displacement+1). Computed once
+            // (sched.merge.store-evidence-displacement+2). Computed once
             // per node, consumed by every displace() call in the arms.
             let displacer_evidence = {
                 let shape = DefinitionEvidence::from_node_shape(node);
@@ -1272,8 +1296,23 @@ impl DerivationDag {
                 // try_from_node copied is overwritten so nothing
                 // downstream of a verified creation can consult the
                 // submitter's claim.
-                if let Some(derived_needs_resolve) = store_evidence.get(&drv_hash) {
-                    state.ca.needs_resolve = *derived_needs_resolve;
+                if let Some(grant) = store_evidence.get(&drv_hash) {
+                    state.ca.needs_resolve = grant.needs_resolve;
+                    // r[impl sched.merge.store-evidence-displacement+2]
+                    // Strip consequence parity (merged_bug_020/038):
+                    // when the verification verdict was
+                    // VerifiedExceptDeclaredHash, the grant carries the
+                    // strip — the created node sheds the submitter's
+                    // unverifiable declared hash exactly like the
+                    // dispatch strip arm (an unverifiable claim is no
+                    // claim), and the claim is PRESERVED out-of-band
+                    // (M_070) so the row this node settles into stays
+                    // matchable. One verdict, one consequence, at both
+                    // consumers.
+                    if let Some(stripped) = grant.stripped_declared_hash {
+                        state.ca.modular_hash = None;
+                        state.ca.modular_hash_stripped = Some(stripped);
+                    }
                 }
                 state.interested_builds.insert(build_id);
                 // The submitting build's per-build contribution — the

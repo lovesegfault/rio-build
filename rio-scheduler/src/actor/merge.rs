@@ -249,7 +249,7 @@ fn settled_row_identity_matches(
 }
 
 /// Per-merge budget for store-evidence `.drv` fetches
-/// (`sched.merge.store-evidence-displacement+1`): settled-conflict
+/// (`sched.merge.store-evidence-displacement+2`): settled-conflict
 /// resolution is a remediation path, not a bulk operation, and an
 /// unbounded fetch loop would let a submission filled with manufactured
 /// conflicts stall the single-threaded actor on store round-trips.
@@ -415,6 +415,15 @@ pub(super) struct VerifiedDefinition {
     /// over the resident DAG's child knowledge — never the submitter's
     /// `needs_resolve` echo (sched.dispatch.claims-derived+2).
     pub(super) needs_resolve: bool,
+    /// `Some(declared)` iff the classification stripped an
+    /// unverifiable declared modular hash
+    /// (`VerifiedExceptDeclaredHash`): consumers that raise rank on
+    /// these bytes apply the strip in the same motion — clear the
+    /// live hash, preserve the declared value (M_070) — so the strip
+    /// verdict has ONE consequence everywhere
+    /// (`sched.merge.store-evidence-displacement+2`). `None` on full
+    /// verification.
+    pub(super) stripped_declared_hash: Option<[u8; 32]>,
 }
 
 /// Outcome of [`DagActor::check_store_evidence`]. Permanence is typed
@@ -628,6 +637,10 @@ pub(super) fn classify_store_evidence(
             StoreEvidenceOutcome::VerifiedExceptDeclaredHash(VerifiedDefinition {
                 bytes: std::mem::take(&mut slice[0].drv_content),
                 needs_resolve,
+                // The declared value the validator stripped — carried
+                // so the consuming raise applies clear+preserve in one
+                // motion (M_070).
+                stripped_declared_hash: node.ca_modular_hash,
             })
         }
         Ok(_) => {
@@ -636,6 +649,7 @@ pub(super) fn classify_store_evidence(
             StoreEvidenceOutcome::Verified(VerifiedDefinition {
                 bytes: std::mem::take(&mut slice[0].drv_content),
                 needs_resolve,
+                stripped_declared_hash: None,
             })
         }
         Err(status) => StoreEvidenceOutcome::Contradicts(status.message().to_string()),
@@ -661,7 +675,7 @@ pub(super) enum SettledArbitration {
 }
 
 /// Exhaustive settled-row displacement arbitration
-/// (`sched.merge.store-evidence-displacement+1`).
+/// (`sched.merge.store-evidence-displacement+2`).
 ///
 /// Soundness arguments per row rank:
 /// - `VerifiedBuilt` / `PathBoundBytes`: byte-anchored — the recorded
@@ -742,7 +756,7 @@ pub(super) fn arbitrate_settled_row(
 /// verdict — the SINGLE arbiter for merge Steps 0.5 (settled rows) and
 /// 0.6 (resident settled squats), so the two steps cannot drift on
 /// what a verdict means. Wire-code consequences are DERIVED from the
-/// verdict's typed permanence (`store-evidence-displacement+1`):
+/// verdict's typed permanence (`store-evidence-displacement+2`):
 /// silence is the only transient verdict and surfaces UNAVAILABLE;
 /// permanent unprovability carries generated remediation back to the
 /// refusing caller.
@@ -759,7 +773,10 @@ fn settle_evidence_verdict(
     build_id: Uuid,
     node: &crate::domain::DerivationNode,
     outcome: StoreEvidenceOutcome,
-    store_evidence: &mut std::collections::HashMap<crate::state::DrvHash, bool>,
+    store_evidence: &mut std::collections::HashMap<
+        crate::state::DrvHash,
+        crate::dag::StoreEvidenceGrant,
+    >,
 ) -> Result<EvidenceVerdict, ActorError> {
     match outcome {
         StoreEvidenceOutcome::Verified(def) => {
@@ -768,11 +785,17 @@ fn settle_evidence_verdict(
                 "result" => "displaced"
             )
             .increment(1);
-            // The map value is the byte-derived resolve flag: the DAG
-            // stamps it on the node it creates for this hash, so a
+            // The grant carries the byte-derived facts: the DAG stamps
+            // them on the node it creates for this hash, so a
             // store-evidence-created node never carries the
             // submitter's echo (sched.dispatch.claims-derived+2).
-            store_evidence.insert(node.drv_hash.as_str().into(), def.needs_resolve);
+            store_evidence.insert(
+                node.drv_hash.as_str().into(),
+                crate::dag::StoreEvidenceGrant {
+                    needs_resolve: def.needs_resolve,
+                    stripped_declared_hash: None,
+                },
+            );
             Ok(EvidenceVerdict::Approved)
         }
         StoreEvidenceOutcome::Contradicts(detail) => {
@@ -792,7 +815,7 @@ fn settle_evidence_verdict(
                 drv_path: node.drv_path.clone(),
             })
         }
-        // r[impl sched.merge.store-evidence-displacement+1]
+        // r[impl sched.merge.store-evidence-displacement+2]
         // TRANSIENT: silence must never harden into the conflict's
         // permanent FAILED_PRECONDITION — surface UNAVAILABLE so the
         // client retries when the store recovers (bug_055's inversion,
@@ -824,19 +847,43 @@ fn settle_evidence_verdict(
             .increment(1);
             Ok(EvidenceVerdict::Unprovable(reason.remediation()))
         }
-        StoreEvidenceOutcome::VerifiedExceptDeclaredHash(_) => {
+        // r[impl sched.merge.store-evidence-displacement+2]
+        // STRIP CONSEQUENCE PARITY (merged_bug_020 + merged_bug_038's
+        // refusal half): the identity verified EXCEPT an unverifiable
+        // declared hash — the SAME verdict the dispatch consumer
+        // strips-and-proceeds on. The previous arm here refused with
+        // "resubmit WITHOUT the declared ca_modular_hash", remediation
+        // the production producer made unfollowable (the gateway
+        // stamps the hash on every submission it can compute one for —
+        // populate_ca_modular_hashes, rio-gateway/src/translate.rs —
+        // and the verdict is deterministic for CA-chain/deferred-IA
+        // nodes because InputFormSeed excludes floating inputs by
+        // construction): a settled squat on such a node was
+        // permanently undisplaceable through the advertised
+        // self-service path. Now: one verdict, one consequence —
+        // approve the displacement on the verified bytes, with the
+        // strip riding the grant (clear live, preserve M_070).
+        StoreEvidenceOutcome::VerifiedExceptDeclaredHash(def) => {
             metrics::counter!(
                 "rio_scheduler_merge_store_evidence_total",
-                "result" => "unavailable"
+                "result" => "stripped"
             )
             .increment(1);
-            Ok(EvidenceVerdict::Unprovable(
-                "the store bytes verify the claimed identity EXCEPT the \
-                 declared modular hash, which cannot be recomputed from \
-                 here; resubmit WITHOUT the declared ca_modular_hash (an \
-                 unverifiable claim is treated as no claim)"
-                    .to_string(),
-            ))
+            info!(
+                build_id = %build_id,
+                drv_hash = %node.drv_hash,
+                "store evidence verified modulo the declared hash; \
+                 stripping (an unverifiable claim is no claim) and \
+                 approving the displacement — dispatch-strip parity"
+            );
+            store_evidence.insert(
+                node.drv_hash.as_str().into(),
+                crate::dag::StoreEvidenceGrant {
+                    needs_resolve: def.needs_resolve,
+                    stripped_declared_hash: def.stripped_declared_hash,
+                },
+            );
+            Ok(EvidenceVerdict::Approved)
         }
         StoreEvidenceOutcome::UnparseableVerified => {
             metrics::counter!(
@@ -856,7 +903,7 @@ fn settle_evidence_verdict(
 }
 
 impl DagActor {
-    // r[impl sched.merge.store-evidence-displacement+1]
+    // r[impl sched.merge.store-evidence-displacement+2]
     /// Verify a bare store-backed submission node against the store's
     /// OWN copy of the `.drv` its declared `drv_path` names: fetch,
     /// then classify through [`classify_store_evidence`].
@@ -1325,7 +1372,7 @@ impl DagActor {
         // the upsert is covered by the upsert's own settled-row WHERE
         // guard (defense in depth).
         //
-        // r[impl sched.merge.store-evidence-displacement+1]
+        // r[impl sched.merge.store-evidence-displacement+2]
         // The rejection is no longer unconditional: a conflicting
         // re-creation of a row whose lineage is CONTENT-BOUND (the
         // row-level mirror of the displacement primitive's verdicts)
@@ -1335,8 +1382,10 @@ impl DagActor {
         // store's own text-CA-bound bytes. Approved hashes bypass the
         // upsert's settled WHERE guard ($-array) and get their stale
         // parent-side edges scrubbed in the same transaction.
-        let mut store_evidence: std::collections::HashMap<crate::state::DrvHash, bool> =
-            std::collections::HashMap::new();
+        let mut store_evidence: std::collections::HashMap<
+            crate::state::DrvHash,
+            crate::dag::StoreEvidenceGrant,
+        > = std::collections::HashMap::new();
         let mut settled_evidence_displaced: Vec<String> = Vec::new();
         let mut evidence_budget: u32 = MERGE_STORE_EVIDENCE_BUDGET;
         // Input-form seeds only — the not-floating predicate lives in
@@ -1476,7 +1525,7 @@ impl DagActor {
         phase!("0.5-settled-identity-freeze");
 
         // === Step 0.6: Resident settled-squat store evidence ==========
-        // r[impl sched.merge.store-evidence-displacement+1]
+        // r[impl sched.merge.store-evidence-displacement+2]
         // The DAG-resident form of the same remediation: a bare
         // store-backed echo whose identity conflicts with a SETTLED
         // authoritative node would be rejected by the merge gate
@@ -1562,7 +1611,7 @@ impl DagActor {
         // Production entry into the merge gate: hashes in the
         // store-evidence set were verified by Step 0.5/0.6 against the
         // store's own text-CA `.drv` bytes
-        // (sched.merge.store-evidence-displacement+1); the gate's
+        // (sched.merge.store-evidence-displacement+2); the gate's
         // displacement primitive still owns every decision.
         let merge_result = match self.dag.merge_with_evidence(
             build_id,
@@ -3310,8 +3359,20 @@ impl DagActor {
                     // (whose bytes are never persisted) and for
                     // deferred-IA rows (is_ca=false, but the gateway
                     // populates the hash because their output paths
-                    // resolve only at dispatch time).
-                    ca_modular_hash: node.ca_modular_hash,
+                    // resolve only at dispatch time). Read from the
+                    // in-memory node the merge just created — NOT the
+                    // submission echo — so a store-evidence GRANT that
+                    // stripped the declaration
+                    // (sched.merge.store-evidence-displacement+2)
+                    // persists the post-strip truth: the submitter's
+                    // unverifiable declared hash must never re-enter
+                    // the row through the persist path after the DAG
+                    // shed it.
+                    ca_modular_hash: self
+                        .dag
+                        .node(node.drv_hash.as_str())
+                        .map(|s| s.ca.modular_hash)
+                        .unwrap_or(node.ca_modular_hash),
                     // r[impl sched.derivation.evidence-rank]
                     // Read from the in-memory node the merge just
                     // created — NOT recomputed from shape — so a
@@ -3326,10 +3387,17 @@ impl DagActor {
                         .node(node.drv_hash.as_str())
                         .map(|s| s.evidence)
                         .unwrap_or_else(|| crate::state::DefinitionEvidence::from_node_shape(node)),
-                    // M_070: the ingress strip's preserved claim rides
-                    // the creation snapshot (the only producer of a
-                    // Some here is the SubmitBuild strip phase).
-                    ca_modular_hash_stripped: node.ca_modular_hash_stripped,
+                    // M_070: the preserved claim — set by the ingress
+                    // strip (riding the domain node) or by a stripping
+                    // store-evidence grant (recorded on the DAG node) —
+                    // rides the creation snapshot. Same DAG-first read
+                    // as the live hash above so both halves of the
+                    // strip persist together.
+                    ca_modular_hash_stripped: self
+                        .dag
+                        .node(node.drv_hash.as_str())
+                        .map(|s| s.ca.modular_hash_stripped)
+                        .unwrap_or(node.ca_modular_hash_stripped),
                 }
             })
             .collect();
@@ -3533,7 +3601,7 @@ impl DagActor {
         // r[impl sched.merge.displaced-edge-scrub+2]
         //
         // Row-only store-evidence displacements
-        // (sched.merge.store-evidence-displacement+1) chain in for the same
+        // (sched.merge.store-evidence-displacement+2) chain in for the same
         // reason: the displaced SETTLED row had no DAG node (reaped), so
         // the gate never scrubbed anything in memory, but its persisted
         // parent-side dependency edges still describe the OLD lineage —
@@ -4873,6 +4941,14 @@ mod evidence_matrix_tests {
                 // derives `true` from the bytes — recorded by the
                 // strip arm exactly like the Verified arm.
                 assert!(def.needs_resolve, "floating-with-input resolves");
+                // r[verify sched.merge.store-evidence-displacement+2]
+                // The stripped declared value rides the verdict so the
+                // consuming raise can clear+preserve in one motion.
+                assert_eq!(
+                    def.stripped_declared_hash,
+                    Some([0xCC; 32]),
+                    "stripped declared hash carried for M_070 preservation"
+                );
             }
             other => panic!(
                 "expected VerifiedExceptDeclaredHash, got {}",

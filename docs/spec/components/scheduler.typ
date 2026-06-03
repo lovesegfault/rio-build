@@ -990,7 +990,7 @@ re-declaration satisfies it); the witnessed heal
 demanding coverage of the recorded witness set --- both operands
 scheduler-owned (the truncation recorded what it removed; the merge knows
 what it attached). Prior art in the same shape: the displacement
-primitive's evidence ranks (#rref("sched.merge.store-evidence-displacement+1"))
+primitive's evidence ranks (#rref("sched.merge.store-evidence-displacement+2"))
 refuse re-definition unless the incoming claim PROVES rank over the
 recorded row, and the born-holed prune stamp
 (#rref("sched.merge.substitute-topdown+12")) records the dropped closure
@@ -2376,7 +2376,7 @@ refresh for free.
   plus at least one piece of content-bound evidence --- MUST be
   rejected with `FAILED_PRECONDITION`, unless the conflicting
   re-creation was approved by the store-evidence check
-  (#rref("sched.merge.store-evidence-displacement+1")). Admissible
+  (#rref("sched.merge.store-evidence-displacement+2")). Admissible
   match bases are: agreement on a shared non-empty expected output
   path; a byte-equal LIVE CA modular hash; a byte-equal PRESERVED
   stripped claim (the segregated column a strip writer moved an
@@ -2431,41 +2431,53 @@ and empty for every other writer --- the freeze stays unconditional
 except where the store's own bytes (or strictly higher ingress-bound
 evidence) proved the settled record is the impostor.
 
-#r("sched.merge.store-evidence-displacement+1")[
+#r("sched.merge.store-evidence-displacement+2")[
   When a store-backed submission's declared identity conflicts with a
-  SETTLED content-bound record --- a resident settled authoritative node,
-  or a settled row whose lineage rank is `content_bound_claim` --- the
-  scheduler MUST attempt to verify the claim against the store's own copy
-  of the derivation before rejecting it: fetch the `.drv` the declared
-  path names (subject to a per-merge fetch budget), re-derive its text
-  content-address in the actor and require it to equal the declared path,
-  and compare the parsed derivation against the submission's claimed
-  identity with the same validator SubmitBuild ingress applies to inline
-  content. A verified claim MUST displace the settled squat --- through
-  the displacement primitive for resident victims, and through a
-  per-merge approved-hash carve-out of the settled-row freeze (with the
-  old row's persisted parent-side dependency edges scrubbed in the same
-  transaction) for row-only victims. A contradiction MUST reject the
-  submission with `FAILED_PRECONDITION`. The row-level decision MUST be
-  an exhaustive arbitration over every (row rank, incoming rank) pair:
-  byte-anchored rows (`path_bound_bytes`, `verified_built`) refuse every
-  claim class; a `content_bound_claim` row is displaced by strictly
-  higher ingress-byte-bound evidence with no store fetch, or by a bare
-  store-verified resubmission; an `unverified_claim` row is displaced by
-  ingress-byte-bound evidence or a bare store-verified resubmission, and
-  MUST NOT be displaced by `content_bound_claim` rank alone (an
-  authoritative claim's bytes are bound to themselves, not to the
-  declared path). Every refusal's remediation text MUST be generated
-  from its arbitration arm. Store silence --- fetch failure, absent
-  path, or non-canonical / non-text-CA-consistent bytes --- MUST NOT
-  count as evidence in either direction AND MUST surface as
+  SETTLED record below byte-anchored rank --- a resident settled node
+  whether its evidence is authoritative content-bound OR a bare
+  store-backed echo, or a settled row whose persisted rank is below
+  `path_bound_bytes` --- the scheduler MUST attempt to verify the claim
+  against the store's own copy of the derivation before rejecting it
+  (rank-uniform: no settled victim form below the byte-anchored ranks
+  may be exempted from the check, and in particular a resident settled
+  BARE node MUST NOT silently join a conflicting incoming claim):
+  fetch the `.drv` the declared path names (subject to a per-merge
+  fetch budget), re-derive its text content-address in the actor and
+  require it to equal the declared path, and compare the parsed
+  derivation against the submission's claimed identity with the same
+  validator SubmitBuild ingress applies to inline content. A verified
+  claim MUST displace the settled squat --- through the displacement
+  primitive for resident victims, and through a per-merge
+  approved-hash carve-out of the settled-row freeze (with the old
+  row's persisted parent-side dependency edges scrubbed in the same
+  transaction) for row-only victims. A verification that succeeds
+  EXCEPT for an unverifiable declared modular hash MUST have the SAME
+  consequence as at the dispatch consumer (one verdict, one
+  consequence): the declaration is STRIPPED --- cleared from the live
+  evidence and PRESERVED in the segregated column --- and the
+  displacement approved on the verified bytes; the merge consumer MUST
+  NOT refuse with remediation the production submission path cannot
+  follow. A contradiction MUST reject the submission with
+  `FAILED_PRECONDITION`. The row-level decision MUST be an exhaustive
+  arbitration over every (row rank, incoming rank) pair: byte-anchored
+  rows (`path_bound_bytes`, `verified_built`) refuse every claim
+  class; a `content_bound_claim` row is displaced by strictly higher
+  ingress-byte-bound evidence with no store fetch, or by a bare
+  store-verified resubmission; an `unverified_claim` row is displaced
+  by ingress-byte-bound evidence or a bare store-verified
+  resubmission, and MUST NOT be displaced by `content_bound_claim`
+  rank alone (an authoritative claim's bytes are bound to themselves,
+  not to the declared path). Every refusal's remediation text MUST be
+  generated from its arbitration arm. Store silence --- fetch failure,
+  absent path, or non-canonical / non-text-CA-consistent bytes ---
+  MUST NOT count as evidence in either direction AND MUST surface as
   `UNAVAILABLE`, never hardening into the conflict's permanent
   `FAILED_PRECONDITION`; permanent unprovability (an unseedable
-  declared-IA input, an undecodable declared hash over otherwise
-  verified bytes, or content-bound non-derivation bytes) keeps
-  `FAILED_PRECONDITION` with the generated remediation. Exhaustion of
-  the per-merge fetch budget MUST fail the merge with
-  `RESOURCE_EXHAUSTED` and no partial displacement persisted.
+  declared-IA input after the persisted-row read-through, or
+  content-bound non-derivation bytes) keeps `FAILED_PRECONDITION` with
+  the generated remediation. Exhaustion of the per-merge fetch budget
+  MUST fail the merge with `RESOURCE_EXHAUSTED` and no partial
+  displacement persisted.
 ]
 This is the self-service path for `bug_076`-class squats: the victim of a
 content-bound squat on its predictable `drv_path` uploads the genuine
@@ -2490,7 +2502,24 @@ victims whose row was squatted by a bare echo --- the previous
 categorical refusal of that rank contradicted the remediation text the
 rejection itself emitted --- while the reverse-squat guard keeps
 hook-fallback-shaped forgeries from erasing genuine store-backed history
-by rank alone. The rank gate on byte-anchored row-only victims is
+by rank alone. The strip-parity clause exists because the two consumers
+of the same verification verdict had drifted (round-16 merged_bug_020):
+dispatch stripped-and-proceeded while merge refused with "resubmit
+WITHOUT the declared ca_modular_hash" --- remediation the gateway makes
+unfollowable (`populate_ca_modular_hashes` stamps the hash on every
+submission it can compute one for) and the verdict deterministic for
+CA-chain/deferred-IA nodes, so a settled squat on such a node was
+permanently undisplaceable through the advertised self-service path.
+Stripped-displacement approvals are observable as the `stripped` result
+label on
+#(refs.metric)("rio_scheduler_merge_store_evidence_total"); dashboards
+keyed on `result=unavailable` see that population move. The
+rank-uniform victim clause closes the resident bare x bare cell
+(round-16 bug_072): a DAG-resident settled BARE squat previously
+escaped both the row check (resident hashes are skipped) and the
+resident scan (which gated on authoritative content), so a
+genuine owner's conflicting store-backed submission silently JOINED
+the squat and was served its forged outputs as a cache hit. The rank gate on byte-anchored row-only victims is
 uniform with the displacement primitive's settled rule
 (#rref("sched.merge.evidence-ranked-displacement")); it is also
 unreachable in honest operation --- store bytes cannot contradict an

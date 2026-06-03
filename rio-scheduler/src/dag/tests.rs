@@ -5156,7 +5156,13 @@ fn store_evidence_set_raises_displacer_standing() -> anyhow::Result<()> {
     assert!(matches!(err, DagError::ConflictingInFlightContent { .. }));
 
     // With the hash in the store-evidence set: displaced.
-    let evidence: HashMap<DrvHash, bool> = HashMap::from([("sev".into(), false)]);
+    let evidence: HashMap<DrvHash, StoreEvidenceGrant> = HashMap::from([(
+        "sev".into(),
+        StoreEvidenceGrant {
+            needs_resolve: false,
+            stripped_declared_hash: None,
+        },
+    )]);
     let res = dag.merge_with_evidence(victim, &[echo], &[], "", &evidence)?;
     assert!(res.displaced.contains(&"sev".into()));
     assert_eq!(
@@ -5170,6 +5176,61 @@ fn store_evidence_set_raises_displacer_standing() -> anyhow::Result<()> {
         "store-evidence-created node carries the BYTE-DERIVED resolve \
          flag from the map, not the submitter's forged echo"
     );
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement+2]
+/// A grant carrying a strip applies it at node creation: the created
+/// node sheds the submitter's unverifiable declared hash (live None)
+/// and preserves the declared value out-of-band (M_070) — exact
+/// dispatch-strip parity at the merge consumer.
+#[test]
+fn store_evidence_grant_strip_applies_at_creation() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+    dag.merge(
+        squatter,
+        &[authoritative_node("sevs", b"Derive-squat2")],
+        &[],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("sevs")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+
+    let mut echo = make_node("sevs", "aarch64-linux");
+    echo.is_content_addressed = true;
+    // The submitter's declared (unverifiable) hash — the verification
+    // stripped it; the grant carries the strip.
+    echo.ca_modular_hash = Some([0xCC; 32]);
+
+    let evidence: HashMap<DrvHash, StoreEvidenceGrant> = HashMap::from([(
+        "sevs".into(),
+        StoreEvidenceGrant {
+            needs_resolve: true,
+            stripped_declared_hash: Some([0xCC; 32]),
+        },
+    )]);
+    let res = dag.merge_with_evidence(victim, &[echo], &[], "", &evidence)?;
+    assert!(res.displaced.contains(&"sevs".into()));
+    let created = dag.node("sevs").unwrap();
+    assert_eq!(
+        created.evidence,
+        DefinitionEvidence::PathBoundBytes,
+        "stripped-verified creation still ranks PathBoundBytes"
+    );
+    assert_eq!(
+        created.ca.modular_hash, None,
+        "the unverifiable declared hash is shed (an unverifiable claim is no claim)"
+    );
+    assert_eq!(
+        created.ca.modular_hash_stripped,
+        Some([0xCC; 32]),
+        "the declared value is preserved out-of-band (M_070)"
+    );
+    assert!(created.ca.needs_resolve, "byte-derived resolve recorded");
     Ok(())
 }
 

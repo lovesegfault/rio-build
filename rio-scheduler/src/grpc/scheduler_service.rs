@@ -951,7 +951,9 @@ fn validate_authoritative_drv_content(
 ///    checked. The stripped node then completes WITHOUT a modular
 ///    hash: completion-time CA bookkeeping skips are surfaced
 ///    (sched.ca.absent-hash-surfaced) and the verifying
-///    re-establisher is the staged follow-up F2 — not yet built.
+///    re-establisher is the staged follow-up F2
+///    (`reestablish_stripped_modular_hash` in actor/completion.rs —
+///    the dangling symbol, fix-discipline R1(c)).
 ///
 /// The seeded-sibling design is sound against squats: a forged sibling
 /// hash moves every derived path AWAY from honest paths (SHA-256 second
@@ -1306,7 +1308,8 @@ pub(crate) fn validate_inline_drv_content(
                     // the persisted row). The stripped node completes
                     // WITHOUT a hash — its CA bookkeeping skips are
                     // surfaced (sched.ca.absent-hash-surfaced); the
-                    // verifying re-establisher is staged follow-up F2.
+                    // verifying re-establisher is staged follow-up F2
+                    // (reestablish_stripped_modular_hash).
                     tracing::info!(
                         node = %node.drv_hash,
                         unresolvable_input = %input,

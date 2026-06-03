@@ -1011,6 +1011,42 @@ impl DagActor {
         self.dispatch_ready().await;
     }
 
+    /// F2 — the verifying re-establisher for stripped modular hashes
+    /// (staged follow-up; fix-discipline R1(c): an unimplemented
+    /// promise must be a DANGLING SYMBOL, not prose — the prose-only
+    /// form of this promise at the realisation_insert skip log was the
+    /// literal R1(c) violation merged_bug_038's chain rode in on).
+    ///
+    /// Contract when wired: for a Completed CA/resolve node whose
+    /// `ca.modular_hash` is `None` (ingress- or dispatch-stripped),
+    /// fetch the node's `.drv` bytes from the store, verify them
+    /// text-CA against the declared path (the same
+    /// `classify_store_evidence` discipline — store transport is never
+    /// trusted), recompute `hash_derivation_modulo` over the verified
+    /// bytes with store-read input digests (blocked on the M_068
+    /// read RPC, the same surface as the round-15 C3c7 rank floor),
+    /// and ONLY THEN write the realisation row and restore the live
+    /// hash. The preserved `ca.modular_hash_stripped` value (M_070) is
+    /// the candidate to verify FIRST — byte-equality with the
+    /// recompute upgrades it from preserved claim to verified
+    /// evidence; mismatch keeps it segregated forever.
+    ///
+    /// Counted population: `rio_scheduler_ca_bookkeeping_skipped_total`
+    /// (consumer="realisation_insert") — every increment is a node
+    /// this fn would heal.
+    #[expect(
+        dead_code,
+        reason = "F2 restorer skeleton — the realisation_insert skip log \
+                  names this symbol; wiring is staged on the M_068 store \
+                  read RPC (see doc)"
+    )]
+    fn reestablish_stripped_modular_hash() {
+        // Deliberately unimplemented: the store-side read surface
+        // (M_068 deriver-proof RPC) does not exist yet; implementing a
+        // non-verifying restore would launder a preserved claim into
+        // evidence, which M_070 forbids by construction.
+    }
+
     pub(super) async fn handle_success_completion(
         &mut self,
         drv_hash: &DrvHash,
@@ -1256,11 +1292,13 @@ impl DagActor {
                     warn!(
                         drv_hash = %drv_hash,
                         consumer = "realisation_insert",
+                        restorer = stringify!(reestablish_stripped_modular_hash),
                         "CA bookkeeping skipped: node has no modular hash \
                          (ingress-stripped or never computed) — the \
                          realisation is NOT registered and clients cannot \
-                         resolve this build's outputs by derivation until a \
-                         verifying re-establisher runs (staged follow-up F2)"
+                         resolve this build's outputs by derivation until \
+                         the verifying re-establisher runs (staged \
+                         follow-up F2; see the named fn's doc)"
                     );
                     metrics::counter!(
                         "rio_scheduler_ca_bookkeeping_skipped_total",

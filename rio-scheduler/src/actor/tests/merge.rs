@@ -9416,7 +9416,7 @@ async fn test_completed_authoritative_node_survives_conflicting_submission() -> 
     // gate, never displaces. (A conflicting BARE echo is no longer this
     // gate's territory: it routes through the store-evidence check,
     // whose silence/verify/refuse contract has its own pins —
-    // sched.merge.store-evidence-displacement+1.)
+    // sched.merge.store-evidence-displacement+2.)
     let attacker = Uuid::new_v4();
     let mut conflicting = make_test_node("settledA", "aarch64-linux");
     conflicting.drv_content = b"Derive-forged-conflict".to_vec();
@@ -10840,7 +10840,7 @@ async fn test_resubmit_reset_persists_prior_build_failure_evidence(
 }
 
 // ===========================================================================
-// Merge-time store-evidence displacement (sched.merge.store-evidence-displacement+1)
+// Merge-time store-evidence displacement (sched.merge.store-evidence-displacement+2)
 // ===========================================================================
 
 /// Stage a settled content-bound squat at `drv_hash` and reap it: build,
@@ -10879,7 +10879,7 @@ async fn settle_and_reap_squat(
     Ok(squatter)
 }
 
-// r[verify sched.merge.store-evidence-displacement+1]
+// r[verify sched.merge.store-evidence-displacement+2]
 // r[verify sched.persist.settled-identity-freeze+2]
 /// THE bug_076 self-service kill test, row-only form: an authoritative
 /// squat settles at the victim's text-CA `drv_path` and is reaped; the
@@ -10943,7 +10943,7 @@ async fn test_store_evidence_displaces_settled_squat() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+1]
+// r[verify sched.merge.store-evidence-displacement+2]
 /// Resident form: the settled authoritative squat is still in the DAG
 /// (not yet reaped). The store-evidence check raises the verified
 /// claimant to path-bound standing and the displacement primitive — not
@@ -11015,7 +11015,7 @@ async fn test_store_evidence_displaces_settled_resident_squat() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+1]
+// r[verify sched.merge.store-evidence-displacement+2]
 /// A claim the store's own bytes CONTRADICT is rejected outright — the
 /// fetched `.drv` is text-CA-bound to the declared path, so the
 /// contradiction is content-bound truth, not transport noise. The
@@ -11056,7 +11056,7 @@ async fn test_store_evidence_mismatch_rejects_submission() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+1]
+// r[verify sched.merge.store-evidence-displacement+2]
 /// Store silence is not evidence — and it is not a CONFLICT either:
 /// with nothing seeded at the declared path, the merge surfaces
 /// UNAVAILABLE ("retry when the store recovers"), never hardening a
@@ -11091,7 +11091,7 @@ async fn test_store_silence_surfaces_unavailable_row_form() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+1]
+// r[verify sched.merge.store-evidence-displacement+2]
 /// The Step 0.6 (resident squat) form of the silence contract: the
 /// settled authoritative squat is still in the DAG, the bare claimant's
 /// evidence fetch finds nothing — UNAVAILABLE again, by the SAME shared
@@ -11139,7 +11139,7 @@ async fn test_store_silence_surfaces_unavailable_resident_form() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+1]
+// r[verify sched.merge.store-evidence-displacement+2]
 /// R4 row-rank gate: a settled row whose persisted lineage is
 /// byte-anchored (`path_bound_bytes`) is NOT displaceable by the
 /// store-evidence path even when the store would verify the claim — the
@@ -11180,7 +11180,7 @@ async fn test_settled_row_rank_gate_refuses_path_bound_rows() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+1]
+// r[verify sched.merge.store-evidence-displacement+2]
 /// The per-merge fetch budget is structural: nine settled conflicts in
 /// one submission exceed the budget of eight, so at least one conflict
 /// keeps its fail-closed rejection and the whole merge fails; the same
@@ -11248,7 +11248,7 @@ async fn test_store_evidence_budget_caps_fetches() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+1]
+// r[verify sched.merge.store-evidence-displacement+2]
 /// A MATCHING-identity store-backed resubmission joins the settled node
 /// without ever consulting the store: the store is seeded with bytes
 /// that would CONTRADICT the claim, and the join still succeeds — the
@@ -11297,7 +11297,7 @@ async fn test_matching_identity_join_never_consults_store() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+1]
+// r[verify sched.merge.store-evidence-displacement+2]
 /// THE 4x4 arbitration matrix, pinned cell by cell (x bare/non-bare):
 /// no `!=` catch-all survives — every (row rank, incoming rank) pair is
 /// an explicit decision, byte-anchored rows are immovable, the
@@ -11359,7 +11359,7 @@ fn test_settled_arbitration_matrix_4x4() {
     }
 }
 
-// r[verify sched.merge.store-evidence-displacement+1]
+// r[verify sched.merge.store-evidence-displacement+2]
 /// merged_bug_043 kill test, rank form: a settled BARE-ECHO row
 /// (`unverified_claim` — e.g. a forged store-backed squat that settled
 /// before anyone noticed) is displaced by the victim's ordinary
@@ -11416,7 +11416,7 @@ async fn test_unverified_claim_row_displaced_by_ingress_bytes() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+1]
+// r[verify sched.merge.store-evidence-displacement+2]
 /// merged_bug_043 kill test, store-proof form: the victim's
 /// resubmission is BARE (no inline bytes), but its claim verifies
 /// against the store's text-CA `.drv` — a bare store-verified
@@ -11457,7 +11457,7 @@ async fn test_unverified_claim_row_displaced_by_store_verified_bare() -> TestRes
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+1]
+// r[verify sched.merge.store-evidence-displacement+2]
 /// Reverse-squat integrity pin: an AUTHORITATIVE inline claim
 /// (ContentBoundClaim — the hook-fallback shape a forger can mint at
 /// will) can NEVER displace a settled store-backed (`unverified_claim`)
@@ -11504,15 +11504,20 @@ async fn test_reverse_squat_authoritative_cannot_displace_bare_row() -> TestResu
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+1]
-/// Strip-case remediation, end to end: the bare claimant's declared
-/// `ca_modular_hash` cannot be recomputed (its only input is a FLOATING
-/// drv absent from every seed), the store bytes verify everything else
-/// — the refusal carries the GENERATED resubmit-without-the-hash
-/// remediation, executable as written: the same submission minus the
-/// declared hash verifies and displaces.
+// r[verify sched.merge.store-evidence-displacement+2]
+/// THE merged_bug_020 kill (strip consequence parity, end to end): the
+/// bare claimant's declared `ca_modular_hash` cannot be recomputed
+/// (its only input is a FLOATING drv absent from every seed) but the
+/// store bytes verify everything else. Pre-+2 this arm REFUSED with
+/// "resubmit WITHOUT the declared ca_modular_hash" — remediation the
+/// gateway makes unfollowable (populate_ca_modular_hashes stamps the
+/// hash unconditionally), so the squat was permanently undisplaceable
+/// through the advertised path. Post-+2: ONE verdict, ONE consequence
+/// — the submission AS PRODUCED displaces directly; the declaration is
+/// stripped with M_070 preservation, exactly like the dispatch
+/// consumer.
 #[tokio::test]
-async fn test_strip_case_remediation_is_executable() -> TestResult {
+async fn test_stripped_verification_displaces_directly() -> TestResult {
     let (db, store, handle, _task) = setup_with_mock_store().await?;
     let (floating, floating_aterm, _pub) = mint_floating_ca_leaf("evi-strip-input");
     let (claimant, aterm) = mint_deferred_ia_node(
@@ -11520,6 +11525,11 @@ async fn test_strip_case_remediation_is_executable() -> TestResult {
         &floating.drv_path,
         &[(floating.drv_path.as_str(), floating_aterm.as_str())],
     );
+    let declared: [u8; 32] = claimant
+        .ca_modular_hash
+        .as_slice()
+        .try_into()
+        .expect("fixture declares a 32-byte hash");
     let drv_path = claimant.drv_path.clone();
 
     sqlx::query(
@@ -11536,41 +11546,46 @@ async fn test_strip_case_remediation_is_executable() -> TestResult {
     .await?;
     store.seed_with_content(&drv_path, aterm.as_bytes());
 
-    // With the declared hash: unprovable as submitted (the floating
-    // input is in no seed), refused with the generated remediation.
-    let result = merge_dag(
-        &handle,
-        Uuid::new_v4(),
-        vec![claimant.clone()],
-        vec![],
-        false,
-    )
-    .await;
-    let err = format!(
-        "{:#}",
-        result.expect_err("declared hash is unprovable as submitted")
-    );
-    assert!(
-        err.contains("resubmit WITHOUT the declared ca_modular_hash"),
-        "refusal carries the generated strip remediation, got: {err}"
-    );
-
-    // Following the remediation verbatim succeeds.
-    let mut stripped = claimant;
-    stripped.ca_modular_hash = Vec::new();
+    // The submission AS THE GATEWAY PRODUCES IT (declared hash and
+    // all) displaces — no refusal, no client-side strip required.
     let build = Uuid::new_v4();
-    merge_dag(&handle, build, vec![stripped], vec![], false).await?;
+    merge_dag(&handle, build, vec![claimant], vec![], false).await?;
     barrier(&handle).await;
     assert_eq!(
         query_status(&handle, build).await?.state,
         rio_proto::types::BuildState::Active as i32,
-        "the remediation is executable: stripped resubmission displaces"
+        "stripped verification approves the displacement directly"
     );
-    let (pname,): (String,) = sqlx::query_as("SELECT pname FROM derivations WHERE drv_hash = $1")
+
+    // The squat is erased; the created node carries the strip with
+    // M_070 preservation and byte-anchored rank — dispatch-strip
+    // parity at the merge consumer.
+    let (pname, rank, live, preserved): (String, String, Option<Vec<u8>>, Option<Vec<u8>>) =
+        sqlx::query_as(
+            "SELECT pname, evidence_rank, ca_modular_hash, ca_modular_hash_stripped \
+             FROM derivations WHERE drv_hash = $1",
+        )
         .bind(&drv_path)
         .fetch_one(&db.pool)
         .await?;
-    assert_eq!(pname, "evi-strip");
+    assert_eq!(pname, "evi-strip", "squat displaced by the claimant");
+    assert_eq!(rank, "path_bound_bytes", "verified standing persisted");
+    assert_eq!(live, None, "unverifiable declaration not persisted live");
+    assert_eq!(
+        preserved.as_deref(),
+        Some(declared.as_slice()),
+        "declared value preserved out-of-band (M_070)"
+    );
+    let d = handle
+        .debug_query_derivation(&drv_path)
+        .await?
+        .expect("created node resident");
+    assert_eq!(d.ca.modular_hash, None, "in-memory live hash shed");
+    assert_eq!(
+        d.ca.modular_hash_stripped,
+        Some(declared),
+        "in-memory preserved claim recorded"
+    );
     Ok(())
 }
 
