@@ -2662,7 +2662,7 @@ async fn test_dispatch_claims_over_cap_drv_poisons_content_bound() -> TestResult
 
 /// Round-16 bug_094: a deferred-IA node's dispatch-time resolution
 /// must record its computed REAL paths as the claim
-/// (`set_claim_output_paths`) — the HMAC `expected_outputs` site reads
+/// (`merge_resolved_claim_paths`) — the HMAC `expected_outputs` site reads
 /// `claim_output_paths()` — while `expected_output_paths` keeps its
 /// INGRESS shape (the empty slot). Pre-fix, dispatch overwrote the
 /// expected slots, which destroyed the emptiness signal the
@@ -2794,6 +2794,137 @@ async fn test_deferred_ia_resolve_claims_real_path_and_preserves_ingress_shape()
         info.expected_output_paths,
         vec![String::new()],
         "expected_output_paths must keep its ingress shape across dispatch"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.path-shape-totality]
+/// Round-17 bug_033: same deferred-IA flow, but the submission OMITS
+/// `expected_output_paths` entirely (the legal `[]` shape). The old
+/// open-coded merge cloned the empty list and `get_mut(i)` returned
+/// `None` for every slot — the resolved real path silently vanished,
+/// the HMAC `expected_outputs` claim was empty, and the worker's
+/// upload failed authorization against a deny-all allowlist. The
+/// arity-total owner method resizes to `output_names.len()` first, so
+/// the resolved path lands at its name's index through the omitted
+/// shape; the ingress list itself stays `[]` (reshaping REJECTED —
+/// padded expected lists are identity-bearing in the
+/// authoritative-conflict matcher).
+#[tokio::test]
+async fn test_deferred_ia_resolve_total_over_omitted_expected_paths() -> TestResult {
+    use crate::ca::resolve::downstream_placeholder;
+    use rio_nix::store_path::StorePath;
+    let (db, _store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let child_modular: [u8; 32] = [0x21; 32];
+    let mut child = make_node("dot-child");
+    child.is_content_addressed = true;
+    child.needs_resolve = true;
+    child.ca_modular_hash = child_modular.to_vec();
+    let child_drv_path = child.drv_path.clone();
+
+    let placeholder = downstream_placeholder(&StorePath::parse(&child_drv_path).unwrap(), "out");
+    let parent_aterm = format!(
+        r#"Derive([("out","","","")],[("{child_drv_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","build"],[("DEP","{placeholder}"),("name","dot-parent"),("out",""),("system","x86_64-linux")])"#
+    );
+    {
+        use rio_nix::derivation::Derivation;
+        let drv = Derivation::parse(&parent_aterm).expect("fixture parses");
+        assert_eq!(drv.to_aterm(), parent_aterm, "fixture must be canonical");
+    }
+    let parent_path = {
+        use rio_nix::hash::{HashAlgo, NixHash};
+        use sha2::{Digest, Sha256};
+        let h = NixHash::new(
+            HashAlgo::SHA256,
+            Sha256::digest(parent_aterm.as_bytes()).to_vec(),
+        )
+        .unwrap();
+        StorePath::make_text(
+            "dot-parent.drv",
+            &h,
+            &[StorePath::parse(&child_drv_path).unwrap()],
+        )
+        .unwrap()
+        .as_str()
+        .to_owned()
+    };
+    let parent = rio_proto::types::DerivationNode {
+        drv_path: parent_path.clone(),
+        drv_hash: parent_path.clone(),
+        pname: "dot-parent".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_content_addressed: false,
+        needs_resolve: true,
+        // THE shape under test: omitted entirely.
+        expected_output_paths: vec![],
+        ..Default::default()
+    };
+    _store.seed_with_content(&parent_path, parent_aterm.as_bytes());
+
+    let mut worker_rx = connect_executor(&handle, "dot-w", "x86_64-linux").await?;
+    merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![child, parent],
+        vec![rio_proto::types::DerivationEdge {
+            parent_drv_path: parent_path.clone(),
+            child_drv_path: child_drv_path.clone(),
+        }],
+        false,
+    )
+    .await?;
+
+    let a1 = recv_assignment(&mut worker_rx).await;
+    assert!(a1.drv_path.contains("dot-child"), "child dispatches first");
+    let realized = test_store_path("dot-child-realized-out");
+    sqlx::query(
+        "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
+         VALUES ($1, 'out', $2, $3)",
+    )
+    .bind(child_modular.as_slice())
+    .bind(&realized)
+    .bind([0x44u8; 32].as_slice())
+    .execute(&db.pool)
+    .await?;
+    complete_success(&handle, "dot-w", "dot-child", &realized).await?;
+
+    let mut worker_rx2 = connect_executor(&handle, "dot-w2", "x86_64-linux").await?;
+    let assignment = recv_assignment(&mut worker_rx2).await;
+    assert_eq!(assignment.drv_path, parent_path);
+
+    let info = expect_drv(&handle, &parent_path).await;
+    // The claim is arity-total: exactly one slot, carrying the
+    // resolved real path — through the OMITTED ingress shape (the old
+    // merge produced an empty claim here and the path vanished).
+    assert_eq!(
+        info.claim_output_paths.len(),
+        1,
+        "claim must be resized to the declared arity through the [] shape"
+    );
+    let claimed = &info.claim_output_paths[0];
+    assert!(
+        claimed.starts_with("/nix/store/") && claimed.ends_with("-dot-parent"),
+        "the resolved path must land at its name's index; got {claimed:?}"
+    );
+    // M_075 write-through happened with the same arity-total vec.
+    let persisted: Option<Vec<String>> =
+        sqlx::query_scalar("SELECT claim_output_paths FROM derivations WHERE drv_hash = $1")
+            .bind(&parent_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        persisted.as_deref(),
+        Some(info.claim_output_paths.as_slice()),
+        "persisted claim must equal the in-memory arity-total claim"
+    );
+    // Ingress shape untouched: still the omitted [].
+    assert_eq!(
+        info.expected_output_paths,
+        Vec::<String>::new(),
+        "expected_output_paths must keep the omitted ingress shape"
     );
     Ok(())
 }

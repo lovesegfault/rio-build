@@ -1296,7 +1296,7 @@ pub struct DerivationState {
     /// resolve probe (`child_unknown` in merge.rs) plus the recovery
     /// degrade (`should_resolve_from_expected_paths`) read exactly that
     /// emptiness signal off RESIDENT siblings. Dispatch-time resolution
-    /// writes its computed paths via [`Self::set_claim_output_paths`] —
+    /// writes its computed paths via [`Self::merge_resolved_claim_paths`] —
     /// the field's one historical mutator (the deferred-IA HMAC-claim
     /// overwrite in dispatch.rs) is deleted; do not add another.
     pub expected_output_paths: Vec<String>,
@@ -1310,7 +1310,7 @@ pub struct DerivationState {
     /// `needs_resolve=false` at its PathBoundBytes raise — the honest
     /// FOD then dispatched with its input's placeholder un-rewritten
     /// and failed deterministically until poison). Private: written
-    /// only via [`Self::set_claim_output_paths`], read via
+    /// only via [`Self::merge_resolved_claim_paths`], read via
     /// [`Self::claim_output_paths`] (falls back to the expected paths
     /// while empty). PERSISTED (M_075, round-17 merged_bug_099):
     /// write-through at the sole dispatch set site and restored
@@ -1979,12 +1979,42 @@ impl DerivationState {
         }
     }
 
-    /// Record the dispatch-resolved output paths (full list,
-    /// index-aligned with `output_names`). Sole writer of the private
-    /// claim field; `expected_output_paths` is NEVER touched — its
-    /// ingress shape is the resolve probes' contract.
-    pub fn set_claim_output_paths(&mut self, resolved: Vec<String>) {
-        self.claim_output_paths = resolved;
+    // r[impl sched.dispatch.path-shape-totality]
+    /// Merge the dispatch-resolved `(output_name, real_path)` pairs
+    /// into the claim vec — the SOLE writer of the private claim field
+    /// (round-17 bug_033 made it the owner method). Total over every
+    /// ingress list shape: the base is the expected paths CLONED then
+    /// resized to the declared arity (`output_names.len()`) with the
+    /// `""` sentinel, so a submission that OMITTED
+    /// `expected_output_paths` (the legal `[]` shape) can no longer
+    /// silently drop resolved paths — pre-totality, the open-coded
+    /// merge indexed into the un-resized clone and `get_mut(i)`
+    /// returned `None` for every slot, so the HMAC claim and GC pin
+    /// carried nothing while the worker built real paths.
+    /// `expected_output_paths` itself is NEVER touched — its ingress
+    /// shape is the resolve probes' contract (round-16 bug_094), and
+    /// reshaping at ingress was REJECTED (a padded expected list is
+    /// identity-bearing in the authoritative-conflict matcher; padding
+    /// would manufacture false identity agreement). Returns the merged
+    /// claim for the caller's write-through persist (M_075 — the DB
+    /// write stays outside the state type).
+    /// Unknown names are ignored (the resolve computes from the same
+    /// declared set, so a miss is a stale-resolve artifact, not data).
+    pub fn merge_resolved_claim_paths(
+        &mut self,
+        resolved: impl IntoIterator<Item = (String, String)>,
+    ) -> &[String] {
+        let mut claim = self.expected_output_paths.clone();
+        claim.resize(self.output_names.len(), String::new());
+        for (name, path) in resolved {
+            if let Some(i) = self.output_names.iter().position(|n| n == &name)
+                && let Some(slot) = claim.get_mut(i)
+            {
+                *slot = path;
+            }
+        }
+        self.claim_output_paths = claim;
+        &self.claim_output_paths
     }
 
     /// In-memory `requiredSystemFeatures`, post I-204 soft-strip (the

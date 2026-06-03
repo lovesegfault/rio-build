@@ -168,7 +168,7 @@ pub struct ResolvedDerivation {
     /// [`BasicDerivation::fill_deferred_outputs`]. Empty for
     /// floating-CA-self (its outputs stay `""` — nix-daemon computes
     /// scratch paths) and for concrete IA. Dispatch records these as
-    /// the node's CLAIM paths (`DerivationState::set_claim_output_paths`)
+    /// the node's CLAIM paths (`DerivationState::merge_resolved_claim_paths`)
     /// so the HMAC `expected_outputs` claim carries the real path, not
     /// `""` — never written to `expected_output_paths`, whose ingress
     /// shape is the resolve probes' contract (round-16 bug_094).
@@ -1029,7 +1029,7 @@ mod tests {
     /// `resolve_ca_inputs`, the parent's own `$out` MUST be a real
     /// store path in BOTH `outputs[0].path` and `env["out"]`, and
     /// `ResolvedDerivation.output_paths` must surface it for the
-    /// dispatch-side claim recording (`set_claim_output_paths`).
+    /// dispatch-side claim recording (`merge_resolved_claim_paths`).
     ///
     /// Regression: pre-fix, `resolve_ca_inputs` only did phase 1
     /// (input collapse + placeholder rewrite); the resolved ATerm

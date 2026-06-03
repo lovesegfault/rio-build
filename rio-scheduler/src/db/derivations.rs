@@ -142,7 +142,7 @@ impl SchedulerDb {
     /// with output_names; unresolved slots keep the "" sentinel — see
     /// M_075's doc-const for the cross-audit slot semantics). Plain
     /// runtime query — no `.sqlx/` impact. The DB write deliberately
-    /// lives OUTSIDE the state type: `set_claim_output_paths` stays a
+    /// lives OUTSIDE the state type: `merge_resolved_claim_paths` stays a
     /// pure field write and the actor owns durability ordering.
     pub async fn persist_claim_output_paths(
         &self,

@@ -1639,6 +1639,29 @@ makes the realisation-insert skip impossible again is the staged
 follow-up F2 (`ModularHashState` lifecycle enum) — no prose in this
 spec may claim that writer exists until it does (R6).
 
+#r("sched.dispatch.path-shape-totality")[
+  The dispatch-time merge of resolved deferred-IA output paths into
+  the claim vector MUST be total over every legal ingress shape of
+  `expected_output_paths` --- in particular the omitted/empty `[]`
+  form: the merge base MUST be resized to the declared output arity
+  (with the empty-string unresolved sentinel) BEFORE any resolved
+  path is placed, so that a resolved path is either placed at its
+  name's index or the placement is a structural impossibility ---
+  never a silent drop. The ingress list itself MUST NOT be reshaped:
+  a padded `expected_output_paths` is identity-bearing in the
+  authoritative-conflict matcher and padding would manufacture false
+  identity agreement between a path-omitting submission and a
+  path-declaring one.
+]
+The rule exists because the open-coded merge indexed into an
+un-resized clone of the ingress list (round-17 bug_033): for the legal
+omitted shape every `get_mut` returned `None`, the resolved real paths
+vanished, and the assignment token's HMAC `expected_outputs` claim plus
+the GC pin carried nothing while the worker built real paths --- the
+upload then failed authorization against an empty allowlist. One owner
+method (`merge_resolved_claim_paths`) now performs resize-then-merge
+and is the claim field's sole writer.
+
 #r("sched.dispatch.claims-derived+5")[
   When assignment tokens are signed, the scheduler MUST NOT sign
   upload-authorization claims (`expected_outputs`, `is_ca`,

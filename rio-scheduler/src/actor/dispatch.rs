@@ -2917,15 +2917,13 @@ impl DagActor {
         {
             state.ca.pending_realisation_deps = resolve_lookups;
             if !resolved_output_paths.is_empty() {
-                let mut claim = state.expected_output_paths.clone();
-                for (name, path) in resolved_output_paths {
-                    if let Some(i) = state.output_names.iter().position(|n| n == &name)
-                        && let Some(slot) = claim.get_mut(i)
-                    {
-                        *slot = path;
-                    }
-                }
-                state.set_claim_output_paths(claim.clone());
+                // Owner method (round-17 bug_033): arity-total over the
+                // omitted-[] ingress shape — the resize-then-merge lives
+                // in ONE place so a resolved path can never be silently
+                // dropped against a short expected list again.
+                let claim = state
+                    .merge_resolved_claim_paths(resolved_output_paths)
+                    .to_vec();
                 persist_claim = Some(claim);
             }
         }
