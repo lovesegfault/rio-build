@@ -2076,10 +2076,14 @@ impl InfraProbeLadder {
 }
 
 /// Convert one archive request record into the engine-owned schedule input,
-/// sanitizing the recorded offset: non-finite values collapse to zero (the
-/// request still replays, just without meaningful timing) and finite values
-/// clamp into `[0, MAX_RECORDED_OFFSET_S]` so schedule construction can
-/// never panic on a corrupt recording.
+/// sanitizing the recorded offset — an ARCHIVE-controlled value (recorded
+/// input, possibly foreign or corrupt): non-finite values collapse to zero
+/// (the request still replays, just without meaningful timing) and finite
+/// values clamp into `[0, MAX_RECORDED_OFFSET_S]` so schedule construction
+/// can never panic on a corrupt recording. CLAMPED, not dropped, because a
+/// request is workload — it must still replay at some schedule point —
+/// unlike the per-unit timing truth ([`recorded_timing_from`]), which is
+/// optional enrichment and degrades to documented defaults.
 fn recorded_request_from(record: &RequestRecord) -> RecordedRequest {
     let offset_s = if record.offset_s.is_finite() {
         record.offset_s.clamp(0.0, MAX_RECORDED_OFFSET_S)
@@ -2106,19 +2110,32 @@ fn recorded_request_from(record: &RequestRecord) -> RecordedRequest {
 }
 
 /// Convert one archive expected-outcome record into the per-unit timing
-/// truth the timed schedule consumes. Non-finite (or, for durations,
-/// negative) recorded values are dropped rather than poisoning the deadline
-/// and disconnect math; oversized stop offsets are dropped too so the
-/// disconnect timer falls back to its default delay instead of effectively
-/// never firing.
+/// truth the timed schedule consumes.
+///
+/// Both numeric fields are ARCHIVE-controlled (recorded input — possibly
+/// foreign, clock-skewed, or corrupt) and live on the recording time axis,
+/// so both are held to that axis's full domain, `[0, MAX_RECORDED_OFFSET_S]`
+/// — the same bound [`recorded_request_from`] clamps request offsets to —
+/// rather than to per-corruption-case checks: a value outside the domain
+/// (negative, oversized, or non-finite) is DROPPED so the consumer falls
+/// back to its documented default (the build-timeout floor for durations,
+/// the scaled default disconnect delay for stop offsets) instead of the
+/// corrupt value steering the deadline or disconnect math. Negative stop
+/// offsets matter concretely: they are the one corrupt class JSON can even
+/// encode (serde refuses NaN/Inf), and a retained negative becomes a
+/// zero-second "recorded" gap that beats every sibling's legitimate gap and
+/// the default delay in the disconnect timer's min. Dropping (here) vs
+/// clamping (request offsets) is deliberate: a request must still replay at
+/// SOME point in the schedule, while timing truth is optional enrichment
+/// with defined fallbacks.
 fn recorded_timing_from(record: &OutcomeRecord) -> RecordedTiming {
     RecordedTiming {
         duration_s: record
             .duration_s
-            .filter(|duration| duration.is_finite() && *duration >= 0.0),
+            .filter(|duration| (0.0..=MAX_RECORDED_OFFSET_S).contains(duration)),
         stop_offset_s: record
             .stop_offset_s
-            .filter(|stop| stop.is_finite() && *stop <= MAX_RECORDED_OFFSET_S),
+            .filter(|stop| (0.0..=MAX_RECORDED_OFFSET_S).contains(stop)),
         interrupted: matches!(
             record.outcome,
             ExpectedOutcome::Cancelled | ExpectedOutcome::Disconnected
@@ -7822,9 +7839,14 @@ mod tests {
             stop_offset_s,
             outputs: BTreeMap::new(),
         };
-        // Non-finite durations/stop offsets are dropped rather than
-        // poisoning the deadline and disconnect math; the interruption and
-        // expected-built flags derive from the recorded outcome.
+        // Both timing fields are archive-controlled values on the recording
+        // time axis and are held to its full domain
+        // [0, MAX_RECORDED_OFFSET_S]: out-of-domain values are DROPPED (the
+        // consumers fall back to their documented defaults), never scaled
+        // or clamped — a clamped negative stop would still mint a corrupt
+        // "recorded" gap. Every hostile-magnitude class is pinned per
+        // field: non-finite (JSON-unreachable, defended anyway), negative
+        // (the one corrupt class JSON can encode), and oversized.
         let disconnected = recorded_timing_from(&outcome(
             ExpectedOutcome::Disconnected,
             Some(f64::NAN),
@@ -7833,6 +7855,34 @@ mod tests {
         assert_eq!(disconnected.duration_s, None);
         assert_eq!(disconnected.stop_offset_s, None);
         assert!(disconnected.interrupted && !disconnected.expected_built);
+        // Negative: dropped for BOTH fields — a retained negative stop
+        // would otherwise become gap = ZERO downstream and beat every
+        // sibling's legitimate recorded gap (and the default delay) in the
+        // disconnect timer's min.
+        let negative = recorded_timing_from(&outcome(
+            ExpectedOutcome::Disconnected,
+            Some(-1.0),
+            Some(-30.0),
+        ));
+        assert_eq!(negative.duration_s, None);
+        assert_eq!(negative.stop_offset_s, None);
+        // Oversized (past the one-year axis cap): dropped for both fields,
+        // not clamped to the cap.
+        let oversized = recorded_timing_from(&outcome(
+            ExpectedOutcome::Disconnected,
+            Some(MAX_RECORDED_OFFSET_S * 2.0),
+            Some(1.0e30),
+        ));
+        assert_eq!(oversized.duration_s, None);
+        assert_eq!(oversized.stop_offset_s, None);
+        // The domain boundaries themselves are kept.
+        let at_cap = recorded_timing_from(&outcome(
+            ExpectedOutcome::Built,
+            Some(MAX_RECORDED_OFFSET_S),
+            Some(0.0),
+        ));
+        assert_eq!(at_cap.duration_s, Some(MAX_RECORDED_OFFSET_S));
+        assert_eq!(at_cap.stop_offset_s, Some(0.0));
         let built =
             recorded_timing_from(&outcome(ExpectedOutcome::Built, Some(120.0), Some(130.0)));
         assert_eq!(built.duration_s, Some(120.0));
@@ -7840,6 +7890,78 @@ mod tests {
         assert!(!built.interrupted && built.expected_built);
         let cancelled = recorded_timing_from(&outcome(ExpectedOutcome::Cancelled, None, Some(2.0)));
         assert!(cancelled.interrupted && !cancelled.expected_built);
+    }
+
+    /// Producer-chain composition for the negative-stop drop: a corrupt
+    /// negative `stop_offset_s` entering through the real conversion chain
+    /// (archive `OutcomeRecord` → [`recorded_timing_from`] →
+    /// `build_schedule`) must degrade that entry to "no recorded gap" — so
+    /// a sibling target's legitimate recorded gap arms the disconnect
+    /// timer — instead of minting a zero-second "recorded" gap that drags
+    /// the whole request to the 1 s disconnect floor.
+    #[test]
+    fn negative_stop_offset_cannot_drag_a_sibling_gap_to_the_floor() {
+        use crate::archive::schema::RequestTarget;
+
+        let drv_corrupt = format!("/nix/store/{}-corrupt.drv", "b".repeat(32));
+        let drv_sibling = format!("/nix/store/{}-sibling.drv", "c".repeat(32));
+        let request = RequestRecord {
+            session: 1,
+            offset_s: 0.0,
+            targets: vec![
+                RequestTarget {
+                    drv: drv_corrupt.clone(),
+                    outputs: vec!["*".to_string()],
+                },
+                RequestTarget {
+                    drv: drv_sibling.clone(),
+                    outputs: vec!["*".to_string()],
+                },
+            ],
+        };
+        let outcome = |drv: &str, stop_offset_s: f64| OutcomeRecord {
+            session: None,
+            drv: drv.to_string(),
+            outcome: ExpectedOutcome::Disconnected,
+            detail: None,
+            duration_s: None,
+            stop_offset_s: Some(stop_offset_s),
+            outputs: BTreeMap::new(),
+        };
+        // The corrupt record carries a negative stop offset; the sibling a
+        // legitimate 30 s one. Both flow through the engine's own sanitizer
+        // — no hand-built RecordedTiming.
+        let corrupt = recorded_timing_from(&outcome(&drv_corrupt, -5.0));
+        let sibling = recorded_timing_from(&outcome(&drv_sibling, 30.0));
+        assert_eq!(corrupt.stop_offset_s, None, "the sanitizer drops it");
+        let requests = vec![recorded_request_from(&request)];
+        let schedule = timeline::build_schedule(
+            &requests,
+            &move |_, drv| {
+                if drv == drv_corrupt {
+                    Some(corrupt.clone())
+                } else if drv == drv_sibling {
+                    Some(sibling.clone())
+                } else {
+                    None
+                }
+            },
+            &|_| None,
+            &|_| true,
+            1.0,
+            None,
+            true,
+        );
+        let plan = schedule[0]
+            .interruption
+            .as_ref()
+            .expect("both targets are interrupted workload members");
+        // Both interrupted targets stay armed (the corrupt one still
+        // replays its interruption — only its TIMING degraded), and the
+        // timer arms from the sibling's recorded 30 s gap, not from a
+        // corrupt zero floored to 1 s.
+        assert_eq!(plan.unit_count(), 2);
+        assert_eq!(plan.disconnect_after(), Duration::from_secs(30));
     }
 
     /// A timed campaign over an archive that does not declare the `timed`
