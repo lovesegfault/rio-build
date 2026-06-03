@@ -120,6 +120,20 @@ pub async fn collect_nar_stream(
         let Some(msg) = next else { break };
         match msg.msg {
             Some(get_path_response::Msg::Info(i)) => {
+                // Free pre-check: the server declares the final
+                // nar_size in this leading Info message (I-180), so a
+                // declared size over the caller's cap aborts before a
+                // single chunk is pulled — for the 16 MiB derivation-
+                // text cap this turns up to 16 MiB of wasted buffering
+                // into an immediate, byte-free rejection. A zeroed
+                // nar_size (writer/trailer modes) never trips this;
+                // a server lying small still hits the chunk-side cap.
+                if i.nar_size > max_size {
+                    return Err(NarCollectError::SizeExceeded {
+                        got: i.nar_size,
+                        limit: max_size,
+                    });
+                }
                 // I-180 fix C: server sends Info first with the final
                 // nar_size. Pre-size the Vec so the chunk loop doesn't
                 // realloc-memcpy ~log2(size) times (a 1.8 GB NAR
@@ -192,7 +206,18 @@ pub async fn collect_nar_stream_to_writer(
         };
         let Some(msg) = next else { break };
         match msg.msg {
-            Some(get_path_response::Msg::Info(i)) => info = Some(i),
+            Some(get_path_response::Msg::Info(i)) => {
+                // Same free pre-check as `collect_nar_stream`: abort
+                // on the declared size before spooling a byte. Zeroed
+                // nar_size (trailer mode) never trips it.
+                if i.nar_size > max_size {
+                    return Err(NarCollectError::SizeExceeded {
+                        got: i.nar_size,
+                        limit: max_size,
+                    });
+                }
+                info = Some(i);
+            }
             Some(get_path_response::Msg::NarChunk(chunk)) => {
                 let new_len = written.saturating_add(chunk.len() as u64);
                 if new_len > max_size {

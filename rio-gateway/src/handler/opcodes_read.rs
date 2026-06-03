@@ -376,7 +376,16 @@ pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + U
     // GRPC_STREAM_TIMEOUT per-chunk so a stalled store can't pin
     // ≤4 GiB of buffered NAR + the SSH session indefinitely.
     let jwt = jwt_unless_drv(jwt_token, &path);
-    let nar_data = match grpc_get_path(store_client, jwt, path.as_str()).await {
+    // General download path: the full NAR bound. Stored .drvs are
+    // already admission-bounded at MAX_DRV_NAR_BYTES by the store.
+    let nar_data = match grpc_get_path(
+        store_client,
+        jwt,
+        path.as_str(),
+        rio_common::limits::MAX_NAR_SIZE,
+    )
+    .await
+    {
         Ok(Some((_info, nar))) => nar,
         Ok(None) => stderr_err!(stderr, "path '{path_str}' is not valid"),
         Err(e) => stderr_err!(stderr, "{e}"),

@@ -367,8 +367,23 @@ impl StoreServiceImpl {
                              MAX_NAR_SIZE {MAX_NAR_SIZE}; fall back to per-output PutPath"
                         )));
                     }
+                    // Path-class byte cap (16 MiB for .drv texts); the
+                    // chunk-before-metadata guard above means info is
+                    // always present here.
+                    let nar_cap = rio_common::limits::nar_size_cap(
+                        accum
+                            .info
+                            .as_ref()
+                            .is_some_and(|i| i.store_path.is_derivation()),
+                    );
                     let permit = self
-                        .accumulate_chunk(&mut accum.nar_data, &mut accum.hasher, &chunk, &ctx)
+                        .accumulate_chunk(
+                            &mut accum.nar_data,
+                            &mut accum.hasher,
+                            &chunk,
+                            nar_cap,
+                            &ctx,
+                        )
                         .await?;
                     held_permits.push(permit);
                 }

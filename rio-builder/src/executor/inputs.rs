@@ -419,7 +419,14 @@ pub(super) async fn fetch_demanded_graph_drvs(
 /// demanded-graph table wants bytes; the glue parses at consumption).
 /// Same classification as [`fetch_drv_from_store`]: stream faults and
 /// missing paths are `MetadataFetch` (infra); extract/UTF-8 failures
-/// are permanent.
+/// are permanent — and so is exceeding `MAX_DRV_NAR_BYTES`: a
+/// "derivation" bigger than the class cap is hostile or corrupt input
+/// that no re-dispatch will shrink. The cap also bounds buffering:
+/// with [`super::MAX_PARALLEL_FETCHES`]-way concurrency the previous
+/// general-NAR bound (4 GiB) let one build buffer tens of GiB of
+/// tenant-controlled bytes (round-16 bug_095); the collector's leading
+/// `Info.nar_size` pre-check rejects an oversized declaration before
+/// pulling a single chunk.
 async fn fetch_drv_text(
     store_client: &mut StoreServiceClient<Channel>,
     drv_path: &str,
@@ -428,16 +435,25 @@ async fn fetch_drv_text(
         store_client,
         drv_path,
         rio_common::grpc::GRPC_STREAM_TIMEOUT,
-        rio_common::limits::MAX_NAR_SIZE,
+        rio_common::limits::MAX_DRV_NAR_BYTES,
         None,
         &[],
     )
     .await
-    .map_err(|e| ExecutorError::MetadataFetch {
-        path: drv_path.to_string(),
-        source: match e {
-            rio_proto::client::NarCollectError::Stream(s) => s,
-            other => tonic::Status::internal(other.to_string()),
+    .map_err(|e| match e {
+        rio_proto::client::NarCollectError::SizeExceeded { got, limit } => {
+            ExecutorError::InvalidDerivation(format!(
+                ".drv NAR for {drv_path} is {got} bytes, exceeding the \
+                 {limit}-byte derivation-text cap"
+            ))
+        }
+        rio_proto::client::NarCollectError::Stream(s) => ExecutorError::MetadataFetch {
+            path: drv_path.to_string(),
+            source: s,
+        },
+        other => ExecutorError::MetadataFetch {
+            path: drv_path.to_string(),
+            source: tonic::Status::internal(other.to_string()),
         },
     })?;
 
@@ -1356,6 +1372,45 @@ mod tests {
         );
         assert_eq!(table.get(&dep_drv).map(String::as_str), Some("Derive-dep"));
         assert_eq!(table.len(), 2);
+        Ok(())
+    }
+
+    /// round-16 bug_095: a "derivation" whose declared NAR size
+    /// exceeds MAX_DRV_NAR_BYTES is rejected as PERMANENT
+    /// `InvalidDerivation` (hostile/corrupt input — re-dispatch cannot
+    /// shrink it), not infra `MetadataFetch`; and the collector's
+    /// Info-message pre-check means the rejection is byte-free (the
+    /// mock serves the forged declared size with a tiny actual NAR —
+    /// no oversized body is ever streamed or buffered).
+    #[tokio::test]
+    async fn oversized_drv_text_is_permanent_invalid_derivation() -> anyhow::Result<()> {
+        use rio_common::limits::MAX_DRV_NAR_BYTES;
+        let (store, mut client) = spawn_and_connect().await?;
+        let big_drv = tp("huge.drv");
+        let (nar, hash) = make_nar(b"Derive-tiny-but-lying");
+        let mut info = make_path_info(&big_drv, &nar, hash);
+        info.nar_size = MAX_DRV_NAR_BYTES + 1; // forged declared size
+        store.seed(info, nar);
+
+        let err = fetch_drv_text(&mut client, &big_drv)
+            .await
+            .expect_err("over-cap declared .drv NAR must be rejected");
+        match &err {
+            ExecutorError::InvalidDerivation(msg) => {
+                assert!(
+                    msg.contains(&MAX_DRV_NAR_BYTES.to_string()),
+                    "rejection names the derivation-text cap: {msg}"
+                );
+            }
+            other => panic!("expected permanent InvalidDerivation, got {other:?}"),
+        }
+
+        // Control: an honest small .drv on the same store still fetches.
+        let ok_drv = tp("ok.drv");
+        let (nar2, hash2) = make_nar(b"Derive-honest");
+        store.seed(make_path_info(&ok_drv, &nar2, hash2), nar2);
+        let text = fetch_drv_text(&mut client, &ok_drv).await?;
+        assert_eq!(text, "Derive-honest");
         Ok(())
     }
 

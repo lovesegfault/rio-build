@@ -31,7 +31,7 @@ use rio_proto::types::{PutPathRequest, PutPathTrailer, put_path_request};
 use rio_proto::validated::ValidatedPathInfo;
 
 use rio_common::grpc::StatusExt;
-use rio_common::limits::{MAX_NAR_SIZE, nar_chunk_charge};
+use rio_common::limits::{MAX_NAR_SIZE, nar_chunk_charge, nar_size_cap};
 
 use crate::cas;
 use crate::grpc::{StoreServiceImpl, putpath_metadata_status, storage_error};
@@ -190,9 +190,15 @@ pub(in crate::grpc) fn apply_trailer(
             t.nar_hash.len()
         ))
     })?;
-    if t.nar_size > MAX_NAR_SIZE {
+    // Path-class cap: derivation texts are bounded by MAX_DRV_NAR_BYTES
+    // (16 MiB), everything else by MAX_NAR_SIZE. The chunk loop enforces
+    // the same cap as bytes arrive (`accumulate_chunk`); checking the
+    // trailer's DECLARED size too means a .drv upload that lied small in
+    // its chunks still cannot register an oversized nar_size.
+    let cap = nar_size_cap(info.store_path.is_derivation());
+    if t.nar_size > cap {
         return Err(Status::invalid_argument(format!(
-            "{ctx_label}: trailer nar_size {} exceeds maximum {MAX_NAR_SIZE}",
+            "{ctx_label}: trailer nar_size {} exceeds maximum {cap} for this path class",
             t.nar_size
         )));
     }
@@ -1115,8 +1121,11 @@ impl StoreServiceImpl {
     }
 
     // r[impl store.put.nar-bytes-budget+3]
-    /// Append a NAR chunk under both bounds: per-output [`MAX_NAR_SIZE`]
-    /// and the GLOBAL `nar_bytes_budget` semaphore. Feeds the chunk
+    /// Append a NAR chunk under both bounds: the caller's per-output
+    /// `nar_cap` (path-class aware — [`nar_size_cap`]: 16 MiB for
+    /// `.drv` texts, [`MAX_NAR_SIZE`] otherwise, so an oversized
+    /// "derivation" blob never finishes buffering) and the GLOBAL
+    /// `nar_bytes_budget` semaphore. Feeds the chunk
     /// into the caller's incremental `hasher` so [`verify_nar`] never
     /// has to one-shot-hash a multi-GiB buffer on a tokio worker.
     /// Returns the held permit; the caller pushes it into a `Vec` so
@@ -1142,6 +1151,7 @@ impl StoreServiceImpl {
         nar_data: &mut Vec<u8>,
         hasher: &mut Sha256,
         chunk: &[u8],
+        nar_cap: u64,
         ctx_label: &str,
     ) -> Result<tokio::sync::SemaphorePermit<'a>, Status> {
         if chunk.is_empty() {
@@ -1150,9 +1160,9 @@ impl StoreServiceImpl {
             )));
         }
         let new_len = (nar_data.len() as u64).saturating_add(chunk.len() as u64);
-        if new_len >= MAX_NAR_SIZE {
+        if new_len >= nar_cap {
             return Err(Status::invalid_argument(format!(
-                "{ctx_label}: NAR chunks exceed size bound {MAX_NAR_SIZE} (received {new_len}+ bytes)"
+                "{ctx_label}: NAR chunks exceed size bound {nar_cap} (received {new_len}+ bytes)"
             )));
         }
         let permit = self
@@ -1207,6 +1217,9 @@ impl StoreServiceImpl {
         // `acquire_many` for permits this task already holds.
         // r[impl store.put.nar-bytes-budget+3]
         let mut charged: u64 = 0;
+        // Path-class byte cap (16 MiB for .drv texts): the metadata is
+        // validated before any chunk arrives, so the class is known here.
+        let nar_cap = nar_size_cap(info.store_path.is_derivation());
         loop {
             let msg = match stream.message().await {
                 Ok(Some(m)) => m,
@@ -1231,7 +1244,7 @@ impl StoreServiceImpl {
                         )));
                     }
                     let permit = self
-                        .accumulate_chunk(&mut nar_data, &mut hasher, &chunk, "PutPath")
+                        .accumulate_chunk(&mut nar_data, &mut hasher, &chunk, nar_cap, "PutPath")
                         .await?;
                     held_permits.push(permit);
                 }
@@ -2659,7 +2672,7 @@ mod verify_nar_tests {
         let mut permits = Vec::new();
         for c in chunks {
             permits.push(
-                svc.accumulate_chunk(&mut buf, &mut hasher, c, "t")
+                svc.accumulate_chunk(&mut buf, &mut hasher, c, MAX_NAR_SIZE, "t")
                     .await
                     .expect("chunk under bounds"),
             );
@@ -2667,5 +2680,71 @@ mod verify_nar_tests {
         let incremental: [u8; 32] = hasher.finalize().into();
         assert_eq!(incremental, digest(&buf));
         assert_eq!(buf, b"first second third");
+    }
+
+    /// round-16 bug_095: a `.drv`-classed accumulation is bounded by
+    /// MAX_DRV_NAR_BYTES, not the general 4 GiB NAR bound — the
+    /// oversized "derivation" blob never finishes buffering. The same
+    /// append under the general cap still succeeds (the cap is per
+    /// path class, not a global tightening).
+    #[tokio::test]
+    async fn drv_chunk_accumulation_rejects_over_class_cap() {
+        use rio_common::limits::MAX_DRV_NAR_BYTES;
+        let svc = StoreServiceImpl::new(
+            sqlx::PgPool::connect_lazy("postgres://unused").expect("lazy pool"),
+        );
+        // Buffer sitting just under the .drv cap; the next chunk crosses it.
+        let mut buf = vec![0u8; (MAX_DRV_NAR_BYTES - 4) as usize];
+        let mut hasher = Sha256::new();
+        let chunk = [0u8; 8];
+
+        let err = svc
+            .accumulate_chunk(&mut buf, &mut hasher, &chunk, MAX_DRV_NAR_BYTES, "t")
+            .await
+            .expect_err(".drv-classed chunk past MAX_DRV_NAR_BYTES must reject");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains(&MAX_DRV_NAR_BYTES.to_string()),
+            "rejection names the class cap: {}",
+            err.message()
+        );
+
+        // Same buffer + chunk under the general cap: accepted.
+        let _permit = svc
+            .accumulate_chunk(&mut buf, &mut hasher, &chunk, MAX_NAR_SIZE, "t")
+            .await
+            .expect("general-classed append under MAX_NAR_SIZE accepted");
+    }
+
+    /// round-16 bug_095 (trailer half): a `.drv` upload cannot register
+    /// an over-cap DECLARED nar_size either — lying small in chunks and
+    /// big in the trailer is caught at `apply_trailer`.
+    #[test]
+    fn drv_trailer_nar_size_rejects_over_class_cap() {
+        use rio_common::limits::MAX_DRV_NAR_BYTES;
+        let drv_text = br#"Derive([("out","/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-x-out","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
+        use std::io::Write as _;
+        let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
+        w.write_all(drv_text).unwrap();
+        let hash = w.finish();
+        let drv_path = rio_nix::store_path::StorePath::make_text("x.drv", &hash, &[]).unwrap();
+        let nar = nar_of_file(drv_text);
+
+        let trailer = PutPathTrailer {
+            nar_hash: vec![0u8; 32],
+            nar_size: MAX_DRV_NAR_BYTES + 1,
+        };
+
+        let mut drv_info = ca_info(&drv_path, &[], &nar);
+        let err = apply_trailer(&mut drv_info, &trailer, "t")
+            .expect_err("over-cap declared nar_size for a .drv must reject");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // The same declared size on a non-.drv path is fine (well under
+        // the general bound).
+        let plain = rio_nix::store_path::StorePath::parse(&test_store_path("plain-out")).unwrap();
+        let mut plain_info = ca_info(&plain, &[], &nar);
+        apply_trailer(&mut plain_info, &trailer, "t")
+            .expect("17 MiB declared size accepted for a general path");
     }
 }

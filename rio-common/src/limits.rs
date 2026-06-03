@@ -141,6 +141,37 @@ pub const MAX_DAG_EDGES: usize = 5_242_880;
 /// drift apart again.
 pub const MAX_DRV_CONTENT_BYTES: usize = 1024 * 1024;
 
+/// Maximum NAR size for a `.drv` (derivation text) transfer: enforced
+/// at the store's PutPath admission — chunk accumulation and the
+/// trailer's declared `nar_size` — so an oversized "derivation" blob
+/// never gets buffered, hashed, or stored; and passed as the collect
+/// cap at every derivation-text fetch site (worker glue-table fetches,
+/// gateway BFS `.drv` resolution), where the leading `Info.nar_size`
+/// pre-check turns it into an immediate, byte-free rejection.
+///
+/// Sizing (no-knobs: const with rationale, not config): derivations
+/// are ATerm text. The largest legitimate `.drv`s observed at
+/// nixpkgs-scale are ~10 MiB (huge env blocks, `exportReferencesGraph`
+/// users), so 16 MiB gives ~60% headroom and equals the gateway's
+/// long-standing write-side `DRV_NAR_BUFFER_LIMIT`, which now aliases
+/// this const. The general [`MAX_NAR_SIZE`] (4 GiB) is 256x too
+/// generous for this class: combined with 16-way worker and 32-way
+/// gateway fan-out it let one tenant-controlled `.drv` name stream
+/// tens of GiB into trusted-plane buffers (round-16 bug_095).
+pub const MAX_DRV_NAR_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The NAR byte cap appropriate for a path class: derivation texts get
+/// [`MAX_DRV_NAR_BYTES`], everything else [`MAX_NAR_SIZE`]. Single
+/// source for the split so the store's admission bound and the
+/// worker/gateway collection bounds cannot drift apart.
+pub const fn nar_size_cap(is_derivation: bool) -> u64 {
+    if is_derivation {
+        MAX_DRV_NAR_BYTES
+    } else {
+        MAX_NAR_SIZE
+    }
+}
+
 /// Worker heartbeat interval. The worker sends a HeartbeatRequest to the
 /// scheduler at this cadence; the scheduler's staleness check uses the
 /// derived timeout below. Changing this one constant moves both sides

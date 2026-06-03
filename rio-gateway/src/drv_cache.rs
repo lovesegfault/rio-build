@@ -80,7 +80,11 @@ pub(crate) fn max_transitive_inputs() -> usize {
 /// reconstruction (one extra round-trip, correctness unchanged).
 /// 16 MiB covers observed outliers (`options.json.drv` ≈ 9.7MB) with
 /// headroom; typical `.drv` NARs are <10KB.
-pub(crate) const DRV_NAR_BUFFER_LIMIT: u64 = 16 * 1024 * 1024;
+///
+/// Aliases the workspace-wide derivation-text bound so the write-side
+/// buffering decision and the store's admission cap / fetch-side
+/// collect caps cannot drift apart (single source: rio-common).
+pub(crate) const DRV_NAR_BUFFER_LIMIT: u64 = rio_common::limits::MAX_DRV_NAR_BYTES;
 
 /// Max in-flight `GetPath` calls during BFS .drv resolution. The store's
 /// `inline_blob` reads are tiny (.drv NARs are KB-range) so the bound is
@@ -229,7 +233,15 @@ pub(crate) async fn resolve_derivation(
 
     let drv = parse_fetched_drv(
         drv_path,
-        grpc_get_path(store_client, None, drv_path.as_str()).await?,
+        // Derivation-text fetch: the .drv class cap, not the general
+        // NAR bound (round-16 bug_095).
+        grpc_get_path(
+            store_client,
+            None,
+            drv_path.as_str(),
+            rio_common::limits::MAX_DRV_NAR_BYTES,
+        )
+        .await?,
     )?;
 
     // Bound drv_cache. resolve_derivation is called from BFS in
@@ -307,8 +319,19 @@ pub(crate) async fn resolve_derivations_batch(
         .map(|sp| {
             let mut client = store_client.clone();
             async move {
-                let drv =
-                    parse_fetched_drv(&sp, grpc_get_path(&mut client, None, sp.as_str()).await?)?;
+                // Derivation-text class cap: with BFS_FETCH_CONCURRENCY-way
+                // fan-out, the general 4 GiB bound let one hostile DAG
+                // buffer tens of GiB here (round-16 bug_095).
+                let drv = parse_fetched_drv(
+                    &sp,
+                    grpc_get_path(
+                        &mut client,
+                        None,
+                        sp.as_str(),
+                        rio_common::limits::MAX_DRV_NAR_BYTES,
+                    )
+                    .await?,
+                )?;
                 Ok::<_, anyhow::Error>((sp, drv))
             }
         })
@@ -440,5 +463,34 @@ mod tests {
             "gate must reject BEFORE any GetPath — pre-fix this was non-empty \
              (fetch happened, then insert_drv_bounded errored)"
         );
+    }
+
+    /// round-16 bug_095 (gateway twin): the BFS `.drv` resolution
+    /// fetches under MAX_DRV_NAR_BYTES, not the general 4 GiB bound —
+    /// a "derivation" declaring an oversized NAR is rejected at the
+    /// Info pre-check (byte-free; the mock serves a tiny actual NAR
+    /// behind the forged declared size).
+    #[tokio::test]
+    async fn bfs_drv_fetch_rejects_over_class_cap() {
+        use rio_test_support::fixtures::make_path_info_for_nar;
+        use rio_test_support::grpc::spawn_mock_store_with_client;
+
+        let (store, store_client, _h) = spawn_mock_store_with_client().await.unwrap();
+
+        let (path, nar) = canonical_drv("huge");
+        let mut info = make_path_info_for_nar(path.as_str(), &nar);
+        info.nar_size = rio_common::limits::MAX_DRV_NAR_BYTES + 1; // forged
+        store.seed(info, nar);
+
+        let mut drv_cache = HashMap::new();
+        let err = resolve_derivations_batch(vec![path], &store_client, &mut drv_cache)
+            .await
+            .expect_err("over-cap declared .drv must fail BFS resolution");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("exceeds maximum size"),
+            "SizeExceeded surfaces from the collect cap: {msg}"
+        );
+        assert!(drv_cache.is_empty(), "nothing cached on rejection");
     }
 }
