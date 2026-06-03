@@ -65,12 +65,10 @@ impl DagActor {
     /// present. Fail-open: store unreachable → no-op (per-drv
     /// fallback in the dispatch loop covers it next pass).
     ///
-    /// Iterates the full DAG, not just `ready_queue` — `ready_queue` is
-    /// a heap (no peek-iter without drain) and stale entries in it are
-    /// harmless (the inner-loop status guard drops them after this
-    /// completes them). Full-DAG scan is O(nodes) but the actor is
-    /// single-threaded so there's no contention; for a 1085-node merge
-    /// the scan is sub-ms vs. ~25s of sequential RPCs it replaces.
+    /// Iterates the full DAG. Full-DAG scan is O(nodes) but the actor
+    /// is single-threaded so there's no contention; for a 1085-node
+    /// merge the scan is sub-ms vs. ~25s of sequential RPCs it
+    /// replaces.
     ///
     /// Returns the set of hashes the drain loop must skip
     /// `ready_check_or_spawn` for (I-163). On success this is the
@@ -474,7 +472,6 @@ impl DagActor {
                 // Promotion arm. A promoted marked-Broken survivor is
                 // settled by the next dispatch sweep's settlement-aware
                 // partition; an unmarked one dispatches normally.
-                self.push_ready(parent.clone());
                 self.persist_status(parent, DerivationStatus::Ready, None)
                     .await;
             }
@@ -581,7 +578,7 @@ impl DagActor {
         self.upsert_path_tenants_for_batch(&ok_hashes).await;
 
         // Batched promote: dedup find_newly_ready across all completed
-        // hashes, transition + push_ready in-mem, then one
+        // hashes, transition in-mem, then one
         // persist_status_batch(Ready). Same shape as the
         // ca_cutoff_cascade batched-promote.
         let mut newly_ready: Vec<DrvHash> = Vec::new();
@@ -594,8 +591,7 @@ impl DagActor {
                 if let Some(s) = self.dag.node_mut(&ready_hash)
                     && s.transition(DerivationStatus::Ready).is_ok()
                 {
-                    newly_ready.push(ready_hash.clone());
-                    self.push_ready(ready_hash);
+                    newly_ready.push(ready_hash);
                 }
             }
         }
@@ -1197,51 +1193,5 @@ impl DagActor {
             });
         }
         inputs
-    }
-
-    // -----------------------------------------------------------------------
-    // Queue priority helpers
-    // -----------------------------------------------------------------------
-    //
-    // Pure DAG lookup helpers (`path_for_hash`, `hash_for_path`,
-    // `path_or_hash_fallback`, `db_id_for_path`) live on
-    // [`crate::dag::DerivationDag`]; the helpers below stay on
-    // `DagActor` because they cross-reference `self.builds`.
-
-    /// Compute the effective queue priority for a derivation: its
-    /// critical-path priority + interactive boost if applicable.
-    ///
-    /// All queue pushes go through this. Replaces the old `push_front`/
-    /// `push_back` split — interactive is now a number, not a position.
-    ///
-    /// Returns 0.0 if the node isn't in the DAG (stale hash). The
-    /// caller probably shouldn't be pushing it, but 0.0 = lowest
-    /// priority = harmless (stale entries get skipped on pop anyway
-    /// if status != Ready).
-    pub(super) fn queue_priority(&self, drv_hash: &DrvHash) -> f64 {
-        let base = self
-            .dag
-            .node(drv_hash)
-            .map(|n| n.sched.priority)
-            .unwrap_or(0.0);
-        // Any interested build is interactive (IFD) → priority boost
-        // dwarfing any critical-path value.
-        let interactive = self.get_interested_builds(drv_hash).iter().any(|id| {
-            self.builds
-                .get(id)
-                .is_some_and(|b| b.priority_class.is_interactive())
-        });
-        if interactive {
-            base + crate::queue::INTERACTIVE_BOOST
-        } else {
-            base
-        }
-    }
-
-    /// Push a derivation onto the ready queue with its computed priority.
-    /// Centralizes the priority lookup so call sites are simple.
-    pub(super) fn push_ready(&mut self, drv_hash: DrvHash) {
-        let prio = self.queue_priority(&drv_hash);
-        self.ready_queue.push(drv_hash, prio);
     }
 }

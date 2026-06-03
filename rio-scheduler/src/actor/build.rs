@@ -174,7 +174,6 @@ impl DagActor {
             if let Some(state) = self.dag.node_mut(drv_hash)
                 && state.transition(DerivationStatus::DependencyFailed).is_ok()
             {
-                self.ready_queue.remove(drv_hash);
                 depfailed.push(drv_hash.as_str());
             }
         }
@@ -184,12 +183,7 @@ impl DagActor {
         }
 
         // Remove build interest from derivations
-        let orphaned = self.dag.remove_build_interest(build_id);
-
-        // Remove orphaned derivations from the ready queue
-        for hash in &orphaned {
-            self.ready_queue.remove(hash);
-        }
+        self.dag.remove_build_interest(build_id);
     }
 
     #[instrument(skip(self), fields(build_id = %build_id))]

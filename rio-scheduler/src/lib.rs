@@ -32,7 +32,6 @@ pub mod grpc;
 /// run_lease_loop}` paths keep working after the B1 extraction.
 pub use rio_lease as lease;
 pub mod lease_hooks;
-pub(crate) mod queue;
 // The Phase-0 reference fold over a derivation's failure history — the
 // executable specification the retryPolicy model's CountersRefineHistory
 // invariant compares the live RetryState counters against. Dead code by

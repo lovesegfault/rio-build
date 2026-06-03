@@ -522,8 +522,8 @@ impl DagActor {
     // r[impl sched.db.batch-unnest]
     /// Slice-taking variant of [`promote_newly_ready`]: walk parents of
     /// EVERY hash in `completed`, dedup the union (a parent may be
-    /// returned by several completed children), transition + push_ready
-    /// in-mem, then ONE `persist_status_batch(Ready)`.
+    /// returned by several completed children), transition in-mem,
+    /// then ONE `persist_status_batch(Ready)`.
     ///
     /// `find_newly_ready` returns ALL Queued parents whose deps are now
     /// satisfied — for stdenv/glibc-class nodes that's hundreds. The
@@ -543,8 +543,7 @@ impl DagActor {
                 if let Some(s) = self.dag.node_mut(&ready_hash)
                     && s.transition(DerivationStatus::Ready).is_ok()
                 {
-                    newly_ready.push(ready_hash.clone());
-                    self.push_ready(ready_hash);
+                    newly_ready.push(ready_hash);
                 }
             }
         }
@@ -2222,7 +2221,7 @@ impl DagActor {
     }
 
     /// Final phases of success completion: release newly-ready
-    /// dependents (find_newly_ready → push_ready) and per-build
+    /// dependents (find_newly_ready) and per-build
     /// completion check. `interested_builds` is the trigger's set;
     /// `skipped_interested` (from CA cutoff cascade) is unioned in so a
     /// merged build the trigger does NOT belong to still terminates.
@@ -2506,16 +2505,15 @@ impl DagActor {
     /// Shared tail of the collapsed non-terminal retry paths
     /// (`handle_infrastructure_failure`, `handle_timeout_failure`
     /// under-cap): the `Ready` persist already happened inside the
-    /// site's appending transaction, so only the in-memory queueing and
-    /// the dashboard progress emit remain. The caller has already done
-    /// the `reset_to_ready` transition + counter bookkeeping.
+    /// site's appending transaction, so only the dashboard progress
+    /// emit remains (the `Ready` status itself re-arms dispatch via
+    /// the spawn-intent pass). The caller has already done the
+    /// `reset_to_ready` transition + counter bookkeeping.
     ///
     /// `handle_transient_failure` does NOT use this — it goes through
-    /// the `Failed→Ready` intermediate with backoff, which has
-    /// different ordering constraints (push_ready inside the
-    /// `node_mut` block).
+    /// the `Failed→Ready` intermediate with backoff and its own
+    /// progress emit.
     fn requeue_after_recorded_retry(&mut self, drv_hash: &DrvHash) {
-        self.push_ready(drv_hash.clone());
         for build_id in self.get_interested_builds(drv_hash) {
             self.emit_progress(build_id);
         }
@@ -2859,7 +2857,6 @@ impl DagActor {
                     if let Err(e) = state.transition(DerivationStatus::Ready) {
                         warn!(drv_hash = %drv_hash, error = %e, "Failed->Ready transition failed");
                     } else {
-                        self.push_ready(drv_hash.clone());
                         metrics::histogram!(
                             "rio_scheduler_attempt_requeue_seconds",
                             "cause" => "worker-report"
@@ -3520,7 +3517,7 @@ impl DagActor {
     // r[impl sched.poison.cascade-dependents]
     // r[impl sched.db.batch-unnest]
     // Collect-then-batch-persist: the BFS runs entirely in-memory
-    // (transitions, ready_queue removes), then ONE persist_status_batch
+    // (transitions), then ONE persist_status_batch
     // for all transitioned ancestors. Safe because recovery re-cascades
     // from the original poisoned leaf on partial persist. The previous
     // per-step await was unbounded N×PG-RTT inside the actor (no
@@ -3565,9 +3562,6 @@ impl DagActor {
                 poisoned_dep = %poisoned_hash,
                 "cascaded DependencyFailed from poisoned dependency"
             );
-
-            // Remove from ready queue if present (Ready -> DependencyFailed).
-            self.ready_queue.remove(&parent_hash);
 
             // Continue cascade: this parent's parents also cannot complete.
             to_visit.extend(self.dag.get_parents(&parent_hash));

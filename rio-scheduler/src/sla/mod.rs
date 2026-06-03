@@ -523,9 +523,9 @@ impl SlaEstimator {
     /// divide by fleet hw_factor for a wall-time estimate.
     ///
     /// `Probe.t_min() = ∞` MUST NOT propagate: priority is additive
-    /// bottom-up (∞ taints the whole ancestor cone, defeating
-    /// `INTERACTIVE_BOOST` and degenerating dispatch order to
-    /// insertion-order), and `est_duration` feeds two metrics that
+    /// bottom-up (∞ taints the whole ancestor cone, collapsing the
+    /// critical-path dispatch order to ties), and `est_duration` feeds
+    /// two metrics that
     /// saturate on ∞ (`ca_cutoff_seconds_saved` → `u64::MAX`;
     /// `critical_path_accuracy` → `actual/∞ = 0`). The flat default is
     /// the same "unfitted" treatment a never-seen key gets.

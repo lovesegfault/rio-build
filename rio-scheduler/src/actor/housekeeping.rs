@@ -92,11 +92,6 @@ impl DagActor {
         // drift (float accumulation, missed edge case) corrects here.
         // O(V+E); ~1ms for a 10k-node DAG.
         crate::critical_path::full_sweep(&mut self.dag, &self.sla_estimator, &self.builds);
-
-        // Compact the ready queue (remove lazy-invalidated garbage).
-        // No-op if garbage <50% of heap. Without this, a long-running
-        // scheduler with lots of cancellations leaks heap memory.
-        self.ready_queue.compact();
     }
 
     pub(super) async fn handle_tick(&mut self) {

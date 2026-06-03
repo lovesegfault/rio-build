@@ -27,7 +27,6 @@ use rio_proto::types::FindMissingPathsRequest;
 use crate::dag::DerivationDag;
 use crate::db::SchedulerDb;
 use crate::lease::LeaderState;
-use crate::queue::ReadyQueue;
 #[allow(unused_imports)]
 use crate::state::{
     BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, ExecutorId, POISON_TTL,
@@ -37,7 +36,7 @@ use crate::state::{
 // `impl DagActor` is sharded across these submodules by concern.
 // Cohesive field clusters live in sub-structs (`events: BuildEventBus`,
 // `leader: LeaderState`); the genuinely
-// cross-cutting fields (`dag`, `builds`, `db`, `ready_queue`) remain
+// cross-cutting fields (`dag`, `builds`, `db`) remain
 // flat — every handler reads/writes them. Keep
 // ALL `mod` decls here so the submodule list is discoverable in one
 // place.
@@ -232,8 +231,6 @@ pub(super) struct StatusBatch {
 pub struct DagActor {
     /// The global derivation DAG.
     dag: DerivationDag,
-    /// FIFO queue of ready derivation hashes.
-    ready_queue: ReadyQueue,
     /// Active builds indexed by build_id.
     builds: HashMap<Uuid, BuildInfo>,
     /// Per-build event broadcast channels + progress-debounce state.
@@ -761,7 +758,6 @@ impl DagActor {
 
         Self {
             dag,
-            ready_queue: ReadyQueue::new(),
             builds: HashMap::new(),
             events: BuildEventBus::new(),
             authoritative_binding: HashMap::new(),
@@ -885,7 +881,6 @@ impl DagActor {
         // explicit and grep-able, not implicit-by-absence.
         let Self {
             dag,
-            ready_queue,
             builds,
             events,
             attempt_record_retries,
@@ -960,7 +955,6 @@ impl DagActor {
         } = self;
         *dag = DerivationDag::new();
         dag.set_soft_features(soft_features.clone());
-        ready_queue.clear();
         builds.clear();
         events.clear();
         // `attempt_record_retries` tracks re-deliveries for the previous

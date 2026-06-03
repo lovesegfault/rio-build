@@ -140,7 +140,7 @@ impl SchedulerDb {
     /// for TTL tracking and keep their edges) — parents whose failed
     /// child is vouched for by a live co-owning build are returned by
     /// [`Self::load_parents_with_failed_deps`] and short-circuited to
-    /// `DependencyFailed` in `seed_ready_queue` BEFORE
+    /// `DependencyFailed` in `recompute_recovered_states` BEFORE
     /// `compute_initial_states` runs, so the missing edge can't cause a
     /// wrong `all_deps_completed() == true` promotion; the rest are not
     /// condemned — they keep whatever non-terminal children survive this
@@ -184,7 +184,7 @@ impl SchedulerDb {
     /// edges, and are visible to the walk directly), so for the dropped
     /// ones `any_dep_terminally_failed` finds no failed child in the
     /// `children` map and `all_deps_completed` can return `true` →
-    /// wrong Ready. This query lets `seed_ready_queue`
+    /// wrong Ready. This query lets `recompute_recovered_states`
     /// transition them directly to `DependencyFailed` without loading
     /// stub nodes for the failed children. `'skipped'` is NOT a
     /// failure (CA-cutoff — `all_deps_completed` treats it as

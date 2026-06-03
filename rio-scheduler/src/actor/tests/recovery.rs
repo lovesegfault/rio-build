@@ -138,16 +138,16 @@ async fn test_recovery_skips_orphan_transitions() -> TestResult {
     );
 
     // The child is the boundary: it was Ready in PG (load query
-    // returns it as-is) and the push_ready loop at the bottom of
-    // recover_from_pg pushes ALL Ready nodes regardless of
-    // interested_builds. That's a separate concern — I-059 scopes
-    // to the I-058 transition pass. This assertion documents the
-    // boundary, not a guarantee.
+    // returns it as-is) and stays Ready — I-059 scopes to the I-058
+    // transition pass, so an already-Ready orphan keeps its loaded
+    // status (spawn-intent arming applies its own interest gate at
+    // dispatch time). This assertion documents the boundary, not a
+    // guarantee.
     let child = expect_drv(&handle, "orphan-child").await;
     assert_eq!(
         child.status,
         DerivationStatus::Ready,
-        "orphan child loaded as Ready from PG (push_ready of orphan-Ready is OUTSIDE I-059 scope)"
+        "orphan child loaded as Ready from PG (already-Ready orphans are OUTSIDE I-059's transition scope)"
     );
 
     Ok(())

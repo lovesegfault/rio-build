@@ -790,7 +790,6 @@ impl DagActor {
                               "failed to persist re-probe-unlocked Ready status");
                     }
                 }
-                self.push_ready(ready_hash);
             }
         }
         phase!("6f-reprobe-unlocked");
@@ -813,25 +812,6 @@ impl DagActor {
             );
         }
         phase!("6g-new-sub-jobs");
-
-        // Pre-existing Ready nodes whose interest set grew: their
-        // critical-path priority may have risen (compute_initial above
-        // re-walked over newly_inserted, but a pre-existing Ready node
-        // already in the queue under its OLD priority isn't touched by
-        // that walk). Re-push so a higher-priority build's shared dep
-        // doesn't sit behind lower-priority work. Re-push at lower
-        // priority is harmless: ReadyQueue's per-session generation
-        // tagging keeps the higher in-session entry winning, and prior-
-        // session leftovers are skipped on pop.
-        for hash in &merge_result.interest_added {
-            if self
-                .dag
-                .node(hash)
-                .is_some_and(|s| s.status() == DerivationStatus::Ready)
-            {
-                self.push_ready(hash.clone());
-            }
-        }
 
         // Pre-existing nodes that weren't newly-inserted, stale-reset,
         // or re-probe-cached: count Completed/Skipped as cached, and
@@ -1210,7 +1190,6 @@ impl DagActor {
                     .node_mut(drv_hash)
                     .is_some_and(|s| s.transition(DerivationStatus::Ready).is_ok())
             {
-                self.push_ready(drv_hash.clone());
                 corrected_ready.push(drv_hash.clone());
             } else {
                 corrected_queued.push(drv_hash.clone());
@@ -1340,8 +1319,8 @@ impl DagActor {
     }
 
     /// Compute initial Ready/Queued/DependencyFailed for `remaining_new`
-    /// (newly-inserted minus cache-hits), transition + push_ready in
-    /// memory, then persist as three batched ANY($1::text[]) updates.
+    /// (newly-inserted minus cache-hits), transition in memory, then
+    /// persist as three batched ANY($1::text[]) updates.
     /// Returns the first DependencyFailed hash (if any) so the caller
     /// can fail-fast / handle_derivation_failure.
     ///
@@ -1373,10 +1352,6 @@ impl DagActor {
                     if let Err(e) = state.transition(DerivationStatus::Ready) {
                         warn!(drv_hash = %drv_hash, error = %e, "Queued->Ready transition failed");
                     }
-                    // push_ready computes critical-path priority +
-                    // interactive boost. Old push_front/push_back
-                    // split is now a number, not a position.
-                    self.push_ready(drv_hash.clone());
                 }
                 DerivationStatus::Queued => {
                     if let Err(e) = state.transition(DerivationStatus::Queued) {
@@ -1635,9 +1610,9 @@ impl DagActor {
         }
 
         // Two-pass: when GC sweeps a chain {A→B}, both must reset; A
-        // gates on B, so A goes to Queued (not Ready) and is NOT
-        // pushed — find_newly_ready picks A up when B re-completes.
-        // Single-pass would push_ready A while B is still
+        // gates on B, so A goes to Queued (not Ready) — find_newly_ready
+        // promotes A when B re-completes. Single-pass would mark A
+        // Ready while B is still
         // Ready/Substituting → worker ENOENT on B's output → burned
         // retry, can cascade to Poisoned. "Ready ⟹ all deps' outputs
         // available in store" is the invariant.
@@ -1707,8 +1682,8 @@ impl DagActor {
             // r[impl sched.merge.stale-completed-verify+5]
             // Pre-existing Ready parents of this reset node were Ready
             // against its now-gone output. Collect for demotion to
-            // Queued after pass 2 (try_dispatch_one's `!= Ready` guard
-            // drops the stale ready_queue entry).
+            // Queued after pass 2 (the spawn-intent pass only arms
+            // `Ready` nodes, so the demotion disarms them).
             for p in self.dag.get_parents(&drv_hash) {
                 if self
                     .dag
@@ -1744,7 +1719,7 @@ impl DagActor {
                 }
             }
             if !deps_ok {
-                // Queued: no push_ready, no spawn — find_newly_ready
+                // Queued: not spawn-armed — find_newly_ready
                 // promotes it when its reset dep re-completes.
                 // DependencyFailed: terminal — the build's completion
                 // check (later in handle_merge) handles it.
@@ -1752,7 +1727,7 @@ impl DagActor {
                 continue;
             }
             // Substitutable subset: route to a materialization job
-            // instead of pushing to ready_queue. The metric above
+            // instead of arming a from-source dispatch. The metric above
             // stays — output WAS gone, even if upstream can re-provide
             // it.
             //
@@ -1784,8 +1759,6 @@ impl DagActor {
                     .cloned()
                     .collect();
                 to_spawn.push((drv_hash_k, carried));
-            } else {
-                self.push_ready(drv_hash_k);
             }
             reset.insert(drv_hash);
         }

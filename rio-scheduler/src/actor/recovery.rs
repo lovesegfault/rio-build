@@ -127,7 +127,7 @@ struct RecoveryLoad {
     build_drv_hashes: HashMap<Uuid, HashSet<DrvHash>>,
     /// Recovered parents with ≥1 `poisoned`/`dependency_failed`/
     /// `cancelled` child in PG that a live co-owning build vouches
-    /// for. `seed_ready_queue` short-circuits these to
+    /// for. `recompute_recovered_states` short-circuits these to
     /// `DependencyFailed` BEFORE `compute_initial_states` (which would
     /// otherwise see no edge → `all_deps_completed` → wrong Ready).
     /// r[sched.recovery.failed-dep-cascade+2]
@@ -252,7 +252,7 @@ impl DagActor {
             }
         }
 
-        self.seed_ready_queue(&failed_dep_parents).await;
+        self.recompute_recovered_states(&failed_dep_parents).await;
 
         self.enforce_recovered_verdicts().await;
 
@@ -261,7 +261,6 @@ impl DagActor {
         info!(
             builds = self.builds.len(),
             derivations = self.dag.iter_nodes().count(),
-            ready_queue = self.ready_queue.len(),
             "state recovery complete"
         );
 
@@ -442,8 +441,8 @@ impl DagActor {
         // ones compute_initial_states would see
         // all_deps_completed()=true and wrongly promote these to
         // Ready. Load the set here (uses id_to_hash, internal to this
-        // fn) and pass through RecoveryLoad for seed_ready_queue to
-        // short-circuit → DependencyFailed.
+        // fn) and pass through RecoveryLoad for
+        // recompute_recovered_states to short-circuit → DependencyFailed.
         //
         // Evidence rule (the failing direction of the strict criterion
         // the durable classifier shares — `classify_durable_evidence`):
@@ -613,14 +612,16 @@ impl DagActor {
         Ok(())
     }
 
-    /// Critical-path sweep + I-058 Created/Queued recompute, then push
-    /// every Ready node into `self.ready_queue`. Reads only from
-    /// `self.dag` (already populated by `load_dag_from_rows`).
+    /// Critical-path sweep + I-058 Created/Queued/Ready recompute
+    /// (failed-dep cascade included). Reads only from `self.dag`
+    /// (already populated by `load_dag_from_rows`). Dispatch arming is
+    /// derived from DAG state by `compute_spawn_intents` — recovered
+    /// `Ready` nodes are armed by status alone, with no queue to seed.
     ///
     /// `failed_dep_parents`: short-circuited to `DependencyFailed`
     /// BEFORE `compute_initial_states` — see
     /// `r[sched.recovery.failed-dep-cascade+2]`.
-    async fn seed_ready_queue(&mut self, failed_dep_parents: &HashSet<DrvHash>) {
+    async fn recompute_recovered_states(&mut self, failed_dep_parents: &HashSet<DrvHash>) {
         // --- Recompute priorities (critical-path sweep) ---
         // est_duration is recomputed from the SLA cache (refreshed on
         // first tick). full_sweep does a bottom-up pass: leaves
@@ -632,9 +633,10 @@ impl DagActor {
         // endpoints are non-terminal — an edge to a Completed dep is
         // dropped (correct: completed dep IS satisfied). But a node
         // that was Queued in PG (waiting on that dep) STAYS Queued —
-        // nothing transitions it. The push_ready loop below filters
-        // on `status() == Ready`, so Queued nodes are never pushed.
-        // Any restart with active builds = permanent freeze.
+        // nothing transitions it. Dispatch arming gates on
+        // `status() == Ready` (the spawn-intent pass), so Queued nodes
+        // are never armed. Any restart with active builds = permanent
+        // freeze.
         //
         // compute_initial_states does the same dep-state walk MergeDag
         // uses for fresh nodes: all_deps_completed() → Ready,
@@ -781,39 +783,11 @@ impl DagActor {
             );
         }
 
-        // --- Populate ready queue ---
-        // Push all Ready-status derivations with at least one active
-        // interested build. push_ready computes the priority-heap key
-        // from state.priority (just set by full_sweep above).
-        // I-059 also applies here: an already-Ready node whose every
-        // build is terminal (orphan-Ready, produced e.g. by
-        // check_build_completion's recovery !keep_going branch which
-        // does not cancel sibling derivations) bypasses the recompute-
-        // set guard above and would otherwise dispatch into GC'd
-        // inputs → infra-fail → spurious poison.
-        let ready: Vec<DrvHash> = self
-            .dag
-            .iter_nodes()
-            .filter(|(_, s)| {
-                if s.status() != DerivationStatus::Ready {
-                    return false;
-                }
-                if s.interested_builds.is_empty() {
-                    orphans_skipped += 1;
-                    return false;
-                }
-                true
-            })
-            .map(|(h, _)| h.into())
-            .collect();
         if orphans_skipped > 0 {
             debug!(
                 count = orphans_skipped,
                 "recovery: skipping orphan Created/Queued/Ready nodes (no active build interested)"
             );
-        }
-        for hash in ready {
-            self.push_ready(hash);
         }
     }
 

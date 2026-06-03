@@ -70,7 +70,7 @@ module closureCalibF14RecoveryKeepsSubstituting {
 
   /// PRE-FIX leader recovery: identical to recoverAsLeader except that
   /// a row loaded with the persisted Substituting status keeps that
-  /// status (no seed_ready_queue re-derivation for it) although no walk
+  /// status (no recompute_recovered_states re-derivation for it) although no walk
   /// instance survives the failover. Every gate, stamp, condemnation
   /// and latch is the live model's.
   action calibRecoverTrustSubstituting: bool = {

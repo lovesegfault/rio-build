@@ -170,7 +170,7 @@ pub struct BuildInfo {
     /// Tenant UUID resolved from name by the gRPC handler. `None` =
     /// single-tenant mode (gateway sent empty string).
     pub tenant_id: Option<Uuid>,
-    /// Priority class. Interactive gets INTERACTIVE_BOOST (+1e9) in the ready queue.
+    /// Priority class (attribution; dispatch order is critical-path based).
     pub priority_class: PriorityClass,
     /// Lifecycle. Private: `state()` derives the BuildState;
     /// `transition()` (non-terminal) / `transition_terminal()` (with

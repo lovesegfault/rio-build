@@ -1482,7 +1482,7 @@ module closureEvidence {
         // recovery mechanisms — BOTH co-ownership-scoped as of the Phase-1
         // Wave-2b fix:
         //  (a) the R2 cascade pre-pass (load_parents_with_failed_deps →
-        //      cascade_failed in seed_ready_queue) — co-ownership-scoped
+        //      cascade_failed in recompute_recovered_states) — co-ownership-scoped
         //      over the DURABLE relation (pCondemnCriterion; the bug_009
         //      evidence rule and the spec's condemnation rule);
         //  (b) the compute_initial_states recompute over the LOADED child
@@ -1507,7 +1507,7 @@ module closureEvidence {
         val clearGate = r.mTp and not(r.mCh) and pStrictPgCriterion(dm1, blds, BUILDS, pgEdges, d)
         val holeStamp = pRecoveryHoleCriterion(dm1, pgEdges, d)
         val depsSatisfied = kidsLoaded.forall(c => dm1.get(c).mSt == MProduced)
-        // seed_ready_queue re-derives dispatchability from the dependency
+        // recompute_recovered_states re-derives dispatchability from the dependency
         // walk: a persisted 'ready'/'substituting' status is never trusted
         // over the recovered child set
         val baseSt =

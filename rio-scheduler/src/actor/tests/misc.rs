@@ -104,7 +104,7 @@ async fn test_not_leader_does_not_set_gauges() -> TestResult {
     // Merge a DAG so there's something to count. Standby DOES merge
     // (r[sched.lease.k8s-lease+2]: "DAGs are still merged so state is
     // warm for takeover"). If the gate is broken, derivations_queued
-    // would be set to 1 (this node enters ready_queue — no deps).
+    // would be set to 1 (this node is Ready — no deps).
     merge_single_node(&handle, Uuid::new_v4(), "sg-drv", PriorityClass::Scheduled).await?;
 
     // Tick on a fresh actor: tick_count 0→1, maybe_refresh_estimator
@@ -1303,10 +1303,9 @@ async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor(db.pool.clone());
 
-    // 3 Ready x86_64, 1 Ready aarch64. test_inject_ready only puts the
-    // node in the DAG; push_ready() also adds it to ready_queue so the
-    // scalar (= ready_queue.len()) and the DAG-derived breakdown agree
-    // — same as the production merge/transition path does.
+    // 3 Ready x86_64, 1 Ready aarch64. test_inject_ready puts the
+    // node in the DAG; the scalar and the per-system breakdown both
+    // derive from DAG state.
     for (h, sys) in [
         ("x1", "x86_64-linux"),
         ("x2", "x86_64-linux"),
@@ -1314,7 +1313,6 @@ async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
         ("a1", "aarch64-linux"),
     ] {
         actor.test_inject_ready(h, None, sys, false);
-        actor.push_ready(h.to_string().into());
     }
 
     let snap = actor.compute_cluster_snapshot();
@@ -1356,7 +1354,6 @@ async fn snapshot_counts_substituting() {
         );
     }
     actor.test_inject_ready("q1", None, "x86_64-linux", false);
-    actor.push_ready("q1".to_string().into());
     actor.test_inject_ready("r1", None, "x86_64-linux", false);
     actor
         .dag

@@ -1716,13 +1716,14 @@ to complete; if it cannot finish within the grace period, it is reassigned.
   always `{}` from current Nix.
 ]
 
-Queue-level preemption is fully supported:
-- High-priority derivations jump ahead of lower-priority queued (not yet
-  running) work. Interactive builds receive an `INTERACTIVE_BOOST` of +1e9 to
-  their priority score, which dominates any realistic critical-path sum while
-  still preserving relative ordering *within* the interactive set.
+Dispatch-order preemption is priority-based:
+- Spawn intents are computed each pass over `Ready` nodes in critical-path
+  priority order (highest first): higher-priority derivations are bound to
+  executors ahead of lower-priority queued (not yet running) work. The
+  queue-era interactive boost was retired with the spawn-intent ordering;
+  interactive builds compete on critical-path priority.
 - _Executor-slot reservation (priority lanes holding a fraction of executors
-  for high-priority work) is not implemented. The boost heuristic plus
+  for high-priority work) is not implemented. Priority ordering plus
   autoscaling is the current mitigation for starvation._
 - Autoscaling is the primary mitigation for all-executors-busy scenarios.
 
@@ -4058,8 +4059,6 @@ entirely: a `requirements` edit takes effect on the next rollout.
 - #src("rio-scheduler/src/state/") --- State machines (DerivationStatus,
   BuildState), transition validation, RetryPolicy, newtypes (DrvHash,
   ExecutorId)
-- #src("rio-scheduler/src/queue.rs") --- Priority BinaryHeap ReadyQueue
-  (OrderedFloat + lazy invalidation)
 - #src("rio-scheduler/src/critical_path.rs") --- Bottom-up priority:
   `est_duration + max(children's priority)`; incremental ancestor-walk on
   completion

@@ -1221,7 +1221,7 @@ reproducible with the manual-target command below):
 Code walk (formal-sprint @ cccb4d778), step by step: the resubmit's
 re-classification spawns a detached fetch whose task dies with the
 process at failover (no walk identity, no persistence — dispatch.rs
-spawn_substitute_fetches); recovery's `seed_ready_queue` re-derives
+spawn_substitute_fetches); recovery's `recompute_recovered_states` re-derives
 dispatchability from the recovered child set and never re-arms
 substitution walks (the D17 in-memory-only Substituting reset —
 recovery.rs); `handle_clear_poison` (completion.rs:2520–2594) removes
@@ -1448,7 +1448,7 @@ Production has TWO recovery condemnation mechanisms; the 0b model encoded only t
 
 | Mechanism | Production | Model pre-correction | Model post-correction |
 |---|---|---|---|
-| R2 cascade pre-pass | `load_parents_with_failed_deps` -> `cascade_failed` short-circuit in `seed_ready_queue` (recovery.rs) — co-ownership-scoped (the bug_009 evidence rule; the `sched.recovery.failed-dep-cascade+2` MUST) | `pCondemnCriterion` (faithful) | unchanged |
+| R2 cascade pre-pass | `load_parents_with_failed_deps` -> `cascade_failed` short-circuit in `recompute_recovered_states` (recovery.rs) — co-ownership-scoped (the bug_009 evidence rule; the `sched.recovery.failed-dep-cascade+2` MUST) | `pCondemnCriterion` (faithful) | unchanged |
 | In-DAG recompute | `compute_initial_states` (dag/mod.rs) -> `any_dep_terminally_failed` over the LOADED child set — NO co-ownership scoping; within-TTL poisoned children are loaded with their edges, so a recovered parent above another build's still-poisoned child IS condemned | **missing** | `kidsLoaded.exists(c => isUnprodTerminal(dm1.get(c).mSt))`, disjoined with the cascade arm |
 
 Faithfulness evidence for the second mechanism: `any_dep_terminally_failed` (dag/mod.rs:950–964,

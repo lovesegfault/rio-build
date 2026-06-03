@@ -3605,10 +3605,10 @@ explicit disposition named in the converting commit's message:
   establishment_never_visits_stream_attempts likewise retires with A.
 - admin suite: the two ClearPoison tests converted.
   cluster_status_counts_queued_and_running stays on the stream — its
-  queued_derivations assertion reads the dispatch-maintained
-  ready_queue length, which a pull mint does not dequeue (recorded in
-  the unit-repoint findings note as a pull-mode signal-accuracy
-  question for the operator-surface re-point) — and it, the
+  queued_derivations assertion reads the DAG-derived queued scalar
+  (the dispatch-maintained ready-queue length it once read, and the
+  pull-mint signal-accuracy question recorded for it, were retired
+  with the ReadyQueue deletion) — and it, the
   ListExecutors/executors-summary surface (workers_tests.rs,
   cluster_status_counts_registered_workers) and the two DrainExecutor
   tests are commit C's operator surface, re-pointed or retired there.

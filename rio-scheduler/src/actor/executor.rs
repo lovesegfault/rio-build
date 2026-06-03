@@ -14,7 +14,7 @@
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::state::{DerivationStatus, DrvHash, ExecutorId};
+use crate::state::{DrvHash, ExecutorId};
 
 use super::DagActor;
 
@@ -201,12 +201,6 @@ impl DagActor {
                 };
                 self.persist_status(drv_hash, released_to, None).await;
                 affected.extend(self.get_interested_builds(drv_hash));
-                // Only a Ready release is dispatch-armed; a Queued
-                // release re-arms when its deps complete (the normal
-                // dep-cascade promotion).
-                if released_to == DerivationStatus::Ready {
-                    self.push_ready(drv_hash.clone());
-                }
             }
         }
         // Dashboard: running count dropped; assigned_executors lost
