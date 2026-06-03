@@ -518,8 +518,19 @@ pub(super) fn classify_store_evidence(
         .outputs()
         .iter()
         .any(|o| matches!(o.kind(), rio_nix::derivation::OutputKind::InputAddressed(_)));
+    // Seed-collection population = the validator's step-6 accept-set
+    // (round-17 bug_052): step 6 recomputes a declared modular hash for
+    // ANY node carrying one — not only declared-IA — so a deferred-IA /
+    // CA-chain node's declared hash is provable from exactly the same
+    // sibling seeds. Gating collection on needs_ia silently withheld
+    // the seeds, and the validator stripped a PROVABLE declaration as
+    // "unverifiable" (or worse, could not refuse a contradicted one:
+    // with seeds present a recompute MISMATCH is a typed refusal —
+    // the Q7-accepted Contradicts widening, fail-closed, never a
+    // forged verification).
+    let declared_hash_present = node.ca_modular_hash.is_some();
     let mut input_seed: Vec<rio_proto::types::DerivationNode> = Vec::new();
-    if needs_ia {
+    if needs_ia || declared_hash_present {
         // Collect ALL unseedable inputs (claims-derived+5): the
         // read-through is batched — one PG roundtrip covers every
         // missing input — and the remediation names the full set
@@ -538,7 +549,15 @@ pub(super) fn classify_store_evidence(
                 None => missing.push(input.clone()),
             }
         }
-        if !missing.is_empty() {
+        // UnseededInputs EMISSION stays IA-gated: for declared-IA the
+        // verification is STRUCTURALLY impossible without every input
+        // (output paths cannot derive), so the typed verdict routes to
+        // the read-through + bounded backoff. For a declared-hash-only
+        // node, missing seeds are the ingress-strip population — the
+        // validator strips the unrecomputable claim and the rest
+        // verifies (VerifiedExceptDeclaredHash), which is the
+        // e47c330a0 bare-CA-chain unbrick this gate must not re-brick.
+        if needs_ia && !missing.is_empty() {
             return StoreEvidenceOutcome::UnseededInputs { missing, bytes };
         }
     }
@@ -4833,6 +4852,109 @@ mod evidence_matrix_tests {
             StoreEvidenceOutcome::UnseededInputs { .. } => "UnseededInputs",
             StoreEvidenceOutcome::VerifiedExceptDeclaredHash(_) => "VerifiedExceptDeclaredHash",
             StoreEvidenceOutcome::UnparseableVerified => "UnparseableVerified",
+        }
+    }
+
+    // r[verify sched.dispatch.claims-derived+5]
+    /// Round-17 bug_052: seed collection follows the validator's
+    /// step-6 accept-set — a deferred-IA (CA-chain) node carries a
+    /// declared modular hash but NO input-addressed output, and its
+    /// declaration is provable from exactly the sibling seeds the old
+    /// `needs_ia` gate withheld. Three cells:
+    ///   seeds present + honest declaration → Verified (no strip);
+    ///   seeds present + corrupted declaration → Contradicts (the
+    ///     Q7-accepted fail-closed widening — previously silently
+    ///     stripped);
+    ///   seeds absent → VerifiedExceptDeclaredHash (the ingress-strip
+    ///     population, byte-for-byte the e47c330a0 unbrick — must not
+    ///     re-brick).
+    #[test]
+    fn deferred_ia_declared_hash_seeds_follow_step6_accept_set() {
+        use crate::actor::tests::helpers::mint_deferred_ia_node;
+        use StoreEvidenceOutcome as O;
+
+        let (leaf, leaf_aterm, _out) = mint_text_ca_leaf("c2seed-leaf");
+        let leaf_path = leaf.drv_path.clone();
+        let (parent, parent_aterm) =
+            mint_deferred_ia_node("c2seed-parent", &leaf_path, &[(&leaf_path, &leaf_aterm)]);
+        assert!(
+            !parent.ca_modular_hash.is_empty()
+                && !parent.expected_output_paths.iter().any(|p| !p.is_empty()),
+            "fixture: declared hash, no concrete IA output"
+        );
+
+        // The leaf's input-position digest, exactly as the walk wants it.
+        let leaf_drv = rio_nix::derivation::Derivation::parse(&leaf_aterm).unwrap();
+        let resolve_none = |_: &str| -> Option<&rio_nix::derivation::Derivation> { None };
+        let leaf_digest = rio_nix::derivation::hash_derivation_modulo(
+            &leaf_drv,
+            &leaf_path,
+            &resolve_none,
+            &mut std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let mut leaf_seed_node = dn(leaf.clone());
+        leaf_seed_node.ca_modular_hash = Some(leaf_digest);
+        let seed = InputFormSeed::from_submission_nodes(std::slice::from_ref(&leaf_seed_node));
+        assert!(!seed.is_empty(), "non-floating leaf must seed");
+
+        // Cell 1: honest declaration + seeds → Verified, no strip.
+        let honest = dn(parent.clone());
+        match classify_store_evidence(
+            &honest,
+            parent_aterm.as_bytes().to_vec(),
+            &seed,
+            &|_| None,
+            &|_| None,
+        ) {
+            O::Verified(def) => {
+                assert!(def.stripped_declared_hash.is_none(), "no strip with seeds");
+            }
+            other => panic!("expected Verified, got {}", outcome_name(&other)),
+        }
+
+        // Cell 2: corrupted declaration + seeds → Contradicts (typed
+        // refusal, never a forged verification, never a silent strip).
+        let mut forged = dn(parent.clone());
+        let mut h = forged.ca_modular_hash.unwrap();
+        h[0] ^= 0xFF;
+        forged.ca_modular_hash = Some(h);
+        match classify_store_evidence(
+            &forged,
+            parent_aterm.as_bytes().to_vec(),
+            &seed,
+            &|_| None,
+            &|_| None,
+        ) {
+            O::Contradicts(msg) => {
+                assert!(
+                    msg.contains("ca_modular_hash"),
+                    "refusal names the contradicted claim; got: {msg}"
+                );
+            }
+            other => panic!("expected Contradicts, got {}", outcome_name(&other)),
+        }
+
+        // Cell 3: seeds absent → the strip population, unchanged.
+        let empty = InputFormSeed::from_submission_nodes(&[]);
+        match classify_store_evidence(
+            &dn(parent.clone()),
+            parent_aterm.as_bytes().to_vec(),
+            &empty,
+            &|_| None,
+            &|_| None,
+        ) {
+            O::VerifiedExceptDeclaredHash(def) => {
+                assert_eq!(
+                    def.stripped_declared_hash,
+                    Some(<[u8; 32]>::try_from(parent.ca_modular_hash.as_slice()).unwrap()),
+                    "the strip preserves the declared value (M_070)"
+                );
+            }
+            other => panic!(
+                "expected VerifiedExceptDeclaredHash, got {}",
+                outcome_name(&other)
+            ),
         }
     }
 }
