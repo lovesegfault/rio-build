@@ -407,6 +407,34 @@ mod tests {
         );
     }
 
+    /// The compensating control the L4-only builder/fetcher netpol
+    /// posture leans on (bug_290; see networkpolicy.yaml's edge
+    /// comment): a worker presenting its VALID credential — the
+    /// assignment-token header, exactly what builder pods hold — must
+    /// still be rejected by TailLog's tenant-JWT class. Assignment
+    /// tokens never produce `TenantClaims` (the JWT interceptor
+    /// attaches claims only from a verified tenant JWT), so the worker
+    /// credential is STRUCTURALLY incapable of satisfying this gate —
+    /// pinned here rather than assumed.
+    #[tokio::test]
+    async fn taillog_assignment_token_rejected() {
+        let mut s = svc(true, true);
+        let mut r = req("/rio.store.LogService/TailLog");
+        // The worker's real credential shape: a log/assignment token
+        // header, NO verified tenant claims in extensions.
+        r.headers_mut().insert(
+            "x-rio-log-token",
+            http::HeaderValue::from_static("hmac.exec.builder.sig"),
+        );
+        let resp = call(&mut s, r).await;
+        assert_eq!(
+            grpc_status(&resp),
+            Some(tonic::Code::Unauthenticated as i32),
+            "a valid-shaped assignment token must not satisfy TailLog's \
+             tenant-JWT credential class"
+        );
+    }
+
     #[tokio::test]
     async fn taillog_with_verified_claims_admitted() {
         let mut s = svc(true, true);

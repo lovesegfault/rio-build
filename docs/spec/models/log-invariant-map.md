@@ -656,5 +656,33 @@ construction — an unverifying layer is unconstructible. All three are
 the wave's classification-cells thesis applied to authorization:
 the fix in every case made the absent/unverified state
 unrepresentable rather than defaulting it to the permissive arm.
+(4) The network-layer leg of bug_290's defense-in-depth — the L7
+HTTP allow-list on the builder/fetcher → store:9002 edges — was
+REMOVED after a deterministic bisect: Cilium's embedded-envoy L7
+redirect breaks the worker's gRPC data plane in the supported
+k3s/Cilium configuration (vm-fetcher-split-k3s: L7 form red twice,
+L4-only green; pull-canary green throughout). The lesson, fourth in
+the class: a removed network-layer defense means the
+application-layer control must be PINNED BY TEST, not assumed.
 Provenance: automated security review during the wave (2026-06-03),
 routed in-series; recorded reds in the respective commit bodies.
+
+**Acceptance of risk — the L4-only builder→store edge (bug_290
+network leg).** The builder/fetcher → store:9002 edges ship as L4
+endpoint scoping only (rendered: `toEndpoints` pinned to the
+rio-store namespace/name pair, `toPorts` 9002, no `rules:` block on
+either policy — fragment 29 asserts both directions: the edge exists
+AND no L7 block reappears). The compensating control is the
+per-method credential-class layer: TailLog's class is
+verified-tenant-JWT (the CredentialClass table in
+rio-store/src/authz.rs, pinned table↔bound-set both ways by the
+descriptor-walk test), and a worker pod's credential — the
+assignment token — never produces `TenantClaims`, so it is
+STRUCTURALLY incapable of satisfying the gate. That exact arm is
+pinned by `taillog_assignment_token_rejected` (a valid-shaped
+assignment token presented to TailLog → Unauthenticated), alongside
+the tokenless, foreign-tenant, wildcard, and tenant-less reds. L7
+re-introduction path: if the chart's supported Cilium configuration
+gains a working L7 proxy for this edge, flip fragment 29's no-L7
+assertion back to the allow-list form and restore the rules block —
+the assertion failing loudly is the reminder.
