@@ -56,6 +56,7 @@
     "rio_controller_reconcile_errors_total",
     "rio_controller_scaling_decisions_total",
     "rio_controller_sketches_reload_pending",
+    "rio_controller_spot_interrupt_dropped_total",
     "rio_controller_wedge_systemic_suppressed_total",
     "rio_gateway_auth_degraded_total",
     "rio_gateway_bytes_total",
@@ -504,6 +505,11 @@
         "name": "rio_controller_sketches_reload_pending",
         "kind": "gauge",
         "help": "1 while the lease-acquire CellSketches reload from PG is pending (load() not yet succeeded since on_acquire); 0 once latched. While 1, persist() is gated off so a stale standby-startup snapshot doesn't overwrite the previous leader's PG rows. Stuck at 1 = PG unreachable from controller; reconcile runs degraded."
+      },
+      {
+        "name": "rio_controller_spot_interrupt_dropped_total",
+        "kind": "counter",
+        "help": "SpotInterrupted Events whose interrupt sample could NOT be attributed to a hw_class (labeled by reason: node_gone | no_hw_class | get_error). Every drop under-counts the spot-reclaim rate λ's numerator — sustained non-zero rate means the SLA solver is biased TOWARD spot exactly while spot is being reclaimed (bug_363; the fallback map covers the common node-already-deleted case, so drops should be rare)."
       },
       {
         "name": "rio_controller_wedge_systemic_suppressed_total",

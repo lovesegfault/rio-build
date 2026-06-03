@@ -158,6 +158,14 @@ pub fn describe_metrics() {
          across loadEndpoint pods at the last tick (labelled by cs=ns/name)."
     );
     describe_counter!(
+        "rio_controller_spot_interrupt_dropped_total",
+        "SpotInterrupted Events whose interrupt sample could NOT be attributed to a hw_class \
+         (labeled by reason: node_gone | no_hw_class | get_error). Every drop under-counts \
+         the spot-reclaim rate λ's numerator — sustained non-zero rate means the SLA solver \
+         is biased TOWARD spot exactly while spot is being reclaimed (bug_363; the fallback \
+         map covers the common node-already-deleted case, so drops should be rare)."
+    );
+    describe_counter!(
         "rio_controller_ephemeral_jobs_reaped_total",
         "Excess Pending ephemeral Jobs deleted (labeled by pool). \
          Non-zero rate = queued dropped after spawn (user cancel, gateway disconnect); \

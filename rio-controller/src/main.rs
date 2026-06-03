@@ -230,12 +230,17 @@ async fn main() -> anyhow::Result<()> {
     // operator's `[sla.hw_classes.$h]` key matched against Node
     // labels (NOT a hardcoded reconstruction; bug_061). Reuses
     // `hw_config` loaded above the `Ctx` block.
+    // bug_363: the exposure flush maintains a name→hw_class fallback
+    // the interrupt watcher consults when the interrupted node is
+    // already gone (the common reclaim case).
+    let hw_fallback: node_informer::HwClassFallback = Default::default();
     rio_common::task::spawn_monitored(
         "node-informer",
         node_informer::run(
             client.clone(),
             hw_config.clone(),
             admin.clone(),
+            hw_fallback.clone(),
             shutdown.clone(),
         ),
     );
@@ -256,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
             client.clone(),
             hw_config.clone(),
             admin.clone(),
+            hw_fallback,
             shutdown.clone(),
         ),
     );

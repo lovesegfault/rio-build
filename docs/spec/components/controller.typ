@@ -638,6 +638,24 @@ Both Roles split `create` (unrestricted --- RBAC cannot scope `create` by
 `resourceNames`) from `get`/`update` (scoped to the one Lease each component
 owns). All other controller reconcilers remain non-leader-gated.
 
+#r("ctrl.informer.interrupt-sample-conservation")[
+  Every `SpotInterrupted` Event observed by the spot-interrupt watcher MUST
+  be either attributed to a `hw_class` (appending the λ-numerator
+  interrupt sample) or counted as a typed drop on
+  `rio_controller_spot_interrupt_dropped_total{reason}` with a warning ---
+  a silent skip is not an outcome. Attribution resolves the node's labels
+  by per-need GET first; when the node is already gone or unreadable (the
+  COMMON reclaim case --- the instance is deleted moments after the Event)
+  the watcher MUST fall back to the exposure flush's `name → hw_class`
+  observation map (refreshed every flush LIST, pruned at 2× the Event TTL
+  bound). A present node whose labels match no configured class is a
+  `no_hw_class` drop even when a stale fallback entry exists --- labels or
+  config changed, and the stale class would mis-attribute.
+]
+Every uncounted drop under-reports the spot-reclaim rate exactly while spot
+is being reclaimed --- the anti-conservative direction for the SLA solver's
+capacity-type decision.
+
 #info(title: [Note])[
   The controller does NOT hold permissions for `NetworkPolicies` or
   `ConfigMaps`. NetworkPolicies are deployed as static manifests via the Helm

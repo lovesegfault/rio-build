@@ -495,6 +495,80 @@ fn flush_spot_exposure(
     by_hw.into_iter().collect()
 }
 
+/// bug_363: `name → (hw_class, last_seen_epoch)` fallback map,
+/// maintained by the 60 s exposure-flush LIST (which sees every node's
+/// labels anyway) and consulted by the spot-interrupt watcher when the
+/// per-need GET cannot resolve — the COMMON interrupt case is the node
+/// disappearing moments after the event, which silently dropped the
+/// numerator sample and biased λ LOW (toward spot) exactly when spot
+/// was reclaiming. Pruned past [`HW_FALLBACK_TTL_SECS`] (2× the 3600 s
+/// Event TTL bound — entries older than any Event that could still
+/// reference them).
+pub type HwClassFallback = std::sync::Arc<std::sync::RwLock<HashMap<String, (String, f64)>>>;
+
+/// bug_363: prune horizon for [`HwClassFallback`].
+const HW_FALLBACK_TTL_SECS: f64 = 2.0 * 3600.0;
+
+/// bug_363: why an interrupt sample could not be attributed. The ONLY
+/// consumer of a failed resolution is [`record_sample_drop`] — the
+/// silent `debug!` skip is unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SampleDropReason {
+    /// Node 404 and no fallback entry.
+    NodeGone,
+    /// Node exists (or fallback hit was possible) but no
+    /// `[sla.hw_classes.$h]` matches its labels.
+    NoHwClass,
+    /// Node GET failed (apiserver error) and no fallback entry.
+    GetError,
+}
+
+impl SampleDropReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NodeGone => "node_gone",
+            Self::NoHwClass => "no_hw_class",
+            Self::GetError => "get_error",
+        }
+    }
+}
+
+// r[impl ctrl.informer.interrupt-sample-conservation]
+/// bug_363: the one chokepoint for dropped interrupt samples — warn +
+/// counted (`rio_controller_spot_interrupt_dropped_total{reason}`), so
+/// an attribution gap is operator-visible instead of a `debug!` line.
+fn record_sample_drop(node: &str, reason: SampleDropReason) {
+    warn!(
+        %node,
+        reason = reason.label(),
+        "spot-interrupt: sample dropped (λ numerator under-counted)"
+    );
+    metrics::counter!(
+        "rio_controller_spot_interrupt_dropped_total",
+        "reason" => reason.label()
+    )
+    .increment(1);
+}
+
+/// bug_363: pure resolution decision — GET outcome × fallback. Unit
+/// table in `informer_tests`; the IO wrapper below is thin.
+fn classify_interrupt_resolution(
+    got: Result<Option<Option<String>>, ()>,
+    fallback: Option<String>,
+) -> Result<String, SampleDropReason> {
+    match got {
+        // Node present: its labels are authoritative. No match ⇒
+        // NoHwClass even if the (older) fallback knew one — config or
+        // labels changed and the stale class would mis-attribute.
+        Ok(Some(Some(hw))) => Ok(hw),
+        Ok(Some(None)) => Err(SampleDropReason::NoHwClass),
+        // Node gone / GET failed: the fallback (last LIST observation)
+        // is the best remaining evidence.
+        Ok(None) => fallback.ok_or(SampleDropReason::NodeGone),
+        Err(()) => fallback.ok_or(SampleDropReason::GetError),
+    }
+}
+
 /// Per-need Node GET + `[sla.hw_classes.$h]` match — the §4(a)2
 /// replacement for the deleted labels-cache lookup. `None` if the
 /// node is gone (404), the GET failed (logged), no `$h` matches, or
@@ -531,6 +605,7 @@ pub async fn run(
     client: Client,
     config: HwClassConfig,
     mut admin: AdminClient,
+    fallback: HwClassFallback,
     shutdown: rio_common::signal::Token,
 ) {
     let nodes: Api<Node> = Api::all(client);
@@ -566,6 +641,23 @@ pub async fn run(
             _ = flush.tick() => {
                 match nodes.list(&ListParams::default()).await {
                     Ok(list) => {
+                        // bug_363: refresh the interrupt watcher's
+                        // hw_class fallback from the same LIST (every
+                        // node's labels are in hand anyway); prune
+                        // entries past the TTL.
+                        {
+                            let now = now_epoch();
+                            let mut fb = fallback.write().expect("fallback map lock");
+                            for node in &list.items {
+                                if let Some(name) = node.metadata.name.as_deref()
+                                    && let Some(labels) = node.metadata.labels.as_ref()
+                                    && let Some(hw) = config.match_node(labels)
+                                {
+                                    fb.insert(name.to_owned(), (hw, now));
+                                }
+                            }
+                            fb.retain(|_, (_, seen)| now - *seen < HW_FALLBACK_TTL_SECS);
+                        }
                         for (hw, secs) in
                             flush_spot_exposure(&mut cursors, &list.items, &config, now_epoch())
                         {
@@ -716,6 +808,7 @@ pub async fn run_spot_interrupt_watcher(
     client: Client,
     config: HwClassConfig,
     mut admin: AdminClient,
+    fallback: HwClassFallback,
     shutdown: rio_common::signal::Token,
 ) {
     let events: Api<Event> = Api::all(client.clone());
@@ -743,9 +836,33 @@ pub async fn run_spot_interrupt_watcher(
         let Some(node) = ev.involved_object.name else {
             continue;
         };
-        let Some(hw_class) = node_hw_class(&nodes, &config, &node).await else {
-            debug!(%node, "spot-interrupt: node unresolvable; skipping");
-            continue;
+        // bug_363: resolution returns Result — the Err arm's only
+        // consumer is the counted recorder; a silent skip no longer
+        // typechecks as "handled".
+        let got = match nodes.get_opt(&node).await {
+            Ok(Some(n)) => Ok(Some(
+                n.metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| config.match_node(labels)),
+            )),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                debug!(%node, error = %e, "spot-interrupt: node GET failed");
+                Err(())
+            }
+        };
+        let fb = fallback
+            .read()
+            .expect("fallback map lock")
+            .get(&node)
+            .map(|(hw, _)| hw.clone());
+        let hw_class = match classify_interrupt_resolution(got, fb) {
+            Ok(hw) => hw,
+            Err(reason) => {
+                record_sample_drop(&node, reason);
+                continue;
+            }
         };
         // `event_uid` makes the INSERT idempotent: `.applied_objects()`
         // re-yields every still-extant Event on relist (controller
@@ -812,6 +929,51 @@ fn annotation_target(pod: &Pod) -> Option<(String, String, String)> {
 
 #[cfg(test)]
 mod tests {
+
+    // r[verify ctrl.informer.interrupt-sample-conservation]
+    /// bug_363's resolution table: present-node labels are
+    /// authoritative; a gone/unreadable node falls back to the flush
+    /// map; only a genuinely unattributable event drops — and the drop
+    /// is TYPED (the silent debug!-skip shape no longer exists; the
+    /// recorded pre-fix red: a 404'd node's sample was skipped even
+    /// though the 60 s flush had just observed its hw_class).
+    #[test]
+    fn interrupt_resolution_classifies_every_cell() {
+        use super::{SampleDropReason, classify_interrupt_resolution};
+        let hw = || Some("mid-ebs-x86".to_string());
+
+        // Present + match ⇒ attributed (fallback irrelevant).
+        assert_eq!(
+            classify_interrupt_resolution(Ok(Some(hw())), None),
+            Ok("mid-ebs-x86".into())
+        );
+        // Present + no match ⇒ NoHwClass even with a stale fallback
+        // (labels/config changed; the old class would mis-attribute).
+        assert_eq!(
+            classify_interrupt_resolution(Ok(Some(None)), hw()),
+            Err(SampleDropReason::NoHwClass)
+        );
+        // Gone + fallback ⇒ attributed via the flush map (the common
+        // reclaim case — the node is deleted moments after the Event).
+        assert_eq!(
+            classify_interrupt_resolution(Ok(None), hw()),
+            Ok("mid-ebs-x86".into())
+        );
+        // Gone + no fallback ⇒ typed drop.
+        assert_eq!(
+            classify_interrupt_resolution(Ok(None), None),
+            Err(SampleDropReason::NodeGone)
+        );
+        // GET error + fallback ⇒ attributed; without ⇒ typed drop.
+        assert_eq!(
+            classify_interrupt_resolution(Err(()), hw()),
+            Ok("mid-ebs-x86".into())
+        );
+        assert_eq!(
+            classify_interrupt_resolution(Err(()), None),
+            Err(SampleDropReason::GetError)
+        );
+    }
     use super::*;
 
     fn node(name: &str, labels: &[(&str, &str)]) -> Node {
