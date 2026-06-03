@@ -2560,8 +2560,9 @@ async fn pause_campaign(
 /// arm or a top-up — so counting raw rows would double-count. The fold
 /// owner's report projection ([`SupplyFold::report_outcomes`]) collapses
 /// to the settled disposition per path, with bookkeeping rows
-/// (`unavailable`, `skipped` — see [`supply_outcome_is_settlement`])
-/// counting only for paths that never settled, because they assert
+/// (`unavailable`, `skipped` — see
+/// [`crate::run::model::supply_outcome_is_settlement`]) counting only
+/// for paths that never settled, because they assert
 /// nothing about delivery: a skip-held row appended after the claim
 /// holder's `delivered` row must leave the path counted delivered, and a
 /// breaker skip after a real failure must leave it counted failed.
