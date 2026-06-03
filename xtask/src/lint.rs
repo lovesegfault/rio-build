@@ -1519,12 +1519,12 @@ const CONTRACT_REGISTRY: &[ContractRow] = &[
         key: "drv-closure.import-skip",
         declared: (
             "rio-replay/src/run/drv_import.rs",
-            "its absence is REPORTED, not swallowed",
+            "returned in [`DrvClosure::skipped`] so the",
         ),
         enforcement: Enforcement::Test {
             file: "rio-replay/src/run/drv_import.rs",
             test_fn: "closure_skips_inputs_the_archive_does_not_embed",
-            artifact_needles: &["the non-embedded input is reported"],
+            artifact_needles: &["reported, not swallowed"],
         },
     },
     // ── Plan-time demotion pin (resume classification stability). ──

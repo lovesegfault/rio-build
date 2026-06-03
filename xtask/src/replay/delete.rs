@@ -845,12 +845,14 @@ mod tests {
                 "delete_object",
                 "get_text",
                 "human_bytes",
+                "is_archive_handle",
                 "list_keys"
             ],
             "every S3 operation must route through the DeleteOps boundary (LiveOps owns \
              list_keys/get_text and the two delete_object sites; archive_prefix, \
-             by_recipe_prefix and human_bytes are pure key/format helpers with no S3 \
-             traffic) — a raw call cannot be interleaved against a scripted history"
+             by_recipe_prefix, human_bytes and the is_archive_handle candidacy predicate \
+             are pure key/format helpers with no S3 traffic) — a raw call cannot be \
+             interleaved against a scripted history"
         );
 
         // No raw AWS client may be constructed or named here at all.

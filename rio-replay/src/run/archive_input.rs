@@ -1730,6 +1730,7 @@ mod tests {
                 .join(format!("{}-libS-1.0.drv", fake_hash("sparse-libS-drv"))),
         )
         .unwrap();
+        reseal_drvs_digest(tmp.path());
         let archive = ReplayArchive::open(tmp.path()).unwrap();
         let err = format!("{:#}", load_units(&archive).unwrap_err());
         assert!(err.contains("no readable derivation"), "got: {err}");
@@ -1737,6 +1738,42 @@ mod tests {
             err.contains("system") && err.contains("outputs") && err.contains("required features"),
             "the error names every field that needed recovery: {err}"
         );
+    }
+
+    /// Re-seal `manifest.json`'s `content_digests.drvs` over the staging
+    /// tree's CURRENT `.drv` members. The membership-damage tests below
+    /// delete a member to pin the unit-recovery contract; a v1 archive
+    /// with a deleted member is otherwise (correctly) refused at open by
+    /// the embedded-derivation listing digest, so the tests re-seal the
+    /// manifest into the shape a non-conforming FOREIGN recorder could
+    /// publish: digests consistent with a member set that omits a
+    /// derivation the units still reference.
+    fn reseal_drvs_digest(root: &std::path::Path) {
+        let manifest_path = root.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let mut listing: Vec<(String, String)> = Vec::new();
+        for entry in std::fs::read_dir(root.join("nix/store")).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            if !name.ends_with(".drv") {
+                continue;
+            }
+            let bytes = std::fs::read(entry.path()).unwrap();
+            listing.push((
+                format!("/nix/store/{name}"),
+                crate::archive::identity::sha256_hex(&bytes),
+            ));
+        }
+        manifest["content_digests"]["drvs"] =
+            serde_json::Value::String(crate::archive::identity::listing_digest(&listing));
+        manifest["counts"]["embedded_drvs"] =
+            serde_json::Value::Number((listing.len() as u64).into());
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1751,6 +1788,7 @@ mod tests {
         write_mini_archive(tmp.path());
         let app_a_drv_name = format!("{}-appA-1.0.drv", fake_hash("appA-1.0-drv"));
         std::fs::remove_file(tmp.path().join("nix/store").join(&app_a_drv_name)).unwrap();
+        reseal_drvs_digest(tmp.path());
 
         let archive = ReplayArchive::open(tmp.path()).unwrap();
         let units = load_units(&archive).unwrap();
