@@ -971,7 +971,7 @@
       "name": "StaleGeneration",
       "crate": "rio-scheduler",
       "msg": "merge fenced: serving generation {serving} is below the durable claims floor {floor} (a newer leader has claimed); retry against the current leader",
-      "doc": "The merge transaction's claims-floor fence rejected the write: this replica's serving generation sits below the durable floor (a successor has claimed), so committing the merge would let a deposed believer write evidence over the new tenure's. Maps to gRPC FAILED_PRECONDITION — the client retries against the live leader (whose own merge will succeed)."
+      "doc": "The merge transaction's claims-floor fence rejected the write: this replica's serving generation sits below the durable floor (a successor has claimed), so committing the merge would let a deposed believer write evidence over the new tenure's. Maps to gRPC UNAVAILABLE (the `ensure_leader` \"not leader\" family): the fence trips exactly in the deposed-believer window — the lease loss precedes the successor's claim, so a health-aware balanced channel has usually ejected this replica already, and a client that still reaches it must RETRY (bounded), not surface a terminal error for a request that is perfectly valid on the live leader. No client retries FAILED_PRECONDITION; mapping the refusal there turned every fence trip into a user-visible failure (bug_393)."
     },
     {
       "enum": "ActorError",
