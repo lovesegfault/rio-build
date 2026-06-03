@@ -311,7 +311,7 @@ pub struct DagActor {
     /// admission's job-view projection. Authority lives in PG
     /// (`materialization_jobs` + the partial-unique dedup index);
     /// recovery rebuild is Phase B.
-    materialization_jobs: materialize::JobView,
+    materialization_jobs: materialize::JobViewState,
     // r[impl sched.attempt.cancel-close-driven]
     /// Terminal-status batches whose persist FAILED, latched for the
     /// housekeeping tick to re-drive until a persist succeeds ("latch
@@ -628,6 +628,12 @@ pub struct DagActor {
     /// `DagActorPlumbing::fail_next_floor_read`.
     #[cfg(test)]
     fail_next_floor_read: bool,
+    /// Test-only: fail the next job-view load inside
+    /// `recover_from_pg()` (after the DAG and builds loaded) — the
+    /// merged_bug_246 required-load arm. See
+    /// `DagActorPlumbing::fail_next_job_view_load`.
+    #[cfg(test)]
+    fail_next_job_view_load: bool,
     /// Test-only structural counters. Asserting on these (rather than
     /// wall-clock or absence-of-side-effect) makes the I-163 / I-139
     /// regression tests fail under their target mutation.
@@ -778,7 +784,21 @@ impl DagActor {
             establishment_report_slack: cfg.establishment_report_slack,
             exec_retention_days: cfg.exec_retention_days,
             materialization_cfg: cfg.materialization,
-            materialization_jobs: materialize::JobView::default(),
+            // Unavailable until the first successful recovery hydrates
+            // it (merged_bug_246: never Hydrated(empty) over a live
+            // DAG). Tests start hydrated by default — the
+            // direct-setup harness serves without driving recovery
+            // (`DagActorPlumbing::start_hydrated_job_view`).
+            #[cfg(not(test))]
+            materialization_jobs: materialize::JobViewState::default(),
+            #[cfg(test)]
+            materialization_jobs: if plumbing.start_hydrated_job_view {
+                let mut v = materialize::JobViewState::default();
+                v.rebuild(std::iter::empty());
+                v
+            } else {
+                materialize::JobViewState::default()
+            },
             pending_carriers: Vec::new(),
             status_outbox: std::collections::VecDeque::new(),
             db,
@@ -828,6 +848,8 @@ impl DagActor {
             recovery_toctou_gate: plumbing.recovery_toctou_gate,
             #[cfg(test)]
             fail_next_recovery_load: plumbing.fail_next_recovery_load,
+            #[cfg(test)]
+            fail_next_job_view_load: plumbing.fail_next_job_view_load,
             #[cfg(test)]
             fail_next_floor_read: plumbing.fail_next_floor_read,
             #[cfg(test)]
@@ -963,6 +985,8 @@ impl DagActor {
             #[cfg(test)]
                 fail_next_floor_read: _,
             #[cfg(test)]
+                fail_next_job_view_load: _,
+            #[cfg(test)]
                 test_counters: _,
         } = self;
         *dag = DerivationDag::new();
@@ -988,9 +1012,11 @@ impl DagActor {
         // fleet-exhaust verdicts.
         acked_spawned.clear();
         // The materialization-job view is a droppable per-tenure cache
-        // of PG rows; a new tenure rebuilds it from PG (Phase B) or
-        // re-populates it from its own creation paths. Stale entries
-        // would project job state for a DAG this wipe just discarded.
+        // of PG rows; a new tenure rebuilds it from PG (Phase B). The
+        // wipe lands on UNAVAILABLE, not Hydrated(empty): stale entries
+        // would project job state for a DAG this wipe just discarded,
+        // and an empty-but-trusted view over a repopulated DAG is the
+        // merged_bug_246 hole (fabricated absence).
         materialization_jobs.wipe();
         // Leader-scoped carrier stash: a deposed leader's pending
         // creates are fenced anyway; the dropped-carrier accounting is

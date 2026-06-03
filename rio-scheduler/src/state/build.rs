@@ -209,8 +209,12 @@ pub struct BuildInfo {
     /// for build-level failures whose `failed_drv` is structurally
     /// `None`). Partial trio writes do not compile any more.
     first_failure: Option<FirstFailure>,
-    /// When the build was submitted (for rio_scheduler_build_duration_seconds).
-    pub submitted_at: Instant,
+    /// When the build was submitted (for
+    /// rio_scheduler_build_duration_seconds and the per-build timeout
+    /// watchdog). [`RecoveredInstant`]: survives failover with its
+    /// PG-recovered age intact — a 30h-old build on a 1h-booted leader
+    /// reads 30h elapsed, never "submitted just now" (merged_bug_300).
+    pub submitted_at: crate::state::RecoveredInstant,
     /// When the orphan-watcher sweep first observed this build's
     /// `build_events` broadcast channel with zero receivers. `None`
     /// while at least one watcher (gateway SubmitBuild/WatchBuild
@@ -249,7 +253,7 @@ impl BuildInfo {
             cached_count: 0,
             failed_count: 0,
             first_failure: None,
-            submitted_at: Instant::now(),
+            submitted_at: crate::state::RecoveredInstant::fresh_now(),
             orphaned_since: None,
         }
     }

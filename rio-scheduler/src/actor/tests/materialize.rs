@@ -7546,3 +7546,271 @@ async fn failed_fenced_job_create_retries_via_stash() -> TestResult {
     );
     Ok(())
 }
+
+/// merged_bug_246 (required load): a term whose job-view load fails
+/// must FAIL recovery and serve fail-closed — a materialization claim
+/// answers NotYetReady (the Unavailable projection), never `Gone`.
+///
+/// RED (pre-fix): the load failure was warn-and-continue — recovery
+/// returned Ok with an EMPTY-but-trusted view, the claim projected
+/// `JobView::None`, and the kernel answered `Gone`: the store treats
+/// Gone as "resolved, skip" and never claims again (the stranded
+/// armed action). The next LeaderAcquired heals (level-triggered).
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn recovery_fails_when_job_view_load_fails() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+
+    // Phase 1: a healthy leader creates one PENDING job, then dies.
+    {
+        let (handle, task) =
+            setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |_, _| {});
+        let out = test_store_path("jvl-fail-out");
+        store.state.substitutable.write().unwrap().push(out.clone());
+        let mut n = make_node("jvl-fail");
+        n.expected_output_paths = vec![out];
+        let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+        barrier(&handle).await;
+        let jobs: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM materialization_jobs WHERE drv_hash = 'jvl-fail' \
+              AND state = 'pending'",
+        )
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(jobs, 1, "precondition: the pending job exists durably");
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Phase 2: the successor's job-view load fails → degraded term.
+    let leader = crate::lease::LeaderState::always_leader(std::sync::Arc::new(
+        std::sync::atomic::AtomicU64::new(1),
+    ));
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let phase2_leader = leader.clone();
+    let (handle, _task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), move |_, p| {
+            p.leader = phase2_leader;
+            p.fail_next_job_view_load = true;
+        });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    let degraded_claim = claim_materialization(&handle, "jvl-fail", "store-test-0").await;
+    assert!(
+        matches!(degraded_claim, Ok(PullOutcome::NotYetReady { .. })),
+        "a degraded term answers NotYetReady (fail-closed Unavailable projection), \
+         never Gone (the stranded-skip) and never Deliver (a job we cannot see); \
+         got {degraded_claim:?}"
+    );
+
+    // The next acquisition heals: recovery succeeds, the view hydrates,
+    // the pending job delivers.
+    handle.send_unchecked(ActorCommand::LeaderLost).await?;
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+    let healed_claim = claim_materialization(&handle, "jvl-fail", "store-test-0").await;
+    assert!(
+        matches!(healed_claim, Ok(PullOutcome::Deliver(_))),
+        "the next successful recovery hydrates the view and the job delivers; \
+         got {healed_claim:?}"
+    );
+    Ok(())
+}
+
+/// merged_bug_246 (re-feed) + bug_385 (scheduler leg): the PG-backed
+/// backstop sweep re-feeds pending rows the view does not track —
+/// rehydrating their TRUE state (a parked row claims NotYetReady, never
+/// the fabricated-unparked Deliver) — and moot rows (no live
+/// derivation) converge to cancelled instead of producing refusals
+/// forever.
+///
+/// RED (pre-fix): no sweep existed — an untracked row answered `Gone`
+/// to every claim (view-absence projected `JobView::None`), and the
+/// dedup re-feed inserted a DEFAULT unparked/unclaimed entry,
+/// delivering parked jobs early.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn backstop_refeeds_untracked_rows_and_cancels_moot() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // A live node, merged WITHOUT a job (not substitutable at merge).
+    let out = test_store_path("bk-live-out");
+    let mut live = make_node("bk-live");
+    live.expected_output_paths = vec![out.clone()];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![live], vec![], false).await?;
+    barrier(&handle).await;
+    // Make the path substitutable so a re-fed claim can deliver later
+    // if the park were (wrongly) ignored.
+    store.state.substitutable.write().unwrap().push(out);
+
+    // Simulate a deposed leader's late commit: a PARKED pending job for
+    // the live node, written directly to PG — the view never saw it.
+    let live_id: Uuid =
+        sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = 'bk-live'")
+            .fetch_one(&db.pool)
+            .await?;
+    sqlx::query(
+        "INSERT INTO materialization_jobs \
+             (job_id, derivation_id, drv_hash, origin, state, created_generation, \
+              park_until, park_began_at) \
+         VALUES ($1, $2, 'bk-live', 'cache_opportunity', 'pending', 1, \
+                 now() + interval '600 seconds', now())",
+    )
+    .bind(Uuid::now_v7())
+    .bind(live_id)
+    .execute(&db.pool)
+    .await?;
+
+    // And a moot row: a derivation no live build references.
+    sqlx::query(
+        "INSERT INTO derivations (drv_hash, drv_path, system, status) \
+         VALUES ('bk-moot', $1, 'x86_64-linux', 'queued')",
+    )
+    .bind(rio_test_support::fixtures::test_drv_path("bk-moot"))
+    .execute(&db.pool)
+    .await?;
+    let moot_id: Uuid =
+        sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = 'bk-moot'")
+            .fetch_one(&db.pool)
+            .await?;
+    sqlx::query(
+        "INSERT INTO materialization_jobs \
+             (job_id, derivation_id, drv_hash, origin, state, created_generation) \
+         VALUES ($1, $2, 'bk-moot', 'cache_opportunity', 'pending', 1)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(moot_id)
+    .execute(&db.pool)
+    .await?;
+
+    // Pre-sweep: the untracked parked row answers Gone (the hole this
+    // sweep exists to close — asserted here as the documented
+    // pre-refeed shape, NOT the desired end state).
+    let pre = claim_materialization(&handle, "bk-live", "store-test-0").await;
+    assert!(
+        matches!(pre, Ok(PullOutcome::Gone)),
+        "precondition (the documented hole): an untracked row projects None → Gone; \
+         got {pre:?}"
+    );
+
+    // Drive past the backstop cadence (every 30th tick).
+    for _ in 0..30 {
+        handle.send_unchecked(ActorCommand::Tick).await?;
+    }
+    barrier(&handle).await;
+
+    // The parked row was re-fed with its TRUE state: NotYetReady (the
+    // park honored), not Deliver (fabricated-unparked), not Gone
+    // (untracked).
+    let refed = claim_materialization(&handle, "bk-live", "store-test-0").await;
+    assert!(
+        matches!(refed, Ok(PullOutcome::NotYetReady { .. })),
+        "the re-fed parked job answers NotYetReady (park rehydrated from PG, \
+         never fabricated unparked); got {refed:?}"
+    );
+
+    // The moot row converged: cancelled charge-free by the
+    // zero-interest pass over the re-fed entry.
+    let moot_state: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = 'bk-moot'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        moot_state, "cancelled",
+        "a pending job with no live derivation converges to cancelled (385's \
+         refusal-producing rows converge)"
+    );
+    let moot_attempts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM drv_attempts WHERE derivation_id = $1 \
+          AND event_kind = 'attempt'",
+    )
+    .bind(moot_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(moot_attempts, 0, "the moot cancel is charge-free");
+    Ok(())
+}
+
+/// bug_252 (the predicate split, extending
+/// `flag_on_pending_jobs_count_as_substituting_bucket` with the
+/// parked-excluded leg): a PARKED job's node counts in NEITHER the
+/// substituting bucket (KEDA must drain — the store cannot progress a
+/// parked job) NOR the queued/builder buckets (the node will be
+/// materialized, not built; spawn exclusion still holds).
+///
+/// RED (pre-fix): the parked node stayed in substituting_derivations —
+/// KEDA held store replicas up against a backlog no replica could
+/// claim.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn flag_on_parked_jobs_leave_substituting_bucket() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+        // One infra failure parks (long backoff — outlives the test).
+        cfg.materialization.max_attempts = 1;
+        cfg.materialization.park_backoff_base_secs = 600;
+    });
+
+    let out = test_store_path("parked-bucket-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("parked-bucket");
+    n.expected_output_paths = vec![out];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    tick(&handle).await?;
+    let snap = handle.cluster_snapshot_cached();
+    assert_eq!(
+        snap.substituting_derivations, 1,
+        "precondition: the claimable pending job counts as backlog"
+    );
+
+    // Park it: claim + infra report at max_attempts=1.
+    let assignment = match claim_materialization(&handle, "parked-bucket", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the pending job must deliver, got {other:?}"),
+    };
+    let exec: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(
+        &handle,
+        exec,
+        "parked-bucket",
+        mat_infra_outcome("upstream down"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    let park: Option<f64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM (park_until - now()))::float8 \
+           FROM materialization_jobs WHERE drv_hash = 'parked-bucket'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        park.is_some_and(|s| s > 0.0),
+        "precondition: the job parked"
+    );
+
+    tick(&handle).await?;
+    let snap = handle.cluster_snapshot_cached();
+    assert_eq!(
+        snap.substituting_derivations, 0,
+        "a parked job leaves the substituting bucket (KEDA drains; bug_252)"
+    );
+    assert_eq!(
+        snap.queued_derivations, 0,
+        "the parked node does NOT fall into the builder bucket (it will be \
+         materialized once the backoff lapses — spawn exclusion holds)"
+    );
+    assert_eq!(
+        snap.queued_by_system.values().sum::<u32>(),
+        0,
+        "queued_by_system mirrors the queued bucket"
+    );
+    Ok(())
+}

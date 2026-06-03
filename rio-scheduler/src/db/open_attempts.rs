@@ -568,6 +568,25 @@ impl SchedulerDb {
         .fetch_all(&self.pool)
         .await
     }
+
+    /// Single-row variant of [`Self::load_unresolved_materialization_jobs`]
+    /// — the merged_bug_246 dedup re-feed: when a creation path's dedup
+    /// finds an unresolved row the in-memory view does not track, the
+    /// entry is rehydrated from the durable truth (park backoff, claim
+    /// holder, carrier) instead of fabricated as unparked/unclaimed.
+    /// Lives here with the bulk loader per the assignments-join policy
+    /// (`nix/misc-checks.nix` `assignments-join-policy`).
+    pub(crate) async fn load_unresolved_job_row(
+        &self,
+        derivation_id: Uuid,
+    ) -> Result<Option<RecoveredJobRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT j.job_id, j.drv_hash, j.carried_realized_paths,                     EXTRACT(EPOCH FROM (j.park_until - now()))::float8 AS park_remaining_secs,                     EXTRACT(EPOCH FROM (now() - j.park_began_at))::float8 AS park_began_secs_ago,                     a.builder_id AS claimed_by                FROM materialization_jobs j                LEFT JOIN assignments a ON a.derivation_id = j.derivation_id                                       AND a.status IN ('pending', 'acknowledged')                                       AND EXISTS (                                           SELECT 1 FROM drv_executions e                                            WHERE e.exec_id = a.exec_id                                              AND e.attempt_kind = 'materialization')               WHERE j.state = 'pending' AND j.derivation_id = $1",
+        )
+        .bind(derivation_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
 }
 
 /// One unresolved job as the recovery view rebuild loads it (T-4.3).

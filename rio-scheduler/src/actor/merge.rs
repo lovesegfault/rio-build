@@ -502,7 +502,7 @@ impl DagActor {
         // Post-commit: feed the in-memory job view from the merge
         // transaction's created jobs (never inside the tx — the view is
         // a droppable cache; a rolled-back merge must leave no entry).
-        self.note_created_materialization_jobs(&created_jobs);
+        self.note_created_materialization_jobs(&created_jobs).await;
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
         Ok(MergeIngest {

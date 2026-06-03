@@ -249,6 +249,10 @@ impl DagActor {
         let mut queued_derivations = 0u32;
         let mut substituting_derivations = 0u32;
         let mut queued_by_system: HashMap<String, u32> = HashMap::new();
+        // One park-expiry comparison instant for the whole pass (the
+        // has_claimable_job "now"); per-node Instant::now() would let
+        // a park expire mid-pass and double-count across buckets.
+        let bucket_now = std::time::Instant::now();
         // r[impl sched.admin.snapshot-substituting+3]
         // Exhaustive over DerivationStatus so a future variant addition
         // is a compile-time break here, not a silently-zero autoscaler
@@ -282,8 +286,15 @@ impl DagActor {
                     // queued_derivations/queued_by_system so the buckets
                     // stay disjoint and builder autoscalers don't scale
                     // on work that will be materialized, not built.
-                    if self.has_pending_unclaimed_job(drv_hash) {
+                    if self.has_claimable_job(drv_hash, bucket_now) {
                         substituting_derivations += 1;
+                    } else if self.has_pending_unclaimed_job(drv_hash) {
+                        // Parked job (bug_252): pacing, not claimable
+                        // demand — counted in NEITHER bucket so the
+                        // KEDA store trigger drains while the node
+                        // stays out of the builder bucket (it will be
+                        // materialized, not built). Visible via
+                        // rio_scheduler_materialization_stalled.
                     } else {
                         // The scalar and the I-107 per-system breakdown
                         // are counted in the same arm so the sum across
@@ -302,8 +313,11 @@ impl DagActor {
                 // not wait for deps, so that node is store-side
                 // backlog exactly like its Ready sibling above.
                 DerivationStatus::Created | DerivationStatus::Queued => {
+                    // bug_252: claimable only — a parked Queued node is
+                    // neither store demand (KEDA must drain) nor
+                    // builder demand (it will be materialized).
                     if s.status() == DerivationStatus::Queued
-                        && self.has_pending_unclaimed_job(drv_hash)
+                        && self.has_claimable_job(drv_hash, bucket_now)
                     {
                         substituting_derivations += 1;
                     }

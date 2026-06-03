@@ -323,11 +323,14 @@ pub fn describe_metrics() {
     );
     describe_gauge!(
         "rio_scheduler_substituting_derivations",
-        "Derivations carrying an unresolved, unclaimed materialization job — the \
-         substitution backlog (the same quantity ClusterStatus.substituting_derivations \
-         reports). Leader-published every housekeeping tick from the freshly computed \
-         cluster snapshot. The leading rio-store KEDA scaling signal: backlog is known \
-         at merge time, minutes before the store feels the ingest load."
+        "Derivations carrying a CLAIMABLE materialization job (unclaimed AND not \
+         parked) — the substitution backlog (the same quantity \
+         ClusterStatus.substituting_derivations reports). Parked jobs are pacing, \
+         not claimable demand: they leave this gauge (bug_252 — KEDA drains while \
+         the backlog parks) and stay visible via rio_scheduler_materialization_stalled. \
+         Leader-published every housekeeping tick from the freshly computed cluster \
+         snapshot. The leading rio-store KEDA scaling signal: backlog is known at \
+         merge time, minutes before the store feels the ingest load."
     );
     describe_gauge!(
         "rio_scheduler_materialization_stalled",

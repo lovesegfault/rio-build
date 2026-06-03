@@ -2322,7 +2322,7 @@ impl DagActor {
                   "poison_already_recorded: ->Poisoned transition rejected, skipping cascade");
             return;
         }
-        state.retry.poisoned_at = Some(Instant::now());
+        state.retry.poisoned_at = Some(crate::state::RecoveredInstant::fresh_now());
         self.unpin_best_effort(drv_hash).await;
         self.terminal_failure_epilogue(
             drv_hash,
@@ -2375,7 +2375,7 @@ impl DagActor {
                   "poison_and_cascade: ->Poisoned transition rejected, skipping PG write + cascade");
             return;
         }
-        state.retry.poisoned_at = Some(Instant::now());
+        state.retry.poisoned_at = Some(crate::state::RecoveredInstant::fresh_now());
 
         self.record_attempt_with_poison(drv_hash, attempt_row).await;
         self.unpin_best_effort(drv_hash).await;
@@ -3266,7 +3266,7 @@ impl DagActor {
                   "handle_permanent_failure: ->Poisoned transition rejected, skipping");
             return FailureHandling::Handled;
         }
-        state.retry.poisoned_at = Some(Instant::now());
+        state.retry.poisoned_at = Some(crate::state::RecoveredInstant::fresh_now());
         // I-209: which builder produced the permanent failure is carried
         // by the appended `permanent` row (the fold's diagnostics-only
         // `failed_builders` insert), so the refreshed view and the

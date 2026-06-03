@@ -149,6 +149,21 @@ pub struct DagActorPlumbing {
     /// exercise that fallback in isolation, without closing the pool.
     #[cfg(test)]
     pub fail_next_floor_read: bool,
+    /// Fail the next job-view load inside `recover_from_pg()` — after
+    /// the DAG and builds loaded — exercising the merged_bug_246
+    /// required-load arm (recovery fails, the term serves degraded
+    /// with an Unavailable view).
+    #[cfg(test)]
+    pub fail_next_job_view_load: bool,
+    /// Start the actor with a HYDRATED (empty) job view, simulating a
+    /// term whose recovery already ran over an empty database — the
+    /// shape every direct-setup test assumes (production actors only
+    /// serve after LeaderAcquired → recovery, which hydrates for
+    /// real). Tests that drive real recovery are unaffected:
+    /// `clear_persisted_state` at recovery start resets to Unavailable
+    /// either way. Default `true`.
+    #[cfg(test)]
+    pub start_hydrated_job_view: bool,
 }
 
 impl Default for DagActorPlumbing {
@@ -169,6 +184,10 @@ impl Default for DagActorPlumbing {
             fail_next_recovery_load: false,
             #[cfg(test)]
             fail_next_floor_read: false,
+            #[cfg(test)]
+            fail_next_job_view_load: false,
+            #[cfg(test)]
+            start_hydrated_job_view: true,
         }
     }
 }

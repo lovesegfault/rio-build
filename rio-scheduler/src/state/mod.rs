@@ -20,6 +20,7 @@ mod db_str;
 mod derivation;
 mod executor;
 mod newtypes;
+mod recovered_instant;
 
 pub(crate) use db_str::db_str_enum;
 
@@ -27,6 +28,7 @@ pub use build::*;
 pub use derivation::*;
 pub use executor::*;
 pub use newtypes::{DrvHash, ExecutorId};
+pub use recovered_instant::RecoveredInstant;
 
 db_str_enum! {
     /// Priority class for scheduling.

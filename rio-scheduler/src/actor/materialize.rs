@@ -62,9 +62,12 @@ pub(crate) struct JobViewEntry {
     /// When the job's MOST RECENT park began (re-park overwrites — the
     /// dwell clock restarts). Mirror of the durable `park_began_at`
     /// (migration 083): set at park time, restored failover-exact by
-    /// the recovery rebuild. `None` = never parked (or parked pre-083
-    /// — the dwell gate treats it as unmet, conservatively).
-    pub parked_at: Option<std::time::Instant>,
+    /// the recovery rebuild as a [`crate::state::RecoveredInstant`] —
+    /// the recovered dwell keeps its true age on a freshly booted
+    /// leader instead of silently restarting (merged_bug_300). `None`
+    /// = never parked (or parked pre-083 — the dwell gate treats it as
+    /// unmet, conservatively).
+    pub parked_at: Option<crate::state::RecoveredInstant>,
 }
 
 /// `#[must_use]` actor-side disposition of a fenced durable write —
@@ -98,6 +101,126 @@ impl WriteDisposition {
     }
 }
 
+/// Fail-closed availability wrapper around the job view
+/// (merged_bug_246). The view is either **Hydrated** — rebuilt from the
+/// durable rows by recovery, the only constructor of trust — or
+/// **Unavailable** — boot, post-wipe, or a term whose recovery failed.
+///
+/// `Unavailable` is NOT "no jobs": a populated DAG over an absent view
+/// is exactly the 246 hole (mat claims answered `Gone`, the store
+/// skips, the armed action strands; build pulls fall into the
+/// `None→DeliverNew` kernel cell and race the job). Every consumer
+/// reads through a per-question accessor whose Unavailable answer is
+/// the conservative one:
+/// pulls → `Pending{parked:true}` (every kind maps to NotYetReady,
+/// token/fence checks still dominate); spawn exclusion → exclude;
+/// KEDA backlog → 0; ticks → skip; creation feeds → dropped (the
+/// durable row is the authority; the backstop sweep re-feeds once
+/// Hydrated).
+///
+/// Transitions: [`Self::rebuild`] (recovery Ok) is the ONLY path to
+/// `Hydrated` — a clear path that produced `Hydrated(empty)` over a
+/// repopulated DAG would recreate the hole, so [`Self::wipe`] and the
+/// default both land on `Unavailable`.
+#[derive(Debug, Default)]
+pub(crate) enum JobViewState {
+    /// No trustworthy view exists this term. Fail closed.
+    #[default]
+    Unavailable,
+    /// Rebuilt from PG by recovery; live-maintained by the creation
+    /// and consumption paths.
+    Hydrated(JobView),
+}
+
+impl JobViewState {
+    /// The hydrated view, if any. Consumers that read entry state for
+    /// settled-write companions use this directly (their writes are
+    /// fence-gated; a `None` here simply skips the in-memory mirror).
+    pub(super) fn hydrated(&self) -> Option<&JobView> {
+        match self {
+            Self::Unavailable => None,
+            Self::Hydrated(v) => Some(v),
+        }
+    }
+
+    pub(super) fn hydrated_mut(&mut self) -> Option<&mut JobView> {
+        match self {
+            Self::Unavailable => None,
+            Self::Hydrated(v) => Some(v),
+        }
+    }
+
+    /// Per-entry read through the availability gate (`None` both for
+    /// "no entry" and "no view" — callers needing to distinguish use
+    /// [`Self::hydrated`]).
+    pub(super) fn get<Q>(&self, k: &Q) -> Option<&JobViewEntry>
+    where
+        DrvHash: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        self.hydrated().and_then(|v| v.get(k))
+    }
+
+    pub(super) fn get_mut<Q>(&mut self, k: &Q) -> Option<&mut JobViewEntry>
+    where
+        DrvHash: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        self.hydrated_mut().and_then(|v| v.get_mut(k))
+    }
+
+    /// Iterate the hydrated entries; empty when Unavailable (the
+    /// "ticks → skip" posture: periodic arms do nothing rather than
+    /// acting on an absent cache).
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&DrvHash, &JobViewEntry)> {
+        self.hydrated().into_iter().flat_map(|v| v.iter())
+    }
+
+    /// Hydrated keys; empty when Unavailable (ticks → skip).
+    pub(super) fn keys(&self) -> impl Iterator<Item = &DrvHash> {
+        self.hydrated().into_iter().flat_map(|v| v.keys())
+    }
+
+    /// Settled-gated removal; `false` when Unavailable (nothing to
+    /// remove — the durable row is the authority).
+    pub(super) fn remove_settled<Q>(&mut self, k: &Q, d: WriteDisposition) -> bool
+    where
+        DrvHash: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        match self.hydrated_mut() {
+            Some(v) => v.remove_settled(k, d),
+            None => false,
+        }
+    }
+
+    /// LeaderLost / pre-recovery clear: the cache is gone AND so is the
+    /// trust — never `Hydrated(empty)` (merged_bug_246).
+    pub(super) fn wipe(&mut self) {
+        *self = Self::Unavailable;
+    }
+
+    /// Recovery: the only `Hydrated` constructor.
+    pub(super) fn rebuild(&mut self, entries: impl IntoIterator<Item = (DrvHash, JobViewEntry)>) {
+        let mut v = JobView::default();
+        v.rebuild(entries);
+        *self = Self::Hydrated(v);
+    }
+
+    /// Test seeding: hydrate-if-needed then insert (tests model a
+    /// healthy post-recovery leader).
+    #[cfg(test)]
+    pub(super) fn insert(&mut self, k: DrvHash, v: JobViewEntry) -> Option<JobViewEntry> {
+        if matches!(self, Self::Unavailable) {
+            *self = Self::Hydrated(JobView::default());
+        }
+        match self {
+            Self::Hydrated(view) => view.insert(k, v),
+            Self::Unavailable => unreachable!(),
+        }
+    }
+}
+
 // r[impl sched.materialize.view-settlement]
 /// The in-memory materialization job view (a droppable cache of the
 /// durable job table). The wrapper makes the removal discipline
@@ -106,7 +229,8 @@ impl WriteDisposition {
 /// unconditional `.remove()` no longer typechecks. Whole-view
 /// transitions are [`JobView::wipe`] (LeaderLost — the cache drops
 /// with the tenure) and [`JobView::rebuild`] (recovery — re-read from
-/// the durable authority).
+/// the durable authority). Availability (hydrated vs absent) is the
+/// enclosing [`JobViewState`]'s concern.
 #[derive(Debug, Default)]
 pub(crate) struct JobView(std::collections::HashMap<DrvHash, JobViewEntry>);
 
@@ -143,21 +267,16 @@ impl JobView {
         self.0.iter()
     }
 
-    /// LeaderLost: the whole cache drops with the tenure.
-    pub(super) fn wipe(&mut self) {
-        self.0.clear();
-    }
-
     /// Recovery: rebuild the cache from the durable rows.
     pub(super) fn rebuild(&mut self, entries: impl IntoIterator<Item = (DrvHash, JobViewEntry)>) {
         self.0.clear();
         self.0.extend(entries);
     }
 
-    /// Direct insertion (test seeding). Additive only — the removal
-    /// discipline is untouched.
+    /// Direct insertion (test seeding via [`JobViewState::insert`]).
+    /// Additive only — the removal discipline is untouched.
     #[cfg(test)]
-    pub(super) fn insert(&mut self, k: DrvHash, v: JobViewEntry) -> Option<JobViewEntry> {
+    fn insert(&mut self, k: DrvHash, v: JobViewEntry) -> Option<JobViewEntry> {
         self.0.insert(k, v)
     }
 
@@ -295,35 +414,24 @@ impl DagActor {
                 created,
                 upgraded,
             }) => {
-                // entry().or_insert(): the dedup arm (created == false)
-                // re-encounters jobs the view may already track — the
-                // dispatch probe re-probing a PARKED node every tick,
-                // or the post-recovery probe pass running over the
-                // T-4.3 rebuilt view — and must NOT reset their
-                // armament state (park backoff, claim holder) to a
-                // fresh unparked/unclaimed entry. A genuinely new job
-                // (created == true) cannot have a view entry (the
-                // partial-unique index guarantees no unresolved job
-                // existed), so or_insert inserts it.
-                let entry = self.materialization_jobs.entry_or_insert(
-                    drv_hash.clone(),
-                    JobViewEntry {
-                        job_id,
-                        parked_until: None,
-                        claimed_by: None,
-                        carried_realized_paths: None,
-                        parked_at: None,
-                    },
-                );
-                // Mirror the durable set-if-null carrier semantics on
-                // the view copy (display only).
-                if entry.carried_realized_paths.is_none()
-                    && carried_realized_paths
-                        .as_ref()
-                        .is_some_and(|c| !c.is_empty())
-                {
-                    entry.carried_realized_paths = carried_realized_paths;
-                }
+                // The view feed (merged_bug_246's re-feed half): a
+                // genuinely new job (created == true) cannot have a
+                // view entry (the partial-unique index guarantees no
+                // unresolved job existed) — insert the fresh entry. The
+                // dedup arm (created == false) re-encounters jobs the
+                // view may already track — the dispatch probe
+                // re-probing a PARKED node every tick, the
+                // post-recovery probe pass — and must NOT reset their
+                // armament state. When the dedup finds a row the view
+                // does NOT track (the unhydrated-entry case), the entry
+                // is REHYDRATED FROM PG — never fabricated as
+                // unparked/unclaimed: a fabricated entry would let a
+                // second claim race the durable holder or deliver a
+                // parked job early. On a load failure the entry stays
+                // absent and the BACKSTOP SWEEP is the level-triggered
+                // repair (tick_backstop_materialization_jobs).
+                self.feed_job_view_entry(drv_hash, job_id, created, carried_realized_paths.clone())
+                    .await;
                 if created {
                     metrics::counter!(
                         "rio_scheduler_materialization_jobs_created_total",
@@ -428,6 +536,104 @@ impl DagActor {
     /// Post-commit feed of the in-memory job view from the merge
     /// transaction's created-jobs list. Called only AFTER the merge tx
     /// committed (never inside it — a rolled-back merge must leave no
+    /// Convert a durable pending-job row into its view entry (the
+    /// recovery rebuild's per-row shape, shared by the dedup re-feed
+    /// and the backstop sweep).
+    fn entry_from_recovered_row(row: crate::db::open_attempts::RecoveredJobRow) -> JobViewEntry {
+        JobViewEntry {
+            job_id: row.job_id,
+            parked_until: row
+                .park_remaining_secs
+                .filter(|secs| *secs > 0.0)
+                .map(|secs| std::time::Instant::now() + std::time::Duration::from_secs_f64(secs)),
+            claimed_by: row.claimed_by.map(crate::state::ExecutorId::from),
+            carried_realized_paths: row.carried_realized_paths,
+            parked_at: row
+                .park_began_secs_ago
+                .filter(|secs| *secs >= 0.0)
+                .map(crate::state::RecoveredInstant::from_age_secs),
+        }
+    }
+
+    /// The single view-feed discipline for every creation path
+    /// (merged_bug_246): fresh rows insert fresh entries; dedup'd rows
+    /// the view already tracks keep their armament state; dedup'd rows
+    /// the view does NOT track are rehydrated from PG — never
+    /// fabricated as unparked/unclaimed (a fabricated entry would race
+    /// the durable holder or early-deliver a parked job). Under an
+    /// Unavailable view the feed is dropped: the durable row is the
+    /// authority and the next recovery hydrates it.
+    async fn feed_job_view_entry(
+        &mut self,
+        drv_hash: &DrvHash,
+        job_id: Uuid,
+        created: bool,
+        carried_realized_paths: Option<Vec<String>>,
+    ) {
+        if self.materialization_jobs.hydrated().is_none() {
+            debug!(
+                drv_hash = %drv_hash, %job_id,
+                "job view unavailable: creation feed dropped (durable row is authoritative;                  the next recovery hydrates)"
+            );
+            return;
+        }
+        let have_entry = self.materialization_jobs.get(drv_hash).is_some();
+        if created {
+            // A genuinely new job cannot have a view entry (the
+            // partial-unique index); insert the fresh shape.
+            if let Some(view) = self.materialization_jobs.hydrated_mut() {
+                view.entry_or_insert(
+                    drv_hash.clone(),
+                    JobViewEntry {
+                        job_id,
+                        parked_until: None,
+                        claimed_by: None,
+                        carried_realized_paths: None,
+                        parked_at: None,
+                    },
+                );
+            }
+        } else if !have_entry {
+            // Dedup'd row, untracked entry: rehydrate from PG.
+            let db_id = self.dag.node(drv_hash.as_str()).and_then(|s| s.db_id);
+            match db_id {
+                Some(db_id) => match self.db.load_unresolved_job_row(db_id).await {
+                    Ok(Some(row)) => {
+                        let entry = Self::entry_from_recovered_row(row);
+                        if let Some(view) = self.materialization_jobs.hydrated_mut() {
+                            view.entry_or_insert(drv_hash.clone(), entry);
+                        }
+                    }
+                    Ok(None) => {
+                        // Resolved between the dedup and this read —
+                        // nothing unresolved to track.
+                    }
+                    Err(e) => {
+                        warn!(
+                            drv_hash = %drv_hash, %job_id, error = %e,
+                            "dedup re-feed load failed; entry stays absent                              (backstop sweep re-feeds)"
+                        );
+                    }
+                },
+                None => {
+                    debug!(drv_hash = %drv_hash, %job_id,
+                           "dedup re-feed skipped: node has no db_id yet");
+                }
+            }
+        }
+        // Mirror the durable set-if-null carrier semantics on the view
+        // copy (display only) — applies to fresh, kept, and rehydrated
+        // entries alike.
+        if let Some(entry) = self.materialization_jobs.get_mut(drv_hash)
+            && entry.carried_realized_paths.is_none()
+            && carried_realized_paths
+                .as_ref()
+                .is_some_and(|c| !c.is_empty())
+        {
+            entry.carried_realized_paths = carried_realized_paths;
+        }
+    }
+
     /// view entry), in the same post-commit phase that seeds states.
     ///
     /// `entry().or_insert()` (DQ-1 armament preservation, T-D2.1): the
@@ -439,21 +645,17 @@ impl DagActor {
     /// job (`created == true`) cannot have a view entry (the
     /// partial-unique index guarantees no unresolved job existed), so
     /// or_insert inserts it.
-    pub(super) fn note_created_materialization_jobs(&mut self, created: &[CreatedJob]) {
+    pub(super) async fn note_created_materialization_jobs(&mut self, created: &[CreatedJob]) {
         for job in created {
-            self.materialization_jobs.entry_or_insert(
-                job.drv_hash.clone(),
-                JobViewEntry {
-                    job_id: job.job_id,
-                    parked_until: None,
-                    claimed_by: None,
-                    // The merge in-tx creation lanes never carry
-                    // realized paths (only the stale_reset post-tx
-                    // site does); recovery rebuilds from the column.
-                    carried_realized_paths: None,
-                    parked_at: None,
-                },
-            );
+            // Same feed discipline as the probe-partition helper
+            // (merged_bug_246): fresh insert for created rows, PG
+            // rehydration for dedup'd rows the view does not track —
+            // never a fabricated unparked/unclaimed default. (The
+            // merge in-tx creation lanes never carry realized paths —
+            // only the stale_reset post-tx site does; recovery and the
+            // rehydration read the column.)
+            self.feed_job_view_entry(&job.drv_hash, job.job_id, job.created, None)
+                .await;
             if job.created {
                 metrics::counter!(
                     "rio_scheduler_materialization_jobs_created_total",
@@ -502,7 +704,19 @@ impl DagActor {
         pulling_identity: &ExecutorId,
     ) -> rio_evidence_kernel::pull::JobView {
         use rio_evidence_kernel::pull::JobView;
-        match self.materialization_jobs.get(drv_hash) {
+        let Some(view) = self.materialization_jobs.hydrated() else {
+            // Fail-closed projection (merged_bug_246): an Unavailable
+            // view must never answer `None` — a build pull would fall
+            // into the kernel's None→DeliverNew cell and race a job we
+            // cannot see, and a materialization claim would get `Gone`
+            // (the store treats Gone as resolved and never claims
+            // again — the stranded-armed-action class).
+            // `Pending { parked: true }` maps EVERY kind to
+            // NotYetReady while keeping the kernel's token/fence
+            // rejections dominant (check order is load-bearing).
+            return JobView::Pending { parked: true };
+        };
+        match view.get(drv_hash) {
             None => JobView::None,
             Some(entry) => match &entry.claimed_by {
                 Some(holder) => JobView::Claimed {
@@ -599,9 +813,36 @@ impl DagActor {
     /// Reads only the in-memory view (a droppable cache of the durable
     /// job table, rebuilt at recovery).
     pub(super) fn has_pending_unclaimed_job(&self, drv_hash: &str) -> bool {
+        match self.materialization_jobs.hydrated() {
+            // Fail closed (merged_bug_246): with no trustworthy view,
+            // assume store-side work MAY exist — the exclusion
+            // consumers (spawn-intent filter, queued-bucket
+            // disjointness) must not spawn builders for nodes whose
+            // jobs we cannot see. Heals at the next successful
+            // recovery.
+            None => true,
+            Some(view) => view
+                .get(drv_hash)
+                .is_some_and(|entry| entry.claimed_by.is_none()),
+        }
+    }
+
+    /// Whether the node carries a job the store could claim RIGHT NOW
+    /// (unclaimed AND not parked) — the KEDA "substituting backlog"
+    /// question (bug_252): parked jobs are pacing, not claimable
+    /// demand, so they must not hold store replicas up; they stay
+    /// visible via `rio_scheduler_materialization_stalled` and the
+    /// parked-inclusive exclusion predicate above.
+    ///
+    /// Unavailable view → `false` (an honest zero: the gauge advertises
+    /// claimable work to autoscalers; advertising unverifiable work
+    /// would scale the store against a view we don't have).
+    pub(super) fn has_claimable_job(&self, drv_hash: &str, now: std::time::Instant) -> bool {
         self.materialization_jobs
             .get(drv_hash)
-            .is_some_and(|entry| entry.claimed_by.is_none())
+            .is_some_and(|entry| {
+                entry.claimed_by.is_none() && entry.parked_until.is_none_or(|until| until <= now)
+            })
     }
 
     /// Whether ANY unresolved job exists for the node (pending,
@@ -611,7 +852,15 @@ impl DagActor {
     /// sub-state, because every job state has its own armed action
     /// (the §3.3 settlement totality).
     pub(super) fn has_unresolved_job(&self, drv_hash: &str) -> bool {
-        self.materialization_jobs.contains_key(drv_hash)
+        match self.materialization_jobs.hydrated() {
+            // Fail closed: treat the node as armed-elsewhere so the
+            // reap-survivor settlement does not run destructive
+            // promotion/fail-fast against jobs we cannot see
+            // (merged_bug_246; the backstop sweep + next recovery are
+            // the level-triggered repair).
+            None => true,
+            Some(view) => view.contains_key(drv_hash),
+        }
     }
 
     // r[impl sched.materialize.job+2]
@@ -631,32 +880,16 @@ impl DagActor {
         &mut self,
         rows: Vec<crate::db::open_attempts::RecoveredJobRow>,
     ) {
-        let entries =
-            rows.into_iter().map(|row| {
-                (
-                    DrvHash::from(row.drv_hash.as_str()),
-                    JobViewEntry {
-                        job_id: row.job_id,
-                        parked_until: row.park_remaining_secs.filter(|secs| *secs > 0.0).map(
-                            |secs| {
-                                std::time::Instant::now() + std::time::Duration::from_secs_f64(secs)
-                            },
-                        ),
-                        claimed_by: row.claimed_by.map(ExecutorId::from),
-                        carried_realized_paths: row.carried_realized_paths,
-                        // Failover-exact dwell (migration 083): the durable
-                        // park-begin anchor, replayed as "that many seconds
-                        // ago" on the recovered leader's clock.
-                        parked_at: row.park_began_secs_ago.filter(|secs| *secs >= 0.0).map(
-                            |secs| {
-                                std::time::Instant::now()
-                                    .checked_sub(std::time::Duration::from_secs_f64(secs))
-                                    .unwrap_or_else(std::time::Instant::now)
-                            },
-                        ),
-                    },
-                )
-            });
+        // Per-row conversion shared with the dedup re-feed and the
+        // backstop sweep; the dwell anchor rides as RecoveredInstant
+        // age-data — exact even when the park pre-dates this leader's
+        // boot (merged_bug_300: no silent dwell restart).
+        let entries = rows.into_iter().map(|row| {
+            (
+                DrvHash::from(row.drv_hash.as_str()),
+                Self::entry_from_recovered_row(row),
+            )
+        });
         self.materialization_jobs.rebuild(entries);
     }
 }
@@ -1563,7 +1796,7 @@ impl DagActor {
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs));
             // The dwell clock (migration 083 mirror): this park is the
             // most recent — re-park restarts the clock by design.
-            entry.parked_at = Some(std::time::Instant::now());
+            entry.parked_at = Some(crate::state::RecoveredInstant::fresh_now());
         }
         // The park's requeue companion (merged_bug_015's park half):
         // the node leaves the mint's Assigned/Running bookkeeping
@@ -1778,9 +2011,7 @@ impl DagActor {
                     .materialization_jobs
                     .get(&drv_hash)
                     .and_then(|e| e.parked_at)
-                    .is_some_and(|began| {
-                        now.saturating_duration_since(began).as_secs() >= dwell_secs
-                    });
+                    .is_some_and(|began| began.elapsed().as_secs() >= dwell_secs);
                 if !dwell_met {
                     debug!(
                         drv_hash = %drv_hash, %job_id, dwell_secs,
@@ -1859,6 +2090,49 @@ impl DagActor {
         }
         // The stalled gauge: ground truth after the re-evaluation pass.
         metrics::gauge!("rio_scheduler_materialization_stalled").set(still_parked as f64);
+    }
+
+    /// The PG-backed view backstop (merged_bug_246's sweep half +
+    /// bug_385's scheduler leg): low-frequency reconciliation of the
+    /// in-memory view against the durable pending rows. Rows the view
+    /// does not track are RE-FED from PG (a live node's job becomes
+    /// claimable again instead of answering Gone-by-absence; a moot
+    /// row — node terminal/absent — gains the entry the zero-interest
+    /// canceler needs and is closed charge-free on the same tick,
+    /// converging the refusal-producing rows). Skips when Unavailable
+    /// (ticks → skip; the next recovery hydrates wholesale).
+    pub(super) async fn tick_backstop_materialization_jobs(&mut self) {
+        const BACKSTOP_EVERY: u64 = 30;
+        if !self.tick_count.is_multiple_of(BACKSTOP_EVERY) {
+            return;
+        }
+        if self.materialization_jobs.hydrated().is_none() {
+            return;
+        }
+        let rows = match self.db.load_unresolved_materialization_jobs().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(error = %e, "materialization view backstop load failed; retried next pass");
+                return;
+            }
+        };
+        let mut refed = 0usize;
+        for row in rows {
+            let drv_hash = DrvHash::from(row.drv_hash.as_str());
+            if self.materialization_jobs.get(&drv_hash).is_none() {
+                let entry = Self::entry_from_recovered_row(row);
+                if let Some(view) = self.materialization_jobs.hydrated_mut() {
+                    view.entry_or_insert(drv_hash, entry);
+                    refed += 1;
+                }
+            }
+        }
+        if refed > 0 {
+            tracing::info!(
+                refed,
+                "materialization view backstop re-fed untracked pending rows from PG                  (moot rows are closed by the zero-interest pass this tick)"
+            );
+        }
     }
 
     /// The flag-gated housekeeping backstop: cancel jobs for

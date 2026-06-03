@@ -12,15 +12,24 @@ use crate::state::{DerivationStatus, ExecutorId};
 
 use super::{DagActor, DebugCmd, DebugDerivationInfo};
 
-/// Backdate an Instant by `secs_ago` seconds. `checked_sub` is used
-/// defensively: if `secs_ago` is absurd (e.g. `u64::MAX`) and
-/// `Instant::now()` can't represent that far back, clamp to "now"
-/// (effectively 0 elapsed). Tokio paused time can't mock `Instant`
-/// — this is why the DebugBackdate* handlers exist at all.
+/// Backdate an Instant by `secs_ago` seconds. Tokio paused time can't
+/// mock `Instant` — this is why the DebugBackdate* handlers exist at
+/// all. Saturates toward the earliest representable instant by halving
+/// when `secs_ago` is absurd (e.g. `u64::MAX`) instead of silently
+/// answering "now" (the no-preboot-instant policy bans the
+/// `unwrap_or(now)` re-anchor idiom; recovery anchors use
+/// [`crate::state::RecoveredInstant`], which represents pre-boot
+/// moments exactly).
 pub(super) fn backdate(secs_ago: u64) -> Instant {
-    Instant::now()
-        .checked_sub(std::time::Duration::from_secs(secs_ago))
-        .unwrap_or_else(Instant::now)
+    let now = Instant::now();
+    let mut d = std::time::Duration::from_secs(secs_ago);
+    while !d.is_zero() {
+        if let Some(t) = now.checked_sub(d) {
+            return t;
+        }
+        d /= 2;
+    }
+    now
 }
 
 impl DagActor {
@@ -224,7 +233,7 @@ impl DagActor {
         let Some(build) = self.builds.get_mut(&build_id) else {
             return false;
         };
-        build.submitted_at = backdate(secs_ago);
+        build.submitted_at = crate::state::RecoveredInstant::backdated(secs_ago);
         true
     }
 
@@ -240,7 +249,7 @@ impl DagActor {
         };
         state.set_status_for_test(DerivationStatus::Poisoned);
         state.retry.resubmit_cycles = resubmit_cycles;
-        state.retry.poisoned_at = Some(std::time::Instant::now());
+        state.retry.poisoned_at = Some(crate::state::RecoveredInstant::fresh_now());
         true
     }
 

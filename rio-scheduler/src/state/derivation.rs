@@ -536,7 +536,7 @@ pub struct RetryState {
     /// `RetryPolicy::infra_retry_window_secs`, `infra_count` resets to
     /// 0 before the cap check — sparse failures over a long build
     /// don't accumulate toward poison.
-    pub last_infra_failure_at: Option<Instant>,
+    pub last_infra_failure_at: Option<crate::state::RecoveredInstant>,
     /// Number of `exempt_from_cap` infra-retry attempts so far
     /// (I-127's CONCURRENT_PUTPATH + D4's `floor_outcome.promoted`).
     /// Increments even when `infra_count` does not — the high-water
@@ -559,7 +559,11 @@ pub struct RetryState {
     /// InfrastructureFailure does NOT increment this (T1's split).
     pub failure_count: u32,
     /// When the derivation entered the poisoned state (for TTL expiry).
-    pub poisoned_at: Option<Instant>,
+    /// [`crate::state::RecoveredInstant`]: a recovered poison keeps its
+    /// PG-computed age — no silent TTL extension on a freshly booted
+    /// node (merged_bug_300; the recovery-time wall-clock expiry
+    /// pre-filter stays as the first line of defense).
+    pub poisoned_at: Option<crate::state::RecoveredInstant>,
     /// Earliest time this derivation may be dispatched. Set by
     /// handle_transient_failure to implement the retry backoff —
     /// the derivation is Ready and in the queue, but dispatch_ready
@@ -1429,24 +1433,14 @@ impl DerivationState {
     ) -> Result<Self, (String, rio_nix::store_path::StorePathError)> {
         let drv_path = rio_nix::store_path::StorePath::parse(&row.drv_path)
             .map_err(|e| (row.drv_hash.clone(), e))?;
-        let now = Instant::now();
-        // Convert PG-computed elapsed seconds back to an Instant.
-        // Clamp: negative/NaN → 0 (conservative full TTL), +inf → 1yr
-        // (poisoned_at = -infinity::timestamp would make from_secs_f64
-        // panic). Follows the `.max(0.0).min(MAX)` pattern from
-        // `state/executor.rs`.
-        //
-        // Note: recovery.rs filters out rows with elapsed_secs >
-        // POISON_TTL before calling this, so the checked_sub(elapsed)
-        // → None → unwrap_or(now) path only fires for still-valid
-        // poison on a recently-booted node — in which case treating
-        // poisoned_at as "now" is a conservative approximation (slight
-        // TTL extension from recovery time, bounded by node uptime).
-        const MAX_ELAPSED_SECS: f64 = 365.0 * 86400.0;
-        #[allow(clippy::manual_clamp)]
-        let clamped = row.elapsed_secs.max(0.0).min(MAX_ELAPSED_SECS);
-        let elapsed = std::time::Duration::from_secs_f64(clamped);
-        let poisoned_at = now.checked_sub(elapsed).unwrap_or(now);
+        // PG-computed elapsed seconds, carried as data: a still-valid
+        // poison on a recently-booted node keeps its TRUE age (no
+        // silent TTL extension — the merged_bug_300 class). The
+        // negative/NaN→0 and +inf→1yr clamps live inside
+        // `RecoveredInstant::from_age_secs` (the -infinity::timestamp
+        // panic guard; recovery.rs still wall-clock-filters expired
+        // rows before calling here).
+        let poisoned_at = crate::state::RecoveredInstant::from_age_secs(row.elapsed_secs);
         // §13e+r35: recovered Poisoned has no persisted features
         // (`required_features = []`). FOD ⟹ `[fetcher]` still derives
         // correctly; non-FOD ⟹ `[]`.
@@ -1909,16 +1903,12 @@ impl DerivationState {
     ) {
         let decision = crate::retry_policy::decide(&self.attempt_history, budget, now_epoch_secs);
         let c = decision.counters;
-        let now = Instant::now();
-        // Epoch-seconds → Instant conversions. Past timestamps clamp at
-        // the process epoch when the node booted more recently than the
-        // event (Instant cannot represent times before boot): the
-        // clamped anchor reads as "just now", which errs on the strict
-        // side (the 300 s window has not elapsed) and self-corrects at
-        // the next counted event.
-        let to_past_instant = |t: crate::retry_policy::AbsTime| -> Instant {
-            now.checked_sub(Duration::from_secs(now_epoch_secs.saturating_sub(t)))
-                .unwrap_or(now)
+        // Epoch-seconds → RecoveredInstant: the event's age is carried
+        // as data, exact even when the node booted more recently than
+        // the event (no process-epoch clamp, no silent "just now"
+        // re-anchor — merged_bug_300).
+        let to_past_instant = |t: crate::retry_policy::AbsTime| -> crate::state::RecoveredInstant {
+            crate::state::RecoveredInstant::from_age_secs(now_epoch_secs.saturating_sub(t) as f64)
         };
         self.retry = RetryState {
             count: c.count,
@@ -1931,10 +1921,18 @@ impl DerivationState {
             failure_count: c.failure_count,
             poisoned_at: self.retry.poisoned_at,
             backoff_until: c.backoff_until.map(|t| {
+                let now = Instant::now();
                 if t > now_epoch_secs {
                     now + Duration::from_secs(t - now_epoch_secs)
                 } else {
-                    to_past_instant(t)
+                    // Already expired: any past anchor is behaviorally
+                    // identical (the dispatch gate compares
+                    // `Instant::now() < backoff_until`); `now` is the
+                    // closest representable expired deadline — no
+                    // pre-boot arithmetic, no re-anchor semantics to
+                    // invert (the deadline is a future-facing gate,
+                    // not an age).
+                    now
                 }
             }),
         };
@@ -3009,10 +3007,10 @@ mod tests {
             is_fixed_output: false,
         };
         let state = DerivationState::from_poisoned_row(row).unwrap();
-        // Clamp caps at 1yr, checked_sub(1yr) on most boxes → None →
-        // poisoned_at = now. This is a panic guard, not correctness
-        // — recovery.rs filters expired rows before calling here so
-        // a +inf elapsed would never reach this in practice.
+        // Clamp caps at 1yr inside RecoveredInstant::from_age_secs.
+        // This is a panic guard, not correctness — recovery.rs filters
+        // expired rows before calling here so a +inf elapsed would
+        // never reach this in practice.
         assert!(state.retry.poisoned_at.is_some());
     }
 

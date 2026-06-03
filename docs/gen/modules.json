@@ -1272,6 +1272,11 @@
       "path": "state/newtypes.rs",
       "depth": 1,
       "doc": "Scheduler identifier newtypes: [`DrvHash`] and [`ExecutorId`]."
+    },
+    {
+      "path": "state/recovered_instant.rs",
+      "depth": 1,
+      "doc": "[`RecoveredInstant`] — a monotonic anchor that survives failover"
     }
   ],
   "rio-store": [

@@ -92,10 +92,14 @@ spec:
     # Substitution backlog (leading, class 1). AverageValue: KEDA
     # divides the fleet-wide backlog by the current replica count, so
     # desiredReplicas = ceil(sum(backlog) / targetBacklogJobsPerReplica).
-    # The gauge counts derivations with unresolved unclaimed
-    # materialization jobs — durable PG-backed state published by the
-    # scheduler leader each tick (sum() collapses the leader-gated
+    # The gauge counts derivations with CLAIMABLE materialization jobs
+    # (unclaimed AND not parked) — durable PG-backed state published by
+    # the scheduler leader each tick (sum() collapses the leader-gated
     # single series; a deposed leader's series is zeroed, not stale).
+    # Parked jobs leave the gauge (bug_252: a parked backlog must DRAIN
+    # store replicas, not hold them — the park is pacing, and the store
+    # cannot make a parked job progress); the parked population stays
+    # visible via rio_scheduler_materialization_stalled.
     # Both prometheus triggers render through rio.promTrigger, which
     # unit-checks metric vs knob against files/metric-units.json and
     # fails the render on mismatch (bug_299).

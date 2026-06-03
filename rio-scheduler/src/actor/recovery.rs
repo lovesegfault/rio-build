@@ -186,27 +186,34 @@ impl DagActor {
 
         // r[impl sched.materialize.job+2]
         // Substitution-replacement Phase B (T-4.3): rebuild the
-        // in-memory materialization job view from PG. Flag-gated:
-        // Without the rebuild, the failed-over leader
-        // answers `Gone` to every materialization claim until a
-        // dispatch-probe tick lazily re-feeds the view (the F10/L1
-        // stranded-armed-action class); claim holders and park
-        // expiries would be lost entirely.
+        // in-memory materialization job view from PG — REQUIRED, like
+        // load_dag_from_rows above (merged_bug_246). A warn-and-
+        // continue arm here would serve a populated DAG over an
+        // Unavailable-or-empty view: mat claims answered Gone (the
+        // store skips forever), build pulls racing unseen jobs, parked
+        // state lost. BEHAVIORAL DELTA (recorded): there is NO
+        // within-term recovery retry — the caller's Err arm logs,
+        // clears state, and serves the term degraded; only the next
+        // LeaderAcquired re-runs recovery. A transient failure of this
+        // one query (after the DAG and builds loaded) now empties the
+        // DAG for the term where it previously cost a lazily-re-fed
+        // view — the deliberate fail-closed trade: that term answers
+        // conservatively everywhere instead of fabricating an
+        // unparked/unclaimed world. Surfaced by
+        // recovery_total{outcome=failure} + the error log.
         {
-            match self.db.load_unresolved_materialization_jobs().await {
-                Ok(rows) => {
-                    let jobs = rows.len();
-                    self.rebuild_materialization_job_view(rows);
-                    if jobs > 0 {
-                        info!(jobs, "rebuilt materialization job view from PG (recovery)");
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e,
-                          "failed to rebuild the materialization job view (the dispatch \
-                           probe's create-job dedup re-feeds it lazily; claims answer \
-                           NotYetReady/Gone until then)");
-                }
+            // Test-only: deterministic job-view-load failure (the DAG
+            // and builds loaded above stay loaded — the point is the
+            // REQUIRED-load contract, not a pool outage).
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_next_job_view_load) {
+                return Err(ActorError::Database(sqlx::Error::PoolClosed));
+            }
+            let rows = self.db.load_unresolved_materialization_jobs().await?;
+            let jobs = rows.len();
+            self.rebuild_materialization_job_view(rows);
+            if jobs > 0 {
+                info!(jobs, "rebuilt materialization job view from PG (recovery)");
             }
 
             // T-D2.3 (PD-D5): rebuild the per-build wanted-contribution
@@ -579,13 +586,14 @@ impl DagActor {
             // and rio_scheduler_build_duration_seconds survive failover
             // (otherwise each failover grants a fresh full
             // build_timeout window, contradicting "wall-clock since
-            // submission"). PG-side elapsed → Instant reconstruction,
-            // same as PoisonedDerivationRow.
-            info.submitted_at = Instant::now()
-                .checked_sub(std::time::Duration::from_secs_f64(
-                    row.submitted_age_secs.max(0.0),
-                ))
-                .unwrap_or_else(Instant::now);
+            // submission"). RecoveredInstant carries the PG age as
+            // data — a build older than this node's uptime keeps its
+            // true age instead of silently re-anchoring to "now"
+            // (merged_bug_300; the watchdog stamps TimedOut on its
+            // first tick when the recovered age already exceeds the
+            // budget).
+            info.submitted_at =
+                crate::state::RecoveredInstant::from_age_secs(row.submitted_age_secs);
             // Transition to current state (Pending → Active if the
             // row says active). new_pending starts at Pending.
             if state == BuildState::Active

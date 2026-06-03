@@ -297,9 +297,35 @@ impl DagActor {
             serving_generation,
             generation_floor,
             pull_kind: kind,
-            // The job view: projected from the actor's in-memory job map.
+            // The job view: projected from the actor's in-memory job map
+            // (Unavailable projects Pending{parked:true} — fail-closed).
             job_view: self.materialization_job_view(&drv_hash, &pulling_identity),
         });
+
+        // merged_bug_246, the Gone half of the fail-closed posture: a
+        // term with no trustworthy job view must never tell a
+        // materialization claimant `Gone` — the store treats Gone as
+        // "job resolved, skip" and NEVER claims again, stranding any
+        // real durable job behind a degraded term. The kernel's Gone
+        // here comes from the base table's unknown/terminal-node arm
+        // (a degraded term's DAG is empty, so every status reads
+        // None); token/fence rejections passed through above it and
+        // are unaffected. Build pulls keep base semantics (an empty
+        // DAG answers Gone to builders exactly as before — the
+        // job-view hole for builds is the DeliverNew cell, closed by
+        // the parked projection).
+        let decision = if matches!(decision, PullDecision::Gone)
+            && kind == rio_evidence_kernel::pull::PullKind::Materialization
+            && self.materialization_jobs.hydrated().is_none()
+        {
+            debug!(
+                intent_id = %intent_id,
+                "materialization claim answered NotYetReady: job view unavailable                  (degraded term — never Gone for a job we cannot see)"
+            );
+            PullDecision::NotYetReady
+        } else {
+            decision
+        };
 
         match decision {
             PullDecision::RejectToken => {

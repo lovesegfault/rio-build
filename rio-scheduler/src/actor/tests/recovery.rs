@@ -3111,3 +3111,91 @@ async fn test_recovery_heals_corrupted_ready() -> TestResult {
     );
     Ok(())
 }
+
+/// merged_bug_300 (the silent re-anchor): a recovered build whose
+/// PG-computed submitted age already exceeds its `build_timeout` must
+/// be stamped TimedOut by the FIRST watchdog tick of the new term.
+///
+/// RED (pre-fix): `submitted_at` was reconstructed via
+/// `Instant::now().checked_sub(age).unwrap_or_else(Instant::now)` — on
+/// a leader whose process is younger than the build's age the fallback
+/// silently re-anchored the clock to "now", granting a fresh full
+/// build_timeout window every failover (a 30h-old build read as 0s
+/// elapsed). `RecoveredInstant` carries the age as data, so the
+/// elapsed reading is exact regardless of process uptime; this test
+/// pins the observable contract (recovered-stale ⇒ first-tick
+/// timeout), which the fallback class breaks whenever uptime < age —
+/// deterministically reproduced here by backdating PG far past the
+/// timeout.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn recovered_stale_build_times_out_on_first_tick() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Phase 1: a leader merges a build with a 60s build_timeout.
+    let build_id = Uuid::new_v4();
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        let _ev = merge_dag_req(
+            &handle,
+            MergeDagRequest {
+                build_id,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![make_node("stale-timeout-drv")],
+                edges: vec![],
+                options: BuildOptions {
+                    max_silent_time: 0,
+                    build_timeout: 60,
+                    build_cores: 0,
+                },
+                keep_going: false,
+                traceparent: String::new(),
+                jti: None,
+                jwt_token: None,
+            },
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Backdate the durable submission far past the timeout (the
+    // failover-with-old-build shape; PG owns submitted_at).
+    sqlx::query("UPDATE builds SET submitted_at = now() - interval '1 hour' WHERE build_id = $1")
+        .bind(build_id)
+        .execute(&db.pool)
+        .await?;
+
+    // Phase 2: a new leader recovers and ticks ONCE.
+    let leader = crate::lease::LeaderState::always_leader(std::sync::Arc::new(
+        std::sync::atomic::AtomicU64::new(1),
+    ));
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let phase2_leader = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = phase2_leader;
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "a recovered build already past its build_timeout fails on the first tick \
+         (RecoveredInstant keeps the 1h age; the re-anchor fallback would read ~0s); \
+         got state={} summary={:?}",
+        status.state,
+        status.error_summary
+    );
+    assert!(
+        status.error_summary.contains("build_timeout"),
+        "the failure is the per-build timeout; got {:?}",
+        status.error_summary
+    );
+    Ok(())
+}

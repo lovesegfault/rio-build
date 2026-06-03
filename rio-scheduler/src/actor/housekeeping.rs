@@ -110,11 +110,10 @@ impl DagActor {
         }
         self.maybe_refresh_estimator().await;
 
-        let now = Instant::now();
         // Ordering is load-bearing: per-build-timeout cancels whole
         // builds (permanent failure) before poison-expire removes DAG
         // nodes.
-        let expired_poisons = self.tick_scan_dag(now);
+        let expired_poisons = self.tick_scan_dag();
         self.tick_check_build_timeouts().await;
         self.tick_recheck_stuck_completions().await;
         self.tick_check_orphaned_builds().await;
@@ -132,6 +131,7 @@ impl DagActor {
         // the PD-20 parked-job arm — re-evaluate parked jobs whose
         // nodes have buildable dependency closures (resolve
         // from-source) and publish the stalled gauge from ground truth.
+        self.tick_backstop_materialization_jobs().await;
         self.tick_cancel_zero_interest_materialization().await;
         self.tick_reevaluate_parked_materialization_jobs().await;
         self.tick_retry_pending_carriers().await;
@@ -192,12 +192,12 @@ impl DagActor {
     /// the session machinery — a stuck pull-mode attempt is bounded by
     /// the Job's `activeDeadlineSeconds` and resolved by the
     /// establishment sweep ([`Self::tick_sweep_open_pull_attempts`]).
-    fn tick_scan_dag(&self, now: Instant) -> Vec<DrvHash> {
+    fn tick_scan_dag(&self) -> Vec<DrvHash> {
         let mut expired_poisons: Vec<DrvHash> = Vec::new();
         for (drv_hash, state) in self.dag.iter_nodes() {
             if state.status() == DerivationStatus::Poisoned
                 && let Some(poisoned_at) = state.retry.poisoned_at
-                && now.duration_since(poisoned_at) > POISON_TTL
+                && poisoned_at.elapsed() > POISON_TTL
             {
                 expired_poisons.push(drv_hash.into());
             }

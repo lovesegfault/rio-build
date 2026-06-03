@@ -625,6 +625,41 @@ in
   # state/derivation.rs (the enum definition) and retry_policy.rs (the
   # kernel mappings) NAME the variant without constructing rows; tests
   # may reference it freely.
+  no-preboot-instant =
+    pkgs.runCommand "rio-no-preboot-instant"
+      {
+        srcDir = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            ../rio-scheduler/src
+            ../rio-store/src
+            ../rio-builder/src
+            ../rio-gateway/src
+            ../rio-controller/src
+            ../rio-common/src
+            ../rio-lease/src
+          ];
+        };
+      }
+      ''
+        set -euo pipefail
+        # merged_bug_300: the silent clock re-anchor. Reconstructing a
+        # past Instant via checked_sub with a fallback to "now" makes a
+        # pre-boot moment read as fresh — a recovered build gets a new
+        # timeout window, a recovered park restarts its dwell, a poison
+        # extends its TTL. The sanctioned representation is
+        # rio_scheduler::state::RecoveredInstant (age carried as data;
+        # elapsed() is total). Zero allowlist.
+        hits=$(grep -rn -A2 'checked_sub' $srcDir --include='*.rs'           | grep -E 'unwrap_or(_else)?\(\s*(std::time::)?Instant::now' || true)
+        if [ -n "$hits" ]; then
+          echo "FAIL: checked_sub with an Instant::now fallback (the silent re-anchor):" >&2
+          echo "$hits" >&2
+          echo "Use rio-scheduler state::RecoveredInstant (or carry the age as data)." >&2
+          exit 1
+        fi
+        touch $out
+      '';
+
   mat-charge-chokepoint =
     pkgs.runCommand "rio-mat-charge-chokepoint"
       {
