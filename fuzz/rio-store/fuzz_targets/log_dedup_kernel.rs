@@ -92,10 +92,30 @@ fuzz_target!(|data: &[u8]| {
     let mut yields: Vec<(u64, u64)> = Vec::new();
     for &(f, n) in &chunks {
         let v = visit_chunk(cursor, f, n);
-        if !v.is_empty() {
-            yields.push((v.yield_from, v.yield_until));
+        match v {
+            rio_log_kernel::ChunkVisit::Skip { .. } => {}
+            rio_log_kernel::ChunkVisit::Serve {
+                yield_from,
+                yield_until,
+                ..
+            } => yields.push((yield_from, yield_until)),
+            rio_log_kernel::ChunkVisit::GapThenServe {
+                gap_from,
+                gap_until,
+                yield_from,
+                yield_until,
+                ..
+            } => {
+                // The gap span must be exactly the jump from the
+                // pre-visit cursor to the chunk start, and disjoint
+                // from (and abutting) the served range.
+                assert_eq!(gap_from, cursor, "gap_from != pre-visit cursor");
+                assert_eq!(gap_until, yield_from, "gap does not abut the serve");
+                assert!(gap_from < gap_until, "empty gap variant");
+                yields.push((yield_from, yield_until));
+            }
         }
-        cursor = v.next_line;
+        cursor = v.next_line();
     }
     // (i) pairwise disjoint, strictly increasing.
     for w in yields.windows(2) {

@@ -31,34 +31,84 @@
 /// What one chunk contributes to a `TailLog` read, given the dedup
 /// watermark at the time the chunk is visited.
 ///
+/// The enum is `#[must_use]` and gap-explicit: a forward jump from the
+/// watermark to the chunk's first line — the shape the old struct
+/// silently absorbed via `yield_from = max(first_line, next_line)` —
+/// is its own variant, so every consumer is compile-forced to write a
+/// gap arm and choose a disclosure (serve across a genuine storage
+/// hole, back-fill a fan-out drop, re-open at the gap, or render a gap
+/// marker). Silent gap absorption is no longer expressible.
+///
 /// The contributed line numbers are the half-open range
-/// `[yield_from, yield_until)` — empty (`yield_from == yield_until`)
-/// when the chunk is skipped. `next_line` is the post-visit watermark
-/// the caller stores back into its `LineCursor` (rio-store's
-/// `logs::tail`).
+/// `[yield_from, yield_until)`; `next_line` is the post-visit
+/// watermark the caller stores back into its cursor (rio-store's
+/// `logs::tail::LineCursor`, the gateway's relay floor, the
+/// dashboard/CLI mirrors).
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChunkVisit {
-    /// First line number this chunk contributes:
-    /// `max(first_line, next_line)` — the chunk's own start, or the
-    /// watermark when an earlier overlapping chunk already served the
-    /// chunk's leading lines.
-    pub yield_from: u64,
-    /// One past the last line this chunk contributes (`first_line +
-    /// n_lines` for a visited chunk, `yield_from` for a skipped one).
-    pub yield_until: u64,
-    /// The post-visit watermark: one past the chunk's last line for a
-    /// visited chunk, the input watermark unchanged for a skipped one.
+pub enum ChunkVisit {
+    /// The chunk contributes nothing: zero lines, or every line is
+    /// below the watermark. The caller skips the object GET entirely.
     /// A skipped chunk MUST NOT advance the watermark — a zero-line
     /// chunk starting past the cursor would otherwise swallow every
     /// line between the cursor and its `first_line`.
-    pub next_line: u64,
+    Skip {
+        /// The watermark, unchanged.
+        next_line: u64,
+    },
+    /// The chunk starts at or below the watermark and contributes
+    /// `[yield_from, yield_until)` with no jump: the served stream
+    /// stays contiguous through this visit.
+    Serve {
+        /// First line this chunk contributes: the watermark (the
+        /// chunk's leading lines below it, if any, were already served
+        /// by an earlier overlapping chunk).
+        yield_from: u64,
+        /// One past the last line this chunk contributes
+        /// (`first_line + n_lines`).
+        yield_until: u64,
+        /// The post-visit watermark: `yield_until`.
+        next_line: u64,
+    },
+    /// The chunk starts strictly past the watermark: the lines
+    /// `[gap_from, gap_until)` (`== [watermark, first_line)`) are not
+    /// held by this chunk — a genuine storage hole on the manifest
+    /// walk, a dropped fan-out batch on the live seam, or a skipped
+    /// span on a relayed wire. The chunk itself contributes
+    /// `[yield_from, yield_until) == [first_line, first_line +
+    /// n_lines)`.
+    GapThenServe {
+        /// First missing line: the input watermark.
+        gap_from: u64,
+        /// One past the last missing line: the chunk's `first_line`.
+        /// Strictly greater than `gap_from`.
+        gap_until: u64,
+        /// First line this chunk contributes (`== gap_until`).
+        yield_from: u64,
+        /// One past the last line this chunk contributes.
+        yield_until: u64,
+        /// The post-visit watermark: `yield_until`.
+        next_line: u64,
+    },
 }
 
 impl ChunkVisit {
     /// The chunk contributes nothing (zero lines, or every line is
-    /// below the watermark). The caller skips the object GET entirely.
+    /// below the watermark).
     pub fn is_empty(&self) -> bool {
-        self.yield_from == self.yield_until
+        matches!(self, ChunkVisit::Skip { .. })
+    }
+
+    /// The post-visit watermark, for cursor stepping that does not
+    /// otherwise inspect the verdict (folds, fuzz oracles, tests).
+    /// Decision-making consumers should `match` instead — the variants
+    /// are the point.
+    pub fn next_line(&self) -> u64 {
+        match *self {
+            ChunkVisit::Skip { next_line }
+            | ChunkVisit::Serve { next_line, .. }
+            | ChunkVisit::GapThenServe { next_line, .. } => next_line,
+        }
     }
 }
 
@@ -102,33 +152,54 @@ impl ChunkVisit {
     kani::requires(first_line <= i64::MAX as u64 && n_lines <= i64::MAX as u64)
 )]
 #[cfg_attr(kani, kani::ensures(|r: &ChunkVisit| {
-    // The contribution is exactly the chunk's range above the
-    // watermark: empty when the chunk has nothing at or above it,
-    // `[max(first_line, next_line), first_line + n_lines)` otherwise.
+    // Variant exactness: the case split is total and each variant
+    // carries exactly the ranges its docs promise. Skipped iff nothing
+    // at or above the watermark; a contributing chunk is Serve when it
+    // starts at or below the watermark and GapThenServe (with the gap
+    // exactly `[watermark, first_line)`) when it starts past it.
     let end = first_line + n_lines;
     if n_lines == 0 || end <= next_line {
-        r.yield_from == r.yield_until
+        matches!(r, ChunkVisit::Skip { .. })
+    } else if first_line > next_line {
+        matches!(r, ChunkVisit::GapThenServe {
+            gap_from, gap_until, yield_from, yield_until, ..
+        } if *gap_from == next_line
+            && *gap_until == first_line
+            && *yield_from == first_line
+            && *yield_until == end)
     } else {
-        r.yield_from == if first_line > next_line { first_line } else { next_line }
-            && r.yield_until == end
+        matches!(r, ChunkVisit::Serve { yield_from, yield_until, .. }
+            if *yield_from == next_line && *yield_until == end)
     }
 }))]
 #[cfg_attr(kani, kani::ensures(|r: &ChunkVisit| {
     // Dedup safety: no yielded line is below the watermark (a line
     // already served by an earlier chunk is never served again), the
-    // yielded range is well-formed, and every yielded line is one the
-    // chunk actually holds.
-    r.yield_from >= next_line
-        && r.yield_from <= r.yield_until
-        && (r.yield_from == r.yield_until
-            || (r.yield_from >= first_line && r.yield_until <= first_line + n_lines))
+    // yielded range is well-formed and within the chunk, and a gap is
+    // non-empty, starts at the watermark, and abuts the served range.
+    match r {
+        ChunkVisit::Skip { .. } => true,
+        ChunkVisit::Serve { yield_from, yield_until, .. } => {
+            *yield_from >= next_line
+                && *yield_from <= *yield_until
+                && *yield_from >= first_line.min(next_line)
+                && *yield_until <= first_line + n_lines
+        }
+        ChunkVisit::GapThenServe { gap_from, gap_until, yield_from, yield_until, .. } => {
+            *gap_from == next_line
+                && *gap_from < *gap_until
+                && *gap_until == *yield_from
+                && *yield_from == first_line
+                && *yield_until == first_line + n_lines
+        }
+    }
 }))]
 #[cfg_attr(kani, kani::ensures(|r: &ChunkVisit| {
     // The watermark is monotone and lands one past the chunk's last
     // line iff the chunk contributed anything; a skipped chunk leaves
     // it untouched.
     let end = first_line + n_lines;
-    r.next_line
+    r.next_line()
         == if n_lines == 0 || end <= next_line {
             next_line
         } else {
@@ -146,16 +217,133 @@ pub fn visit_chunk(next_line: u64, first_line: u64, n_lines: u64) -> ChunkVisit 
     // chunk from an earlier-visited overlapping session whose lines
     // were all already yielded. Both leave the watermark untouched.
     if n_lines == 0 || last_line < next_line {
-        return ChunkVisit {
-            yield_from: next_line,
-            yield_until: next_line,
-            next_line,
+        return ChunkVisit::Skip { next_line };
+    }
+    if first_line > next_line {
+        // Forward jump: the span `[next_line, first_line)` is missing
+        // from this chunk. Naming it is the whole point of the enum —
+        // the caller decides the disclosure.
+        return ChunkVisit::GapThenServe {
+            gap_from: next_line,
+            gap_until: first_line,
+            yield_from: first_line,
+            yield_until: end,
+            next_line: end,
         };
     }
-    ChunkVisit {
-        yield_from: first_line.max(next_line),
+    ChunkVisit::Serve {
+        yield_from: next_line,
         yield_until: end,
         next_line: end,
+    }
+}
+
+/// The divergence between a chunk's manifest claim and what its object
+/// actually decompressed to. The manifest row and the object are
+/// written from the same line slice in the same call, so any
+/// disagreement is corruption-grade — but the two directions have
+/// different blast radii and therefore different policies (decided by
+/// the caller; classified here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectDivergence {
+    /// The object holds FEWER lines than the manifest claims: the span
+    /// `[missing_from, missing_until)` exists in no object — data loss
+    /// with `NotFound` parity (the manifest promised lines that cannot
+    /// be served).
+    ShortObject {
+        /// First missing line: `first_line + object_count`.
+        missing_from: u64,
+        /// One past the last missing line: `first_line +
+        /// manifest_count`.
+        missing_until: u64,
+    },
+    /// The object holds MORE lines than the manifest claims: `excess`
+    /// trailing lines have no manifest identity. Serving them would
+    /// attribute them to the NEXT chunk's line numbers and advance the
+    /// watermark past lines that chunk genuinely holds — they must be
+    /// discarded.
+    LongObject {
+        /// How many trailing object lines exceed the claim.
+        excess: u64,
+    },
+}
+
+/// One chunk's read verdict when the object's decompressed line count
+/// can disagree with its manifest row: the dedup visit, clamped to the
+/// manifest claim BY CONSTRUCTION, plus the divergence classification.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectVisit {
+    /// The dedup verdict over `min(manifest_count, object_count)`
+    /// lines: the served range and the post-visit watermark can never
+    /// exceed what BOTH the manifest claims and the object holds.
+    pub visit: ChunkVisit,
+    /// `None` when the object matches its claim exactly.
+    pub divergence: Option<ObjectDivergence>,
+}
+
+/// The manifest/object clamp for one fetched chunk
+/// (`docs/spec/models/logService.qnt`'s `visitChunk` composed with the
+/// served-count clamp): evaluate the dedup over
+/// `min(manifest_count, object_count)` so an over-length object can
+/// never displace a successor chunk's range (the watermark is bounded
+/// by the claim) and an under-length object can never silently shrink
+/// the stream (the missing span is named).
+///
+/// Same `BIGINT` precondition as [`visit_chunk`]; `object_count` is
+/// additionally bounded in production by the decompressor's 16 MiB
+/// frame budget, far below `i64::MAX`.
+#[cfg_attr(
+    kani,
+    kani::requires(
+        first_line <= i64::MAX as u64
+            && manifest_count <= i64::MAX as u64
+            && object_count <= i64::MAX as u64
+    )
+)]
+#[cfg_attr(kani, kani::ensures(|r: &ObjectVisit| {
+    // The visit is exactly the dedup verdict over the clamped count —
+    // the composition with visit_chunk is definitional, so the whole
+    // per-variant contract of visit_chunk transfers.
+    let served = if manifest_count < object_count { manifest_count } else { object_count };
+    r.visit == visit_chunk(next_line, first_line, served)
+}))]
+#[cfg_attr(kani, kani::ensures(|r: &ObjectVisit| {
+    // Divergence classification is exact and total.
+    match r.divergence {
+        None => object_count == manifest_count,
+        Some(ObjectDivergence::ShortObject { missing_from, missing_until }) => {
+            object_count < manifest_count
+                && missing_from == first_line + object_count
+                && missing_until == first_line + manifest_count
+        }
+        Some(ObjectDivergence::LongObject { excess }) => {
+            object_count > manifest_count && excess == object_count - manifest_count
+        }
+    }
+}))]
+pub fn visit_object(
+    next_line: u64,
+    first_line: u64,
+    manifest_count: u64,
+    object_count: u64,
+) -> ObjectVisit {
+    let served = manifest_count.min(object_count);
+    let divergence = if object_count < manifest_count {
+        Some(ObjectDivergence::ShortObject {
+            missing_from: first_line.saturating_add(object_count),
+            missing_until: first_line.saturating_add(manifest_count),
+        })
+    } else if object_count > manifest_count {
+        Some(ObjectDivergence::LongObject {
+            excess: object_count - manifest_count,
+        })
+    } else {
+        None
+    };
+    ObjectVisit {
+        visit: visit_chunk(next_line, first_line, served),
+        divergence,
     }
 }
 
@@ -494,9 +682,91 @@ mod proofs {
         x >= first_line && x < first_line + n_lines
     }
 
-    /// Is `x` in the half-open range a [`ChunkVisit`] yielded?
+    /// Is `x` in the half-open range a [`ChunkVisit`] yielded? A gap
+    /// span is NOT served — only the yield range counts, in both
+    /// contributing variants (the union/at-most-once equalities below
+    /// therefore hold across gap-shaped folds too).
     fn in_visit(x: u64, v: &ChunkVisit) -> bool {
-        x >= v.yield_from && x < v.yield_until
+        match *v {
+            ChunkVisit::Skip { .. } => false,
+            ChunkVisit::Serve {
+                yield_from,
+                yield_until,
+                ..
+            }
+            | ChunkVisit::GapThenServe {
+                yield_from,
+                yield_until,
+                ..
+            } => x >= yield_from && x < yield_until,
+        }
+    }
+
+    /// Verify [`visit_object`] against its contracts for every
+    /// quadruple under the BIGINT precondition: the visit equals the
+    /// dedup verdict over the clamped count, and the divergence
+    /// classification is exact. Loop-free, exhaustive over the domain.
+    #[kani::proof_for_contract(visit_object)]
+    fn check_visit_object_contract() {
+        let next_line: u64 = kani::any();
+        let first_line: u64 = kani::any();
+        let manifest_count: u64 = kani::any();
+        let object_count: u64 = kani::any();
+        let _ = visit_object(next_line, first_line, manifest_count, object_count);
+    }
+
+    /// Composition: an over-length object can NEVER displace a
+    /// successor chunk's range. Visiting chunk A through
+    /// [`visit_object`] bounds the watermark by A's manifest claim, so
+    /// a successor chunk B starting at A's claimed end always serves
+    /// its full range — the property the unclamped wiring violated
+    /// (advancing by the object count suppressed B's leading lines and
+    /// attributed A's excess to B's numbers).
+    #[kani::proof]
+    fn check_object_clamp_preserves_successor() {
+        let since: u64 = kani::any();
+        let f_a: u64 = kani::any();
+        let mc_a: u64 = kani::any();
+        let oc_a: u64 = kani::any();
+        let f_b: u64 = kani::any();
+        let n_b: u64 = kani::any();
+        kani::assume(f_a <= i64::MAX as u64 && mc_a <= i64::MAX as u64);
+        kani::assume(oc_a <= i64::MAX as u64);
+        kani::assume(f_b <= i64::MAX as u64 && n_b <= i64::MAX as u64);
+        // B is the successor row: it starts exactly at A's claimed end
+        // (the manifest ORDER BY puts it second), and the reader's
+        // cursor began at or before A's claim domain.
+        kani::assume(f_b == f_a + mc_a);
+        kani::assume(since <= f_b);
+        kani::assume(n_b > 0);
+
+        let ov_a = visit_object(since, f_a, mc_a, oc_a);
+        let cursor = ov_a.visit.next_line();
+        // The watermark after A never exceeds A's claimed end —
+        // regardless of how over-length A's object was.
+        assert!(cursor <= f_b);
+        // Therefore B's visit serves B's entire range: no leading line
+        // of B is suppressed by A's excess.
+        match visit_chunk(cursor, f_b, n_b) {
+            ChunkVisit::Serve {
+                yield_from,
+                yield_until,
+                ..
+            }
+            | ChunkVisit::GapThenServe {
+                yield_from,
+                yield_until,
+                ..
+            } => {
+                assert!(yield_from == f_b.max(cursor));
+                assert!(yield_until == f_b + n_b);
+            }
+            ChunkVisit::Skip { .. } => {
+                // B is non-empty and starts at or past the cursor, so
+                // it can never be skipped.
+                assert!(false);
+            }
+        }
     }
 
     // (The tracey verify markers for these harnesses live at the
@@ -532,7 +802,7 @@ mod proofs {
 
         let mut cursor = since;
         let v_a = visit_chunk(cursor, f_a, n_a);
-        cursor = v_a.next_line;
+        cursor = v_a.next_line();
         let v_b = visit_chunk(cursor, f_b, n_b);
 
         let x: u64 = kani::any();
@@ -564,9 +834,9 @@ mod proofs {
 
         let mut cursor = since;
         let v_a = visit_chunk(cursor, f_a, n_a);
-        cursor = v_a.next_line;
+        cursor = v_a.next_line();
         let v_b = visit_chunk(cursor, f_b, n_b);
-        cursor = v_b.next_line;
+        cursor = v_b.next_line();
         let v_c = visit_chunk(cursor, f_c, n_c);
 
         let x: u64 = kani::any();
@@ -668,44 +938,187 @@ mod proofs {
 mod tests {
     use super::*;
 
-    /// One visit step per row: `(cursor, first, n) -> (yield_from,
-    /// yield_until, next_line)`. The skip rows pin the two skip causes
-    /// (zero-line chunk; chunk entirely below the watermark) leaving
-    /// the watermark untouched.
+    /// One visit step per row: `(cursor, first, n) -> expected
+    /// variant`. This is THE shared case table — the dashboard's
+    /// `lineCursor.ts` mirror duplicates these vectors verbatim (see
+    /// `rio-dashboard/src/lib/lineCursor.ts`); change them together.
+    /// The skip rows pin the two skip causes (zero-line chunk; chunk
+    /// entirely below the watermark) leaving the watermark untouched;
+    /// the gap rows pin the forward-jump split, including a cursor
+    /// strictly inside the gap and the BIGINT edge.
     #[test]
     fn visit_chunk_table() {
-        type Case = ((u64, u64, u64), (u64, u64, u64));
+        use ChunkVisit::*;
+        type Case = ((u64, u64, u64), ChunkVisit);
         let cases: &[Case] = &[
-            // Fresh cursor, chunk ahead of it: full yield.
-            ((0, 0, 4), (0, 4, 4)),
-            ((0, 10, 4), (10, 14, 14)),
-            // Cursor inside the chunk: leading lines deduped.
-            ((12, 10, 4), (12, 14, 14)),
+            // Fresh cursor, chunk at it: contiguous serve.
+            (
+                (0, 0, 4),
+                Serve {
+                    yield_from: 0,
+                    yield_until: 4,
+                    next_line: 4,
+                },
+            ),
+            // Fresh cursor, chunk strictly ahead: the jump is a gap.
+            (
+                (0, 10, 4),
+                GapThenServe {
+                    gap_from: 0,
+                    gap_until: 10,
+                    yield_from: 10,
+                    yield_until: 14,
+                    next_line: 14,
+                },
+            ),
+            // Cursor inside the chunk: leading lines deduped, no gap.
+            (
+                (12, 10, 4),
+                Serve {
+                    yield_from: 12,
+                    yield_until: 14,
+                    next_line: 14,
+                },
+            ),
+            // Cursor strictly inside a forward jump: gap is exactly
+            // [cursor, first).
+            (
+                (47, 50, 3),
+                GapThenServe {
+                    gap_from: 47,
+                    gap_until: 50,
+                    yield_from: 50,
+                    yield_until: 53,
+                    next_line: 53,
+                },
+            ),
+            // One-line jump: minimal non-empty gap.
+            (
+                (9, 10, 1),
+                GapThenServe {
+                    gap_from: 9,
+                    gap_until: 10,
+                    yield_from: 10,
+                    yield_until: 11,
+                    next_line: 11,
+                },
+            ),
             // Chunk entirely below the watermark: skipped, no advance.
-            ((20, 10, 4), (20, 20, 20)),
+            ((20, 10, 4), Skip { next_line: 20 }),
             // Last line exactly at the watermark boundary: 10..14 with
             // cursor 14 is fully served already.
-            ((14, 10, 4), (14, 14, 14)),
+            ((14, 10, 4), Skip { next_line: 14 }),
             // Zero-line chunk past the cursor must NOT advance the
-            // watermark (the doc-comment's swallow hazard).
-            ((3, 50, 0), (3, 3, 3)),
-            // BIGINT-edge chunk: exact arithmetic at the precondition
-            // boundary (first + n == i64::MAX as u64 + 1 is the largest
-            // representable end).
+            // watermark (the doc-comment swallow hazard) — and must
+            // NOT report a gap either: it holds no lines to serve
+            // after one.
+            ((3, 50, 0), Skip { next_line: 3 }),
+            // BIGINT-edge chunk reached by a gap: exact arithmetic at
+            // the precondition boundary (first + n == i64::MAX as u64
+            // is the largest representable end here).
             (
                 (0, i64::MAX as u64 - 3, 3),
-                (i64::MAX as u64 - 3, i64::MAX as u64, i64::MAX as u64),
+                GapThenServe {
+                    gap_from: 0,
+                    gap_until: i64::MAX as u64 - 3,
+                    yield_from: i64::MAX as u64 - 3,
+                    yield_until: i64::MAX as u64,
+                    next_line: i64::MAX as u64,
+                },
+            ),
+            // BIGINT-edge contiguous serve.
+            (
+                (i64::MAX as u64 - 3, i64::MAX as u64 - 3, 3),
+                Serve {
+                    yield_from: i64::MAX as u64 - 3,
+                    yield_until: i64::MAX as u64,
+                    next_line: i64::MAX as u64,
+                },
             ),
         ];
-        for &((cursor, first, n), (from, until, next)) in cases {
+        for &((cursor, first, n), expected) in cases {
             let v = visit_chunk(cursor, first, n);
-            assert_eq!(
-                (v.yield_from, v.yield_until, v.next_line),
-                (from, until, next),
-                "visit_chunk({cursor}, {first}, {n})"
-            );
-            assert_eq!(v.is_empty(), from == until);
+            assert_eq!(v, expected, "visit_chunk({cursor}, {first}, {n})");
+            assert_eq!(v.is_empty(), matches!(expected, Skip { .. }));
+            assert_eq!(v.next_line(), expected.next_line());
         }
+    }
+
+    /// The clamp + classification table: `(cursor, first, manifest,
+    /// object) -> (visit-over-min, divergence)`.
+    #[test]
+    fn visit_object_table() {
+        use ChunkVisit::*;
+        use ObjectDivergence::*;
+        // Exact agreement: no divergence, plain serve.
+        let v = visit_object(0, 0, 4, 4);
+        assert_eq!(v.divergence, None);
+        assert_eq!(
+            v.visit,
+            Serve {
+                yield_from: 0,
+                yield_until: 4,
+                next_line: 4
+            }
+        );
+        // Over-length object: clamped to the claim, excess named.
+        let v = visit_object(0, 0, 10, 15);
+        assert_eq!(v.divergence, Some(LongObject { excess: 5 }));
+        assert_eq!(
+            v.visit,
+            Serve {
+                yield_from: 0,
+                yield_until: 10,
+                next_line: 10
+            }
+        );
+        // Short object: served range is what the object holds, the
+        // missing span is exactly the claimed remainder.
+        let v = visit_object(0, 0, 10, 6);
+        assert_eq!(
+            v.divergence,
+            Some(ShortObject {
+                missing_from: 6,
+                missing_until: 10
+            })
+        );
+        assert_eq!(
+            v.visit,
+            Serve {
+                yield_from: 0,
+                yield_until: 6,
+                next_line: 6
+            }
+        );
+        // Divergence is classified even when the dedup skips the chunk
+        // entirely (cursor past it).
+        let v = visit_object(20, 0, 10, 15);
+        assert_eq!(v.divergence, Some(LongObject { excess: 5 }));
+        assert_eq!(v.visit, Skip { next_line: 20 });
+        // Gap + clamp compose: cursor below a divergent chunk's start.
+        let v = visit_object(2, 5, 3, 9);
+        assert_eq!(v.divergence, Some(LongObject { excess: 6 }));
+        assert_eq!(
+            v.visit,
+            GapThenServe {
+                gap_from: 2,
+                gap_until: 5,
+                yield_from: 5,
+                yield_until: 8,
+                next_line: 8
+            }
+        );
+        // Zero-line object against a non-zero claim: everything
+        // missing, nothing served.
+        let v = visit_object(0, 7, 4, 0);
+        assert_eq!(
+            v.divergence,
+            Some(ShortObject {
+                missing_from: 7,
+                missing_until: 11
+            })
+        );
+        assert_eq!(v.visit, Skip { next_line: 0 });
     }
 
     /// The verdict partition in gate order: overflow beats

@@ -32,7 +32,7 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use super::chunks::{LogChunkError, LogChunkStore, decompress_lines};
-use super::kernel::visit_chunk;
+use super::kernel::{ChunkVisit, ObjectDivergence, visit_chunk, visit_object};
 
 /// One `drv_log_chunks` manifest row, as the read path needs it.
 ///
@@ -195,7 +195,11 @@ pub async fn read_chunk(
                 exec_id = %chunk.exec_id,
                 "TailLog: manifest references a missing chunk object (data loss)"
             );
-            metrics::counter!("rio_store_log_read_data_loss_total").increment(1);
+            metrics::counter!(
+                "rio_store_log_read_data_loss_total",
+                "reason" => "missing_object"
+            )
+            .increment(1);
             Status::internal(format!(
                 "TailLog: manifest references a missing chunk object (data loss): {key}"
             ))
@@ -213,38 +217,104 @@ pub async fn read_chunk(
         ))
     })?;
 
-    if lines.len() as u64 != chunk.line_count {
-        // The manifest row and the object are written from the same
-        // line slice in the same call, so they cannot legitimately
-        // disagree. Attribute and advance by what the object actually
-        // holds (the conservative choice: it can only ever let a later
-        // overlapping chunk fill in lines this one was supposed to
-        // have, never skip lines that exist).
-        warn!(
-            key = %chunk.s3_key,
-            manifest_count = chunk.line_count,
-            actual_count = lines.len(),
-            "TailLog: chunk line count disagrees with its manifest row"
-        );
+    // The dedup proper, with the manifest/object clamp: the kernel
+    // evaluates the visit over `min(manifest_count, object_count)`, so
+    // the served range and the watermark are bounded by the manifest
+    // claim BY CONSTRUCTION, and any disagreement between the row and
+    // the object is classified for policy here:
+    //
+    // - A LONG object (holds more lines than the row claims) has its
+    //   excess discarded — served, those lines would carry the NEXT
+    //   chunk's line numbers (garbage attribution) and the advanced
+    //   watermark would suppress that chunk's genuine lines. Disclosed
+    //   via the data-loss counter and a warn; the lines that ARE
+    //   claimed serve normally.
+    // - A SHORT object (holds fewer lines than the row claims) is data
+    //   loss with `NotFound` parity: the manifest promised lines that
+    //   exist in no object. `Internal` naming the key, never a
+    //   silently shorter stream presented as complete.
+    //
+    // Gap disposition (the enum forces the choice): the manifest walk
+    // SERVES across a forward jump. A hole between manifest rows is
+    // genuine storage loss — chunks are committed in line order, so a
+    // missing span has no row to read — and the disclosure is the
+    // completeness predicate (`manifest_covers_contiguously` drives
+    // `is_complete=false` in the handler's final message), not a
+    // refusal to serve the lines that DO exist.
+    let object_visit = visit_object(
+        cursor.next_line,
+        chunk.first_line,
+        chunk.line_count,
+        lines.len() as u64,
+    );
+    match object_visit.divergence {
+        Some(ObjectDivergence::ShortObject {
+            missing_from,
+            missing_until,
+        }) => {
+            error!(
+                s3_key = %chunk.s3_key,
+                exec_id = %chunk.exec_id,
+                manifest_count = chunk.line_count,
+                actual_count = lines.len(),
+                missing_from,
+                missing_until,
+                "TailLog: chunk object holds fewer lines than its manifest row (data loss)"
+            );
+            metrics::counter!(
+                "rio_store_log_read_data_loss_total",
+                "reason" => "short_object"
+            )
+            .increment(1);
+            return Err(Status::internal(format!(
+                "TailLog: chunk object holds fewer lines than its manifest row \
+                 (data loss, lines {missing_from}..{missing_until} missing): {}",
+                chunk.s3_key
+            )));
+        }
+        Some(ObjectDivergence::LongObject { excess }) => {
+            warn!(
+                key = %chunk.s3_key,
+                manifest_count = chunk.line_count,
+                actual_count = lines.len(),
+                excess,
+                "TailLog: chunk object holds more lines than its manifest row; \
+                 excess discarded"
+            );
+            metrics::counter!(
+                "rio_store_log_read_data_loss_total",
+                "reason" => "overlong_object"
+            )
+            .increment(1);
+        }
+        None => {}
     }
-
-    // The dedup proper, re-evaluated against the number of lines the
-    // object ACTUALLY decompressed to (which the warn above allows to
-    // disagree with the manifest's count): yield `[yield_from,
-    // yield_until)` and advance the watermark to the kernel's answer.
-    // `kernel::visit_chunk` is the single owner of the skip/advance
-    // decision — a skipped chunk (everything already yielded) leaves
-    // the cursor untouched.
-    let visit = visit_chunk(cursor.next_line, chunk.first_line, lines.len() as u64);
+    let visit = object_visit.visit;
+    let (yield_from, yield_until) = match visit {
+        ChunkVisit::Skip { next_line } => {
+            cursor.next_line = next_line;
+            return Ok(Vec::new());
+        }
+        ChunkVisit::Serve {
+            yield_from,
+            yield_until,
+            ..
+        } => (yield_from, yield_until),
+        ChunkVisit::GapThenServe {
+            yield_from,
+            yield_until,
+            ..
+        } => (yield_from, yield_until),
+    };
     let mut out = Vec::new();
     for (i, line) in lines.into_iter().enumerate() {
         let line_no = chunk.first_line.saturating_add(i as u64);
-        if line_no < visit.yield_from {
+        if line_no < yield_from || line_no >= yield_until {
             continue;
         }
         out.push((line_no, line));
     }
-    cursor.next_line = visit.next_line;
+    cursor.next_line = visit.next_line();
     Ok(out)
 }
 
@@ -562,6 +632,102 @@ mod tests {
         // Past A's end, session B's copy is the only one.
         assert_eq!(out[150].1, b"b:150".to_vec());
         assert_eq!(out[299].1, b"b:299".to_vec());
+    }
+
+    /// Seed a DIVERGENT chunk: the manifest row claims `claimed_count`
+    /// lines but the object holds exactly `lines` — the shape
+    /// `seed_chunk` makes unconstructible, for the divergence-policy
+    /// tests. Returns the s3 key.
+    async fn seed_divergent_chunk(
+        pool: &PgPool,
+        store: &MemoryLogChunkStore,
+        exec_id: Uuid,
+        session_id: Uuid,
+        first_line: u64,
+        claimed_count: u64,
+        lines: &[&[u8]],
+    ) -> String {
+        // Always chunk_seq 0: divergence fixtures need one chunk per
+        // session, so the seq axis adds nothing but an argument.
+        let key = log_chunk_key(DRV_HASH_32, &exec_id, &session_id, 0);
+        let owned: Vec<Vec<u8>> = lines.iter().map(|l| l.to_vec()).collect();
+        let blob = compress_lines(&owned).unwrap();
+        let byte_size = blob.len() as i64;
+        store.put(&key, blob).await.unwrap();
+        sqlx::query(
+            "INSERT INTO drv_log_chunks \
+                 (exec_id, session_id, chunk_seq, first_line, line_count, byte_size, s3_key) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(exec_id)
+        .bind(session_id)
+        .bind(0i32)
+        .bind(first_line as i64)
+        .bind(claimed_count as i64)
+        .bind(byte_size)
+        .bind(&key)
+        .execute(pool)
+        .await
+        .unwrap();
+        key
+    }
+
+    /// An over-length object (holds more lines than its manifest row
+    /// claims) must be CLAMPED to the manifest claim: the excess lines
+    /// are discarded — they would otherwise be served as garbage under
+    /// the NEXT chunk's line numbers — and the next chunk's genuine
+    /// lines must not be suppressed by an over-advanced watermark.
+    #[tokio::test]
+    async fn over_length_object_clamps_and_preserves_next_chunk() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let exec = Uuid::now_v7();
+        let sess_a = Uuid::now_v7();
+        let sess_b = Uuid::now_v7();
+        // Manifest claims 10 lines at 0..10; the object holds 15.
+        let a = lines("a", 0, 15);
+        seed_divergent_chunk(&db.pool, &store, exec, sess_a, 0, 10, &line_refs(&a)).await;
+        // The next chunk genuinely owns 10..20.
+        let b = lines("b", 10, 10);
+        seed_chunk(&db.pool, &store, exec, sess_b, 0, 10, &line_refs(&b)).await;
+
+        let refs = read_manifest_range(&db.pool, exec, 0).await.unwrap();
+        let out = stream_chunks(&store, &refs, 0).await.unwrap();
+
+        assert_eq!(out.len(), 20, "10 clamped from A + 10 genuine from B");
+        for (i, (n, _)) in out.iter().enumerate() {
+            assert_eq!(*n, i as u64);
+        }
+        // Lines 10..20 are chunk B's content — the over-length excess
+        // of A must not displace them.
+        assert_eq!(out[10].1, b"b:10".to_vec());
+        assert_eq!(out[19].1, b"b:19".to_vec());
+    }
+
+    /// An under-length object (holds fewer lines than its manifest row
+    /// claims) is data loss with NotFound parity: an `Internal` error
+    /// naming the key, never a silently shorter stream.
+    #[tokio::test]
+    async fn short_object_is_data_loss_error() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let exec = Uuid::now_v7();
+        let sess = Uuid::now_v7();
+        // Manifest claims 10 lines; the object holds 6.
+        let content = lines("a", 0, 6);
+        let key =
+            seed_divergent_chunk(&db.pool, &store, exec, sess, 0, 10, &line_refs(&content)).await;
+
+        let refs = read_manifest_range(&db.pool, exec, 0).await.unwrap();
+        let err = stream_chunks(&store, &refs, 0)
+            .await
+            .expect_err("a short object is data loss, not a shorter stream");
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(
+            err.message().contains(&key),
+            "the error names the lossy key: {}",
+            err.message()
+        );
     }
 
     /// A manifest row whose object is gone from the store is data loss:

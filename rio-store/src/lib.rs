@@ -540,9 +540,13 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_log_read_data_loss_total",
-        "TailLog reads that hit a drv_log_chunks manifest row whose S3 \
-         object is missing. Each increment is a hole in a stored build \
-         log that cannot be recovered. Alert on ANY increment."
+        "TailLog reads that hit unrecoverable stored-log loss, by \
+         reason: missing_object (a drv_log_chunks manifest row whose S3 \
+         object is gone), short_object (the object holds fewer lines \
+         than its row claims), overlong_object (the object holds more \
+         lines than its row claims; the unclaimed excess is discarded). \
+         Each increment is a hole in a stored build log that cannot be \
+         recovered. Alert on ANY increment."
     );
     describe_counter!(
         "rio_store_log_tail_proxied_total",
