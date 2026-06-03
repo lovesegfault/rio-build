@@ -151,16 +151,22 @@ pub fn measured_attempt_requeues(state: &StateDir) -> Result<HashMap<String, u32
 /// [`RequeueReason::counts_as_cluster_attempt`] applies to journaled
 /// history, asked of the event the record is about — never "was the job
 /// committed to a batch", which diverges from it exactly where it
-/// matters. Collect terminals derive it from batch evidence (a build id
-/// or in-band results prove the cluster saw the submission); the
+/// matters. The equivalence is total because every discriminator the
+/// current-event judgment keys on is journalable: collect terminals
+/// derive it from batch evidence (a build id or in-band results prove
+/// the cluster saw the submission), and the requeue vocabulary carries
+/// the same bit — an engine cancellation that fired after the cluster's
+/// acknowledgment journals
+/// [`RequeueReason::EngineCancelledAnnounced`] (counted), while the
 /// no-result engine-side arm — submission failures and fully cancelled
-/// engine-cancel cycles — has NO current cluster attempt, because its
-/// settled submission is the very event class the predicate excludes
-/// ("never reached the cluster"). A stalled-active terminal counts its
-/// committed, cluster-held stalled attempt; a stalled-queued terminal has
-/// no current attempt (the job sat in the queue since its last requeue).
-/// Both zero-cluster-contact writers therefore stamp the same value for
-/// the same truth: the attempts the cluster actually saw.
+/// engine-cancel cycles — has NO current cluster attempt and journals
+/// the uncounted reasons, because its settled submission is the very
+/// event class the predicate excludes ("never reached the cluster"). A
+/// stalled-active terminal counts its committed, cluster-held stalled
+/// attempt; a stalled-queued terminal has no current attempt (the job
+/// sat in the queue since its last requeue). Both zero-cluster-contact
+/// writers therefore stamp the same value for the same truth: the
+/// attempts the cluster actually saw.
 pub fn stamped_attempts(prior_cluster_requeues: u32, current_is_cluster_attempt: bool) -> u32 {
     prior_cluster_requeues + u32::from(current_is_cluster_attempt)
 }
@@ -281,8 +287,13 @@ impl JobLedger {
                     // The engine-cancel cycle budget is the why-slice of
                     // the collect source (the why is journal vocabulary,
                     // written through the same typed reason decide()
-                    // mints — [`RequeueReason::EngineCancelled`]).
-                    if entry.why == RequeueReason::EngineCancelled.as_str() {
+                    // mints): both cancel variants count, per
+                    // [`RequeueReason::is_engine_cancel_cycle`] — the
+                    // announced/unannounced split carries measurement
+                    // semantics, never cycle arithmetic.
+                    if RequeueReason::from_wire(&entry.why)
+                        .is_some_and(RequeueReason::is_engine_cancel_cycle)
+                    {
                         *cancel_cycles.entry(entry.job.clone()).or_default() += 1;
                     }
                 }
@@ -375,8 +386,11 @@ impl JobLedger {
             .or_default() += 1;
         // The engine-cancelled carve-out's granted cycles are tracked on
         // their own counter (the why is the journal vocabulary the fold
-        // matches on), backing the explicit cycle bound.
-        if why == RequeueReason::EngineCancelled {
+        // matches on), backing the explicit cycle bound. Both cancel
+        // variants count ([`RequeueReason::is_engine_cancel_cycle`]):
+        // live counter and resume fold share the predicate, so the bound
+        // cannot widen across a restart.
+        if why.is_engine_cancel_cycle() {
             *self
                 .tracker
                 .cancel_cycles
@@ -691,6 +705,12 @@ mod tests {
     async fn budget_counts_every_reason_but_measurement_only_cluster_attempts() {
         let expected: &[(RequeueReason, bool)] = &[
             (RequeueReason::EngineCancelled, false),
+            // The announced cancel: the cluster acknowledged the
+            // submission (build id / per-root results) before the engine
+            // cut it — cluster contact, counted, mirroring the
+            // batch-evidence judgment the record writers stamp the
+            // current event with.
+            (RequeueReason::EngineCancelledAnnounced, true),
             (RequeueReason::EngineSubmissionFailure, false),
             (RequeueReason::NoInbandResult, true),
             (RequeueReason::InfraAutoRetry, true),
@@ -1017,9 +1037,10 @@ mod tests {
     /// its two sibling budget families survived restarts.
     #[tokio::test]
     async fn journal_backed_bounds_all_rehydrate() {
-        // One journal exercising every source: two collect re-offers and a
-        // stall retry for "resub.x" (the resubmission-backed bounds), and
-        // two queued ladder steps for "starved.x".
+        // One journal exercising every source: three collect re-offers
+        // (including BOTH engine-cancel variants) and a stall retry for
+        // "resub.x" (the resubmission-backed bounds), and two queued
+        // ladder steps for "starved.x".
         let (dir, ledger, _tracker, _watchdog) = ledger();
         ledger
             .requeue_collected("resub.x", RequeueReason::InfraAutoRetry)
@@ -1027,6 +1048,10 @@ mod tests {
             .unwrap();
         ledger
             .requeue_collected("resub.x", RequeueReason::EngineCancelled)
+            .await
+            .unwrap();
+        ledger
+            .requeue_collected("resub.x", RequeueReason::EngineCancelledAnnounced)
             .await
             .unwrap();
         ledger.commit_batch(1, &["resub.x".to_string()]).await;
@@ -1064,7 +1089,7 @@ mod tests {
                 | "attempts-accounting" => {
                     assert_eq!(
                         resumed.tracker().resubmission_count("resub.x").await,
-                        3,
+                        4,
                         "{bound}: collect+stall entries rehydrate the resubmission counter"
                     );
                     assert_eq!(
@@ -1089,8 +1114,10 @@ mod tests {
                             .await
                             .get("resub.x")
                             .unwrap_or(&0),
-                        1,
-                        "{bound}: the engine-cancelled why-slice rehydrates the cycle budget"
+                        2,
+                        "{bound}: BOTH engine-cancel wire strings rehydrate the cycle budget \
+                         (the announced/unannounced split is measurement vocabulary, not \
+                         cycle arithmetic)"
                     );
                     assert_eq!(
                         *resumed

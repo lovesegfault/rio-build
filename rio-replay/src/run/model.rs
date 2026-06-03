@@ -1528,10 +1528,22 @@ pub const REQUEUE_SOURCE_QUEUED: &str = "queued";
 /// decided in the predicate's exhaustive match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequeueReason {
-    /// The engine itself cancelled the batch (deadline, abort) before
-    /// results arrived. Documented at the carve-out as "the engine's own
-    /// act, not evidence about the job".
+    /// The engine itself cancelled the batch (deadline, abort) before the
+    /// cluster acknowledged it — neither a build id nor any in-band
+    /// result was observed. Documented at the carve-out as "the engine's
+    /// own act, not evidence about the job".
     EngineCancelled,
+    /// The engine cancelled the batch AFTER the cluster acknowledged the
+    /// submission: a `rio: build <uuid>` announcement (or per-root
+    /// results for batch-mates) was observed before the cut. The journal
+    /// carries this bit because the record writers' current-event
+    /// judgment (`stamped_attempts` over batch evidence) counts an
+    /// acknowledged submission as cluster contact — a discriminator the
+    /// live predicate keys on must be journalable, or the fold of
+    /// history can never equal the sum of per-event judgments and the
+    /// same cancel cycle scores +1 as the settling event but 0 as
+    /// history.
+    EngineCancelledAnnounced,
     /// The submission failed engine-side (channel open, drv import, the
     /// build op erroring before any result) — the build never reached the
     /// cluster.
@@ -1567,8 +1579,9 @@ impl RequeueReason {
     /// Every requeue reason. The vocabulary as data: the per-reason
     /// measurement-semantics test iterates this, so a new reason cannot
     /// ship without an expected-flakiness row.
-    pub const ALL: [RequeueReason; 8] = [
+    pub const ALL: [RequeueReason; 9] = [
         RequeueReason::EngineCancelled,
+        RequeueReason::EngineCancelledAnnounced,
         RequeueReason::EngineSubmissionFailure,
         RequeueReason::NoInbandResult,
         RequeueReason::InfraAutoRetry,
@@ -1584,6 +1597,7 @@ impl RequeueReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             RequeueReason::EngineCancelled => "engine-cancelled",
+            RequeueReason::EngineCancelledAnnounced => "engine-cancelled-announced",
             RequeueReason::EngineSubmissionFailure => "engine-submission-failure",
             RequeueReason::NoInbandResult => "no-inband-result",
             RequeueReason::InfraAutoRetry => "infra-auto-retry",
@@ -1606,14 +1620,21 @@ impl RequeueReason {
     /// toward the user-facing measurement (`attempts`, `flaky`, the
     /// report's retry split).
     ///
-    /// The two engine-side reasons do not count: an engine-cancelled batch
-    /// is the engine's own scheduling act (its members may never have
-    /// started), and an engine-side submission failure never reached the
-    /// cluster at all. Counting either marks first-real-attempt successes
-    /// flaky and reports a deadline-cut wave as "succeeded after retries".
-    /// Every other reason describes an attempt that ran (or was denied a
-    /// fair run) on the cluster, which is exactly what a flakiness
-    /// measurement is about.
+    /// The two engine-side reasons do not count: a fully cancelled
+    /// engine-cancel cycle is the engine's own scheduling act, cut before
+    /// the cluster acknowledged anything, and an engine-side submission
+    /// failure never reached the cluster at all. Counting either marks
+    /// first-real-attempt successes flaky and reports a deadline-cut wave
+    /// as "succeeded after retries". The ANNOUNCED cancel counts: the
+    /// cluster acknowledged the submission (a build id, or per-root
+    /// results for batch-mates) before the engine cut it — that
+    /// acknowledgment IS cluster contact, the same batch-evidence
+    /// judgment the record writers stamp the current event with
+    /// (`ledger::stamped_attempts`), so the journaled history and the
+    /// settling event score one cancel cycle identically. Every other
+    /// reason describes an attempt that ran (or was denied a fair run) on
+    /// the cluster, which is exactly what a flakiness measurement is
+    /// about.
     ///
     /// The retry BUDGET deliberately ignores this distinction — see
     /// `collect::decide`.
@@ -1622,12 +1643,31 @@ impl RequeueReason {
             RequeueReason::EngineCancelled
             | RequeueReason::EngineSubmissionFailure
             | RequeueReason::InfraProbe => false,
-            RequeueReason::NoInbandResult
+            RequeueReason::EngineCancelledAnnounced
+            | RequeueReason::NoInbandResult
             | RequeueReason::InfraAutoRetry
             | RequeueReason::FailfastBatchMate
             | RequeueReason::DependencyFailedNoTrigger
             | RequeueReason::ActiveStall => true,
         }
+    }
+
+    /// Whether a journaled re-offer of this reason is one granted
+    /// engine-cancel cycle — the why-slice both cancel-cycle folds (the
+    /// live counter in [`super::ledger::JobLedger::requeue_collected`]
+    /// and the resume fold in
+    /// [`super::ledger::JobLedger::from_journals`]) count toward
+    /// `max_engine_cancel_cycles`. Both cancel variants count: the bound
+    /// is about the ENGINE's repeated cancellation of this job's batches
+    /// (each granted cycle consumed a full batch timeout of cluster
+    /// time), and whether the cluster acknowledged the submission before
+    /// the cut changes the measurement semantics, never the cycle
+    /// arithmetic — splitting the vocabulary must not widen the bound.
+    pub const fn is_engine_cancel_cycle(self) -> bool {
+        matches!(
+            self,
+            RequeueReason::EngineCancelled | RequeueReason::EngineCancelledAnnounced
+        )
     }
 }
 
@@ -1661,10 +1701,11 @@ pub struct RequeueRecord {
     /// journal from a different engine version) counts, preserving the
     /// historical every-requeue semantics for foreign entries.
     /// One load-bearing value beyond the measurement: the resume fold
-    /// counts collect-source entries whose why is
-    /// [`RequeueReason::EngineCancelled`]'s wire string into the
-    /// engine-cancel cycle budget (`max_engine_cancel_cycles`), so that
-    /// bound survives restarts.
+    /// counts collect-source entries whose why is an engine-cancel cycle
+    /// ([`RequeueReason::is_engine_cancel_cycle`] — both the announced
+    /// and the fully cancelled wire strings) into the engine-cancel
+    /// cycle budget (`max_engine_cancel_cycles`), so that bound survives
+    /// restarts.
     pub why: String,
     pub at: String,
 }

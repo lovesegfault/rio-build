@@ -60,9 +60,10 @@ pub struct SubmitTracker {
     /// submit loop only reads it.
     pub resubmissions: Mutex<HashMap<String, u32>>,
     /// Job → engine-cancel carve-out cycles already granted (the
-    /// `RequeueReason::EngineCancelled` why-slice of the resubmissions): the
-    /// explicit bound on the cancel-and-requeue loop, rehydrated from the
-    /// same journal fold.
+    /// engine-cancel why-slice of the resubmissions —
+    /// `RequeueReason::is_engine_cancel_cycle`, both the announced and
+    /// the fully cancelled variants): the explicit bound on the
+    /// cancel-and-requeue loop, rehydrated from the same journal fold.
     pub cancel_cycles: Mutex<HashMap<String, u32>>,
     /// Job → earliest instant it may be offered again after its batch
     /// settled (the post-settlement cool-down; see

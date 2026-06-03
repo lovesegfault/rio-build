@@ -85,7 +85,9 @@ pub struct PriorBudgets {
     /// (see [`decide`]'s conservative-budget contract).
     pub requeues: u32,
     /// Engine-cancelled carve-out re-offers already granted (the
-    /// `RequeueReason::EngineCancelled` why-slice of the same journal).
+    /// engine-cancel why-slice of the same journal —
+    /// [`RequeueReason::is_engine_cancel_cycle`], both the announced and
+    /// the fully cancelled variants).
     pub cancel_cycles: u32,
 }
 
@@ -153,12 +155,14 @@ mod requeue_budget {
         /// engine's own act, not evidence about the job. The carve-out
         /// carries its OWN explicit bound: `prior_cancel_cycles <
         /// max_engine_cancel_cycles`, each granted cycle journaled (the
-        /// `RequeueReason::EngineCancelled` why-slice) so the budget survives
-        /// restarts. Exhaustion terminalizes — a job whose batches the
-        /// engine keeps cancelling has consumed cycles x batch_timeout of
-        /// cluster time without producing a result, and another re-offer
-        /// cannot converge. Do NOT reach for this constructor from a new
-        /// arm without consulting the cycle budget.
+        /// engine-cancel why-slice,
+        /// `RequeueReason::is_engine_cancel_cycle` — announced and fully
+        /// cancelled variants alike) so the budget survives restarts.
+        /// Exhaustion terminalizes — a job whose batches the engine keeps
+        /// cancelling has consumed cycles x batch_timeout of cluster time
+        /// without producing a result, and another re-offer cannot
+        /// converge. Do NOT reach for this constructor from a new arm
+        /// without consulting the cycle budget.
         pub fn engine_cancelled(prior_cancel_cycles: u32, knobs: &Knobs) -> Option<Self> {
             (prior_cancel_cycles < knobs.max_engine_cancel_cycles).then_some(Self(Charge::Counted))
         }
@@ -635,6 +639,22 @@ pub struct BatchView {
 }
 
 impl BatchView {
+    /// Whether the cluster acknowledged the settled submission this
+    /// batch describes: a build id (the gateway's `rio: build <uuid>`
+    /// announcement) or in-band per-root results prove the cluster saw
+    /// it; their joint absence is the engine-side shape (submission
+    /// failure, fully cancelled engine-cancel cycle) that never reached
+    /// the cluster. THE single batch-evidence predicate behind the
+    /// attempts measurement: `process_settled_batch` derives
+    /// `current_is_cluster_attempt` from it for every record writer, and
+    /// decide()'s engine-cancelled arm keys the journaled requeue
+    /// vocabulary (announced vs fully cancelled) on it — one predicate,
+    /// so the current-event judgment and the journaled history cannot
+    /// drift on what "the cluster saw it" means.
+    pub fn cluster_acknowledged(&self) -> bool {
+        self.build_id.is_some() || !self.results.is_empty()
+    }
+
     /// THE batch-record → batch-view projection. Deliberately an
     /// exhaustive destructuring with no `..` rest pattern: a new
     /// `BatchRecord` field refuses to compile until this constructor
@@ -804,13 +824,25 @@ pub fn decide(
         // cannot converge by re-offering (see
         // [`RequeueBudget::engine_cancelled`]); otherwise a missing
         // result is a transport defect — one auto-retry, then an infra
-        // failure.
+        // failure. The journaled reason carries the batch-evidence bit
+        // the record writers stamp attempts from: a cancellation that
+        // fired AFTER the cluster acknowledged the submission (a build
+        // id, or per-root results for batch-mates —
+        // [`BatchView::cluster_acknowledged`], the same predicate
+        // `process_settled_batch` derives `current_is_cluster_attempt`
+        // from) journals the announced variant, which the measurement
+        // counts as a cluster attempt — so the journal fold and the
+        // current-event judgment cannot disagree about the same cycle.
+        // Both variants charge the same cycle budget
+        // ([`RequeueReason::is_engine_cancel_cycle`]).
         if batch.engine_cancelled {
             if let Some(budget) = RequeueBudget::engine_cancelled(prior.cancel_cycles, knobs) {
-                return CollectDecision::Requeue {
-                    why: RequeueReason::EngineCancelled,
-                    budget,
+                let why = if batch.cluster_acknowledged() {
+                    RequeueReason::EngineCancelledAnnounced
+                } else {
+                    RequeueReason::EngineCancelled
                 };
+                return CollectDecision::Requeue { why, budget };
             }
             return CollectDecision::Terminal {
                 rio: RioOutcome::TargetFailed {
@@ -1473,20 +1505,27 @@ pub async fn process_settled_batch(
     // per settled batch so every record this pass writes shares one view.
     let prior_attempts = measured_attempt_requeues(state)?;
     // Whether the CURRENT settled submission was itself a cluster attempt,
-    // derived once from batch evidence so no writer arm can hand-tune the
-    // +1: a build id or in-band results prove the cluster saw the
-    // submission; their joint absence is the engine-side shape
+    // derived once from THE batch-evidence predicate
+    // ([`BatchView::cluster_acknowledged`]) so no writer arm can
+    // hand-tune the +1: a build id or in-band results prove the cluster
+    // saw the submission; their joint absence is the engine-side shape
     // (submission failure, fully cancelled engine-cancel cycle) whose
     // requeue class `RequeueReason::counts_as_cluster_attempt` pins as
     // never-reached-the-cluster — the same judgment, asked of the current
     // event instead of journaled history. The ANNOUNCED-cancel cell sits
-    // on the true side deliberately: an engine cancellation that fires
-    // after the cluster acknowledged the submission leaves a build id
-    // (or per-root results) behind, and that acknowledgment IS cluster
-    // contact — only the fully cancelled cycle, cut before anything was
-    // announced, is engine-side. False by construction in the no-result
-    // arm below; true by construction in every with-result arm.
-    let current_is_cluster_attempt = batch.build_id.is_some() || !batch.results.is_empty();
+    // on the true side: an engine cancellation that fires after the
+    // cluster acknowledged the submission leaves a build id (or per-root
+    // results) behind, and that acknowledgment IS cluster contact — only
+    // the fully cancelled cycle, cut before anything was announced, is
+    // engine-side. The journal agrees cell-for-cell: decide()'s
+    // engine-cancelled arm keys the journaled reason on the SAME
+    // predicate (`EngineCancelledAnnounced`, counted, vs
+    // `EngineCancelled`, not), so N announced cancels followed by a
+    // settle stamp the same attempts whether they are folded from
+    // history or judged as the current event. False by construction in
+    // the no-result arm below; true by construction in every with-result
+    // arm.
+    let current_is_cluster_attempt = batch.cluster_acknowledged();
     // Members of timed batches are never re-offered to the timeless pending
     // pool: the timed dispatcher owns its own retries (confirmation
     // re-submissions), and whatever stays unresolved is covered by the
@@ -6331,35 +6370,55 @@ mod tests {
     /// An engine-cancelled batch (channel abandoned at the batch deadline)
     /// settles with no in-band results: every member is re-offered via the
     /// engine-cancelled rule regardless of how much retry budget it has
-    /// already spent.
+    /// already spent — and the journaled reason carries the
+    /// batch-evidence bit on both sides of the announcement conjunct
+    /// (`BatchView::cluster_acknowledged`): a batch the cluster
+    /// acknowledged before the cut (build id observed) journals the
+    /// ANNOUNCED variant (counted by the attempts measurement), a batch
+    /// cut before any acknowledgment journals the plain variant (not
+    /// counted) — so fold(journal) agrees with the current-event
+    /// judgment for the same cycle. Both ride the same cycle budget.
     #[test]
     fn engine_cancelled_batch_requeues_members_without_results() {
         let knobs = Knobs::default();
-        let batch = BatchView {
-            build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".into()),
-            results: vec![],
-            engine_cancelled: true,
-            ..BatchView::default()
-        };
         let no_poison: HashMap<String, Vec<String>> = HashMap::new();
-        for (job, prior_requeues) in [
-            (ctx("a.x86_64-linux", T, &[], ExpectedOutcome::Built), 0),
-            (ctx("b.x86_64-linux", DEP, &[], ExpectedOutcome::Built), 5),
+        for (case, build_id, expected_why) in [
+            (
+                "announced (build id observed before the cut)",
+                Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+                "engine-cancelled-announced",
+            ),
+            (
+                "fully cancelled (cut before any acknowledgment)",
+                None,
+                "engine-cancelled",
+            ),
         ] {
-            assert_eq!(
-                decide(
-                    &job,
-                    None,
-                    &batch,
-                    &no_poison,
-                    prior(prior_requeues),
-                    &knobs,
-                    None
-                )
-                .requeue_why(),
-                Some("engine-cancelled"),
-                "prior_requeues = {prior_requeues}"
-            );
+            let batch = BatchView {
+                build_id,
+                results: vec![],
+                engine_cancelled: true,
+                ..BatchView::default()
+            };
+            for (job, prior_requeues) in [
+                (ctx("a.x86_64-linux", T, &[], ExpectedOutcome::Built), 0),
+                (ctx("b.x86_64-linux", DEP, &[], ExpectedOutcome::Built), 5),
+            ] {
+                assert_eq!(
+                    decide(
+                        &job,
+                        None,
+                        &batch,
+                        &no_poison,
+                        prior(prior_requeues),
+                        &knobs,
+                        None
+                    )
+                    .requeue_why(),
+                    Some(expected_why),
+                    "[{case}] prior_requeues = {prior_requeues}"
+                );
+            }
         }
     }
 
@@ -6575,6 +6634,191 @@ mod tests {
         assert_eq!(retried.verdict.as_deref(), Some("match-built"));
         assert_eq!(retried.attempts, 2, "the infra-failed attempt counts");
         assert!(retried.flaky, "a needed retry IS flaky");
+    }
+
+    /// The announced-cancel cell of the attempts measurement, both
+    /// temporal positions and both sides of the announcement conjunct.
+    /// An engine cancellation that fired AFTER the cluster acknowledged
+    /// the submission journals `engine-cancelled-announced`, which the
+    /// measurement counts — so a cycle scores identically as journaled
+    /// history and as the settling event:
+    ///
+    /// - announced cancel then success: attempts = 2, flaky (the cluster
+    ///   saw two submissions of this job);
+    /// - two announced cancels then cycle-budget exhaustion: the
+    ///   terminal stamps attempts = 3 (two journaled cluster-acknowledged
+    ///   cycles + the final acknowledged submission);
+    /// - control, fully cancelled cycles (never announced): the
+    ///   journaled history counts 0 and the exhaustion terminal rides
+    ///   the no-result writer with no current attempt — attempts = 0,
+    ///   agreeing with the never-reached-the-cluster truth.
+    #[tokio::test]
+    async fn announced_cancel_cycles_count_in_the_attempts_measurement() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let contexts: HashMap<String, JobContext> = [
+            (
+                "ack.x86_64-linux".to_string(),
+                ctx("ack.x86_64-linux", T, &[], ExpectedOutcome::Built),
+            ),
+            (
+                "exhausted.x86_64-linux".to_string(),
+                ctx("exhausted.x86_64-linux", DEP, &[], ExpectedOutcome::Built),
+            ),
+            (
+                "cold.x86_64-linux".to_string(),
+                ctx("cold.x86_64-linux", OTHER, &[], ExpectedOutcome::Built),
+            ),
+        ]
+        .into();
+        // Journaled history: one announced cancel for "ack", two for
+        // "exhausted" (the full default cycle budget), two FULLY
+        // cancelled cycles for "cold".
+        for (job, why, n) in [
+            (
+                "ack.x86_64-linux",
+                RequeueReason::EngineCancelledAnnounced,
+                1,
+            ),
+            (
+                "exhausted.x86_64-linux",
+                RequeueReason::EngineCancelledAnnounced,
+                2,
+            ),
+            ("cold.x86_64-linux", RequeueReason::EngineCancelled, 2),
+        ] {
+            for _ in 0..n {
+                state
+                    .append_jsonl(
+                        StateFile::Requeues,
+                        &crate::run::model::RequeueRecord {
+                            job: job.to_string(),
+                            source: crate::run::model::REQUEUE_SOURCE_COLLECT.to_string(),
+                            why: why.as_str().to_string(),
+                            at: "2026-05-26T00:00:00Z".to_string(),
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+
+        // "ack" succeeds on the next wave: the announced cycle counts, so
+        // the success is the SECOND cluster attempt — flaky.
+        let success_batch = BatchView {
+            kind: BATCH_KIND_SUBMIT.to_string(),
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-3f2e3d4c5b6d".into()),
+            results: vec![po(T, BuildStatus::Built, "")],
+            ..BatchView::default()
+        };
+        process_settled_batch(
+            &state,
+            &LogAdmin::default(),
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &["ack.x86_64-linux".into()],
+            &success_batch,
+            &[("ack.x86_64-linux".to_string(), prior(1))].into(),
+            &Knobs::default(),
+            "leaf",
+            "c1",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+
+        // "exhausted": a third announced cancellation with the cycle
+        // budget spent terminalizes; the record stamps the two journaled
+        // cycles plus the current acknowledged submission.
+        let announced_cancel = BatchView {
+            kind: BATCH_KIND_SUBMIT.to_string(),
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-3f2e3d4c5b6e".into()),
+            results: vec![],
+            engine_cancelled: true,
+            ..BatchView::default()
+        };
+        process_settled_batch(
+            &state,
+            &LogAdmin::default(),
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &["exhausted.x86_64-linux".into()],
+            &announced_cancel,
+            &[(
+                "exhausted.x86_64-linux".to_string(),
+                PriorBudgets {
+                    requeues: 2,
+                    cancel_cycles: 2,
+                },
+            )]
+            .into(),
+            &Knobs::default(),
+            "leaf",
+            "c1",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+
+        // "cold": the never-announced exhaustion control — no build id,
+        // no results, the engine-side shape end to end.
+        let cold_cancel = BatchView {
+            kind: BATCH_KIND_SUBMIT.to_string(),
+            build_id: None,
+            results: vec![],
+            engine_cancelled: true,
+            ..BatchView::default()
+        };
+        process_settled_batch(
+            &state,
+            &LogAdmin::default(),
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &["cold.x86_64-linux".into()],
+            &cold_cancel,
+            &[(
+                "cold.x86_64-linux".to_string(),
+                PriorBudgets {
+                    requeues: 2,
+                    cancel_cycles: 2,
+                },
+            )]
+            .into(),
+            &Knobs::default(),
+            "leaf",
+            "c1",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        let by_job = |job: &str| records.iter().find(|r| r.job == job).unwrap();
+        let ack = by_job("ack.x86_64-linux");
+        assert_eq!(ack.verdict.as_deref(), Some("match-built"));
+        assert_eq!(
+            ack.attempts, 2,
+            "the announced cancel was cluster contact; the success is attempt two"
+        );
+        assert!(ack.flaky, "two cluster attempts were needed");
+        let exhausted = by_job("exhausted.x86_64-linux");
+        assert_eq!(exhausted.verdict.as_deref(), Some("infra-indeterminate"));
+        assert_eq!(
+            exhausted.attempts, 3,
+            "two journaled announced cycles + the current acknowledged submission"
+        );
+        let cold = by_job("cold.x86_64-linux");
+        assert_eq!(cold.verdict.as_deref(), Some("infra-indeterminate"));
+        assert_eq!(
+            cold.attempts, 0,
+            "fully cancelled cycles never reached the cluster — both temporal \
+             positions agree on zero"
+        );
     }
 
     /// A duplicate batch for a job that already settled terminally (the
@@ -6882,8 +7126,10 @@ mod tests {
                 },
                 job,
                 &empty_set,
+                // The build id was observed before the cut, so the
+                // requeue-shaped reason is the announced variant.
                 CollectDecision::Defer {
-                    reason: "engine-cancelled",
+                    reason: "engine-cancelled-announced",
                 },
             ),
             (
