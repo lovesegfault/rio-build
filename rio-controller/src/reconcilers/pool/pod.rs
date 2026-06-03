@@ -181,6 +181,20 @@ fn is_fetcher(pool: &Pool) -> bool {
     pool.spec.kind == ExecutorKind::Fetcher
 }
 
+/// r16 bug_097: can this `hashedMirrors` entry survive the env
+/// transport byte-for-byte? `RIO_HASHED_MIRRORS` is comma-joined here
+/// and comma-split by the worker (`comma_vec`), then space-joined and
+/// whitespace-split again on the way into `builtin:fetchurl` — an
+/// entry containing either delimiter fragments into garbage mirror
+/// candidates that burn the fetch backoff ladder. The CRD CEL rule
+/// additionally requires an absolute URL; this runtime filter guards
+/// only the transport-fatal class (delimiters), because a schemeless
+/// entry fails one candidate loudly while a fragmented one corrupts
+/// the WHOLE list silently.
+fn mirror_entry_survives_transport(entry: &str) -> bool {
+    !entry.is_empty() && !entry.contains(',') && !entry.chars().any(|c| c.is_whitespace())
+}
+
 /// §13e: Fetcher Pools advertise `[fetcher]`, NOT empty. FODs route by
 /// `effective_features(state) = [fetcher]` at the scheduler chokepoint
 /// (`r[sched.sla.fod-feature-derivation+3]`); the I-181 ∅-guard requires
@@ -925,10 +939,37 @@ fn build_executor_container(
             // the builtin path; builders may run non-builtin FODs that
             // simply ignore it). Comma-separated per the RIO_ env
             // layer's comma_vec convention.
+            //
+            // r16 bug_097: an entry containing the transport delimiters
+            // (comma here, whitespace one layer down) would silently
+            // fragment into garbage mirror candidates. The CRD CEL rule
+            // rejects such entries at admission; this filter is the
+            // belt-and-suspenders for pre-CEL CRs the apiserver already
+            // accepted — skip and WARN, never silently mangle.
             if let Some(mirrors) = &pool.spec.hashed_mirrors
                 && !mirrors.is_empty()
             {
-                e.push(env("RIO_HASHED_MIRRORS", &mirrors.join(",")));
+                let (valid, malformed): (Vec<&String>, Vec<&String>) = mirrors
+                    .iter()
+                    .partition(|m| mirror_entry_survives_transport(m));
+                for m in &malformed {
+                    tracing::warn!(
+                        mirror = %m,
+                        "skipping hashedMirrors entry that cannot survive the \
+                         comma/whitespace env transport (the CRD CEL rule rejects \
+                         these at admission; this CR predates it)"
+                    );
+                }
+                if !valid.is_empty() {
+                    e.push(env(
+                        "RIO_HASHED_MIRRORS",
+                        &valid
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ));
+                }
             }
             // Coverage + RUST_LOG passthrough (test-only / operator
             // knob respectively). `$(RIO_EXECUTOR_ID)` (downward-API
@@ -1172,6 +1213,40 @@ mod tests {
         // unknown → no constraint
         assert_eq!(nix_systems_to_k8s_arch(&s(&["riscv64-linux"])), None);
         assert_eq!(nix_systems_to_k8s_arch(&[]), None);
+    }
+
+    /// r16 bug_097: the transport filter passes well-formed mirror
+    /// URLs and rejects exactly the entries the comma/whitespace env
+    /// round trips would fragment. The CRD CEL is the admission gate;
+    /// this filter is the pre-CEL-CR belt-and-suspenders, so its
+    /// accept set must be a superset of CEL's (no scheme check here —
+    /// schemeless fails one candidate loudly, fragmentation corrupts
+    /// the whole list silently).
+    #[test]
+    fn mirror_transport_filter() {
+        // Survivors
+        assert!(mirror_entry_survives_transport(
+            "https://tarballs.nixos.org"
+        ));
+        assert!(mirror_entry_survives_transport(
+            "http://mirror.internal:8080/hashed"
+        ));
+        assert!(mirror_entry_survives_transport(
+            "s3://bucket/prefix?region=us-east-2"
+        ));
+        // RFC 3986 sub-delim comma inside a legal URL — the bug_097
+        // shape: would fragment at the comma_vec split.
+        assert!(!mirror_entry_survives_transport(
+            "https://cdn.example/v1,v2/mirror"
+        ));
+        // Whitespace variants — would fragment at the space split.
+        assert!(!mirror_entry_survives_transport(
+            "https://a.example /mirror"
+        ));
+        assert!(!mirror_entry_survives_transport("https://a.example\tx"));
+        assert!(!mirror_entry_survives_transport("https://a.example\nx"));
+        // Empty contributes nothing but a leading/trailing comma.
+        assert!(!mirror_entry_survives_transport(""));
     }
 
     // r[verify ctrl.pool.fetcher-hardening+2]

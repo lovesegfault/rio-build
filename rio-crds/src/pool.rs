@@ -206,6 +206,26 @@ impl ExecutorKind {
         "kind=Builder forbids nodeSelector['rio.build/fetcher'] — the fetcher taint repels Builder pods (no toleration) so the pod would be permanently Pending (r35 bug_044)"
     )
 )]
+// r16 bug_097: hashedMirrors values traverse two delimiter round
+// trips on the way to builtin:fetchurl — comma-joined into
+// RIO_HASHED_MIRRORS by the reconciler, comma-split by the worker's
+// `comma_vec`, then space-joined/space-split again into the fetch
+// path. Commas are legal unescaped URL sub-delims (RFC 3986), so an
+// entry containing one silently fragments into garbage candidates:
+// the intended mirror is never consulted and the non-URL fragment
+// burns the full fetch backoff ladder on every FOD. Reject at
+// admission: absolute URL, no comma, no whitespace (the `\t\r\n`
+// escapes are CEL escapes — literal chars inside the RE2 class).
+// The reconciler additionally skip-warns malformed entries from
+// pre-CEL CRs (`pod::mirror_entry_survives_transport`), the same
+// belt-and-suspenders posture as the fetcher hardening above.
+#[x_kube(
+    validation = Rule::new(
+        "!has(self.hashedMirrors) || self.hashedMirrors.all(m, m.matches('^[a-zA-Z][a-zA-Z0-9+.-]*://[^,\\t\\r\\n ]+$'))"
+    ).message(
+        "hashedMirrors entries must be absolute URLs containing no comma or whitespace — the value is transported through comma- and space-delimited env vars (RIO_HASHED_MIRRORS), so a delimiter inside a URL silently fragments it into garbage mirror candidates (r16 bug_097)"
+    )
+)]
 pub struct PoolSpec {
     /// Builder or Fetcher. Required — there is no sensible default
     /// (the two have opposite network postures).
@@ -286,7 +306,9 @@ pub struct PoolSpec {
     /// URL). Maps to `RIO_HASHED_MIRRORS`. Mostly relevant for
     /// `kind=Fetcher` pools, but allowed on both kinds — builders may
     /// also run non-builtin FODs that never consult it. `None` = no
-    /// mirrors (origin URLs only).
+    /// mirrors (origin URLs only). CEL-validated: each entry must be
+    /// an absolute URL with no comma or whitespace (the env transport
+    /// is comma- and space-delimited; r16 bug_097).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hashed_mirrors: Option<Vec<String>>,
 
