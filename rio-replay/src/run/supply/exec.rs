@@ -2601,9 +2601,18 @@ pub struct SupplyStageOutput {
 /// execution on the prefetch shortfall.
 ///
 /// Resume costs re-probing, never correctness: prior `supply.jsonl` content
-/// is reporting-only and never read for decisions — validity is re-probed on
-/// every run, already-valid paths are recorded `already-present`, and a
-/// re-run after a crash re-converges without re-sending anything.
+/// is never re-trusted for path VALIDITY — that is re-probed on every run,
+/// already-valid paths are recorded `already-present`, and a re-run after a
+/// crash re-converges without re-sending anything. The journal's deferral
+/// and settlement rows ARE load-bearing decision inputs, though, not
+/// telemetry: the inline-resume refusal gate folds outstanding
+/// inline-deferral rows (`SupplyFold::outstanding_inline_deferrals`, the
+/// design doc's §6.7 carve-out) into a hard refusal to resume past a
+/// completed stage whose deferred uploads nothing can deliver, and the
+/// supply-retirement rollup (`supply_rollup_dispositions`) re-derives
+/// upload-rejected / supply-failed retirements from settled refusal and
+/// failure rows on every start. An editor who stops appending these rows —
+/// or lets bookkeeping rows displace them — silently disarms both.
 ///
 /// When the planned-but-missing prefetch fraction exceeds
 /// `knobs.prefetch_shortfall_pause_pct`, the campaign PAUSE file is written
