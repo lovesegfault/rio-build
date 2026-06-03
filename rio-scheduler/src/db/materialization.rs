@@ -544,7 +544,12 @@ impl SchedulerDb {
         &self,
         horizon_secs: f64,
         limit: i64,
+        serving_generation: i64,
     ) -> Result<u64, sqlx::Error> {
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            crate::db::FencedBegin::Fenced { .. } => return Ok(0),
+            crate::db::FencedBegin::Open(ftx) => ftx,
+        };
         let result = sqlx::query(
             "DELETE FROM materialization_jobs WHERE job_id IN (
                  SELECT j.job_id FROM materialization_jobs j
@@ -560,8 +565,9 @@ impl SchedulerDb {
         )
         .bind(horizon_secs)
         .bind(limit)
-        .execute(&self.pool)
+        .execute(tx.conn())
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 }

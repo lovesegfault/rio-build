@@ -2098,6 +2098,76 @@ in
       ];
     };
 
+    # ── placeholderClaim: the manifests claim ownership protocol after
+    # the bughunt-wave D1 takeover rework (merged_bug_003 stall-takeover
+    # predicate + merged_bug_082 validation floor). The main regime
+    # holds the predicate's THREE real guarantees: the 092 phase
+    # exemption (no parked/persisting steal), the 2x-heartbeat floor
+    # theorem (no steady-advancer steal on stamp lag), and the liveness
+    # conjunct (strikes only inside the freshness window — long-dead
+    # owners always fall to the no-strike reap arm). The heartbeat is
+    # modeled as the reliable claim-guarded ticker it is in cas.rs.
+    # r[verify store.substitute.stale-reclaim+3]
+    # r[verify store.put.placeholder-claim+2]
+    quint-placeholder-claim-main = mkQuintCheck {
+      name = "placeholder-claim-main";
+      spec = "placeholderClaim";
+      main = "placeholderClaimMain";
+      invariants = [
+        "boundsOK"
+        "liveOwnerNeverDeposed"
+        "steadyAdvancerNeverDeposed"
+        "strikeOnlyWithinLivenessWindow"
+      ];
+    };
+
+    # Falsification twin: the PRE-FIX predicate (no liveness conjunct)
+    # strikes an owner dead past the stall window — the merged_bug_003
+    # 180-300s strike window, demonstrated as a model violation.
+    quint-placeholder-claim-falsify-no-liveness = mkQuintWitnessCheck {
+      name = "placeholder-claim-falsify-no-liveness";
+      spec = "placeholderClaim";
+      main = "placeholderClaimNoLiveness";
+      witness = "strikeOnlyWithinLivenessWindow";
+    };
+
+    # Falsification twin: pre-092 (no phase column) — a budget-parked
+    # owner with frozen progress and a live heartbeat is deposed
+    # mid-park (the backpressured-owner steal).
+    quint-placeholder-claim-falsify-no-phase = mkQuintWitnessCheck {
+      name = "placeholder-claim-falsify-no-phase";
+      spec = "placeholderClaim";
+      main = "placeholderClaimNoPhase";
+      witness = "liveOwnerNeverDeposed";
+    };
+
+    # Falsification twin: a stall window below 2x the heartbeat
+    # interval deposes a live owner advancing every tick, on stamp lag
+    # alone — the model justification for the Config::validate() floor
+    # substitute_stall >= 2 * heartbeat (merged_bug_082).
+    quint-placeholder-claim-falsify-sub-heartbeat = mkQuintWitnessCheck {
+      name = "placeholder-claim-falsify-sub-heartbeat";
+      spec = "placeholderClaim";
+      main = "placeholderClaimSubHeartbeatWindow";
+      witness = "steadyAdvancerNeverDeposed";
+    };
+
+    # Reachability witnesses on the main regime: the intended takeover
+    # (an alive-but-wedged downloader is stolen) and the no-strike reap
+    # of a dead owner both actually happen.
+    quint-placeholder-claim-witness-wedged-deposed = mkQuintWitnessCheck {
+      name = "placeholder-claim-witness-wedged-deposed";
+      spec = "placeholderClaim";
+      main = "placeholderClaimMain";
+      witness = "wedgedOwnerDeposedW";
+    };
+    quint-placeholder-claim-witness-dead-reaped = mkQuintWitnessCheck {
+      name = "placeholder-claim-witness-dead-reaped";
+      spec = "placeholderClaim";
+      main = "placeholderClaimMain";
+      witness = "deadOwnerReapedW";
+    };
+
     # The late-mark holds-half (Phase-1 input list item 1): under a
     # relaxed heartbeat contract (a live owner may stall past the
     # reclaim thresholds), the T-pre.1 `AND deleted = FALSE` guard on

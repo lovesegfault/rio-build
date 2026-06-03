@@ -947,7 +947,9 @@ async fn gc_resolved_jobs_sweeps_only_unreferenced_resolved() -> anyhow::Result<
     .execute(&test_db.pool)
     .await?;
 
-    let deleted = db.gc_resolved_materialization_jobs(86_400.0, 1000).await?;
+    let deleted = db
+        .gc_resolved_materialization_jobs(86_400.0, 1000, 1)
+        .await?;
     assert_eq!(deleted, 1, "exactly the unreferenced resolved-old job");
     assert_eq!(job_count(&test_db.pool, drv_swept).await?, 0, "swept");
     assert_eq!(

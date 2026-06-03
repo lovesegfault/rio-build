@@ -191,7 +191,12 @@ impl SchedulerDb {
         &self,
         horizon_secs: f64,
         limit: i64,
+        serving_generation: i64,
     ) -> Result<u64, sqlx::Error> {
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            FencedBegin::Fenced { .. } => return Ok(0),
+            FencedBegin::Open(ftx) => ftx,
+        };
         let result = sqlx::query(
             "DELETE FROM build_wanted_outputs WHERE (build_id, derivation_id) IN (
                  SELECT w.build_id, w.derivation_id
@@ -204,8 +209,9 @@ impl SchedulerDb {
         )
         .bind(horizon_secs)
         .bind(limit)
-        .execute(&self.pool)
+        .execute(tx.conn())
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 }

@@ -2343,3 +2343,62 @@ What landed (one change set on top of the close-out):
 Unchanged claims: nothing is deployment-validated by this update — no
 database has ever applied 070 (or any other migration of this
 campaign); the "What the campaign does NOT claim" section stands.
+
+## Bughunt-wave D1 addendum (2026-06-03): the chunk-row lifecycle and the placeholder-claim model
+
+**The chunk-row lifecycle, declared** (merged_bug_336; migration 091 +
+the post-pass reap in `gc/collect.rs`). Every `chunks` row is in exactly
+one of five states, with one owner per transition:
+
+| transition | owner |
+|---|---|
+| (absent) → live | the chunked-upgrade upsert (`metadata/chunked.rs`, write-ahead tx; on conflict it also clears `deleted`/`deleted_at` — the resurrect) |
+| live → soft-deleted (`deleted`, `deleted_at` stamped) | the collect cycle's batch update (`COLLECT_BATCH_UPDATE_SQL`) |
+| soft-deleted → drained (S3 object gone) | the outbox drain (`gc/drain.rs`; resurrect-skip reads `deleted` only) |
+| drained → reaped (row gone) | the post-pass reap: live arm only, `pass_complete` only, `deleted_at` past `CHUNK_GRACE_SECS`, no `pending_s3_deletes` row, keyset-batched, `REAP_CYCLE_CAP`-bounded |
+| soft-deleted/drained → live | the resurrect upsert (same writer as insert; `deleted_at` NULLed) |
+
+Tombstones are therefore bounded: a drained row outlives its object by
+at most one grace term plus one collect cycle (`rio_store_gc_chunks_reaped_total`
+counts the exits). The reap's outbox conjunct keeps the drain's
+resurrect-skip exact — a row is never deleted while its S3 delete is
+still queued, so `PutPath` on the same hash after a reap is a fresh
+INSERT, never a half-drained resurrect.
+
+**placeholderClaim.qnt** (merged_bug_003 + merged_bug_082; the 092
+phase-keyed two-clock takeover). The model states the THREE guarantees
+the single-sourced `STALL_TAKEOVER_PREDICATE` actually makes — no more:
+
+- `liveOwnerNeverDeposed`: an alive parked/persisting owner is never
+  deposed (phase exemption AS DATA; pre-092 falsified by
+  `placeholderClaimNoPhase`).
+- `steadyAdvancerNeverDeposed`: an owner advancing within one heartbeat
+  whose advance was durably stamped within 2x the heartbeat is never
+  deposed — true exactly because of the `Config::validate()` floor
+  `substitute_stall >= 2 * heartbeat`; `placeholderClaimSubHeartbeatWindow`
+  drops the floor and falsifies it on stamp lag alone.
+- `strikeOnlyWithinLivenessWindow`: a strike only lands while durable
+  liveness is fresh; owners dead past the stall window always fall to
+  the no-strike reap arm (`placeholderClaimNoLiveness` — the pre-fix
+  predicate — falsifies; the 180-300 s strike window of merged_bug_003
+  is unrepresentable in the fixed model). The strike on an owner dead
+  SHORTER than one stall window is the accepted residual: the durable
+  image cannot distinguish it from an alive-wedged owner, and the model
+  does not pretend otherwise.
+
+Reachability witnesses (`wedgedOwnerDeposedW`, `deadOwnerReapedW`) pin
+both competitor arms live. The heartbeat is modeled as the reliable
+claim-guarded ticker `cas.rs` implements (folded into `tick`,
+fires-when-due; only death or release stops it) — scheduling
+nondeterminism on the heartbeat would understate the predicate.
+Budgets: all six checks converge in seconds at the default samples
+(state space: one owner, one competitor, 14-16 bounded ticks); no
+bounded-coverage rows needed.
+
+Remaining model work recorded for this workstream: the `gcCoordination`
+sibling module (cluster cadence/cursor/gauges over the durable
+`gc_collect_state` row), the `shadowEquivalence` regime
+(`CollectMode::Shadow` exclusion vs live), and the `reap` action joining
+the `chunkCollect` base alphabet (`reapSafety`, `noTombstoneReaped`
+witness) — scoped in the wave log; the code they model shipped in this
+workstream with its differential/property test batteries.

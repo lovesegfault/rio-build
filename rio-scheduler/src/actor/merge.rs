@@ -350,7 +350,11 @@ impl DagActor {
             Ok(r) => r,
             Err(e) => {
                 // Best-effort: clean up the orphan build row.
-                match self.db.delete_build(build_id, self.serving_generation()).await {
+                match self
+                    .db
+                    .delete_build(build_id, self.serving_generation())
+                    .await
+                {
                     Ok(crate::db::FencedOutcome::Fenced) => {
                         warn!(build_id = %build_id,
                               "fenced: deposed replica skipped orphan build cleanup (successor owns it)");
@@ -2302,18 +2306,22 @@ impl DagActor {
         );
         self.events.remove(build_id);
         self.builds.remove(&build_id);
-        match self.db.delete_build(build_id, self.serving_generation()).await {
+        match self
+            .db
+            .delete_build(build_id, self.serving_generation())
+            .await
+        {
             Ok(crate::db::FencedOutcome::Fenced) => {
                 warn!(build_id = %build_id, "fenced: deposed replica skipped build rollback delete");
             }
             Ok(_) => {}
             Err(db_e) => {
-            warn!(
-                build_id = %build_id,
-                error = %db_e,
-                "failed to delete orphan build row during merge rollback"
-            );
-        }
+                warn!(
+                    build_id = %build_id,
+                    error = %db_e,
+                    "failed to delete orphan build row during merge rollback"
+                );
+            }
         }
     }
 

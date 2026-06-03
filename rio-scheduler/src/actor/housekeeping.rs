@@ -537,7 +537,11 @@ impl DagActor {
         #[allow(clippy::cast_precision_loss)] // horizon ≪ 2^52 s
         match self
             .db
-            .gc_resolved_materialization_jobs(horizon as f64, MAT_JOBS_GC_BATCH)
+            .gc_resolved_materialization_jobs(
+                horizon as f64,
+                MAT_JOBS_GC_BATCH,
+                self.serving_generation(),
+            )
             .await
         {
             Ok(0) => {}
@@ -566,7 +570,11 @@ impl DagActor {
         #[allow(clippy::cast_precision_loss)] // horizon ≪ 2^52 s
         match self
             .db
-            .gc_dead_build_wanted_outputs(horizon as f64, WANTED_GC_BATCH)
+            .gc_dead_build_wanted_outputs(
+                horizon as f64,
+                WANTED_GC_BATCH,
+                self.serving_generation(),
+            )
             .await
         {
             Ok(0) => {}

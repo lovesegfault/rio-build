@@ -597,11 +597,22 @@ let
             "the wedge; raise the payload size / lower the netem rate"
         )
 
-        # Wedge: loss 100% — packets silently dropped, no RST; the
-        # connection stays alive while fetched_bytes freezes. The
-        # throttled-but-advancing phase above already proved slow≠stuck
-        # (per-read clock restarted on every read).
-        client.succeed("tc qdisc replace dev eth1 root netem loss 100%")
+        # Wedge: SIGSTOP the upstream server. The kernel keeps the TCP
+        # session ESTABLISHED and silently drains the already-buffered
+        # send bytes (a few seconds at 8 mbit), then the stream goes
+        # quiet with a perfectly healthy socket: no FIN, no RST, no
+        # app-level timeout — the ONLY clock left running is the
+        # store's per-read stall watchdog. Network-level wedges (netem
+        # loss/delay) proved non-deterministic at the 60 s floor
+        # (merged_bug_082): an environmental ~33 s connection death —
+        # which the old 15 s window always beat — killed the body read
+        # with a decode error first, and the per-upstream retry arm
+        # swallowed the stall (no released-in-place, no stall_abort
+        # metric). Freezing the server process removes every timer
+        # except the one under test. The throttled-but-advancing phase
+        # above already proved slow≠stuck (per-read clock restarted on
+        # every read); the throttle stays in place, harmless.
+        client.succeed("pkill -STOP -f 'http.server 8080'")
 
         # Owner-side abort at the 60 s window (+ slack for the in-flight
         # read to drain): journal warn pair → metric → row state.
@@ -645,9 +656,10 @@ let
 
         # Heal FIRST (mandatory cleanup: client-egress shaping also
         # degrades coverage collection if leaked).
+        client.succeed("pkill -CONT -f 'http.server 8080' || true")
         client.succeed("tc qdisc del dev eth1 root || true")
 
-        # Post-abort claim behavior (stale-reclaim+2 arm 1): a DEDICATED
+        # Post-abort claim behavior (stale-reclaim+3 arm 1): a DEDICATED
         # re-fetch with its own -max-time 180 — QueryPathInfo blocks on
         # the full re-download + finalize from byte 0 (the release
         # NULLed fetched_bytes); a 30 s budget would client-cancel under

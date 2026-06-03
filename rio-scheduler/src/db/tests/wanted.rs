@@ -390,7 +390,7 @@ async fn gc_dead_wanted_sweeps_terminal_and_orphans() -> anyhow::Result<()> {
         .execute(&test_db.pool)
         .await?;
 
-    let deleted = db.gc_dead_build_wanted_outputs(86_400.0, 1000).await?;
+    let deleted = db.gc_dead_build_wanted_outputs(86_400.0, 1000, 1).await?;
     assert_eq!(deleted, 2, "terminal-old + orphan");
     let remaining: Vec<Uuid> =
         sqlx::query_scalar("SELECT build_id FROM build_wanted_outputs ORDER BY build_id")
@@ -439,4 +439,3 @@ async fn delete_build_purges_wanted_rows_same_fenced_tx() -> anyhow::Result<()> 
     assert_eq!((builds, wanted), (0, 0), "both gone atomically");
     Ok(())
 }
-

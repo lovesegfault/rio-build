@@ -7,7 +7,7 @@
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use super::{BuildListRow, SchedulerDb, list_builds_select, FencedBegin, FencedOutcome};
+use super::{BuildListRow, FencedBegin, FencedOutcome, SchedulerDb, list_builds_select};
 use crate::state::{BuildState, BuildStateExt};
 
 impl SchedulerDb {
