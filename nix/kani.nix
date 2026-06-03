@@ -268,19 +268,27 @@ in
   #     — if the build-kind subset alone does not poison, no amount of
   #     interleaved materialization rows makes the full set poison.
   #   - check_sweep_suffix_equivalence: the attempt-ledger GC sweep's
-  #     structural half — for every bounded history and every deletion
-  #     mask confined to attempt-kind rows strictly before the last
-  #     reset row (the sweep's E1+E2 conjuncts; the age conjunct is
-  #     deliberately absent, so every age implementation is a
-  #     mask-shrinking special case), the post-cut suffix is
-  #     element-wise unchanged (MAX=5: no decide() call, so the
-  #     structural harness carries the larger bound).
+  #     structural half, re-stated over the PER-LANE cut (migration
+  #     084) — for every bounded history and every deletion mask
+  #     confined to attempt-kind rows strictly before THEIR OWN lane's
+  #     last reset row (the sweep's E1+E2 conjuncts, kinded; the age
+  #     conjunct is deliberately absent, so every age implementation is
+  #     a mask-shrinking special case), the LOADED VIEW
+  #     (row_survives_load) is element-wise unchanged (MAX=5: no
+  #     decide() call, so the structural harness carries the larger
+  #     bound).
   #   - check_sweep_decide_invariant: the loader-composed end-to-end
-  #     theorem — decide() and materialization_decide() over the cut
-  #     suffix are bit-identical before/after any structural sweep
+  #     theorem — decide() and materialization_decide() over the loaded
+  #     view are bit-identical before/after any structural sweep
   #     (MAX=4, ~2× the check_decide_contract fold cost; documented
   #     fallback to MAX=3 if the gate budget is ever exceeded — the
   #     bounded-exhaustive unit test keeps len<=4 covered regardless).
+  #   - check_loader_cut_preserves_materialization_decide: the per-lane
+  #     loader cut loses NO materialization-decision information —
+  #     materialization_decide over the loaded view equals it over the
+  #     full history (under the pre-084 any-kind cut, a trailing build
+  #     reset emptied the view and flipped parked verdicts back to
+  #     Claimable: merged_bug_011's resurrection class).
   # r[verify sched.retry.transient-budget]
   # r[verify sched.retry.attempts-bounded+2]
   # r[verify sched.retry.exempt-infra-cap]
@@ -291,7 +299,7 @@ in
   kani-rio-retry-kernel = mkKaniCheck {
     name = "rio-retry-kernel";
     crate = crateBuildKani.members.rio-retry-kernel;
-    expectedHarnesses = 10;
+    expectedHarnesses = 11;
   };
 
   # rio-evidence-kernel: the scheduler's closure-evidence decision kernel

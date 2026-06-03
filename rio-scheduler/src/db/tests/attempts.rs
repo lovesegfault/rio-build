@@ -28,7 +28,12 @@ async fn test_attempt_append_load_roundtrip() -> anyhow::Result<()> {
     let (_test_db, db, drv_id) = setup("attempt-rt-hash").await?;
 
     let exec_id = Uuid::now_v7();
-    let mut row = AttemptRow::new(drv_id, OutcomeClass::Infra, ReportingParty::Worker);
+    let mut row = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Infra,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
     row.exec_id = Some(exec_id);
     row.executor_id = Some(ExecutorId::from("builder-1"));
     row.exempt = true;
@@ -86,12 +91,18 @@ async fn test_attempt_duplicate_exec_id_append_is_noop() -> anyhow::Result<()> {
         drv_id,
         OutcomeClass::Disconnected,
         ReportingParty::Scheduler,
+        AttemptKind::Build,
     );
     first.exec_id = Some(exec_id);
 
     // A different attempt_id for the same execution — e.g. a stray
     // duplicate append racing the two-installment discipline.
-    let mut dup = AttemptRow::new(drv_id, OutcomeClass::Timeout, ReportingParty::Controller);
+    let mut dup = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Timeout,
+        ReportingParty::Controller,
+        AttemptKind::Build,
+    );
     dup.exec_id = Some(exec_id);
 
     let mut tx = db.pool().begin().await?;
@@ -108,7 +119,12 @@ async fn test_attempt_duplicate_exec_id_append_is_noop() -> anyhow::Result<()> {
     assert!(
         SchedulerDb::append_attempt(
             &mut tx,
-            &AttemptRow::new(drv_id, OutcomeClass::Cascade, ReportingParty::Scheduler),
+            &AttemptRow::new(
+                drv_id,
+                OutcomeClass::Cascade,
+                ReportingParty::Scheduler,
+                AttemptKind::Build
+            ),
         )
         .await?
     );
@@ -118,7 +134,8 @@ async fn test_attempt_duplicate_exec_id_append_is_noop() -> anyhow::Result<()> {
             &AttemptRow::new(
                 drv_id,
                 OutcomeClass::FleetExhaust,
-                ReportingParty::Scheduler
+                ReportingParty::Scheduler,
+                AttemptKind::Build,
             ),
         )
         .await?
@@ -148,7 +165,12 @@ async fn test_attempt_append_and_status_persist_share_tx() -> anyhow::Result<()>
     let (test_db, db, drv_id) = setup("attempt-tx-hash").await?;
     let drv_hash: DrvHash = "attempt-tx-hash".into();
 
-    let mut row = AttemptRow::new(drv_id, OutcomeClass::Timeout, ReportingParty::Worker);
+    let mut row = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Timeout,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
     row.exec_id = Some(Uuid::now_v7());
 
     let mut tx = db.pool().begin().await?;
@@ -171,7 +193,12 @@ async fn test_attempt_append_and_status_persist_share_tx() -> anyhow::Result<()>
     assert_eq!(loaded.get(&drv_id).map(Vec::len), Some(1));
 
     // The poison variant joins a caller-owned transaction the same way.
-    let mut row2 = AttemptRow::new(drv_id, OutcomeClass::Permanent, ReportingParty::Worker);
+    let mut row2 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Permanent,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
     row2.exec_id = Some(Uuid::now_v7());
     let mut tx = db.pool().begin().await?;
     assert!(SchedulerDb::append_attempt(&mut tx, &row2).await?);
@@ -199,12 +226,22 @@ async fn test_attempt_suffix_cuts_at_last_reset() -> anyhow::Result<()> {
 
     let mut tx = db.pool().begin().await?;
     // Pre-reset history: two attempts (one with an exec).
-    let mut a1 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let mut a1 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Transient,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
     a1.exec_id = Some(Uuid::now_v7());
     SchedulerDb::append_attempt(&mut tx, &a1).await?;
     SchedulerDb::append_attempt(
         &mut tx,
-        &AttemptRow::new(drv_id, OutcomeClass::Backstop, ReportingParty::Scheduler),
+        &AttemptRow::new(
+            drv_id,
+            OutcomeClass::Backstop,
+            ReportingParty::Scheduler,
+            AttemptKind::Build,
+        ),
     )
     .await?;
     // The reset event (resubmit reset, cycle 1).
@@ -213,10 +250,16 @@ async fn test_attempt_suffix_cuts_at_last_reset() -> anyhow::Result<()> {
         OutcomeClass::ResubmitReset,
         ReportingParty::Scheduler,
         1,
+        AttemptKind::Build,
     );
     SchedulerDb::append_attempt(&mut tx, &reset).await?;
     // Post-reset history: one attempt.
-    let mut a3 = AttemptRow::new(drv_id, OutcomeClass::Infra, ReportingParty::Worker);
+    let mut a3 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Infra,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
     a3.exec_id = Some(Uuid::now_v7());
     SchedulerDb::append_attempt(&mut tx, &a3).await?;
     tx.commit().await?;
@@ -391,8 +434,12 @@ async fn test_suffix_load_carries_attempt_kind_and_partition() -> anyhow::Result
     // Three ledger rows: a transient build attempt (exec A), a
     // materialization-infra row (exec B), and a cascade row (no exec —
     // loads as Build by the COALESCE default).
-    let mut build_attempt =
-        AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let mut build_attempt = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Transient,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
     build_attempt.exec_id = Some(exec_a);
     build_attempt.executor_id = Some(ExecutorId::from("builder-1"));
     build_attempt.source_node = Some("node-1".into());
@@ -401,11 +448,17 @@ async fn test_suffix_load_carries_attempt_kind_and_partition() -> anyhow::Result
         drv_id,
         OutcomeClass::MaterializationInfra,
         ReportingParty::Worker,
+        AttemptKind::Materialization,
     );
     mat_attempt.exec_id = Some(exec_b);
     mat_attempt.executor_id = Some(ExecutorId::from("intent@store-0"));
 
-    let cascade = AttemptRow::new(drv_id, OutcomeClass::Cascade, ReportingParty::Scheduler);
+    let cascade = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Cascade,
+        ReportingParty::Scheduler,
+        AttemptKind::Build,
+    );
 
     let mut tx = db.pool().begin().await?;
     assert!(SchedulerDb::append_attempt(&mut tx, &build_attempt).await?);
@@ -561,17 +614,39 @@ async fn test_attempts_gc_deletes_only_pre_reset_rows_past_horizon() -> anyhow::
         OutcomeClass::CacheHitClear,
         ReportingParty::Admin,
         0,
+        AttemptKind::Build,
     );
-    let a1 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
-    let a2 = AttemptRow::new(drv_id, OutcomeClass::Infra, ReportingParty::Scheduler);
+    let a1 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Transient,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
+    let a2 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Infra,
+        ReportingParty::Scheduler,
+        AttemptKind::Build,
+    );
     let r1 = AttemptRow::new_reset(
         drv_id,
         OutcomeClass::ResubmitReset,
         ReportingParty::Scheduler,
         1,
+        AttemptKind::Build,
     );
-    let a3 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
-    let a4 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let a3 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Transient,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
+    let a4 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Transient,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
     let keep = [r0.attempt_id, r1.attempt_id, a3.attempt_id, a4.attempt_id];
     let victims = [a1.attempt_id, a2.attempt_id];
     append_committed(&db, &[r0, a1, a2, r1, a3, a4]).await?;
@@ -608,19 +683,45 @@ async fn test_attempts_gc_decide_invariant_for_poisoned_history() -> anyhow::Res
     // Earlier cycle: two old attempts, then the cycle-2 resubmit reset
     // (also old). Current cycle: three fresh distinct-source failures —
     // a poisoned suffix.
-    let a1 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
-    let a2 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let a1 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Transient,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
+    let a2 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Transient,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
     let r1 = AttemptRow::new_reset(
         drv_id,
         OutcomeClass::ResubmitReset,
         ReportingParty::Scheduler,
         2,
+        AttemptKind::Build,
     );
-    let mut f1 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let mut f1 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Transient,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
     f1.source_node = Some("node-w1".into());
-    let mut f2 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let mut f2 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Transient,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
     f2.source_node = Some("node-w2".into());
-    let mut f3 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let mut f3 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Transient,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
     f3.source_node = Some("node-w3".into());
     let old = [a1.attempt_id, a2.attempt_id, r1.attempt_id];
     append_committed(&db, &[a1, a2, r1, f1, f2, f3]).await?;
@@ -678,13 +779,19 @@ async fn test_attempts_gc_skips_rows_with_active_assignment() -> anyhow::Result<
     let (_test_db, db, drv_id) = setup("gc-active-assignment-hash").await?;
 
     let exec_id = Uuid::now_v7();
-    let mut a1 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let mut a1 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Transient,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
     a1.exec_id = Some(exec_id);
     let r1 = AttemptRow::new_reset(
         drv_id,
         OutcomeClass::ResubmitReset,
         ReportingParty::Scheduler,
         1,
+        AttemptKind::Build,
     );
     let a1_id = a1.attempt_id;
     let old = [a1.attempt_id, r1.attempt_id];
@@ -726,12 +833,18 @@ async fn test_attempts_gc_reaps_orphaned_histories() -> anyhow::Result<()> {
     let (_test_db, db, orphan_id) = setup("gc-orphan-hash").await?;
 
     // Orphan-to-be: attempt + reset rows, all old.
-    let o1 = AttemptRow::new(orphan_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let o1 = AttemptRow::new(
+        orphan_id,
+        OutcomeClass::Transient,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
     let o2 = AttemptRow::new_reset(
         orphan_id,
         OutcomeClass::ResubmitReset,
         ReportingParty::Scheduler,
         1,
+        AttemptKind::Build,
     );
     let old = [o1.attempt_id, o2.attempt_id];
     append_committed(&db, &[o1, o2]).await?;
@@ -739,8 +852,18 @@ async fn test_attempts_gc_reaps_orphaned_histories() -> anyhow::Result<()> {
 
     // A live derivation with NO reset row and equally old rows.
     let live_id = insert_test_derivation(&db, "gc-orphan-live-hash").await?;
-    let l1 = AttemptRow::new(live_id, OutcomeClass::Transient, ReportingParty::Worker);
-    let l2 = AttemptRow::new(live_id, OutcomeClass::Infra, ReportingParty::Scheduler);
+    let l1 = AttemptRow::new(
+        live_id,
+        OutcomeClass::Transient,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
+    let l2 = AttemptRow::new(
+        live_id,
+        OutcomeClass::Infra,
+        ReportingParty::Scheduler,
+        AttemptKind::Build,
+    );
     let live_old = [l1.attempt_id, l2.attempt_id];
     append_committed(&db, &[l1, l2]).await?;
     backdate(&db, &live_old).await?;
@@ -783,14 +906,30 @@ async fn test_attempts_gc_reaps_orphaned_histories() -> anyhow::Result<()> {
 async fn test_attempts_gc_respects_batch_limit() -> anyhow::Result<()> {
     let (_test_db, db, drv_id) = setup("gc-batch-hash").await?;
 
-    let v1 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
-    let v2 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
-    let v3 = AttemptRow::new(drv_id, OutcomeClass::Infra, ReportingParty::Scheduler);
+    let v1 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Transient,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
+    let v2 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Transient,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
+    let v3 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Infra,
+        ReportingParty::Scheduler,
+        AttemptKind::Build,
+    );
     let r1 = AttemptRow::new_reset(
         drv_id,
         OutcomeClass::ResubmitReset,
         ReportingParty::Scheduler,
         1,
+        AttemptKind::Build,
     );
     let old = [v1.attempt_id, v2.attempt_id, v3.attempt_id, r1.attempt_id];
     append_committed(&db, &[v1, v2, v3, r1]).await?;
@@ -808,47 +947,87 @@ async fn test_attempts_gc_respects_batch_limit() -> anyhow::Result<()> {
 }
 
 // r[verify sched.db.attempts-gc]
-/// Cross-layer pin: the SQL suffix cut (`load_attempt_suffix`) returns
-/// exactly `rows[ledger_suffix_start(rows)..]` of the full ordered
-/// history — the kernel mirror and the SQL agree on where the suffix
-/// begins, which is the premise the sweep-invariance proofs rest on.
+/// Cross-layer pin: the SQL per-lane cut (`load_attempt_suffix`)
+/// returns exactly the rows `rio_retry_kernel::row_survives_load`
+/// keeps of the full ordered history — the kernel mirror and the SQL
+/// agree on where EACH LANE's suffix begins, which is the premise the
+/// sweep-invariance proofs rest on. The history interleaves both
+/// lanes' charges and resets so every cross-lane case is pinned: a
+/// build reset cuts only build rows, a materialization reset only
+/// materialization rows.
 #[tokio::test]
 async fn test_suffix_cut_matches_kernel_ledger_suffix_start() -> anyhow::Result<()> {
     let (_test_db, db, drv_id) = setup("gc-cut-pin-hash").await?;
 
     let rows = [
-        AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker),
+        // Build lane: transient, CacheHitClear reset, infra,
+        // ResubmitReset reset, transient — the build cut lands at the
+        // second build reset (index 4 of the full history).
+        AttemptRow::new(
+            drv_id,
+            OutcomeClass::Transient,
+            ReportingParty::Worker,
+            AttemptKind::Build,
+        ),
+        // Mat lane: a charge BEFORE its lane's reset (cut away), the
+        // mat reset, a charge after (kept).
+        AttemptRow::new(
+            drv_id,
+            OutcomeClass::MaterializationInfra,
+            ReportingParty::Worker,
+            AttemptKind::Materialization,
+        ),
         AttemptRow::new_reset(
             drv_id,
             OutcomeClass::CacheHitClear,
             ReportingParty::Admin,
             0,
+            AttemptKind::Build,
         ),
-        AttemptRow::new(drv_id, OutcomeClass::Infra, ReportingParty::Scheduler),
+        AttemptRow::new_reset(
+            drv_id,
+            OutcomeClass::ResubmitReset,
+            ReportingParty::Scheduler,
+            0,
+            AttemptKind::Materialization,
+        ),
         AttemptRow::new_reset(
             drv_id,
             OutcomeClass::ResubmitReset,
             ReportingParty::Scheduler,
             1,
+            AttemptKind::Build,
         ),
-        AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker),
+        AttemptRow::new(
+            drv_id,
+            OutcomeClass::MaterializationInfra,
+            ReportingParty::Worker,
+            AttemptKind::Materialization,
+        ),
+        AttemptRow::new(
+            drv_id,
+            OutcomeClass::Transient,
+            ReportingParty::Worker,
+            AttemptKind::Build,
+        ),
     ];
     append_committed(&db, &rows).await?;
 
     // Full ordered history straight from PG.
-    let full: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT attempt_id, event_kind FROM drv_attempts \
+    let full: Vec<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT attempt_id, event_kind, attempt_kind FROM drv_attempts \
          WHERE derivation_id = $1 ORDER BY recorded_at, attempt_id",
     )
     .bind(drv_id)
     .fetch_all(&db.pool)
     .await?;
-    assert_eq!(full.len(), 5);
+    assert_eq!(full.len(), 7);
 
-    // Project to kernel rows (only event_kind matters for the cut).
+    // Project to kernel rows (event_kind + kind are what the cut
+    // consumes).
     let kernel_rows: Vec<rio_retry_kernel::LedgerRow<String>> = full
         .iter()
-        .map(|(_, ek)| rio_retry_kernel::LedgerRow {
+        .map(|(_, ek, ak)| rio_retry_kernel::LedgerRow {
             event_kind: if ek == "reset" {
                 rio_retry_kernel::AttemptEventKind::Reset
             } else {
@@ -861,11 +1040,25 @@ async fn test_suffix_cut_matches_kernel_ledger_suffix_start() -> anyhow::Result<
             floor_at_cap: false,
             resubmit_cycle: 0,
             at: 0,
-            kind: rio_retry_kernel::AttemptKind::Build,
+            kind: if ak == "materialization" {
+                rio_retry_kernel::AttemptKind::Materialization
+            } else {
+                rio_retry_kernel::AttemptKind::Build
+            },
         })
         .collect();
-    let cut = rio_retry_kernel::ledger_suffix_start(&kernel_rows);
-    let expected: Vec<Uuid> = full[cut..].iter().map(|(id, _)| *id).collect();
+    let expected: Vec<Uuid> = (0..kernel_rows.len())
+        .filter(|&i| rio_retry_kernel::row_survives_load(&kernel_rows, i))
+        .map(|i| full[i].0)
+        .collect();
+    // Sanity on the hand-built shape: the pre-mat-reset charge and the
+    // pre-build-reset build rows are cut; both lanes keep their own
+    // reset row and everything after it.
+    assert_eq!(
+        expected.len(),
+        4,
+        "mat reset + build reset + 2 post-cut rows"
+    );
 
     let suffix = db
         .load_attempt_suffix(&[drv_id])
@@ -873,6 +1066,174 @@ async fn test_suffix_cut_matches_kernel_ledger_suffix_start() -> anyhow::Result<
         .remove(&drv_id)
         .unwrap_or_default();
     let got: Vec<Uuid> = suffix.iter().map(|r| r.attempt_id).collect();
-    assert_eq!(got, expected, "SQL cut == kernel ledger_suffix_start");
+    assert_eq!(
+        got, expected,
+        "SQL per-lane cut == kernel row_survives_load"
+    );
+
+    // And the in-tx single-derivation loader agrees.
+    let mut tx = db.pool().begin().await?;
+    let in_tx = SchedulerDb::load_attempt_suffix_one_in_tx(&mut tx, drv_id).await?;
+    tx.commit().await?;
+    let in_tx_ids: Vec<Uuid> = in_tx.iter().map(|r| r.attempt_id).collect();
+    assert_eq!(in_tx_ids, expected, "in-tx loader matches the batch loader");
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Per-lane suffix cut (migration 084, merged_bug_011): a build-lane
+// reset must neither hide nor delete materialization-lane evidence.
+// RED (recorded pre-fix, against the any-kind cut): the loader test
+// failed `left: 0, right: 2` — the build reset cut both mat charges
+// out of the loaded suffix; the GC test failed `left: 1, right: 0` —
+// the sweep deleted the backdated mat charge behind the build reset.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Two mat-infra charges, then a build resubmit reset: the loader must
+/// still return BOTH materialization rows (each lane cuts at its OWN
+/// last reset).
+// r[verify sched.db.attempts-gc]
+#[tokio::test]
+async fn test_build_reset_preserves_materialization_lane_in_loader() -> anyhow::Result<()> {
+    let (_test_db, db, drv_id) = setup("kindlaneloadhash").await?;
+
+    let mut m1 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::MaterializationInfra,
+        ReportingParty::Worker,
+        AttemptKind::Materialization,
+    );
+    m1.exec_id = Some(Uuid::now_v7());
+    let mut m2 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::MaterializationInfra,
+        ReportingParty::Worker,
+        AttemptKind::Materialization,
+    );
+    m2.exec_id = Some(Uuid::now_v7());
+    let reset = AttemptRow::new_reset(
+        drv_id,
+        OutcomeClass::ResubmitReset,
+        ReportingParty::Scheduler,
+        1,
+        AttemptKind::Build,
+    );
+    append_committed(&db, &[m1, m2, reset]).await?;
+
+    let suffix = db
+        .load_attempt_suffix(&[drv_id])
+        .await?
+        .remove(&drv_id)
+        .unwrap_or_default();
+    let mat_loaded = suffix
+        .iter()
+        .filter(|r| r.attempt_kind == AttemptKind::Materialization)
+        .count();
+    assert_eq!(
+        mat_loaded, 2,
+        "a build-lane reset must not cut the materialization lane out of the loaded suffix"
+    );
+    Ok(())
+}
+
+/// Same shape through the GC sweep: backdated mat-infra rows behind a
+/// build reset are NOT deletable — a build reset structurally cannot
+/// make materialization evidence eligible.
+// r[verify sched.db.attempts-gc]
+#[tokio::test]
+async fn test_build_reset_does_not_gc_materialization_evidence() -> anyhow::Result<()> {
+    let (_test_db, db, drv_id) = setup("kindlanegchash").await?;
+
+    let mut m1 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::MaterializationInfra,
+        ReportingParty::Worker,
+        AttemptKind::Materialization,
+    );
+    m1.exec_id = Some(Uuid::now_v7());
+    let reset = AttemptRow::new_reset(
+        drv_id,
+        OutcomeClass::ResubmitReset,
+        ReportingParty::Scheduler,
+        1,
+        AttemptKind::Build,
+    );
+    let backdated = [m1.attempt_id, reset.attempt_id];
+    append_committed(&db, &[m1, reset]).await?;
+    backdate(&db, &backdated).await?;
+
+    let deleted = db.gc_attempt_ledger(TEST_HORIZON_SECS, 100).await?;
+    assert_eq!(
+        deleted, 0,
+        "a build-lane reset must not make materialization evidence GC-eligible"
+    );
+    let suffix = db
+        .load_attempt_suffix(&[drv_id])
+        .await?
+        .remove(&drv_id)
+        .unwrap_or_default();
+    assert_eq!(
+        suffix
+            .iter()
+            .filter(|r| r.attempt_kind == AttemptKind::Materialization)
+            .count(),
+        1,
+        "the materialization charge survives the sweep"
+    );
+    Ok(())
+}
+
+/// And the mirror through the sweep: a MATERIALIZATION-lane reset cuts
+/// only its own lane — backdated build rows behind it stay live (their
+/// lane has no reset), while the mat charge before it becomes
+/// eligible.
+// r[verify sched.db.attempts-gc]
+#[tokio::test]
+async fn test_mat_reset_cuts_only_its_own_lane_in_gc() -> anyhow::Result<()> {
+    let (_test_db, db, drv_id) = setup("kindlanemirrhash").await?;
+
+    let mut b1 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::Infra,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
+    b1.exec_id = Some(Uuid::now_v7());
+    let mut m1 = AttemptRow::new(
+        drv_id,
+        OutcomeClass::MaterializationInfra,
+        ReportingParty::Worker,
+        AttemptKind::Materialization,
+    );
+    m1.exec_id = Some(Uuid::now_v7());
+    let mat_reset = AttemptRow::new_reset(
+        drv_id,
+        OutcomeClass::ResubmitReset,
+        ReportingParty::Scheduler,
+        0,
+        AttemptKind::Materialization,
+    );
+    let backdated = [b1.attempt_id, m1.attempt_id, mat_reset.attempt_id];
+    append_committed(&db, &[b1, m1, mat_reset]).await?;
+    backdate(&db, &backdated).await?;
+
+    let deleted = db.gc_attempt_ledger(TEST_HORIZON_SECS, 100).await?;
+    assert_eq!(
+        deleted, 1,
+        "exactly the pre-reset materialization charge is eligible"
+    );
+    let suffix = db
+        .load_attempt_suffix(&[drv_id])
+        .await?
+        .remove(&drv_id)
+        .unwrap_or_default();
+    assert_eq!(
+        suffix
+            .iter()
+            .filter(|r| r.attempt_kind == AttemptKind::Build)
+            .count(),
+        1,
+        "the build charge survives a materialization reset"
+    );
     Ok(())
 }

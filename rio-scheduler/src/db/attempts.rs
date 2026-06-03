@@ -118,20 +118,24 @@ pub(crate) struct AttemptRow {
 impl AttemptRow {
     /// A new attempt-event row for `derivation_id` with a freshly
     /// minted UUIDv7 `attempt_id`, `occurred_at` = now, and every
-    /// optional column empty. Callers fill the fields the path knows
-    /// (exec_id, executor, floor flags, error message, …) before
-    /// appending.
+    /// optional column empty. The LANE (`kind`) is a constructor
+    /// parameter — migration 084 made it a durable column on every
+    /// row, and forcing every caller to state it makes a
+    /// materialization row that forgets its kind uncompilable. Callers
+    /// fill the fields the path knows (exec_id, executor, floor flags,
+    /// error message, …) before appending.
     pub(crate) fn new(
         derivation_id: Uuid,
         outcome_class: OutcomeClass,
         reporting_party: ReportingParty,
+        kind: AttemptKind,
     ) -> Self {
         Self {
             attempt_id: Uuid::now_v7(),
             derivation_id,
             exec_id: None,
             executor_id: None,
-            attempt_kind: AttemptKind::Build,
+            attempt_kind: kind,
             source_node: None,
             event_kind: AttemptEventKind::Attempt,
             outcome_class,
@@ -151,17 +155,24 @@ impl AttemptRow {
     /// A new reset-event row (`event_kind = 'reset'`). `outcome_class`
     /// must be one of the reset classes (`resubmit_reset`,
     /// `cache_hit_clear`, `poison_cleared`); `resubmit_cycle` carries
-    /// the cycle index the reset starts.
+    /// the cycle index the reset starts. The reset CARRIES ITS LANE
+    /// (migration 084): a build reset cuts only the build suffix, a
+    /// materialization reset only the materialization suffix — the
+    /// loaders and the GC sweep key their cuts on it. No production
+    /// writer constructs a materialization reset until the
+    /// materialization-lifecycle workstream's job-creation resets land
+    /// (085) — see the retry-invariant-map "mat-lane reset" entry.
     pub(crate) fn new_reset(
         derivation_id: Uuid,
         outcome_class: OutcomeClass,
         reporting_party: ReportingParty,
         resubmit_cycle: i32,
+        kind: AttemptKind,
     ) -> Self {
         Self {
             event_kind: AttemptEventKind::Reset,
             resubmit_cycle,
-            ..Self::new(derivation_id, outcome_class, reporting_party)
+            ..Self::new(derivation_id, outcome_class, reporting_party, kind)
         }
     }
 
@@ -292,9 +303,9 @@ impl SchedulerDb {
                  (attempt_id, derivation_id, exec_id, executor_id, source_node, event_kind, \
                   outcome_class, termination_reason, reporting_party, exempt, \
                   floor_promoted, floor_at_cap, error_msg, final_line_count, \
-                  resubmit_cycle, occurred_at) \
+                  resubmit_cycle, occurred_at, attempt_kind) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                     to_timestamp($16)) \
+                     to_timestamp($16), $17) \
              ON CONFLICT (exec_id) WHERE exec_id IS NOT NULL DO NOTHING",
         )
         .bind(row.attempt_id)
@@ -313,6 +324,7 @@ impl SchedulerDb {
         .bind(row.final_line_count)
         .bind(row.resubmit_cycle)
         .bind(row.occurred_at_epoch_secs)
+        .bind(row.attempt_kind.as_str())
         .execute(&mut *tx)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -345,6 +357,7 @@ impl SchedulerDb {
         let mut final_line_count = Vec::with_capacity(rows.len());
         let mut resubmit_cycle = Vec::with_capacity(rows.len());
         let mut occurred_at = Vec::with_capacity(rows.len());
+        let mut attempt_kind = Vec::with_capacity(rows.len());
         for r in rows {
             attempt_id.push(r.attempt_id);
             derivation_id.push(r.derivation_id);
@@ -362,25 +375,26 @@ impl SchedulerDb {
             final_line_count.push(r.final_line_count);
             resubmit_cycle.push(r.resubmit_cycle);
             occurred_at.push(r.occurred_at_epoch_secs);
+            attempt_kind.push(r.attempt_kind.as_str());
         }
         let result = sqlx::query(
             "INSERT INTO drv_attempts \
                  (attempt_id, derivation_id, exec_id, executor_id, source_node, event_kind, \
                   outcome_class, termination_reason, reporting_party, exempt, \
                   floor_promoted, floor_at_cap, error_msg, final_line_count, \
-                  resubmit_cycle, occurred_at) \
+                  resubmit_cycle, occurred_at, attempt_kind) \
              SELECT attempt_id, derivation_id, exec_id, executor_id, source_node, event_kind, \
                     outcome_class, termination_reason, reporting_party, exempt, \
                     floor_promoted, floor_at_cap, error_msg, final_line_count, \
-                    resubmit_cycle, to_timestamp(occurred_at) \
+                    resubmit_cycle, to_timestamp(occurred_at), attempt_kind \
              FROM UNNEST($1::uuid[], $2::uuid[], $3::uuid[], $4::text[], $5::text[], \
                          $6::text[], $7::text[], $8::text[], $9::bool[], $10::bool[], \
                          $11::bool[], $12::text[], $13::bigint[], $14::int[], \
-                         $15::float8[], $16::text[]) \
+                         $15::float8[], $16::text[], $17::text[]) \
                   AS t(attempt_id, derivation_id, exec_id, executor_id, event_kind, \
                        outcome_class, termination_reason, reporting_party, exempt, \
                        floor_promoted, floor_at_cap, error_msg, final_line_count, \
-                       resubmit_cycle, occurred_at, source_node) \
+                       resubmit_cycle, occurred_at, source_node, attempt_kind) \
              ON CONFLICT (exec_id) WHERE exec_id IS NOT NULL DO NOTHING",
         )
         .bind(&attempt_id)
@@ -399,6 +413,7 @@ impl SchedulerDb {
         .bind(&resubmit_cycle)
         .bind(&occurred_at)
         .bind(&source_node)
+        .bind(&attempt_kind)
         .execute(&mut *tx)
         .await?;
         Ok(result.rows_affected())
@@ -471,23 +486,23 @@ impl SchedulerDb {
                     a.event_kind, a.outcome_class, a.termination_reason, \
                     a.reporting_party, a.exempt, a.floor_promoted, a.floor_at_cap, \
                     a.error_msg, a.final_line_count, a.resubmit_cycle, \
-                    COALESCE(e.attempt_kind, 'build') AS attempt_kind, \
+                    a.attempt_kind, \
                     EXTRACT(EPOCH FROM a.occurred_at)::float8 AS occurred_at_epoch_secs, \
                     EXTRACT(EPOCH FROM a.recorded_at)::float8 AS recorded_at_epoch_secs \
              FROM drv_attempts a \
-             LEFT JOIN drv_executions e ON e.exec_id = a.exec_id \
              LEFT JOIN LATERAL ( \
                  SELECT r.recorded_at, r.attempt_id \
                  FROM drv_attempts r \
                  WHERE r.derivation_id = a.derivation_id \
                    AND r.event_kind = 'reset' \
+                   AND r.attempt_kind = a.attempt_kind \
                  ORDER BY r.recorded_at DESC, r.attempt_id DESC \
                  LIMIT 1 \
-             ) last_reset ON TRUE \
+             ) last_lane_reset ON TRUE \
              WHERE a.derivation_id = $1 \
-               AND (last_reset.recorded_at IS NULL \
+               AND (last_lane_reset.recorded_at IS NULL \
                     OR (a.recorded_at, a.attempt_id) \
-                       >= (last_reset.recorded_at, last_reset.attempt_id)) \
+                       >= (last_lane_reset.recorded_at, last_lane_reset.attempt_id)) \
              ORDER BY a.recorded_at, a.attempt_id",
         )
         .bind(derivation_id)
@@ -513,40 +528,45 @@ impl SchedulerDb {
         if derivation_ids.is_empty() {
             return Ok(HashMap::new());
         }
-        // The LATERAL picks each derivation's most recent reset row
-        // (served by the partial index on `WHERE event_kind = 'reset'`);
-        // the row-wise tuple comparison keeps everything at-or-after it,
+        // The LATERAL picks each ROW'S OWN LANE's most recent reset row
+        // (served by the partial index on `WHERE event_kind = 'reset'`,
+        // correlated on `r.attempt_kind = a.attempt_kind` — migration
+        // 084 put the lane on every row, resets included); the
+        // row-wise tuple comparison keeps everything at-or-after it,
         // with `attempt_id` (UUIDv7, append-ordered) breaking
-        // `recorded_at` ties. The drv_executions join carries the
-        // attempt kind onto each row (COALESCE'd to 'build' for rows
-        // with no execution — cascade victims, fleet-exhaust markers,
-        // resets) so the fold input can key the kind partition. One
-        // `&'static str` literal — sqlx 0.9's
-        // `SqlSafeStr` bound on `query_as()` rejects runtime-composed
-        // SQL. Timestamps come back as epoch seconds (no chrono/time
-        // dependency — same pattern as the recovery rows).
+        // `recorded_at` ties. This is the verbatim transcription of
+        // `rio_retry_kernel::row_survives_load`: a build reset cuts
+        // only the build lane, a materialization reset only the
+        // materialization lane — cross-lane truncation is structurally
+        // impossible. The kind column is read DIRECTLY off the row
+        // (the drv_executions join died with 084: reset rows carry
+        // their lane themselves). One `&'static str` literal — sqlx
+        // 0.9's `SqlSafeStr` bound on `query_as()` rejects
+        // runtime-composed SQL. Timestamps come back as epoch seconds
+        // (no chrono/time dependency — same pattern as the recovery
+        // rows).
         let raw: Vec<RawAttemptRow> = sqlx::query_as(
             "SELECT a.attempt_id, a.derivation_id, a.exec_id, a.executor_id, a.source_node, \
                     a.event_kind, a.outcome_class, a.termination_reason, \
                     a.reporting_party, a.exempt, a.floor_promoted, a.floor_at_cap, \
                     a.error_msg, a.final_line_count, a.resubmit_cycle, \
-                    COALESCE(e.attempt_kind, 'build') AS attempt_kind, \
+                    a.attempt_kind, \
                     EXTRACT(EPOCH FROM a.occurred_at)::float8 AS occurred_at_epoch_secs, \
                     EXTRACT(EPOCH FROM a.recorded_at)::float8 AS recorded_at_epoch_secs \
              FROM drv_attempts a \
-             LEFT JOIN drv_executions e ON e.exec_id = a.exec_id \
              LEFT JOIN LATERAL ( \
                  SELECT r.recorded_at, r.attempt_id \
                  FROM drv_attempts r \
                  WHERE r.derivation_id = a.derivation_id \
                    AND r.event_kind = 'reset' \
+                   AND r.attempt_kind = a.attempt_kind \
                  ORDER BY r.recorded_at DESC, r.attempt_id DESC \
                  LIMIT 1 \
-             ) last_reset ON TRUE \
+             ) last_lane_reset ON TRUE \
              WHERE a.derivation_id = ANY($1) \
-               AND (last_reset.recorded_at IS NULL \
+               AND (last_lane_reset.recorded_at IS NULL \
                     OR (a.recorded_at, a.attempt_id) \
-                       >= (last_reset.recorded_at, last_reset.attempt_id)) \
+                       >= (last_lane_reset.recorded_at, last_lane_reset.attempt_id)) \
              ORDER BY a.derivation_id, a.recorded_at, a.attempt_id",
         )
         .bind(derivation_ids)
@@ -562,12 +582,17 @@ impl SchedulerDb {
 
     // r[impl sched.db.attempts-gc]
     /// The attempt-ledger GC sweep: delete (live arm) attempt-kind rows
-    /// strictly before their derivation's last-reset cut, older than
-    /// `horizon_secs`, with no ACTIVE assignment for their `exec_id`;
-    /// plus (orphan arm) any-kind rows whose `derivation_id` has no
-    /// `derivations` row, older than the horizon. At most `2 × limit`
-    /// rows per pass (one `LIMIT` per arm; subselect-LIMIT shape — PG
-    /// has no `DELETE .. LIMIT` — per the derivations-GC precedent).
+    /// strictly before their derivation's last-reset cut OF THEIR OWN
+    /// LANE (migration 084: `last_resets` is keyed per
+    /// `(derivation_id, attempt_kind)` and the victim join matches
+    /// `r.attempt_kind = a.attempt_kind` — a build reset structurally
+    /// cannot make materialization evidence eligible, mirroring
+    /// `rio_retry_kernel::sweep_eligible`), older than `horizon_secs`,
+    /// with no ACTIVE assignment for their `exec_id`; plus (orphan arm)
+    /// any-kind rows whose `derivation_id` has no `derivations` row,
+    /// older than the horizon. At most `2 × limit` rows per pass (one
+    /// `LIMIT` per arm; subselect-LIMIT shape — PG has no
+    /// `DELETE .. LIMIT` — per the derivations-GC precedent).
     ///
     /// ONE statement, deliberately and load-bearingly: a single MVCC
     /// snapshot evaluates the whole eligibility predicate — including
@@ -602,12 +627,14 @@ impl SchedulerDb {
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
             "WITH last_resets AS (
-                 SELECT DISTINCT ON (derivation_id) derivation_id, recorded_at, attempt_id
+                 SELECT DISTINCT ON (derivation_id, attempt_kind)
+                        derivation_id, attempt_kind, recorded_at, attempt_id
                  FROM drv_attempts WHERE event_kind = 'reset'
-                 ORDER BY derivation_id, recorded_at DESC, attempt_id DESC),
+                 ORDER BY derivation_id, attempt_kind, recorded_at DESC, attempt_id DESC),
              pre_reset AS (
                  SELECT a.attempt_id FROM drv_attempts a
                  JOIN last_resets r ON r.derivation_id = a.derivation_id
+                                   AND r.attempt_kind = a.attempt_kind
                  WHERE a.event_kind = 'attempt'
                    AND (a.recorded_at, a.attempt_id) < (r.recorded_at, r.attempt_id)
                    AND a.recorded_at < now() - make_interval(secs => $1)

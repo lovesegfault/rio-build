@@ -846,6 +846,7 @@ impl DagActor {
             derivation_id,
             crate::state::OutcomeClass::Disconnected,
             reporting_party,
+            crate::state::AttemptKind::Build,
         );
         row.exec_id = Some(exec_id);
         row.executor_id = Some(executor_id.clone());

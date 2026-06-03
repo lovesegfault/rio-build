@@ -1889,6 +1889,7 @@ async fn test_poisoned_recovery_preserves_resubmit_cycles() -> TestResult {
             crate::state::OutcomeClass::ResubmitReset,
             crate::state::ReportingParty::Scheduler,
             POISON_RESUBMIT_RETRY_LIMIT as i32,
+            crate::state::AttemptKind::Build,
         );
         let mut tx = pool.begin().await?;
         crate::db::SchedulerDb::append_attempt(&mut tx, &reset).await?;
@@ -2942,6 +2943,7 @@ async fn phase1b_recovery_under_budget_history_poisons_nothing() -> TestResult {
                 derivation_id,
                 crate::state::OutcomeClass::Transient,
                 crate::state::ReportingParty::Worker,
+                crate::state::AttemptKind::Build,
             );
             row.executor_id = Some(w.into());
             // The exclusion/budget key is the source node (P12): seed
@@ -3005,6 +3007,7 @@ async fn phase1b_recovery_enforces_at_budget_verdict() -> TestResult {
                 derivation_id,
                 crate::state::OutcomeClass::Transient,
                 crate::state::ReportingParty::Worker,
+                crate::state::AttemptKind::Build,
             );
             row.executor_id = Some(w.into());
             row.error_msg = Some("counted failure with no persisted verdict".into());

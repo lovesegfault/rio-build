@@ -2143,14 +2143,25 @@ async fn test_attempt_ledger_gc_tick_leader_sweeps_standby_noops() -> TestResult
     {
         use crate::db::attempts::AttemptRow;
         use crate::state::{OutcomeClass, ReportingParty};
-        let a1 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+        let a1 = AttemptRow::new(
+            drv_id,
+            OutcomeClass::Transient,
+            ReportingParty::Worker,
+            crate::state::AttemptKind::Build,
+        );
         let r1 = AttemptRow::new_reset(
             drv_id,
             OutcomeClass::ResubmitReset,
             ReportingParty::Scheduler,
             1,
+            crate::state::AttemptKind::Build,
         );
-        let a2 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+        let a2 = AttemptRow::new(
+            drv_id,
+            OutcomeClass::Transient,
+            ReportingParty::Worker,
+            crate::state::AttemptKind::Build,
+        );
         let old = [a1.attempt_id, r1.attempt_id];
         let mut tx = db.pool.begin().await?;
         crate::db::SchedulerDb::append_attempts_batch(&mut tx, &[a1, r1, a2]).await?;

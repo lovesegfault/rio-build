@@ -106,7 +106,12 @@ impl DagActor {
     ) -> Option<AttemptRow> {
         let state = self.dag.node(drv_hash)?;
         let db_id = state.db_id?;
-        let mut row = AttemptRow::new(db_id, outcome_class, reporting_party);
+        let mut row = AttemptRow::new(
+            db_id,
+            outcome_class,
+            reporting_party,
+            crate::state::AttemptKind::Build,
+        );
         row.exec_id = state.exec_id;
         row.executor_id = state.assigned_executor.clone();
         row.source_node = self.pull_attempt_source_node(drv_hash);
@@ -283,6 +288,7 @@ impl DagActor {
             outcome_class,
             reporting_party,
             i32::try_from(state.retry.resubmit_cycles).unwrap_or(i32::MAX),
+            crate::state::AttemptKind::Build,
         ))
     }
 

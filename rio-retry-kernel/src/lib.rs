@@ -1735,29 +1735,43 @@ pub fn sweep_horizon_secs(budget: &Budget, retention_floor_secs: u64) -> u64 {
         .max(budget.poison_ttl_secs)
 }
 
-/// Index where the decision suffix of `rows` begins: the position of
-/// the LAST row with `event_kind == Reset`, or 0 when no reset row
-/// exists (the whole history is the suffix). The kernel mirror of the
-/// SQL cut `(recorded_at, attempt_id) >= (last_reset.recorded_at,
-/// last_reset.attempt_id)` — slice order here corresponds to
-/// `(recorded_at, attempt_id)` order there, and the suffix INCLUDES the
-/// reset row itself, exactly as both loaders return it. Pinned to the
-/// SQL by the cross-layer DB test
+/// Index where the decision suffix of ONE LANE of `rows` begins: the
+/// position of the LAST row with `kind == lane && event_kind == Reset`,
+/// or 0 when the lane has no reset row (the lane's whole history is
+/// its suffix). The kernel mirror of the per-lane SQL cut
+/// `(recorded_at, attempt_id) >= (last_lane_reset.recorded_at,
+/// last_lane_reset.attempt_id)` — slice order here corresponds to
+/// `(recorded_at, attempt_id)` order there, and the lane suffix
+/// INCLUDES the lane's own reset row, exactly as both loaders return
+/// it. Pinned to the SQL by the cross-layer DB test
 /// `test_suffix_cut_matches_kernel_ledger_suffix_start` in
 /// rio-scheduler.
 // r[impl sched.db.attempts-gc]
-pub fn ledger_suffix_start<Id>(rows: &[LedgerRow<Id>]) -> usize {
+pub fn ledger_suffix_start<Id>(rows: &[LedgerRow<Id>], lane: AttemptKind) -> usize {
     rows.iter()
-        .rposition(|r| r.event_kind == AttemptEventKind::Reset)
+        .rposition(|r| r.kind == lane && r.event_kind == AttemptEventKind::Reset)
         .unwrap_or(0)
 }
 
+/// Whether `rows[index]` is part of the loaded view: at-or-after the
+/// suffix cut of ITS OWN lane (migration 084: the lane is a column on
+/// every row, resets included — a build reset cuts only the build
+/// lane, a materialization reset only the materialization lane). The
+/// loaders' WHERE clause transcribes exactly this predicate (per-lane
+/// LATERALs + a kind-keyed CASE), so the loaded view is the
+/// order-preserving filter of the full history under this function —
+/// the shape every sweep theorem quantifies over.
+// r[impl sched.db.attempts-gc]
+pub fn row_survives_load<Id>(rows: &[LedgerRow<Id>], index: usize) -> bool {
+    index >= ledger_suffix_start(rows, rows[index].kind)
+}
+
 /// Sweep eligibility of `rows[index]` under the live-derivation arm:
-/// an attempt-kind row strictly before the suffix cut, older than the
-/// horizon. Reset rows are NEVER eligible (keeping every reset row
-/// makes "the cut never moves backward" structural), and a history with
-/// no reset row has no cut — nothing is eligible, the whole history is
-/// the live suffix.
+/// an attempt-kind row strictly before ITS OWN lane's suffix cut,
+/// older than the horizon. Reset rows are NEVER eligible (keeping
+/// every reset row makes "the cut never moves backward" structural),
+/// and a lane with no reset row has no cut — none of its rows are
+/// eligible, that lane's whole history is its live suffix.
 ///
 /// The age conjunct here models time on the kernel's single abstract
 /// clock while the SQL transcription ages on PG-assigned `recorded_at`;
@@ -1776,7 +1790,7 @@ pub fn sweep_eligible<Id>(
     horizon_secs: u64,
 ) -> bool {
     rows[index].event_kind == AttemptEventKind::Attempt
-        && index < ledger_suffix_start(rows)
+        && index < ledger_suffix_start(rows, rows[index].kind)
         && now.saturating_sub(rows[index].at) > horizon_secs
 }
 
@@ -2484,13 +2498,20 @@ mod tests {
     }
 
     /// sched.db.attempts-gc, exhaustively: over ALL histories of length
-    /// <= 4 drawn from a 6-shape alphabet (three attempt shapes × three
-    /// reset shapes, deliberately including the ResubmitReset cycle
-    /// seed and the CacheHitClear backoff carve-out) × ALL subsets of
-    /// fully-eligible indices, the cut suffix is element-wise unchanged
-    /// and decide()/materialization_decide() are bit-identical. The
-    /// dependency-free bounded-exhaustive twin of the kani harnesses —
-    /// runs under every cfg.
+    /// <= 4 drawn from an 8-shape alphabet (three build attempt shapes
+    /// × three build reset shapes — deliberately including the
+    /// ResubmitReset cycle seed and the CacheHitClear backoff
+    /// carve-out — plus a materialization-infra charge and a
+    /// materialization-lane reset, so every cross-lane interleaving is
+    /// inside the domain) × ALL subsets of fully-eligible indices: the
+    /// LOADED VIEW (`row_survives_load`, the per-lane cut) is
+    /// element-wise unchanged, decide()/materialization_decide() over
+    /// it are bit-identical, and the per-lane loader cut itself
+    /// preserves `materialization_decide` relative to the FULL history
+    /// (the loader-cut theorem the kani harness
+    /// `check_loader_cut_preserves_materialization_decide` proves over
+    /// symbolic rows). The dependency-free bounded-exhaustive twin of
+    /// the kani harnesses — runs under every cfg.
     // r[verify sched.db.attempts-gc]
     #[test]
     fn decide_invariant_under_eligible_sweep_exhaustive() {
@@ -2501,8 +2522,21 @@ mod tests {
                 2 => build_row(OutcomeClass::ExecutorCrash, Some("w2"), at),
                 3 => reset_build_row(OutcomeClass::ResubmitReset, 2, at),
                 4 => reset_build_row(OutcomeClass::CacheHitClear, 0, at),
-                _ => reset_build_row(OutcomeClass::PoisonCleared, 0, at),
+                5 => reset_build_row(OutcomeClass::PoisonCleared, 0, at),
+                6 => mat_row(OutcomeClass::MaterializationInfra, Some("s1"), at),
+                _ => LedgerRow {
+                    event_kind: AttemptEventKind::Reset,
+                    reporting_party: ReportingParty::Scheduler,
+                    ..mat_row(OutcomeClass::ResubmitReset, None, at)
+                },
             }
+        }
+
+        fn loaded_view(rows: &[LedgerRow<String>]) -> Vec<LedgerRow<String>> {
+            (0..rows.len())
+                .filter(|&i| row_survives_load(rows, i))
+                .map(|i| rows[i].clone())
+                .collect()
         }
 
         let budget = Budget::default();
@@ -2511,7 +2545,7 @@ mod tests {
         let mut cases: u64 = 0;
 
         for len in 0..=4usize {
-            for history_code in 0..6usize.pow(u32::try_from(len).expect("small")) {
+            for history_code in 0..8usize.pow(u32::try_from(len).expect("small")) {
                 let mut code = history_code;
                 let mut rows: Vec<LedgerRow<String>> = Vec::with_capacity(len);
                 for position in 0..len {
@@ -2519,9 +2553,20 @@ mod tests {
                     // age conjunct, so eligibility is decided by the
                     // structural predicate (the truth-table test owns
                     // the age corner).
-                    rows.push(shape(code % 6, position as AbsTime));
-                    code /= 6;
+                    rows.push(shape(code % 8, position as AbsTime));
+                    code /= 8;
                 }
+
+                // The loader-cut theorem: the per-lane view loses no
+                // materialization-decision information relative to the
+                // full history (materialization_decide cuts at the mat
+                // lane's own last reset, which the view preserves).
+                assert_eq!(
+                    materialization_decide(&loaded_view(&rows), 1),
+                    materialization_decide(&rows, 1),
+                    "per-lane loader cut must preserve the materialization \
+                     verdict: history {rows:?}"
+                );
 
                 let eligible: Vec<usize> = (0..len)
                     .filter(|&i| sweep_eligible(&rows, i, now, horizon))
@@ -2541,20 +2586,16 @@ mod tests {
                         .map(|(_, r)| r.clone())
                         .collect();
 
-                    let s1 = ledger_suffix_start(&rows);
-                    let s2 = ledger_suffix_start(&swept);
+                    let v1 = loaded_view(&rows);
+                    let v2 = loaded_view(&swept);
                     assert_eq!(
-                        &rows[s1..],
-                        &swept[s2..],
-                        "suffix changed under sweep: history {rows:?}, deleted {deleted:?}"
+                        v1, v2,
+                        "loaded view changed under sweep: history {rows:?}, deleted {deleted:?}"
                     );
+                    assert_eq!(decide(&v1, &budget, now), decide(&v2, &budget, now),);
                     assert_eq!(
-                        decide(&rows[s1..], &budget, now),
-                        decide(&swept[s2..], &budget, now),
-                    );
-                    assert_eq!(
-                        materialization_decide(&rows[s1..], 1),
-                        materialization_decide(&swept[s2..], 1),
+                        materialization_decide(&v1, 1),
+                        materialization_decide(&v2, 1),
                     );
                     cases += 1;
                 }
@@ -2562,6 +2603,51 @@ mod tests {
         }
 
         assert!(cases > 1_500, "case-count sanity: {cases}");
+    }
+
+    /// The kernel half of merged_bug_011, as a named pin: two
+    /// materialization-infra charges followed by a BUILD resubmit reset
+    /// — the per-lane loaded view keeps both charges, so
+    /// `materialization_decide` still parks. Under the pre-084 any-kind
+    /// cut the build reset truncated the whole history to itself and
+    /// the loaded verdict came back `Claimable` (the parked-job
+    /// resurrection this workstream closes); the DB twin
+    /// (`test_build_reset_preserves_materialization_lane_in_loader`)
+    /// recorded that red against the live SQL.
+    // r[verify sched.db.attempts-gc]
+    #[test]
+    fn build_reset_does_not_cut_materialization_lane() {
+        let rows = vec![
+            mat_row(OutcomeClass::MaterializationInfra, Some("s1"), 1),
+            mat_row(OutcomeClass::MaterializationInfra, Some("s1"), 2),
+            reset_build_row(OutcomeClass::ResubmitReset, 1, 3),
+        ];
+        let view: Vec<LedgerRow<String>> = (0..rows.len())
+            .filter(|&i| row_survives_load(&rows, i))
+            .map(|i| rows[i].clone())
+            .collect();
+        assert_eq!(view, rows, "no mat reset → the mat lane has no cut");
+        assert_eq!(
+            materialization_decide(&view, 2),
+            MaterializationVerdict::Park,
+            "both charges visible: the budget stays exhausted across a build reset"
+        );
+
+        // And the mirror: a materialization-lane reset cuts ONLY the
+        // mat lane — the build suffix is untouched.
+        let mirror = vec![
+            build_row(OutcomeClass::Infra, Some("w1"), 1),
+            LedgerRow {
+                event_kind: AttemptEventKind::Reset,
+                reporting_party: ReportingParty::Scheduler,
+                ..mat_row(OutcomeClass::ResubmitReset, None, 2)
+            },
+            mat_row(OutcomeClass::MaterializationInfra, Some("s1"), 3),
+        ];
+        assert!(
+            (0..mirror.len()).all(|i| row_survives_load(&mirror, i)),
+            "the build row survives a mat-lane reset; the mat charge is post-cut"
+        );
     }
 }
 
@@ -3070,79 +3156,130 @@ mod proofs {
         (swept, m)
     }
 
-    /// sched.db.attempts-gc, structural half: for EVERY bounded history
-    /// and EVERY deletion mask confined to attempt-kind rows strictly
-    /// before the last reset row (`sweep_eligible`'s structural
-    /// conjuncts E1+E2; deliberately WITHOUT the age conjunct, so every
-    /// age implementation — any clock, any skew — is covered as a
-    /// mask-shrinking special case), the post-cut suffix is element-wise
-    /// unchanged. No decide() call — cheap row comparisons only, which
-    /// is what lets this harness carry the larger MAX=5 bound.
+    /// The loaded view of `rows[..n]` under the per-lane cut
+    /// (`row_survives_load`), compacted into a fresh fixed array (index
+    /// loop, no Vec — the CBMC-blowup lesson): the harness-side model
+    /// of what the per-lane loaders return.
+    fn loaded_view<const MAX: usize>(
+        rows: &[LedgerRow<u8>; MAX],
+        n: usize,
+    ) -> ([LedgerRow<u8>; MAX], usize) {
+        let mut view = rows.clone();
+        let mut m = 0;
+        let mut i = 0;
+        while i < n {
+            if row_survives_load(&rows[..n], i) {
+                view[m] = rows[i].clone();
+                m += 1;
+            }
+            i += 1;
+        }
+        (view, m)
+    }
+
+    /// sched.db.attempts-gc, structural half (re-stated over the
+    /// per-lane cut, migration 084): for EVERY bounded history and
+    /// EVERY deletion mask confined to attempt-kind rows strictly
+    /// before THEIR OWN lane's last reset row (`sweep_eligible`'s
+    /// structural conjuncts E1+E2, kinded; deliberately WITHOUT the age
+    /// conjunct, so every age implementation — any clock, any skew — is
+    /// covered as a mask-shrinking special case), the LOADED VIEW
+    /// (`row_survives_load`) is element-wise unchanged. No decide()
+    /// call — cheap row comparisons only, which is what lets this
+    /// harness carry the larger MAX=5 bound.
     #[kani::proof]
     #[kani::unwind(8)]
     fn check_sweep_suffix_equivalence() {
         const MAX: usize = 5;
         let (rows, n) = any_history::<MAX>();
         let mask: [bool; MAX] = [(); MAX].map(|_| kani::any());
-        let s1 = ledger_suffix_start(&rows[..n]);
         let mut i = 0;
         while i < MAX {
             kani::assume(
-                !mask[i] || (i < n && rows[i].event_kind == AttemptEventKind::Attempt && i < s1),
+                !mask[i]
+                    || (i < n
+                        && rows[i].event_kind == AttemptEventKind::Attempt
+                        && i < ledger_suffix_start(&rows[..n], rows[i].kind)),
             );
             i += 1;
         }
 
         let (swept, m) = sweep_view(&rows, n, &mask);
-        let s2 = ledger_suffix_start(&swept[..m]);
 
-        let suffix = &rows[s1..n];
-        let swept_suffix = &swept[s2..m];
-        assert_eq!(suffix.len(), swept_suffix.len());
+        let (v1, l1) = loaded_view(&rows, n);
+        let (v2, l2) = loaded_view(&swept, m);
+        assert_eq!(l1, l2);
         let mut k = 0;
-        while k < suffix.len() {
-            assert_eq!(suffix[k], swept_suffix[k]);
+        while k < l1 {
+            assert_eq!(v1[k], v2[k]);
             k += 1;
         }
     }
 
-    /// sched.db.attempts-gc, end-to-end half: the loader-composed
-    /// theorem itself — `decide()` and `materialization_decide()` over
-    /// the cut suffix are bit-identical before and after any structural
-    /// sweep. Folds decide() twice at MAX=4 (~2× check_decide_contract);
-    /// documented fallback if it ever exceeds the gate budget: shrink to
-    /// MAX=3 and record the measurement (the exhaustive unit test keeps
-    /// the len<=4 equivalence machine-checked under every cfg
-    /// regardless).
+    /// sched.db.attempts-gc, end-to-end half (re-stated over the
+    /// per-lane cut): the loader-composed theorem itself — `decide()`
+    /// and `materialization_decide()` over the LOADED VIEW are
+    /// bit-identical before and after any structural sweep. Folds
+    /// decide() twice at MAX=4 (~2× check_decide_contract); documented
+    /// fallback if it ever exceeds the gate budget: shrink to MAX=3 and
+    /// record the measurement (the exhaustive unit test keeps the
+    /// len<=4 equivalence machine-checked under every cfg regardless).
     #[kani::proof]
     #[kani::unwind(7)]
     fn check_sweep_decide_invariant() {
         const MAX: usize = 4;
         let (rows, n) = any_history::<MAX>();
         let mask: [bool; MAX] = [(); MAX].map(|_| kani::any());
-        let s1 = ledger_suffix_start(&rows[..n]);
         let mut i = 0;
         while i < MAX {
             kani::assume(
-                !mask[i] || (i < n && rows[i].event_kind == AttemptEventKind::Attempt && i < s1),
+                !mask[i]
+                    || (i < n
+                        && rows[i].event_kind == AttemptEventKind::Attempt
+                        && i < ledger_suffix_start(&rows[..n], rows[i].kind)),
             );
             i += 1;
         }
 
         let (swept, m) = sweep_view(&rows, n, &mask);
-        let s2 = ledger_suffix_start(&swept[..m]);
+
+        let (v1, l1) = loaded_view(&rows, n);
+        let (v2, l2) = loaded_view(&swept, m);
 
         let budget = any_small_budget();
         let now = small_time(16);
-        let before = decide(&rows[s1..n], &budget, now);
-        let after = decide(&swept[s2..m], &budget, now);
+        let before = decide(&v1[..l1], &budget, now);
+        let after = decide(&v2[..l2], &budget, now);
         assert_eq!(before, after);
 
         let k: u8 = kani::any();
         kani::assume(k <= 2);
         assert_eq!(
-            materialization_decide(&rows[s1..n], u32::from(k)),
-            materialization_decide(&swept[s2..m], u32::from(k)),
+            materialization_decide(&v1[..l1], u32::from(k)),
+            materialization_decide(&v2[..l2], u32::from(k)),
+        );
+    }
+
+    /// merged_bug_011, the loader-cut theorem: the per-lane loaded view
+    /// loses NO materialization-decision information relative to the
+    /// FULL history — `materialization_decide` over the view equals it
+    /// over everything, for every bounded history and budget. (The
+    /// fold's own window is the mat lane's last reset, which
+    /// `row_survives_load` preserves by construction; under the pre-084
+    /// any-kind cut a trailing build reset emptied the view and flipped
+    /// parked verdicts back to Claimable.)
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn check_loader_cut_preserves_materialization_decide() {
+        const MAX: usize = 4;
+        let (rows, n) = any_history::<MAX>();
+        let (view, m) = loaded_view(&rows, n);
+
+        let k: u8 = kani::any();
+        kani::assume(k <= 2);
+        assert_eq!(
+            materialization_decide(&view[..m], u32::from(k)),
+            materialization_decide(&rows[..n], u32::from(k)),
         );
     }
 }

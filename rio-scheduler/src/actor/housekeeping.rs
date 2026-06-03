@@ -933,6 +933,7 @@ impl DagActor {
             attempt.derivation_id,
             OutcomeClass::ExecutorCrash,
             ReportingParty::Scheduler,
+            crate::state::AttemptKind::Build,
         );
         row.exec_id = Some(attempt.exec_id);
         row.executor_id = Some(executor.clone());

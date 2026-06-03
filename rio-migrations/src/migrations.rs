@@ -1855,6 +1855,41 @@ pub const M_082: () = ();
 /// window has zero behavioral delta.
 pub const M_083: () = ();
 
+/// `migrations/084_attempt_kind_partition.sql`
+///
+/// The attempt-kind partition becomes a DURABLE LANE on every ledger
+/// row (bughunt wave, merged_bug_011/bug_266; spec rule
+/// `sched.db.attempts-gc`). Before this migration the kind existed
+/// only on `drv_executions` and reached `drv_attempts` via the
+/// `exec_id` join — so reset rows (`exec_id IS NULL` always) were
+/// unrepresentably build-kind, every loader cut at the LAST RESET OF
+/// ANY KIND, and the GC sweep deleted under that same any-kind cut: a
+/// build resubmit reset silently hid (loader) and then deleted (GC)
+/// materialization-infra evidence, resurrecting parked jobs.
+///
+/// - `drv_attempts.attempt_kind TEXT NOT NULL DEFAULT 'build'` with
+///   the two-value CHECK: every row now CARRIES its lane; the backfill
+///   stamps existing materialization rows from their execution. The
+///   DEFAULT keeps the column append-compatible, but the Rust writer
+///   makes kind a CONSTRUCTOR PARAMETER — no production INSERT relies
+///   on the default.
+/// - Loaders and the GC sweep cut PER LANE from here on: each row
+///   survives iff it is at-or-after the last reset row OF ITS OWN
+///   lane (`rio_retry_kernel::row_survives_load`); a build reset
+///   structurally cannot truncate the materialization lane, and vice
+///   versa. Mat-lane reset rows have no production writer until the
+///   materialization-lifecycle workstream's job-creation resets land
+///   (085) — until then the mat lane simply has no cut and keeps its
+///   full history (bounded by the per-derivation GC orphan arm).
+/// - `drv_executions.source_node` is scrubbed for materialization
+///   executions and locked by the `drv_executions_build_only_source_node`
+///   CHECK (bug_075): node attribution is a build-lane concept — the
+///   mint stamped builder pod bindings onto store executions, feeding
+///   wrong exclusion keys. Schema/binary lockstep: the CHECK and the
+///   kind-aware mint deploy together (the repo's stop-the-world
+///   migration posture).
+pub const M_084: () = ();
+
 /// `migrations/087_build_terminal_payload.sql`
 ///
 /// Durable terminal payload for builds (bughunt fix wave C1

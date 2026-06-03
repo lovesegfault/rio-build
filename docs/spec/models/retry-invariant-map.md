@@ -2617,3 +2617,41 @@ them as working-tree calibrations only); `materializationJob.qnt` (the
 draft this campaign's T-5.3 added) is completed and wired as the §9.1
 check set, at which point the partition invariants are checked in both
 models.
+
+## Cross-campaign addendum — the per-lane ledger cut (bughunt wave, A2 kind-partition-completion)
+
+Migration 084 put `attempt_kind` ON every `drv_attempts` row (constructor
+parameter in `AttemptRow::new`/`new_reset` — a row that forgets its lane
+is uncompilable), and the suffix loaders + GC sweep now cut PER LANE:
+each row survives iff it is at-or-after the last reset row of ITS OWN
+lane (`rio_retry_kernel::row_survives_load`; SQL transcribed as a
+kind-correlated LATERAL). The pre-084 any-kind cut let a build resubmit
+reset hide (loader) and then delete (GC) materialization-infra
+evidence — recorded reds: loader `left: 0, right: 2`, GC `left: 1,
+right: 0` (merged_bug_011); a parked job's budget silently re-opened.
+Proof surface: `check_sweep_suffix_equivalence` and
+`check_sweep_decide_invariant` re-stated over the loaded view at their
+unchanged per-harness bounds (MAX=5/unwind 8; MAX=4/unwind 7), NEW
+`check_loader_cut_preserves_materialization_decide` (the view loses no
+materialization-decision information relative to the full history),
+and the bounded-exhaustive twin re-drawn over an 8-shape two-lane
+alphabet.
+
+**Mat-lane reset rows — documented absence (superseded by the
+materialization-lifecycle workstream).** `AttemptRow::new_reset(..,
+AttemptKind::Materialization)` is constructible and fully supported by
+the cut/sweep/proofs from this entry on, but has NO production writer
+yet: every reset site today (resubmit, cache-hit clear, poison clear)
+is build-lane. Until the materialization-lifecycle workstream's
+job-creation reset rows land (migration 085, outcome class
+`materialization_reset`), the materialization lane simply has no cut —
+its full per-derivation history stays live (bounded by the
+derivation-deletion orphan arm of the GC). That workstream REPLACES
+this paragraph with the live mechanism when it lands; if it somehow
+does not, the absence is behavior-preserving (the lane's counts and
+`materialization_decide` fold the same rows they always did).
+`count_materialization_rows_in_history` /
+`count_worker_materialization_infra_in_history` are already windowed
+through the kernel cut (`retry_policy::materialization_window_start`),
+so the counts re-zero exactly when the first mat-lane reset row
+appears.

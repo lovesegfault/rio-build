@@ -127,6 +127,25 @@ pub(crate) fn decide(history: &[AttemptRecord], budget: &Budget, now: AbsTime) -
     }
 }
 
+/// Index where the MATERIALIZATION lane's window of `history` begins:
+/// the kernel's per-lane suffix cut
+/// ([`rio_retry_kernel::ledger_suffix_start`] over the
+/// materialization lane), projected through the same record→row
+/// conversion `decide()` uses. The in-memory history is the loaded
+/// per-lane view (each lane already cut at ITS OWN last reset by the
+/// suffix loaders); this helper re-derives the mat-lane cut for the
+/// budget/one-shot COUNT consumers in `actor/materialize.rs`, so a
+/// materialization-lane reset row (live from the
+/// materialization-lifecycle workstream's job-creation resets on)
+/// re-windows those counts exactly as it re-windows
+/// [`rio_retry_kernel::materialization_decide`]'s own fold. Build-lane
+/// rows (reset or not) never move this cut.
+pub(crate) fn materialization_window_start(history: &[AttemptRecord]) -> usize {
+    let rows: Vec<rio_retry_kernel::LedgerRow<String>> =
+        history.iter().map(record_to_row).collect();
+    rio_retry_kernel::ledger_suffix_start(&rows, rio_retry_kernel::AttemptKind::Materialization)
+}
+
 /// Project one in-memory ledger record onto the kernel's row vocabulary.
 /// Field-for-field: the fields `decide()` ignores (UUIDs, error
 /// messages, `recorded_at_epoch_secs`, the `exempt` convenience flag —

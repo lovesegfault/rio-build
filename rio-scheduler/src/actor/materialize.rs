@@ -914,10 +914,10 @@ impl DagActor {
                     attempt.derivation_id,
                     crate::state::OutcomeClass::MaterializationUnobtainable,
                     crate::state::ReportingParty::Worker,
+                    crate::state::AttemptKind::Materialization,
                 );
                 row.exec_id = Some(exec_id);
                 row.executor_id = Some(executor.clone());
-                row.attempt_kind = crate::state::AttemptKind::Materialization;
                 row.error_msg = (!u.cause.is_empty()).then(|| u.cause.clone());
                 let prior_unobtainable = self.count_materialization_rows_in_history(
                     &drv_hash,
@@ -1073,10 +1073,10 @@ impl DagActor {
                     attempt.derivation_id,
                     crate::state::OutcomeClass::MaterializationInfra,
                     crate::state::ReportingParty::Worker,
+                    crate::state::AttemptKind::Materialization,
                 );
                 row.exec_id = Some(exec_id);
                 row.executor_id = Some(executor.clone());
-                row.attempt_kind = crate::state::AttemptKind::Materialization;
                 row.error_msg = (!f.detail.is_empty()).then(|| f.detail.clone());
                 let close_d = self
                     .close_materialization_attempt(
@@ -1197,8 +1197,13 @@ impl DagActor {
     }
 
     /// Count this node's in-memory ledger rows of one materialization
-    /// outcome class (the budget/one-shot inputs). The in-memory
-    /// history mirrors committed rows (read-through cache).
+    /// outcome class (the budget/one-shot inputs), WINDOWED at the
+    /// materialization lane's last reset row (the kernel cut, via
+    /// `retry_policy::materialization_window_start`) — the same window
+    /// `materialization_decide` folds, so a mat-lane job-creation
+    /// reset re-zeros these counts exactly when it re-opens the
+    /// budget. The in-memory history mirrors committed rows
+    /// (read-through cache of the per-lane loaded view).
     fn count_materialization_rows_in_history(
         &self,
         drv_hash: &DrvHash,
@@ -1207,7 +1212,9 @@ impl DagActor {
         self.dag
             .node(drv_hash)
             .map(|s| {
-                s.attempt_history()
+                let history = s.attempt_history();
+                let window = crate::retry_policy::materialization_window_start(history);
+                history[window..]
                     .iter()
                     .filter(|r| {
                         r.attempt_kind == crate::state::AttemptKind::Materialization
@@ -1228,7 +1235,9 @@ impl DagActor {
         self.dag
             .node(drv_hash)
             .map(|s| {
-                s.attempt_history()
+                let history = s.attempt_history();
+                let window = crate::retry_policy::materialization_window_start(history);
+                history[window..]
                     .iter()
                     .filter(|r| {
                         r.attempt_kind == crate::state::AttemptKind::Materialization
@@ -1558,10 +1567,10 @@ impl DagActor {
             attempt.derivation_id,
             crate::state::OutcomeClass::MaterializationInfra,
             crate::state::ReportingParty::Scheduler,
+            crate::state::AttemptKind::Materialization,
         );
         row.exec_id = Some(attempt.exec_id);
         row.executor_id = Some(executor.clone());
-        row.attempt_kind = crate::state::AttemptKind::Materialization;
         row.source_node = attempt.source_node.clone();
         row.termination_reason = Some("unreported".into());
         let close_d = self
