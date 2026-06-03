@@ -2469,7 +2469,7 @@ undispatchable (workers would be told to fetch a `.drv` that exists in no
 store). Reap-then-resubmit and crash-retry re-creations get the same
 refresh for free.
 
-#r("sched.persist.settled-identity-freeze+2")[
+#r("sched.persist.settled-identity-freeze+3")[
   A persisted derivation row whose status is `completed` or `skipped`
   MUST NOT be re-created under a conflicting identity: before any state
   is written for a submission, every submitted hash that has no resident
@@ -2496,11 +2496,24 @@ refresh for free.
   definition (an authoritative claim's bytes are bound to themselves,
   not to the declared path, so it has no second anchor and MUST prove
   identity through the classical bases). An undecodable persisted
-  rank MUST NOT grant the dual-anchor basis. The
+  rank MUST NOT grant the dual-anchor basis, and on the settled VICTIM
+  side an undecodable persisted rank MUST take the refusal arm of the
+  displacement arbitration --- never a low-rank floor (flooring a
+  victim demotes exactly the protection the persisted rank provides;
+  the displacer-conservative lossy decode MUST be unreachable from
+  victim-side call sites by construction). The
   persistence layer MUST additionally refuse to update a settled row
   whose public identity conflicts with the incoming re-creation,
   independent of the pre-merge check, admitting only the per-merge
-  hash list that check approved.
+  hash list that check approved --- and its conflict predicate MUST
+  cover the same axes with the same semantics as the pre-merge
+  matcher: output names compared as sorted sets (a set-equal
+  reordered resubmission is NOT a conflict), expected output paths
+  compared per output name where both sides declare one, and a
+  present-on-both-sides-but-differing live CA modular hash vetoing
+  the update. Axis parity between the two implementations MUST be
+  pinned by a differential test driving both over the same
+  single-axis mutations.
 ]
 The two M_070 bases exist because the strip writers (ingress and
 dispatch) leave exactly the rows they processed with NO classical

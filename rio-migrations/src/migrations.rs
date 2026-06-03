@@ -1416,7 +1416,7 @@ pub const M_069: () = ();
 /// with no client-side escape). The segregated column preserves the
 /// claim WITHOUT laundering it into evidence: the settled-row matcher
 /// admits a byte-equal preserved claim as match-basis only
-/// (`sched.persist.settled-identity-freeze+2` — never ranked, never
+/// (`sched.persist.settled-identity-freeze+3` — never ranked, never
 /// vetoing: a DIFFERING preserved value falls through instead of
 /// rejecting, because an unverified value cannot contradict anything).
 ///

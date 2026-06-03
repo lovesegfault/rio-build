@@ -365,7 +365,7 @@ in
 
   # r[verify sched.ca.cutoff-propagate+2]
   # r[verify sched.ca.resolve+3]
-  # r[verify sched.persist.settled-identity-freeze+2]
+  # r[verify sched.persist.settled-identity-freeze+3]
   # r[verify sched.merge.store-evidence-displacement+2]
   #   stripped-ca-resubmit: warm deferred-IA consumer over the realized
   #   b1 chain is ingress-STRIPPED with M_070 preservation (live NULL +

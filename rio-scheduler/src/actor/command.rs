@@ -927,7 +927,7 @@ pub enum ActorError {
     #[error("not leader (standby replica)")]
     NotLeader,
 
-    /// `r[sched.persist.settled-identity-freeze+2]`: a submission tried to
+    /// `r[sched.persist.settled-identity-freeze+3]`: a submission tried to
     /// (re)create a derivation whose persisted row is SETTLED
     /// (completed/skipped — the durable record of a successful build,
     /// possibly already reaped from the DAG) under a conflicting

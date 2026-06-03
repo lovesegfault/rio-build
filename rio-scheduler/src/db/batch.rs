@@ -47,17 +47,26 @@ impl SchedulerDb {
     /// floor promoted by a prior run's failures. Without this the next
     /// SpawnIntent re-uses probe defaults and re-OOMs every run.
     ///
-    /// `evidence_displaced` is the merge-time store-evidence verdict
-    /// (`sched.merge.store-evidence-displacement+2`): hashes whose
-    /// conflicting re-creation of a SETTLED row was approved by the
-    /// actor's pre-merge check (ingress-byte-bound rank, or the store's
-    /// own text-CA `.drv` bytes deriving the claimed identity). Only
-    /// these may pass the settled-identity WHERE guard below; the actor's
-    /// check is the decision, this array is its in-transaction execution.
+    /// `definition_changed` is the merge's full APPROVED
+    /// definition-change set: DAG-level displacements and authority
+    /// takeovers (`sched.merge.authoritative-conflict`) plus row-only
+    /// store-evidence displacements
+    /// (`sched.merge.store-evidence-displacement+2`). Only these may
+    /// pass the settled-identity WHERE guard below
+    /// (`sched.persist.settled-identity-freeze+3`); the actor's
+    /// arbitration is the decision, this array is its in-transaction
+    /// execution. The same enumeration feeds Batch 1a's
+    /// closure-witness clear — assembled ONCE at the caller so the two
+    /// consumers cannot drift on the population.
+    ///
+    /// `evidence_displaced` (the old name/scope — row-only arm alone)
+    /// was an axis-gap accident: resident displacements only passed
+    /// the guard because the pre-+3 conflict predicate lacked the
+    /// path/hash axes.
     pub(crate) async fn batch_upsert_derivations(
         tx: &mut PgConnection,
         rows: &[DerivationRow],
-        evidence_displaced: &[String],
+        definition_changed: &[String],
     ) -> Result<HashMap<String, (Uuid, crate::state::ResourceFloor)>, sqlx::Error> {
         if rows.is_empty() {
             return Ok(HashMap::new());
@@ -372,35 +381,81 @@ impl SchedulerDb {
                     WHEN derivations.drv_content IS NOT NULL
                          AND EXCLUDED.drv_content IS DISTINCT FROM derivations.drv_content
                     THEN 0 ELSE derivations.floor_deadline_secs END
-            -- r[impl sched.persist.settled-identity-freeze+2]
+            -- r[impl sched.persist.settled-identity-freeze+3]
             -- Defense-in-depth twin of the pre-merge settled-identity
-            -- check (actor/merge.rs): a SETTLED row (completed/skipped —
-            -- the durable record of a successful build) whose public
-            -- identity conflicts with the incoming re-creation is left
-            -- completely untouched by this upsert. The row then does not
-            -- appear in RETURNING, so the merge's link/edge persistence
-            -- fails loudly (MissingDbId → Internal → cleanup) instead of
-            -- silently rewriting settled history. Matching-identity
-            -- re-creations (legitimate rebuild after store GC) update
-            -- normally. Primary enforcement is the pre-merge check; this
-            -- guard only matters if that check is bypassed (bug) or a
-            -- racing writer settles the row between check and upsert.
+            -- check (actor/settled.rs): a SETTLED row (completed/
+            -- skipped — the durable record of a successful build) whose
+            -- public identity conflicts with the incoming re-creation
+            -- is left completely untouched by this upsert. The row then
+            -- does not appear in RETURNING, so the merge's link/edge
+            -- persistence fails loudly (MissingDbId → Internal →
+            -- cleanup) instead of silently rewriting settled history.
+            -- Matching-identity re-creations (legitimate rebuild after
+            -- store GC) update normally. Primary enforcement is the
+            -- pre-merge check; this guard only matters if that check is
+            -- bypassed (bug) or a racing writer settles the row between
+            -- check and upsert.
+            --
+            -- AXIS PARITY with settled_row_identity_matches (round-16
+            -- merged_bug_087; pinned by the differential conformance
+            -- test in db/tests/batch.rs — a divergence in either
+            -- direction is a bug):
+            --   * output_names as SORTED sets (raw IS DISTINCT FROM was
+            --     order-sensitive: a set-equal reordered resubmission
+            --     passed the merge check, then died here with an opaque
+            --     Internal);
+            --   * expected_output_paths per output name where BOTH
+            --     sides declare one (omission let a four-axis-matching
+            --     re-creation silently overwrite the settled row's
+            --     paths in exactly the bypass/race scenarios the guard
+            --     documents itself as existing for);
+            --   * live ca_modular_hash present on both sides but
+            --     differing vetoes (same omission consequence). The
+            --     EXCLUDED hash is NULLIF-normalized in the source
+            --     SELECT, so NULL = "no claim" on either side never
+            --     conflicts (one-sided evidence is not a contradiction
+            --     — same as ModularHashEvidence's one-sided arm).
             --
             -- r[impl sched.merge.store-evidence-displacement+2]
-            -- The $19 carve-out is the SAME pre-merge check approving a
-            -- conflicting re-creation it verified — by ingress-byte-bound
-            -- rank or against the store's own text-CA .drv bytes
-            -- (sched.merge.store-evidence-displacement+2). The hash list is
-            -- per-merge and threaded through the one transaction, so the
-            -- guard stays unconditional for every other writer.
+            -- The $19 carve-out is the merge's FULL approved
+            -- definition-change set: DAG-level displacements and
+            -- authority takeovers (arbitrated by
+            -- sched.merge.authoritative-conflict) plus row-only
+            -- store-evidence displacements (verified by the pre-merge
+            -- check against ingress-byte-bound rank or the store's own
+            -- text-CA .drv bytes,
+            -- sched.merge.store-evidence-displacement+2). Every
+            -- legitimately arbitrated definition change is admitted
+            -- EXPLICITLY by this list — never by an axis gap in the
+            -- conflict predicate (pre-+3, the missing path/hash axes
+            -- accidentally admitted resident-displacement re-creations
+            -- whose only conflict was the path; the axis alignment
+            -- exposed that the resident arm was never carved out). The
+            -- hash list is per-merge and threaded through the one
+            -- transaction, so the guard stays unconditional for every
+            -- other writer.
             WHERE derivations.drv_hash = ANY($19)
                OR NOT (
                 derivations.status IN ('completed', 'skipped')
                 AND (
                     derivations.system IS DISTINCT FROM EXCLUDED.system
-                    OR derivations.output_names IS DISTINCT FROM EXCLUDED.output_names
+                    OR ARRAY(SELECT unnest(derivations.output_names) ORDER BY 1)
+                       IS DISTINCT FROM
+                       ARRAY(SELECT unnest(EXCLUDED.output_names) ORDER BY 1)
                     OR derivations.is_fixed_output IS DISTINCT FROM EXCLUDED.is_fixed_output
                     OR derivations.is_ca IS DISTINCT FROM EXCLUDED.is_ca
+                    OR (derivations.ca_modular_hash IS NOT NULL
+                        AND EXCLUDED.ca_modular_hash IS NOT NULL
+                        AND derivations.ca_modular_hash <> EXCLUDED.ca_modular_hash)
+                    OR EXISTS (
+                        SELECT 1
+                        FROM unnest(derivations.output_names,
+                                    derivations.expected_output_paths) AS r(name, path)
+                        JOIN unnest(EXCLUDED.output_names,
+                                    EXCLUDED.expected_output_paths) AS e(name, path)
+                          ON r.name = e.name
+                        WHERE r.path <> '' AND e.path <> '' AND r.path <> e.path
+                    )
                 )
             )
             RETURNING drv_hash, derivation_id,
@@ -425,7 +480,7 @@ impl SchedulerDb {
         .bind(&evidence_rank)
         .bind(&ca_modular_hash_stripped)
         .bind(&needs_resolve)
-        .bind(evidence_displaced)
+        .bind(definition_changed)
         .fetch_all(&mut *tx)
         .await?;
         Ok(result

@@ -258,7 +258,7 @@ pub(crate) struct InputFormRow {
 
 /// Identity columns of a SETTLED (`completed`/`skipped`) derivation row,
 /// loaded by `load_settled_identity_rows` for the pre-merge
-/// settled-identity freeze (`sched.persist.settled-identity-freeze+2`).
+/// settled-identity freeze (`sched.persist.settled-identity-freeze+3`).
 /// Compared against an incoming submission node by
 /// `actor::merge::settled_row_identity_matches` — the row-level twin of
 /// `dag::verifiable_identity_matches`.
@@ -295,7 +295,7 @@ pub(crate) struct SettledIdentityRow {
     /// strip writers (ingress move, dispatch
     /// `persist_evidence_rank_and_strip_modular_hash`); selected here
     /// so the loader and its reader (the settled-row matcher's
-    /// preserved-claim basis, `sched.persist.settled-identity-freeze+2`)
+    /// preserved-claim basis, `sched.persist.settled-identity-freeze+3`)
     /// cannot drift. NEVER evidence: the matcher admits a byte-equal
     /// value as match basis but a differing value falls through (an
     /// unverified value cannot contradict).

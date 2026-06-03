@@ -9564,7 +9564,7 @@ async fn test_completed_authoritative_node_survives_conflicting_submission() -> 
     Ok(())
 }
 
-// r[verify sched.persist.settled-identity-freeze+2]
+// r[verify sched.persist.settled-identity-freeze+3]
 /// After a successful build's node is REAPED (terminal cleanup), its
 /// settled PG row is the only record left — the merge gate cannot see
 /// it. A conflicting resubmission for the same hash must be rejected by
@@ -9651,7 +9651,7 @@ async fn test_settled_row_rejects_conflicting_resubmission_after_reap() -> TestR
     Ok(())
 }
 
-// r[verify sched.persist.settled-identity-freeze+2]
+// r[verify sched.persist.settled-identity-freeze+3]
 /// A MATCHING-identity resubmission of a reaped hash (same system,
 /// output names, flags, and the same declared expected output path as
 /// content evidence) is a legitimate rebuild — e.g. after the store
@@ -11073,7 +11073,7 @@ async fn settle_and_reap_squat(
 }
 
 // r[verify sched.merge.store-evidence-displacement+2]
-// r[verify sched.persist.settled-identity-freeze+2]
+// r[verify sched.persist.settled-identity-freeze+3]
 /// THE bug_076 self-service kill test, row-only form: an authoritative
 /// squat settles at the victim's text-CA `drv_path` and is reaped; the
 /// victim uploads its genuine `.drv` to the store and resubmits
@@ -11305,7 +11305,7 @@ async fn test_store_evidence_displaces_settled_bare_squat() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.persist.settled-identity-freeze+2]
+// r[verify sched.persist.settled-identity-freeze+3]
 /// THE merged_bug_038 kill on the HYDRATED row path: Step 0.5 loads
 /// the settled row from PG (load_settled_identity_rows — the
 /// post-reap / post-failover surface) and the M_070 bases admit the
@@ -11695,10 +11695,13 @@ async fn test_matching_identity_join_never_consults_store() -> TestResult {
 /// no `!=` catch-all survives — every (row rank, incoming rank) pair is
 /// an explicit decision, byte-anchored rows are immovable, the
 /// reverse-squat guard holds, and a bare echo gets the store fetch
-/// exactly where a displaceable row meets an unproven claim.
+/// exactly where a displaceable row meets an unproven claim. The
+/// arbitration takes the PERSISTED rank string (the victim-side decode
+/// is internal and fail-closed); the undecodable-row arm is pinned
+/// separately below.
 #[test]
 fn test_settled_arbitration_matrix_4x4() {
-    use crate::actor::merge::{SettledArbitration, arbitrate_settled_row};
+    use crate::actor::settled::{SettledArbitration, arbitrate_settled_row};
     use crate::state::DefinitionEvidence as E;
     let ranks = [
         E::UnverifiedClaim,
@@ -11709,7 +11712,7 @@ fn test_settled_arbitration_matrix_4x4() {
     for row in ranks {
         for incoming in ranks {
             for bare in [false, true] {
-                let got = arbitrate_settled_row(row, incoming, bare);
+                let got = arbitrate_settled_row(row.as_str(), incoming, bare);
                 let want: SettledArbitration = match (row, incoming) {
                     // Byte-anchored rows refuse every claim class.
                     (E::VerifiedBuilt | E::PathBoundBytes, _) => {
@@ -11747,6 +11750,39 @@ fn test_settled_arbitration_matrix_4x4() {
                         "arbitration cell ({row:?},{incoming:?},bare={bare})"
                     ),
                 }
+            }
+        }
+    }
+}
+
+// r[verify sched.persist.settled-identity-freeze+3]
+/// Round-16 bug_073: an UNDECODABLE persisted rank on the settled
+/// VICTIM side must take the immutable Refuse arm — never the
+/// parse_lossy unverified_claim floor, which is conservative only for
+/// a displacer and made the row maximally displaceable here (a future
+/// rank-widening migration read by older code would have silently
+/// demoted byte-anchored rows to DisplaceByRank/NeedsStoreEvidence).
+/// Pinned across every incoming rank x bare shape.
+#[test]
+fn test_settled_arbitration_refuses_undecodable_row_rank() {
+    use crate::actor::settled::{SettledArbitration, arbitrate_settled_row};
+    use crate::state::DefinitionEvidence as E;
+    for incoming in [
+        E::UnverifiedClaim,
+        E::ContentBoundClaim,
+        E::PathBoundBytes,
+        E::VerifiedBuilt,
+    ] {
+        for bare in [false, true] {
+            match arbitrate_settled_row("rank-from-the-future", incoming, bare) {
+                SettledArbitration::Refuse(msg) => assert!(
+                    msg.contains("could not be decoded"),
+                    "remediation must name the decode failure; got {msg:?}"
+                ),
+                other => panic!(
+                    "undecodable row rank must refuse (incoming={incoming:?}, \
+                     bare={bare}); got {other:?}"
+                ),
             }
         }
     }

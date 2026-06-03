@@ -988,7 +988,7 @@ fn validate_authoritative_drv_content(
 /// Returns the set of nodes whose unverifiable declared modular hash
 /// was STRIPPED, as `(drv_hash, stripped_hash)` pairs — the caller
 /// preserves them out-of-band (M_070,
-/// `sched.persist.settled-identity-freeze+2`); the live field is
+/// `sched.persist.settled-identity-freeze+3`); the live field is
 /// cleared in place and must never carry an unverified value forward.
 pub(crate) fn validate_inline_drv_content(
     nodes: &mut [rio_proto::types::DerivationNode],

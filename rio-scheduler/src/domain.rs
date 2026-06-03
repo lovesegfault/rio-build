@@ -83,7 +83,7 @@ pub struct DerivationNode {
     /// could not be recomputed (`ingress-inline-drv-binding+1`):
     /// preserved out-of-band so the settled-row matcher can later
     /// admit a byte-equal re-presentation of the same claim
-    /// (M_070, `sched.persist.settled-identity-freeze+2`). Never set
+    /// (M_070, `sched.persist.settled-identity-freeze+3`). Never set
     /// from the wire (`From<proto>` always maps it to `None`); the
     /// only producer is the SubmitBuild ingress validator's strip
     /// phase, applied at the actor's proto→domain boundary. Never

@@ -54,6 +54,7 @@ mod handle;
 mod housekeeping;
 mod merge;
 mod recovery;
+pub(crate) mod settled;
 mod snapshot;
 
 pub(super) use breaker::CacheCheckBreaker;

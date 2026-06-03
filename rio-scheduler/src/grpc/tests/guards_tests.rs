@@ -80,7 +80,7 @@ fn test_actor_error_to_status_all_arms() {
         ),
         (ActorError::NotLeader, Code::Unavailable, "not leader"),
         (
-            // r[verify sched.persist.settled-identity-freeze+2]
+            // r[verify sched.persist.settled-identity-freeze+3]
             ActorError::SettledIdentityConflict {
                 drv_path: "/nix/store/x".into(),
                 remediation: "resubmit store-backed".into(),

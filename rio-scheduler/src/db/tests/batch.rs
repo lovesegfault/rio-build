@@ -925,7 +925,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
     // ── Store-origin row, re-created store-backed ─────────────────────
     // The prior creation parked in a terminal FAILURE state: that is the
     // only settled-adjacent state a conflicting re-creation can reach
-    // (a completed/skipped row is frozen — sched.persist.settled-identity-freeze+2).
+    // (a completed/skipped row is frozen — sched.persist.settled-identity-freeze+3).
     let first = DerivationRow {
         needs_resolve: false,
         drv_hash: "recreate-store".into(),
@@ -1219,7 +1219,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
     // Pre-existing terminal-FAILURE authoritative squat row (a prior
     // creation's snapshot that a displacing merge would recreate-refresh
     // — only failure-parked rows are displaceable; completed/skipped
-    // rows are frozen by sched.persist.settled-identity-freeze+2).
+    // rows are frozen by sched.persist.settled-identity-freeze+3).
     let squat = DerivationRow {
         needs_resolve: false,
         drv_hash: "atomic-squat".into(),
@@ -1643,7 +1643,7 @@ async fn test_batch_upsert_persists_and_refreshes_ca_modular_hash() -> anyhow::R
     Ok(())
 }
 
-// r[verify sched.persist.settled-identity-freeze+2]
+// r[verify sched.persist.settled-identity-freeze+3]
 /// M_070 preservation-column write semantics, all three writers:
 /// the creation upsert (insert + supersede-vs-carry on conflict) and
 /// the dispatch strip mover (single-statement live→stripped move,
@@ -1758,7 +1758,7 @@ async fn test_preserved_stripped_hash_supersede_carry_and_move() -> anyhow::Resu
     Ok(())
 }
 
-// r[verify sched.persist.settled-identity-freeze+2]
+// r[verify sched.persist.settled-identity-freeze+3]
 /// The upsert's settled-row WHERE guard (defense-in-depth twin of the
 /// pre-merge check): a `completed`/`skipped` row whose public identity
 /// conflicts with the incoming re-creation is left completely untouched
@@ -1884,7 +1884,7 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
 }
 
 // r[verify sched.merge.store-evidence-displacement+2]
-// r[verify sched.persist.settled-identity-freeze+2]
+// r[verify sched.persist.settled-identity-freeze+3]
 /// The settled-row WHERE guard's evidence carve-out: a conflicting
 /// re-creation whose hash is in the per-merge approved array (the
 /// actor's store-evidence verdict) updates the settled row — and an
@@ -2109,5 +2109,241 @@ async fn test_batch_upsert_evidence_rank_roundtrip_and_recreation() -> anyhow::R
             .execute(&test_db.pool)
             .await;
     assert!(res.is_err(), "CHECK constraint rejects unknown ranks");
+    Ok(())
+}
+
+// r[verify sched.persist.settled-identity-freeze+3]
+/// Round-16 merged_bug_087: AXIS-ISOLATED DIFFERENTIAL CONFORMANCE
+/// between the in-memory settled matcher
+/// (`actor::settled::settled_row_identity_matches`) and the SQL freeze
+/// guard in `batch_upsert_derivations`. For every single-axis mutation
+/// of an incoming re-creation against a settled baseline row, both
+/// implementations must produce the SAME verdict: matcher-match ⇔
+/// guard-admits (row appears in RETURNING). Pre-fix divergences pinned:
+/// reordered output names (matcher matched, guard blocked → opaque
+/// Internal for a legitimate set-equal resubmission) and the missing
+/// expected-path / differing-live-hash axes (matcher conflicted, guard
+/// silently overwrote settled history in exactly the bypass/race
+/// window it exists for). The in-memory side reads the row through the
+/// PRODUCTION loader (`load_settled_identity_rows`), so a loader
+/// column omission also fails this test.
+#[tokio::test]
+async fn test_settled_freeze_guard_matches_matcher_axis_by_axis() -> anyhow::Result<()> {
+    use crate::actor::settled::settled_row_identity_matches;
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let dev_path = "/nix/store/00000000000000000000000000000000-axis-dev";
+    let out_path = "/nix/store/11111111111111111111111111111111-axis-out";
+
+    struct Case {
+        label: &'static str,
+        // Mutations applied to the incoming re-creation.
+        names: Vec<String>,
+        paths: Vec<String>,
+        system: &'static str,
+        is_fixed_output: bool,
+        is_ca: bool,
+        incoming_hash: Option<[u8; 32]>,
+        // Hash staged on the settled ROW (None = baseline no-hash).
+        row_hash: Option<[u8; 32]>,
+        expect_match: bool,
+    }
+    let base_names = || vec!["dev".to_string(), "out".to_string()];
+    let base_paths = || vec![dev_path.to_string(), out_path.to_string()];
+    let cases = vec![
+        Case {
+            label: "identical",
+            names: base_names(),
+            paths: base_paths(),
+            system: "x86_64-linux",
+            is_fixed_output: false,
+            is_ca: false,
+            incoming_hash: None,
+            row_hash: None,
+            expect_match: true,
+        },
+        Case {
+            label: "names-reordered-set-equal",
+            names: vec!["out".into(), "dev".into()],
+            paths: vec![out_path.into(), dev_path.into()],
+            system: "x86_64-linux",
+            is_fixed_output: false,
+            is_ca: false,
+            incoming_hash: None,
+            row_hash: None,
+            expect_match: true,
+        },
+        Case {
+            label: "system-differs",
+            names: base_names(),
+            paths: base_paths(),
+            system: "aarch64-linux",
+            is_fixed_output: false,
+            is_ca: false,
+            incoming_hash: None,
+            row_hash: None,
+            expect_match: false,
+        },
+        Case {
+            label: "fixed-output-flag-differs",
+            names: base_names(),
+            paths: base_paths(),
+            system: "x86_64-linux",
+            is_fixed_output: true,
+            is_ca: false,
+            incoming_hash: None,
+            row_hash: None,
+            expect_match: false,
+        },
+        Case {
+            label: "ca-flag-differs",
+            names: base_names(),
+            paths: base_paths(),
+            system: "x86_64-linux",
+            is_fixed_output: false,
+            is_ca: true,
+            incoming_hash: None,
+            row_hash: None,
+            expect_match: false,
+        },
+        Case {
+            label: "names-different-set",
+            names: vec!["doc".into(), "out".into()],
+            paths: vec![dev_path.into(), out_path.into()],
+            system: "x86_64-linux",
+            is_fixed_output: false,
+            is_ca: false,
+            incoming_hash: None,
+            row_hash: None,
+            expect_match: false,
+        },
+        Case {
+            label: "expected-path-differs-on-shared-name",
+            names: base_names(),
+            paths: vec![
+                "/nix/store/22222222222222222222222222222222-axis-dev-evil".into(),
+                out_path.into(),
+            ],
+            system: "x86_64-linux",
+            is_fixed_output: false,
+            is_ca: false,
+            incoming_hash: None,
+            row_hash: None,
+            expect_match: false,
+        },
+        Case {
+            label: "live-hash-differs-both-present",
+            names: base_names(),
+            paths: base_paths(),
+            system: "x86_64-linux",
+            is_fixed_output: false,
+            is_ca: false,
+            incoming_hash: Some([0xBB; 32]),
+            row_hash: Some([0xAA; 32]),
+            expect_match: false,
+        },
+        Case {
+            label: "hash-one-sided-no-veto",
+            names: base_names(),
+            paths: base_paths(),
+            system: "x86_64-linux",
+            is_fixed_output: false,
+            is_ca: false,
+            incoming_hash: None,
+            row_hash: Some([0xAA; 32]),
+            expect_match: true,
+        },
+    ];
+
+    for (i, c) in cases.iter().enumerate() {
+        let hash = format!("axis-{i}");
+        // Stage the settled baseline through the production upsert,
+        // then settle it.
+        let baseline = DerivationRow {
+            drv_hash: hash.clone(),
+            drv_path: format!("/nix/store/{:0>32}-axis.drv", i),
+            pname: None,
+            system: "x86_64-linux".into(),
+            status: DerivationStatus::Created,
+            required_features: vec![],
+            expected_output_paths: base_paths(),
+            output_names: base_names(),
+            is_fixed_output: false,
+            is_ca: false,
+            wanted_output_names: vec![],
+            topdown_pruned: false,
+            closure_hole: false,
+            drv_content: None,
+            ca_modular_hash: c.row_hash,
+            ca_modular_hash_stripped: None,
+            evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            needs_resolve: false,
+        };
+        let mut tx = db.pool().begin().await?;
+        SchedulerDb::batch_upsert_derivations(&mut tx, &[baseline], &[]).await?;
+        tx.commit().await?;
+        sqlx::query("UPDATE derivations SET status = 'completed' WHERE drv_hash = $1")
+            .bind(&hash)
+            .execute(&test_db.pool)
+            .await?;
+
+        // In-memory verdict — row through the PRODUCTION loader.
+        let rows = db
+            .load_settled_identity_rows(std::slice::from_ref(&hash))
+            .await?;
+        assert_eq!(rows.len(), 1, "{}: settled row loads", c.label);
+        let incoming: crate::domain::DerivationNode = rio_proto::types::DerivationNode {
+            drv_hash: hash.clone(),
+            drv_path: format!("/nix/store/{:0>32}-axis.drv", i),
+            system: c.system.into(),
+            output_names: c.names.clone(),
+            expected_output_paths: c.paths.clone(),
+            is_fixed_output: c.is_fixed_output,
+            is_content_addressed: c.is_ca,
+            ca_modular_hash: c.incoming_hash.map(|h| h.to_vec()).unwrap_or_default(),
+            ..Default::default()
+        }
+        .into();
+        let matcher_matches = settled_row_identity_matches(&rows[0], &incoming).is_some();
+
+        // SQL verdict — re-creation upsert, empty carve-out; admitted
+        // iff the hash appears in RETURNING.
+        let recreation = DerivationRow {
+            drv_hash: hash.clone(),
+            drv_path: format!("/nix/store/{:0>32}-axis.drv", i),
+            pname: None,
+            system: c.system.into(),
+            status: DerivationStatus::Created,
+            required_features: vec![],
+            expected_output_paths: c.paths.clone(),
+            output_names: c.names.clone(),
+            is_fixed_output: c.is_fixed_output,
+            is_ca: c.is_ca,
+            wanted_output_names: vec![],
+            topdown_pruned: false,
+            closure_hole: false,
+            drv_content: None,
+            ca_modular_hash: c.incoming_hash,
+            ca_modular_hash_stripped: None,
+            evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            needs_resolve: false,
+        };
+        let mut tx = db.pool().begin().await?;
+        let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[recreation], &[]).await?;
+        tx.commit().await?;
+        let guard_admits = ids.contains_key(&hash);
+
+        assert_eq!(
+            matcher_matches, c.expect_match,
+            "{}: in-memory matcher verdict",
+            c.label
+        );
+        assert_eq!(
+            guard_admits, c.expect_match,
+            "{}: SQL guard verdict diverges from the matcher",
+            c.label
+        );
+    }
     Ok(())
 }

@@ -204,7 +204,7 @@ pub fn describe_metrics() {
         "rio_scheduler_merge_stripped_rejoin_total",
         "Settled rows REJOINED by a re-creating submission via the M_070 \
          match bases the pre-strip-preservation matcher refused \
-         (sched.persist.settled-identity-freeze+2), labeled by basis: \
+         (sched.persist.settled-identity-freeze+3), labeled by basis: \
          preserved_claim (byte-equal preserved stripped claim) or \
          dual_anchor (byte-anchored row + same declared path, no \
          contradicting evidence). Each increment is a rebuild that \
