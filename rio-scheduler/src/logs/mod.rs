@@ -770,7 +770,7 @@ impl LogBuffers {
     /// is unverified worker input and must not be fanned out.
     ///
     /// The completion path's analogous check
-    /// (`sched.completion.output-membership`, `completion.rs`) runs
+    /// (`sched.completion.output-membership+1`, `completion.rs`) runs
     /// inside the actor. This runs in the recv task, which deliberately
     /// bypasses the actor (see module header comment) — so the check is
     /// colocated with the data the recv task has: the ring buffer entry,

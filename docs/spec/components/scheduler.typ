@@ -150,16 +150,34 @@ any critical-path value).
   state.
 ]
 
-#r("sched.completion.output-membership")[
-  `handle_completion` MUST drop any worker-supplied `BuiltOutput` whose
-  `output_name` is not in the derivation's scheduler-trusted `output_names`
-  (parsed from the `.drv` at DAG-merge time), and MUST drop duplicates by
-  `output_name`. Builders are untrusted; without this filter a compromised
-  worker reporting on its own assigned drv could write arbitrary worker-chosen
-  paths to `path_tenants` (pinning them against GC) and stall the actor via the
-  sequential `insert_realisation` loop. After filtering, `built_outputs.len() ≤
-  output_names.len()`. Dropped entries increment
-  #(refs.metric)("rio_scheduler_undeclared_built_output_total").
+#r("sched.completion.output-membership+1")[
+  Worker-supplied built outputs MUST reach trusted-plane consumers
+  (`state.output_paths` and its GC-pin / `path_tenants` readers,
+  realisations, cutoff-compare, the client output report) only through
+  ONE admission chokepoint that takes the raw report by value, so no
+  consumer can read pre-admission data. The chokepoint MUST drop any
+  `BuiltOutput` whose `output_name` is not in the derivation's
+  scheduler-trusted `output_names` (parsed from the `.drv` at
+  DAG-merge time), MUST drop duplicates by `output_name`, MUST drop
+  malformed `output_path` values (store-path parse), and MUST bind
+  each remaining output's `output_path` to the scheduler-held claim
+  for that output's slot: for every output whose dispatch-time claim
+  or merge-time expected path is non-empty, a worker-reported path
+  that differs from it MUST be dropped (index-aligned by the slot the
+  assignment token signs --- never set-membership, which would admit
+  cross-slot permutations), counted per reason; outputs whose slot the
+  scheduler holds no path for (floating-CA, or a deferred-IA slot
+  whose claim did not survive) MUST be admitted through an explicit
+  per-reason accept cell, also counted. Builders are untrusted;
+  without the membership bound a compromised worker reporting on its
+  own assigned drv could write arbitrary worker-chosen paths to
+  `path_tenants` (pinning them against GC) and stall the actor via
+  the sequential `insert_realisation` loop; without the binding it
+  could substitute ANY well-formed path for a known slot. After
+  admission, `len() ≤ output_names.len()`. Dropped entries increment
+  #(refs.metric)("rio_scheduler_undeclared_built_output_total") or
+  #(refs.metric)("rio_scheduler_completion_path_binding_total") by
+  reason.
 ]
 
 #r("sched.log.batch-binding")[
@@ -168,7 +186,7 @@ any critical-path value).
   batch for an unsolicited derivation MUST NOT allocate a buffer entry.
 ]
 
-This is the log-path analogue of #rref("sched.completion.output-membership").
+This is the log-path analogue of #rref("sched.completion.output-membership+1").
 The completion check runs inside the actor with `state.assigned_executor` in
 scope; the log batch ingestion path deliberately bypasses the actor (so a
 chatty build can't fill the actor's bounded mpsc), so the gate is colocated

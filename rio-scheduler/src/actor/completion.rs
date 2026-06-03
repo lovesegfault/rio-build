@@ -12,6 +12,76 @@ use crate::state::{BuildStateExt, DerivationStatus, DrvHash, ExecutorId};
 
 use super::DagActor;
 
+/// Built outputs ADMITTED past the completion trust boundary — the ONE
+/// owner of every check between a worker-reported `BuildResult` and
+/// the trusted-plane consumers (`state.output_paths` → GC pins +
+/// `path_tenants`, realisations, cutoff-compare, client output report).
+///
+/// r[impl sched.completion.output-membership+1]
+/// Construction is the boundary: [`AdmittedOutputs::admit`] takes the
+/// raw outputs by value (`mem::take` at the sole call site — the raw
+/// vector is gone after admission, so no consumer can read
+/// pre-admission data), and every check lives INSIDE the constructor.
+/// The conformance check `completion-admission-conformance` denies
+/// `.built_outputs` reads anywhere else in the actor, so a future
+/// consumer cannot compile-or-CI around the boundary.
+pub(super) struct AdmittedOutputs(Vec<crate::domain::BuiltOutput>);
+
+impl AdmittedOutputs {
+    /// Admit worker-reported outputs against the scheduler-trusted
+    /// declaration. Checks, in order:
+    /// 1. Path SHAPE: `output_path` parses as a store path (malformed
+    ///    paths never reach PG/realisations/path_tenants).
+    /// 2. Name MEMBERSHIP + dedup: only outputs the `.drv` declares
+    ///    (parsed at DAG-merge time), at most once each — bounds the
+    ///    list at `declared.len()` against report stuffing.
+    pub(super) fn admit(
+        raw: Vec<crate::domain::BuiltOutput>,
+        declared: &[String],
+        executor_id: &ExecutorId,
+        drv_hash: &DrvHash,
+    ) -> Self {
+        let mut seen: HashSet<String> = HashSet::with_capacity(declared.len());
+        let admitted = raw
+            .into_iter()
+            .filter(|o| {
+                if rio_nix::store_path::StorePath::parse(&o.output_path).is_err() {
+                    warn!(
+                        executor_id = %executor_id,
+                        drv_hash = %drv_hash,
+                        output_name = %o.output_name,
+                        output_path = %o.output_path,
+                        "dropping malformed worker-supplied output_path"
+                    );
+                    metrics::counter!("rio_scheduler_malformed_built_output_total").increment(1);
+                    return false;
+                }
+                if !declared.contains(&o.output_name) {
+                    warn!(
+                        executor_id = %executor_id,
+                        drv_hash = %drv_hash,
+                        output_name = %o.output_name,
+                        "dropping worker-supplied output not declared by derivation"
+                    );
+                    metrics::counter!("rio_scheduler_undeclared_built_output_total").increment(1);
+                    return false;
+                }
+                // Dedup by output_name (keep first).
+                seen.insert(o.output_name.clone())
+            })
+            .collect();
+        Self(admitted)
+    }
+
+    pub(super) fn as_slice(&self) -> &[crate::domain::BuiltOutput] {
+        &self.0
+    }
+
+    pub(super) fn iter(&self) -> std::slice::Iter<'_, crate::domain::BuiltOutput> {
+        self.0.iter()
+    }
+}
+
 /// Timeout for the CA cutoff-compare realisation lookup.
 ///
 /// `query_prior_realisation` is an indexed point-lookup on
@@ -733,28 +803,11 @@ impl DagActor {
         // stays proto-typed so `actor/tests/` keeps constructing it
         // unchanged (b03 reconciles post-integration).
         let mut result: crate::domain::BuildResult = result.into();
-        // Threat model: builders are untrusted. `built_outputs.
-        // output_path` reaches PG `realisations` (ca_insert_
-        // realisations) and `path_tenants` (state.output_paths →
-        // upsert_path_tenants_for) and the gateway reads both for
-        // client-facing responses. Filter to valid store paths HERE,
-        // at the boundary, so every consumer sees only well-formed
-        // data. `ca_cutoff_compare`'s `is_empty()` guard becomes
-        // defense-in-depth.
-        result.built_outputs.retain(|o| {
-            if rio_nix::store_path::StorePath::parse(&o.output_path).is_ok() {
-                true
-            } else {
-                warn!(
-                    executor_id = %executor_id,
-                    output_name = %o.output_name,
-                    output_path = %o.output_path,
-                    "dropping malformed worker-supplied output_path"
-                );
-                metrics::counter!("rio_scheduler_malformed_built_output_total").increment(1);
-                false
-            }
-        });
+        // Threat model: builders are untrusted. Every check between
+        // the raw report and the trusted-plane consumers lives in
+        // [`AdmittedOutputs::admit`] — invoked ONCE below, after the
+        // DAG state (the trusted declaration) is resolved. Until then
+        // the raw vector is not consulted.
         let status = result.status;
 
         // Resolve drv_key (which may be a drv_path or a drv_hash) to drv_hash.
@@ -828,37 +881,21 @@ impl DagActor {
             warn!(drv_hash = %drv_hash, "completion for unknown derivation, ignoring");
             return;
         };
-        // r[impl sched.completion.output-membership]
-        // Threat-model boundary, part 2: now that `state` is available,
-        // bound `built_outputs` to the scheduler-trusted `output_names`
-        // (parsed from the .drv at DAG-merge time). The format-filter
-        // above runs before `state` is resolved and validates path
-        // SHAPE only — it does not check membership or cardinality. A
-        // compromised worker reporting on its own assigned drv could
-        // otherwise stuff ~30k fabricated entries (4MB tonic limit ÷
-        // ~130B/entry), all reaching `state.output_paths` →
-        // `upsert_path_tenants` (arbitrary worker-chosen paths pinned
-        // against GC) and, for CA drvs, the sequential
-        // `insert_realisation` loop (~150s actor stall — same I-139
-        // shape called out at the cascade-dispatch comment). After
-        // this retain, `built_outputs.len() ≤ output_names.len()`.
-        let declared = &state.output_names;
-        let mut seen: HashSet<String> = HashSet::with_capacity(declared.len());
-        result.built_outputs.retain(|o| {
-            if !declared.contains(&o.output_name) {
-                warn!(
-                    executor_id = %executor_id,
-                    drv_hash = %drv_hash,
-                    output_name = %o.output_name,
-                    "dropping worker-supplied output not declared by derivation"
-                );
-                metrics::counter!("rio_scheduler_undeclared_built_output_total").increment(1);
-                return false;
-            }
-            // Dedup by output_name (keep first). `insert` returns
-            // false on dup → drop.
-            seen.insert(o.output_name.clone())
-        });
+        // r[impl sched.completion.output-membership+1]
+        // THE admission boundary: now that `state` (the trusted
+        // declaration) is available, the raw worker report is taken by
+        // value and admitted through the chokepoint. Shape, membership,
+        // cardinality (`admitted.len() ≤ output_names.len()` against
+        // ~30k-entry report stuffing → path_tenants GC pinning + the
+        // sequential insert_realisation actor stall), and dedup all
+        // live INSIDE `AdmittedOutputs::admit`; the raw vector is gone
+        // after this statement.
+        let admitted = AdmittedOutputs::admit(
+            std::mem::take(&mut result.built_outputs),
+            &state.output_names,
+            executor_id,
+            drv_hash,
+        );
         let current_status = state.status();
 
         // Idempotency: completed -> completed is a no-op
@@ -931,7 +968,7 @@ impl DagActor {
             | rio_proto::types::BuildResultStatus::AlreadyValid => {
                 self.handle_success_completion(
                     drv_hash,
-                    &result,
+                    (&result, &admitted),
                     executor_id,
                     (peak_memory_bytes, peak_cpu_cores),
                     (node_name, hw_class),
@@ -1052,7 +1089,11 @@ impl DagActor {
     pub(super) async fn handle_success_completion(
         &mut self,
         drv_hash: &DrvHash,
-        result: &crate::domain::BuildResult,
+        // The raw result (status/log metadata) and the ADMITTED outputs
+        // — tupled to stay under clippy's 7-arg limit; the outputs were
+        // taken from the result at the admission boundary, so the pair
+        // is the complete completion record.
+        (result, admitted): (&crate::domain::BuildResult, &AdmittedOutputs),
         executor_id: &ExecutorId,
         // Same tuple pattern as handle_completion — clippy 7-arg limit.
         (peak_memory_bytes, peak_cpu_cores): (u64, f64),
@@ -1088,16 +1129,12 @@ impl DagActor {
                 return;
             }
 
-            // Store output paths from built_outputs
-            state.output_paths = result
-                .built_outputs
-                .iter()
-                .map(|o| o.output_path.clone())
-                .collect();
+            // Store output paths from the ADMITTED outputs.
+            state.output_paths = admitted.iter().map(|o| o.output_path.clone()).collect();
         }
 
         let skipped_interested = self
-            .complete_ca_bookkeeping(drv_hash, &result.built_outputs)
+            .complete_ca_bookkeeping(drv_hash, admitted.as_slice())
             .await;
 
         // I-209: persist_status(.., Completed, ..) now also closes the

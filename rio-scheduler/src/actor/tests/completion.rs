@@ -768,7 +768,7 @@ async fn cascade_matches_versioned_stdenv_name() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.completion.output-membership]
+// r[verify sched.completion.output-membership+1]
 /// bug_071 regression: `handle_completion` validated worker-supplied
 /// `built_outputs` only by `StorePath::parse` format, never by
 /// membership in scheduler-trusted `output_names` or by cardinality.

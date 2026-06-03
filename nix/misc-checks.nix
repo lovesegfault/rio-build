@@ -1867,4 +1867,61 @@ in
         [ "$fail" = 0 ] || exit 1
         touch $out
       '';
+
+  # Round-17 bug_100 (RC17-06): worker-reported built outputs reach the
+  # trusted plane ONLY through actor::completion::AdmittedOutputs. The
+  # deny-table pins every `.built_outputs` field access (the raw,
+  # pre-admission data) to the proto→domain conversion and the single
+  # mem::take at the admission boundary; a new consumer must go through
+  # the chokepoint or register here with a reason.
+  completion-admission-conformance =
+    pkgs.runCommand "rio-completion-admission-conformance"
+      {
+        nativeBuildInputs = [ pkgs.ripgrep ];
+        src = pkgs.lib.fileset.toSource {
+          root = ../rio-scheduler/src;
+          fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src;
+        };
+      }
+      ''
+        cd $src
+        fail=0
+        # Format: path:expected-count:reason.
+        carveouts() {
+          cat <<'TABLE'
+        domain.rs:1:the proto→domain conversion (constructs the raw vector; pre-trust by definition)
+        actor/completion.rs:1:the mem::take at the AdmittedOutputs::admit boundary — the SOLE consumption
+        TABLE
+        }
+        # Field ACCESS only (`.built_outputs`), comments excluded; the
+        # actor's test tree exercises raw shapes deliberately and is
+        # excluded from the production surface.
+        actual=$(rg -n '\.built_outputs' --type rust . \
+          | rg -v '^\S+:\s*\d+:\s*//' \
+          | grep -v '^\./actor/tests/' | sed 's|^\./||' | sort)
+        while IFS=: read -r file expected reason; do
+          file=$(echo "$file" | tr -d ' ')
+          [ -n "$file" ] || continue
+          got=$(echo "$actual" | grep -c "^$file:" || true)
+          if [ "$got" != "$expected" ]; then
+            echo "FAIL: $file has $got raw .built_outputs accesses, deny-table pins $expected ($reason)." >&2
+            echo "  Worker-reported outputs are trusted-plane data ONLY after" >&2
+            echo "  actor::completion::AdmittedOutputs::admit (sched.completion.output-membership+1)." >&2
+            echo "  Consume the AdmittedOutputs value, or register a count-pinned carve-out here." >&2
+            fail=1
+          fi
+        done < <(carveouts | sed 's/^[[:space:]]*//')
+        table_files=$(carveouts | sed 's/^[[:space:]]*//' | cut -d: -f1 | tr -d ' ')
+        echo "$actual" | cut -d: -f1 | sort -u | while read -r f; do
+          [ -n "$f" ] || continue
+          echo "$table_files" | grep -qx "$f" || {
+            echo "FAIL: $f reads .built_outputs outside the admission boundary:" >&2
+            echo "$actual" | grep "^$f:" >&2
+            echo "  Route through actor::completion::AdmittedOutputs (round-17 bug_100)." >&2
+            exit 1
+          }
+        done || fail=1
+        [ "$fail" = 0 ] || exit 1
+        touch $out
+      '';
 }
