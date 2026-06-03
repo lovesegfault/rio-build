@@ -887,6 +887,24 @@ pub fn decide(
         // evidence — under force-build the root re-executes), then a
         // terminal infra row.
         //
+        // TIMED batches terminalize immediately instead of consulting
+        // the requeue budget: a timed member is never re-offered (the
+        // dispatcher owns retries), and NO dispatcher re-attempt exists
+        // for THIS row — the confirmation-retry filter selects
+        // expected-built positions whose replayed result is a failure,
+        // and a marked row is success-shaped (`Substituted`), while
+        // armed requests skip the retry loop entirely — so a requeue
+        // decision here would be converted to a record-less Defer and
+        // backfilled `not-attempted` (GateAccounting::Excluded): the
+        // same evidence-loss event would trip the gate timeless and
+        // vanish timed. The terminal is the §7.2 evidence-loss row the
+        // budget-exhausted leg mints, with the same evidence; for an
+        // ARMED member, classification's step-0 timed-interruption
+        // precedence (the in-band success out-raced the abandon
+        // deadline) yields `interruption-not-reproduced`, agreeing with
+        // the timed-stats bucket the dispatcher counted from the same
+        // in-band row.
+        //
         // Detector conjuncts, both producer-exact: the marker is read
         // from the RELAY capture only (`batch.lost_terminals`, the same
         // channel that captures the `rio: build <uuid>` announcement —
@@ -905,7 +923,9 @@ pub fn decide(
                     budget: RequeueBudget::probe_carveout(),
                 };
             }
-            if let Some(budget) = RequeueBudget::auto_retry(prior_requeues, knobs) {
+            if batch.kind != BATCH_KIND_TIMED
+                && let Some(budget) = RequeueBudget::auto_retry(prior_requeues, knobs)
+            {
                 return CollectDecision::Requeue {
                     why: RequeueReason::InfraAutoRetry,
                     budget,
@@ -1190,7 +1210,26 @@ pub fn decide(
                 budget: RequeueBudget::probe_carveout(),
             };
         }
-        if let Some(budget) = RequeueBudget::auto_retry(prior_requeues, knobs) {
+        // The in-band evidence-loss row of a TIMED batch terminalizes
+        // immediately, like its marker sibling in the success arm above:
+        // a timed member is never re-offered, so the requeue would
+        // become a record-less Defer — and while THIS row is
+        // failure-shaped (the confirmation retry CAN select an
+        // expected-built position carrying it, unlike the success-shaped
+        // marker row), that retry runs off the batch record's statuses
+        // regardless of this decision, and its executed-Built success
+        // supersedes the terminal through the already-terminal belt
+        // (§9.2). Recording now means an unretried or armed or
+        // non-built-expectation member ends as the §7.2
+        // infra-indeterminate evidence-loss terminal instead of
+        // vanishing into the not-attempted backfill. Ordinary
+        // positively-identified infra failures in timed batches keep the
+        // requeue shape: their Defer leaves the member to the
+        // confirmation retry / end-of-run backfill exactly as designed —
+        // only the evidence-loss rows had no completing leg.
+        if !(lost_terminal_row && batch.kind == BATCH_KIND_TIMED)
+            && let Some(budget) = RequeueBudget::auto_retry(prior_requeues, knobs)
+        {
             return CollectDecision::Requeue {
                 why: RequeueReason::InfraAutoRetry,
                 budget,
@@ -1864,7 +1903,13 @@ pub async fn process_settled_batch(
                     // for a later confirmation-retry batch or the
                     // end-of-run backfill (no transition; its explicit
                     // `Defer` entry below only releases the watchdog
-                    // stall clock).
+                    // stall clock). The evidence-loss rows (the gateway's
+                    // lost-terminal marker and the in-band
+                    // `lost_terminal_unverified` shape) never reach this
+                    // arm: decide() terminalizes them directly for timed
+                    // batches, because no dispatcher re-attempt completes
+                    // their leg and a Defer here would convert them to
+                    // gate-excluded not-attempted backfill rows.
                     if timed_interruption_for(batch, &ctx.drv_path, None)
                         == Some(TimedInterruption::Replayed)
                     {
@@ -2788,11 +2833,15 @@ mod tests {
     /// arm reads (`probe` × `engine_cancelled`), Signal-2 states (no
     /// poison row / poison row WITH builders — the two-signal
     /// contradiction deliberately does NOT defeat an evidence-loss
-    /// report), the fixed-output bit (no source-rot shadow), and the
-    /// budget axis (fresh / exhausted). Must-NOT-match direction: same
-    /// status with a different message, the needle mid-string instead of
-    /// at byte 0, a different status carrying the needle, and the needle
-    /// arriving only on the relayed-line channel.
+    /// report), the fixed-output bit (no source-rot shadow), the budget
+    /// axis (fresh / exhausted), and the batch-kind axis (a TIMED batch
+    /// terminalizes the row immediately whatever the budget — a timed
+    /// member is never re-offered, so the requeue shape would drain
+    /// record-less into the gate-excluded not-attempted backfill).
+    /// Must-NOT-match direction: same status with a different message,
+    /// the needle mid-string instead of at byte 0, a different status
+    /// carrying the needle, and the needle arriving only on the
+    /// relayed-line channel.
     #[tokio::test]
     async fn lost_terminal_unverified_row_is_evidence_loss_not_a_substitution_or_failure()
     -> Result<()> {
@@ -2885,6 +2934,45 @@ mod tests {
                     ),
                     other => panic!("{cell}: expected terminal infra, got {other:?}"),
                 }
+            }
+        }
+
+        // ── Timed batch: immediate evidence-loss terminal on BOTH sides
+        // of the budget axis — no dispatcher leg completes this row for
+        // a non-built expectation or an armed request, and the
+        // confirmation retry that CAN fire (expected-built positions —
+        // the row is failure-shaped) runs off the batch record's
+        // statuses regardless of this decision and supersedes through
+        // the belt with an executed Built. ──
+        let timed_batch = BatchView {
+            kind: BATCH_KIND_TIMED.to_string(),
+            ..BatchView::default()
+        };
+        for prior_requeues in [0, 1] {
+            match decide(
+                &c,
+                Some(row),
+                &timed_batch,
+                &no_poison,
+                prior(prior_requeues),
+                &knobs,
+                None,
+            ) {
+                CollectDecision::Terminal {
+                    rio:
+                        RioOutcome::TargetFailed {
+                            kind: FailureKind::Infra,
+                        },
+                    evidence,
+                } => assert!(
+                    evidence.unwrap().contains("gateway evidence-loss row"),
+                    "timed prior={prior_requeues}: terminal evidence must name the row's \
+                     provenance"
+                ),
+                other => panic!(
+                    "timed prior={prior_requeues}: expected immediate terminal infra, got \
+                     {other:?}"
+                ),
             }
         }
 
@@ -3272,16 +3360,27 @@ mod tests {
     /// - the unmarked control of the same row records disposition
     ///   `target-substituted` — the genuine substitution-event leg the
     ///   marker must not erase;
-    /// - timed batch (marker × `kind=timed`): the requeue-shaped decision
-    ///   defers to the timed dispatcher — never re-offered to the
-    ///   timeless pool, no terminal record minted;
+    /// - timed batch (marker × `kind=timed`), BOTH budget states: the
+    ///   row terminalizes as the §7.2 evidence-loss record IMMEDIATELY —
+    ///   no dispatcher re-attempt exists for a success-shaped row (the
+    ///   confirmation-retry filter selects expected-built FAILURES), so
+    ///   the former Defer drained record-less into the not-attempted
+    ///   backfill (gate-excluded) while the same event tripped the gate
+    ///   timeless;
     /// - armed interruption (marker × `kind=timed` ×
-    ///   `interruption_drvs`), BOTH budget states: fresh budget defers
-    ///   exactly like the unarmed timed cell (the marker arm's requeue
-    ///   shape — not an immediate interruption record); exhausted budget
-    ///   records verdict `interruption-not-reproduced` carrying the
-    ///   marker arm's infra evidence — the deliberately pinned
-    ///   precedence choice (see the cell's comment);
+    ///   `interruption_drvs`), BOTH budget states: records verdict
+    ///   `interruption-not-reproduced` carrying the marker arm's infra
+    ///   evidence — classification's step-0 precedence answers the
+    ///   armed question from the in-band settle (the build out-raced
+    ///   the abandon deadline), which outranks the row's evidence
+    ///   QUALITY; the timed-stats `not_reproduced` bucket counts the
+    ///   same in-band row, so record and stats agree;
+    /// - timed batch × ordinary positively-identified infra (the
+    ///   conjunct's other side — NOT an evidence-loss row): still the
+    ///   requeue shape, deferred to the dispatcher's confirmation retry
+    ///   / end-of-run backfill — the timed terminalization is scoped to
+    ///   the rows with no completing leg, never to infra failures whose
+    ///   retry story is real;
     /// - confirmation belt (marker × `confirmation_attempt` ×
     ///   already-terminal): a marked `Substituted` retry is
     ///   presence-shaped, not an executed build, so it cannot supersede
@@ -3394,9 +3493,17 @@ mod tests {
         );
         assert_eq!(records[0].verdict, None);
 
-        // ── Timed batch: the marker's requeue-shaped decision defers to
-        // the timed dispatcher (its confirmation retry is the
-        // re-attempt), with no terminal record and no timeless re-offer. ──
+        // ── Timed batch, FRESH budget: the marked row terminalizes as
+        // the evidence-loss record immediately. The deferral premise
+        // ("the timed dispatcher's confirmation retry is the designed
+        // re-attempt") is structurally false for this row — the retry
+        // filter selects `expected_built && !is_success` positions and a
+        // marked row is success-shaped (`Substituted`), `lost_terminals`
+        // is never consulted by the dispatcher, and armed requests skip
+        // the retry loop — so a Defer here drained record-less into the
+        // not-attempted backfill (GateAccounting::Excluded): the same
+        // evidence-loss event tripped the gate timeless and vanished
+        // timed. ──
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path()).unwrap();
         let decisions = process_settled_batch(
@@ -3416,27 +3523,91 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(matches!(
+            decisions[job],
+            CollectDecision::Terminal {
+                rio: RioOutcome::TargetFailed {
+                    kind: FailureKind::Infra
+                },
+                ..
+            }
+        ));
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].verdict.as_deref(),
+            Some("infra-indeterminate"),
+            "the timed marked row is the same §7.2 evidence-loss terminal as the \
+             timeless exhausted leg — never a record-less Defer"
+        );
+        assert!(
+            records[0]
+                .evidence
+                .as_deref()
+                .unwrap()
+                .contains("gateway lost-terminal relay marker"),
+            "{:?}",
+            records[0].evidence
+        );
+
+        // ── Timed batch × ordinary positively-identified infra: the
+        // conjunct's other side. A NON-evidence-loss infra row (the
+        // scheduler's infra-retries-exhausted vocabulary) keeps the
+        // requeue shape and is deferred to the timed dispatcher /
+        // backfill — the timed terminalization is scoped to evidence
+        // loss, not to infra failures whose confirmation-retry story is
+        // real (the row is failure-shaped, so the retry filter selects
+        // it). ──
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let infra_batch = BatchView {
+            kind: BATCH_KIND_TIMED.to_string(),
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+            results: vec![po(
+                T,
+                BuildStatus::TransientFailure,
+                "max_infra_retries=3 exhausted after infrastructure failures: store unavailable",
+            )],
+            ..BatchView::default()
+        };
+        let decisions = process_settled_batch(
+            &state,
+            &LogAdmin::default(),
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &[job.to_string()],
+            &infra_batch,
+            &HashMap::new(),
+            &Knobs::default(),
+            "timed",
+            "c1",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             decisions[job],
             CollectDecision::Defer {
                 reason: "infra-auto-retry"
-            }
+            },
+            "ordinary timed infra failures keep the deferred requeue shape"
         );
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert!(records.is_empty(), "{records:?}");
 
-        // ── Armed interruption × marker, fresh budget: the marker arm's
-        // requeue shape defers like the unarmed timed cell — a CHANGE
-        // from the pre-marker behavior, where the success-shaped row
-        // terminalized immediately and the armed unit recorded
-        // interruption-not-reproduced on the spot. Deferring is correct:
-        // the evidence channel was lost, and the timed dispatcher's
-        // confirmation retry is the designed re-attempt that produces a
-        // real terminal to answer the interruption question with.
-        // (`timed_interruption_for(batch, drv, None)` is consulted on
-        // the requeue path and only short-circuits for a FIRED
-        // disconnect-replay deadline, which a with-results batch cannot
-        // carry.) ──
+        // ── Armed interruption × marker, fresh budget: terminalizes like
+        // the unarmed timed cell, and classification's step-0
+        // timed-interruption precedence answers the armed question from
+        // the in-band settle — `timed_interruption_for(batch, drv,
+        // Some(true))` derives `NotReproduced` (armed, deadline did not
+        // fire, the submission settled in band success-shaped), which
+        // outranks the row's evidence QUALITY. The record agrees with
+        // the timed-stats `not_reproduced` bucket, which the dispatcher
+        // counts from the same in-band row — under the former Defer the
+        // stats said `not_reproduced` while the record said
+        // not-attempted. ──
         let armed = |confirmation_attempt: u32| {
             let mut batch = marked_batch(BATCH_KIND_TIMED, confirmation_attempt);
             batch.interruption_drvs = vec![T.to_string()];
@@ -3461,16 +3632,36 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            decisions[job],
-            CollectDecision::Defer {
-                reason: "infra-auto-retry"
-            },
-            "an armed interruption does not turn the marker's re-attempt into an \
-             immediate interruption record"
+        assert!(
+            matches!(
+                decisions[job],
+                CollectDecision::Terminal {
+                    rio: RioOutcome::TargetFailed {
+                        kind: FailureKind::Infra
+                    },
+                    ..
+                }
+            ),
+            "{:?}",
+            decisions[job]
         );
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
-        assert!(records.is_empty(), "{records:?}");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].verdict.as_deref(),
+            Some("interruption-not-reproduced"),
+            "step-0 precedence answers the armed cell from the in-band settle"
+        );
+        assert!(
+            records[0]
+                .evidence
+                .as_deref()
+                .unwrap()
+                .contains("gateway lost-terminal relay marker"),
+            "the marker arm's provenance evidence must ride the interruption \
+             verdict: {:?}",
+            records[0].evidence
+        );
 
         // ── Armed interruption × marker, budget exhausted: the marker
         // arm terminalizes TargetFailed{Infra} with its provenance

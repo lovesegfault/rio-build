@@ -9663,6 +9663,138 @@ mod tests {
         );
     }
 
+    /// A timed campaign whose member settles as the gateway's
+    /// lost-terminal evidence-loss row (marked `Substituted`) must end
+    /// the FULL run — drain, end-of-run backfill, report — with the §7.2
+    /// `infra-indeterminate` terminal, not a `not-attempted` backfill
+    /// record. The dispatcher has no completing leg for this row (the
+    /// confirmation-retry filter selects expected-built FAILURES and a
+    /// marked row is success-shaped), so before collect terminalized it
+    /// at settle, the unit drained record-less and the backfill wrote
+    /// the gate-EXCLUDED disposition: the same evidence-loss event
+    /// tripped the gate timeless and vanished timed. The backfill must
+    /// also not overwrite the settle-time record (existing records win).
+    #[tokio::test]
+    async fn mini_timed_campaign_terminalizes_marked_evidence_loss_at_settle() {
+        let archive_dir = tempfile::tempdir().unwrap();
+        let built = write_mini_timed_archive(archive_dir.path(), MiniTimedSpec::default());
+        let archive = Arc::new(ReplayArchive::open(archive_dir.path()).unwrap());
+        let manifest = load_units(&archive).unwrap();
+        let app_a = manifest
+            .iter()
+            .find(|m| m.job == "appA.x86_64-linux")
+            .unwrap()
+            .clone();
+        let app_b = manifest
+            .iter()
+            .find(|m| m.job == "appB.x86_64-linux")
+            .unwrap()
+            .clone();
+        let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
+        let mut narinfos = HashMap::new();
+        narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
+
+        let submitter = Arc::new(KeyedSubmitter::default());
+        submitter.outcomes.lock().unwrap().insert(
+            app_a.drv_path.clone(),
+            BatchOutcome {
+                build_id: Some("0193e4a2-7c1b-7d20-9b3a-00000000eeee".into()),
+                results: vec![PathOutcome {
+                    drv_path: app_a.drv_path.clone(),
+                    status: build_status_name(BuildStatus::Built).into(),
+                    error_msg: String::new(),
+                    start_time: 0,
+                    stop_time: 0,
+                }],
+                ..BatchOutcome::default()
+            },
+        );
+        // appB settles with the producer pair's marked Substituted shape:
+        // the in-band row says Substituted (store presence is real) and
+        // the gateway's stderr relay carried the lost-terminal marker for
+        // exactly this drv — captured into the batch record's
+        // lost_terminals like production's observer does.
+        submitter.outcomes.lock().unwrap().insert(
+            app_b.drv_path.clone(),
+            BatchOutcome {
+                build_id: Some("0193e4a2-7c1b-7d20-9b3a-00000000ffff".into()),
+                results: vec![PathOutcome {
+                    drv_path: app_b.drv_path.clone(),
+                    status: build_status_name(BuildStatus::Substituted).into(),
+                    error_msg: String::new(),
+                    start_time: 0,
+                    stop_time: 0,
+                }],
+                lost_terminals: [app_b.drv_path.clone()].into_iter().collect(),
+                ..BatchOutcome::default()
+            },
+        );
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let mut spec = leaf_spec(&built.archive_id);
+        spec.scheduling.mode = ScheduleMode::Timed;
+        spec.knobs.speedup = 1000.0;
+        let backends = Backends {
+            store: Arc::new(FakeStoreApi::default()),
+            admin: Arc::new(NoLogsAdmin),
+            cluster: Arc::new(HealthyCluster),
+            submitter: submitter.clone(),
+            supply_transport: Some(Arc::new(FakeSupplyTransport::default())),
+            narinfo: Some(Arc::new(MapNarinfo(narinfos))),
+            artifacts: None,
+        };
+        run_with_backends(
+            run_args(state_dir.path()),
+            spec,
+            StateDir::new(state_dir.path()).unwrap(),
+            archive,
+            backends,
+        )
+        .await
+        .unwrap();
+
+        let state = StateDir::new(state_dir.path()).unwrap();
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        assert_eq!(
+            records["appA.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+        let app_b_record = &records["appB.x86_64-linux"];
+        assert_eq!(
+            app_b_record.verdict.as_deref(),
+            Some("infra-indeterminate"),
+            "the marked row must end the run as the evidence-loss terminal, not vanish \
+             into the backfill: {app_b_record:?}"
+        );
+        assert_eq!(app_b_record.disposition, None);
+        assert!(
+            app_b_record
+                .evidence
+                .as_deref()
+                .unwrap()
+                .contains("gateway lost-terminal relay marker"),
+            "{:?}",
+            app_b_record.evidence
+        );
+        // The settle-time terminal survived the end-of-run backfill
+        // (existing records win): exactly one results.jsonl row for appB.
+        let raw: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(
+            raw.iter().filter(|r| r.job == "appB.x86_64-linux").count(),
+            1,
+            "the backfill must not write over (or duplicate) the settle-time terminal"
+        );
+        // Conservation still holds on the ordinary exit path.
+        let campaign: CampaignRecord = state.read_json("campaign.json").unwrap().unwrap();
+        let in_scope = campaign.plan.as_ref().unwrap().in_scope.len();
+        let agg = report::aggregate(&records);
+        assert_eq!(
+            agg.verdict_counts.values().sum::<usize>()
+                + agg.disposition_counts.values().sum::<usize>(),
+            in_scope
+        );
+    }
+
     /// An operator PAUSE held from before dispatch until past schedule
     /// drain — the wedge-spanning-drain shape — must surface as
     /// `timing_degraded` in timed-stats.json and as the `timing-degraded`
