@@ -20833,6 +20833,10 @@
           "packageId": "config"
         },
         {
+          "name": "metrics",
+          "packageId": "metrics"
+        },
+        {
           "name": "proptest",
           "packageId": "proptest"
         },

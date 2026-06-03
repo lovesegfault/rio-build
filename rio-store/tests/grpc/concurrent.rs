@@ -16,6 +16,7 @@ use super::*;
 use rio_auth::hmac::{AssignmentClaims, HmacSigner, HmacVerifier};
 use rio_proto::types::PutPathTrailer;
 use rio_store::test_helpers::{path_hash, seed_tenant};
+use rio_test_support::metrics::CountingRecorder;
 
 const KEY: &[u8] = b"concurrent-test-hmac-key-32-byte";
 
@@ -108,6 +109,29 @@ async fn wait_for_placeholder(pool: &sqlx::PgPool, path: &str) {
     panic!("winner never claimed the 'uploading' placeholder");
 }
 
+/// Block until the loser has actually entered the bounded-wait arm,
+/// observable via the `outcome=waiting` entry counter. Replaces a
+/// blind 300 ms sleep that could let the whole test resolve through
+/// the idempotent-skip fast path under load — passing without ever
+/// exercising the wait it exists to verify.
+///
+/// Works because `#[tokio::test]` is a current-thread runtime: the
+/// spawned server task emits into the thread-local recorder (same
+/// pattern as rio-gateway/tests/ssh_hardening.rs).
+async fn wait_for_wait_arm(recorder: &CountingRecorder) {
+    const KEY: &str = "rio_store_putpath_concurrent_wait_total{outcome=waiting}";
+    for _ in 0..500 {
+        if recorder.get(KEY) >= 1 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!(
+        "loser never reached the concurrent-wait arm; counters seen: {:?}",
+        recorder.all_keys()
+    );
+}
+
 /// The live repro: winner holds the placeholder mid-stream; loser
 /// arrives for the same path. The loser MUST wait for the winner and
 /// resolve as an idempotent skip (`created: false`) — not surface
@@ -116,6 +140,8 @@ async fn wait_for_placeholder(pool: &sqlx::PgPool, path: &str) {
 // r[verify store.put.concurrent-wait]
 #[tokio::test]
 async fn concurrent_putpath_loser_waits_for_winner_then_skips() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
     let s = StoreSession::new_with_hmac(KEY.to_vec()).await?;
     let tenant_a = seed_tenant(&s.db.pool, "conc-winner").await;
     let tenant_b = seed_tenant(&s.db.pool, "conc-loser").await;
@@ -142,9 +168,9 @@ async fn concurrent_putpath_loser_waits_for_winner_then_skips() -> TestResult {
         put_path_with_token(&mut loser_client, loser_info, loser_nar, &loser_token).await
     });
 
-    // Give the loser time to hit the Concurrent arm and start waiting,
+    // Only proceed once the loser is provably parked in the wait arm —
     // then let the winner finish.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    wait_for_wait_arm(&recorder).await;
     winner_tx
         .send(PutPathRequest {
             msg: Some(put_path_request::Msg::NarChunk(nar.clone())),
@@ -230,6 +256,8 @@ async fn concurrent_putpath_wait_budget_bounded() -> TestResult {
 // r[verify store.put.concurrent-wait]
 #[tokio::test]
 async fn concurrent_putpath_winner_abort_loser_takes_over() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
     let s = StoreSession::new_with_hmac(KEY.to_vec()).await?;
     let _tenant_a = seed_tenant(&s.db.pool, "conc-dead-winner").await;
     let tenant_b = seed_tenant(&s.db.pool, "conc-dead-loser").await;
@@ -253,7 +281,9 @@ async fn concurrent_putpath_winner_abort_loser_takes_over() -> TestResult {
     let loser = tokio::spawn(async move {
         put_path_with_token(&mut loser_client, loser_info, loser_nar, &loser_token).await
     });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Only proceed once the loser is provably parked in the wait arm —
+    // a takeover can only be exercised by a waiter that exists.
+    wait_for_wait_arm(&recorder).await;
 
     // Winner dies: stream ends without trailer → handler error path →
     // abort_upload reaps the placeholder.

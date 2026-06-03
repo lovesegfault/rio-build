@@ -168,6 +168,9 @@ rstest = { workspace = true }
 # feature is the only way they see `test_helpers` / `MIGRATOR`.
 rio-store = { path = ".", features = ["test-utils"] }
 rio-test-support = { workspace = true }
+# concurrent.rs installs a CountingRecorder and latches on the wait-arm
+# entry counter (structural race scheduling instead of sleeps).
+metrics = { workspace = true }
 tempfile = { workspace = true }
 # In-memory cert generation for tls_integration tests.
 tokio = { workspace = true, features = ["test-util"] }
