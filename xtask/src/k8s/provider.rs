@@ -22,6 +22,11 @@ pub struct DeployOpts {
     /// Bypass the pre-deploy cluster health check (EKS-only; k3s
     /// ignores it).
     pub skip_preflight: bool,
+    /// Bypass the pg connection-budget preflight (EKS-only). The
+    /// store ceiling then falls back to the tf-modeled
+    /// `pg_max_connections` output with a loud warning instead of the
+    /// live measurement.
+    pub skip_pg_preflight: bool,
     /// Pass `--no-hooks` to helm — skips post-install/upgrade hooks
     /// (smoke tests etc.) for AMI bring-up where the hook itself needs
     /// the thing being brought up.

@@ -128,6 +128,10 @@ pub struct UpOpts {
     /// Skip the pre-deploy cluster health check (eks).
     #[arg(long = "deploy-skip-preflight")]
     deploy_skip_preflight: bool,
+    /// Skip the pg connection-budget preflight (eks): no measurement
+    /// pod; the store ceiling falls back to the tf model with a warn.
+    #[arg(long = "deploy-skip-pg-preflight")]
+    deploy_skip_pg_preflight: bool,
     /// Pass --no-hooks to helm upgrade — skips post-install/upgrade
     /// hooks (smoke tests). For AMI bring-up where the hook needs
     /// working nodes that don't exist yet.
@@ -219,6 +223,11 @@ impl UpOpts {
         req!(
             self.deploy_skip_preflight,
             "--deploy-skip-preflight",
+            Phase::Deploy
+        );
+        req!(
+            self.deploy_skip_pg_preflight,
+            "--deploy-skip-pg-preflight",
             Phase::Deploy
         );
         req!(self.deploy_no_hooks, "--deploy-no-hooks", Phase::Deploy);
@@ -678,6 +687,7 @@ pub(super) async fn run_up(
                 .unwrap_or_else(|| crate::config::RIO_DEBUG.into()),
             tenant: o.deploy_tenant.clone(),
             skip_preflight: o.deploy_skip_preflight,
+            skip_pg_preflight: o.deploy_skip_pg_preflight,
             no_hooks: o.deploy_no_hooks,
             wait_drift: o.wait_drift,
             // CLI > env: any --public-cidr flag wins; otherwise fall

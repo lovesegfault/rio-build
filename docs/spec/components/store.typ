@@ -1524,16 +1524,18 @@ it degrades to the manifest-only view rather than erroring.
   proceeds.
 ]
 
-#r("store.db.pool-idle-timeout")[
+#r("store.db.pool-idle-timeout+2")[
   The PostgreSQL connection pool MUST set `idle_timeout` (60s) and
-  `min_connections` (2). Aurora Serverless v2 scales `max_connections` with ACU
-  --- at `min_capacity=0.5` ACU only \~105 slots are usable, and idle
-  connections count against that limit. The sqlx default 10-minute idle reap
-  means a burst-grown pool holds its full `max_connections` long after the
-  burst ends; with 2×store + 2×scheduler replicas the idle floor exceeds
-  Aurora's min-ACU ceiling and ad-hoc psql gets `FATAL: remaining connection
-  slots are reserved`. The same constraint applies to any service holding a PG
-  pool against the shared database (scheduler).
+  `min_connections` (2). Aurora Serverless v2's `max_connections` is
+  RUNTIME-CONSTANT, derived from the configured MAXIMUM capacity (the AWS
+  PostgreSQL table in `infra/eks/rds.tf`) and capped at 2,000 when
+  `min_capacity` ≤ 0.5 ACU --- it does not scale with the live ACU. Idle
+  connections count against that fixed budget: the sqlx default 10-minute
+  idle reap means a burst-grown pool holds its full `max_connections` long
+  after the burst ends, so N store + scheduler replicas at their pool maxima
+  can exhaust the budget and ad-hoc psql gets `FATAL: remaining connection
+  slots are reserved`. The same constraint applies to any service holding a
+  PG pool against the shared database (scheduler).
 ]
 
 Pseudo-DDL for all store tables. `narinfo` and `manifests` are split to avoid

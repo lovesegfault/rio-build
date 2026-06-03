@@ -15,7 +15,7 @@ use super::TF_DIR;
 use crate::config::XtaskConfig;
 use crate::k8s::client as kube;
 use crate::k8s::provider::DeployOpts;
-use crate::k8s::{NS, ensure_namespaces, shared, status};
+use crate::k8s::{NS, NS_STORE, ensure_namespaces, shared, status};
 use crate::{git, helm, tofu, ui};
 
 /// `pools[]` (helm list — replaced wholesale, hence one const).
@@ -58,6 +58,7 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     let log_level = opts.log_level.as_str();
     let tenant = opts.tenant.as_deref();
     let skip_preflight = opts.skip_preflight;
+    let skip_pg_preflight = opts.skip_pg_preflight;
     let no_hooks = opts.no_hooks;
     // Image tag recomputed from git state — `git::image_tag()` is
     // content-addressed (`sha256(git diff HEAD)`), so the same tree
@@ -95,6 +96,12 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     let vpc_ipv6_cidr = tf.get("vpc_ipv6_cidr_block")?;
     let cluster = tf.get("cluster_name")?;
     let node_role = tf.get("karpenter_node_role_name")?;
+    // rds.tf locals: the AWS PG max_connections table at the
+    // provisioned capacity, min-capacity cap applied (merged_bug_080).
+    let modeled_pg_max: u32 = tf
+        .get("pg_max_connections")?
+        .parse()
+        .context("tf output pg_max_connections is not an integer")?;
     let gateway_dns_fqdn = tf.get_opt("gateway_dns_fqdn");
 
     info!("deploy tag={tag} ami={ami_tag} registry={ecr} cluster={cluster}");
@@ -113,6 +120,69 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         .await?;
         status::preflight_check(&report)?;
     }
+
+    // PG connection-budget preflight (merged_bug_080): MEASURE the
+    // live server's max_connections from inside the cluster, assert
+    // it equals the tf model (rds.tf locals — the AWS PG table at
+    // the provisioned capacity), and derive the store ceiling from
+    // the MEASUREMENT. The chart's values.yaml default is only the
+    // modeled fallback for chart-only consumers; EKS always deploys
+    // the derived value. Bypass: --deploy-skip-pg-preflight.
+    let store_ceiling = if skip_pg_preflight {
+        let fallback = derive_store_ceiling(
+            modeled_pg_max,
+            NON_STORE_PG_BUDGET,
+            STORE_PG_MAX_CONNECTIONS_PER_REPLICA,
+            STORE_PG_HEADROOM,
+        );
+        warn!(
+            modeled_pg_max,
+            ceiling = fallback,
+            "pg preflight SKIPPED (--deploy-skip-pg-preflight): store ceiling derived from the tf MODEL, not a live measurement"
+        );
+        fallback
+    } else if kube::get_secret_key(&client, NS_STORE, "rio-postgres", "url")
+        .await
+        .is_err()
+    {
+        // First install: the rio-store namespace / ESO-synced secret
+        // does not exist yet, so the measurement pod cannot run. Fall
+        // back to the model — the next deploy enforces the
+        // measurement.
+        let fallback = derive_store_ceiling(
+            modeled_pg_max,
+            NON_STORE_PG_BUDGET,
+            STORE_PG_MAX_CONNECTIONS_PER_REPLICA,
+            STORE_PG_HEADROOM,
+        );
+        warn!(
+            modeled_pg_max,
+            ceiling = fallback,
+            "pg preflight: rio-postgres secret not readable (first install?) — store ceiling derived from the tf MODEL; the next deploy enforces the live measurement"
+        );
+        fallback
+    } else {
+        let measured =
+            ui::step("pg preflight", || pg_preflight_measure(&client, &ecr, tag)).await?;
+        if measured != modeled_pg_max {
+            anyhow::bail!(
+                "pg preflight: live max_connections={measured} but the tf model \
+                 (rds.tf aurora_pg_max_connections_by_max_acu + min-capacity cap) \
+                 says {modeled_pg_max}. Either the capacity change has not been \
+                 applied/rebooted yet (max_connections is a STATIC parameter — \
+                 it changes only after an instance reboot) or the rds.tf table \
+                 is wrong for this capacity. Fix the model or finish the resize; \
+                 do not hand-edit the ceiling."
+            );
+        }
+        derive_store_ceiling(
+            measured,
+            NON_STORE_PG_BUDGET,
+            STORE_PG_MAX_CONNECTIONS_PER_REPLICA,
+            STORE_PG_HEADROOM,
+        )
+    };
+    info!(store_ceiling, modeled_pg_max, "store autoscaling ceiling");
 
     // CRDs first, server-side apply.
     ui::step("apply CRDs", || kube::apply_crds(&client)).await?;
@@ -263,25 +333,28 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             //
             // r[impl infra.store.autoscaling+2]
             // Store replica count: owned by the chart-default KEDA
-            // ScaledObject (store.autoscaling.enabled=true,
-            // 2..105 (PG backstop; Karpenter-bounded in practice) on
-            // backlog/builders/CPU triggers — the I-128 fixed-8 era
-            // and the ComponentScaler era both retired).
-            // No --set needed; store.replicas is not rendered while
-            // autoscaling is on (store.yaml's lookup-echo branch).
+            // ScaledObject (store.autoscaling.enabled=true; backlog/
+            // builders/CPU triggers — the I-128 fixed-8 era and the
+            // ComponentScaler era both retired). store.replicas is
+            // not rendered while autoscaling is on (store.yaml's
+            // lookup-echo branch).
             //
+            // The CEILING is the pg preflight's derivation above:
+            // measured (or tf-modeled, on skip/first-install)
+            // max_connections -> derive_store_ceiling. The chart
+            // default (values.yaml) is only the modeled fallback for
+            // chart-only consumers; EKS always deploys this value.
+            .set("store.autoscaling.maxReplicas", store_ceiling.to_string())
             // I-171: pgMaxConnections was 200 (sized for 16-ACU
             // Aurora); 20 + idle_timeout (rio-store/src/main.rs) keeps
             // steady-state under budget and self-shrinks after bursts.
-            // The ceiling side is closed: values.yaml derives
-            // store.autoscaling.maxReplicas from (rds max_connections
-            // at the provisioned max_capacity / pgMaxConnections) with
-            // ~30% headroom — max_capacity was raised 16→32 ACU
-            // (2026-06-02, rds.tf), setting the runtime-constant
-            // parameter to ~3,000; min_capacity stays 0.5 (idle cost
-            // unchanged — the parameter derives from MAX capacity, and
-            // the idle_timeout pools self-correct after bursts).
-            .set("store.pgMaxConnections", "20")
+            // Single-sourced with the ceiling derivation above
+            // (STORE_PG_MAX_CONNECTIONS_PER_REPLICA) so the divisor
+            // and the deployed pool size cannot drift.
+            .set(
+                "store.pgMaxConnections",
+                STORE_PG_MAX_CONNECTIONS_PER_REPLICA.to_string(),
+            )
             // I-147/I-150: production-scale resources. values.yaml defaults
             // stay small so VM-test k3s (2-node QEMU) can schedule; EKS
             // gets the real sizing here.
@@ -531,5 +604,140 @@ async fn ec2nodeclass_resolved_amis(
             );
             std::collections::HashSet::new()
         }
+    }
+}
+
+/// Non-store PG connection consumers, subtracted from the budget
+/// before dividing by the per-replica pool size: scheduler 2 replicas
+/// x pool 10 + controller 4 + ad-hoc psql headroom 10.
+const NON_STORE_PG_BUDGET: u32 = 34;
+
+/// The store chart's `pgMaxConnections` (per-replica sqlx pool size).
+/// Single source for both the helm `--set` and the ceiling division.
+const STORE_PG_MAX_CONNECTIONS_PER_REPLICA: u32 = 20;
+
+/// Fraction of the measured budget the store fleet may consume; the
+/// remaining ~30% absorbs migration bursts, ESO, and operator psql.
+const STORE_PG_HEADROOM: f64 = 0.70;
+
+/// Pure ceiling derivation: `floor((headroom x measured - non_store) /
+/// per_replica)`, saturating at 0. The same formula the values.yaml
+/// default comment documents — change both together.
+fn derive_store_ceiling(
+    measured_max_connections: u32,
+    non_store_budget: u32,
+    per_replica: u32,
+    headroom: f64,
+) -> u32 {
+    let usable = headroom * f64::from(measured_max_connections) - f64::from(non_store_budget);
+    if usable <= 0.0 {
+        return 0;
+    }
+    (usable / f64::from(per_replica)).floor() as u32
+}
+
+/// Spawn the one-shot `rio-store pg-preflight` pod in the store
+/// namespace (it inherits the store-egress CiliumNetworkPolicy via the
+/// rio-store name label) and parse its `max_connections=N` output.
+async fn pg_preflight_measure(client: &kube::Client, ecr: &str, tag: &str) -> Result<u32> {
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "rio-pg-preflight",
+            "labels": {
+                // rio-store name label: rides the store-egress CNP
+                // (postgres allow). Distinct component label so the
+                // Service selector / PDB never match it.
+                "app.kubernetes.io/name": "rio-store",
+                "app.kubernetes.io/component": "pg-preflight",
+            },
+        },
+        "spec": {
+            "restartPolicy": "Never",
+            "securityContext": {
+                "runAsNonRoot": true,
+                "runAsUser": 65532,
+                "runAsGroup": 65532,
+                "fsGroup": 65532,
+                "seccompProfile": {"type": "RuntimeDefault"},
+            },
+            "containers": [{
+                "name": "pg-preflight",
+                "image": format!("{ecr}/rio-store:{tag}"),
+                "args": ["pg-preflight"],
+                "env": [{
+                    "name": "RIO_DATABASE_URL",
+                    "valueFrom": {"secretKeyRef": {"name": "rio-postgres", "key": "url"}},
+                }],
+                "securityContext": {
+                    "allowPrivilegeEscalation": false,
+                    "readOnlyRootFilesystem": true,
+                    "capabilities": {"drop": ["ALL"]},
+                },
+                "resources": {
+                    "requests": {"cpu": "100m", "memory": "128Mi"},
+                    "limits": {"memory": "256Mi"},
+                },
+            }],
+        },
+    });
+    let logs = kube::run_oneshot_pod(client, NS_STORE, pod, Duration::from_secs(180)).await?;
+    parse_pg_preflight_output(&logs)
+}
+
+/// Parse `max_connections=N` from the preflight pod's logs (last
+/// occurrence wins — earlier lines may be connection-retry noise).
+fn parse_pg_preflight_output(logs: &str) -> Result<u32> {
+    logs.lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("max_connections="))
+        .and_then(|v| v.trim().parse().ok())
+        .with_context(|| {
+            format!("pg preflight pod produced no max_connections=N line; logs:\n{logs}")
+        })
+}
+
+#[cfg(test)]
+mod ceiling_tests {
+    use super::*;
+
+    /// The two documented operating points of the AWS PG table:
+    /// the min-capacity-capped 2,000 and the 32-ACU 5,000.
+    #[test]
+    fn derive_store_ceiling_documented_points() {
+        // floor((0.70x2000 - 34)/20) = floor(1366/20) = 68
+        assert_eq!(derive_store_ceiling(2000, 34, 20, 0.70), 68);
+        // floor((0.70x5000 - 34)/20) = floor(3466/20) = 173
+        assert_eq!(derive_store_ceiling(5000, 34, 20, 0.70), 173);
+    }
+
+    /// Headroom edges: budgets at or below the non-store floor
+    /// saturate at 0 (the caller deploys a floor-violating ceiling
+    /// loudly rather than panicking), and the boundary where one
+    /// replica first fits.
+    #[test]
+    fn derive_store_ceiling_edges() {
+        assert_eq!(derive_store_ceiling(0, 34, 20, 0.70), 0);
+        assert_eq!(derive_store_ceiling(48, 34, 20, 0.70), 0); // 33.6 - 34 < 0
+        assert_eq!(derive_store_ceiling(49, 34, 20, 0.70), 0); // 0.3/20 floors to 0
+        assert_eq!(derive_store_ceiling(78, 34, 20, 0.70), 1); // 20.6/20 -> 1
+        // Full headroom (1.0) sanity: floor((189-34)/20) = 7.
+        assert_eq!(derive_store_ceiling(189, 34, 20, 1.0), 7);
+    }
+
+    /// Output-contract parser: last max_connections= line wins, noise
+    /// tolerated, absence is an error.
+    #[test]
+    fn parse_pg_preflight_output_contract() {
+        assert_eq!(
+            parse_pg_preflight_output("warn: retrying\nmax_connections=5000\n").unwrap(),
+            5000
+        );
+        assert_eq!(
+            parse_pg_preflight_output("max_connections=10\nmax_connections=2000").unwrap(),
+            2000
+        );
+        assert!(parse_pg_preflight_output("no luck").is_err());
     }
 }

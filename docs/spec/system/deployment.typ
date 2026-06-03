@@ -131,7 +131,11 @@ on-demand pool mints a node in tens of seconds, up to the pool's
 depends on scaling). The KEDA ceiling is only the connection backstop:
 `maxReplicas × pgMaxConnections` stays ~30 % under the provisioned
 Aurora `max_connections` (runtime-constant at the configured
-`max_capacity`); the trigger thresholds are seeded (600 backlog/replica,
+`max_capacity`, and capped at 2,000 when `min_capacity` ≤ 0.5 ACU ---
+the model lives in `infra/eks/rds.tf`; `xtask deploy`'s pg preflight
+measures the live value, asserts it matches the model, and deploys the
+ceiling derived from the measurement); the trigger thresholds are
+seeded (600 backlog/replica,
 50 builders/replica, 70 % CPU) and re-derived from the post-wipe
 warm-phase capture. The
 no-KEDA profiles (`values/vmtest-full.yaml`, `values/dev.yaml`) set

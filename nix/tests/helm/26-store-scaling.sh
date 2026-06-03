@@ -80,13 +80,13 @@ test "$reps" = "null" || {
   exit 1
 }
 
-# Floor 2; ceiling 105 = the PG-connection safety backstop (the
+# Floor 2; ceiling 173 = the PG-connection safety backstop (the
 # values.yaml formula comment carries the derivation against the
 # 32-ACU Aurora parameter), NOT a product cap — Karpenter binds first.
 minr=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.minReplicaCount' "$out")
 maxr=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.maxReplicaCount' "$out")
-test "$minr" = "2" && test "$maxr" = "105" || {
-  echo "FAIL: store ScaledObject floor/ceiling = $minr/$maxr, expected 2/105 (PG backstop at 32-ACU Aurora; see values.yaml formula)" >&2
+test "$minr" = "2" && test "$maxr" = "173" || {
+  echo "FAIL: store ScaledObject floor/ceiling = $minr/$maxr, expected 2/173 (PG backstop: modeled 5,000 max_connections at min 1 / max 32 ACU; see values.yaml formula + infra/eks/rds.tf)" >&2
   exit 1
 }
 
@@ -127,7 +127,7 @@ test "$n_avg" -eq 2 || {
 
 # Scale-down damped (1800s window) but geometric once it engages:
 # max(25%, 1 pod) per 600s (selectPolicy Max), so an uncapped fleet
-# drains 105→2 in ~12-16 periods instead of 103 ticks of Pods-1 alone.
+# drains 173→2 in ~12-16 periods instead of 171 ticks of Pods-1 alone.
 # Scale-up unstabilized.
 sd=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.advanced.horizontalPodAutoscalerConfig.behavior.scaleDown.stabilizationWindowSeconds' "$out")
 su=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.advanced.horizontalPodAutoscalerConfig.behavior.scaleUp.stabilizationWindowSeconds' "$out")

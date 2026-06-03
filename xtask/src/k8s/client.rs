@@ -442,6 +442,76 @@ fn chrono_now() -> String {
     format!("{secs}")
 }
 
+/// Run a one-shot pod to completion and return its stdout logs.
+///
+/// Creates `pod` (a full Pod manifest; `restartPolicy: Never` is the
+/// caller's responsibility), polls its phase every 2s until
+/// `Succeeded` (returns logs) or `Failed` (bails with the logs in the
+/// error), and deletes it best-effort either way. Used by deploy's pg
+/// preflight to measure the live database from inside the cluster's
+/// network policies.
+pub async fn run_oneshot_pod(
+    client: &Client,
+    ns: &str,
+    pod: serde_json::Value,
+    timeout: Duration,
+) -> Result<String> {
+    use kube::api::{DeleteParams, LogParams, PostParams};
+
+    let name = pod
+        .pointer("/metadata/name")
+        .and_then(|v| v.as_str())
+        .context("run_oneshot_pod: pod manifest has no metadata.name")?
+        .to_string();
+    let api: Api<Pod> = Api::namespaced(client.clone(), ns);
+    // Re-runs after an interrupted deploy: clear a leftover pod first.
+    let _ = api.delete(&name, &DeleteParams::default()).await;
+    // Deletion is async; wait briefly for the name to free up.
+    for _ in 0..15 {
+        if api.get_opt(&name).await?.is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let pod: Pod = serde_json::from_value(pod)
+        .context("run_oneshot_pod: manifest does not deserialize as a Pod")?;
+    api.create(&PostParams::default(), &pod).await?;
+
+    let logs_of = |api: Api<Pod>, name: String| async move {
+        api.logs(&name, &LogParams::default())
+            .await
+            .unwrap_or_default()
+    };
+
+    let deadline = std::time::Instant::now() + timeout;
+    let result = loop {
+        if std::time::Instant::now() > deadline {
+            break Err(anyhow::anyhow!(
+                "run_oneshot_pod: {ns}/{name} did not complete within {timeout:?}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let phase = api
+            .get_opt(&name)
+            .await?
+            .and_then(|p| p.status)
+            .and_then(|s| s.phase)
+            .unwrap_or_default();
+        match phase.as_str() {
+            "Succeeded" => break Ok(logs_of(api.clone(), name.clone()).await),
+            "Failed" => {
+                let logs = logs_of(api.clone(), name.clone()).await;
+                break Err(anyhow::anyhow!(
+                    "run_oneshot_pod: {ns}/{name} failed; logs:\n{logs}"
+                ));
+            }
+            _ => continue,
+        }
+    };
+    let _ = api.delete(&name, &DeleteParams::default()).await;
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

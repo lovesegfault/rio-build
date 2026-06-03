@@ -517,16 +517,19 @@ fn build_cors_layer(cors_allow_origins: &str) -> tower_http::cors::CorsLayer {
 /// Connect to PostgreSQL and run migrations. URL is logged with
 /// password redacted.
 ///
-// r[impl store.db.pool-idle-timeout]
-/// Aurora Serverless v2 scales `max_connections` with ACU; at
-/// `min_capacity=0.5` (infra/eks/rds.tf) that's ~105 usable slots. The
-/// sqlx default 10-minute idle reap means a burst-grown pool holds
-/// `max_connections` long after the burst — so two store replicas at
-/// 50 + two scheduler at 10 = 120 idle conns against a 105-slot
-/// server, and ad-hoc psql gets `FATAL: remaining connection slots
-/// are reserved`. Setting `idle_timeout=60s` + `min_connections=2`
-/// shrinks the pool back to baseline within a minute of burst end
-/// (I-171).
+// r[impl store.db.pool-idle-timeout+2]
+/// Aurora Serverless v2's `max_connections` is RUNTIME-CONSTANT —
+/// derived from the configured MAXIMUM capacity (the AWS PG table in
+/// infra/eks/rds.tf) and capped at 2,000 when `min_capacity` ≤ 0.5 —
+/// it does not scale with the live ACU. The sqlx default 10-minute
+/// idle reap means a burst-grown pool holds `max_connections` long
+/// after the burst, so N replicas at their pool maxima can exhaust
+/// the fixed budget and ad-hoc psql gets `FATAL: remaining connection
+/// slots are reserved`. Setting `idle_timeout=60s` +
+/// `min_connections=2` shrinks the pool back to baseline within a
+/// minute of burst end (I-171). The fleet-level budget is enforced at
+/// deploy time: the pg preflight (this binary's `pg-preflight` mode)
+/// measures the parameter and derives the store ceiling.
 async fn init_db_pool(database_url: &str, max_connections: u32) -> anyhow::Result<sqlx::PgPool> {
     info!(
         url = %rio_common::config::redact_db_url(database_url),

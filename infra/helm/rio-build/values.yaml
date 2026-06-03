@@ -253,18 +253,31 @@ store:
     # PG-connection SAFETY BACKSTOP, NOT a product cap (owner decision
     # 2026-06-02: store scale is Karpenter-bounded; the operative scale
     # knob is karpenter.nodePools[rio-general].limits.cpu below).
-    # Derivation, against Aurora's runtime-constant max_connections at
-    # the provisioned max_capacity=32 ACU (~3,000; see infra/eks/rds.tf):
-    #   floor((3000 − scheduler 2×10 − controller 4 − psql headroom 10)
-    #         / pgMaxConnections 20) = floor(2966/20) = 148 (hard bound)
-    # Default 105 ⇒ worst case 105×20 = 2,100 store conns (2,134 with
-    # the non-store consumers) ≈ 70% of the parameter — ~30% headroom
-    # for migration bursts / ESO / ad-hoc psql. 105 is 2.3-3.4× the
-    # Karpenter-schedulable max (~31-46 store nodes at limits.cpu=1500
-    # with 32-vCPU one-per-node bin-packing), so KEDA never binds
-    # before Karpenter. Recompute if pgMaxConnections, Aurora
-    # max_capacity (rds.tf — 16 ACU would re-cap the parameter at
-    # 2,000) or min_capacity, or the scheduler/controller pools change.
+    #
+    # This default is the MODELED fallback for chart-only consumers.
+    # On EKS, `xtask deploy`'s pg preflight measures the live
+    # max_connections, asserts it equals the tf model
+    # (infra/eks/rds.tf locals — the AWS PG table at the provisioned
+    # capacity), and --sets the ceiling derived from the MEASUREMENT;
+    # this value is overridden on every deploy.
+    #
+    # Derivation (deploy.rs derive_store_ceiling — change together):
+    #   floor((0.70 × max_connections − 34) / pgMaxConnections 20)
+    #   where 34 = scheduler 2×10 + controller 4 + psql headroom 10
+    # At the modeled config (rds.tf: min_capacity=1 lifts the AWS
+    # PG min-capacity cap; max_capacity=32 ⇒ max_connections 5,000;
+    # owner decision Q1 2026-06-03):
+    #   floor((0.70×5000 − 34)/20) = floor(3466/20) = 173
+    # ⇒ worst case 173×20 + 34 = 3,494 conns ≈ 70% of the parameter —
+    # ~30% headroom for migration bursts / ESO / ad-hoc psql.
+    # WORST CASE (min_capacity ≤ 0.5 re-caps max_connections at
+    # 2,000): the same formula gives 68 — the preflight derives and
+    # deploys that automatically; do not hand-tune this default for
+    # it. max_connections is a STATIC parameter: a capacity change
+    # takes effect only after an instance reboot.
+    # 173 is 3.7-5.6× the Karpenter-schedulable max (~31-46 store
+    # nodes at limits.cpu=1500 with 32-vCPU one-per-node bin-packing),
+    # so KEDA never binds before Karpenter.
     # S3 is not a binding constraint: content-hashed chunk keys spread
     # prefixes uniformly and ~46 replicas × chunkUploadMaxConcurrent=8
     # ≈ 370 concurrent PUTs, orders below S3's per-prefix envelope.
@@ -272,7 +285,7 @@ store:
     # Karpenter mints a node or the pool limit is raised (the
     # AverageValue triggers divide by the scale subresource's count and
     # the CPU trigger averages running pods — no thrash).
-    maxReplicas: 105
+    maxReplicas: 173
     # Desired replicas (backlog trigger) =
     # ceil(sum(rio_scheduler_substituting_derivations) / this).
     # Seeded 600: the reference incident's ~7.4k-path backlog asks for
@@ -364,14 +377,15 @@ store:
   maxBatchPaths: 1048576
   # PG connection pool size. The QueryPathInfo / FindMissingPaths hot
   # path under autoscaled builder load is bottlenecked on connection
-  # acquisition (PK lookups, not query latency). Aurora handles
-  # hundreds of connections per instance; raise this with `replicas`
-  # for thousands-of-builds scale (I-076).
+  # acquisition (PK lookups, not query latency).
   #
-  # Budget vs Aurora Serverless v2 at min_capacity=0.5 ACU (~105 usable
-  # connections): 2×store(20) + 2×scheduler(10) + headroom(10) = 70.
-  # Pools also set idle_timeout=60s so a burst-grown pool shrinks back;
-  # live pg_pool_util ≈ 0.01 ⇒ ~0.5 conns actually in use (I-171).
+  # This is the per-replica divisor of the connection budget: the
+  # store ceiling is floor((0.70 × max_connections − 34) / THIS) —
+  # see autoscaling.maxReplicas above and infra/eks/rds.tf for the
+  # budget model. Pools also set idle_timeout=60s so a burst-grown
+  # pool shrinks back; live pg_pool_util ≈ 0.01 ⇒ ~0.5 conns actually
+  # in use (I-171). xtask deploy --sets this from its single-sourced
+  # constant (STORE_PG_MAX_CONNECTIONS_PER_REPLICA).
   pgMaxConnections: 20
   # Per-replica r[store.substitute.admission] gate. Unset → derived as
   # (pgMaxConnections × 3).clamp(64, 128). Override only when the
