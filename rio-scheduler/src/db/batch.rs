@@ -790,19 +790,41 @@ impl SchedulerDb {
         if holes.is_empty() {
             return Ok(0);
         }
+        let mut tx = self.pool.begin().await?;
+        let result = Self::set_closure_holes_tx(&mut tx, holes).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// Transaction-scoped paired writer for the closure-hole invariant:
+    /// the M_064 flag and its 069 witness rows are written together and
+    /// are never observable apart (the recovery debug-assert and the
+    /// LOST_WITNESS sentinel's "impossible by construction" claim both
+    /// rest on this). This is THE flag-true writer — every stamping
+    /// site (the pool wrapper [`Self::set_closure_holes`] and the
+    /// merge-transaction Batch 1b for born-holed pruned parents, joined
+    /// and newly created alike) routes through it; per fix-discipline
+    /// R2-PAIRED-WRITERS, two writers with different population scopes
+    /// is exactly the round-16 bug_045 signature this helper retires.
+    ///
+    /// The flag update carries no `AND NOT closure_hole` filter: a
+    /// SECOND truncation of an already-holed parent must append its
+    /// children (ON CONFLICT DO NOTHING dedups), not be filtered out by
+    /// the bool. ON CONFLICT DO NOTHING also makes a re-pruned parent
+    /// append only new children. Plain runtime queries — no `.sqlx/`
+    /// impact.
+    pub(crate) async fn set_closure_holes_tx(
+        tx: &mut PgConnection,
+        holes: &[(String, Vec<String>)],
+    ) -> Result<u64, sqlx::Error> {
+        if holes.is_empty() {
+            return Ok(0);
+        }
         let parents: Vec<String> = holes.iter().map(|(p, _)| p.clone()).collect();
         let (side_parents, side_children): (Vec<String>, Vec<String>) = holes
             .iter()
             .flat_map(|(p, cs)| cs.iter().map(move |c| (p.clone(), c.clone())))
             .unzip();
-        // ONE transaction: the M_064 flag and its 069 witness rows are
-        // never observable apart (the recovery debug-assert and the
-        // sentinel's "impossible by construction" claim both rest on
-        // this). The flag update DROPS the old `AND NOT closure_hole`
-        // filter: a SECOND truncation of an already-holed parent must
-        // append its children (ON CONFLICT DO NOTHING dedups), not be
-        // filtered out by the bool.
-        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"
             UPDATE derivations SET closure_hole = true, updated_at = now()
@@ -825,7 +847,46 @@ impl SchedulerDb {
             .execute(&mut *tx)
             .await?;
         }
-        tx.commit().await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Transaction-scoped paired CLEAR of the closure-hole invariant:
+    /// flag false + witness-row DELETE in the caller's transaction.
+    /// Two callers: the pool wrapper [`Self::clear_closure_hole_by_hashes`]
+    /// (merge-time heal) and the merge persist's definition-change
+    /// clear (`sched.closure.witness-epoch`): displaced nodes,
+    /// authority takeovers, and row-only store-evidence displacements
+    /// all replace the definition the witness testified about, and the
+    /// creation upsert's `closure_hole: OR` semantics would otherwise
+    /// preserve the dead epoch's flag+rows for recovery to resurrect
+    /// (round-16 bug_011). At the merge site this runs after Batch 1
+    /// and BEFORE the born-holed stamp (Batch 1b), so a re-creation
+    /// that is itself a pruned stamping parent ends the transaction
+    /// with ITS OWN epoch's witness, not a union of eras.
+    pub(crate) async fn clear_closure_holes_tx(
+        tx: &mut PgConnection,
+        drv_hashes: &[String],
+    ) -> Result<u64, sqlx::Error> {
+        if drv_hashes.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            r#"
+            UPDATE derivations SET closure_hole = false, updated_at = now()
+            WHERE drv_hash = ANY($1) AND closure_hole
+            "#,
+        )
+        .bind(drv_hashes)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            DELETE FROM derivation_closure_missing WHERE drv_hash = ANY($1)
+            "#,
+        )
+        .bind(drv_hashes)
+        .execute(&mut *tx)
+        .await?;
         Ok(result.rows_affected())
     }
 
@@ -854,25 +915,11 @@ impl SchedulerDb {
         // Same-transaction DELETE of the witness rows (069): a healed
         // parent's stale missing-set must not survive to poison the
         // NEXT hole's coverage check (subset over a union of eras).
+        // Shares the paired statement body with the merge-transaction
+        // definition-change clear (`clear_closure_holes_tx`).
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
-            r#"
-            UPDATE derivations SET closure_hole = false, updated_at = now()
-            WHERE drv_hash = ANY($1) AND closure_hole
-            "#,
-        )
-        .bind(drv_hashes)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            r#"
-            DELETE FROM derivation_closure_missing WHERE drv_hash = ANY($1)
-            "#,
-        )
-        .bind(drv_hashes)
-        .execute(&mut *tx)
-        .await?;
+        let result = Self::clear_closure_holes_tx(&mut tx, drv_hashes).await?;
         tx.commit().await?;
-        Ok(result.rows_affected())
+        Ok(result)
     }
 }

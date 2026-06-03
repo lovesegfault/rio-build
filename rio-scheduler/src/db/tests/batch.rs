@@ -616,6 +616,104 @@ async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Res
     Ok(())
 }
 
+/// The transaction-scoped paired writers: `set_closure_holes_tx` and
+/// `clear_closure_holes_tx` keep the flag ⇔ witness-rows invariant in
+/// a CALLER-owned transaction, in both directions, and a rolled-back
+/// caller transaction leaves neither half behind (the property the
+/// pool wrappers cannot exercise — their transaction is their own).
+#[tokio::test]
+async fn closure_hole_tx_writers_pair_flag_and_rows() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let drv_hash = "closure-hole-tx-test";
+    let row = DerivationRow {
+        drv_hash: drv_hash.into(),
+        drv_path: rio_test_support::fixtures::test_drv_path(drv_hash),
+        pname: Some("test-pkg".into()),
+        system: "x86_64-linux".into(),
+        status: DerivationStatus::Created,
+        required_features: vec![],
+        expected_output_paths: vec![format!("/nix/store/{}-out", "c".repeat(32))],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: false,
+        wanted_output_names: vec![],
+        topdown_pruned: false,
+        closure_hole: false,
+        drv_content: None,
+        ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
+        evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+    };
+    {
+        let mut tx = db.pool().begin().await?;
+        SchedulerDb::batch_upsert_derivations(&mut tx, &[row], &[]).await?;
+        tx.commit().await?;
+    }
+    let state = async || -> anyhow::Result<(bool, i64)> {
+        let flag: bool =
+            sqlx::query_scalar("SELECT closure_hole FROM derivations WHERE drv_hash = $1")
+                .bind(drv_hash)
+                .fetch_one(&test_db.pool)
+                .await?;
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM derivation_closure_missing WHERE drv_hash = $1",
+        )
+        .bind(drv_hash)
+        .fetch_one(&test_db.pool)
+        .await?;
+        Ok((flag, rows))
+    };
+    let holes = vec![(drv_hash.to_string(), vec!["tx-child-a".to_string()])];
+    let hashes = vec![drv_hash.to_string()];
+
+    // Rolled-back set: NEITHER half lands.
+    {
+        let mut tx = db.pool().begin().await?;
+        SchedulerDb::set_closure_holes_tx(&mut tx, &holes).await?;
+        drop(tx); // rollback
+    }
+    assert_eq!(
+        state().await?,
+        (false, 0),
+        "a rolled-back caller tx must leave neither the flag nor the rows"
+    );
+
+    // Committed set: BOTH halves land together.
+    {
+        let mut tx = db.pool().begin().await?;
+        assert_eq!(SchedulerDb::set_closure_holes_tx(&mut tx, &holes).await?, 1);
+        tx.commit().await?;
+    }
+    assert_eq!(state().await?, (true, 1));
+
+    // Rolled-back clear: BOTH halves survive.
+    {
+        let mut tx = db.pool().begin().await?;
+        SchedulerDb::clear_closure_holes_tx(&mut tx, &hashes).await?;
+        drop(tx); // rollback
+    }
+    assert_eq!(
+        state().await?,
+        (true, 1),
+        "a rolled-back caller tx must clear neither the flag nor the rows"
+    );
+
+    // Committed clear: BOTH halves drop together.
+    {
+        let mut tx = db.pool().begin().await?;
+        assert_eq!(
+            SchedulerDb::clear_closure_holes_tx(&mut tx, &hashes).await?,
+            1
+        );
+        tx.commit().await?;
+    }
+    assert_eq!(state().await?, (false, 0));
+
+    Ok(())
+}
+
 // r[verify sched.db.batch-unnest]
 /// Edges: 40k rows. Old limit was 32767 (2 cols). Build a
 /// dense DAG over 10k nodes (fresh DB, so re-insert).

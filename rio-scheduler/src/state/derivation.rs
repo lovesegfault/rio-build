@@ -1021,6 +1021,50 @@ impl ClosureHole {
     pub fn clear_for_heal(&mut self, _witness: &crate::dag::HealWitness) {
         self.missing.clear();
     }
+
+    /// Carry (or drop) this witness across a definition transition.
+    ///
+    /// A closure-hole witness testifies that a specific DEFINITION's
+    /// declared closure lost children — it is evidence about one
+    /// definition epoch, not about the hash. A same-definition
+    /// resubmit keeps the epoch, so the witness rides along; an
+    /// authority takeover replaces the definition (the merge scrubs
+    /// the old children and resets the poison budget on the same
+    /// condition), so the witness MUST die with the epoch — carrying
+    /// it forward would demand the new definition "re-supply" the old
+    /// definition's (possibly attacker-chosen) children, which its
+    /// real inputDrvs can never contain, leaving the node permanently
+    /// heal-refused (round-16 bug_011).
+    ///
+    /// Consuming `self` (not `&mut`) makes the carry site state its
+    /// decision in the type: the only way to move a witness across a
+    /// transition is through this match.
+    #[must_use]
+    pub fn carry_across(self, transition: DefinitionTransition) -> Self {
+        match transition {
+            DefinitionTransition::SameDefinition => self,
+            DefinitionTransition::AuthorityTakeover => Self::default(),
+        }
+    }
+}
+
+/// The two definition transitions a resubmit-carry can cross
+/// ([`ClosureHole::carry_across`]). Mirrors the `authority_flip`
+/// condition that already gates the dependency-edge scrub and the
+/// resubmit-cycle reset in `DerivationDag::merge` — the witness epoch
+/// boundary is the SAME boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefinitionTransition {
+    /// Byte-identical (or identity-matching) resubmission of the same
+    /// definition: accumulators reset per their own rules; the witness
+    /// epoch continues.
+    SameDefinition,
+    /// A store-backed re-creation replacing an authoritative squat
+    /// (`authority_flip`): a NEW definition epoch. Edges are scrubbed,
+    /// the poison budget restarts, and the closure witness is dropped
+    /// here (in-memory) and cleared flag+rows in the merge transaction
+    /// (durable half — `clear_closure_holes_tx`).
+    AuthorityTakeover,
 }
 
 /// In-memory state for a single derivation node in the global DAG.
@@ -2161,6 +2205,34 @@ pub const POISON_TTL: std::time::Duration = std::time::Duration::from_millis(100
 
 #[cfg(test)]
 mod tests {
+
+    /// The witness-epoch boundary in the type: a same-definition carry
+    /// keeps the witness verbatim; an authority takeover drops it (the
+    /// new definition's closure owes nothing to the dead epoch's
+    /// missing set — round-16 bug_011's permanent-heal-refusal arm).
+    #[test]
+    fn closure_hole_carry_across_definition_transitions() {
+        use super::{ClosureHole, DefinitionTransition};
+        use crate::state::DrvHash;
+        let mut hole = ClosureHole::default();
+        hole.stamp([DrvHash::from("squat-junk-child")]);
+        assert!(hole.is_holed());
+
+        let carried = hole
+            .clone()
+            .carry_across(DefinitionTransition::SameDefinition);
+        assert_eq!(
+            carried, hole,
+            "a same-definition resubmit carries the witness verbatim"
+        );
+
+        let crossed = hole.carry_across(DefinitionTransition::AuthorityTakeover);
+        assert!(
+            !crossed.is_holed(),
+            "an authority takeover must not inherit the squat's witness"
+        );
+        assert!(crossed.missing().is_empty());
+    }
 
     // r[verify sched.dispatch.claims-derived+3]
     /// The unseeded-inputs budget is its OWN charge arm: independent
