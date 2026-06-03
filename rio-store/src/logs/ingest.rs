@@ -780,22 +780,40 @@ impl IngestSession {
         Ok(())
     }
 
+    /// A cut attempt was abandoned by the driver's watchdog (the cut
+    /// future hung past its bound and was dropped): count it exactly
+    /// like an answered cut failure. The dropped future never reached
+    /// the `Err` arm of [`Self::cut`], so without this the wedge
+    /// produced zero countable failures (merged_bug_119); the staged
+    /// run is folded back by the next cut's `restore_in_flight` — an
+    /// abandoned cut degrades to a retried cut.
+    pub fn note_cut_abandoned(&mut self) {
+        self.consecutive_cut_failures = self.consecutive_cut_failures.saturating_add(1);
+        metrics::counter!("rio_store_log_chunk_write_failures_total").increment(1);
+    }
+
     /// The gray-failure bound: should the handler abort this stream with
     /// `UNAVAILABLE` so the builder fails over to a replica that can
     /// actually commit chunks?
     ///
-    /// Two triggers, either sufficient: `MAX_CONSECUTIVE_CUT_FAILURES`
-    /// failed cuts in a row, or buffered lines older than 2x the cut
-    /// interval (the backstop for a wedge that somehow is not producing
-    /// countable cut failures). Aborting drops the in-memory buffer —
-    /// that is safe, the builder's retransmit buffer still holds every
+    /// The trigger is `MAX_CONSECUTIVE_CUT_FAILURES` cut attempts in a
+    /// row that failed OR were abandoned by the watchdog (a hung cut is
+    /// counted via [`Self::note_cut_abandoned`], so a wedged replica
+    /// always produces countable failures). The staleness check is a
+    /// backstop CONDITIONED on at least one observed failure
+    /// (merged_bug_119: pure staleness with zero failures is a healthy
+    /// paced multi-run drain — a multi-MiB buffer legitimately takes
+    /// several cut intervals to drain one run at a time and must not be
+    /// aborted mid-drain). Aborting drops the in-memory buffer — that
+    /// is safe, the builder's retransmit buffer still holds every
     /// un-acked line and replays it to the next replica.
     pub fn should_abort(&self) -> Option<AbortReason> {
         if self.consecutive_cut_failures >= MAX_CONSECUTIVE_CUT_FAILURES {
             return Some(AbortReason::ConsecutiveCutFailures);
         }
         let shared = self.lock_shared();
-        if let Some(since) = shared.oldest_pending_since
+        if self.consecutive_cut_failures > 0
+            && let Some(since) = shared.oldest_pending_since
             && since.elapsed() > 2 * self.config.cut_interval
         {
             return Some(AbortReason::StaleBuffer);
@@ -1513,6 +1531,93 @@ mod tests {
                 );
             }
             other => panic!("expected Accepted, got {other:?}"),
+        }
+    }
+
+    /// merged_bug_119 (spurious-fire half, red-first): a healthy paced
+    /// multi-run drain — old pending lines, ZERO cut failures — must
+    /// NOT trip the StaleBuffer abort. Staleness is a backstop
+    /// conditioned on at least one observed failure.
+    #[tokio::test]
+    async fn paced_multirun_drain_never_trips_stale_buffer() {
+        let mut session = new_session(IngestConfig {
+            per_exec_byte_cap: 1024 * 1024,
+            cut_threshold_bytes: 1024,
+            cut_interval: Duration::from_millis(10),
+        });
+        session.accept(batch(0, 5)).unwrap();
+        // Real-time wait past 2x the (tiny) cut interval: the buffer is
+        // now "stale" by age, with zero failures — a paced multi-run
+        // drain mid-progress.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            session.should_abort(),
+            None,
+            "pure staleness with zero cut failures is a healthy drain, not a wedge"
+        );
+        // With an observed failure the same staleness DOES abort
+        // (the backstop still exists for wedges).
+        session.note_cut_abandoned();
+        assert_eq!(session.should_abort(), Some(AbortReason::StaleBuffer));
+    }
+
+    /// merged_bug_119 (parked-cut half): a cut whose PUT hangs forever
+    /// is abandoned at the watchdog bound and counted like a failure;
+    /// three abandonments trip ConsecutiveCutFailures, and the staged
+    /// run folds back so nothing is lost. (The do_cut watchdog wires
+    /// timeout(cut_interval) + note_cut_abandoned; this exercises the
+    /// composition against a parked store. Pre-fix RED: the cut future
+    /// pends forever — the timeout wrapper did not exist and
+    /// note_cut_abandoned did not exist, so a wedged replica produced
+    /// zero countable failures.)
+    #[tokio::test]
+    async fn parked_cut_does_not_starve_abort() {
+        struct BlockingPutStore;
+        #[async_trait::async_trait]
+        impl LogChunkStore for BlockingPutStore {
+            async fn put(&self, _key: &str, _body: Vec<u8>) -> Result<PutOutcome, LogChunkError> {
+                std::future::pending::<()>().await;
+                unreachable!("the parked PUT never answers")
+            }
+            async fn get(&self, key: &str) -> Result<Vec<u8>, LogChunkError> {
+                Err(LogChunkError::NotFound {
+                    key: key.to_string(),
+                })
+            }
+            async fn delete_batch(&self, _keys: &[String]) -> Result<(), LogChunkError> {
+                Ok(())
+            }
+        }
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let mut session = new_session(IngestConfig {
+            per_exec_byte_cap: 1024 * 1024,
+            cut_threshold_bytes: 1024,
+            cut_interval: Duration::from_millis(20),
+        });
+        session.accept(batch(0, 5)).unwrap();
+        let store = BlockingPutStore;
+
+        for round in 1..=3u8 {
+            let bound = session.config().cut_interval;
+            let outcome = tokio::time::timeout(bound, session.cut(&store, &db.pool)).await;
+            assert!(
+                outcome.is_err(),
+                "the parked cut must hit the watchdog bound (round {round})"
+            );
+            session.note_cut_abandoned();
+        }
+        assert_eq!(
+            session.should_abort(),
+            Some(AbortReason::ConsecutiveCutFailures),
+            "three abandoned cuts trip the failover abort"
+        );
+        // Nothing was lost: the next cut entry folds the staged run
+        // back (restore_in_flight) — all 5 lines are still pending.
+        {
+            let mut shared = session.shared().lock().unwrap();
+            shared.restore_in_flight();
+            assert_eq!(shared.buffer.len(), 5, "the abandoned run folded back");
         }
     }
 }

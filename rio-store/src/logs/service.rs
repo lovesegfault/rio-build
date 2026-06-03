@@ -924,9 +924,10 @@ impl AppendDriver {
                     if let Some(exit) = self.cut_once_if_nonempty(ack_tx).await {
                         return exit;
                     }
-                    // The staleness abort can fire without a cut ever
-                    // failing (a wedged replica whose cut future hangs
-                    // rather than erroring) — check it on every tick.
+                    // A wedged cut future is abandoned (and counted) by
+                    // the do_cut watchdog, so hangs always produce
+                    // countable failures; the per-tick check converts
+                    // them into the failover abort promptly.
                     if let Some(reason) = self.session.should_abort() {
                         return LoopExit::Abort(self.abort_status(reason));
                     }
@@ -1038,13 +1039,31 @@ impl AppendDriver {
                 self.max_chunks_per_exec
             ))));
         }
-        match self
-            .session
-            .cut(self.chunk_store.as_ref(), &self.pool)
-            .await
+        // The watchdog never awaits monitored work unbounded
+        // (merged_bug_119): a cut whose PUT/INSERT hangs (wedged blob
+        // backend, stuck PG connection) is abandoned at one cut
+        // interval — the driver loop's abort check, heartbeat, and
+        // inbound arms regain liveness, the abandonment is counted
+        // like a failure, and three in a row trip ConsecutiveCutFailures
+        // → UNAVAILABLE → builder failover. The staged run is folded
+        // back by the next cut's restore_in_flight.
+        match tokio::time::timeout(
+            self.session_cut_interval(),
+            self.session.cut(self.chunk_store.as_ref(), &self.pool),
+        )
+        .await
         {
-            Ok(None) => CutStep::Empty,
-            Ok(Some(durable_through_line)) => {
+            Err(_elapsed) => {
+                warn!(
+                    exec_id = %self.session.exec_id,
+                    bound_secs = self.session_cut_interval().as_secs_f64(),
+                    "AppendLog: chunk cut abandoned by the watchdog (hung past one cut interval)"
+                );
+                self.session.note_cut_abandoned();
+                return CutStep::Failed;
+            }
+            Ok(Ok(None)) => CutStep::Empty,
+            Ok(Ok(Some(durable_through_line))) => {
                 if ack_tx
                     .send(Ok(AppendLogAck {
                         durable_through_line,
@@ -1061,7 +1080,7 @@ impl AppendDriver {
                 }
                 CutStep::Committed
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(
                     exec_id = %self.session.exec_id,
                     error = %e,
