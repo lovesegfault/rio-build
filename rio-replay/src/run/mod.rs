@@ -1500,10 +1500,22 @@ async fn write_terminal_stall(
             return Ok(());
         }
     }
-    let prior = ledger::measured_attempt_requeues(state)?
-        .get(job)
-        .copied()
-        .unwrap_or(0);
+    // The attempts stamp is a best-effort projection of the requeue
+    // journal: an unreadable journal degrades to an empty fold (warned)
+    // instead of failing the write — the verdict, and the per-action
+    // independence the stall loop guarantees its siblings, outrank the
+    // record's attempts metadata.
+    let prior = match ledger::measured_attempt_requeues(state) {
+        Ok(counts) => counts.get(job).copied().unwrap_or(0),
+        Err(e) => {
+            tracing::warn!(
+                job,
+                error = %format!("{e:#}"),
+                "requeue journal unreadable; stamping attempts from an empty fold"
+            );
+            0
+        }
+    };
     let attempts = ledger::stamped_attempts(prior, currently_committed);
     let record = stall_record(ctx, signature, mode, campaign_id, attempts);
     state.append_jsonl(StateFile::Results, &record)?;

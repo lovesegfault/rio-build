@@ -100,7 +100,13 @@ use super::watchdog::{JobPhase, Watchdog};
 /// included), which is correct for bounding re-offers but marks
 /// first-real-attempt successes flaky when reused as the measurement.
 ///
-/// An entry whose `why` is outside the vocabulary (a journal written by a
+/// Like the resume fold ([`JobLedger::from_journals`]), the projection
+/// routes by source FIRST: `REQUEUE_SOURCE_QUEUED` entries are ladder
+/// steps, not re-offers — the job never left the pending pool, so they
+/// can no more be a cluster attempt than they can be a resubmission, and
+/// their why ("queued-watchdog") is deliberately outside the
+/// collect-decision vocabulary. Among the re-offer sources, an entry
+/// whose `why` is outside the vocabulary (a journal written by a
 /// different engine version) counts, preserving the historical
 /// every-requeue semantics for foreign entries; a state dir without the
 /// journal folds to empty counts.
@@ -108,6 +114,9 @@ pub fn measured_attempt_requeues(state: &StateDir) -> Result<HashMap<String, u32
     let entries: Vec<RequeueRecord> = state.load_jsonl(StateFile::Requeues)?;
     let mut counts: HashMap<String, u32> = HashMap::new();
     for entry in &entries {
+        if entry.source == REQUEUE_SOURCE_QUEUED {
+            continue;
+        }
         if RequeueReason::from_wire(&entry.why).is_none_or(RequeueReason::counts_as_cluster_attempt)
         {
             *counts.entry(entry.job.clone()).or_default() += 1;
