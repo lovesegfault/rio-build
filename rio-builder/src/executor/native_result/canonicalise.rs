@@ -307,14 +307,56 @@ fn is_ignored_xattr(name: &[u8]) -> bool {
     )
 }
 
+/// The three xattr syscall arms of [`strip_xattrs`], each with its own
+/// errno-tolerance table. A separate enum (rather than inline matches)
+/// because the tables ARE the oracle-parity artifact and the
+/// load-bearing answers cannot be produced by local filesystems in a
+/// test: `ENODATA` from a *list* call is an SSHFS-class translation,
+/// `ENOTSUP` from the *fill* call requires xattr support to vanish
+/// between two adjacent syscalls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XattrArm {
+    /// `llistxattr(path, NULL, 0)` — the size probe.
+    ListProbe,
+    /// `llistxattr(path, buf, len)` — the buffer fill.
+    ListFill,
+    /// `lremovexattr(path, name)` — the per-attribute removal.
+    Remove,
+}
+
+/// Errno disposition per arm, exactly `canonicalisePathMetaData_`
+/// (`posix-fs-canonicalise.cc:67-84`):
+///
+/// - `ListProbe`: `errno != ENOTSUP && errno != ENODATA` throws
+///   (lines 69-71) — i.e. ENOTSUP (no xattr support) and ENODATA
+///   (SSHFS-class filesystems answer the list probe with it; bug_101:
+///   treating it as fatal failed every build on such filesystems
+///   permanently where stock Nix succeeds) are success-empty.
+/// - `ListFill`: any failure throws (lines 76-77) — no tolerance.
+/// - `Remove`: the oracle throws on any failure (lines 81-83; it skips
+///   `ignored-acls` names BEFORE attempting). rio's REGISTERED
+///   divergence: ENOTSUP/ENODATA are tolerated here — the attribute is
+///   already gone (removed concurrently, or support vanished mid-walk),
+///   so failing the build would punish a benign race; an attribute that
+///   REMAINS still fails the arm.
+// r[impl builder.exec.canonicalise-xattr-errno]
+fn xattr_errno_tolerated(arm: XattrArm, errno: nix::errno::Errno) -> bool {
+    use nix::errno::Errno;
+    match arm {
+        XattrArm::ListProbe => matches!(errno, Errno::ENOTSUP | Errno::ENODATA),
+        XattrArm::ListFill => false,
+        XattrArm::Remove => matches!(errno, Errno::ENOTSUP | Errno::ENODATA),
+    }
+}
+
 /// Remove every extended attribute on `path` (without following
 /// symlinks — callers only invoke this for non-symlinks anyway), except
 /// the kernel-owned ACL labels in [`is_ignored_xattr`], which are left in
 /// place exactly as CppNix's `canonicalisePathMetaData_` does.
 ///
-/// `ENOTSUP` (filesystem without xattr support) and `ENODATA` (attribute
-/// vanished between list and remove) are not errors. Uses raw libc:
-/// the `nix` crate does not wrap the xattr family.
+/// Errno handling per arm is [`xattr_errno_tolerated`] — the oracle's
+/// tables verbatim plus one registered divergence on the remove arm.
+/// Uses raw libc: the `nix` crate does not wrap the xattr family.
 fn strip_xattrs(path: &Path) -> Result<(), CanonicaliseError> {
     let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| CanonicaliseError::Io {
         op: "llistxattr",
@@ -328,9 +370,10 @@ fn strip_xattrs(path: &Path) -> Result<(), CanonicaliseError> {
     let len = unsafe { libc::llistxattr(c_path.as_ptr(), std::ptr::null_mut(), 0) };
     if len < 0 {
         let errno = nix::errno::Errno::last();
-        return match errno {
-            nix::errno::Errno::ENOTSUP => Ok(()),
-            e => Err(CanonicaliseError::io("llistxattr", path, e)),
+        return if xattr_errno_tolerated(XattrArm::ListProbe, errno) {
+            Ok(())
+        } else {
+            Err(CanonicaliseError::io("llistxattr", path, errno))
         };
     }
     if len == 0 {
@@ -344,9 +387,10 @@ fn strip_xattrs(path: &Path) -> Result<(), CanonicaliseError> {
     let len = unsafe { libc::llistxattr(c_path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
     if len < 0 {
         let errno = nix::errno::Errno::last();
-        return match errno {
-            nix::errno::Errno::ENOTSUP => Ok(()),
-            e => Err(CanonicaliseError::io("llistxattr", path, e)),
+        return if xattr_errno_tolerated(XattrArm::ListFill, errno) {
+            Ok(())
+        } else {
+            Err(CanonicaliseError::io("llistxattr", path, errno))
         };
     }
     names.truncate(len as usize);
@@ -364,15 +408,12 @@ fn strip_xattrs(path: &Path) -> Result<(), CanonicaliseError> {
         let rc = unsafe { libc::lremovexattr(c_path.as_ptr(), c_name.as_ptr()) };
         if rc < 0 {
             let errno = nix::errno::Errno::last();
-            match errno {
-                nix::errno::Errno::ENOTSUP | nix::errno::Errno::ENODATA => {}
-                e => {
-                    return Err(CanonicaliseError::Xattr {
-                        path: path.display().to_string(),
-                        attr: name.escape_ascii().to_string(),
-                        errno: e,
-                    });
-                }
+            if !xattr_errno_tolerated(XattrArm::Remove, errno) {
+                return Err(CanonicaliseError::Xattr {
+                    path: path.display().to_string(),
+                    attr: name.escape_ascii().to_string(),
+                    errno,
+                });
             }
         }
     }
@@ -710,6 +751,7 @@ mod tests {
 
     /// The ignored set is exactly CppNix's `ignored-acls` default; build-
     /// or user-written attributes are never ignored.
+    // r[verify builder.exec.canonicalise-xattr-errno]
     #[test]
     fn ignored_xattr_set_matches_cppnix_default() {
         assert!(is_ignored_xattr(b"security.selinux"));
@@ -721,5 +763,58 @@ mod tests {
         assert!(!is_ignored_xattr(b"trusted.overlay.opaque"));
         assert!(!is_ignored_xattr(b"security.capability"));
         assert!(!is_ignored_xattr(b"security.selinux.extra"));
+    }
+
+    /// The full errno-disposition table of the three xattr arms, vs
+    /// `canonicalisePathMetaData_` (posix-fs-canonicalise.cc:67-84).
+    /// Pinned as a table because the load-bearing rows are
+    /// untriggerable on local filesystems: ENODATA from a LIST call is
+    /// an SSHFS-class translation (bug_101 — every build on such a
+    /// filesystem failed permanently as an output rejection where
+    /// stock Nix succeeds), and ENOTSUP at the fill arm needs support
+    /// to vanish between adjacent syscalls.
+    // r[verify builder.exec.canonicalise-xattr-errno]
+    #[test]
+    fn xattr_errno_table_matches_oracle() {
+        use nix::errno::Errno;
+
+        // Probe arm: oracle line 69-71 — ENOTSUP and ENODATA are
+        // success-empty; everything else fails the build.
+        assert!(xattr_errno_tolerated(XattrArm::ListProbe, Errno::ENOTSUP));
+        assert!(xattr_errno_tolerated(XattrArm::ListProbe, Errno::ENODATA));
+        for fatal in [Errno::EACCES, Errno::EPERM, Errno::EIO, Errno::ERANGE] {
+            assert!(
+                !xattr_errno_tolerated(XattrArm::ListProbe, fatal),
+                "{fatal} must fail the probe arm"
+            );
+        }
+
+        // Fill arm: oracle line 76-77 — NOTHING is tolerated; rio's
+        // former ENOTSUP tolerance here was an unregistered delta,
+        // removed.
+        for e in [
+            Errno::ENOTSUP,
+            Errno::ENODATA,
+            Errno::EACCES,
+            Errno::EIO,
+            Errno::ERANGE,
+        ] {
+            assert!(
+                !xattr_errno_tolerated(XattrArm::ListFill, e),
+                "{e} must fail the fill arm (oracle tolerates nothing)"
+            );
+        }
+
+        // Remove arm: the REGISTERED divergence — the oracle (line
+        // 81-83) throws on any failure; rio tolerates exactly the
+        // already-gone answers and nothing else.
+        assert!(xattr_errno_tolerated(XattrArm::Remove, Errno::ENOTSUP));
+        assert!(xattr_errno_tolerated(XattrArm::Remove, Errno::ENODATA));
+        for fatal in [Errno::EACCES, Errno::EPERM, Errno::EIO] {
+            assert!(
+                !xattr_errno_tolerated(XattrArm::Remove, fatal),
+                "{fatal} must fail the remove arm"
+            );
+        }
     }
 }

@@ -713,6 +713,35 @@ the overlay upper store — with a raw-string fallback, a declared "path" like
 `/build/exfil` would strip to itself and the join would escape the upper
 store entirely (an absolute path replaces the join target).
 
+#r("builder.exec.canonicalise-xattr-errno")[
+  The xattr-strip pass of output canonicalisation MUST dispose of syscall
+  errnos exactly as the oracle's `canonicalisePathMetaData_`
+  (`posix-fs-canonicalise.cc:67-84`) does, arm by arm: the `llistxattr`
+  size probe tolerates `ENOTSUP` (no xattr support) and `ENODATA`
+  (SSHFS-class filesystems answer the list probe with it) as
+  success-empty and fails the build on anything else; the `llistxattr`
+  buffer fill tolerates nothing; `lremovexattr` skips the kernel-owned
+  ACL names of the oracle's `ignored-acls` default
+  (`security.selinux`, `system.nfs4_acl`, `security.csm` —
+  `local-settings.hh:590-600`) before attempting removal. The single
+  registered divergence: rio additionally tolerates
+  `ENOTSUP`/`ENODATA` from `lremovexattr` itself, where the oracle
+  would fail the build on a benign list→remove race (an attribute
+  removed concurrently, or xattr support vanishing mid-walk) — strictly
+  more permissive only for an attribute that is already gone, never for
+  one that remains.
+]
+
+The errno tables are the parity unit, kept in one test-reachable
+function (`xattr_errno_tolerated`) precisely because the load-bearing
+answers cannot be produced by local filesystems in a unit test:
+`ENODATA` from a *list* call is an SSHFS-class translation (the bug
+this rule pins was every build on such a filesystem failing permanently
+as an output rejection where stock Nix succeeds), and `ENOTSUP` from a
+*fill* call requires xattr support to vanish between two adjacent
+syscalls. A table the tests can pin is the difference between "exact
+parity" as a doc claim and as an artifact.
+
 == Sandbox process-tree lifecycle
 
 The executor forks twice (parent → intermediate → sandbox child) and
