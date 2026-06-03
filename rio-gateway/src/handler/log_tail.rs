@@ -39,11 +39,13 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use rio_log_kernel::{ChunkVisit, TailNext, TailStopCause, tail_next, visit_chunk};
 use rio_proto::LogServiceClient;
 use rio_proto::store::{TailLogChunk, TailLogRequest};
 use rio_proto::types;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tonic::transport::Channel;
 use tracing::{Instrument, debug, info_span, warn};
 
@@ -257,21 +259,27 @@ impl LogTailSet {
     }
 }
 
-/// Why one connected `TailLog` stream stopped being driven.
-enum StreamEnd {
-    /// The stream ended (or errored) while the derivation was not yet
-    /// terminal. The caller backs off and re-opens.
-    Premature,
-    /// The derivation is terminal and the stream ended naturally or the
-    /// post-terminal grace expired. The subscription is finished.
-    Drained,
+/// Why one driven `TailLog` stream stopped yielding, as observed by
+/// [`drive_stream`]. The kernel's [`tail_next`] — not this enum —
+/// decides whether the subscription re-opens or exits.
+enum DriveEnd {
+    /// The stream stopped; `tail_next(cause, ..)` decides what happens.
+    Ended(TailStopCause),
+    /// The stream jumped past the relay floor and the gap has not had
+    /// its one re-open chance yet. Nothing was relayed or advanced;
+    /// the caller re-opens at `gap_from` (== the unchanged floor).
+    Gap { gap_from: u64 },
     /// The output channel's receiver is gone — the build's event loop
     /// has exited. Nothing left to relay to.
     OutputClosed,
 }
 
 // r[impl store.log.tail-reconnect]
-/// One subscription's lifetime: open → drive → (backoff → re-open)*.
+// r[impl store.log.tail-grace-drain]
+/// One subscription's lifetime: open → drive → (backoff → re-open)*,
+/// with the exit decision delegated to the kernel's [`tail_next`] law:
+/// exit only when the post-terminal grace expired, or the stream ended
+/// naturally with the derivation terminal and the served log complete.
 async fn run_tail(
     mut client: LogServiceClient<Channel>,
     jwt_token: Option<String>,
@@ -286,6 +294,25 @@ async fn run_tail(
     // that makes the at-least-once store stream exactly-once on the
     // client's wire.
     let mut last_relayed: Option<u64> = None;
+    // The most recent message's `is_complete` — at any stream end this
+    // is the final message's claim, the store's own statement that
+    // everything durable was served. Empty finals carry it too (they
+    // are dropped for relay purposes AFTER this is recorded).
+    let mut served_complete = false;
+    // The post-terminal grace deadline, armed exactly ONCE at the
+    // first observation of the drain signal (any path: mid-stream,
+    // between streams, during backoff). Re-arming on every stream end
+    // would let a terminal subscription ride re-opens forever.
+    let mut grace_deadline: Option<Instant> = None;
+    // A forward jump observed on the previous stream, awaiting its one
+    // re-open chance: the same `gap_from` seen again means the hole is
+    // durable (the store re-served the same split) and is accepted
+    // with an inline marker. Each distinct gap_from is retried exactly
+    // once — the loop cannot ping-pong on one hole.
+    let mut pending_gap: Option<u64> = None;
+    // Gaps at line numbers below this have already been disclosed with
+    // a marker; never re-mark them.
+    let mut accepted_gap_floor: Option<u64> = None;
     // Set once the first open-failure of a consecutive run has been
     // logged at `warn!`; reset on a successful open. Without the latch
     // a store that is down for a whole build would emit one warn per
@@ -296,6 +323,7 @@ async fn run_tail(
     // status code" breadcrumb next to it.
     let mut warned_open_failure = false;
     loop {
+        arm_grace(&mut grace_deadline, &drain, config.terminal_grace);
         let since_line = last_relayed.map_or(0, |n| n.saturating_add(1));
         let mut request = tonic::Request::new(TailLogRequest {
             derivation: derivation_path.clone(),
@@ -312,27 +340,52 @@ async fn run_tail(
                 .metadata_mut()
                 .insert(rio_proto::TENANT_TOKEN_HEADER, value);
         }
-        let stream = match client.tail_log(request).await {
-            Ok(resp) => resp.into_inner(),
+        let cause = match client.tail_log(request).await {
+            Ok(resp) => {
+                warned_open_failure = false;
+                match drive_stream(
+                    resp.into_inner(),
+                    &derivation_path,
+                    &out_tx,
+                    &mut drain,
+                    &mut last_relayed,
+                    &mut served_complete,
+                    &mut grace_deadline,
+                    &mut pending_gap,
+                    &mut accepted_gap_floor,
+                    config.terminal_grace,
+                )
+                .await
+                {
+                    DriveEnd::OutputClosed => return,
+                    DriveEnd::Ended(cause) => cause,
+                    DriveEnd::Gap { gap_from } => {
+                        // Remember the jump; the very next stream gets
+                        // one chance to serve the missing span before
+                        // the gap is accepted and disclosed.
+                        pending_gap = Some(gap_from);
+                        debug!(
+                            gap_from,
+                            "TailLog stream jumped past the relay floor; re-opening at the gap"
+                        );
+                        TailStopCause::GapObserved
+                    }
+                }
+            }
             Err(status) => {
                 // Open failed (store unreachable, NotFound because the
                 // execution hasn't recorded anything yet, ...). All of
                 // these are retryable from the live tail's perspective
                 // — the lines are durable in the store regardless, and
                 // a reader that gives up early just degrades to the
-                // historical read path. Once the derivation is
-                // terminal, stop retrying: the current stream (there
-                // is none) has nothing to drain.
+                // historical read path. After terminal the kernel keeps
+                // retrying within the grace budget: the final lines may
+                // land on a replica that is restarting right now.
                 //
                 // Deliberately NOT surfaced to the nix client: a
                 // "log tail reconnecting" line in build output is
                 // noise the user can't act on, and the lines are
                 // durable in the store regardless.
-                metrics::counter!(
-                    "rio_gateway_log_tail_reconnects_total",
-                    "reason" => "open_failed"
-                )
-                .increment(1);
                 if warned_open_failure {
                     debug!(code = ?status.code(), "TailLog open failed");
                 } else {
@@ -345,174 +398,243 @@ async fn run_tail(
                         config.reconnect_backoff
                     );
                 }
-                if *drain.borrow() {
-                    return;
-                }
-                if backoff_or_terminal(&mut drain, config.reconnect_backoff).await {
-                    return;
-                }
-                continue;
+                TailStopCause::OpenFailed
             }
         };
-        warned_open_failure = false;
-        match drive_stream(
-            stream,
-            &derivation_path,
-            &out_tx,
-            &mut drain,
-            &mut last_relayed,
-            config.terminal_grace,
-        )
-        .await
-        {
-            StreamEnd::OutputClosed | StreamEnd::Drained => return,
-            StreamEnd::Premature => {
+        // The drain signal may have flipped while the stream was being
+        // driven or opened; observe it before deciding.
+        arm_grace(&mut grace_deadline, &drain, config.terminal_grace);
+        let terminal = *drain.borrow();
+        let grace_expired = grace_deadline.is_some_and(|d| Instant::now() >= d);
+        match tail_next(cause, terminal, grace_expired, served_complete) {
+            TailNext::Exit => {
+                debug!(
+                    ?cause,
+                    terminal, grace_expired, served_complete, "log tail finished"
+                );
+                return;
+            }
+            TailNext::Reopen => {
                 metrics::counter!(
                     "rio_gateway_log_tail_reconnects_total",
-                    "reason" => "stream_ended"
+                    "reason" => reconnect_reason(cause)
                 )
                 .increment(1);
-                debug!(
-                    last_relayed = ?last_relayed,
-                    "TailLog stream ended before the derivation was terminal; re-opening"
-                );
-                if backoff_or_terminal(&mut drain, config.reconnect_backoff).await {
-                    return;
-                }
+                backoff_capped(&mut drain, config.reconnect_backoff, grace_deadline).await;
             }
         }
     }
 }
 
-/// Sleep for `backoff`, waking early if the drain signal flips. Returns
-/// `true` if the subscription should exit instead of re-opening (the
-/// derivation went terminal while there was no stream to drain).
-async fn backoff_or_terminal(drain: &mut watch::Receiver<bool>, backoff: Duration) -> bool {
-    tokio::select! {
-        _ = tokio::time::sleep(backoff) => false,
-        // `changed()` errors only when the sender is dropped (the
-        // LogTailSet entry was removed by a re-dispatch replacement —
-        // but that aborts this task outright, so the Err arm is
-        // unreachable belt-and-suspenders).
-        res = drain.changed() => res.is_err() || *drain.borrow(),
+/// The metrics label for one re-open decision.
+fn reconnect_reason(cause: TailStopCause) -> &'static str {
+    match cause {
+        TailStopCause::NaturalEnd | TailStopCause::TransportErr => "stream_ended",
+        TailStopCause::OpenFailed => "open_failed",
+        TailStopCause::GapObserved => "gap_observed",
     }
 }
 
-/// Drive one connected stream until it ends, the grace expires, or the
-/// output closes.
+/// Arm the post-terminal grace deadline if the drain signal is set and
+/// the deadline has not been armed yet. Idempotent; the deadline is
+/// armed at most once per subscription.
+fn arm_grace(deadline: &mut Option<Instant>, drain: &watch::Receiver<bool>, grace: Duration) {
+    if deadline.is_none() && *drain.borrow() {
+        *deadline = Some(Instant::now() + grace);
+    }
+}
+
+/// Sleep for `backoff`, capped at the remaining grace budget, waking
+/// early if the drain signal flips (so the loop can arm the grace
+/// deadline and consult [`tail_next`] — going terminal during a
+/// backoff no longer exits the subscription by itself).
+async fn backoff_capped(
+    drain: &mut watch::Receiver<bool>,
+    backoff: Duration,
+    deadline: Option<Instant>,
+) {
+    let dur = match deadline {
+        Some(d) => backoff.min(d.saturating_duration_since(Instant::now())),
+        None => backoff,
+    };
+    tokio::select! {
+        _ = tokio::time::sleep(dur) => {}
+        // Err = sender dropped; the set aborts this task on removal so
+        // this is unreachable, and waking early is the safe
+        // interpretation either way.
+        _ = drain.changed() => {}
+    }
+}
+
+/// Drive one connected stream until it stops yielding, the grace
+/// expires, or the output closes. Every chunk steps the kernel cursor
+/// ([`visit_chunk`]); the gap variant either ends the drive (first
+/// sighting — the caller re-opens at the gap) or, when the same gap
+/// survives its re-open chance, is accepted with one synthesized
+/// marker line ahead of the chunk.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the subscription's cursor state lives in run_tail; one drive borrows it all"
+)]
 async fn drive_stream(
     mut stream: tonic::Streaming<TailLogChunk>,
     derivation_path: &str,
     out_tx: &mpsc::Sender<TaggedLogChunk>,
     drain: &mut watch::Receiver<bool>,
     last_relayed: &mut Option<u64>,
+    served_complete: &mut bool,
+    grace_deadline: &mut Option<Instant>,
+    pending_gap: &mut Option<u64>,
+    accepted_gap_floor: &mut Option<u64>,
     terminal_grace: Duration,
-) -> StreamEnd {
-    // `None` until the derivation goes terminal; then a sleep that caps
-    // how long we keep waiting for the stream's natural end.
-    let mut grace: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = if *drain.borrow() {
-        Some(Box::pin(tokio::time::sleep(terminal_grace)))
-    } else {
-        None
-    };
+) -> DriveEnd {
     loop {
         tokio::select! {
             msg = stream.message() => match msg {
                 Ok(Some(chunk)) => {
-                    if let Some(tagged) = trim_chunk(chunk, derivation_path, *last_relayed) {
-                        *last_relayed = Some(
-                            tagged
-                                .first_line_number
-                                .saturating_add(tagged.lines.len() as u64)
-                                .saturating_sub(1),
-                        );
-                        // Blocking send: a slow nix client backpressures
-                        // this subscription (and, transitively, the
-                        // store's reads on our behalf). While blocked the
-                        // grace timer is not polled — acceptable, because
-                        // a blocked send means the event loop is not
-                        // consuming, which means the client write is the
-                        // bottleneck and "exit promptly after terminal"
-                        // has already lost to "deliver the lines at all".
-                        if out_tx.send(tagged).await.is_err() {
-                            return StreamEnd::OutputClosed;
+                    // The completeness claim rides every message; the
+                    // value at stream end is the final message's — the
+                    // one `tail_next` needs. Recorded BEFORE the empty
+                    // final is dropped below.
+                    *served_complete = chunk.is_complete;
+                    let floor = last_relayed.map_or(0, |n| n.saturating_add(1));
+                    let first = chunk.first_line_number;
+                    match visit_chunk(floor, first, chunk.lines.len() as u64) {
+                        ChunkVisit::Skip { .. } => {}
+                        ChunkVisit::Serve { yield_from, yield_until, next_line } => {
+                            let tagged =
+                                slice_chunk(chunk, derivation_path, yield_from, yield_until);
+                            *last_relayed = Some(next_line.saturating_sub(1));
+                            // Blocking send: a slow nix client backpressures
+                            // this subscription (and, transitively, the
+                            // store's reads on our behalf). While blocked the
+                            // grace timer is not polled — acceptable, because
+                            // a blocked send means the event loop is not
+                            // consuming, which means the client write is the
+                            // bottleneck and "exit promptly after terminal"
+                            // has already lost to "deliver the lines at all".
+                            if out_tx.send(tagged).await.is_err() {
+                                return DriveEnd::OutputClosed;
+                            }
+                        }
+                        ChunkVisit::GapThenServe {
+                            gap_from,
+                            gap_until,
+                            yield_from,
+                            yield_until,
+                            next_line,
+                        } => {
+                            if *pending_gap == Some(gap_from) {
+                                // The gap survived its one re-open
+                                // chance: the store re-served the same
+                                // split, so the hole is durable.
+                                // Disclose it inline (owner decision
+                                // Q8: the marker enters client-visible
+                                // build output) and move on.
+                                *pending_gap = None;
+                                if accepted_gap_floor.is_none_or(|f| gap_from >= f) {
+                                    *accepted_gap_floor = Some(gap_until);
+                                    let marker = gap_marker(gap_from, gap_until);
+                                    if out_tx
+                                        .send(TaggedLogChunk {
+                                            derivation_path: derivation_path.to_string(),
+                                            first_line_number: gap_from,
+                                            lines: vec![marker],
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return DriveEnd::OutputClosed;
+                                    }
+                                }
+                                let tagged = slice_chunk(
+                                    chunk,
+                                    derivation_path,
+                                    yield_from,
+                                    yield_until,
+                                );
+                                *last_relayed = Some(next_line.saturating_sub(1));
+                                if out_tx.send(tagged).await.is_err() {
+                                    return DriveEnd::OutputClosed;
+                                }
+                            } else {
+                                // First sighting of this jump: do NOT
+                                // relay or advance — give the store one
+                                // re-open at the gap to serve the span
+                                // (a transient: mid-flight cut, replica
+                                // version skew, racing manifest read).
+                                return DriveEnd::Gap { gap_from };
+                            }
                         }
                     }
                 }
-                // The store ends a follow stream when the ingest session
-                // closes (the builder finished or reconnected elsewhere)
-                // — that is not the same thing as "the derivation is
-                // done", so before terminal it is a premature end. An
-                // in-stream error (the store's grpc-web-compatible error
-                // convention) is treated identically: retryable before
-                // terminal, final after.
-                Ok(None) => {
-                    return if grace.is_some() { StreamEnd::Drained } else { StreamEnd::Premature };
-                }
+                Ok(None) => return DriveEnd::Ended(TailStopCause::NaturalEnd),
                 Err(status) => {
                     debug!(code = ?status.code(), "TailLog stream error");
-                    return if grace.is_some() { StreamEnd::Drained } else { StreamEnd::Premature };
+                    return DriveEnd::Ended(TailStopCause::TransportErr);
                 }
             },
             // The derivation went terminal while the stream is open:
-            // arm the grace timer and keep draining. Guarded so the
-            // branch is only polled until the timer is armed.
-            res = drain.changed(), if grace.is_none() => {
+            // arm the grace deadline (once) and keep draining. Guarded
+            // so the branch is only polled until the deadline is armed.
+            res = drain.changed(), if grace_deadline.is_none() => {
                 // Err = the sender (the LogTailSet entry) is gone; the
                 // set aborts this task on removal so this is
-                // unreachable, but exiting is the safe interpretation.
+                // unreachable, but a closed drain means there is nobody
+                // left to flip it — treat as terminal-with-no-grace.
                 if res.is_err() {
-                    return StreamEnd::Drained;
+                    return DriveEnd::Ended(TailStopCause::NaturalEnd);
                 }
-                if *drain.borrow() {
-                    grace = Some(Box::pin(tokio::time::sleep(terminal_grace)));
-                }
+                arm_grace(grace_deadline, drain, terminal_grace);
             }
             // The post-terminal grace expired with the stream still
-            // open: stop waiting for its natural end.
-            () = async { grace.as_mut().expect("guarded by the if").await }, if grace.is_some() => {
+            // open: stop waiting for its natural end. The cause value
+            // is immaterial — `tail_next` exits on an expired grace
+            // regardless of it.
+            () = tokio::time::sleep_until(grace_deadline.unwrap_or_else(Instant::now)),
+                if grace_deadline.is_some() =>
+            {
                 debug!("post-terminal grace expired; closing the log tail");
-                return StreamEnd::Drained;
+                return DriveEnd::Ended(TailStopCause::NaturalEnd);
             }
         }
     }
 }
 
-/// Drop the prefix of `chunk` that has already been relayed and tag it
-/// with the derivation path. Returns `None` when nothing new remains.
-///
-/// The store's chunk granularity means a re-opened stream (and even the
-/// first response of a fresh stream, which replays whole stored chunks)
-/// can carry lines below the requested `since_line`; this trim is what
-/// turns the store's at-least-once delivery into exactly-once on the
-/// client's wire.
-fn trim_chunk(
+/// The synthesized disclosure for an accepted durable gap (owner
+/// decision Q8: one marker line in client-visible build output, never
+/// repeated for the same span).
+fn gap_marker(gap_from: u64, gap_until: u64) -> Vec<u8> {
+    format!(
+        "*** rio: lines {}-{} missing (durable log gap) ***",
+        gap_from,
+        gap_until.saturating_sub(1)
+    )
+    .into_bytes()
+}
+
+/// Tag the kernel-chosen `[yield_from, yield_until)` slice of `chunk`
+/// for relay. The slice bounds come from [`visit_chunk`], which
+/// guarantees they lie inside the chunk.
+fn slice_chunk(
     chunk: TailLogChunk,
     derivation_path: &str,
-    last_relayed: Option<u64>,
-) -> Option<TaggedLogChunk> {
-    if chunk.lines.is_empty() {
-        return None;
-    }
-    let floor = last_relayed.map_or(0, |n| n.saturating_add(1));
+    yield_from: u64,
+    yield_until: u64,
+) -> TaggedLogChunk {
     let first = chunk.first_line_number;
-    let last = first.saturating_add(chunk.lines.len() as u64 - 1);
-    if last < floor {
-        return None;
-    }
-    let skip = usize::try_from(floor.saturating_sub(first)).unwrap_or(usize::MAX);
-    if skip >= chunk.lines.len() {
-        return None;
-    }
+    let skip = usize::try_from(yield_from.saturating_sub(first)).unwrap_or(usize::MAX);
+    let take = usize::try_from(yield_until.saturating_sub(yield_from)).unwrap_or(usize::MAX);
     let mut lines = chunk.lines;
     if skip > 0 {
-        lines.drain(..skip);
+        lines.drain(..skip.min(lines.len()));
     }
-    Some(TaggedLogChunk {
+    lines.truncate(take);
+    TaggedLogChunk {
         derivation_path: derivation_path.to_string(),
-        first_line_number: first.saturating_add(skip as u64),
+        first_line_number: yield_from,
         lines,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -543,6 +665,9 @@ mod tests {
         /// Keep the stream open until the test drops the guard sender or
         /// the client disconnects. Models a quiet live build.
         Hold,
+        /// End the stream with an in-stream error (a store replica
+        /// dying mid-serve / a proxy reset).
+        Error(tonic::Code),
     }
 
     /// One scripted `tail_log` response.
@@ -572,6 +697,10 @@ mod tests {
         /// this to deterministically interleave "the subscription is
         /// open" with "the terminal signal fires".
         gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        /// How many upcoming `tail_log` calls fail at the open itself
+        /// (UNAVAILABLE). The request is still recorded — the counter
+        /// counts attempts.
+        fail_opens: Mutex<u32>,
     }
 
     impl MockTail {
@@ -581,6 +710,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push_back(SessionScript { chunks, end });
+        }
+
+        /// Fail the next `n` `tail_log` opens with UNAVAILABLE.
+        fn fail_next_opens(&self, n: u32) {
+            *self.inner.fail_opens.lock().unwrap() = n;
         }
 
         /// The next `tail_log` call records its request, then parks
@@ -620,6 +754,13 @@ mod tests {
         ) -> Result<Response<Self::TailLogStream>, Status> {
             let req = request.into_inner();
             self.inner.requests.lock().unwrap().push(req);
+            {
+                let mut fails = self.inner.fail_opens.lock().unwrap();
+                if *fails > 0 {
+                    *fails -= 1;
+                    return Err(Status::unavailable("scripted open failure"));
+                }
+            }
             let gate = self.inner.gate.lock().unwrap().take();
             let script = self
                 .inner
@@ -648,6 +789,11 @@ mod tests {
                         // Park the sender so the stream stays open until
                         // the mock is dropped or the client disconnects.
                         inner.holds.lock().unwrap().push(tx);
+                    }
+                    SessionEnd::Error(code) => {
+                        let _ = tx
+                            .send(Err(Status::new(code, "scripted stream error")))
+                            .await;
                     }
                 }
             });
@@ -681,13 +827,17 @@ mod tests {
     }
 
     async fn harness() -> Harness {
+        harness_with(test_config()).await
+    }
+
+    async fn harness_with(config: LogTailConfig) -> Harness {
         let mock = MockTail::default();
         let router = Server::builder().add_service(LogServiceServer::new(mock.clone()));
         let (addr, server) = spawn_grpc_server(router).await;
         let client = rio_proto::LogServiceClient::connect(format!("http://{addr}"))
             .await
             .expect("connect to the mock LogService");
-        let (set, out_rx) = LogTailSet::with_config(client, None, test_config());
+        let (set, out_rx) = LogTailSet::with_config(client, None, config);
         Harness {
             mock,
             set,
@@ -704,6 +854,17 @@ mod tests {
                 .collect(),
             first_line_number: first_line,
             is_complete: false,
+        }
+    }
+
+    /// A final, possibly-empty chunk carrying the store's completeness
+    /// claim (`send_final` / the last message of a session).
+    fn final_chunk(next_line: u64, complete: bool) -> TailLogChunk {
+        TailLogChunk {
+            exec_id: EXEC_A.to_string(),
+            lines: Vec::new(),
+            first_line_number: next_line,
+            is_complete: complete,
         }
     }
 
@@ -947,5 +1108,160 @@ mod tests {
             "no TailLog request for an execution-less Started"
         );
         assert!(set.tasks.is_empty(), "no task spawned");
+    }
+
+    // r[verify store.log.tail-grace-drain]
+    /// A transport error after the terminal signal does not end the
+    /// subscription while grace budget remains — the final lines may be
+    /// on a replica that is restarting right now.
+    #[tokio::test]
+    async fn transport_error_after_terminal_reopens_within_grace() {
+        let mut h = harness().await;
+        let gate = h.mock.gate_next_session();
+        h.mock.push_script(
+            vec![chunk(0, 2)],
+            SessionEnd::Error(tonic::Code::Unavailable),
+        );
+        h.mock
+            .push_script(vec![final_chunk(2, true)], SessionEnd::Close);
+
+        h.set.on_started(DRV, EXEC_A);
+        wait_for("the subscription to open", || h.mock.request_count() == 1).await;
+        h.set.on_terminal(DRV);
+        gate.notify_one();
+
+        let lines = recv_lines(&mut h.out_rx, 2).await;
+        assert_eq!(lines.len(), 2);
+        wait_for(
+            "a re-open after the post-terminal transport error (grace unspent)",
+            || h.mock.request_count() == 2,
+        )
+        .await;
+        h.set.abort_all();
+    }
+
+    /// An open failure after the terminal signal keeps retrying within
+    /// the grace budget instead of giving up with zero attempts.
+    #[tokio::test]
+    async fn open_failure_at_terminal_retries_within_grace() {
+        let mut h = harness().await;
+        h.mock.fail_next_opens(u32::MAX);
+
+        h.set.on_started(DRV, EXEC_A);
+        wait_for("the first failed open", || h.mock.request_count() >= 1).await;
+        h.set.on_terminal(DRV);
+        let snapshot = h.mock.request_count();
+        // The old code exits on the first post-terminal check; the
+        // kernel keeps retrying every backoff tick until the grace
+        // expires (~8 attempts at test scale). Two more attempts is
+        // race-proof in both directions.
+        wait_for("post-terminal open retries within the grace budget", || {
+            h.mock.request_count() >= snapshot + 2
+        })
+        .await;
+        h.set.abort_all();
+    }
+
+    /// The terminal signal landing during a between-streams backoff
+    /// does not exit the subscription — the loop wakes, arms the grace,
+    /// and re-opens to drain the final lines.
+    #[tokio::test]
+    async fn terminal_during_backoff_still_reopens() {
+        // A long backoff so the terminal signal deterministically lands
+        // inside the backoff window.
+        let mut h = harness_with(LogTailConfig {
+            reconnect_backoff: Duration::from_millis(300),
+            terminal_grace: Duration::from_millis(800),
+        })
+        .await;
+        h.mock.push_script(vec![chunk(0, 2)], SessionEnd::Close);
+        h.mock
+            .push_script(vec![final_chunk(2, true)], SessionEnd::Close);
+
+        h.set.on_started(DRV, EXEC_A);
+        let _ = recv_lines(&mut h.out_rx, 2).await;
+        h.set.on_terminal(DRV);
+        wait_for("the post-terminal re-open after the backoff", || {
+            h.mock.request_count() == 2
+        })
+        .await;
+        h.set.abort_all();
+    }
+
+    // r[verify store.log.tail-grace-drain]
+    /// A natural stream end after terminal with the store NOT claiming
+    /// completeness re-opens (the served log is incomplete and there is
+    /// budget left); the re-opened stream's complete final exits it.
+    #[tokio::test]
+    async fn natural_end_incomplete_reopens_until_grace() {
+        let mut h = harness().await;
+        let gate = h.mock.gate_next_session();
+        // Session 1 ends naturally but its final says incomplete.
+        h.mock
+            .push_script(vec![chunk(0, 3), final_chunk(3, false)], SessionEnd::Close);
+        // Session 2 serves nothing new and claims complete.
+        h.mock
+            .push_script(vec![final_chunk(3, true)], SessionEnd::Close);
+
+        h.set.on_started(DRV, EXEC_A);
+        wait_for("the subscription to open", || h.mock.request_count() == 1).await;
+        h.set.on_terminal(DRV);
+        gate.notify_one();
+        let _ = recv_lines(&mut h.out_rx, 3).await;
+
+        wait_for("an incomplete natural end re-opens", || {
+            h.mock.request_count() == 2
+        })
+        .await;
+        // The complete final exits the subscription well before the
+        // grace cap.
+        let handle = h
+            .set
+            .tasks
+            .get(DRV)
+            .expect("the subscription is still tracked")
+            .task
+            .abort_handle();
+        wait_for("exit on served-complete", || handle.is_finished()).await;
+        h.set.abort_all();
+    }
+
+    /// A forward jump in the served stream is NOT silently relayed: the
+    /// subscription re-opens once at the gap, and only when the store
+    /// re-serves the same split is the gap accepted — disclosed with
+    /// exactly one synthesized marker line ahead of the chunk.
+    #[tokio::test]
+    async fn gap_reopened_once_then_marked() {
+        let mut h = harness().await;
+        // Session 1: lines 0..50, then a jump to 100 (a durable hole).
+        h.mock
+            .push_script(vec![chunk(0, 50), chunk(100, 5)], SessionEnd::Hold);
+        // Session 2: the store re-serves the same shape.
+        h.mock.push_script(vec![chunk(100, 5)], SessionEnd::Hold);
+
+        h.set.on_started(DRV, EXEC_A);
+
+        let lines = recv_lines(&mut h.out_rx, 56).await;
+        let reqs = h.mock.requests();
+        assert_eq!(reqs.len(), 2, "the gap re-opened exactly once");
+        assert_eq!(
+            reqs[1].since_line, 50,
+            "the re-open lands at the gap, not past it"
+        );
+        assert_eq!(lines[49].0, 49, "the contiguous prefix is intact");
+        assert_eq!(
+            lines[50],
+            (
+                50,
+                "*** rio: lines 50-99 missing (durable log gap) ***".to_string()
+            ),
+            "the durable gap is disclosed inline exactly once"
+        );
+        assert_eq!(
+            lines[51].0, 100,
+            "the gapped chunk is relayed after the marker"
+        );
+        assert_eq!(lines[55].0, 104);
+        h.set.abort_all();
     }
 }

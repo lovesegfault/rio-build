@@ -6336,6 +6336,7 @@ dependencies = [
  "rand 0.10.1",
  "rio-auth",
  "rio-common",
+ "rio-log-kernel",
  "rio-migrations",
  "rio-nix",
  "rio-proto",

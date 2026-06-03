@@ -285,6 +285,7 @@ pub enum TailNext {
 /// passed" (false whenever the deadline is not yet armed);
 /// `served_complete` is the most recent final message's `is_complete`
 /// — the store's own claim that everything durable was served.
+// r[impl store.log.tail-grace-drain]
 pub fn tail_next(
     cause: TailStopCause,
     terminal: bool,

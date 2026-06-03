@@ -20022,6 +20022,10 @@
           "packageId": "rio-common"
         },
         {
+          "name": "rio-log-kernel",
+          "packageId": "rio-log-kernel"
+        },
+        {
           "name": "rio-nix",
           "packageId": "rio-nix"
         },
