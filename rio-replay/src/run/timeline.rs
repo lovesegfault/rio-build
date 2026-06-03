@@ -968,14 +968,29 @@ async fn dispatch_one_request(
         .collect();
 
     // Inline top-up fallback (prewarm-miss / inline delivery): a failure
-    // degrades to a log line, never aborts the request. Whether it
-    // succeeded is recorded on the request's batch records (the
-    // inline-resume gate's delivery proof): a failed or absent top-up
-    // dispatches anyway but proves nothing.
+    // degrades to a log line, never aborts the request. The request's
+    // delivery proof (the inline-resume gate's evidence on its batch
+    // records) is the returned per-path outcome over this request's own
+    // plan, collapsed FAIL-CLOSED: only a complete delivery proves — a
+    // partial one and an Err alike dispatch anyway but prove nothing,
+    // because Ok-ness is not delivery (a breaker-tripped top-up journals
+    // every remaining path skipped and still returns Ok).
     let mut topup_delivered = false;
     if let Some(topup) = &shared.topup {
         match topup.topup(&drvs).await {
-            Ok(()) => topup_delivered = true,
+            Ok(outcome) => {
+                topup_delivered = outcome.proves_delivery();
+                if !topup_delivered {
+                    tracing::warn!(
+                        request = scheduled.index,
+                        planned = outcome.planned,
+                        delivered = outcome.delivered,
+                        undelivered = outcome.undelivered,
+                        "pre-submission supply top-up left paths undelivered; \
+                         dispatching the request without delivery proof"
+                    );
+                }
+            }
             Err(e) => tracing::warn!(
                 request = scheduled.index,
                 error = %format!("{e:#}"),
@@ -1267,6 +1282,7 @@ mod tests {
     use crate::run::state::latest_per_job;
     use crate::run::submitter::BatchOutcome;
     use crate::run::submitter::test_support::FakeSubmitter;
+    use crate::run::supply::exec::TopupOutcome;
 
     use super::*;
 
@@ -2191,35 +2207,50 @@ mod tests {
 
     /// Scripted pre-submission supply hook: records the roots of every call
     /// together with how many submissions the instrumented submitter had
-    /// already made at that moment, then fails — proving both the
-    /// before-submission ordering and that a top-up failure never blocks the
-    /// dispatch.
+    /// already made at that moment, then answers from a script (front
+    /// first; calls beyond it fail) — proving the before-submission
+    /// ordering, that a top-up failure never blocks the dispatch, and the
+    /// fail-closed bit collapse on the timed carrier.
     struct RecordingTopup {
         submitter: Arc<InstrumentedSubmitter>,
         /// `(roots, submissions already made)` per call, in call order.
         calls: std::sync::Mutex<Vec<(Vec<String>, usize)>>,
+        outcomes: std::sync::Mutex<std::collections::VecDeque<anyhow::Result<TopupOutcome>>>,
     }
 
     #[async_trait::async_trait]
     impl PreSubmitSupply for RecordingTopup {
-        async fn topup(&self, roots: &[String]) -> anyhow::Result<()> {
+        async fn topup(&self, roots: &[String]) -> anyhow::Result<TopupOutcome> {
             let submitted = self.submitter.calls.lock().unwrap().len();
             self.calls.lock().unwrap().push((roots.to_vec(), submitted));
-            anyhow::bail!("scripted top-up failure")
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| anyhow::bail!("scripted top-up failure"))
         }
     }
 
     /// The pre-submission top-up runs once per request with that request's
-    /// root drvs, before the request's own submission; a failing top-up
-    /// degrades to a warning and the request is submitted anyway — with
-    /// the failure journaled on the request's batch record
-    /// (`topup_delivered: false`): the batch proves the dispatch attempt,
-    /// never that the deferred supply landed.
+    /// root drvs, before the request's own submission; a failing or
+    /// incomplete top-up degrades to a warning and the request is
+    /// submitted anyway — with the evidence journaled on the request's
+    /// batch record: the timed carrier collapses the same producer
+    /// vocabulary as the submit loop's, FAIL-CLOSED (quantification
+    /// domain: Err and the full TopupDelivery tri-state — only a complete
+    /// delivery records `topup_delivered: true`; a partial one proves
+    /// nothing for the request's jobs, and the batch proves the dispatch
+    /// attempt, never that the deferred supply landed).
     #[tokio::test(start_paused = true)]
     async fn topup_runs_before_each_submission_and_failures_never_block_dispatch() {
         let dir = tempfile::tempdir().unwrap();
         let state = Arc::new(StateDir::new(dir.path()).unwrap());
-        let requests = vec![request(1, 0.0, DRV_A), request(2, 5.0, DRV_B)];
+        let requests = vec![
+            request(1, 0.0, DRV_A),
+            request(2, 5.0, DRV_B),
+            request(3, 10.0, DRV_A),
+            request(4, 15.0, DRV_B),
+        ];
         let jobs = BTreeMap::from([
             (DRV_A.to_string(), "a".to_string()),
             (DRV_B.to_string(), "b".to_string()),
@@ -2234,7 +2265,7 @@ mod tests {
             true,
         );
         let fake = FakeSubmitter::default();
-        for _ in 0..2 {
+        for _ in 0..4 {
             fake.outcomes
                 .lock()
                 .unwrap()
@@ -2244,6 +2275,29 @@ mod tests {
         let topup = Arc::new(RecordingTopup {
             submitter: submitter.clone(),
             calls: std::sync::Mutex::new(Vec::new()),
+            outcomes: std::sync::Mutex::new(
+                [
+                    Err(anyhow::anyhow!("scripted top-up failure")),
+                    // Complete / partial / nothing-delivered (the
+                    // breaker-tripped all-skipped Ok).
+                    Ok(TopupOutcome {
+                        planned: 2,
+                        delivered: 2,
+                        undelivered: 0,
+                    }),
+                    Ok(TopupOutcome {
+                        planned: 2,
+                        delivered: 1,
+                        undelivered: 1,
+                    }),
+                    Ok(TopupOutcome {
+                        planned: 2,
+                        delivered: 0,
+                        undelivered: 2,
+                    }),
+                ]
+                .into(),
+            ),
         });
 
         let stats = run_timed_dispatch(
@@ -2265,22 +2319,30 @@ mod tests {
 
         // One top-up call per request, carrying that request's roots, and
         // each happened before the request's own submission: the first saw
-        // zero prior submissions, the second exactly one.
+        // zero prior submissions, each later one exactly its predecessors.
         let calls = topup.calls.lock().unwrap().clone();
         assert_eq!(
             calls,
-            vec![(vec![DRV_A.to_string()], 0), (vec![DRV_B.to_string()], 1),]
+            vec![
+                (vec![DRV_A.to_string()], 0),
+                (vec![DRV_B.to_string()], 1),
+                (vec![DRV_A.to_string()], 2),
+                (vec![DRV_B.to_string()], 3),
+            ]
         );
-        // Both requests were submitted despite the scripted top-up failures,
-        // and both batch records journal the failed top-up.
-        assert_eq!(submitter.calls.lock().unwrap().len(), 2);
-        assert_eq!(stats.dispatched, 2);
-        let records: Vec<crate::run::model::BatchRecord> =
+        // Every request was submitted regardless of its top-up's outcome,
+        // and each batch record collapses that outcome fail-closed.
+        assert_eq!(submitter.calls.lock().unwrap().len(), 4);
+        assert_eq!(stats.dispatched, 4);
+        let mut records: Vec<crate::run::model::BatchRecord> =
             state.load_jsonl(StateFile::Batches).unwrap();
-        assert_eq!(records.len(), 2);
-        assert!(
-            records.iter().all(|record| !record.topup_delivered),
-            "{records:?}"
+        records.sort_by_key(|record| record.batch_id);
+        let delivered: Vec<bool> = records.iter().map(|r| r.topup_delivered).collect();
+        assert_eq!(
+            delivered,
+            vec![false, true, false, false],
+            "Err / complete / partial / nothing-delivered must collapse to \
+             false / true / false / false on the timed carrier: {records:?}"
         );
     }
 
@@ -2594,9 +2656,9 @@ mod tests {
         struct SlowTopup;
         #[async_trait::async_trait]
         impl PreSubmitSupply for SlowTopup {
-            async fn topup(&self, _roots: &[String]) -> anyhow::Result<()> {
+            async fn topup(&self, _roots: &[String]) -> anyhow::Result<TopupOutcome> {
                 tokio::time::sleep(Duration::from_secs(6)).await;
-                Ok(())
+                Ok(TopupOutcome::default())
             }
         }
 

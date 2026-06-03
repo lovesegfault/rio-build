@@ -143,6 +143,68 @@ pub trait SupplyTransport: Send + Sync {
     ) -> anyhow::Result<Vec<PathOutcome>>;
 }
 
+/// What one pre-submission top-up actually did for ITS roots' closure —
+/// the delivery evidence the submit loops collapse into
+/// [`crate::run::model::BatchRecord::topup_delivered`]. Returned (never
+/// just logged) so the caller MUST consume it: the proof bit is derived
+/// from per-path delivery truth over the batch's own plan, never from the
+/// call's `Result` shape — `Ok` means "no systemic engine error", while
+/// per-path failure degrades to journal rows (refused/failed/skipped) and
+/// plan-level gaps never error at all, so a breaker-tripped run that
+/// skipped every upload still returns `Ok` with `undelivered > 0`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TopupOutcome {
+    /// Paths this top-up's plan owed an upload (its large + batch items).
+    pub planned: usize,
+    /// Owed paths this invocation delivered (the daemon accepted them).
+    pub delivered: usize,
+    /// Paths NOT proven delivered: settled refused/failed, skipped
+    /// without an attempt (breaker open, or the claim held by another
+    /// request whose settlement is unknown here), or unsourceable at plan
+    /// time (the plan's skipped set — closure paths missing on the target
+    /// that no rung can provide). Owed paths in none of these buckets
+    /// landed through a sibling request's completed claim and need no
+    /// proof from this invocation.
+    pub undelivered: usize,
+}
+
+/// Tri-state collapse of a [`TopupOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopupDelivery {
+    /// Every owed path is accounted for — delivered here, landed through
+    /// a sibling's completed claim, or nothing was owed at all.
+    Complete,
+    /// Some delivered, some not.
+    Partial,
+    /// Something was owed and nothing was delivered by this invocation.
+    Undelivered,
+}
+
+impl TopupOutcome {
+    /// Collapse to the tri-state.
+    pub fn delivery(&self) -> TopupDelivery {
+        match (self.delivered, self.undelivered) {
+            (_, 0) => TopupDelivery::Complete,
+            (0, _) => TopupDelivery::Undelivered,
+            _ => TopupDelivery::Partial,
+        }
+    }
+
+    /// FAIL-CLOSED collapse for the one bool consumer (the batch record's
+    /// `topup_delivered` delivery proof): only [`TopupDelivery::Complete`]
+    /// proves delivery — partial reads as NOT delivered. The inline-resume
+    /// gate consumes the bit one-sidedly (a true bit excuses the batch's
+    /// jobs from the resume refusal forever), so a 5-of-6 top-up with one
+    /// path breaker-skipped must prove nothing: the job that needed the
+    /// sixth path would resume hookless and fail on missing inputs as a
+    /// false parity regression. The cost of the closed direction is only
+    /// an operator marker-delete re-running the supply stage — re-probing,
+    /// never correctness.
+    pub fn proves_delivery(&self) -> bool {
+        matches!(self.delivery(), TopupDelivery::Complete)
+    }
+}
+
 /// Pre-submission supply hook: deliver whatever the given roots' closures
 /// still miss before the request is submitted (the prewarm-miss fallback and
 /// the inline-delivery path). The production implementation is
@@ -150,8 +212,13 @@ pub trait SupplyTransport: Send + Sync {
 /// ladder context.
 #[async_trait]
 pub trait PreSubmitSupply: Send + Sync {
-    /// Top up the target store for the given root derivations.
-    async fn topup(&self, roots: &[String]) -> anyhow::Result<()>;
+    /// Top up the target store for the given root derivations, returning
+    /// the per-path delivery evidence ([`TopupOutcome`]). `Err` is a
+    /// systemic engine failure (probe transport, closure walk, state-dir
+    /// I/O) and proves nothing; `Ok` proves only what the outcome says —
+    /// callers derive delivery proof from
+    /// [`TopupOutcome::proves_delivery`], never from the `Result` shape.
+    async fn topup(&self, roots: &[String]) -> anyhow::Result<TopupOutcome>;
 }
 
 /// Production [`PreSubmitSupply`]: the supply stage's ladder context and
@@ -209,7 +276,7 @@ impl LadderTopup {
 
 #[async_trait]
 impl PreSubmitSupply for LadderTopup {
-    async fn topup(&self, roots: &[String]) -> anyhow::Result<()> {
+    async fn topup(&self, roots: &[String]) -> anyhow::Result<TopupOutcome> {
         topup_for_roots(
             self.transport.as_ref(),
             &self.archive,
@@ -1754,6 +1821,13 @@ pub async fn prefetch_arm(
 /// uploads for the gaps only (claims-deduplicated against concurrent
 /// requests), and push them with the same machinery and vocabulary as the
 /// prewarm pass.
+///
+/// Returns the per-path delivery evidence over THIS call's own plan (the
+/// roots' closure remainder — never campaign-global state): what was
+/// owed, what landed, and what was not proven delivered, including the
+/// paths the planner could not source at all. `Ok` alone proves nothing —
+/// per-path failures degrade to journal rows and a breaker-tripped run
+/// returns `Ok` after journaling every remaining path `skipped`.
 pub async fn topup_for_roots(
     transport: &dyn SupplyTransport,
     archive: &Arc<ReplayArchive>,
@@ -1762,9 +1836,9 @@ pub async fn topup_for_roots(
     knobs: &Knobs,
     state: &StateDir,
     claims: &UploadClaims,
-) -> Result<()> {
+) -> Result<TopupOutcome> {
     if roots.is_empty() {
-        return Ok(());
+        return Ok(TopupOutcome::default());
     }
     // The closure walk reads and parses derivation texts — keep the
     // synchronous work off the async runtime.
@@ -1851,7 +1925,15 @@ pub async fn topup_for_roots(
         );
     }
     if plan.large.is_empty() && plan.batch.is_empty() {
-        return Ok(());
+        // Nothing uploadable — but plan-skipped paths (closure members
+        // missing on the target that no rung can source) are still
+        // undelivered: the affected jobs will dispatch without them, so
+        // this call must not read as a complete delivery.
+        return Ok(TopupOutcome {
+            planned: 0,
+            delivered: 0,
+            undelivered: plan.skipped.len(),
+        });
     }
 
     let breaker = GatewayBreaker::new(knobs.upload_workers.saturating_mul(2).max(6));
@@ -1876,15 +1958,27 @@ pub async fn topup_for_roots(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    // The evidence is scoped to THIS plan: the totals accumulator is
+    // fresh per invocation, so refused/failed/skipped count exactly the
+    // owed paths this call did not prove delivered; plan-skipped paths
+    // (no row is journaled for them) join them. Owed paths in no bucket
+    // landed through a sibling's completed claim.
+    let outcome = TopupOutcome {
+        planned: plan.large.len() + plan.batch.len(),
+        delivered: totals.delivered,
+        undelivered: totals.refused + totals.failed + totals.skipped + plan.skipped.len(),
+    };
     tracing::debug!(
         roots = roots.len(),
+        planned = outcome.planned,
         delivered = totals.delivered,
         refused = totals.refused,
         failed = totals.failed,
         skipped = totals.skipped,
+        plan_skipped = plan.skipped.len(),
         "top-up finished"
     );
-    Ok(())
+    Ok(outcome)
 }
 
 /// Append one bookkeeping-only supply.jsonl line (no batch, no bytes).
@@ -4061,8 +4155,18 @@ mod tests {
 
         // Nothing is valid on the target (the prewarm pass missed the whole
         // closure): the top-up delivers the three derivation texts
-        // (appB → libA → stdenv) and records each as a supply entry.
-        topup.topup(&roots).await.unwrap();
+        // (appB → libA → stdenv) and records each as a supply entry. The
+        // two dependency outputs (libA's, stdenv's) are unsourceable here
+        // (not embedded, no relay narinfo, no coverage) — plan-skipped, so
+        // the returned evidence reads PARTIAL and proves no delivery even
+        // though the call succeeded: the affected job would still dispatch
+        // missing those outputs.
+        let outcome = topup.topup(&roots).await.unwrap();
+        assert_eq!(outcome.planned, 3, "{outcome:?}");
+        assert_eq!(outcome.delivered, 3, "{outcome:?}");
+        assert_eq!(outcome.undelivered, 2, "{outcome:?}");
+        assert_eq!(outcome.delivery(), TopupDelivery::Partial);
+        assert!(!outcome.proves_delivery());
         let uploaded: BTreeSet<String> = fake
             .uploaded_batches
             .lock()
@@ -4086,10 +4190,17 @@ mod tests {
 
         // Everything the first call delivered is remembered by the shared
         // ladder context, so a second top-up for the same roots makes no
-        // further upload calls and appends nothing.
-        topup.topup(&roots).await.unwrap();
+        // further upload calls and appends nothing — but the unsourceable
+        // outputs are still owed, so the evidence still proves nothing.
+        let second = topup.topup(&roots).await.unwrap();
         assert_eq!(fake.upload_calls.load(Ordering::SeqCst), upload_calls);
         assert_eq!(entries(&state).len(), journal.len());
+        assert_eq!(
+            (second.planned, second.delivered, second.undelivered),
+            (0, 0, 2),
+            "{second:?}"
+        );
+        assert!(!second.proves_delivery());
     }
 
     /// A top-up over a target that already has the whole closure makes no
@@ -4117,7 +4228,7 @@ mod tests {
             state.clone(),
         );
 
-        topup
+        let outcome = topup
             .topup(std::slice::from_ref(&app_b.drv_path))
             .await
             .unwrap();
@@ -4127,5 +4238,315 @@ mod tests {
             entries(&state).is_empty(),
             "nothing was missing, so nothing is recorded"
         );
+        // Nothing was owed: a vacuously complete delivery — the proof the
+        // resume gate needs for "this batch's jobs had their gap covered".
+        assert_eq!(outcome, TopupOutcome::default());
+        assert_eq!(outcome.delivery(), TopupDelivery::Complete);
+        assert!(outcome.proves_delivery());
+    }
+
+    /// The top-up's returned delivery evidence, quantified over the
+    /// (delivered × undelivered) ∈ {0, >0}² cross product — every
+    /// [`TopupDelivery`] cell — with each cell produced by the REAL
+    /// producer chain (`topup_for_roots` over the mini archive against a
+    /// scripted transport), never hand-built outcomes:
+    ///
+    /// - (>0, 0) Complete: dependency outputs already valid on the
+    ///   target, drv texts delivered → proves delivery.
+    /// - (>0, >0) Partial: one drv text persistently refused by the
+    ///   daemon, the rest delivered → proves NOTHING (fail-closed — the
+    ///   job needing the refused text dispatches doomed).
+    /// - (0, >0) Undelivered: every upload hard-fails → settled failed
+    ///   rows, zero delivery, and STILL `Ok` — the exact shape that
+    ///   previously minted a false delivery proof from the unit Result.
+    /// - (0, 0) Complete (vacuous): covered by
+    ///   `ladder_topup_makes_no_upload_calls_when_nothing_is_missing`.
+    #[tokio::test]
+    async fn topup_outcome_quantifies_delivery_over_its_own_plan() {
+        // Cell (>0, 0): everything sourceable delivered, dep outputs
+        // already valid on the target.
+        let (_archive_dir, archive, app_b) = mini_archive_app_b();
+        let (_dir, state1) = state();
+        let state1 = Arc::new(state1);
+        let fake = Arc::new(FakeSupplyTransport::default());
+        let closure = walk_closure(&archive, std::slice::from_ref(&app_b.drv_path)).unwrap();
+        let closure_drvs: BTreeSet<String> = closure
+            .topo
+            .iter()
+            .map(|node| node.drv_path.clone())
+            .collect();
+        // Mark every non-drv closure path (the dependency outputs) valid;
+        // the three drv texts stay missing and get uploaded.
+        fake.valid.lock().unwrap().extend(
+            closure
+                .all_paths
+                .iter()
+                .filter(|path| !closure_drvs.contains(*path))
+                .cloned(),
+        );
+        let mut ctx = SupplyContext::new(SupplyDependencies::Substituters);
+        ctx.workload_outputs = app_b.outputs.values().cloned().collect();
+        let topup = LadderTopup::new(
+            fake.clone(),
+            archive.clone(),
+            ctx,
+            Knobs::default(),
+            state1.clone(),
+        );
+        let complete = topup
+            .topup(std::slice::from_ref(&app_b.drv_path))
+            .await
+            .unwrap();
+        assert_eq!(
+            (complete.planned, complete.delivered, complete.undelivered),
+            (3, 3, 0),
+            "{complete:?}"
+        );
+        assert_eq!(complete.delivery(), TopupDelivery::Complete);
+        assert!(complete.proves_delivery());
+
+        // Cell (>0, >0): same geometry, but the daemon persistently
+        // refuses one drv text (both the attempt and the fresh-channel
+        // retry) — a settled refusal among deliveries.
+        let (_archive_dir2, archive2, app_b2) = mini_archive_app_b();
+        let (_dir2, state2) = state();
+        let state2 = Arc::new(state2);
+        let fake2 = Arc::new(FakeSupplyTransport::default());
+        let closure2 = walk_closure(&archive2, std::slice::from_ref(&app_b2.drv_path)).unwrap();
+        let closure_drvs2: BTreeSet<String> = closure2
+            .topo
+            .iter()
+            .map(|node| node.drv_path.clone())
+            .collect();
+        fake2.valid.lock().unwrap().extend(
+            closure2
+                .all_paths
+                .iter()
+                .filter(|path| !closure_drvs2.contains(*path))
+                .cloned(),
+        );
+        fake2
+            .refusals
+            .lock()
+            .unwrap()
+            .insert(app_b2.drv_path.clone(), u32::MAX);
+        let mut ctx2 = SupplyContext::new(SupplyDependencies::Substituters);
+        ctx2.workload_outputs = app_b2.outputs.values().cloned().collect();
+        let topup2 = LadderTopup::new(
+            fake2.clone(),
+            archive2.clone(),
+            ctx2,
+            Knobs {
+                upload_workers: 1,
+                upload_batch_max_entries: 1,
+                ..Knobs::default()
+            },
+            state2.clone(),
+        );
+        let partial = topup2
+            .topup(std::slice::from_ref(&app_b2.drv_path))
+            .await
+            .unwrap();
+        assert_eq!(
+            (partial.planned, partial.delivered, partial.undelivered),
+            (3, 2, 1),
+            "{partial:?}"
+        );
+        assert_eq!(partial.delivery(), TopupDelivery::Partial);
+        assert!(
+            !partial.proves_delivery(),
+            "a partial delivery must read NOT delivered at the bool consumer"
+        );
+        assert_eq!(
+            entry_for(&entries(&state2), &app_b2.drv_path).outcome,
+            SUPPLY_OUTCOME_REFUSED
+        );
+
+        // Cell (0, >0): every upload hard-fails; the call still returns
+        // Ok, with the evidence saying nothing was delivered.
+        let (_archive_dir3, archive3, app_b3) = mini_archive_app_b();
+        let (_dir3, state3) = state();
+        let state3 = Arc::new(state3);
+        let fake3 = Arc::new(FakeSupplyTransport::default());
+        fake3.fail_uploads.store(true, Ordering::SeqCst);
+        let mut ctx3 = SupplyContext::new(SupplyDependencies::Substituters);
+        ctx3.workload_outputs = app_b3.outputs.values().cloned().collect();
+        let topup3 = LadderTopup::new(
+            fake3.clone(),
+            archive3.clone(),
+            ctx3,
+            Knobs {
+                upload_workers: 1,
+                upload_batch_max_entries: 1,
+                ..Knobs::default()
+            },
+            state3.clone(),
+        );
+        let undelivered = topup3
+            .topup(std::slice::from_ref(&app_b3.drv_path))
+            .await
+            .expect("per-path upload failures degrade to journal rows, never to Err");
+        assert_eq!(undelivered.delivered, 0, "{undelivered:?}");
+        assert!(undelivered.undelivered >= 3, "{undelivered:?}");
+        assert_eq!(undelivered.delivery(), TopupDelivery::Undelivered);
+        assert!(
+            !undelivered.proves_delivery(),
+            "an Ok that delivered nothing must prove nothing"
+        );
+    }
+
+    /// The m-composition the inline-resume gate depends on, end to end
+    /// through the REAL producers: a supply stage under inline delivery
+    /// defers every planned upload (deferral rows), then a gateway outage
+    /// during the execute-stage top-up trips the breaker — settled failed
+    /// rows for the attempted paths, a skipped bookkeeping stamp for the
+    /// rest — and the gate's two evidence sources must BOTH survive:
+    ///
+    /// - the returned outcome proves no delivery (the batch record's
+    ///   `topup_delivered` stays false → its jobs keep counting as
+    ///   awaiting their first delivered submission), and
+    /// - the breaker's skipped stamp does NOT displace the deferral
+    ///   evidence ([`SupplyFold::outstanding_inline_deferrals`] keeps the
+    ///   skipped path owed), while the settled failures legitimately
+    ///   clear theirs (the supply rollup retires those dependents
+    ///   instead).
+    ///
+    /// Pre-fix, both sources failed open in this exact geometry: the bare
+    /// Ok minted `topup_delivered: true`, and the raw latest-row fold let
+    /// the skipped stamp erase the deferral.
+    #[tokio::test]
+    async fn breaker_tripped_topup_proves_nothing_and_deferrals_survive() {
+        use crate::run::archive_input::write_mini_wide_archive;
+        use crate::run::model::SupplyFold;
+
+        // Eight INDEPENDENT drv texts: six consecutive transport failures
+        // trip the breaker (threshold max(6, 2×workers) = 6 with one
+        // worker), leaving work behind it to skip-stamp.
+        let archive_dir = tempfile::tempdir().unwrap();
+        let drvs = write_mini_wide_archive(archive_dir.path(), 8);
+        let archive = Arc::new(ReplayArchive::open(archive_dir.path()).unwrap());
+        let roots: Vec<String> = drvs.clone();
+        let (_dir, state) = state();
+        let state = Arc::new(state);
+        let fake = Arc::new(FakeSupplyTransport::default());
+        let knobs = Knobs {
+            upload_workers: 1,
+            upload_batch_max_entries: 1,
+            ..Knobs::default()
+        };
+
+        // Stage 1 (inline supply stage, hermetic embedded-only ladder):
+        // defers every planned upload instead of delivering. Workload
+        // outputs are declared as such (production always does): the
+        // units' own outputs are what the campaign measures, never owed
+        // supply, so they must not count as undelivered plan-skips. The
+        // wide archive's units are independent, so every non-drv closure
+        // path IS a workload output.
+        let workload_closure = walk_closure(&archive, &roots).unwrap();
+        let workload_drv_set: BTreeSet<&str> = workload_closure
+            .topo
+            .iter()
+            .map(|node| node.drv_path.as_str())
+            .collect();
+        let workload_outputs: BTreeSet<String> = workload_closure
+            .all_paths
+            .iter()
+            .filter(|path| !workload_drv_set.contains(path.as_str()))
+            .cloned()
+            .collect();
+        let inputs = SupplyInputs {
+            workload_outputs,
+            workload_drvs: drvs.iter().cloned().collect(),
+            prefetch_paths: BTreeMap::new(),
+            prior_valid: BTreeSet::new(),
+            target_coverage: BTreeSet::new(),
+            archive: Some(archive.clone()),
+            target_substituters: Vec::new(),
+            relay_substituters: Vec::new(),
+            dependencies: SupplyDependencies::EmbeddedOnly,
+            delivery: SupplyDelivery::Inline,
+        };
+        let stage = run_supply_stage(
+            state.clone(),
+            fake.clone(),
+            inputs,
+            &knobs,
+            Arc::new(AtomicU64::new(1)),
+            false,
+        )
+        .await
+        .unwrap();
+        let ladder = stage.ladder.expect("the inline stage builds a ladder");
+        let deferred_before: BTreeSet<String> = {
+            let journal = entries(&state);
+            let owed = SupplyFold::collapse(&journal).outstanding_inline_deferrals();
+            assert_eq!(
+                owed.len(),
+                8,
+                "the inline stage defers every planned drv text: {owed:?}"
+            );
+            owed.iter().map(|path| path.to_string()).collect()
+        };
+
+        // Stage 2 (execute-stage top-up under a gateway outage): every
+        // transport call fails, the breaker trips mid-run.
+        fake.fail_uploads.store(true, Ordering::SeqCst);
+        let topup = LadderTopup::new(fake.clone(), archive.clone(), ladder, knobs, state.clone());
+        let outcome = topup.topup(&roots).await.unwrap();
+        assert_eq!(
+            (outcome.planned, outcome.delivered, outcome.undelivered),
+            (8, 0, 8),
+            "{outcome:?}"
+        );
+        assert!(
+            !outcome.proves_delivery(),
+            "a breaker-tripped run must prove nothing: {outcome:?}"
+        );
+
+        let journal = entries(&state);
+        let skipped: BTreeSet<&str> = journal
+            .iter()
+            .filter(|entry| entry.outcome == SUPPLY_OUTCOME_SKIPPED)
+            .map(|entry| entry.path.as_str())
+            .collect();
+        let failed: BTreeSet<&str> = journal
+            .iter()
+            .filter(|entry| entry.outcome == SUPPLY_OUTCOME_FAILED)
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(
+            failed.len(),
+            6,
+            "six failures latch the breaker: {journal:?}"
+        );
+        assert_eq!(
+            skipped.len(),
+            2,
+            "the tripped breaker skip-stamps the remaining work: {journal:?}"
+        );
+
+        // The displacement law, on producer-built rows: skipped stamps
+        // keep their deferrals owed; settled failures clear theirs.
+        let owed_after: BTreeSet<&str> = SupplyFold::collapse(&journal)
+            .outstanding_inline_deferrals()
+            .into_iter()
+            .collect();
+        for path in &skipped {
+            assert!(
+                deferred_before.contains(*path),
+                "every skipped path here was a deferred upload: {path}"
+            );
+            assert!(
+                owed_after.contains(path),
+                "a breaker skip must not erase the deferral evidence for {path}"
+            );
+        }
+        for path in &failed {
+            assert!(
+                !owed_after.contains(path),
+                "a settled failure redeems the deferral (the rollup retires \
+                 its dependents instead): {path}"
+            );
+        }
     }
 }

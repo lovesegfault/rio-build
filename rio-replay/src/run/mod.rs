@@ -4978,9 +4978,17 @@ mod tests {
             .find(|m| m.job == "appB.x86_64-linux")
             .unwrap()
             .clone();
+        // Both dependency outputs are relayable here: this scenario's
+        // final phase asserts every batch carries a GENUINE delivery
+        // proof, and the proof is the fail-closed collapse of the
+        // top-up's per-path outcome — an unsourceable closure path
+        // (correctly) withholds it, so the happy-path fixture must make
+        // appB's whole closure deliverable.
         let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
+        let (_stdenv_drv, stdenv_out) = app_b_dep(&archive, "-stdenv-");
         let mut narinfos = HashMap::new();
         narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
+        narinfos.insert(stdenv_out.clone(), narinfo_text(&stdenv_out));
         let submitter = Arc::new(KeyedSubmitter::default());
         let supply_transport = Arc::new(FakeSupplyTransport::default());
         let store_dir = tempfile::tempdir().unwrap();

@@ -181,11 +181,13 @@ pub fn pending_wave(
 /// own budget cut — classification reads the bit, never re-derives it.
 ///
 /// `topup_delivered` records whether this batch's pre-submission supply
-/// top-up ran and succeeded; the caller derives it from the top-up call it
-/// made (false when no hook is wired or the top-up failed). It is written
-/// verbatim onto the record — the inline-resume gate reads the bit as the
-/// batch's delivery proof, so bare batch membership never stands in for
-/// delivery.
+/// top-up proved a COMPLETE delivery; the caller derives it from the
+/// top-up's returned per-path outcome (`TopupOutcome::proves_delivery`,
+/// fail-closed: false when no hook is wired, the call failed, or any owed
+/// path went undelivered). It is written verbatim onto the record — the
+/// inline-resume gate reads the bit as the batch's delivery proof, so
+/// neither bare batch membership nor a top-up's bare Ok ever stands in
+/// for delivery.
 ///
 /// A submitter `Err` (ssh/spawn/import failure) is evidence, not a fatal
 /// error: it is recorded on the batch record with no build id and the jobs
@@ -493,13 +495,30 @@ pub async fn run_submit_loop(
             // dispatcher's per-request call: a failure degrades to a
             // warning so a supply hiccup can never wedge the batch — a
             // truly undelivered input surfaces as the unit's build failure
-            // instead. Whether the top-up succeeded is recorded on the
-            // batch (the inline-resume gate's delivery proof): a failed or
-            // absent top-up submits the batch but proves nothing.
+            // instead. The batch's delivery proof (the inline-resume
+            // gate's evidence) is the returned per-path outcome over this
+            // batch's own plan, collapsed FAIL-CLOSED: only a complete
+            // delivery proves — a partial one (paths breaker-skipped,
+            // refused, claim-held, or unsourceable) and an Err alike
+            // submit the batch but prove nothing, because Ok-ness is not
+            // delivery (a breaker-tripped top-up journals every remaining
+            // path skipped and still returns Ok).
             let mut topup_delivered = false;
             if let Some(topup) = &supply_topup {
                 match topup.topup(&batch.root_drvs).await {
-                    Ok(()) => topup_delivered = true,
+                    Ok(outcome) => {
+                        topup_delivered = outcome.proves_delivery();
+                        if !topup_delivered {
+                            tracing::warn!(
+                                batch_id,
+                                planned = outcome.planned,
+                                delivered = outcome.delivered,
+                                undelivered = outcome.undelivered,
+                                "pre-submission supply top-up left paths undelivered; \
+                                 submitting the batch without delivery proof"
+                            );
+                        }
+                    }
                     Err(e) => tracing::warn!(
                         batch_id,
                         error = %format!("{e:#}"),
@@ -544,6 +563,7 @@ mod tests {
     use crate::run::model::{PathOutcome, build_status_name};
     use crate::run::submitter::BatchOutcome;
     use crate::run::submitter::test_support::FakeSubmitter;
+    use crate::run::supply::exec::TopupOutcome;
     use rio_nix::protocol::build::BuildStatus;
 
     /// Wrap a tracker in a fresh ledger (default-knob watchdog) over the
@@ -889,7 +909,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PreSubmitSupply for RecordingTopup {
-        async fn topup(&self, roots: &[String]) -> anyhow::Result<()> {
+        async fn topup(&self, roots: &[String]) -> anyhow::Result<TopupOutcome> {
             let submitted = self.submitter.submitted.lock().unwrap().len();
             self.calls.lock().unwrap().push((roots.to_vec(), submitted));
             anyhow::bail!("scripted top-up failure")
@@ -973,44 +993,81 @@ mod tests {
     }
 
     /// Scripted [`PreSubmitSupply`] whose outcomes pop from a list (front
-    /// first); calls beyond the script succeed.
+    /// first); calls beyond the script report a vacuous complete delivery.
     struct ScriptedTopup {
-        outcomes: std::sync::Mutex<std::collections::VecDeque<anyhow::Result<()>>>,
+        outcomes: std::sync::Mutex<std::collections::VecDeque<anyhow::Result<TopupOutcome>>>,
     }
 
     #[async_trait::async_trait]
     impl PreSubmitSupply for ScriptedTopup {
-        async fn topup(&self, _roots: &[String]) -> anyhow::Result<()> {
-            self.outcomes.lock().unwrap().pop_front().unwrap_or(Ok(()))
+        async fn topup(&self, _roots: &[String]) -> anyhow::Result<TopupOutcome> {
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(TopupOutcome::default()))
         }
     }
 
-    /// The batch record's `topup_delivered` bit is derived at this
-    /// chokepoint from the top-up call the loop actually made — both
-    /// directions: a successful top-up records true (the inline-resume
-    /// gate's delivery proof for the batch's jobs), a failed one records
-    /// false even though the batch is still submitted, and with no hook
-    /// wired every record stays false (bare membership proves nothing).
+    /// The batch record's `topup_delivered` bit is the FAIL-CLOSED
+    /// collapse of the top-up's returned per-path outcome, derived at this
+    /// chokepoint from the call the loop actually made.
+    ///
+    /// Quantification domain: every value the producer can return — the
+    /// full [`TopupDelivery`] tri-state (complete / partial / nothing
+    /// delivered, the latter the breaker-tripped all-skipped shape that
+    /// returns Ok after delivering nothing) plus the `Err` arm — and, in
+    /// the sibling test above, the no-hook case. Only a COMPLETE delivery
+    /// records true; partial is NOT delivered (the gate consumes the bit
+    /// one-sidedly, so a 5-of-6 top-up must prove nothing for the job
+    /// that needed the sixth path), and the Ok-with-zero-delivered shape
+    /// that previously minted a false proof records false. The fixture
+    /// returns producer-typed [`TopupOutcome`] values, so the violating
+    /// state (Ok with undelivered > 0) is expressible — the prior unit
+    /// `Result` fixture could not express it and pinned the flawed
+    /// Ok→true mapping instead of the requirement.
     #[tokio::test]
     async fn submit_loop_records_topup_delivery_proof_per_batch() {
         let dir = tempfile::tempdir().unwrap();
         let state = Arc::new(StateDir::new(dir.path()).unwrap());
         let submitter = Arc::new(FakeSubmitter::default());
-        for _ in 0..2 {
+        for _ in 0..4 {
             submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
                 build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".into()),
                 ..BatchOutcome::default()
             }));
         }
-        // First batch's top-up fails, second succeeds; serial submission
+        // One single-job batch per scripted outcome; serial submission
         // (concurrency 1) keeps the order deterministic.
         let topup = Arc::new(ScriptedTopup {
             outcomes: std::sync::Mutex::new(
-                [Err(anyhow::anyhow!("scripted top-up failure")), Ok(())].into(),
+                [
+                    Err(anyhow::anyhow!("scripted top-up failure")),
+                    // Complete: everything owed was delivered.
+                    Ok(TopupOutcome {
+                        planned: 2,
+                        delivered: 2,
+                        undelivered: 0,
+                    }),
+                    // Partial: one path delivered, one breaker-skipped.
+                    Ok(TopupOutcome {
+                        planned: 2,
+                        delivered: 1,
+                        undelivered: 1,
+                    }),
+                    // Nothing delivered: the breaker-tripped all-skipped
+                    // run — Ok, but zero delivery.
+                    Ok(TopupOutcome {
+                        planned: 2,
+                        delivered: 0,
+                        undelivered: 2,
+                    }),
+                ]
+                .into(),
             ),
         });
         let knobs = Knobs {
-            batch_max_jobs: 2,
+            batch_max_jobs: 1,
             submit_concurrency: 1,
             ..Knobs::default()
         };
@@ -1020,7 +1077,7 @@ mod tests {
             submitter.clone(),
             test_ledger(&state, Arc::new(SubmitTracker::default())),
             Arc::new(PauseState::default()),
-            vec![pj("a", 0), pj("b", 0), pj("c", 0)],
+            vec![pj("a", 0), pj("b", 0), pj("c", 0), pj("d", 0)],
             move || {
                 submitted_view
                     .submitted
@@ -1038,13 +1095,19 @@ mod tests {
         )
         .await
         .unwrap();
-        let records: Vec<BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
+        let mut records: Vec<BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
+        records.sort_by_key(|record| record.batch_id);
         let delivered: Vec<bool> = records.iter().map(|r| r.topup_delivered).collect();
         assert_eq!(
             delivered,
-            vec![false, true],
-            "the bit must mirror each batch's own top-up outcome: {records:?}"
+            vec![false, true, false, false],
+            "Err / complete / partial / nothing-delivered must collapse to \
+             false / true / false / false: {records:?}"
         );
+        // All four batches were still submitted: the proof bit gates the
+        // resume refusal, never the submission itself.
+        assert_eq!(records.len(), 4);
+        assert!(records.iter().all(|r| r.build_id.is_some()), "{records:?}");
     }
 
     /// The permit wait is a staleness window for the terminal set, not just

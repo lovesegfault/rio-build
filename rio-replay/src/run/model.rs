@@ -1243,16 +1243,20 @@ pub struct BatchRecord {
     /// defect this field exists to fix), and they are not re-classified.
     #[serde(default)]
     pub confirmation_attempt: u32,
-    /// True when this batch's pre-submission supply top-up ran and
-    /// returned success before the submission (the inline-delivery
-    /// mechanism, or the prewarm-miss fallback). The inline-resume gate
-    /// reads this as the delivery proof for the batch's jobs: membership
-    /// in a batch submitted WITHOUT a successful top-up — no hook wired in
-    /// that process, or the top-up failed and the batch was submitted
-    /// anyway — proves nothing about the jobs' deferred uploads. Defaults
-    /// to false on records written before the field existed: those
-    /// campaigns re-prove delivery by re-running the supply stage on their
-    /// next inline resume instead of trusting bare batch membership.
+    /// True when this batch's pre-submission supply top-up PROVED a
+    /// complete delivery of everything its plan owed (the inline-delivery
+    /// mechanism, or the prewarm-miss fallback) — the fail-closed
+    /// collapse of the top-up's returned per-path outcome, never the
+    /// call's Ok/Err shape: a top-up that ran, returned Ok, and left
+    /// paths undelivered (breaker-skipped, refused, claim-held, or
+    /// unsourceable) records false, like a failed or absent one. The
+    /// inline-resume gate reads this as the delivery proof for the
+    /// batch's jobs: membership in a batch without the proof tells the
+    /// gate nothing about the jobs' deferred uploads. Defaults to false
+    /// on records written before the field existed; records written
+    /// while the bit was minted from bare Ok-ness may carry a true bit
+    /// no delivery backs — re-running the supply stage (the gate's
+    /// remedy) re-proves delivery either way.
     #[serde(default)]
     pub topup_delivered: bool,
 }
@@ -1273,9 +1277,10 @@ pub struct BatchIntent {
     /// re-confirmation submissions; 0 for every other writer (see
     /// [`BatchRecord::confirmation_attempt`]).
     pub confirmation_attempt: u32,
-    /// The batch's pre-submission supply top-up succeeded (see
-    /// [`BatchRecord::topup_delivered`]). Set by the submit loops from
-    /// the actual top-up outcome immediately before the submission.
+    /// The batch's pre-submission supply top-up proved complete delivery
+    /// (see [`BatchRecord::topup_delivered`]). Set by the submit loops
+    /// from the top-up's returned per-path outcome — its fail-closed
+    /// `proves_delivery()` collapse — immediately before the submission.
     pub topup_delivered: bool,
 }
 
