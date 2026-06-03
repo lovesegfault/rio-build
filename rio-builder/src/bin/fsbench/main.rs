@@ -28,7 +28,7 @@ mod stats;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -46,6 +46,14 @@ const FSBENCH_REV: u32 = 1;
 /// downstream). Cold phases are single-rep by construction — their
 /// uniqueness is consumed by the first read.
 const WARM_REPS: u32 = 3;
+
+/// Settle gap between the cold storm and the first warm rep. The
+/// operator-side metrics sampler ticks every 5s, so a windowed check
+/// whose window opens the instant the previous phase ends inherits up
+/// to one sample interval of that phase's tail traffic. Three sampler
+/// intervals of quiet guarantee a clean boundary sample (in-flight
+/// chunk fetches drain in well under a second once reads stop).
+const PHASE_SETTLE: Duration = Duration::from_secs(15);
 
 #[derive(Parser)]
 #[command(
@@ -122,19 +130,21 @@ fn main() -> Result<()> {
             jq_src.as_deref(),
             &out,
             RANDREAD_IOS,
+            PHASE_SETTLE,
         ),
     }
 }
 
-/// `randread_ios` is a function parameter, not a CLI knob — the
-/// no-knobs rule protects the compare-keyed CLI surface; the CLI
-/// always passes the production [`RANDREAD_IOS`]. The parameter exists
-/// for the phase-coverage unit test: at the production count the full
-/// run is ~half a million psync IOs across the randread phases, which
-/// is fine on tmpfs (where O_DIRECT is unsupported and silently falls
-/// back to page-cache reads) but real disk traffic in the nix build
-/// sandbox — enough to blow the 90s nextest timeout on a loaded
-/// builder.
+/// `randread_ios` and `phase_settle` are function parameters, not CLI
+/// knobs — the no-knobs rule protects the compare-keyed CLI surface;
+/// the CLI always passes the production [`RANDREAD_IOS`] /
+/// [`PHASE_SETTLE`]. The parameters exist for the phase-coverage unit
+/// test: at the production IO count the full run is ~half a million
+/// psync IOs across the randread phases, which is fine on tmpfs (where
+/// O_DIRECT is unsupported and silently falls back to page-cache
+/// reads) but real disk traffic in the nix build sandbox — enough to
+/// blow the 90s nextest timeout on a loaded builder — and the
+/// production settle would add a flat 15s.
 fn run(
     dataset_root: &Path,
     closure: &Path,
@@ -142,6 +152,7 @@ fn run(
     jq_src: Option<&Path>,
     out: &Path,
     randread_ios: u64,
+    phase_settle: Duration,
 ) -> Result<()> {
     let manifest = Manifest::load(dataset_root)?;
     let mut rec = Recorder::default();
@@ -201,6 +212,15 @@ fn run(
         let o = phases::read_storm(dataset_root, &storm_files, true)?;
         rec.end_read_storm(ph, "read_storm_cold", o, true);
     }
+
+    // Settle before the warm reps: the warm-leak honesty window opens
+    // at the first warm rep's start marker, and without a quiet gap
+    // the sampler's boundary sample bills the cold storm's tail
+    // traffic to the warm window (observed: ~45 MiB at the cold rate
+    // vs a 1%-of-dataset threshold — a guaranteed false refusal).
+    // Outside the phase markers on purpose: phase durations must not
+    // absorb it.
+    std::thread::sleep(phase_settle);
 
     // 2. read_storm_warm — passthrough + page cache.
     for rep in 1..=WARM_REPS {
@@ -596,8 +616,18 @@ mod tests {
         // count it does ~500k real psync IOs in the nix build sandbox
         // (the dev shell hides them: $TMPDIR is tmpfs, where O_DIRECT
         // is unsupported and falls back to page cache) and times out
-        // nextest.
-        run(data.path(), data.path(), scratch.path(), None, &outf, 512).unwrap();
+        // nextest. 50ms settle, not PHASE_SETTLE: enough to prove the
+        // gap lands between the markers without a flat 15s test sleep.
+        run(
+            data.path(),
+            data.path(),
+            scratch.path(),
+            None,
+            &outf,
+            512,
+            Duration::from_millis(50),
+        )
+        .unwrap();
 
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&outf).unwrap()).unwrap();
@@ -634,5 +664,26 @@ mod tests {
         for p in raw["phases"].as_array().unwrap() {
             assert!(p["end_epoch_ms"].as_u64() >= p["start_epoch_ms"].as_u64());
         }
+        // The settle gap sits BETWEEN the cold end marker and the
+        // first warm start marker — outside both phase windows. The
+        // warm-leak honesty window opens at warm rep 1's start, so a
+        // settle absorbed into either phase would defeat its purpose.
+        let phases = raw["phases"].as_array().unwrap();
+        let cold_end = phases
+            .iter()
+            .find(|p| p["name"] == "read_storm_cold")
+            .unwrap()["end_epoch_ms"]
+            .as_u64()
+            .unwrap();
+        let warm_start = phases
+            .iter()
+            .find(|p| p["name"] == "read_storm_warm" && p["rep"] == 1)
+            .unwrap()["start_epoch_ms"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            warm_start >= cold_end + 50,
+            "settle gap missing between cold end ({cold_end}) and warm start ({warm_start})"
+        );
     }
 }
