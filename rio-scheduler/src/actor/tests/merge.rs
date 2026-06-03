@@ -7356,7 +7356,7 @@ async fn test_resubmit_poisoned_retry_limit_bound(
 
     // Build #2: resubmit.
     let build2 = Uuid::new_v4();
-    merge_dag(&handle, build2, vec![node], vec![], false).await?;
+    let mut rx2 = merge_dag(&handle, build2, vec![node], vec![], false).await?;
     barrier(&handle).await;
 
     let info = expect_drv(&handle, tag).await;
@@ -7370,6 +7370,28 @@ async fn test_resubmit_poisoned_retry_limit_bound(
         assert_eq!(
             info.retry.count, 0,
             "per-cycle retry budget reset on resubmit"
+        );
+        // The reset lane emits NO failure terminal: the node re-enters
+        // through seeding as a retry, so the merge-time CachedFailure
+        // emission (the at-limit lane) must not fire here.
+        assert_eq!(
+            drain_failed_derivation_events(&mut rx2).len(),
+            0,
+            "an under-limit poison reset is a retry, not a remembered failure"
+        );
+    } else {
+        // The at-limit lane emits the remembered failure to the new
+        // build (CACHED_FAILURE — see actor::tests::keep_going for the
+        // full event-shape assertions).
+        let failed = drain_failed_derivation_events(&mut rx2);
+        assert_eq!(
+            failed.len(),
+            1,
+            "the at-limit lane must emit exactly one remembered-failure terminal"
+        );
+        assert_eq!(
+            failed[0].failure_status(),
+            rio_proto::types::BuildResultStatus::CachedFailure,
         );
     }
     assert_eq!(
@@ -7428,7 +7450,7 @@ async fn test_resubmit_poisoned_at_limit_substitutable(
     // Build #2: resubmit. Single-node → topdown short-circuit doesn't
     // apply; goes through existing_reprobe → check_cached_outputs.
     let build2 = Uuid::new_v4();
-    merge_dag(&handle, build2, vec![node], vec![], false).await?;
+    let mut rx2 = merge_dag(&handle, build2, vec![node], vec![], false).await?;
     if !locally_present {
         settle_substituting(&handle, &[tag]).await;
     }
@@ -7450,6 +7472,14 @@ async fn test_resubmit_poisoned_at_limit_substitutable(
         query_status(&handle, build2).await?.state,
         rio_proto::types::BuildState::Succeeded as i32,
         "build #2 should succeed via re-probe"
+    );
+    // The substitutable/cached lanes pull the at-limit node out of the
+    // pre-existing reconciliation BEFORE its failed arm — no remembered
+    // failure may be emitted for a node that just resolved successfully.
+    assert_eq!(
+        drain_failed_derivation_events(&mut rx2).len(),
+        0,
+        "an at-limit node rescued by re-probe must not emit a failure terminal"
     );
     Ok(())
 }
