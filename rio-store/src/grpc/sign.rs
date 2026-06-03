@@ -430,7 +430,7 @@ mod tests {
     /// (The Some-tenant path IS tested by the integration test at
     /// `tests/grpc/signing.rs`, which has a real PG.)
     fn svc_with_signer() -> StoreServiceImpl {
-        let cluster = crate::signing::Signer::from_seed("test-key-1", &[0x42u8; 32]);
+        let cluster = crate::signing::Signer::from_seed("test-key-1", &[0x42u8; 32]).unwrap();
         // Pool is lazy — never connects since these tests pass tenant_id=None
         // (the cluster-key path in resolve_once skips the DB entirely).
         let pool = PgPool::connect_lazy("postgres://unused").expect("lazy pool never connects");
@@ -543,7 +543,7 @@ mod tests {
 
         // Seed a path with a signature from key K.
         let seed_k = [0x77u8; 32];
-        let signer_k = Signer::from_seed("key-K", &seed_k);
+        let signer_k = Signer::from_seed("key-K", &seed_k).unwrap();
         let pk_k = ed25519_dalek::SigningKey::from_bytes(&seed_k).verifying_key();
         let trusted_k = format!(
             "key-K:{}",
@@ -759,7 +759,7 @@ mod tests {
         let sub = Arc::new(Substituter::new(db.pool.clone(), None));
         // Signer present (cluster key DIFFERENT from tenant key — proves
         // it's the tenant_keys union doing the work, not cluster).
-        let cluster = Signer::from_seed("rio-cluster", &[0xCCu8; 32]);
+        let cluster = Signer::from_seed("rio-cluster", &[0xCCu8; 32]).unwrap();
         let ts = TenantSigner::new(cluster, db.pool.clone());
         let svc = StoreServiceImpl::new(db.pool.clone())
             .with_substituter(sub)
@@ -777,7 +777,7 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        let tenant_signer = Signer::from_seed("tenant-own-key-1", &tenant_seed);
+        let tenant_signer = Signer::from_seed("tenant-own-key-1", &tenant_seed).unwrap();
 
         // Path signed ONLY by the tenant key (no cluster sig, no
         // upstream sig). Zero path_tenants rows.
@@ -929,7 +929,7 @@ mod tests {
         let tid_c = seed_tenant(&db.pool, "batch-c").await;
 
         let seed_k = [0x77u8; 32];
-        let signer_k = Signer::from_seed("key-K", &seed_k);
+        let signer_k = Signer::from_seed("key-K", &seed_k).unwrap();
         let trusted_k = signer_k.trusted_key_entry();
         metadata::upstreams::insert(
             &db.pool,
@@ -1031,12 +1031,12 @@ mod tests {
 
         // — Cluster key A: the OLD key. Sign the path with this. —
         let seed_a = [0xAAu8; 32];
-        let cluster_a = Signer::from_seed("rio-cluster-1", &seed_a);
+        let cluster_a = Signer::from_seed("rio-cluster-1", &seed_a).unwrap();
         let entry_a = cluster_a.trusted_key_entry();
 
         // — Cluster key B: the NEW key. Active Signer post-rotation. —
         let seed_b = [0xBBu8; 32];
-        let cluster_b = Signer::from_seed("rio-cluster-2", &seed_b);
+        let cluster_b = Signer::from_seed("rio-cluster-2", &seed_b).unwrap();
 
         assert_ne!(seed_a, seed_b, "precondition: distinct keys");
         assert_ne!(
@@ -1121,8 +1121,10 @@ mod tests {
         // — Negative control: same rotation WITHOUT prior_cluster →
         //   path goes dark. Proves the test isn't passing for the
         //   wrong reason (e.g. some other bypass). —
-        let ts_no_history =
-            TenantSigner::new(Signer::from_seed("rio-cluster-2", &seed_b), db.pool.clone());
+        let ts_no_history = TenantSigner::new(
+            Signer::from_seed("rio-cluster-2", &seed_b).unwrap(),
+            db.pool.clone(),
+        );
         let svc_no_history = StoreServiceImpl::new(db.pool.clone())
             .with_substituter(sub)
             .with_signer(ts_no_history);

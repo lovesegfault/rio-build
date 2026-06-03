@@ -1784,7 +1784,7 @@ mod tests {
         use base64::Engine;
 
         let seed = [0x42u8; 32];
-        let signer = Signer::from_seed(key_name, &seed);
+        let signer = Signer::from_seed(key_name, &seed).unwrap();
         let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
         let trusted_key = format!(
             "{key_name}:{}",
@@ -1881,7 +1881,7 @@ mod tests {
         use base64::Engine;
 
         let seed = [0x42u8; 32];
-        let signer = Signer::from_seed(key_name, &seed);
+        let signer = Signer::from_seed(key_name, &seed).unwrap();
         let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
         let trusted_key = format!(
             "{key_name}:{}",
@@ -2394,7 +2394,7 @@ mod tests {
 
         // Signer with a distinct key name so we can tell upstream vs
         // rio sigs apart.
-        let cluster = Signer::from_seed("rio-cluster-1", &[0x99u8; 32]);
+        let cluster = Signer::from_seed("rio-cluster-1", &[0x99u8; 32]).unwrap();
         let ts = Arc::new(TenantSigner::new(cluster, db.pool.clone()));
         let sub = test_substituter(db.pool.clone()).with_signer(ts);
 
@@ -2432,7 +2432,7 @@ mod tests {
         .await
         .unwrap();
 
-        let cluster = Signer::from_seed("rio-cluster-2", &[0x88u8; 32]);
+        let cluster = Signer::from_seed("rio-cluster-2", &[0x88u8; 32]).unwrap();
         let ts = Arc::new(TenantSigner::new(cluster, db.pool.clone()));
         let sub = test_substituter(db.pool.clone()).with_signer(ts);
 
@@ -3809,7 +3809,7 @@ mod tests {
         use base64::Engine;
 
         let seed = [0x42u8; 32];
-        let signer = Signer::from_seed(key_name, &seed);
+        let signer = Signer::from_seed(key_name, &seed).unwrap();
         let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
         let trusted_key = format!(
             "{key_name}:{}",
@@ -3946,7 +3946,7 @@ mod tests {
         nar_size_override: Option<u64>,
     ) -> String {
         let seed = [0x42u8; 32];
-        let signer = Signer::from_seed(key_name, &seed);
+        let signer = Signer::from_seed(key_name, &seed).unwrap();
         let nar_hash: [u8; 32] = sha2::Sha256::digest(nar).into();
         let nar_hash_str = format!(
             "sha256:{}",
@@ -4686,7 +4686,7 @@ mod tests {
         .await
         .unwrap();
         let cluster_seed = [0x77u8; 32];
-        let cluster = Signer::from_seed("rio-ac-1", &cluster_seed);
+        let cluster = Signer::from_seed("rio-ac-1", &cluster_seed).unwrap();
         let ts = Arc::new(TenantSigner::new(cluster, db.pool.clone()));
         let sub_b = test_substituter(db.pool.clone()).with_signer(ts);
 

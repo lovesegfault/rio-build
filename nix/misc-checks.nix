@@ -1721,4 +1721,98 @@ in
         [ "$fail" = 0 ] || exit 1
         touch $out
       '';
+
+  # Migration-completeness conformance for the signing_keyfmt codec
+  # (round-17 RC17-11, bet consequence: adoption-incomplete ⇒ every
+  # owner chokepoint gains a CI artifact that makes the NEXT missed
+  # sibling a build failure, not a review hope).
+  #
+  # The codec owns the `name:base64` key-entry byte contract. Every
+  # raw base64 use in the registered key-handling files is
+  # count-pinned with a reason; a NEW site (hand-rolled parser or
+  # encoder) drifts a count and fails this check, naming the
+  # remediation. Signature bytes (sign/verify loops) are a different
+  # byte contract and stay raw — they are part of each file's pinned
+  # count, classified in the reason column.
+  single-source-conformance =
+    pkgs.runCommand "rio-single-source-conformance"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            ../rio-common/src/signing_keyfmt.rs
+            ../rio-store/src/signing.rs
+            ../rio-store/src/grpc/admin.rs
+            ../rio-store/src/grpc/sign.rs
+            ../rio-store/src/metadata/tenant_keys.rs
+            ../rio-store/src/metadata/cluster_key_history.rs
+            ../rio-store/src/substitute.rs
+            ../rio-cli/src/keygen.rs
+            ../nix/bootstrap-job.sh
+          ];
+        };
+      }
+      ''
+        cd $src
+        fail=0
+
+        # ── Key-material base64 deny-table ──────────────────────────
+        # file : expected `general_purpose::STANDARD` count : reason
+        # Production key-entry parse/encode lives ONLY in the codec;
+        # every other pinned site is signature-byte handling or a
+        # test fixture (deliberately hand-built adversarial entries).
+        check_count() {
+          file=$1; expected=$2; reason=$3
+          actual=$(grep -c 'general_purpose::STANDARD' "$file" || true)
+          if [ "$actual" != "$expected" ]; then
+            echo "FAIL: $file has $actual raw base64 sites, pinned $expected ($reason)." >&2
+            echo "  A new raw base64 use of KEY-ENTRY material must route through" >&2
+            echo "  rio_common::signing_keyfmt (SecretEntry/PublicEntry parse/encode/from_parts)." >&2
+            echo "  Signature-byte or test-fixture sites: re-pin the count here WITH the reason." >&2
+            fail=1
+          fi
+        }
+        check_count rio-common/src/signing_keyfmt.rs 5 \
+          "the OWNER: 2 production decode (secret/public parse), 2 canonical encode, 1 test helper"
+        check_count rio-store/src/signing.rs 14 \
+          "2 production SIGNATURE encode/decode (sign(), any_sig_trusted) + 12 test fixtures"
+        check_count rio-store/src/grpc/admin.rs 2 \
+          "2 test fixtures (valid/short pubkey payloads); the write gate parses via PublicEntry"
+        check_count rio-store/src/grpc/sign.rs 1 \
+          "1 test fixture (hand-built trusted entry)"
+        check_count rio-store/src/metadata/tenant_keys.rs 1 \
+          "1 test SIGNATURE decode; production entries via Signer::trusted_key_entry -> codec"
+        check_count rio-store/src/metadata/cluster_key_history.rs 0 \
+          "passes DB strings through; parse happens at the read gate via the codec"
+        check_count rio-store/src/substitute.rs 4 \
+          "3 test trusted-entry fixtures + 1 test SIGNATURE decode"
+        check_count rio-cli/src/keygen.rs 3 \
+          "3 test fixtures verifying codec output; production writes via SecretEntry/PublicEntry encode"
+
+        # ── Hand-rolled derive deny ─────────────────────────────────
+        # The bug_023 shape (byte-window slicing of decoded key
+        # material) must never reappear in the bootstrap script: key
+        # bytes are only touched by `rio-cli keygen`. Comments may
+        # mention it as history; strip them first.
+        if sed 's/[[:space:]]*#.*//' nix/bootstrap-job.sh | grep -qE 'base64|tail -c'; then
+          echo "FAIL: nix/bootstrap-job.sh performs raw key-byte operations (base64/tail)." >&2
+          echo "  All key-byte work goes through 'rio-cli keygen' (the signing_keyfmt codec)." >&2
+          fail=1
+        fi
+
+        # ── Owner-file self-test ────────────────────────────────────
+        # Prove the grep pattern still matches reality: the owner must
+        # contain the canonical constructors this check's remediation
+        # names. If a refactor renames them, this check must be
+        # updated alongside (not silently weakened).
+        for sym in 'fn parse' 'fn from_parts' 'fn from_seed' 'fn derive_pub' 'fn encode' 'validate_key_name'; do
+          grep -q "$sym" rio-common/src/signing_keyfmt.rs || {
+            echo "FAIL: signing_keyfmt.rs lost '$sym' — update single-source-conformance with the rename." >&2
+            fail=1
+          }
+        done
+
+        [ "$fail" = 0 ] || exit 1
+        touch $out
+      '';
 }

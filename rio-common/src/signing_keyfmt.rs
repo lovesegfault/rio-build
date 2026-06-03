@@ -332,6 +332,24 @@ pub struct PublicEntry {
 }
 
 impl PublicEntry {
+    /// Construct from already-separated parts (a key name and 32
+    /// public-key bytes), applying the SAME validation as
+    /// [`PublicEntry::parse`]: name framing rules and the curve-point
+    /// check. The encode-side twin of `parse` — producers that hold
+    /// `(name, bytes)` (e.g. a `Signer`'s derived verifying key, a DB
+    /// row) route through here instead of hand-formatting
+    /// `"{name}:{base64}"`, so a malformed name or a non-point payload
+    /// can no longer be ENCODED, only refused.
+    pub fn from_parts(name: &str, pubkey: &[u8; SEED_LEN]) -> Result<Self, KeyFmtError> {
+        validate_key_name(name)?;
+        ed25519_dalek::VerifyingKey::from_bytes(pubkey)
+            .map_err(|_| KeyFmtError::InvalidCurvePoint)?;
+        Ok(Self {
+            name: name.to_string(),
+            pubkey: *pubkey,
+        })
+    }
+
     /// Parse a public entry, validating base64, length, and that the
     /// bytes form a valid ed25519 curve point.
     pub fn parse(entry: &str) -> Result<Self, KeyFmtError> {

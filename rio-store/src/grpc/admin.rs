@@ -654,28 +654,20 @@ fn parse_tenant_id(s: &str) -> Result<uuid::Uuid, Status> {
     uuid::Uuid::parse_str(s).status_invalid(&format!("invalid tenant_id {s:?}"))
 }
 
-/// Validate a `name:base64(pubkey)` trusted-key entry. Rejects
-/// unparseable base64 and wrong-length pubkeys (ed25519 is 32 bytes).
+/// Validate a `name:base64(pubkey)` trusted-key entry through the
+/// signing_keyfmt codec — the same parser the READ gate
+/// (`signing::parse_trusted_key_entry` → `any_sig_trusted`) uses, so
+/// the write gate can no longer accept an entry the read gate skips.
+/// This closes the previous divergence: the hand-rolled check here
+/// validated base64 + length but NOT the curve point, so a 32-byte
+/// non-point payload was accepted at write and then silently dropped
+/// from the trust set at every verify (an upstream that "has keys"
+/// but trusts nothing). Echoing the entry in the Status is fine —
+/// it is public key material by definition.
 fn validate_trusted_key(k: &str) -> Result<(), Status> {
-    let (name, b64) = k.split_once(':').ok_or_else(|| {
-        Status::invalid_argument(format!("trusted_key {k:?}: missing ':' separator"))
-    })?;
-    if name.is_empty() {
-        return Err(Status::invalid_argument(format!(
-            "trusted_key {k:?}: empty key name"
-        )));
-    }
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .status_invalid(&format!("trusted_key {k:?}: bad base64"))?;
-    if bytes.len() != 32 {
-        return Err(Status::invalid_argument(format!(
-            "trusted_key {k:?}: pubkey must be 32 bytes (ed25519), got {}",
-            bytes.len()
-        )));
-    }
-    Ok(())
+    rio_common::signing_keyfmt::PublicEntry::parse(k)
+        .map(|_| ())
+        .map_err(|e| Status::invalid_argument(format!("trusted_key {k:?}: {e}")))
 }
 
 fn upstream_to_proto(u: metadata::Upstream) -> UpstreamInfo {
