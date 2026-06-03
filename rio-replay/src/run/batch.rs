@@ -19,11 +19,85 @@ pub struct PendingJob {
     pub dep_drvs: Vec<String>,
 }
 
+/// One submission root: the target drv plus the output selection the wire
+/// demand string is formatted from at the submission chokepoint
+/// ([`derived_path`](Self::derived_path)). Carrying the selection ON the
+/// root — instead of in a parallel vector or a projection the dispatcher
+/// re-derives — makes "root submitted without its recorded selection"
+/// unrepresentable: every producer that names a root decides its outputs in
+/// the same expression.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchRoot {
+    /// Store path of the root derivation.
+    pub drv: String,
+    /// Recorded output names; `[]` and `["*"]` both mean every output.
+    /// ARCHIVE-controlled (recorded request input, possibly foreign or
+    /// corrupt — neither the v1 schema nor the v0 shim validates names),
+    /// so the wire formatting clamps rather than trusting it; see
+    /// [`derived_path`](Self::derived_path). Workload producers (the
+    /// assembler's units, canary probes) have no recorded selection and
+    /// leave this empty.
+    pub outputs: Vec<String>,
+}
+
+impl BatchRoot {
+    /// `"<drv>!out1,out2"` / `"<drv>!*"` formatting for
+    /// `BuildPathsWithResults` — the engine side of the wire grammar the
+    /// gateway parses with [`rio_nix::protocol::derived_path::DerivedPath::parse`].
+    ///
+    /// `outputs` is ARCHIVE-controlled, and the parser REJECTS shapes a raw
+    /// join could emit — duplicate names (`DuplicateOutputName`), empty
+    /// names (`EmptyOutputName`), more than
+    /// [`MAX_OUTPUT_NAMES`](rio_nix::protocol::derived_path::MAX_OUTPUT_NAMES)
+    /// names (`TooManyOutputs`) — turning the whole root into an
+    /// `InputRejected` failure. It also treats `*` as "all outputs" only
+    /// when `*` is the ENTIRE spec; a `*` mixed among names parses as a
+    /// literal output name no derivation declares. So the recorded
+    /// selection is normalized here, at the one formatting site:
+    ///
+    /// - `[]` and any list containing `*` format as `!*` — the recording
+    ///   asked for everything, and `*` saturates exactly like the
+    ///   gateway's own demand union (all ∪ X = all).
+    /// - Duplicates collapse to the first occurrence: repeats are
+    ///   unambiguous about intent, and the parser rejects them verbatim.
+    /// - A wire-inexpressible member (empty, or containing the `,`
+    ///   separator) collapses the WHOLE selection to `!*`: the recorded
+    ///   selection is corrupt evidence, and the all-outputs demand — the
+    ///   pre-threading posture for every root — over-asks rather than
+    ///   guessing a narrower set or getting the root wire-rejected.
+    /// - More than `MAX_OUTPUT_NAMES` distinct names cannot be expressed
+    ///   in one demand string; same widest-demand fallback.
+    ///
+    /// CLAMPED, not dropped, for the same reason `recorded_request_from`
+    /// clamps corrupt offsets: a request is workload — it must still
+    /// submit — and `!*` is the unique fallback that never under-asks
+    /// relative to the recording.
+    pub fn derived_path(&self) -> String {
+        use rio_nix::protocol::derived_path::MAX_OUTPUT_NAMES;
+        let mut names: Vec<&str> = Vec::with_capacity(self.outputs.len());
+        for name in &self.outputs {
+            if name == "*" {
+                return format!("{}!*", self.drv);
+            }
+            if name.is_empty() || name.contains(',') {
+                return format!("{}!*", self.drv);
+            }
+            if !names.contains(&name.as_str()) {
+                names.push(name);
+            }
+        }
+        if names.is_empty() || names.len() > MAX_OUTPUT_NAMES {
+            return format!("{}!*", self.drv);
+        }
+        format!("{}!{}", self.drv, names.join(","))
+    }
+}
+
 /// One assembled batch.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Batch {
     pub jobs: Vec<String>,
-    pub root_drvs: Vec<String>,
+    pub roots: Vec<BatchRoot>,
     /// The PRODUCER's a-priori merged-DAG node estimate. For batches from
     /// [`assemble_batches`] this is the exact union of {target drv} ∪ dep
     /// drvs over the batch — the quantity the packing caps act on; the
@@ -36,6 +110,17 @@ pub struct Batch {
     /// producer can under-key the belt. The construction-site enumeration
     /// test below pins every literal producer.
     pub est_nodes: usize,
+}
+
+impl Batch {
+    /// The bare root drv paths, in submission order — the projection the
+    /// drv-closure import, the supply top-up, the positional result
+    /// mapping, and the batches.jsonl record key on (results are always
+    /// drv-keyed; only the wire demand string carries the output
+    /// selection).
+    pub fn root_drv_paths(&self) -> Vec<String> {
+        self.roots.iter().map(|root| root.drv.clone()).collect()
+    }
 }
 
 /// Greedy accumulation in input order, capped on both job count and the
@@ -74,7 +159,12 @@ pub fn assemble_batches(jobs: &[PendingJob], max_jobs: usize, max_nodes: usize) 
         }
         union.extend(added);
         current.jobs.push(job.job.clone());
-        current.root_drvs.push(job.drv_path.clone());
+        // Workload units carry no recorded per-target output selection —
+        // empty formats as the all-outputs demand (`!*`).
+        current.roots.push(BatchRoot {
+            drv: job.drv_path.clone(),
+            outputs: Vec::new(),
+        });
     }
     if !current.jobs.is_empty() {
         current.est_nodes = union.len();
@@ -155,6 +245,128 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// The assembler is a producer of the demand-string vocabulary like
+    /// the timed dispatcher: its workload units carry no recorded
+    /// per-target output selection, so every root it emits formats as the
+    /// all-outputs demand — the absent-subset side of the wire contract.
+    #[test]
+    fn assembler_roots_demand_all_outputs() {
+        let jobs: Vec<PendingJob> = (0..3).map(|i| job(&format!("j{i}"), 1)).collect();
+        let batches = assemble_batches(&jobs, 50, 1_000);
+        let roots: Vec<&BatchRoot> = batches.iter().flat_map(|b| &b.roots).collect();
+        assert_eq!(roots.len(), 3);
+        for root in roots {
+            assert!(root.outputs.is_empty());
+            assert_eq!(root.derived_path(), format!("{}!*", root.drv));
+        }
+    }
+
+    /// Wire-grammar conformance of the demand-string formatter against the
+    /// REAL parser the gateway runs on every received derived path
+    /// (`DerivedPath::parse` — `rio-gateway/src/handler/build.rs` calls it
+    /// verbatim on each `wopBuildPathsWithResults` entry, and a parse
+    /// failure turns the root into an `InputRejected` result).
+    ///
+    /// Quantification domain: the recorded-outputs value class is
+    /// ARCHIVE-controlled with no validation at the v1 schema, the v0
+    /// shim, or the schedule conversion — so the corpus enumerates the
+    /// honest shapes (absent / `["*"]` / explicit subset, the SR-mandated
+    /// rows on both sides of the "has recorded subset" condition) AND
+    /// every parser-rejection class a corrupt recording can trigger
+    /// (duplicates, empty name, separator-in-name, over-cap) plus the
+    /// `*`-among-names shape the parser ACCEPTS with the wrong meaning.
+    ///
+    /// Each corrupt row asserts clamp-vs-scale explicitly, two-directional:
+    /// the formatter's output is the documented clamp AND the naive join
+    /// it replaces is rejected (or mis-parsed, for the two accept-but-wrong
+    /// shapes) by the same parser — proving the normalization is
+    /// load-bearing, not decorative.
+    #[test]
+    fn derived_path_conforms_to_the_gateway_parser() {
+        use rio_nix::protocol::derived_path::{
+            DerivedPath, DerivedPathError, MAX_OUTPUT_NAMES, OutputSpec,
+        };
+
+        let drv = format!("/nix/store/{:0>32}-multi-1.0.drv", 7);
+        let root = |outputs: &[&str]| BatchRoot {
+            drv: drv.clone(),
+            outputs: outputs.iter().map(|s| s.to_string()).collect(),
+        };
+        // The unnormalized join `derived_path` replaces — what reaching
+        // the wire raw would have produced for the same recorded list.
+        let naive = |outputs: &[&str]| format!("{drv}!{}", outputs.join(","));
+        let parsed_spec = |s: &str| match DerivedPath::parse(s) {
+            Ok(DerivedPath::Built { outputs, .. }) => outputs,
+            other => panic!("expected a Built derived path for {s:?}, got {other:?}"),
+        };
+        let names = |list: &[&str]| OutputSpec::Names(list.iter().map(|s| s.to_string()).collect());
+
+        // ── Honest shapes: format exactly, parse back to the selection ──
+        // Absent subset (workload producers) and the recorded all-outputs
+        // spelling: the all-outputs demand.
+        for all in [&[] as &[&str], &["*"]] {
+            let formatted = root(all).derived_path();
+            assert_eq!(formatted, format!("{drv}!*"));
+            assert_eq!(parsed_spec(&formatted), OutputSpec::All);
+        }
+        // Recorded subsets: exact demand, recorded order preserved.
+        for subset in [&["out"] as &[&str], &["out", "dev"], &["dev", "out"]] {
+            let formatted = root(subset).derived_path();
+            assert_eq!(formatted, format!("{drv}!{}", subset.join(",")));
+            assert_eq!(parsed_spec(&formatted), names(subset));
+        }
+
+        // ── `*` among names: parser ACCEPTS the naive string but as a
+        // literal output name no derivation declares (only a whole-spec
+        // `*` means "all"); the formatter saturates to all-outputs, the
+        // gateway's own demand-union semantics (all ∪ X = all).
+        let formatted = root(&["out", "*"]).derived_path();
+        assert_eq!(formatted, format!("{drv}!*"));
+        assert_eq!(parsed_spec(&formatted), OutputSpec::All);
+        assert_eq!(parsed_spec(&naive(&["out", "*"])), names(&["out", "*"]));
+
+        // ── Duplicates: unambiguous intent, deduped to first occurrence;
+        // the naive string is parser-REJECTED.
+        let formatted = root(&["out", "out", "dev", "out"]).derived_path();
+        assert_eq!(formatted, format!("{drv}!out,dev"));
+        assert_eq!(parsed_spec(&formatted), names(&["out", "dev"]));
+        assert!(matches!(
+            DerivedPath::parse(&naive(&["out", "out"])),
+            Err(DerivedPathError::DuplicateOutputName)
+        ));
+
+        // ── Wire-inexpressible members clamp the WHOLE selection to the
+        // widest demand (never under-ask on corrupt evidence, never get
+        // the root wire-rejected). Empty name: naive string REJECTED.
+        let formatted = root(&["out", ""]).derived_path();
+        assert_eq!(formatted, format!("{drv}!*"));
+        assert!(matches!(
+            DerivedPath::parse(&naive(&["out", ""])),
+            Err(DerivedPathError::EmptyOutputName)
+        ));
+        // Separator inside a recorded name: the naive string PARSES but as
+        // two names the recording never listed.
+        let formatted = root(&["a,b"]).derived_path();
+        assert_eq!(formatted, format!("{drv}!*"));
+        assert_eq!(parsed_spec(&naive(&["a,b"])), names(&["a", "b"]));
+
+        // ── Over the parser's name cap: clamped to all-outputs; one more
+        // distinct name than the cap is naive-REJECTED. At the cap
+        // exactly, no clamp: the full subset formats and parses.
+        let over: Vec<String> = (0..=MAX_OUTPUT_NAMES).map(|i| format!("o{i}")).collect();
+        let over_refs: Vec<&str> = over.iter().map(String::as_str).collect();
+        let formatted = root(&over_refs).derived_path();
+        assert_eq!(formatted, format!("{drv}!*"));
+        assert!(matches!(
+            DerivedPath::parse(&naive(&over_refs)),
+            Err(DerivedPathError::TooManyOutputs(n)) if n == MAX_OUTPUT_NAMES + 1
+        ));
+        let at_cap_refs = &over_refs[..MAX_OUTPUT_NAMES];
+        let formatted = root(at_cap_refs).derived_path();
+        assert_eq!(formatted, naive(at_cap_refs));
+        assert_eq!(parsed_spec(&formatted), names(at_cap_refs));
+    }
+
     /// Standing enumeration of [`Batch`] est_nodes producers: every `.rs`
     /// file in the crate is scanned for literal `Batch` constructions —
     /// the universe is a directory walk at test time
@@ -176,7 +388,9 @@ mod tests {
     /// estimates) reviewed whenever a construction site appears.
     ///
     /// The audited production sites:
-    ///  1. src/run/batch.rs — the struct declaration itself;
+    ///  1. src/run/batch.rs — the struct declaration itself, plus the
+    ///     `impl Batch` block header (the needle is a plain substring
+    ///     match; the impl block constructs nothing);
     ///  2. src/run/timeline.rs — the timed dispatcher's initial-dispatch
     ///     construction (roots-only floor; no adjacency data exists for
     ///     recorded request targets);
@@ -184,16 +398,17 @@ mod tests {
     ///     floor, same rationale).
     ///
     /// Test-zone occurrences are fixtures: submitter.rs scripted batches
-    /// (incl. the under-/over-keyed chokepoint fixtures), submit.rs
+    /// (incl. the under-/over-keyed chokepoint fixtures and the
+    /// recorded-output-selection wire-conformance rows), submit.rs
     /// chokepoint records, mod.rs stage harnesses.
     #[test]
     fn batch_construction_sites_are_enumerated() {
         // Built at runtime so this test's own strings cannot match it.
         let needle = format!("{}{}", "Batch ", "{");
         let allowed: std::collections::BTreeMap<&str, (usize, usize)> = [
-            ("src/run/batch.rs", (1, 0)),
+            ("src/run/batch.rs", (2, 0)),
             ("src/run/timeline.rs", (2, 0)),
-            ("src/run/submitter.rs", (0, 4)),
+            ("src/run/submitter.rs", (0, 6)),
             ("src/run/submit.rs", (0, 3)),
             ("src/run/mod.rs", (0, 2)),
         ]

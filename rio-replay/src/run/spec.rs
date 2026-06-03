@@ -1340,25 +1340,25 @@ mod tests {
 
         let one_root_corner_seen = corner_batches
             .iter()
-            .any(|batch| batch.root_drvs.len() == 1 && batch.est_nodes >= knobs.batch_max_nodes);
+            .any(|batch| batch.roots.len() == 1 && batch.est_nodes >= knobs.batch_max_nodes);
         assert!(
             one_root_corner_seen,
             "corner enumeration must include the min-roots/max-nodes shape; got {:?}",
             corner_batches
                 .iter()
-                .map(|b| (b.root_drvs.len(), b.est_nodes))
+                .map(|b| (b.roots.len(), b.est_nodes))
                 .collect::<Vec<_>>()
         );
 
         for batch in &corner_batches {
             let healthy_volume = batch.est_nodes * LOG_LINES_PER_CLOSURE_NODE;
-            let budget = stderr_budget_for_workload(batch.root_drvs.len(), batch.est_nodes);
+            let budget = stderr_budget_for_workload(batch.roots.len(), batch.est_nodes);
             assert!(
                 budget >= healthy_volume,
                 "a legal batch shape ({} roots × {} nodes; {healthy_volume} healthy lines) \
                  would trip the drain budget ({budget}) — healthy log-heavy batches must never \
                  be cut off mid-DAG",
-                batch.root_drvs.len(),
+                batch.roots.len(),
                 batch.est_nodes,
             );
         }

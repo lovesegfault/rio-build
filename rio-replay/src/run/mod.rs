@@ -4636,7 +4636,7 @@ mod tests {
                 .outcomes
                 .lock()
                 .unwrap()
-                .get(&batch.root_drvs[0])
+                .get(&batch.roots[0].drv)
                 .cloned()
                 .unwrap_or_default())
         }
@@ -7736,7 +7736,13 @@ mod tests {
         let submit = |batch_id: u64, kind: &'static str, jobs: Vec<&str>, deadline, drvs| {
             let batch = batch::Batch {
                 jobs: jobs.iter().map(|j| (*j).to_string()).collect(),
-                root_drvs: jobs.iter().map(|j| drv(j)).collect(),
+                roots: jobs
+                    .iter()
+                    .map(|j| batch::BatchRoot {
+                        drv: drv(j),
+                        outputs: Vec::new(),
+                    })
+                    .collect(),
                 est_nodes: jobs.len(),
             };
             submit_one_batch(
@@ -7948,7 +7954,10 @@ mod tests {
                     batch_id,
                     batch::Batch {
                         jobs: vec![job.to_string()],
-                        root_drvs: vec![drv],
+                        roots: vec![batch::BatchRoot {
+                            drv,
+                            outputs: Vec::new(),
+                        }],
                         est_nodes: 1,
                     },
                     submitter::BatchDeadline::Build(

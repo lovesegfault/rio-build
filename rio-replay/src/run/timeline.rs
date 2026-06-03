@@ -48,7 +48,7 @@ use tokio::task::JoinSet;
 
 use crate::archive::reader::ReplayArchive;
 
-use super::batch::Batch;
+use super::batch::{Batch, BatchRoot};
 use super::ledger::JobLedger;
 use super::model::{
     BATCH_KIND_TIMED, BatchIntent, BatchRecord, DispatchEntry, build_status_from_name, now_rfc3339,
@@ -334,16 +334,6 @@ pub fn build_timeout_for(
             Duration::from_secs_f64(capped).max(floor)
         }
         _ => floor,
-    }
-}
-
-/// `"<drv>!out1,out2"` / `"<drv>!*"` formatting for `BuildPathsWithResults`:
-/// `[]` and `["*"]` both mean every output.
-pub fn format_derived(drv: &str, outputs: &[String]) -> String {
-    if outputs.is_empty() || (outputs.len() == 1 && outputs[0] == "*") {
-        format!("{drv}!*")
-    } else {
-        format!("{drv}!{}", outputs.join(","))
     }
 }
 
@@ -1143,9 +1133,20 @@ async fn dispatch_one_request(
         // roots-only floor, recorded as such on the batch record. The
         // stderr drain budget does NOT read it: the submitter derives the
         // op workload from the realized import closure at its chokepoint.
+        // Each root carries the request's RECORDED output selection — the
+        // chokepoint formats the wire demand string from it, so a recorded
+        // `!out,dev` subset reaches the gateway instead of widening to
+        // every declared output.
         Batch {
             jobs: jobs.clone(),
-            root_drvs: drvs.clone(),
+            roots: scheduled
+                .targets
+                .iter()
+                .map(|target| BatchRoot {
+                    drv: target.drv.clone(),
+                    outputs: target.outputs.clone(),
+                })
+                .collect(),
             est_nodes: drvs.len(),
         },
         deadline,
@@ -1213,8 +1214,6 @@ async fn dispatch_one_request(
             {
                 break;
             }
-            let failing_drvs: Vec<String> =
-                failing.iter().map(|target| target.drv.clone()).collect();
             // The same resolved job keys the initial submission used.
             let retry_jobs: Vec<String> = failing
                 .iter()
@@ -1238,11 +1237,19 @@ async fn dispatch_one_request(
                 retry_id,
                 // Audited literal construction, the retry sibling of the
                 // initial dispatch above: same roots-only `est_nodes`
-                // floor, same chokepoint-derived drain budget.
+                // floor, same chokepoint-derived drain budget — and the
+                // same recorded output selection per root: a confirmation
+                // retry re-asks exactly what the recording asked.
                 Batch {
                     jobs: retry_jobs,
-                    root_drvs: failing_drvs.clone(),
-                    est_nodes: failing_drvs.len(),
+                    roots: failing
+                        .iter()
+                        .map(|target| BatchRoot {
+                            drv: target.drv.clone(),
+                            outputs: target.outputs.clone(),
+                        })
+                        .collect(),
+                    est_nodes: failing.len(),
                 },
                 // Each confirmation retry gets a fresh full build budget,
                 // anchored when the retry starts.
@@ -1893,21 +1900,6 @@ mod tests {
     }
 
     #[test]
-    fn format_derived_forms() {
-        let drv = DRV_A;
-        assert_eq!(
-            format_derived(drv, &["out".to_string()]),
-            format!("{drv}!out")
-        );
-        assert_eq!(format_derived(drv, &["*".to_string()]), format!("{drv}!*"));
-        assert_eq!(format_derived(drv, &[]), format!("{drv}!*"));
-        assert_eq!(
-            format_derived(drv, &["out".to_string(), "dev".to_string()]),
-            format!("{drv}!out,dev")
-        );
-    }
-
-    #[test]
     fn build_timeout_scales_clamps_and_falls_back() {
         let floor = Duration::from_secs(30 * 60);
         let cap = Duration::from_secs(2 * 60 * 60);
@@ -2078,7 +2070,7 @@ mod tests {
         ) -> anyhow::Result<BatchOutcome> {
             self.calls.lock().unwrap().push((
                 self.started.elapsed(),
-                batch.root_drvs.clone(),
+                batch.root_drv_paths(),
                 deadline,
             ));
             if !self.delay.is_zero() {
@@ -2666,14 +2658,17 @@ mod tests {
         );
 
         // Scripted wire: the initial submission's root fails in-band, the
-        // retry (unscripted → default) reports it Built.
+        // retry (unscripted → default) reports it Built. The echoed key
+        // mirrors the daemon's behavior (the submitted demand string
+        // verbatim — the recorded `out` selection, not `!*`); the result
+        // mapping is positional and never parses it.
         let source = Arc::new(FakeChannelSource::default());
         source
             .results
             .lock()
             .unwrap()
             .push_back(vec![KeyedBuildResult {
-                derived_path: format!("{app_b}!*"),
+                derived_path: format!("{app_b}!out"),
                 result: BuildResult {
                     status: BuildStatus::PermanentFailure,
                     error_msg: "builder failed with exit code 2".into(),
@@ -2698,11 +2693,13 @@ mod tests {
         assert_eq!(stats.dispatched, 1);
 
         // Both timed constructions reached the wire with the REALIZED
-        // 3-node workload — never the roots-only est_nodes (1) they carry.
+        // 3-node workload — never the roots-only est_nodes (1) they carry —
+        // and both demand the request's RECORDED `out` selection, the
+        // initial dispatch and the confirmation retry alike.
         let calls = source.build_calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 2, "initial dispatch + confirmation retry");
         for call in &calls {
-            assert_eq!(call.derived, vec![format!("{app_b}!*")]);
+            assert_eq!(call.derived, vec![format!("{app_b}!out")]);
             assert_eq!(
                 call.closure_nodes, 3,
                 "the drain-budget workload must be the realized import \
@@ -2733,6 +2730,202 @@ mod tests {
         let entries: Vec<DispatchEntry> = state.load_jsonl(StateFile::Dispatch).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].attempts, 2);
+    }
+
+    /// WIRE CONFORMANCE through the full production chain: recorded
+    /// per-target output selections written by the production
+    /// `ArchiveWriter`, read back by `ReplayArchive`, converted by
+    /// `recorded_request_from` (the run loop's only request conversion),
+    /// scheduled by `build_schedule`, dispatched by the timed dispatcher,
+    /// and formatted at the real `ClientOpsSubmitter` chokepoint — then
+    /// every captured wire string is fed to the REAL gateway-side parser
+    /// (`DerivedPath::parse`, the exact fn
+    /// `rio-gateway/src/handler/build.rs` calls per received entry) and
+    /// must parse back to the recorded selection. No hop is hand-mirrored:
+    /// a format change anywhere in the producer chain or the parser moves
+    /// this test.
+    ///
+    /// One request, three targets — the three recorded shapes one
+    /// submission can carry: an explicit PROPER subset (`["out","dev"]` of
+    /// an out/dev/doc derivation — the demand the recording narrows), the
+    /// recorded all-outputs spelling (`["*"]`), and a corrupt duplicate
+    /// list (`["out","out"]`, which the production writer passes through
+    /// verbatim and the parser would reject as a raw join). Both sides of
+    /// the has-recorded-subset condition ride in the same wire call, and
+    /// the corrupt row proves the chokepoint clamp holds on
+    /// archive-sourced (not just hand-built) data.
+    #[tokio::test(start_paused = true)]
+    async fn timed_dispatch_submits_recorded_output_selections_end_to_end() {
+        use crate::archive::schema::{Capabilities, RequestRecord, RequestTarget, Substituters};
+        use crate::archive::writer::{ArchiveWriter, ManifestSeed};
+        use crate::run::archive_input::fake_hash;
+        use crate::run::drv_import::DrvArchive;
+        use crate::run::submitter::ClientOpsSubmitter;
+        use crate::run::submitter::test_support::FakeChannelSource;
+        use rio_nix::protocol::derived_path::{DerivedPath, OutputSpec};
+
+        // Three dependency-free derivations; `multi` declares THREE
+        // outputs so the recorded ["out","dev"] is a proper subset.
+        let archive_dir = tempfile::tempdir().unwrap();
+        let drv = |name: &str| {
+            format!(
+                "/nix/store/{}-{name}.drv",
+                fake_hash(&format!("{name}-drv"))
+            )
+        };
+        let out = |name: &str, output: &str| {
+            format!(
+                "/nix/store/{}-{name}-{output}",
+                fake_hash(&format!("{name}-{output}"))
+            )
+        };
+        let multi_drv = drv("multi-1.0");
+        let all_drv = drv("all-1.0");
+        let dup_drv = drv("dup-1.0");
+        let writer = ArchiveWriter::create(archive_dir.path()).unwrap();
+        let aterm = |outputs: &[(&str, String)]| {
+            let outs = outputs
+                .iter()
+                .map(|(name, path)| format!(r#"("{name}","{path}","","")"#))
+                .collect::<Vec<_>>()
+                .join(",");
+            let env = outputs
+                .iter()
+                .map(|(name, path)| format!(r#"("{name}","{path}")"#))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(r#"Derive([{outs}],[],[],"x86_64-linux","/bin/sh",["-c","true"],[{env}])"#)
+        };
+        writer
+            .add_drv(
+                &multi_drv,
+                &aterm(&[
+                    ("out", out("multi-1.0", "out")),
+                    ("dev", out("multi-1.0", "dev")),
+                    ("doc", out("multi-1.0", "doc")),
+                ]),
+            )
+            .unwrap();
+        writer
+            .add_drv(&all_drv, &aterm(&[("out", out("all-1.0", "out"))]))
+            .unwrap();
+        writer
+            .add_drv(&dup_drv, &aterm(&[("out", out("dup-1.0", "out"))]))
+            .unwrap();
+        writer
+            .write_requests(&[RequestRecord {
+                session: 11,
+                offset_s: 0.0,
+                targets: vec![
+                    RequestTarget {
+                        drv: multi_drv.clone(),
+                        outputs: vec!["out".to_string(), "dev".to_string()],
+                    },
+                    RequestTarget {
+                        drv: all_drv.clone(),
+                        outputs: vec!["*".to_string()],
+                    },
+                    RequestTarget {
+                        drv: dup_drv.clone(),
+                        outputs: vec!["out".to_string(), "out".to_string()],
+                    },
+                ],
+            }])
+            .unwrap();
+        let stamp: jiff::Timestamp = "2026-05-28T00:00:00Z".parse().unwrap();
+        writer
+            .finalize(ManifestSeed {
+                created_at: stamp,
+                from: stamp,
+                to: stamp,
+                capabilities: Capabilities::default(),
+                substituters: Substituters {
+                    relay: vec!["https://cache.example.org".to_string()],
+                    target: Vec::new(),
+                },
+                fat: false,
+                provenance: serde_json::Map::new(),
+            })
+            .unwrap();
+
+        // Production read-back and conversion: the archive's own request
+        // records, through the run loop's conversion fn, into the schedule.
+        let archive =
+            Arc::new(crate::archive::reader::ReplayArchive::open(archive_dir.path()).unwrap());
+        let requests: Vec<RecordedRequest> = archive
+            .requests()
+            .iter()
+            .map(crate::run::recorded_request_from)
+            .collect();
+        let schedule = build_schedule(
+            &requests,
+            &no_timing,
+            &no_jobs,
+            &all_workload,
+            1.0,
+            None,
+            true,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDir::new(dir.path()).unwrap());
+        let source = Arc::new(FakeChannelSource::default());
+        let submitter = Arc::new(ClientOpsSubmitter {
+            pool: source.clone(),
+            archive: Arc::new(DrvArchive::new(archive)),
+            op_timeout: Duration::from_secs(5),
+            probe_chunk: 2000,
+        });
+        let stats = drive_dispatch(
+            &state,
+            submitter,
+            schedule,
+            timing_arc(HashMap::new()),
+            TimelineConfig::from_knobs(&Knobs::default()),
+            HashSet::new(),
+        )
+        .await;
+        assert_eq!(stats.dispatched, 1);
+
+        // The wire received the recorded selections: the proper subset in
+        // recorded order, the all-outputs spelling, and the duplicate list
+        // clamped to its recorded set.
+        let calls = source.build_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].derived,
+            vec![
+                format!("{multi_drv}!out,dev"),
+                format!("{all_drv}!*"),
+                format!("{dup_drv}!out"),
+            ]
+        );
+        // And the gateway's parser reads each back to the recorded demand.
+        let specs: Vec<OutputSpec> = calls[0]
+            .derived
+            .iter()
+            .map(|raw| match DerivedPath::parse(raw).unwrap() {
+                DerivedPath::Built { outputs, .. } => outputs,
+                other => panic!("expected Built, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            specs,
+            vec![
+                OutputSpec::Names(vec!["out".into(), "dev".into()]),
+                OutputSpec::All,
+                OutputSpec::Names(vec!["out".into()]),
+            ]
+        );
+        // The batches.jsonl record stays bare-drv-keyed (resume and
+        // collect index by drv path; only the wire carries selectors).
+        let records: Vec<crate::run::model::BatchRecord> =
+            state.load_jsonl(StateFile::Batches).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].root_drvs,
+            vec![multi_drv.clone(), all_drv.clone(), dup_drv.clone()]
+        );
     }
 
     /// A request whose only target was recorded as interrupted is submitted

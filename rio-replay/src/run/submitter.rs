@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use rio_nix::protocol::client::{KeyedBuildResult, StoreEntry};
 
-use super::batch::Batch;
+use super::batch::{Batch, BatchRoot};
 use super::drv_import::DrvArchive;
 use super::model::{PathOutcome, path_outcomes_from_keyed};
 use super::stderrparse::{ParsedStderr, parse_line};
@@ -406,7 +406,8 @@ impl Submitter for ClientOpsSubmitter {
             .context("open a gateway daemon channel for the batch submission")?;
 
         // ── Import: the batch's drv closure from the replay archive ────────
-        let closure = self.archive.closure(&batch.root_drvs)?;
+        let root_paths = batch.root_drv_paths();
+        let closure = self.archive.closure(&root_paths)?;
         // Workload basis for the build op's stderr drain budget: every
         // derivation the submitted DAG can REACH — the importable texts
         // (`order`) plus the gaps a non-conforming archive cannot offer
@@ -435,7 +436,7 @@ impl Submitter for ClientOpsSubmitter {
             // these roots is now attributable to the archive gap instead
             // of silently charging the target.
             tracing::warn!(
-                roots = batch.root_drvs.len(),
+                roots = batch.roots.len(),
                 skipped = closure.skipped.len(),
                 paths = ?closure.skipped,
                 "embedded ATerms reference derivations the archive does not embed; \
@@ -469,7 +470,15 @@ impl Submitter for ClientOpsSubmitter {
         }
 
         // ── Build: one BuildPathsWithResults call over every root ──────────
-        let derived: Vec<String> = batch.root_drvs.iter().map(|d| format!("{d}!*")).collect();
+        // The wire demand string per root comes from the root's RECORDED
+        // output selection ([`BatchRoot::derived_path`]: `!out,dev` for an
+        // explicit subset, `!*` for absent/all/corrupt selections) — the
+        // gateway widens its per-root store verification and the
+        // scheduler's substitutability classification to exactly the
+        // outputs this string names, so an all-outputs demand here would
+        // diverge from the recording for partially-cached multi-output
+        // derivations.
+        let derived: Vec<String> = batch.roots.iter().map(BatchRoot::derived_path).collect();
         let mut parsed = ParsedStderr::default();
         let mut tail: VecDeque<String> = VecDeque::new();
         // The wire still wants a relative timeout: convert HERE, after the
@@ -488,7 +497,7 @@ impl Submitter for ClientOpsSubmitter {
             // The mapping checks the daemon's result count against the
             // submitted roots and warns on a mismatch; uncovered roots are
             // handled by collect's missing-result rule.
-            Ok(keyed) => (path_outcomes_from_keyed(&batch.root_drvs, &keyed), false),
+            Ok(keyed) => (path_outcomes_from_keyed(&root_paths, &keyed), false),
             Err(TransportError::Timeout { .. }) => {
                 // The batch deadline fired mid-build. Abandoning the channel
                 // IS the cancellation mechanism (the gateway cancels the
@@ -497,7 +506,7 @@ impl Submitter for ClientOpsSubmitter {
                 // via the engine-cancelled rule.
                 tracing::warn!(
                     connection = chan.connection_index(),
-                    roots = batch.root_drvs.len(),
+                    roots = batch.roots.len(),
                     timeout_secs = timeout.as_secs(),
                     "batch build deadline reached; abandoning the gateway channel"
                 );
@@ -705,12 +714,21 @@ mod tests {
     use rio_nix::protocol::build::{BuildResult, BuildStatus};
     use rio_nix::protocol::client::KeyedBuildResult;
 
+    /// All-outputs root (no recorded selection), the workload-producer
+    /// shape.
+    fn all_outputs_root(drv: &str) -> BatchRoot {
+        BatchRoot {
+            drv: drv.to_string(),
+            outputs: Vec::new(),
+        }
+    }
+
     fn batch() -> Batch {
         Batch {
             jobs: vec!["libfoo.x86_64-linux".into(), "app.x86_64-linux".into()],
-            root_drvs: vec![
-                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv".into(),
-                "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-app-2.0.drv".into(),
+            roots: vec![
+                all_outputs_root("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv"),
+                all_outputs_root("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-app-2.0.drv"),
             ],
             est_nodes: 17,
         }
@@ -817,7 +835,7 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn client_ops_outcome_maps_keyed_results_positionally() {
-        let roots = batch().root_drvs;
+        let roots = batch().root_drv_paths();
         let keyed = vec![
             KeyedBuildResult {
                 derived_path: format!("{}!*", roots[0]),
@@ -1109,12 +1127,12 @@ mod tests {
         }
     }
 
-    /// Batch over the given roots with a PRODUCER-side node estimate — the
-    /// field the budget chokepoint must not consult.
+    /// Batch over the given all-outputs roots with a PRODUCER-side node
+    /// estimate — the field the budget chokepoint must not consult.
     fn batch_with_estimate(jobs: &[&str], roots: &[String], est_nodes: usize) -> Batch {
         Batch {
             jobs: jobs.iter().map(|s| s.to_string()).collect(),
-            root_drvs: roots.to_vec(),
+            roots: roots.iter().map(|drv| all_outputs_root(drv)).collect(),
             est_nodes,
         }
     }
@@ -1229,6 +1247,144 @@ mod tests {
         // probe_chunk 2 over 3 paths: the chunked probe still covered the
         // whole closure.
         assert_eq!(source.probes.lock().unwrap().len(), 2);
+    }
+
+    /// The submission chokepoint formats each root's wire demand string
+    /// from its RECORDED output selection via [`BatchRoot::derived_path`]
+    /// — never the blanket `!*` it once hardcoded, and never a raw join of
+    /// the archive-controlled list. Asserted at the wire seam through the
+    /// REAL `ClientOpsSubmitter` (the captured `derived` strings are what
+    /// `build_paths_with_results_observed` hands the protocol layer), and
+    /// each captured string is fed to the REAL gateway-side parser
+    /// (`DerivedPath::parse`, the exact fn
+    /// `rio-gateway/src/handler/build.rs` runs per received entry) to
+    /// prove the gateway accepts and reads back the recorded selection.
+    ///
+    /// Rows cover both sides of the has-recorded-subset condition (an
+    /// explicit proper subset AND an absent selection on the same batch)
+    /// plus the corrupt-list clamps at the chokepoint (duplicate names
+    /// dedupe; an empty name collapses to all-outputs) — so this goes red
+    /// if the chokepoint reverts to blanket `!*` (subset row), bypasses
+    /// normalization with a naive join (duplicate row would be
+    /// `DuplicateOutputName`-rejected by the parser assertion), or starts
+    /// keying results by the selector-carrying string (bare-drv-path
+    /// assertion on the outcome rows).
+    #[tokio::test]
+    async fn client_ops_submits_recorded_output_selections() {
+        use crate::run::archive_input::{load_units, write_mini_archive};
+        use rio_nix::protocol::derived_path::{DerivedPath, OutputSpec};
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_mini_archive(tmp.path());
+        let archive = Arc::new(crate::archive::reader::ReplayArchive::open(tmp.path()).unwrap());
+        let unit_drv = |job: &str| {
+            load_units(&archive)
+                .unwrap()
+                .into_iter()
+                .find(|u| u.job == job)
+                .unwrap()
+                .drv_path
+        };
+        // appB declares `out` AND `dev` in the mini archive's ATerms, so
+        // ["out"] is a PROPER subset; appA is the absent-selection sibling
+        // on the same submission.
+        let app_a = unit_drv("appA.x86_64-linux");
+        let app_b = unit_drv("appB.x86_64-linux");
+
+        let source = Arc::new(test_support::FakeChannelSource::default());
+        let outcome = client_ops(archive.clone(), &source, 2000)
+            .submit_batch(
+                "ssh-ng://test",
+                // Audited literal construction (enumeration test in
+                // `run::batch`): scripted per-root selections, est_nodes
+                // is packing bookkeeping the chokepoint ignores.
+                &Batch {
+                    jobs: vec!["appB.x86_64-linux".into(), "appA.x86_64-linux".into()],
+                    roots: vec![
+                        BatchRoot {
+                            drv: app_b.clone(),
+                            outputs: vec!["out".into()],
+                        },
+                        all_outputs_root(&app_a),
+                    ],
+                    est_nodes: 2,
+                },
+                BatchDeadline::Build(tokio::time::Instant::now() + Duration::from_secs(30)),
+            )
+            .await
+            .unwrap();
+
+        let calls = source.build_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        // The recorded subset reaches the wire; the absent selection stays
+        // the all-outputs demand. Submission order preserved.
+        assert_eq!(
+            calls[0].derived,
+            vec![format!("{app_b}!out"), format!("{app_a}!*")]
+        );
+        // The gateway parses exactly what was submitted, back to the
+        // recorded selection.
+        match DerivedPath::parse(&calls[0].derived[0]).unwrap() {
+            DerivedPath::Built { drv, outputs } => {
+                assert_eq!(drv.to_string(), app_b);
+                assert_eq!(outputs, OutputSpec::Names(vec!["out".into()]));
+            }
+            other => panic!("expected Built, got {other:?}"),
+        }
+        match DerivedPath::parse(&calls[0].derived[1]).unwrap() {
+            DerivedPath::Built { drv, outputs } => {
+                assert_eq!(drv.to_string(), app_a);
+                assert_eq!(outputs, OutputSpec::All);
+            }
+            other => panic!("expected Built, got {other:?}"),
+        }
+        // Result keying stays on the bare root drv path — the selector
+        // never leaks into the outcome rows collect indexes by.
+        assert_eq!(
+            outcome
+                .results
+                .iter()
+                .map(|o| o.drv_path.clone())
+                .collect::<Vec<_>>(),
+            vec![app_b.clone(), app_a.clone()]
+        );
+
+        // Corrupt recorded lists are clamped AT THE CHOKEPOINT: duplicates
+        // dedupe to the recorded set, an empty member collapses to the
+        // widest demand — and both wire strings parse cleanly (a naive
+        // join of either list is parser-rejected; pinned with the rest of
+        // the corrupt-shape corpus in `run::batch`).
+        let source = Arc::new(test_support::FakeChannelSource::default());
+        client_ops(archive, &source, 2000)
+            .submit_batch(
+                "ssh-ng://test",
+                // Audited literal construction: the corrupt-selection rows.
+                &Batch {
+                    jobs: vec!["appB.x86_64-linux".into(), "appA.x86_64-linux".into()],
+                    roots: vec![
+                        BatchRoot {
+                            drv: app_b.clone(),
+                            outputs: vec!["out".into(), "out".into()],
+                        },
+                        BatchRoot {
+                            drv: app_a.clone(),
+                            outputs: vec!["out".into(), String::new()],
+                        },
+                    ],
+                    est_nodes: 2,
+                },
+                BatchDeadline::Build(tokio::time::Instant::now() + Duration::from_secs(30)),
+            )
+            .await
+            .unwrap();
+        let calls = source.build_calls.lock().unwrap().clone();
+        assert_eq!(
+            calls[0].derived,
+            vec![format!("{app_b}!out"), format!("{app_a}!*")]
+        );
+        for derived in &calls[0].derived {
+            DerivedPath::parse(derived).unwrap();
+        }
     }
 
     /// Closure gaps a non-conforming archive cannot offer still count into

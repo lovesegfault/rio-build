@@ -219,7 +219,9 @@ pub async fn submit_one_batch(
         batch_id,
         kind: kind.to_string(),
         jobs: batch.jobs.clone(),
-        root_drvs: batch.root_drvs.clone(),
+        // The record keys results/resume by bare drv path; the output
+        // selection lives on the wire demand string only.
+        root_drvs: batch.root_drv_paths(),
         est_nodes: batch.est_nodes,
         build_id: None,
         started_at,
@@ -510,7 +512,7 @@ pub async fn run_submit_loop(
             // path skipped and still returns Ok).
             let mut topup_delivered = false;
             if let Some(topup) = &supply_topup {
-                match topup.topup(&batch.root_drvs).await {
+                match topup.topup(&batch.root_drv_paths()).await {
                     Ok(outcome) => {
                         topup_delivered = outcome.proves_delivery();
                         if !topup_delivered {
@@ -565,6 +567,7 @@ pub async fn run_submit_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run::batch::BatchRoot;
     use crate::run::model::{PathOutcome, build_status_name};
     use crate::run::submitter::BatchOutcome;
     use crate::run::submitter::test_support::FakeSubmitter;
@@ -639,7 +642,10 @@ mod tests {
         }));
         let batch = Batch {
             jobs: vec!["x.x86_64-linux".into()],
-            root_drvs: vec!["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".into()],
+            roots: vec![BatchRoot {
+                drv: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".into(),
+                outputs: Vec::new(),
+            }],
             est_nodes: 1,
         };
         tracker
@@ -708,7 +714,10 @@ mod tests {
             .push(Err(anyhow::anyhow!("ssh handshake failed")));
         let batch = Batch {
             jobs: vec!["x.x86_64-linux".into()],
-            root_drvs: vec!["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".into()],
+            roots: vec![BatchRoot {
+                drv: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".into(),
+                outputs: Vec::new(),
+            }],
             est_nodes: 1,
         };
         tracker
@@ -767,7 +776,10 @@ mod tests {
         let submitter = FakeSubmitter::default();
         let batch = || Batch {
             jobs: vec!["x.x86_64-linux".into()],
-            root_drvs: vec!["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".into()],
+            roots: vec![BatchRoot {
+                drv: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".into(),
+                outputs: Vec::new(),
+            }],
             est_nodes: 1,
         };
         let in_one_min = || tokio::time::Instant::now() + Duration::from_secs(60);
@@ -996,7 +1008,7 @@ mod tests {
         for (index, ((roots, prior), (_, batch, _))) in
             calls.iter().zip(submitted.iter()).enumerate()
         {
-            assert_eq!(roots, &batch.root_drvs);
+            assert_eq!(roots, &batch.root_drv_paths());
             assert_eq!(*prior, index);
         }
         // A failed top-up submits the batch but proves no delivery: the
