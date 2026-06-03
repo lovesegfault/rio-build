@@ -217,21 +217,20 @@ pub struct Config {
     /// URL template the cross-replica `TailLog` proxy uses to dial the
     /// store replica holding an execution's live ingest stream. Every
     /// `{pod}` is replaced with the owning replica's
-    /// `log_ingest_sessions.replica_pod` value (its `HOSTNAME`, i.e.
-    /// the pod name). Default
-    /// `http://{pod}.rio-store-headless.rio-store.svc:9002` — the
-    /// store's headless Service. NOTE: named per-pod A records under a
-    /// headless Service require the pod spec to set BOTH `hostname` and
-    /// `subdomain`, and a Deployment cannot give each replica a
-    /// distinct `hostname` — so the practical production configuration
-    /// is an IP-based template (e.g. `http://{pod}:9002`) with the
-    /// replica registering `status.podIP` (via the downward API) as its
-    /// identity instead of `HOSTNAME`. The helm chart owns that
-    /// pairing. A
-    /// template that does not resolve degrades cross-replica live
-    /// tails to the history-only view (counted by
-    /// `rio_store_log_tail_proxy_failures_total`); it never fails a
-    /// read. Env: `RIO_LOG_PEER_URL_TEMPLATE`.
+    /// `log_ingest_sessions.replica_pod` value; an identity that
+    /// parses as an IPv6 address is bracketed automatically, so the
+    /// template always uses the bare `{pod}` form (`[{pod}]` is
+    /// rejected by validation). Default EMPTY = the cross-replica
+    /// proxy is disabled, fail-closed: a bare binary cannot know the
+    /// deployment's pod-addressing scheme, and a wrong guess silently
+    /// misroutes instead of failing. The helm chart supplies the real
+    /// template (`store.logPeerUrlTemplate`, default
+    /// `http://{pod}:9002` paired with `status.podIP` via the downward
+    /// API as the replica identity). With the proxy disabled or a
+    /// template that does not resolve, cross-replica live tails
+    /// degrade to the history-only view (counted by
+    /// `rio_store_log_tail_proxy_failures_total`); a read never
+    /// fails over it. Env: `RIO_LOG_PEER_URL_TEMPLATE`.
     pub log_peer_url_template: String,
     /// Substitution-replacement campaign (design §8): the store-side
     /// materialization-job executor. `[materialization]` table in
@@ -287,7 +286,14 @@ impl Default for Config {
             log_cut_interval: crate::logs::ingest::DEFAULT_CUT_INTERVAL,
             log_cut_threshold_bytes: crate::logs::ingest::DEFAULT_CUT_THRESHOLD_BYTES,
             log_cors_allow_origins: String::new(),
-            log_peer_url_template: crate::logs::DEFAULT_PEER_URL_TEMPLATE.to_string(),
+            // Empty = the cross-replica live-tail proxy is DISABLED,
+            // fail-closed: a bare binary cannot know the deployment's
+            // pod-addressing scheme, and a wrong guess silently
+            // misroutes (resolves but dials the wrong pod) instead of
+            // failing. The helm chart supplies the real template
+            // (values.yaml `logPeerUrlTemplate`); readers on a
+            // template-less deployment get the history-only view.
+            log_peer_url_template: String::new(),
             materialization: MaterializationConfig::default(),
             log_retention_days: 30,
         }
@@ -494,16 +500,31 @@ impl rio_common::config::ValidateConfig for Config {
             self.log_retention_days >= 1,
             "log_retention_days must be >= 1; set RIO_LOG_RETENTION_DAYS"
         );
-        // Without `{pod}` every peer resolves to the same URI, so every
-        // cross-replica tail relays to one (probably wrong) pod —
-        // a confusing misroute that looks like it works in a
-        // single-replica deployment and silently breaks at two.
-        anyhow::ensure!(
-            self.log_peer_url_template.contains("{pod}"),
-            "log_peer_url_template must contain the literal `{{pod}}` \
-             placeholder (got {:?}); set RIO_LOG_PEER_URL_TEMPLATE",
-            self.log_peer_url_template
-        );
+        // Empty disables the cross-replica proxy (fail-closed). A
+        // non-empty template without `{pod}` resolves every peer to
+        // the same URI, so every cross-replica tail relays to one
+        // (probably wrong) pod — a confusing misroute that looks like
+        // it works in a single-replica deployment and silently breaks
+        // at two. The bracketed `[{pod}]` form is rejected outright:
+        // uri_for now brackets IPv6 identities itself (the
+        // address-form rule lives in exactly one place), so a pinned
+        // bracketed template would double-bracket every dial.
+        if !self.log_peer_url_template.is_empty() {
+            anyhow::ensure!(
+                self.log_peer_url_template.contains("{pod}"),
+                "log_peer_url_template must contain the literal `{{pod}}` \
+                 placeholder (got {:?}); set RIO_LOG_PEER_URL_TEMPLATE",
+                self.log_peer_url_template
+            );
+            anyhow::ensure!(
+                !self.log_peer_url_template.contains("[{pod}]"),
+                "log_peer_url_template must use the bare `{{pod}}` placeholder \
+                 (got {:?}): the store now brackets IPv6 identities itself, so \
+                 drop the literal brackets (e.g. `http://{{pod}}:9002`); set \
+                 RIO_LOG_PEER_URL_TEMPLATE",
+                self.log_peer_url_template
+            );
+        }
         // Substitution-replacement materialization executor (Phase A:
         // dormant; the bounds hold whether or not the flag is on so a
         // flip-on never trips over degenerate knobs).
@@ -893,6 +914,36 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("log_peer_url_template"), "got: {err}");
+    }
+
+    /// The bracketed template `[{pod}]` was the pre-fail-closed
+    /// default; uri_for now brackets IPv6 identities itself, so a
+    /// pinned bracketed template would double-bracket every dial.
+    #[test]
+    fn validate_rejects_bracketed_pod_placeholder() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            log_peer_url_template: "http://[{pod}]:9002".into(),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("[{pod}]"),
+            "the bracketed form must be rejected with the migration note; got: {err}"
+        );
+    }
+
+    /// Empty = the cross-replica proxy is disabled, fail-closed; a
+    /// deployment that wants the proxy must say where peers live.
+    #[test]
+    fn validate_accepts_empty_peer_template() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            log_peer_url_template: String::new(),
+            ..Default::default()
+        };
+        cfg.validate()
+            .expect("empty template is the disabled posture");
     }
 
     // r[verify store.cas.s3-retry]

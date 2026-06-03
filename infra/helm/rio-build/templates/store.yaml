@@ -171,7 +171,10 @@ spec:
                 fieldRef:
                   fieldPath: status.podIP
             - name: RIO_LOG_PEER_URL_TEMPLATE
-              value: {{ $s.logPeerUrlTemplate | default "http://[{pod}]:9002" | quote }}
+              # No `| default` shadow: values.yaml owns the single
+              # default; nulling the key renders an empty env, which
+              # the binary treats as proxy-disabled (fail-closed).
+              value: {{ $s.logPeerUrlTemplate | quote }}
             # Dashboard gRPC-Web TailLog CORS (merged_bug_161): the
             # SAME origin list the scheduler renders — the contract is
             # single-sourced in rio_common::cors; the env was simply

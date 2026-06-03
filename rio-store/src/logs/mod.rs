@@ -46,4 +46,4 @@ pub mod sessions;
 pub mod sweep;
 pub mod tail;
 
-pub use service::{DEFAULT_PEER_URL_TEMPLATE, LogServiceImpl};
+pub use service::LogServiceImpl;

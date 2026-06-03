@@ -524,7 +524,7 @@
       {
         "key": "log_peer_url_template",
         "type": "string",
-        "default": "http://{pod}.rio-store-headless.rio-store.svc:9002",
+        "default": "",
         "description": "URL template the cross-replica `TailLog` proxy uses to dial the store replica holding an execution's live ingest stream."
       },
       {

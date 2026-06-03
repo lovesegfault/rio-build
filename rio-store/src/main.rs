@@ -258,7 +258,8 @@ async fn main() -> anyhow::Result<()> {
     //
     // RIO_STORE_REPLICA_ID is preferred: the helm chart injects
     // `status.podIP` via the downward API and pairs it with an
-    // IP-based template (`http://[{pod}]:9002`) — a Deployment's pods
+    // IP-based template (`http://{pod}:9002`; the store brackets IPv6
+    // identities itself at dial time) — a Deployment's pods
     // get no per-pod DNS A records (no `hostname`/`subdomain` in the
     // pod spec), so the HOSTNAME pod name is registrable but not
     // resolvable. Fallback to HOSTNAME (kubelet sets it to the pod
@@ -283,6 +284,18 @@ async fn main() -> anyhow::Result<()> {
     .with_byte_budget(cfg.log_bytes_budget)
     .with_max_chunks_per_exec(cfg.log_max_chunks_per_exec)
     .with_peer_url_template(cfg.log_peer_url_template.clone());
+    if cfg.log_peer_url_template.is_empty() {
+        // Fail-closed posture: without a template this replica cannot
+        // dial peers, so a reader landing on a non-owning replica gets
+        // the history-only view (laggy but correct). One warn at boot;
+        // rio_store_log_tail_proxy_failures_total never fires because
+        // the proxy is never attempted.
+        tracing::warn!(
+            "log_peer_url_template is empty: the cross-replica live-tail proxy is \
+             disabled; set RIO_LOG_PEER_URL_TEMPLATE (helm: store.logPeerUrlTemplate) \
+             to enable live tails across replicas"
+        );
+    }
     // Same HMAC key as PutPath: the assignment token authorizes both
     // the output upload and the log stream for one build attempt.
     let log_hmac = rio_auth::hmac::HmacVerifier::load(cfg.hmac_key_path.as_deref())

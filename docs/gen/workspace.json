@@ -97,6 +97,7 @@
         "rio-auth",
         "rio-common",
         "rio-crds",
+        "rio-log-kernel",
         "rio-proto"
       ],
       "optional": [],

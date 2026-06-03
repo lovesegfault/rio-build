@@ -116,15 +116,6 @@ const PROXIED_METADATA_KEY: &str = "x-rio-log-proxied";
 /// wrong.
 const PROXY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Default `{pod}` → URI template for dialling a peer replica. The
-/// store's headless Service is `rio-store-headless` in the `rio-store`
-/// namespace (helm `rio.grpcServicePair`); named per-pod DNS under a
-/// headless Service additionally requires the pod spec to set
-/// `subdomain` (the store is a Deployment, not a StatefulSet), which is
-/// the helm chart's job to wire alongside this template — see
-/// `Config::log_peer_url_template`.
-pub const DEFAULT_PEER_URL_TEMPLATE: &str = "http://{pod}.rio-store-headless.rio-store.svc:9002";
-
 /// Turns the owning replica's self-identity (the
 /// `log_ingest_sessions.replica_pod` value it registered at
 /// `sessions::acquire` time) into a URI the cross-replica `TailLog`
@@ -146,7 +137,21 @@ impl PeerResolver {
     /// the test map); counted as a proxy failure by the caller.
     fn uri_for(&self, pod: &str) -> Option<String> {
         match self {
-            PeerResolver::Template(t) => Some(t.replace("{pod}", pod)),
+            // Empty template = the proxy is disabled (fail-closed
+            // config default; the chart supplies the real template).
+            PeerResolver::Template(t) if t.is_empty() => None,
+            PeerResolver::Template(t) => {
+                // The address-form rule, in exactly one place: an
+                // identity that parses as an IPv6 address is
+                // bracketed for URI authority position; hostnames and
+                // IPv4 pass through bare.
+                let identity = if pod.parse::<std::net::Ipv6Addr>().is_ok() {
+                    format!("[{pod}]")
+                } else {
+                    pod.to_string()
+                };
+                Some(t.replace("{pod}", &identity))
+            }
             #[cfg(test)]
             PeerResolver::Static(m) => m.get(pod).cloned(),
         }
@@ -229,7 +234,10 @@ impl LogServiceImpl {
             hmac_verifier: None,
             active_ingests: Arc::new(DashMap::new()),
             replica_pod,
-            peer_resolver: PeerResolver::Template(DEFAULT_PEER_URL_TEMPLATE.to_string()),
+            // Empty = proxy disabled until with_peer_url_template
+            // supplies the deployment's template (fail-closed; matches
+            // Config::default).
+            peer_resolver: PeerResolver::Template(String::new()),
             ingest_config,
             max_chunks_per_exec: 100_000,
             stream_permits: Arc::new(tokio::sync::Semaphore::new(256)),
@@ -2746,5 +2754,34 @@ mod tests {
                 "the final cursor {final_cursor} advertises line {n} as served, but it never was"
             );
         }
+    }
+
+    /// The address-form rule lives in uri_for alone: IPv6 identities
+    /// are bracketed, hostnames and IPv4 pass through bare, and an
+    /// empty template (the fail-closed default) names nobody.
+    #[test]
+    fn uri_for_brackets_only_ipv6() {
+        let r = PeerResolver::Template("http://{pod}:9002".to_string());
+        assert_eq!(
+            r.uri_for("10.2.3.4").as_deref(),
+            Some("http://10.2.3.4:9002"),
+            "IPv4 stays bare"
+        );
+        assert_eq!(
+            r.uri_for("2001:db8::8be7").as_deref(),
+            Some("http://[2001:db8::8be7]:9002"),
+            "IPv6 is bracketed for URI authority position"
+        );
+        assert_eq!(
+            r.uri_for("rio-store-abc123").as_deref(),
+            Some("http://rio-store-abc123:9002"),
+            "hostnames stay bare"
+        );
+        let disabled = PeerResolver::Template(String::new());
+        assert_eq!(
+            disabled.uri_for("10.2.3.4"),
+            None,
+            "an empty template names nobody (proxy disabled)"
+        );
     }
 }

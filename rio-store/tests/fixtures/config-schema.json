@@ -201,9 +201,9 @@
         "default": ""
       },
       "log_peer_url_template": {
-        "description": "URL template the cross-replica `TailLog` proxy uses to dial the\nstore replica holding an execution's live ingest stream. Every\n`{pod}` is replaced with the owning replica's\n`log_ingest_sessions.replica_pod` value (its `HOSTNAME`, i.e.\nthe pod name). Default\n`http://{pod}.rio-store-headless.rio-store.svc:9002` — the\nstore's headless Service. NOTE: named per-pod A records under a\nheadless Service require the pod spec to set BOTH `hostname` and\n`subdomain`, and a Deployment cannot give each replica a\ndistinct `hostname` — so the practical production configuration\nis an IP-based template (e.g. `http://{pod}:9002`) with the\nreplica registering `status.podIP` (via the downward API) as its\nidentity instead of `HOSTNAME`. The helm chart owns that\npairing. A\ntemplate that does not resolve degrades cross-replica live\ntails to the history-only view (counted by\n`rio_store_log_tail_proxy_failures_total`); it never fails a\nread. Env: `RIO_LOG_PEER_URL_TEMPLATE`.",
+        "description": "URL template the cross-replica `TailLog` proxy uses to dial the\nstore replica holding an execution's live ingest stream. Every\n`{pod}` is replaced with the owning replica's\n`log_ingest_sessions.replica_pod` value; an identity that\nparses as an IPv6 address is bracketed automatically, so the\ntemplate always uses the bare `{pod}` form (`[{pod}]` is\nrejected by validation). Default EMPTY = the cross-replica\nproxy is disabled, fail-closed: a bare binary cannot know the\ndeployment's pod-addressing scheme, and a wrong guess silently\nmisroutes instead of failing. The helm chart supplies the real\ntemplate (`store.logPeerUrlTemplate`, default\n`http://{pod}:9002` paired with `status.podIP` via the downward\nAPI as the replica identity). With the proxy disabled or a\ntemplate that does not resolve, cross-replica live tails\ndegrade to the history-only view (counted by\n`rio_store_log_tail_proxy_failures_total`); a read never\nfails over it. Env: `RIO_LOG_PEER_URL_TEMPLATE`.",
         "type": "string",
-        "default": "http://{pod}.rio-store-headless.rio-store.svc:9002"
+        "default": ""
       },
       "materialization": {
         "description": "Substitution-replacement campaign (design §8): the store-side\nmaterialization-job executor. `[materialization]` table in\nstore.toml. Env: `RIO_MATERIALIZATION__*`. Phase B activated the\nexecutor at the deployment layer (helm values default ON); this\nstruct's default stays `false` — a bare binary spawns no\nexecutor task set.",
@@ -361,7 +361,7 @@
     "log_cut_interval_secs": 60,
     "log_cut_threshold_bytes": 8388608,
     "log_cors_allow_origins": "",
-    "log_peer_url_template": "http://{pod}.rio-store-headless.rio-store.svc:9002",
+    "log_peer_url_template": "",
     "materialization": {
       "executor_concurrency": 8,
       "poll_interval_secs": 1,

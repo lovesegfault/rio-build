@@ -343,7 +343,12 @@ store:
   # downward API — see store.yaml). Bracketed for v6-only pod IPs. Only
   # override if the store stops being a Deployment (a StatefulSet's
   # per-pod DNS names would let this go back to a name-based template).
-  logPeerUrlTemplate: "http://[{pod}]:9002"
+  # {pod} is substituted with the replica identity (status.podIP via
+  # the downward API); the store brackets IPv6 identities itself, so
+  # the template stays bare. THE only default — the template renders
+  # this value verbatim; null/empty disables the cross-replica proxy
+  # fail-closed (history-only view for readers on non-owning replicas).
+  logPeerUrlTemplate: "http://{pod}:9002"
   # Upstream binary-cache egress allowlist. Each entry opens 443/TCP
   # to the given FQDN from the rio-store pod via CiliumNetworkPolicy
   # `toFQDNs` (DNS-aware — Cilium's L7 DNS proxy resolves and tracks
