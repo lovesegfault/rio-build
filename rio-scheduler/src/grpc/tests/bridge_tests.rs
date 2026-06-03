@@ -43,13 +43,22 @@ async fn test_bridge_build_events_lagged_keeps_receiver_alive() {
 
     let mut stream = bridge_build_events("test-bridge", state_only(rx), None);
 
-    // First poll: bridge's first recv() hits Lagged(2), continues, next
-    // recv() returns event 3 (oldest still in the cap-1 ring). NOT an Err.
+    // First poll: bridge's first recv() hits Lagged(2) → the in-stream
+    // ResyncRequired signal precedes the post-lag events
+    // (test_bridge_lagged_emits_one_resync_per_streak owns the signal
+    // contract; this test owns receiver liveness). Then event 3 (oldest
+    // still in the cap-1 ring). NOT an Err.
     let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
         .await
         .expect("bridge should not hang post-lag")
         .expect("stream should yield, not end");
-    let ev = first.expect("post-lag event must be Ok, not DATA_LOSS");
+    let signal = first.expect("post-lag signal must be Ok, not DATA_LOSS");
+    assert!(is_resync(&signal), "Lagged surfaces the resync signal");
+    let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("bridge should not hang post-lag")
+        .expect("stream should yield, not end")
+        .expect("post-lag event must be Ok, not DATA_LOSS");
     assert_eq!(
         event_tag(&ev),
         "seq-3",
@@ -361,4 +370,74 @@ async fn test_bridge_no_first_message_passthrough() {
         "no snapshot prepended on the SubmitBuild path, got {:?}",
         first.event
     );
+}
+
+/// Helper: next stream item, unwrapped.
+async fn next_ev(
+    stream: &mut tokio_stream::wrappers::ReceiverStream<
+        Result<rio_proto::types::BuildEvent, tonic::Status>,
+    >,
+) -> rio_proto::types::BuildEvent {
+    tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("stream should not hang")
+        .expect("stream should yield")
+        .expect("Ok event")
+}
+
+fn is_resync(ev: &rio_proto::types::BuildEvent) -> bool {
+    matches!(
+        ev.event,
+        Some(rio_proto::types::build_event::Event::ResyncRequired(_))
+    )
+}
+
+// r[verify gw.resync.loss-signal]
+/// A state-channel Lagged streak emits exactly ONE in-stream
+/// `ResyncRequired` before the post-lag events; a successful forward
+/// re-arms the signal so the NEXT streak emits exactly one more.
+#[tokio::test]
+async fn test_bridge_lagged_emits_one_resync_per_streak() {
+    let build_id = Uuid::new_v4();
+    // Capacity 1 + send 3 → the receiver (subscribed at creation) lags
+    // by 2 on its first recv.
+    let (tx, rx) = broadcast::channel(1);
+    for i in 1..=3u64 {
+        let _ = tx.send(mk_event(build_id, i));
+    }
+
+    let mut stream = bridge_build_events("test-bridge-resync", state_only(rx), None);
+
+    // Streak 1: ResyncRequired FIRST, then the oldest in-ring event.
+    let first = next_ev(&mut stream).await;
+    assert!(
+        is_resync(&first),
+        "the Lagged streak must surface an in-stream ResyncRequired before \
+         post-lag events (got {:?})",
+        first.event
+    );
+    let ev = next_ev(&mut stream).await;
+    assert_eq!(event_tag(&ev), "seq-3", "post-lag event follows the signal");
+
+    // A successful forward re-arms the signal.
+    let _ = tx.send(mk_event(build_id, 4));
+    let ev = next_ev(&mut stream).await;
+    assert_eq!(
+        event_tag(&ev),
+        "seq-4",
+        "no spurious resync between streaks"
+    );
+
+    // Streak 2: flood again → exactly one more ResyncRequired.
+    let _ = tx.send(mk_event(build_id, 5));
+    let _ = tx.send(mk_event(build_id, 6));
+    let ev = next_ev(&mut stream).await;
+    assert!(
+        is_resync(&ev),
+        "a NEW Lagged streak after a successful forward must re-emit the \
+         signal (got {:?})",
+        ev.event
+    );
+    let ev = next_ev(&mut stream).await;
+    assert_eq!(event_tag(&ev), "seq-6");
 }

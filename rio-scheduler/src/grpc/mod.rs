@@ -317,12 +317,16 @@ pub(crate) async fn resolve_tenant_name(
 /// state-channel `Lagged` should now be very rare (only initial dispatch
 /// burst > 4096). Log-channel `Lagged` is expected under chatty parallel
 /// builds and is debug-level: S3 + AdminService is the authoritative log
-/// path. A *state-channel* terminal lost to `Lagged` is recovered by the
-/// Closed → `EofWithoutTerminal` → WatchBuild reconnect → snapshot path —
-/// the snapshot reports the terminal state directly while the build is
-/// resident, and from the durable builds row after cleanup
-/// (`r[sched.watch.terminal-from-durable-row]`), so the recovery holds
-/// unconditionally.
+/// path.
+///
+/// A state-channel `Lagged` gap is healed STRUCTURALLY: the bridge sends
+/// one in-stream `ResyncRequired` per Lagged streak (re-armed by the
+/// next successfully forwarded state event), and the gateway re-attaches
+/// via a fresh `WatchBuild` whose snapshot reconcile recovers ALL display
+/// state (`r[gw.resync.loss-signal]`) — no per-event-type gap
+/// compensation anywhere. Terminals stay covered even without the
+/// signal: snapshot while resident, durable builds row after cleanup
+/// (`r[sched.watch.terminal-from-durable-row]`).
 pub(crate) fn bridge_build_events(
     task_name: &'static str,
     rx: BuildEventReceivers,
@@ -352,6 +356,11 @@ pub(crate) fn bridge_build_events(
         // batches. This is a fairness preference, not the correctness
         // guarantee — the guarantee is the channel split itself.
         let mut log_closed = false;
+        // One ResyncRequired per state-Lagged streak: armed at attach,
+        // re-armed by every successfully forwarded STATE event,
+        // disarmed when the signal is sent. The gateway resyncs from
+        // one fresh snapshot however many events the streak dropped.
+        let mut resync_armed = true;
         loop {
             let recv = tokio::select! {
                 biased;
@@ -359,7 +368,15 @@ pub(crate) fn bridge_build_events(
                 r = log_bcast.recv(), if !log_closed => StateOrLog::Log(r),
             };
             match recv {
-                StateOrLog::State(Ok(event)) | StateOrLog::Log(Ok(event)) => {
+                StateOrLog::State(Ok(event)) => {
+                    if tx.send(Ok(event)).await.is_err() {
+                        break; // client disconnected
+                    }
+                    // A state event reached the consumer: a future
+                    // Lagged is a NEW streak.
+                    resync_armed = true;
+                }
+                StateOrLog::Log(Ok(event)) => {
                     if tx.send(Ok(event)).await.is_err() {
                         break; // client disconnected
                     }
@@ -393,6 +410,28 @@ pub(crate) fn bridge_build_events(
                     );
                     metrics::counter!("rio_scheduler_broadcast_lagged_total", "kind" => "state")
                         .increment(n);
+                    // r[impl gw.resync.loss-signal]
+                    // Tell THIS watcher its event stream has a gap:
+                    // one in-stream ResyncRequired per streak. The
+                    // gateway re-attaches with zero backoff and
+                    // recovers everything from the snapshot reconcile
+                    // — the bridge never enumerates which event types
+                    // the gap may have contained. build_id is left
+                    // empty: the stream itself is the build identity,
+                    // and the synthesized signal has no emitter row.
+                    if resync_armed {
+                        resync_armed = false;
+                        let signal = rio_proto::types::BuildEvent {
+                            build_id: String::new(),
+                            timestamp: None,
+                            event: Some(rio_proto::types::build_event::Event::ResyncRequired(
+                                rio_proto::types::ResyncRequired {},
+                            )),
+                        };
+                        if tx.send(Ok(signal)).await.is_err() {
+                            break; // client disconnected
+                        }
+                    }
                     continue;
                 }
                 StateOrLog::Log(Err(broadcast::error::RecvError::Lagged(n))) => {
