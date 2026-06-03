@@ -225,15 +225,102 @@ async fn materialization_pins_released_only_after_all_interest_terminal() -> any
 }
 
 // r[verify sched.materialize.pinning]
-/// PD-10 (rewritten per finding DF-3): pin-at-ingest re-kinds an
-/// existing build_input pin UPWARD to materialization
-/// (`ON CONFLICT ... DO UPDATE`). Re-kinding moves the release LATER
-/// (job resolved AND no live interest instead of build-terminal) — the
-/// path stays protected strictly longer, so the original pinning build
-/// cannot be harmed. The re-kinded pin then survives
-/// `unpin_live_inputs` for the original build's terminal drv.
+/// bug_253 (bughunt wave, migration 093): pin kinds are DISJOINT ROW
+/// SETS with independent lifecycles — the PK is
+/// (store_path_hash, drv_hash, pin_kind). A materialization pin for
+/// the same (path, drv) coexists with the build_input pin instead of
+/// re-kinding it; the from_source sequence (build pin → mat pin →
+/// resolve+release) leaves the build_input row protecting the path
+/// for the still-live build.
 #[tokio::test]
-async fn pin_at_ingest_rekinds_existing_build_pin_upward() -> anyhow::Result<()> {
+async fn pin_kinds_are_disjoint_rows() -> anyhow::Result<()> {
+    use crate::db::materialization::FencedJobCreate;
+    use crate::state::{JobOrigin, JobState};
+
+    let (test_db, db) = setup().await;
+    let drv_id = insert_test_derivation(&db, "fs-seq-drv").await?;
+
+    // The from_source build pinned its input path.
+    let shared = "/nix/store/fff-from-source-input".to_string();
+    db.pin_live_inputs(&DrvHash::from("fs-seq-drv"), std::slice::from_ref(&shared))
+        .await?;
+
+    // The drv is re-minted as a materialization job; its execution
+    // ingests/verifies the same path and pins at ingest.
+    let FencedJobCreate::Applied { job_id, .. } = db
+        .create_materialization_job_fenced(drv_id, "fs-seq-drv", None, JobOrigin::Reprobe, None, 1)
+        .await?
+    else {
+        anyhow::bail!("job create must apply");
+    };
+    db.pin_materialized_paths(job_id, &DrvHash::from("fs-seq-drv"), &[shared])
+        .await?;
+
+    // Disjoint rows: BOTH kinds present (the pre-093 DO-UPDATE re-kind
+    // collapsed them to one materialization row).
+    assert_eq!(
+        pin_count(&test_db.pool, "fs-seq-drv", "build_input").await?,
+        1,
+        "the build_input pin must coexist, not be re-kinded away"
+    );
+    assert_eq!(
+        pin_count(&test_db.pool, "fs-seq-drv", "materialization").await?,
+        1,
+        "pin-at-ingest writes its own materialization row"
+    );
+
+    // Independent release: the job resolves with no live interest, the
+    // §5.3 release deletes ONLY the materialization row.
+    db.resolve_materialization_job_fenced(
+        job_id,
+        Some(Uuid::now_v7()),
+        JobState::ResolvedSuccess,
+        1,
+    )
+    .await?;
+    let released = db.release_materialization_pins_for_resolved_jobs().await?;
+    assert_eq!(released, 1, "only the materialization pin is released");
+    assert_eq!(
+        pin_count(&test_db.pool, "fs-seq-drv", "build_input").await?,
+        1,
+        "the still-live build's input stays protected by its own row \
+         (pre-093 RED: the single re-kinded row was deleted mid-build)"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.pinning]
+/// bug_233 (bughunt wave, migration 093): the CHECK constraint makes
+/// the unreleasable NULL-job materialization pin UNREPRESENTABLE — a
+/// direct INSERT violating it is rejected by PG.
+#[tokio::test]
+async fn null_job_materialization_pin_is_unrepresentable() -> anyhow::Result<()> {
+    let (test_db, _db) = setup().await;
+    let res = sqlx::query(
+        "INSERT INTO scheduler_live_pins (store_path_hash, drv_hash, pin_kind, job_id) \
+         VALUES ($1, 'null-job-drv', 'materialization', NULL)",
+    )
+    .bind(path_hash("/nix/store/ggg-null-job"))
+    .execute(&test_db.pool)
+    .await;
+    assert!(
+        res.is_err(),
+        "a NULL-job materialization pin must violate \
+         scheduler_live_pins_materialization_job (pre-093 RED: insert succeeded)"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.pinning]
+/// PD-10 (superseded by migration 093 / bug_253): pin-at-ingest writes
+/// the materialization pin as its OWN row under the
+/// (store_path_hash, drv_hash, pin_kind) key — an existing build_input
+/// pin for the same (path, drv) is untouched, and re-pinning the same
+/// materialization path is an idempotent job_id refresh. The
+/// materialization row then survives the original build's terminal
+/// release paths (the §5.3/B2-strong GC window stays closed).
+#[tokio::test]
+async fn pin_at_ingest_writes_disjoint_materialization_row() -> anyhow::Result<()> {
     let (test_db, db) = setup().await;
     insert_test_derivation(&db, "pin-rekind-drv").await?;
 
@@ -249,29 +336,37 @@ async fn pin_at_ingest_rekinds_existing_build_pin_upward() -> anyhow::Result<()>
         1
     );
 
-    // A materialization execution ingests/verifies the same path.
+    // A materialization execution ingests/verifies the same path —
+    // twice (the second pin is the idempotent job_id refresh).
     let job_id = Uuid::now_v7();
+    db.pin_materialized_paths(
+        job_id,
+        &DrvHash::from("pin-rekind-drv"),
+        std::slice::from_ref(&shared_path),
+    )
+    .await?;
     db.pin_materialized_paths(job_id, &DrvHash::from("pin-rekind-drv"), &[shared_path])
         .await?;
 
-    // The pin is re-kinded upward — one row, kind=materialization,
-    // job_id stamped.
+    // Disjoint rows: the build_input pin is untouched; the
+    // materialization row carries the job attribution.
     assert_eq!(
         pin_count(&test_db.pool, "pin-rekind-drv", "build_input").await?,
-        0,
-        "the build_input row is re-kinded, not duplicated"
+        1,
+        "the build_input row is untouched by pin-at-ingest (093 key)"
     );
     let (kind, pinned_job): (String, Option<Uuid>) = sqlx::query_as(
-        "SELECT pin_kind, job_id FROM scheduler_live_pins WHERE drv_hash = 'pin-rekind-drv'",
+        "SELECT pin_kind, job_id FROM scheduler_live_pins \
+          WHERE drv_hash = 'pin-rekind-drv' AND pin_kind = 'materialization'",
     )
     .fetch_one(&test_db.pool)
     .await?;
     assert_eq!(kind, "materialization");
     assert_eq!(pinned_job, Some(job_id));
 
-    // The original build's drv goes terminal and its release path runs:
-    // the re-kinded pin SURVIVES (the §5.3/B2-strong GC window the
-    // DO-NOTHING form would have opened stays closed).
+    // The original build's drv goes terminal and its release paths run:
+    // the materialization row SURVIVES them (the §5.3/B2-strong GC
+    // window stays closed); only the build_input row is released.
     sqlx::query("UPDATE derivations SET status = 'completed' WHERE drv_hash = 'pin-rekind-drv'")
         .execute(&test_db.pool)
         .await?;
@@ -279,9 +374,14 @@ async fn pin_at_ingest_rekinds_existing_build_pin_upward() -> anyhow::Result<()>
         .await?;
     db.sweep_stale_live_pins().await?;
     assert_eq!(
+        pin_count(&test_db.pool, "pin-rekind-drv", "build_input").await?,
+        0,
+        "the build_input row is released by the build-terminal paths"
+    );
+    assert_eq!(
         pin_count(&test_db.pool, "pin-rekind-drv", "materialization").await?,
         1,
-        "the re-kinded pin survives the original build's terminal release paths"
+        "the materialization pin survives the original build's terminal release paths"
     );
     Ok(())
 }

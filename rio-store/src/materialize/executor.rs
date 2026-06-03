@@ -389,19 +389,20 @@ async fn live_wanted_paths(
     // (an immutable content-addressed snapshot; the wanted NAME set
     // above stays live). The scheduler-side consumption coverage reads
     // the same column, so seed set and coverage agree by construction.
-    if let Some(job_id) = claimed.job_id {
-        let carried: Option<Vec<String>> = sqlx::query_scalar(
-            "SELECT carried_realized_paths FROM materialization_jobs \
-              WHERE job_id = $1",
-        )
-        .bind(job_id)
-        .fetch_optional(&ctx.pool)
-        .await?
-        .flatten();
-        for p in carried.unwrap_or_default() {
-            if !p.is_empty() && !paths.contains(&p) {
-                paths.push(p);
-            }
+    // Unconditional since bug_233's parse-don't-validate: every
+    // ClaimedJob carries a real job_id, so the carrier read can never
+    // be silently skipped for a carried job.
+    let carried: Option<Vec<String>> = sqlx::query_scalar(
+        "SELECT carried_realized_paths FROM materialization_jobs \
+          WHERE job_id = $1",
+    )
+    .bind(claimed.job_id)
+    .fetch_optional(&ctx.pool)
+    .await?
+    .flatten();
+    for p in carried.unwrap_or_default() {
+        if !p.is_empty() && !paths.contains(&p) {
+            paths.push(p);
         }
     }
 
@@ -410,13 +411,13 @@ async fn live_wanted_paths(
 
 /// The store-side pin-at-ingest INSERT (design §5.1).
 ///
-/// This is the rio-store copy of
-/// `SchedulerDb::pin_materialized_paths` (rio-scheduler/src/db/
-/// live_pins.rs) — duplicated SQL with a cross-reference per PD-13
-/// (rio-store cannot link rio-scheduler; both write the same shared
-/// table). Keep both texts in sync. `ON CONFLICT … DO UPDATE` re-kinds
-/// an existing build_input pin UPWARD (PD-10 as rewritten per DF-3):
-/// release moves later, never earlier.
+/// Executes `rio_migrations::sql::PIN_MATERIALIZED_UPSERT_SQL` — the
+/// ONE shared text `SchedulerDb::pin_materialized_paths`
+/// (rio-scheduler/src/db/live_pins.rs) also runs (bug_192; PD-13:
+/// rio-store cannot link rio-scheduler, both link rio-migrations).
+/// Binds 1-element arrays. Under the 093 key the materialization pin
+/// is its OWN row: a build_input pin for the same (path, drv) is never
+/// re-kinded (bug_253), and re-pinning refreshes job_id idempotently.
 // r[impl sched.materialize.pinning]
 // r[impl obs.metric.store]
 async fn pin_materialized_path(
@@ -426,17 +427,12 @@ async fn pin_materialized_path(
 ) -> Result<(), sqlx::Error> {
     use sha2::Digest;
     let path_hash = sha2::Sha256::digest(store_path.as_bytes()).to_vec();
-    sqlx::query(
-        "INSERT INTO scheduler_live_pins (store_path_hash, drv_hash, pin_kind, job_id) \
-         VALUES ($1, $2, 'materialization', $3) \
-         ON CONFLICT (store_path_hash, drv_hash) DO UPDATE \
-             SET pin_kind = 'materialization', job_id = EXCLUDED.job_id",
-    )
-    .bind(&path_hash)
-    .bind(&claimed.drv_hash)
-    .bind(claimed.job_id)
-    .execute(&ctx.pool)
-    .await?;
+    sqlx::query(rio_migrations::sql::PIN_MATERIALIZED_UPSERT_SQL)
+        .bind(std::slice::from_ref(&path_hash))
+        .bind(std::slice::from_ref(&claimed.drv_hash))
+        .bind(claimed.job_id)
+        .execute(&ctx.pool)
+        .await?;
     // T-6.2: the pin-supply counter — pairs with the scheduler's §5.3
     // release lifecycle for pin-leak detection (a pinned-paths rate with
     // no matching release activity after jobs resolve means pins are
@@ -711,7 +707,7 @@ mod tests {
 
         SeededJob {
             claimed: ClaimedJob {
-                job_id: Some(job_id),
+                job_id,
                 drv_hash: drv_hash.to_string(),
                 tenant_hint: job_tenant,
                 origin: "cache_opportunity".to_string(),

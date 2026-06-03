@@ -204,19 +204,19 @@ impl SchedulerDb {
     /// design §5.1 pin-at-ingest write, issued BEFORE the Success
     /// report is sent.
     ///
-    /// `ON CONFLICT … DO UPDATE` re-kinds an existing build_input pin
-    /// for the same (path, drv) UPWARD to materialization (PD-10 as
-    /// rewritten per review finding DF-3): re-kinding moves the pin's
-    /// release LATER (job resolved AND no live interest, instead of the
-    /// build-terminal release), so the build that originally pinned the
-    /// path cannot be harmed — the path stays protected strictly
-    /// longer.
+    /// Pin kinds are DISJOINT ROW SETS under the 093 key
+    /// (store_path_hash, drv_hash, pin_kind): a build_input pin for the
+    /// same (path, drv) is a different row with its own (build-terminal)
+    /// release lifecycle, never re-kinded (bug_253 — the pre-093
+    /// re-kind deleted a still-live build's only protecting row in the
+    /// from_source sequence). Re-pinning the same materialization path
+    /// is an idempotent `job_id` refresh.
     ///
-    /// This SchedulerDb method serves the PG test battery and any
-    /// scheduler-side caller. The store-side executor
-    /// (`rio-store/src/materialize/executor.rs`) carries its own copy
-    /// of this INSERT against the shared PG (PD-13: rio-store cannot
-    /// link rio-scheduler). Keep both SQL texts in sync.
+    /// Executes [`rio_migrations::sql::PIN_MATERIALIZED_UPSERT_SQL`] —
+    /// the ONE shared text the store-side executor
+    /// (`rio-store/src/materialize/executor.rs`) also runs against the
+    /// shared PG (bug_192; PD-13: rio-store cannot link rio-scheduler,
+    /// both link rio-migrations).
     // r[impl sched.materialize.pinning]
     pub async fn pin_materialized_paths(
         &self,
@@ -233,18 +233,12 @@ impl SchedulerDb {
             .map(|p| sha2::Sha256::digest(p.as_bytes()).to_vec())
             .collect();
         let drv_hashes: Vec<String> = vec![drv_hash.as_str().to_string(); hashes.len()];
-        sqlx::query(
-            "INSERT INTO scheduler_live_pins (store_path_hash, drv_hash, pin_kind, job_id) \
-             SELECT h, d, 'materialization', $3 \
-               FROM UNNEST($1::bytea[], $2::text[]) AS u(h, d) \
-             ON CONFLICT (store_path_hash, drv_hash) DO UPDATE \
-                 SET pin_kind = 'materialization', job_id = EXCLUDED.job_id",
-        )
-        .bind(&hashes)
-        .bind(&drv_hashes)
-        .bind(job_id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query(rio_migrations::sql::PIN_MATERIALIZED_UPSERT_SQL)
+            .bind(&hashes)
+            .bind(&drv_hashes)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

@@ -409,6 +409,16 @@ pub fn describe_metrics() {
          pins are accumulating (GC pressure)."
     );
     describe_counter!(
+        "rio_store_materialization_claim_rejected_total",
+        "Materialization claims REFUSED by this replica before any \
+         PullAssignment, labeled by reason (bad_job_id: the listing \
+         descriptor's job_id failed UUID parse — bug_233's \
+         parse-don't-validate gate; a malformed descriptor is a \
+         scheduler-side bug). Nonzero means jobs are being listed that \
+         no replica can attribute, so they sit unclaimed until the \
+         descriptor is fixed."
+    );
+    describe_counter!(
         "rio_store_substitute_integrity_failures_total",
         "Upstream substitution NAR hash or size mismatches, labeled by \
          tenant (UUID). Nonzero is a security-relevant signal: upstream \

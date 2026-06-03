@@ -186,6 +186,7 @@
     "rio_store_log_tail_proxied_total",
     "rio_store_log_tail_proxy_failures_total",
     "rio_store_log_tail_subscribers",
+    "rio_store_materialization_claim_rejected_total",
     "rio_store_materialization_executions_total",
     "rio_store_materialization_pinned_paths_total",
     "rio_store_pg_pool_utilization",
@@ -1152,6 +1153,11 @@
         "name": "rio_store_log_tail_subscribers",
         "kind": "gauge",
         "help": "Live TailLog follow-subscriptions currently attached to this replica's ingest sessions."
+      },
+      {
+        "name": "rio_store_materialization_claim_rejected_total",
+        "kind": "counter",
+        "help": "Materialization claims REFUSED by this replica before any PullAssignment, labeled by reason (bad_job_id: the listing descriptor's job_id failed UUID parse — bug_233's parse-don't-validate gate; a malformed descriptor is a scheduler-side bug). Nonzero means jobs are being listed that no replica can attribute, so they sit unclaimed until the descriptor is fixed."
       },
       {
         "name": "rio_store_materialization_executions_total",

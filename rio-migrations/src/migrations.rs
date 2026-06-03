@@ -1855,6 +1855,38 @@ pub const M_082: () = ();
 /// window has zero behavioral delta.
 pub const M_083: () = ();
 
+/// `migrations/093_live_pins_kind_key.sql`
+///
+/// Pin kinds become DISJOINT ROW SETS (bughunt wave, bug_253/bug_233;
+/// D1 store-gc-claim-state):
+///
+/// - PK widens `(store_path_hash, drv_hash)` →
+///   `(store_path_hash, drv_hash, pin_kind)`. A build_input pin and a
+///   materialization pin for the same `(path, drv)` coexist with
+///   independent lifecycles: build_input releases on the pinning
+///   build's terminal status, materialization on the §5.3
+///   all-interest-terminal rule. The pre-093 `ON CONFLICT … DO UPDATE`
+///   re-kind (PD-10/DF-3's "release moves strictly later" argument)
+///   was FALSE in the from_source sequence: re-kinding the build pin
+///   and then resolving the job released the only row protecting a
+///   still-live build's input.
+/// - CHECK `scheduler_live_pins_materialization_job`: a
+///   materialization pin without `job_id` is unrepresentable — the
+///   §5.3 release rule resolves every pin's job, so the immortal
+///   NULL-job pin class (bug_233: the store client swallowed job_id
+///   parse failures into NULL) cannot exist. The store client now
+///   refuses claims whose descriptor job_id does not parse
+///   (`ClaimedJob.job_id: Uuid`, parse-don't-validate).
+/// - The defensive DELETE is expected to remove 0 rows (the only
+///   NULL-job writer was the store client's swallowed parse, and the
+///   §5.3 release rule never matched those rows — any that exist are
+///   exactly the immortal pins the CHECK now forbids).
+///
+/// The shared upsert text both crates execute against this key lives
+/// in `rio_migrations::sql::PIN_MATERIALIZED_UPSERT_SQL` (bug_192 —
+/// PD-13's duplicated-SQL pair collapsed to one const).
+pub const M_093: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

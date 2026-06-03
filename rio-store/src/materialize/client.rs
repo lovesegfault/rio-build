@@ -60,7 +60,11 @@ pub trait MaterializeTransport {
 #[derive(Debug, Clone)]
 pub struct ClaimedJob {
     /// `materialization_jobs.job_id` (from the listing descriptor).
-    pub job_id: Option<Uuid>,
+    /// Parse-don't-validate (bug_233): a descriptor whose job_id does
+    /// not parse is REFUSED before the claim, so every held job is
+    /// attributable — the pin-at-ingest write always binds a real job
+    /// and the 093 CHECK's NULL-job pin class cannot be minted.
+    pub job_id: Uuid,
     /// The derivation this job materializes (the pull's intent).
     pub drv_hash: String,
     /// Recorded creating-build tenant — a HINT only (PDQ-8): execution
@@ -115,6 +119,25 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
 
     let mut claimed = Vec::new();
     for descriptor in listed.into_iter().take(available_slots) {
+        // bug_233 (parse-don't-validate): refuse the claim BEFORE the
+        // pull when the descriptor's job_id does not parse. Claiming an
+        // attempt we cannot attribute to a job would strand it (the
+        // resolve path is keyed by job) and the pin-at-ingest write
+        // would mint the immortal NULL-job pin class the 093 CHECK now
+        // forbids. A malformed descriptor is a scheduler-side bug —
+        // surface it loudly and leave the attempt unclaimed.
+        let job_id = match Uuid::parse_str(&descriptor.job_id) {
+            Ok(id) => id,
+            Err(err) => {
+                warn!(drv_hash = %descriptor.drv_hash,
+                      job_id = %descriptor.job_id, %err,
+                      "malformed job_id in listing descriptor; claim refused");
+                metrics::counter!("rio_store_materialization_claim_rejected_total",
+                                  "reason" => "bad_job_id")
+                .increment(1);
+                continue;
+            }
+        };
         let req = PullAssignmentRequest {
             // No executor token: the store's credential is the
             // service token in metadata (the kind-attested credential).
@@ -129,7 +152,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             Ok(resp) => match resp.outcome {
                 Some(pull_assignment_response::Outcome::Assignment(assignment)) => {
                     claimed.push(ClaimedJob {
-                        job_id: Uuid::parse_str(&descriptor.job_id).ok(),
+                        job_id,
                         drv_hash: descriptor.drv_hash,
                         tenant_hint: Uuid::parse_str(&descriptor.tenant_id).ok(),
                         origin: descriptor.origin,
@@ -562,6 +585,31 @@ mod tests {
         );
         assert_eq!(t.list_calls, 1);
         assert_eq!(t.pull_calls, 2);
+    }
+
+    /// bug_233 (bughunt wave): a descriptor whose job_id does not parse
+    /// as a UUID is REFUSED before any claim is attempted — no
+    /// ClaimedJob, no PullAssignment RPC (claiming an attempt we cannot
+    /// attribute to a job would mint the immortal NULL-job pin class).
+    // r[verify store.materialize.executor+3]
+    #[tokio::test]
+    async fn malformed_job_id_refuses_the_claim() {
+        let mut bad = descriptor(9);
+        bad.job_id = "not-a-uuid".to_string();
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![bad]))],
+            vec![Ok(deliver("exec-9", "/nix/store/zzz-bad.drv"))],
+            vec![],
+        );
+        let claimed = poll_and_claim(&mut t, "store-replica-0", 8).await;
+        assert!(
+            claimed.is_empty(),
+            "a malformed job_id must refuse the claim (pre-fix RED: claimed with job_id=None)"
+        );
+        assert_eq!(
+            t.pull_calls, 0,
+            "the refusal happens BEFORE the pull — the attempt is never claimed"
+        );
     }
 
     /// (b) NotYetReady on a claim is race tolerance, not an error: the

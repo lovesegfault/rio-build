@@ -121,6 +121,7 @@ let
     "creationLeavesTenantResolvable"
     "materializationCrashChargedOnce"
     "crossBuildWantedIsolation"
+    "materializationPinHasJob"
   ];
 
   # The leader-election model as its own single-file store path (the
@@ -3639,6 +3640,18 @@ in
       extraSpecs = [ "materializationJob" ];
       step = "calibStep";
       witness = "pinCoversIngestUntilAllInterestTerminal";
+    };
+    # bug_233 (bughunt wave, D1): the swallowed job_id parse → an
+    # unattributed (NULL-job) materialization pin the §5.3 release rule
+    # can never resolve — immortal. Production close: ClaimedJob.job_id
+    # parse-don't-validate + the 093 CHECK.
+    quint-materialization-calib-233-unattributed-pin = mkQuintWitnessCheck {
+      name = "materialization-calib-233-unattributed-pin";
+      spec = "calibration/mat-233-unattributed-pin";
+      main = "matCalib233UnattributedPin";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "materializationPinHasJob";
     };
     # F5 / PP-5 (i): the wholesale relation overwrite breaks
     # cross-build isolation.

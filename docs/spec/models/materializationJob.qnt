@@ -564,6 +564,20 @@ module materializationJob {
     )
   )
 
+  /// 233 (bughunt wave, D1/migration 093): every materialization pin
+  /// is attributable to its job row — production: ClaimedJob.job_id is
+  /// a parsed Uuid (the store client refuses unattributable claims)
+  /// and the 093 CHECK (pin_kind <> 'materialization' OR job_id IS NOT
+  /// NULL) makes the NULL-job pin unrepresentable, so the §5.3 release
+  /// rule can always resolve a pin's job — no immortal pins.
+  /// Falsifiability pair: quint-materialization-calib-233-unattributed-pin
+  /// (an ingest that pins without a job row).
+  val materializationPinHasJob = DRVS.forall(d =>
+    OUTPUTS.forall(o =>
+      (pins.get((d, o)) == PinMaterialization) implies (jobs.get(d) != NoJob)
+    )
+  )
+
   /// A10 (delta-5): failover never drops durable job rows. The frame
   /// keeps it constant-false as built; a row-dropping override latches.
   val failoverPreservesJobs = not(failoverDroppedJobs)

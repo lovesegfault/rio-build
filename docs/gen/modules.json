@@ -674,6 +674,11 @@
       "path": "schema.rs",
       "depth": 0,
       "doc": "Cross-service row types — compile-time schema contract."
+    },
+    {
+      "path": "sql.rs",
+      "depth": 0,
+      "doc": "Cross-crate SQL texts against shared tables."
     }
   ],
   "rio-nix": [
