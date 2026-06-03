@@ -126,7 +126,12 @@ pub(crate) const MAX_DRV_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
 /// not a peer-declared figure. It bounds what `dump_nar` will BUFFER
 /// (the supply path materializes whole NARs in memory today — see
 /// `dump_nar`'s streaming TODO), converting the decompression-bomb tree
-/// into a per-path refusal naming this cap.
+/// into a per-path refusal naming this cap. The bomb half of that claim
+/// is image-arm-only: only the DwarFS lane can amplify a compact
+/// archive into multi-GiB buffered contents — a staging directory
+/// already holds its trees at full size on disk, so on the directory
+/// arm the budget is the same uniform buffer ceiling with no
+/// amplification threat behind it.
 ///
 /// Sizing: 3.2× the largest single object the publisher PUTs (the 5 GiB
 /// compressed image, [`S3_SINGLE_PUT_MAX_BYTES`]) — a single member
