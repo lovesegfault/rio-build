@@ -1222,11 +1222,22 @@ mod tests {
     /// so this is the test that fails when either crate moves its end of
     /// the calibration.
     ///
-    /// Universe: the corners of the legal (roots, est_nodes) space at
-    /// `Knobs::default()`, ENUMERATED FROM THE ADMISSION CODE — each corner
-    /// batch is produced by `assemble_batches` itself, not hand-assumed.
-    /// Budget is monotone in each axis while volume follows nodes alone,
-    /// so the binding corner is min-roots × max-nodes, not the diagonal:
+    /// Universe: the budget's true input universe is the SUBMISSION
+    /// CHOKEPOINT'S feeders, one level above the assembler — wave batches,
+    /// fail-fast singletons, canary probes, AND the timed dispatcher's two
+    /// literal constructions, which never pass through the assembler (the
+    /// round-3 calibration quantified over assembler output and those two
+    /// feeders escaped it; the submitter now derives the budget workload
+    /// itself from the realized import closure, pinned through the real
+    /// submitter by the chokepoint tests in `run::submitter` and
+    /// `run::timeline`). For a conforming archive the assembler's
+    /// `est_nodes` IS that realized closure (plan-verified adjacency), so
+    /// the corners of the legal (roots, est_nodes) space at
+    /// `Knobs::default()` remain the calibration shapes, ENUMERATED FROM
+    /// THE ADMISSION CODE — each corner batch is produced by
+    /// `assemble_batches` itself, not hand-assumed. Budget is monotone in
+    /// each axis while volume follows nodes alone, so the binding corner
+    /// is min-roots × max-nodes, not the diagonal:
     ///
     /// 1. max-roots × max-nodes (the packed default batch),
     /// 2. ONE root carrying `batch_max_nodes` (a wave-tail batch),
@@ -1234,12 +1245,18 @@ mod tests {
     ///    `batch_max_nodes` — admitted alone, est_nodes above the cap),
     /// 4. the fail-fast/canary singleton admission `(1, usize::MAX)`,
     ///    whose REALIZED est_nodes is the job's actual closure union (the
-    ///    admission cap is not a workload).
+    ///    admission cap is not a workload),
+    /// 5. the timed feeder, which has NO admission caps at all (a recorded
+    ///    request is submitted verbatim): checked at the formula's node
+    ///    multiplier cap — the largest workload the budget still scales
+    ///    for — plus the explicit beyond-cap clamp row (above the cap the
+    ///    belt deliberately stops scaling and the wall-clock deadline is
+    ///    the liveness bound; rio-nix pins the same clamp from its side).
     #[test]
     fn default_batch_shape_fits_the_stderr_drain_budget() {
         use rio_nix::protocol::client::{
-            STDERR_BUDGET_NODE_MULTIPLIER_CAP, STDERR_BUDGET_ROOT_MULTIPLIER_CAP,
-            stderr_budget_for_workload,
+            STDERR_BUDGET_NODE_MULTIPLIER_CAP, STDERR_BUDGET_PER_CLOSURE_NODE,
+            STDERR_BUDGET_ROOT_MULTIPLIER_CAP, stderr_budget_for_workload,
         };
 
         use crate::run::batch::{PendingJob, assemble_batches};
@@ -1342,6 +1359,28 @@ mod tests {
                 batch.est_nodes,
             );
         }
+
+        // Corner 5: the timed feeder. A recorded request is submitted
+        // verbatim (no assembler, no caps), so the chokepoint can realize
+        // a one-root workload of ANY size; the budget must absorb the
+        // healthy-volume model all the way up to the formula's node
+        // multiplier cap...
+        assert!(
+            stderr_budget_for_workload(1, STDERR_BUDGET_NODE_MULTIPLIER_CAP)
+                >= STDERR_BUDGET_NODE_MULTIPLIER_CAP * LOG_LINES_PER_CLOSURE_NODE,
+            "a one-root timed workload at the node multiplier cap must still fit its \
+             healthy log volume"
+        );
+        // ...and beyond the cap it must CLAMP, not scale: the count belt
+        // stays a real bound on a runaway daemon, and past this point the
+        // wall-clock batch deadline is the liveness bound. Asserted
+        // explicitly (not assumed unreachable) because the timed feeder
+        // has no admission cap that would keep workloads below it.
+        assert_eq!(
+            stderr_budget_for_workload(1, usize::MAX),
+            STDERR_BUDGET_NODE_MULTIPLIER_CAP * STDERR_BUDGET_PER_CLOSURE_NODE,
+            "an over-cap workload estimate must clamp at the node multiplier cap"
+        );
     }
 
     #[test]

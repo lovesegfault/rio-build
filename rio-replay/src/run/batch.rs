@@ -24,8 +24,17 @@ pub struct PendingJob {
 pub struct Batch {
     pub jobs: Vec<String>,
     pub root_drvs: Vec<String>,
-    /// Exact size of the union of {target drv} ∪ dep drvs over the batch —
-    /// the merged-DAG node estimate the caps act on.
+    /// The PRODUCER's a-priori merged-DAG node estimate. For batches from
+    /// [`assemble_batches`] this is the exact union of {target drv} ∪ dep
+    /// drvs over the batch — the quantity the packing caps act on; the
+    /// timed dispatcher's audited literal constructions (which have no
+    /// adjacency data — recorded request targets need not be workload
+    /// units) write the roots-only floor. Packing and batches.jsonl
+    /// bookkeeping ONLY: the build op's stderr drain budget is keyed at
+    /// the submission chokepoint from the realized import closure
+    /// (`ClientOpsSubmitter::submit_batch`), never from this field, so no
+    /// producer can under-key the belt. The construction-site enumeration
+    /// test below pins every literal producer.
     pub est_nodes: usize,
 }
 
@@ -144,5 +153,72 @@ mod tests {
         let a = assemble_batches(&jobs, 4, 30);
         let b = assemble_batches(&jobs, 4, 30);
         assert_eq!(a, b);
+    }
+
+    /// Standing enumeration of [`Batch`] est_nodes producers: every `.rs`
+    /// file in the crate is scanned for literal `Batch` constructions —
+    /// the universe is a directory walk at test time
+    /// (`crate::run::crate_sources`), so a NEW production site in any
+    /// existing or any new file fails this lint until it either comes from
+    /// [`assemble_batches`] (whose batches never match the needle — it
+    /// builds via `Batch::default`) or is audited here with its
+    /// `est_nodes` justification. Each file pins both its production-zone
+    /// and test-zone count (`crate::run::lint_zones`; zone semantics
+    /// documented on `run::tests::assert_consumer_counts`).
+    ///
+    /// Why this enumeration exists: the stderr drain budget was once keyed
+    /// on the producer-written `est_nodes`, and the two timed-dispatcher
+    /// literal sites wrote the ROOT COUNT — under-budgeting legal one-root
+    /// deep-closure submissions to the single-unit floor. The budget is
+    /// now derived at the submission chokepoint from the realized import
+    /// closure, so a producer cannot under-key it; this lint keeps the
+    /// remaining producer obligations (honest packing/bookkeeping
+    /// estimates) reviewed whenever a construction site appears.
+    ///
+    /// The audited production sites:
+    ///  1. src/run/batch.rs — the struct declaration itself;
+    ///  2. src/run/timeline.rs — the timed dispatcher's initial-dispatch
+    ///     construction (roots-only floor; no adjacency data exists for
+    ///     recorded request targets);
+    ///  3. src/run/timeline.rs — its confirmation-retry sibling (same
+    ///     floor, same rationale).
+    ///
+    /// Test-zone occurrences are fixtures: submitter.rs scripted batches
+    /// (incl. the under-/over-keyed chokepoint fixtures), submit.rs
+    /// chokepoint records, mod.rs stage harnesses.
+    #[test]
+    fn batch_construction_sites_are_enumerated() {
+        // Built at runtime so this test's own strings cannot match it.
+        let needle = format!("{}{}", "Batch ", "{");
+        let allowed: std::collections::BTreeMap<&str, (usize, usize)> = [
+            ("src/run/batch.rs", (1, 0)),
+            ("src/run/timeline.rs", (2, 0)),
+            ("src/run/submitter.rs", (0, 4)),
+            ("src/run/submit.rs", (0, 3)),
+            ("src/run/mod.rs", (0, 2)),
+        ]
+        .into_iter()
+        .collect();
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (file, text) in crate::run::crate_sources() {
+            let (prod, tail) = crate::run::lint_zones(&text);
+            let expected = allowed.get(file.as_str()).copied().unwrap_or((0, 0));
+            assert_eq!(
+                (prod.matches(&needle).count(), tail.matches(&needle).count()),
+                expected,
+                "{file} (production zone, test zone): a new literal Batch construction \
+                 site must come from assemble_batches or be audited into this enumeration \
+                 with its est_nodes justification (the stderr drain budget is keyed at the \
+                 submission chokepoint from the realized import closure, but est_nodes \
+                 still feeds batch packing and the batches.jsonl record)"
+            );
+            seen.insert(file);
+        }
+        for file in allowed.keys() {
+            assert!(
+                seen.contains(*file),
+                "{file} is enumerated but no longer exists; drop or move its row"
+            );
+        }
     }
 }

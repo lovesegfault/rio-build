@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use rio_nix::protocol::client::StoreEntry;
+use rio_nix::protocol::client::{KeyedBuildResult, StoreEntry};
 
 use super::batch::Batch;
 use super::drv_import::DrvArchive;
@@ -190,6 +190,101 @@ fn observe_line(parsed: &mut ParsedStderr, tail: &mut VecDeque<String>, payload:
 /// default batch-entry cap (`upload_batch_max_entries`).
 const DRV_UPLOAD_CHUNK: usize = 500;
 
+/// The slice of the gateway daemon-channel surface one batch submission
+/// drives, behind a seam so the submission chokepoint is testable without
+/// SSH (the submit-side sibling of the supply stage's `SupplyTransport`
+/// seam). Production is [`DaemonChannel`]; tests script it to pin the
+/// values the chokepoint actually hands the wire layer — most importantly
+/// the workload estimate that keys the build op's stderr drain budget,
+/// which no scripted-[`Submitter`] test can observe.
+#[async_trait]
+pub trait SubmitChannel: Send {
+    /// Index of the underlying pool connection (for triage logs).
+    fn connection_index(&self) -> usize;
+    /// `wopQueryValidPaths` (no daemon-side substitution): which of `paths`
+    /// the target already has.
+    async fn query_valid_paths(
+        &mut self,
+        paths: &[String],
+        timeout: Duration,
+    ) -> std::result::Result<BTreeSet<String>, TransportError>;
+    /// `wopAddMultipleToStore` of drv-text upload entries.
+    async fn add_multiple_to_store(
+        &mut self,
+        entries: Vec<StoreEntry>,
+        base_timeout: Duration,
+    ) -> std::result::Result<(), TransportError>;
+    /// `wopBuildPathsWithResults` with a relayed-stderr observer.
+    /// `closure_nodes` is the workload estimate that keys the op's stderr
+    /// drain budget (see `DaemonChannel::build_paths_with_results`).
+    async fn build_paths_with_results_observed(
+        &mut self,
+        derived: &[String],
+        timeout: Duration,
+        closure_nodes: usize,
+        observer: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> std::result::Result<Vec<KeyedBuildResult>, TransportError>;
+    /// Abandon the channel without waiting for protocol teardown (the
+    /// gateway cancels the session's in-flight builds).
+    fn abandon(self: Box<Self>);
+}
+
+#[async_trait]
+impl SubmitChannel for DaemonChannel {
+    fn connection_index(&self) -> usize {
+        DaemonChannel::connection_index(self)
+    }
+    async fn query_valid_paths(
+        &mut self,
+        paths: &[String],
+        timeout: Duration,
+    ) -> std::result::Result<BTreeSet<String>, TransportError> {
+        DaemonChannel::query_valid_paths(self, paths, timeout).await
+    }
+    async fn add_multiple_to_store(
+        &mut self,
+        entries: Vec<StoreEntry>,
+        base_timeout: Duration,
+    ) -> std::result::Result<(), TransportError> {
+        DaemonChannel::add_multiple_to_store(self, entries, base_timeout).await
+    }
+    async fn build_paths_with_results_observed(
+        &mut self,
+        derived: &[String],
+        timeout: Duration,
+        closure_nodes: usize,
+        observer: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> std::result::Result<Vec<KeyedBuildResult>, TransportError> {
+        DaemonChannel::build_paths_with_results_observed(
+            self,
+            derived,
+            timeout,
+            closure_nodes,
+            observer,
+        )
+        .await
+    }
+    fn abandon(self: Box<Self>) {
+        DaemonChannel::abandon(*self)
+    }
+}
+
+/// Source of [`SubmitChannel`]s for batch submissions. Production is
+/// [`GatewayPool`] (one SSH-exec'd `nix-daemon --stdio` session per
+/// channel); tests provide scripted channels.
+#[async_trait]
+pub trait SubmitChannelSource: Send + Sync {
+    /// Open one daemon session ready for ops (handshake done).
+    async fn open_channel(&self) -> Result<Box<dyn SubmitChannel>>;
+}
+
+#[async_trait]
+impl SubmitChannelSource for GatewayPool {
+    async fn open_channel(&self) -> Result<Box<dyn SubmitChannel>> {
+        Ok(Box::new(GatewayPool::open_channel(self).await?))
+    }
+}
+
 /// Submitter that drives the gateway's worker protocol directly: per batch
 /// it imports the batch's drv closure from the replay archive
 /// (a `QueryValidPaths` probe + `AddMultipleToStore` of the missing texts in
@@ -197,9 +292,9 @@ const DRV_UPLOAD_CHUNK: usize = 500;
 /// per-root results become the batch outcome. Relayed stderr lines are
 /// captured as evidence only (build id, failure reasons, tail).
 pub struct ClientOpsSubmitter {
-    /// SSH channel pool to the gateway; one channel is held per in-flight
-    /// submission.
-    pub pool: Arc<GatewayPool>,
+    /// Daemon-channel source (the gateway SSH pool in production); one
+    /// channel is held per in-flight submission.
+    pub pool: Arc<dyn SubmitChannelSource>,
     /// Open replay archive the drv texts are imported from.
     pub archive: Arc<DrvArchive>,
     /// Per-op deadline for the probe and upload calls
@@ -246,9 +341,9 @@ impl ClientOpsSubmitter {
     /// outcome of this arm lands in the same engine-side bucket.
     async fn upload_chunk(
         &self,
-        mut chan: DaemonChannel,
+        mut chan: Box<dyn SubmitChannel>,
         paths: &[String],
-    ) -> Result<DaemonChannel> {
+    ) -> Result<Box<dyn SubmitChannel>> {
         let entries = self.materialize_entries(paths)?;
         let op = format!("AddMultipleToStore ({} drv texts)", paths.len());
         // The base deadline is the metadata-scale per-op bound; the channel
@@ -307,6 +402,24 @@ impl Submitter for ClientOpsSubmitter {
 
         // ── Import: the batch's drv closure from the replay archive ────────
         let closure = self.archive.closure(&batch.root_drvs)?;
+        // Workload basis for the build op's stderr drain budget: every
+        // derivation the submitted DAG can REACH — the importable texts
+        // (`order`) plus the gaps a non-conforming archive cannot offer
+        // (`skipped`, which the target may still resolve from its own
+        // store and build). Derived HERE, at the one chokepoint every
+        // batch funnels through, never from the producer's
+        // `Batch::est_nodes`: that field is the assembler's packing
+        // estimate, and two producers (the timed dispatcher's initial and
+        // confirmation-retry constructions) structurally lack adjacency
+        // data — recorded request targets need not even be workload units
+        // — so a producer-side key would under-budget legal one-root
+        // deep-closure submissions down to the single-unit floor and trip
+        // the drain belt mid-DAG (a wire error that cancels every
+        // in-flight build in the batch). Target-side validity is
+        // deliberately NOT subtracted: force-build campaigns rebuild
+        // already-valid paths, and the estimate may only widen the belt
+        // above its roots floor, never narrow it.
+        let workload_nodes = closure.order.len() + closure.skipped.len();
         if !closure.skipped.is_empty() {
             // A conforming archive embeds the full requisite .drv closure
             // of every workload unit, so a non-empty skipped set means the
@@ -360,17 +473,11 @@ impl Submitter for ClientOpsSubmitter {
         let timeout = deadline.remaining_from(tokio::time::Instant::now());
         let build_result = {
             let mut observer = |line: &str| observe_line(&mut parsed, &mut tail, line);
-            // `est_nodes` is the assembler's exact merged-closure union for
-            // this batch (roots + dependency drvs, shared deps counted
-            // once) — the workload estimate that keys the op's stderr
+            // `workload_nodes` is the realized import closure resolved
+            // above — the workload estimate that keys the op's stderr
             // drain budget to the volume the DAG can healthily emit.
-            chan.build_paths_with_results_observed(
-                &derived,
-                timeout,
-                batch.est_nodes,
-                &mut observer,
-            )
-            .await
+            chan.build_paths_with_results_observed(&derived, timeout, workload_nodes, &mut observer)
+                .await
         };
         let (results, engine_cancelled) = match build_result {
             // The mapping checks the daemon's result count against the
@@ -437,6 +544,115 @@ pub fn repro_command(campaign_id: &str, drv_path: &str) -> String {
 pub(crate) mod test_support {
     use super::*;
     use std::sync::Mutex;
+
+    /// One recorded `BuildPathsWithResults` call a [`FakeChannelSource`]
+    /// channel served: the submitted derived paths and — the value these
+    /// fakes exist to observe — the `closure_nodes` workload estimate that
+    /// keys the op's stderr drain budget.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct RecordedBuildCall {
+        pub derived: Vec<String>,
+        pub closure_nodes: usize,
+    }
+
+    /// Scripted [`SubmitChannelSource`] driving the REAL
+    /// [`ClientOpsSubmitter`] without SSH: every channel it opens shares
+    /// one log of probe/upload/build calls and one script of build
+    /// results. Probes answer from `valid_paths`; uploads succeed and
+    /// record their entry counts; build calls record `(derived,
+    /// closure_nodes)` and pop one scripted result vector (an exhausted
+    /// script reports every derived path Built). Tests keep their own
+    /// `Arc` clone of the source to read the logs after the submitter ran.
+    #[derive(Default)]
+    pub struct FakeChannelSource {
+        /// Paths every validity probe reports as already on the target.
+        pub valid_paths: BTreeSet<String>,
+        /// Scripted per-build-call results, popped from the FRONT (one
+        /// entry per `BuildPathsWithResults` call, in call order).
+        pub results: Arc<Mutex<VecDeque<Vec<KeyedBuildResult>>>>,
+        /// Probed path slices, in call order.
+        pub probes: Arc<Mutex<Vec<Vec<String>>>>,
+        /// Upload entry counts, in call order.
+        pub uploads: Arc<Mutex<Vec<usize>>>,
+        /// Recorded build calls, in call order.
+        pub build_calls: Arc<Mutex<Vec<RecordedBuildCall>>>,
+    }
+
+    /// One channel handed out by [`FakeChannelSource`]; shares its
+    /// source's logs and script.
+    pub struct FakeChannel {
+        valid_paths: BTreeSet<String>,
+        results: Arc<Mutex<VecDeque<Vec<KeyedBuildResult>>>>,
+        probes: Arc<Mutex<Vec<Vec<String>>>>,
+        uploads: Arc<Mutex<Vec<usize>>>,
+        build_calls: Arc<Mutex<Vec<RecordedBuildCall>>>,
+    }
+
+    #[async_trait]
+    impl SubmitChannelSource for FakeChannelSource {
+        async fn open_channel(&self) -> Result<Box<dyn SubmitChannel>> {
+            Ok(Box::new(FakeChannel {
+                valid_paths: self.valid_paths.clone(),
+                results: self.results.clone(),
+                probes: self.probes.clone(),
+                uploads: self.uploads.clone(),
+                build_calls: self.build_calls.clone(),
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl SubmitChannel for FakeChannel {
+        fn connection_index(&self) -> usize {
+            0
+        }
+        async fn query_valid_paths(
+            &mut self,
+            paths: &[String],
+            _timeout: Duration,
+        ) -> std::result::Result<BTreeSet<String>, TransportError> {
+            self.probes.lock().unwrap().push(paths.to_vec());
+            Ok(paths
+                .iter()
+                .filter(|p| self.valid_paths.contains(*p))
+                .cloned()
+                .collect())
+        }
+        async fn add_multiple_to_store(
+            &mut self,
+            entries: Vec<StoreEntry>,
+            _base_timeout: Duration,
+        ) -> std::result::Result<(), TransportError> {
+            self.uploads.lock().unwrap().push(entries.len());
+            Ok(())
+        }
+        async fn build_paths_with_results_observed(
+            &mut self,
+            derived: &[String],
+            _timeout: Duration,
+            closure_nodes: usize,
+            _observer: &mut (dyn for<'a> FnMut(&'a str) + Send),
+        ) -> std::result::Result<Vec<KeyedBuildResult>, TransportError> {
+            self.build_calls.lock().unwrap().push(RecordedBuildCall {
+                derived: derived.to_vec(),
+                closure_nodes,
+            });
+            let scripted = self.results.lock().unwrap().pop_front();
+            Ok(scripted.unwrap_or_else(|| {
+                derived
+                    .iter()
+                    .map(|path| KeyedBuildResult {
+                        derived_path: path.clone(),
+                        result: rio_nix::protocol::build::BuildResult {
+                            status: rio_nix::protocol::build::BuildStatus::Built,
+                            ..rio_nix::protocol::build::BuildResult::default()
+                        },
+                    })
+                    .collect()
+            }))
+        }
+        fn abandon(self: Box<Self>) {}
+    }
 
     /// Scripted [`Submitter`] for stage-level tests: pops pre-programmed
     /// results and records every submitted batch.
@@ -820,5 +1036,233 @@ mod tests {
                 format!("derivation '{dependent}' failed: {cascade_reason}"),
             ]
         );
+    }
+
+    /// Real [`ClientOpsSubmitter`] over a scripted channel source and a
+    /// real mini archive (written by the production `ArchiveWriter` chain).
+    fn client_ops(
+        archive: Arc<crate::archive::reader::ReplayArchive>,
+        source: &Arc<test_support::FakeChannelSource>,
+        probe_chunk: usize,
+    ) -> ClientOpsSubmitter {
+        ClientOpsSubmitter {
+            pool: source.clone(),
+            archive: Arc::new(DrvArchive::new(archive)),
+            op_timeout: Duration::from_secs(5),
+            probe_chunk,
+        }
+    }
+
+    /// Batch over the given roots with a PRODUCER-side node estimate — the
+    /// field the budget chokepoint must not consult.
+    fn batch_with_estimate(jobs: &[&str], roots: &[String], est_nodes: usize) -> Batch {
+        Batch {
+            jobs: jobs.iter().map(|s| s.to_string()).collect(),
+            root_drvs: roots.to_vec(),
+            est_nodes,
+        }
+    }
+
+    /// The build op's stderr-drain-budget workload is derived HERE, at the
+    /// submission chokepoint, from the realized import closure — never
+    /// from the producer's `Batch::est_nodes`.
+    ///
+    /// Universe (the chokepoint's FEEDERS, not the assembler's output):
+    /// every production batch funnels through
+    /// `ClientOpsSubmitter::submit_batch` — `assemble_batches` waves,
+    /// fail-fast isolation singletons, canary probe batches, and the timed
+    /// dispatcher's two literal constructions (initial dispatch and
+    /// confirmation retry), which never pass through the assembler and
+    /// carry a roots-only `est_nodes`. The round-3 budget fix calibrated
+    /// against the assembler's output and was escaped one level up by
+    /// exactly those timed feeders; quantifying over the chokepoint's
+    /// input data (the closure it just resolved) covers every feeder,
+    /// including future ones, by construction.
+    ///
+    /// Mutation pin: the suite previously stayed green when the build
+    /// call's workload argument was hard-flipped to `0` — no test observed
+    /// the wire-layer argument through the real submitter. This test (and
+    /// its timed sibling in `timeline.rs`) goes red for `0`,
+    /// `batch.est_nodes`, and `root_drvs.len()` alike.
+    #[tokio::test]
+    async fn build_op_workload_is_the_realized_import_closure_not_the_producer_estimate() {
+        use crate::run::archive_input::{load_units, write_mini_archive};
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_mini_archive(tmp.path());
+        let archive = Arc::new(crate::archive::reader::ReplayArchive::open(tmp.path()).unwrap());
+        let app_b = load_units(&archive)
+            .unwrap()
+            .into_iter()
+            .find(|u| u.job == "appB.x86_64-linux")
+            .unwrap()
+            .drv_path;
+        // The realized import closure of appB is the 3-node chain
+        // stdenv → libA → appB (pinned by the drv_import module tests).
+        let closure = DrvArchive::new(archive.clone())
+            .closure(std::slice::from_ref(&app_b))
+            .unwrap();
+        assert_eq!(
+            closure.order.len(),
+            3,
+            "fixture premise: {:?}",
+            closure.order
+        );
+
+        // The timed dispatcher's exact under-keyed shape: one root, the
+        // producer estimate pinned to the ROOT COUNT (no adjacency data at
+        // that producer).
+        let source = Arc::new(test_support::FakeChannelSource::default());
+        let outcome = client_ops(archive.clone(), &source, 2000)
+            .submit_batch(
+                "ssh-ng://test",
+                &batch_with_estimate(&["appB.x86_64-linux"], std::slice::from_ref(&app_b), 1),
+                BatchDeadline::Build(tokio::time::Instant::now() + Duration::from_secs(30)),
+            )
+            .await
+            .unwrap();
+        let calls = source.build_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].derived, vec![format!("{app_b}!*")]);
+        assert_eq!(
+            calls[0].closure_nodes, 3,
+            "the budget workload must be the realized 3-node import closure, \
+             not the producer's roots-only estimate (1)"
+        );
+        // The whole closure was probed and (nothing being valid) uploaded,
+        // references before referrers.
+        let probed: Vec<String> = source.probes.lock().unwrap().concat();
+        assert_eq!(probed, closure.order);
+        assert_eq!(source.uploads.lock().unwrap().iter().sum::<usize>(), 3);
+        assert_eq!(outcome.results.len(), 1);
+        assert!(!outcome.engine_cancelled);
+
+        // Single-owner, both directions: an OVER-keyed producer estimate
+        // is not consulted either — the chokepoint's realized closure wins
+        // high and low alike, so no producer can widen the belt by lying.
+        let source = Arc::new(test_support::FakeChannelSource::default());
+        client_ops(archive.clone(), &source, 2000)
+            .submit_batch(
+                "ssh-ng://test",
+                &batch_with_estimate(&["appB.x86_64-linux"], std::slice::from_ref(&app_b), 9_999),
+                BatchDeadline::Build(tokio::time::Instant::now() + Duration::from_secs(30)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(source.build_calls.lock().unwrap()[0].closure_nodes, 3);
+
+        // Target-side validity does not shrink the workload basis: with
+        // every closure path already valid (nothing to upload), the DAG
+        // can still build — and stream logs for — all of it (force-build
+        // campaigns rebuild valid paths), so the budget keeps the full
+        // realized count.
+        let source = Arc::new(test_support::FakeChannelSource {
+            valid_paths: closure.order.iter().cloned().collect(),
+            ..test_support::FakeChannelSource::default()
+        });
+        client_ops(archive, &source, 2)
+            .submit_batch(
+                "ssh-ng://test",
+                &batch_with_estimate(&["appB.x86_64-linux"], std::slice::from_ref(&app_b), 1),
+                BatchDeadline::Build(tokio::time::Instant::now() + Duration::from_secs(30)),
+            )
+            .await
+            .unwrap();
+        assert!(source.uploads.lock().unwrap().is_empty());
+        assert_eq!(source.build_calls.lock().unwrap()[0].closure_nodes, 3);
+        // probe_chunk 2 over 3 paths: the chunked probe still covered the
+        // whole closure.
+        assert_eq!(source.probes.lock().unwrap().len(), 2);
+    }
+
+    /// Closure gaps a non-conforming archive cannot offer still count into
+    /// the budget workload: the target may resolve a skipped interior drv
+    /// from its own store and build it — the conservative workload basis
+    /// is everything the submitted DAG can REACH (`order` + `skipped`),
+    /// not just what the archive could import. Fixture staged via the
+    /// production `ArchiveWriter` chain (the same producer path the
+    /// drv_import gap tests use), so the gap is a real records-vs-texts
+    /// disagreement, not a hand-built `DrvClosure`.
+    #[tokio::test]
+    async fn build_op_workload_counts_unimportable_closure_gaps() {
+        use crate::archive::schema::{Capabilities, RequestRecord, RequestTarget, Substituters};
+        use crate::archive::writer::{ArchiveWriter, ManifestSeed};
+        use crate::run::archive_input::fake_hash;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_drv = format!("/nix/store/{}-base-1.0.drv", fake_hash("base-drv"));
+        let base_out = format!("/nix/store/{}-base-1.0", fake_hash("base-out"));
+        let extra_drv = format!("/nix/store/{}-extra-1.0.drv", fake_hash("extra-drv"));
+        let extra_out = format!("/nix/store/{}-extra-1.0", fake_hash("extra-out"));
+        let absent_drv = "/nix/store/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy-absent.drv";
+        let writer = ArchiveWriter::create(tmp.path()).unwrap();
+        writer
+            .add_drv(
+                &base_drv,
+                &format!(
+                    r#"Derive([("out","{base_out}","","")],[],[],"x86_64-linux","/bin/sh",["-c","true"],[("out","{base_out}")])"#
+                ),
+            )
+            .unwrap();
+        writer
+            .add_drv(
+                &extra_drv,
+                &format!(
+                    r#"Derive([("out","{extra_out}","","")],[("{absent_drv}",["out"]),("{base_drv}",["out"])],[],"x86_64-linux","/bin/sh",["-c","true"],[("out","{extra_out}")])"#
+                ),
+            )
+            .unwrap();
+        // Only the dependency-free derivation is a workload target, so the
+        // writer's closure-completeness walk tolerates the extra member's
+        // non-embedded input.
+        writer
+            .write_requests(&[RequestRecord {
+                session: 0,
+                offset_s: 0.0,
+                targets: vec![RequestTarget {
+                    drv: base_drv.clone(),
+                    outputs: vec!["*".to_string()],
+                }],
+            }])
+            .unwrap();
+        let stamp: jiff::Timestamp = "2026-05-28T00:00:00Z".parse().unwrap();
+        writer
+            .finalize(ManifestSeed {
+                created_at: stamp,
+                from: stamp,
+                to: stamp,
+                capabilities: Capabilities::default(),
+                substituters: Substituters {
+                    relay: vec!["https://cache.example.org".to_string()],
+                    target: Vec::new(),
+                },
+                fat: false,
+                provenance: serde_json::Map::new(),
+            })
+            .unwrap();
+        let archive = Arc::new(crate::archive::reader::ReplayArchive::open(tmp.path()).unwrap());
+
+        let source = Arc::new(test_support::FakeChannelSource::default());
+        let outcome = client_ops(archive, &source, 2000)
+            .submit_batch(
+                "ssh-ng://test",
+                &batch_with_estimate(&["extra"], std::slice::from_ref(&extra_drv), 1),
+                BatchDeadline::Build(tokio::time::Instant::now() + Duration::from_secs(30)),
+            )
+            .await
+            .unwrap();
+        // order = [base, extra] (2 importable) + skipped = [absent] (1):
+        // the workload is 3 — the importable count alone (2) under-keys
+        // the belt for exactly the DAG shapes gap retirement exists for.
+        let calls = source.build_calls.lock().unwrap().clone();
+        assert_eq!(calls[0].closure_nodes, 3, "order(2) + skipped(1)");
+        assert_ne!(
+            calls[0].closure_nodes, 2,
+            "order alone must not key the budget"
+        );
+        assert_eq!(outcome.import_skipped_drvs, vec![absent_drv.to_string()]);
+        // Only the importable texts were probed/uploaded.
+        assert_eq!(source.probes.lock().unwrap().concat().len(), 2);
+        assert_eq!(source.uploads.lock().unwrap().iter().sum::<usize>(), 2);
     }
 }

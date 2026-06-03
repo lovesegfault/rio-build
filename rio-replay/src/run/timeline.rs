@@ -1091,6 +1091,13 @@ async fn dispatch_one_request(
         &shared.store_url,
         BATCH_KIND_TIMED,
         batch_id,
+        // Audited literal construction (enumeration test in `run::batch`):
+        // a recorded request is submitted verbatim — no assembler, no
+        // packing caps — and this producer has no adjacency data (recorded
+        // targets need not be workload units), so `est_nodes` is the
+        // roots-only floor, recorded as such on the batch record. The
+        // stderr drain budget does NOT read it: the submitter derives the
+        // op workload from the realized import closure at its chokepoint.
         Batch {
             jobs: jobs.clone(),
             root_drvs: drvs.clone(),
@@ -1184,6 +1191,9 @@ async fn dispatch_one_request(
                 &shared.store_url,
                 BATCH_KIND_TIMED,
                 retry_id,
+                // Audited literal construction, the retry sibling of the
+                // initial dispatch above: same roots-only `est_nodes`
+                // floor, same chokepoint-derived drain budget.
                 Batch {
                     jobs: retry_jobs,
                     root_drvs: failing_drvs.clone(),
@@ -2518,6 +2528,149 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].attempts, 1);
         assert_eq!(entries[0].batch_ids.len(), 1);
+    }
+
+    /// END-TO-END through the real producers: the timed dispatcher's OWN
+    /// batch constructions (initial dispatch AND confirmation retry — the
+    /// two literal sites that never pass through the assembler) feed the
+    /// real `ClientOpsSubmitter` over a real archive, and the wire layer
+    /// receives the realized import-closure workload, not the dispatcher's
+    /// roots-only `est_nodes`.
+    ///
+    /// This is the corner the roots-only key broke: a legal timed
+    /// campaign whose one-target request carries a deep closure was
+    /// budgeted at the single-unit stderr drain floor, and a healthy
+    /// log-heavy DAG tripped the count belt — wire error, channel
+    /// abandoned, every in-flight build cancelled, the unit falsely
+    /// terminalized as an engine-side failure. Universe note: the
+    /// drain-budget calibration quantifies over the SUBMISSION
+    /// CHOKEPOINT'S feeders (assembler waves, fail-fast singletons, canary
+    /// probes, both timed constructions), not over assembler output — the
+    /// round-3 calibration stopped one level below and these two feeders
+    /// escaped it.
+    ///
+    /// Mutation pin: this test (with its submitter-level sibling
+    /// `build_op_workload_is_the_realized_import_closure_not_the_producer_estimate`)
+    /// goes red when the submitter's build-op workload argument is flipped
+    /// to `0`, to `batch.est_nodes`, or to `root_drvs.len()`.
+    #[tokio::test(start_paused = true)]
+    async fn timed_dispatch_keys_the_drain_budget_on_the_realized_closure() {
+        use crate::run::archive_input::{load_units, write_mini_archive};
+        use crate::run::drv_import::DrvArchive;
+        use crate::run::submitter::ClientOpsSubmitter;
+        use crate::run::submitter::test_support::FakeChannelSource;
+        use rio_nix::protocol::build::BuildResult;
+        use rio_nix::protocol::client::KeyedBuildResult;
+
+        // Real archive via the production writer chain: appB's realized
+        // import closure is the 3-node chain stdenv → libA → appB.
+        let archive_dir = tempfile::tempdir().unwrap();
+        write_mini_archive(archive_dir.path());
+        let archive =
+            Arc::new(crate::archive::reader::ReplayArchive::open(archive_dir.path()).unwrap());
+        let app_b = load_units(&archive)
+            .unwrap()
+            .into_iter()
+            .find(|u| u.job == "appB.x86_64-linux")
+            .unwrap()
+            .drv_path;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDir::new(dir.path()).unwrap());
+        // One recorded request over appB, expected built — so the scripted
+        // in-band failure below triggers the dispatcher's confirmation
+        // retry (the second literal construction) through the same
+        // submitter.
+        let requests = vec![request(7, 0.0, &app_b)];
+        let mut map = HashMap::new();
+        map.insert(
+            (7_i64, app_b.clone()),
+            RecordedTiming {
+                duration_s: Some(1.0),
+                stop_offset_s: None,
+                interrupted: false,
+                expected_built: true,
+            },
+        );
+        let jobs = BTreeMap::from([(app_b.clone(), "appB.x86_64-linux".to_string())]);
+        let schedule = build_schedule(
+            &requests,
+            &timing_in(&map),
+            &jobs_in(&jobs),
+            &all_workload,
+            1.0,
+            None,
+            true,
+        );
+
+        // Scripted wire: the initial submission's root fails in-band, the
+        // retry (unscripted → default) reports it Built.
+        let source = Arc::new(FakeChannelSource::default());
+        source
+            .results
+            .lock()
+            .unwrap()
+            .push_back(vec![KeyedBuildResult {
+                derived_path: format!("{app_b}!*"),
+                result: BuildResult {
+                    status: BuildStatus::PermanentFailure,
+                    error_msg: "builder failed with exit code 2".into(),
+                    ..BuildResult::default()
+                },
+            }]);
+        let submitter = Arc::new(ClientOpsSubmitter {
+            pool: source.clone(),
+            archive: Arc::new(DrvArchive::new(archive)),
+            op_timeout: Duration::from_secs(5),
+            probe_chunk: 2000,
+        });
+        let stats = drive_dispatch(
+            &state,
+            submitter,
+            schedule,
+            timing_arc(map),
+            TimelineConfig::from_knobs(&Knobs::default()),
+            HashSet::new(),
+        )
+        .await;
+        assert_eq!(stats.dispatched, 1);
+
+        // Both timed constructions reached the wire with the REALIZED
+        // 3-node workload — never the roots-only est_nodes (1) they carry.
+        let calls = source.build_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "initial dispatch + confirmation retry");
+        for call in &calls {
+            assert_eq!(call.derived, vec![format!("{app_b}!*")]);
+            assert_eq!(
+                call.closure_nodes, 3,
+                "the drain-budget workload must be the realized import \
+                 closure, not the timed producer's root count"
+            );
+        }
+
+        // The records still book the producer's a-priori estimate (the
+        // roots-only floor, honest bookkeeping for a producer with no
+        // adjacency data) — the wire workload above came from the
+        // chokepoint, not from this field.
+        let mut records: Vec<crate::run::model::BatchRecord> =
+            state.load_jsonl(StateFile::Batches).unwrap();
+        records.sort_by_key(|record| record.batch_id);
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r.kind == "timed"));
+        assert_eq!(
+            records.iter().map(|r| r.est_nodes).collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.confirmation_attempt)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        let entries: Vec<DispatchEntry> = state.load_jsonl(StateFile::Dispatch).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].attempts, 2);
     }
 
     /// A request whose only target was recorded as interrupted is submitted

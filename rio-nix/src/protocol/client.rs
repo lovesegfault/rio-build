@@ -308,12 +308,13 @@ pub const STDERR_BUDGET_PER_CLOSURE_NODE: usize = 100_000;
 /// more than 7× the largest closure pinned by an in-repo batch-assembly
 /// test (a 9,001-node oversized singleton) and more than 4× a
 /// chromium/texlive-class nixpkgs closure; the estimate is computed
-/// engine-side from the replay
-/// archive's dependency records (archive-controlled, not wire-peer-
-/// controlled), and a hostile or corrupt archive declaring absurd
-/// dependency lists buys at most this multiplier. Ops estimating more
-/// nodes get no additional count headroom and rely on their wall-clock
-/// deadline, exactly like the root cap above.
+/// engine-side from the replay archive's embedded derivation texts (the
+/// realized import-closure walk at the engine's submission chokepoint —
+/// archive-controlled, not wire-peer-controlled), and a hostile or
+/// corrupt archive embedding absurd reference chains buys at most this
+/// multiplier. Ops estimating more nodes get no additional count headroom
+/// and rely on their wall-clock deadline, exactly like the root cap
+/// above.
 pub const STDERR_BUDGET_NODE_MULTIPLIER_CAP: usize = 65_536;
 
 /// STDERR message budget for one build op submitting `roots` derived
@@ -331,13 +332,15 @@ pub const STDERR_BUDGET_NODE_MULTIPLIER_CAP: usize = 65_536;
 /// singletons, fail-fast isolation singletons, wave-tail batches) at the
 /// single-unit budget while its healthy volume is hundreds of times that.
 ///
-/// `closure_nodes` provenance: an engine-side estimate derived from the
-/// submitted plan (the replay engine's batch assembler computes the exact
-/// union of root + dependency derivations from the archive's records).
-/// Callers with no estimate pass `0`: the floor keeps them at exactly the
-/// roots-scaled budget. The estimate can only RAISE the budget above the
-/// floor, never lower it, so a too-small estimate degrades to the
-/// pre-existing roots calibration rather than below it.
+/// `closure_nodes` provenance: an engine-side estimate the replay engine
+/// derives at its submission chokepoint as the realized import closure of
+/// the submitted roots (the archive's embedded-ATerm reference walk —
+/// every batch producer funnels through that one derivation site, so no
+/// producer-written estimate can under-key the budget). Callers with no
+/// estimate pass `0`: the floor keeps them at exactly the roots-scaled
+/// budget. The estimate can only RAISE the budget above the floor, never
+/// lower it, so a too-small estimate degrades to the pre-existing roots
+/// calibration rather than below it.
 pub fn stderr_budget_for_workload(roots: usize, closure_nodes: usize) -> usize {
     stderr_budget_for_roots(roots).max(
         STDERR_BUDGET_PER_CLOSURE_NODE

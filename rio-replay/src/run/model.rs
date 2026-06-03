@@ -1315,6 +1315,12 @@ pub struct BatchRecord {
     pub kind: String,
     pub jobs: Vec<String>,
     pub root_drvs: Vec<String>,
+    /// The producing side's a-priori merged-DAG node estimate, recorded
+    /// verbatim from `Batch::est_nodes`: the assembler's exact closure
+    /// union for wave batches, the roots-only floor for timed-dispatcher
+    /// records (that producer has no adjacency data). Bookkeeping only —
+    /// the build op's stderr drain budget is keyed at the submission
+    /// chokepoint from the realized import closure, not from this field.
     pub est_nodes: usize,
     pub build_id: Option<String>,
     pub started_at: String,

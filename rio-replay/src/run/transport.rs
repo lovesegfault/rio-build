@@ -1241,8 +1241,10 @@ impl DaemonChannel {
     /// the daemon's per-path results (submission order).
     ///
     /// `closure_nodes` is the engine-side estimate of how many derivations
-    /// the op's merged closure builds (the batch assembler's `est_nodes`,
-    /// derived from the replay archive's dependency records); it keys the
+    /// the op's merged closure builds — the submitter derives it at its
+    /// chokepoint as the realized import closure of the submitted roots
+    /// (the archive's embedded-ATerm walk: importable texts plus reported
+    /// gaps), archive-controlled, never wire-peer-controlled; it keys the
     /// stderr drain budget to the op's workload. Callers without an
     /// estimate pass `0` and keep the roots-scaled floor.
     pub async fn build_paths_with_results(
