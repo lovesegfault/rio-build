@@ -507,13 +507,16 @@ impl Submitter for ClientOpsSubmitter {
             Err(
                 err @ (TransportError::Refused(_)
                 | TransportError::MaybeRefused(_)
+                | TransportError::PayloadSource(_)
                 | TransportError::Other(_)),
             ) => {
                 // Daemon refusal (e.g. quota) or a transport/protocol failure
-                // (`MaybeRefused` is unreachable here — it is minted only by
-                // the upload ops — but it would belong in this bucket too):
-                // an engine-side submission failure, recorded on the batch
-                // record and re-offered — never charged to the workload.
+                // (`MaybeRefused` and `PayloadSource` are unreachable here —
+                // both are minted only by the payload-bearing upload ops, and
+                // the build op carries no payload reader — but both would
+                // belong in this bucket too): an engine-side submission
+                // failure, recorded on the batch record and re-offered —
+                // never charged to the workload.
                 return Err(anyhow!(
                     "BuildPathsWithResults failed on gateway connection {}: {}",
                     chan.connection_index(),

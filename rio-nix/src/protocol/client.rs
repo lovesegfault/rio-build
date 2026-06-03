@@ -224,19 +224,42 @@ pub(crate) async fn drain_stderr<R: AsyncRead + Unpin>(r: &mut R) -> Result<()> 
 
 /// Error from a client-side daemon operation.
 ///
-/// [`Daemon`](ClientOpError::Daemon) is the daemon's verdict on the
-/// operation, delivered as an STDERR_ERROR frame with protocol framing intact
-/// (the transport is not corrupted) — callers may report it as a daemon-side
-/// rejection or retry the operation. [`Wire`](ClientOpError::Wire) means the
-/// channel itself is suspect and must be abandoned.
+/// The variants type the failure's SOURCE — three physically distinct
+/// parties can fail an op, and conflating them misroutes consumer
+/// policy (retry/settle decisions, circuit-breaker evidence):
+///
+/// - [`Daemon`](ClientOpError::Daemon) is the daemon's verdict on the
+///   operation, delivered as an STDERR_ERROR frame with protocol
+///   framing intact (the transport is not corrupted) — callers may
+///   report it as a daemon-side rejection or retry the operation.
+/// - [`Wire`](ClientOpError::Wire) means the CHANNEL itself is suspect
+///   (an I/O error on the daemon connection, a framing/bounds
+///   violation) and must be abandoned.
+/// - [`PayloadSource`](ClientOpError::PayloadSource) means a
+///   caller-supplied payload READER failed mid-op (the byte source —
+///   e.g. a relay cache's HTTP/S3 body — died or ended short of its
+///   declared length) while nothing is known to be wrong with the
+///   daemon channel. The channel must STILL be abandoned (the framed
+///   upload was left incomplete, same contract as `Wire`), but the
+///   failure is attributable to the payload's source, never to the
+///   daemon or the channel — a consumer feeding channel-health
+///   evidence (a "gateway unreachable" breaker) from this variant
+///   would charge the wrong party.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientOpError {
     /// The daemon refused the operation (STDERR_ERROR frame).
     #[error("daemon refused operation: {}", .0.message)]
     Daemon(StderrError),
-    /// Wire-level failure (I/O, framing, bounds).
+    /// Wire-level failure on the daemon channel (I/O, framing, bounds).
     #[error(transparent)]
     Wire(#[from] WireError),
+    /// A caller-supplied [`NarPayload::Reader`] failed while its bytes
+    /// were being streamed into the op: the read itself errored, or the
+    /// source ended short of the declared length. Minted ONLY by the
+    /// payload copy loop's reader arms (`write_nar_payload`) — channel
+    /// writes in the same loop stay [`Wire`](ClientOpError::Wire).
+    #[error("payload source failed: {0}")]
+    PayloadSource(std::io::Error),
 }
 
 /// Per-ROOT ceiling on STDERR messages a build-op drain consumes.
@@ -776,7 +799,7 @@ pub enum NarPayload {
     Bytes(Vec<u8>),
     /// A streaming source of exactly `len` NAR bytes. Only the first `len`
     /// bytes are consumed (a longer source is never over-read); a source that
-    /// ends before `len` bytes is a wire error.
+    /// ends before `len` bytes is a [`ClientOpError::PayloadSource`] error.
     Reader {
         /// Exact number of bytes to take from `reader`.
         len: u64,
@@ -832,8 +855,19 @@ fn check_entry_nar_size(entry: &StoreEntry) -> Result<()> {
 /// `Bytes` payloads are handed to the framed writer whole (it slices them
 /// into frames itself); `Reader` payloads are copied in [`NAR_COPY_CHUNK`]
 /// pieces. Each read is capped to the bytes still owed, so a longer source
-/// can never overrun the declared length; a source that ends early is a wire
-/// error.
+/// can never overrun the declared length.
+///
+/// Failure-source typing: this loop is the one place two failure
+/// domains meet ten lines apart, and the error variant records which
+/// side died. The READ half pulls from the caller's payload source — on
+/// the streamed relay lane a live HTTP/S3 body whose mid-transfer reset
+/// or short delivery (vs the peer-declared length) says nothing about
+/// the daemon channel — so a read error or early EOF is
+/// [`ClientOpError::PayloadSource`]. The WRITE half pushes onto the
+/// daemon channel, so framed-write failures stay
+/// [`ClientOpError::Wire`]. Either way the caller must abandon the
+/// connection afterwards (the framed stream is left incomplete); the
+/// variant types WHO failed, not whether the channel survives.
 async fn write_nar_payload<W: AsyncWrite + Unpin>(
     framed: &mut wire::FramedWriter<W>,
     store_path: &str,
@@ -846,15 +880,18 @@ async fn write_nar_payload<W: AsyncWrite + Unpin>(
             let mut remaining = len;
             while remaining > 0 {
                 let cap = remaining.min(NAR_COPY_CHUNK as u64) as usize;
-                let n = reader.read(&mut buf[..cap]).await.map_err(WireError::Io)?;
+                let n = reader
+                    .read(&mut buf[..cap])
+                    .await
+                    .map_err(ClientOpError::PayloadSource)?;
                 if n == 0 {
-                    return Err(ClientOpError::Wire(WireError::Io(std::io::Error::new(
+                    return Err(ClientOpError::PayloadSource(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         format!(
                             "NAR reader for {store_path} ended {remaining} bytes short of \
                              the declared {len}"
                         ),
-                    ))));
+                    )));
                 }
                 framed.write(&buf[..n]).await?;
                 remaining -= n as u64;
@@ -895,6 +932,10 @@ async fn write_nar_payload<W: AsyncWrite + Unpin>(
 /// may surface as a [`Wire`](ClientOpError::Wire) I/O error instead of
 /// [`Daemon`](ClientOpError::Daemon) — treat both variants as "upload
 /// rejected/failed" rather than classifying on the variant alone.
+/// [`PayloadSource`](ClientOpError::PayloadSource) sits OUTSIDE that
+/// ambiguity: it is minted from the caller's own `Reader` payload failing
+/// client-side and is never a disguised refusal — but it still leaves the
+/// framed upload incomplete, so the abandonment requirement is identical.
 ///
 /// As with [`drain_stderr_typed`], callers are expected to bound the call
 /// with their own deadline (e.g. `tokio::time::timeout`): a silently stalled
@@ -972,6 +1013,9 @@ where
 /// surface as a [`Wire`](ClientOpError::Wire) I/O error instead of
 /// [`Daemon`](ClientOpError::Daemon) — treat both variants as "upload
 /// rejected/failed" rather than classifying on the variant alone.
+/// [`PayloadSource`](ClientOpError::PayloadSource) sits outside that
+/// ambiguity (a caller-supplied `Reader` entry failed client-side, never a
+/// disguised refusal) but carries the same abandonment requirement.
 ///
 /// As with [`drain_stderr_typed`], callers are expected to bound the call
 /// with their own deadline (e.g. `tokio::time::timeout`): a silently stalled
@@ -2251,8 +2295,11 @@ mod tests {
     }
 
     /// A streaming (`NarPayload::Reader`) source that ends before its declared
-    /// `len` is a prompt `ClientOpError::Wire` failure: the local short read
-    /// must be reported without waiting on the (silent) daemon. The fake
+    /// `len` is a prompt `ClientOpError::PayloadSource` failure: the local
+    /// short read must be reported without waiting on the (silent) daemon,
+    /// and typed to the PAYLOAD side — the daemon channel did nothing wrong,
+    /// and a `Wire` here would feed channel-health consumers (the supply
+    /// stage's gateway breaker) evidence about the wrong party. The fake
     /// server reads only the op-39 header, then parks on a oneshot without
     /// writing anything and without reading the framed payload — as in the
     /// refusal test, the duplex buffer is far smaller than the declared
@@ -2309,13 +2356,144 @@ mod tests {
         .expect("short source must fail promptly, not hang on the silent daemon");
 
         let err = result.expect_err("short source must surface as an error");
-        assert!(matches!(err, ClientOpError::Wire(_)), "got: {err:?}");
+        assert!(
+            matches!(err, ClientOpError::PayloadSource(_)),
+            "a short payload source is the SOURCE failing, not the channel: {err:?}"
+        );
         assert!(
             err.to_string().contains("bytes short of the declared"),
             "message must say the payload ended short: {err}"
         );
         drop(done_tx);
         server.await??;
+        Ok(())
+    }
+
+    /// A streaming reader that ERRORS mid-body (the relay connection
+    /// resetting partway through a transfer — the other minting arm of
+    /// the payload-source domain, alongside the short read above) is a
+    /// prompt `ClientOpError::PayloadSource` for both upload ops. The
+    /// channel-side control lives in the refusal/teardown tests: a
+    /// daemon-side death surfaces as `Daemon` or `Wire`, never as
+    /// `PayloadSource` — the variant is minted exclusively from the
+    /// caller-supplied reader's arms.
+    #[tokio::test]
+    async fn upload_ops_reader_error_mid_body_is_payload_source_error() -> anyhow::Result<()> {
+        /// Reader yielding some bytes, then a connection-reset error —
+        /// the relay-body shape.
+        struct DyingReader {
+            yielded: bool,
+        }
+        impl tokio::io::AsyncRead for DyingReader {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if self.yielded {
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "relay body reset mid-transfer",
+                    )));
+                }
+                self.yielded = true;
+                buf.put_slice(&[0x55u8; 1024]);
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let declared_len = 1024 * 1024u64;
+        let entry = || StoreEntry {
+            store_path: "/nix/store/iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii-dies".to_string(),
+            info: ValidPathInfo {
+                nar_hash: vec![0xab; 32],
+                nar_size: declared_len,
+                ..Default::default()
+            },
+            nar: NarPayload::Reader {
+                len: declared_len,
+                reader: Box::new(DyingReader { yielded: false }),
+            },
+        };
+
+        // Streamed op (39).
+        {
+            let (client_stream, _server_stream) = tokio::io::duplex(64 * 1024);
+            let (mut cr, mut cw) = tokio::io::split(client_stream);
+            let err = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client_add_to_store_nar(&mut cr, &mut cw, entry(), false, true),
+            )
+            .await
+            .expect("the dying source must fail promptly")
+            .expect_err("a mid-body reader error must surface");
+            assert!(
+                matches!(err, ClientOpError::PayloadSource(_)),
+                "reader-side death is the payload source failing, not the channel: {err:?}"
+            );
+            assert!(
+                err.to_string().contains("relay body reset mid-transfer"),
+                "{err}"
+            );
+        }
+
+        // Batch op (44): same minting arm, reached through the
+        // multi-entry framed stream.
+        {
+            let (client_stream, _server_stream) = tokio::io::duplex(64 * 1024);
+            let (mut cr, mut cw) = tokio::io::split(client_stream);
+            let err = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client_add_multiple_to_store(&mut cr, &mut cw, false, true, vec![entry()]),
+            )
+            .await
+            .expect("the dying source must fail promptly")
+            .expect_err("a mid-body reader error must surface");
+            assert!(
+                matches!(err, ClientOpError::PayloadSource(_)),
+                "reader-side death is the payload source failing, not the channel: {err:?}"
+            );
+        }
+
+        // Control, the other side of the split: the CHANNEL dying
+        // mid-upload while the Reader payload is perfectly healthy must
+        // stay `Wire` (or surface the drain's channel error) — never
+        // `PayloadSource`. The daemon side closes after the op header;
+        // the healthy 1 MiB source is far larger than the duplex buffer,
+        // so the failure lands on the channel half of the copy loop.
+        {
+            let (client_stream, server_stream) = tokio::io::duplex(8 * 1024);
+            let server = tokio::spawn(async move {
+                let (mut sr, _sw) = tokio::io::split(server_stream);
+                let _op = wire::read_u64(&mut sr).await;
+                // Drop both halves: every later client write/read fails.
+            });
+            let healthy = StoreEntry {
+                store_path: "/nix/store/jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj-healthy".to_string(),
+                info: ValidPathInfo {
+                    nar_hash: vec![0xcd; 32],
+                    nar_size: declared_len,
+                    ..Default::default()
+                },
+                nar: NarPayload::Reader {
+                    len: declared_len,
+                    reader: Box::new(std::io::Cursor::new(vec![0u8; declared_len as usize])),
+                },
+            };
+            let (mut cr, mut cw) = tokio::io::split(client_stream);
+            let err = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client_add_to_store_nar(&mut cr, &mut cw, healthy, false, true),
+            )
+            .await
+            .expect("a dead channel must fail promptly")
+            .expect_err("a dead channel must surface");
+            assert!(
+                matches!(err, ClientOpError::Wire(_)),
+                "channel death with a healthy payload source is channel evidence: {err:?}"
+            );
+            server.await?;
+        }
         Ok(())
     }
 

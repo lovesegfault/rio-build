@@ -415,10 +415,17 @@
     },
     {
       "enum": "ClientOpError",
+      "name": "PayloadSource",
+      "crate": "rio-nix",
+      "msg": "payload source failed: {0}",
+      "doc": "A caller-supplied [`NarPayload::Reader`] failed while its bytes were being streamed into the op: the read itself errored, or the source ended short of the declared length. Minted ONLY by the payload copy loop's reader arms (`write_nar_payload`) — channel writes in the same loop stay [`Wire`](ClientOpError::Wire)."
+    },
+    {
+      "enum": "ClientOpError",
       "name": "Wire",
       "crate": "rio-nix",
       "msg": "(transparent — delegates to inner error)",
-      "doc": "Wire-level failure (I/O, framing, bounds)."
+      "doc": "Wire-level failure on the daemon channel (I/O, framing, bounds)."
     },
     {
       "enum": "DerivationError",
@@ -954,6 +961,13 @@
     },
     {
       "enum": "SupplyTransportError",
+      "name": "PayloadSource",
+      "crate": "rio-replay",
+      "msg": "payload source failed during upload: {0}",
+      "doc": "The caller-supplied payload reader died mid-upload (relay body reset, or short of its declared length): per-path failure attributable to the payload's SOURCE, never channel evidence — rio-nix types it at the producer (`ClientOpError::PayloadSource`), and no daemon teardown can surface here (those land on the write/drain halves as `MaybeRefused`)."
+    },
+    {
+      "enum": "SupplyTransportError",
       "name": "Refused",
       "crate": "rio-replay",
       "msg": "daemon refused: {0}",
@@ -1422,7 +1436,7 @@
     {
       "name": "ClientOpError",
       "crate": "rio-nix",
-      "doc": "Error from a client-side daemon operation. [`Daemon`](ClientOpError::Daemon) is the daemon's verdict on the operation, delivered as an STDERR_ERROR frame with protocol framing intact (the transport is not corrupted) — callers may report it as a daemon-side rejection or retry the operation. [`Wire`](ClientOpError::Wire) means the channel itself is suspect and must be abandoned."
+      "doc": "Error from a client-side daemon operation. The variants type the failure's SOURCE — three physically distinct parties can fail an op, and conflating them misroutes consumer policy (retry/settle decisions, circuit-breaker evidence): - [`Daemon`](ClientOpError::Daemon) is the daemon's verdict on the operation, delivered as an STDERR_ERROR frame with protocol framing intact (the transport is not corrupted) — callers may report it as a daemon-side rejection or retry the operation. - [`Wire`](ClientOpError::Wire) means the CHANNEL itself is suspect (an I/O error on the daemon connection, a framing/bounds violation) and must be abandoned. - [`PayloadSource`](ClientOpError::PayloadSource) means a caller-supplied payload READER failed mid-op (the byte source — e.g. a relay cache's HTTP/S3 body — died or ended short of its declared length) while nothing is known to be wrong with the daemon channel. The channel must STILL be abandoned (the framed upload was left incomplete, same contract as `Wire`), but the failure is attributable to the payload's source, never to the daemon or the channel — a consumer feeding channel-health evidence (a \"gateway unreachable\" breaker) from this variant would charge the wrong party."
     },
     {
       "name": "DerivationError",
@@ -1482,7 +1496,7 @@
     {
       "name": "SupplyTransportError",
       "crate": "rio-replay",
-      "doc": "Errors the upload arms distinguish, three-state because the settlement they feed is irreversible: a clean daemon refusal (the wire op completed and the daemon answered — retried once on a fresh channel; daemon evidence is NECESSARY for settling REFUSED, never sufficient: a pair whose attempts produced only refusals and wire deaths, with at least one clean refusal among them, settles REFUSED — `upload-rejected` for dependents, regression-gate trip — while a hard transport or materialization failure settles FAILED at once whatever the other attempt carried, the held refusal disclosed in the detail rather than promoted to the verdict), a mid-upload wire death whose meaning is undetermined (retry once like a refusal — a genuine refusal racing session teardown re-presents as a clean `Refused` on the fresh channel — but with no clean refusal observed it settles FAILED: `supply-failed`, excluded from the gate, because the only evidence is that the connection died), and everything else (failed immediately). Breaker accounting follows the evidence the same way: `Refused` proves the gateway answered and resets the count; `MaybeRefused` and `Other` are transport failures."
+      "doc": "Errors the upload arms distinguish, four-state because the settlement they feed is irreversible AND the breaker they feed assumes channel-only evidence: a clean daemon refusal (the wire op completed and the daemon answered — retried once on a fresh channel; daemon evidence is NECESSARY for settling REFUSED, never sufficient: a pair whose attempts produced only refusals and wire deaths, with at least one clean refusal among them, settles REFUSED — `upload-rejected` for dependents, regression-gate trip — while a hard transport, materialization, or payload-source failure settles FAILED at once whatever the other attempt carried, the held refusal disclosed in the detail rather than promoted to the verdict), a mid-upload wire death whose meaning is undetermined (retry once like a refusal — a genuine refusal racing session teardown re-presents as a clean `Refused` on the fresh channel — but with no clean refusal observed it settles FAILED: `supply-failed`, excluded from the gate, because the only evidence is that the connection died), a payload-source death (the relay reader feeding the streamed upload died or came up short — settle FAILED immediately: a retry would re-fetch the same failing source, and the gateway answered nothing wrong), and everything else (failed immediately). Breaker accounting follows the evidence the same way: `Refused` proves the gateway answered and resets the count; `MaybeRefused` and `Other` are channel failures and count; `PayloadSource` is a THIRD party's failure — it neither resets nor charges the breaker, because charging it would let a failing relay trip the \"gateway unreachable\" collapse on a healthy gateway."
     },
     {
       "name": "TransportError",

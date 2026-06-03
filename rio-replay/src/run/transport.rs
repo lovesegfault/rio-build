@@ -272,6 +272,19 @@ pub enum TransportError {
     /// a transport failure for circuit-breaker purposes (the only evidence
     /// in hand is that the connection died).
     MaybeRefused(String),
+    /// The caller-supplied PAYLOAD READER died during an upload op (the
+    /// streamed lane's relay body resetting mid-transfer, or delivering
+    /// fewer bytes than its narinfo declared) — rio-nix's typed
+    /// `ClientOpError::PayloadSource`, minted at the producer where the
+    /// read half and the write half of the copy loop are distinguishable.
+    /// NOT channel evidence: the daemon connection did nothing wrong (it
+    /// must still be abandoned — the framed upload is incomplete — but
+    /// abandonment is hygiene, not diagnosis), so this never feeds the
+    /// gateway breaker, and it is never a disguised refusal (the reader
+    /// is client-side; daemon teardown surfaces on the write/drain
+    /// halves as `MaybeRefused`). Callers settle the path FAILED — a
+    /// retry would re-fetch the same failing source.
+    PayloadSource(String),
     /// The operation exceeded its deadline. The wire position is unknown
     /// afterwards — the channel must not be reused.
     Timeout {
@@ -294,6 +307,9 @@ impl std::fmt::Display for TransportError {
                 f,
                 "transport failed during upload (may be a refusal racing session teardown): {msg}"
             ),
+            Self::PayloadSource(msg) => {
+                write!(f, "payload source failed during upload: {msg}")
+            }
             Self::Timeout {
                 op,
                 connection,
@@ -310,7 +326,10 @@ impl std::fmt::Display for TransportError {
 impl std::error::Error for TransportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Refused(_) | Self::MaybeRefused(_) | Self::Timeout { .. } => None,
+            Self::Refused(_)
+            | Self::MaybeRefused(_)
+            | Self::PayloadSource(_)
+            | Self::Timeout { .. } => None,
             // Mirror thiserror's `#[error(transparent)]`: delegate to the
             // wrapped error's source so the chain is not duplicated.
             Self::Other(err) => {
@@ -338,10 +357,17 @@ impl From<anyhow::Error> for TransportError {
 /// kept as [`TransportError::MaybeRefused`] (`WireError` spans everything
 /// from a TCP reset to client-side framing bugs, so collapsing it into
 /// `Refused` would let a dead data path settle paths as daemon-rejected and
-/// feed the upload circuit breaker false successes).
+/// feed the upload circuit breaker false successes). `PayloadSource` is the
+/// producer-typed third domain — the caller-supplied payload reader died,
+/// not the channel — and maps to its own variant under EVERY op kind: it
+/// can only be minted by the upload ops' payload copy loop, but the mapping
+/// keys on the producer's typing, never on this function's `upload` hint,
+/// so the source attribution cannot be laundered back into channel
+/// evidence by a mislabeled call site.
 fn map_client_op_error(err: ClientOpError, op: &str, upload: bool) -> TransportError {
     match err {
         ClientOpError::Daemon(daemon_err) => TransportError::Refused(daemon_err.message),
+        ClientOpError::PayloadSource(io_err) => TransportError::PayloadSource(io_err.to_string()),
         ClientOpError::Wire(wire_err) if upload => {
             TransportError::MaybeRefused(wire_err.to_string())
         }
@@ -1056,14 +1082,18 @@ type GatewayStream = russh::ChannelStream<russh::client::Msg>;
 
 /// Whether an op error leaves the channel's wire position unknown, making
 /// the channel unusable for further ops: timeouts (the op was cut off
-/// mid-read/-write), transport failures, and mid-upload wire deaths
-/// ([`TransportError::MaybeRefused`] — the wire died by definition) always
-/// do; a clean refusal does only for upload ops, which may have started
-/// writing a framed payload before the daemon refused.
+/// mid-read/-write), transport failures, mid-upload wire deaths
+/// ([`TransportError::MaybeRefused`] — the wire died by definition), and
+/// payload-source deaths ([`TransportError::PayloadSource`] — the channel
+/// itself is healthy, but the framed upload it was carrying is incomplete,
+/// so its wire position is desynced all the same) always do; a clean
+/// refusal does only for upload ops, which may have started writing a
+/// framed payload before the daemon refused.
 fn poisons_channel(err: &TransportError, upload: bool) -> bool {
     match err {
         TransportError::Refused(_) => upload,
         TransportError::MaybeRefused(_)
+        | TransportError::PayloadSource(_)
         | TransportError::Timeout { .. }
         | TransportError::Other(_) => true,
     }
@@ -1647,14 +1677,18 @@ mod tests {
         assert_eq!(pick_connection(&[], &[]), None);
     }
 
-    /// The (error shape × upload bit) mapping table, every cell. The
-    /// load-bearing direction: `Refused` is minted ONLY from a clean
+    /// The (error shape × upload bit) mapping table, every cell — all
+    /// THREE producer domains crossed with both upload-bit values. The
+    /// load-bearing directions: `Refused` is minted ONLY from a clean
     /// `ClientOpError::Daemon` — the one shape where the daemon actually
     /// answered — never synthesized from a wire error. A mid-upload wire
     /// death is `MaybeRefused` (undetermined: refusal-races-teardown OR
     /// transport death), and `WireError` spans TCP resets AND client-side
     /// framing errors, so collapsing it into `Refused` would settle paths
-    /// as daemon-rejected on a dead data path.
+    /// as daemon-rejected on a dead data path. A `PayloadSource` error is
+    /// the producer's typed third domain (the caller's reader died, not
+    /// the channel) and maps to `PayloadSource` under every upload-bit
+    /// value — never into the breaker-feeding `MaybeRefused` class.
     #[test]
     fn transport_error_mapping() {
         // Daemon refusal → Refused carrying the daemon's message — on
@@ -1704,6 +1738,139 @@ mod tests {
                 );
             }
             other => panic!("wire error during upload must map to MaybeRefused, got {other:?}"),
+        }
+
+        // Payload-source error → PayloadSource under EVERY upload-bit
+        // value: the producer's typing decides, never the call-site
+        // hint, so a payload death can never be laundered back into the
+        // channel-evidence MaybeRefused class (which feeds the gateway
+        // breaker).
+        for upload in [true, false] {
+            let payload = ClientOpError::PayloadSource(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "NAR reader for /nix/store/x ended 4096 bytes short of the declared 8192",
+            ));
+            match map_client_op_error(payload, "AddToStoreNar /nix/store/x", upload) {
+                TransportError::PayloadSource(msg) => {
+                    assert!(msg.contains("4096 bytes short"), "message: {msg}");
+                    let rendered = TransportError::PayloadSource(msg).to_string();
+                    assert!(
+                        rendered.contains("payload source failed during upload"),
+                        "rendered: {rendered}"
+                    );
+                }
+                other => panic!(
+                    "payload-source error must map to PayloadSource (upload={upload}), \
+                     got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// Producer-mirrored cross-crate pin: drive the REAL streamed upload
+    /// op (`client_add_to_store_nar`) with a relay-shaped reader that
+    /// dies mid-body, across the rio-nix boundary, and map the resulting
+    /// error exactly the way [`run_op`] does. The classification must be
+    /// `PayloadSource`, never `MaybeRefused` — the latter is what fed
+    /// the gateway breaker for relay deaths when every upload-time
+    /// failure was a blanket `Wire`. The channel-side control (a dead
+    /// daemon connection with a healthy reader → `MaybeRefused`) rides
+    /// the same harness one block down, so both sides of the producer's
+    /// split are pinned through the same op.
+    #[tokio::test]
+    async fn streamed_upload_relay_reader_death_maps_to_payload_source() {
+        use rio_nix::protocol::client::{NarPayload, client_add_to_store_nar};
+        use rio_nix::protocol::pathinfo::ValidPathInfo;
+
+        /// The relay-body shape: yields one chunk, then a reset.
+        struct DyingBody {
+            yielded: bool,
+        }
+        impl tokio::io::AsyncRead for DyingBody {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if self.yielded {
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "relay body reset mid-transfer",
+                    )));
+                }
+                self.yielded = true;
+                buf.put_slice(&[0x11u8; 4096]);
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let declared = 1024 * 1024u64;
+        let entry = |reader: Box<dyn tokio::io::AsyncRead + Send + Unpin>| StoreEntry {
+            store_path: "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-relay".to_string(),
+            info: ValidPathInfo {
+                nar_hash: vec![0x42; 32],
+                nar_size: declared,
+                ..Default::default()
+            },
+            nar: NarPayload::Reader {
+                len: declared,
+                reader,
+            },
+        };
+
+        // Relay reader dies; the daemon side stays parked (healthy but
+        // silent) — the producer chain mints PayloadSource and the
+        // mapping must keep it out of the breaker-feeding classes.
+        {
+            let (client_stream, _server_alive) = tokio::io::duplex(64 * 1024);
+            let (mut cr, mut cw) = tokio::io::split(client_stream);
+            let err = tokio::time::timeout(
+                Duration::from_secs(5),
+                client_add_to_store_nar(
+                    &mut cr,
+                    &mut cw,
+                    entry(Box::new(DyingBody { yielded: false })),
+                    false,
+                    true,
+                ),
+            )
+            .await
+            .expect("payload death must surface promptly")
+            .expect_err("payload death must error");
+            match map_client_op_error(err, "AddToStoreNar /nix/store/k...-relay", true) {
+                TransportError::PayloadSource(msg) => {
+                    assert!(msg.contains("relay body reset mid-transfer"), "{msg}");
+                }
+                other => panic!(
+                    "a relay reader death through the real wire op must classify \
+                     PayloadSource, got {other:?}"
+                ),
+            }
+        }
+
+        // Control: the CHANNEL dies (daemon side dropped) while the
+        // reader is healthy — the same op must classify MaybeRefused
+        // (channel evidence; the breaker's business), proving the split
+        // keys on the failing party, not on the op.
+        {
+            let (client_stream, server_stream) = tokio::io::duplex(8 * 1024);
+            drop(server_stream);
+            let healthy = Box::new(std::io::Cursor::new(vec![0u8; declared as usize]));
+            let (mut cr, mut cw) = tokio::io::split(client_stream);
+            let err = tokio::time::timeout(
+                Duration::from_secs(5),
+                client_add_to_store_nar(&mut cr, &mut cw, entry(healthy), false, true),
+            )
+            .await
+            .expect("channel death must surface promptly")
+            .expect_err("channel death must error");
+            match map_client_op_error(err, "AddToStoreNar /nix/store/k...-relay", true) {
+                TransportError::MaybeRefused(_) => {}
+                other => panic!(
+                    "a dead channel with a healthy payload stays channel evidence \
+                     (MaybeRefused), got {other:?}"
+                ),
+            }
         }
     }
 
