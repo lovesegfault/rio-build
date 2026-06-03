@@ -2311,6 +2311,61 @@ fn versioned_citation_regex() -> regex::Regex {
     regex::Regex::new(r"`([a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+\+[0-9]+)`").expect("static regex")
 }
 
+/// `#r(...)` declaration matcher for [`spec_rule_citations`], anchored at
+/// a `#r(` token. Tolerates BOTH spec styles in use: the inline
+/// `#r("id")` and crate-structure.typ's multi-line
+/// `#r(\n  "id",\n)` — `\s` spans newlines and the trailing comma is
+/// optional. Anchored (`\A`) so it can be applied AT each found token:
+/// the universe scan is parity-checked token by token, not trusted to a
+/// free-floating search.
+fn rule_declaration_regex() -> regex::Regex {
+    regex::Regex::new(r#"\A#r\(\s*"([a-z0-9.+-]+)"\s*,?\s*\)"#).expect("static regex")
+}
+
+/// Collect every `#r("…")` rule declaration from one spec file into
+/// `universe`, with an inventory-parity guarantee: EVERY `#r(` token in
+/// the file must either parse as a declaration ([`rule_declaration_regex`]
+/// anchored at the token) or sit behind a `//` line comment (a prose
+/// mention). Anything else is a violation — a declaration style this
+/// matcher does not parse — so a third style fails the lint loudly
+/// instead of silently shrinking the universe (the original inline-only
+/// matcher missed all 19 multi-line declarations and would have
+/// false-redded citations of perfectly live rules). Returns the number
+/// of declaration tokens parsed, so callers can assert the full
+/// accounting: parsed + commented + violations == `#r(` tokens.
+fn collect_spec_rules(
+    src: &str,
+    rel: &str,
+    universe: &mut BTreeSet<String>,
+    violations: &mut Vec<String>,
+) -> usize {
+    let decl_re = rule_declaration_regex();
+    let mut parsed = 0usize;
+    for (pos, _) in src.match_indices("#r(") {
+        if let Some(cap) = decl_re.captures(&src[pos..]) {
+            universe.insert(cap[1].to_string());
+            parsed += 1;
+            continue;
+        }
+        // Not a parseable declaration: tolerate ONLY a `//`-commented
+        // mention on the same line. Anything else (a new declaration
+        // style, a block-commented declaration, prose markup) must be
+        // looked at by a human — loud beats a silently partial universe.
+        let line_start = src[..pos].rfind('\n').map_or(0, |i| i + 1);
+        if src[line_start..pos].contains("//") {
+            continue;
+        }
+        let line_no = src[..pos].matches('\n').count() + 1;
+        violations.push(format!(
+            "{rel}:{line_no}: `#r(` token is neither a declaration this matcher parses nor a \
+             `//`-commented mention — if a new declaration style was introduced, extend \
+             `rule_declaration_regex` (the citation universe would otherwise silently shrink \
+             and live citations would false-red)",
+        ));
+    }
+    parsed
+}
+
 /// Scan one prose file for versioned citations and record each one that
 /// the spec universe does not declare at that exact revision. Returns the
 /// number of citations seen (matching or not).
@@ -2328,10 +2383,13 @@ fn check_spec_rule_citations(
             let id = &cap[1];
             if !universe.contains(id) {
                 violations.push(format!(
-                    "{rel}:{}: cites `{id}`, but no `#r(\"{id}\")` exists in docs/spec — the \
-                     rule was bumped (or the citation is a typo). Re-point the citation at the \
-                     live revision, or drop the `+N` suffix to track the rule across bumps.",
+                    "{rel}:{}: cites `{id}`, but the scanned docs/spec universe ({} rules) does \
+                     not declare it. Either the rule was bumped (re-point the citation at the \
+                     live revision, or drop the `+N` suffix to track the rule across bumps), \
+                     the citation is a typo, or — if the rule IS live in docs/spec — the \
+                     declaration matcher missed its style: extend `rule_declaration_regex`.",
                     idx + 1,
+                    universe.len(),
                 ));
             }
         }
@@ -2345,7 +2403,11 @@ fn check_spec_rule_citations(
 ///
 /// - citations: every backticked `` `<id>+<N>` `` span in
 ///   `docs/dev/**/*.md` matching [`versioned_citation_regex`];
-/// - universe: every `#r("<id>")` declaration in `docs/spec/**/*.typ`.
+/// - universe: every `#r("<id>")` declaration in `docs/spec/**/*.typ`,
+///   inline or multi-line ([`rule_declaration_regex`]), with
+///   inventory parity enforced per `#r(` token
+///   ([`collect_spec_rules`]: parse it, or it must be `//`-commented,
+///   or the lint is red).
 ///
 /// Each citation must name an id+revision the spec declares verbatim.
 /// One-directional by design (prose → spec): the spec owes prose
@@ -2363,15 +2425,25 @@ fn check_spec_rule_citations(
 /// bump as the tree's only `+3` reference).
 fn spec_rule_citations() -> Result<()> {
     let root = repo_root();
-    let decl_re = regex::Regex::new(r#"#r\("([a-z0-9.+-]+)"\)"#).expect("static regex");
     let mut universe: BTreeSet<String> = BTreeSet::new();
+    let mut decl_violations = Vec::new();
+    let mut declarations = 0usize;
     walk_ext(&root.join("docs/spec"), "typ", &mut |path| {
         let src = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        for cap in decl_re.captures_iter(&src) {
-            universe.insert(cap[1].to_string());
-        }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        declarations += collect_spec_rules(&src, &rel, &mut universe, &mut decl_violations);
         Ok(())
     })?;
+    ensure!(
+        decl_violations.is_empty(),
+        "{} unparsed `#r(` declaration token(s) — the citation universe is incomplete:\n{}",
+        decl_violations.len(),
+        decl_violations.join("\n")
+    );
     ensure!(
         !universe.is_empty(),
         "docs/spec scan produced an empty rule universe (parser drift?)"
@@ -2395,7 +2467,12 @@ fn spec_rule_citations() -> Result<()> {
         violations.len(),
         violations.join("\n")
     );
-    tracing::info!(citations, rules = universe.len(), "spec-rule-citations ok");
+    tracing::info!(
+        citations,
+        declarations,
+        rules = universe.len(),
+        "spec-rule-citations ok"
+    );
     Ok(())
 }
 
@@ -2696,6 +2773,97 @@ impl Other {\n\
     #[test]
     fn supply_fold_owner_passes_on_the_real_tree() {
         supply_fold_owner().unwrap();
+    }
+
+    /// The declaration matcher against the REAL spec grammar: both
+    /// styles in use today — inline `#r("id")` and crate-structure.typ's
+    /// multi-line `#r(\n  "id",\n)` (with and without the trailing
+    /// comma) — land in the universe; a `//`-commented `#r()` mention is
+    /// tolerated without parsing; and an `#r(` token in a style the
+    /// matcher does NOT parse is a loud violation rather than a silent
+    /// universe shrink. The original inline-only matcher missed all 19
+    /// multi-line declarations (universe 529 of 548) and false-redded a
+    /// citation of the live `ts.mock.scheduler-outcome+2`.
+    #[test]
+    fn rule_declarations_parsed_in_both_styles_and_parity_enforced() {
+        let src = "\
+#r(\"sched.dispatch.fod-substitute+4\")[inline body]
+#r(
+  \"ts.mock.scheduler-outcome+2\",
+)[multi-line body, trailing comma]
+#r(
+  \"common.bootstrap\"
+)[multi-line body, no trailing comma]
+// the dict below holds ALL trailing per-crate content (#r() markers,
+";
+        let mut universe = BTreeSet::new();
+        let mut violations = Vec::new();
+        let parsed = collect_spec_rules(src, "docs/spec/x.typ", &mut universe, &mut violations);
+        assert!(violations.is_empty(), "{violations:?}");
+        assert_eq!(parsed, 3, "all three declaration styles parsed");
+        let expected: BTreeSet<String> = [
+            "sched.dispatch.fod-substitute+4",
+            "ts.mock.scheduler-outcome+2",
+            "common.bootstrap",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(universe, expected);
+
+        // A third style the matcher does not parse (a comment between
+        // the paren and the id) must red the lint, not shrink the
+        // universe.
+        let mut universe = BTreeSet::new();
+        let mut violations = Vec::new();
+        let parsed = collect_spec_rules(
+            "#r(\n  // why\n  \"sched.unparsed.style\",\n)[body]\n",
+            "docs/spec/y.typ",
+            &mut universe,
+            &mut violations,
+        );
+        assert_eq!(parsed, 0);
+        assert!(universe.is_empty(), "{universe:?}");
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].starts_with("docs/spec/y.typ:1:")
+                && violations[0].contains("extend `rule_declaration_regex`"),
+            "{violations:?}"
+        );
+    }
+
+    /// The token-parity accounting is exact, not just violation-free:
+    /// over a corpus mixing every tolerated shape, parsed declarations
+    /// plus commented mentions account for EVERY `#r(` token, so the
+    /// universe equals the grep-derived declaration inventory by
+    /// construction. (The same accounting runs inside the lint over the
+    /// REAL docs/spec tree on every `xtask lint` / xtask-lint CI run —
+    /// 548 declarations + 1 commented mention today — which is where
+    /// the real-tree parity is enforced; the nextest sandbox stages no
+    /// docs/spec, so a unit test cannot see the real tree without going
+    /// vacuous.)
+    #[test]
+    fn token_parity_accounts_for_every_declaration_token() {
+        let src = "\
+#r(\"a.b+1\")[x]
+// prose mention: #r() markers
+#r(
+  \"c.d\",
+)[y]
+#r(\"a.b+1\")[duplicate id, second token]
+";
+        let tokens = src.matches("#r(").count();
+        let commented = 1usize;
+        let mut universe = BTreeSet::new();
+        let mut violations = Vec::new();
+        let parsed = collect_spec_rules(src, "docs/spec/z.typ", &mut universe, &mut violations);
+        assert_eq!(tokens, 4);
+        // The full accounting: every token is parsed, commented, or a
+        // violation — nothing falls through silently.
+        assert_eq!(parsed + commented + violations.len(), tokens);
+        assert!(violations.is_empty(), "{violations:?}");
+        assert_eq!(parsed, 3, "3 declaration tokens (one id declared twice)");
+        assert_eq!(universe.len(), 2);
     }
 
     /// Both directions of the citation check on synthetic prose: a
