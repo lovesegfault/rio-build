@@ -5943,10 +5943,15 @@ mod tests {
     /// QUANTIFICATION DOMAIN: every fallible RPC in the probe's
     /// observation chain (`list_builds`, then `get_build_graph` per
     /// listed build — there are no others on the path) crossed with
-    /// {ok, error}, and for the fully-evidenced walks the holder-vs-
-    /// snapshot relation {no snapshot (baseline), same build (same /
-    /// changed statuses), newer build, older build, no holder, snapshot
-    /// aged out of the window}. Newer/older derives from the listing's
+    /// {ok, error}; the graph-error cells are additionally crossed with
+    /// the error's WALK POSITION relative to the snapshot {on the
+    /// snapshotted build, on a non-snapshot build above it, mid-walk
+    /// below a non-holder, above a holder on a fresh probe} — the hold
+    /// keys on the chain breaking at all, never on WHICH build broke
+    /// it. For the fully-evidenced walks, the holder-vs-snapshot
+    /// relation {no snapshot (baseline), same build (same / changed
+    /// statuses), newer build, older build, no holder, snapshot aged
+    /// out of the window}. Newer/older derives from the listing's
     /// most-recent-first order (`AdminApi::list_builds`, backed by the
     /// scheduler's `ORDER BY submitted_at DESC, build_id DESC` in
     /// rio-scheduler/src/db/builds.rs).
@@ -6130,6 +6135,58 @@ mod tests {
         admin.fail_graphs.lock().unwrap().insert(MID.to_string());
         assert_eq!(probe.progressed_since_prior(JOB, DRV).await, None);
         assert_eq!(snapshot_of(&probe), None, "no baseline from a failed walk");
+
+        // ── Error injection: the failure is on a NON-snapshot build
+        // ABOVE the snapshot, while the snapshotted holder sits below
+        // with UNCHANGED statuses. The failed build cannot testify — it
+        // may hold the drv (the newer-build progress license) — so
+        // reading the unchanged snapshot below it as no-progress would
+        // mint a terminal off an incomplete walk. The hold must key on
+        // the chain breaking AT ALL, not on WHICH build broke it. ──────
+        let admin = Arc::new(ProbeAdmin::default());
+        let mut probe = probe_over(&admin);
+        *admin.builds.lock().unwrap() = vec![(MID.to_string(), None)];
+        admin
+            .graphs
+            .lock()
+            .unwrap()
+            .insert(MID.to_string(), graph_with("created"));
+        probe.progressed_since_prior(JOB, DRV).await; // baseline at MID
+        *admin.builds.lock().unwrap() = vec![(NEW.to_string(), None), (MID.to_string(), None)];
+        admin.fail_graphs.lock().unwrap().insert(NEW.to_string());
+        assert_eq!(
+            probe.progressed_since_prior(JOB, DRV).await,
+            None,
+            "an error above the snapshot holds — the unchanged snapshot below it must \
+             not read as no-progress"
+        );
+        assert_eq!(
+            snapshot_of(&probe).map(|(id, _)| id),
+            Some(MID.to_string()),
+            "the held walk leaves the snapshot untouched"
+        );
+
+        // ── Error injection: a FRESH probe (no snapshot yet) whose walk
+        // fails above a build that holds the drv. No verdict — and
+        // critically NO baseline either: a baseline minted below a
+        // broken chain would anchor the next tick's comparison to a
+        // build that may not be the newest holder, turning the next
+        // unchanged read into a spurious no-progress terminal. ─────────
+        let admin = Arc::new(ProbeAdmin::default());
+        let mut probe = probe_over(&admin);
+        *admin.builds.lock().unwrap() = vec![(NEW.to_string(), None), (MID.to_string(), None)];
+        admin
+            .graphs
+            .lock()
+            .unwrap()
+            .insert(MID.to_string(), graph_with("created"));
+        admin.fail_graphs.lock().unwrap().insert(NEW.to_string());
+        assert_eq!(probe.progressed_since_prior(JOB, DRV).await, None);
+        assert_eq!(
+            snapshot_of(&probe),
+            None,
+            "no baseline may be minted below a broken chain"
+        );
     }
 
     /// The collect pass's batch-settle supply rollup, quantified over the
