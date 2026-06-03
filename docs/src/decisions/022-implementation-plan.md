@@ -1,7 +1,7 @@
 # ADR-022 Implementation Plan — castore-FUSE lazy store + per-AZ S3 Express chunk cache
 
 **Status:** Phase-0 gate passed (P0541, P0544, P0569 done; P0543 does not block the gate and is still UNIMPL; P0578 PARTIAL — kernel-mechanism subtests Q7-Q12 done; the deferred mountd-protocol subtests landed as `vm-mountd` under P0567, perf criteria measured there but ungated). Phase 1/2 in progress: P0545, P0546, P0548, P0549, P0550, P0551, P0552, P0568, P0570, P0572, P0573, P0577, P0588, P0589 done. Castore RPC surface (`GetDirectory`/`Has*`/`ReadBlob`/`StatBlob`) is now complete. Phase 3 in progress: P0567 done (rio-mountd daemon + UDS wire protocol + `vm-mountd` VM test + helm DS + eks-node `/var/rio` prjquota bind; the DS ships `enabled: false` until something dials it); P0559 done (the castore-FUSE itself — tree/open/circuit/mountd-client + the `Filesystem` impl, unit-tested; nothing mounts it yet); P0571 done (mountd's disk-pressure LRU over `cache`/`chunks` + the dead-staging backstop); P0575 done (streaming open for files above the threshold — first-chunk reply gate, chunk-cache-first windowed fill, `PromoteChunks` cross-build dedup). **P0560 is DONE (2026-05-28)** — the builder mounts a per-build castore FUSE via rio-mountd, the old JIT FUSE is deleted, executor pods / the NixOS module / the helm chart are wired to the node-local castore (incl. the assignment-HMAC mount the chart was missing), `vm-castore-e2e` covers the production chain, and the whole VM matrix runs on the fixture-level explicit-tenancy stopgap recorded in the P0560 reconciliation note (Phase 8 / P0590–P0593 is the product-side resolution and the stopgap's deletion). **P0562 (post-cutover audit) is DONE (2026-05-28)** — the JIT-FUSE rule/string sweep is clean (the deliberate survivors are listed in the P0562 reconciliation note) and `builder.fs.parity` is wired on the lifecycle suite. **Next on the critical path: P0574 (gateway delta-sync client); Phase 8 is sequenced after the cutover merges.** P0586 (PutPathChunked) is DONE — the wire surface, the DAG codecs, the builder fused walk, HasChunks + the durable flip, `validate_begin`, the blob-stream storage conversion (one format, eager castore index, GetPath framing regeneration), and the RPC handler (the §6.3 sequential verify walk + the §6.2 single-transaction commit) are landed, and the builder client switch is landed too (the builder now walks, probes HasChunks, and streams only novel chunks; the legacy PutPath/PutPathBatch client path is deleted), and `vm-put-path-chunked` verifies the flow end-to-end (multi-output single stream, cross-output refs, chunk dedup via HasChunks, floating-CA). P0557 (eager nar_index compute) is DONE — it landed inside P0586's storage conversion as a mandatory part of the complete transaction (the index can no longer be recomputed after ingest), not as the gated spawn originally planned; see the P0557 reconciliation note. Design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023. Per-item status is in the metadata line under each `### P05xx` heading.
-**Plan-number range:** P0541–P0593 (gaps at 0542/0547/0558/0561/0587 are abandoned numbers; P0556 abandoned 2026-04-23 — do not reuse).
+**Plan-number range:** P0541–P0594 (gaps at 0542/0547/0558/0561/0587 are abandoned numbers; P0556 abandoned 2026-04-23 — do not reuse).
 **Clean-cutover constraint:** no FUSE fallback flag, no `RIO_STORE_BACKEND` selector. P0560 deletes the old FUSE module wholesale.
 **Cross-region forward-compat:** object store (S3/GCS) is authoritative for bytes; S3 Express One Zone is a per-AZ read-through cache; PG is single-region. Nothing here precludes cross-region deployment (object-store-authoritative, cache tier stateless) but it is not implemented. No DRA. **Express AZ-ID availability constrains region/AZ choice** — see [Design Overview §9](./022-design-overview.md).
 **Migration-number range:** ADR-022 has shipped `062_nar_index`, `063_file_blob_size`, `064_directory_paths`, and `065_drop_nar_indexed` (062-064 were originally numbered 061-063; renumbered when the rebase onto `main` picked up `061_drv_logs.sql`. The `054_*` slot this plan originally reserved was consumed by unrelated work). Next free: `066_*`. The prose below says "migration 061" wherever it predates the renumber — read 061→062, 062→063, 063→064 for the ADR-022 migrations.
@@ -1017,6 +1017,34 @@ rather than making end-user JWTs mandatory.
 
 ---
 
+### P0594 — fsbench: castore-FUSE performance benchmark
+**Crate:** `rio-builder,xtask,nix` · **Deps:** P0560 · **Complexity:** MED · **Status:** PARTIAL
+
+The measurement instrument for the castore-FUSE data path: a micro-bench that runs **as a real
+build** (production mount path, zero new privileges), with structurally-cold datasets (per-run
+seed keyed into file *contents* → fresh blake3 digests, no eviction games) and criterion-style
+local baselines.
+
+| File | Change |
+|---|---|
+| `rio-builder/src/bin/fsbench/` | `gen` (re-roots ghc's out path — ~1.9 GiB, 6.5k real files, largest 476 MB — under a seeded layout; stamps per-file digests, FastCDC unique-chunk honesty references with the store's parameters, and a whole-tree `dataset_digest` into the manifest) + `run` (read_storm cold/warm, jq_build cold/warm — a real configure+make through the mount-served toolchain — open_storm 2-pass, randread 4KiB psync cold-during-fill+warm, local `$TMPDIR` baseline; PHASE/PERF lines + raw-JSON twin in `$out`). NOT production code. |
+| `nix/fsbench/` | dataset + bench-run drvs; seed via `builtins.getEnv "FSBENCH_SEED"` at local `--impure` eval (pure eval → `UNSEEDED`, refused by the parser). `packages.fsbench-bin` = rio-builder member-bins (xtask pre-builds locally; ssh-ng copies the closure). |
+| `xtask/src/k8s/fsbench/` | `run`: one strictly-serial submission via `shared::{pre_eval_installable,spawn_remote_nix_build}`; co-tenancy attribution (`workers --json` running_build → executor pod → node → mountd scrape @5s); cold-honesty gate (cold-window `promote_bytes_total` ≥ 0.95× cold bytes, warm-window remote fetch ≤ 1%); `result.json` schema fsbench/v1; baselines `.fsbench/baselines/<name>.json` with identity-key refusal (instance type, kernel major.minor, workload, contended) and exit codes 0/2-refused/3-regressed. `compare A.json B.json` reuses the engine. |
+
+**Scope notes:** strictly serial — no parallel bench mode (parallel benches generate the
+contention they then measure; passive co-tenancy *tagging* is the chosen alternative).
+P0578 vi/vii/x stay TCG-measured in `vm-mountd`; hardware-grade raw-protocol numbers are an
+explicit non-goal. Dataset hygiene: the fixed-seed dataset (~1.9 GiB) uploads once and is reused
+— run `rio-cli gc` periodically on bench clusters. Phase 2 (`--perf` full-system traces via a
+capability-scoped profiler pod + `-fp` frame-pointer image variant) is designed but not yet
+implemented — see the fsbench plan doc.
+
+**Exit:** first live run on rio-jorg passes the seven Phase-1 acceptance criteria (exact
+attribution, schema-valid result, cold-honesty cross-check, ratios printed, baseline
+save/compare round-trip, contended/cross-instance refusal).
+
+---
+
 ## `onibus dag append` rows
 
 ```jsonl
@@ -1068,6 +1096,7 @@ rather than making end-user JWTs mandatory.
 {"plan":591,"title":"Ownership at ingest: path_tenants written by PutPath/PutPathBatch/PutPathChunked (JWT|claims.tenant|service+header) + scheduler input-closure upsert + default-tenant backfill","deps":[590,586],"crate":"rio-store,rio-gateway,rio-scheduler,rio-migrations","priority":85,"status":"UNIMPL","complexity":"MED","note":"makes client-uploaded sources/.drvs visible to tenant-scoped castore reads; replaces the P0560 fixture trigger"}
 {"plan":592,"title":"No anonymous access: mandatory HMAC keys, drop unsigned assignment tokens, retire anonymous-unfiltered read carve-outs + anon .drv lookup","deps":[590,591],"crate":"rio-store,rio-gateway,rio-scheduler,nix,infra,docs","priority":75,"status":"UNIMPL","complexity":"MED","note":"spec rework: store.tenant.narinfo-filter, gw.jwt.anon-drv-lookup, single-tenant-mode language removed"}
 {"plan":593,"title":"Test estate on explicit tenancy: fixtures default to tenant+keys, delete standalone defaultTenant narinfo trigger, sweep standalone+k3s scenarios","deps":[591,592],"crate":"nix","priority":75,"status":"UNIMPL","complexity":"LOW","note":"deletes the P0560 stopgap (defaultTenant flag, tenantStopgapSeedSql triggers, tenant key comments, sla-sizing SLA_TENANT shim) once P0591/P0592 make it redundant; the build-running scenarios are already green via the stopgap"}
+{"plan":594,"title":"fsbench: castore-FUSE micro-bench as a real build (seed-keyed structurally-cold dataset, PHASE/PERF parse, co-tenancy attribution + cold-honesty gate, criterion-style baselines, exit 0/2/3)","deps":[560],"crate":"rio-builder,xtask,nix","priority":70,"status":"PARTIAL","complexity":"MED","note":"Phase 0 (open_seconds{case} labels) + Phase 1 landed; workload: re-rooted ghc closure (seed keys layout only) + jq_build compile phases; honesty references manifest unique-chunk bytes (store FastCDC params); dataset_digest + jq_src + toolchain join the identity key; strictly serial by design; P0578 vi/vii/x stay TCG-measured in vm-mountd (non-goal here); fixed-seed dataset uploads once (~1.9GiB); Phase 2 --perf (capability-scoped profiler pod + -fp images) designed, unimplemented"}
 ```
 
 ---
