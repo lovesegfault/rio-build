@@ -123,6 +123,24 @@ sources to the operator-configured map. Accepted residual: per-attempt
 HTTP status log lines remain a status oracle for the explicitly
 opted-in `machine` hosts.
 
+#r("fetcher.divergence.s3-transport")[
+  `s3://` URLs are not supported as a fetch transport (divergence from
+  the oracle, which links aws-sdk). The limitation MUST be applied per
+  candidate, never per fetch: an `s3://` candidate is skipped with a
+  log line and without consuming attempt or backoff budget, while the
+  remaining candidates --- in particular operator-configured hashed
+  mirrors --- are still consulted. A fetch whose every candidate was
+  skipped MUST fail with an error naming the unsupported scheme.
+]
+
+The per-candidate scope is what keeps the divergence harmless in the
+population that actually hits it: a mirror-fronted pool whose
+derivations carry `s3://` origin URLs (nixpkgs has them) builds
+exactly as under the oracle, because the oracle too serves the content
+from `hashed-mirrors` before consulting the origin. Only a fetch that
+NEEDS the s3 transport --- no mirror serves the hash --- observes the
+divergence, as a clean rejection instead of a download.
+
 = Transfer contract
 
 #r("fetcher.fetchurl.transfer-cap")[

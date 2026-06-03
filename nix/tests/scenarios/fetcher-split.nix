@@ -528,6 +528,29 @@ pkgs.testers.runNixOSTest {
         print(f"fod-dead-origin PASS: {out.strip().splitlines()[-1]}")
 
     # ══════════════════════════════════════════════════════════════════
+    # fod-s3-origin — s3:// origin must not veto the hashed mirrors
+    # ══════════════════════════════════════════════════════════════════
+    # The origin uses the unsupported s3:// transport. A correct
+    # builtin:fetchurl skips that ONE candidate (per-candidate
+    # divergence) and serves the content from {mirror}/sha256/{hex} —
+    # the same entry fod-dead-origin uses. A regression to the
+    # whole-fetch s3 bail (round-16 bug_067) fails this build without
+    # ever consulting the mirror.
+    with subtest("fod-s3-origin: s3 origin skipped, mirror serves"):
+        rc, out = client.execute(
+            "timeout 180 nix-build --no-out-link --store ssh-ng://k3s-server "
+            "${drvs.fodS3Origin} 2>&1"
+        )
+        if rc != 0:
+            raise AssertionError(
+                f"fod-s3-origin build failed (rc={rc}); the s3:// origin "
+                f"must be skipped per-candidate and the hashed mirror at "
+                f"/sha256/${drvs.hashedMirrorProbeHex} must serve.\n{out}"
+            )
+        assert "rio-s3-mirror-probe" in out, f"unexpected output {out!r}"
+        print(f"fod-s3-origin PASS: {out.strip().splitlines()[-1]}")
+
+    # ══════════════════════════════════════════════════════════════════
     # fod-bad-hash — wrong origin content is rejected BEFORE upload
     # ══════════════════════════════════════════════════════════════════
     # /bad-hash serves 200 with a body whose sha256 differs from the

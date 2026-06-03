@@ -77,6 +77,12 @@ rec {
   # hashed-mirrors lookup ({mirror}/sha256/{hex}). Drives the
   # fetcher-split fod-dead-origin subtest.
   fodDeadOrigin = "${dir}/fod-dead-origin.nix";
+
+  # Flat-hash FOD with an s3:// origin URL (unsupported transport).
+  # Succeeds only if the s3 limitation is per-candidate so the hashed
+  # mirror is still consulted (round-16 bug_067). Shares the
+  # fod-dead-origin probe body/hex. fetcher-split fod-s3-origin.
+  fodS3Origin = "${dir}/fod-s3-origin.nix";
   ergOnDrv = "${dir}/erg-on-drv.nix";
 
   # Recursive-hash FOD whose output is a directory (`mkdir $out`).

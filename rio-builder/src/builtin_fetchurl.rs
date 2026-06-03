@@ -27,7 +27,10 @@
 //!   restored at the output path. The restored size is capped to keep
 //!   a hostile stream from filling the disk past any plausible source
 //!   archive.
-//! - `s3://` URLs are not supported (documented divergence from Nix).
+//! - `s3://` URLs are not supported as a *transport* (documented
+//!   divergence from Nix). The limitation is per-candidate: an s3://
+//!   origin is skipped with a log line while hashed mirrors are still
+//!   consulted, so mirror-served content fetches normally.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -363,19 +366,35 @@ impl<R: std::io::Read> std::io::Read for MeteredRead<R> {
 
 /// Fetch `params.url` (or a mirror) to `params.output`.
 async fn fetch(params: &FetchurlParams) -> anyhow::Result<()> {
-    if params.url.starts_with("s3://") {
-        bail!(
-            "s3:// URLs are not supported by the native builtin:fetchurl \
-             (use an https:// endpoint URL instead)"
-        );
-    }
-
     let (client, tls_roots_available) = build_client(Path::new(SANDBOX_CA_BUNDLE))?;
     let candidates = params.candidates();
     let mut last_err: Option<anyhow::Error> = None;
 
     for candidate in &candidates {
         let url = &candidate.url;
+        // r[impl fetcher.divergence.s3-transport]
+        // The s3 transport limitation is a property of ONE candidate,
+        // never of the whole fetch: an s3:// origin must not veto the
+        // hashed mirrors that can serve the same content by hash (an
+        // air-gapped pool with mirrors configured is exactly the
+        // population that hits this). Skip-with-log, no attempt or
+        // backoff budget consumed; if every candidate is skipped the
+        // remembered error still names the limitation.
+        if url.starts_with("s3://") {
+            eprintln!(
+                "builtin:fetchurl: skipping {url}: s3:// URLs are not \
+                 supported by the native builtin:fetchurl (use an \
+                 https:// endpoint URL, or rely on hashed mirrors)"
+            );
+            if last_err.is_none() {
+                last_err = Some(anyhow::anyhow!(
+                    "s3:// URLs are not supported by the native \
+                     builtin:fetchurl (use an https:// endpoint URL \
+                     instead); no other candidate served the content"
+                ));
+            }
+            continue;
+        }
         for attempt in 0..ATTEMPTS_PER_URL {
             if attempt > 0 {
                 tokio::time::sleep(RETRY_BACKOFF.duration(attempt - 1)).await;
@@ -1028,6 +1047,9 @@ mod tests {
         assert_eq!(exact, Some(("alice".into(), "s3cret".into())));
     }
 
+    /// All-candidates-skipped arm: an s3 origin with no mirrors still
+    /// fails, naming the unsupported scheme (no silent empty loop).
+    // r[verify fetcher.divergence.s3-transport]
     #[test]
     fn s3_urls_rejected() {
         let p = params("s3://bucket/key", &[]);
@@ -1038,6 +1060,39 @@ mod tests {
             .block_on(fetch(&p))
             .unwrap_err();
         assert!(err.to_string().contains("s3://"), "{err}");
+    }
+
+    /// The skip is per-candidate: an s3 origin must not veto hashed
+    /// mirrors. A local server playing the mirror serves the hash
+    /// path; the fetch succeeds without ever touching the s3 URL.
+    // r[verify fetcher.divergence.s3-transport]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn s3_origin_consults_hashed_mirrors() {
+        use axum::{Router, routing::get};
+
+        let body = b"mirror-served-content".to_vec();
+        let hex = "ab".repeat(32); // params() declares this hash_b16
+        let app = Router::new().route(
+            &format!("/sha256/{hex}"),
+            get({
+                let body = body.clone();
+                move || {
+                    let body = body.clone();
+                    async move { body }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let mut p = params("s3://bucket/key", &[&format!("http://{addr}/")]);
+        p.output = out.clone();
+
+        fetch(&p).await.expect("mirror should serve the content");
+        assert_eq!(std::fs::read(&out).unwrap(), body);
     }
 
     /// End-to-end against a local axum server: plain download,
