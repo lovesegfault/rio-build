@@ -48,7 +48,7 @@ pub enum HashError {
 
 /// Supported hash algorithms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-// r[impl nix.hash.algos]
+// r[impl nix.hash.algos+1]
 pub enum HashAlgo {
     SHA256,
     SHA512,
@@ -58,8 +58,17 @@ pub enum HashAlgo {
 impl std::str::FromStr for HashAlgo {
     type Err = HashError;
 
+    /// Parse an algorithm name CASE-EXACTLY, like the oracle.
+    ///
+    /// CppNix's `parseHashAlgoOpt` (`hash.cc:468-483`) compares the raw
+    /// string against lowercase literals — `"SHA256"` is an error there,
+    /// at every site that names an algorithm (SRI prefixes, colon
+    /// prefixes, `outputHashAlgo`, content-address methods). A lax
+    /// case-folding parse here is how two gates disagree about the same
+    /// declaration: this function is the single string→`HashAlgo` parse,
+    /// so its case posture IS the system's case posture.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
+        match s {
             "sha256" => Ok(HashAlgo::SHA256),
             "sha512" => Ok(HashAlgo::SHA512),
             "sha1" => Ok(HashAlgo::SHA1),
@@ -108,6 +117,57 @@ impl HashAlgo {
 impl std::fmt::Display for HashAlgo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// A parsed `outputHashAlgo` declaration: the optional `r:` ingestion
+/// prefix plus a case-exact algorithm.
+///
+/// This is THE constructor for FOD/floating-CA algo declarations — the
+/// gateway's verifiability screen and declared-hash gate, the
+/// scheduler's authoritative-content validation, the worker glue's FOD
+/// declaration check, the fetch-verify pipeline, the floating-CA
+/// finalizer spec, the modulo-hash fingerprint, and the hashed-mirror
+/// env all parse through here, so no two components can read the same
+/// declaration differently (a spelling accepted at one gate and
+/// rejected at another is unrepresentable).
+///
+/// Oracle parity (`parseDerivationOutput`, `derivations.cc:306-317`):
+/// the oracle first strips one ingestion-method prefix with
+/// `ContentAddressMethod::parsePrefix` (`content-address.cc:84-95`) —
+/// a case-sensitive `splitPrefix(m, "r:")` — then parses the REMAINDER
+/// with case-exact `parseHashAlgo` (`hash.cc:468-490`). The `git:` and
+/// `text:` method prefixes are experimental-feature-gated upstream
+/// (`GitHashing` / `DynamicDerivations`); rio's feature posture is
+/// fixed off, so both fall through to [`HashAlgo::from_str`]'s
+/// unknown-algorithm rejection here, matching the xp-disabled oracle.
+/// `md5` and `blake3` are accepted by the oracle but not by rio — the
+/// registered divergence `nix.divergence.fod-fallback-fingerprint+1`.
+// r[impl nix.hash.algos+1]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OutputHashAlgo {
+    /// True for `r:`-prefixed declarations (NAR ingestion — the prefix
+    /// selects the hash MODE, not the algorithm).
+    pub recursive: bool,
+    /// The case-exact algorithm named after the prefix.
+    pub algo: HashAlgo,
+}
+
+impl OutputHashAlgo {
+    /// Parse a raw `outputHashAlgo` string (`"sha256"`, `"r:sha512"`, …).
+    ///
+    /// Strips at most one case-sensitive `"r:"` prefix, then parses the
+    /// remainder case-exactly. See the type docs for the oracle parity
+    /// argument.
+    pub fn parse(raw: &str) -> Result<Self, HashError> {
+        let (recursive, algo_str) = match raw.strip_prefix("r:") {
+            Some(rest) => (true, rest),
+            None => (false, raw),
+        };
+        Ok(OutputHashAlgo {
+            recursive,
+            algo: algo_str.parse()?,
+        })
     }
 }
 
@@ -273,11 +333,168 @@ mod tests {
     #[test]
     fn test_algo_parse() -> anyhow::Result<()> {
         assert_eq!("sha256".parse::<HashAlgo>()?, HashAlgo::SHA256);
-        assert_eq!("SHA256".parse::<HashAlgo>()?, HashAlgo::SHA256);
         assert_eq!("sha512".parse::<HashAlgo>()?, HashAlgo::SHA512);
         assert_eq!("sha1".parse::<HashAlgo>()?, HashAlgo::SHA1);
         assert!("md5".parse::<HashAlgo>().is_err());
+        // Case-exact like the oracle's `parseHashAlgoOpt`
+        // (`hash.cc:468-483`): a folded spelling is an error, not an
+        // alias — otherwise gates that parse here and gates that
+        // compare exactly disagree about the same declaration.
+        assert!("SHA256".parse::<HashAlgo>().is_err());
+        assert!("Sha256".parse::<HashAlgo>().is_err());
+        assert!("sHa512".parse::<HashAlgo>().is_err());
+        assert!("SHA1".parse::<HashAlgo>().is_err());
+        assert!(" sha256".parse::<HashAlgo>().is_err());
+        assert!("sha256 ".parse::<HashAlgo>().is_err());
         Ok(())
+    }
+
+    /// Spelled-string differential for the algorithm parse: rio's
+    /// [`HashAlgo::from_str`] / [`OutputHashAlgo::parse`] vs the
+    /// line-by-line `parseHashAlgoOpt` / `ContentAddressMethod::
+    /// parsePrefix` port (`hash_oracle.rs`), exhaustively over the case
+    /// axis (every case mask of every algorithm name, bare and behind
+    /// every method prefix) plus whitespace/affix junk.
+    ///
+    /// Laws:
+    /// 1. rio accepts ⇒ the xp-disabled oracle accepts, with the same
+    ///    algorithm and the same recursive bit;
+    /// 2. the xp-disabled oracle accepts but rio rejects ⇒ the
+    ///    algorithm is exactly md5 — the registered divergence
+    ///    `nix.divergence.fod-fallback-fingerprint+1` (blake3 joins only
+    ///    under the xp-enabled oracle, asserted separately);
+    /// 3. on the case axis specifically: any non-lowercase mask is
+    ///    rejected by BOTH sides (a case-fold regression in rio
+    ///    violates law 1; one in the port violates law 3).
+    // r[verify nix.hash.algos+1]
+    // r[verify nix.divergence.fod-fallback-fingerprint+1]
+    #[test]
+    fn algo_parse_differential_spelled_strings() {
+        use crate::hash_oracle::{
+            OracleAlgo, parse_hash_algo_oracle, parse_hash_algo_oracle_xp,
+            parse_output_hash_algo_oracle,
+        };
+
+        fn case_masks(name: &str) -> Vec<String> {
+            // Letters only — digits have one form. 2^letters spellings.
+            let letters: Vec<usize> = name
+                .char_indices()
+                .filter(|(_, c)| c.is_ascii_alphabetic())
+                .map(|(i, _)| i)
+                .collect();
+            let mut out = Vec::with_capacity(1 << letters.len());
+            for mask in 0u32..(1 << letters.len()) {
+                let mut s: Vec<u8> = name.as_bytes().to_vec();
+                for (bit, &idx) in letters.iter().enumerate() {
+                    if mask & (1 << bit) != 0 {
+                        s[idx] = s[idx].to_ascii_uppercase();
+                    }
+                }
+                out.push(String::from_utf8(s).unwrap());
+            }
+            out
+        }
+
+        let mut corpus: Vec<String> = Vec::new();
+        for name in ["sha1", "sha256", "sha512", "md5", "blake3"] {
+            for spelling in case_masks(name) {
+                corpus.push(spelling.clone());
+                corpus.push(format!("r:{spelling}"));
+                corpus.push(format!("R:{spelling}"));
+                corpus.push(format!("git:{spelling}"));
+                corpus.push(format!("text:{spelling}"));
+                corpus.push(format!("r:r:{spelling}"));
+                corpus.push(format!(" {spelling}"));
+                corpus.push(format!("{spelling} "));
+                corpus.push(format!("{spelling}\n"));
+            }
+        }
+        corpus.extend(
+            [
+                "", ":", "r:", "sha", "sha2", "sha-256", "sha256:", "ssha256", "sha2566",
+            ]
+            .map(str::to_owned),
+        );
+
+        let to_oracle = |a: HashAlgo| match a {
+            HashAlgo::SHA1 => OracleAlgo::Sha1,
+            HashAlgo::SHA256 => OracleAlgo::Sha256,
+            HashAlgo::SHA512 => OracleAlgo::Sha512,
+        };
+
+        for s in &corpus {
+            // Bare algorithm names: FromStr vs parseHashAlgoOpt.
+            let rio = s.parse::<HashAlgo>();
+            let oracle = parse_hash_algo_oracle(s);
+            match (&rio, &oracle) {
+                (Ok(r), Some(o)) => assert_eq!(to_oracle(*r), *o, "algo disagreement on {s:?}"),
+                (Ok(r), None) => panic!("rio accepts {s:?} as {r:?}; the oracle rejects it"),
+                (Err(_), Some(o)) => assert_eq!(
+                    *o,
+                    OracleAlgo::Md5,
+                    "{s:?}: oracle-accepts/rio-rejects outside the registered md5 divergence"
+                ),
+                (Err(_), None) => {}
+            }
+
+            // Full outputHashAlgo strings: OutputHashAlgo::parse vs
+            // parsePrefix + parseHashAlgoOpt.
+            let rio_out = OutputHashAlgo::parse(s);
+            let oracle_out = parse_output_hash_algo_oracle(s);
+            match (&rio_out, &oracle_out) {
+                (Ok(r), Some((rec, o))) => {
+                    assert_eq!(r.recursive, *rec, "recursive bit disagreement on {s:?}");
+                    assert_eq!(to_oracle(r.algo), *o, "algo disagreement on {s:?}");
+                }
+                (Ok(r), None) => {
+                    panic!("rio accepts outputHashAlgo {s:?} as {r:?}; the oracle rejects it")
+                }
+                (Err(_), Some((_, o))) => assert_eq!(
+                    *o,
+                    OracleAlgo::Md5,
+                    "{s:?}: oracle-accepts/rio-rejects outside the registered md5 divergence"
+                ),
+                (Err(_), None) => {}
+            }
+
+            // The xp-enabled oracle additionally accepts blake3; the
+            // divergence set under THAT oracle is exactly {md5, blake3}.
+            if let (Err(_), Some(o)) = (&rio, &parse_hash_algo_oracle_xp(s)) {
+                assert!(
+                    matches!(o, OracleAlgo::Md5 | OracleAlgo::Blake3),
+                    "{s:?}: xp-oracle-accepts/rio-rejects outside {{md5, blake3}}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn output_hash_algo_parse_table() {
+        let ok = OutputHashAlgo::parse("sha256").unwrap();
+        assert!(!ok.recursive);
+        assert_eq!(ok.algo, HashAlgo::SHA256);
+
+        let rec = OutputHashAlgo::parse("r:sha512").unwrap();
+        assert!(rec.recursive);
+        assert_eq!(rec.algo, HashAlgo::SHA512);
+
+        // One prefix strip only; case-sensitive prefix; xp-gated
+        // method prefixes rejected (rio's features are fixed off).
+        for bad in [
+            "r:r:sha256",
+            "R:sha256",
+            "git:sha256",
+            "text:sha256",
+            "r:SHA256",
+            "SHA256",
+            "",
+            "r:",
+        ] {
+            assert!(
+                OutputHashAlgo::parse(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -568,8 +785,8 @@ mod tests {
     /// (`hash.cc:468-490`); rio's `HashAlgo` does not — an md5
     /// declaration is undecodable here and survives only through the
     /// raw-string fingerprint fallback
-    /// (`nix.divergence.fod-fallback-fingerprint`).
-    // r[verify nix.divergence.fod-fallback-fingerprint]
+    /// (`nix.divergence.fod-fallback-fingerprint+1`).
+    // r[verify nix.divergence.fod-fallback-fingerprint+1]
     #[test]
     fn md5_spelling_is_a_registered_divergence() {
         assert!("md5".parse::<HashAlgo>().is_err());

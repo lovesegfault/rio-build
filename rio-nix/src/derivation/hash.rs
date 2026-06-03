@@ -83,7 +83,7 @@ pub fn hash_derivation_modulo_input_form<'c>(
 /// stable — failing here would turn an admission-policy decision into a
 /// hash error deep inside the modulo walk.
 // r[impl nix.hash.fod-decode+1]
-// r[impl nix.divergence.fod-fallback-fingerprint]
+// r[impl nix.divergence.fod-fallback-fingerprint+1]
 fn canonical_fod_hash(raw_algo: &str, raw_hash: &str) -> String {
     use crate::hash::{HashAlgo, NixHash};
 
@@ -451,7 +451,7 @@ mod hash_derivation_modulo_tests {
     /// the raw string in the fingerprint — stable across versions, never an
     /// error. The gateway's offender-exemption flow depends on this.
     // r[verify nix.hash.fod-decode+1]
-    // r[verify nix.divergence.fod-fallback-fingerprint]
+    // r[verify nix.divergence.fod-fallback-fingerprint+1]
     #[test]
     fn fod_hash_undecodable_falls_back_to_raw() -> anyhow::Result<()> {
         use sha2::{Digest, Sha256};

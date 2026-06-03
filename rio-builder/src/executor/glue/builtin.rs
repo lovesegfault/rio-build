@@ -138,7 +138,7 @@ pub(crate) fn prepare_fetchurl(
         // runs before any builtin planning), so decoding cannot fail here;
         // fall back to the raw string defensively rather than panicking.
         // r[impl nix.hash.fod-decode+1]
-        // r[impl nix.divergence.fod-fallback-fingerprint]
+        // r[impl nix.divergence.fod-fallback-fingerprint+1]
         let canonical_b16 = algo
             .parse::<rio_nix::hash::HashAlgo>()
             .ok()
@@ -438,7 +438,7 @@ mod tests {
     /// `<mirror>/<algo>/<base16>` URLs (fetchurl.cc), so a nixbase32
     /// declaration passed through raw would produce a garbage URL.
     // r[verify nix.hash.fod-decode+1]
-    // r[verify nix.divergence.fod-fallback-fingerprint]
+    // r[verify nix.divergence.fod-fallback-fingerprint+1]
     #[test]
     fn hashed_mirror_env_canonicalizes_declared_hash() {
         let digest = vec![0u8; 32];
