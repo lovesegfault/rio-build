@@ -41,6 +41,15 @@ wire_enum! {
 
 impl BuildStatus {
     /// Whether this status represents a successful build.
+    ///
+    /// "Success" is completion-shaped, not evidence-graded: it includes
+    /// the three presence statuses (`Substituted` / `AlreadyValid` /
+    /// `ResolvesToAlreadyValid`), which prove the outputs exist in the
+    /// store — possibly landed by someone else entirely — and say nothing
+    /// about whether THIS request could have built them. Polarity-only
+    /// consumers (failure detection, retry loops) may use this; any
+    /// consumer whose decision needs proof the build EXECUTED must use
+    /// [`BuildStatus::executed`] instead.
     pub fn is_success(&self) -> bool {
         matches!(
             self,
@@ -49,6 +58,21 @@ impl BuildStatus {
                 | BuildStatus::AlreadyValid
                 | BuildStatus::ResolvesToAlreadyValid
         )
+    }
+
+    /// Whether this status proves the build was EXECUTED for this
+    /// request: `Built` only.
+    ///
+    /// The success vocabulary splits along an evidence grade —
+    /// execution vs presence — and the two must not be conflated at
+    /// gates that re-confirm buildability: store presence can be
+    /// produced by a concurrent campaign, a warm-tenant prefetch, or an
+    /// upstream substitution, so a presence status can never refute an
+    /// earlier observed build failure. (The replay engine's
+    /// confirmation-retry supersede is the canonical consumer: only an
+    /// executed success may erase a recorded unexpected-failure.)
+    pub fn executed(&self) -> bool {
+        matches!(self, BuildStatus::Built)
     }
 }
 
@@ -494,6 +518,40 @@ mod tests {
         assert!(BuildStatus::ResolvesToAlreadyValid.is_success());
         assert!(!BuildStatus::PermanentFailure.is_success());
         assert!(!BuildStatus::TimedOut.is_success());
+    }
+
+    /// `executed()` partitions the success vocabulary at the member
+    /// level: exactly `Built` is execution-evidenced; the three presence
+    /// statuses are successes WITHOUT execution; no failure status is
+    /// either. Quantification domain: the full wire vocabulary, derived
+    /// from the wire mapping itself (`try_from` over the contiguous code
+    /// range, with the bound pinned by `build_status_roundtrip`) — so a
+    /// new status cannot ship without landing in exactly one of the
+    /// three classes asserted here.
+    #[test]
+    fn executed_partitions_success_at_the_member_level() {
+        let presence = [
+            BuildStatus::Substituted,
+            BuildStatus::AlreadyValid,
+            BuildStatus::ResolvesToAlreadyValid,
+        ];
+        for code in 0..=14u64 {
+            let status = BuildStatus::try_from(code).expect("contiguous wire vocabulary");
+            if status == BuildStatus::Built {
+                assert!(status.executed() && status.is_success(), "{status:?}");
+            } else if presence.contains(&status) {
+                assert!(
+                    status.is_success() && !status.executed(),
+                    "{status:?}: presence proves the outputs exist, never that THIS \
+                     request built them"
+                );
+            } else {
+                assert!(
+                    !status.is_success() && !status.executed(),
+                    "{status:?}: failures are neither successes nor executions"
+                );
+            }
+        }
     }
 
     /// The two success constructors encode different claims and must not

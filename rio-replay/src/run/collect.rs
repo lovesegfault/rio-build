@@ -1444,27 +1444,56 @@ pub async fn process_settled_batch(
             // dispatcher's DESIGNED post-terminal superseding writer (an
             // expected-built unit whose first replayed result failed is
             // re-confirmed before unexpected-failure may stand), so its
-            // SUCCESS results pass the belt and supersede the initial
-            // failure under latest-record-per-job semantics. Everything
-            // else — duplicate plain submissions, and retry results that
-            // merely re-confirm the failure — is dropped, so a duplicate
-            // can never overwrite the job's real verdict.
-            let confirmation_supersede = batch.confirmation_attempt > 0
-                && target
-                    .and_then(|t| build_status_from_name(&t.status))
-                    .is_some_and(|status| status.is_success());
+            // EXECUTED success results pass the belt and supersede the
+            // initial failure under latest-record-per-job semantics.
+            //
+            // Executed means `BuildStatus::executed()` — `Built` only.
+            // The presence-shaped successes (Substituted / AlreadyValid /
+            // ResolvesToAlreadyValid) prove the outputs exist in the
+            // store, possibly landed by a concurrent campaign, a
+            // warm-tenant prefetch, or an upstream substitution — never
+            // that THIS retry could build the unit (the gateway's own
+            // presence-claim honesty invariant), so they cannot refute
+            // the recorded failure: the design's §9.2 re-confirmation
+            // contract demands the failure be contradicted by a build,
+            // and an expected-built unit's outputs always exist upstream
+            // by construction, so admitting presence here would let any
+            // concurrent landing erase a genuine regression from the
+            // gate. Presence retries are dropped like re-confirmed
+            // failures — the initial verdict stands — with the
+            // observation logged so operators learn the outputs appeared
+            // mid-campaign. Everything else — duplicate plain
+            // submissions, and retry results that merely re-confirm the
+            // failure — is dropped the same way, so a duplicate can never
+            // overwrite the job's real verdict.
+            let retry_status = (batch.confirmation_attempt > 0)
+                .then(|| target.and_then(|t| build_status_from_name(&t.status)))
+                .flatten();
+            let confirmation_supersede = retry_status.is_some_and(|status| status.executed());
             if !confirmation_supersede {
-                tracing::info!(
-                    job,
-                    "settled-batch member already has a terminal record; dropping"
-                );
+                if retry_status.is_some_and(|status| status.is_success()) {
+                    tracing::info!(
+                        job,
+                        attempt = batch.confirmation_attempt,
+                        status = ?retry_status,
+                        "confirmation retry settled with store PRESENCE, not an executed \
+                         build; the recorded failure stands (the outputs appeared \
+                         mid-campaign through another channel)"
+                    );
+                } else {
+                    tracing::info!(
+                        job,
+                        "settled-batch member already has a terminal record; dropping"
+                    );
+                }
                 decisions.insert(job.clone(), CollectDecision::AlreadyTerminal);
                 continue;
             }
             tracing::info!(
                 job,
                 attempt = batch.confirmation_attempt,
-                "sanctioned confirmation retry succeeded; superseding the terminal record"
+                "sanctioned confirmation retry succeeded with an executed build; superseding \
+                 the terminal record"
             );
         }
         let prior = prior_budgets.get(job).copied().unwrap_or_default();
@@ -1755,6 +1784,7 @@ mod tests {
     use crate::run::grpc::test_support::FakeStoreApi;
     use crate::run::grpc::{GraphSnapshot, PoisonedView};
     use crate::run::model::{BATCH_KIND_SUBMIT, Disposition, build_status_name};
+    use crate::run::state::latest_per_job;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The re-offer view of a decision map: the jobs the caller must
@@ -4642,12 +4672,24 @@ mod tests {
     ///
     /// Must-admit: the initial timed batch records the genuine-classified
     /// failure; the dispatcher's confirmation retry (confirmation_attempt
-    /// > 0) succeeds, passes the already-terminal belt as the sanctioned
-    /// superseding writer, and the surviving record is flaky match-built
-    /// with attempts = confirmation_attempt + 1. Must-block: a plain
-    /// duplicate success (confirmation_attempt == 0) is still dropped, and
-    /// a confirmation retry whose result is another FAILURE adds nothing —
-    /// the initial record stands.
+    /// > 0) settles an EXECUTED success (`Built`), passes the
+    /// already-terminal belt as the sanctioned superseding writer, and
+    /// the surviving record is flaky match-built with attempts =
+    /// confirmation_attempt + 1.
+    ///
+    /// Must-block, partitioned at the gating predicate's real granularity
+    /// (`BuildStatus` has FOUR success members, not one — the belt gates
+    /// on `executed()`, so every non-executed member needs its own row):
+    /// a plain duplicate success (confirmation_attempt == 0) is still
+    /// dropped; a confirmation retry whose result is another FAILURE adds
+    /// nothing; and a confirmation retry that settles each of the THREE
+    /// presence statuses (Substituted / AlreadyValid /
+    /// ResolvesToAlreadyValid) is dropped too — presence proves the
+    /// outputs landed in the store (any concurrent campaign or upstream
+    /// substitution can do that for an expected-built unit, whose outputs
+    /// exist upstream by construction), never that this retry could BUILD
+    /// the unit, so it must not erase the recorded unexpected-failure
+    /// from the regression gate.
     #[tokio::test]
     async fn confirmation_retry_success_supersedes_but_duplicates_still_cannot() {
         let job = "flaky.x86_64-linux";
@@ -4760,6 +4802,50 @@ mod tests {
         );
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1, "{records:?}");
+
+        // Must-block legs 3-5: ALL THREE presence-shaped success statuses
+        // on a sanctioned confirmation retry. Each is a wire success
+        // (`is_success()`), none is an execution (`executed()`): the belt
+        // must drop them and the recorded unexpected-failure must remain
+        // the surviving verdict — presence on the retry is consistent
+        // with the unit being unbuildable on rio while its outputs land
+        // through any other channel.
+        for presence_status in [
+            BuildStatus::Substituted,
+            BuildStatus::AlreadyValid,
+            BuildStatus::ResolvesToAlreadyValid,
+        ] {
+            assert!(
+                presence_status.is_success() && !presence_status.executed(),
+                "{presence_status:?}: the row only makes sense for non-executed successes"
+            );
+            let presence_retry = BatchView {
+                kind: BATCH_KIND_TIMED.to_string(),
+                build_id: Some("0193e4a2-7c1b-7d20-9b3a-5f2e3d4c5b6e".to_string()),
+                results: vec![po(T, presence_status, "")],
+                confirmation_attempt: 1,
+                ..BatchView::default()
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let state = StateDir::new(dir.path()).unwrap();
+            let mut already_terminal: HashSet<String> = HashSet::new();
+            run_batch(&state, &initial_failure, &already_terminal).await;
+            already_terminal.insert(job.to_string());
+            let decisions = run_batch(&state, &presence_retry, &already_terminal).await;
+            assert_eq!(
+                decisions.get(job),
+                Some(&CollectDecision::AlreadyTerminal),
+                "{presence_status:?}: a presence retry must be dropped, not supersede"
+            );
+            let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+            assert_eq!(records.len(), 1, "{presence_status:?}: {records:?}");
+            let surviving = latest_per_job(records);
+            assert_eq!(
+                surviving[job].verdict.as_deref(),
+                Some(Verdict::UnexpectedFailure.as_str()),
+                "{presence_status:?}: the genuine unexpected-failure must survive on the gate"
+            );
+        }
     }
 
     /// Exit totality over the deliberate skip arms, enumerated as data:
