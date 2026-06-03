@@ -721,7 +721,13 @@ its basis from the evidence ("build completed" only over an own executed
 terminal, "substituted" over an own `Cached` terminal, "DAG completed" when
 the target's own terminal was lost). For a target WITH its own success
 terminal, outputs that cannot be mapped to a queryable store path leave
-that terminal authoritative.
+that terminal authoritative. A batch the scheduler never accepted
+(validation rejection, pre-acknowledgment submit error) skips the store
+verification entirely: every per-path verdict reports the synthesized
+refusal verbatim regardless of store state, so the verification could
+influence nothing — running it would only add the store's own failure mode
+(an opcode-level abort) to replies the client is owed per path during a
+correlated outage.
 
 `wopBuildDerivation` (the build-hook path) is a single-target reply, so the
 batch-aggregation hazards above do not apply, but the client-crash one does:

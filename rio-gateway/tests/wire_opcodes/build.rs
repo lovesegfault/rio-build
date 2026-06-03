@@ -3133,6 +3133,127 @@ async fn test_build_paths_with_results_submit_error_not_rescued_by_presence() ->
 }
 
 // r[verify gw.opcode.build-results-honest+2]
+/// An unsubmitted batch (validate_dag rejection) issues NO store
+/// verification: every root's verdict ignores the check (the lattice's
+/// check-invariance audit), so running it would be dead I/O whose only
+/// live effect is its failure mode — a store error escalating the
+/// designed per-path refusal into a session-level STDERR_ERROR abort.
+/// Scripted here: the store's FindMissingPaths is DOWN (a correlated
+/// outage), and the per-path refusal must still reach the client
+/// verbatim with zero store-verification calls. `drain_stderr_until_last`
+/// panics on STDERR_ERROR, so the no-abort property is load-bearing in
+/// the helper itself.
+#[tokio::test]
+async fn test_build_paths_with_results_rejected_batch_skips_store_verification()
+-> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    h.store
+        .seed_with_content(NOCHROOT_PRESENT_DRV, NOCHROOT_PRESENT_ATERM.as_bytes());
+    // The store's verification RPC errors if asked — the gate under test
+    // means it is never asked.
+    h.store
+        .faults
+        .fail_find_missing
+        .store(true, Ordering::SeqCst);
+
+    let derived_path = format!("{NOCHROOT_PRESENT_DRV}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: std::slice::from_ref(&derived_path),
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1);
+
+    let (echoed, result) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(echoed, derived_path);
+    assert_eq!(
+        result.status,
+        BuildStatus::InputRejected,
+        "the refusal must survive a store outage untouched: {result:?}"
+    );
+    assert!(
+        result.error_msg.contains("noChroot") || result.error_msg.contains("sandbox"),
+        "the rejection reason must reach the client verbatim, got: {:?}",
+        result.error_msg
+    );
+    assert_eq!(
+        h.store.calls.find_missing_calls.load(Ordering::SeqCst),
+        0,
+        "a rejected batch must not pay the store verification at all"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.build-results-honest+2]
+/// Same gate for the pre-acknowledgment submit error: scheduler down AND
+/// store verification down (the same-cluster correlated-outage shape).
+/// The synthesized per-path transport failure must still be delivered —
+/// not replaced by a session abort from a verification no verdict reads
+/// — with zero store-verification calls.
+#[tokio::test]
+async fn test_build_paths_with_results_submit_error_skips_store_verification() -> anyhow::Result<()>
+{
+    use std::sync::atomic::Ordering;
+
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler
+        .set_submit_outcome(SubmitOutcome::Error(tonic::Code::Unavailable));
+
+    h.store
+        .seed_with_content(HONEST_A_DRV, HONEST_A_ATERM.as_bytes());
+    h.store
+        .faults
+        .fail_find_missing
+        .store(true, Ordering::SeqCst);
+
+    let path_a = format!("{HONEST_A_DRV}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: std::slice::from_ref(&path_a),
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1);
+
+    let (echoed, result) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(echoed, path_a);
+    assert_eq!(
+        result.status,
+        BuildStatus::TransientFailure,
+        "the synthesized transport failure must survive the store outage: {result:?}"
+    );
+    assert!(
+        result.error_msg.contains("scheduler error"),
+        "the failure reason must reach the client verbatim, got: {:?}",
+        result.error_msg
+    );
+    // Exactly ONE FindMissingPaths is recorded: translate's
+    // pre-submission .drv-inlining probe, which runs before the submit
+    // outcome exists and degrades gracefully on error ("skipping .drv
+    // inlining"). The post-failure store VERIFICATION adds none — that
+    // call is the one whose error path would abort the session.
+    assert_eq!(
+        h.store.calls.find_missing_calls.load(Ordering::SeqCst),
+        1,
+        "an unacknowledged batch must not pay the store verification \
+         (the single expected call is translate's pre-submission inlining probe)"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.build-results-honest+2]
 /// wopBuildPaths (9): the bare success word is gated on the same store
 /// verification. Aggregate success but the wanted output path is missing
 /// from the store ⇒ STDERR_ERROR naming the path, not u64(1).

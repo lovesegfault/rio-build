@@ -1744,6 +1744,33 @@ struct TargetOutputsCheck {
     unverifiable: bool,
 }
 
+impl TargetOutputsCheck {
+    /// A check that asked the store NOTHING: no missing evidence, no
+    /// presence evidence, `unverifiable` (which blocks
+    /// `confirmed_present` like any other store silence).
+    ///
+    /// Stand-in for batches the scheduler never accepted: every root's
+    /// verdict is the unsubmitted arm of [`per_root_verdict`], which is
+    /// check-INVARIANT (pinned by the lattice audit), so querying the
+    /// store could not influence any reported result — the only live
+    /// effects of running the verification would be its failure mode
+    /// (a store outage during an unrelated rejection escalating the
+    /// designed per-path replies into a session-level abort) and wasted
+    /// store I/O exactly when the cluster is degraded. The stand-in
+    /// keeps every root flowing through the verdict chokepoint instead
+    /// of the result loop's defensive no-check arm.
+    fn unqueried() -> Self {
+        Self {
+            missing: Vec::new(),
+            confirmed_present: false,
+            realized: HashMap::new(),
+            wanted_names: Vec::new(),
+            checkable: Vec::new(),
+            unverifiable: true,
+        }
+    }
+}
+
 // r[impl gw.opcode.build-results-honest+2]
 /// Resolve every target's wanted outputs to concrete store paths and ask the
 /// store — ONE batched `FindMissingPaths` over the union, tenant-scoped via
@@ -2349,9 +2376,26 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         // honesty invariants (own failures stand; execution claims need
         // own terminals; the presence rescue needs an acknowledged
         // batch).
+        //
+        // The store verification runs ONLY for acknowledged batches: an
+        // unsubmitted stand-in's verdicts are check-invariant (pinned by
+        // the lattice audit), so the query's answers could not influence
+        // any reported result, while its failure mode — stderr_err!
+        // aborting the session on a store error — would replace the
+        // designed per-path refusal/transport replies exactly when a
+        // correlated outage makes both backends unhealthy. Sibling
+        // opcodes already gate the same way (opcode 9 short-circuits
+        // rejection/submit-Err before any check; opcode 36 checks only
+        // on success), so this is the discipline, not an exception.
         let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
-        let mut checks =
-            check_targets_against_store(stderr, ctx, &drv_for_idx, &mut hash_cache).await?;
+        let mut checks = if processed.submitted {
+            check_targets_against_store(stderr, ctx, &drv_for_idx, &mut hash_cache).await?
+        } else {
+            drv_for_idx
+                .keys()
+                .map(|&idx| (idx, TargetOutputsCheck::unqueried()))
+                .collect()
+        };
 
         for (idx, _raw) in raw_paths.iter().enumerate() {
             if let Some(opaque) = opaque_results.remove(&idx) {
