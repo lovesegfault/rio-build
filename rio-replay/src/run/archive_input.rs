@@ -13,7 +13,7 @@
 //! closures, and `exclusions.jsonl` feeds the plan-time completeness
 //! accounting.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use anyhow::{Context as _, Result};
 use rio_nix::derivation::{Derivation, structured_attrs};
