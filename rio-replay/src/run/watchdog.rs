@@ -1554,7 +1554,9 @@ mod tests {
             ("mod.rs", "IcePoll::NotPolled"),
             ("mod.rs", "let tick = PollTick {"),
         ];
-        let run_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/run");
+        // Runtime resolution (crate::test_manifest_dir): the compile-time
+        // env! path does not exist inside the nextest sandbox.
+        let run_dir = crate::test_manifest_dir().join("src/run");
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         let mut pending = vec![run_dir.clone()];
         while let Some(dir) = pending.pop() {

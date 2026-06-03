@@ -3010,7 +3010,9 @@ mod tests {
                 "polarity only: a prefetch submission's success status",
             ),
         ];
-        let run_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/run");
+        // Runtime resolution (crate::test_manifest_dir): the compile-time
+        // env! path does not exist inside the nextest sandbox.
+        let run_root = crate::test_manifest_dir().join("src/run");
         // Built at runtime so this test's own source cannot match.
         let success_needle = format!(".{}{}", "is_success", "()");
         let executed_needle = format!(".{}{}", "executed", "()");

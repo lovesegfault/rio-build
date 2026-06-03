@@ -79,14 +79,19 @@ pub(crate) fn http_client(
     }
 }
 
-/// Crate directory for locating committed test fixtures at run time.
+/// Crate directory for run-time reads from the crate's own tree:
+/// committed test fixtures AND the source-walking enumeration lints
+/// (the `*_consumers_are_enumerated` family, [`crate::run::crate_sources`])
+/// that grep `src/` at test time. Every such read MUST resolve through
+/// here — not through a compile-time `env!` of its own.
 ///
 /// Reads the runtime `CARGO_MANIFEST_DIR` (set by cargo and
 /// cargo-nextest for every test process) instead of the compile-time
 /// `env!` value: under the crate2nix test pipeline the compile-time
 /// path names a per-crate build sandbox that no longer exists when the
 /// test binary actually runs, while the runtime value points at the
-/// real (or remapped) crate directory containing `tests/fixtures/`.
+/// real (or remapped) crate directory containing `tests/fixtures/`
+/// and `src/`.
 #[cfg(test)]
 pub(crate) fn test_manifest_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(

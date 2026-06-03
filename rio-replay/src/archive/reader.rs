@@ -1848,7 +1848,9 @@ mod tests {
                 }
             }
         }
-        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Runtime resolution (crate::test_manifest_dir): the compile-time
+        // env! path does not exist inside the nextest sandbox.
+        let src_root = crate::test_manifest_dir().join("src");
         let mut files = Vec::new();
         walk(&src_root, &mut files);
         assert!(files.len() > 10, "the source walk must visit the crate");

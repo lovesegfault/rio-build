@@ -153,11 +153,41 @@ in
   #   xtask — the dev dry-run test (xtask/src/replay/dev.rs) opens
   #     rio-replay's committed archive fixture via
   #     CARGO_MANIFEST_DIR/../rio-replay/tests/fixtures/archive/v1-basic.
+  #
+  #   xtask — the lint self-tests run their lints against the real tree
+  #     via repo_root() (= the runtime CARGO_MANIFEST_DIR's parent =
+  #     the remapped sandbox workspace, see xtask/src/sh.rs):
+  #     supply_fold_owner walks rio-replay/src (SupplyFold projections
+  #     in run/model.rs + every StateFile::Supply call site), and
+  #     contract_registry resolves its rows' declaration/test files —
+  #     rio-replay/src plus exactly one file each from rio-nix,
+  #     rio-proto, and docs/dev (the design doc several rows declare
+  #     their contract in). The non-rio-replay reads are staged as
+  #     single-file filesets so editing the rest of those trees doesn't
+  #     invalidate nextest-xtask; a NEW registry row pointing at an
+  #     unstaged file fails the sandbox run loudly ("declaration file
+  #     ... unreadable") and gets its staging entry here.
   crossMemberRuntimeSrcs = {
     xtask = {
+      "rio-replay/src" = pkgs.lib.fileset.toSource {
+        root = unfilteredRoot + "/rio-replay/src";
+        fileset = unfilteredRoot + "/rio-replay/src";
+      };
       "rio-replay/tests/fixtures/archive" = pkgs.lib.fileset.toSource {
         root = unfilteredRoot + "/rio-replay/tests/fixtures/archive";
         fileset = unfilteredRoot + "/rio-replay/tests/fixtures/archive";
+      };
+      "rio-nix/src/protocol" = pkgs.lib.fileset.toSource {
+        root = unfilteredRoot + "/rio-nix/src/protocol";
+        fileset = unfilteredRoot + "/rio-nix/src/protocol/build.rs";
+      };
+      "rio-proto/src" = pkgs.lib.fileset.toSource {
+        root = unfilteredRoot + "/rio-proto/src";
+        fileset = unfilteredRoot + "/rio-proto/src/lib.rs";
+      };
+      "docs/dev" = pkgs.lib.fileset.toSource {
+        root = unfilteredRoot + "/docs/dev";
+        fileset = unfilteredRoot + "/docs/dev/2026-05-28-build-replay-design.md";
       };
     };
   };

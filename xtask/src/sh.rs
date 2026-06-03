@@ -36,18 +36,32 @@ use crate::ui;
 static REPO_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// Absolute path to the workspace root (the dir containing Cargo.toml
-/// with `\[workspace\]`). `RIO_REPO_ROOT` env override wins (used by
-/// `nix/docs.nix` to point the crate2nix-built binary at a runCommand
-/// `$src` tree — the compile-time `CARGO_MANIFEST_DIR` is a store
-/// path there). Otherwise computed from CARGO_MANIFEST_DIR at build
-/// time.
+/// with `\[workspace\]`). Resolution order:
+///
+/// 1. `RIO_REPO_ROOT` env override (used by `nix/docs.nix` and the
+///    `xtask-lint` check to point the crate2nix-built binary at a
+///    staged source tree — the compile-time `CARGO_MANIFEST_DIR` is a
+///    store path there).
+/// 2. The RUNTIME `CARGO_MANIFEST_DIR`'s parent. cargo and
+///    cargo-nextest both set the var for the processes they spawn;
+///    nextest remaps it to the sandboxed workspace copy, where the
+///    real-tree lint self-tests' staged sibling sources live
+///    (`crossMemberRuntimeSrcs` in nix/lib/nextest-args.nix). The
+///    compile-time value cannot serve here: crate2nix bakes a build
+///    sandbox path that no longer exists when the test binary runs.
+/// 3. The compile-time `CARGO_MANIFEST_DIR`'s parent, for invocations
+///    with neither var. `cargo xtask` lands here too: `init_env`
+///    strips inherited `CARGO_*` before its own `kubeconfig_path`
+///    call initializes this lock — same real checkout either way.
 pub fn repo_root() -> &'static Path {
     REPO_ROOT.get_or_init(|| {
         if let Ok(p) = std::env::var("RIO_REPO_ROOT") {
             return PathBuf::from(p);
         }
         // xtask/Cargo.toml → parent = repo root
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_owned());
+        PathBuf::from(manifest_dir)
             .parent()
             .expect("xtask has a parent dir")
             .to_path_buf()
@@ -458,14 +472,11 @@ mod tests {
     #[tokio::test]
     async fn run_capture_returns_status_and_combined_output() {
         // Shell::new(), not shell(): shell() change_dir()s to
-        // repo_root(), which falls back to env!("CARGO_MANIFEST_DIR")'s
-        // parent when RIO_REPO_ROOT is unset. crate2nix bakes the build
-        // sandbox path (/build/xtask → /build) at compile time; that
-        // path only exists at *test* runtime if the sandbox is
-        // configured with `sandbox-build-dir = /build` (NixOS default,
-        // not the determinate nix-installer default). The cwd is
-        // irrelevant to run_capture's behavior — same convention as the
-        // run_benign_if_* tests above.
+        // repo_root(), needlessly coupling this test to root
+        // resolution (under nextest that's the runtime
+        // CARGO_MANIFEST_DIR arm — see repo_root's doc). The cwd is
+        // irrelevant to run_capture's behavior — same convention as
+        // the run_benign_if_* tests above.
         let s = Shell::new().unwrap();
         // Command that writes to both streams and exits 1 — exactly the
         // shape iso03 needs to assert on.

@@ -4119,7 +4119,9 @@ pub(crate) fn crate_sources() -> Vec<(String, String)> {
             }
         }
     }
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Runtime resolution (crate::test_manifest_dir): the compile-time
+    // env! path does not exist inside the nextest sandbox.
+    let manifest_dir = crate::test_manifest_dir();
     let mut files = Vec::new();
     walk(&manifest_dir.join("src"), &mut files);
     files.sort();
@@ -4127,7 +4129,7 @@ pub(crate) fn crate_sources() -> Vec<(String, String)> {
         .into_iter()
         .map(|path| {
             let rel = path
-                .strip_prefix(manifest_dir)
+                .strip_prefix(&manifest_dir)
                 .expect("walked file lives under the manifest dir")
                 .to_str()
                 .expect("crate source paths are UTF-8")
