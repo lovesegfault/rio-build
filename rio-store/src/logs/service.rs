@@ -56,6 +56,7 @@ use super::gate::{self, OpenCaps};
 use super::ingest::{AbortReason, AcceptOutcome, IngestConfig, IngestSession, IngestShared};
 use super::sessions::{self, Acquire, HeartbeatOutcome};
 use super::tail::{self, LineCursor};
+use rio_log_kernel::{ChunkVisit, visit_chunk};
 
 /// One live ingest registration: the shared buffer handle a `TailLog`
 /// reader subscribes to, plus the cancel token that tears the driver
@@ -88,8 +89,11 @@ const TAIL_CHUNK_LINES: usize = 256;
 
 /// Capacity of one TailLog subscriber's fan-out queue, in batches. At
 /// the builder's 64-line/100 ms batch cadence this absorbs ~25 s of a
-/// stalled reader before batches start dropping (lossy by contract —
-/// the reader recovers from the manifest on reconnect).
+/// stalled reader before batches start dropping. A drop is NOT a lost
+/// span for the reader: the serve loop observes the forward jump and
+/// back-fills from manifest ∪ live buffer in-stream
+/// (store.log.tail-fanout-recovery) — the capacity bounds memory and
+/// the cost of a drop is one recovery pool read, not missing lines.
 const TAIL_SUBSCRIBER_QUEUE: usize = 256;
 
 /// gRPC metadata key marking a `TailLog` request as already having been
@@ -208,6 +212,10 @@ pub struct LogServiceImpl {
     /// open: `2 × cut_threshold_bytes` (one chunk mid-cut + one
     /// refilling), clamped to u32 (tokio's `acquire_many` takes u32).
     per_stream_byte_reservation: u32,
+    /// Capacity of one TailLog subscriber's fan-out queue, in batches.
+    /// Injectable so the in-stream recovery tests can force drops with
+    /// a handful of batches.
+    tail_subscriber_queue: usize,
 }
 
 impl LogServiceImpl {
@@ -227,6 +235,7 @@ impl LogServiceImpl {
             stream_permits: Arc::new(tokio::sync::Semaphore::new(256)),
             byte_budget: Arc::new(tokio::sync::Semaphore::new(1024 * 1024 * 1024)),
             per_stream_byte_reservation: 0,
+            tail_subscriber_queue: TAIL_SUBSCRIBER_QUEUE,
         };
         s.per_stream_byte_reservation = per_stream_reservation(&s.ingest_config);
         s
@@ -266,6 +275,13 @@ impl LogServiceImpl {
 
     /// Set the `{pod}` → URI template the cross-replica `TailLog` proxy
     /// dials peers with. See `Config::log_peer_url_template`.
+    /// Override the per-subscriber fan-out queue capacity (test knob;
+    /// production uses [`TAIL_SUBSCRIBER_QUEUE`]).
+    pub fn with_tail_subscriber_queue(mut self, n: usize) -> Self {
+        self.tail_subscriber_queue = n.max(1);
+        self
+    }
+
     pub fn with_peer_url_template(mut self, template: String) -> Self {
         self.peer_resolver = PeerResolver::Template(template);
         self
@@ -601,10 +617,10 @@ impl LogServiceImpl {
                     // Register + snapshot atomically w.r.t. the cutter
                     // (one lock over the buffer, the in-flight staging
                     // area, and the subscriber list — the seam).
-                    let (tx, rx) = mpsc::channel(TAIL_SUBSCRIBER_QUEUE);
+                    let (tx, rx) = mpsc::channel(self.tail_subscriber_queue);
                     let snapshot = lock_shared(shared).subscribe(tx);
                     metrics::gauge!("rio_store_log_tail_subscribers").increment(1.0);
-                    Some((snapshot, rx))
+                    Some((snapshot, rx, Arc::downgrade(shared)))
                 } else {
                     // A non-follow read still wants the not-yet-durable
                     // lines (the dashboard's one-shot view should show
@@ -613,12 +629,16 @@ impl LogServiceImpl {
                     // would register a permanently-full sender;
                     // snapshot without registering instead.
                     let snapshot = lock_shared(shared).snapshot();
-                    Some((snapshot, {
-                        // An already-closed channel: the live phase
-                        // ends immediately.
-                        let (_tx, rx) = mpsc::channel(1);
-                        rx
-                    }))
+                    Some((
+                        snapshot,
+                        {
+                            // An already-closed channel: the live phase
+                            // ends immediately.
+                            let (_tx, rx) = mpsc::channel(1);
+                            rx
+                        },
+                        Arc::downgrade(shared),
+                    ))
                 }
             }
             None => {
@@ -1276,7 +1296,15 @@ enum CutStep {
 /// of the not-yet-manifest-visible lines, and the receiver for every
 /// batch accepted after it. `None` = history-only (no live session
 /// here).
-type LiveSubscription = Option<(Vec<(u64, Vec<u8>)>, mpsc::Receiver<Arc<BuildLogBatch>>)>;
+type LiveSubscription = Option<(
+    Vec<(u64, Vec<u8>)>,
+    mpsc::Receiver<Arc<BuildLogBatch>>,
+    // Weak: serve_tail must NOT keep the IngestShared (and with it the
+    // fan-out sender registered in `subscribers`) alive — the live
+    // loop's rx closes exactly when the driver and the registry drop
+    // their Arcs. Upgraded only for the moment of a gap back-fill.
+    std::sync::Weak<Mutex<IngestShared>>,
+)>;
 
 /// The whole TailLog response body: history (manifest chunks), then the
 /// live snapshot, then the subscription stream, all deduplicated by one
@@ -1307,7 +1335,7 @@ async fn serve_tail(
 
     // -- Phase 2 + 3: the live snapshot and the subscription. Only
     // present when this replica holds the execution's ingest session.
-    let Some((snapshot, mut rx)) = subscription else {
+    let Some((snapshot, mut rx, shared)) = subscription else {
         // History-only. The final (possibly empty) message carries the
         // computed completeness so the CLI/dashboard can render their
         // "(log incomplete)" notice.
@@ -1346,6 +1374,7 @@ async fn serve_tail(
     // build that has gone silent leaves this task (and its subscriber
     // queue, and the `tail_subscribers` gauge) parked until the next
     // line arrives.
+    // r[impl store.log.tail-fanout-recovery]
     loop {
         let batch = tokio::select! {
             batch = rx.recv() => match batch {
@@ -1354,22 +1383,105 @@ async fn serve_tail(
             },
             _ = tx.closed() => return Ok(()),
         };
-        let lines: Vec<(u64, Vec<u8>)> = batch
-            .lines
-            .iter()
-            .enumerate()
-            .map(|(i, l)| (batch.first_line_number + i as u64, l.clone()))
+        match visit_chunk(
+            cursor.next_line(),
+            batch.first_line_number,
+            batch.lines.len() as u64,
+        ) {
+            ChunkVisit::Skip { .. } => {}
+            ChunkVisit::Serve { yield_from, .. } => {
+                let lines: Vec<(u64, Vec<u8>)> = batch
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| (batch.first_line_number + i as u64, l.clone()))
+                    .filter(|(n, _)| *n >= yield_from)
+                    .collect();
+                let end = lines.last().map(|(n, _)| *n);
+                send_lines(tx, &exec_str, lines, false).await?;
+                if let Some(end) = end {
+                    cursor.advance_to(end + 1);
+                }
+            }
+            ChunkVisit::GapThenServe { .. } => {
+                // The fan-out is lossy (a full subscriber queue drops
+                // batches); the dropped span was buffered in the SAME
+                // critical section as the drop, so at observation it
+                // is durable (manifest) or still in the live buffer.
+                // Back-fill BOTH before serving the triggering batch —
+                // a served follow stream is gapless by construction
+                // modulo genuine holes the store never accepted.
+                metrics::counter!("rio_store_log_tail_fanout_recovered_total").increment(1);
+                // (a) Everything cut to chunks since the cursor.
+                let refs = tail::read_manifest_range(&pool, exec_id, cursor.next_line()).await?;
+                for chunk in &refs {
+                    let lines = tail::read_chunk(store.as_ref(), chunk, &mut cursor).await?;
+                    send_lines(tx, &exec_str, lines, false).await?;
+                }
+                // (b) The live buffer (accepted, not yet cut). The
+                // session may have ended between the drop and now —
+                // then the manifest walk above already held everything.
+                if let Some(shared) = shared.upgrade() {
+                    let snap: Vec<(u64, Vec<u8>)> = lock_shared(&shared)
+                        .snapshot()
+                        .into_iter()
+                        .filter(|(n, _)| *n >= cursor.next_line())
+                        .collect();
+                    let end = snap.last().map(|(n, _)| *n);
+                    send_lines(tx, &exec_str, snap, false).await?;
+                    if let Some(end) = end {
+                        cursor.advance_to(end + 1);
+                    }
+                }
+                // (c) The triggering batch through the (advanced)
+                // cursor — usually fully deduplicated by (b), which
+                // snapshotted after this batch was buffered.
+                let lines: Vec<(u64, Vec<u8>)> = batch
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| (batch.first_line_number + i as u64, l.clone()))
+                    .filter(|(n, _)| *n >= cursor.next_line())
+                    .collect();
+                let end = lines.last().map(|(n, _)| *n);
+                send_lines(tx, &exec_str, lines, false).await?;
+                if let Some(end) = end {
+                    cursor.advance_to(end + 1);
+                }
+            }
+        }
+    }
+
+    // The ingest session ended. Catch up to everything that became
+    // durable after the last live batch before finalizing — the
+    // driver's final drain cuts the remaining buffer, so a fan-out
+    // drop on the LAST batches must not become a missing tail the
+    // final message advertises past.
+    let mut recovered = false;
+    let refs = tail::read_manifest_range(&pool, exec_id, cursor.next_line()).await?;
+    for chunk in &refs {
+        let lines = tail::read_chunk(store.as_ref(), chunk, &mut cursor).await?;
+        recovered |= !lines.is_empty();
+        send_lines(tx, &exec_str, lines, false).await?;
+    }
+    if let Some(shared) = shared.upgrade() {
+        let snap: Vec<(u64, Vec<u8>)> = lock_shared(&shared)
+            .snapshot()
+            .into_iter()
             .filter(|(n, _)| *n >= cursor.next_line())
             .collect();
-        let end = lines.last().map(|(n, _)| *n);
-        send_lines(tx, &exec_str, lines, false).await?;
+        let end = snap.last().map(|(n, _)| *n);
+        recovered |= !snap.is_empty();
+        send_lines(tx, &exec_str, snap, false).await?;
         if let Some(end) = end {
             cursor.advance_to(end + 1);
         }
     }
-
-    // The ingest session ended. Tell the reader where things stand;
-    // the client's reconnect contract takes it from here.
+    if recovered {
+        metrics::counter!("rio_store_log_tail_fanout_recovered_total").increment(1);
+    }
+    // Tell the reader where things stand; the client's reconnect
+    // contract takes it from here.
     let is_complete = gate::log_is_complete(&pool, exec_id).await?;
     send_final(tx, &exec_str, cursor.next_line(), is_complete).await?;
     Ok(())
@@ -2491,6 +2603,148 @@ mod tests {
                 "condition not reached within 5s"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    // r[verify store.log.tail-fanout-recovery]
+    /// A stalled follow reader whose fan-out queue overflows gets the
+    /// dropped span back IN-STREAM: the serve loop observes the jump
+    /// and back-fills from manifest ∪ live buffer before serving the
+    /// triggering batch. Every accepted line arrives exactly once.
+    #[tokio::test]
+    async fn follow_recovers_fanout_drops_in_stream() {
+        let mut h = harness_with(256, |s| s.with_tail_subscriber_queue(1)).await;
+        let exec = seed_assignment(&h.db.pool, "builder-0").await;
+        let tok = token("builder-0", DRV);
+
+        let (tx, _acks) = open_append(&mut h.client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("open");
+        tx.send(batch_msg(0, &["line-00000"])).await.unwrap();
+        wait_for(|| {
+            h.active
+                .get(&exec)
+                .map(|s| !lock_shared(&s.shared).snapshot().is_empty())
+                .unwrap_or(false)
+        })
+        .await;
+
+        let mut tail = h
+            .client
+            .tail_log(tail_req(exec, true))
+            .await
+            .expect("tail")
+            .into_inner();
+        // Read ONLY the snapshot message, then stall the reader.
+        let first = tail.message().await.expect("snapshot").expect("present");
+        assert_eq!(first.first_line_number, 0);
+
+        // With the reader stalled, the response channel (4) + the
+        // subscriber queue (1) fill after a handful of batches; the
+        // rest are dropped by the lossy fan-out.
+        // 4 KiB lines: large enough that HTTP/2 flow control clogs
+        // with the reader stalled, so the response channel and then
+        // the 1-slot fan-out queue fill and batches drop.
+        for i in 1..=30u64 {
+            let payload = format!("line-{i:05}-{}", "x".repeat(4000));
+            tx.send(batch_msg(i, &[&payload])).await.unwrap();
+        }
+        wait_for(|| {
+            h.active
+                .get(&exec)
+                .map(|s| lock_shared(&s.shared).tail_dropped > 0)
+                .unwrap_or(false)
+        })
+        .await;
+
+        // Resume reading; close the append so the stream finishes.
+        drop(tx);
+        let mut got: Vec<u64> = vec![0];
+        let mut final_seen = false;
+        while let Some(chunk) = tail.message().await.expect("stream ok") {
+            if chunk.lines.is_empty() {
+                final_seen = true;
+                continue;
+            }
+            for (i, _) in chunk.lines.iter().enumerate() {
+                got.push(chunk.first_line_number + i as u64);
+            }
+        }
+        assert!(final_seen, "the stream ends with a final message");
+        got.sort_unstable();
+        got.dedup();
+        assert_eq!(
+            got,
+            (0..=30).collect::<Vec<u64>>(),
+            "every accepted line is served exactly once across the drop \
+             (the fan-out drop is recovered in-stream, not a permanent hole)"
+        );
+    }
+
+    // r[verify store.log.tail-fanout-recovery]
+    /// The final message after a fan-out drop advertises a cursor the
+    /// reader can trust: everything below it was actually served.
+    #[tokio::test]
+    async fn follow_final_after_drop_advertises_contiguous_cursor() {
+        let mut h = harness_with(256, |s| s.with_tail_subscriber_queue(1)).await;
+        let exec = seed_assignment(&h.db.pool, "builder-0").await;
+        let tok = token("builder-0", DRV);
+
+        let (tx, _acks) = open_append(&mut h.client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("open");
+        tx.send(batch_msg(0, &["line-00000"])).await.unwrap();
+        wait_for(|| {
+            h.active
+                .get(&exec)
+                .map(|s| !lock_shared(&s.shared).snapshot().is_empty())
+                .unwrap_or(false)
+        })
+        .await;
+
+        let mut tail = h
+            .client
+            .tail_log(tail_req(exec, true))
+            .await
+            .expect("tail")
+            .into_inner();
+        let _ = tail.message().await.expect("snapshot").expect("present");
+
+        // 4 KiB lines: large enough that HTTP/2 flow control clogs
+        // with the reader stalled, so the response channel and then
+        // the 1-slot fan-out queue fill and batches drop.
+        for i in 1..=30u64 {
+            let payload = format!("line-{i:05}-{}", "x".repeat(4000));
+            tx.send(batch_msg(i, &[&payload])).await.unwrap();
+        }
+        wait_for(|| {
+            h.active
+                .get(&exec)
+                .map(|s| lock_shared(&s.shared).tail_dropped > 0)
+                .unwrap_or(false)
+        })
+        .await;
+        drop(tx);
+
+        let mut served: Vec<u64> = vec![0];
+        let mut final_cursor = None;
+        while let Some(chunk) = tail.message().await.expect("stream ok") {
+            if chunk.lines.is_empty() {
+                final_cursor = Some(chunk.first_line_number);
+            } else {
+                for (i, _) in chunk.lines.iter().enumerate() {
+                    served.push(chunk.first_line_number + i as u64);
+                }
+            }
+        }
+        let final_cursor = final_cursor.expect("a final message");
+        served.sort_unstable();
+        served.dedup();
+        for n in 0..final_cursor {
+            assert!(
+                served.contains(&n),
+                "the final cursor {final_cursor} advertises line {n} as served, but it never was"
+            );
         }
     }
 }

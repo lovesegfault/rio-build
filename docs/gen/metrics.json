@@ -188,6 +188,7 @@
     "rio_store_log_sweep_chunks_deleted_total",
     "rio_store_log_sweep_objects_deleted_total",
     "rio_store_log_tail_dropped_total",
+    "rio_store_log_tail_fanout_recovered_total",
     "rio_store_log_tail_proxied_total",
     "rio_store_log_tail_proxy_failures_total",
     "rio_store_log_tail_subscribers",
@@ -1167,7 +1168,12 @@
       {
         "name": "rio_store_log_tail_dropped_total",
         "kind": "counter",
-        "help": "Live-tail fan-out batches dropped because a TailLog subscriber's queue was full. Lossy by contract (a slow reader must never backpressure ingest); the reader recovers the lines from the manifest on its next reconnect."
+        "help": "Live-tail fan-out batches dropped because a TailLog subscriber's queue was full. The drop never blocks ingest; the serve loop observes the resulting jump and back-fills the span in-stream (see rio_store_log_tail_fanout_recovered_total)."
+      },
+      {
+        "name": "rio_store_log_tail_fanout_recovered_total",
+        "kind": "counter",
+        "help": "In-stream recoveries performed by a follow TailLog serve loop after a fan-out drop: the loop observed a forward jump and back-filled the missing span from the chunk manifest and the live ingest buffer before continuing. Each increment is one recovery pass (pool read + possible chunk GETs), not one line. Sustained high rates mean slow tail readers (rio_store_log_tail_dropped_total gives the dropped volume)."
       },
       {
         "name": "rio_store_log_tail_proxied_total",

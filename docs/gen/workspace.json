@@ -137,6 +137,7 @@
       "prod": [
         "rio-auth",
         "rio-common",
+        "rio-log-kernel",
         "rio-nix",
         "rio-proto"
       ],

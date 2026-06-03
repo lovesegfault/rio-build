@@ -1689,6 +1689,46 @@ unread. The served-complete bit is load-bearing: it is the only signal
 that distinguishes "the session closed because everything durable was
 served" from "the session closed mid-upload".
 
+#r("store.log.tail-fanout-recovery")[
+  The live-tail fan-out MAY drop batches (a slow reader must never
+  backpressure ingest), but a follow serve loop MUST NOT advance its
+  cursor past a dropped span: on observing a forward jump it MUST
+  back-fill from the chunk manifest and the live ingest buffer --- which
+  together hold every accepted line, because the drop and the buffering
+  happen in one critical section --- before serving the triggering batch,
+  and MUST run the same catch-up before its final message so the
+  advertised resume cursor covers only served lines.
+]
+
+The recovery is in-stream because the alternative --- the reader noticing
+the hole on reconnect --- never happens for the common consumer: the
+gateway relay holds one continuous follow stream for a build's whole
+lifetime, so a dropped batch used to become a permanent hole in the nix
+client's output while the final message advertised a clean cursor past it.
+A drop now costs one recovery pass (a manifest read and possibly chunk
+GETs) instead of lines.
+
+#r("store.log.read-divergence")[
+  A chunk's served range and post-visit watermark MUST be bounded by the
+  smaller of the manifest row's claim and the object's actual line count,
+  and any disagreement between the two MUST be classified and disclosed: a
+  short object (object holds fewer lines than the row claims) is
+  unrecoverable data loss --- served as an error naming the chunk key,
+  never as a silently shorter stream; a long object serves the claimed
+  range only, the unclaimed excess discarded and counted. The manifest
+  claim is the single authoritative bound at every decision point of the
+  read path.
+]
+
+The two divergence directions have different blast radii: an over-length
+object used to serve its excess under the NEXT chunk's line numbers ---
+garbage output that also suppressed the genuine successor lines via the
+advanced watermark; an under-length object was a silent hole presented as
+complete. Both are corruption-grade (the row and object are written from
+the same slice in the same call), so both count toward
+`rio_store_log_read_data_loss_total`, but only the short direction is
+unrecoverable and surfaces as an error.
+
 = PostgreSQL Schema
 <store-schema>
 

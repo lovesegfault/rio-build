@@ -165,6 +165,7 @@ impl LineCursor {
 /// object PUT succeeds): it is surfaced as an `Internal` error naming
 /// the key so the operator can find the hole, never silently skipped —
 /// a silent skip would present a gapped log as complete.
+// r[impl store.log.read-divergence]
 pub async fn read_chunk(
     store: &dyn LogChunkStore,
     chunk: &ChunkRef,
@@ -677,6 +678,7 @@ mod tests {
     /// are discarded — they would otherwise be served as garbage under
     /// the NEXT chunk's line numbers — and the next chunk's genuine
     /// lines must not be suppressed by an over-advanced watermark.
+    // r[verify store.log.read-divergence]
     #[tokio::test]
     async fn over_length_object_clamps_and_preserves_next_chunk() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -707,6 +709,7 @@ mod tests {
     /// An under-length object (holds fewer lines than its manifest row
     /// claims) is data loss with NotFound parity: an `Internal` error
     /// naming the key, never a silently shorter stream.
+    // r[verify store.log.read-divergence]
     #[tokio::test]
     async fn short_object_is_data_loss_error() {
         let db = TestDb::new(&crate::MIGRATOR).await;

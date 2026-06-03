@@ -524,9 +524,19 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_log_tail_dropped_total",
         "Live-tail fan-out batches dropped because a TailLog subscriber's \
-         queue was full. Lossy by contract (a slow reader must never \
-         backpressure ingest); the reader recovers the lines from the \
-         manifest on its next reconnect."
+         queue was full. The drop never blocks ingest; the serve loop \
+         observes the resulting jump and back-fills the span in-stream \
+         (see rio_store_log_tail_fanout_recovered_total)."
+    );
+    describe_counter!(
+        "rio_store_log_tail_fanout_recovered_total",
+        "In-stream recoveries performed by a follow TailLog serve loop \
+         after a fan-out drop: the loop observed a forward jump and \
+         back-filled the missing span from the chunk manifest and the \
+         live ingest buffer before continuing. Each increment is one \
+         recovery pass (pool read + possible chunk GETs), not one line. \
+         Sustained high rates mean slow tail readers \
+         (rio_store_log_tail_dropped_total gives the dropped volume)."
     );
     describe_counter!(
         "rio_store_log_ingest_streams_aborted_total",

@@ -388,6 +388,7 @@ pub struct ObjectVisit {
         }
     }
 }))]
+// r[impl store.log.read-divergence]
 pub fn visit_object(
     next_line: u64,
     first_line: u64,
