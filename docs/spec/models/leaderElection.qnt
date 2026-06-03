@@ -793,10 +793,14 @@ module leaderElection {
   ///   - holder = other, new rv (or first observation) -> StartObserving
   ///
   /// fence[n] is UNCHANGED: a bare read does not reset the self-fence
-  /// clock. Production resets `last_successful_renew` at exactly two
+  /// clock. Production stamps the blind-window clock at exactly two
   /// sites -- run_lease_loop's loop init (before the node has ever
   /// led) and its `Ok(Ok(result))` arm after a COMPLETE
-  /// try_acquire_or_renew() round-trip. Every path through that
+  /// try_acquire_or_renew() round-trip -- and the stamped VALUE is a
+  /// RenewAnchor minted before the attempt's await, so the production
+  /// anchor is at or BEFORE the apiserver commit this model anchors
+  /// fence[n] at (anchor <= send <= commit; stamping a response-time
+  /// reading has no API). Every path through that
   /// function which
   /// returns Leading ends in an rv-bumping write (create()'s POST or
   /// replace()'s PUT); the paths that complete without a write return

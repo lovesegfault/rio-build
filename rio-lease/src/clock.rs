@@ -3,13 +3,20 @@
 //! sleeps.
 //!
 //! Property: the self-fence blind-time is measured on a clock that
-//! ADVANCES ACROSS HOST SUSPEND. With CLOCK_MONOTONIC (`Instant::now()`)
-//! a suspend straddling [`SELF_FENCE_AFTER`](crate::SELF_FENCE_AFTER)
-//! resumed with `last_successful_renew` looking fresh — a zombie leader
-//! until the next failed apiserver round-trip — while a standby
-//! legitimately stole at STEAL_AFTER of real time mid-suspend. With
-//! CLOCK_BOOTTIME the first post-resume tick-time fence check sees the
-//! full blind interval and fences immediately.
+//! ADVANCES ACROSS HOST SUSPEND, and the window is anchored at the
+//! renew attempt's START (`RenewAnchor`, minted before the await), so
+//! the property holds unconditionally — wherever the suspend lands.
+//! With CLOCK_MONOTONIC (`Instant::now()`) a suspend straddling
+//! [`SELF_FENCE_AFTER`](crate::SELF_FENCE_AFTER) resumed with the blind
+//! window looking fresh — a zombie leader until the next failed
+//! apiserver round-trip — while a standby legitimately stole at
+//! STEAL_AFTER of real time mid-suspend. With CLOCK_BOOTTIME the first
+//! post-resume tick-time fence check sees the full blind interval and
+//! fences immediately; a suspend that straddles an IN-FLIGHT renew is
+//! covered too, because the post-resume response stamps the attempt's
+//! pre-suspend anchor, never its own arrival time (the in-flight
+//! straddle that response anchoring left open is closed by
+//! construction — `BlindClock` has no API for a post-response stamp).
 //!
 //! Residuals (deliberately NOT chased here; the generation fence
 //! r\[sched.lease.generation-fence+3\] is the backstop): hypervisor-level

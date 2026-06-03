@@ -152,27 +152,25 @@ const RENEW_SLOP: Duration = Duration::from_secs(2);
 /// when a failed attempt resolves — an additional, earlier opportunity,
 /// never the only one), so the fence fires at most one RENEW_INTERVAL
 /// after the deadline crossing. The model anchors the victim's fence at
-/// the apiserver COMMIT of its last renew, while production stamps
-/// `last_successful_renew` at the RESPONSE arrival; that is sound
-/// because renew attempts start exactly on interval ticks and the send
-/// precedes the commit, so the anchoring renew's response can lag its
-/// commit by at most the attempt deadline (RENEW_INTERVAL − RENEW_SLOP),
-/// and that deadline stays strictly under the gap from SELF_FENCE_AFTER
-/// up to the next RENEW_INTERVAL multiple — equivalently RENEW_SLOP >
-/// SELF_FENCE_AFTER mod RENEW_INTERVAL — so the response lag cannot
-/// push the firing tick past the commit-anchored bound (commit +
-/// SELF_FENCE_AFTER + RENEW_INTERVAL) the model assumes; that arithmetic
-/// premise is pinned by the const assert below. What remains of
-/// the separation is a 1.5s one-sided clock-skew budget — far above NTP
-/// drift on cloud nodes. Host suspend is caught at the first post-resume
-/// fence check by the suspend-aware fence clock (`clock::suspend_aware_now`,
-/// CLOCK_BOOTTIME on Linux); the remaining pause classes — hypervisor-level
-/// VM pause (invisible to BOOTTIME too), long stop-the-world stalls, and
-/// the resume-to-first-tick gap — still re-open the window, which is the
-/// impossibility result the generation fence
-/// (r\[sched.lease.generation-fence+3\]) backstops. The model also shows
-/// the bound is tight: one tick less separation and a dual-belief state
-/// is reachable.
+/// the apiserver COMMIT of its last renew; production stamps
+/// `last_successful_renew` with a [`RenewAnchor`] minted BEFORE the
+/// attempt's await — anchor ≤ send ≤ commit — so the production anchor
+/// is never later than the model's commit anchor and the model's bound
+/// (commit + SELF_FENCE_AFTER + RENEW_INTERVAL) is conservative for
+/// production with no arithmetic premise about response lag at all
+/// (stamping a post-response reading has no API; see [`BlindClock`]).
+/// What remains of the separation is a 1.5s one-sided clock-skew budget
+/// — far above NTP drift on cloud nodes. Host suspend is caught at the
+/// first post-resume fence check by the suspend-aware fence clock
+/// (`clock::suspend_aware_now`, CLOCK_BOOTTIME on Linux) — including a
+/// suspend that straddles an in-flight renew, whose pre-suspend anchor
+/// preserves the blind window the response would otherwise erase; the
+/// remaining pause classes — hypervisor-level VM pause (invisible to
+/// BOOTTIME too), long stop-the-world stalls, and the resume-to-first-
+/// tick gap — still re-open the window, which is the impossibility
+/// result the generation fence (r\[sched.lease.generation-fence+3\])
+/// backstops. The model also shows the bound is tight: one tick less
+/// separation and a dual-belief state is reachable.
 const FENCE_MARGIN: Duration = Duration::from_secs(4);
 
 /// The leader self-fences after this long without a successful renew:
@@ -222,19 +220,10 @@ const _: () = {
         RENEW_SLOP.as_secs() > 0,
         "the renew attempt deadline must be strictly shorter than RENEW_INTERVAL"
     );
-    // The response-anchoring premise in FENCE_MARGIN's doc: production
-    // stamps last_successful_renew at the renew RESPONSE, which can lag
-    // the apiserver commit by up to the attempt deadline
-    // (RENEW_INTERVAL - RENEW_SLOP). The tick-grid fence checks — the
-    // only cadence the apiserver cannot delay; the error-arm re-check
-    // only fires earlier — then stay within the commit-anchored bound
-    // the model assumes (commit + SELF_FENCE_AFTER + RENEW_INTERVAL)
-    // only while that deadline is strictly under the gap from
-    // SELF_FENCE_AFTER up to the next tick multiple.
-    assert!(
-        RENEW_SLOP.as_secs() > SELF_FENCE_AFTER.as_secs() % RENEW_INTERVAL.as_secs(),
-        "the renew attempt deadline must keep the response-anchored self-fence within the model's commit-anchored bound"
-    );
+    // (The response-anchoring premise that used to be pinned here is
+    // gone with response anchoring itself: the blind window is stamped
+    // from a RenewAnchor minted before the attempt's await, which is
+    // never later than the apiserver commit the model anchors at.)
     // The leader must get at least one renew attempt before fencing.
     assert!(
         SELF_FENCE_AFTER.as_secs() > RENEW_INTERVAL.as_secs(),
@@ -1012,10 +1001,11 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     // freed slot always means the flag already reflects that task's
     // outcome.
     let marks_patch_in_flight = Arc::new(AtomicBool::new(false));
-    // Blind-time stamp on the injected fence clock (production:
+    // Blind-window clock on the injected fence clock (production:
     // CLOCK_BOOTTIME — advances across host suspend, so a suspend
-    // straddling SELF_FENCE_AFTER fences at the first post-resume tick).
-    let mut last_successful_renew: Duration = fence_now();
+    // straddling SELF_FENCE_AFTER fences at the first post-resume
+    // tick). Stamped only with attempt-START anchors; see BlindClock.
+    let mut blind = BlindClock::starting_at(RenewAnchor::mint(&fence_now));
     let mut interval = tokio::time::interval(RENEW_INTERVAL);
     // Skip: if one renewal is slow (apiserver busy), don't fire
     // twice immediately. SELF_FENCE_AFTER is 11s; we have slack.
@@ -1040,9 +1030,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
             &state,
             &mut was_leading,
             &marks_dirty,
-            // saturating_sub is purely defensive; both readings come from
-            // the same non-decreasing fence clock.
-            fence_now().saturating_sub(last_successful_renew),
+            blind.blind_for(fence_now()),
         ) {
             hooks.on_lose();
         }
@@ -1053,14 +1041,19 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
         // above it knows the confirming round began after the snapshot
         // (sched.recovery.bump-confirm).
         let round = state.begin_renew_round();
+        // The blind-window anchor for this attempt: minted BEFORE the
+        // await, so anchor <= send <= apiserver commit. A suspend that
+        // straddles the in-flight round-trip is therefore part of the
+        // stamped window — the response's arrival time never enters the
+        // blind clock (there is no API for it).
+        let attempt_anchor = RenewAnchor::mint(&fence_now);
         match tokio::time::timeout(renew_deadline, election.try_acquire_or_renew()).await {
             Ok(Ok(result)) => {
                 // Successful round-trip (apiserver answered). Even
-                // Standby/Conflict reset the self-fence clock — we
-                // KNOW the apiserver state, we just don't hold the
-                // lease. The clock tracks "am I blind", not "am I
-                // leader".
-                last_successful_renew = fence_now();
+                // Standby/Conflict restart the blind window — we KNOW
+                // the apiserver state, we just don't hold the lease.
+                // The clock tracks "am I blind", not "am I leader".
+                blind.stamp(attempt_anchor);
                 // Conflict on renew = someone stole since our GET
                 // → unambiguous lose. Conflict on steal = another
                 // standby raced us → we were never leading. Both
@@ -1295,11 +1288,13 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 // generation fence (r[sched.lease.generation-fence+3])
                 // saves correctness either way; this fence saves ops
                 // sanity.
+                // attempt_anchor is dropped on this path: a failed
+                // round-trip stamps nothing and the window keeps aging.
                 if maybe_self_fence(
                     &state,
                     &mut was_leading,
                     &marks_dirty,
-                    fence_now().saturating_sub(last_successful_renew),
+                    blind.blind_for(fence_now()),
                 ) {
                     // Self-fence is a lose-transition: same on-lose
                     // hook as the explicit lose arm above.
@@ -1333,6 +1328,62 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
         }
     }
     debug!("lease loop exited");
+}
+
+/// A blind-window anchor minted at the START of a renew attempt — on
+/// the suspend-aware fence clock, strictly BEFORE the attempt's await.
+/// `anchor ≤ send ≤ apiserver commit`, so a blind window stamped from
+/// it is never shorter than one anchored at the commit (the event the
+/// leader-election model anchors at).
+///
+/// No other constructor exists: the single mint site is the line above
+/// the attempt's `await` in `run_lease_loop_with_client`, which makes
+/// "stamp the blind clock from a post-response reading" — the
+/// suspend-straddle zombie-leader bug — unrepresentable rather than
+/// merely avoided. The mint is infallible and cheap; the value is
+/// consumed by [`BlindClock::stamp`] (or dropped when the attempt
+/// fails, leaving the window aging — correct: a failed round-trip is
+/// blind time).
+struct RenewAnchor(Duration);
+
+impl RenewAnchor {
+    /// Mint an anchor from the injected fence clock. Call ONLY before
+    /// the renew attempt's await (see the type doc).
+    fn mint(fence_now: &impl Fn() -> Duration) -> Self {
+        Self(fence_now())
+    }
+}
+
+/// The self-fence blind-window clock: remembers the anchor of the last
+/// successful renew round-trip and answers "how long have I been
+/// blind". The only write API consumes a [`RenewAnchor`], so the value
+/// stored is always an attempt-START reading; the saturating subtraction
+/// lives here so no caller ever computes the window by hand.
+struct BlindClock {
+    last: Duration,
+}
+
+impl BlindClock {
+    /// Initialize at loop start: the node has never completed a
+    /// round-trip, so the window starts aging from "now" (an anchor
+    /// minted before any await — the loop-init mint site).
+    fn starting_at(anchor: RenewAnchor) -> Self {
+        Self { last: anchor.0 }
+    }
+
+    /// Record a successful round-trip: the blind window restarts at the
+    /// attempt's START. Consumes the anchor — each mint stamps at most
+    /// once.
+    fn stamp(&mut self, anchor: RenewAnchor) {
+        self.last = anchor.0;
+    }
+
+    /// The blind window as of `now`. Saturating: both readings come
+    /// from the same non-decreasing fence clock, so a zero from an
+    /// out-of-order reading is purely defensive.
+    fn blind_for(&self, now: Duration) -> Duration {
+        now.saturating_sub(self.last)
+    }
 }
 
 /// Local self-fence: if we believed we were leading but haven't
@@ -1742,6 +1793,35 @@ mod tests {
     /// Previously `from_env()` read `std::env::var("RIO_LEASE_NAME")`
     /// directly (bypassing the config loader); now the scheduler's
     /// Config passes the merged value through.
+    /// BlindClock algebra: the window grows with `now`, restarts at a
+    /// stamped anchor's mint time (not at stamp-call time), and is
+    /// saturating for out-of-order readings. RenewAnchor's single-mint
+    /// discipline is compile-level (no other constructor; consumed by
+    /// stamp), so no runtime case exists to test.
+    #[test]
+    fn blind_clock_window_algebra() {
+        let mut blind = BlindClock::starting_at(RenewAnchor(Duration::from_secs(10)));
+        assert_eq!(blind.blind_for(Duration::from_secs(10)), Duration::ZERO);
+        assert_eq!(
+            blind.blind_for(Duration::from_secs(25)),
+            Duration::from_secs(15),
+            "the window ages with now"
+        );
+        // Saturating: a reading older than the anchor is zero, not a
+        // panic or an underflow.
+        assert_eq!(blind.blind_for(Duration::from_secs(9)), Duration::ZERO);
+
+        // Stamping an anchor minted at t=20 restarts the window at 20 —
+        // however late the stamp call happens (the suspend-straddle
+        // property in one line: the response's arrival time is not an
+        // input).
+        blind.stamp(RenewAnchor(Duration::from_secs(20)));
+        assert_eq!(
+            blind.blind_for(Duration::from_secs(33)),
+            Duration::from_secs(13)
+        );
+    }
+
     #[test]
     fn from_parts_none_when_unset() {
         assert!(
@@ -2876,10 +2956,13 @@ mod tests {
 
         // t=0: the interval's first tick fires immediately; the mock is
         // Healthy, so the attempt creates the Lease and the acquire arm
-        // runs. t_acquire is a valid proxy for `last_successful_renew`
-        // ONLY because this scripted schedule makes the t=0 acquire the
-        // last successful round-trip — if the schedule ever gains
-        // another Healthy tick, the anchor must move to that tick.
+        // runs. t_acquire (recorded at the on_acquire hook) is a valid
+        // proxy for the blind clock's stamped anchor ONLY because this
+        // scripted schedule makes the t=0 acquire the last successful
+        // round-trip AND no virtual time elapses between that attempt's
+        // anchor mint and its hook — under start_paused the two are the
+        // same instant. If the schedule ever gains another Healthy
+        // tick, the anchor must move to that tick.
         settle().await;
         let t_acquire = {
             let acquires = hooks.acquires.lock().expect("acquires lock");
@@ -3031,6 +3114,109 @@ mod tests {
             hooks.loses.lock().expect("loses lock").len(),
             1,
             "no second lose from the error-arm re-check"
+        );
+
+        shutdown.cancel();
+        loop_task.await.expect("lease loop task exits cleanly");
+    }
+
+    /// The in-flight-straddle half of the suspend-blindness class
+    /// (bug_096): a suspend that straddles an IN-FLIGHT renew must still
+    /// fence. The renew is sent before the suspend, the apiserver
+    /// answers, and the response is read after resume — with the blind
+    /// window anchored at the RESPONSE, the post-resume stamp erases the
+    /// entire suspended interval and the zombie leader survives; with
+    /// the anchor minted BEFORE the attempt's await (anchor <= send <=
+    /// commit), the stamp preserves the blind time and the next
+    /// tick-time check fences.
+    // r[verify sched.lease.self-fence+2]
+    #[tokio::test(start_paused = true)]
+    async fn fence_fires_after_suspend_straddles_inflight_renew() {
+        let (client, mock) = MockApiServer::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let jump_ms = Arc::new(AtomicU64::new(0));
+        let fence_now = {
+            let a = Instant::now();
+            let jump_ms = jump_ms.clone();
+            move || a.elapsed() + Duration::from_millis(jump_ms.load(Ordering::SeqCst))
+        };
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            fence_now,
+        ));
+
+        // t=0: the immediate first tick acquires healthily.
+        settle().await;
+        assert!(
+            state.is_leader.load(Ordering::Relaxed),
+            "t=0 acquire must succeed"
+        );
+        let requests_after_acquire = mock.requests().len();
+
+        // Park the apiserver: the +5s tick's renew round-trip is held
+        // in flight (sent, unanswered).
+        mock.set_behavior(MockBehavior::Park);
+        tokio::time::advance(RENEW_INTERVAL).await; // tick at +5s, renew in flight
+        settle().await;
+
+        // "Suspend" WHILE the round-trip is in flight: the fence clock
+        // jumps 12s (> SELF_FENCE_AFTER = 11s); the tokio virtual clock
+        // — the monotonic view, which also drives the attempt timeout —
+        // does not advance, exactly like CLOCK_MONOTONIC across a host
+        // suspend.
+        jump_ms.store(12_000, Ordering::SeqCst);
+
+        // Resume: the parked round-trip completes successfully (the
+        // request log proves the round actually happened — the red/
+        // green difference must be about anchoring, not about a failed
+        // attempt, whose un-stamped error arm would fence even
+        // pre-fix). Repeated release+settle drains the GET, the PUT,
+        // and the detached marks PATCH the Ok arm spawns.
+        for _ in 0..4 {
+            mock.release_parked();
+            settle().await;
+        }
+        assert!(
+            mock.requests().len() > requests_after_acquire,
+            "the parked renew round-trip must have been issued"
+        );
+        assert_eq!(
+            mock.holder().as_deref(),
+            Some("us"),
+            "the parked renew must have completed successfully (still holder)"
+        );
+        assert_eq!(
+            hooks.acquires.lock().expect("acquires lock").len(),
+            1,
+            "no second acquire edge: the round resolved Leading-steady"
+        );
+
+        // First post-resume tick: the blind window (anchored before the
+        // await) now spans the suspend — the tick-time fence check MUST
+        // fire before the next attempt starts.
+        tokio::time::advance(RENEW_INTERVAL).await;
+        settle().await;
+        assert!(
+            !state.is_leader.load(Ordering::Relaxed),
+            "the first post-resume tick-time fence check must fence the zombie leader \
+             (a stamp from the post-suspend response erased the blind window)"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "exactly one lose: the suspend-straddled renew must not reset the blind window"
         );
 
         shutdown.cancel();
