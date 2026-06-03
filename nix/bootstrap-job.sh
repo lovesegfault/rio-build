@@ -107,13 +107,20 @@ if [ "$sec_state" = present ]; then
   rio-cli keygen derive-pub < "$tmp/sec.entry" > "$tmp/pub.derived"
   if [ "$pub_state" = present ]; then
     # Pair-consistency probe: every upgrade's Job log must show
-    # either "pair consistent" or a heal. cmp (byte-exact) — the
-    # canonical entries are newline-free; only the CLI transport
-    # newline from --output text is stripped.
+    # either "pair consistent" or a heal. cmp (byte-exact), with NO
+    # command substitution anywhere in the compared operands'
+    # dataflow: $(...) strips ALL trailing newlines, so a stored pub
+    # corrupted to 'name:b64\n' — the exact round-16 merged_bug_004
+    # class this heal exists to converge — would normalize to the
+    # canonical bytes and log 'pair consistent' forever (round-17
+    # bug_006). Instead the RAW stored bytes are compared against
+    # derived + exactly the ONE newline `--output text` appends:
+    # canonical stored value 'entry' arrives as 'entry\n' (match);
+    # corrupted 'entry\n' arrives as 'entry\n\n' (heal fires).
     aws secretsmanager get-secret-value --secret-id rio/signing-key-pub \
       --query SecretString --output text > "$tmp/pub.stored.raw"
-    printf '%s' "$(cat "$tmp/pub.stored.raw")" > "$tmp/pub.stored"
-    if cmp -s "$tmp/pub.stored" "$tmp/pub.derived"; then
+    { cat "$tmp/pub.derived"; echo; } > "$tmp/pub.derived.nl"
+    if cmp -s "$tmp/pub.stored.raw" "$tmp/pub.derived.nl"; then
       echo "[bootstrap] signing-key pair consistent"
     else
       echo "[bootstrap] rio/signing-key-pub does not match the private half; healing"

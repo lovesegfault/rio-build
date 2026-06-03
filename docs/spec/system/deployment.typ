@@ -136,6 +136,11 @@ See #cross-link("/spec/system/security.typ")[Security: Secrets Management] for r
 ]
 A secret in its 7--30 day deletion recovery window keeps answering `describe-secret` while refusing every read and write: classifying it `present` wedges the Job for the whole window (every retry dies at the first `get-secret-value`/`put-secret-value`), and classifying a throttle `missing` would regenerate a live key. The probe instead aborts printing the only two operator exits, so a delete-only rotation converges in minutes (operator finalizes or restores) instead of stalling for up to 30 days. The `bootstrap-probe-conformance` check pins `secret_state` as the script's sole `describe-secret` call site; `bootstrap-idempotent` scenarios J--M pin the deletion arm per secret class and the fail-closed routing of the create-only guards.
 
+#r("infra.bootstrap.pair-probe-byte-exact")[
+  The pair-consistency probe MUST compare the stored public entry byte-exactly against the derived entry plus exactly the one transport newline `--output text` appends, with no command substitution anywhere in the compared operands' dataflow; any other byte difference --- including trailing-newline corruption of the stored value itself --- MUST trigger the heal.
+]
+POSIX `$(...)` strips _all_ trailing newlines, not just the transport framing: a normalization built on it erases the only byte distinguishing a `name:b64\n`-corrupted stored pub (the legacy shell re-derive's artifact class) from the canonical entry, so the probe logs `pair consistent` forever over the very corruption the heal exists to converge. `bootstrap-idempotent` scenario N plants that corruption directly in provider state and pins detect-heal-settle.
+
 = Verification
 
 After deployment:

@@ -1263,6 +1263,27 @@ in
           || { echo "FAIL-M: hmac guard abort did not come from the fail-closed probe" >&2; cat $TMPDIR/m-stderr >&2; exit 1; }
         cmp secrets/rio_hmac tmp/l.hmac \
           || { echo "FAIL-M: transient hmac-describe failure mutated rio/hmac" >&2; exit 1; }
+
+        # Scenario N (round-17 bug_006): a trailing-newline-corrupted
+        # stored pub — the round-16 merged_bug_004 class the heal
+        # exists for — written DIRECTLY into the provider state
+        # (bypassing the byte-faithful put path; the corruption
+        # entered via the legacy shell re-derive, not via this
+        # script). The probe must DETECT it (the old normalization
+        # stripped all trailing newlines via command substitution, so
+        # 'entry\n' compared equal and logged 'pair consistent'
+        # forever) and heal the stored pub back to canonical
+        # newline-free bytes.
+        derive < secrets/rio_signing-key > tmp/n.canonical
+        { cat tmp/n.canonical; echo; } > secrets/rio_signing-key-pub
+        run > tmp/n.log
+        grep -q "healing" tmp/n.log \
+          || { echo "FAIL-N: newline-corrupted pub logged 'pair consistent' (bug_006)" >&2; cat tmp/n.log >&2; exit 1; }
+        cmp secrets/rio_signing-key-pub tmp/n.canonical \
+          || { echo "FAIL-N: heal did not converge the pub to canonical newline-free bytes" >&2; exit 1; }
+        run > tmp/n2.log
+        grep -q "signing-key pair consistent" tmp/n2.log \
+          || { echo "FAIL-N: healed pub did not settle to the consistent steady state" >&2; exit 1; }
         touch $out
       '';
 

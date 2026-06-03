@@ -465,6 +465,11 @@ rec {
   # (bootstrap-idempotent scenarios J-M: deletion arm per secret
   # class + fail-closed create-only guards; bootstrap-probe-conformance:
   # the count-pinned deny.)
+  # r[impl infra.bootstrap.pair-probe-byte-exact]
+  # r[verify infra.bootstrap.pair-probe-byte-exact]
+  # (bootstrap-idempotent scenario N: a newline-corrupted pub planted
+  # directly in provider state must detect, heal to canonical bytes,
+  # and settle consistent.)
   bootstrapScript = pkgs.writeShellScript "rio-bootstrap" (builtins.readFile ./bootstrap-job.sh);
   # The real rio-cli package, exported so the bootstrap-idempotent
   # check runs the genuine binary (round-16 MP4: the previous mock
