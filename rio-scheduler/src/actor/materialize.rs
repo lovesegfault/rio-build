@@ -121,7 +121,14 @@ impl WriteDisposition {
 /// Transitions: [`Self::rebuild`] (recovery Ok) is the ONLY path to
 /// `Hydrated` — a clear path that produced `Hydrated(empty)` over a
 /// repopulated DAG would recreate the hole, so [`Self::wipe`] and the
-/// default both land on `Unavailable`.
+/// default both land on `Unavailable`. One construction-time
+/// exception, mirroring `dag_authoritative`: the always-leader
+/// (non-K8s) actor starts hydrated-EMPTY via `rebuild`, because no
+/// lease loop will ever send the `LeaderAcquired` that runs recovery
+/// there, and at construction the DAG is empty too — the empty view
+/// is faithful, not fabricated (the 246 hole requires a populated
+/// DAG over an absent view). K8s mode is unchanged: `Unavailable`
+/// until the first successful recovery.
 #[derive(Debug, Default)]
 pub(crate) enum JobViewState {
     /// No trustworthy view exists this term. Fail closed.

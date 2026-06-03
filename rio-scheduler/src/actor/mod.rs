@@ -784,13 +784,28 @@ impl DagActor {
             establishment_report_slack: cfg.establishment_report_slack,
             exec_retention_days: cfg.exec_retention_days,
             materialization_cfg: cfg.materialization,
-            // Unavailable until the first successful recovery hydrates
-            // it (merged_bug_246: never Hydrated(empty) over a live
-            // DAG). Tests start hydrated by default — the
+            // K8s mode: Unavailable until the first successful
+            // recovery hydrates it (merged_bug_246: never
+            // Hydrated(empty) over a live DAG). always_leader mode
+            // mirrors `dag_authoritative` above — no lease loop ever
+            // sends LeaderAcquired, so no recovery will ever hydrate
+            // the view; it starts hydrated-empty, which IS the
+            // faithful projection there (the DAG is empty at
+            // construction and moves with the view; the 246 hole
+            // needs a populated DAG over a fabricated-empty view).
+            // The dedup re-feed ([E.2]) rehydrates any pre-restart PG
+            // rows on first re-encounter; the backstop sweep cancels
+            // orphans. Tests start hydrated by default — the
             // direct-setup harness serves without driving recovery
             // (`DagActorPlumbing::start_hydrated_job_view`).
             #[cfg(not(test))]
-            materialization_jobs: materialize::JobViewState::default(),
+            materialization_jobs: if dag_authoritative {
+                let mut v = materialize::JobViewState::default();
+                v.rebuild(std::iter::empty());
+                v
+            } else {
+                materialize::JobViewState::default()
+            },
             #[cfg(test)]
             materialization_jobs: if plumbing.start_hydrated_job_view {
                 let mut v = materialize::JobViewState::default();
