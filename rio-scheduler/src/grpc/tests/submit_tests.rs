@@ -1250,6 +1250,43 @@ async fn test_submit_build_rejects_authoritative_identity_mismatch() {
     );
 }
 
+/// merged_bug_048 pin: the scheduler ingress parses outputHashAlgo
+/// case-exactly through the shared constructor — a case-variant
+/// spelling on an authoritative fixed-output submission is an
+/// unsupported algorithm here exactly as it is at the gateway, the
+/// worker glue, and the oracle's eval (`parseHashAlgo`,
+/// hash.cc:468-490), never a lax-folded alias that one gate accepts
+/// and another rejects.
+// r[verify nix.hash.algos+1]
+#[tokio::test]
+async fn test_submit_build_rejects_authoritative_case_variant_algo() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    // Same canonical-poisoning harness as the identity-mismatch test,
+    // but the algo is spelled "SHA256" — the rejection must be the
+    // algo parse, before any hash decoding or path derivation.
+    let aterm = r#"Derive([("out","/nix/store/ffffffffffffffffffffffffffffffff-victim","SHA256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/ffffffffffffffffffffffffffffffff-victim")])"#;
+    let mut node = make_node("auth-case-variant");
+    node.drv_content = aterm.as_bytes().to_vec();
+    node.drv_content_authoritative = true;
+    node.is_fixed_output = true;
+    node.is_content_addressed = true;
+    node.expected_output_paths = vec!["/nix/store/ffffffffffffffffffffffffffffffff-victim".into()];
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("unsupported outputHashAlgo"),
+        "should reject the spelling at the algo parse: {}",
+        status.message()
+    );
+}
+
 #[tokio::test]
 async fn test_submit_build_rejects_authoritative_input_addressed_content() {
     let (_db, grpc, _handle, _task) = setup_grpc().await;

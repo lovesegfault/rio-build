@@ -660,15 +660,17 @@ fn validate_fixed_output_binding(
     use rio_nix::hash::NixHash;
     use rio_nix::store_path::{StorePath, output_path_name};
 
-    let (recursive, algo_str) = match algo.strip_prefix("r:") {
-        Some(rest) => (true, rest),
-        None => (false, algo),
-    };
-    let parsed_algo = algo_str.parse().map_err(|_| {
+    // Shared FodAlgo constructor — case-exact algo, one case-sensitive
+    // `r:` strip — identical to the gateway gate and the worker glue,
+    // so this authoritative validator cannot accept a spelling any
+    // other gate rejects (merged_bug_048).
+    // r[impl nix.hash.algos+1]
+    let parsed = rio_nix::hash::OutputHashAlgo::parse(algo).map_err(|_| {
         Status::invalid_argument(format!(
             "{context} output '{out_name}' declares unsupported outputHashAlgo '{algo}'"
         ))
     })?;
+    let (recursive, parsed_algo) = (parsed.recursive, parsed.algo);
     // Shared length-discriminated decode (base16 / nixbase32 / base64) —
     // identical to the gateway gate and the worker glue, so no component
     // can decode the same declaration differently.
@@ -1224,11 +1226,17 @@ pub(crate) fn validate_inline_drv_content(
                     // the enforcement; the expected path must still equal
                     // the ATerm-declared one.
                     let path = path.as_str();
-                    let algo_supported = hash_algo
-                        .strip_prefix("r:")
-                        .unwrap_or(hash_algo)
-                        .parse::<HashAlgo>()
-                        .is_ok();
+                    // Shared FodAlgo constructor decides supportedness —
+                    // the same parse validate_fixed_output_binding will
+                    // redo, so "supported here, rejected there" is
+                    // unrepresentable. Case-variant spellings land in
+                    // the legacy arm with junk algos: both sides of the
+                    // oracle reject them at eval, no honest .drv carries
+                    // one, and for a hand-written one the path-equality
+                    // + text-CA + store upload verification posture is
+                    // exactly the documented junk-algo enforcement.
+                    // r[impl nix.hash.algos+1]
+                    let algo_supported = rio_nix::hash::OutputHashAlgo::parse(hash_algo).is_ok();
                     if algo_supported {
                         validate_fixed_output_binding(
                             &drv_name, name, path, hash_algo, hash, exp, &context,
