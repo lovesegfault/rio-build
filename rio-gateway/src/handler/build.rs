@@ -1332,7 +1332,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // reconnects — the subscriptions are independent of the scheduler
     // connection (a scheduler failover must not restart the log tail
     // from line 0).
-    let (mut tails, mut log_rx) = LogTailSet::new(log_client.clone());
+    let (mut tails, mut log_rx) = LogTailSet::new(log_client.clone(), jwt_token.map(str::to_owned));
 
     let outcome = loop {
         match process_build_events(

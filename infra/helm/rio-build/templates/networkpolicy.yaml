@@ -68,12 +68,35 @@ spec:
             k8s:io.kubernetes.pod.namespace: {{ $ns.system.name }}
             k8s:app.kubernetes.io/name: rio-scheduler
       toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
-    # Store: GetPath inputs, PutPath outputs.
+    # Store: GetPath inputs, PutPath outputs, AppendLog log ingest.
+    # L7 allow-list (bug_290): untrusted builders may call exactly the
+    # data-plane RPCs a build needs — TailLog is deliberately ABSENT,
+    # so build-log reads are unreachable from builder pods even with a
+    # leaked token. Pinned by nix/tests/helm/29-builder-l7-log-allowlist.sh.
     - toEndpoints:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
             k8s:app.kubernetes.io/name: rio-store
-      toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
+      toPorts:
+        - ports: [{port: "9002", protocol: TCP}]
+          rules:
+            http:
+              - method: "POST"
+                path: "/rio.store.StoreService/PutPath"
+              - method: "POST"
+                path: "/rio.store.StoreService/PutPathBatch"
+              - method: "POST"
+                path: "/rio.store.StoreService/GetPath"
+              - method: "POST"
+                path: "/rio.store.StoreService/QueryPathInfo"
+              - method: "POST"
+                path: "/rio.store.StoreService/BatchQueryPathInfo"
+              - method: "POST"
+                path: "/rio.store.StoreService/BatchGetManifest"
+              - method: "POST"
+                path: "/rio.store.StoreService/FindMissingPaths"
+              - method: "POST"
+                path: "/rio.store.LogService/AppendLog"
     {{- with .Values.networkPolicy.builderS3Cidr }}
     # S3 VPC endpoint CIDR — builder reads chunks via presigned URL.
     # toCIDR (not toEndpoints) — S3 endpoint is outside the cluster.
@@ -127,11 +150,31 @@ spec:
             k8s:io.kubernetes.pod.namespace: {{ $ns.system.name }}
             k8s:app.kubernetes.io/name: rio-scheduler
       toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
+    # Same L7 allow-list as the builder copy above (TailLog absent).
     - toEndpoints:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
             k8s:app.kubernetes.io/name: rio-store
-      toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
+      toPorts:
+        - ports: [{port: "9002", protocol: TCP}]
+          rules:
+            http:
+              - method: "POST"
+                path: "/rio.store.StoreService/PutPath"
+              - method: "POST"
+                path: "/rio.store.StoreService/PutPathBatch"
+              - method: "POST"
+                path: "/rio.store.StoreService/GetPath"
+              - method: "POST"
+                path: "/rio.store.StoreService/QueryPathInfo"
+              - method: "POST"
+                path: "/rio.store.StoreService/BatchQueryPathInfo"
+              - method: "POST"
+                path: "/rio.store.StoreService/BatchGetManifest"
+              - method: "POST"
+                path: "/rio.store.StoreService/FindMissingPaths"
+              - method: "POST"
+                path: "/rio.store.LogService/AppendLog"
     # Public internet on 80/443. `world` entity = any non-cluster IP.
     - toEntities: [world]
       toPorts:

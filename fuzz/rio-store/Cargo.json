@@ -13016,6 +13016,10 @@
           "packageId": "tonic-web"
         },
         {
+          "name": "tower",
+          "packageId": "tower"
+        },
+        {
           "name": "tower-http",
           "packageId": "tower-http"
         },

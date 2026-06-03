@@ -4093,6 +4093,7 @@ dependencies = [
  "tonic",
  "tonic-health",
  "tonic-web",
+ "tower",
  "tower-http",
  "tracing",
  "uuid",

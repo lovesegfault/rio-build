@@ -351,6 +351,66 @@ pub async fn resolve_exec(
     })
 }
 
+/// Does `tenant` own the derivation whose log `exec_id` carries?
+///
+/// Primary: the execution's `assignments` row joins to its
+/// `derivations` row (`derivations.tenant_id`). Fallback (assignment
+/// swept or never recorded): match the derivation row whose DAG key
+/// has the request derivation's 32-char log-hash prefix. A derivation
+/// row with `tenant_id IS NULL` matches neither arm — fail closed.
+///
+/// Runtime queries over scheduler-owned tables; the columns are pinned
+/// by the `STORE_READS` cross-service contract.
+pub async fn tenant_owns_exec(
+    pool: &PgPool,
+    exec_id: Uuid,
+    derivation: &str,
+    tenant: Uuid,
+) -> Result<bool, Status> {
+    let owned: bool = sqlx::query_scalar(
+        "SELECT EXISTS( \
+             SELECT 1 FROM assignments a \
+             JOIN derivations d USING (derivation_id) \
+             WHERE a.exec_id = $1 AND d.tenant_id = $2)",
+    )
+    .bind(exec_id)
+    .bind(tenant)
+    .fetch_one(pool)
+    .await
+    .status_internal("TailLog: ownership lookup")?;
+    if owned {
+        return Ok(true);
+    }
+    if derivation.is_empty() {
+        return Ok(false);
+    }
+    // The hash flows into a LIKE prefix pattern. Validate BEFORE the
+    // query, exactly like the QueryPathFromHashPart precedent
+    // (grpc/queries.rs): `drv_log_hash` passes unparseable input
+    // through verbatim, so an attacker-supplied `%`/`_` would
+    // otherwise satisfy the prefix predicate against ANY derivation
+    // their tenant owns — and ownership here authorizes a PINNED
+    // (possibly foreign) exec_id. nixbase32 decode checks length AND
+    // charset (no `%`/`_` in the alphabet); failure takes the same
+    // not-owned path as any other mismatch (indistinguishable).
+    let hash = drv_log_hash(derivation);
+    if hash.len() != rio_nix::store_path::HASH_CHARS
+        || rio_nix::store_path::nixbase32::decode(&hash).is_err()
+    {
+        return Ok(false);
+    }
+    sqlx::query_scalar(
+        "SELECT EXISTS( \
+             SELECT 1 FROM derivations \
+             WHERE tenant_id = $2 AND drv_hash LIKE $1 || '%')",
+    )
+    .bind(&hash)
+    .bind(tenant)
+    .fetch_one(pool)
+    .await
+    .status_internal("TailLog: ownership fallback lookup")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

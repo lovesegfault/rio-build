@@ -128,6 +128,13 @@ struct TailHandle {
 /// `None` while the set is alive.
 pub(super) struct LogTailSet {
     client: LogServiceClient<Channel>,
+    /// The watching caller's session tenant token, forwarded on every
+    /// `TailLog` open (the store enforces tenant ownership; bug_290).
+    /// Snapshot semantics match `with_jwt` on the scheduler stream: a
+    /// token that expires mid-build degrades the live tail (opens get
+    /// UNAUTHENTICATED and the reconnect loop keeps retrying) without
+    /// affecting the build itself.
+    jwt_token: Option<String>,
     out_tx: mpsc::Sender<TaggedLogChunk>,
     config: LogTailConfig,
     tasks: HashMap<String, TailHandle>,
@@ -136,18 +143,23 @@ pub(super) struct LogTailSet {
 impl LogTailSet {
     /// Create the set and its output channel. The receiver goes to the
     /// build's event loop; the set keeps a sender clone.
-    pub(super) fn new(client: LogServiceClient<Channel>) -> (Self, mpsc::Receiver<TaggedLogChunk>) {
-        Self::with_config(client, LogTailConfig::default())
+    pub(super) fn new(
+        client: LogServiceClient<Channel>,
+        jwt_token: Option<String>,
+    ) -> (Self, mpsc::Receiver<TaggedLogChunk>) {
+        Self::with_config(client, jwt_token, LogTailConfig::default())
     }
 
     pub(super) fn with_config(
         client: LogServiceClient<Channel>,
+        jwt_token: Option<String>,
         config: LogTailConfig,
     ) -> (Self, mpsc::Receiver<TaggedLogChunk>) {
         let (out_tx, out_rx) = mpsc::channel(OUT_QUEUE_DEPTH);
         (
             Self {
                 client,
+                jwt_token,
                 out_tx,
                 config,
                 tasks: HashMap::new(),
@@ -203,6 +215,7 @@ impl LogTailSet {
         let task = tokio::spawn(
             run_tail(
                 self.client.clone(),
+                self.jwt_token.clone(),
                 derivation_path.to_string(),
                 exec_id.to_string(),
                 self.out_tx.clone(),
@@ -261,6 +274,7 @@ enum StreamEnd {
 /// One subscription's lifetime: open → drive → (backoff → re-open)*.
 async fn run_tail(
     mut client: LogServiceClient<Channel>,
+    jwt_token: Option<String>,
     derivation_path: String,
     exec_id: String,
     out_tx: mpsc::Sender<TaggedLogChunk>,
@@ -283,12 +297,21 @@ async fn run_tail(
     let mut warned_open_failure = false;
     loop {
         let since_line = last_relayed.map_or(0, |n| n.saturating_add(1));
-        let request = TailLogRequest {
+        let mut request = tonic::Request::new(TailLogRequest {
             derivation: derivation_path.clone(),
             exec_id: exec_id.clone(),
             since_line,
             follow: true,
-        };
+        });
+        // Forward the watching caller's tenant token — the store
+        // verifies it and checks derivation ownership (bug_290).
+        if let Some(token) = jwt_token.as_deref()
+            && let Ok(value) = token.parse()
+        {
+            request
+                .metadata_mut()
+                .insert(rio_proto::TENANT_TOKEN_HEADER, value);
+        }
         let stream = match client.tail_log(request).await {
             Ok(resp) => resp.into_inner(),
             Err(status) => {
@@ -664,7 +687,7 @@ mod tests {
         let client = rio_proto::LogServiceClient::connect(format!("http://{addr}"))
             .await
             .expect("connect to the mock LogService");
-        let (set, out_rx) = LogTailSet::with_config(client, test_config());
+        let (set, out_rx) = LogTailSet::with_config(client, None, test_config());
         Harness {
             mock,
             set,

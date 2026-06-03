@@ -38,6 +38,8 @@ pub mod realisations;
 #[cfg(feature = "server")]
 pub mod admission;
 #[cfg(feature = "server")]
+pub mod authz;
+#[cfg(feature = "server")]
 pub mod backend;
 #[cfg(feature = "server")]
 pub mod cas;

@@ -326,6 +326,10 @@ async fn cross_service_schema_contract() {
         ("assignments", "derivation_id",  "uuid"),
         ("derivations", "derivation_id",  "uuid"),
         ("derivations", "drv_hash",       "text"),
+        // logs (authz): TailLog ownership — the handler joins the
+        // exec's assignment to its derivation row and compares the
+        // owner tenant against the verified claims.
+        ("derivations", "tenant_id",      "uuid"),
         // logs (063): latest-exec resolution + the completeness
         // predicate. drv_executions is scheduler-WRITTEN, store-READ.
         ("drv_executions", "exec_id",          "uuid"),

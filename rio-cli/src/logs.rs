@@ -28,6 +28,13 @@ pub(crate) struct Args {
     /// every build log) or the dashboard's per-derivation log view.
     #[arg(long)]
     exec_id: Option<String>,
+    /// Tenant session token (JWT) presented to the store. Required
+    /// when the store has a JWT pubkey configured: `TailLog` is
+    /// tenant-authenticated and ownership-checked (the gateway and
+    /// dashboard send their session tokens automatically; direct CLI
+    /// reads supply one here).
+    #[arg(long, env = "RIO_TENANT_TOKEN")]
+    tenant_token: Option<String>,
 }
 
 /// Run the `logs` subcommand.
@@ -48,18 +55,24 @@ pub(crate) async fn run(client: &mut LogsClient, a: Args) -> anyhow::Result<()> 
     // (plus the live in-memory buffer if the execution is still
     // ingesting). A `--follow` tail would set this true and re-open
     // on premature end; not yet exposed.
-    let mut stream = rio_common::grpc::with_timeout(
-        "TailLog",
-        RPC_TIMEOUT,
-        client.tail_log(TailLogRequest {
-            derivation: a.drv_path,
-            exec_id: a.exec_id.unwrap_or_default(),
-            since_line: 0,
-            follow: false,
-        }),
-    )
-    .await?
-    .into_inner();
+    let mut request = tonic::Request::new(TailLogRequest {
+        derivation: a.drv_path,
+        exec_id: a.exec_id.unwrap_or_default(),
+        since_line: 0,
+        follow: false,
+    });
+    if let Some(token) = a.tenant_token.as_deref() {
+        request.metadata_mut().insert(
+            rio_proto::TENANT_TOKEN_HEADER,
+            token
+                .parse()
+                .map_err(|e| anyhow!("--tenant-token is not a valid header value: {e}"))?,
+        );
+    }
+    let mut stream =
+        rio_common::grpc::with_timeout("TailLog", RPC_TIMEOUT, client.tail_log(request))
+            .await?
+            .into_inner();
 
     // Drain. `lines` is `repeated bytes` — may be non-UTF-8
     // (build output can be arbitrary). Write raw bytes to

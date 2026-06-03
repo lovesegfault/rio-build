@@ -1510,6 +1510,27 @@ filter so every consumer inherits it; the `log-no-raw-latest-exec` policy
 check bans new raw `ORDER BY exec_id DESC` reads of `drv_executions` outside
 migrations.
 
+#r("store.log.method-credential")[
+  Every gRPC method bound on the store's service port MUST carry an explicit
+  credential class (assignment-token, tenant-JWT, service-or-tenant, or
+  open) in one reviewable table, enforced by a transport-layer gate that
+  fails closed on undeclared methods; `TailLog` MUST require a verified
+  tenant token whose tenant owns the requested derivation whenever a JWT
+  pubkey is configured, with no service-token bypass.
+]
+
+Before the table existed, a method's credential demand was implicit in its
+handler — `TailLog` required nothing and was indistinguishable from a
+missing check, leaving build-log content readable by any pod that could
+reach the port (untrusted builders included). The class table makes the
+demand explicit per method, the layer rejects any method added without a
+declared class, and ownership is checked in the handler against the
+verified claims (assignments→derivations join, drv-hash-prefix fallback,
+tenant-less rows fail closed). Enforcement is enforce-when-configured so
+keyless dev/VM deployments keep working. Builder/fetcher network policy
+additionally pins an L7 allow-list that omits `TailLog` — an untrusted
+build cannot reach the method even with a stolen token.
+
 #r("store.log.completeness-gate")[
   An execution's log is complete when its lifecycle row is terminal, its
   builder-reported `final_line_count` is known, and its chunk manifest

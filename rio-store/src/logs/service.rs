@@ -17,15 +17,19 @@
 //!
 //! `AppendLog` callers are untrusted builder pods presenting an
 //! HMAC-signed assignment token; everything they send is bounded and
-//! authorized per-stream. `TailLog` is **not token-authenticated** —
-//! it is a read-only RPC gated by the same network-level access
-//! control (CiliumNetworkPolicy + the Gateway route allow-list) that
-//! gated the scheduler's `GetDerivationLogs` before the cutover, and it
-//! is reachable
-//! over gRPC-Web for the dashboard. Build-log *content* is therefore
-//! readable by anything that can reach the store's port; that is the
-//! existing posture of the admin log API this RPC replaced, not a new
-//! exposure. See `DESIGN.md §5.1`.
+//! authorized per-stream. `TailLog` is **tenant-authenticated**: the
+//! per-method credential layer ([`crate::authz`]) requires a verified
+//! tenant token whenever a JWT pubkey is configured, and the handler
+//! additionally checks that the claims' tenant OWNS the requested
+//! derivation (assignments→derivations join, drv-hash-prefix fallback,
+//! tenant-less rows fail closed — see [`tail::tenant_owns_exec`]). The
+//! gateway relay forwards the watching caller's session token; the
+//! dashboard sends its tenant session token over gRPC-Web; `rio-cli
+//! logs` sends `--tenant-token`/`RIO_TENANT_TOKEN`. Builder/fetcher
+//! network policy pins an L7 allow-list that excludes `TailLog`, so an
+//! untrusted build cannot even reach the method. (The pre-authz
+//! posture — network reachability as the only read gate — is retired;
+//! bug_290.)
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -524,8 +528,23 @@ impl LogService for LogServiceImpl {
         // is served from local state no matter what the session table
         // says (see PROXIED_METADATA_KEY).
         let proxied = request.metadata().contains_key(PROXIED_METADATA_KEY);
+        // Verified by the JWT interceptor (the authz layer requires
+        // presence when a pubkey is configured); ownership is checked
+        // below against the resolved derivation. The raw token is kept
+        // for the cross-replica relay so the peer can re-verify.
+        let tenant = request
+            .extensions()
+            .get::<rio_auth::jwt::TenantClaims>()
+            .map(|c| c.sub);
+        let tenant_token = request
+            .metadata()
+            .get(rio_common::grpc::TENANT_TOKEN_HEADER)
+            .cloned();
         let req = request.into_inner();
-        Ok(Response::new(self.tail_log_stream(req, proxied).await))
+        Ok(Response::new(
+            self.tail_log_stream(req, proxied, tenant, tenant_token)
+                .await,
+        ))
     }
 }
 
@@ -537,6 +556,8 @@ impl LogServiceImpl {
         &self,
         req: TailLogRequest,
         proxied: bool,
+        tenant: Option<Uuid>,
+        tenant_token: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     ) -> ReceiverStream<Result<TailLogChunk, Status>> {
         // Resolve the execution. NotFound here is the common "no such
         // log" case and must reach grpc-web clients in-body.
@@ -544,6 +565,23 @@ impl LogServiceImpl {
             Ok(id) => id,
             Err(status) => return err_stream(status),
         };
+
+        // Ownership: a verified tenant may only read logs of
+        // derivations it owns (bug_290; owner decision Q4 — no
+        // service-token bypass). Enforce-when-presented mirrors the
+        // authz layer: when no pubkey is configured no claims exist
+        // and the deployment is in the dev/VM posture.
+        if let Some(tenant) = tenant {
+            match tail::tenant_owns_exec(&self.pool, exec_id, &req.derivation, tenant).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return err_stream(Status::permission_denied(
+                        "derivation is not owned by the caller's tenant",
+                    ));
+                }
+                Err(status) => return err_stream(status),
+            }
+        }
 
         // Find the live ingest buffer, if any. Only a LOCAL session can
         // be subscribed to; a session on another replica is relayed by
@@ -593,7 +631,10 @@ impl LogServiceImpl {
                     // beats an error, and the reader's reconnect loop
                     // will find the new owner once the builder
                     // re-establishes its ingest stream.
-                    match self.proxy_tail(&live.replica_pod, req.clone()).await {
+                    match self
+                        .proxy_tail(&live.replica_pod, req.clone(), tenant_token.clone())
+                        .await
+                    {
                         Ok(upstream) => {
                             metrics::counter!("rio_store_log_tail_proxied_total").increment(1);
                             debug!(
@@ -655,6 +696,7 @@ impl LogServiceImpl {
         &self,
         owner_pod: &str,
         req: TailLogRequest,
+        tenant_token: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     ) -> Result<Streaming<TailLogChunk>, anyhow::Error> {
         let uri = self
             .peer_resolver
@@ -673,6 +715,14 @@ impl LogServiceImpl {
             PROXIED_METADATA_KEY,
             tonic::metadata::MetadataValue::from_static("1"),
         );
+        // Forward the caller's tenant token: the peer's interceptor
+        // re-verifies and its handler re-checks ownership — the relay
+        // never widens access.
+        if let Some(token) = tenant_token {
+            request
+                .metadata_mut()
+                .insert(rio_common::grpc::TENANT_TOKEN_HEADER, token);
+        }
         Ok(client
             .tail_log(request)
             .await
@@ -1495,6 +1545,165 @@ mod tests {
     /// `drv_executions` lifecycle row the scheduler INSERTs at dispatch
     /// (always before the builder opens its log stream). Returns the
     /// exec_id the token holder is authorized for.
+    async fn seed_tenant(pool: &PgPool, name: &str) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO tenants (tenant_name) VALUES ($1) RETURNING tenant_id",
+        )
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    fn tenant_claims(sub: Uuid) -> rio_auth::jwt::TenantClaims {
+        rio_auth::jwt::TenantClaims {
+            sub,
+            iat: 0,
+            exp: i64::MAX,
+            jti: String::from("test-jti"),
+        }
+    }
+
+    /// Direct-impl TailLog call with claims attached, returning the
+    /// first stream item (None = empty history stream).
+    async fn tail_first_item(
+        svc: &LogServiceImpl,
+        exec: Uuid,
+        claims: Option<rio_auth::jwt::TenantClaims>,
+    ) -> Option<Result<TailLogChunk, Status>> {
+        let mut request = Request::new(TailLogRequest {
+            derivation: DRV_PATH.to_string(),
+            exec_id: exec.to_string(),
+            since_line: 0,
+            follow: false,
+        });
+        if let Some(c) = claims {
+            request.extensions_mut().insert(c);
+        }
+        let mut stream = svc.tail_log(request).await.unwrap().into_inner();
+        use tokio_stream::StreamExt as _;
+        stream.next().await
+    }
+
+    // r[verify store.log.method-credential]
+    #[tokio::test]
+    async fn taillog_foreign_tenant_rejected() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let chunk_store = Arc::new(MemoryLogChunkStore::default());
+        let exec = seed_assignment(&db.pool, "builder-own").await;
+        let owner = seed_tenant(&db.pool, "tenant-owner").await;
+        sqlx::query("UPDATE derivations SET tenant_id = $1 WHERE drv_hash = $2")
+            .bind(owner)
+            .bind(DRV)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let foreign = seed_tenant(&db.pool, "tenant-foreign").await;
+        let svc = LogServiceImpl::new(db.pool.clone(), chunk_store, "test-pod".to_string());
+        match tail_first_item(&svc, exec, Some(tenant_claims(foreign))).await {
+            Some(Err(status)) => assert_eq!(
+                status.code(),
+                tonic::Code::PermissionDenied,
+                "foreign tenant must get PERMISSION_DENIED, got {status:?}"
+            ),
+            other => panic!(
+                "a verified-but-foreign tenant read the log (got {other:?}); \
+                 ownership must be enforced"
+            ),
+        }
+    }
+
+    // r[verify store.log.method-credential]
+    #[tokio::test]
+    async fn taillog_owner_admitted() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let chunk_store = Arc::new(MemoryLogChunkStore::default());
+        let exec = seed_assignment(&db.pool, "builder-own2").await;
+        let owner = seed_tenant(&db.pool, "tenant-owner2").await;
+        sqlx::query("UPDATE derivations SET tenant_id = $1 WHERE drv_hash = $2")
+            .bind(owner)
+            .bind(DRV)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let svc = LogServiceImpl::new(db.pool.clone(), chunk_store, "test-pod".to_string());
+        if let Some(Err(status)) = tail_first_item(&svc, exec, Some(tenant_claims(owner))).await {
+            assert_ne!(
+                status.code(),
+                tonic::Code::PermissionDenied,
+                "the owning tenant must be admitted"
+            );
+        }
+    }
+
+    /// LIKE-injection guard: a wildcard "derivation" must not satisfy
+    /// the ownership fallback (cross-tenant read: pin a foreign exec,
+    /// bind `%` so the prefix predicate matches ANY derivation the
+    /// caller's own tenant has).
+    // r[verify store.log.method-credential]
+    #[tokio::test]
+    async fn taillog_wildcard_derivation_rejected() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let chunk_store = Arc::new(MemoryLogChunkStore::default());
+        // Foreign tenant owns the execution's derivation.
+        let exec = seed_assignment(&db.pool, "builder-own4").await;
+        let owner = seed_tenant(&db.pool, "tenant-owner4").await;
+        sqlx::query("UPDATE derivations SET tenant_id = $1 WHERE drv_hash = $2")
+            .bind(owner)
+            .bind(DRV)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        // The attacker tenant owns SOME unrelated derivation.
+        let attacker = seed_tenant(&db.pool, "tenant-attacker").await;
+        sqlx::query(
+            "INSERT INTO derivations (drv_hash, drv_path, system, status, tenant_id) \
+             VALUES ('zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-other.drv', '/nix/store/zz-other.drv', \
+                     'x86_64-linux', 'assigned', $1)",
+        )
+        .bind(attacker)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let svc = LogServiceImpl::new(db.pool.clone(), chunk_store, "test-pod".to_string());
+        for wildcard in ["%", "_", "zz%"] {
+            let mut request = Request::new(TailLogRequest {
+                derivation: wildcard.to_string(),
+                exec_id: exec.to_string(),
+                since_line: 0,
+                follow: false,
+            });
+            request.extensions_mut().insert(tenant_claims(attacker));
+            let mut stream = svc.tail_log(request).await.unwrap().into_inner();
+            use tokio_stream::StreamExt as _;
+            match stream.next().await {
+                Some(Err(status)) => assert_eq!(
+                    status.code(),
+                    tonic::Code::PermissionDenied,
+                    "wildcard {wildcard:?} must be rejected, got {status:?}"
+                ),
+                other => panic!(
+                    "wildcard {wildcard:?} satisfied the ownership fallback \
+                     (cross-tenant read); got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// Tenant-less derivation row + verified claims => fail closed.
+    #[tokio::test]
+    async fn taillog_tenantless_derivation_fails_closed() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let chunk_store = Arc::new(MemoryLogChunkStore::default());
+        let exec = seed_assignment(&db.pool, "builder-own3").await;
+        let any = seed_tenant(&db.pool, "tenant-any").await;
+        let svc = LogServiceImpl::new(db.pool.clone(), chunk_store, "test-pod".to_string());
+        match tail_first_item(&svc, exec, Some(tenant_claims(any))).await {
+            Some(Err(status)) => assert_eq!(status.code(), tonic::Code::PermissionDenied),
+            other => panic!("tenant-less derivation must fail closed, got {other:?}"),
+        }
+    }
+
     async fn seed_assignment(pool: &PgPool, builder_id: &str) -> Uuid {
         let exec = Uuid::now_v7();
         let derivation_id = sqlx::query_scalar::<_, Uuid>(

@@ -96,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
     if service_verifier.is_some() {
         info!("x-rio-service-token verification enabled on PutPath + StoreAdminService");
     }
+    let service_verifier_for_authz = service_verifier.clone();
 
     // Tenant-aware signer (with prior-cluster-key history). Computed
     // before the StoreServiceImpl chain so the side-effecty PG load +
@@ -284,9 +285,10 @@ async fn main() -> anyhow::Result<()> {
     .with_peer_url_template(cfg.log_peer_url_template.clone());
     // Same HMAC key as PutPath: the assignment token authorizes both
     // the output upload and the log stream for one build attempt.
-    if let Some(v) = rio_auth::hmac::HmacVerifier::load(cfg.hmac_key_path.as_deref())
-        .map_err(|e| anyhow::anyhow!("HMAC key load (LogService): {e}"))?
-    {
+    let log_hmac = rio_auth::hmac::HmacVerifier::load(cfg.hmac_key_path.as_deref())
+        .map_err(|e| anyhow::anyhow!("HMAC key load (LogService): {e}"))?;
+    let log_hmac_configured = log_hmac.is_some();
+    if let Some(v) = log_hmac {
         log_service = log_service.with_hmac_verifier(Arc::new(v));
     } else {
         info!("HMAC verification disabled on AppendLog (dev mode)");
@@ -433,8 +435,18 @@ async fn main() -> anyhow::Result<()> {
         // wrapping ChunkService/StoreAdminService is harmless — those
         // callers never set x-rio-tenant-token either.
         .layer(tonic::service::InterceptorLayer::new(
-            rio_auth::jwt_interceptor::jwt_interceptor(jwt_pubkey),
+            rio_auth::jwt_interceptor::jwt_interceptor(jwt_pubkey.clone()),
         ))
+        // Per-method credential-class enforcement, AFTER the JWT
+        // interceptor (it consumes the claims the interceptor
+        // attaches). Fails closed on undeclared methods; per-class
+        // enforcement is enforce-when-configured. See authz.rs.
+        // r[impl store.log.method-credential]
+        .layer(rio_store::authz::AuthzLayer {
+            jwt_configured: jwt_pubkey.is_some(),
+            hmac_configured: log_hmac_configured,
+            service_verifier: service_verifier_for_authz,
+        })
         .add_service(health_service)
         .add_service(
             StoreServiceServer::new(store_service)

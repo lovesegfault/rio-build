@@ -20923,6 +20923,10 @@
           "packageId": "tonic-web"
         },
         {
+          "name": "tower",
+          "packageId": "tower"
+        },
+        {
           "name": "tower-http",
           "packageId": "tower-http"
         },
@@ -20971,6 +20975,14 @@
         {
           "name": "proptest",
           "packageId": "proptest"
+        },
+        {
+          "name": "prost",
+          "packageId": "prost"
+        },
+        {
+          "name": "prost-types",
+          "packageId": "prost-types"
         },
         {
           "name": "quint-connect",
