@@ -154,6 +154,7 @@ fn golden_summary_matches_and_rerenders_identically() {
         abort_recommended: false,
         plan_rss_mib: None,
         plan_rss_peak_mib: None,
+        recorder_excluded: &BTreeMap::new(),
     };
     let rendered = render_summary(&input);
     let rendered_again = render_summary(&input);

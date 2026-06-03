@@ -2316,6 +2316,13 @@ pub async fn run_with_backends(
         .archive_id()
         .context("the campaign engine requires a v1 archive (this archive has no archive id)")?
         .to_string();
+    // Recorder-side exclusion counts, re-derived from the ARCHIVE on every
+    // start. The comparability refresh consumes these as its one
+    // non-engine-derivable excluded source; re-reading the pinned archive —
+    // never the previously persisted comparability block — is what keeps a
+    // stale engine-derived count from resurrecting across resume cycles
+    // disguised as recorder truth.
+    let recorder_excluded = archive_input::exclusion_counts(&archive);
     let mut campaign = match state.read_json::<CampaignRecord>("campaign.json")? {
         Some(existing) => {
             // Resume gate: one campaign must never mix two archives.
@@ -2351,8 +2358,11 @@ pub async fn run_with_backends(
                 .extend(scheduling_low_confidence.iter().cloned());
             // Recorder-side exclusions (eval errors, aggregates) never become
             // workload units, so they enter the comparability accounting here
-            // and are merged — never overwritten — by the report-time refresh.
-            record.comparability.excluded = archive_input::exclusion_counts(&archive);
+            // for the first campaign.json write; every later refresh re-reads
+            // them from the archive (the `recorder_excluded` map above), so
+            // this seed is presentation, never a source the refresh folds
+            // back in.
+            record.comparability.excluded = recorder_excluded.clone();
             record.comparability.exclusions_recorded = archive_input::exclusions_recorded(&archive);
             // Units whose cross-session truth disagreement the reader's
             // collapse resolves by informativeness rank: recorded next to
@@ -2868,6 +2878,7 @@ pub async fn run_with_backends(
         let abort_recommended = abort_recommended.clone();
         let timing_degraded = timing_degraded.clone();
         let supply_for_progress = supply_summary.clone();
+        let recorder_excluded_for_progress = recorder_excluded.clone();
         let processed = processed.clone();
         let mut stop_rx = stop_rx.clone();
         // Per-job count of stall auto-retries already spent (the single
@@ -3182,6 +3193,7 @@ pub async fn run_with_backends(
                         supply_for_progress.as_ref(),
                         None,
                         abort_recommended.load(Ordering::SeqCst),
+                        &recorder_excluded_for_progress,
                     )
                 };
                 if let Err(e) = state.write_json_atomic("progress.json", &progress) {
@@ -3530,6 +3542,7 @@ pub async fn run_with_backends(
         &spec.knobs,
         supply_summary.as_ref(),
         timed_summary.as_ref(),
+        &recorder_excluded,
     );
     state.write_json_atomic("campaign.json", &campaign)?;
     let plan_count_u64 = |key: &str| {
@@ -3549,6 +3562,7 @@ pub async fn run_with_backends(
         abort_recommended: final_abort_recommended,
         plan_rss_mib: plan_count_u64(PLAN_COUNT_RSS_BEFORE),
         plan_rss_peak_mib: plan_count_u64(PLAN_COUNT_RSS_PEAK),
+        recorder_excluded: &recorder_excluded,
     };
     report::write_report(&state, &input)?;
     let progress = report::build_progress(
@@ -3561,6 +3575,7 @@ pub async fn run_with_backends(
         supply_summary.as_ref(),
         timed_summary.as_ref(),
         final_abort_recommended,
+        &recorder_excluded,
     );
     state.write_json_atomic("progress.json", &progress)?;
     state.set_marker("report")?;

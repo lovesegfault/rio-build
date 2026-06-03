@@ -146,6 +146,12 @@ pub struct ReportInput<'a> {
     /// Process peak resident-set size after the closure/overlap computation,
     /// in MiB.
     pub plan_rss_peak_mib: Option<u64>,
+    /// Recorder-side exclusion counts, re-derived from the ARCHIVE by the
+    /// caller (`archive_input::exclusion_counts`) — never read back from a
+    /// previously persisted comparability block, so a stale derived count
+    /// in campaign.json cannot masquerade as recorder truth (see
+    /// [`comparability_with_counts`]).
+    pub recorder_excluded: &'a BTreeMap<String, usize>,
 }
 
 fn fmt_pct(v: Option<f64>) -> String {
@@ -244,6 +250,42 @@ pub const FLAG_REPLAY_INTERRUPTIONS_DISABLED: &str = "replay-interruptions-disab
 /// both mean the headline measured something other than what was planned.
 pub const FLAG_SUPPLY_FAILED_UNITS: &str = "supply-failed-units";
 
+/// The full low-confidence flag vocabulary, partitioned by refresh
+/// provenance. Every flag the engine can mint appears in exactly one of
+/// the two lists (the registry test pins the partition against the
+/// `FLAG_` constants above), and [`comparability_with_counts`] reads the
+/// partition as data:
+///
+/// - [`STICKY_BASE_FLAGS`]: minted once at plan/bootstrap time from facts
+///   the report-time refresh cannot re-derive (tenant verification ran in
+///   the plan stage; the interruption-replay knob was forced off when the
+///   campaign record was first written). These survive from the persisted
+///   base block — the merge is the persistence mechanism.
+/// - [`REFRESH_DERIVED_FLAGS`]: predicates over the CURRENT campaign
+///   truth (final cumulative rates, sticky context fields, terminal
+///   counts), re-derived by [`low_confidence_flags`] on every refresh and
+///   NEVER carried over from the base — carrying them is how a
+///   deadline-partial run's tiny denominator used to latch a rate flag
+///   onto a campaign whose final rates are clean.
+pub const STICKY_BASE_FLAGS: &[&str] = &[
+    FLAG_TENANT_UPSTREAMS_UNVERIFIED,
+    FLAG_REPLAY_INTERRUPTIONS_DISABLED,
+];
+
+/// See [`STICKY_BASE_FLAGS`]. The re-derivation sources, per flag: the
+/// two rate flags from the campaign-cumulative aggregates; prefetch
+/// shortfall and timing degradation from the block's own sticky context
+/// fields (`prefetch_shortfall_pct`, `timing_degraded` — those FIELDS
+/// persist; the flags are recomputed from them); supply-failed-units from
+/// the terminal disposition counts.
+pub const REFRESH_DERIVED_FLAGS: &[&str] = &[
+    FLAG_INFRA_INDETERMINATE_RATE,
+    FLAG_NO_TRUTH_RATE,
+    FLAG_PREFETCH_SHORTFALL,
+    FLAG_TIMING_DEGRADED,
+    FLAG_SUPPLY_FAILED_UNITS,
+];
+
 /// Derive the report-time low-confidence flags, in their fixed order:
 /// infra-indeterminate rate, no-truth rate, prefetch shortfall, timing
 /// degradation, supply-failed units. Flags set at plan/bootstrap time
@@ -288,6 +330,30 @@ pub fn low_confidence_flags(
 
 /// Refresh the comparability block with final counts, the supply/timing
 /// context, and the re-derived low-confidence flags.
+///
+/// Provenance discipline: the refreshed block is written back to
+/// campaign.json at the end of every run and reloaded as `base` on resume,
+/// so anything copied from `base` that the refresh ALSO derives becomes a
+/// permanent latch across resume cycles (a deadline-partial run's stale
+/// derivation indistinguishable from a source-authoritative fact). The
+/// refresh therefore re-derives every derivable entry from current truth
+/// and takes from its inputs only what no derivation can reproduce:
+///
+/// - excluded counts: re-derived from the class counts, plus
+///   `recorder_excluded` — the archive's recorder-side exclusions
+///   (re-read from the archive by the caller each run, never from the
+///   previously persisted block; recorder-excluded units never become
+///   workload units, so the two count disjoint populations and a shared
+///   reason key SUMS — the engine count never shadows the recorder's).
+///   `base.excluded` is deliberately not read at all.
+/// - low-confidence flags: re-derived by [`low_confidence_flags`]; from
+///   `base.low_confidence` only the [`STICKY_BASE_FLAGS`] (plan/bootstrap
+///   facts with no report-time source) survive, plus — conservatively —
+///   any flag outside the engine's vocabulary (a foreign or newer-engine
+///   artifact: provably re-derivable it is not, and dropping it could
+///   only upgrade confidence). A [`REFRESH_DERIVED_FLAGS`] member in the
+///   base that the current truth no longer supports is GONE after the
+///   refresh — flags can clear, counts can shrink.
 pub fn comparability_with_counts(
     base: &ComparabilityBlock,
     agg: &Aggregates,
@@ -295,6 +361,7 @@ pub fn comparability_with_counts(
     knobs: &Knobs,
     supply: Option<&SupplyStageReport>,
     timed: Option<&TimedRunStats>,
+    recorder_excluded: &BTreeMap<String, usize>,
 ) -> ComparabilityBlock {
     let mut block = base.clone();
     block.in_scope = plan_counts.get(PLAN_COUNT_IN_SCOPE).copied().unwrap_or(0);
@@ -324,13 +391,17 @@ pub fn comparability_with_counts(
             excluded.insert(disposition.clone(), *count);
         }
     }
-    // Merge, never overwrite: the base block carries exclusion counts the
-    // job records cannot reproduce (the archive's recorder-side eval errors
-    // and aggregates never become workload units), so any reason already
-    // recorded there and not re-derived from the class counts above
-    // survives the refresh.
-    for (reason, count) in &base.excluded {
-        excluded.entry(reason.clone()).or_insert(*count);
+    // Recorder-side exclusions overlay the engine-derived counts by
+    // SUMMING: the populations are disjoint (a recorder-excluded unit
+    // never became a workload unit, so no engine record can describe it),
+    // and the previous or_insert-from-base policy both resurrected stale
+    // engine counts and silently dropped the recorder's count whenever
+    // the engine re-derived the same reason key (e.g. `eval-error`, which
+    // is a Disposition wire string AND a recorder reason).
+    for (reason, count) in recorder_excluded {
+        if *count > 0 {
+            *excluded.entry(reason.clone()).or_insert(0) += *count;
+        }
     }
     block.excluded = excluded;
     let terminal = terminal_job_count(&agg.verdict_counts, &agg.disposition_counts);
@@ -338,7 +409,9 @@ pub fn comparability_with_counts(
     // Supply/timing context: copied into the block so the low-confidence
     // derivation below (and anyone reading campaign.json or progress.json)
     // sees them without chasing the per-stage reports. A missing stage
-    // report keeps whatever the base block already recorded.
+    // report keeps whatever the base block already recorded — these FIELDS
+    // are the sticky carriers (campaign-lifetime events: a shortfall
+    // happened, a cadence was not honored); the FLAGS over them re-derive.
     if let Some(pct) = supply.and_then(|report| report.shortfall_pct) {
         block.prefetch_shortfall_pct = Some(pct);
     }
@@ -346,15 +419,28 @@ pub fn comparability_with_counts(
         block.timing_degraded = true;
     }
     // Low-confidence flags: the report-time derivations first (in their
-    // fixed order), then any flag already recorded at plan/bootstrap time
-    // (tenant verification, scheduling degradations) that the derivation
-    // did not re-emit. Merging instead of overwriting keeps the refresh
-    // idempotent across resume cycles: a flag can be added, never lost.
+    // fixed order), then the sticky plan/bootstrap flags (and unknown-
+    // vocabulary flags, kept conservatively) from the base that the
+    // derivation did not re-emit. Derived flags in the base are NOT
+    // carried: a rate flag latched by an earlier partial run clears here
+    // when the final cumulative rates no longer support it.
     let mut low_confidence = low_confidence_flags(agg, knobs, &block);
     for flag in &base.low_confidence {
-        if !low_confidence.contains(flag) {
-            low_confidence.push(flag.clone());
+        if low_confidence.contains(flag) {
+            continue;
         }
+        let known_derived = REFRESH_DERIVED_FLAGS.contains(&flag.as_str());
+        if known_derived {
+            continue;
+        }
+        if !STICKY_BASE_FLAGS.contains(&flag.as_str()) {
+            tracing::warn!(
+                flag,
+                "comparability flag outside the engine vocabulary; keeping it \
+                 (cannot prove it re-derivable — confidence only ever degrades)"
+            );
+        }
+        low_confidence.push(flag.clone());
     }
     block.low_confidence = low_confidence;
     block
@@ -406,6 +492,7 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
         &input.campaign.spec.knobs,
         input.supply,
         input.timed,
+        input.recorder_excluded,
     );
     let mut out = String::new();
     let _ = writeln!(
@@ -912,6 +999,9 @@ pub struct Progress {
 }
 
 /// Build the progress.json document from the current records and stage.
+/// `recorder_excluded` carries the archive's recorder-side exclusion
+/// counts, re-derived from the archive by the caller (see
+/// [`comparability_with_counts`]'s provenance discipline).
 #[allow(clippy::too_many_arguments)]
 pub fn build_progress(
     campaign: &CampaignRecord,
@@ -923,6 +1013,7 @@ pub fn build_progress(
     supply: Option<&SupplyStageReport>,
     timed: Option<&TimedRunStats>,
     abort_recommended: bool,
+    recorder_excluded: &BTreeMap<String, usize>,
 ) -> Progress {
     let agg = aggregate(records);
     let empty_counts = BTreeMap::new();
@@ -938,6 +1029,7 @@ pub fn build_progress(
         &campaign.spec.knobs,
         supply,
         timed,
+        recorder_excluded,
     );
     let terminal = terminal_job_count(&agg.verdict_counts, &agg.disposition_counts);
     let remaining = block.in_scope.saturating_sub(terminal);
@@ -1207,6 +1299,7 @@ mod tests {
             None,
             None,
             false,
+            &BTreeMap::new(),
         );
         // 1 of 2 in-scope jobs is terminal; the 3 filtered records are
         // bookkeeping for jobs outside the denominator's population.
@@ -1274,6 +1367,7 @@ mod tests {
             None,
             None,
             false,
+            &BTreeMap::new(),
         );
         assert!(
             (p.comparability.completeness_pct - 100.0).abs() < 1e-9,
@@ -1356,6 +1450,7 @@ mod tests {
             abort_recommended: false,
             plan_rss_mib: None,
             plan_rss_peak_mib: None,
+            recorder_excluded: &BTreeMap::new(),
         };
         let one = render_summary(&input);
         let two = render_summary(&input);
@@ -1397,6 +1492,7 @@ mod tests {
             None,
             None,
             false,
+            &BTreeMap::new(),
         );
         assert_eq!(p.stage, "submit+collect");
         assert_eq!(p.comparability.in_scope, 10);
@@ -1428,6 +1524,7 @@ mod tests {
             None,
             None,
             false,
+            &BTreeMap::new(),
         );
         assert_eq!(p.comparability.in_scope, 0);
         assert_eq!(p.eta_hours, None);
@@ -1477,6 +1574,7 @@ mod tests {
             abort_recommended: false,
             plan_rss_mib: None,
             plan_rss_peak_mib: None,
+            recorder_excluded: &BTreeMap::new(),
         };
         let out = render_summary(&input);
         assert!(
@@ -1541,6 +1639,7 @@ mod tests {
             Some(&supply),
             Some(&timed),
             true,
+            &BTreeMap::new(),
         );
         assert!(p.abort_recommended);
         let supply_block = p.supply.as_ref().expect("supply block present");
@@ -1624,6 +1723,7 @@ mod tests {
             abort_recommended: true,
             plan_rss_mib: Some(512),
             plan_rss_peak_mib: Some(2048),
+            recorder_excluded: &BTreeMap::new(),
         };
         let out = render_summary(&input);
         assert!(out.contains("## Supply"), "{out}");
@@ -1996,6 +2096,7 @@ mod tests {
             &campaign.spec.knobs,
             None,
             None,
+            &BTreeMap::new(),
         );
         assert_eq!(
             block.low_confidence,
@@ -2021,6 +2122,7 @@ mod tests {
             &campaign.spec.knobs,
             Some(&supply),
             Some(&timed),
+            &BTreeMap::new(),
         );
         assert_eq!(block.prefetch_shortfall_pct, Some(2.5));
         assert!(block.timing_degraded);
@@ -2036,11 +2138,211 @@ mod tests {
         // Refreshing an already-refreshed block is idempotent: no duplicate
         // flags accumulate across resume cycles, and a context value persists
         // even when its stage report is no longer supplied.
-        let again =
-            comparability_with_counts(&block, &agg, &plan_counts, &campaign.spec.knobs, None, None);
+        let again = comparability_with_counts(
+            &block,
+            &agg,
+            &plan_counts,
+            &campaign.spec.knobs,
+            None,
+            None,
+            &BTreeMap::new(),
+        );
         assert_eq!(again.low_confidence, block.low_confidence);
         assert_eq!(again.prefetch_shortfall_pct, Some(2.5));
         assert!(again.timing_degraded);
+    }
+
+    /// The latch-clearing direction the idempotency case above structurally
+    /// cannot exercise: a refresh whose BASE carries entries the current
+    /// truth no longer supports. The refreshed block is written back to
+    /// campaign.json and reloaded as the base on resume, so without
+    /// provenance partitioning a deadline-partial run's tiny-denominator
+    /// rate flag and its drained `not-attempted` count would latch
+    /// permanently. Both directions of every entry class are pinned:
+    /// derived flags clear AND appear; derived counts shrink to absence
+    /// AND appear; sticky plan/bootstrap flags and recorder-side counts
+    /// survive (the latter from the ARCHIVE parameter, never from the
+    /// base); unknown-vocabulary flags are kept conservatively.
+    #[test]
+    fn comparability_refresh_clears_stale_derived_flags_and_counts() {
+        let spec: crate::run::spec::CampaignSpec =
+            serde_json::from_str(r#"{"mode":"leaf"}"#).unwrap();
+        let campaign = CampaignRecord::new(
+            "c-resume".into(),
+            "2026-05-26T00:00:00Z".into(),
+            spec,
+            crate::run::spec::ArchivePin::default(),
+        );
+        // The persisted base, as a deadline-partial run leaves it: a rate
+        // flag derived from a 1-attempted denominator, a sticky plan flag,
+        // a foreign flag from some newer engine, the recorder's eval-error
+        // count, and a thousand not-attempted backfills.
+        let base = ComparabilityBlock {
+            low_confidence: vec![
+                FLAG_INFRA_INDETERMINATE_RATE.to_string(),
+                FLAG_TENANT_UPSTREAMS_UNVERIFIED.to_string(),
+                "some-future-flag".to_string(),
+            ],
+            excluded: BTreeMap::from([
+                ("eval-error".to_string(), 1),
+                ("not-attempted".to_string(), 1000),
+            ]),
+            ..ComparabilityBlock::default()
+        };
+        // Current truth after the resumed run drained: ten attempted jobs,
+        // all match-built — 0% infra rate, nothing not-attempted.
+        let mut records = BTreeMap::new();
+        for i in 0..10 {
+            let name = format!("job{i}");
+            records.insert(
+                name.clone(),
+                rec(&name, v(Verdict::MatchBuilt), 1, None, false),
+            );
+        }
+        let agg = aggregate(&records);
+        let plan_counts = BTreeMap::from([(PLAN_COUNT_IN_SCOPE.to_string(), 10)]);
+        let recorder_excluded = BTreeMap::from([("eval-error".to_string(), 1)]);
+        let block = comparability_with_counts(
+            &base,
+            &agg,
+            &plan_counts,
+            &campaign.spec.knobs,
+            None,
+            None,
+            &recorder_excluded,
+        );
+        // Flags: the stale derived rate flag CLEARED; the sticky plan flag
+        // and the unknown flag survived.
+        assert_eq!(
+            block.low_confidence,
+            vec![FLAG_TENANT_UPSTREAMS_UNVERIFIED, "some-future-flag"],
+            "a derived rate flag latched by a partial run must clear once the \
+             campaign-cumulative rates no longer support it"
+        );
+        // Counts: the drained not-attempted count is GONE (next to an
+        // honest completeness), the recorder count survives via the
+        // archive parameter.
+        assert_eq!(
+            block.excluded,
+            BTreeMap::from([("eval-error".to_string(), 1)]),
+            "a drained derived class must not resurrect from the persisted base"
+        );
+        assert_eq!(block.completeness_pct, 100.0);
+
+        // The appear directions, from the SAME base shapes: an infra-heavy
+        // truth re-derives the rate flag, and a fresh not-attempted record
+        // re-enters the counts — clearing is re-derivation, not deletion.
+        let mut records = BTreeMap::new();
+        records.insert("a".into(), rec("a", v(Verdict::MatchBuilt), 1, None, false));
+        records.insert(
+            "b".into(),
+            rec("b", v(Verdict::InfraIndeterminate), 1, None, false),
+        );
+        records.insert(
+            "c".into(),
+            rec("c", d(Disposition::NotAttempted), 0, None, false),
+        );
+        let agg = aggregate(&records);
+        let block = comparability_with_counts(
+            &block,
+            &agg,
+            &plan_counts,
+            &campaign.spec.knobs,
+            None,
+            None,
+            &recorder_excluded,
+        );
+        assert!(
+            block
+                .low_confidence
+                .contains(&FLAG_INFRA_INDETERMINATE_RATE.to_string()),
+            "{:?}",
+            block.low_confidence
+        );
+        assert_eq!(block.excluded.get("not-attempted"), Some(&1));
+        assert_eq!(block.excluded.get("eval-error"), Some(&1));
+    }
+
+    /// Shared reason keys between the engine's class counts and the
+    /// recorder's exclusion reasons (e.g. `eval-error`, which is both a
+    /// Disposition wire string and a recorder-side reason) SUM: the two
+    /// count disjoint populations — a recorder-excluded unit never became
+    /// a workload unit — so the previous engine-shadows-recorder collision
+    /// accident understated the exclusions.
+    #[test]
+    fn comparability_excluded_sums_disjoint_recorder_and_engine_populations() {
+        let spec: crate::run::spec::CampaignSpec =
+            serde_json::from_str(r#"{"mode":"leaf"}"#).unwrap();
+        let campaign = CampaignRecord::new(
+            "c-sum".into(),
+            "2026-05-26T00:00:00Z".into(),
+            spec,
+            crate::run::spec::ArchivePin::default(),
+        );
+        let mut records = BTreeMap::new();
+        records.insert(
+            "a".into(),
+            rec("a", d(Disposition::EvalError), 0, None, false),
+        );
+        records.insert(
+            "b".into(),
+            rec("b", d(Disposition::EvalError), 0, None, false),
+        );
+        let agg = aggregate(&records);
+        let recorder_excluded = BTreeMap::from([("eval-error".to_string(), 1)]);
+        let block = comparability_with_counts(
+            &ComparabilityBlock::default(),
+            &agg,
+            &BTreeMap::new(),
+            &campaign.spec.knobs,
+            None,
+            None,
+            &recorder_excluded,
+        );
+        assert_eq!(block.excluded.get("eval-error"), Some(&3));
+    }
+
+    /// The flag-vocabulary partition is total: every `pub const FLAG_`
+    /// declared in this file (the universe is grepped from the source, not
+    /// hand-listed) appears in exactly one of [`STICKY_BASE_FLAGS`] /
+    /// [`REFRESH_DERIVED_FLAGS`]. A new flag constant fails this test
+    /// until it is classified — unclassified flags would silently take the
+    /// conservative unknown-vocabulary path and latch forever.
+    #[test]
+    fn every_low_confidence_flag_is_provenance_classified() {
+        let src = include_str!("report.rs");
+        let prod = src
+            .split_once("#[cfg(test)]")
+            .map(|(prod, _)| prod)
+            .unwrap_or(src);
+        let declared: std::collections::BTreeSet<&str> = prod
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("pub const FLAG_")
+                    .and_then(|rest| rest.split_once(": &str = \""))
+                    .and_then(|(_, value)| value.split_once('"'))
+                    .map(|(value, _)| value)
+            })
+            .collect();
+        assert!(
+            !declared.is_empty(),
+            "the FLAG_ constant scrape matched nothing; fix the scrape, not the registry"
+        );
+        let sticky: std::collections::BTreeSet<&str> = STICKY_BASE_FLAGS.iter().copied().collect();
+        let derived: std::collections::BTreeSet<&str> =
+            REFRESH_DERIVED_FLAGS.iter().copied().collect();
+        assert!(
+            sticky.is_disjoint(&derived),
+            "a flag cannot be both sticky and re-derived"
+        );
+        let classified: std::collections::BTreeSet<&str> =
+            sticky.union(&derived).copied().collect();
+        assert_eq!(
+            declared, classified,
+            "every declared FLAG_ constant must be classified sticky-or-derived \
+             (and every registry entry must be a declared flag)"
+        );
     }
 
     #[test]
@@ -2068,6 +2370,7 @@ mod tests {
             abort_recommended: false,
             plan_rss_mib: None,
             plan_rss_peak_mib: None,
+            recorder_excluded: &BTreeMap::new(),
         };
         let out = render_summary(&input);
         // Campaign identity (scheduling mode, supply policy) is seeded by
@@ -2108,6 +2411,7 @@ mod tests {
             abort_recommended: false,
             plan_rss_mib: None,
             plan_rss_peak_mib: None,
+            recorder_excluded: &BTreeMap::new(),
         };
         let out = render_summary(&input);
         assert!(
@@ -2141,6 +2445,7 @@ mod tests {
             abort_recommended: false,
             plan_rss_mib: None,
             plan_rss_peak_mib: None,
+            recorder_excluded: &BTreeMap::new(),
         };
         let out = render_summary(&input);
         assert!(!out.contains("| truth collapse conflicts |"), "{out}");
@@ -2178,6 +2483,7 @@ mod tests {
             abort_recommended: false,
             plan_rss_mib: None,
             plan_rss_peak_mib: None,
+            recorder_excluded: &BTreeMap::new(),
         };
         write_report(&state, &input).unwrap();
         assert!(state.path("buckets/not-attempted.jsonl").exists());
@@ -2199,6 +2505,7 @@ mod tests {
             abort_recommended: false,
             plan_rss_mib: None,
             plan_rss_peak_mib: None,
+            recorder_excluded: &BTreeMap::new(),
         };
         write_report(&state, &input).unwrap();
         assert!(state.path("buckets/match-built.jsonl").exists());
