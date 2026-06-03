@@ -58,8 +58,21 @@ message BuildEvent {
     BuildPhase phase = 12;                  // Per-derivation build phase change (resSetPhase)
     SubstituteProgress substitute_progress = 13;  // Per-derivation upstream-fetch byte progress
     BuildSnapshot snapshot = 14;            // Full-state snapshot (first WatchBuild message)
+    // The scheduler-side broadcast ring lagged this watcher and events
+    // were irrecoverably dropped (tokio broadcast RecvError::Lagged).
+    // The consumer's ONLY correct recovery is to re-attach (fresh
+    // WatchBuild) and reconcile from the snapshot — this signal replaces
+    // per-consumer guesswork about which event types a gap may have
+    // contained. Sent at most once per lagged streak (debounced;
+    // re-armed by the next successfully forwarded event).
+    ResyncRequired resync_required = 15;
   }
 }
+
+// Loss signal: the server dropped events for this watcher (broadcast
+// ring overrun). Carries no payload — the snapshot of the re-attach is
+// the recovery, not anything in this message.
+message ResyncRequired {}
 
 // Full build-state snapshot: the first message on every WatchBuild stream.
 //
@@ -108,6 +121,13 @@ message RunningDerivation {
   // gateway's log-tail subscription. Empty when the assignment has not
   // minted an execution yet (Assigned, pod not yet pulled).
   string exec_id = 2;
+  // Which attempt class is running this derivation. BUILD entries get the
+  // builder display treatment (log tail + per-drv build activity);
+  // MATERIALIZATION entries get the substitution display treatment (no
+  // tail, substitute activity pair). Absent-vs-zero: UNSPECIFIED (an old
+  // scheduler that predates the field) is treated as BUILD — byte-for-
+  // byte the pre-field behavior, so no `optional` is needed.
+  AttemptKind kind = 3;
 }
 
 // Byte-level progress for a derivation's upstream materialization
@@ -170,6 +190,12 @@ message BuildProgress {
   // derivations. Deduplicated — an executor building 3 drvs for this
   // build appears once. Sorted for deterministic wire order.
   repeated string assigned_executors = 6;
+  // Derivations failed so far — the same summary.failed the snapshot's
+  // failed_derivations carries, so a live Progress event can no longer
+  // silently zero a count the snapshot just reported. Absent-vs-zero:
+  // both render as "no failures", which is the pre-field display for
+  // senders that predate the field — no `optional` needed.
+  uint32 failed = 7;
 }
 
 message BuildCompleted {
