@@ -54,6 +54,24 @@ const KVM_NODE_LABEL: &str = "rio.build/kvm";
 /// knob is retired), so this value is unconditional: there is no spec
 /// override and no per-kind drain grace left.
 #[allow(clippy::cast_possible_wrap)] // 45 ≪ i64::MAX
+/// Builder idle-exit bound, rendered into the pod env as
+/// `RIO_IDLE_SECS` (merged_bug_221 leg 2): pod env wins over image
+/// env, so the effective value is pinned HERE — the orphan-reap grace
+/// can then assert its headroom at compile time instead of carrying a
+/// "MUST exceed" comment that nothing enforces. 120 s matches the
+/// builder config default, so today's effective value is unchanged.
+// r[impl ctrl.job.idle-render-coupled]
+pub(super) const POOL_IDLE_EXIT_SECS: u64 = 120;
+
+/// The coupling the prose used to carry: a healthy idle pod
+/// self-terminates (idle bound) well before the controller-side
+/// orphan reap may fire. 60 s of slack covers exit/Job-Complete
+/// propagation.
+const _: () = assert!(
+    super::job::ORPHAN_REAP_GRACE.as_secs() >= POOL_IDLE_EXIT_SECS + 60,
+    "ORPHAN_REAP_GRACE must exceed the rendered RIO_IDLE_SECS plus propagation slack"
+);
+
 pub(super) const PULL_MODE_TGPS_SECS: i64 =
     rio_common::limits::PULL_MODE_TERMINATION_GRACE_SECS as i64;
 
@@ -964,6 +982,11 @@ fn build_executor_container(
                 // §Executor enforcement — a builder receiving a FOD
                 // returns WrongKind without spawning).
                 env("RIO_EXECUTOR_KIND", pool.spec.kind.as_str()),
+                // Idle-exit bound (merged_bug_221 leg 2): rendered
+                // from POOL_IDLE_EXIT_SECS so the orphan-reap grace
+                // const-asserts its headroom against the value pods
+                // actually run with (pod env wins over image env).
+                env("RIO_IDLE_SECS", "120"),
             ];
             // No dispatch-protocol discriminator: pull is the only
             // delivery path (the builder binary ignores a stray
@@ -1330,6 +1353,37 @@ mod tests {
             Some(rio_common::k8s::FETCHER_FEATURE),
             "RIO_FEATURES = [fetcher] for Fetcher (same chokepoint)"
         );
+    }
+
+    // r[verify ctrl.job.idle-render-coupled]
+    /// merged_bug_221 leg 2: the pod spec renders `RIO_IDLE_SECS`
+    /// from `POOL_IDLE_EXIT_SECS` (pod env wins over image env), so
+    /// the orphan-grace const-assert checks the value pods actually
+    /// run with.
+    #[test]
+    fn pod_renders_idle_exit_seconds() {
+        let pool = crate::fixtures::test_pool("p", ExecutorKind::Builder);
+        let c = build_executor_container(
+            &pool,
+            &crate::fixtures::test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+            false,
+            true,
+            None,
+        );
+        let idle = c
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|e| e.name == "RIO_IDLE_SECS")
+            .expect("RIO_IDLE_SECS rendered into the pod env");
+        assert_eq!(
+            idle.value.as_deref(),
+            Some("120"),
+            "rendered value == POOL_IDLE_EXIT_SECS (the const-assert anchor)"
+        );
+        assert_eq!(POOL_IDLE_EXIT_SECS, 120);
     }
 
     /// `LLVM_PROFILE_FILE` carries `$(RIO_EXECUTOR_ID)` for per-pod

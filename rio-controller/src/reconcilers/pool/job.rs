@@ -228,7 +228,7 @@ pub(super) fn is_pending_job(j: &Job) -> bool {
 /// Active AND `status.ready > 0` — the Job's pod container has
 /// started. Complement of [`is_pending_job`] within the active set
 /// (both predicates exclude terminating Jobs). The orphan-reap
-/// boundary for `r[ctrl.ephemeral.reap-orphan-running+4]`: only Running
+/// boundary for `r[ctrl.ephemeral.reap-orphan-running+5]`: only Running
 /// Jobs are candidates (Pending is handled by `reap_excess_pending`;
 /// Complete/Failed by TTL).
 ///
@@ -245,14 +245,16 @@ pub(super) fn is_running_job(j: &Job) -> bool {
         && j.status.as_ref().and_then(|s| s.ready).unwrap_or(0) > 0
 }
 
-/// Minimum age before a Running Job is orphan-reapable. 5min: MUST
-/// exceed the builder's `RIO_IDLE_SECS` (default 120s) so
-/// the process-level idle-exit gets first chance — a healthy idle
-/// pod self-terminates at 120s and the Job goes Complete
-/// well before this fires. The reap targets pods that CANNOT
-/// self-exit (I-165: D-state FUSE wait, OOM-loop) and would otherwise
-/// burn `activeDeadlineSeconds` (default 1h) holding a node.
-// r[impl ctrl.ephemeral.reap-orphan-running+4]
+/// Minimum age before a Running Job is orphan-reapable. 5min: must
+/// exceed the builder's idle-exit bound so the process-level exit
+/// gets first chance — a healthy idle pod self-terminates at
+/// [`super::pod::POOL_IDLE_EXIT_SECS`] (the controller-rendered
+/// `RIO_IDLE_SECS`) and the Job goes Complete well before this fires;
+/// the headroom is a `const_assert` beside that const, not prose. The
+/// reap targets pods that CANNOT self-exit (I-165: D-state FUSE wait,
+/// OOM-loop) and would otherwise burn `activeDeadlineSeconds`
+/// (default 1h) holding a node.
+// r[impl ctrl.ephemeral.reap-orphan-running+5]
 pub(super) const ORPHAN_REAP_GRACE: Duration = Duration::from_secs(300);
 
 /// Effective orphan-reap grace: [`ORPHAN_REAP_GRACE`] unless the
@@ -688,7 +690,7 @@ pub(super) fn job_older_than(j: &Job, min_age: Duration) -> bool {
 
 /// Running Jobs older than `min_age` with no open pull-mode attempt
 /// covering them — the reap set for
-/// `r[ctrl.ephemeral.reap-orphan-running+4]`.
+/// `r[ctrl.ephemeral.reap-orphan-running+5]`.
 ///
 /// Busy has exactly one carrier: an open attempt from the scheduler's
 /// durable open-attempt view ([`covered_by_open_pull_attempt`]). A
@@ -737,7 +739,7 @@ pub(super) fn select_orphan_running<'a>(
         .collect()
 }
 
-// r[impl ctrl.ephemeral.reap-orphan-running+4]
+// r[impl ctrl.ephemeral.reap-orphan-running+5]
 // r[impl ctrl.job.busy-from-open-attempts+2]
 /// Delete Running ephemeral Jobs with no open attempt covering them
 /// after [`orphan_reap_grace`]. Same I-165 stuck-process failure
@@ -745,10 +747,16 @@ pub(super) fn select_orphan_running<'a>(
 ///
 /// Busy is the ledger-backed open-attempt view (`ListOpenAttempts`,
 /// pull-filtered server-side) — durable PG state that survives
-/// scheduler failover, so there is no leader-age or empty-list gate:
-/// a successful read is authoritative whatever its age or size. (The
-/// stream-era `ListExecutors` consultation and its leader-age arm
-/// retired with the stream path at the 1d controller cleanup.)
+/// scheduler failover, so a successful read is authoritative whatever
+/// its size. The one freshness input is the leader's OWN AGE
+/// (`leader_for_secs`): a never-pulled pod has no row BY CONSTRUCTION
+/// (the builder retries pull transport errors forever and a row only
+/// exists after a successful mint), so during a scheduler outage +
+/// failover the view can be durably, truthfully EMPTY of rows for
+/// pods that are about to pull. Reaping on that emptiness right after
+/// failover would mass-delete the whole waiting cohort; gating on
+/// `leader_for_secs >= grace` gives every such pod one full grace
+/// against the NEW leader before absence becomes reapable.
 ///
 /// Lazy RPC: `ListOpenAttempts` is only called if there are Running
 /// Jobs past the grace. The common case (all Jobs young or none
@@ -788,14 +796,14 @@ pub(super) async fn reap_orphan_running(
     // cannot be proven and nothing is reaped this tick. (No leader-age
     // arm: the view is durable PG state, not an in-memory map that
     // refills after failover.)
-    let open_attempts = match admin_call(
+    let resp = match admin_call(
         ctx.admin
             .clone()
             .list_open_attempts(rio_proto::types::ListOpenAttemptsRequest {}),
     )
     .await
     {
-        Ok(resp) => resp.into_inner().attempts,
+        Ok(resp) => resp.into_inner(),
         Err(e) => {
             warn!(
                 pool, error = %e,
@@ -804,6 +812,21 @@ pub(super) async fn reap_orphan_running(
             return 0;
         }
     };
+    // r[impl ctrl.job.orphan-leader-age]
+    // Freshness gate (merged_bug_221): never-pulled pods have no row
+    // by construction, so a freshly-failed-over leader's view cannot
+    // distinguish "orphaned" from "about to pull". One full grace
+    // against the NEW leader before absence is actionable.
+    if resp.leader_for_secs < grace.as_secs() {
+        debug!(
+            pool,
+            leader_for_secs = resp.leader_for_secs,
+            grace_secs = grace.as_secs(),
+            "leader younger than the orphan grace; skipping orphan-reap this tick (fail-closed)"
+        );
+        return 0;
+    }
+    let open_attempts = resp.attempts;
     let orphans = select_orphan_running(jobs, reaped, &open_attempts, grace);
     if orphans.is_empty() {
         return 0;
@@ -863,54 +886,40 @@ pub(super) async fn reap_orphan_running(
     reaped
 }
 
-// r[impl ctrl.drain.disruption-target+3]
-/// The cancel arm's pure evidence fold (unit-tested exhaustively): for
-/// every active Job, a covering open pull-mode attempt records
-/// evidence in `seen_open`; a Job whose previously-recorded evidence
-/// is no longer backed by the (successful) view read is selected for
-/// cancellation — the closed→active edge — and its evidence consumed;
-/// a Job never recorded is never selected (bare absence, no age gate
-/// in either direction). Evidence is keyed and pruned per
-/// `{ns}/{pool}/` scope: `active` is one pool's Job set, so the prune
-/// must only ever touch that pool's own keys — two pull-mode pools
-/// sharing a namespace would otherwise erase each other's evidence
-/// every tick and the closed→active edge would never be observed. The
-/// pool name is a slash-delimited segment (never a name prefix —
-/// dash-prefixed pool names like `x86-64`/`x86-64-kvm` must not
-/// cross-prune).
+// r[impl ctrl.job.cancel-close-cause]
+/// The cancel arm's pure selection fold (unit-tested exhaustively): a
+/// Job is selected iff a `recently_closed` entry for its intent
+/// carries `CLOSE_CAUSE_CANCELLED` AND no open attempt covers it. The
+/// cause travels WITH the close on the wire — closed-ness alone (the
+/// retired closed→active edge inference over tick-local `seen_open`
+/// evidence) stopped being a verdict: a normal completion sitting in
+/// the Job-status propagation lag window has cause `COMPLETED` and is
+/// untouchable BY TYPE, and bare absence (a pod that never pulled)
+/// matches no entry at all. The open-attempt guard covers re-dispatch:
+/// a derivation cancelled and re-submitted inside the window has a
+/// fresh open attempt, and the new Job (deterministic name — there is
+/// never a second Job per intent) is never selected.
 pub(super) fn select_closed_attempt_jobs<'a>(
     active: &[&'a Job],
     open_attempts: &[rio_proto::types::OpenAttempt],
-    seen_open: &mut HashMap<String, Instant>,
-    ns: &str,
-    pool: &str,
+    recently_closed: &[rio_proto::types::ClosedAttempt],
 ) -> Vec<&'a Job> {
-    let key_of = |name: &str| format!("{ns}/{pool}/{name}");
-    let scope = format!("{ns}/{pool}/");
-    let active_keys: HashSet<String> = active
+    let cancelled: HashSet<&str> = recently_closed
         .iter()
-        .filter_map(|j| j.metadata.name.as_deref().map(key_of))
+        .filter(|c| c.cause == rio_proto::types::CloseCause::Cancelled as i32)
+        .map(|c| c.intent_id.as_str())
         .collect();
-    // Prune evidence for THIS pool's Jobs that are no longer active
-    // (completed, deleted, or replaced); other pools' evidence is
-    // never touched here.
-    seen_open.retain(|k, _| !k.starts_with(&scope) || active_keys.contains(k));
-    let mut selected = Vec::new();
-    for job in active {
-        let Some(name) = job.metadata.name.as_deref() else {
-            continue;
-        };
-        let key = key_of(name);
-        if covered_by_open_pull_attempt(job, open_attempts) {
-            seen_open.insert(key, Instant::now());
-        } else if seen_open.remove(&key).is_some() {
-            // The closed→active edge: positive evidence the attempt
-            // ended while the Job (and its pod) lives on.
-            selected.push(*job);
-        }
-        // else: never observed open — bare absence, never touched.
+    if cancelled.is_empty() {
+        return Vec::new();
     }
-    selected
+    active
+        .iter()
+        .filter(|j| {
+            job_intent_id(j).is_some_and(|i| !i.is_empty() && cancelled.contains(i))
+                && !covered_by_open_pull_attempt(j, open_attempts)
+        })
+        .copied()
+        .collect()
 }
 
 // r[impl ctrl.drain.disruption-target+3]
@@ -920,22 +929,22 @@ pub(super) fn select_closed_attempt_jobs<'a>(
 /// SIGTERM → builder cgroup-kill) instead of at
 /// `activeDeadlineSeconds`.
 ///
-/// Evidence rule: a Job is cancelled only on the closed→active edge —
-/// the controller previously matched this Job to an open attempt in a
-/// successful `ListOpenAttempts` read (recorded in
-/// `Ctx::pull_attempt_seen_open`) and a later successful read no
-/// longer lists it while the Job is still active. There is no age gate
-/// on that pair. Bare absence is NEVER cancellation evidence: a
-/// pull-mode Job whose pod has not yet pulled (Pending, image pull,
-/// cold NodeClaim, pull-retry backoff) or is receiving `NotYetReady`
-/// has never had an attempt and is never touched by this arm — those
-/// Jobs remain covered only by the grace-gated orphan reap and
-/// `activeDeadlineSeconds`. The view read is fail-closed exactly like
-/// the orphan reap's: an error produces no cancel decisions and leaves
-/// the recorded evidence untouched. A closed edge missed because the
-/// controller restarted between the close and the next read falls back
-/// to the orphan-reap arm / `activeDeadlineSeconds` (accepted; see the
-/// composite-budget note at [`super::pod::PULL_MODE_TGPS_SECS`]).
+/// Evidence rule: a Job is cancelled only when the scheduler's
+/// `recently_closed` window lists its intent with
+/// `CLOSE_CAUSE_CANCELLED` and no open attempt covers it — the cause
+/// travels with the close ([`select_closed_attempt_jobs`]). Bare
+/// absence is NEVER cancellation evidence: a pull-mode Job whose pod
+/// has not yet pulled (Pending, image pull, cold NodeClaim, pull-retry
+/// backoff) or is receiving `NotYetReady` matches no closed entry and
+/// is never touched by this arm — those Jobs remain covered only by
+/// the grace-gated orphan reap and `activeDeadlineSeconds`. The view
+/// read is fail-closed exactly like the orphan reap's: an error
+/// produces no cancel decisions. A close that ages out of the window
+/// during a controller outage falls back to the orphan-reap arm /
+/// `activeDeadlineSeconds` (accepted; see the composite-budget note at
+/// [`super::pod::PULL_MODE_TGPS_SECS`]). Latency is bounded by the
+/// window (the close is visible for `RECENTLY_CLOSED_WINDOW_SECS` on
+/// the scheduler side) plus one controller tick.
 ///
 /// Deletions route through [`delete_job_with_synthesized_report`]
 /// (reason `Cancelled`): the attempt is already closed, so the
@@ -950,7 +959,6 @@ pub(super) async fn cancel_closed_attempt_jobs(
     jobs_api: &Api<Job>,
     jobs: &[Job],
     ctx: &Ctx,
-    ns: &str,
     pool: &str,
 ) -> u32 {
     let active: Vec<&Job> = jobs
@@ -958,25 +966,17 @@ pub(super) async fn cancel_closed_attempt_jobs(
         .filter(|j| is_active_job(j) && j.metadata.deletion_timestamp.is_none())
         .collect();
     if active.is_empty() {
-        // Nothing active: drop any leftover evidence for THIS pool's
-        // scope so the map stays bounded — never the whole namespace,
-        // which would erase sibling pools' evidence every tick.
-        let scope = format!("{ns}/{pool}/");
-        ctx.pull_attempt_seen_open
-            .lock()
-            .retain(|k, _| !k.starts_with(&scope));
         return 0;
     }
-    // One view read per tick; fail-closed on error (no decisions, no
-    // evidence changes).
-    let open_attempts = match admin_call(
+    // One view read per tick; fail-closed on error (no decisions).
+    let resp = match admin_call(
         ctx.admin
             .clone()
             .list_open_attempts(rio_proto::types::ListOpenAttemptsRequest {}),
     )
     .await
     {
-        Ok(resp) => resp.into_inner().attempts,
+        Ok(resp) => resp.into_inner(),
         Err(e) => {
             warn!(
                 pool, error = %e,
@@ -985,10 +985,9 @@ pub(super) async fn cancel_closed_attempt_jobs(
             return 0;
         }
     };
-    let to_cancel: Vec<&Job> = {
-        let mut seen_open = ctx.pull_attempt_seen_open.lock();
-        select_closed_attempt_jobs(&active, &open_attempts, &mut seen_open, ns, pool)
-    };
+    let open_attempts = resp.attempts;
+    let to_cancel: Vec<&Job> =
+        select_closed_attempt_jobs(&active, &open_attempts, &resp.recently_closed);
     let mut cancelled = 0u32;
     for job in to_cancel {
         let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
@@ -2166,7 +2165,7 @@ mod tests {
         assert_eq!(names, vec!["rio-builder-p-a"]);
     }
 
-    // r[verify ctrl.ephemeral.reap-orphan-running+4]
+    // r[verify ctrl.ephemeral.reap-orphan-running+5]
     /// Same-tick consistency for the orphan-running selector: a Job
     /// already foreground-deleted by `reap_stale_for_intents` is not
     /// re-selected (would re-delete + double-count the metric).
@@ -2209,7 +2208,7 @@ mod tests {
         assert!(!is_running_job(&terminating));
     }
 
-    // r[verify ctrl.ephemeral.reap-orphan-running+4]
+    // r[verify ctrl.ephemeral.reap-orphan-running+5]
     /// Grace + phase filtering: Jobs younger than grace are excluded
     /// (process-level idle-exit gets first chance); Pending and
     /// Completed Jobs are excluded (other reapers' territory).
@@ -2293,7 +2292,7 @@ mod tests {
     }
 
     // r[verify ctrl.job.busy-from-open-attempts+2]
-    // r[verify ctrl.ephemeral.reap-orphan-running+4]
+    // r[verify ctrl.ephemeral.reap-orphan-running+5]
     /// The open-attempt busy view: a Running Job past the grace backed
     /// by an open pull-mode attempt is NOT selected; the same Job with
     /// no open attempt still IS selected (the I-165 stuck-pod reap

@@ -838,7 +838,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // pod's SIGTERM-abort fires now instead of at
     // activeDeadlineSeconds. Unconditional since the dispatch-mode
     // knob retired: every pool is a pull pool.
-    super::job::cancel_closed_attempt_jobs(&jobs_api, &jobs.items, ctx, &ns, &name).await;
+    super::job::cancel_closed_attempt_jobs(&jobs_api, &jobs.items, ctx, &name).await;
 
     // ---- Report terminations ----
     report_terminated_pods(ctx, &ns, &name).await;

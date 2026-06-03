@@ -467,6 +467,56 @@ impl SchedulerDb {
     }
 }
 
+/// The recently-closed window served on `ListOpenAttempts` (C2/120):
+/// attempts that reached a terminal `assignments.status` within this
+/// many seconds travel with their close cause so the controller's
+/// cancel arm selects on CAUSE, never on absence. Sized to exceed two
+/// controller ticks (10 s) plus clock skew and survive one controller
+/// outage tick; well under any re-dispatch of the same derivation
+/// becoming plausible evidence again.
+pub(crate) const RECENTLY_CLOSED_WINDOW_SECS: u64 = 120;
+
+/// One recently-terminal pull attempt (`recently_closed` on the
+/// ListOpenAttempts wire — see [`RECENTLY_CLOSED_WINDOW_SECS`]).
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct ClosedAttemptRow {
+    /// `derivations.drv_hash` — the intent id (same key as
+    /// `OpenAttempt.intent_id`).
+    pub drv_hash: String,
+    /// The closed execution.
+    pub exec_id: Uuid,
+    /// Terminal `assignments.status`: completed | failed | cancelled.
+    pub status: String,
+    /// Seconds since the terminal transition (PG clock).
+    pub closed_age_secs: f64,
+}
+
+impl SchedulerDb {
+    /// Every pull attempt whose assignment reached a terminal status
+    /// within [`RECENTLY_CLOSED_WINDOW_SECS`] — the close cause
+    /// travels WITH the close instead of being re-inferred from
+    /// absence by the consumer (C2/120).
+    ///
+    /// Runtime-bound (not `query!`) per the wave's regen rule.
+    pub(crate) async fn list_recently_closed_pull_attempts(
+        &self,
+    ) -> Result<Vec<ClosedAttemptRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT d.drv_hash, a.exec_id, a.status, \
+                    GREATEST(EXTRACT(EPOCH FROM (now() - a.completed_at))::float8, 0.0) \
+                        AS closed_age_secs \
+             FROM assignments a \
+             JOIN derivations d ON d.derivation_id = a.derivation_id \
+             WHERE a.status IN ('completed', 'failed', 'cancelled') \
+               AND a.completed_at > now() - make_interval(secs => $1::float8) \
+             ORDER BY a.completed_at DESC, a.exec_id",
+        )
+        .bind(RECENTLY_CLOSED_WINDOW_SECS as f64)
+        .fetch_all(&self.pool)
+        .await
+    }
+}
+
 /// The open pull-mode attempts, partitioned by work class (A2.4).
 #[derive(Debug, Default)]
 pub(crate) struct OpenAttemptsByKind {

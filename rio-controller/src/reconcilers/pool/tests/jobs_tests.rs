@@ -1105,14 +1105,12 @@ async fn delete_job_report_failure_does_not_block_delete() {
     guard.verified().await;
 }
 
-// r[verify ctrl.ephemeral.reap-orphan-running+4]
-/// Obligation-(i) posture after the 1d cleanup: the orphan reap's only
-/// busy source is the durable open-attempt view, and an unreadable
-/// view (RPC error / scheduler unreachable) means NO reap this tick —
-/// fail-closed is retained while the stream-era leader-age and
-/// empty-list arms are gone (they gated an in-memory map that no
-/// longer exists). With the dead admin channel every RPC fails, so the
-/// Running Job past the grace must NOT be deleted.
+// r[verify ctrl.ephemeral.reap-orphan-running+5]
+/// Obligation-(i) posture: the orphan reap's only busy source is the
+/// durable open-attempt view, and an unreadable view (RPC error /
+/// scheduler unreachable) means NO reap this tick — fail-closed. With
+/// the dead admin channel every RPC fails, so the Running Job past
+/// the grace must NOT be deleted.
 #[tokio::test]
 async fn reap_orphan_running_fail_closed_on_view_error() {
     let (client, _verifier) = ApiServerVerifier::new();
@@ -1133,19 +1131,21 @@ async fn reap_orphan_running_fail_closed_on_view_error() {
     // never-answering verifier instead of passing).
 }
 
-// r[verify ctrl.ephemeral.reap-orphan-running+4]
+// r[verify ctrl.ephemeral.reap-orphan-running+5]
 // r[verify ctrl.job.busy-from-open-attempts+2]
+// r[verify ctrl.job.orphan-leader-age]
 /// Positive control for the fail-closed test above, and the busy-view
-/// re-key: with a readable (empty) open-attempt view the same Job IS
-/// reaped — absence from the durable view is authoritative on its own,
-/// with no leader-age or non-empty-list precondition; and a Job whose
-/// intent has an open attempt is left alone.
+/// re-key: with a readable (empty) open-attempt view served by a
+/// leader past the grace, the aged uncovered Job IS reaped — absence
+/// from the durable view is authoritative once the leader has
+/// observed a full grace window of pulls.
 #[tokio::test]
 async fn reap_orphan_running_reaps_on_readable_view() {
     let (client, verifier) = ApiServerVerifier::new();
-    // In-process MockAdmin: ListOpenAttempts answers Ok with the
-    // default (empty) view.
-    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    // In-process MockAdmin: ListOpenAttempts answers Ok with an empty
+    // view from a long-tenured leader (well past the 300 s grace).
+    let (ctx, mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    mock.open_attempts.write().unwrap().leader_for_secs = 3600;
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     let job = running_job_for_intent("rio-builder-p-orph2", "drv-orph-2");
@@ -1346,174 +1346,125 @@ fn report_intent_id_carries_the_intent_annotation() {
 // AD5 cancel arm (pull-mode pools only)
 // ───────────────────────────────────────────────────────────────────
 
-// r[verify ctrl.drain.disruption-target+3]
-/// The cancel arm's evidence rule, exhaustively: only the
-/// closed→active edge selects a Job; an open attempt records evidence;
-/// bare absence (a pod that has not pulled yet, or one waiting on
-/// NotYetReady — neither has ever had an attempt) never selects, with
-/// no age gate in either direction; evidence for gone Jobs is pruned.
+// r[verify ctrl.job.cancel-close-cause]
+/// The cancel arm's selection rule, exhaustively over the close-cause
+/// witness: a CANCELLED entry for an uncovered active Job selects it;
+/// COMPLETED and FAILED entries never select (the Job-status
+/// propagation lag window is untouchable by type); a CANCELLED entry
+/// whose intent has a fresh open attempt (re-dispatch) never selects;
+/// bare absence (no entry at all — a pod that never pulled) never
+/// selects; an empty window selects nothing.
 #[test]
-fn cancel_arm_selects_only_closed_attempt_edges() {
+fn cancel_arm_selects_only_cancelled_close_causes() {
     use crate::reconcilers::pool::job::select_closed_attempt_jobs;
-    use std::collections::HashMap;
-    use std::time::Instant;
+    use rio_proto::types::CloseCause;
 
-    let mut seen_open: HashMap<String, Instant> = HashMap::new();
-    let building = running_job_for_intent("rio-builder-p-bld1", "drv-building");
-    // An OLD Job whose pod has never completed a pull (Pending /
-    // pre-pull / NotYetReady waiter): no attempt has ever existed.
-    let mut never_pulled = running_job_for_intent("rio-builder-p-wait1", "drv-waiting");
-    never_pulled.metadata.creation_timestamp =
-        Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
-            k8s_openapi::jiff::Timestamp::now()
-                - k8s_openapi::jiff::SignedDuration::from_secs(3600),
-        ));
-    let active = [&building, &never_pulled];
+    let closed = |intent: &str, cause: CloseCause| rio_proto::types::ClosedAttempt {
+        intent_id: intent.into(),
+        exec_id: format!("exec-{intent}"),
+        cause: cause as i32,
+        closed_age_secs: 5,
+    };
 
-    // Tick 1: the building Job's attempt is open → evidence recorded,
-    // nothing selected; the never-pulled Job has no attempt → nothing
-    // recorded, nothing selected (bare absence, even at 1 h old).
-    let open = vec![pull_attempt("drv-building", "exec-b", "node-1")];
-    let selected = select_closed_attempt_jobs(&active, &open, &mut seen_open, "rio", "p");
-    assert!(
-        selected.is_empty(),
-        "open attempts and bare absence never cancel"
+    let cancelled = running_job_for_intent("rio-builder-p-can1", "drv-cancelled");
+    let completed = running_job_for_intent("rio-builder-p-done1", "drv-done");
+    let failed = running_job_for_intent("rio-builder-p-fail1", "drv-failed");
+    let redispatched = running_job_for_intent("rio-builder-p-re1", "drv-redispatched");
+    let never_pulled = running_job_for_intent("rio-builder-p-wait1", "drv-waiting");
+    let active = [
+        &cancelled,
+        &completed,
+        &failed,
+        &redispatched,
+        &never_pulled,
+    ];
+
+    let window = vec![
+        closed("drv-cancelled", CloseCause::Cancelled),
+        closed("drv-done", CloseCause::Completed),
+        closed("drv-failed", CloseCause::Failed),
+        closed("drv-redispatched", CloseCause::Cancelled),
+    ];
+    // The re-dispatched intent has a FRESH open attempt covering it.
+    let open = vec![pull_attempt("drv-redispatched", "exec-r2", "node-2")];
+
+    let selected = select_closed_attempt_jobs(&active, &open, &window);
+    assert_eq!(
+        selected.len(),
+        1,
+        "exactly the uncovered CANCELLED close is selected"
     );
-    assert!(seen_open.contains_key("rio/p/rio-builder-p-bld1"));
-    assert!(!seen_open.contains_key("rio/p/rio-builder-p-wait1"));
-
-    // Tick 2: same view → still nothing selected (no churn while open).
-    let selected = select_closed_attempt_jobs(&active, &open, &mut seen_open, "rio", "p");
-    assert!(selected.is_empty());
-
-    // Tick 3: the attempt closed (a successful read no longer lists
-    // it) while both Jobs are still active → exactly the previously
-    // covered Job is selected, immediately (no age gate); the
-    // never-pulled one is still untouched.
-    let selected = select_closed_attempt_jobs(&active, &[], &mut seen_open, "rio", "p");
-    assert_eq!(selected.len(), 1);
     assert_eq!(
         selected[0].metadata.name.as_deref(),
-        Some("rio-builder-p-bld1"),
-        "only the closed→active edge cancels"
+        Some("rio-builder-p-can1"),
+        "cause discrimination: completed/failed closes and covered \
+         re-dispatches are untouchable"
     );
+
+    // An empty window selects nothing, whatever is active.
     assert!(
-        !seen_open.contains_key("rio/p/rio-builder-p-bld1"),
-        "the consumed edge does not re-fire next tick"
-    );
-
-    // Tick 4: nothing further — the edge was consumed.
-    let selected = select_closed_attempt_jobs(&active, &[], &mut seen_open, "rio", "p");
-    assert!(selected.is_empty());
-
-    // Pruning: evidence for a Job that is no longer active is dropped.
-    seen_open.insert("rio/p/rio-builder-p-gone1".into(), Instant::now());
-    let _ = select_closed_attempt_jobs(&active, &[], &mut seen_open, "rio", "p");
-    assert!(!seen_open.contains_key("rio/p/rio-builder-p-gone1"));
-}
-
-// r[verify ctrl.drain.disruption-target+3]
-/// The AD5 evidence map is scoped per pool: one pool's tick (with its
-/// own active set, or the empty-active early return) never erases a
-/// sibling pool's evidence in the same namespace, the sibling's
-/// closed→active edge still fires, each pool's own stale keys are
-/// still pruned, and dash-prefixed pool names (`x86-64` vs
-/// `x86-64-kvm`) do not cross-prune.
-#[test]
-fn cancel_arm_evidence_is_scoped_per_pool() {
-    use crate::reconcilers::pool::job::select_closed_attempt_jobs;
-    use std::collections::HashMap;
-    use std::time::Instant;
-
-    let mut seen_open: HashMap<String, Instant> = HashMap::new();
-
-    // Pool b records evidence for its building Job.
-    let b_job = running_job_for_intent("rio-builder-b-bld1", "drv-b");
-    let b_active = [&b_job];
-    let b_open = vec![pull_attempt("drv-b", "exec-b", "node-1")];
-    let selected = select_closed_attempt_jobs(&b_active, &b_open, &mut seen_open, "rio", "b");
-    assert!(selected.is_empty());
-    assert!(seen_open.contains_key("rio/b/rio-builder-b-bld1"));
-
-    // Pool a's tick runs with a DIFFERENT active set (and a stale key
-    // of its own): b's evidence must survive, a's stale key must not.
-    seen_open.insert("rio/a/rio-builder-a-gone1".into(), Instant::now());
-    let a_job = running_job_for_intent("rio-builder-a-bld1", "drv-a");
-    let a_active = [&a_job];
-    let _ = select_closed_attempt_jobs(&a_active, &[], &mut seen_open, "rio", "a");
-    assert!(
-        seen_open.contains_key("rio/b/rio-builder-b-bld1"),
-        "pool a's prune must not erase pool b's evidence"
-    );
-    assert!(
-        !seen_open.contains_key("rio/a/rio-builder-a-gone1"),
-        "pool a's own stale keys are still pruned (per-pool boundedness)"
-    );
-
-    // The empty-active early-return path of pool a (modeled directly
-    // as the same scope-prefixed retain the production arm applies)
-    // must also leave b's evidence alone.
-    let scope_a = "rio/a/";
-    seen_open.retain(|k, _| !k.starts_with(scope_a));
-    assert!(seen_open.contains_key("rio/b/rio-builder-b-bld1"));
-
-    // Pool b's next tick observes the attempt gone → its own edge
-    // still fires.
-    let selected = select_closed_attempt_jobs(&b_active, &[], &mut seen_open, "rio", "b");
-    assert_eq!(selected.len(), 1);
-    assert_eq!(
-        selected[0].metadata.name.as_deref(),
-        Some("rio-builder-b-bld1"),
-        "the sibling pool's closed→active edge still fires after pool a's ticks"
-    );
-
-    // Dash-prefix pool names: x86-64's slash-terminated scope must not
-    // cross-prune x86-64-kvm's evidence.
-    let kvm_job = running_job_for_intent("rio-builder-x86-64-kvm-bld1", "drv-kvm");
-    let kvm_active = [&kvm_job];
-    let kvm_open = vec![pull_attempt("drv-kvm", "exec-k", "node-2")];
-    let _ = select_closed_attempt_jobs(&kvm_active, &kvm_open, &mut seen_open, "rio", "x86-64-kvm");
-    assert!(seen_open.contains_key("rio/x86-64-kvm/rio-builder-x86-64-kvm-bld1"));
-    let plain_job = running_job_for_intent("rio-builder-x86-64-bld1", "drv-plain");
-    let plain_active = [&plain_job];
-    let _ = select_closed_attempt_jobs(&plain_active, &[], &mut seen_open, "rio", "x86-64");
-    assert!(
-        seen_open.contains_key("rio/x86-64-kvm/rio-builder-x86-64-kvm-bld1"),
-        "a dash-prefix pool name must not cross-prune its sibling's evidence"
+        select_closed_attempt_jobs(&active, &open, &[]).is_empty(),
+        "no closes in the window → no cancellations"
     );
 }
 
-// r[verify ctrl.drain.disruption-target+3]
-/// End-to-end over the wire mocks: a recorded closed→active edge gets
-/// its Job foreground-deleted (and only that Job); the synthesize arm
-/// is structurally inert because nothing is open any more.
+// r[verify ctrl.job.cancel-close-cause]
+/// merged_bug_120's recorded red, kept as the regression pin: a build
+/// whose attempt closed COMPLETED and whose Job status has not
+/// propagated yet (the teardown-lag window) is NOT selected — the old
+/// closed→active edge inference (covered tick N, gone tick N+1 ⇒
+/// cancel) selected it because absence carried no cause.
+#[test]
+fn cancel_arm_normal_completion_in_lag_window_not_selected() {
+    use crate::reconcilers::pool::job::select_closed_attempt_jobs;
+    use rio_proto::types::CloseCause;
+
+    let job = running_job_for_intent("rio-builder-p-done2", "drv-done2");
+    let active = [&job];
+    // The attempt closed normally moments ago; no open attempt.
+    let window = vec![rio_proto::types::ClosedAttempt {
+        intent_id: "drv-done2".into(),
+        exec_id: "exec-d2".into(),
+        cause: CloseCause::Completed as i32,
+        closed_age_secs: 3,
+    }];
+    assert!(
+        select_closed_attempt_jobs(&active, &[], &window).is_empty(),
+        "a normal completion in the Job-status propagation lag window \
+         must not be selected for cancellation"
+    );
+}
+
+// r[verify ctrl.job.cancel-close-cause]
+/// End-to-end over the wire mocks: a CANCELLED entry in the served
+/// `recently_closed` window gets its (uncovered) Job
+/// foreground-deleted, and only that Job.
 #[tokio::test]
-async fn cancel_arm_deletes_job_on_closed_edge() {
+async fn cancel_arm_deletes_job_on_cancelled_close() {
     use crate::reconcilers::pool::job::cancel_closed_attempt_jobs;
+    use rio_proto::types::CloseCause;
 
     let (client, verifier) = ApiServerVerifier::new();
-    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let (ctx, mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     let job = running_job_for_intent("rio-builder-p-edge1", "drv-edge");
-    // Previously observed open (the recorded evidence half of the edge).
-    ctx.pull_attempt_seen_open.lock().insert(
-        "rio/test-pool/rio-builder-p-edge1".into(),
-        std::time::Instant::now(),
-    );
+    mock.open_attempts.write().unwrap().recently_closed = vec![rio_proto::types::ClosedAttempt {
+        intent_id: "drv-edge".into(),
+        exec_id: "exec-e1".into(),
+        cause: CloseCause::Cancelled as i32,
+        closed_age_secs: 4,
+    }];
 
-    // The MockAdmin's ListOpenAttempts returns an empty view — the
-    // "subsequent successful read no longer lists it" half.
     let guard = verifier.run(vec![delete_scenario("rio-builder-p-edge1")]);
-    let cancelled = cancel_closed_attempt_jobs(&jobs_api, &[job], &ctx, "rio", "test-pool").await;
+    let cancelled = cancel_closed_attempt_jobs(&jobs_api, &[job], &ctx, "test-pool").await;
     guard.verified().await;
-    assert_eq!(cancelled, 1, "exactly the edge Job is deleted");
+    assert_eq!(cancelled, 1, "exactly the cancelled-close Job is deleted");
 }
 
-// r[verify ctrl.drain.disruption-target+3]
+// r[verify ctrl.job.cancel-close-cause]
 /// Fail-closed: a failed `ListOpenAttempts` read produces no cancel
-/// decisions and leaves the recorded evidence untouched, exactly like
-/// the orphan reap's posture.
+/// decisions, exactly like the orphan reap's posture.
 #[tokio::test]
 async fn cancel_arm_fail_closed_on_view_error() {
     use crate::reconcilers::pool::job::cancel_closed_attempt_jobs;
@@ -1524,19 +1475,8 @@ async fn cancel_arm_fail_closed_on_view_error() {
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     let job = running_job_for_intent("rio-builder-p-fc1", "drv-fc");
-    ctx.pull_attempt_seen_open.lock().insert(
-        "rio/test-pool/rio-builder-p-fc1".into(),
-        std::time::Instant::now(),
-    );
-
-    let cancelled = cancel_closed_attempt_jobs(&jobs_api, &[job], &ctx, "rio", "test-pool").await;
+    let cancelled = cancel_closed_attempt_jobs(&jobs_api, &[job], &ctx, "test-pool").await;
     assert_eq!(cancelled, 0, "no decisions on a failed view read");
-    assert!(
-        ctx.pull_attempt_seen_open
-            .lock()
-            .contains_key("rio/test-pool/rio-builder-p-fc1"),
-        "the evidence is retained for the next successful read"
-    );
 }
 
 /// Structural guard: the cancel arm is wired into the reconcile
@@ -1549,5 +1489,31 @@ fn cancel_arm_call_site_is_wired() {
     assert!(
         src.contains("cancel_closed_attempt_jobs("),
         "the cancel arm must stay wired into the reconcile"
+    );
+}
+
+// r[verify ctrl.job.orphan-leader-age]
+/// merged_bug_221's recorded red, kept as the regression pin: a
+/// freshly-failed-over leader (leader_for_secs = 0, the mock default)
+/// must NOT reap an aged uncovered Running Job — never-pulled pods
+/// have no row by construction, so the new leader's empty view is not
+/// orphan evidence until it has observed one full grace window. No
+/// DELETE is issued (a wrongly-attempted DELETE would hang against
+/// the un-driven verifier).
+#[tokio::test]
+async fn orphan_reap_skips_young_leader() {
+    use crate::reconcilers::pool::job::reap_orphan_running;
+
+    let (client, _verifier) = ApiServerVerifier::new();
+    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    // Aged, uncovered Running Job; the mock leader is brand new.
+    let job = running_job_for_intent("rio-builder-p-young1", "drv-young");
+    let reaped = reap_orphan_running(&jobs_api, &[job], &HashSet::new(), &ctx, "p").await;
+    assert_eq!(
+        reaped, 0,
+        "a leader younger than the orphan grace must not reap \
+         never-pulled pods (they get one full grace against the NEW leader)"
     );
 }

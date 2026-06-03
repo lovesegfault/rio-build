@@ -188,7 +188,6 @@ async fn main() -> anyhow::Result<()> {
         kube_build_scheduler_enabled: cfg.nodeclaim_pool.kube_build_scheduler_enabled,
         hw_config: hw_config.clone(),
         terminal_report_sampled: Default::default(),
-        pull_attempt_seen_open: Default::default(),
         exhausted_streak: Default::default(),
     });
 

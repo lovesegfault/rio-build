@@ -537,8 +537,17 @@ impl AdminService for AdminServiceImpl {
             .chain(rows.materialization)
             .map(open_attempt_row_to_proto)
             .collect();
+        // C2/120: the close-cause window. The cancel arm's evidence is
+        // a CANCELLED entry here, never the absence of an open row.
+        let recently_closed = db
+            .list_recently_closed_pull_attempts()
+            .await
+            .status_internal("list_recently_closed_pull_attempts")?
+            .into_iter()
+            .map(closed_attempt_row_to_proto)
+            .collect();
         Ok(Response::new(rio_proto::types::ListOpenAttemptsResponse {
-            recently_closed: vec![],
+            recently_closed,
             attempts,
             leader_for_secs: self.leader.leader_for().map_or(0, |d| d.as_secs()),
         }))
@@ -1258,6 +1267,27 @@ mod tests;
 /// cross-boundary test pins the mapping against a *really minted* row —
 /// the same-value-vacuity trap of pure-fixture tests (consumer fixtures
 /// inventing the field the producer never sent) cannot recur.
+/// `ClosedAttemptRow` -> wire (`recently_closed`). The cause mirrors
+/// the terminal `assignments.status` value; an unknown status maps to
+/// UNSPECIFIED, which no consumer treats as cancellation evidence.
+pub(crate) fn closed_attempt_row_to_proto(
+    r: crate::db::open_attempts::ClosedAttemptRow,
+) -> rio_proto::types::ClosedAttempt {
+    use rio_proto::types::CloseCause;
+    let cause = match r.status.as_str() {
+        "completed" => CloseCause::Completed,
+        "failed" => CloseCause::Failed,
+        "cancelled" => CloseCause::Cancelled,
+        _ => CloseCause::Unspecified,
+    };
+    rio_proto::types::ClosedAttempt {
+        intent_id: r.drv_hash,
+        exec_id: r.exec_id.to_string(),
+        cause: cause as i32,
+        closed_age_secs: r.closed_age_secs.max(0.0) as u64,
+    }
+}
+
 pub(crate) fn open_attempt_row_to_proto(
     r: crate::db::open_attempts::OpenAttemptRow,
 ) -> rio_proto::types::OpenAttempt {

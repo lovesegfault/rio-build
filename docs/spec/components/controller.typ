@@ -116,7 +116,7 @@ pool-delete cleanup.
   for them.
 ]
 
-#r("ctrl.ephemeral.reap-orphan-running+4")[
+#r("ctrl.ephemeral.reap-orphan-running+5")[
   When a Running Job (`JobStatus.ready > 0`) is older than the orphan grace
   (default 5min) AND no open pull-mode attempt from
   `AdminService.ListOpenAttempts` covers it (match key: the Job's
@@ -133,11 +133,27 @@ pool-delete cleanup.
   `ListOpenAttempts` read fails (scheduler unreachable / standby) ---
   fail-closed, same posture as
   #rref("ctrl.ephemeral.reap-excess-pending"). A successful read is
-  authoritative on its own: the view is durable ledger state that survives
-  scheduler failover, so there is no leader-age or empty-list precondition
-  (the stream-era `ListExecutors` consultation and its leader-age arm retired
-  with the stream protocol at the 1d controller cleanup).
+  authoritative about what it CONTAINS (durable ledger state that survives
+  scheduler failover), but absence is only actionable once the serving
+  leader is older than the grace (#rref("ctrl.job.orphan-leader-age")).
 ]
+
+#r("ctrl.job.orphan-leader-age")[
+  The orphan-Running reap MUST NOT act on the absence of an open attempt
+  while the serving leader's own age (`leader_for_secs` on the
+  `ListOpenAttempts` response) is below the orphan grace. A never-pulled pod
+  has no attempt row by construction (the builder retries pull transport
+  errors indefinitely; a row exists only after a successful mint), so a
+  freshly-failed-over leader's view is durably, truthfully empty of rows for
+  pods that are about to pull --- reaping on that emptiness would mass-delete
+  the entire waiting cohort after a scheduler outage. Every such pod gets one
+  full grace measured against the NEW leader before absence becomes
+  evidence.
+]
+The gate is per-tick and self-clearing: once `leader_for_secs` crosses the
+grace the reap proceeds with no state to reconcile --- the cost of the gate
+is at most one extra grace window of delay for a genuine D-state orphan
+after a failover (accepted; `activeDeadlineSeconds` still bounds it).
 
 *Cleanup:* the finalizer's `cleanup()` returns immediately. In-flight Jobs
 finish their one build naturally; ownerRef GC removes them after the pool is
@@ -853,6 +869,33 @@ The open-attempt ledger is the only busy carrier --- the stream-mode
 `ListExecutors.running_build` arm and the executor-id prefix correlation it
 needed retired with the stream protocol, and at no point may the reap infer
 busyness (or its absence) from anything other than the durable view.
+
+#r("ctrl.job.cancel-close-cause")[
+  The AD5 cancel arm MUST select a Job for teardown only when the
+  scheduler's `ListOpenAttempts.recently_closed` window lists the Job's
+  intent with `CLOSE_CAUSE_CANCELLED` and no open attempt covers the intent.
+  The close cause travels WITH the close on the wire; the absence of an open
+  attempt is never, by itself, cancellation evidence. A normal completion
+  sitting in the Job-status propagation lag window carries
+  `CLOSE_CAUSE_COMPLETED` and is untouchable by type; a pod that never
+  pulled matches no entry at all and is covered only by the grace-gated
+  orphan reap and `activeDeadlineSeconds`.
+]
+The window (120s server-side) bounds the arm's latency: cancel-to-teardown
+is at most the controller tick plus propagation, and a close that ages out
+during a controller outage falls back to the orphan reap ---
+the same backstop pair as before, minus the wrongful teardown of normal
+completions the closed-edge inference allowed.
+
+#r("ctrl.job.idle-render-coupled")[
+  The controller MUST render the builder idle-exit bound (`RIO_IDLE_SECS`)
+  into the executor pod env from its own `POOL_IDLE_EXIT_SECS` constant, and
+  the orphan grace MUST satisfy `ORPHAN_REAP_GRACE >= POOL_IDLE_EXIT_SECS +
+  60s` as a compile-time assertion. Pod env wins over image env, so the
+  value pods actually run with is the one the assertion checks --- the
+  reap/idle coupling is enforced where it can fail the build, not stated in
+  prose beside two constants that can drift apart.
+]
 
 = ComponentScaler
 

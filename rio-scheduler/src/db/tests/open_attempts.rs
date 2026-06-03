@@ -258,3 +258,67 @@ async fn attempt_resolution_requires_the_execution_row() -> anyhow::Result<()> {
     drop(test_db);
     Ok(())
 }
+
+// r[verify ctrl.job.cancel-close-cause]
+// r[verify sched.admin.list-open-attempts+3]
+/// C2/120: a terminal close inside the window travels on
+/// `recently_closed` WITH its cause — the controller's cancel arm
+/// selects on `CLOSE_CAUSE_CANCELLED`, never on the absence of an
+/// open row. An old close (beyond the 120 s window) is excluded.
+#[tokio::test]
+async fn recently_closed_window_carries_the_close_cause() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // A cancelled close moments ago.
+    let drv = insert_test_derivation(&db, "rc-cancelled").await?;
+    let exec = Uuid::now_v7();
+    db.insert_assignment(drv, &ExecutorId::from("rc-cancelled"), 1, exec)
+        .await?;
+    insert_pull_execution(
+        &test_db.pool,
+        exec,
+        &log_hash("rccancel"),
+        "rc-cancelled",
+        None,
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE assignments SET status = 'cancelled', completed_at = now() \
+         WHERE exec_id = $1",
+    )
+    .bind(exec)
+    .execute(&test_db.pool)
+    .await?;
+
+    // A completed close that aged OUT of the window.
+    let old_drv = insert_test_derivation(&db, "rc-old").await?;
+    let old_exec = Uuid::now_v7();
+    db.insert_assignment(old_drv, &ExecutorId::from("rc-old"), 1, old_exec)
+        .await?;
+    sqlx::query(
+        "UPDATE assignments \
+         SET status = 'completed', completed_at = now() - interval '10 minutes' \
+         WHERE exec_id = $1",
+    )
+    .bind(old_exec)
+    .execute(&test_db.pool)
+    .await?;
+
+    let closed = db.list_recently_closed_pull_attempts().await?;
+    assert_eq!(closed.len(), 1, "only the in-window close is served");
+    assert_eq!(closed[0].exec_id, exec);
+    assert_eq!(closed[0].status, "cancelled");
+    assert!(closed[0].closed_age_secs < 60.0);
+
+    // The wire mapping: cause + intent id (drv hash), pinned against
+    // the really-closed row.
+    let proto = crate::admin::closed_attempt_row_to_proto(closed.into_iter().next().unwrap());
+    assert_eq!(
+        proto.cause,
+        rio_proto::types::CloseCause::Cancelled as i32,
+        "the close cause travels with the close"
+    );
+    assert!(!proto.intent_id.is_empty());
+    Ok(())
+}

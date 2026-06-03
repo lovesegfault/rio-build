@@ -2868,7 +2868,12 @@ about work nobody wanted.
   and the dispatched deadline persisted by the pull mint (`deadline_secs`;
   0 = unknown, and consumers MUST treat 0 as not-expirable); the response
   carries `leader_for_secs` with the same fail-closed freshness semantics as
-  #rref("sched.admin.list-executors-leader-age+2"). The RPC is leader-served.
+  #rref("sched.admin.list-executors-leader-age+2"), and `recently_closed`
+  --- every attempt whose assignment reached a terminal status within the
+  recent window (120s), each entry carrying its close cause
+  (`completed`/`failed`/`cancelled`) so consumers select on CAUSE rather
+  than re-inferring it from the absence of an open row. The RPC is
+  leader-served.
 ]
 The same view feeds the #(refs.metric)("rio_scheduler_open_attempts") gauge
 (the busy-fleet gauge; the stream fleet's `workers_active` is retired) and

@@ -192,23 +192,6 @@ pub struct Ctx {
     /// Pruned in `pool/job::report_terminated_pods` once entries
     /// outlive the TTL window.
     pub terminal_report_sampled: Mutex<HashMap<String, Instant>>,
-    /// `{ns}/{pool}/{job}` → when the cancel arm last saw an open
-    /// pull-mode attempt covering that active Job (`pool/job::
-    /// cancel_closed_attempt_jobs`). The closed→active edge — a Job
-    /// previously recorded here whose attempt is no longer listed by a
-    /// SUCCESSFUL `ListOpenAttempts` read while the Job is still
-    /// active — is the only positive cancellation evidence the arm
-    /// accepts; bare absence (never recorded) never cancels. The pool
-    /// name is its own slash-delimited key segment so each pool's tick
-    /// prunes only its own evidence (two pull-mode pools sharing a
-    /// namespace must not erase each other's, and dash-prefixed pool
-    /// names must not cross-prune). In-process only: a controller
-    /// restart loses the map, so a closed edge that happened across
-    /// the restart falls back to the orphan-reap arm /
-    /// `activeDeadlineSeconds` (accepted, documented at the AD5
-    /// constants). Entries are pruned when their Job stops being
-    /// active.
-    pub pull_attempt_seen_open: Mutex<HashMap<String, Instant>>,
     /// `intent_id` → consecutive ticks the AD2 spawn gate observed
     /// fleet exhaustion for that intent (`pool/jobs` gate block). The
     /// NoEligibleSource report — the verdict that POISONS the
