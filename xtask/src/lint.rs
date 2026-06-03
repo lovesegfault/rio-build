@@ -96,6 +96,14 @@ pub enum Lint {
     /// deferral evidence while the settlement-aware sibling folds read
     /// the same journal correctly.
     SupplyFoldOwner,
+    /// Every revision-pinned spec-rule citation in docs/dev prose
+    /// (`` `domain.area.detail+N` `` in backticks) exists in docs/spec
+    /// at exactly that revision (some `#r("…+N")` declares it). Catches
+    /// the prose half of a `tracey bump`: tracey re-validates code-side
+    /// `r[impl]`/`r[verify]` markers against the bumped id, but
+    /// markdown citations are invisible to it, so a bump silently
+    /// orphans them.
+    SpecRuleCitations,
 }
 
 impl Lint {
@@ -118,6 +126,7 @@ impl Lint {
             Lint::ContractRegistry,
             Lint::BoundedIo,
             Lint::SupplyFoldOwner,
+            Lint::SpecRuleCitations,
         ]
     }
 }
@@ -134,6 +143,7 @@ pub fn run(lint: &Lint) -> Result<()> {
         Lint::ContractRegistry => contract_registry(),
         Lint::BoundedIo => bounded_io(),
         Lint::SupplyFoldOwner => supply_fold_owner(),
+        Lint::SpecRuleCitations => spec_rule_citations(),
     }
 }
 
@@ -2274,17 +2284,118 @@ fn supply_fold_marker_above(lines: &[&str], load_idx: usize) -> Option<SupplyFol
 }
 
 fn walk_rs(dir: &Path, f: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {
+    walk_ext(dir, "rs", f)
+}
+
+fn walk_ext(dir: &Path, ext: &str, f: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {
     for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
         // `metadata()` (not `file_type()`) so symlinked dirs recurse.
         let md = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
         if md.is_dir() {
-            walk_rs(&path, f)?;
-        } else if path.extension().is_some_and(|e| e == "rs") {
+            walk_ext(&path, ext, f)?;
+        } else if path.extension().is_some_and(|e| e == ext) {
             f(&path)?;
         }
     }
+    Ok(())
+}
+
+/// Backticked revision-pinned rule-id pattern for [`spec_rule_citations`]:
+/// a dotted lowercase id with an explicit `+N` revision suffix, e.g.
+/// `` `sched.dispatch.fod-substitute+4` ``. Bare ids (no `+N`) and glob
+/// citations (`sched.merge.substitute-*`) deliberately do not match: a
+/// bare id tracks its rule across bumps and cannot dangle the same way.
+fn versioned_citation_regex() -> regex::Regex {
+    regex::Regex::new(r"`([a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+\+[0-9]+)`").expect("static regex")
+}
+
+/// Scan one prose file for versioned citations and record each one that
+/// the spec universe does not declare at that exact revision. Returns the
+/// number of citations seen (matching or not).
+fn check_spec_rule_citations(
+    universe: &BTreeSet<String>,
+    rel: &str,
+    src: &str,
+    violations: &mut Vec<String>,
+) -> usize {
+    let cite_re = versioned_citation_regex();
+    let mut citations = 0usize;
+    for (idx, line) in src.lines().enumerate() {
+        for cap in cite_re.captures_iter(line) {
+            citations += 1;
+            let id = &cap[1];
+            if !universe.contains(id) {
+                violations.push(format!(
+                    "{rel}:{}: cites `{id}`, but no `#r(\"{id}\")` exists in docs/spec — the \
+                     rule was bumped (or the citation is a typo). Re-point the citation at the \
+                     live revision, or drop the `+N` suffix to track the rule across bumps.",
+                    idx + 1,
+                ));
+            }
+        }
+    }
+    citations
+}
+
+/// Versioned spec-rule citation gate over docs/dev prose.
+///
+/// Quantification domain (stated, per the lint contract):
+///
+/// - citations: every backticked `` `<id>+<N>` `` span in
+///   `docs/dev/**/*.md` matching [`versioned_citation_regex`];
+/// - universe: every `#r("<id>")` declaration in `docs/spec/**/*.typ`.
+///
+/// Each citation must name an id+revision the spec declares verbatim.
+/// One-directional by design (prose → spec): the spec owes prose
+/// nothing. Bare and glob citations are out of domain (see the regex
+/// doc); so is prose outside docs/dev (READMEs, code comments — code
+/// markers are tracey's domain). HONESTY CLAUSE: this validates that a
+/// pinned citation EXISTS, not that the surrounding sentence is true of
+/// that revision's text — semantic drift still needs a human read.
+///
+/// Why this exists: `tracey bump` re-validates spec `#r()` declarations
+/// and code-side `r[impl]`/`r[verify]` markers, and tracey-validate
+/// fails CI on dangling code markers — but a markdown citation is
+/// invisible to both, so every bump silently orphans prose pins (a
+/// `+3` citation survived the `sched.dispatch.fod-substitute` +3→+4
+/// bump as the tree's only `+3` reference).
+fn spec_rule_citations() -> Result<()> {
+    let root = repo_root();
+    let decl_re = regex::Regex::new(r#"#r\("([a-z0-9.+-]+)"\)"#).expect("static regex");
+    let mut universe: BTreeSet<String> = BTreeSet::new();
+    walk_ext(&root.join("docs/spec"), "typ", &mut |path| {
+        let src = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        for cap in decl_re.captures_iter(&src) {
+            universe.insert(cap[1].to_string());
+        }
+        Ok(())
+    })?;
+    ensure!(
+        !universe.is_empty(),
+        "docs/spec scan produced an empty rule universe (parser drift?)"
+    );
+
+    let mut violations = Vec::new();
+    let mut citations = 0usize;
+    walk_ext(&root.join("docs/dev"), "md", &mut |path| {
+        let src = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        citations += check_spec_rule_citations(&universe, &rel, &src, &mut violations);
+        Ok(())
+    })?;
+    ensure!(
+        violations.is_empty(),
+        "{} dangling spec-rule citation(s):\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
+    tracing::info!(citations, rules = universe.len(), "spec-rule-citations ok");
     Ok(())
 }
 
@@ -2585,6 +2696,40 @@ impl Other {\n\
     #[test]
     fn supply_fold_owner_passes_on_the_real_tree() {
         supply_fold_owner().unwrap();
+    }
+
+    /// Both directions of the citation check on synthetic prose: a
+    /// pinned citation the universe declares passes, one it does not
+    /// declare is flagged with file:line, and out-of-domain spans (bare
+    /// ids, globs, dotless tokens, unbackticked ids) are not citations
+    /// at all.
+    #[test]
+    fn versioned_citations_checked_against_the_universe() {
+        let universe: BTreeSet<String> = ["sched.dispatch.fod-substitute+4"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let src = "\
+pinned and live: `sched.dispatch.fod-substitute+4` is fine.
+pinned and dangling: `gw.build.per-tenant-policy+2` was bumped away.
+out of domain: bare `sched.merge.force-build-roots`, glob
+`sched.merge.substitute-*`, dotless `foo+1`, and an unbackticked
+sched.dispatch.fod-substitute+3 are not citations.
+two on one line: `sched.dispatch.fod-substitute+4` `sched.dispatch.fod-substitute+9`.";
+        let mut violations = Vec::new();
+        let citations = check_spec_rule_citations(&universe, "docs/dev/x.md", src, &mut violations);
+        assert_eq!(citations, 4, "exactly the four pinned spans are in domain");
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(
+            violations[0].starts_with("docs/dev/x.md:2:")
+                && violations[0].contains("gw.build.per-tenant-policy+2"),
+            "{violations:?}"
+        );
+        assert!(
+            violations[1].starts_with("docs/dev/x.md:6:")
+                && violations[1].contains("sched.dispatch.fod-substitute+9"),
+            "{violations:?}"
+        );
     }
 
     fn scan(sql: &str) -> Result<BTreeSet<String>> {
