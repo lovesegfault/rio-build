@@ -492,7 +492,11 @@ are no application-level TLS certificates --- transport encryption is at the
 Cilium overlay layer. Operator fetch credentials (the worker netrc) are
 provenance-scoped inside the fetcher: the catch-all `default` entry never
 travels to tenant-controlled origin URLs
-(#rref("fetcher.fetchurl.netrc-origin-scope")).
+(#rref("fetcher.fetchurl.netrc-origin-scope")). Note that netrc delivery is
+not yet wired: no production sandbox construction passes a netrc file and no
+`Config` exposes a netrc key, so today this scoping protects no live secret
+--- the capability is gated out until a delivery contract lands
+(#rref("fetcher.netrc.delivery-unwired")).
 
 === Recommended Patterns (by maturity)
 

@@ -1192,6 +1192,16 @@ async fn run_native_lifecycle(
         cgroup: Some(cgroup_kill_path.clone()),
         hashed_mirrors: sandbox_cfg.hashed_mirrors.clone(),
         builder_binary: std::env::current_exe().ok(),
+        // netrc is NOT yet a config surface (this is the only
+        // production SandboxOptions construction): the strict parser
+        // and its provenance scoping are kept correct under test, but
+        // no operator knob delivers a file here. This hardcoded None,
+        // the deliberately-uncovered spec rule
+        // `fetcher.netrc.delivery-unwired`, and the config-schema
+        // tripwire (`netrc_stays_unwired` in tests/config_schema.rs,
+        // whose failure message is the wiring checklist) are the
+        // recorded gate-out — wiring it later without the delivery
+        // contract fails CI at the exact commit.
         netrc: None,
     };
 

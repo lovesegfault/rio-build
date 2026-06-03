@@ -167,6 +167,28 @@ mis-split truncates passwords. An operator netrc is a handful of
 loudly at first parse beats authenticating with mangled credentials or
 phantom `default` entries.
 
+#r("fetcher.netrc.delivery-unwired")[
+  netrc credentials are NOT yet an operator-reachable capability:
+  every production `SandboxOptions` construction MUST pass `netrc:
+  None`, and no binary crate's `Config` may expose a netrc key.
+  Wiring the capability MUST land as one change carrying: a file-path
+  secret delivery following the `ca_bundle` pattern (a mounted secret,
+  never inline config), an `impl` annotation on the producing knob
+  that moves this rule out of the uncovered set and rewrites it as the
+  delivery contract, and the origin-scope, case-fold, and strict-parse
+  rules above exercised against the operator-delivered file.
+]
+
+This rule is DELIBERATELY left without an implementation annotation:
+it names an absence, and its standing entry in `tracey query
+uncovered` is the machine-visible reminder that the parser above is
+gate-level code with no production delivery path --- correct under
+test, unreachable in deployment. The committed config-schema snapshot
+doubles as the tripwire: a netrc key appearing in the builder `Config`
+fails the schema test whose failure message is the wiring checklist,
+so the knob cannot land silently, partially, or without revisiting the
+credential-scope rules.
+
 #r("fetcher.divergence.s3-transport")[
   `s3://` URLs are not supported as a fetch transport (divergence from
   the oracle, which links aws-sdk). The limitation MUST be applied per

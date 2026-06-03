@@ -286,6 +286,11 @@ pub(crate) struct SandboxOptions {
     /// any candidate URL; the `default` entry applies to
     /// operator-configured mirrors only, never to the tenant-
     /// controlled origin (`fetcher.fetchurl.netrc-origin-scope`).
+    ///
+    /// NOT yet operator-reachable: the production activation hardcodes
+    /// `None` and no `Config` exposes a netrc key — only tests pass
+    /// `Some` (`fetcher.netrc.delivery-unwired`; the config-schema
+    /// tripwire `netrc_stays_unwired` carries the wiring checklist).
     pub netrc: Option<Vec<u8>>,
 }
 
