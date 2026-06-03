@@ -677,6 +677,23 @@ impl CampaignSpec {
                 && self.knobs.build_timeout_cap_hours > 0.0,
             "campaign spec field knobs.build_timeout_cap_hours must be a positive finite number of hours"
         );
+        // The cap's hours-to-seconds conversion
+        // (`TimelineConfig::from_knobs` multiplies by 3600 before the
+        // float→Duration conversion) must stay representable — the same
+        // derived-bound discipline as the speedup quotient above. Two
+        // finite classes fail it: hours whose seconds exceed Duration's
+        // u64 range (above ~5.1e15 hours), and hours large enough that
+        // the ×3600 multiplication itself overflows to +inf (~5e304).
+        // Both die here as a named-field refusal instead of wiring a
+        // campaign whose every build deadline is the meaningless
+        // saturated maximum.
+        anyhow::ensure!(
+            std::time::Duration::try_from_secs_f64(self.knobs.build_timeout_cap_hours * 3600.0)
+                .is_ok(),
+            "campaign spec field knobs.build_timeout_cap_hours ({}) is too large: the cap in \
+             seconds (hours × 3600) exceeds the representable Duration range — use a smaller cap",
+            self.knobs.build_timeout_cap_hours
+        );
         // Zero would disable the supply/upload arms or produce zero-length
         // deadlines and empty admission windows downstream.
         let nonzero_supply_knobs = [
@@ -1617,6 +1634,111 @@ mod tests {
         .unwrap();
         spec.validate()
             .expect("a speedup whose worst-case quotient fits a Duration is admitted");
+    }
+
+    #[test]
+    fn build_timeout_cap_overflowing_duration_is_refused() {
+        let base = spec_base();
+        // The cap converts hours → seconds (×3600) → Duration at the timed
+        // wiring point; Duration's seconds are u64, so the derived bound is
+        // u64::MAX seconds ≈ 5.124e15 hours. Both sides of it are pinned —
+        // 6e15 h refused (2.16e19 s > u64::MAX ≈ 1.845e19), 5e15 h
+        // admitted (1.8e19 s fits) — so the bound cannot silently widen.
+        let timed_cap = |hours: &str| -> CampaignSpec {
+            serde_json::from_str(&format!(
+                "{base}, \"scheduling\": {{\"mode\": \"timed\"}}, \
+                 \"knobs\": {{\"build_timeout_cap_hours\": {hours}}}}}"
+            ))
+            .unwrap()
+        };
+        let err = timed_cap("6e15").validate().unwrap_err().to_string();
+        assert!(err.contains("build_timeout_cap_hours"), "{err}");
+        timed_cap("5e15")
+            .validate()
+            .expect("a cap whose seconds value fits a Duration is admitted");
+        // 1e306 h is finite but its ×3600 multiplication overflows to +inf
+        // BEFORE the conversion — the bound must be checked on the
+        // multiplied value, not as a pre-multiplication finiteness check.
+        let err = timed_cap("1e306").validate().unwrap_err().to_string();
+        assert!(err.contains("build_timeout_cap_hours"), "{err}");
+        // The default passes (every other validation test covers it via
+        // specs that never override the knob); pin it here explicitly so
+        // the bound provably admits the shipped default.
+        timed_cap("2.0").validate().expect("the default cap passes");
+    }
+
+    /// Knob-universe enumeration for the float→Duration conversion family
+    /// (the panicking `Duration::from_secs_f64` class): every f64-typed
+    /// knob — the universe is read from the serialized [`Knobs`] schema,
+    /// not hand-listed — must be classified here against that family, with
+    /// the contract that keeps its downstream conversion total. A new f64
+    /// knob fails this test until a row names its bound (or its
+    /// never-converted role), so a sibling of the speedup/cap overflow
+    /// class cannot ship unexamined. The conversion-site half of the same
+    /// audit lives in `timeline::tests::
+    /// duration_from_secs_f64_sites_are_enumerated`.
+    #[test]
+    fn every_float_knob_is_classified_against_the_duration_conversion_family() {
+        const CLASSIFIED: &[(&str, &str)] = &[
+            (
+                "active_stall_hours",
+                "float comparison threshold (watchdog/stall ladders); never converted to Duration",
+            ),
+            (
+                "queued_watchdog_hours",
+                "float comparison threshold (watchdog); never converted to Duration",
+            ),
+            (
+                "batch_timeout_hours",
+                "validate() requires finite>0; converted via saturating `as u64` cast \
+                 (submit.rs), which cannot panic",
+            ),
+            (
+                "infra_pause_pct",
+                "rate threshold; never converted to Duration",
+            ),
+            (
+                "infra_low_confidence_pct",
+                "rate threshold; never converted to Duration",
+            ),
+            (
+                "no_truth_threshold_pct",
+                "rate threshold; never converted to Duration",
+            ),
+            (
+                "prefetch_shortfall_pause_pct",
+                "rate threshold; never converted to Duration",
+            ),
+            (
+                "build_timeout_cap_hours",
+                "validate() demands try_from_secs_f64(hours*3600) representability \
+                 (named-field refusal); from_knobs converts via try_from_secs_f64 \
+                 saturating to Duration::MAX",
+            ),
+            (
+                "speedup",
+                "validate() demands try_from_secs_f64(MAX_RECORDED_OFFSET_S/speedup) \
+                 representability; every schedule division site's numerator is bounded \
+                 by the recorded-offset domain clamp",
+            ),
+        ];
+        let knobs = serde_json::to_value(Knobs::default()).unwrap();
+        let f64_fields: std::collections::BTreeSet<String> = knobs
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(_, value)| value.is_f64())
+            .map(|(field, _)| field.clone())
+            .collect();
+        let classified: std::collections::BTreeSet<String> = CLASSIFIED
+            .iter()
+            .map(|(field, _)| field.to_string())
+            .collect();
+        assert_eq!(
+            f64_fields, classified,
+            "every f64 knob must carry a conversion-family classification row \
+             (and every row must name a live knob)"
+        );
     }
 
     #[test]

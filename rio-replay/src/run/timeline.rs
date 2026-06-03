@@ -637,9 +637,18 @@ impl TimelineConfig {
             speedup: k.speedup,
             replay_interruptions: k.replay_interruptions,
             build_timeout_floor: Duration::from_secs(k.build_timeout_floor_mins.saturating_mul(60)),
-            build_timeout_cap: Duration::from_secs_f64(
+            // Total by construction: spec validation refuses caps whose
+            // seconds value is not a representable Duration (the
+            // named-field, operator-facing guard), and the saturation here
+            // keeps hand-built `Knobs` that bypass validation from
+            // panicking the wiring point — per this function's clamp
+            // contract above. NaN saturates through `.max(1.0)` to one
+            // second; +inf (a cap whose ×3600 overflowed) to
+            // `Duration::MAX`.
+            build_timeout_cap: Duration::try_from_secs_f64(
                 (k.build_timeout_cap_hours * 3600.0).max(1.0),
-            ),
+            )
+            .unwrap_or(Duration::MAX),
             op_timeout: Duration::from_secs(k.op_timeout_secs.max(1)),
             claim_wait: Duration::from_secs(k.claim_wait_mins.saturating_mul(60)),
         }
@@ -1477,6 +1486,102 @@ mod tests {
             plan.default_gap,
             Duration::from_secs_f64(DEFAULT_DISCONNECT_DELAY_S / speedup)
         );
+    }
+
+    /// The cap conversion is total for ANY f64 input: spec validation is
+    /// the operator-facing named-field refusal, and this saturation is the
+    /// belt for hand-built `Knobs` that never pass through it (per
+    /// `from_knobs`' clamp contract). Both overflow classes the validator
+    /// refuses — seconds past Duration's u64 range, and a multiplication
+    /// that overflows to +inf — saturate to `Duration::MAX` here instead
+    /// of panicking the timed wiring point after plan/truth/supply
+    /// already ran.
+    #[test]
+    fn from_knobs_saturates_an_overflowing_build_timeout_cap() {
+        let cap_for = |hours: f64| {
+            TimelineConfig::from_knobs(&Knobs {
+                build_timeout_cap_hours: hours,
+                ..Knobs::default()
+            })
+            .build_timeout_cap
+        };
+        assert_eq!(cap_for(1e16), Duration::MAX, "seconds exceed u64::MAX");
+        assert_eq!(
+            cap_for(1e306),
+            Duration::MAX,
+            "hours*3600 overflows to +inf"
+        );
+        assert_eq!(
+            cap_for(f64::NAN),
+            Duration::from_secs(1),
+            "NaN takes the 1 s clamp"
+        );
+        assert_eq!(
+            cap_for(-3.0),
+            Duration::from_secs(1),
+            "negative takes the 1 s clamp"
+        );
+        // The shipped default converts exactly.
+        assert_eq!(cap_for(2.0), Duration::from_secs(7200));
+    }
+
+    /// Site enumeration for the float→Duration conversion family: every
+    /// production `Duration::from_secs_f64(` call in the run module's
+    /// schedule/conversion files is counted here, with the bound that
+    /// keeps it total. A new bare site fails the count until it is either
+    /// converted to `try_from_secs_f64` (the totalized shape `from_knobs`
+    /// uses) or audited into this list with its bound. Domain: the
+    /// production half (pre-`#[cfg(test)]`) of each named file — the same
+    /// shape as the `remote_object_match` consumer lint in archive/s3.rs.
+    /// The knob-side half of the audit is
+    /// `spec::tests::every_float_knob_is_classified_against_the_duration_conversion_family`.
+    #[test]
+    fn duration_from_secs_f64_sites_are_enumerated() {
+        let prod_half = |src: &str| -> String {
+            src.split_once("#[cfg(test)]")
+                .map(|(prod, _)| prod.to_string())
+                .unwrap_or_else(|| src.to_string())
+        };
+        // Built at runtime so this test's own strings cannot match it.
+        let needle = format!("Duration::{}{}", "from_secs_f64", "(");
+        // timeline.rs: exactly the four audited sites —
+        //  1. the due time `offset / speedup` (offset clamped to
+        //     MAX_RECORDED_OFFSET_S by recorded_request_from; the speedup
+        //     quotient bound in validate() makes the worst case
+        //     representable);
+        //  2. the recorded disconnect gap `(stop - offset).max(0) /
+        //     speedup` (stop bounded by the recorded-timing domain filter,
+        //     same quotient bound);
+        //  3. the default disconnect gap `DEFAULT_DISCONNECT_DELAY_S /
+        //     speedup` (constant numerator below the offset cap, same
+        //     quotient bound);
+        //  4. build_timeout_for's `(2 * duration).min(cap)` (duration
+        //     bounded by the recorded-timing domain filter AND capped by
+        //     an admitted — hence representable — cap before converting).
+        assert_eq!(
+            prod_half(include_str!("timeline.rs"))
+                .matches(&needle)
+                .count(),
+            4,
+            "a new bare Duration::from_secs_f64 site in timeline.rs must be audited \
+             here (or use try_from_secs_f64)"
+        );
+        // The sibling files of the family hold no bare sites at all: the
+        // sanitizers in mod.rs only filter/clamp, spec.rs only validates
+        // (try_from_secs_f64), and submit.rs converts via a saturating
+        // integer cast.
+        for (file, src) in [
+            ("mod.rs", include_str!("mod.rs")),
+            ("spec.rs", include_str!("spec.rs")),
+            ("submit.rs", include_str!("submit.rs")),
+        ] {
+            assert_eq!(
+                prod_half(src).matches(&needle).count(),
+                0,
+                "{file} gained a bare Duration::from_secs_f64 site; route it through \
+                 try_from_secs_f64 or audit it in this test"
+            );
+        }
     }
 
     /// Job keys are resolved once at schedule construction: mapped targets
