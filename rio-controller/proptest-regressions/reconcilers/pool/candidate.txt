@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ad92bb0435efdc3970f0d64b9acfbb666d030648c31bd0a628dc913cd8adbceb # shrinks to intent = SpawnIntent { intent_id: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv", cores: 1, mem_bytes: 1, disk_bytes: 0, node_selector: {}, kind: Builder, system: "", required_features: [], deadline_secs: 0, node_affinity: [], eta_seconds: 0.0, ready: None, hw_class_names: [], disk_headroom_factor: None, excluded_nodes: [], resubmit_cycle: 0 }

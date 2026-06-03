@@ -1698,3 +1698,83 @@ defines no CR (componentscaler.yaml deleted, store-scaledobject.yaml
 present, store.autoscaling.enabled re-key); annotation sites moved
 with their bumps (controller.typ:843/:875, observability.typ:260). No
 Model J/N assumption is invalidated.
+
+## Bughunt-wave C2 entry — controller-verdict-projections (delta pass)
+
+Workstream C2 (bw-sched-consumers) lands the close-cause cancel arm,
+the leader-age orphan gate, exec-pinned synthesized verdicts, the
+presence-preserving binding snapshot, the must-use evidence buffer,
+the acquire-epoch token, and the interrupt-sample conservation
+chokepoint, plus the area-A candidate-set keystone and area-B wedge
+co-land it builds on. Formal anchors land in the same series; this
+entry records the closure mode for every roster id and the residuals
+the models deliberately do not carry.
+
+### Roster closure (13 ids)
+
+| id | mode | anchor |
+|---|---|---|
+| bug_008 (deadline truth) | S, predecessor co-land | `mint_persists_dispatched_deadline_and_view_returns_it` (pg) + the 072 mint plumbing |
+| bug_222 (wedge kind/anchor) | S, predecessor co-land | wedge unit battery + `wedgeEvidence` proptest plane (`wedge.rs::proptests`, mirror-spec verdict law) |
+| bug_077 (fleet-exhaust persistence) | S + formal | `noPoisonWhilePlaceable`: falsified as-built (`spawnCoherenceExhaustAsBuilt`, seed 0x180c313ab8735048, 325 ms) / HOLD (`spawnCoherenceExhaustPersist`, TLC-exhaustive 10.45 M distinct states, 56 s) + `canReachPoison` witness + `streak_fires_only_at_threshold` property |
+| bug_106 (rendered-deadline carry) | S, predecessor (A2 axis) | `establishedOnlyPastRenderedDeadline` (A2's regime; C2 axes follow its gating) |
+| merged_bug_249 (fingerprint axes) | S, predecessor + formal | `fingerprint_deterministic_and_axis_sensitive` — the plane FALSIFIED the raw-field deadline law and pinned the rendered (floor-180) form instead |
+| merged_bug_124 (candidate set) | S, predecessor + formal | `admits_is_pre_minus_exclusion` + `exhaustion_matches_mirror` (the single-universe conjunction laws) |
+| bug_120 (cancel close-cause) | S + formal | `cancelArmDeletesOnlyCancelled`: falsified as-built (seed 0x921f023cd1d05ce, 401 ms) / HOLD (`spawnCoherenceCancelCause`) + `canReachCancelReap`; Rust reds recorded in 492daa84b |
+| merged_bug_221 (orphan leader age) | S + formal | `noReapOfNeverPulledBeforeLeaderAged`: falsified as-built (`spawnCoherenceReapYoungLeader`, seed 0x6750afad1ef92e49) / HOLD on the existing fault-lease regime + the `const_assert` idle coupling |
+| merged_bug_135 (identity-pinned verdicts) | S + DR + formal | `closeTargetsIssuedAttempt`: falsified as-built (seed 0xe3766a6e3ff4cfad, deep search 10.45 s @ 67 k traces/s) / HOLD (`spawnCoherenceSynthClosePinned`) + `canReachSynthClose`; DR residual below |
+| bug_285 (binding snapshot presence) | S + formal | `ackCarriesSnapshot`: falsified as-built (seed 0x9bc8fa9604158290) / HOLD (`nodeclaimLifecycleSnapshot`) + `canReachBindingCleared` |
+| merged_bug_007 (evidence buffer) | S + formal | `iceClearDelivered`: falsified as-built (seed 0xd5a902daa46a0d88) / HOLD (`nodeclaimLifecycleClearBuffer`) + `canReachBufferedClearDelivered` |
+| bug_346 (acquire-epoch token) | S + formal | `idleSpellSurvivesReloadErr`: falsified as-built (seed 0x66dc8b7b1d990952) / HOLD (`nodeclaimLifecycleEpoch`) + `canReachEdgeIdleClear` |
+| bug_363 (interrupt-sample conservation) | S, none-sensible formal | `interrupt_resolution_classifies_every_cell` (the full 6-cell resolution table) — a quint axis would re-state the same finite table with no environment dynamics; recorded none-sensible |
+
+Local sampled HOLD measurements (rust backend, 200 k samples × 40
+steps each): noPoisonWhilePlaceable 1.68 s, cancelArmDeletesOnly-
+Cancelled 1.73 s, noReapOfNeverPulledBeforeLeaderAged 1.34 s,
+closeTargetsIssuedAttempt 1.86 s, idleSpellSurvivesReloadErr 2.36 s,
+iceClearDelivered 2.08 s, ackCarriesSnapshot 2.50 s. The merge-gated
+checks are TLC-exhaustive (`mkQuintCheck`); the worst new regime
+(`spawnCoherenceExhaustPersist`) exhausts 10,455,424 distinct states
+in 56 s on the CI builder — inside the per-check budget with margin.
+
+### Residuals (deliberate, recorded — not TODOs)
+
+- **135 mode-2 (one-RTT in-flight-success window):** a Build-success
+  report racing the disruption watcher's decide→land window can still
+  lose to the synthesized close by at most ONE admin-RPC round-trip —
+  the close is exec-pinned, so the race is bounded to the observed
+  attempt itself (never a successor; `closeTargetsIssuedAttempt` is
+  the pin). Accepted: the alternative (a scheduler-side
+  compare-and-swap on report arrival order) re-introduces the
+  cross-component ordering oracle the wave removed. The charge-free
+  idempotent close + requeue make the worst case a redundant rebuild.
+- **120 stale-window respawn (bounded):** a derivation cancelled and
+  RE-SUBMITTED inside the 120 s `recently_closed` window whose fresh
+  Job has not yet pulled matches the stale CANCELLED entry and is
+  cancel-selected once per tick until the window expires or the pull
+  opens (the open-attempt guard then covers it). Bounded by the window
+  (≤120 s of respawn churn, no charge, no poison). The
+  `spawnCoherenceCancelCause` regime contains this trace and the
+  invariant correctly does NOT flag it (the cause IS cancelled);
+  re-keying the window by exec generation would shrink it and is
+  recorded as a non-goal (needs resubmit_cycle on the close row).
+- **007 ack-failure drain loss:** the evidence buffer drains into the
+  healthy tick's Ack BEFORE the RPC; an ack failure on exactly that
+  tick loses the batch (same loss class as fresh same-tick edges,
+  pre-existing). Modeled faithfully (`pendingClear' = Set()` on the
+  drain regardless of `ackFails`); the invariant scopes to
+  non-delivering-tick discards only.
+- **007/346 acquire-edge suppress:** the qnt models do not compose the
+  buffer axis with the lease-fault axis (the suppress-clear on
+  re-acquisition is therefore out of model); the Rust pins
+  `pending_evidence_cleared_on_acquire_edge` and
+  `acquire_epoch_token_semantics` carry that edge.
+- **Pull-mode wedge VM fixture:** the wedge two-axis verdict's
+  end-to-end VM exercise needs a solve-deadline small enough to expire
+  inside a VM test budget; the deadline plumbing resists the fixture
+  (the floor-180 render + establishment slack floor put the minimum
+  observable expiry past the scenario budget). Per the §2 escape
+  hatch, the recorded pin is the sqlx boundary test
+  (`mint_persists_dispatched_deadline_and_view_returns_it`) plus the
+  `wedgeEvidence` proptest plane — NOT a VM subtest. Revisit only if
+  the slack floor drops.

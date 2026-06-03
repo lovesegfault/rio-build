@@ -376,3 +376,217 @@ mod tests {
         assert_eq!(node_excluded(&i, "n2"), ri.excluded("n2"));
     }
 }
+
+/// C2 formal-delta proptest plane 2: the candidate-set equivalence
+/// laws. The keystone claim of the area-A refactor is that the gate,
+/// the render, and the pack all project from ONE `RenderInputs`
+/// universe — these properties pin the algebra of that universe
+/// against a mirror specification, over arbitrary intents and fleets.
+// r[verify ctrl.pool.intent-candidate-set]
+// r[verify ctrl.pool.no-eligible-persist]
+#[cfg(test)]
+mod proptests {
+    use std::collections::BTreeMap;
+
+    use proptest::prelude::*;
+    use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm, SpawnIntent};
+
+    use super::*;
+
+    const KEYS: [&str; 3] = ["arch", "cap", "zone"];
+    const VALS: [&str; 2] = ["x", "y"];
+    const NODES: [&str; 4] = ["n0", "n1", "n2", "n3"];
+    const OPS: [&str; 5] = ["In", "NotIn", "Exists", "DoesNotExist", "Gt"];
+
+    fn arb_labels() -> impl Strategy<Value = BTreeMap<String, String>> {
+        proptest::collection::btree_map(
+            proptest::sample::select(&KEYS[..]).prop_map(str::to_owned),
+            proptest::sample::select(&VALS[..]).prop_map(str::to_owned),
+            0..=3,
+        )
+    }
+
+    fn arb_nodes() -> impl Strategy<Value = Vec<CandidateNode>> {
+        proptest::collection::vec(
+            (
+                proptest::sample::select(&NODES[..]),
+                arb_labels(),
+                any::<bool>(),
+            )
+                .prop_map(|(name, labels, schedulable)| CandidateNode {
+                    name: name.to_owned(),
+                    labels,
+                    schedulable,
+                }),
+            0..=4,
+        )
+    }
+
+    fn arb_term() -> impl Strategy<Value = NodeSelectorTerm> {
+        proptest::collection::vec(
+            (
+                proptest::sample::select(&KEYS[..]),
+                proptest::sample::select(&OPS[..]),
+                proptest::collection::vec(
+                    proptest::sample::select(&VALS[..]).prop_map(str::to_owned),
+                    0..=2,
+                ),
+            )
+                .prop_map(|(key, operator, values)| NodeSelectorRequirement {
+                    key: key.to_owned(),
+                    operator: operator.to_owned(),
+                    values,
+                }),
+            0..=2,
+        )
+        .prop_map(|match_expressions| NodeSelectorTerm { match_expressions })
+    }
+
+    fn arb_intent() -> impl Strategy<Value = SpawnIntent> {
+        (
+            proptest::collection::btree_map(
+                proptest::sample::select(&KEYS[..]).prop_map(str::to_owned),
+                proptest::sample::select(&VALS[..]).prop_map(str::to_owned),
+                0..=2,
+            ),
+            proptest::collection::vec(arb_term(), 0..=2),
+            proptest::collection::vec(
+                proptest::sample::select(&NODES[..]).prop_map(str::to_owned),
+                0..=4,
+            ),
+            1u32..=8,
+            1u64..=1u64 << 33,
+            0u32..=7200,
+        )
+            .prop_map(
+                |(node_selector, node_affinity, excluded_nodes, cores, mem_bytes, deadline)| {
+                    SpawnIntent {
+                        intent_id: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".into(),
+                        node_selector: node_selector.into_iter().collect(),
+                        node_affinity,
+                        excluded_nodes,
+                        cores,
+                        mem_bytes,
+                        disk_bytes: mem_bytes / 2,
+                        deadline_secs: deadline,
+                        ..Default::default()
+                    }
+                },
+            )
+    }
+
+    /// Mirror spec of `admits_ignoring_exclusion`: selector ⊆ labels ∧
+    /// (no terms ∨ some term's exprs all admit), with the fail-open
+    /// arm for operators the gate cannot evaluate.
+    fn mirror_pre(ri: &RenderInputs, labels: &BTreeMap<String, String>) -> bool {
+        let sel_ok = ri
+            .node_selector
+            .iter()
+            .all(|(k, v)| labels.get(k) == Some(v));
+        let aff_ok = ri.node_affinity.is_empty()
+            || ri.node_affinity.iter().any(|t| {
+                t.match_expressions
+                    .iter()
+                    .all(|r| match r.operator.as_str() {
+                        "In" => labels.get(&r.key).is_some_and(|v| r.values.contains(v)),
+                        "NotIn" => labels.get(&r.key).is_none_or(|v| !r.values.contains(v)),
+                        "Exists" => labels.contains_key(&r.key),
+                        "DoesNotExist" => !labels.contains_key(&r.key),
+                        _ => true,
+                    })
+            });
+        sel_ok && aff_ok
+    }
+
+    proptest! {
+        /// Law 1 (the single-universe conjunction): full admission is
+        /// EXACTLY pre-universe membership minus the exclusion axis —
+        /// the gate, the render's anti-affinity, and the pack can never
+        /// disagree about a node.
+        #[test]
+        fn admits_is_pre_minus_exclusion(intent in arb_intent(), nodes in arb_nodes()) {
+            let ri = RenderInputs::from_intent(&intent);
+            for n in &nodes {
+                prop_assert_eq!(
+                    ri.admits(&n.name, &n.labels),
+                    ri.admits_ignoring_exclusion(&n.labels) && !ri.excluded(&n.name)
+                );
+                prop_assert_eq!(ri.admits_ignoring_exclusion(&n.labels), mirror_pre(&ri, &n.labels));
+                prop_assert_eq!(node_excluded(&intent, &n.name), ri.excluded(&n.name));
+            }
+        }
+
+        /// Law 2 (exhaustion ≡ excluded-consumed-pre-universe): the AD2
+        /// verdict is true iff exclusions exist, some schedulable node
+        /// matches ignoring exclusion, and NO node is fully admitted —
+        /// pinned against an independent fold over the same universe.
+        #[test]
+        fn exhaustion_matches_mirror(intent in arb_intent(), nodes in arb_nodes()) {
+            let ri = RenderInputs::from_intent(&intent);
+            let pre: Vec<&CandidateNode> = nodes
+                .iter()
+                .filter(|n| n.schedulable && ri.admits_ignoring_exclusion(&n.labels))
+                .collect();
+            let expected = !intent.excluded_nodes.is_empty()
+                && !pre.is_empty()
+                && pre.iter().all(|n| ri.excluded(&n.name));
+            prop_assert_eq!(no_eligible_source(&intent, &nodes), expected);
+        }
+
+        /// Law 3 (fingerprint determinism + axis sensitivity): equal
+        /// inputs render equal fingerprints; growing the exclusion set
+        /// or re-solving the deadline drifts the fingerprint (the
+        /// drift-reap trigger merged_bug_249 depends on). The deadline
+        /// axis is sensitive in its RENDERED form: `ephemeral_deadline`
+        /// floors at 180 s, so sub-floor re-solves correctly do NOT
+        /// drift (this property originally asserted raw-field
+        /// sensitivity and the plane falsified it — the floor is the
+        /// law).
+        #[test]
+        fn fingerprint_deterministic_and_axis_sensitive(intent in arb_intent()) {
+            let a = RenderInputs::from_intent(&intent);
+            let b = RenderInputs::from_intent(&intent);
+            prop_assert_eq!(a.fingerprint(), b.fingerprint());
+
+            let mut grown = intent.clone();
+            grown.excluded_nodes.push("zz-not-a-node".into());
+            prop_assert_ne!(
+                RenderInputs::from_intent(&grown).fingerprint(),
+                a.fingerprint()
+            );
+
+            // Above the floor every re-solve drifts: 7300 exceeds both
+            // the 180 floor and the strategy's 7200 cap, so the
+            // rendered deadline always differs from the base's.
+            let mut redl = intent.clone();
+            redl.deadline_secs = 7300;
+            prop_assert_ne!(
+                RenderInputs::from_intent(&redl).fingerprint(),
+                a.fingerprint()
+            );
+
+            // And BELOW the floor, re-solves are render-equivalent:
+            // the fingerprint is the rendered tuple, not the raw wire.
+            let mut sub_a = intent.clone();
+            sub_a.deadline_secs = 0;
+            let mut sub_b = intent.clone();
+            sub_b.deadline_secs = 179;
+            prop_assert_eq!(
+                RenderInputs::from_intent(&sub_a).fingerprint(),
+                RenderInputs::from_intent(&sub_b).fingerprint()
+            );
+        }
+
+        /// Law 4 (persistence threshold): the streak fires iff it has
+        /// reached NO_ELIGIBLE_SOURCE_PERSIST_TICKS, and a reset (None)
+        /// always restarts at one-not-firing.
+        #[test]
+        fn streak_fires_only_at_threshold(prev in proptest::option::of(0u32..=10)) {
+            let (streak, fire) = exhausted_streak_step(prev);
+            prop_assert_eq!(streak, prev.unwrap_or(0).saturating_add(1));
+            prop_assert_eq!(fire, streak >= NO_ELIGIBLE_SOURCE_PERSIST_TICKS);
+            let (s1, f1) = exhausted_streak_step(None);
+            prop_assert_eq!((s1, f1), (1, false));
+        }
+    }
+}

@@ -19869,6 +19869,10 @@
           "packageId": "metrics-util"
         },
         {
+          "name": "proptest",
+          "packageId": "proptest"
+        },
+        {
           "name": "prost",
           "packageId": "prost"
         },

@@ -498,3 +498,147 @@ mod tests {
         );
     }
 }
+
+/// C2 formal-delta proptest plane 1: the wedge evidence laws over
+/// arbitrary open-attempt views — kinded (build only), attributed
+/// (ledger source_node only), deadline-true (expired = past
+/// deadline+grace, deadline known), first-observation anchored, and
+/// systemic-guarded. Pinned against a mirror specification.
+// r[verify ctrl.nodeclaim.wedge-two-axis]
+#[cfg(test)]
+mod proptests {
+    use proptest::prelude::*;
+    use rio_proto::types::OpenAttempt;
+    use std::collections::{HashMap, HashSet};
+
+    use super::*;
+
+    const DRVS: [&str; 5] = ["d0", "d1", "d2", "d3", "d4"];
+    const NODES: [&str; 5] = ["", "n0", "n1", "n2", "n3"];
+
+    fn arb_attempt() -> impl Strategy<Value = OpenAttempt> {
+        (
+            proptest::sample::select(&DRVS[..]),
+            proptest::sample::select(&NODES[..]),
+            prop_oneof![
+                Just(rio_proto::types::AttemptKind::Build as i32),
+                Just(rio_proto::types::AttemptKind::Materialization as i32),
+                Just(0i32),
+            ],
+            prop_oneof![Just(0u64), Just(10u64)],
+            prop_oneof![Just(0u64), Just(5u64), Just(100u64)],
+        )
+            .prop_map(|(intent, node, kind, deadline, age)| OpenAttempt {
+                intent_id: intent.to_owned(),
+                source_node: node.to_owned(),
+                attempt_kind: kind,
+                deadline_secs: deadline,
+                assigned_at_age_secs: age,
+                ..Default::default()
+            })
+    }
+
+    /// Mirror spec of one observation pass: which (node, drv) pairs are
+    /// evidence, and what the attributed fleet is.
+    fn mirror(attempts: &[OpenAttempt]) -> (HashMap<String, HashSet<String>>, HashSet<String>) {
+        let mut evidence: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut fleet = HashSet::new();
+        for a in attempts {
+            if a.attempt_kind != rio_proto::types::AttemptKind::Build as i32
+                || a.source_node.is_empty()
+            {
+                continue;
+            }
+            fleet.insert(a.source_node.clone());
+            if a.deadline_secs == 0
+                || a.assigned_at_age_secs <= a.deadline_secs + WEDGE_DEADLINE_GRACE_SECS
+            {
+                continue;
+            }
+            evidence
+                .entry(a.source_node.clone())
+                .or_default()
+                .insert(a.intent_id.clone());
+        }
+        (evidence, fleet)
+    }
+
+    proptest! {
+        /// The single-tick verdict law: wedged = nodes whose evidence
+        /// spans ≥ MIN_DISTINCT drvs; the verdict is Systemic (nothing
+        /// marked) iff ≥2 such nodes cover > the systemic fraction of
+        /// the attributed fleet, else exactly the mirror's node set,
+        /// sorted. Materialization / unattributed / deadline-unknown /
+        /// healthy attempts never contribute.
+        #[test]
+        fn verdict_matches_mirror(attempts in proptest::collection::vec(arb_attempt(), 0..=10)) {
+            let mut tracker = WedgeTracker::default();
+            let verdict = tracker.update(&attempts, 1_000_000.0);
+
+            let (evidence, fleet) = mirror(&attempts);
+            let mut expected: Vec<String> = evidence
+                .iter()
+                .filter(|(_, drvs)| drvs.len() >= WEDGE_CLUSTER_MIN_DISTINCT_DRVS)
+                .map(|(n, _)| n.clone())
+                .collect();
+            expected.sort();
+
+            let systemic = expected.len() >= 2
+                && !fleet.is_empty()
+                && (expected.len() as f64 / fleet.len() as f64) > WEDGE_SYSTEMIC_FRACTION;
+            match verdict {
+                WedgeVerdict::Systemic { affected, of } => {
+                    prop_assert!(systemic, "Systemic verdict outside the guard condition");
+                    prop_assert_eq!(affected, expected.len());
+                    prop_assert_eq!(of, fleet.len());
+                }
+                WedgeVerdict::NodeWedged(nodes) => {
+                    prop_assert!(!systemic, "guard condition met but nodes were marked");
+                    prop_assert_eq!(nodes, expected);
+                }
+            }
+        }
+
+        /// Idempotence (first-observation anchor): re-observing the
+        /// same view at the same instant changes nothing — a stuck
+        /// attempt re-observed every tick neither slides its window
+        /// nor double-counts.
+        #[test]
+        fn reobservation_is_idempotent(attempts in proptest::collection::vec(arb_attempt(), 0..=10)) {
+            let mut t1 = WedgeTracker::default();
+            let v1 = t1.update(&attempts, 1_000_000.0);
+            let v2 = t1.update(&attempts, 1_000_000.0);
+            let (n1, n2) = match (v1, v2) {
+                (WedgeVerdict::NodeWedged(a), WedgeVerdict::NodeWedged(b)) => (a, b),
+                (
+                    WedgeVerdict::Systemic { affected: a, of: oa },
+                    WedgeVerdict::Systemic { affected: b, of: ob },
+                ) => {
+                    prop_assert_eq!(a, b);
+                    prop_assert_eq!(oa, ob);
+                    return Ok(());
+                }
+                (a, b) => return Err(TestCaseError::fail(format!("verdict flipped: {a:?} vs {b:?}"))),
+            };
+            prop_assert_eq!(&n1, &n2);
+        }
+
+        /// Window conservation: every piece of evidence ages out — one
+        /// full window plus a tick after the last observation, an empty
+        /// view yields an empty verdict (nothing wedged forever).
+        #[test]
+        fn evidence_ages_out(attempts in proptest::collection::vec(arb_attempt(), 0..=10)) {
+            let mut tracker = WedgeTracker::default();
+            let _ = tracker.update(&attempts, 1_000_000.0);
+            let later = 1_000_000.0 + WEDGE_CLUSTER_WINDOW_SECS + 1.0;
+            match tracker.update(&[], later) {
+                WedgeVerdict::NodeWedged(nodes) => prop_assert!(nodes.is_empty()),
+                WedgeVerdict::Systemic { .. } => {
+                    return Err(TestCaseError::fail(
+                        proptest::test_runner::Reason::from("empty view cannot be systemic"),
+                    ));
+                }
+            }
+        }
+    }
+}

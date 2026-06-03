@@ -4477,6 +4477,255 @@ in
     };
 
     # ------------------------------------------------------------------
+    # Bughunt-wave C2 axes (areas A/C/D on Model J, areas E/F/G on the
+    # NodeClaim lifecycle): each fix is wired as a falsify/hold PAIR per
+    # the wave discipline — the as-built regime must keep falsifying the
+    # invariant (the bug stays expressible and found), the fixed-law
+    # regime must hold it, and a reachability witness keeps the hold
+    # non-vacuous. All pre-C2 regimes bind the axes false and are
+    # state-space identical (§4.F16). Local sampled measurements
+    # (quint run, rust backend) recorded in the introducing commit.
+
+    # C2/077 (area A): the AD2 fleet-exhaust verdict fires only at the
+    # third consecutive exhausted-and-wanted tick; a placeable tick
+    # resets the streak.
+    # r[verify ctrl.pool.no-eligible-persist]
+    quint-spawn-coherence-falsify-exhaust-asbuilt = mkQuintWitnessCheck {
+      name = "spawn-coherence-falsify-exhaust-asbuilt";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceExhaustAsBuilt";
+      witness = "noPoisonWhilePlaceable";
+    };
+    # r[verify ctrl.pool.no-eligible-persist]
+    quint-spawn-coherence-exhaust-persist = mkQuintCheck {
+      name = "spawn-coherence-exhaust-persist";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceExhaustPersist";
+      invariants = [
+        "ceilingRespected"
+        "reapSafety"
+        "orphanRemoved"
+        "ackSoundness"
+        "ackCoversPending"
+        "degradedPolarity"
+        "gateFailClosed"
+        "freedSlotsSpendable"
+        "noPoisonWhilePlaceable"
+      ];
+    };
+    quint-spawn-coherence-witness-poison = mkQuintWitnessCheck {
+      name = "spawn-coherence-witness-poison";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceExhaustPersist";
+      witness = "canReachPoison";
+    };
+
+    # C2/120 (area C): the AD5 cancel arm selects on CLOSE CAUSE — a
+    # CANCELLED entry in the recently_closed window with no covering
+    # open attempt — never on the absence of an open row.
+    # r[verify ctrl.job.cancel-close-cause]
+    quint-spawn-coherence-falsify-cancel-asbuilt = mkQuintWitnessCheck {
+      name = "spawn-coherence-falsify-cancel-asbuilt";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceCancelAsBuilt";
+      witness = "cancelArmDeletesOnlyCancelled";
+    };
+    # r[verify ctrl.job.cancel-close-cause]
+    quint-spawn-coherence-cancel-cause = mkQuintCheck {
+      name = "spawn-coherence-cancel-cause";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceCancelCause";
+      invariants = [
+        "ceilingRespected"
+        "reapSafety"
+        "orphanRemoved"
+        "ackSoundness"
+        "ackCoversPending"
+        "degradedPolarity"
+        "gateFailClosed"
+        "freedSlotsSpendable"
+        "cancelArmDeletesOnlyCancelled"
+      ];
+    };
+    quint-spawn-coherence-witness-cancel-reap = mkQuintWitnessCheck {
+      name = "spawn-coherence-witness-cancel-reap";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceCancelCause";
+      witness = "canReachCancelReap";
+    };
+
+    # C2/221 (area C): the orphan reap acts on the absence of an open
+    # attempt only once the serving leader is older than the grace —
+    # the never-pulled cohort gets one full grace against a NEW leader.
+    # The HOLD half rides the existing fault-lease regime (the gate
+    # forbids exactly the falsified trace there).
+    # r[verify ctrl.job.orphan-leader-age]
+    quint-spawn-coherence-falsify-young-leader-reap = mkQuintWitnessCheck {
+      name = "spawn-coherence-falsify-young-leader-reap";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceReapYoungLeader";
+      witness = "noReapOfNeverPulledBeforeLeaderAged";
+    };
+    # r[verify ctrl.job.orphan-leader-age]
+    # r[verify ctrl.ephemeral.reap-orphan-running+5]
+    quint-spawn-coherence-leader-age-hold = mkQuintCheck {
+      name = "spawn-coherence-leader-age-hold";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceFaultLease";
+      invariants = [ "noReapOfNeverPulledBeforeLeaderAged" ];
+    };
+
+    # C2/135 (area D): a synthesized close consumes only the attempt
+    # the controller observed open at decision time — the scheduler
+    # refuses an exec-pinned close whose attempt is no longer the open
+    # one; newest-open-wins resolution for synthesized verdicts is the
+    # falsified as-built law.
+    # r[verify sched.attempt.synthesized-verdict+3]
+    quint-spawn-coherence-falsify-synth-close-asbuilt = mkQuintWitnessCheck {
+      name = "spawn-coherence-falsify-synth-close-asbuilt";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceSynthCloseAsBuilt";
+      witness = "closeTargetsIssuedAttempt";
+    };
+    # r[verify sched.attempt.synthesized-verdict+3]
+    # r[verify ctrl.drain.disruption-target+4]
+    quint-spawn-coherence-synth-close-pinned = mkQuintCheck {
+      name = "spawn-coherence-synth-close-pinned";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceSynthClosePinned";
+      invariants = [
+        "ceilingRespected"
+        "reapSafety"
+        "orphanRemoved"
+        "ackSoundness"
+        "ackCoversPending"
+        "degradedPolarity"
+        "gateFailClosed"
+        "freedSlotsSpendable"
+        "closeTargetsIssuedAttempt"
+      ];
+    };
+    quint-spawn-coherence-witness-synth-close = mkQuintWitnessCheck {
+      name = "spawn-coherence-witness-synth-close";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceSynthClosePinned";
+      witness = "canReachSynthClose";
+    };
+
+    # C2/346 (area G): the lease-acquire edge is an epoch token — the
+    # amplify-class prev_idle clear fires once per acquisition, never
+    # once per reload-Err tick.
+    # r[verify ctrl.nodeclaim.acquire-edge-token]
+    quint-nodeclaim-falsify-epoch-asbuilt = mkQuintWitnessCheck {
+      name = "nodeclaim-falsify-epoch-asbuilt";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleEpochAsBuilt";
+      witness = "idleSpellSurvivesReloadErr";
+    };
+    # r[verify ctrl.nodeclaim.acquire-edge-token]
+    # r[verify ctrl.nodeclaim.lease-edge-polarity+3]
+    quint-nodeclaim-epoch = mkQuintCheck {
+      name = "nodeclaim-epoch";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleEpoch";
+      invariants = [
+        "boundsOK"
+        "idleReapSafety"
+        "iceMarkSoundness"
+        "bootSampleNotLost"
+        "noMassClearAfterFailover"
+        "reloadLatchRespected"
+        "singleEffectiveProvisioner"
+        "gateProducerGuarantee"
+        "provisioningBudget"
+        "coverRespectsMask"
+        "degradedCoverPolarity"
+        "idleSpellSurvivesReloadErr"
+      ];
+    };
+    quint-nodeclaim-witness-edge-idle-clear = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-edge-idle-clear";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleEpoch";
+      witness = "canReachEdgeIdleClear";
+    };
+
+    # C2/007 (area F): scheduler-bound ICE-clears produced by ticks
+    # that cannot deliver them are buffered, never discarded — the
+    # producing Registered edge is consume-once.
+    # r[verify ctrl.nodeclaim.evidence-buffered]
+    quint-nodeclaim-falsify-clear-dropped-asbuilt = mkQuintWitnessCheck {
+      name = "nodeclaim-falsify-clear-dropped-asbuilt";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleClearBufferAsBuilt";
+      witness = "iceClearDelivered";
+    };
+    # r[verify ctrl.nodeclaim.evidence-buffered]
+    # r[verify ctrl.nodeclaim.consolidate-only-degraded+3]
+    quint-nodeclaim-clear-buffer = mkQuintCheck {
+      name = "nodeclaim-clear-buffer";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleClearBuffer";
+      invariants = [
+        "boundsOK"
+        "idleReapSafety"
+        "iceMarkSoundness"
+        "bootSampleNotLost"
+        "noMassClearAfterFailover"
+        "reloadLatchRespected"
+        "singleEffectiveProvisioner"
+        "gateProducerGuarantee"
+        "provisioningBudget"
+        "coverRespectsMask"
+        "degradedCoverPolarity"
+        "iceClearDelivered"
+      ];
+    };
+    quint-nodeclaim-witness-buffered-clear = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-buffered-clear";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleClearBuffer";
+      witness = "canReachBufferedClearDelivered";
+    };
+
+    # C2/285 (area E): the binding snapshot is presence-preserving —
+    # every full-tick ack carries the bound set; present-and-empty
+    # CLEARS the scheduler's map (scale-to-zero says so).
+    # r[verify sched.snapshot.binding-presence]
+    quint-nodeclaim-falsify-snapshot-asbuilt = mkQuintWitnessCheck {
+      name = "nodeclaim-falsify-snapshot-asbuilt";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleSnapshotAsBuilt";
+      witness = "ackCarriesSnapshot";
+    };
+    # r[verify sched.snapshot.binding-presence]
+    quint-nodeclaim-snapshot-presence = mkQuintCheck {
+      name = "nodeclaim-snapshot-presence";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleSnapshot";
+      invariants = [
+        "boundsOK"
+        "idleReapSafety"
+        "iceMarkSoundness"
+        "bootSampleNotLost"
+        "noMassClearAfterFailover"
+        "reloadLatchRespected"
+        "singleEffectiveProvisioner"
+        "gateProducerGuarantee"
+        "provisioningBudget"
+        "coverRespectsMask"
+        "degradedCoverPolarity"
+        "ackCarriesSnapshot"
+      ];
+    };
+    quint-nodeclaim-witness-binding-cleared = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-binding-cleared";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleSnapshot";
+      witness = "canReachBindingCleared";
+    };
+
+    # ------------------------------------------------------------------
     # Gateway connection/session lifecycle campaign (gw-session-formal,
     # round-2 Track B), Phase 0 Stage C: the rio-gateway accept → auth →
     # channel open → exec admission → protocol session → teardown

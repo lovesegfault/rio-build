@@ -6283,6 +6283,7 @@ dependencies = [
  "metrics",
  "metrics-util",
  "parking_lot",
+ "proptest",
  "prost",
  "rand 0.10.1",
  "rio-auth",

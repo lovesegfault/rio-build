@@ -207,6 +207,9 @@ module nodeclaimLifecycle {
     | EDegradedReloadTick
     | EStaleRecordOnly
     | EPublished
+    | EEdgeIdleClear
+    | EBufferedClearDelivered
+    | EBindingCleared
 
   type Violation =
     | VIdleOverReap
@@ -222,6 +225,9 @@ module nodeclaimLifecycle {
     | VCreateNoCeilings
     | VCreateUnconfigured
     | VCoverMasked
+    | VIdleSpellLost
+    | VClearEvidenceDropped
+    | VStaleBinding
 
   // ------------------------------------------------------------------
   // 2. Constants
@@ -246,6 +252,27 @@ module nodeclaimLifecycle {
   const ENABLE_KARPENTER_FAULT: bool
   /// Whether the GetHwClassConfig global ceilings are loaded at init.
   const START_CEILINGS_KNOWN: bool
+  /// C2 area-G axis pair (bug_346): MACHINERY moves the edge-token
+  /// state + latch; ACQUIRE_EPOCH selects the FIXED law (the
+  /// amplify-class prev_idle clear fires once per acquisition, keyed
+  /// on the epoch token) vs the as-built per-reload-pending-tick
+  /// re-clear. All pre-C2 regimes bind both false — state-space
+  /// identical.
+  const ENABLE_EPOCH_MACHINERY: bool
+  const ENABLE_ACQUIRE_EPOCH: bool
+  /// C2 area-F axis pair (merged_bug_007): MACHINERY moves the
+  /// pending-clear buffer + the drop latch; EVIDENCE_BUFFER selects
+  /// the FIXED law (scheduler-bound ICE-clears produced on ⊥ /
+  /// consolidate-only ticks are buffered and drained into the next
+  /// full tick's ack) vs the as-built discard.
+  const ENABLE_CLEARBUF_MACHINERY: bool
+  const ENABLE_EVIDENCE_BUFFER: bool
+  /// C2 area-E axis pair (bug_285): MACHINERY moves the scheduler-side
+  /// binding map + latch; SNAPSHOT_PRESENCE selects the FIXED law
+  /// (every full-tick ack carries the snapshot — present-and-empty
+  /// CLEARS) vs the as-built empty-suppressed legacy field.
+  const ENABLE_SNAPSHOT_MACHINERY: bool
+  const ENABLE_SNAPSHOT_PRESENCE: bool
 
   pure val CLAIMS: Set[ClaimId] = Set("c1", "c2")
   pure val CELLS: Set[Cell] = Set("cellA", "cellB")
@@ -286,6 +313,16 @@ module nodeclaimLifecycle {
   var ceilingsKnown: bool
   /// Latch: at least one lease acquire has happened (witness scoping).
   var hadAcquire: bool
+  /// C2/346: the current acquisition's edge actions have run (the
+  /// epoch-token cursor, collapsed to a bool: false = an acquisition
+  /// edge is pending consumption). Constant true off-machinery.
+  var edgeClearDone: bool
+  /// C2/007: scheduler-bound ICE-clears consumed by non-delivering
+  /// ticks, awaiting the next full tick. Constant empty off-machinery.
+  var pendingClear: Set[Cell]
+  /// C2/285: the SCHEDULER's authoritative-binding map, abstracted to
+  /// the set of claims it believes bound. Constant empty off-machinery.
+  var schedBinding: Set[ClaimId]
   var effects: Set[Effect]
   var violations: Set[Violation]
 
@@ -324,6 +361,31 @@ module nodeclaimLifecycle {
   val canReachFreshClearAfterAcquire =
     not(hadAcquire and effects.contains(EClearEmitted))
   val canReachStaleRecordOnly = not(effects.contains(EStaleRecordOnly))
+
+  /// C2/346: an idle spell seeded under the current tenure survives a
+  /// reload-Err loop — the amplify-class prev_idle clear is an
+  /// acquisition-EDGE action, never a per-tick action. Falsified
+  /// as-built (the boolean latch re-cleared every Err tick); holds
+  /// with ENABLE_ACQUIRE_EPOCH.
+  val idleSpellSurvivesReloadErr = not(violations.contains(VIdleSpellLost))
+  /// C2/007: a fresh-tenure Registered edge consumed by a tick that
+  /// cannot deliver its ICE-clear (⊥ pre-threshold / consolidate-only)
+  /// never DROPS the clear — it is buffered for the next full tick.
+  /// Falsified as-built (the discard); holds with
+  /// ENABLE_EVIDENCE_BUFFER.
+  val iceClearDelivered = not(violations.contains(VClearEvidenceDropped))
+  /// C2/285: after every successful full-tick ack the scheduler's
+  /// binding map equals the controller's bound set — present-and-empty
+  /// clears (scale-to-zero says so). Falsified as-built (the all-empty
+  /// suppression + empty-means-no-snapshot legacy wire); holds with
+  /// ENABLE_SNAPSHOT_PRESENCE.
+  val ackCarriesSnapshot = not(violations.contains(VStaleBinding))
+
+  // C2 reachability witnesses (expected-violation checks in the hold
+  // regimes — non-vacuity).
+  val canReachEdgeIdleClear = not(effects.contains(EEdgeIdleClear))
+  val canReachBufferedClearDelivered = not(effects.contains(EBufferedClearDelivered))
+  val canReachBindingCleared = not(effects.contains(EBindingCleared))
 
   // ------------------------------------------------------------------
   // 5. Pure helpers (the per-phase pieces of the tick)
@@ -409,6 +471,9 @@ module nodeclaimLifecycle {
     configuredCells' = configuredCells,
     ceilingsKnown' = ceilingsKnown,
     hadAcquire' = hadAcquire,
+    edgeClearDone' = edgeClearDone,
+    pendingClear' = pendingClear,
+    schedBinding' = schedBinding,
     effects' = Set(),
     violations' = violations,
   }
@@ -432,11 +497,26 @@ module nodeclaimLifecycle {
       // Reload-latch processing (run loop, before the body): prev_idle
       // clears unconditionally; the load may fail and leave the latch.
       val loadOk = reloadPending and not(pgLoadFails)
+      // C2/346: the amplify-class prev_idle clear. Fixed law: keyed on
+      // the acquisition-edge token (once per acquisition, even across
+      // a reload-Err loop). As-built law: keyed on the still-pending
+      // reload latch (re-fires every Err tick — the bug).
+      val clearIdleNow =
+        if (ENABLE_EPOCH_MACHINERY and ENABLE_ACQUIRE_EPOCH) not(edgeClearDone)
+        else reloadPending
+      val idleTrackedNow =
+        CLAIMS.filter(k => aged.get(k).pIdle != INotTracked).size() > 0
+      // The latch: a re-clear — the edge actions already ran for this
+      // acquisition, yet a tick clears tracked idle spells again.
+      val vIdleLost =
+        ENABLE_EPOCH_MACHINERY and clearIdleNow and edgeClearDone and idleTrackedNow
+      // The witness: the EDGE clear acting on stale pre-tenure spells.
+      val edgeClearActed =
+        ENABLE_EPOCH_MACHINERY and clearIdleNow and not(edgeClearDone) and idleTrackedNow
       val afterLatch = CLAIMS.mapBy(k =>
-        if (reloadPending)
-          { ...aged.get(k), pIdle: INotTracked,
-            inflightTracked: if (loadOk) false else aged.get(k).inflightTracked }
-        else aged.get(k))
+        { ...aged.get(k),
+          pIdle: if (clearIdleNow) INotTracked else aged.get(k).pIdle,
+          inflightTracked: if (loadOk) false else aged.get(k).inflightTracked })
       val reloadStillPending = reloadPending and not(loadOk)
       // Kube-only observations (shared with reconcile_once and
       // consolidate_only — the whole point of the fix).
@@ -445,8 +525,21 @@ module nodeclaimLifecycle {
       val afterObs = CLAIMS.mapBy(k => obsReg.get(k)._1)
       val staleRecordOnly = CLAIMS.filter(k => obsReg.get(k)._3).size() > 0
       val lostSamples = CLAIMS.filter(k => obsReg.get(k)._4).size() > 0
+      // C2/007: scheduler-bound clears produced by THIS non-delivering
+      // tick — buffered (fixed) or dropped-with-latch (as-built).
+      val freshClears: Set[Cell] =
+        CLAIMS.filter(k => obsReg.get(k)._2).map(k => afterObs.get(k).cell)
+      val vClearDropped =
+        ENABLE_CLEARBUF_MACHINERY and not(ENABLE_EVIDENCE_BUFFER)
+        and freshClears.size() > 0
       all {
         claims' = afterObs,
+        edgeClearDone' = if (ENABLE_EPOCH_MACHINERY) true else edgeClearDone,
+        pendingClear' =
+          if (ENABLE_CLEARBUF_MACHINERY and ENABLE_EVIDENCE_BUFFER)
+            pendingClear.union(freshClears)
+          else pendingClear,
+        schedBinding' = schedBinding,
         placeableArmed' = if (losePending) false else placeableArmed,
         losePending' = false,
         isLeader' = isLeader,
@@ -459,13 +552,16 @@ module nodeclaimLifecycle {
         effects' = Set()
           .union(if (staleRecordOnly) Set(EStaleRecordOnly) else Set())
           .union(if (reloadStillPending) Set(EDegradedReloadTick) else Set())
+          .union(if (edgeClearActed) Set(EEdgeIdleClear) else Set())
           .union(if (reloadPending and CLAIMS.filter(k => claims.get(k).inflightTracked).size() > 0)
                    Set(EAcquireWithInflight) else Set()),
         // lostSamples retained as the latch: with observations on every
         // leader tick it is structurally unreachable in fault-rpc (the
         // bootSampleNotLost HOLD invariant pins exactly that).
         violations' = violations
-          .union(if (lostSamples) Set(VBootSampleLost) else Set()),
+          .union(if (lostSamples) Set(VBootSampleLost) else Set())
+          .union(if (vIdleLost) Set(VIdleSpellLost) else Set())
+          .union(if (vClearDropped) Set(VClearEvidenceDropped) else Set()),
       }
   }
 
@@ -487,11 +583,26 @@ module nodeclaimLifecycle {
       // Reload-latch processing (run loop, before the body): prev_idle
       // clears unconditionally; the load may fail and leave the latch.
       val loadOk = reloadPending and not(pgLoadFails)
+      // C2/346: the amplify-class prev_idle clear. Fixed law: keyed on
+      // the acquisition-edge token (once per acquisition, even across
+      // a reload-Err loop). As-built law: keyed on the still-pending
+      // reload latch (re-fires every Err tick — the bug).
+      val clearIdleNow =
+        if (ENABLE_EPOCH_MACHINERY and ENABLE_ACQUIRE_EPOCH) not(edgeClearDone)
+        else reloadPending
+      val idleTrackedNow =
+        CLAIMS.filter(k => aged.get(k).pIdle != INotTracked).size() > 0
+      // The latch: a re-clear — the edge actions already ran for this
+      // acquisition, yet a tick clears tracked idle spells again.
+      val vIdleLost =
+        ENABLE_EPOCH_MACHINERY and clearIdleNow and edgeClearDone and idleTrackedNow
+      // The witness: the EDGE clear acting on stale pre-tenure spells.
+      val edgeClearActed =
+        ENABLE_EPOCH_MACHINERY and clearIdleNow and not(edgeClearDone) and idleTrackedNow
       val afterLatch = CLAIMS.mapBy(k =>
-        if (reloadPending)
-          { ...aged.get(k), pIdle: INotTracked,
-            inflightTracked: if (loadOk) false else aged.get(k).inflightTracked }
-        else aged.get(k))
+        { ...aged.get(k),
+          pIdle: if (clearIdleNow) INotTracked else aged.get(k).pIdle,
+          inflightTracked: if (loadOk) false else aged.get(k).inflightTracked })
       val reloadStillPending = reloadPending and not(loadOk)
       // Kube-only observations (r43 bug_023: shared with reconcile_once).
       val observed = CLAIMS.mapBy(k => observeIdleToBusy(afterLatch.get(k)))
@@ -499,6 +610,12 @@ module nodeclaimLifecycle {
       val afterObs = CLAIMS.mapBy(k => obsReg.get(k)._1)
       val staleRecordOnly = CLAIMS.filter(k => obsReg.get(k)._3).size() > 0
       val lostSamples = CLAIMS.filter(k => obsReg.get(k)._4).size() > 0
+      // C2/007: same buffered-or-dropped split as the ⊥ tick.
+      val freshClears: Set[Cell] =
+        CLAIMS.filter(k => obsReg.get(k)._2).map(k => afterObs.get(k).cell)
+      val vClearDropped =
+        ENABLE_CLEARBUF_MACHINERY and not(ENABLE_EVIDENCE_BUFFER)
+        and freshClears.size() > 0
       // Unhealthy reap (the stuck in-flight arm) — ICE cells dropped
       // (no scheduler to report to), names still pruned from inflight.
       val stuckReaped = CLAIMS.filter(k =>
@@ -531,6 +648,12 @@ module nodeclaimLifecycle {
         else c)
       all {
         claims' = claimsAfter,
+        edgeClearDone' = if (ENABLE_EPOCH_MACHINERY) true else edgeClearDone,
+        pendingClear' =
+          if (ENABLE_CLEARBUF_MACHINERY and ENABLE_EVIDENCE_BUFFER)
+            pendingClear.union(freshClears)
+          else pendingClear,
+        schedBinding' = schedBinding,
         placeableArmed' = if (losePending) false else placeableArmed,
         losePending' = false,
         isLeader' = isLeader,
@@ -546,12 +669,15 @@ module nodeclaimLifecycle {
           .union(if (vanished.size() > 0) Set(EVanishDetected) else Set())
           .union(if (staleRecordOnly) Set(EStaleRecordOnly) else Set())
           .union(if (reloadStillPending) Set(EDegradedReloadTick) else Set())
+          .union(if (edgeClearActed) Set(EEdgeIdleClear) else Set())
           .union(if (reloadPending and CLAIMS.filter(k => claims.get(k).inflightTracked).size() > 0)
                    Set(EAcquireWithInflight) else Set()),
         violations' = violations
           .union(if (overReap) Set(VIdleOverReap) else Set())
           .union(if (spurious) Set(VSpuriousMark) else Set())
-          .union(if (lostSamples) Set(VBootSampleLost) else Set()),
+          .union(if (lostSamples) Set(VBootSampleLost) else Set())
+          .union(if (vIdleLost) Set(VIdleSpellLost) else Set())
+          .union(if (vClearDropped) Set(VClearEvidenceDropped) else Set()),
       }
   }
 
@@ -573,11 +699,26 @@ module nodeclaimLifecycle {
       // ---- run-loop prelude: lose flag, then the reload latch --------
       val gateAfterLose = if (losePending) false else placeableArmed
       val loadOk = reloadPending and not(pgLoadFails)
+      // C2/346: the amplify-class prev_idle clear. Fixed law: keyed on
+      // the acquisition-edge token (once per acquisition, even across
+      // a reload-Err loop). As-built law: keyed on the still-pending
+      // reload latch (re-fires every Err tick — the bug).
+      val clearIdleNow =
+        if (ENABLE_EPOCH_MACHINERY and ENABLE_ACQUIRE_EPOCH) not(edgeClearDone)
+        else reloadPending
+      val idleTrackedNow =
+        CLAIMS.filter(k => aged.get(k).pIdle != INotTracked).size() > 0
+      // The latch: a re-clear — the edge actions already ran for this
+      // acquisition, yet a tick clears tracked idle spells again.
+      val vIdleLost =
+        ENABLE_EPOCH_MACHINERY and clearIdleNow and edgeClearDone and idleTrackedNow
+      // The witness: the EDGE clear acting on stale pre-tenure spells.
+      val edgeClearActed =
+        ENABLE_EPOCH_MACHINERY and clearIdleNow and not(edgeClearDone) and idleTrackedNow
       val afterLatch = CLAIMS.mapBy(k =>
-        if (reloadPending)
-          { ...aged.get(k), pIdle: INotTracked,
-            inflightTracked: if (loadOk) false else aged.get(k).inflightTracked }
-        else aged.get(k))
+        { ...aged.get(k),
+          pIdle: if (clearIdleNow) INotTracked else aged.get(k).pIdle,
+          inflightTracked: if (loadOk) false else aged.get(k).inflightTracked })
       val reloadStillPending = reloadPending and not(loadOk)
       val acquireWithInflight =
         reloadPending and CLAIMS.filter(k => claims.get(k).inflightTracked).size() > 0
@@ -585,7 +726,13 @@ module nodeclaimLifecycle {
       val observed = CLAIMS.mapBy(k => observeIdleToBusy(afterLatch.get(k)))
       val obsReg = CLAIMS.mapBy(k => observeRegistered(observed.get(k)))
       val afterObs = CLAIMS.mapBy(k => obsReg.get(k)._1)
-      val clears: Set[Cell] = CLAIMS.filter(k => obsReg.get(k)._2).map(k => afterObs.get(k).cell)
+      val freshClearsFull: Set[Cell] =
+        CLAIMS.filter(k => obsReg.get(k)._2).map(k => afterObs.get(k).cell)
+      // C2/007: the buffered clears from ⊥/consolidate ticks drain into
+      // THIS tick's ack alongside the fresh ones.
+      val clears: Set[Cell] = freshClearsFull.union(
+        if (ENABLE_CLEARBUF_MACHINERY and ENABLE_EVIDENCE_BUFFER) pendingClear
+        else Set())
       val staleRecordOnly = CLAIMS.filter(k => obsReg.get(k)._3).size() > 0
       val lostSamples = CLAIMS.filter(k => obsReg.get(k)._4).size() > 0
       // ---- FFD outcome (opaque): reserved registered idle claims ------
@@ -646,6 +793,29 @@ module nodeclaimLifecycle {
       val ackOk = ackPayload and not(ackFails)
       val iceMaskedAfter = if (ackOk) iceMasked.union(marksThisTick).exclude(clears) else iceMasked
       val clearOfMasked = ackOk and clears.intersect(iceMasked).size() > 0
+      val bufferedDelivered =
+        ENABLE_CLEARBUF_MACHINERY and ENABLE_EVIDENCE_BUFFER
+        and ackOk and pendingClear.size() > 0
+      // C2/285: the binding snapshot. Fixed law: the full-tick ack is
+      // ALWAYS sent (the snapshot is its payload — present-and-empty
+      // clears) and the scheduler wholesale-rebuilds. As-built law:
+      // the all-empty tick is suppressed and an empty bound set means
+      // "no snapshot" — the scheduler keeps its stale map.
+      val boundNow = CLAIMS.filter(k =>
+        afterObs.get(k).phase == CRegistered and afterObs.get(k).spell == SNotIdle)
+      val snapAckOk =
+        if (ENABLE_SNAPSHOT_PRESENCE) not(ackFails)
+        else (ackPayload or boundNow.size() > 0) and not(ackFails)
+      val schedBindingAfter =
+        if (not(ENABLE_SNAPSHOT_MACHINERY)) schedBinding
+        else if (ENABLE_SNAPSHOT_PRESENCE and snapAckOk) boundNow
+        else if (not(ENABLE_SNAPSHOT_PRESENCE) and snapAckOk and boundNow.size() > 0) boundNow
+        else schedBinding
+      val vStaleBinding =
+        ENABLE_SNAPSHOT_MACHINERY and snapAckOk and schedBindingAfter != boundNow
+      val bindingCleared =
+        ENABLE_SNAPSHOT_MACHINERY and ENABLE_SNAPSHOT_PRESENCE and snapAckOk
+        and boundNow.size() == 0 and schedBinding.size() > 0
       // ---- reap_idle ------------------------------------------------------
       val idleReaped = CLAIMS.filter(k =>
         val c = afterObs.get(k)
@@ -689,6 +859,14 @@ module nodeclaimLifecycle {
       val vGateProd = losePending and not(isLeader)
       all {
         claims' = claimsAfter,
+        edgeClearDone' = if (ENABLE_EPOCH_MACHINERY) true else edgeClearDone,
+        // Drained whether or not the ack lands (mirrors the code's
+        // mem::take before the RPC; an ack failure loses the batch —
+        // recorded residual, same as fresh same-tick edges).
+        pendingClear' =
+          if (ENABLE_CLEARBUF_MACHINERY and ENABLE_EVIDENCE_BUFFER) Set()
+          else pendingClear,
+        schedBinding' = schedBindingAfter,
         placeableArmed' = true,
         losePending' = false,
         isLeader' = isLeader,
@@ -712,7 +890,10 @@ module nodeclaimLifecycle {
           .union(if (dropA or dropB) Set(EUnknownCellDrop) else Set())
           .union(if (acquireWithInflight) Set(EAcquireWithInflight) else Set())
           .union(if (reloadStillPending) Set(EDegradedReloadTick) else Set())
-          .union(if (staleRecordOnly) Set(EStaleRecordOnly) else Set()),
+          .union(if (staleRecordOnly) Set(EStaleRecordOnly) else Set())
+          .union(if (edgeClearActed) Set(EEdgeIdleClear) else Set())
+          .union(if (bufferedDelivered) Set(EBufferedClearDelivered) else Set())
+          .union(if (bindingCleared) Set(EBindingCleared) else Set()),
         violations' = violations
           .union(if (overReap) Set(VIdleOverReap) else Set())
           .union(if (spurious) Set(VSpuriousMark) else Set())
@@ -723,7 +904,9 @@ module nodeclaimLifecycle {
           .union(if (vNoCeil) Set(VCreateNoCeilings) else Set())
           .union(if (vUnconfigured) Set(VCreateUnconfigured) else Set())
           .union(if (vMasked) Set(VCoverMasked) else Set())
-          .union(if (vGateProd) Set(VGateProducer) else Set()),
+          .union(if (vGateProd) Set(VGateProducer) else Set())
+          .union(if (vIdleLost) Set(VIdleSpellLost) else Set())
+          .union(if (vStaleBinding) Set(VStaleBinding) else Set()),
       }
   }
 
@@ -742,6 +925,9 @@ module nodeclaimLifecycle {
   // ------------------------------------------------------------------
   action envFrame = all {
     isLeader' = isLeader,
+    edgeClearDone' = edgeClearDone,
+    pendingClear' = pendingClear,
+    schedBinding' = schedBinding,
     losePending' = losePending,
     reloadPending' = reloadPending,
     botStreak' = botStreak,
@@ -839,6 +1025,8 @@ module nodeclaimLifecycle {
     placeableArmed' = placeableArmed,
     configuredCells' = configuredCells, ceilingsKnown' = ceilingsKnown,
     hadAcquire' = hadAcquire, effects' = effects, violations' = violations,
+    edgeClearDone' = edgeClearDone, pendingClear' = pendingClear,
+    schedBinding' = schedBinding,
   }
 
   /// The lease is lost: the on_lose hook arms the unarm-gate flag.
@@ -852,6 +1040,8 @@ module nodeclaimLifecycle {
     placeableArmed' = placeableArmed, iceMasked' = iceMasked,
     configuredCells' = configuredCells, ceilingsKnown' = ceilingsKnown,
     hadAcquire' = hadAcquire, effects' = effects, violations' = violations,
+    edgeClearDone' = edgeClearDone, pendingClear' = pendingClear,
+    schedBinding' = schedBinding,
   }
 
   /// The lease is (re-)acquired: the on_acquire hook arms the reload
@@ -863,6 +1053,15 @@ module nodeclaimLifecycle {
     reloadPending' = true,
     hadAcquire' = true,
     claims' = CLAIMS.mapBy(k => acquireRekey(claims.get(k))),
+    // C2/346: a NEW acquisition arms the edge token (the on_acquire
+    // fetch_add); the first leader tick consumes it.
+    edgeClearDone' = if (ENABLE_EPOCH_MACHINERY) false else edgeClearDone,
+    // C2/007: suppress polarity — pre-tenure buffered evidence must
+    // not ship a stale clear under the new tenure (mirrors the code's
+    // edge reset; the Rust pin is pending_evidence_cleared_on_acquire_edge).
+    pendingClear' =
+      if (ENABLE_CLEARBUF_MACHINERY) Set() else pendingClear,
+    schedBinding' = schedBinding,
     losePending' = losePending, botStreak' = botStreak,
     placeableArmed' = placeableArmed, iceMasked' = iceMasked,
     configuredCells' = configuredCells, ceilingsKnown' = ceilingsKnown,
@@ -886,6 +1085,12 @@ module nodeclaimLifecycle {
     iceMasked' = iceMasked,
     configuredCells' = configuredCells, ceilingsKnown' = ceilingsKnown,
     hadAcquire' = hadAcquire, effects' = effects, violations' = violations,
+    // A restart loses the in-memory buffer (crash loss is outside the
+    // discard latch — recorded residual) and has no pending edge until
+    // the next acquisition; the scheduler's map is its own state.
+    edgeClearDone' = if (ENABLE_EPOCH_MACHINERY) true else edgeClearDone,
+    pendingClear' = if (ENABLE_CLEARBUF_MACHINERY) Set() else pendingClear,
+    schedBinding' = schedBinding,
   }
 
   /// GetHwClassConfig finally delivers the global ceilings.
@@ -898,6 +1103,8 @@ module nodeclaimLifecycle {
     placeableArmed' = placeableArmed, iceMasked' = iceMasked,
     configuredCells' = configuredCells,
     hadAcquire' = hadAcquire, effects' = effects, violations' = violations,
+    edgeClearDone' = edgeClearDone, pendingClear' = pendingClear,
+    schedBinding' = schedBinding,
   }
 
   /// The config mirror loses a cell (hwClass removed mid-rollout).
@@ -912,6 +1119,8 @@ module nodeclaimLifecycle {
     placeableArmed' = placeableArmed, iceMasked' = iceMasked,
     ceilingsKnown' = ceilingsKnown,
     hadAcquire' = hadAcquire, effects' = effects, violations' = violations,
+    edgeClearDone' = edgeClearDone, pendingClear' = pendingClear,
+    schedBinding' = schedBinding,
   }
 
   /// The next refresh restores the cell.
@@ -925,6 +1134,8 @@ module nodeclaimLifecycle {
     placeableArmed' = placeableArmed, iceMasked' = iceMasked,
     ceilingsKnown' = ceilingsKnown,
     hadAcquire' = hadAcquire, effects' = effects, violations' = violations,
+    edgeClearDone' = edgeClearDone, pendingClear' = pendingClear,
+    schedBinding' = schedBinding,
   }
 
   // ------------------------------------------------------------------
@@ -941,6 +1152,9 @@ module nodeclaimLifecycle {
     configuredCells' = CELLS,
     ceilingsKnown' = START_CEILINGS_KNOWN,
     hadAcquire' = false,
+    edgeClearDone' = true,
+    pendingClear' = Set(),
+    schedBinding' = Set(),
     effects' = Set(),
     violations' = Set(),
   }
@@ -987,7 +1201,13 @@ module nodeclaimLifecycleBase {
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
     ENABLE_KARPENTER_FAULT = false,
-    START_CEILINGS_KNOWN = true
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false
   ).*
 }
 
@@ -1004,7 +1224,13 @@ module nodeclaimLifecycleFaultRpc {
     ENABLE_RPC_FAULT = true,
     ENABLE_LEASE_FAULT = false,
     ENABLE_KARPENTER_FAULT = false,
-    START_CEILINGS_KNOWN = false
+    START_CEILINGS_KNOWN = false,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false
   ).*
 
   /// The conflation trace, post-fix: the claim is observed idle, goes
@@ -1051,7 +1277,13 @@ module nodeclaimLifecycleFaultLease {
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = true,
     ENABLE_KARPENTER_FAULT = false,
-    START_CEILINGS_KNOWN = true
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false
   ).*
 }
 
@@ -1067,6 +1299,148 @@ module nodeclaimLifecycleFaultKarpenter {
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
     ENABLE_KARPENTER_FAULT = true,
-    START_CEILINGS_KNOWN = true
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false
+  ).*
+}
+
+/// C2/346 FALSIFY half: the as-built boolean reload latch re-runs the
+/// amplify-class prev_idle clear on EVERY Err tick of a PG outage —
+/// idleSpellSurvivesReloadErr is expected to be violated (an idle
+/// spell seeded under the current tenure is re-cleared).
+module nodeclaimLifecycleEpochAsBuilt {
+  import nodeclaimLifecycle(
+    MAX_FLEET_CORES = 2,
+    CLASS_CAP_A = 1,
+    PER_CELL_TICK_CAP = 1,
+    BOT_THRESHOLD = 2,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = true,
+    ENABLE_KARPENTER_FAULT = false,
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = true,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false
+  ).*
+}
+
+/// C2/346 HOLD half: the acquisition-epoch token — edge actions fire
+/// exactly once per acquisition; a re-acquire mid-Err-loop is a new
+/// epoch and re-fires once. canReachEdgeIdleClear keeps it
+/// non-vacuous (the edge clear acts on stale pre-tenure spells).
+module nodeclaimLifecycleEpoch {
+  import nodeclaimLifecycle(
+    MAX_FLEET_CORES = 2,
+    CLASS_CAP_A = 1,
+    PER_CELL_TICK_CAP = 1,
+    BOT_THRESHOLD = 2,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = true,
+    ENABLE_KARPENTER_FAULT = false,
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = true,
+    ENABLE_ACQUIRE_EPOCH = true,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false
+  ).*
+}
+
+/// C2/007 FALSIFY half: the as-built ⊥/consolidate ticks DISCARD the
+/// scheduler-bound ICE-clear of a consumed (consume-once) Registered
+/// edge — iceClearDelivered is expected to be violated.
+module nodeclaimLifecycleClearBufferAsBuilt {
+  import nodeclaimLifecycle(
+    MAX_FLEET_CORES = 2,
+    CLASS_CAP_A = 1,
+    PER_CELL_TICK_CAP = 1,
+    BOT_THRESHOLD = 2,
+    ENABLE_RPC_FAULT = true,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_KARPENTER_FAULT = false,
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = true,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false
+  ).*
+}
+
+/// C2/007 HOLD half: the must-use evidence buffer — clears produced on
+/// non-delivering ticks are buffered and drained into the next full
+/// tick's ack. canReachBufferedClearDelivered keeps it non-vacuous.
+module nodeclaimLifecycleClearBuffer {
+  import nodeclaimLifecycle(
+    MAX_FLEET_CORES = 2,
+    CLASS_CAP_A = 1,
+    PER_CELL_TICK_CAP = 1,
+    BOT_THRESHOLD = 2,
+    ENABLE_RPC_FAULT = true,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_KARPENTER_FAULT = false,
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = true,
+    ENABLE_EVIDENCE_BUFFER = true,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false
+  ).*
+}
+
+/// C2/285 FALSIFY half: the as-built ack suppresses the all-empty tick
+/// and an empty bound set means "no snapshot" — after scale-to-zero
+/// the scheduler keeps a stale binding map (ackCarriesSnapshot is
+/// expected to be violated).
+module nodeclaimLifecycleSnapshotAsBuilt {
+  import nodeclaimLifecycle(
+    MAX_FLEET_CORES = 2,
+    CLASS_CAP_A = 1,
+    PER_CELL_TICK_CAP = 1,
+    BOT_THRESHOLD = 2,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_KARPENTER_FAULT = false,
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_SNAPSHOT_MACHINERY = true,
+    ENABLE_SNAPSHOT_PRESENCE = false
+  ).*
+}
+
+/// C2/285 HOLD half: presence-preserving snapshots — every full-tick
+/// ack carries the bound set and present-and-empty CLEARS.
+/// canReachBindingCleared keeps it non-vacuous (a scale-to-zero tick
+/// actually clears a previously non-empty map).
+module nodeclaimLifecycleSnapshot {
+  import nodeclaimLifecycle(
+    MAX_FLEET_CORES = 2,
+    CLASS_CAP_A = 1,
+    PER_CELL_TICK_CAP = 1,
+    BOT_THRESHOLD = 2,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_KARPENTER_FAULT = false,
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_SNAPSHOT_MACHINERY = true,
+    ENABLE_SNAPSHOT_PRESENCE = true
   ).*
 }

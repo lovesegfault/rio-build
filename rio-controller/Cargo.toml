@@ -69,3 +69,6 @@ tokio = { workspace = true, features = ["test-util"] }
 prost = { workspace = true }
 # Counter assertions in nodeclaim_pool tests (intent_dropped_total reasons).
 metrics-util = { workspace = true }
+# C2 formal-delta proptest planes (candidate-set equivalence; wedge
+# evidence laws).
+proptest = { workspace = true }

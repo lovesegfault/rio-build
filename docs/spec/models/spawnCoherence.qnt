@@ -156,6 +156,11 @@ module spawnCoherence {
   /// The placeable gate as the consumer sees it (CRD-present runs).
   type GateState = GUnarmed | GArmed(Set[IntentId])
 
+  /// C2/120: the intent's entry in the scheduler's `recently_closed`
+  /// window (CCNone = no entry). Single-valued last-writer abstraction
+  /// of the per-exec window.
+  type CloseCause = CCNone | CCCompleted | CCCancelled
+
   type JobRec = { phase: JobPhase, age: Age, fp: Fp, podRunning: bool }
 
   /// Per-tick observable effects (rewritten every tick) — the witness
@@ -174,6 +179,9 @@ module spawnCoherence {
     | EExcessSuppressed
     | EMatJobFiltered
     | EEstablished
+    | EPoisoned
+    | ECancelReap
+    | ESynthClose
 
   /// Violation latches. Each invariant below is `not(contains(...))`;
   /// in a correct model every latch stays unset forever, so these add
@@ -189,6 +197,10 @@ module spawnCoherence {
     | VFreedSlotUnused
     | VMatJobServed
     | VEstablishedEarly
+    | VPoisonTransient
+    | VCancelNonCancelled
+    | VYoungLeaderReap
+    | VStaleClose
 
   // ------------------------------------------------------------------
   // 2. Constants (regime modules instantiate these)
@@ -229,6 +241,28 @@ module spawnCoherence {
   /// never to a shrunk mint-time re-solve. C2's four axes follow this
   /// same gating (announced in the wave log).
   const ENABLE_RENDERED_DEADLINE: bool
+  /// C2 area-A axis pair (bug_077 fleet-exhaust persistence): POISON
+  /// turns on the exhaustion environment + the AD2 spawn-gate verdict;
+  /// PERSIST selects the FIXED law (poison only at the third
+  /// consecutive exhausted tick) vs the as-built immediate poison.
+  const ENABLE_EXHAUST_POISON: bool
+  const ENABLE_EXHAUST_PERSIST: bool
+  /// C2 area-C axis pair (bug_120 close-cause): ASBUILT models the
+  /// retired closed→active edge inference over tick-local seen-open
+  /// evidence; CAUSE models the recently_closed cause-witness arm.
+  /// Mutually exclusive by regime construction.
+  const ENABLE_CANCEL_ASBUILT: bool
+  const ENABLE_CANCEL_CAUSE: bool
+  /// C2 area-C axis (merged_bug_221): true = the as-built reap with NO
+  /// leader-age gate (the c473655f4 pin's behavior). All pre-C2
+  /// regimes bind false and keep the gate — state-space identical.
+  const ENABLE_YOUNG_LEADER_REAP: bool
+  /// C2 area-D axis pair (merged_bug_135): SYNTH turns on the
+  /// disruption-decide / close-land machinery; PINNED selects the
+  /// exec-pinned law (a close lands only on the OBSERVED attempt;
+  /// otherwise refused) vs the as-built newest-open-wins resolution.
+  const ENABLE_SYNTH_CLOSE: bool
+  const ENABLE_EXEC_PINNED: bool
 
   pure val INTENTS: Set[IntentId] = Set("i1", "i2")
 
@@ -257,6 +291,10 @@ module spawnCoherence {
   /// Age ordering for the oldest-first excess sort (older = larger).
   pure def ageRank(a: Age): int =
     match a { AgeFresh => 0 | AgePastPending => 1 | AgePastOrphan => 2 }
+
+  /// NO_ELIGIBLE_SOURCE_PERSIST_TICKS clamp (the streak saturates at
+  /// the poison threshold; higher counts are behaviorally identical).
+  pure def clampStreak(n: int): int = if (n > 3) 3 else n
 
   /// Deterministic intent order — stands in for the scheduler's
   /// priority sort and the oldest-first tie-break.
@@ -297,6 +335,25 @@ module spawnCoherence {
   /// rendered threshold; the pre-fix shrunk re-solve would have fired
   /// at AgePastPending).
   var renderedFarDl: IntentId -> bool
+  /// C2/120: the recently_closed window entry per intent (env-driven;
+  /// constant CCNone unless a cancel axis is on).
+  var closedCause: IntentId -> CloseCause
+  /// C2/120 as-built arm: the tick-local covered-by-open-attempt
+  /// evidence map (constant-false unless ENABLE_CANCEL_ASBUILT).
+  var seenOpen: IntentId -> bool
+  /// C2/077: this tick the candidate set excludes every spawnable
+  /// source for the intent (env-driven; constant-false off-axis).
+  var exhausted: IntentId -> bool
+  /// C2/077: consecutive exhausted-and-wanted ticks (clamped at 3;
+  /// constant-zero off-axis).
+  var streak: IntentId -> int
+  /// C2/135: a synthesized preempted close is in flight for the intent
+  /// (decided, not yet landed). Constant-false unless ENABLE_SYNTH_CLOSE.
+  var pendingClose: IntentId -> bool
+  /// C2/135: the attempt the disruption watcher OBSERVED open is still
+  /// the open one (false the moment that attempt ends, and never set by
+  /// a successor attempt). Constant-false unless ENABLE_SYNTH_CLOSE.
+  var obsLive: IntentId -> bool
 
   // ------------------------------------------------------------------
   // 5. Invariants
@@ -338,6 +395,36 @@ module spawnCoherence {
   /// Violated when an establishment actually happens (the rendered-
   /// deadline regime's contended edge is reachable — non-vacuity).
   val canReachEstablished = not(effects.contains(EEstablished))
+
+  /// C2/077: the AD2 fleet-exhaust verdict fires only after the full
+  /// persistence window — a transient (sub-threshold) exhaustion never
+  /// poisons a derivation that still has a placeable source within the
+  /// window. Falsified as-built (immediate poison); holds with
+  /// ENABLE_EXHAUST_PERSIST.
+  val noPoisonWhilePlaceable = not(violations.contains(VPoisonTransient))
+  /// C2/120: the AD5 cancel arm deletes only Jobs whose close cause is
+  /// CANCELLED. Falsified as-built (the closed→active edge is
+  /// cause-blind: a normal completion in the Job-status lag window is
+  /// selected); holds with ENABLE_CANCEL_CAUSE.
+  val cancelArmDeletesOnlyCancelled = not(violations.contains(VCancelNonCancelled))
+  /// C2/221: a never-pulled Running Job (no executor entry) is never
+  /// orphan-reaped while the serving leader is younger than the grace.
+  /// Falsified with ENABLE_YOUNG_LEADER_REAP (the as-built gate-less
+  /// reap); holds in every gated regime including fault-lease.
+  val noReapOfNeverPulledBeforeLeaderAged = not(violations.contains(VYoungLeaderReap))
+  /// C2/135: a synthesized close consumes only the attempt the
+  /// controller OBSERVED open at decision time — never a successor
+  /// attempt minted in the decide→land window. Falsified as-built
+  /// (newest-open-wins intent resolution); holds with
+  /// ENABLE_EXEC_PINNED (the scheduler refuses instead).
+  val closeTargetsIssuedAttempt = not(violations.contains(VStaleClose))
+
+  // C2 reachability witnesses (each wired as an expected-violation
+  // check in its hold regime — the invariants above must not hold
+  // vacuously).
+  val canReachPoison = not(effects.contains(EPoisoned))
+  val canReachCancelReap = not(effects.contains(ECancelReap))
+  val canReachSynthClose = not(effects.contains(ESynthClose))
 
   // ------------------------------------------------------------------
   // 6. The tick (one action; helper pure defs first)
@@ -426,7 +513,24 @@ module spawnCoherence {
     // Existing-name filter BEFORE the headroom truncate; deterministic
     // priority order (i1 before i2) stands in for the scheduler's
     // priority sort.
-    val spawnCandidates = postGate.filter(i => not(existingNames.contains(i)))
+    val wantedCandidates = postGate.filter(i => not(existingNames.contains(i)))
+    // C2/077: the AD2 fleet-exhaust gate — an exhausted intent's spawn
+    // is WITHHELD (never created this tick) and its streak advances;
+    // any non-exhausted (or unwanted) tick resets the streak to zero.
+    // The poison verdict fires at the persistence threshold (PERSIST)
+    // or immediately (the as-built law).
+    val spawnCandidates = wantedCandidates.filter(i =>
+      not(ENABLE_EXHAUST_POISON and exhausted.get(i)))
+    val streakAfter = INTENTS.mapBy(i =>
+      if (ENABLE_EXHAUST_POISON and exhausted.get(i)
+          and postGate.contains(i) and jobsAtList.get(i).phase == JAbsent)
+        clampStreak(streak.get(i) + 1)
+      else 0)
+    val poisoned = INTENTS.filter(i =>
+      ENABLE_EXHAUST_POISON and exhausted.get(i)
+      and postGate.contains(i) and jobsAtList.get(i).phase == JAbsent
+      and (if (ENABLE_EXHAUST_PERSIST) streakAfter.get(i) >= 3
+           else streakAfter.get(i) >= 1))
     val toSpawn = spawnCandidates.filter(i =>
       spawnCandidates.filter(o => idRank(o) < idRank(i)).size() < headroom)
     // The create's outcome depends on the slot's truth at create time:
@@ -442,9 +546,34 @@ module spawnCoherence {
     val createFailed = toSpawn.filter(i =>
       jobsAfterReap.get(i).phase == JAbsent and createFailsFor.contains(i))
 
+    // ---- 6b. AD5 cancel arm (C2/120) ----------------------------------
+    // CAUSE law: select iff the window lists the intent CANCELLED and
+    // no open attempt covers it (ExecBusy = open attempt). ASBUILT law:
+    // the closed→active edge over the seen-open evidence map — covered
+    // last successful read, uncovered now, still active (cause-blind).
+    // Both fail closed on an unreadable view (the same listExec fault
+    // models ListOpenAttempts).
+    val cancelSelected =
+      if (ENABLE_CANCEL_CAUSE)
+        INTENTS.filter(i =>
+          not(listExecFails)
+          and censusActive(jobsAtList.get(i))
+          and closedCause.get(i) == CCCancelled
+          and execr.get(i) != ExecBusy
+          and not(reaped.contains(i)))
+      else if (ENABLE_CANCEL_ASBUILT)
+        INTENTS.filter(i =>
+          not(listExecFails)
+          and censusActive(jobsAtList.get(i))
+          and seenOpen.get(i)
+          and execr.get(i) != ExecBusy
+          and not(reaped.contains(i)))
+      else Set()
+
     // ---- 7. Ack (spawned ∪ already-Pending, minus reaped) -------------
     val pendingNotReaped = postGate.filter(i =>
-      isPending(jobsAtList.get(i)) and not(reaped.contains(i)))
+      isPending(jobsAtList.get(i)) and not(reaped.contains(i))
+      and not(cancelSelected.contains(i)))
     val toAck = pendingNotReaped.union(spawnedSet)
     val ackHappens = toAck.size() > 0 and not(ackFails)
 
@@ -473,8 +602,11 @@ module spawnCoherence {
     val orphanGatePasses =
       orphanCandidates.size() > 0
       and not(listExecFails)
-      and leaderOld
-      and executorsPresent.size() > 0
+      // C2/221 axis: the as-built reap had neither a leader-age gate
+      // nor the stream-era executors-present arm — a successful read
+      // of the durably-empty post-failover view was authoritative.
+      and (leaderOld or ENABLE_YOUNG_LEADER_REAP)
+      and (executorsPresent.size() > 0 or ENABLE_YOUNG_LEADER_REAP)
     val orphanReaped = if (orphanGatePasses)
         orphanCandidates.filter(i => execr.get(i) != ExecBusy)
       else Set()
@@ -483,7 +615,8 @@ module spawnCoherence {
     val jobsAfter = INTENTS.mapBy(i =>
       if (spawnedSet.contains(i))
         { phase: JPending, age: AgeFresh, fp: intentFp.get(i), podRunning: false }
-      else if (excessReaped.contains(i) or orphanReaped.contains(i))
+      else if (excessReaped.contains(i) or orphanReaped.contains(i)
+               or cancelSelected.contains(i))
         { ...jobsAfterReap.get(i), phase: JTerminating }
       else jobsAfterReap.get(i))
 
@@ -507,6 +640,8 @@ module spawnCoherence {
         .union(if (excessSuppressed) Set(EExcessSuppressed) else Set())
         .union(if (matFiltered.size() > 0 and not(pollFails) and not(useStalePoll))
           Set(EMatJobFiltered) else Set())
+        .union(if (poisoned.size() > 0) Set(EPoisoned) else Set())
+        .union(if (cancelSelected.size() > 0) Set(ECancelReap) else Set())
 
     // ---- Violation checks ----------------------------------------------
     // I4: spawns never push active-minus-freed past the ceiling.
@@ -517,6 +652,16 @@ module spawnCoherence {
       excessReaped.filter(i => jobsAtList.get(i).podRunning).size() > 0
       or orphanReaped.filter(i => execr.get(i) == ExecBusy).size() > 0
       or (orphanReaped.size() > 0 and not(orphanGatePasses))
+    // C2/221: an orphan reap of a never-pulled Job (no executor entry)
+    // under a young leader.
+    val vYoungReap =
+      orphanReaped.filter(i => execr.get(i) == ExecAbsent).size() > 0
+      and not(leaderOld)
+    // C2/077: a poison verdict before the persistence window closed.
+    val vPoisonT = poisoned.filter(i => streakAfter.get(i) < 3).size() > 0
+    // C2/120: a cancel of a Job whose close cause is not CANCELLED.
+    val vCancelNonC =
+      cancelSelected.filter(i => closedCause.get(i) != CCCancelled).size() > 0
     // I2 safety form: enabling conditions at tick start imply the delete
     // by tick end (orphan-pending and orphan-running arms).
     val orphanPendingDue = if (schedErr or postGate.size() == 0) Set() else
@@ -540,7 +685,7 @@ module spawnCoherence {
       (schedErr and (
         spawnedSet.size() > 0 or reaped.size() > 0 or excessReaped.size() > 0
         or ackHappens))
-      or (listExecFails and orphanReaped.size() > 0)
+      or (listExecFails and (orphanReaped.size() > 0 or cancelSelected.size() > 0))
       or (ackFails and ackHappens)
     // GateFailClosed, split per configuration (C1/C2 adjudications).
     val builderGated = CRD_PRESENT and IS_BUILDER
@@ -569,6 +714,11 @@ module spawnCoherence {
     val vFreed =
       driftReaps.filter(i =>
         postGate.contains(i)
+        // C2/077: the freed-slot obligation binds only spawnABLE
+        // intents — an exhausted intent's spawn is withheld by the
+        // AD2 gate itself (that withholding is the law under test,
+        // not a freed-slot regression).
+        and not(ENABLE_EXHAUST_POISON and exhausted.get(i))
         and spawnCandidates.exclude(Set(i)).size() == 0
         and headroom >= 1
         and not(toSpawn.contains(i))
@@ -588,6 +738,9 @@ module spawnCoherence {
         .union(if (vGateV) Set(VGate) else Set())
         .union(if (vFreed) Set(VFreedSlotUnused) else Set())
         .union(if (vMatServed) Set(VMatJobServed) else Set())
+        .union(if (vPoisonT) Set(VPoisonTransient) else Set())
+        .union(if (vCancelNonC) Set(VCancelNonCancelled) else Set())
+        .union(if (vYoungReap) Set(VYoungLeaderReap) else Set())
 
     all {
       job' = jobsAfter,
@@ -603,6 +756,17 @@ module spawnCoherence {
       gate' = gate,
       matJob' = matJob,
       renderedFarDl' = renderedFarDl,
+      // C2/120 as-built evidence rebuild — only on a SUCCESSFUL view
+      // read (fail-closed leaves the recorded evidence untouched).
+      seenOpen' = if (ENABLE_CANCEL_ASBUILT and not(listExecFails))
+        INTENTS.mapBy(i =>
+          censusActive(jobsAtList.get(i)) and execr.get(i) == ExecBusy)
+      else seenOpen,
+      streak' = streakAfter,
+      closedCause' = closedCause,
+      exhausted' = exhausted,
+      pendingClose' = pendingClose,
+      obsLive' = obsLive,
     }
   }
 
@@ -618,6 +782,14 @@ module spawnCoherence {
     prevQueuedSnap' = prevQueuedSnap,
     matJob' = matJob,
     renderedFarDl' = renderedFarDl,
+    // C2 vars framed for every composing environment action. obsLive
+    // is NOT here: the attempt-ending actions must clear it, so each
+    // composing action frames (or clears) it explicitly.
+    closedCause' = closedCause,
+    seenOpen' = seenOpen,
+    exhausted' = exhausted,
+    streak' = streak,
+    pendingClose' = pendingClose,
   }
 
   /// A drv becomes Ready: the intent (re-)appears in the queue.
@@ -626,6 +798,7 @@ module spawnCoherence {
     queued' = queued.set(i, true),
     intentFp' = intentFp, job' = job, execr' = execr,
     leaderOld' = leaderOld, gate' = gate,
+    obsLive' = obsLive,
     bookkeepingUnchanged,
   }
 
@@ -635,6 +808,7 @@ module spawnCoherence {
     queued' = queued.set(i, false),
     intentFp' = intentFp, job' = job, execr' = execr,
     leaderOld' = leaderOld, gate' = gate,
+    obsLive' = obsLive,
     bookkeepingUnchanged,
   }
 
@@ -645,6 +819,7 @@ module spawnCoherence {
     intentFp' = intentFp.set(i, if (intentFp.get(i) == FpA) FpB else FpA),
     queued' = queued, job' = job, execr' = execr,
     leaderOld' = leaderOld, gate' = gate,
+    obsLive' = obsLive,
     bookkeepingUnchanged,
   }
 
@@ -656,6 +831,7 @@ module spawnCoherence {
     job' = job.set(i, { ...job.get(i), podRunning: true }),
     queued' = queued, intentFp' = intentFp, execr' = execr,
     leaderOld' = leaderOld, gate' = gate,
+    obsLive' = obsLive,
     bookkeepingUnchanged,
   }
 
@@ -666,6 +842,7 @@ module spawnCoherence {
     job' = job.set(i, { ...job.get(i), phase: JRunning }),
     queued' = queued, intentFp' = intentFp, execr' = execr,
     leaderOld' = leaderOld, gate' = gate,
+    obsLive' = obsLive,
     bookkeepingUnchanged,
   }
 
@@ -677,6 +854,7 @@ module spawnCoherence {
     execr' = execr.set(i, ExecAbsent),
     queued' = queued, intentFp' = intentFp,
     leaderOld' = leaderOld, gate' = gate,
+    obsLive' = obsLive.set(i, false),
     bookkeepingUnchanged,
   }
 
@@ -687,6 +865,7 @@ module spawnCoherence {
     job' = job.set(i, { phase: JTerminal, age: AgeFresh, fp: FpA, podRunning: false }),
     queued' = queued, intentFp' = intentFp, execr' = execr,
     leaderOld' = leaderOld, gate' = gate,
+    obsLive' = obsLive,
     bookkeepingUnchanged,
   }
 
@@ -696,6 +875,7 @@ module spawnCoherence {
     job' = job.set(i, { phase: JAbsent, age: AgeFresh, fp: FpA, podRunning: false }),
     queued' = queued, intentFp' = intentFp, execr' = execr,
     leaderOld' = leaderOld, gate' = gate,
+    obsLive' = obsLive,
     bookkeepingUnchanged,
   }
 
@@ -706,6 +886,7 @@ module spawnCoherence {
     execr' = execr.set(i, ExecAbsent),
     queued' = queued, intentFp' = intentFp,
     leaderOld' = leaderOld, gate' = gate,
+    obsLive' = obsLive.set(i, false),
     bookkeepingUnchanged,
   }
 
@@ -717,6 +898,7 @@ module spawnCoherence {
       age: if (job.get(i).age == AgeFresh) AgePastPending else AgePastOrphan }),
     queued' = queued, intentFp' = intentFp, execr' = execr,
     leaderOld' = leaderOld, gate' = gate,
+    obsLive' = obsLive,
     bookkeepingUnchanged,
   }
 
@@ -727,6 +909,7 @@ module spawnCoherence {
     execr' = execr.set(i, ExecIdle),
     queued' = queued, intentFp' = intentFp, job' = job,
     leaderOld' = leaderOld, gate' = gate,
+    obsLive' = obsLive,
     bookkeepingUnchanged,
   }
 
@@ -744,6 +927,12 @@ module spawnCoherence {
     dispatched' = dispatched, effects' = effects,
     violations' = violations, prevQueuedSnap' = prevQueuedSnap,
     matJob' = matJob,
+    closedCause' = closedCause,
+    seenOpen' = seenOpen,
+    exhausted' = exhausted,
+    streak' = streak,
+    pendingClose' = pendingClose,
+    obsLive' = obsLive,
   }
 
   /// The build finishes but the pod lingers (idle past its self-exit).
@@ -752,6 +941,7 @@ module spawnCoherence {
     execr' = execr.set(i, ExecIdle),
     queued' = queued, intentFp' = intentFp, job' = job,
     leaderOld' = leaderOld, gate' = gate,
+    obsLive' = obsLive.set(i, false),
     bookkeepingUnchanged,
   }
 
@@ -762,6 +952,7 @@ module spawnCoherence {
     execr' = execr.set(i, ExecAbsent),
     queued' = queued, intentFp' = intentFp, job' = job,
     leaderOld' = leaderOld, gate' = gate,
+    obsLive' = obsLive.set(i, false),
     bookkeepingUnchanged,
   }
 
@@ -771,6 +962,7 @@ module spawnCoherence {
     leaderOld' = true,
     queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
     gate' = gate,
+    obsLive' = obsLive,
     bookkeepingUnchanged,
   }
 
@@ -787,6 +979,15 @@ module spawnCoherence {
     // A2/106: the carried deadline is durable (AuthBinding) — restart
     // does not lose it.
     renderedFarDl' = renderedFarDl,
+    // C2: the recently_closed window is PG-durable; the seen-open /
+    // exhaust / pending-close maps are CONTROLLER-side (a scheduler
+    // restart does not clear them).
+    closedCause' = closedCause,
+    seenOpen' = seenOpen,
+    exhausted' = exhausted,
+    streak' = streak,
+    pendingClose' = pendingClose,
+    obsLive' = obsLive,
   }
 
   /// A dispatched_cells entry is consumed scheduler-side (heartbeat
@@ -799,6 +1000,12 @@ module spawnCoherence {
     effects' = effects, violations' = violations, prevQueuedSnap' = prevQueuedSnap,
     matJob' = matJob,
     renderedFarDl' = renderedFarDl,
+    closedCause' = closedCause,
+    seenOpen' = seenOpen,
+    exhausted' = exhausted,
+    streak' = streak,
+    pendingClose' = pendingClose,
+    obsLive' = obsLive,
   }
 
   /// The L10 producer publishes a placeable set (assume-guarantee: any
@@ -809,6 +1016,7 @@ module spawnCoherence {
     gate' = GArmed(s),
     queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
     leaderOld' = leaderOld,
+    obsLive' = obsLive,
     bookkeepingUnchanged,
   }
 
@@ -824,6 +1032,12 @@ module spawnCoherence {
     dispatched' = dispatched, effects' = effects, violations' = violations,
     prevQueuedSnap' = prevQueuedSnap,
     renderedFarDl' = renderedFarDl,
+    closedCause' = closedCause,
+    seenOpen' = seenOpen,
+    exhausted' = exhausted,
+    streak' = streak,
+    pendingClose' = pendingClose,
+    obsLive' = obsLive,
   }
 
   /// PD-7: the job resolves (success / from-source / cancelled) — the
@@ -837,6 +1051,12 @@ module spawnCoherence {
     dispatched' = dispatched, effects' = effects, violations' = violations,
     prevQueuedSnap' = prevQueuedSnap,
     renderedFarDl' = renderedFarDl,
+    closedCause' = closedCause,
+    seenOpen' = seenOpen,
+    exhausted' = exhausted,
+    streak' = streak,
+    pendingClose' = pendingClose,
+    obsLive' = obsLive,
   }
 
   /// The producer loses its lease (or restarts): the gate is unarmed
@@ -848,6 +1068,7 @@ module spawnCoherence {
     gate' = GUnarmed,
     queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
     leaderOld' = leaderOld,
+    obsLive' = obsLive,
     bookkeepingUnchanged,
   }
 
@@ -876,6 +1097,134 @@ module spawnCoherence {
     dispatched' = dispatched, prevQueuedSnap' = prevQueuedSnap,
     matJob' = matJob,
     renderedFarDl' = renderedFarDl,
+    closedCause' = closedCause,
+    seenOpen' = seenOpen,
+    exhausted' = exhausted,
+    streak' = streak,
+    pendingClose' = pendingClose,
+    obsLive' = obsLive,
+  }
+
+  /// C2/077: the spawnable-source universe flips for the intent —
+  /// excluded ⊇ spawnable starts or stops holding (node restart,
+  /// informer lag, genuine fleet exhaustion).
+  action exhaustFlips(i: IntentId): bool = all {
+    ENABLE_EXHAUST_POISON,
+    exhausted' = exhausted.set(i, not(exhausted.get(i))),
+    queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
+    leaderOld' = leaderOld, gate' = gate,
+    dispatched' = dispatched, effects' = effects, violations' = violations,
+    prevQueuedSnap' = prevQueuedSnap, matJob' = matJob,
+    renderedFarDl' = renderedFarDl,
+    closedCause' = closedCause, seenOpen' = seenOpen,
+    streak' = streak, pendingClose' = pendingClose, obsLive' = obsLive,
+  }
+
+  /// C2/120: the scheduler cancels the intent's open attempt (user
+  /// cancel): the attempt closes CANCELLED while the Job lives on —
+  /// the teardown the cancel arm exists to perform.
+  action attemptCancelled(i: IntentId): bool = all {
+    or { ENABLE_CANCEL_ASBUILT, ENABLE_CANCEL_CAUSE },
+    execr.get(i) != ExecAbsent,
+    execr' = execr.set(i, ExecAbsent),
+    closedCause' = closedCause.set(i, CCCancelled),
+    obsLive' = obsLive.set(i, false),
+    queued' = queued, intentFp' = intentFp, job' = job,
+    leaderOld' = leaderOld, gate' = gate,
+    dispatched' = dispatched, effects' = effects, violations' = violations,
+    prevQueuedSnap' = prevQueuedSnap, matJob' = matJob,
+    renderedFarDl' = renderedFarDl,
+    seenOpen' = seenOpen, exhausted' = exhausted,
+    streak' = streak, pendingClose' = pendingClose,
+  }
+
+  /// C2/120: the attempt completes NORMALLY but the Job's status has
+  /// not propagated yet — the teardown-lag window. The close cause is
+  /// COMPLETED; the Job stays Running until the controller's informer
+  /// catches up (modeled by jobCompletes never having fired).
+  action attemptCompletesLagged(i: IntentId): bool = all {
+    or { ENABLE_CANCEL_ASBUILT, ENABLE_CANCEL_CAUSE },
+    execr.get(i) == ExecBusy,
+    job.get(i).phase == JRunning,
+    execr' = execr.set(i, ExecAbsent),
+    closedCause' = closedCause.set(i, CCCompleted),
+    obsLive' = obsLive.set(i, false),
+    queued' = queued, intentFp' = intentFp, job' = job,
+    leaderOld' = leaderOld, gate' = gate,
+    dispatched' = dispatched, effects' = effects, violations' = violations,
+    prevQueuedSnap' = prevQueuedSnap, matJob' = matJob,
+    renderedFarDl' = renderedFarDl,
+    seenOpen' = seenOpen, exhausted' = exhausted,
+    streak' = streak, pendingClose' = pendingClose,
+  }
+
+  /// C2/120: the close ages out of the recently_closed window (120 s).
+  action windowExpires(i: IntentId): bool = all {
+    or { ENABLE_CANCEL_ASBUILT, ENABLE_CANCEL_CAUSE },
+    closedCause.get(i) != CCNone,
+    closedCause' = closedCause.set(i, CCNone),
+    queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
+    leaderOld' = leaderOld, gate' = gate,
+    dispatched' = dispatched, effects' = effects, violations' = violations,
+    prevQueuedSnap' = prevQueuedSnap, matJob' = matJob,
+    renderedFarDl' = renderedFarDl,
+    seenOpen' = seenOpen, exhausted' = exhausted,
+    streak' = streak, pendingClose' = pendingClose, obsLive' = obsLive,
+  }
+
+  /// C2/135: the disruption watcher decides to preempt — it OBSERVES
+  /// the currently-open attempt and synthesizes the close it will send.
+  action disruptionDecides(i: IntentId): bool = all {
+    ENABLE_SYNTH_CLOSE,
+    execr.get(i) == ExecBusy,
+    not(pendingClose.get(i)),
+    pendingClose' = pendingClose.set(i, true),
+    obsLive' = obsLive.set(i, true),
+    queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
+    leaderOld' = leaderOld, gate' = gate,
+    dispatched' = dispatched, effects' = effects, violations' = violations,
+    prevQueuedSnap' = prevQueuedSnap, matJob' = matJob,
+    renderedFarDl' = renderedFarDl,
+    closedCause' = closedCause, seenOpen' = seenOpen,
+    exhausted' = exhausted, streak' = streak,
+  }
+
+  /// C2/135: the synthesized close lands at the scheduler. As-built
+  /// (intent-keyed, newest-open-wins): it consumes WHATEVER attempt is
+  /// open — a successor minted in the decide→land window included
+  /// (VStaleClose). Exec-pinned: it consumes the attempt iff it is
+  /// still the OBSERVED one; otherwise the scheduler refuses and
+  /// nothing is consumed.
+  action closeLands(i: IntentId): bool = all {
+    ENABLE_SYNTH_CLOSE,
+    pendingClose.get(i),
+    pendingClose' = pendingClose.set(i, false),
+    obsLive' = obsLive.set(i, false),
+    execr' =
+      if (ENABLE_EXEC_PINNED)
+        (if (obsLive.get(i) and execr.get(i) != ExecAbsent)
+          execr.set(i, ExecAbsent) else execr)
+      else
+        (if (execr.get(i) != ExecAbsent) execr.set(i, ExecAbsent) else execr),
+    effects' =
+      if (ENABLE_EXEC_PINNED)
+        (if (obsLive.get(i) and execr.get(i) != ExecAbsent)
+          effects.union(Set(ESynthClose)) else effects)
+      else
+        (if (execr.get(i) != ExecAbsent)
+          effects.union(Set(ESynthClose)) else effects),
+    violations' =
+      if (not(ENABLE_EXEC_PINNED) and execr.get(i) != ExecAbsent
+          and not(obsLive.get(i)))
+        violations.union(Set(VStaleClose))
+      else violations,
+    queued' = queued, intentFp' = intentFp, job' = job,
+    leaderOld' = leaderOld, gate' = gate,
+    dispatched' = dispatched,
+    prevQueuedSnap' = prevQueuedSnap, matJob' = matJob,
+    renderedFarDl' = renderedFarDl,
+    closedCause' = closedCause, seenOpen' = seenOpen,
+    exhausted' = exhausted, streak' = streak,
   }
 
   // ------------------------------------------------------------------
@@ -894,6 +1243,12 @@ module spawnCoherence {
     violations' = Set(),
     matJob' = INTENTS.mapBy(i => false),
     renderedFarDl' = INTENTS.mapBy(i => false),
+    closedCause' = INTENTS.mapBy(i => CCNone),
+    seenOpen' = INTENTS.mapBy(i => false),
+    exhausted' = INTENTS.mapBy(i => false),
+    streak' = INTENTS.mapBy(i => 0),
+    pendingClose' = INTENTS.mapBy(i => false),
+    obsLive' = INTENTS.mapBy(i => false),
   }
 
   action step = {
@@ -922,6 +1277,12 @@ module spawnCoherence {
       matJobOpens(i),
       matJobResolves(i),
       establishExpired(i),
+      exhaustFlips(i),
+      attemptCancelled(i),
+      attemptCompletesLagged(i),
+      windowExpires(i),
+      disruptionDecides(i),
+      closeLands(i),
     }
   }
 }
@@ -942,7 +1303,14 @@ module spawnCoherenceBase {
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = false,
     ENABLE_MAT_JOBS = false,
-    ENABLE_RENDERED_DEADLINE = false
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
   ).*
 }
 
@@ -957,7 +1325,14 @@ module spawnCoherenceFaultRpc {
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = false,
     ENABLE_MAT_JOBS = false,
-    ENABLE_RENDERED_DEADLINE = false
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
   ).*
 }
 
@@ -973,7 +1348,14 @@ module spawnCoherenceFaultLease {
     ENABLE_LEASE_FAULT = true,
     ENABLE_STALE_POLL = false,
     ENABLE_MAT_JOBS = false,
-    ENABLE_RENDERED_DEADLINE = false
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
   ).*
 }
 
@@ -989,7 +1371,14 @@ module spawnCoherenceFaultStale {
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = true,
     ENABLE_MAT_JOBS = false,
-    ENABLE_RENDERED_DEADLINE = false
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
   ).*
 }
 
@@ -1005,7 +1394,14 @@ module spawnCoherenceCrdAbsent {
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = false,
     ENABLE_MAT_JOBS = false,
-    ENABLE_RENDERED_DEADLINE = false
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
   ).*
 }
 
@@ -1020,7 +1416,14 @@ module spawnCoherenceFetcher {
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = false,
     ENABLE_MAT_JOBS = false,
-    ENABLE_RENDERED_DEADLINE = false
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
   ).*
 }
 
@@ -1039,7 +1442,14 @@ module spawnCoherenceMatJobs {
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = false,
     ENABLE_MAT_JOBS = true,
-    ENABLE_RENDERED_DEADLINE = false
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
   ).*
 }
 
@@ -1059,6 +1469,181 @@ module spawnCoherenceRenderedDeadline {
     ENABLE_LEASE_FAULT = false,
     ENABLE_STALE_POLL = false,
     ENABLE_MAT_JOBS = false,
-    ENABLE_RENDERED_DEADLINE = true
+    ENABLE_RENDERED_DEADLINE = true,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
+  ).*
+}
+
+/// C2/077 FALSIFY half: the as-built AD2 gate poisons on the FIRST
+/// exhausted tick — noPoisonWhilePlaceable is expected to be violated
+/// here (a transient single-tick exhaustion poisons).
+module spawnCoherenceExhaustAsBuilt {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = true,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
+  ).*
+}
+
+/// C2/077 HOLD half: the persistence-window law — the verdict fires
+/// only at the third consecutive exhausted-and-wanted tick; any
+/// placeable tick resets the streak. canReachPoison keeps the
+/// invariant non-vacuous.
+module spawnCoherenceExhaustPersist {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = true,
+    ENABLE_EXHAUST_PERSIST = true,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
+  ).*
+}
+
+/// C2/120 FALSIFY half: the retired closed→active edge inference —
+/// cause-blind, so a normal completion in the Job-status lag window is
+/// selected for cancellation (cancelArmDeletesOnlyCancelled violated).
+module spawnCoherenceCancelAsBuilt {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = true,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
+  ).*
+}
+
+/// C2/120 HOLD half: the close-cause witness arm — selection iff the
+/// recently_closed window lists the intent CANCELLED and no open
+/// attempt covers it. canReachCancelReap keeps it non-vacuous.
+module spawnCoherenceCancelCause {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = true,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
+  ).*
+}
+
+/// C2/221 FALSIFY half: the as-built orphan reap with NO leader-age
+/// gate, under the failover environment (scheduler restarts empty the
+/// executor map and reset leader age) —
+/// noReapOfNeverPulledBeforeLeaderAged is expected to be violated (the
+/// post-failover empty view mass-reaps the never-pulled cohort). The
+/// HOLD half is the existing fault-lease regime, whose gate forbids
+/// exactly this trace.
+module spawnCoherenceReapYoungLeader {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = true,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = true,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false
+  ).*
+}
+
+/// C2/135 FALSIFY half: as-built synthesized closes resolve by intent
+/// (newest-open-wins) — a successor attempt minted in the decide→land
+/// window is consumed by a verdict that never observed it
+/// (closeTargetsIssuedAttempt violated).
+module spawnCoherenceSynthCloseAsBuilt {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = true,
+    ENABLE_EXEC_PINNED = false
+  ).*
+}
+
+/// C2/135 HOLD half: exec-pinned synthesized closes — the close lands
+/// iff the observed attempt is still the open one; otherwise the
+/// scheduler refuses and consumes nothing. canReachSynthClose keeps it
+/// non-vacuous.
+module spawnCoherenceSynthClosePinned {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = true,
+    ENABLE_EXEC_PINNED = true
   ).*
 }
