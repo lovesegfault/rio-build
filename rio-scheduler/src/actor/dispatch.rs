@@ -3277,10 +3277,17 @@ impl DagActor {
     /// "degrade to the pre-P0408 behavior" — dispatch unresolved,
     /// worker fails on placeholder, retry-with-backoff self-heals.
     ///
-    /// Hard 2s timeout + 1 MiB NAR cap: a `.drv` is ~1-50 KB ASCII.
-    /// A larger-than-1-MiB blob means something is badly wrong (the
-    /// path isn't a `.drv`, or the store returned a closure NAR).
-    /// Either way, bail — resolve can't parse a non-ATerm.
+    /// Hard 2s idle timeout + the shared derivation-text NAR cap
+    /// ([`rio_common::limits::MAX_DRV_NAR_BYTES`], 16 MiB): legitimate
+    /// `.drv`s reach ~10 MiB at nixpkgs scale (huge env blocks,
+    /// `exportReferencesGraph` users — the cap's own sizing note), and
+    /// every other derivation-text fetch site (store admission,
+    /// gateway BFS, worker glue fetch) admits up to that bound. A
+    /// private lower cap here deterministically failed every
+    /// (1,16] MiB `.drv`'s claims verification as "store silence"
+    /// (round-17 bug_030). The class cap still bounds mis-resolution:
+    /// a closure NAR behind a mis-resolved path is rejected by the
+    /// collector's leading `Info.nar_size` pre-check, byte-free.
     ///
     /// Shared by the dispatch-time CA resolve (this module) and the
     /// merge-time store-evidence check
@@ -3292,10 +3299,6 @@ impl DagActor {
         drv_hash: &str,
         drv_path: &str,
     ) -> Option<Vec<u8>> {
-        /// `.drv` NAR cap. ~1-50 KB typical; 1 MiB is ~20× any
-        /// real-world `.drv`. Avoids pulling a multi-GB closure if
-        /// the store path was mis-resolved.
-        const MAX_DRV_NAR_SIZE: u64 = 1024 * 1024;
         /// Per-chunk idle bound for `GetPath` (initial RPC + each
         /// stream.message() — I-211, not whole-call). ~10-50 ms
         /// typical; 2 s covers a slow store without blocking
@@ -3309,7 +3312,7 @@ impl DagActor {
             &mut client,
             drv_path,
             FETCH_TIMEOUT,
-            MAX_DRV_NAR_SIZE,
+            rio_common::limits::MAX_DRV_NAR_BYTES,
             None,
             &[],
         )

@@ -2559,6 +2559,65 @@ async fn test_dispatch_claims_derived_from_store_bytes() -> TestResult {
     Ok(())
 }
 
+/// Round-17 bug_030 population cell: a (1,16] MiB `.drv` — too big to
+/// arrive inline (`MAX_DRV_CONTENT_BYTES` = 1 MiB caps that path), so
+/// necessarily a BARE store-backed node — must pass claims
+/// verification through the store fetch. Pre-fix, the dispatch-side
+/// fetch carried a private 1 MiB cap while store admission, gateway
+/// BFS, and the worker fetch all admit 16 MiB
+/// (`rio_common::limits::MAX_DRV_NAR_BYTES`): this exact node was
+/// admitted everywhere else, then deterministically failed the fetch
+/// → `StoreSilence` → transient backoff → poison blaming store
+/// health. The cell pins the shared-cap behavior end to end: bytes
+/// verified, forwarded, and the byte-bound rank persisted.
+// r[verify sched.dispatch.claims-derived+3]
+#[tokio::test]
+async fn test_dispatch_claims_verifies_multi_mib_drv() -> TestResult {
+    use rio_auth::hmac::HmacVerifier;
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    // 2 MiB of env padding: comfortably inside the 16 MiB class cap,
+    // comfortably outside the old private 1 MiB one.
+    let (node, aterm, out_path) = mint_text_ca_leaf_padded("claims-2mib", 2 * 1024 * 1024);
+    assert!(
+        aterm.len() > rio_common::limits::MAX_DRV_CONTENT_BYTES,
+        "fixture must exceed the inline cap (else the cell tests nothing)"
+    );
+    assert!(
+        (aterm.len() as u64) < rio_common::limits::MAX_DRV_NAR_BYTES,
+        "fixture must remain inside the derivation-text class cap"
+    );
+    let drv_path = node.drv_path.clone();
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+
+    let mut worker_rx = connect_executor(&handle, "claims-2mib-w", "x86_64-linux").await?;
+    merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    let assignment = recv_assignment(&mut worker_rx).await;
+    assert_eq!(assignment.drv_path, drv_path);
+    assert_eq!(
+        assignment.drv_content,
+        aterm.as_bytes(),
+        "the multi-MiB store-verified bytes are forwarded as the build instructions"
+    );
+    let claims = HmacVerifier::from_key(test_key)
+        .verify::<rio_auth::hmac::AssignmentClaims>(&assignment.assignment_token)
+        .expect("token verifies");
+    assert_eq!(claims.expected_outputs, vec![out_path]);
+
+    let (rank,): (String,) =
+        sqlx::query_as("SELECT evidence_rank FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        rank, "path_bound_bytes",
+        "multi-MiB .drv reaches byte-bound rank — not StoreSilence backoff"
+    );
+    Ok(())
+}
+
 /// Round-16 bug_094: a deferred-IA node's dispatch-time resolution
 /// must record its computed REAL paths as the claim
 /// (`set_claim_output_paths`) — the HMAC `expected_outputs` site reads
