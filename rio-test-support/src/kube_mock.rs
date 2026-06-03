@@ -275,7 +275,20 @@ pub enum MockBehavior {
     /// request future pends until its own deadline fires — the
     /// "apiserver hung" shape of an outage.
     Hang,
+    /// Hold the reply slot open — like [`Hang`](Self::Hang) the client's
+    /// request future pends — but keep the request itself so
+    /// [`MockApiServer::release_parked`] can answer it later from the
+    /// lease state STORED AT RELEASE TIME. This is the "in-flight
+    /// round-trip straddles a stall" shape (slow apiserver, host
+    /// suspend): the request was sent before the stall and its response
+    /// is read after it. `Hang` can never deliver a response; `Park`
+    /// always can.
+    Park,
 }
+
+/// One request held by [`MockBehavior::Park`]: method + body bytes +
+/// the open reply slot, kept until [`MockApiServer::release_parked`].
+type ParkedCall = (http::Method, Vec<u8>, SendResponse<Response<Body>>);
 
 /// The stored side of [`MockApiServer`]: at most one Lease object plus
 /// the resourceVersion source the handler stamps writes from.
@@ -333,6 +346,16 @@ pub struct MockApiServer {
     /// Shared with the handler task so [`set_behavior`](Self::set_behavior)
     /// applies to every request pulled after the store.
     behavior: Arc<Mutex<MockBehavior>>,
+    /// Requests parked by [`MockBehavior::Park`], waiting for
+    /// [`release_parked`](Self::release_parked). Body bytes are kept so
+    /// the eventual dispatch sees exactly what the client sent.
+    parked: Arc<Mutex<Vec<ParkedCall>>>,
+    /// Every request the handler task has pulled, in arrival order,
+    /// regardless of behavior — the request log
+    /// ([`requests`](Self::requests)). Lets a test assert the code under
+    /// test actually issued (or provably did not issue) a call, so a
+    /// choreographed scenario cannot pass for the wrong reason.
+    log: Arc<Mutex<Vec<(http::Method, String)>>>,
 }
 
 impl MockApiServer {
@@ -344,8 +367,12 @@ impl MockApiServer {
         let client = Client::new(mock_service, "default");
         let state = Arc::new(Mutex::new(LeaseStore::default()));
         let behavior = Arc::new(Mutex::new(MockBehavior::default()));
+        let parked = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let task_state = Arc::clone(&state);
         let task_behavior = Arc::clone(&behavior);
+        let task_parked = Arc::clone(&parked);
+        let task_log = Arc::clone(&log);
         tokio::spawn(async move {
             let mut handle = pin!(handle);
             // Hang mode parks the send halves here: never responded to,
@@ -353,13 +380,18 @@ impl MockApiServer {
             // future with a connection error — a fast failure, not a
             // hang). The Vec lives as long as the handler task, i.e. as
             // long as the Client — exactly the window a hung request
-            // must stay hung for.
-            let mut parked = Vec::new();
+            // must stay hung for. (Park mode's slots live in
+            // `task_parked` instead — those ARE answered later.)
+            let mut hung = Vec::new();
             while let Some((request, send)) = handle.next_request().await {
                 let behavior = *task_behavior.lock().expect("mock apiserver behavior lock");
+                let method = request.method().clone();
+                task_log
+                    .lock()
+                    .expect("mock apiserver request log lock")
+                    .push((method.clone(), request.uri().to_string()));
                 match behavior {
                     MockBehavior::Healthy => {
-                        let method = request.method().clone();
                         let body_bytes = request
                             .into_body()
                             .collect()
@@ -373,11 +405,64 @@ impl MockApiServer {
                         "ServiceUnavailable",
                         "injected outage: the mock apiserver is failing fast",
                     )),
-                    MockBehavior::Hang => parked.push(send),
+                    MockBehavior::Hang => hung.push(send),
+                    MockBehavior::Park => {
+                        let body_bytes = request
+                            .into_body()
+                            .collect()
+                            .await
+                            .expect("request body collectible")
+                            .to_bytes();
+                        task_parked
+                            .lock()
+                            .expect("mock apiserver parked lock")
+                            .push((method, body_bytes.to_vec(), send));
+                    }
                 }
             }
         });
-        (client, Self { state, behavior })
+        (
+            client,
+            Self {
+                state,
+                behavior,
+                parked,
+                log,
+            },
+        )
+    }
+
+    /// Answer every request parked by [`MockBehavior::Park`], in arrival
+    /// order, against the CURRENT stored lease state — the state at
+    /// release time, not at park time. Returns how many were answered.
+    ///
+    /// The dispatch is [`MockBehavior::Healthy`]'s: a parked PUT still
+    /// runs the resourceVersion CAS, a parked GET serves the current
+    /// object. This mirrors a real apiserver whose reply was delayed in
+    /// flight: the commit happened when the request arrived (here:
+    /// deferred to release, which for the single-writer schedules these
+    /// tests script is observationally the same), and the client reads
+    /// the response after the stall ends.
+    pub fn release_parked(&self) -> usize {
+        let drained: Vec<_> = {
+            let mut parked = self.parked.lock().expect("mock apiserver parked lock");
+            parked.drain(..).collect()
+        };
+        let n = drained.len();
+        for (method, body, send) in drained {
+            send.send_response(Self::handle(&self.state, &method, &body));
+        }
+        n
+    }
+
+    /// Snapshot of every request the mock has received, in arrival
+    /// order: `(method, full request URI)`. Includes parked and hung
+    /// requests (logged at arrival, not at answer).
+    pub fn requests(&self) -> Vec<(http::Method, String)> {
+        self.log
+            .lock()
+            .expect("mock apiserver request log lock")
+            .clone()
     }
 
     /// Switch how the handler task answers subsequent requests. Takes
@@ -934,6 +1019,49 @@ mod tests {
             mock.holder().as_deref(),
             Some("n2"),
             "the stale writer did not clobber the recreated lease"
+        );
+    }
+
+    /// Park holds a request's reply slot open and `release_parked`
+    /// answers it from the lease state stored AT RELEASE TIME — the
+    /// in-flight-straddles-a-stall primitive. The request log records
+    /// the call at arrival, while it is still parked.
+    #[tokio::test]
+    async fn park_releases_against_current_state() {
+        let (client, mock) = MockApiServer::new();
+        let api: Api<Lease> = Api::namespaced(client, "ns");
+
+        mock.set_behavior(MockBehavior::Park);
+        let parked_get = tokio::spawn({
+            let api = api.clone();
+            async move { api.get("l").await }
+        });
+        // Wait until the request has actually arrived at the mock (the
+        // log records arrival, not answer).
+        while mock.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            mock.requests()
+                .iter()
+                .any(|(m, p)| *m == http::Method::GET && p.contains("/leases/l")),
+            "the parked GET must be in the request log at arrival"
+        );
+
+        // State changes WHILE the request is parked.
+        mock.seed(
+            serde_json::to_value(lease("l", "late-holder", Some("7"))).expect("lease serializes"),
+        );
+
+        assert_eq!(mock.release_parked(), 1, "exactly one parked request");
+        let got = parked_get
+            .await
+            .expect("join")
+            .expect("released GET succeeds");
+        assert_eq!(
+            got.spec.and_then(|s| s.holder_identity).as_deref(),
+            Some("late-holder"),
+            "the released response must serve the state stored at release time"
         );
     }
 }
