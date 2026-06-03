@@ -1484,7 +1484,7 @@ makes the realisation-insert skip impossible again is the staged
 follow-up F2 (`ModularHashState` lifecycle enum) — no prose in this
 spec may claim that writer exists until it does (R6).
 
-#r("sched.dispatch.claims-derived+2")[
+#r("sched.dispatch.claims-derived+3")[
   When assignment tokens are signed, the scheduler MUST NOT sign
   upload-authorization claims (`expected_outputs`, `is_ca`,
   `is_fixed_output`) or forward worker build instructions for a
@@ -1507,12 +1507,25 @@ spec may claim that writer exists until it does (R6).
   The verdict's
   consequence MUST follow its typed permanence, and no arm may retry
   unbounded on deterministic inputs: a contradiction MUST poison the
-  node without signing; STORE SILENCE — the only transient verdict —
+  node without signing; STORE SILENCE — a transient verdict —
   MUST roll the assignment back with dispatch backoff, bounded by its
-  own budget; a STRUCTURALLY unverifiable node (an input neither
-  submitted nor resident, an unparseable declared path) MUST be
-  poisoned with remediation generated from the typed reason, never
-  retried; and a node whose declared modular hash cannot be recomputed
+  own budget; INSTANT permanence MUST be restricted to CONTENT-BOUND
+  reasons (an unparseable declared path, a contradiction, content-bound
+  unparseable bytes) — a verification blocked on MISSING INPUT IDENTITY
+  MUST NOT be concluded permanent from resident state alone, because
+  residency is scheduler-mutated (terminal reap and leader failover
+  both erase a completed input's node without touching content):
+  the verifier MUST first re-seed from the persisted derivation rows
+  (one batched lookup of the missing inputs' recorded input-form
+  hashes, under the same not-floating predicate as every other seed
+  source, performed at the shared verification chokepoint so the merge
+  and dispatch consumers get it uniformly), and only a
+  POST-read-through unseeded verdict may have consequences: at
+  dispatch, bounded backoff on a dedicated budget whose exhaustion
+  poisons with remediation generated from the post-read-through fact
+  set; at merge, synchronous refusal with the same generated
+  remediation (the submitter is present). A node whose declared
+  modular hash cannot be recomputed
   against otherwise-fully-verified store bytes MUST have the
   declaration STRIPPED — cleared in memory and in the persisted row,
   exact ingress-strip parity (an unverifiable claim is no claim) — and
@@ -1521,6 +1534,24 @@ spec may claim that writer exists until it does (R6).
   recorded values; nodes already at `path_bound_bytes` or higher skip
   the re-fetch. Unsigned dev mode mints no claims and is exempt.
 ]
+The unseeded-input clause is round-16 bug_029 (the +3 delta): the +2
+text's "an input neither submitted nor resident" arm typed a fact about
+MUTABLE STATE as structural permanence. A guaranteed deploy failover
+erases every completed input's residency at once — recovery rehydrates
+non-terminal rows only — so the first post-failover dispatch of any
+bare deferred-IA node whose inputs had completed instant-poisoned
+honest in-flight builds through the claims gate; terminal reap produced
+the same shape one node at a time. The persisted row is CONTENT-DERIVED
+state that survives both erasers, which is what qualifies it as the
+read-through source. Read-through outcomes are observable on
+#(refs.metric)("rio_scheduler_claims_row_readthrough_total") (seeded /
+miss / error — a PG error defers as transient silence, never a
+permanence verdict) and deferrals on
+#(refs.metric)("rio_scheduler_dispatch_claims_unseeded_total");
+dashboards keyed on
+#(refs.metric)("rio_scheduler_dispatch_claims_unverifiable_total") see
+the unseeded population move out (it now counts only content-bound
+structural poisons).
 This is the dispatch half of the worker-claims story (CppNix parity:
 `Store::queryPartialDerivationOutputMap` consults the store's own copy of
 the derivation, `store-api.cc:396-410` --- never a client's claim about

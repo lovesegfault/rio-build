@@ -243,6 +243,19 @@ pub(crate) struct PoisonedDerivationRow {
     pub elapsed_secs: f64,
 }
 
+/// Input-form columns of a derivation row, loaded by drv PATH for the
+/// unseeded-input read-through (`sched.dispatch.claims-derived+3`,
+/// bug_029). Selected narrow on purpose: the consumer
+/// (`InputFormSeed::from_persisted_rows`) needs exactly the recorded
+/// hash plus the two flags its not-floating predicate reads.
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct InputFormRow {
+    pub drv_path: String,
+    pub ca_modular_hash: Option<Vec<u8>>,
+    pub is_fixed_output: bool,
+    pub is_ca: bool,
+}
+
 /// Identity columns of a SETTLED (`completed`/`skipped`) derivation row,
 /// loaded by `load_settled_identity_rows` for the pre-merge
 /// settled-identity freeze (`sched.persist.settled-identity-freeze+2`).

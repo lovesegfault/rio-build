@@ -1382,7 +1382,7 @@ pub(crate) fn validate_inline_drv_content(
 /// `expected_output_paths`); a child outside the submission degrades
 /// to not-unknown — the resident-DAG/store-evidence writers re-derive
 /// with wider knowledge at their own chokepoints.
-// r[impl sched.dispatch.claims-derived+2]
+// r[impl sched.dispatch.claims-derived+3]
 fn normalize_inline_needs_resolve(nodes: &mut [rio_proto::types::DerivationNode]) {
     use rio_nix::derivation::Derivation;
 
@@ -1441,7 +1441,7 @@ mod normalize_needs_resolve_tests {
         }
     }
 
-    // r[verify sched.dispatch.claims-derived+2]
+    // r[verify sched.dispatch.claims-derived+3]
     /// Both polarities: a forged-true echo on an inputless floating
     /// leaf is normalized DOWN (oracle empty-inputs clause), a
     /// forged-false echo on a deferred-IA consumer of a floating

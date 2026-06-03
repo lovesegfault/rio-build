@@ -616,7 +616,7 @@ pub struct RetryState {
     /// Cleared on successful dispatch (assign_to_worker).
     pub backoff_until: Option<Instant>,
     /// Number of dispatch-time claims-derivation deferrals on STORE
-    /// SILENCE (`sched.dispatch.claims-derived+2`) for this node.
+    /// SILENCE (`sched.dispatch.claims-derived+3`) for this node.
     /// In-memory only — failover forgives (a fresh leader re-probes a
     /// store that may have recovered; the bound exists to stop a
     /// PERSISTENTLY silent store from deferring a deterministic input
@@ -627,6 +627,19 @@ pub struct RetryState {
     /// which silence must not consume — merged_bug_010) and from the
     /// completion-side poison budget.
     pub claims_unavailable_count: u32,
+
+    /// Consecutive dispatch deferrals on POST-READ-THROUGH unseeded
+    /// inputs (`sched.dispatch.claims-derived+3`, bug_029): the
+    /// claims gate could not seed a direct input's identity from the
+    /// submission, the resident DAG, or the persisted rows. Bounded
+    /// like `claims_unavailable_count` (its own arm of
+    /// [`RetryState::charge`]), and reset on the same Verified /
+    /// VerifiedExceptDeclaredHash edges: the missing identity can
+    /// arrive at any time (a deeper submission, an upload, a
+    /// mid-merge row landing), so instant permanence was the bug —
+    /// residency is scheduler-mutated state and a deploy failover
+    /// erased it for every in-flight build at once.
+    pub unseeded_inputs_count: u32,
 }
 
 /// Failure classes chargeable against [`RetryState`] through the
@@ -639,6 +652,9 @@ pub struct RetryState {
 pub enum FailureClass {
     /// Dispatch-time claims derivation deferred on store silence.
     ClaimsUnavailable,
+    /// Dispatch-time claims derivation deferred on post-read-through
+    /// unseeded inputs (`sched.dispatch.claims-derived+3`).
+    UnseededInputs,
 }
 
 /// Decision returned by [`RetryState::charge`].
@@ -666,14 +682,26 @@ impl RetryState {
                     ChargeDecision::Backoff(attempt)
                 }
             }
+            FailureClass::UnseededInputs => {
+                if self.unseeded_inputs_count >= cap {
+                    ChargeDecision::Exhausted
+                } else {
+                    let attempt = self.unseeded_inputs_count;
+                    self.unseeded_inputs_count += 1;
+                    ChargeDecision::Backoff(attempt)
+                }
+            }
         }
     }
 
-    /// Reset the claims-unavailable budget after a successful
-    /// verification (the `Verified` / `VerifiedExceptDeclaredHash`
-    /// edges): consecutive-failure semantics, not lifetime.
+    /// Reset the claims-deferral budgets (store silence AND unseeded
+    /// inputs) after a successful verification (the `Verified` /
+    /// `VerifiedExceptDeclaredHash` edges): consecutive-failure
+    /// semantics, not lifetime — one verified pass proves the gate
+    /// can converge for this node.
     pub fn reset_claims_unavailable(&mut self) {
         self.claims_unavailable_count = 0;
+        self.unseeded_inputs_count = 0;
     }
 }
 
@@ -692,6 +720,11 @@ impl RetryState {
         self.failed_builders.clear();
         self.failure_count = 0;
         self.poisoned_at = None;
+        // Claims-deferral budgets (NOTE: claims_unavailable_count is
+        // known-missing here pre-round-16 — merged_bug_022's W2-S8
+        // completeness sweep owns that; the unseeded twin is cleared
+        // from birth so the sweep finds one gap, not two).
+        self.unseeded_inputs_count = 0;
     }
 }
 
@@ -2128,6 +2161,59 @@ pub const POISON_TTL: std::time::Duration = std::time::Duration::from_millis(100
 
 #[cfg(test)]
 mod tests {
+
+    // r[verify sched.dispatch.claims-derived+3]
+    /// The unseeded-inputs budget is its OWN charge arm: independent
+    /// of the claims-unavailable counter (charging one never moves
+    /// the other), capped to Exhausted, and both reset together on
+    /// the verified edge (consecutive-failure semantics). clear()
+    /// zeroes the unseeded counter from birth (the unavailable twin's
+    /// omission is merged_bug_022's W2-S8 sweep).
+    #[test]
+    fn unseeded_inputs_budget_is_independent_and_resets() {
+        use super::{ChargeDecision, FailureClass, RetryState};
+        let mut r = RetryState::default();
+        let cap = 2;
+
+        assert_eq!(
+            r.charge(FailureClass::UnseededInputs, cap),
+            ChargeDecision::Backoff(0)
+        );
+        assert_eq!(
+            r.charge(FailureClass::UnseededInputs, cap),
+            ChargeDecision::Backoff(1)
+        );
+        assert_eq!(
+            r.charge(FailureClass::UnseededInputs, cap),
+            ChargeDecision::Exhausted,
+            "cap reached: caller MUST route to a terminal visible outcome"
+        );
+        assert_eq!(
+            r.claims_unavailable_count, 0,
+            "unseeded charges never touch the silence budget"
+        );
+
+        // Independence in the other direction.
+        assert_eq!(
+            r.charge(FailureClass::ClaimsUnavailable, cap),
+            ChargeDecision::Backoff(0)
+        );
+        assert_eq!(r.unseeded_inputs_count, 2, "still at its own cap");
+
+        // Verified edge resets BOTH consecutive budgets.
+        r.reset_claims_unavailable();
+        assert_eq!(r.unseeded_inputs_count, 0);
+        assert_eq!(r.claims_unavailable_count, 0);
+
+        // clear() zeroes the unseeded counter.
+        let mut dirty = RetryState {
+            unseeded_inputs_count: 7,
+            ..RetryState::default()
+        };
+        dirty.clear();
+        assert_eq!(dirty.unseeded_inputs_count, 0);
+    }
+
     use super::*;
 
     fn dummy_node() -> crate::domain::DerivationNode {

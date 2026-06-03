@@ -127,6 +127,18 @@ pub(super) enum AssignmentProtoOutcome {
     /// remediation (generated from the typed reason, fix-discipline
     /// R6) instead of livelocking through backoff.
     PermanentlyUnverifiable(String),
+    /// Direct input identities are missing AFTER the persisted-row
+    /// read-through (`sched.dispatch.claims-derived+3`, bug_029):
+    /// NOT instant permanence — the missing identity is a fact about
+    /// CURRENT state (a deeper submission, an upload, or a mid-merge
+    /// row can supply it at any time), so the caller rolls back and
+    /// charges the node's own bounded unseeded-inputs budget; only
+    /// exhaustion poisons, with the carried post-read-through
+    /// remediation. Pre-fix this population routed through
+    /// PermanentlyUnverifiable: a deploy failover (which erases every
+    /// completed input's residency at once) instantly poisoned honest
+    /// in-flight builds through the claims gate.
+    UnseededInputs(String),
 }
 
 /// `DrvHash` → owned `String` (the domain node synth wants `String`).
@@ -2127,7 +2139,7 @@ impl DagActor {
             // (TOCTOU vs. concurrent cancel) — legacy no-rollback
             // semantics: caller defers.
             AssignmentProtoOutcome::NodeGone => return false,
-            // r[impl sched.dispatch.claims-derived+2]
+            // r[impl sched.dispatch.claims-derived+3]
             // The store could not vouch for a bare store-backed node's
             // claims — STORE SILENCE only; the cause population is the
             // `SilenceReason` enum (merge.rs), nothing else routes
@@ -2142,8 +2154,10 @@ impl DagActor {
             AssignmentProtoOutcome::Unavailable(reason) => {
                 metrics::counter!("rio_scheduler_dispatch_claims_unavailable_total").increment(1);
                 self.rollback_assignment(drv_hash, executor_id).await;
-                // r[impl sched.dispatch.claims-derived+2]
-                // Store silence is the SOLE transient verdict, and it
+                // r[impl sched.dispatch.claims-derived+3]
+                // Store silence is a transient verdict (post-+3 the
+                // unseeded-inputs arm below defers too, on its own
+                // budget), and it
                 // is bounded by its OWN budget (charge(); cap = the
                 // existing max_infra_retries — no new knob): a
                 // persistently silent store on a deterministic input
@@ -2218,7 +2232,7 @@ impl DagActor {
                 }
                 return false;
             }
-            // r[impl sched.dispatch.claims-derived+2]
+            // r[impl sched.dispatch.claims-derived+3]
             // Structurally unverifiable: PERMANENT for retries of this
             // submission shape — surface a visible poison carrying the
             // generated remediation instead of livelocking through
@@ -2238,6 +2252,63 @@ impl DagActor {
                 self.poison_and_cascade(drv_hash, &msg).await;
                 for build_id in self.get_interested_builds(drv_hash) {
                     self.record_failure_evidence(build_id, drv_hash).await;
+                }
+                return false;
+            }
+            // r[impl sched.dispatch.claims-derived+3]
+            // Post-read-through unseeded inputs (bug_029): bounded
+            // backoff on the node's OWN budget, exactly the
+            // claims-unavailable shape — because the blocking fact is
+            // mutable state (residency erased by reap/failover; rows
+            // that may land mid-merge), not content. Pre-fix this
+            // population instant-poisoned: a deploy failover erased
+            // every completed input's residency at once and the
+            // claims gate poisoned every in-flight dependent honest
+            // build it touched. Exhaustion converges to the SAME
+            // visible poison, but only after the budget proves the
+            // identity is genuinely not arriving.
+            AssignmentProtoOutcome::UnseededInputs(remediation) => {
+                metrics::counter!("rio_scheduler_dispatch_claims_unseeded_total").increment(1);
+                self.rollback_assignment(drv_hash, executor_id).await;
+                let cap = self.retry_policy.max_infra_retries;
+                let decision = match self.dag.node_mut(drv_hash) {
+                    Some(state) => state
+                        .retry
+                        .charge(crate::state::FailureClass::UnseededInputs, cap),
+                    None => return false,
+                };
+                match decision {
+                    crate::state::ChargeDecision::Backoff(attempt) => {
+                        warn!(
+                            drv_hash = %drv_hash,
+                            executor_id = %executor_id,
+                            attempt,
+                            cap,
+                            "claims inputs unseeded after row read-through; \
+                             assignment rolled back with backoff"
+                        );
+                        if let Some(state) = self.dag.node_mut(drv_hash) {
+                            let backoff = self.retry_policy.backoff_duration(attempt);
+                            state.retry.backoff_until = Some(std::time::Instant::now() + backoff);
+                        }
+                    }
+                    crate::state::ChargeDecision::Exhausted => {
+                        warn!(
+                            drv_hash = %drv_hash,
+                            executor_id = %executor_id,
+                            cap,
+                            "unseeded-inputs budget exhausted; poisoning with remediation"
+                        );
+                        let msg = format!(
+                            "dispatch claims verification could not seed the \
+                             derivation's input identities after {cap} attempts: \
+                             {remediation}"
+                        );
+                        self.poison_and_cascade(drv_hash, &msg).await;
+                        for build_id in self.get_interested_builds(drv_hash) {
+                            self.record_failure_evidence(build_id, drv_hash).await;
+                        }
+                    }
                 }
                 return false;
             }
@@ -2484,8 +2555,8 @@ impl DagActor {
         executor_id: &ExecutorId,
         generation: u64,
     ) -> AssignmentProtoOutcome {
-        // === Claims derivation (sched.dispatch.claims-derived+2) ======
-        // r[impl sched.dispatch.claims-derived+2]
+        // === Claims derivation (sched.dispatch.claims-derived+3) ======
+        // r[impl sched.dispatch.claims-derived+3]
         // Decide the byte-bound source of every value the token will
         // sign and the worker will obey, BEFORE any of it is used.
         // Unsigned dev mode mints no claims — nothing to derive (the
@@ -2616,7 +2687,7 @@ impl DagActor {
                     // raise the node's standing so re-dispatch skips
                     // the re-fetch. Best-effort persist — a lost write
                     // degrades to re-derivation after failover.
-                    // r[impl sched.dispatch.claims-derived+2]
+                    // r[impl sched.dispatch.claims-derived+3]
                     // The resolve flag is recorded HERE, in the same
                     // node_mut block as the rank raise, from the
                     // byte-derived fact the classification site
@@ -2653,7 +2724,7 @@ impl DagActor {
                             .into(),
                     );
                 }
-                // r[impl sched.dispatch.claims-derived+2]
+                // r[impl sched.dispatch.claims-derived+3]
                 // Three-way permanence contract (the merged_bug_019
                 // deploy-blocker fix; fix-discipline R1 — consequences
                 // derived from the variant's typed permanence):
@@ -2667,9 +2738,24 @@ impl DagActor {
                 // with remediation generated from the typed reason.
                 // Backoff cannot resolve it: pre-fix this arm
                 // livelocked (deterministic re-verification, identical
-                // result, forever).
+                // result, forever). Restricted BY TYPE to content-bound
+                // reasons (claims-derived+3): missing input identity
+                // is the UnseededInputs arm below.
                 Some(super::merge::StoreEvidenceOutcome::StructurallyUnverifiable(reason)) => {
                     return AssignmentProtoOutcome::PermanentlyUnverifiable(reason.remediation());
+                }
+                // r[impl sched.dispatch.claims-derived+3]
+                // Post-read-through unseeded inputs → BOUNDED BACKOFF
+                // (the bug_029 kill): the chokepoint already consulted
+                // the persisted rows, but residency/rows are state
+                // that can still change under this node (deeper
+                // submission, upload, mid-merge row). The caller
+                // charges the dedicated budget; exhaustion poisons
+                // with this remediation.
+                Some(super::merge::StoreEvidenceOutcome::UnseededInputs { missing, .. }) => {
+                    return AssignmentProtoOutcome::UnseededInputs(
+                        super::merge::unseeded_remediation(&missing),
+                    );
                 }
                 // Strip-resolvable: the bytes ARE the store's text-CA
                 // object and the identity verifies EXCEPT the declared
@@ -2704,7 +2790,7 @@ impl DagActor {
                             state.ca.modular_hash_stripped = Some(stripped);
                         }
                         state.evidence = crate::state::DefinitionEvidence::PathBoundBytes;
-                        // r[impl sched.dispatch.claims-derived+2]
+                        // r[impl sched.dispatch.claims-derived+3]
                         // Same record-at-raise as the Verified arm:
                         // the strip raises rank on these bytes, so the
                         // byte-derived resolve flag rides the raise.
@@ -3007,7 +3093,7 @@ impl DagActor {
         Vec<(String, String)>,
     ) {
         // Gate: the RECORDED resolve flag, single-source
-        // (sched.dispatch.claims-derived+2). Every writer derived it
+        // (sched.dispatch.claims-derived+3). Every writer derived it
         // from bytes through the shared oracle predicate
         // (`rio_nix::derivation::should_resolve`): the gateway's
         // post-BFS pass for ingress-bound nodes (normalized again at

@@ -1,7 +1,8 @@
 //! Per-derivation state + poison tracking — `derivations` table.
 
 use super::{
-    AssignmentStatus, PoisonedDerivationRow, SchedulerDb, SettledIdentityRow, terminal_status_sql,
+    AssignmentStatus, InputFormRow, PoisonedDerivationRow, SchedulerDb, SettledIdentityRow,
+    terminal_status_sql,
 };
 use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 
@@ -534,6 +535,36 @@ impl SchedulerDb {
         .await
     }
 
+    // r[impl sched.dispatch.claims-derived+3]
+    /// Load the input-form columns of derivation rows by drv PATH —
+    /// the unseeded-input read-through (bug_029). The rows are
+    /// CONTENT-DERIVED state that survives reap and failover (the two
+    /// residency erasers), which is what qualifies them to re-seed a
+    /// verification that resident state alone could not. Only rows
+    /// with a recorded hash are returned (a NULL hash contributes
+    /// nothing); the not-floating seed predicate stays with
+    /// `InputFormSeed::from_persisted_rows` (single owner). One
+    /// batched lookup per check, sized by the derivation's direct
+    /// input count.
+    pub(crate) async fn load_input_form_rows(
+        &self,
+        drv_paths: &[String],
+    ) -> Result<Vec<InputFormRow>, sqlx::Error> {
+        if drv_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as(
+            r#"
+            SELECT drv_path, ca_modular_hash, is_fixed_output, is_ca
+            FROM derivations
+            WHERE drv_path = ANY($1) AND ca_modular_hash IS NOT NULL
+            "#,
+        )
+        .bind(drv_paths)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     // r[impl sched.derivation.evidence-rank]
     /// Persist a definition-evidence rank UPGRADE outside the
     /// creation-scoped upsert: the settle chokepoint
@@ -563,7 +594,7 @@ impl SchedulerDb {
     /// Persist a stripped-claim verification: the rank rises on the
     /// verified bytes AND the unverifiable declared modular hash is
     /// MOVED to the segregated preservation column in the same
-    /// statement (`sched.dispatch.claims-derived+2` — an unverifiable
+    /// statement (`sched.dispatch.claims-derived+3` — an unverifiable
     /// claim is NO claim and never stays in the live evidence column;
     /// exact ingress-strip parity, `ingress-inline-drv-binding+1`).
     /// M_070: round-15 destroyed the value here, which left

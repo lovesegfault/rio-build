@@ -5183,7 +5183,7 @@ fn store_evidence_set_raises_displacer_standing() -> anyhow::Result<()> {
         DefinitionEvidence::PathBoundBytes,
         "store-evidence-backed creation ranks PathBoundBytes"
     );
-    // r[verify sched.dispatch.claims-derived+2]
+    // r[verify sched.dispatch.claims-derived+3]
     assert!(
         !dag.node("sev").unwrap().ca.needs_resolve,
         "store-evidence-created node carries the BYTE-DERIVED resolve \

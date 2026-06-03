@@ -235,7 +235,30 @@ pub fn describe_metrics() {
          shapes never land here — they poison with remediation \
          (..._claims_unverifiable_total) and unverifiable declared hashes \
          strip and proceed (..._claims_stripped_total) \
-         (sched.dispatch.claims-derived+2)"
+         (sched.dispatch.claims-derived+3)"
+    );
+    describe_counter!(
+        "rio_scheduler_dispatch_claims_unseeded_total",
+        "Dispatch-time claims derivations deferred on POST-READ-THROUGH \
+         unseeded inputs (sched.dispatch.claims-derived+3, bug_029): a \
+         direct input's identity was found in neither the resident DAG \
+         nor the persisted rows. Bounded by the node's own budget \
+         (max_infra_retries); exhaustion poisons with the generated \
+         remediation. Pre-+3 this population instant-poisoned through \
+         ..._claims_unverifiable_total — a deploy failover (which erases \
+         every completed input's residency at once) poisoned honest \
+         in-flight builds; expect transient nonzero here right after a \
+         scheduler failover, converging as read-throughs hit."
+    );
+    describe_counter!(
+        "rio_scheduler_claims_row_readthrough_total",
+        "Persisted-row read-throughs for unseeded claim inputs at the \
+         check_store_evidence chokepoint (sched.dispatch.claims-derived+3), \
+         labeled by result: seeded (rows re-seeded the verification — the \
+         reap/failover recovery path working as designed), miss (no \
+         seedable rows; the verdict stands post-read-through), error (PG \
+         lookup failed; deferred as transient store silence, never a \
+         permanence verdict)."
     );
     describe_counter!(
         "rio_scheduler_dispatch_claims_stripped_total",
@@ -244,16 +267,19 @@ pub fn describe_metrics() {
          STRIPPED at dispatch (an unverifiable claim is no claim — exact \
          ingress-strip parity): the node proceeds on the verified bytes at \
          path_bound_bytes with the hash cleared in memory and PG \
-         (sched.dispatch.claims-derived+2). The expected nonzero source is \
+         (sched.dispatch.claims-derived+3). The expected nonzero source is \
          warm gateway CA-chain / deferred-IA submissions."
     );
     describe_counter!(
         "rio_scheduler_dispatch_claims_unverifiable_total",
         "Bare store-backed nodes whose claims verification is STRUCTURALLY \
-         impossible (unseedable input, unparseable declared path): poisoned \
-         at dispatch with generated remediation instead of livelocking \
-         through backoff (sched.dispatch.claims-derived+2). Nonzero means \
-         submitters are submitting underspecified closures."
+         impossible for CONTENT-BOUND reasons (today exactly: unparseable \
+         declared drv_path): poisoned at dispatch with generated \
+         remediation instead of livelocking through backoff \
+         (sched.dispatch.claims-derived+3). Missing input identity is NO \
+         LONGER in this population — it defers through \
+         ..._claims_unseeded_total with a bounded budget; dashboards keyed \
+         here see the unseeded population move."
     );
     describe_counter!(
         "rio_scheduler_cache_hits_total",
