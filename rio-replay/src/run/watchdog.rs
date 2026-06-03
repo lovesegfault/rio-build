@@ -91,7 +91,12 @@ pub const COMPONENT_DISPATCH: &str = "dispatch";
 /// [`SuspensionSummary::degrades_timing`] — are pinned against this list
 /// by tests, so adding a component here without deciding its membership
 /// in each classifying predicate fails the build's tests rather than
-/// silently falling into a default bucket.
+/// silently falling into a default bucket. `on_tick` additionally
+/// enforces membership at runtime (a hard assert, both profiles) before
+/// a component can enter a suspension window: the tests pin only the
+/// triggers they drive, and a future component asserted by an orthogonal
+/// trigger must fail loudly rather than classify non-degrading by
+/// default.
 pub const ALL_COMPONENTS: &[&str] = &[
     COMPONENT_PAUSE,
     COMPONENT_IDLE,
@@ -662,6 +667,26 @@ impl Watchdog {
         self.last_tick_unix = Some(tick.at_unix);
 
         let components = self.evaluate_components(tick);
+        // Hard registry gate at the single point where the tick vocabulary
+        // enters the persisted summary (window open/extend and the
+        // per-component totals all consume this vec): a component outside
+        // [`ALL_COMPONENTS`] must never reach a window, because every
+        // classifying predicate over the window log — today
+        // [`SuspensionSummary::degrades_timing`] — is pinned against the
+        // registry and would silently route an unregistered value into its
+        // default (non-degrading) bucket. The registry-completeness test
+        // covers only the components its ticks can trigger; a future
+        // component asserted by an orthogonal trigger would sail past it,
+        // so this is a release-profile assert, not a debug_assert — four
+        // slice probes once per poll tick.
+        for c in &components {
+            assert!(
+                ALL_COMPONENTS.contains(c),
+                "suspension component {c:?} is not in ALL_COMPONENTS — register it and \
+                 classify it in every predicate over the window log (degrades_timing) \
+                 before it can enter a suspension window"
+            );
+        }
         let suspended = !components.is_empty();
         let dispatch_pause = components.contains(&COMPONENT_DISPATCH);
         // Queue-depth assertion under the same stale-evidence gate as the
