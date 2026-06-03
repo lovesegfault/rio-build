@@ -1254,6 +1254,7 @@ in
         "servedSpanExact"
         "completeLogServesAllProduced"
         "completenessGate"
+        "ingestLossCounted"
       ];
     };
 
@@ -1276,6 +1277,7 @@ in
         "servedSpanExact"
         "completeLogServesAllProduced"
         "completenessGate"
+        "ingestLossCounted"
       ];
     };
 
@@ -1300,13 +1302,19 @@ in
         "completeLogServesAllProduced"
         "completenessGate"
         "acceptedWithinCap"
+        "ingestLossCounted"
       ];
     };
 
-    # The TTL sweep against a live ingest pipeline: the expired-only
-    # guard, the chunks-before-execution-row deletion order with a cut
-    # interleavable between the two DELETEs, and the disclosed-loss
-    # accounting for swept lines.
+    # The TTL machinery against a live ingest pipeline, v2 ownership
+    # split: the STORE pass strips chunks (age-only by design — it
+    # never touches the lifecycle row) while the SCHEDULER's gcExecRow
+    # reclaims the row behind the kernel eligibility (terminal AND
+    # ledger-unreferenced AND aged out —
+    # `rio_retry_kernel::exec_row_sweep_eligible`); an
+    # expired-but-referenced execution's row survives until the
+    # attempt-ledger GC releases it.
+    # r[verify store.log.sweep-ownership]
     quint-log-service-sweep = mkQuintCheck {
       name = "log-service-sweep";
       spec = "logService";
@@ -1320,6 +1328,8 @@ in
         "servedSpanExact"
         "completeLogServesAllProduced"
         "completenessGate"
+        "ingestLossCounted"
+        "sweepOnlyTerminalUnreferenced"
       ];
     };
 
@@ -1462,6 +1472,94 @@ in
       spec = "logService";
       main = "logServiceCalibGateRow";
       witness = "authGateExcludesUnassignedWriters";
+    };
+
+    # The kind-mix regime: a materialization attempt takes the
+    # latest-assignment slot mid-stream and the build execution's late
+    # replay must still be admitted while the mat execution never is —
+    # the displacement class merged_bug_101's claimed-exec re-keying
+    # fixed, kind half (the gate's `attempt_kind` conjunct).
+    # r[verify store.log.append-auth+2]
+    quint-log-service-kind-mix = mkQuintCheck {
+      name = "log-service-kind-mix";
+      spec = "logService";
+      main = "logServiceKindMix";
+      invariants = [
+        "boundsOK"
+        "noCrossExecContamination"
+        "authGateExcludesUnassignedWriters"
+        "noSilentLineLoss"
+        "servedSpanExact"
+        "completeLogServesAllProduced"
+        "completenessGate"
+        "ingestLossCounted"
+        "buildTailAdmittable"
+      ];
+    };
+
+    # A build execution's replay open is admitted while a later
+    # materialization attempt holds the latest slot — the admission the
+    # pre-fix latest-only gate displaced is reachable, so
+    # buildTailAdmittable's verdict in the kind-mix regime is not
+    # vacuous.
+    quint-log-service-witness-kind-mix-replay = mkQuintWitnessCheck {
+      name = "log-service-witness-kind-mix-replay";
+      spec = "logService";
+      main = "logServiceKindMix";
+      witness = "noMatDispatchThenBuildReplayAdmitted";
+    };
+
+    # CALIBRATION (expect-violation): the pre-fix latest-assignment-only
+    # open gate — a materialization mint landing after the build revokes
+    # the build's replay (merged_bug_101's displacement hole) —
+    # buildTailAdmittable falsifies.
+    quint-log-service-calib-latest-only = mkQuintWitnessCheck {
+      name = "log-service-calib-latest-only";
+      spec = "logService";
+      main = "logServiceCalibLatestOnly";
+      witness = "buildTailAdmittable";
+    };
+
+    # An abandonment actually fires the disclosure counter — the
+    # counted arm of the loss lattice is exercised.
+    # r[verify builder.log.loss-disclosure]
+    quint-log-service-witness-loss-counted = mkQuintWitnessCheck {
+      name = "log-service-witness-loss-counted";
+      spec = "logService";
+      main = "logServiceBase";
+      witness = "noLossCounterFired";
+    };
+
+    # CALIBRATION (expect-violation): the pre-fix rejected:true
+    # suppression — the permanent-rejection discard skips the counter
+    # and an execution with produced-but-never-stored lines abandons
+    # silently (merged_bug_360) — ingestLossCounted falsifies.
+    quint-log-service-calib-loss-escape = mkQuintWitnessCheck {
+      name = "log-service-calib-loss-escape";
+      spec = "logService";
+      main = "logServiceCalibLossEscape";
+      witness = "ingestLossCounted";
+    };
+
+    # CALIBRATION (expect-violation): the pre-fix age-only sweep SELECT
+    # deletes a never-terminal or still-referenced execution's
+    # lifecycle row (merged_bug_086) — sweepOnlyTerminalUnreferenced
+    # falsifies.
+    quint-log-service-calib-sweep-age-only = mkQuintWitnessCheck {
+      name = "log-service-calib-sweep-age-only";
+      spec = "logService";
+      main = "logServiceCalibSweepAgeOnly";
+      witness = "sweepOnlyTerminalUnreferenced";
+    };
+
+    # An expired execution SURVIVES the sweep with its row intact
+    # because it is still non-terminal or ledger-referenced — the v2
+    # eligibility actually refuses something the age-only sweep took.
+    quint-log-service-witness-live-exec-survives = mkQuintWitnessCheck {
+      name = "log-service-witness-live-exec-survives";
+      spec = "logService";
+      main = "logServiceSweep";
+      witness = "noLiveExecSurvivesSweep";
     };
 
     # Two executions' logs grow concurrently (the superseded execution's

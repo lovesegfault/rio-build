@@ -40,9 +40,22 @@
 //     status, known count, the contiguous-coverage fold;
 //   - the scheduler's terminal stamp (`completion.rs`): the 0 -> NULL
 //     final-line-count mapping;
-//   - the TTL sweep (`sweep.rs::sweep_expired_logs`): the expired-only
-//     guard and the chunks-before-execution-row deletion order, split
-//     into two actions so the mid-pass crash window is reachable.
+//   - the TTL sweep (`sweep.rs::sweep_expired_logs`): the v2
+//     eligibility (`rio_retry_kernel::exec_row_sweep_eligible` —
+//     terminal AND attempt-ledger-unreferenced AND aged out; the
+//     fourth kernel conjunct, no-active-assignment, is scheduler-side
+//     state outside this model and its omission only WIDENS the
+//     modeled sweep, so every safety verdict transfers) and the
+//     row left to the SCHEDULER's `gcExecRow` reclaim — the bughunt
+//     wave's ownership split (`store.log.sweep-ownership`);
+//   - the execution-kind population (bughunt-wave B2): a
+//     materialization attempt of the same derivation can take the
+//     latest-assignment slot, and the open gate's kind conjunct
+//     (`gate.rs`'s `attempt_kind` read) admits build executions only;
+//   - the uploader's loss-disclosure accounting (`log_upload.rs::
+//     disclose`, the single chokepoint every abandoned line routes
+//     through): an abandonment either counted its real loss or had
+//     none to count.
 //
 // WHAT IS NOT MODELED (deliberate scope boundaries, each priced):
 //   - Line content and byte sizes. Lines are integers (worker-assigned
@@ -188,14 +201,25 @@ module logService {
   /// grows (ingest) or is emptied wholesale (the TTL sweep).
   type Chunk = { sess: int, first: int, count: int }
 
+  /// The execution's `drv_executions.attempt_kind` (bughunt-wave B2):
+  /// the open gate admits `KBuild` only — a materialization execution
+  /// never holds an AppendLog stream, and its taking the
+  /// latest-assignment slot must not revoke a build execution's
+  /// replay (merged_bug_101's displacement class, the kind half).
+  type Kind = | KBuild | KMat
+
   /// The per-build-attempt uploader's terminal state
-  /// (`log_upload.rs::DrainStatus`). `Uploading` covers the whole live
-  /// lifecycle (streaming, reconnecting, draining); `Abandoned` covers
-  /// both the drain-deadline expiry (real, counted, error-logged data
-  /// loss) and the permanent store rejection (the execution was
-  /// superseded or its log is already complete — the buffer is
-  /// discarded and the warn at the rejection site is the disclosure).
-  type Uploader = | Uploading | Abandoned
+  /// (`log_upload.rs::DrainStatus` x the `disclose()` chokepoint).
+  /// `Uploading` covers the whole live lifecycle (streaming,
+  /// reconnecting, draining). `Abandoned({ counted })` covers the
+  /// drain-deadline expiry, the permanent store rejection, and the
+  /// panic guard — every arm routes through `disclose()`, which
+  /// increments `rio_builder_log_drain_abandoned_total` iff real lines
+  /// were lost; `counted: false` therefore CLAIMS the abandonment had
+  /// no un-stored lines (`ingestLossCounted` checks that claim; the
+  /// pre-fix rejected:true suppression that skipped the counter is
+  /// `CALIB_LOSS_ESCAPE`).
+  type Uploader = | Uploading | Abandoned({ counted: bool })
 
   // --- 2. constants (const = overridable per regime) --------------------
 
@@ -253,6 +277,45 @@ module logService {
   const CALIB_GATE_IGNORES_ROW: bool
   /// Executions can expire and the TTL sweep can run.
   const ENABLE_SWEEP: bool
+
+  /// A materialization attempt can be dispatched into the
+  /// latest-assignment slot (`dispatchMaterialization`). Off in the
+  /// regimes that predate the kind axis — their state spaces carry
+  /// `execKind` as a constant-`KBuild` map and are unchanged.
+  const ENABLE_MAT_DISPATCH: bool
+  /// Upper bound on BUILD-kind dispatches (`dispatch`). The regimes
+  /// that predate the kind axis bind it to MAX_EXECS (no behavior
+  /// change); the kind-mix regime binds 1 so its second slot is
+  /// exclusively the materialization attempt — without the bound the
+  /// regime explores the two-build-execs x two-sessions cross product
+  /// (the redispatch and resend subjects multiplied; measured past
+  /// 300M distinct states), and the displacement scenario needs
+  /// exactly one build.
+  const MAX_BUILD_EXECS: int
+
+  /// CALIBRATION ONLY (`logServiceCalibLatestOnly`): re-encode the
+  /// pre-fix latest-assignment-only open gate — admission requires
+  /// `e == dispatched`, so any later dispatch (a re-attempt or a
+  /// materialization mint) silently revokes a terminal-but-incomplete
+  /// build's late replay (merged_bug_101's displacement hole).
+  /// Production regimes bind false; the calibration check pins that
+  /// `buildTailAdmittable` falsifies under it.
+  const CALIB_GATE_LATEST_ONLY: bool
+
+  /// CALIBRATION ONLY (`logServiceCalibLossEscape`): the pre-fix
+  /// rejected:true suppression — the permanent-rejection abandonment
+  /// discards the retransmit buffer WITHOUT routing through the
+  /// disclosure counter (merged_bug_360's PERMISSION_DENIED hole).
+  /// Production regimes bind false; the calibration check pins that
+  /// `ingestLossCounted` falsifies under it.
+  const CALIB_LOSS_ESCAPE: bool
+
+  /// CALIBRATION ONLY (`logServiceCalibSweepAgeOnly`): the pre-fix
+  /// age-only sweep SELECT — eligibility ignores the terminal and
+  /// ledger-reference conjuncts (merged_bug_086). Production regimes
+  /// bind false; the calibration check pins that
+  /// `sweepOnlyTerminalUnreferenced` falsifies under it.
+  const CALIB_SWEEP_AGE_ONLY: bool
 
   // --- 3. pure helpers --------------------------------------------------
 
@@ -328,10 +391,24 @@ module logService {
   /// `store.log.caps-durable` fix). The accept guard charges it; the
   /// open gate refuses an at-cap execution.
   var acceptedTotal: int -> int
-  /// Per execution: the current sweep pass has deleted the manifest
-  /// rows and may now delete the execution row (the program counter
-  /// between `sweep.rs`'s two DELETE statements; a cut can interleave).
+  /// Per execution: the store's TTL pass has stripped this execution
+  /// (chunks + session registry). Mirrors the SELECT's EXISTS
+  /// disjunction keeping a stripped execution out of later passes.
   var sweepChunksDone: int -> bool
+
+  /// Per execution: `drv_executions.attempt_kind`, stamped at dispatch
+  /// and immutable (the dispatch INSERT writes it once).
+  var execKind: int -> Kind
+  /// Per execution: the scheduler's attempt ledger still references
+  /// this execution (`drv_attempts` rows whose exec joins here — the
+  /// retry kernel's decision suffix). Set at dispatch (the attempt
+  /// INSERT), released by the environment when the ledger GC's own
+  /// per-lane cut moves past it (`ledgerReleases`); the v2 sweep
+  /// refuses to delete a referenced row. Frozen once the row is gone
+  /// (a post-deletion release changes nothing this subsystem reads),
+  /// which is what makes `sweepOnlyTerminalUnreferenced` checkable
+  /// from post-states.
+  var ledgerReferenced: int -> bool
 
   /// Per execution: the uploader's lifecycle.
   var uploader: int -> Uploader
@@ -373,12 +450,17 @@ module logService {
   ///   - `nonMonotoneRejected`: the monotone floor dropped a batch
   ///     numbered below the session's high-water mark.
   ///   - `sweptChunks`: the TTL sweep deleted a non-empty manifest.
+  ///   - `matThenBuildReplayAdmitted`: a build execution's reopen was
+  ///     admitted while a LATER materialization attempt held the
+  ///     latest-assignment slot — the replay the pre-fix latest-only
+  ///     gate displaced.
   var wit: {
     supersededOpenRejected: bool,
     completeOpenRejected: bool,
     pastFinalRejected: bool,
     nonMonotoneRejected: bool,
     sweptChunks: bool,
+    matThenBuildReplayAdmitted: bool,
   }
 
   // --- 5. derived state -------------------------------------------------
@@ -390,12 +472,20 @@ module logService {
   /// emitted into its uploader.
   def delivered(e: int): Set[int] = interval(0, producedEnd.get(e))
 
+  /// The uploader has reached a terminal state (any abandonment arm).
+  def uploaderAbandoned(e: int): bool = uploader.get(e) != Uploading
+
+  /// The uploader's abandonment routed through the disclosure counter
+  /// (`disclose()` with `lost > 0`). False while uploading.
+  def uploaderLossCounted(e: int): bool =
+    match uploader.get(e) { | Uploading => false | Abandoned(a) => a.counted }
+
   /// The builder's retransmit buffer: every emitted line not yet covered
   /// by a received ack. Emptied by abandonment (the deadline expiry or
   /// the permanent rejection — `UploadTask::reject_permanently` clears
   /// the deque, and an exited task's heap is gone either way).
   def builderBuf(e: int): Set[int] =
-    if (uploader.get(e) == Abandoned) Set()
+    if (uploaderAbandoned(e)) Set()
     else interval(ackedBelow.get(e), producedEnd.get(e))
 
   // Session accessors. Quint's effect system requires every branch of a
@@ -437,6 +527,28 @@ module logService {
   /// Is line `n` in some session's not-yet-durable ingest buffer for `e`?
   def storeBufHolds(e: int, n: int): bool =
     SESSION_IDS.exists(s => sessBuf(e, s).contains(n))
+
+  /// `rio_retry_kernel::exec_row_sweep_eligible`, projected onto this
+  /// model's state (bughunt-wave B2, merged_bug_086): the sweep pass
+  /// may target an execution only if its lifecycle row is TERMINAL
+  /// (the model's collapsed encoding: a stamped count — see the
+  /// `dbFinalCount` doc; a terminal row with an unknown count is
+  /// indistinguishable from a non-terminal one here, which only makes
+  /// the modeled guard stricter), the attempt ledger no longer
+  /// references it, and the retention clock has aged it out. The
+  /// kernel's fourth conjunct (no active assignment) is scheduler-side
+  /// state this model does not carry; omitting it only widens the
+  /// modeled reclaim. Guards `gcExecRow` (the scheduler's row delete);
+  /// the store's chunk/session pass is age-only BY DESIGN — it never
+  /// touches the row.
+  def execRowSweepEligible(e: int): bool = and {
+    expired.get(e),
+    // CALIBRATION: the pre-fix SELECT was age-only.
+    CALIB_SWEEP_AGE_ONLY or and {
+      dbFinalCount.get(e) != NoCount,
+      not(ledgerReferenced.get(e)),
+    },
+  }
 
   // -- The completeness predicate (`gate.rs::log_is_complete`) ---------
 
@@ -631,6 +743,60 @@ module logService {
   /// boundary — the cap conjuncts are exercised, not vacuous.
   val noCapBoundary = EXECS.forall(e => acceptedTotal.get(e) < CAP)
 
+  /// `store.log.append-auth+2`'s kind half + the displacement fix
+  /// (bughunt-wave B2 item 8, merged_bug_101's kind leg): a
+  /// materialization execution is NEVER admitted to AppendLog, and a
+  /// build execution whose own row is intact, whose log is incomplete
+  /// and unexpired, and whose durable account has headroom IS admitted
+  /// — even while a later attempt (in particular a materialization
+  /// mint) holds the latest-assignment slot. In the production gate
+  /// the second conjunct is the gate's own definition (the calibration
+  /// gives it teeth: `CALIB_GATE_LATEST_ONLY` re-adds the pre-fix
+  /// `e == dispatched` conjunct and a mat dispatch then falsifies it).
+  val buildTailAdmittable = EXECS.forall(e => and {
+    execKind.get(e) == KMat implies not(openAdmitted(e)),
+    (and {
+      e <= dispatched,
+      execKind.get(e) == KBuild,
+      not(assignmentRowLost.get(e)),
+      not(logIsComplete(e)),
+      not(expired.get(e)),
+      acceptedTotal.get(e) < CAP,
+    }) implies openAdmitted(e),
+  })
+
+  /// `builder.log.loss-disclosure` at the ingest plane (bughunt-wave
+  /// B2 item 8, merged_bug_360): an abandonment that did NOT route a
+  /// loss through the disclosure counter must have had nothing real to
+  /// lose — every line its build produced is store-held (buffered or
+  /// committed). Deliberately WITHOUT `noSilentLineLoss`'s
+  /// not-complete and abandoned escapes: the pre-fix rejected:true
+  /// suppression (`CALIB_LOSS_ESCAPE`) satisfied those and still
+  /// vanished real lines silently — exactly the hole this plane pins.
+  val ingestLossCounted = EXECS.forall(e =>
+    match uploader.get(e) {
+      | Uploading => true
+      | Abandoned(a) =>
+        not(a.counted) implies
+          delivered(e).forall(n => storeBufHolds(e, n) or manifestHolds(e, n))
+    })
+
+  /// `store.log.sweep-ownership` (bughunt-wave B2 item 8,
+  /// merged_bug_086): a deleted lifecycle row implies the execution
+  /// was sweep-eligible — terminal, attempt-ledger-unreferenced, and
+  /// aged out. Sound from post-states because all three facts are
+  /// frozen or monotone once the row is gone (`recordFinalLineCount`
+  /// and `ledgerReleases` both require the row; `expired` never
+  /// clears). The age-only calibration (`CALIB_SWEEP_AGE_ONLY`)
+  /// falsifies it by sweeping a never-terminal or still-referenced
+  /// execution.
+  val sweepOnlyTerminalUnreferenced = EXECS.forall(e =>
+    (e <= dispatched and not(execRowExists.get(e))) implies and {
+      dbFinalCount.get(e) != NoCount,
+      not(ledgerReferenced.get(e)),
+      expired.get(e),
+    })
+
   /// `NoSilentLineLoss` (the conservation law), the four-disjunct
   /// disclosed-loss form from log-invariant-map.md's campaign close-out:
   /// every line the build emitted into its uploader is, at all times,
@@ -657,7 +823,7 @@ module logService {
       storeBufHolds(e, n),
       manifestHolds(e, n),
       not(logIsComplete(e)),
-      uploader.get(e) == Abandoned,
+      uploaderAbandoned(e),
     }))
 
   /// The conservation law's load-bearing refinement FOR THE HONEST
@@ -816,7 +982,7 @@ module logService {
   /// the disclosed-loss channel (`rio_builder_log_drain_abandoned_total`
   /// / the permanent-rejection discard) actually fires.
   val noAbandonedWithUnacked = not(EXECS.exists(e => and {
-    uploader.get(e) == Abandoned,
+    uploaderAbandoned(e),
     ackedBelow.get(e) < producedEnd.get(e),
   }))
 
@@ -837,6 +1003,28 @@ module logService {
   /// expired carve-out and the conservation law's disclosed-loss
   /// disjunct are exercised against a real deletion.
   val noSweptChunks = not(wit.sweptChunks)
+
+  /// Violated when a build execution's REPLAY open is admitted while a
+  /// later materialization attempt holds the latest-assignment slot —
+  /// the exact displacement scenario merged_bug_101's fix exists for.
+  /// `buildTailAdmittable`'s verdict in the kind-mix regime is about a
+  /// state space that actually contains this admission.
+  val noMatDispatchThenBuildReplayAdmitted = not(wit.matThenBuildReplayAdmitted)
+
+  /// Violated when some abandonment actually fires the disclosure
+  /// counter — `ingestLossCounted`'s counted arm is exercised against
+  /// a real counted loss, not merely encoded.
+  val noLossCounterFired = not(EXECS.exists(e => uploaderLossCounted(e)))
+
+  /// Violated when an expired execution SURVIVES with its lifecycle
+  /// row intact because it is still ineligible (non-terminal or
+  /// ledger-referenced) — the v2 guard actually refuses something the
+  /// age-only sweep would have taken.
+  val noLiveExecSurvivesSweep = not(EXECS.exists(e => and {
+    expired.get(e),
+    execRowExists.get(e),
+    or { dbFinalCount.get(e) == NoCount, ledgerReferenced.get(e) },
+  }))
 
   // --- 6. actions -------------------------------------------------------
   //
@@ -863,11 +1051,81 @@ module logService {
   //          rio-scheduler/src/db/executions.rs (the dispatch INSERT).
   action dispatch = all {
     dispatched < MAX_EXECS,
+    EXECS.filter(e => e <= dispatched and execKind.get(e) == KBuild).size() < MAX_BUILD_EXECS,
     dispatched' = dispatched + 1,
     execRowExists' = execRowExists.put(dispatched + 1, true),
+    execKind' = execKind.put(dispatched + 1, KBuild),
+    ledgerReferenced' = ledgerReferenced.put(dispatched + 1, true),
     producedEnd' = producedEnd,
     buildFinished' = buildFinished,
     dbFinalCount' = dbFinalCount,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessions' = sessions,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    wit' = wit,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
+  }
+
+  /// A materialization attempt of the same derivation takes the
+  /// latest-assignment slot (the zeroth-executor mint): a fresh
+  /// exec_id with `attempt_kind = 'materialization'` becomes the
+  /// LATEST assignment and its lifecycle row is INSERTed. It has no
+  /// uploader, produces no log lines, and the open gate's kind
+  /// conjunct never admits it — what it CAN do, pre-fix, is displace
+  /// a build execution's late replay (the latest-only gate;
+  /// `CALIB_GATE_LATEST_ONLY`).
+  // Mirrors: rio-scheduler mint_and_deliver (kind = materialization)
+  //          observed by gate.rs as a newer assignments row.
+  action dispatchMaterialization = all {
+    ENABLE_MAT_DISPATCH,
+    dispatched < MAX_EXECS,
+    dispatched' = dispatched + 1,
+    execRowExists' = execRowExists.put(dispatched + 1, true),
+    execKind' = execKind.put(dispatched + 1, KMat),
+    ledgerReferenced' = ledgerReferenced.put(dispatched + 1, true),
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessions' = sessions,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    wit' = wit,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
+  }
+
+  /// ENVIRONMENT: the scheduler's attempt-ledger GC moves its per-lane
+  /// suffix cut past this execution's rows — the ledger no longer
+  /// references it and the v2 sweep may reclaim the lifecycle row.
+  /// Guarded on the row still existing so the reference state is
+  /// frozen after deletion (see the var's doc).
+  // Mirrors: the drv_attempts per-lane GC cut observed by
+  //          sweep.rs's eligibility SELECT as zero referencing rows.
+  action ledgerReleases(e: int): bool = all {
+    ENABLE_SWEEP,
+    e <= dispatched,
+    ledgerReferenced.get(e),
+    execRowExists.get(e),
+    ledgerReferenced' = ledgerReferenced.put(e, false),
+    execKind' = execKind,
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
     expired' = expired,
     sweepChunksDone' = sweepChunksDone,
     uploader' = uploader,
@@ -888,6 +1146,7 @@ module logService {
   //          log_upload.rs::UploadTask::accept (the buffer push).
   action produceLine(e: int): bool = all {
     e <= dispatched,
+    execKind.get(e) == KBuild,
     not(buildFinished.get(e)),
     producedEnd.get(e) < MAX_LINE,
     producedEnd' = producedEnd.put(e, producedEnd.get(e) + 1),
@@ -906,6 +1165,8 @@ module logService {
     fabricated' = fabricated,
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
 
@@ -916,6 +1177,7 @@ module logService {
   //          completion report) + log_upload.rs::accept(None).
   action buildFinishes(e: int): bool = all {
     e <= dispatched,
+    execKind.get(e) == KBuild,
     not(buildFinished.get(e)),
     buildFinished' = buildFinished.put(e, true),
     dispatched' = dispatched,
@@ -933,6 +1195,8 @@ module logService {
     fabricated' = fabricated,
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
 
@@ -977,6 +1241,8 @@ module logService {
     fabricated' = fabricated,
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
 
@@ -992,13 +1258,19 @@ module logService {
   /// `store.log.caps-durable`). Checks 1-2 (HMAC, the token-vs-header
   /// derivation match) are pure equality on signed fields; the
   /// single-live-session lease is the `openSessionOf(e) == 0`
-  /// admission conjunct on the action itself. The kind axis (a
-  /// materialization execution is never admitted) is a constant in
-  /// this model — every modeled execution is build-kind.
+  /// admission conjunct on the action itself. v3 (bughunt-wave B2
+  /// item 8): the kind axis is modeled — the gate's `attempt_kind`
+  /// read admits build executions only, and token expiry is part of
+  /// the per-exec predicate (the gate's view of an expired row).
   def openAdmitted(e: int): bool = and {
     e <= dispatched,
+    execKind.get(e) == KBuild,
+    // CALIBRATION: the pre-fix latest-assignment-only gate — any later
+    // dispatch (including a materialization mint) revoked the replay.
+    not(CALIB_GATE_LATEST_ONLY) or e == dispatched,
     CALIB_GATE_IGNORES_ROW or not(assignmentRowLost.get(e)),
     not(logIsComplete(e)),
+    not(expired.get(e)),
     // CALIBRATION: pre-fix there WAS no open-time cap check (check 5
     // did not exist) — the per-session encoding drops this conjunct
     // along with resetting the account.
@@ -1027,8 +1299,8 @@ module logService {
     // that do not explore the at-least-once shape disable it (the first
     // open is always allowed).
     sessionsOpened.get(e) == 0 or ENABLE_RECONNECT,
-    // Token expiry << the 30-day TTL (see the header's scope notes).
-    not(expired.get(e)),
+    // Token expiry << the 30-day TTL (see the header's scope notes);
+    // the conjunct lives in `openAdmitted` (v3).
     sessions' = sessions.put(e, sessions.get(e).put(sessionsOpened.get(e) + 1, Session({
       phase: SessOpen,
       highWater: 0,
@@ -1044,6 +1316,13 @@ module logService {
     // open; production keeps the lifetime account.
     acceptedTotal' = if (CALIB_SESSION_SCOPED_CAPS) acceptedTotal.put(e, 0)
                      else acceptedTotal,
+    // Witness ghost: this open is a REPLAY (not the first session) and
+    // a later materialization attempt holds the latest slot — the
+    // admission the pre-fix latest-only gate displaced.
+    wit' = if (sessionsOpened.get(e) > 0 and
+               EXECS.exists(m => m <= dispatched and m > e and execKind.get(m) == KMat))
+             { ...wit, matThenBuildReplayAdmitted: true }
+           else wit,
     dispatched' = dispatched,
     producedEnd' = producedEnd,
     buildFinished' = buildFinished,
@@ -1055,8 +1334,9 @@ module logService {
     ackedBelow' = ackedBelow,
     chunks' = chunks,
     fabricated' = fabricated,
-    wit' = wit,
     assignmentRowLost' = assignmentRowLost,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
   }
 
   /// The gate rejects a stream open whose claimed execution's
@@ -1071,10 +1351,15 @@ module logService {
   //          log_upload.rs::reject_permanently.
   action openRejectedSuperseded(e: int): bool = all {
     e <= dispatched,
+    execKind.get(e) == KBuild,
     assignmentRowLost.get(e),
     uploader.get(e) == Uploading,
     openSessionOf(e) == 0,
-    uploader' = uploader.put(e, Abandoned),
+    // v2 (2f975de9a): the permanent-rejection discard routes through
+    // the `disclose()` chokepoint like every other abandonment arm.
+    // CALIBRATION: pre-fix, rejected:true SUPPRESSED the counter — the
+    // buffer vanished silently (merged_bug_360).
+    uploader' = uploader.put(e, Abandoned({ counted: not(CALIB_LOSS_ESCAPE) })),
     wit' = { ...wit, supersededOpenRejected: true },
     dispatched' = dispatched,
     producedEnd' = producedEnd,
@@ -1090,6 +1375,8 @@ module logService {
     chunks' = chunks,
     fabricated' = fabricated,
     assignmentRowLost' = assignmentRowLost,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
 
@@ -1112,6 +1399,8 @@ module logService {
     execRowExists' = execRowExists,
     expired' = expired,
     acceptedTotal' = acceptedTotal,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
     sweepChunksDone' = sweepChunksDone,
     uploader' = uploader,
     ackedBelow' = ackedBelow,
@@ -1133,10 +1422,11 @@ module logService {
   action openRejectedComplete(e: int): bool = all {
     e <= dispatched,
     e == dispatched,
+    execKind.get(e) == KBuild,
     logIsComplete(e),
     uploader.get(e) == Uploading,
     openSessionOf(e) == 0,
-    uploader' = uploader.put(e, Abandoned),
+    uploader' = uploader.put(e, Abandoned({ counted: true })),
     wit' = { ...wit, completeOpenRejected: true },
     dispatched' = dispatched,
     producedEnd' = producedEnd,
@@ -1152,6 +1442,8 @@ module logService {
     chunks' = chunks,
     fabricated' = fabricated,
     assignmentRowLost' = assignmentRowLost,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
 
@@ -1237,6 +1529,8 @@ module logService {
     chunks' = chunks,
     fabricated' = fabricated,
     assignmentRowLost' = assignmentRowLost,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
   }
 
   /// The bound builder sends a batch that is NOT its uploader's honest
@@ -1308,6 +1602,8 @@ module logService {
     sessionsOpened' = sessionsOpened,
     chunks' = chunks,
     assignmentRowLost' = assignmentRowLost,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
   }
 
   /// A session learns the execution's recorded `final_line_count`
@@ -1355,6 +1651,8 @@ module logService {
     fabricated' = fabricated,
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
 
@@ -1405,6 +1703,8 @@ module logService {
     fabricated' = fabricated,
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
 
@@ -1447,6 +1747,8 @@ module logService {
     fabricated' = fabricated,
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
 
@@ -1490,6 +1792,8 @@ module logService {
     fabricated' = fabricated,
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
 
@@ -1528,6 +1832,8 @@ module logService {
     fabricated' = fabricated,
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
 
@@ -1540,10 +1846,13 @@ module logService {
   // Mirrors: log_upload.rs::run_inner (DeadlineExpired -> abandoned()).
   action uploaderAbandons(e: int): bool = all {
     e <= dispatched,
+    execKind.get(e) == KBuild,
     uploader.get(e) == Uploading,
     buildFinished.get(e),
     ackedBelow.get(e) < producedEnd.get(e),
-    uploader' = uploader.put(e, Abandoned),
+    // The drain-deadline arm always routes through `disclose()`; its
+    // un-acked lines are real loss, so the counter fires.
+    uploader' = uploader.put(e, Abandoned({ counted: true })),
     dispatched' = dispatched,
     producedEnd' = producedEnd,
     buildFinished' = buildFinished,
@@ -1559,6 +1868,8 @@ module logService {
     fabricated' = fabricated,
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
 
@@ -1586,23 +1897,39 @@ module logService {
     fabricated' = fabricated,
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
     acceptedTotal' = acceptedTotal,
   }
 
-  /// The TTL sweep's first DELETE for one expired execution: every
-  /// `drv_log_chunks` manifest row (and, transitively, the objects they
-  /// reference). The guard is the sweep's SELECT: the execution's
-  /// lifecycle row is older than the retention window AND still exists
-  /// (the SELECT is over `drv_executions`).
+  /// The store's TTL sweep pass for one expired execution
+  /// (`sweep.rs::sweep_expired_logs`): every `drv_log_chunks` manifest
+  /// row (and transitively the objects). The pass also clears the
+  /// `log_ingest_sessions` REGISTRY rows — hygiene this model does not
+  /// carry: the `sessions` variable mirrors the IN-MEMORY ingest
+  /// sessions (phase, high water, buffer), which the pass never
+  /// touches — a still-open session keeps cutting after the pass, and
+  /// the SELECT's EXISTS disjunction re-finds the new chunks next
+  /// pass. v2 (`store.log.sweep-ownership`): the pass NEVER deletes
+  /// the `drv_executions` row — lifecycle state is scheduler-owned
+  /// (`gcExecRow`). Age is the pass's only eligibility: safe precisely
+  /// BECAUSE the row survives. The guard requires something to strip
+  /// (the EXISTS disjunction keeps a stripped execution out of every
+  /// later pass).
   // Mirrors: sweep.rs::sweep_expired_logs (the drv_log_chunks DELETE +
-  //          the object delete_batch).
+  //          delete_batch; the registry DELETE is unmodeled hygiene).
   action sweepChunks(e: int): bool = all {
     ENABLE_SWEEP,
     e <= dispatched,
     expired.get(e),
     execRowExists.get(e),
     not(sweepChunksDone.get(e)),
+    or {
+      chunks.get(e) != Set(),
+      SESSION_IDS.exists(s => hasSession(e, s)),
+    },
     chunks' = chunks.put(e, Set()),
+    sessions' = sessions,
     sweepChunksDone' = sweepChunksDone.put(e, true),
     wit' = if (chunks.get(e) != Set()) { ...wit, sweptChunks: true } else wit,
     dispatched' = dispatched,
@@ -1614,29 +1941,31 @@ module logService {
     uploader' = uploader,
     ackedBelow' = ackedBelow,
     sentBelow' = sentBelow,
-    sessions' = sessions,
     sessionsOpened' = sessionsOpened,
     fabricated' = fabricated,
     assignmentRowLost' = assignmentRowLost,
     acceptedTotal' = acceptedTotal,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
   }
 
-  /// The same sweep pass's last DELETE: the `drv_executions` row
-  /// itself. Ordered after the manifest DELETE so a crash mid-pass
-  /// leaves an expired execution with no chunks (re-found and finished
-  /// next hour) rather than chunks with no execution (never re-found).
-  /// A live session's cut CAN interleave between the two DELETEs and
-  /// commit a manifest row that survives the pass — that row references
-  /// a deleted execution and is never re-swept (the SELECT is over
-  /// `drv_executions`), a bounded leak priced in the header's scope
-  /// notes, not a safety violation.
-  // Mirrors: sweep.rs::sweep_expired_logs (the drv_executions DELETE).
-  action sweepExecRow(e: int): bool = all {
+  /// The SCHEDULER's execution-row reclaim
+  /// (`SchedulerDb::gc_exec_rows`, the housekeeping tick arm): deletes
+  /// the `drv_executions` row behind the kernel's eligibility —
+  /// `execRowSweepEligible` (terminal AND ledger-unreferenced AND aged
+  /// out; see the def's doc for the priced fourth conjunct). Runs in a
+  /// different service from the store's sweep pass: no ordering with
+  /// `sweepChunks` — a row reclaimed before its chunks are stripped
+  /// leaves the chunks unreachable to the store SELECT (bounded by the
+  /// S3 lifecycle backstop, priced in the header), and a row that
+  /// outlives its stripped chunks reads incomplete forever (disclosed).
+  // Mirrors: rio-scheduler/src/db/attempts.rs::gc_exec_rows behind
+  //          rio_retry_kernel::exec_row_sweep_eligible.
+  action gcExecRow(e: int): bool = all {
     ENABLE_SWEEP,
     e <= dispatched,
-    expired.get(e),
+    execRowSweepEligible(e),
     execRowExists.get(e),
-    sweepChunksDone.get(e),
     execRowExists' = execRowExists.put(e, false),
     dispatched' = dispatched,
     producedEnd' = producedEnd,
@@ -1654,6 +1983,8 @@ module logService {
     wit' = wit,
     assignmentRowLost' = assignmentRowLost,
     acceptedTotal' = acceptedTotal,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
   }
 
   // --- 8. init ----------------------------------------------------------
@@ -1668,6 +1999,8 @@ module logService {
     assignmentRowLost' = EXECS.mapBy(e => false),
     acceptedTotal' = EXECS.mapBy(e => 0),
     sweepChunksDone' = EXECS.mapBy(e => false),
+    execKind' = EXECS.mapBy(e => KBuild),
+    ledgerReferenced' = EXECS.mapBy(e => true),
     uploader' = EXECS.mapBy(e => Uploading),
     ackedBelow' = EXECS.mapBy(e => 0),
     sentBelow' = EXECS.mapBy(e => 0),
@@ -1681,6 +2014,7 @@ module logService {
       pastFinalRejected: false,
       nonMonotoneRejected: false,
       sweptChunks: false,
+      matThenBuildReplayAdmitted: false,
     },
   }
 
@@ -1724,10 +2058,12 @@ module logService {
   action uploaderAbandonsAny = { nondet e = EXECS.oneOf() uploaderAbandons(e) }
   action executionExpiresAny = { nondet e = EXECS.oneOf() executionExpires(e) }
   action sweepChunksAny = { nondet e = EXECS.oneOf() sweepChunks(e) }
-  action sweepExecRowAny = { nondet e = EXECS.oneOf() sweepExecRow(e) }
+  action gcExecRowAny = { nondet e = EXECS.oneOf() gcExecRow(e) }
+  action ledgerReleasesAny = { nondet e = EXECS.oneOf() ledgerReleases(e) }
 
   action step = any {
     dispatch,
+    dispatchMaterialization,
     produceLineAny,
     buildFinishesAny,
     recordFinalLineCountAny,
@@ -1745,7 +2081,8 @@ module logService {
     uploaderAbandonsAny,
     executionExpiresAny,
     sweepChunksAny,
-    sweepExecRowAny,
+    gcExecRowAny,
+    ledgerReleasesAny,
   }
 }
 
@@ -1781,6 +2118,7 @@ module logService {
 module logServiceBase {
   import logService(
     MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
     MAX_SESSIONS = 1,
     MAX_LINE = 3,
     ENABLE_FABRICATION = true,
@@ -1788,7 +2126,11 @@ module logServiceBase {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
-    CALIB_GATE_IGNORES_ROW = false
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
   ).*
 
   // --- deterministic protocol runs --------------------------------------
@@ -1886,6 +2228,7 @@ module logServiceBase {
 module logServiceRedispatch {
   import logService(
     MAX_EXECS = 2,
+    MAX_BUILD_EXECS = 2,
     MAX_SESSIONS = 1,
     MAX_LINE = 3,
     ENABLE_FABRICATION = false,
@@ -1893,7 +2236,11 @@ module logServiceRedispatch {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
-    CALIB_GATE_IGNORES_ROW = false
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
   ).*
 
   /// The superseded writer, v2: execution 1's session is open and
@@ -1926,7 +2273,10 @@ module logServiceRedispatch {
       .then(openRejectedSuperseded(1))
       .expect(all {
         wit.supersededOpenRejected,
-        uploader.get(1) == Abandoned,
+        uploaderAbandoned(1),
+        // v2: the permanent-rejection discard routes through
+        // disclose() — the loss is counted, never silent.
+        uploaderLossCounted(1),
       })
 }
 
@@ -1946,6 +2296,7 @@ module logServiceRedispatch {
 module logServiceResend {
   import logService(
     MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
     MAX_SESSIONS = 2,
     MAX_LINE = 3,
     ENABLE_FABRICATION = false,
@@ -1960,7 +2311,11 @@ module logServiceResend {
     // witness), making the cap conjuncts non-vacuous here.
     CAP = 4,
     CALIB_SESSION_SCOPED_CAPS = false,
-    CALIB_GATE_IGNORES_ROW = false
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
   ).*
 
   /// The ambiguous-disconnect overlap: session 1 commits a chunk for
@@ -2009,6 +2364,7 @@ module logServiceResend {
 module logServiceSweep {
   import logService(
     MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
     MAX_SESSIONS = 1,
     MAX_LINE = 3,
     ENABLE_FABRICATION = false,
@@ -2016,7 +2372,11 @@ module logServiceSweep {
     ENABLE_SWEEP = true,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
-    CALIB_GATE_IGNORES_ROW = false
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
   ).*
 
   /// The TTL sweep deletes a complete log: the manifest and the
@@ -2036,13 +2396,19 @@ module logServiceSweep {
       .expect(logIsComplete(1))
       .then(executionExpires(1))
       .then(sweepChunks(1))
+      // v2 ownership split: the store pass strips the manifest and the
+      // session registry but the lifecycle row SURVIVES it.
       .expect(all {
         chunks.get(1) == Set(),
         not(logIsComplete(1)),
+        execRowExists.get(1),
         wit.sweptChunks,
         noSilentLineLoss,
       })
-      .then(sweepExecRow(1))
+      // The scheduler's reclaim needs the attempt ledger released
+      // first (terminal and aged it already is).
+      .then(ledgerReleases(1))
+      .then(gcExecRow(1))
       .expect(not(execRowExists.get(1)))
 }
 
@@ -2058,6 +2424,7 @@ module logServiceSweep {
 module logServiceCalibSessionCaps {
   import logService(
     MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
     MAX_SESSIONS = 2,
     MAX_LINE = 3,
     ENABLE_FABRICATION = false,
@@ -2072,7 +2439,11 @@ module logServiceCalibSessionCaps {
     // reopen itself.
     CAP = 2,
     CALIB_SESSION_SCOPED_CAPS = true,
-    CALIB_GATE_IGNORES_ROW = false
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
   ).*
 }
 
@@ -2086,6 +2457,7 @@ module logServiceCalibSessionCaps {
 module logServiceCalibGateRow {
   import logService(
     MAX_EXECS = 2,
+    MAX_BUILD_EXECS = 2,
     MAX_SESSIONS = 1,
     MAX_LINE = 3,
     ENABLE_FABRICATION = false,
@@ -2093,6 +2465,146 @@ module logServiceCalibGateRow {
     ENABLE_SWEEP = false,
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
-    CALIB_GATE_IGNORES_ROW = true
+    CALIB_GATE_IGNORES_ROW = true,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+  ).*
+}
+
+// =========================================================================
+// THE KIND-MIX REGIME (bughunt-wave B2 item 8): one build execution and
+// one materialization attempt of the same derivation. The mat dispatch
+// takes the latest-assignment slot mid-stream; the build's late replay
+// (a reconnect after its first session detaches) must still be admitted
+// — the displacement merged_bug_101's v2 gate fixed — and the mat
+// execution must never be admitted at all. `buildTailAdmittable` is
+// load-bearing here; the witness check pins the
+// replay-after-mat-dispatch admission as reachable. Fabrication is
+// disabled (the adversary is the dispatch interleaving, not the batch
+// stream); two sessions are required for the replay open.
+// =========================================================================
+module logServiceKindMix {
+  import logService(
+    MAX_EXECS = 2,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 2,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = true,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = true,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+  ).*
+
+  /// The displacement scenario, fixed: the build streams and cuts a
+  /// chunk, disconnects, a materialization mint takes the latest slot,
+  /// and the build's replay open is STILL admitted (v2: its own row is
+  /// intact) while the mat execution never is.
+  run matDispatchThenBuildReplayRun =
+    init
+      .then(dispatch)
+      .then(produceLine(1))
+      .then(openSession(1))
+      .then(appendHonest(1))
+      .then(cutChunk(1, 1))
+      .then(builderDisconnects(1))
+      .then(dispatchMaterialization)
+      .expect(all {
+        execKind.get(2) == KMat,
+        not(openAdmitted(2)),
+        openAdmitted(1),
+      })
+      .then(openSession(1))
+      .expect(all {
+        wit.matThenBuildReplayAdmitted,
+        buildTailAdmittable,
+      })
+}
+
+// =========================================================================
+// CALIBRATION: the pre-fix latest-assignment-only open gate
+// (merged_bug_101's displacement hole, the kind-mix face). With
+// `e == dispatched` re-added to admission, the materialization mint
+// landing after the build revokes the build's replay —
+// `buildTailAdmittable` falsifies. Pins that the invariant catches the
+// displacement class B2's claimed-exec re-keying fixed.
+// =========================================================================
+module logServiceCalibLatestOnly {
+  import logService(
+    MAX_EXECS = 2,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 2,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = true,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = true,
+    CALIB_GATE_LATEST_ONLY = true,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+  ).*
+}
+
+// =========================================================================
+// CALIBRATION: the pre-fix rejected:true suppression (merged_bug_360's
+// PERMISSION_DENIED hole). The permanent-rejection abandonment discards
+// the retransmit buffer without the disclosure counter; an execution
+// with produced-but-never-stored lines abandons silently —
+// `ingestLossCounted` falsifies. Two executions so the in-place row
+// rewrite (the rejection's trigger) is reachable.
+// =========================================================================
+module logServiceCalibLossEscape {
+  import logService(
+    MAX_EXECS = 2,
+    MAX_BUILD_EXECS = 2,
+    MAX_SESSIONS = 1,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = false,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = true,
+    CALIB_SWEEP_AGE_ONLY = false,
+  ).*
+}
+
+// =========================================================================
+// CALIBRATION: the pre-fix age-only sweep SELECT (merged_bug_086). With
+// the terminal and ledger-reference conjuncts ignored, the pass deletes
+// a never-terminal (or still-referenced) execution's lifecycle row —
+// `sweepOnlyTerminalUnreferenced` falsifies. Pins that the invariant
+// catches the unguarded-delete class the kernel's
+// `exec_row_sweep_eligible` guard fixed.
+// =========================================================================
+module logServiceCalibSweepAgeOnly {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 1,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = false,
+    ENABLE_SWEEP = true,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = true,
   ).*
 }

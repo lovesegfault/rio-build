@@ -1125,10 +1125,24 @@ enum Action {
     DeliverAck(u64),
     BuilderDisconnects(u64),
     ExecutionExpires(u64),
-    /// Runs the real sweep pass; the post-step comparison is skipped.
+    /// Model-only environment fact (the scheduler's per-lane attempt-GC
+    /// cut releasing the execution): the store-side system under test
+    /// holds no `drv_attempts` rows for the harness executions, so the
+    /// implementation is ALREADY unreferenced and the step is a no-op
+    /// here. The model variable it flips (`ledgerReferenced`) is
+    /// scheduler-side state outside the projection.
+    LedgerReleases(u64),
+    /// The SCHEDULER's execution-row reclaim (`gc_exec_rows` behind
+    /// `rio_retry_kernel::exec_row_sweep_eligible`). The store crate
+    /// cannot call the scheduler's tick arm, so the mirror executes the
+    /// reclaim's EFFECT (the row DELETE); the eligibility guard is the
+    /// model's `gcExecRow` precondition here and the kernel's
+    /// kani-pinned predicate (`check_exec_sweep_preserves_decisions` +
+    /// the unit decision table) in production.
+    GcExecRow(u64),
+    /// Runs the real sweep pass (chunks + session registry; the
+    /// lifecycle row survives — `store.log.sweep-ownership`).
     SweepChunks(u64),
-    /// No-op; the post-step comparison checks the whole pass's effect.
-    SweepExecRow(u64),
 }
 
 use Action::*;
@@ -1162,6 +1176,22 @@ impl MbtSystem {
             DeliverAck(e) => self.deliver_ack(e).await,
             BuilderDisconnects(e) => self.builder_disconnects(e),
             ExecutionExpires(e) => self.execution_expires(e).await,
+            // The exec index is carried for symmetry with the model
+            // action's parameter; the implementation step is a no-op
+            // (see the variant's doc).
+            LedgerReleases(e) => {
+                let _ = e;
+                Ok(())
+            }
+            GcExecRow(e) => {
+                let exec_id = self.exec(e)?.exec_id;
+                sqlx::query("DELETE FROM drv_executions WHERE exec_id = $1")
+                    .bind(exec_id)
+                    .execute(self.pool())
+                    .await
+                    .context("gc_exec_rows mirror delete")?;
+                Ok(())
+            }
             // The sweep pass selects every expired execution itself;
             // the exec indices are carried for symmetry with the
             // model's per-execution sweep actions and read only here.
@@ -1169,18 +1199,18 @@ impl MbtSystem {
                 let _ = e;
                 self.sweep_pass().await
             }
-            SweepExecRow(e) => {
-                let _ = e;
-                Ok(())
-            }
         }
     }
 }
 
 /// Should the post-step state comparison be skipped for this action?
-/// Only the sweep's mid-pass step qualifies; see the module header.
+/// None today: the store's sweep pass is atomic in both the model
+/// (one `sweepChunks` action strips chunks + sessions, the row
+/// survives) and the implementation, so its post-state is exact; the
+/// scheduler's row reclaim is its own mirrored step (`GcExecRow`).
 fn skip_state_diff(action: Action) -> bool {
-    matches!(action, SweepChunks(_))
+    let _ = action;
+    false
 }
 
 /// One named run: which regime module to ask quint for, the regime's
@@ -1322,7 +1352,10 @@ const SWEEP_COMPLETE_LOG: NamedRun = NamedRun {
         RecordFinalLineCount(1),
         ExecutionExpires(1),
         SweepChunks(1),
-        SweepExecRow(1),
+        // v2 ownership split: the store pass leaves the lifecycle row;
+        // the scheduler reclaims it once the attempt ledger releases.
+        LedgerReleases(1),
+        GcExecRow(1),
     ],
 };
 
