@@ -833,10 +833,9 @@ impl DagActor {
             .filter(|p| !p.is_empty())
             .cloned()
             .collect();
-        let missing = self.batch_probe_orphan_outputs(probe_paths).await;
+        let probe = self.batch_probe_orphan_outputs(probe_paths).await;
         for attempt in expired {
-            self.establish_open_pull_attempt(&attempt, missing.as_ref())
-                .await;
+            self.establish_open_pull_attempt(&attempt, &probe).await;
         }
     }
 
@@ -846,7 +845,7 @@ impl DagActor {
     async fn establish_open_pull_attempt(
         &mut self,
         attempt: &crate::db::open_attempts::OpenAttemptRow,
-        missing: Option<&std::collections::HashSet<String>>,
+        probe: &super::recovery::StoreProbe,
     ) {
         // Standby replicas must neither write attempt rows nor decide
         // from them (the same gate every establishment vehicle carries).
@@ -878,16 +877,16 @@ impl DagActor {
             Some(s) if s.status() == DerivationStatus::Cancelled => NodeDisposition::Cancelled,
             Some(_) => NodeDisposition::WantedLive,
         };
-        // Probe axis — conservative caller stub per §4.R2: the
-        // evidence-classification workstream owns the probe-axis split
-        // (its caller mapping distinguishes probe-failure ⇒ Unavailable
-        // ⇒ Defer from no-store ⇒ ChargeExecutorCrash); this mapping
-        // reproduces the pre-kernel behavior (any probe absence
-        // charges) so the two workstreams compose without a behavior
-        // gap between their landings.
-        let probe = match missing {
-            Some(m) => ProbeEvidence::Verified(m),
-            None => ProbeEvidence::NoStoreConfigured,
+        // Probe axis (merged_bug_232, the §4.R2 split this workstream
+        // owns): a failed probe is Unavailable — the kernel DEFERS a
+        // build establishment (absence of evidence is not evidence of
+        // absence; the attempt stays open for a pass with a working
+        // probe). Only the no-client deployment shape charges without
+        // a probe.
+        let probe = match probe {
+            super::recovery::StoreProbe::Verified(m) => ProbeEvidence::Verified(m),
+            super::recovery::StoreProbe::Unavailable => ProbeEvidence::Unavailable,
+            super::recovery::StoreProbe::NoClient => ProbeEvidence::NoStoreConfigured,
         };
         // The wanted set is the LIVE effective resolution (T-D2.3: the
         // rebuilt in-memory union over live builds' durable

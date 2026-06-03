@@ -88,6 +88,21 @@ use super::*;
 use crate::db::RecoveryBuildRow;
 use crate::state::DerivationState;
 
+/// The batch store probe's tri-state verdict (merged_bug_232): probe
+/// evidence, probe failure (no evidence either way), or no client
+/// configured (a deployment fact). Consumers map failure to their
+/// conservative arm — the establishment sweep DEFERS a build attempt;
+/// charging without a probe is honest only on the no-client shape.
+#[derive(Debug)]
+pub(super) enum StoreProbe {
+    /// The probe ran: the authoritative absent-set for the probed paths.
+    Verified(std::collections::HashSet<String>),
+    /// The probe was attempted and failed (RPC error / timeout).
+    Unavailable,
+    /// No store client is configured on this deployment.
+    NoClient,
+}
+
 /// How long a recovery whose claim target the durable floor cannot
 /// vouch for (a bump target, or a retained entry generation over a
 /// non-adjacent floor) waits for the lease loop to complete
@@ -1933,21 +1948,24 @@ impl DagActor {
     }
 
     /// One `FindMissingPaths` over the union of all orphans' expected
-    /// outputs. `Some(missing_set)` on success; `None` on no-client
-    /// (tests) / RPC error / timeout — caller treats `None` as "all
-    /// orphans incomplete" (conservative reset_to_ready). Wrapped in
+    /// outputs, with the TRI-STATE verdict (merged_bug_232): `Verified`
+    /// on success, `Unavailable` on RPC error / timeout (no evidence
+    /// either way — the establishment kernel DEFERS build attempts),
+    /// `NoClient` when no store client is configured (the only shape
+    /// where charging without a probe is honest; the old `Option`
+    /// return conflated it with probe failure). Wrapped in
     /// `grpc_timeout` so a dead store stalls the sweep at most ONCE
     /// (not N×); feeds `cache_breaker` like the merge-time FMP path so
     /// a 30s stall here counts toward opening.
     pub(super) async fn batch_probe_orphan_outputs(
         &mut self,
         store_paths: Vec<String>,
-    ) -> Option<HashSet<String>> {
+    ) -> StoreProbe {
         if store_paths.is_empty() {
-            return Some(HashSet::new());
+            return StoreProbe::Verified(HashSet::new());
         }
         let Some(client) = &mut self.store_client else {
-            return None;
+            return StoreProbe::NoClient;
         };
         let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
         rio_proto::interceptor::inject_current(req.metadata_mut());
@@ -1955,19 +1973,18 @@ impl DagActor {
         match tokio::time::timeout(grpc_timeout, client.find_missing_paths(req)).await {
             Ok(Ok(resp)) => {
                 self.cache_breaker.record_success();
-                Some(resp.into_inner().missing_paths.into_iter().collect())
+                StoreProbe::Verified(resp.into_inner().missing_paths.into_iter().collect())
             }
             Ok(Err(e)) => {
                 self.cache_breaker.record_failure();
-                warn!(error = %e,
-                      "reconcile: FindMissingPaths failed, assuming all orphans incomplete");
-                None
+                warn!(error = %e, "reconcile: FindMissingPaths failed (no evidence either way)");
+                StoreProbe::Unavailable
             }
             Err(_) => {
                 self.cache_breaker.record_failure();
                 warn!(timeout = ?grpc_timeout,
-                      "reconcile: FindMissingPaths timed out, assuming all orphans incomplete");
-                None
+                      "reconcile: FindMissingPaths timed out (no evidence either way)");
+                StoreProbe::Unavailable
             }
         }
     }

@@ -393,3 +393,105 @@ async fn cancelled_attempt_is_never_charged_and_close_is_redriven() -> TestResul
     assert_eq!(attempt_rows_for(&db.pool, "est-cancel").await.len(), 0);
     Ok(())
 }
+
+// r[verify sched.attempt.establishment-window+4]
+/// merged_bug_232 (bughunt wave, A4): a probe FAILURE is not evidence.
+/// An expired BUILD attempt swept while FindMissingPaths is failing
+/// must DEFER — no executor_crash row, the attempt stays open — and a
+/// later pass with a working probe decides it. Pre-fix the caller
+/// conflated probe-failure with no-store-configured and charged an
+/// irreversible crash on an RPC blip.
+#[tokio::test]
+async fn probe_unavailable_defers_build_establishment() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let out_path = test_store_path("est-d-out");
+    let mut node = make_node("est-d");
+    node.expected_output_paths = vec![out_path.clone()];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    let assignment = pull_deliver(&handle, "est-d").await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    backdate_assignment(&db.pool, exec_id).await?;
+
+    // The store is up but FMP fails (RPC error): no evidence either way.
+    store
+        .faults
+        .fail_find_missing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    tick(&handle).await?;
+
+    let rows = attempt_rows_for(&db.pool, "est-d").await;
+    assert_eq!(
+        rows.len(),
+        0,
+        "probe Unavailable must DEFER a build establishment (no charge), got {rows:?}"
+    );
+    assert_eq!(
+        assignment_statuses(&db.pool, "est-d").await,
+        vec!["pending"],
+        "the attempt stays open across the deferred pass"
+    );
+
+    // The probe heals: the next pass decides (charge — outputs absent).
+    store
+        .faults
+        .fail_find_missing
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    tick(&handle).await?;
+    let rows = attempt_rows_for(&db.pool, "est-d").await;
+    assert_eq!(rows.len(), 1, "the healed pass establishes exactly once");
+    assert_eq!(rows[0].outcome_class, OutcomeClass::ExecutorCrash.as_str());
+    Ok(())
+}
+
+// r[verify sched.attempt.establishment-window+4]
+/// merged_bug_232 green pin: the MATERIALIZATION arm still charges on a
+/// failing probe — the kind axis decides before the probe axis (a
+/// mid-walk crash leaves the closure incomplete; outputs-present is
+/// not adoption evidence for a walk), so probe availability never
+/// defers a materialization establishment.
+#[tokio::test]
+async fn establishment_mat_arm_charges_with_failing_probe() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("est-e-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("est-e");
+    n.expected_output_paths = vec![out.clone()];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+    barrier(&handle).await;
+    let claimed = handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: "est-e".into(),
+            auth_intent: Some("est-e".into()),
+            kind: rio_evidence_kernel::pull::PullKind::Materialization,
+            executor_instance: Some("store-test-0".into()),
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    let assignment = match claimed {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    backdate_assignment(&db.pool, exec_id).await?;
+
+    store
+        .faults
+        .fail_find_missing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    tick(&handle).await?;
+
+    let rows = attempt_rows_for(&db.pool, "est-e").await;
+    let infra: Vec<_> = rows
+        .iter()
+        .filter(|r| r.outcome_class == OutcomeClass::MaterializationInfra.as_str())
+        .collect();
+    assert_eq!(
+        infra.len(),
+        1,
+        "the mat establishment is probe-independent (kind axis decides \
+         before the probe axis), got {rows:?}"
+    );
+    Ok(())
+}
