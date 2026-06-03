@@ -2760,12 +2760,21 @@ async fn test_build_paths_with_results_missing_output_fails_only_that_target() -
 }
 
 // r[verify gw.opcode.build-results-honest+2]
+// r[verify gw.opcode.lost-terminal-relay+2]
 /// Partial outcome, the other direction: the aggregate build FAILS with no
 /// per-derivation terminal for either target, but target A's wanted output
 /// is present in the store. A is rescued from the blanket failure — as
 /// `Substituted` with `timesBuilt = 0` on the wire (outputs present without
 /// execution; presence evidence never fabricates an executed `Built`) — and
 /// B keeps the mapped failure status + message.
+///
+/// This is the marker's must-NOT cell for FAIL-FAST batches: the session
+/// runs the default policy (`keep_going = false`, pinned on the wire by
+/// `test_build_paths_success`'s submit-call assertion), the failure word
+/// is scheduler-settled, and under fail-fast a terminal-less root was
+/// plausibly never attempted — nothing was lost, so the rescue stays a
+/// measurable substitution-shaped event. The keep-going sibling test
+/// below flips exactly that one conjunct and demands the marker.
 #[tokio::test]
 async fn test_build_paths_with_results_failure_rescues_verified_target_as_substituted()
 -> anyhow::Result<()> {
@@ -2845,6 +2854,117 @@ async fn test_build_paths_with_results_failure_rescues_verified_target_as_substi
     Ok(())
 }
 
+// r[verify gw.opcode.lost-terminal-relay+2]
+/// The keep-going sibling of the fail-fast rescue test above — same
+/// scenario, ONE conjunct flipped: the tenant policy stamps
+/// `keep_going = true` onto the submission, so the scheduler settles the
+/// DAG-level failure word only once every derivation resolved, and a
+/// terminal-less confirmed-present root means its evidence never reached
+/// the relay (event loss, or a merge-seeded node that emits no event —
+/// marking either is the conservative polarity per the rio-nix trust
+/// bound). The rescue's wire value is IDENTICAL to the fail-fast cell —
+/// `Substituted`, `timesBuilt = 0`, empty message, same builtOutputs —
+/// and the lost-terminal marker line rides the stderr side channel for
+/// exactly the rescued root, never for the verbatim-failed batch-mate.
+/// Without the marker this row classifies `target-substituted`
+/// downstream — the false force-build policy violation under the
+/// keep-going tenants that actually run this configuration.
+#[tokio::test]
+async fn test_build_paths_with_results_keepgoing_failure_rescue_relays_lost_terminal_marker()
+-> anyhow::Result<()> {
+    let policy = rio_gateway::config::BuildPolicy {
+        keep_going: true,
+        force_build_roots: false,
+    };
+    let mut h = GatewaySession::new_with_tenant_and_policy("replay-leaf", policy).await?;
+    do_handshake(&mut h.stream).await?;
+    send_set_options(&mut h.stream).await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 2,
+            cached_derivations: 0,
+        })),
+        // B's failure settles the keep-going DAG; A's own terminal is
+        // never delivered (the loss window under test).
+        ev(build_event::Event::Failed(types::BuildFailed {
+            error_message: "boom".into(),
+            failed_derivation: HONEST_B_DRV.into(),
+            status: types::BuildResultStatus::PermanentFailure as i32,
+        })),
+    ]));
+
+    h.store
+        .seed_with_content(HONEST_A_DRV, HONEST_A_ATERM.as_bytes());
+    h.store
+        .seed_with_content(HONEST_B_DRV, HONEST_B_ATERM.as_bytes());
+    // A's output exists (its pre-loss execution uploaded, or another
+    // batch landed it); B's does not.
+    h.store.seed_with_content(HONEST_A_OUT, b"a-out");
+
+    let path_a = format!("{HONEST_A_DRV}!out");
+    let path_b = format!("{HONEST_B_DRV}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: &[path_a.clone(), path_b.clone()],
+        u64: 0,
+    );
+
+    let frames = collect_stderr_frames(&mut h.stream).await;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 2);
+
+    // The submission carried the keep-going bit (the conjunct under
+    // test reached the wire, not just the session config).
+    let submits = h.scheduler.submit_calls.read().unwrap().clone();
+    assert_eq!(submits.len(), 1);
+    assert!(
+        submits[0].keep_going,
+        "the policy's keep_going must be stamped on the submission"
+    );
+
+    // Exactly one marker, for exactly the rescued root, byte-for-byte
+    // the shared producer formatter's line on its own frame.
+    assert_eq!(
+        lost_terminal_marker_drvs(&frames),
+        vec![HONEST_A_DRV.to_string()],
+        "a keep-going blanket rescue stands on a lost evidence channel — \
+         the marker must ride it: {frames:?}"
+    );
+    let expected_payload = format!("{}\n", BuildResult::lost_terminal_relay_line(HONEST_A_DRV));
+    assert!(
+        frames
+            .iter()
+            .any(|m| matches!(m, StderrMessage::Next(s) if *s == expected_payload)),
+        "marker payload must be the shared producer formatter's output: {frames:?}"
+    );
+
+    // The wire value is unchanged from the fail-fast cell: the marker
+    // is side-channel-only.
+    let (_, result_a) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(result_a.status, BuildStatus::Substituted, "{result_a:?}");
+    assert_eq!(result_a.times_built, 0, "{result_a:?}");
+    assert!(result_a.error_msg.is_empty(), "{result_a:?}");
+    assert_eq!(result_a.built_outputs.len(), 1, "{result_a:?}");
+    assert_eq!(result_a.built_outputs[0].out_path, HONEST_A_OUT);
+
+    // The unverifiable batch-mate keeps the verbatim blanket failure —
+    // and no marker (it minted no presence claim).
+    let (_, result_b) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(
+        result_b.status,
+        BuildStatus::PermanentFailure,
+        "B keeps the scheduler's mapped failure status: {result_b:?}"
+    );
+    assert!(
+        result_b.error_msg.contains("boom"),
+        "B keeps the scheduler's error message, got: {:?}",
+        result_b.error_msg
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
 /// __noChroot derivation with a PARSEABLE output path, so the store check
 /// can positively confirm presence — the no-rescue-on-rejection test needs
 /// `confirmed_present` to be true while the batch is refused.
@@ -2853,7 +2973,7 @@ const NOCHROOT_PRESENT_DRV: &str = "/nix/store/00000000000000000000000000000555-
 const NOCHROOT_PRESENT_ATERM: &str = r#"Derive([("out","/nix/store/cccccccccccccccccccccccccccccccc-nochroot-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("__noChroot","1"),("out","/nix/store/cccccccccccccccccccccccccccccccc-nochroot-out")])"#;
 
 // r[verify gw.opcode.build-results-honest+2]
-// r[verify gw.opcode.lost-terminal-relay]
+// r[verify gw.opcode.lost-terminal-relay+2]
 /// Event-loss shape, confirmed-present cell: the scheduler completes the
 /// DAG but THIS root's terminal event never arrives (state-channel
 /// Lagged, a leader-failover reconnect gap, dispatch-vs-completion
@@ -2959,7 +3079,7 @@ async fn test_build_paths_with_results_eventless_completed_reports_substituted()
     Ok(())
 }
 
-// r[verify gw.opcode.lost-terminal-relay]
+// r[verify gw.opcode.lost-terminal-relay+2]
 /// The marker's must-NOT-emit direction for genuine substitution: a root
 /// WITH its own `Cached` terminal (the scheduler recorded a real
 /// substitution event) reports the same `Substituted`/`timesBuilt = 0`

@@ -989,6 +989,25 @@ struct ProcessedBuild {
     /// root and the per-root loop must not treat the stand-in result or
     /// the (vacuously empty) terminal map as evidence to refine.
     submitted: bool,
+    /// The submission's batch failure semantics, stamped from the
+    /// per-tenant policy onto `SubmitBuildRequest.keep_going`. Decides
+    /// what a failed DAG-level word implies about a terminal-less root:
+    /// under fail-fast the scheduler stops early, so such a root was
+    /// plausibly never attempted; under keep-going the scheduler settles
+    /// the failure word only once every derivation resolved, so a
+    /// terminal-less root there means its evidence never reached this
+    /// relay (event loss, or a merge-seeded node that emits no event) —
+    /// see [`per_root_verdict`]'s marker decision.
+    keep_going: bool,
+    /// True when the DAG-level `result` is a failure word THIS GATEWAY
+    /// synthesized rather than a verdict the scheduler emitted: the
+    /// post-acknowledgment stream death (reconnects exhausted) for
+    /// submitted builds, and every [`Self::unsubmitted`] stand-in. A
+    /// synthesized word carries no information about any root's build —
+    /// the gateway knows the EVIDENCE CHANNEL died, not that anything
+    /// failed — which is exactly what the lost-terminal marker exists to
+    /// say (see [`per_root_verdict`]).
+    dag_synthesized: bool,
 }
 
 impl ProcessedBuild {
@@ -996,27 +1015,36 @@ impl ProcessedBuild {
     /// validation rejection, or a submit error before acknowledgment.
     /// Carries the synthesized blanket failure and no terminals; the
     /// per-root verdict reports it verbatim — store presence must not
-    /// upgrade it (see [`per_root_verdict`]).
-    fn unsubmitted(result: BuildResult) -> Self {
+    /// upgrade it (see [`per_root_verdict`]). `keep_going` is the
+    /// policy bit the submission would have carried; the unsubmitted
+    /// arm never consults it (pinned by the lattice audit's
+    /// check-invariance assertions), it is threaded for honesty only.
+    fn unsubmitted(result: BuildResult, keep_going: bool) -> Self {
         Self {
             result,
             per_drv: HashMap::new(),
             submitted: false,
+            keep_going,
+            dag_synthesized: true,
         }
     }
 
     /// The verdict basis for one requested root: its own recorded
     /// terminal when the event relay captured one, otherwise the
     /// DAG-level result tagged with whether the scheduler ever
-    /// acknowledged this batch. The single derivation site — every root
-    /// of the multi-root result loop goes through here, so "which
-    /// evidence backs this verdict?" is decided in one place.
+    /// acknowledged this batch and with the batch semantics that decide
+    /// what that fallback word implies (`keep_going`, `synthesized`).
+    /// The single derivation site — every root of the multi-root result
+    /// loop goes through here, so "which evidence backs this verdict?"
+    /// is decided in one place.
     fn root_evidence(&self, drv_path: &str) -> RootEvidence {
         match self.per_drv.get(drv_path) {
             Some(own) => RootEvidence::OwnTerminal(own.clone()),
             None => RootEvidence::DagFallback {
                 dag: self.result.clone(),
                 submitted: self.submitted,
+                keep_going: self.keep_going,
+                synthesized: self.dag_synthesized,
             },
         }
     }
@@ -1036,7 +1064,16 @@ enum RootEvidence {
     /// reconnect, path-key mismatch) from "the scheduler never saw the
     /// batch at all" (validation rejection, pre-acknowledgment submit
     /// error) — the latter has no scheduler evidence to refine.
-    DagFallback { dag: BuildResult, submitted: bool },
+    /// `keep_going` and `synthesized` qualify what a FAILURE `dag` word
+    /// implies about this terminal-less root (see
+    /// [`per_root_verdict`]'s marker decision); both are batch-level
+    /// facts stamped by [`ProcessedBuild::root_evidence`].
+    DagFallback {
+        dag: BuildResult,
+        submitted: bool,
+        keep_going: bool,
+        synthesized: bool,
+    },
 }
 
 /// Decide ONE requested root's reported result from its evidence and the
@@ -1073,9 +1110,21 @@ enum RootEvidence {
 ///   substitution event — which force-build measurement tenants make
 ///   definitionally impossible, so an unmarked mint records a false
 ///   policy violation downstream. The bit is exact: never set over an
-///   own `Cached` terminal, and never for the blanket rescue (no
-///   terminal was lost there — under a fail-fast DAG failure none was
-///   ever expected for the unattempted root).
+///   own `Cached` terminal (a recorded substitution event), and on the
+///   blanket-failure presence rescue it is set exactly when the failure
+///   word says nothing about THIS root having been resolved without a
+///   terminal — under keep-going the scheduler settles the failure word
+///   only once every derivation resolved, so a terminal-less root means
+///   its evidence never reached this relay (event loss, or a
+///   merge-seeded node that emits no event — marking either is the
+///   conservative polarity, see the consumer-enforced trust bound in
+///   rio-nix's relay-marker doc); and a SYNTHESIZED failure word
+///   (reconnect-exhausted stream death, unsubmitted stand-ins) is the
+///   gateway's own statement that the evidence channel died, whatever
+///   the batch semantics. Only the fail-fast scheduler-settled rescue
+///   stays unmarked: there the scheduler stops early, so a
+///   terminal-less root was plausibly never attempted and nothing was
+///   lost.
 /// - A lost-terminal root under a completed DAG with NO presence
 ///   evidence reports the honest evidence-loss failure
 ///   ([`BuildResult::lost_terminal_unverified`]) — never a fabricated
@@ -1143,9 +1192,12 @@ fn per_root_verdict(
         RootEvidence::DagFallback {
             dag,
             submitted: false,
+            ..
         } => {
             // Never acknowledged: the stand-in is a synthesized failure
-            // by construction, and no store state may upgrade it. The
+            // by construction, and no store state may upgrade it — the
+            // batch-semantics bits are deliberately not consulted (the
+            // lattice audit pins invariance over them). The
             // success-shaped guard is defense in depth — reporting an
             // unsubmitted "success" would fabricate an outcome for a
             // batch no scheduler processed.
@@ -1161,6 +1213,8 @@ fn per_root_verdict(
         RootEvidence::DagFallback {
             dag,
             submitted: true,
+            keep_going,
+            synthesized,
         } => {
             if dag.status.is_success() {
                 // Completed DAG, no terminal for THIS root (event lost,
@@ -1210,15 +1264,56 @@ fn per_root_verdict(
                 // timesBuilt = 0. Presence proves the outputs exist
                 // somehow (a concurrent batch, another tenant, an
                 // earlier substitution), not that this submission
-                // executed the build. No lost-terminal marker: nothing
-                // was lost — under the fail-fast DAG failure no terminal
-                // was ever expected for this unattempted root.
+                // executed the build.
+                //
+                // The marker decision keys on what the failure word
+                // says about a terminal-less root, not on the word
+                // itself:
+                //
+                // - Fail-fast, scheduler-settled (`!keep_going &&
+                //   !synthesized`): the scheduler stops early, so this
+                //   root was plausibly never attempted — nothing was
+                //   lost; the rescue mints a plain Substituted (a
+                //   measurable substitution-shaped event downstream).
+                // - Keep-going (`keep_going`): the scheduler settles
+                //   the failure word only once EVERY derivation
+                //   resolved (one terminal each, with merge-seeded
+                //   DependencyFailed nodes resolved without emitting
+                //   any event), so no own terminal here means this
+                //   root's evidence never reached the relay — the same
+                //   event-loss shape as the completed-DAG cell above.
+                //   Marking a merge-seeded root that happens to be
+                //   present is the conservative polarity: the marker
+                //   only flips that drv's row to evidence-loss
+                //   exclusion, never minting a success or a violation
+                //   (rio-nix's consumer-enforced trust bound), while
+                //   leaving it unmarked records a substitution event
+                //   that force-build measurement tenants make
+                //   definitionally impossible.
+                // - Synthesized (`synthesized`): the failure word is
+                //   this gateway's own reconnect-exhausted stand-in —
+                //   the gateway KNOWS the evidence channel died and
+                //   knows nothing about the build, so a confirmed-
+                //   present root here is the lost-terminal shape
+                //   whatever the batch semantics.
                 RootVerdict::Success {
                     base: BuildResult::substituted(),
-                    lost_terminal: false,
+                    lost_terminal: keep_going || synthesized,
                 }
             } else {
-                // Unverified blanket failure stands.
+                // Unverified blanket failure stands — under EVERY
+                // (keep_going × synthesized) combination. Under
+                // keep-going the terminal-less unverifiable state is
+                // genuinely ambiguous between event loss and a
+                // merge-seeded DependencyFailed root (the scheduler
+                // emits no event for nodes seeded terminal at merge),
+                // and the verbatim blanket is what the measurement
+                // consumer's poison-recovery arm matches on — minting
+                // an evidence-loss report here would break that
+                // recovery for the seeded case. Closing this cell
+                // needs the producer to disambiguate (scheduler-side
+                // events for merge-seeded nodes), not another
+                // consumer-side guess.
                 RootVerdict::Verbatim(dag)
             }
         }
@@ -1232,20 +1327,26 @@ enum RootVerdict {
     /// wanted outputs (`result_with_wanted_outputs`).
     Success {
         base: BuildResult,
-        /// True for exactly one cell: the Completed-DAG lost-terminal
-        /// presence mint (`Substituted` off `confirmed_present` with no
-        /// own terminal). The wire result is unchanged — presence is
-        /// real and stock clients keep seeing a plain `Substituted` —
-        /// but on the wire alone that word is indistinguishable from a
-        /// genuine substitution terminal, so the caller relays the
-        /// lost-terminal marker line
+        /// True for exactly the presence mints whose `Substituted` word
+        /// stands on a lost evidence channel: the Completed-DAG
+        /// lost-terminal cell, the keep-going blanket-rescue cell (the
+        /// scheduler settles a keep-going failure only once every
+        /// derivation resolved, so a terminal-less root there lost its
+        /// evidence), and the synthesized-failure rescue cell (the
+        /// reconnect-exhausted word is the gateway's own statement that
+        /// the evidence channel died) — all `Substituted` off
+        /// `confirmed_present` with no own terminal. The wire result is
+        /// unchanged — presence is real and stock clients keep seeing a
+        /// plain `Substituted` — but on the wire alone that word is
+        /// indistinguishable from a genuine substitution terminal, so
+        /// the caller relays the lost-terminal marker line
         /// ([`BuildResult::lost_terminal_relay_line`]) before writing
         /// results: the side channel measurement consumers use to
         /// classify the row as evidence loss instead of recording a
         /// substitution event. Never set for an own `Cached` terminal
-        /// (a recorded substitution event) or for the blanket-failure
-        /// rescue (no terminal was lost; under fail-fast none was ever
-        /// expected).
+        /// (a recorded substitution event) or for the fail-fast
+        /// scheduler-settled blanket rescue (the scheduler stops early,
+        /// so no terminal was ever expected for that root).
         lost_terminal: bool,
     },
     /// Report this result verbatim (failures are never enriched).
@@ -1276,6 +1377,10 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     jwt_token: Option<&str>,
     result_roots: HashSet<String>,
 ) -> anyhow::Result<ProcessedBuild> {
+    // The submission's batch failure semantics, kept for the per-root
+    // verdict: what a failed DAG-level word implies about a
+    // terminal-less root depends on this bit (see ProcessedBuild).
+    let keep_going = request.keep_going;
     // Gateway is the trace ROOT (Nix doesn't speak W3C trace context).
     // with_jwt injects the enclosing span's context + tenant JWT — this
     // is THE hop that makes distributed tracing work; without it,
@@ -1480,6 +1585,14 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
         let _ = stderr.stop_activity(aid).await;
     }
 
+    // The Err arm below is the one place a SUBMITTED build's DAG-level
+    // word is synthesized by this gateway instead of relayed from the
+    // scheduler: the bit tells the per-root verdict that the failure
+    // word is a statement about the dead evidence channel, not about
+    // any root's build. Completed/Failed/Cancelled are scheduler
+    // verdicts (Cancelled's failure WRAPPING is local, but the
+    // cancellation it reports is scheduler state).
+    let dag_synthesized = outcome.is_err();
     let result = match outcome {
         Ok(BuildEventOutcome::Completed) => BuildResult::success(),
         Ok(BuildEventOutcome::Failed {
@@ -1503,6 +1616,8 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
         // the reconnect-exhausted synthesized failure above, which still
         // carries every terminal collected before the stream died).
         submitted: true,
+        keep_going,
+        dag_synthesized,
     })
 }
 
@@ -2390,20 +2505,28 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
             .values()
             .map(|demand| demand.drv_path.clone())
             .collect();
+        // The policy bit the submission carries (or would have carried,
+        // for unsubmitted stand-ins — threaded for honesty; the
+        // unsubmitted verdict arm never consults it).
+        let keep_going = ctx.build_policy.keep_going;
         let processed = match submit_dag(stderr, ctx, all_nodes, all_edges, result_roots).await {
             Ok(DagSubmitOutcome::Gated) => return Ok(()),
             Ok(DagSubmitOutcome::Rejected(reason)) => ProcessedBuild::unsubmitted(
                 BuildResult::failure(BuildStatus::InputRejected, reason),
+                keep_going,
             ),
             Ok(DagSubmitOutcome::Built(p)) => p,
             Err(e) => {
                 warn!(error = %e, "wopBuildPathsWithResults: build submission failed");
                 metrics::counter!("rio_gateway_errors_total", "type" => "scheduler_submit")
                     .increment(1);
-                ProcessedBuild::unsubmitted(BuildResult::failure(
-                    BuildStatus::TransientFailure,
-                    format!("scheduler error: {e}"),
-                ))
+                ProcessedBuild::unsubmitted(
+                    BuildResult::failure(
+                        BuildStatus::TransientFailure,
+                        format!("scheduler error: {e}"),
+                    ),
+                    keep_going,
+                )
             }
         };
 
@@ -2476,7 +2599,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                     base,
                     lost_terminal,
                 } => {
-                    // r[impl gw.opcode.lost-terminal-relay]
+                    // r[impl gw.opcode.lost-terminal-relay+2]
                     // The lost-terminal presence mint keeps Substituted
                     // on the wire (stock-client compat; presence is
                     // real) and relays the marker line on the stderr
@@ -2574,7 +2697,20 @@ mod tests {
     /// defensively-handled success-shaped stand-in no call site can
     /// construct). Store state enumerates the three
     /// [`TargetOutputsCheck`] verdict classes: confirmed-present,
-    /// missing, unverifiable.
+    /// missing, unverifiable. Every `DagFallback` shape is additionally
+    /// crossed with the FULL `keep_going` × `synthesized` square — both
+    /// sides of each conjunct of the marker decision, including the
+    /// producer-impossible combinations (a synthesized success word, a
+    /// scheduler-settled word carrying the reconnect text): the decision
+    /// keys on the BITS, never on message text, and the impossible
+    /// cells must behave identically to their reachable neighbors. Per
+    /// producer site: `keep_going` is stamped from the tenant policy at
+    /// `translate::build_submit_request`; `synthesized=true` is minted
+    /// by exactly two producers — `submit_and_process_build`'s
+    /// stream-death `Err` arm (submitted) and
+    /// `ProcessedBuild::unsubmitted` (both stand-in call sites);
+    /// `OwnTerminal` carries neither bit, so the square is vacuous
+    /// there by construction.
     ///
     /// Cross-cell invariants, checked at every cell on top of the table:
     ///  1. execution honesty — `timesBuilt ≥ 1` is reported only from the
@@ -2603,16 +2739,21 @@ mod tests {
     ///     executed `Built`;
     ///  7. lost-terminal marker exactness — the relay-marker bit is set
     ///     ONLY on a `Substituted` mint with positive presence, no own
-    ///     terminal, and an acknowledged batch (the value table pins it
-    ///     to exactly the Completed-DAG lost-terminal × confirmed cell:
-    ///     the own `Cached` terminal is a recorded substitution event
-    ///     and the blanket rescue lost no terminal, so neither may
-    ///     carry it — a marker there would reroute genuine
+    ///     terminal, and an acknowledged batch (the value table pins
+    ///     the marked set: the Completed-DAG lost-terminal × confirmed
+    ///     cell, plus the blanket-rescue × confirmed cells whose
+    ///     failure word implies a lost evidence channel — `keep_going`
+    ///     batches, where the scheduler settles the failure only once
+    ///     every derivation resolved, and `synthesized` words, the
+    ///     gateway's own statement that the stream died. The own
+    ///     `Cached` terminal is a recorded substitution event and the
+    ///     fail-fast scheduler-settled rescue lost no terminal, so
+    ///     neither may carry it — a marker there would reroute genuine
     ///     substitution events out of the measurable vocabulary). The
     ///     marker never changes the wire value: same status, same
     ///     `timesBuilt`, same message, same floor (invariant 6 holds
-    ///     unchanged on the marked cell).
-    // r[verify gw.opcode.lost-terminal-relay]
+    ///     unchanged on the marked cells).
+    // r[verify gw.opcode.lost-terminal-relay+2]
     #[test]
     fn per_root_verdict_lattice_totality() {
         const CONFIRMED: usize = 0;
@@ -2676,8 +2817,11 @@ mod tests {
             times_built: u64,
             msg: Msg,
             /// The lost-terminal relay-marker bit: a decided column of
-            /// every cell. True for exactly one cell — the Completed-DAG
-            /// lost-terminal evidence under confirmed presence.
+            /// every cell. True for the confirmed-presence cells whose
+            /// `Substituted` stands on a lost evidence channel: the
+            /// Completed-DAG lost-terminal cell (every batch-semantics
+            /// combination), and the blanket-rescue cell exactly when
+            /// `keep_going || synthesized`.
             lost_terminal: bool,
         }
         fn exp(enriched: bool, status: BuildStatus, times_built: u64, msg: Msg) -> Expected {
@@ -2689,7 +2833,7 @@ mod tests {
                 lost_terminal: false,
             }
         }
-        /// The marked cell: same wire value as an `exp` row (the marker
+        /// A marked cell: same wire value as an `exp` row (the marker
         /// changes nothing the client sees), plus the relay-marker bit.
         fn exp_marked(status: BuildStatus, times_built: u64, msg: Msg) -> Expected {
             Expected {
@@ -2707,10 +2851,15 @@ mod tests {
             own_failure: Option<(BuildStatus, &'static str)>,
             submitted: Option<bool>,
         }
-        type MakeFn = fn() -> RootEvidence;
-        type ExpectFn = fn(usize) -> Expected;
+        /// Evidence constructor, parameterized over the batch-semantics
+        /// square (`keep_going`, `synthesized`); `OwnTerminal` shapes
+        /// ignore both (the constructor carries neither bit).
+        type MakeFn = fn(bool, bool) -> RootEvidence;
+        /// Expected output of one (store-state × keep_going ×
+        /// synthesized) cell.
+        type ExpectFn = fn(usize, bool, bool) -> Expected;
         /// One row of the lattice: the evidence shape's metadata, its
-        /// constructor, and its per-store-state expected output.
+        /// constructor, and its per-cell expected output.
         type Shape = (Cell, MakeFn, ExpectFn);
         let evidence_shapes: Vec<Shape> = vec![
             (
@@ -2720,10 +2869,11 @@ mod tests {
                     own_failure: None,
                     submitted: None,
                 },
-                || RootEvidence::OwnTerminal(BuildResult::success()),
+                |_, _| RootEvidence::OwnTerminal(BuildResult::success()),
                 // Unverifiable defers to the own terminal; only positive
                 // missing evidence demotes, naming the executed basis.
-                |state| match state {
+                // Batch semantics never reach an own terminal.
+                |state, _, _| match state {
                     MISSING => exp(
                         false,
                         BuildStatus::MiscFailure,
@@ -2740,10 +2890,14 @@ mod tests {
                     own_failure: None,
                     submitted: None,
                 },
-                || RootEvidence::OwnTerminal(BuildResult::substituted()),
+                |_, _| RootEvidence::OwnTerminal(BuildResult::substituted()),
                 // Same shape, but the demotion basis must say what the
                 // evidence says — substituted, not "build completed".
-                |state| match state {
+                // The recorded substitution event stays UNMARKED under
+                // every batch-semantics combination: a marker here
+                // would reroute genuine substitution events out of the
+                // measurable vocabulary.
+                |state, _, _| match state {
                     MISSING => exp(
                         false,
                         BuildStatus::MiscFailure,
@@ -2760,14 +2914,14 @@ mod tests {
                     own_failure: Some((BuildStatus::PermanentFailure, "builder exit 1")),
                     submitted: None,
                 },
-                || {
+                |_, _| {
                     RootEvidence::OwnTerminal(BuildResult::failure(
                         BuildStatus::PermanentFailure,
                         "builder exit 1",
                     ))
                 },
                 // Verbatim under EVERY store state.
-                |_| {
+                |_, _, _| {
                     exp(
                         false,
                         BuildStatus::PermanentFailure,
@@ -2783,22 +2937,25 @@ mod tests {
                     own_failure: None,
                     submitted: Some(true),
                 },
-                || RootEvidence::DagFallback {
+                |kg, synth| RootEvidence::DagFallback {
                     dag: BuildResult::success(),
                     submitted: true,
+                    keep_going: kg,
+                    synthesized: synth,
                 },
-                // THE round-introduced cells: presence claim only on
-                // positive presence — and the confirmed cell is the ONE
-                // cell carrying the lost-terminal relay marker (the wire
-                // value is a plain Substituted, indistinguishable from a
-                // genuine substitution; the marker is the side channel
-                // that keeps measurement consumers from recording a
-                // substitution event off a lost evidence channel);
-                // positive absence demotes naming the DAG-level basis
-                // (this root's execution is unknown); no evidence either
-                // way is an honest evidence-loss row, never a fabricated
+                // Presence claim only on positive presence — and the
+                // confirmed cell carries the lost-terminal relay marker
+                // under EVERY batch-semantics combination: a completed
+                // DAG means every root resolved whatever `keep_going`
+                // says, so a terminal-less root is loss either way (the
+                // synthesized × success combination is producer-
+                // impossible — synthesized words are failures — and
+                // must not change the decision); positive absence
+                // demotes naming the DAG-level basis (this root's
+                // execution is unknown); no evidence either way is an
+                // honest evidence-loss row, never a fabricated
                 // substitution.
-                |state| match state {
+                |state, _, _| match state {
                     CONFIRMED => exp_marked(BuildStatus::Substituted, 0, Msg::Empty),
                     MISSING => exp(
                         false,
@@ -2821,16 +2978,33 @@ mod tests {
                     own_failure: None,
                     submitted: Some(true),
                 },
-                || RootEvidence::DagFallback {
+                |kg, synth| RootEvidence::DagFallback {
                     dag: BuildResult::failure(
                         BuildStatus::PermanentFailure,
                         "derivation '/nix/store/x.drv' failed: boom",
                     ),
                     submitted: true,
+                    keep_going: kg,
+                    synthesized: synth,
                 },
                 // Rescued ONLY by positive presence; otherwise the
-                // blanket failure stands verbatim.
-                |state| match state {
+                // blanket failure stands verbatim under every batch-
+                // semantics combination. The rescue's marker keys on
+                // the bits — both sides of each conjunct:
+                // (kg=f, synth=f) fail-fast scheduler-settled → plain
+                // rescue (the scheduler stopped early; nothing was
+                // lost); (kg=t, synth=f) keep-going scheduler-settled →
+                // marked (every derivation resolved, so a terminal-less
+                // root lost its evidence — or was merge-seeded, where
+                // marking is the conservative polarity); (kg=f,
+                // synth=t) and (kg=t, synth=t) → marked (the word is
+                // the gateway's own; the synthesized bit alone decides,
+                // pinned here against its producer —
+                // `submit_and_process_build`'s stream-death Err arm —
+                // even under a permanent-failure text no producer pairs
+                // with it).
+                |state, kg, synth| match state {
+                    CONFIRMED if kg || synth => exp_marked(BuildStatus::Substituted, 0, Msg::Empty),
                     CONFIRMED => exp(true, BuildStatus::Substituted, 0, Msg::Empty),
                     _ => exp(
                         false,
@@ -2847,14 +3021,22 @@ mod tests {
                     own_failure: None,
                     submitted: Some(true),
                 },
-                || RootEvidence::DagFallback {
+                // The reconnect-exhausted word's REAL producer mints
+                // synthesized=true (`dag_synthesized = outcome.is_err()`
+                // in submit_and_process_build); the synth=false rows
+                // below are the producer-impossible neighbors that pin
+                // bit-keyed (not text-keyed) decisions.
+                |kg, synth| RootEvidence::DagFallback {
                     dag: BuildResult::failure(
                         BuildStatus::TransientFailure,
                         "build stream error (reconnect exhausted): transport",
                     ),
                     submitted: true,
+                    keep_going: kg,
+                    synthesized: synth,
                 },
-                |state| match state {
+                |state, kg, synth| match state {
+                    CONFIRMED if kg || synth => exp_marked(BuildStatus::Substituted, 0, Msg::Empty),
                     CONFIRMED => exp(true, BuildStatus::Substituted, 0, Msg::Empty),
                     _ => exp(
                         false,
@@ -2871,16 +3053,22 @@ mod tests {
                     own_failure: None,
                     submitted: Some(false),
                 },
-                || RootEvidence::DagFallback {
+                |kg, synth| RootEvidence::DagFallback {
                     dag: BuildResult::failure(
                         BuildStatus::InputRejected,
                         "DAG validation failed: __noChroot",
                     ),
                     submitted: false,
+                    keep_going: kg,
+                    synthesized: synth,
                 },
                 // Check-invariant: the same verbatim refusal under every
-                // store state (also asserted structurally below).
-                |_| {
+                // store state and every batch-semantics combination
+                // (also asserted structurally below). The real producer
+                // (`ProcessedBuild::unsubmitted`) mints synthesized=true
+                // with the policy's keep_going; the other rows pin that
+                // the unsubmitted arm never consults either bit.
+                |_, _, _| {
                     exp(
                         false,
                         BuildStatus::InputRejected,
@@ -2896,14 +3084,16 @@ mod tests {
                     own_failure: None,
                     submitted: Some(false),
                 },
-                || RootEvidence::DagFallback {
+                |kg, synth| RootEvidence::DagFallback {
                     dag: BuildResult::failure(
                         BuildStatus::TransientFailure,
                         "scheduler error: connect refused",
                     ),
                     submitted: false,
+                    keep_going: kg,
+                    synthesized: synth,
                 },
-                |_| {
+                |_, _, _| {
                     exp(
                         false,
                         BuildStatus::TransientFailure,
@@ -2919,11 +3109,13 @@ mod tests {
                     own_failure: None,
                     submitted: Some(false),
                 },
-                || RootEvidence::DagFallback {
+                |kg, synth| RootEvidence::DagFallback {
                     dag: BuildResult::success(),
                     submitted: false,
+                    keep_going: kg,
+                    synthesized: synth,
                 },
-                |_| {
+                |_, _, _| {
                     exp(
                         false,
                         BuildStatus::MiscFailure,
@@ -2936,168 +3128,200 @@ mod tests {
             ),
         ];
 
+        // The full batch-semantics square, crossed with every evidence
+        // shape: both sides of each marker conjunct (SR-style — the
+        // failing cell is always one row past where a fixture stops).
+        const SEMANTICS: [(bool, bool); 4] =
+            [(false, false), (false, true), (true, false), (true, true)];
+
         for (cell, make, expect) in &evidence_shapes {
             // Per-evidence verdict collection for the check-invariance
-            // audit (invariant 3's second half).
+            // audit (invariant 3's second half), across store states AND
+            // the batch-semantics square.
             let mut outputs: Vec<(bool, BuildResult)> = Vec::new();
-            for state in [CONFIRMED, MISSING, UNVERIFIABLE] {
-                let chk = check(state);
-                let verdict = per_root_verdict(make(), &chk, "/nix/store/under-test.drv");
-                let (result, enriched, lost_terminal) = match verdict {
-                    RootVerdict::Success {
-                        base,
-                        lost_terminal,
-                    } => (base, true, lost_terminal),
-                    RootVerdict::Verbatim(r) => (r, false, false),
-                };
-                let ctx = format!(
-                    "evidence: {}, store state: {}",
-                    cell.label, STATE_NAMES[state]
-                );
+            // Per-state collection across the square, for the
+            // wire-invariance audit (invariant 8 below).
+            let mut per_state: HashMap<usize, Vec<(bool, BuildResult)>> = HashMap::new();
+            for (kg, synth) in SEMANTICS {
+                for state in [CONFIRMED, MISSING, UNVERIFIABLE] {
+                    let chk = check(state);
+                    let verdict =
+                        per_root_verdict(make(kg, synth), &chk, "/nix/store/under-test.drv");
+                    let (result, enriched, lost_terminal) = match verdict {
+                        RootVerdict::Success {
+                            base,
+                            lost_terminal,
+                        } => (base, true, lost_terminal),
+                        RootVerdict::Verbatim(r) => (r, false, false),
+                    };
+                    let ctx = format!(
+                        "evidence: {}, store state: {}, keep_going: {kg}, synthesized: {synth}",
+                        cell.label, STATE_NAMES[state]
+                    );
 
-                // ── The value table: this cell's exact expected output. ──
-                let want = expect(state);
-                assert_eq!(enriched, want.enriched, "{ctx}: verdict arm: {result:?}");
-                assert_eq!(result.status, want.status, "{ctx}: status: {result:?}");
-                assert_eq!(
-                    result.times_built, want.times_built,
-                    "{ctx}: timesBuilt: {result:?}"
-                );
-                assert_eq!(
-                    lost_terminal, want.lost_terminal,
-                    "{ctx}: lost-terminal relay marker: a wrong-true reroutes a genuine \
-                     substitution event out of the measurable vocabulary; a wrong-false \
-                     re-opens the false force-build policy violation: {result:?}"
-                );
-                match want.msg {
-                    Msg::Empty => {
-                        assert!(result.error_msg.is_empty(), "{ctx}: {:?}", result.error_msg);
+                    // ── The value table: this cell's exact expected output. ──
+                    let want = expect(state, kg, synth);
+                    assert_eq!(enriched, want.enriched, "{ctx}: verdict arm: {result:?}");
+                    assert_eq!(result.status, want.status, "{ctx}: status: {result:?}");
+                    assert_eq!(
+                        result.times_built, want.times_built,
+                        "{ctx}: timesBuilt: {result:?}"
+                    );
+                    assert_eq!(
+                        lost_terminal, want.lost_terminal,
+                        "{ctx}: lost-terminal relay marker: a wrong-true reroutes a genuine \
+                         substitution event out of the measurable vocabulary; a wrong-false \
+                         re-opens the false force-build policy violation: {result:?}"
+                    );
+                    match want.msg {
+                        Msg::Empty => {
+                            assert!(result.error_msg.is_empty(), "{ctx}: {:?}", result.error_msg);
+                        }
+                        Msg::Exact(text) => assert_eq!(result.error_msg, text, "{ctx}"),
+                        Msg::DemotedWithBasis(basis) => {
+                            assert!(
+                                result
+                                    .error_msg
+                                    .starts_with(&format!("{basis} but requested outputs are ")),
+                                "{ctx}: demotion basis must match the evidence, got: {:?}",
+                                result.error_msg
+                            );
+                            assert!(
+                                result.error_msg.contains("not in the store")
+                                    && result.error_msg.contains("output 'out'"),
+                                "{ctx}: demotion must name the missing output: {}",
+                                result.error_msg
+                            );
+                        }
+                        Msg::LostTerminalUnverified => {
+                            assert_eq!(
+                                result.error_msg,
+                                BuildResult::lost_terminal_unverified().error_msg,
+                                "{ctx}: the evidence-loss row is the shared constructor's, \
+                                 byte-for-byte (measurement consumers match its prefix)"
+                            );
+                        }
                     }
-                    Msg::Exact(text) => assert_eq!(result.error_msg, text, "{ctx}"),
-                    Msg::DemotedWithBasis(basis) => {
+
+                    // ── Cross-cell honesty invariants. ──
+                    // 1. Execution honesty: timesBuilt ≥ 1 only from an own
+                    //    executed-success terminal.
+                    if result.times_built >= 1 {
                         assert!(
-                            result
-                                .error_msg
-                                .starts_with(&format!("{basis} but requested outputs are ")),
-                            "{ctx}: demotion basis must match the evidence, got: {:?}",
-                            result.error_msg
+                            cell.own_success && result.status == BuildStatus::Built,
+                            "{ctx}: execution claim without an own executed terminal: {result:?}"
+                        );
+                    }
+                    // 2. Success provenance: own terminal, or acknowledged
+                    //    batch with POSITIVE presence. A completed DAG alone
+                    //    is never success evidence for a terminal-less root.
+                    if result.status.is_success() {
+                        let own_ok = cell.own_success && chk.missing.is_empty();
+                        let dag_ok = cell.submitted == Some(true) && chk.confirmed_present;
+                        assert!(
+                            own_ok || dag_ok,
+                            "{ctx}: success without per-root or positive-presence evidence: \
+                             {result:?}"
                         );
                         assert!(
-                            result.error_msg.contains("not in the store")
-                                && result.error_msg.contains("output 'out'"),
-                            "{ctx}: demotion must name the missing output: {}",
-                            result.error_msg
+                            enriched,
+                            "{ctx}: success must carry builtOutputs enrichment"
+                        );
+                    } else {
+                        assert!(!enriched, "{ctx}: failures are never enriched");
+                    }
+                    // 3 (first half). Unsubmitted stand-ins are verbatim
+                    //    failures under every store state.
+                    if cell.submitted == Some(false) {
+                        assert!(
+                            !result.status.is_success(),
+                            "{ctx}: a batch the scheduler never accepted reported success: \
+                             {result:?}"
                         );
                     }
-                    Msg::LostTerminalUnverified => {
+                    // 4. Own failures stand verbatim under every store state.
+                    if let Some((status, msg)) = cell.own_failure {
+                        assert_eq!(result.status, status, "{ctx}: own failure overridden");
+                        assert_eq!(result.error_msg, msg, "{ctx}: own failure message changed");
+                    }
+                    // 6. Claim-uniform evidence floor: a Substituted mint
+                    //    without an own terminal requires confirmed_present —
+                    //    the same minimum evidence in BOTH minting arms — and
+                    //    is always a presence shape, never an executed Built.
+                    //    The marker bit does not loosen this floor (it rides
+                    //    cells that already pass it; see invariant 7).
+                    if result.status.is_success() && !cell.own_success {
+                        assert!(
+                            chk.confirmed_present,
+                            "{ctx}: presence claim minted without positive presence evidence: \
+                             {result:?}"
+                        );
                         assert_eq!(
-                            result.error_msg,
-                            BuildResult::lost_terminal_unverified().error_msg,
-                            "{ctx}: the evidence-loss row is the shared constructor's, \
-                             byte-for-byte (measurement consumers match its prefix)"
+                            result.status,
+                            BuildStatus::Substituted,
+                            "{ctx}: evidence-less success must be a presence claim"
+                        );
+                        assert_eq!(result.times_built, 0, "{ctx}");
+                    }
+                    // 7. Lost-terminal marker exactness: the marker may ride
+                    //    ONLY a Substituted presence mint with positive
+                    //    presence, no own terminal, and an acknowledged
+                    //    batch — it is a side-channel annotation on an
+                    //    already-licensed mint, never a license of its own,
+                    //    and never an alteration of the wire value.
+                    if lost_terminal {
+                        assert_eq!(
+                            result.status,
+                            BuildStatus::Substituted,
+                            "{ctx}: the marker only annotates the presence word"
+                        );
+                        assert_eq!(result.times_built, 0, "{ctx}");
+                        assert!(
+                            chk.confirmed_present,
+                            "{ctx}: a marked mint still requires the presence floor"
+                        );
+                        assert!(
+                            !cell.own_success && cell.own_failure.is_none(),
+                            "{ctx}: an own terminal is never a lost terminal"
+                        );
+                        assert_eq!(
+                            cell.submitted,
+                            Some(true),
+                            "{ctx}: only an acknowledged batch can lose a terminal"
                         );
                     }
+                    outputs.push((enriched, result.clone()));
+                    per_state.entry(state).or_default().push((enriched, result));
                 }
-
-                // ── Cross-cell honesty invariants. ──
-                // 1. Execution honesty: timesBuilt ≥ 1 only from an own
-                //    executed-success terminal.
-                if result.times_built >= 1 {
-                    assert!(
-                        cell.own_success && result.status == BuildStatus::Built,
-                        "{ctx}: execution claim without an own executed terminal: {result:?}"
-                    );
-                }
-                // 2. Success provenance: own terminal, or acknowledged
-                //    batch with POSITIVE presence. A completed DAG alone
-                //    is never success evidence for a terminal-less root.
-                if result.status.is_success() {
-                    let own_ok = cell.own_success && chk.missing.is_empty();
-                    let dag_ok = cell.submitted == Some(true) && chk.confirmed_present;
-                    assert!(
-                        own_ok || dag_ok,
-                        "{ctx}: success without per-root or positive-presence evidence: \
-                         {result:?}"
-                    );
-                    assert!(
-                        enriched,
-                        "{ctx}: success must carry builtOutputs enrichment"
-                    );
-                } else {
-                    assert!(!enriched, "{ctx}: failures are never enriched");
-                }
-                // 3 (first half). Unsubmitted stand-ins are verbatim
-                //    failures under every store state.
-                if cell.submitted == Some(false) {
-                    assert!(
-                        !result.status.is_success(),
-                        "{ctx}: a batch the scheduler never accepted reported success: \
-                         {result:?}"
-                    );
-                }
-                // 4. Own failures stand verbatim under every store state.
-                if let Some((status, msg)) = cell.own_failure {
-                    assert_eq!(result.status, status, "{ctx}: own failure overridden");
-                    assert_eq!(result.error_msg, msg, "{ctx}: own failure message changed");
-                }
-                // 6. Claim-uniform evidence floor: a Substituted mint
-                //    without an own terminal requires confirmed_present —
-                //    the same minimum evidence in BOTH minting arms — and
-                //    is always a presence shape, never an executed Built.
-                //    The marker bit does not loosen this floor (it rides
-                //    cells that already pass it; see invariant 7).
-                if result.status.is_success() && !cell.own_success {
-                    assert!(
-                        chk.confirmed_present,
-                        "{ctx}: presence claim minted without positive presence evidence: \
-                         {result:?}"
-                    );
-                    assert_eq!(
-                        result.status,
-                        BuildStatus::Substituted,
-                        "{ctx}: evidence-less success must be a presence claim"
-                    );
-                    assert_eq!(result.times_built, 0, "{ctx}");
-                }
-                // 7. Lost-terminal marker exactness: the marker may ride
-                //    ONLY a Substituted presence mint with positive
-                //    presence, no own terminal, and an acknowledged
-                //    batch — it is a side-channel annotation on an
-                //    already-licensed mint, never a license of its own,
-                //    and never an alteration of the wire value.
-                if lost_terminal {
-                    assert_eq!(
-                        result.status,
-                        BuildStatus::Substituted,
-                        "{ctx}: the marker only annotates the presence word"
-                    );
-                    assert_eq!(result.times_built, 0, "{ctx}");
-                    assert!(
-                        chk.confirmed_present,
-                        "{ctx}: a marked mint still requires the presence floor"
-                    );
-                    assert!(
-                        !cell.own_success && cell.own_failure.is_none(),
-                        "{ctx}: an own terminal is never a lost terminal"
-                    );
-                    assert_eq!(
-                        cell.submitted,
-                        Some(true),
-                        "{ctx}: only an acknowledged batch can lose a terminal"
-                    );
-                }
-                outputs.push((enriched, result));
             }
             // 3 (second half). Check-invariance: an unsubmitted batch's
-            // verdict is identical under every store state — the standing
-            // audit that licenses the handler to skip the store
-            // verification (and its abort path) for unsubmitted batches.
+            // verdict is identical under every store state (and every
+            // batch-semantics combination) — the standing audit that
+            // licenses the handler to skip the store verification (and
+            // its abort path) for unsubmitted batches.
             if cell.submitted == Some(false) {
                 assert!(
                     outputs.windows(2).all(|w| w[0] == w[1]),
                     "evidence: {}: unsubmitted verdicts must not depend on store state \
                      (what licenses the handler to skip the store check for them): {outputs:?}",
                     cell.label
+                );
+            }
+            // 8. Wire invariance over the batch-semantics square: for
+            //    every evidence shape and store state, the four
+            //    (keep_going × synthesized) combinations produce the
+            //    IDENTICAL wire result and verdict arm — the bits decide
+            //    only the side-channel marker (asserted cell-exactly by
+            //    the value table above), never anything a stock client
+            //    sees. A new arm that branches the wire value on either
+            //    bit fails here before it can ship.
+            for (state, results) in &per_state {
+                assert!(
+                    results.windows(2).all(|w| w[0] == w[1]),
+                    "evidence: {}, store state: {}: the batch-semantics square must never \
+                     change the wire value (marker bit only): {results:?}",
+                    cell.label,
+                    STATE_NAMES[*state]
                 );
             }
         }

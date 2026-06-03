@@ -729,18 +729,26 @@ influence nothing — running it would only add the store's own failure mode
 (an opcode-level abort) to replies the client is owed per path during a
 correlated outage.
 
-#r("gw.opcode.lost-terminal-relay")[
+#r("gw.opcode.lost-terminal-relay+2")[
   When a `wopBuildPathsWithResults` target with no recorded terminal of its
-  own under a *completed* DAG is reported `Substituted` on positive store
-  presence, the gateway MUST relay the lost-terminal marker line for that
-  target — the shared rio-nix producer formatter's output
-  (`rio: terminal lost for '<drv>'`), newline-terminated as its own
-  `STDERR_NEXT` payload, before the opcode's stderr loop closes — without
-  altering the in-band result (status `Substituted`, `timesBuilt = 0`, empty
-  `errorMsg`, the same positive-presence evidence floor), and MUST NOT relay
-  the marker for any other cell: not for a target with its own `Cached`
-  terminal (a recorded substitution event), and not for the blanket-failure
-  presence rescue (no terminal was lost; under fail-fast none was expected).
+  own is reported `Substituted` on positive store presence and the DAG-level
+  word implies the target's evidence channel was lost — a *completed* DAG
+  (every root resolved, so a missing terminal is loss); a *failed* DAG under
+  `keep_going` batch semantics (the scheduler settles that word only once
+  every derivation resolved, so a terminal-less target's evidence never
+  reached the relay); or a failure word the gateway itself *synthesized*
+  (the reconnect-exhausted stream death — the gateway's own statement that
+  the channel died, whatever the batch semantics) — the gateway MUST relay
+  the lost-terminal marker line for that target — the shared rio-nix
+  producer formatter's output (`rio: terminal lost for '<drv>'`),
+  newline-terminated as its own `STDERR_NEXT` payload, before the opcode's
+  stderr loop closes — without altering the in-band result (status
+  `Substituted`, `timesBuilt = 0`, empty `errorMsg`, the same
+  positive-presence evidence floor), and MUST NOT relay the marker for any
+  other cell: not for a target with its own `Cached` terminal (a recorded
+  substitution event), and not for the *fail-fast scheduler-settled*
+  blanket-failure presence rescue (the scheduler stops early, so a
+  terminal-less target was plausibly never attempted and nothing was lost).
 ]
 
 The marker exists because the wire vocabulary cannot carry the distinction:
@@ -755,8 +763,22 @@ force-build measurement tenants make definitionally impossible, so an
 unmarked lost-terminal mint would record a false policy violation and
 spuriously fail the zero-target-substituted smoke criterion. The exactness
 in the other direction is equally load-bearing: a marker on a genuine
-substitution cell would reroute real substitution events out of the
-measurable vocabulary and blind that same criterion.
+substitution cell — an own `Cached` terminal, or the fail-fast rescue of a
+root the scheduler plausibly never attempted — would reroute real
+substitution events out of the measurable vocabulary and blind that same
+criterion. Under keep-going the failed-DAG cell is not perfectly
+disambiguated — a terminal-less root may also be a merge-seeded
+`DependencyFailed` node, which the scheduler resolves without emitting any
+event — but marking is the conservative polarity there: the consumer-side
+trust bound (rio-nix's relay-marker doc) caps a marker's effect at flipping
+that drv's same-batch `Substituted` row to evidence-loss exclusion, never
+minting a success or a violation, and the evidence-loss route's re-attempt
+produces fresh evidence either way. The unverifiable sibling cell of the
+failed keep-going DAG keeps the verbatim blanket failure for the same
+seeding ambiguity in the opposite direction: the blanket text is what the
+measurement consumer's poison-recovery arm matches on, and resolving that
+cell honestly needs the producer to disambiguate (scheduler-side events for
+merge-seeded nodes), not another consumer-side guess.
 
 `wopBuildDerivation` (the build-hook path) is a single-target reply, so the
 batch-aggregation hazards above do not apply, but the client-crash one does:

@@ -223,11 +223,16 @@ impl BuildResult {
     /// `STDERR_NEXT` frame, never embedded in other text.
     ///
     /// Emitted EXACTLY when the gateway mints `Substituted` for a root
-    /// whose own terminal event was lost under a completed DAG and whose
-    /// requested outputs the store positively confirmed — never for an
-    /// own `Cached` terminal (a recorded substitution event) and never
-    /// for the blanket-failure presence rescue (no terminal was lost
-    /// there; under fail-fast none was ever expected). Measurement
+    /// with no own terminal event, positively store-confirmed outputs,
+    /// and a DAG-level word that implies the evidence channel was lost:
+    /// a completed DAG (every root resolved, so a missing terminal is
+    /// loss), a failed keep-going DAG (the scheduler settles that word
+    /// only once every derivation resolved), or a gateway-synthesized
+    /// failure word (reconnect exhausted — the gateway's own statement
+    /// that the stream died). Never for an own `Cached` terminal (a
+    /// recorded substitution event) and never for the fail-fast
+    /// scheduler-settled blanket rescue (the scheduler stops early, so
+    /// no terminal was ever expected for that root). Measurement
     /// consumers route a `Substituted` row carrying this marker to
     /// evidence-loss classification instead of recording a substitution
     /// event; clients that do not know the marker see an informational

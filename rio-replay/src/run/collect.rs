@@ -902,9 +902,11 @@ pub fn decide(
         // The gateway's lost-terminal relay marker, classified BEFORE the
         // completed-without-execution discriminator: a `Substituted` row
         // for a root the gateway marked stands on a LOST evidence channel
-        // — this root's terminal event was lost under a completed DAG and
-        // the store positively confirmed its outputs — not on a recorded
-        // substitution event. The wire status stays Substituted for stock
+        // — this root's terminal event never reached the relay while the
+        // DAG-level word implied it was resolved (completed DAG, failed
+        // keep-going DAG, or a gateway-synthesized reconnect-exhausted
+        // word) and the store positively confirmed its outputs — not on
+        // a recorded substitution event. The wire status stays Substituted for stock
         // clients (presence is real), so the in-band row alone is
         // indistinguishable from a genuine substitution; without the
         // marker it would classify `target-substituted`, which a
@@ -969,7 +971,7 @@ pub fn decide(
                 },
                 evidence: Some(
                     "gateway lost-terminal relay marker with an in-band Substituted row \
-                     (terminal lost under a completed DAG; store presence confirmed, execution \
+                     (terminal never reached the relay; store presence confirmed, execution \
                      unknown): evidence loss, never a recorded substitution event"
                         .to_string(),
                 ),
