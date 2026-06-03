@@ -245,18 +245,22 @@ impl BuildResult {
     /// raw payload lines (no progress-bar rendering exists on that
     /// channel; prefix tolerance in the older relay regexes is a
     /// nix-CLI-capture artifact this engine-only vocabulary does not
-    /// inherit). Trust provenance: the line arrives on the gateway's
-    /// `STDERR_NEXT` stream, which also relays `derivation '<drv>'
-    /// failed: <message>` payloads whose message embeds WORKER-quoted
-    /// log text — the byte-0 anchor rejects those embeddings (the
-    /// daemon's quoted log lines carry a `> ` prefix and the failure
-    /// relay's first line carries the `derivation '` prefix), and worker
-    /// build-log lines themselves travel as `STDERR_RESULT` frames the
-    /// observer never sees. A spoofed marker's worst case is bounded by
-    /// the consumer's status conjunct (it only affects a `Substituted`
-    /// row for the same drv in the same batch) and is conservative in
-    /// direction: it can move a row from a recorded substitution event
-    /// to evidence-loss exclusion, never mint a success or a violation.
+    /// inherit). Trust provenance: the anchoring NARROWS the spoof
+    /// surface but is not a trust boundary — it rejects the failure
+    /// relay's own first line (`derivation '` prefix) and the daemon's
+    /// `> `-quoted log embeddings, yet worker-influenced text can still
+    /// reach byte 0 of an observed line: the gateway's log relay falls
+    /// back to a plain `STDERR_NEXT` for drvs with no live activity
+    /// (lines arriving before `Started`, post-terminal stragglers —
+    /// `relay_log_batch` in rio-gateway), and the observer's line split
+    /// puts the non-first lines of a multi-line failure payload at
+    /// byte 0. The load-bearing bound is consumer-enforced instead: a
+    /// spoofed marker only flips THAT drv's same-batch `Substituted`
+    /// row from a recorded substitution event to conservative
+    /// evidence-loss exclusion — never minting a success or a violation
+    /// — the same channel-exposure class as the existing relayed-reason
+    /// capture (rio-replay's `DRV_FAILED_RE`), which is strictly looser
+    /// (it matches anywhere in any line).
     pub fn lost_terminal_relay_drv(line: &str) -> Option<&str> {
         let drv = line
             .strip_prefix(Self::LOST_TERMINAL_RELAY_PREFIX)?
