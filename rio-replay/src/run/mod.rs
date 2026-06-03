@@ -2064,7 +2064,8 @@ enum ProbeAction {
 /// ladder is the bounded middle: while the latch holds, release ONE
 /// budget-exempt single-job probe per cycle; a probe that produces a
 /// WORK-EVIDENCING terminal record (built, genuine failure, source-rot,
-/// … — `model::is_work_evidencing_terminal`, the scorer's witness; bare
+/// an in-band target substitution, … —
+/// `model::is_work_evidencing_terminal`, the scorer's witness; bare
 /// terminality is not enough, because outage-minted classes like
 /// infra-indeterminate exhaustion terminals and supply-failed exclusions
 /// are terminal too) refreshes the window and resets the ladder; a probe
@@ -3180,8 +3181,9 @@ pub async fn run_with_backends(
                     // batch has been collected, and success means its job
                     // now holds a WORK-EVIDENCING terminal record — a
                     // class the cluster could only have produced by
-                    // executing the build (built, genuine failure,
-                    // source-rot, …). Bare terminality is NOT the witness:
+                    // resolving the unit end to end (built, genuine
+                    // failure, source-rot, an in-band target
+                    // substitution, …). Bare terminality is NOT the witness:
                     // outage-minted classes (an infra-indeterminate
                     // budget-exhaustion terminal, a supply-failed
                     // exclusion from the rollup) are terminal records the
@@ -8789,6 +8791,421 @@ mod tests {
             batches.iter().all(|b| b.probe && b.jobs.len() == 1),
             "{batches:?}"
         );
+    }
+
+    /// The ladder's closed loop when a probe SUBSTITUTES instead of
+    /// building: the conscripted unit settles an UNMARKED in-band
+    /// `Substituted` row — a genuine substitution event the cluster
+    /// answered end to end (submit → gateway → scheduler → store), the
+    /// `target-substituted` disposition's only producer — and the cycle
+    /// must score SUCCESS, resetting the failed-cycle run. Before
+    /// `Disposition::evidences_cluster_work` admitted the cell, three
+    /// substituting probes on a HEALTHY cluster wrote the operator PAUSE
+    /// file ("infra-rate canary probes exhausted") while the same records
+    /// refreshed the rate window as healthy non-infra terminals — the
+    /// ladder and the window reading one record with opposite health
+    /// conclusions.
+    ///
+    /// Producer-mirrored fixture (the same chain the real submitter
+    /// runs): `BuildResult::substituted()` → the production wire codec →
+    /// `KeyedBuildResult` → `path_outcomes_from_keyed`. No marker — the
+    /// gateway pairs the lost-terminal marker only with evidence-loss
+    /// mints, and the composed sibling test below pins that direction.
+    ///
+    /// Script shape (pinning the RESET, not just the grade): two failed
+    /// cycles, then the substituted success, then three more failures.
+    /// With the reset, escalation lands after probe SIX (3 consecutive
+    /// failures post-reset); without it (the substituted cycle scored as
+    /// failure number three), escalation would land after probe THREE —
+    /// the batch count is the discriminating witness.
+    #[tokio::test(start_paused = true)]
+    async fn substituting_probe_scores_success_and_resets_the_ladder() -> Result<()> {
+        use rio_nix::protocol::build::{BuildResult, read_build_result, write_build_result};
+        use rio_nix::protocol::client::KeyedBuildResult;
+        use rio_nix::protocol::handshake::PROTOCOL_VERSION;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDir::new(dir.path()).unwrap());
+        let pause = Arc::new(model::PauseState::default());
+        pause.set_backpressure(true);
+        let jobs = ["a.x86_64-linux", "b.x86_64-linux"];
+        let drv = |job: &str| format!("/nix/store/{}-{job}.drv", fake_hash(job));
+
+        // ── Producer chain for the substituted probe answer: constructor
+        // → wire encode → wire decode → transport projection, exactly the
+        // submitter's own assembly. ──
+        let drv_a = drv(jobs[0]);
+        let minted = BuildResult::substituted();
+        let mut buf = Vec::new();
+        write_build_result(&mut buf, &minted, PROTOCOL_VERSION).await?;
+        let parsed = read_build_result(&mut std::io::Cursor::new(buf), PROTOCOL_VERSION).await?;
+        let keyed = KeyedBuildResult {
+            derived_path: format!("{drv_a}!*"),
+            result: parsed,
+        };
+        let substituted_outcome = BatchOutcome {
+            results: model::path_outcomes_from_keyed(
+                std::slice::from_ref(&drv_a),
+                std::slice::from_ref(&keyed),
+            ),
+            ..BatchOutcome::default()
+        };
+
+        // Outcomes pop from the BACK: push the last cycle's first.
+        let submitter = Arc::new(FakeSubmitter::default());
+        {
+            let mut outcomes = submitter.outcomes.lock().unwrap();
+            for _ in 0..3 {
+                outcomes.push(Err(anyhow::anyhow!("gateway unreachable")));
+            }
+            outcomes.push(Ok(substituted_outcome));
+            for _ in 0..2 {
+                outcomes.push(Err(anyhow::anyhow!("gateway unreachable")));
+            }
+        }
+
+        let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let (job_ledger, _budgets) =
+            ledger::JobLedger::from_journals((*state).clone(), watchdog).unwrap();
+        let job_ledger = Arc::new(job_ledger);
+        let attemptable: Vec<batch::PendingJob> = jobs
+            .iter()
+            .map(|job| batch::PendingJob {
+                job: (*job).to_string(),
+                drv_path: drv(job),
+                dep_drvs: Vec::new(),
+            })
+            .collect();
+        let contexts: HashMap<String, JobContext> = jobs
+            .iter()
+            .map(|job| ((*job).to_string(), fold_ctx(job, &drv(job))))
+            .collect();
+        let backends = CollectBackends {
+            admin: Arc::new(NoLogsAdmin),
+            store: Arc::new(FakeStoreApi::default()),
+            artifacts: None,
+        };
+        let results: Arc<tokio::sync::Mutex<BTreeMap<String, JobRecord>>> =
+            Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+        let mut processed: HashSet<u64> = HashSet::new();
+        let loop_handle = tokio::spawn(run_submit_loop(
+            state.clone(),
+            submitter.clone(),
+            job_ledger.clone(),
+            pause.clone(),
+            attemptable,
+            // The production terminal view: a retired probe unit must
+            // stop being conscripted (its stale record would otherwise
+            // re-score every later cycle).
+            terminal_view(results.clone(), HashSet::new()),
+            || false,
+            "ssh-ng://test".into(),
+            Knobs::default(),
+            Arc::new(AtomicU64::new(1)),
+            None,
+        ));
+
+        let mut ladder = InfraProbeLadder::new();
+        let mut escalated = false;
+        for _tick in 0..200 {
+            let concluded = match pause.probe_batch() {
+                Some((batch_id, probe_jobs)) if processed.contains(&batch_id) => {
+                    pause.clear_probe();
+                    let res = results.lock().await;
+                    Some(probe_jobs.iter().any(|job| {
+                        res.get(job).is_some_and(|r| {
+                            model::is_work_evidencing_terminal(&r.verdict, &r.disposition)
+                        })
+                    }))
+                }
+                _ => None,
+            };
+            let in_flight = job_ledger.tracker().in_flight.lock().await.len();
+            match ladder.on_tick(true, false, in_flight, !pause.probe_idle(), concluded) {
+                ProbeAction::Hold => {}
+                ProbeAction::Grant => pause.grant_probe(),
+                ProbeAction::EscalateToOperatorPause => {
+                    std::fs::write(state.path("PAUSE"), b"infra-rate canary probes exhausted\n")
+                        .unwrap();
+                    escalated = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            collect_pass_with(
+                &state,
+                &backends,
+                &contexts,
+                &job_ledger,
+                &results,
+                &mut processed,
+                &Knobs::default(),
+                "leaf",
+                "c-subst-probe",
+                None,
+                &no_supply_retirement(),
+            )
+            .await
+            .unwrap();
+            let mut res = results.lock().await;
+            *res = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        }
+        loop_handle.abort();
+
+        // The discriminating witness: SIX probe batches before escalation.
+        // Without the success reset (the substituted cycle scored as the
+        // third failure) the ladder would have escalated after THREE.
+        assert!(escalated, "the post-reset failure run still escalates");
+        {
+            let submitted = submitter.submitted.lock().unwrap();
+            assert_eq!(
+                submitted.len(),
+                6,
+                "the substituted probe must reset the failed-cycle run: three more \
+                 failures were needed after it (3 would mean the healthy answer was \
+                 scored as the escalating failure)"
+            );
+        }
+
+        // The substituted probe RETIRED its unit honestly: one record,
+        // the target-substituted disposition (a real substitution event,
+        // measurable), and that record is the work-evidence witness the
+        // scorer accepted.
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].job, jobs[0]);
+        assert_eq!(
+            records[0].disposition.as_deref(),
+            Some(Disposition::TargetSubstituted.as_str()),
+            "{records:?}"
+        );
+        assert!(
+            model::is_work_evidencing_terminal(&records[0].verdict, &records[0].disposition),
+            "an unmarked in-band substitution is cluster work — the probe's witness"
+        );
+        // Probe mechanics unchanged: single-job probe batches throughout.
+        let batches: Vec<model::BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
+        assert!(
+            batches.iter().all(|b| b.probe && b.jobs.len() == 1),
+            "{batches:?}"
+        );
+        Ok(())
+    }
+
+    /// COMPOSED probe × failed-keep-going-DAG × lost-terminal cell, over
+    /// the real submit loop, collect pass, and ladder: when the gateway
+    /// rescues a confirmed-present root under a failed keep-going DAG it
+    /// relays the lost-terminal MARKER alongside the in-band
+    /// `Substituted` row (the row stands on a lost evidence channel, not
+    /// a recorded substitution event), and the engine must route the
+    /// marked row away BEFORE classification — on a probe batch, into
+    /// the budget-exempt InfraProbe carve-out. ROUTING and SCORING only:
+    /// no terminal record is minted (so `target-substituted` — now a
+    /// work-evidencing grade — can never be reached from this shape),
+    /// the cycle scores FAILED, and after INFRA_PROBE_PAUSE_AFTER cycles
+    /// the operator PAUSE lands.
+    ///
+    /// This is the no-launder pin for admitting `target-substituted` as
+    /// work evidence: during a genuine partial outage (builds complete
+    /// server-side, the evidence channel dies), the rescued rows arrive
+    /// MARKED, route to InfraProbe, and cannot reset the ladder. If the
+    /// marker were dropped (or the routing bypassed), the row would mint
+    /// a target-substituted record, the flipped grade would score the
+    /// cycle a success, the ladder would reset every cycle, and the
+    /// PAUSE would never land while a unit retired per cycle — exactly
+    /// the laundering window this fixture forecloses: zero records and
+    /// escalation are the two assertions that fail in that world.
+    ///
+    /// Producer-mirrored on BOTH channels, like the settle-level marker
+    /// test: the in-band row via constructor → wire codec → transport
+    /// projection, and the marker via the shared producer formatter
+    /// (`lost_terminal_relay_line`, what the gateway's keep-going rescue
+    /// emits — pinned at the wire by the gateway's
+    /// `test_build_paths_with_results_keepgoing_failure_rescue_relays_lost_terminal_marker`)
+    /// fed through the engine's own capture (`parse_stderr`), together
+    /// with the keep-going batch-mate failure line the same stderr
+    /// channel relays.
+    #[tokio::test(start_paused = true)]
+    async fn marked_substituted_probe_under_failed_keep_going_dag_never_scores_success()
+    -> Result<()> {
+        use rio_nix::protocol::build::{BuildResult, read_build_result, write_build_result};
+        use rio_nix::protocol::client::KeyedBuildResult;
+        use rio_nix::protocol::handshake::PROTOCOL_VERSION;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDir::new(dir.path()).unwrap());
+        let pause = Arc::new(model::PauseState::default());
+        pause.set_backpressure(true);
+        let jobs = ["a.x86_64-linux", "b.x86_64-linux", "c.x86_64-linux"];
+        let drv = |job: &str| format!("/nix/store/{}-{job}.drv", fake_hash(job));
+        let drv_a = drv(jobs[0]);
+        let dep_drv = format!("/nix/store/{}-dep.drv", fake_hash("dep"));
+
+        // ── Producer chain, in-band channel: the gateway's keep-going
+        // rescue mints Substituted (constructor → wire codec → transport
+        // projection). ──
+        let minted = BuildResult::substituted();
+        let mut buf = Vec::new();
+        write_build_result(&mut buf, &minted, PROTOCOL_VERSION).await?;
+        let parsed = read_build_result(&mut std::io::Cursor::new(buf), PROTOCOL_VERSION).await?;
+        let keyed = KeyedBuildResult {
+            derived_path: format!("{drv_a}!*"),
+            result: parsed,
+        };
+        // ── Producer chain, relay channel: the marker line for the
+        // rescued root plus the keep-going batch-mate failure relay, fed
+        // through the engine's own stderr capture (the submitter's
+        // assembly: parsed.lost_terminals / parsed.reasons onto the
+        // outcome). ──
+        let stderr_block = format!(
+            "{}\nderivation '{dep_drv}' failed: builder exit 1\n",
+            BuildResult::lost_terminal_relay_line(&drv_a)
+        );
+        let probe_answer = || {
+            let captured = crate::run::stderrparse::parse_stderr(&stderr_block);
+            assert_eq!(captured.lost_terminals, BTreeSet::from([drv_a.clone()]));
+            Ok(BatchOutcome {
+                results: model::path_outcomes_from_keyed(
+                    std::slice::from_ref(&drv_a),
+                    std::slice::from_ref(&keyed),
+                ),
+                reasons: captured.reasons,
+                lost_terminals: captured.lost_terminals,
+                stderr_tail: stderr_block.trim_end().to_string(),
+                ..BatchOutcome::default()
+            })
+        };
+        let submitter = Arc::new(FakeSubmitter::default());
+        for _ in 0..INFRA_PROBE_PAUSE_AFTER {
+            submitter.outcomes.lock().unwrap().push(probe_answer());
+        }
+
+        let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let (job_ledger, _budgets) =
+            ledger::JobLedger::from_journals((*state).clone(), watchdog).unwrap();
+        let job_ledger = Arc::new(job_ledger);
+        let attemptable: Vec<batch::PendingJob> = jobs
+            .iter()
+            .map(|job| batch::PendingJob {
+                job: (*job).to_string(),
+                drv_path: drv(job),
+                dep_drvs: Vec::new(),
+            })
+            .collect();
+        let contexts: HashMap<String, JobContext> = jobs
+            .iter()
+            .map(|job| ((*job).to_string(), fold_ctx(job, &drv(job))))
+            .collect();
+        let backends = CollectBackends {
+            admin: Arc::new(NoLogsAdmin),
+            store: Arc::new(FakeStoreApi::default()),
+            artifacts: None,
+        };
+        let results: tokio::sync::Mutex<BTreeMap<String, JobRecord>> =
+            tokio::sync::Mutex::new(BTreeMap::new());
+        let mut processed: HashSet<u64> = HashSet::new();
+        let loop_handle = tokio::spawn(run_submit_loop(
+            state.clone(),
+            submitter.clone(),
+            job_ledger.clone(),
+            pause.clone(),
+            attemptable,
+            HashSet::new,
+            || false,
+            "ssh-ng://test".into(),
+            Knobs::default(),
+            Arc::new(AtomicU64::new(1)),
+            None,
+        ));
+
+        let mut ladder = InfraProbeLadder::new();
+        let mut escalated = false;
+        for _tick in 0..200 {
+            let concluded = match pause.probe_batch() {
+                Some((batch_id, probe_jobs)) if processed.contains(&batch_id) => {
+                    pause.clear_probe();
+                    let res = results.lock().await;
+                    Some(probe_jobs.iter().any(|job| {
+                        res.get(job).is_some_and(|r| {
+                            model::is_work_evidencing_terminal(&r.verdict, &r.disposition)
+                        })
+                    }))
+                }
+                _ => None,
+            };
+            let in_flight = job_ledger.tracker().in_flight.lock().await.len();
+            match ladder.on_tick(true, false, in_flight, !pause.probe_idle(), concluded) {
+                ProbeAction::Hold => {}
+                ProbeAction::Grant => pause.grant_probe(),
+                ProbeAction::EscalateToOperatorPause => {
+                    std::fs::write(state.path("PAUSE"), b"infra-rate canary probes exhausted\n")
+                        .unwrap();
+                    escalated = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            collect_pass_with(
+                &state,
+                &backends,
+                &contexts,
+                &job_ledger,
+                &results,
+                &mut processed,
+                &Knobs::default(),
+                "leaf",
+                "c-marked-probe",
+                None,
+                &no_supply_retirement(),
+            )
+            .await
+            .unwrap();
+            let mut res = results.lock().await;
+            *res = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        }
+        loop_handle.abort();
+
+        // SCORING: every marked cycle is a FAILED cycle — the ladder
+        // escalates on schedule. A laundered cell (marked row scored as
+        // success via the flipped target-substituted grade) would reset
+        // the ladder every cycle and never escalate.
+        assert!(
+            escalated,
+            "marked Substituted probe rows must never score success — escalation \
+             after {INFRA_PROBE_PAUSE_AFTER} cycles is the no-launder witness"
+        );
+        assert!(state.path("PAUSE").exists());
+        {
+            let submitted = submitter.submitted.lock().unwrap();
+            assert_eq!(
+                submitted.len(),
+                INFRA_PROBE_PAUSE_AFTER as usize,
+                "exactly one probe batch per failed cycle — no resets, no extra cycles"
+            );
+        }
+
+        // ROUTING: the marked row took the InfraProbe carve-out before
+        // classification — no terminal record of ANY kind, in particular
+        // no target-substituted record (the disposition this shape would
+        // launder into without the marker routing).
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert!(
+            records.is_empty(),
+            "a marked probe row must route to InfraProbe, never terminalize: {records:?}"
+        );
+
+        // The capture chain demonstrably carried the marker (the batch
+        // records hold the captured set) — the routing assertion above
+        // is not vacuously passing on a dropped marker.
+        let batches: Vec<model::BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
+        assert!(!batches.is_empty());
+        assert!(
+            batches
+                .iter()
+                .all(|b| b.probe && b.jobs.len() == 1 && b.lost_terminals.contains(&drv_a)),
+            "every probe batch carries the captured marker: {batches:?}"
+        );
+        Ok(())
     }
 
     /// Recorded offsets and timing values from an archive are sanitized at

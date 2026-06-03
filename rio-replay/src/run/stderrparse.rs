@@ -108,10 +108,12 @@ pub struct ParsedStderr {
     pub reasons: BTreeMap<String, String>,
     /// Roots for which the gateway relayed the lost-terminal marker line
     /// ([`BuildResult::lost_terminal_relay_line`]): the root's own
-    /// terminal event was lost under a completed DAG, store presence was
-    /// positively confirmed, and the wire status is therefore
-    /// `Substituted` — indistinguishable in band from a genuine
-    /// substitution terminal. Collect routes such a root's `Substituted`
+    /// terminal event never reached the gateway's relay while the
+    /// DAG-level word implied it was resolved (completed DAG, failed
+    /// keep-going DAG, or a gateway-synthesized reconnect-exhausted
+    /// word), store presence was positively confirmed, and the wire
+    /// status is therefore `Substituted` — indistinguishable in band
+    /// from a genuine substitution terminal. Collect routes such a root's `Substituted`
     /// row to evidence-loss classification instead of recording a
     /// substitution event. Parsed by the shared producer-exact pair in
     /// rio-nix, the same discipline as the in-band evidence-loss prefix.

@@ -339,21 +339,36 @@ impl Disposition {
         Self::ALL.into_iter().find(|d| d.as_str() == disposition)
     }
 
-    /// Whether this disposition is evidence the cluster EXECUTED the
-    /// unit's build — the work-evidence grade
-    /// [`is_work_evidencing_terminal`] projects: NO disposition is.
+    /// Whether this disposition is evidence the cluster RESOLVED the
+    /// unit's build end to end — the work-evidence grade
+    /// [`is_work_evidencing_terminal`] projects.
     ///
-    /// Dispositions are non-attempt classes by construction ("why a
-    /// workload unit was never compared"): plan-time exclusions and
-    /// supply-stage retirements never reached the cluster, and even
-    /// `target-substituted` — the one attempted() disposition — records
-    /// a completion WITHOUT execution. Several are minted BY outages
-    /// (supply-failed / upload-rejected from the supply rollup during a
-    /// dead-uploads window), so admitting any of them as work evidence
-    /// would let an outage satisfy its own probe's success witness.
-    /// Deliberately an exhaustive all-false match rather than a `_`:
-    /// adding a disposition refuses to compile until its evidence grade
-    /// is decided here, keeping this projection's totality test honest.
+    /// The grade is decided per class against each class's only
+    /// PRODUCERS, not against a class-level slogan ("dispositions are
+    /// non-attempt classes"), because the slogan's threat model is
+    /// false for one member:
+    ///
+    /// - `target-substituted` is `true`: its only mint is the
+    ///   classifier's completed-without-execution arm over an UNMARKED
+    ///   in-band `Substituted`/`AlreadyValid` success row (collect's
+    ///   with-result success arm), which requires the full
+    ///   submit→gateway→scheduler→store round trip to have answered —
+    ///   exactly what a canary probe is testing. No outage can launder
+    ///   into this cell: evidence-loss `Substituted` rows arrive with
+    ///   the gateway's lost-terminal relay marker and are routed away
+    ///   BEFORE classification (the marker arm — on probe batches it
+    ///   takes the budget-exempt InfraProbe carve-out, so a marked row
+    ///   never even terminalizes the probe job).
+    /// - Every other disposition is `false`: plan-time exclusions and
+    ///   supply-stage retirements never reached the cluster, and
+    ///   several are minted BY outages (supply-failed / upload-rejected
+    ///   from the supply rollup during a dead-uploads window), so
+    ///   admitting them would let an outage satisfy its own probe's
+    ///   success witness.
+    ///
+    /// Deliberately an exhaustive match rather than a `_`: adding a
+    /// disposition refuses to compile until its evidence grade is
+    /// decided here, keeping this projection's totality test honest.
     pub fn evidences_cluster_work(self) -> bool {
         match self {
             Disposition::Filtered
@@ -364,8 +379,12 @@ impl Disposition {
             | Disposition::CachedPrior
             | Disposition::UploadRejected
             | Disposition::SupplyFailed
-            | Disposition::TargetSubstituted
             | Disposition::NotAttempted => false,
+            // Minted only from an in-band substitution-shaped success
+            // row the cluster answered (see above): the cluster
+            // demonstrably resolved the unit, completing it without
+            // execution.
+            Disposition::TargetSubstituted => true,
         }
     }
 
@@ -2732,16 +2751,20 @@ mod tests {
     ///
     /// Every member is asserted on BOTH evidence axes so the two
     /// projections cannot silently merge again: terminality (scheduling
-    /// liveness) and work evidence (did the cluster execute). The
-    /// expected rows derive from the classes' own contracts:
-    /// `infra-indeterminate` states the replayed outcome cannot be
-    /// trusted (rio-side infrastructure failed — the class every
-    /// budget-exhaustion terminal mints DURING an outage), and every
-    /// disposition is a non-attempt class by construction (dispositions
-    /// answer "why was the unit never compared"; supply-failed /
-    /// upload-rejected are minted BY dead-uploads outages). A new
-    /// verdict or disposition fails the exhaustive matches behind this
-    /// test until its evidence grade is decided.
+    /// liveness) and work evidence (did the cluster resolve the unit).
+    /// The expected rows derive from each class's PRODUCERS, not from a
+    /// class-level slogan: `infra-indeterminate` states the replayed
+    /// outcome cannot be trusted (rio-side infrastructure failed — the
+    /// class every budget-exhaustion terminal mints DURING an outage);
+    /// `target-substituted`'s only mint is the classifier's
+    /// completed-without-execution arm over an unmarked in-band success
+    /// row — a full cluster round trip (evidence-loss rows are routed
+    /// away pre-classification by the lost-terminal marker arm), so it
+    /// IS work evidence; every other disposition is a non-attempt or
+    /// outage-mintable class (supply-failed / upload-rejected come from
+    /// dead-uploads windows). A new verdict or disposition fails the
+    /// exhaustive matches behind this test until its evidence grade is
+    /// decided.
     #[test]
     #[tracing_test::traced_test]
     fn work_evidence_projection_covers_the_whole_vocabulary() {
@@ -2759,10 +2782,14 @@ mod tests {
             assert_eq!(Verdict::from_wire(verdict.as_str()), Some(verdict));
         }
         for disposition in Disposition::ALL {
+            let expected = disposition == Disposition::TargetSubstituted;
             let raw = Some(disposition.as_str().to_string());
-            assert!(
-                !is_work_evidencing_terminal(&None, &raw),
-                "{disposition:?}: dispositions are non-attempt classes — never work evidence"
+            assert_eq!(
+                is_work_evidencing_terminal(&None, &raw),
+                expected,
+                "{disposition:?}: target-substituted is minted only by a cluster-answered \
+                 in-band success row (work evidence); every other disposition is a \
+                 non-attempt or outage-mintable class"
             );
             assert_eq!(
                 Disposition::from_wire(disposition.as_str()),
