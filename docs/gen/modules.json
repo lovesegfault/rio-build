@@ -40,7 +40,7 @@
     {
       "path": "bin/fsbench/dataset.rs",
       "depth": 2,
-      "doc": "Deterministic unique-content dataset generation."
+      "doc": "The dataset: a re-rooted REAL closure."
     },
     {
       "path": "bin/fsbench/main.rs",
@@ -1689,6 +1689,16 @@
       "doc": "`xtask k8s fsbench` — the castore-FUSE micro-benchmark driver"
     },
     {
+      "path": "k8s/fsbench/baseline.rs",
+      "depth": 2,
+      "doc": "Criterion-style local baselines: `.fsbench/baselines/<name>.json`,"
+    },
+    {
+      "path": "k8s/fsbench/compare.rs",
+      "depth": 2,
+      "doc": "The compare engine: identity-key gate, thresholded per-metric"
+    },
+    {
       "path": "k8s/fsbench/cotenancy.rs",
       "depth": 2,
       "doc": "Build→node attribution + passive co-tenancy tagging."
@@ -1706,7 +1716,7 @@
     {
       "path": "k8s/fsbench/submit.rs",
       "depth": 2,
-      "doc": "Bench submission: local prebuild of the fsbench bin, the I-161"
+      "doc": "Bench submission: local prebuild of the fsbench bin, an explicit"
     },
     {
       "path": "k8s/k3s/",

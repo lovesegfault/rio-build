@@ -12,6 +12,7 @@ use crate::{helm, sh, ui};
 pub(crate) mod chaos;
 pub mod client;
 pub(crate) mod eks;
+mod fsbench;
 mod k3s;
 mod phases;
 mod probe_boot;
@@ -358,6 +359,10 @@ pub enum K8sCmd {
         #[arg(long)]
         restart: bool,
     },
+    /// castore-FUSE micro-benchmark (P0594): submit one bench build
+    /// through the production mount path, sample co-tenancy, write
+    /// .fsbench/{ts}/result.json. Operator tooling; NOT a CI test.
+    Fsbench(fsbench::FsbenchArgs),
     /// ADR-023 §13a empirical gates (a–d). Operator-run on EKS; NOT a
     /// CI test. a/b assert; c/d report only.
     SlaGates {
@@ -529,6 +534,17 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
                     no_dry_run,
                 } => eks::ami::gc(older_than_days, !no_dry_run).await,
             }
+        }
+        K8sCmd::Fsbench(a) => {
+            let code = fsbench::run(a, &*p, kind, cfg).await?;
+            // fsbench exit-code vocabulary: 2 = refusal (compare
+            // identity mismatch OR refused --save-baseline),
+            // 3 = regression — for operator scripting; anyhow's Err
+            // path always exits 1, so nonzero verdicts exit directly.
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
         }
         K8sCmd::SlaGates { gate } => sla_gates::run(gate).await,
         K8sCmd::ProbeBoot => {
