@@ -10,7 +10,7 @@
 //! — never hand-typed literals — so the record values can never drift from
 //! the enum vocabulary.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rio_nix::protocol::build::BuildStatus;
@@ -1331,6 +1331,20 @@ pub struct BatchRecord {
     pub results: Vec<PathOutcome>,
     /// drv path → relayed failure reason (captured live from nix stderr).
     pub reasons: BTreeMap<String, String>,
+    /// Roots whose lost-terminal relay marker the gateway emitted on this
+    /// submission's stderr (captured live, like `reasons`): their in-band
+    /// `Substituted` rows stand on a lost evidence channel — terminal
+    /// event lost under a completed DAG, store presence confirmed — not
+    /// on a recorded substitution event, and collect classifies them as
+    /// evidence loss instead of `target-substituted`. Defaults to empty
+    /// on records written before the marker existed: their lost-terminal
+    /// `Substituted` rows are wire-indistinguishable from genuine
+    /// substitutions and are not re-classified — resumed pre-marker
+    /// campaigns keep their recorded `target-substituted` counts, and the
+    /// counts shift only for batches submitted after both gateway and
+    /// engine carry the marker vocabulary.
+    #[serde(default)]
+    pub lost_terminals: BTreeSet<String>,
     pub stderr_tail: Option<String>,
     /// True when the engine itself killed/cancelled this batch (timeout, abort).
     #[serde(default)]
@@ -2355,6 +2369,7 @@ mod tests {
                 stop_time: 2,
             }],
             reasons: BTreeMap::new(),
+            lost_terminals: BTreeSet::from([drv.to_string()]),
             stderr_tail: None,
             engine_cancelled: false,
             disconnect_deadline_fired: false,
@@ -2368,6 +2383,7 @@ mod tests {
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains(r#""results":[{"drvPath":"#), "{json}");
         assert!(json.contains(r#""topupDelivered":true"#), "{json}");
+        assert!(json.contains(r#""lostTerminals":["/nix/store/"#), "{json}");
         assert!(json.contains(r#""status":"Built""#), "{json}");
         assert!(json.contains(r#""errorMsg":"""#), "{json}");
         assert!(json.contains(r#""startTime":1"#), "{json}");
@@ -2405,6 +2421,12 @@ mod tests {
         assert!(!parsed.probe);
         assert_eq!(parsed.confirmation_attempt, 0);
         assert!(!parsed.topup_delivered);
+        // Lines written before the lost-terminal relay marker existed
+        // lack `lostTerminals` (defaults to empty: their lost-terminal
+        // Substituted rows are wire-indistinguishable from genuine
+        // substitutions and keep classifying as target-substituted —
+        // pre-marker campaigns are not re-classified on resume).
+        assert!(parsed.lost_terminals.is_empty());
         assert_eq!(parsed.batch_id, 3);
         assert_eq!(parsed.stderr_tail.as_deref(), Some("tail"));
     }

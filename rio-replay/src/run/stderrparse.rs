@@ -4,10 +4,11 @@
 //! scheduler reasons (infra vs. target vs. dependency) and the deterministic
 //! failure signatures used to group identical failures.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
+use rio_nix::protocol::build::BuildResult;
 
 /// `rio: build <uuid>` — emitted once per accepted build by the gateway
 /// (`rio-gateway/src/handler/build.rs`). The optional ` (trace <hex>)`
@@ -46,6 +47,16 @@ pub struct ParsedStderr {
     /// drv path → reason (first occurrence wins; the scheduler emits one
     /// terminal Failed per drv per build).
     pub reasons: BTreeMap<String, String>,
+    /// Roots for which the gateway relayed the lost-terminal marker line
+    /// ([`BuildResult::lost_terminal_relay_line`]): the root's own
+    /// terminal event was lost under a completed DAG, store presence was
+    /// positively confirmed, and the wire status is therefore
+    /// `Substituted` — indistinguishable in band from a genuine
+    /// substitution terminal. Collect routes such a root's `Substituted`
+    /// row to evidence-loss classification instead of recording a
+    /// substitution event. Parsed by the shared producer-exact pair in
+    /// rio-nix, the same discipline as the in-band evidence-loss prefix.
+    pub lost_terminals: BTreeSet<String>,
 }
 
 /// Feed one stderr line into `parsed` (streaming form, used by the
@@ -76,6 +87,13 @@ pub fn parse_line(parsed: &mut ParsedStderr, line: &str) {
             .reasons
             .entry(c[1].to_string())
             .or_insert_with(|| c[2].trim().to_string());
+    }
+    // The gateway's lost-terminal relay marker, matched by the shared
+    // producer-exact parser (byte-0 anchored, whole-line — see its doc
+    // for why this vocabulary does not inherit the progress-prefix
+    // tolerance of the regexes above).
+    if let Some(drv) = BuildResult::lost_terminal_relay_drv(line) {
+        parsed.lost_terminals.insert(drv.to_string());
     }
 }
 
@@ -358,6 +376,61 @@ mod tests {
         assert_eq!(
             p.build_id.as_deref(),
             Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a")
+        );
+    }
+
+    /// The lost-terminal relay marker is captured into `lost_terminals`
+    /// — fixture constructed VIA the shared producer formatter
+    /// ([`BuildResult::lost_terminal_relay_line`], the exact fn the
+    /// gateway emission calls), never a hand-written consumer string —
+    /// and the capture admits ONLY the producer's whole-line shape: the
+    /// embedded forms a relayed failure payload can carry (worker-quoted
+    /// log lines, the failure relay's own first line) must not mint a
+    /// marker, because their text is worker-controlled while the genuine
+    /// marker is gateway-authored.
+    #[test]
+    fn lost_terminal_marker_is_captured_producer_exact() {
+        let drv = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv";
+        let other = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-app-2.0.drv";
+        let marker = BuildResult::lost_terminal_relay_line(drv);
+
+        // Whole-capture form (resume / post-mortem): the marker line as
+        // the gateway frames it — its own newline-terminated payload —
+        // among ordinary relay traffic.
+        let capture = format!(
+            "rio: build 0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a\n\
+             {marker}\n\
+             derivation '{other}' failed: builder failed with exit code 2\n"
+        );
+        let parsed = parse_stderr(&capture);
+        assert_eq!(
+            parsed.lost_terminals,
+            BTreeSet::from([drv.to_string()]),
+            "the marker must be captured for exactly its drv"
+        );
+        assert!(parsed.build_id.is_some());
+        assert_eq!(parsed.reasons.len(), 1, "the failure relay still parses");
+
+        // Streaming form: same line through parse_line.
+        let mut p = ParsedStderr::default();
+        parse_line(&mut p, &marker);
+        assert!(p.lost_terminals.contains(drv));
+
+        // Must-NOT-capture: the marker text on worker-controllable
+        // channels — embedded in a relayed failure message (its first
+        // line, and a daemon-quoted log line inside the same payload) —
+        // and the engine's own evidence-tail rendering of such payloads.
+        let mut p = ParsedStderr::default();
+        for line in [
+            format!("derivation '{other}' failed: {marker}"),
+            format!("> {marker}"),
+            format!("{marker} (trace ab)"),
+        ] {
+            parse_line(&mut p, &line);
+        }
+        assert!(
+            p.lost_terminals.is_empty(),
+            "embedded/suffixed marker text must not mint a capture: {p:?}"
         );
     }
 

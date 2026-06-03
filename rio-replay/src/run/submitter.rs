@@ -90,6 +90,11 @@ pub struct BatchOutcome {
     pub results: Vec<PathOutcome>,
     /// drv path → relayed failure reason, captured live from stderr.
     pub reasons: BTreeMap<String, String>,
+    /// Roots whose lost-terminal relay marker was captured live from
+    /// stderr (see [`ParsedStderr::lost_terminals`]): their `Substituted`
+    /// rows stand on a lost evidence channel, not a recorded substitution
+    /// event. Empty for submitters that observe no stderr.
+    pub lost_terminals: BTreeSet<String>,
     /// Last ~200 stderr lines, kept verbatim as raw evidence for
     /// batches.jsonl.
     pub stderr_tail: String,
@@ -521,6 +526,7 @@ impl Submitter for ClientOpsSubmitter {
             build_id: parsed.build_id,
             results,
             reasons: parsed.reasons,
+            lost_terminals: parsed.lost_terminals,
             stderr_tail: Vec::from(tail).join("\n"),
             import_skipped_drvs: closure.skipped,
             import_skipped_by_root: closure.skipped_for,
@@ -945,6 +951,53 @@ mod tests {
     /// update this generator in the same change.
     fn gateway_submit_failed(err: &str) -> String {
         format!("SubmitBuild RPC failed: {err}\n")
+    }
+
+    /// Generate the gateway's lost-terminal relay payload. Unlike the
+    /// mirrors above, the line text comes from the SHARED producer
+    /// formatter ([`rio_nix::protocol::build::BuildResult::lost_terminal_relay_line`]
+    /// — the exact fn the gateway emission calls), so producer and this
+    /// fixture cannot drift; only the `STDERR_NEXT` framing newline is
+    /// mirrored here.
+    fn gateway_lost_terminal_relay(drv: &str) -> String {
+        format!(
+            "{}\n",
+            rio_nix::protocol::build::BuildResult::lost_terminal_relay_line(drv)
+        )
+    }
+
+    /// The lost-terminal relay marker is captured at the observer
+    /// boundary from the producer's exact payload (the shared-formatter
+    /// line plus the framing newline): the drv lands in
+    /// `lost_terminals`, the line joins the evidence tail, and neither
+    /// the build-id capture nor the reason capture is disturbed. The
+    /// marker line never doubles as a failure reason.
+    #[test]
+    fn client_ops_observer_captures_lost_terminal_markers() {
+        let lost = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv";
+        let mut parsed = ParsedStderr::default();
+        let mut tail: VecDeque<String> = VecDeque::new();
+
+        observe_line(
+            &mut parsed,
+            &mut tail,
+            &gateway_build_announcement("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a", ""),
+        );
+        let payload = gateway_lost_terminal_relay(lost);
+        assert!(payload.ends_with('\n'), "premise: {payload:?}");
+        observe_line(&mut parsed, &mut tail, &payload);
+
+        assert_eq!(parsed.lost_terminals, BTreeSet::from([lost.to_string()]));
+        assert!(parsed.reasons.is_empty(), "{:?}", parsed.reasons);
+        assert_eq!(
+            parsed.build_id.as_deref(),
+            Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a")
+        );
+        assert_eq!(
+            tail.back().map(String::as_str),
+            Some(format!("rio: terminal lost for '{lost}'").as_str()),
+            "the marker line is evidence-tail-visible like every relay line"
+        );
     }
 
     /// The gateway newline-TERMINATES its build announcement and its

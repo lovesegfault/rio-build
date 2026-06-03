@@ -11,7 +11,7 @@
 //! pass a chance to classify a settled batch before its jobs can be
 //! offered again).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -225,6 +225,7 @@ pub async fn submit_one_batch(
         finished_at: Some(now_rfc3339()),
         results: Vec::new(),
         reasons: BTreeMap::new(),
+        lost_terminals: BTreeSet::new(),
         stderr_tail: None,
         engine_cancelled: false,
         disconnect_deadline_fired: false,
@@ -240,6 +241,7 @@ pub async fn submit_one_batch(
             record.build_id = o.build_id;
             record.results = o.results;
             record.reasons = o.reasons;
+            record.lost_terminals = o.lost_terminals;
             record.stderr_tail = Some(o.stderr_tail);
             record.engine_cancelled = o.engine_cancelled;
             record.import_skipped_drvs = o.import_skipped_drvs;
@@ -626,6 +628,9 @@ mod tests {
                 "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".to_string(),
                 "failed on every eligible worker".to_string(),
             )]),
+            lost_terminals: BTreeSet::from([
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".to_string()
+            ]),
             stderr_tail: "tail".into(),
             engine_cancelled: false,
             import_skipped_drvs: Vec::new(),
@@ -676,6 +681,13 @@ mod tests {
         assert_eq!(on_disk.len(), 1);
         assert_eq!(on_disk[0].reasons.len(), 1);
         assert_eq!(on_disk[0].results, vec![scripted_result]);
+        // The captured lost-terminal markers ride the record like the
+        // reasons do — collect's evidence-loss disambiguation reads them
+        // from here, including across resume.
+        assert_eq!(
+            on_disk[0].lost_terminals,
+            BTreeSet::from(["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".to_string()])
+        );
     }
 
     /// A submitter `Err` (engine-side submission failure) is evidence, not a

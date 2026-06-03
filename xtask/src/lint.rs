@@ -1914,6 +1914,30 @@ const CONTRACT_REGISTRY: &[ContractRow] = &[
             ],
         },
     },
+    // ── The lost-terminal cell's other half: when store presence IS
+    // confirmed, the wire stays Substituted (stock-client compat) and
+    // the gateway disambiguates over the stderr side channel — the relay
+    // marker line, formatted by the shared rio-nix producer pair. The
+    // measurement consumer must route a Substituted row carrying the
+    // marker to evidence-loss classification (auto-retry, then
+    // infra-indeterminate), never to the target-substituted disposition
+    // that force-build measurement tenants make definitionally
+    // impossible — while an UNMARKED Substituted row keeps the
+    // substitution-event leg. The consumer test builds both channels via
+    // the producer's own chain (the wire codec for the row; the shared
+    // formatter through the engine's capture for the marker). ──
+    ContractRow {
+        key: "wire.lost-terminal-relay-marker",
+        declared: (
+            "rio-nix/src/protocol/build.rs",
+            "Leading bytes of the gateway's lost-terminal stderr RELAY line",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/run/collect.rs",
+            test_fn: "lost_terminal_marker_substituted_row_is_evidence_loss_not_target_substituted",
+            artifact_needles: &["lost_terminal_relay_line(", "lost_terminals"],
+        },
+    },
 ];
 
 /// Field names of one struct in `src`: the `pub <name>: <..>` lines

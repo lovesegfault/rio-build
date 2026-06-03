@@ -28,7 +28,7 @@
 //! row through the cascaded source-rot classification instead of charging
 //! the rotted dependency's fan-out to the parity headline.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
 use rio_nix::protocol::build::{BuildResult, BuildStatus};
@@ -560,6 +560,13 @@ pub struct BatchView {
     pub results: Vec<PathOutcome>,
     /// drv → relayed reason line (the Signal-1 fallback).
     pub reasons: BTreeMap<String, String>,
+    /// Roots whose lost-terminal relay marker the gateway emitted on this
+    /// submission's stderr (from the batch record): the disambiguator
+    /// [`decide`]'s success arm reads — a `Substituted` row for a marked
+    /// root stands on a lost evidence channel, not a recorded
+    /// substitution event, and classifies as evidence loss instead of
+    /// `target-substituted`.
+    pub lost_terminals: BTreeSet<String>,
     /// Raw stderr evidence captured at submission time — for an engine-side
     /// submission failure this is the recorded `engine submission error: …`
     /// text, the only evidence the failure left behind. It becomes the
@@ -623,6 +630,7 @@ impl BatchView {
             started_at,
             results,
             reasons,
+            lost_terminals,
             stderr_tail,
             engine_cancelled,
             disconnect_deadline_fired,
@@ -636,6 +644,7 @@ impl BatchView {
             build_id: build_id.clone(),
             results: results.clone(),
             reasons: reasons.clone(),
+            lost_terminals: lost_terminals.clone(),
             stderr_tail: stderr_tail.clone(),
             engine_cancelled: *engine_cancelled,
             disconnect_deadline_fired: *disconnect_deadline_fired,
@@ -810,12 +819,73 @@ pub fn decide(
         };
     };
     if status == BuildStatus::Built {
+        // An executed Built stands whatever the relay carried: the root's
+        // own success terminal is per-root scheduler evidence, strictly
+        // stronger than any side-channel marker (the producer never pairs
+        // the lost-terminal marker with an own terminal in one batch —
+        // the marker exists because no terminal was captured).
         return CollectDecision::Terminal {
             rio: RioOutcome::Built { executed: true },
             evidence: None,
         };
     }
     if status.is_success() {
+        // The gateway's lost-terminal relay marker, classified BEFORE the
+        // completed-without-execution discriminator: a `Substituted` row
+        // for a root the gateway marked stands on a LOST evidence channel
+        // — this root's terminal event was lost under a completed DAG and
+        // the store positively confirmed its outputs — not on a recorded
+        // substitution event. The wire status stays Substituted for stock
+        // clients (presence is real), so the in-band row alone is
+        // indistinguishable from a genuine substitution; without the
+        // marker it would classify `target-substituted`, which a
+        // force-build measurement tenant makes definitionally impossible
+        // — a false policy-violation record. The row is the evidence-loss
+        // leg of the design's `infra-indeterminate` class (§7.2: "an
+        // engine transport failure after the retry budget, or evidence
+        // loss — counted against run confidence, never against the
+        // target"), routed exactly like its in-band sibling
+        // ([`BuildResult::lost_terminal_unverified`]): probe carve-out,
+        // then the auto-retry budget (a re-attempt produces fresh
+        // evidence — under force-build the root re-executes), then a
+        // terminal infra row.
+        //
+        // Detector conjuncts, both producer-exact: the marker is read
+        // from the RELAY capture only (`batch.lost_terminals`, the same
+        // channel that captures the `rio: build <uuid>` announcement —
+        // in-band `error_msg` text cannot select this arm), and the
+        // status conjunct is `Substituted` exactly (the only status the
+        // producer pairs the marker with; an executed `Built` returned
+        // above, and `AlreadyValid`-shaped rows never carry the marker).
+        if status == BuildStatus::Substituted && batch.lost_terminals.contains(&ctx.drv_path) {
+            if batch.probe {
+                // Same arm-entry rule as every infra-shaped exit: a
+                // marked row on a canary probe is the probed outage
+                // answering (the evidence channel is what is being
+                // probed), budget-exempt.
+                return CollectDecision::Requeue {
+                    why: RequeueReason::InfraProbe,
+                    budget: RequeueBudget::probe_carveout(),
+                };
+            }
+            if let Some(budget) = RequeueBudget::auto_retry(prior_requeues, knobs) {
+                return CollectDecision::Requeue {
+                    why: RequeueReason::InfraAutoRetry,
+                    budget,
+                };
+            }
+            return CollectDecision::Terminal {
+                rio: RioOutcome::TargetFailed {
+                    kind: FailureKind::Infra,
+                },
+                evidence: Some(
+                    "gateway lost-terminal relay marker with an in-band Substituted row \
+                     (terminal lost under a completed DAG; store presence confirmed, execution \
+                     unknown): evidence loss, never a recorded substitution event"
+                        .to_string(),
+                ),
+            };
+        }
         // Substituted / AlreadyValid / ResolvesToAlreadyValid: completed
         // without execution; the completed-without-execution discriminator
         // (cached-prior vs target-substituted) is the classifier's job,
@@ -1939,6 +2009,7 @@ mod tests {
             finished_at: Some("2026-06-01T00:10:00Z".into()),
             results: vec![po("/nix/store/r.drv", BuildStatus::Built, "")],
             reasons: BTreeMap::from([("/nix/store/r.drv".to_string(), "reason".to_string())]),
+            lost_terminals: BTreeSet::from(["/nix/store/r.drv".to_string()]),
             stderr_tail: Some("tail".into()),
             engine_cancelled: true,
             disconnect_deadline_fired: true,
@@ -1957,6 +2028,7 @@ mod tests {
         assert_eq!(view.build_id, record.build_id);
         assert_eq!(view.results.len(), 1);
         assert_eq!(view.reasons, record.reasons);
+        assert_eq!(view.lost_terminals, record.lost_terminals);
         assert_eq!(view.stderr_tail, record.stderr_tail);
         assert!(view.engine_cancelled);
         assert!(view.disconnect_deadline_fired);
@@ -2834,6 +2906,458 @@ mod tests {
         Ok(())
     }
 
+    /// Wire contract for the gateway's lost-terminal RELAY marker — the
+    /// side-channel disambiguator for the confirmed-present lost-terminal
+    /// cell, where the wire status stays `Substituted` (presence is real;
+    /// stock clients keep seeing a plain success) and is therefore
+    /// in-band-indistinguishable from a genuine substitution terminal. A
+    /// `Substituted` row WITH the marker must classify as evidence loss —
+    /// probe carve-out / auto-retry / terminal infra (the
+    /// `infra-indeterminate` "evidence loss" leg, design §7.2) — never as
+    /// `Built {executed: false}` → `target-substituted`, the recorded
+    /// substitution event a force-build measurement tenant makes
+    /// definitionally impossible. Without the marker the same row keeps
+    /// the substitution-event leg: genuine target substitutions stay
+    /// measurable.
+    ///
+    /// Producer-mirrored fixtures, both channels: the in-band row is
+    /// CONSTRUCTED via the producer's own chain — `substituted()` (the
+    /// constructor the gateway's confirmed-present arm calls), the
+    /// production wire codec (`write_build_result`/`read_build_result`),
+    /// the production transport projection (`path_outcomes_from_keyed`) —
+    /// and the marker is constructed via the SHARED producer formatter
+    /// (`lost_terminal_relay_line`, the fn the gateway emission calls)
+    /// fed through the engine's own capture (`parse_stderr`, the channel
+    /// that captures the `rio: build <uuid>` announcement). No
+    /// hand-written consumer-side strings on either channel.
+    ///
+    /// Quantification domain: the detector's two conjuncts (relay marker
+    /// for THIS drv × in-band `Substituted`) crossed with every sibling
+    /// input of the with-result success arm — BatchView bits the arm
+    /// reads (`probe` × `engine_cancelled`), Signal-2 states (no poison /
+    /// stale poison rows WITH builders — successes never consult poison,
+    /// and a poison row must not flip an evidence-loss report), the
+    /// fixed-output bit (no source-rot shadow), and the budget axis
+    /// (fresh / exhausted). The timed-batch and confirmation-belt
+    /// crossings live in `process_settled_batch` (membership decisions,
+    /// not outcome decisions) and are pinned by
+    /// `lost_terminal_marker_rows_settle_as_evidence_loss_end_to_end`.
+    /// Must-NOT-match: no marker (the genuine-substitution leg, asserted
+    /// all the way to the `target-substituted` disposition), marker for a
+    /// DIFFERENT drv, marker × executed `Built` (an own terminal is
+    /// strictly stronger evidence), marker × `AlreadyValid` (the status
+    /// conjunct — the producer pairs the marker with `Substituted` only),
+    /// marker × failure rows (the failure path is untouched), and the
+    /// marker text arriving in-band instead of on the relay channel.
+    #[tokio::test]
+    async fn lost_terminal_marker_substituted_row_is_evidence_loss_not_target_substituted()
+    -> Result<()> {
+        use crate::run::model::path_outcomes_from_keyed;
+        use crate::run::stderrparse::parse_stderr;
+        use rio_nix::protocol::build::{read_build_result, write_build_result};
+        use rio_nix::protocol::client::KeyedBuildResult;
+        use rio_nix::protocol::handshake::PROTOCOL_VERSION;
+
+        // ── Producer chain, in-band channel: constructor → wire encode →
+        // wire decode → transport projection. ──
+        let minted = BuildResult::substituted();
+        let mut buf = Vec::new();
+        write_build_result(&mut buf, &minted, PROTOCOL_VERSION).await?;
+        let parsed = read_build_result(&mut std::io::Cursor::new(buf), PROTOCOL_VERSION).await?;
+        let keyed = KeyedBuildResult {
+            derived_path: format!("{T}!*"),
+            result: parsed,
+        };
+        let outcomes = path_outcomes_from_keyed(&[T.to_string()], std::slice::from_ref(&keyed));
+        let row = &outcomes[0];
+        assert_eq!(row.status, build_status_name(BuildStatus::Substituted));
+        assert!(row.error_msg.is_empty(), "{row:?}");
+
+        // ── Producer chain, relay channel: shared formatter → the
+        // gateway's newline framing → the engine's own line-split
+        // capture. ──
+        let captured = parse_stderr(&format!("{}\n", BuildResult::lost_terminal_relay_line(T)));
+        assert_eq!(captured.lost_terminals, BTreeSet::from([T.to_string()]));
+        let marked = |probe: bool, cancelled: bool| BatchView {
+            probe,
+            engine_cancelled: cancelled,
+            lost_terminals: captured.lost_terminals.clone(),
+            ..BatchView::default()
+        };
+
+        let knobs = Knobs::default();
+        let c = ctx("app.x86_64-linux", T, &[DEP], ExpectedOutcome::Built);
+        let no_poison: HashMap<String, Vec<String>> = HashMap::new();
+        // Stale poison rows WITH recorded builders, surviving from prior
+        // attempts of the same drv: a success-status row never consults
+        // poison, and the contradiction must not flip an evidence-loss
+        // report either.
+        let poisoned_with_builders: HashMap<String, Vec<String>> =
+            HashMap::from([(T.to_string(), vec!["b1".to_string()])]);
+        // Fixed-output target: no source-rot shadow on the success arm.
+        let mut fod_ctx = ctx("app.x86_64-linux", T, &[DEP], ExpectedOutcome::Built);
+        fod_ctx.fixed_output_drvs = std::sync::Arc::new([T.to_string()].into_iter().collect());
+
+        // ── Must-admit: every (probe × engine_cancelled) cell, under
+        // every Signal-2/ctx state. ──
+        for (probe, cancelled) in [(false, false), (false, true), (true, false), (true, true)] {
+            let batch = marked(probe, cancelled);
+            for (label, job_ctx, poison) in [
+                ("no poison", &c, &no_poison),
+                ("contradicting builders", &c, &poisoned_with_builders),
+                ("fixed-output target", &fod_ctx, &no_poison),
+            ] {
+                let cell = format!("probe={probe} cancelled={cancelled} {label}");
+                if probe {
+                    // Budget-exempt carve-out: the lost evidence channel
+                    // is the probed outage answering.
+                    assert_eq!(
+                        decide(job_ctx, Some(row), &batch, poison, prior(5), &knobs, None)
+                            .requeue_why(),
+                        Some("infra-probe"),
+                        "{cell}"
+                    );
+                    continue;
+                }
+                // Fresh budget: one fair re-attempt — fresh evidence
+                // (under force-build the root re-executes).
+                assert_eq!(
+                    decide(job_ctx, Some(row), &batch, poison, prior(0), &knobs, None)
+                        .requeue_why(),
+                    Some("infra-auto-retry"),
+                    "{cell}"
+                );
+                // Exhausted budget: terminal infra (→ infra-indeterminate,
+                // counted against run confidence) with provenance evidence
+                // — never a substitution event.
+                match decide(job_ctx, Some(row), &batch, poison, prior(1), &knobs, None) {
+                    CollectDecision::Terminal {
+                        rio:
+                            RioOutcome::TargetFailed {
+                                kind: FailureKind::Infra,
+                            },
+                        evidence,
+                    } => assert!(
+                        evidence
+                            .unwrap()
+                            .contains("gateway lost-terminal relay marker"),
+                        "{cell}: terminal evidence must name the row's provenance"
+                    ),
+                    other => panic!("{cell}: expected terminal infra, got {other:?}"),
+                }
+            }
+        }
+
+        // ── Must-NOT-match: the detector is producer-exact on both
+        // conjuncts. ──
+        // No marker: the genuine-substitution leg stands — completed
+        // without execution, and the classifier still mints the
+        // target-substituted disposition for a plan-absent root. This is
+        // the cell that keeps REAL substitution events measurable (the
+        // zero-target-substituted smoke criterion needs both directions).
+        let unmarked = BatchView::default();
+        match decide(&c, Some(row), &unmarked, &no_poison, prior(0), &knobs, None) {
+            CollectDecision::Terminal {
+                rio: rio @ RioOutcome::Built { executed: false },
+                evidence: None,
+            } => {
+                let class = classify(&c.expected_outcome, &rio, &AuxFlags::default());
+                assert_eq!(
+                    class.class,
+                    UnifiedClass::Disposition(Disposition::TargetSubstituted),
+                    "an unmarked Substituted row must keep the substitution-event leg"
+                );
+            }
+            other => panic!("unmarked Substituted row must stay a success: {other:?}"),
+        }
+        // Marker for a DIFFERENT drv: this root's row is unmarked.
+        let other_marked = BatchView {
+            lost_terminals: BTreeSet::from([OTHER.to_string()]),
+            ..BatchView::default()
+        };
+        assert!(matches!(
+            decide(
+                &c,
+                Some(row),
+                &other_marked,
+                &no_poison,
+                prior(0),
+                &knobs,
+                None
+            ),
+            CollectDecision::Terminal {
+                rio: RioOutcome::Built { executed: false },
+                ..
+            }
+        ));
+        // Marker × executed Built: the root's own success terminal is
+        // strictly stronger evidence than any side-channel marker (the
+        // producer never pairs the two in one batch; a stale or spoofed
+        // marker must not erase a real execution).
+        assert!(matches!(
+            decide(
+                &c,
+                Some(&po(T, BuildStatus::Built, "")),
+                &marked(false, false),
+                &no_poison,
+                prior(0),
+                &knobs,
+                None
+            ),
+            CollectDecision::Terminal {
+                rio: RioOutcome::Built { executed: true },
+                ..
+            }
+        ));
+        // Marker × AlreadyValid: the status conjunct holds — the producer
+        // pairs the marker with Substituted only.
+        assert!(matches!(
+            decide(
+                &c,
+                Some(&po(T, BuildStatus::AlreadyValid, "")),
+                &marked(false, false),
+                &no_poison,
+                prior(0),
+                &knobs,
+                None
+            ),
+            CollectDecision::Terminal {
+                rio: RioOutcome::Built { executed: false },
+                ..
+            }
+        ));
+        // Marker × a failure row: the failure path is untouched — the
+        // marker disambiguates success words only, and the in-band
+        // failure (here a genuine worker message) classifies normally.
+        assert!(matches!(
+            decide(
+                &c,
+                Some(&po(
+                    T,
+                    BuildStatus::PermanentFailure,
+                    "builder failed with exit code 2"
+                )),
+                &marked(false, false),
+                &no_poison,
+                prior(0),
+                &knobs,
+                None
+            ),
+            CollectDecision::Terminal {
+                rio: RioOutcome::TargetFailed {
+                    kind: FailureKind::Genuine
+                },
+                ..
+            }
+        ));
+        // Marker text arriving IN-BAND (error_msg) instead of on the
+        // relay channel: the detector reads the relay capture only — an
+        // in-band string, which a worker could influence on failure
+        // shapes, cannot select the arm. The row stays on the
+        // substitution-event leg.
+        let inband_text = BuildResult::lost_terminal_relay_line(T);
+        assert!(matches!(
+            decide(
+                &c,
+                Some(&po(T, BuildStatus::Substituted, &inband_text)),
+                &BatchView::default(),
+                &no_poison,
+                prior(0),
+                &knobs,
+                None
+            ),
+            CollectDecision::Terminal {
+                rio: RioOutcome::Built { executed: false },
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    /// The lost-terminal marker through `process_settled_batch` — the
+    /// membership crossings the decide()-level contract test cannot
+    /// reach, plus the recorded artifact both ways:
+    ///
+    /// - submit batch, budget exhausted: the record carries verdict
+    ///   `infra-indeterminate` (the §7.2 evidence-loss leg) with the
+    ///   provenance evidence — and NO disposition;
+    /// - the unmarked control of the same row records disposition
+    ///   `target-substituted` — the genuine substitution-event leg the
+    ///   marker must not erase;
+    /// - timed batch (marker × `kind=timed`): the requeue-shaped decision
+    ///   defers to the timed dispatcher — never re-offered to the
+    ///   timeless pool, no terminal record minted;
+    /// - confirmation belt (marker × `confirmation_attempt` ×
+    ///   already-terminal): a marked `Substituted` retry is
+    ///   presence-shaped, not an executed build, so it cannot supersede
+    ///   the recorded verdict — `AlreadyTerminal`, no new record.
+    #[tokio::test]
+    async fn lost_terminal_marker_rows_settle_as_evidence_loss_end_to_end() {
+        use crate::run::stderrparse::parse_stderr;
+
+        let job = "app.x86_64-linux";
+        let contexts: HashMap<String, JobContext> =
+            [(job.to_string(), ctx(job, T, &[], ExpectedOutcome::Built))].into();
+        let captured = parse_stderr(&format!("{}\n", BuildResult::lost_terminal_relay_line(T)));
+        let marked_batch = |kind: &str, confirmation_attempt: u32| BatchView {
+            kind: kind.to_string(),
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+            results: vec![po(T, BuildStatus::Substituted, "")],
+            lost_terminals: captured.lost_terminals.clone(),
+            confirmation_attempt,
+            ..BatchView::default()
+        };
+        let exhausted: HashMap<String, PriorBudgets> = [(job.to_string(), prior(1))].into();
+
+        // ── Submit batch, budget exhausted: the recorded unit is
+        // evidence loss, never a substitution event. ──
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let decisions = process_settled_batch(
+            &state,
+            &LogAdmin::default(),
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &[job.to_string()],
+            &marked_batch(BATCH_KIND_SUBMIT, 0),
+            &exhausted,
+            &Knobs::default(),
+            "leaf",
+            "c1",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            decisions[job],
+            CollectDecision::Terminal {
+                rio: RioOutcome::TargetFailed {
+                    kind: FailureKind::Infra
+                },
+                ..
+            }
+        ));
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].verdict.as_deref(),
+            Some("infra-indeterminate"),
+            "the marked row's terminal is the evidence-loss leg (design §7.2), \
+             counted against run confidence"
+        );
+        assert_eq!(records[0].disposition, None);
+        assert!(
+            records[0]
+                .evidence
+                .as_deref()
+                .unwrap()
+                .contains("gateway lost-terminal relay marker"),
+            "{:?}",
+            records[0].evidence
+        );
+
+        // ── Unmarked control: the same row without the marker records
+        // the substitution-event disposition — the leg force-build smoke
+        // criteria alarm on, kept fully measurable. ──
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let unmarked = BatchView {
+            lost_terminals: BTreeSet::new(),
+            ..marked_batch(BATCH_KIND_SUBMIT, 0)
+        };
+        let decisions = process_settled_batch(
+            &state,
+            &LogAdmin::default(),
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &[job.to_string()],
+            &unmarked,
+            &exhausted,
+            &Knobs::default(),
+            "leaf",
+            "c1",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            decisions[job],
+            CollectDecision::Terminal {
+                rio: RioOutcome::Built { executed: false },
+                ..
+            }
+        ));
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].disposition.as_deref(),
+            Some("target-substituted")
+        );
+        assert_eq!(records[0].verdict, None);
+
+        // ── Timed batch: the marker's requeue-shaped decision defers to
+        // the timed dispatcher (its confirmation retry is the
+        // re-attempt), with no terminal record and no timeless re-offer. ──
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let decisions = process_settled_batch(
+            &state,
+            &LogAdmin::default(),
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &[job.to_string()],
+            &marked_batch(BATCH_KIND_TIMED, 0),
+            &HashMap::new(),
+            &Knobs::default(),
+            "timed",
+            "c1",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            decisions[job],
+            CollectDecision::Defer {
+                reason: "infra-auto-retry"
+            }
+        );
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert!(records.is_empty(), "{records:?}");
+
+        // ── Confirmation belt: a marked Substituted retry is
+        // presence-shaped — it cannot supersede the recorded verdict
+        // (only an EXECUTED Built may), and the belt drops it before the
+        // evidence-loss arm could mint anything. ──
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let decisions = process_settled_batch(
+            &state,
+            &LogAdmin::default(),
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &[job.to_string()],
+            &marked_batch(BATCH_KIND_TIMED, 1),
+            &HashMap::new(),
+            &Knobs::default(),
+            "timed",
+            "c1",
+            &HashMap::new(),
+            &HashSet::from([job.to_string()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(decisions[job], CollectDecision::AlreadyTerminal);
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert!(records.is_empty(), "{records:?}");
+    }
+
     /// The canary-probe carve-out, both directions. Must-exempt: a probe
     /// batch's infra-shaped failures (missing in-band result, two-signal
     /// infra) re-offer with the budget-exempt witness even with the
@@ -3090,6 +3614,7 @@ mod tests {
             build_id: _,
             results: _,
             reasons: _,
+            lost_terminals: _,
             stderr_tail: _,
             engine_cancelled: _,
             disconnect_deadline_fired: _,
@@ -3174,6 +3699,16 @@ mod tests {
                         vec!["/nix/store/dddddddddddddddddddddddddddddddd-gap.drv".to_string()],
                     )]);
                 }),
+            ),
+            // A lost-terminal relay marker for the root: its detector
+            // conjunct requires an IN-BAND Substituted row, so in this
+            // arm's no-result shape the marker is inert and the
+            // carve-out still dominates — a marker whose row was lost
+            // too settles through the no-result rule on a non-probe
+            // batch, never through a budget charge here.
+            (
+                "lost_terminals=this-root",
+                probe_with(|b| b.lost_terminals = BTreeSet::from([T.to_string()])),
             ),
         ];
         // Budgets fully exhausted on BOTH counters: any arm that consults
@@ -5720,6 +6255,7 @@ mod tests {
                     format!("dependency '{T}' failed: failed on every eligible worker"),
                 ),
             ]),
+            lost_terminals: BTreeSet::new(),
             stderr_tail: None,
             engine_cancelled: false,
             disconnect_deadline_fired: false,
