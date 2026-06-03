@@ -333,6 +333,11 @@ pub(crate) struct RecoveryDerivationRow {
     pub retry_count: i32,
     pub resubmit_cycles: i32,
     pub expected_output_paths: Vec<String>,
+    /// M_075 (round-17 merged_bug_099): dispatch-resolved claim paths,
+    /// NULL for legacy/never-resolved rows. Restored verbatim so a
+    /// surviving worker's deferred-IA build keeps its GC pin and its
+    /// completion path-binding across failover.
+    pub claim_output_paths: Option<Vec<String>>,
     pub output_names: Vec<String>,
     /// Demand-driven wanted-output set (`migrations/062`). Empty = all
     /// declared outputs wanted (also the pre-migration default, so old
@@ -427,6 +432,7 @@ impl RecoveryDerivationRow {
             retry_count: 0,
             resubmit_cycles: 0,
             expected_output_paths: vec![],
+            claim_output_paths: None,
             output_names: vec!["out".into()],
             wanted_output_names: vec![],
             is_fixed_output: false,

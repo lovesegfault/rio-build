@@ -650,7 +650,7 @@ async fn test_gc_roots_dedupes() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.gc.live-pins]
+// r[verify sched.gc.live-pins+2]
 /// Floating-CA derivations carry `expected_output_paths == [""]`
 /// pre-completion (translate.rs convention). GcRoots must filter these
 /// — a `""` in the roots list makes the store's `validate_store_path`

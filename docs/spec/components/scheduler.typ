@@ -749,7 +749,7 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
   queried directly to compare its view against the leader's.
 ]
 
-#r("sched.gc.live-pins")[
+#r("sched.gc.live-pins+2")[
   On dispatch, the scheduler writes the assigned derivation's input-closure
   paths to the `scheduler_live_pins` PG table; on completion (success or
   failure) it deletes those rows; a periodic stale-sweep clears rows older than
@@ -757,9 +757,14 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
   mark CTE reads `scheduler_live_pins` directly as additional roots, so an
   in-flight build's inputs survive a concurrent sweep even if no narinfo
   references them yet. The complementary output side is `AdminQuery::GcRoots`,
-  which returns `expected_output_paths ∪ output_paths` for all non-terminal
-  derivations as extra mark-phase roots covering outputs the executor hasn't
-  uploaded.
+  which MUST return the three-way union `expected_output_paths ∪
+  claim_output_paths ∪ output_paths` (empty slots filtered) for all
+  non-terminal derivations as extra mark-phase roots covering outputs the
+  executor hasn't uploaded --- the claim term is the deferred-IA node's
+  dispatch-RESOLVED real paths, which its expected slots do not contain by
+  construction, and it MUST survive leader failover via the persisted claim
+  column (M_075) so a surviving worker's about-to-upload paths stay pinned
+  while the new leader recovers.
 ]
 
 #r("sched.heartbeat.adopt")[
@@ -2280,6 +2285,28 @@ pre-071 row) is distinguishable from an authoritative false; the COALESCE
 raise writers and the always-bound creation snapshot keep every post-071
 row authoritative. This supersedes both the earlier wholly-lossy posture
 and the re-derivation posture.
+
+#r("sched.recovery.claim-paths-restored")[
+  The dispatch-resolved claim paths of a deferred-IA derivation MUST be
+  persisted at their sole set site (the dispatch-time resolve, in the
+  same actor turn) and restored VERBATIM by recovery --- index-aligned
+  with `output_names`, resolved slots carrying real store paths and
+  still-unresolved slots carrying the empty-string sentinel. A recovered
+  derivation whose persisted claim is absent (legacy row, or a node that
+  never reached the deferred-IA resolve) MUST restore with an empty
+  claim vector so the read accessor falls back to the expected paths. A
+  definition change MUST clear the persisted claim in the same statement
+  that resets the other per-definition accumulators.
+]
+The rule exists because the claim paths feed two consumers that outlive
+the leader (round-17 merged_bug_099): the GC root union --- a surviving
+worker's in-flight deferred-IA build pins its REAL output paths, and a
+failover that dropped the claim left those paths sweepable in the window
+before a re-dispatch happened to re-resolve them --- and the completion
+path-binding gate, whose resolved-slot/unresolved-slot distinction is
+exactly the persisted vec's shape. A floating-CA node never reaches the
+set site, so its column stays NULL --- the persisted form can never
+present the `""` sentinel as a resolved claim slot.
 
 #r("sched.merge.authoritative-conflict+6")[
   A node whose in-memory state carries authoritative inline derivation

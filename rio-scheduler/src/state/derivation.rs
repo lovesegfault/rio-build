@@ -1312,8 +1312,15 @@ pub struct DerivationState {
     /// and failed deterministically until poison). Private: written
     /// only via [`Self::set_claim_output_paths`], read via
     /// [`Self::claim_output_paths`] (falls back to the expected paths
-    /// while empty). Not persisted — recomputed on every resolve;
-    /// post-failover the first dispatch re-resolves.
+    /// while empty). PERSISTED (M_075, round-17 merged_bug_099):
+    /// write-through at the sole dispatch set site and restored
+    /// verbatim by recovery — a surviving worker's in-flight
+    /// deferred-IA build keeps its real-path GC pin and its
+    /// completion path-binding across a leader failover (pre-M_075
+    /// the pin vanished until a re-dispatch re-resolved, leaving the
+    /// about-to-upload paths sweepable). NULL/legacy rows restore as
+    /// empty — the fallback-to-expected behaviour is unchanged.
+    // r[impl sched.recovery.claim-paths-restored]
     claim_output_paths: Vec<String>,
     /// Output NAMES any consumer actually references (∪ over parents'
     /// inputDrvs sets ∪ the root OutputsSpec). EMPTY = all declared
@@ -1846,7 +1853,12 @@ impl DerivationState {
             },
             output_paths: Vec::new(), // completed rows not loaded
             expected_output_paths: row.expected_output_paths,
-            claim_output_paths: Vec::new(),
+            // r[impl sched.recovery.claim-paths-restored]
+            // M_075: restored verbatim (round-17 merged_bug_099) — the
+            // dispatch-resolved real paths keep their GC pin and their
+            // completion binding across failover; NULL/legacy rows
+            // restore empty (accessor falls back to expected paths).
+            claim_output_paths: row.claim_output_paths.unwrap_or_default(),
             // Persisted with union-on-conflict (`migrations/062`,
             // `batch_upsert_derivations`). Pre-migration rows carry the
             // column DEFAULT '{}' = all declared outputs wanted, so
@@ -3100,6 +3112,7 @@ mod tests {
             drv_content: Some(b"Derive-A".to_vec()),
             required_features: vec!["big-parallel".into()],
             expected_output_paths: vec![String::new()],
+            claim_output_paths: None,
             output_names: vec!["out".into(), "dev".into()],
             status: "poisoned".into(),
             failed_builders: vec!["builder-1".into()],
@@ -3161,6 +3174,7 @@ mod tests {
             retry_count: 0,
             resubmit_cycles: 0,
             expected_output_paths: vec![],
+            claim_output_paths: None,
             output_names: vec!["out".into()],
             wanted_output_names: vec![],
             is_fixed_output: false,

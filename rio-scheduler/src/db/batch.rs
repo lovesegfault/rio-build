@@ -369,6 +369,16 @@ impl SchedulerDb {
                     WHEN derivations.drv_content IS NOT NULL
                          AND EXCLUDED.drv_content IS DISTINCT FROM derivations.drv_content
                     THEN 0 ELSE derivations.resubmit_cycles END,
+                -- M_075 (round-17 merged_bug_099, R7(b)): a definition
+                -- change makes the dispatch-resolved claim paths stale
+                -- by construction — the new definition re-resolves at
+                -- its own dispatch. Same accumulator-reset CASE as the
+                -- failure-history columns above; an unchanged
+                -- definition keeps its persisted claim verbatim.
+                claim_output_paths = CASE
+                    WHEN derivations.drv_content IS NOT NULL
+                         AND EXCLUDED.drv_content IS DISTINCT FROM derivations.drv_content
+                    THEN NULL ELSE derivations.claim_output_paths END,
                 floor_mem_bytes = CASE
                     WHEN derivations.drv_content IS NOT NULL
                          AND EXCLUDED.drv_content IS DISTINCT FROM derivations.drv_content

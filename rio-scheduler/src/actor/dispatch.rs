@@ -2411,7 +2411,7 @@ impl DagActor {
     /// PG `assignments` row, in-mem `worker.running_build`, GC
     /// `scheduler_live_pins`. All best-effort (log+continue). Inverse
     /// is [`rollback_assignment`](Self::rollback_assignment).
-    // r[impl sched.gc.live-pins]
+    // r[impl sched.gc.live-pins+2]
     async fn record_assignment(
         &mut self,
         drv_hash: &DrvHash,
@@ -2911,6 +2911,7 @@ impl DagActor {
         // failed deterministically on the un-rewritten placeholder.
         // Floating-CA leaves resolved_output_paths empty → claim falls
         // back to expected (its HMAC path is `is_ca` instead).
+        let mut persist_claim: Option<Vec<String>> = None;
         if (!resolve_lookups.is_empty() || !resolved_output_paths.is_empty())
             && let Some(state) = self.dag.node_mut(drv_hash)
         {
@@ -2924,8 +2925,26 @@ impl DagActor {
                         *slot = path;
                     }
                 }
-                state.set_claim_output_paths(claim);
+                state.set_claim_output_paths(claim.clone());
+                persist_claim = Some(claim);
             }
+        }
+        // M_075 write-through (round-17 merged_bug_099): the claim vec
+        // persists at its sole set site so a leader failover keeps the
+        // surviving worker's GC pin and completion path-binding. The
+        // exact in-memory vec is written — resolved slots carry real
+        // paths, still-unresolved slots keep the "" sentinel (the
+        // completion gate's accepted_unresolved_slot cell distinguishes
+        // them; a floating-CA node never reaches this set site, so its
+        // column stays NULL and the fallback-to-expected behaviour is
+        // untouched). Best-effort: on write failure the pre-M_075
+        // behaviour (re-resolve at next dispatch) is the fallback.
+        if let Some(claim) = persist_claim
+            && let Err(e) = self.db.persist_claim_output_paths(drv_hash, &claim).await
+        {
+            warn!(%drv_hash, error = %e,
+                  "failed to persist dispatch-resolved claim paths \
+                   (GC pin and binding fall back to re-resolve after failover)");
         }
 
         let Some(state) = self.dag.node(drv_hash) else {

@@ -1537,6 +1537,47 @@ pub const M_073: () = ();
 /// migration loudly instead of lurking.
 pub const M_074: () = ();
 
+/// `migrations/075_derivations_claim_output_paths.sql`
+///
+/// Adds `derivations.claim_output_paths TEXT[]` (round-17
+/// merged_bug_099, class RC17-08): the dispatch-resolved REAL output
+/// paths of a deferred-IA node — computed by `maybe_resolve_ca` once
+/// the floating inputs have realisations, recorded via the sole
+/// in-memory setter (`DerivationState::set_claim_output_paths`) and
+/// write-through-persisted at that same dispatch site.
+///
+/// ## Why persisted
+///
+/// The claim paths feed two consumers that must survive a leader
+/// failover while the WORKER survives: the GC root union (a
+/// surviving worker's in-flight deferred-IA build pins its real
+/// output paths — pre-M_075, a failover dropped the pin until the
+/// node happened to re-dispatch, and a concurrent store sweep could
+/// collect the very paths the worker was about to upload) and the
+/// completion path-binding gate (which distinguishes resolved slots
+/// from the unresolved `""` sentinel). NULL = no dispatch-resolve
+/// recorded (the node never reached the deferred-IA resolve, or
+/// pre-M_075 rows) — restore treats NULL as empty and the accessor
+/// falls back to `expected_output_paths`, the pre-M_075 behaviour.
+///
+/// ## Slot semantics (cross-audit with round-17 RC17-06)
+///
+/// The persisted vec is the EXACT in-memory claim vec: index-aligned
+/// with `output_names`, resolved slots carry real store paths,
+/// still-unresolved slots carry `""`. A floating-CA node never calls
+/// the setter (its resolve produces no path list), so its claim
+/// column stays NULL and the completion gate's
+/// `accepted_floating_ca` cell keeps matching on the fallback —
+/// never on a persisted `""` masquerading as a resolved slot.
+///
+/// ## Definition-change clear
+///
+/// The recreate-refresh upsert NULLs the column under the same
+/// drv_content-differs CASE as the failure-history accumulators
+/// (R7(b)): a displaced/redefined node's resolved paths are stale by
+/// definition — the new definition re-resolves at its own dispatch.
+pub const M_075: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

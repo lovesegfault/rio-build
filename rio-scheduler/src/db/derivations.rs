@@ -134,6 +134,32 @@ impl SchedulerDb {
         Ok(result.rows_affected())
     }
 
+    // r[impl sched.recovery.claim-paths-restored]
+    /// M_075 write-through (round-17 merged_bug_099): persist the
+    /// dispatch-resolved claim paths at their sole in-memory set site
+    /// so the GC pin and the completion path-binding survive leader
+    /// failover. The vec is the EXACT in-memory claim (index-aligned
+    /// with output_names; unresolved slots keep the "" sentinel — see
+    /// M_075's doc-const for the cross-audit slot semantics). Plain
+    /// runtime query — no `.sqlx/` impact. The DB write deliberately
+    /// lives OUTSIDE the state type: `set_claim_output_paths` stays a
+    /// pure field write and the actor owns durability ordering.
+    pub async fn persist_claim_output_paths(
+        &self,
+        drv_hash: &DrvHash,
+        claim: &[String],
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE derivations SET claim_output_paths = $2, updated_at = now() \
+             WHERE drv_hash = $1",
+        )
+        .bind(drv_hash.as_str())
+        .bind(claim)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+    }
+
     /// Increment the retry count for a derivation.
     pub async fn increment_retry_count(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         sqlx::query!(
@@ -512,7 +538,7 @@ impl SchedulerDb {
                    required_features,
                    NULL::text AS assigned_builder_id,
                    retry_count, resubmit_cycles,
-                   expected_output_paths, output_names, wanted_output_names,
+                   expected_output_paths, claim_output_paths, output_names, wanted_output_names,
                    is_fixed_output,
                    is_ca, topdown_pruned, closure_hole,
                    failed_builders,

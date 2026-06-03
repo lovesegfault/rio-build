@@ -82,7 +82,7 @@ impl SchedulerDb {
                    d.required_features,
                    d.assigned_builder_id,
                    d.retry_count, d.resubmit_cycles,
-                   d.expected_output_paths, d.output_names,
+                   d.expected_output_paths, d.claim_output_paths, d.output_names,
                    d.wanted_output_names, d.is_fixed_output,
                    d.is_ca, d.topdown_pruned, d.closure_hole,
                    d.failed_builders,

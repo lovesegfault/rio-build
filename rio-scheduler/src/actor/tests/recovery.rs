@@ -6375,3 +6375,65 @@ async fn test_recovered_store_backed_ca_node_accepts_identical_authoritative_cla
     );
     Ok(())
 }
+
+// r[verify sched.recovery.claim-paths-restored]
+// r[verify sched.gc.live-pins+2]
+/// Round-17 merged_bug_099 (M_075): a deferred-IA node's
+/// dispatch-resolved claim paths survive failover — restored verbatim
+/// (including the "" sentinel for unresolved slots) and immediately
+/// visible in the GC root union, so a SURVIVING worker's about-to-upload
+/// real paths stay pinned while the new leader recovers. Pre-M_075 the
+/// claim was in-memory only: the GC pin vanished until a re-dispatch
+/// re-resolved, and a concurrent store sweep could collect the paths.
+#[tokio::test]
+async fn test_recovery_restores_claim_paths_and_gc_pin() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let resolved = test_store_path("claim-restore-out");
+    let resolved_clone = resolved.clone();
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        let mut node = make_node("claim-restore");
+        // Deferred-IA shape: two declared outputs, the first resolved
+        // at dispatch, the second still placeholder-unknown.
+        node.output_names = vec!["out".into(), "dev".into()];
+        node.expected_output_paths = vec![String::new(), String::new()];
+        merge_dag(&handle, build_id, vec![node.clone()], vec![], false).await?;
+        barrier(&handle).await;
+        // Simulate the dispatch-time resolve write-through (the sole
+        // set site persists exactly this shape).
+        sqlx::query(
+            "UPDATE derivations SET claim_output_paths = ARRAY[$2, ''] \
+             WHERE drv_hash = $1",
+        )
+        .bind(&node.drv_hash)
+        .bind(&resolved_clone)
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    let info = expect_drv(&handle, "claim-restore").await;
+    assert_eq!(
+        info.claim_output_paths,
+        vec![resolved.clone(), String::new()],
+        "claim restored VERBATIM incl. the unresolved-slot sentinel"
+    );
+
+    // The GC root union must include the restored resolved path and
+    // filter the sentinel.
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::Admin(AdminQuery::GcRoots { reply: reply_tx }))
+        .await?;
+    let roots = reply_rx.await?;
+    assert!(
+        roots.contains(&resolved),
+        "restored claim path must be in the GC root union (the surviving-worker pin)"
+    );
+    assert!(
+        !roots.iter().any(String::is_empty),
+        "empty sentinel slots are filtered from GC roots"
+    );
+    Ok(())
+}

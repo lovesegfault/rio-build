@@ -2046,7 +2046,7 @@ impl DagActor {
     /// pre-completion (translate.rs convention) — filter so the
     /// store's `validate_store_path` doesn't reject the whole batch
     /// with `InvalidArgument` whenever any CA build is in flight.
-    // r[impl sched.gc.live-pins]
+    // r[impl sched.gc.live-pins+2]
     pub(super) fn handle_gc_roots(&self) -> Vec<String> {
         self.dag
             .iter_nodes()
