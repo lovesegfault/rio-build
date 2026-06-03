@@ -1321,8 +1321,13 @@ pub async fn process_settled_batch(
     // (submission failure, fully cancelled engine-cancel cycle) whose
     // requeue class `RequeueReason::counts_as_cluster_attempt` pins as
     // never-reached-the-cluster — the same judgment, asked of the current
-    // event instead of journaled history. False by construction in the
-    // no-result arm below; true by construction in every with-result arm.
+    // event instead of journaled history. The ANNOUNCED-cancel cell sits
+    // on the true side deliberately: an engine cancellation that fires
+    // after the cluster acknowledged the submission leaves a build id
+    // (or per-root results) behind, and that acknowledgment IS cluster
+    // contact — only the fully cancelled cycle, cut before anything was
+    // announced, is engine-side. False by construction in the no-result
+    // arm below; true by construction in every with-result arm.
     let current_is_cluster_attempt = batch.build_id.is_some() || !batch.results.is_empty();
     // Members of timed batches are never re-offered to the timeless pending
     // pool: the timed dispatcher owns its own retries (confirmation
