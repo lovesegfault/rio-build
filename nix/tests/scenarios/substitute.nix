@@ -1261,17 +1261,19 @@ pkgs.testers.runNixOSTest {
             f"progress events would be skipped (cache-hit lane)"
         )
 
-        # Submit via ssh-ng with internal-json on stderr → cap.json. The
-        # tee preserves the capture even if nom/nix exits oddly. The
-        # build SUCCEEDS without any worker — all 4 drvs' outputs are
-        # in upstream → materialization jobs fetch them → Cached.
+        # Submit via ssh-ng with internal-json on stderr → cap.json,
+        # read after the command exits so the capture is fully flushed.
+        # The build SUCCEEDS without any worker — all 4 drvs' outputs
+        # are in upstream → materialization jobs fetch them → Cached.
         client.succeed(
             "nix build --impure --no-link "
             "${bbArg} -f ${progressClosure} "
             "  --store 'ssh-ng://${gatewayHost}' --eval-store auto "
             "  --log-format internal-json -v "
-            "  2> >(tee /tmp/cap.json >&2)"
+            "  2>/tmp/cap.json"
         )
+        # Replay the capture to the test log for debuggability.
+        client.execute("cat /tmp/cap.json >&2")
         cap = client.succeed("cat /tmp/cap.json")
         events = []
         for line in cap.splitlines():
