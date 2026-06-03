@@ -930,7 +930,7 @@ transaction); serves the castore-FUSE builder.
   consume permits, so a wide fan-out on one cold path cannot pin the cap.
 ]
 
-#r("store.substitute.singleflight+3")[
+#r("store.substitute.singleflight+4")[
   `try_substitute` is wrapped in a moka `Cache<(tenant_id, store_path),
   Option<Arc<ValidatedPathInfo>>>` with 30s TTL and 10 000-entry cap. moka's
   `try_get_with` coalesces N concurrent callers for the same key into one
@@ -944,7 +944,7 @@ transaction); serves the castore-FUSE builder.
   `AlreadyComplete`. The narinfo/`nix-cache-info`/HEAD requests have a 30s
   per-request timeout so a hung upstream can't wedge the singleflight slot
   forever; the NAR GET is bounded only by the `MAX_NAR_SIZE` decompressed cap
-  and the 5-minute stale-reclaim.
+  and the stale-reclaim threshold (#rref("store.substitute.stale-reclaim")).
 ]
 
 #r("store.substitute.untrusted-upstream+3")[
@@ -985,14 +985,16 @@ transaction); serves the castore-FUSE builder.
   `B.narinfo` would otherwise ingest A and return it from `QueryPathInfo(B)`.
 ]
 
-#r("store.substitute.stale-reclaim")[
+#r("store.substitute.stale-reclaim+2")[
   When `try_substitute` finds an existing `'uploading'` placeholder for the
   requested path, it MUST check the placeholder's age. If older than
-  `SUBSTITUTE_STALE_THRESHOLD` (5 minutes), the substituter reclaims the
-  placeholder (DELETE + re-INSERT) and proceeds with the fetch. A young
-  placeholder indicates a live concurrent uploader and returns a miss. This
-  prevents a crashed substitution from blocking the path for the full
-  orphan-scanner interval (15 minutes). The
+  `SUBSTITUTE_STALE_THRESHOLD` (90 seconds --- 3x the 30 s placeholder
+  heartbeat, so a live owner is never collected; `reap_one` re-checks the
+  threshold inside its transaction as the race guard), the substituter
+  reclaims the placeholder (DELETE + re-INSERT) and proceeds with the fetch.
+  A young placeholder indicates a live concurrent uploader and returns a
+  miss. This prevents a crashed or aborted upload from blocking the path for
+  the full orphan-scanner interval (15 minutes). The
   #(refs.metric)("rio_store_substitute_stale_reclaimed_total") counter tracks
   reclaim events.
 ]

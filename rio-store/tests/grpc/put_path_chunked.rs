@@ -1066,3 +1066,77 @@ async fn put_failure_mid_stream_is_unavailable_and_uncommitted() -> TestResult {
     assert_eq!(n, 0, "no manifest may commit when chunk PUTs failed");
     Ok(())
 }
+
+// ── placeholder reap / stale-reclaim tests ─────────────────────────
+
+/// An upload aborted mid-stream (Begin sent, stream closed before any
+/// novel chunk) must not leave its placeholder behind: the
+/// PlaceholderGuard drop-reap removes it, so the NEXT attempt starts
+/// clean instead of hitting Aborted-concurrent until the stale
+/// threshold. Run 5's silent variant of this is why the reap now logs
+/// every outcome.
+#[tokio::test]
+async fn aborted_stream_reaps_placeholder() -> TestResult {
+    let (mut s, _backend) = StoreSession::new_chunked().await?;
+    let dir = tempfile::TempDir::new()?;
+    let root = dir.path().join("root");
+    write_fixture_tree(&root, &dep_path());
+    let fx = fixture_for_tree(&root, &out_path("rps"), vec![dep_path()]);
+    let (begin, _frames) = assemble_begin(&[&fx], vec![dep_path()], &Default::default());
+
+    // Begin only — the sender closes with novel chunks outstanding,
+    // the verify walk sees the stream end (Incomplete).
+    let err = send_chunked(&mut s.client, begin, Vec::new(), None)
+        .await
+        .expect_err("incomplete stream must fail the upload");
+    assert_ne!(err.code(), tonic::Code::Ok, "{err:?}");
+
+    // The drop-reap is spawned fire-and-forget from the guard's Drop;
+    // poll until it lands. A leftover row here is exactly the run-5
+    // wedge.
+    let n = poll_scalar_until::<i64>(&s.db.pool, "SELECT COUNT(*) FROM manifests", 0).await;
+    assert_eq!(n, 0, "aborted upload left its placeholder behind");
+    Ok(())
+}
+
+// r[verify store.substitute.stale-reclaim+2]
+/// The hot-path stale threshold is 90 s (3× the placeholder
+/// heartbeat), not the old 5 minutes: a placeholder whose owner died
+/// 2 minutes ago must be reclaimed by the next upload attempt instead
+/// of aborting it as concurrent. (A LIVE owner heartbeats every 30 s,
+/// so 120 s of silence means the owning future is gone; reap_one
+/// re-checks the threshold inside its tx, so a racing fresh re-upload
+/// is never collected.)
+#[tokio::test]
+async fn dead_placeholder_is_reclaimed_after_90s_not_300s() -> TestResult {
+    let (mut s, _backend) = StoreSession::new_chunked().await?;
+    let dir = tempfile::TempDir::new()?;
+    let root = dir.path().join("root");
+    write_fixture_tree(&root, &dep_path());
+    let path = out_path("src90");
+    let fx = fixture_for_tree(&root, &path, vec![dep_path()]);
+
+    // A dead attempt's leftovers: 'uploading', heartbeat silent for
+    // 120 s — stale under the 90 s threshold, FRESH under the old
+    // 300 s one (which would have wedged this test in
+    // Aborted-concurrent).
+    rio_store::test_helpers::StoreSeed::raw_path(path.as_str())
+        .with_manifest_status("uploading")
+        .seed(&s.db.pool)
+        .await;
+    sqlx::query(
+        "UPDATE manifests SET updated_at = now() - interval '120 seconds', \
+         claim_id = gen_random_uuid()",
+    )
+    .execute(&s.db.pool)
+    .await?;
+
+    let (begin, frames) = assemble_begin(&[&fx], vec![dep_path()], &Default::default());
+    assert_eq!(
+        send_chunked(&mut s.client, begin, frames, None).await?,
+        vec![true],
+        "the dead placeholder must be stale-reclaimed, not treated as live"
+    );
+    assert_eq!(get_path_bytes(&mut s.client, &path).await?, fx.nar);
+    Ok(())
+}
