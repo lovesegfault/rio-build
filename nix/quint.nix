@@ -4656,5 +4656,70 @@ in
       # modules); validated at 8 GiB.
       serverHeapMb = 8192;
     };
+
+    # ----- bughunt fix wave, workstream C1 (terminal-capture) -----
+    # Gateway build-watch display under event loss: the single kinded
+    # display map (bug_150/144), the in-stream resync signal (bug_153),
+    # and the durable terminal row (merged_bug_323). Tier-1: TLC
+    # exhausts the 2-drv space in seconds.
+    # r[verify gw.display.single-map]
+    # r[verify gw.resync.loss-signal]
+    # r[verify sched.pull.kinded-running-surface]
+    # r[verify sched.watch.terminal-from-durable-row]
+    quint-gw-build-resync = mkQuintCheck {
+      name = "gw-build-resync";
+      spec = "gwBuildResync";
+      invariants = [
+        "kindedSurfaceAgrees"
+        "noStuckDisplay"
+        "tailCoverage"
+        "terminalVerdictNeverFabricated"
+      ];
+    };
+
+    # Open-attempt closure under cancellation: the status outbox + the
+    # establishment kernel's charge-free arm (bug_347). Tier-1.
+    # r[verify sched.attempt.cancel-close-driven]
+    quint-open-attempts = mkQuintCheck {
+      name = "open-attempts";
+      spec = "openAttempts";
+      invariants = [
+        "cancelledNeverChargedAsCrash"
+        "openAttemptHasDriver"
+      ];
+    };
+
+    # Expect-violation calibrations: each freezes one as-shipped design
+    # and pins its falsification permanently.
+    quint-gwresync-calib-two-map = mkQuintWitnessCheck {
+      name = "gwresync-calib-two-map";
+      spec = "calibration/gwresync-two-map";
+      main = "gwResyncTwoMap";
+      witness = "noStuckDisplay";
+    };
+    quint-gwresync-calib-no-signal = mkQuintWitnessCheck {
+      name = "gwresync-calib-no-signal";
+      spec = "calibration/gwresync-no-signal";
+      main = "gwResyncNoSignal";
+      witness = "tailCoverage";
+    };
+    quint-gwresync-calib-kind-blind = mkQuintWitnessCheck {
+      name = "gwresync-calib-kind-blind";
+      spec = "calibration/gwresync-kind-blind";
+      main = "gwResyncKindBlind";
+      witness = "kindedSurfaceAgrees";
+    };
+    quint-gwresync-calib-no-pg-fallback = mkQuintWitnessCheck {
+      name = "gwresync-calib-no-pg-fallback";
+      spec = "calibration/gwresync-no-pg-fallback";
+      main = "gwResyncNoPgFallback";
+      witness = "terminalVerdictNeverFabricated";
+    };
+    quint-openattempts-calib-charge-blind = mkQuintWitnessCheck {
+      name = "openattempts-calib-charge-blind";
+      spec = "calibration/openattempts-charge-blind";
+      main = "openAttemptsChargeBlind";
+      witness = "cancelledNeverChargedAsCrash";
+    };
   };
 }
