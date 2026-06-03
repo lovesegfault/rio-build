@@ -798,7 +798,17 @@ impl SupplyTransport for PoolSupplyTransport {
             .open_channel()
             .await
             .context("open a daemon channel for the prefetch build")?;
-        let derived: Vec<String> = roots.iter().map(|drv| format!("{drv}!*")).collect();
+        // Prefetch roots are plan-derived drv paths with no recorded
+        // output selection (the prefetch plan tracks roots and the paths
+        // they produce), so every root takes the widest demand — spelled
+        // by the demand grammar's one production owner
+        // (`batch::all_outputs_demand`, the same arm `derived_path`
+        // saturates to), so the prefetch spelling cannot drift from the
+        // submission chokepoint's.
+        let derived: Vec<String> = roots
+            .iter()
+            .map(|drv| crate::run::batch::all_outputs_demand(drv))
+            .collect();
         // No closure-node estimate here (the prefetch plan tracks roots and
         // the paths they produce, not closure unions), so the op keeps the
         // roots-scaled drain-budget floor; prefetch ops resolve via target-

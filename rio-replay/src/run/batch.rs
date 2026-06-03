@@ -84,20 +84,34 @@ impl BatchRoot {
         let mut names: Vec<&str> = Vec::with_capacity(self.outputs.len());
         for name in &self.outputs {
             if name == "*" {
-                return format!("{}!*", self.drv);
+                return all_outputs_demand(&self.drv);
             }
             if name.is_empty() || name.contains(',') {
-                return format!("{}!*", self.drv);
+                return all_outputs_demand(&self.drv);
             }
             if !names.contains(&name.as_str()) {
                 names.push(name);
             }
         }
         if names.is_empty() || names.len() > MAX_OUTPUT_NAMES {
-            return format!("{}!*", self.drv);
+            return all_outputs_demand(&self.drv);
         }
         format!("{}!{}", self.drv, names.join(","))
     }
+}
+
+/// The all-outputs demand string — the ONE production spelling of the
+/// `` `<drv>!*` `` wire form ([`rio_nix::protocol::derived_path::DerivedPath::parse`]
+/// reads it back as `OutputSpec::All`). Every saturating arm of
+/// [`BatchRoot::derived_path`] and the supply prefetch arm
+/// (`run/supply/exec.rs`, whose roots are plan-derived paths that carry
+/// no recorded selection vocabulary at all) route through this owner,
+/// so the demand grammar's widest form cannot fork spellings across
+/// producers. The literal-site enumeration test below pins the
+/// single-owner rule: a new production site formatting the form
+/// directly fails the count until it routes here.
+pub fn all_outputs_demand(drv: &str) -> String {
+    format!("{drv}!*")
 }
 
 /// One assembled batch.
@@ -424,10 +438,13 @@ mod tests {
     ///
     /// Outside the audited set, named so the census stays honest about
     /// its universe: the supply prefetch arm's `prefetch_build`
-    /// (`run/supply/exec.rs`) formats a constant `{drv}!*` demand per
-    /// root without constructing a `Batch`, so the needle structurally
-    /// cannot see it — by design, since the prefetch arm asks the target
-    /// to substitute everything and carries no recorded selection.
+    /// (`run/supply/exec.rs`) emits a per-root all-outputs demand
+    /// without constructing a `Batch`, so the needle structurally
+    /// cannot see it — by design, since the prefetch arm asks the
+    /// target to substitute everything and carries no recorded
+    /// selection. Its demand STRING is not outside the audit, though:
+    /// it routes through [`all_outputs_demand`], whose single-owner
+    /// rule `all_outputs_demand_is_the_only_production_spelling` pins.
     #[test]
     fn batch_construction_sites_are_enumerated() {
         // Built at runtime so this test's own strings cannot match it.
@@ -453,6 +470,93 @@ mod tests {
                  with its est_nodes justification (the stderr drain budget is keyed at the \
                  submission chokepoint from the realized import closure, but est_nodes \
                  still feeds batch packing and the batches.jsonl record)"
+            );
+            seen.insert(file);
+        }
+        for file in allowed.keys() {
+            assert!(
+                seen.contains(*file),
+                "{file} is enumerated but no longer exists; drop or move its row"
+            );
+        }
+    }
+
+    /// [`all_outputs_demand`] IS the saturating arm of the audited
+    /// chokepoint, byte-for-byte — the prefetch arm routing through it
+    /// therefore emits exactly what the submission chokepoint emits for
+    /// a selection-less root — and the REAL gateway parser reads the
+    /// form back as the all-outputs selection (the same parser
+    /// `derived_path_conforms_to_the_gateway_parser` pins for every
+    /// other arm). Both directions: the owner's output equals the
+    /// independent spelling AND parses as `OutputSpec::All`, so neither
+    /// a drifted owner nor a parser regression passes silently.
+    #[test]
+    fn all_outputs_demand_matches_the_saturating_arm_and_the_parser() {
+        use rio_nix::protocol::derived_path::{DerivedPath, OutputSpec};
+
+        let drv = format!("/nix/store/{:0>32}-prefetch-1.0.drv", 9);
+        let demand = all_outputs_demand(&drv);
+        // Independent spelling of the wire form (kept literal here so a
+        // rewrite of the owner cannot re-derive the expectation).
+        assert_eq!(demand, format!("{drv}!*"));
+        // The owner and the chokepoint's selection-less arm agree.
+        let selection_less = BatchRoot {
+            drv: drv.clone(),
+            outputs: Vec::new(),
+        };
+        assert_eq!(demand, selection_less.derived_path());
+        // The gateway parser reads it back as the all-outputs demand.
+        match DerivedPath::parse(&demand) {
+            Ok(DerivedPath::Built { outputs, .. }) => assert_eq!(outputs, OutputSpec::All),
+            other => panic!("expected a Built all-outputs derived path, got {other:?}"),
+        }
+    }
+
+    /// Single-owner rule for the all-outputs demand literal, as a
+    /// standing enumeration (same walked two-zone universe as the
+    /// `Batch` census above): the only PRODUCTION-zone spellings of the
+    /// wire form's format literal in the crate are this file's — the
+    /// `derived_path` doc's quoted grammar example and the
+    /// [`all_outputs_demand`] body. Every other producer (the
+    /// submission chokepoint's saturating arms, the supply prefetch
+    /// arm) routes through the owner fn, so a NEW production site that
+    /// formats the literal directly — the shape that put the prefetch
+    /// demand outside the audited construction set — fails this count
+    /// until it routes through the owner or is audited here.
+    ///
+    /// Test-zone occurrences are deliberate spellings: wire-echo
+    /// fixtures (`KeyedBuildResult.derived_path` values simulating the
+    /// daemon's keyed echo) and expected-demand assertions, counted per
+    /// file so a swapped zone cannot keep the books balanced.
+    #[test]
+    fn all_outputs_demand_is_the_only_production_spelling() {
+        // Built at runtime so this test's own strings cannot match it
+        // (each character separately — even a quoted two-char fragment
+        // would re-create the needle in this file's source): the format
+        // literal's closing characters (`!`, `*`, `"`).
+        let needle = format!("{}{}{}", '!', '*', '"');
+        let allowed: std::collections::BTreeMap<&str, (usize, usize)> = [
+            ("src/run/batch.rs", (2, 7)),
+            ("src/run/collect.rs", (0, 2)),
+            ("src/run/mod.rs", (0, 2)),
+            ("src/run/model.rs", (0, 1)),
+            ("src/run/submitter.rs", (0, 5)),
+            ("src/run/timeline.rs", (0, 1)),
+            ("src/run/supply/exec.rs", (0, 1)),
+        ]
+        .into_iter()
+        .collect();
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (file, text) in crate::run::crate_sources() {
+            let (prod, tail) = crate::run::lint_zones(&text);
+            let expected = allowed.get(file.as_str()).copied().unwrap_or((0, 0));
+            assert_eq!(
+                (prod.matches(&needle).count(), tail.matches(&needle).count()),
+                expected,
+                "{file} (production zone, test zone): a new spelling of the all-outputs \
+                 demand literal must route through batch::all_outputs_demand (the one \
+                 production owner) or be audited into this enumeration with its \
+                 justification"
             );
             seen.insert(file);
         }
