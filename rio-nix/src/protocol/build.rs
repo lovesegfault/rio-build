@@ -199,6 +199,71 @@ impl BuildResult {
         )
     }
 
+    /// Leading bytes of the gateway's lost-terminal stderr RELAY line —
+    /// the side-channel disambiguator for the sibling lost-terminal cell
+    /// where store presence IS positively confirmed. That cell keeps
+    /// `Substituted` on the wire (presence is real, and stock clients
+    /// must keep seeing a plain success), which makes it
+    /// wire-indistinguishable from a genuine substitution terminal; the
+    /// relay line is the only signal that the substitution word stands
+    /// on a lost evidence channel rather than on a recorded substitution
+    /// event. Producer ([`Self::lost_terminal_relay_line`], emitted by
+    /// the gateway's per-root result loop) and detector
+    /// ([`Self::lost_terminal_relay_drv`], applied by the replay
+    /// engine's stderr capture — the same channel that captures the
+    /// `rio: build <uuid>` announcement) both go through the paired
+    /// functions below, so the two cannot drift.
+    pub const LOST_TERMINAL_RELAY_PREFIX: &str = "rio: terminal lost for '";
+
+    /// Format the lost-terminal stderr relay line for one root: the
+    /// marker prefix, the root's full `.drv` store path single-quoted in
+    /// the relay vocabulary's quoting discipline (`derivation '<drv>'
+    /// failed: …`, `↳ rio-cli logs '<drv>'`). The line is the whole
+    /// payload — the producer emits it newline-terminated on its own
+    /// `STDERR_NEXT` frame, never embedded in other text.
+    ///
+    /// Emitted EXACTLY when the gateway mints `Substituted` for a root
+    /// whose own terminal event was lost under a completed DAG and whose
+    /// requested outputs the store positively confirmed — never for an
+    /// own `Cached` terminal (a recorded substitution event) and never
+    /// for the blanket-failure presence rescue (no terminal was lost
+    /// there; under fail-fast none was ever expected). Measurement
+    /// consumers route a `Substituted` row carrying this marker to
+    /// evidence-loss classification instead of recording a substitution
+    /// event; clients that do not know the marker see an informational
+    /// line, like the `rio: build <uuid>` announcement.
+    pub fn lost_terminal_relay_line(drv_path: &str) -> String {
+        format!("{}{drv_path}'", Self::LOST_TERMINAL_RELAY_PREFIX)
+    }
+
+    /// Parse one observed stderr line as the lost-terminal relay marker,
+    /// returning the root's `.drv` store path on a match.
+    ///
+    /// Producer-exact, both ends anchored: the prefix must sit at byte 0
+    /// and the closing quote must end the line — the producer emits the
+    /// marker as a whole payload line, and the engine's observer feeds
+    /// raw payload lines (no progress-bar rendering exists on that
+    /// channel; prefix tolerance in the older relay regexes is a
+    /// nix-CLI-capture artifact this engine-only vocabulary does not
+    /// inherit). Trust provenance: the line arrives on the gateway's
+    /// `STDERR_NEXT` stream, which also relays `derivation '<drv>'
+    /// failed: <message>` payloads whose message embeds WORKER-quoted
+    /// log text — the byte-0 anchor rejects those embeddings (the
+    /// daemon's quoted log lines carry a `> ` prefix and the failure
+    /// relay's first line carries the `derivation '` prefix), and worker
+    /// build-log lines themselves travel as `STDERR_RESULT` frames the
+    /// observer never sees. A spoofed marker's worst case is bounded by
+    /// the consumer's status conjunct (it only affects a `Substituted`
+    /// row for the same drv in the same batch) and is conservative in
+    /// direction: it can move a row from a recorded substitution event
+    /// to evidence-loss exclusion, never mint a success or a violation.
+    pub fn lost_terminal_relay_drv(line: &str) -> Option<&str> {
+        let drv = line
+            .strip_prefix(Self::LOST_TERMINAL_RELAY_PREFIX)?
+            .strip_suffix('\'')?;
+        (!drv.is_empty() && !drv.contains('\'')).then_some(drv)
+    }
+
     /// Populate built_outputs from derivation output definitions and a
     /// pre-computed modular derivation hash.
     ///
@@ -652,6 +717,76 @@ mod tests {
             lost.error_msg
         );
         assert!(lost.built_outputs.is_empty());
+    }
+
+    /// The lost-terminal relay pair (formatter ↔ parser) round-trips, and
+    /// the parser admits exactly the producer's shape: byte-0 prefix,
+    /// quoted drv, closing quote ending the line.
+    ///
+    /// The marker LITERAL is pinned like its in-band sibling above — but
+    /// the skew here is cross-BINARY, not cross-resume: the line is
+    /// produced by whatever gateway is deployed and parsed by whatever
+    /// engine is deployed, and the two upgrade independently. Rewording
+    /// the constant would compile on both sides while a mixed fleet
+    /// silently stops disambiguating — every lost-terminal presence row
+    /// would fall back to a recorded substitution event again. If the
+    /// wording ever must change, the parser needs to accept BOTH
+    /// spellings for one deploy generation; change the pin only together
+    /// with that compatibility arm.
+    #[test]
+    fn lost_terminal_relay_line_roundtrips_and_parses_producer_exact() {
+        assert_eq!(
+            BuildResult::LOST_TERMINAL_RELAY_PREFIX,
+            "rio: terminal lost for '",
+            "cross-binary classification-bearing marker changed; a mixed \
+             gateway/engine fleet would silently stop disambiguating \
+             lost-terminal presence rows from genuine substitutions"
+        );
+
+        let drv = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-app.drv";
+        let line = BuildResult::lost_terminal_relay_line(drv);
+        assert_eq!(line, format!("rio: terminal lost for '{drv}'"));
+        // Roundtrip through the paired parser.
+        assert_eq!(BuildResult::lost_terminal_relay_drv(&line), Some(drv));
+
+        // Must-NOT-parse: every non-producer shape.
+        for (label, not_marker) in [
+            // Prefix not at byte 0: the failure relay embedding the
+            // marker text mid-line, and the daemon's `> `-quoted log
+            // lines inside a relayed failure message.
+            (
+                "embedded in a failure relay",
+                format!("derivation '{drv}' failed: {line}"),
+            ),
+            ("daemon-quoted log embedding", format!("> {line}")),
+            ("leading whitespace", format!(" {line}")),
+            // Tail not ending at the closing quote.
+            ("trailing text", format!("{line} (trace ab)")),
+            (
+                "missing closing quote",
+                format!("rio: terminal lost for '{drv}"),
+            ),
+            // Structural rejects.
+            ("empty drv", "rio: terminal lost for ''".to_string()),
+            (
+                "interior quote (two markers concatenated)",
+                format!("{line} rio: terminal lost for '{drv}'"),
+            ),
+            (
+                "prefix only",
+                BuildResult::LOST_TERMINAL_RELAY_PREFIX.to_string(),
+            ),
+            (
+                "build-id announcement",
+                "rio: build 0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string(),
+            ),
+        ] {
+            assert_eq!(
+                BuildResult::lost_terminal_relay_drv(&not_marker),
+                None,
+                "{label} must not parse as the marker: {not_marker:?}"
+            );
+        }
     }
 
     #[tokio::test]
