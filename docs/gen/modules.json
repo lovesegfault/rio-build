@@ -232,7 +232,7 @@
     {
       "path": "lib.rs",
       "depth": 0,
-      "doc": "Build-script helper: surface out-of-band proc-macro inputs as tracked"
+      "doc": "Hash out-of-band proc-macro inputs into tracked rustc env-deps."
     }
   ],
   "rio-cli": [

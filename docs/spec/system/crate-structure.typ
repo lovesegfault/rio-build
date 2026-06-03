@@ -73,6 +73,7 @@ derivation is invalidated on `.proto` changes but not on Rust-only commits.
   )
   let dev = (stroke: (paint: muted, dash: "dashed", thickness: 0.6pt))
   let opt = (stroke: (paint: rule-color, dash: "dotted", thickness: 0.6pt))
+  let bld = (stroke: (paint: muted, dash: "dash-dotted", thickness: 0.6pt))
   figure(
     autograph.diagram(
       engine: "twopi",
@@ -95,12 +96,16 @@ derivation is invalidated on `.proto` changes but not on Rust-only commits.
           d.prod.map(t => autograph.edge(label(c), label(t)))
           d.optional.map(t => autograph.edge(label(c), label(t), ..opt))
           d.dev.map(t => autograph.edge(label(c), label(t), ..dev))
+          d
+            .at("build", default: ())
+            .map(t => autograph.edge(label(c), label(t), ..bld))
         })
         .flatten(),
     ),
     caption: [Workspace dependency graph. Solid = prod (default-feature
       reachable); dotted = `optional = true` not enabled by `default`;
-      dashed = `[dev-dependencies]` only.],
+      dashed = `[dev-dependencies]` only; dash-dotted =
+      `[build-dependencies]` (build-script only).],
   )
 }
 

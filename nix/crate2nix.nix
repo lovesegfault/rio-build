@@ -224,26 +224,26 @@ let
     fileset = pkgs.lib.fileset.maybeMissing ../.sqlx;
   };
 
-  # query! macros read .sqlx/*.json instead of connecting to PG at
+  # query! macros read .sqlx/query-*.json instead of connecting to PG at
   # compile time. sqlx-macros-core 0.9.x finds the cache by (in order,
   # short-circuiting — query/mod.rs:97-117 @ 0.9.0):
-  #   1. SQLX_OFFLINE_DIR — real env var or `.env` at $CARGO_MANIFEST_DIR
-  #      (merged in query/metadata.rs:120-155; .env wins only when the
-  #      env var is unset, which is the case here)
+  #   1. SQLX_OFFLINE_DIR — real env var (or a `.env` at
+  #      $CARGO_MANIFEST_DIR when the env var is unset)
   #   2. $CARGO_MANIFEST_DIR/.sqlx
   #   3. workspace_root().join(".sqlx") — spawns `$CARGO metadata`
   # buildRustCrate calls rustc directly (no cargo, no CARGO env var, no
   # workspace Cargo.lock), so (3) would need a fake `cargo` shim. (1) is
-  # checked first and short-circuits — write the .env in postUnpack so
-  # the macro never reaches (3). (Setting the env var directly on the
-  # derivation would also work on 0.9; the .env file is kept because it
-  # predates that and is already proven against this fileset layout.)
+  # checked first and short-circuits — set it as a plain derivation env
+  # var. This is also THE single-channel contract for rio-buildhash's
+  # build scripts (rio-{store,scheduler,controller}/build.rs): both the
+  # macros and the RIO_SQLX_HASH tracker read exactly this variable, so
+  # they can never disagree about which cache is in play. (The previous
+  # postUnpack-written `.env` carried the same value; the env var
+  # replaced it so the in-repo tracker needs no dotenv parser.)
   # Applied to every crate with `query!()`/`query_as!()` callsites.
   sqlxOffline = {
     SQLX_OFFLINE = "true";
-    postUnpack = ''
-      echo "SQLX_OFFLINE_DIR=${sqlxCacheFileset}/.sqlx" > $sourceRoot/.env
-    '';
+    SQLX_OFFLINE_DIR = "${sqlxCacheFileset}/.sqlx";
   };
 
   # Crates whose build.rs invokes `protoc` (directly or via prost-build/

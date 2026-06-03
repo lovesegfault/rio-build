@@ -464,6 +464,7 @@ fn workspace() -> Result<serde_json::Value> {
         let mut prod = BTreeSet::<String>::new();
         let mut optional = BTreeSet::<String>::new();
         let mut dev = BTreeSet::<String>::new();
+        let mut build = BTreeSet::<String>::new();
         if let Some(d) = t.get("dependencies").and_then(|v| v.as_table()) {
             let (r, o) = internal(d);
             prod.extend(r);
@@ -471,6 +472,14 @@ fn workspace() -> Result<serde_json::Value> {
         }
         if let Some(d) = t.get("dev-dependencies").and_then(|v| v.as_table()) {
             dev.extend(internal(d).0); // dev-deps don't carry `optional`
+        }
+        // [build-dependencies] — build.rs-only edges (rio-buildhash's
+        // consumers). Optional build-deps fold into the same set: the
+        // edge kind is "build" either way for the autograph.
+        if let Some(d) = t.get("build-dependencies").and_then(|v| v.as_table()) {
+            let (r, o) = internal(d);
+            build.extend(r);
+            build.extend(o);
         }
         // [target.<cfg>.dependencies] — same partition.
         if let Some(tg) = t.get("target").and_then(|v| v.as_table()) {
@@ -490,13 +499,21 @@ fn workspace() -> Result<serde_json::Value> {
         prod.remove(name);
         optional.remove(name);
         dev.remove(name);
+        build.remove(name);
         // Dep in prod+dev → solid only; in optional+dev → dotted only
         // (rio-store has rio-test-support in both optional [deps] AND
         // [dev-deps]; without this filter the autograph would render a
-        // dotted+dashed double-edge).
+        // dotted+dashed double-edge). Build edges dedup the same way:
+        // a dep that is also a runtime dep renders only its stronger
+        // runtime edge.
         let dev: Vec<_> = dev
             .difference(&prod)
             .filter(|d| !optional.contains(*d))
+            .cloned()
+            .collect();
+        let build: Vec<_> = build
+            .difference(&prod)
+            .filter(|d| !optional.contains(*d) && !dev.contains(*d))
             .cloned()
             .collect();
         deps.insert(
@@ -505,6 +522,7 @@ fn workspace() -> Result<serde_json::Value> {
                 "prod": prod.into_iter().collect::<Vec<_>>(),
                 "optional": optional.into_iter().collect::<Vec<_>>(),
                 "dev": dev,
+                "build": build,
             }),
         );
     }

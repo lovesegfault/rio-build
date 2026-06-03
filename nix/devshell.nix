@@ -398,6 +398,16 @@ let
             #     Single-line VAR=value entries only; already-exported
             #     values win (direnv loads .env.local before the flake).
             rio_root="$(git rev-parse --show-toplevel)"
+            # Single-channel sqlx contract: this is the one variable both
+            # sqlx-macros-core (first in its own discovery chain) and
+            # rio-buildhash's RIO_SQLX_HASH tracker read, so the offline
+            # cache the macros expand against and the one the cache key
+            # hashes are the same directory by construction. Exported
+            # UNCONDITIONALLY — the value is the contract, not a knob; a
+            # stale inherited value would silently retarget both readers.
+            # Per-invocation override (SQLX_OFFLINE_DIR=… cargo check)
+            # still works for debugging after shell entry.
+            export SQLX_OFFLINE_DIR="$rio_root/.sqlx"
             for kache_knob in KACHE_DISABLED KACHE_MAX_SIZE KACHE_CACHE_DIR; do
               if [ -z "''${!kache_knob+x}" ] && [ -f "$rio_root/.env.local" ]; then
                 kache_line="$(grep -E "^''${kache_knob}=" "$rio_root/.env.local" | tail -n1)" || true
