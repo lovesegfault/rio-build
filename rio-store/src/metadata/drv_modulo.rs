@@ -337,7 +337,7 @@ pub(crate) async fn heal_if_missing(
             return;
         }
     }
-    let mut budget = WorkBudget::new(PROOF_WALK_WORK_MAX);
+    let mut budget = WorkBudget::new(PROOF_WALK_WORK_MAX, PROOF_WALK_ARENA_BYTES_MAX);
     match own_drv_bytes(pool, chunks, drv_path, &mut budget).await {
         Ok(FetchedDrv::Bytes(bytes)) => {
             let _ = populate_on_ingest(pool, drv_path, &bytes).await;
@@ -402,25 +402,86 @@ pub(crate) const PROOF_WALK_WORK_MAX: usize = 16_384;
 /// honest derivation while bounding what one proof walk will buffer.
 pub(crate) const DRV_REASSEMBLY_CAP: u64 = 64 * 1024 * 1024;
 
+/// Cap on the BYTES one proof walk may RETAIN in its arena
+/// (fetched-but-uncomputed `.drv` bytes + their path/input strings),
+/// charged BEFORE each retention (round-16 bug_079; pattern R4
+/// SCALE-PER-DIMENSION: the work-unit budget counts *operations* and is
+/// blind to padded payloads — 16,384 units of 16 MiB `.drv`s would have
+/// retained ~256 GiB while "within budget").
+///
+/// SIZING: the measured nixpkgs `hello` closure (1,963 `.drv`s) totals
+/// single-digit MiB of `.drv` text, so 256 MiB is ~30× the measured
+/// real-world closure; a walk needing more is byte-flood-shaped, not
+/// honest. Adversarial floor: with the W1 admission cap
+/// (`rio_common::limits::MAX_DRV_NAR_BYTES` = 16 MiB per `.drv` at
+/// ingestion), one walk retains at most ~16 maximal-padding nodes
+/// before exhausting — typed `RESOURCE_EXHAUSTED`, and the monotone
+/// exit drain still persists every leaf-complete subtree first.
+///
+/// DOMINANCE (what is and is not charged): the arena's
+/// `(bytes, inputs)` values and their path keys are charged via
+/// [`arena_charge`]; the `seeds` (32-byte hashes) and `queued`
+/// (path-string) ledgers are NOT charged — both are bounded by the
+/// work-unit budget (entries exist only for charged probes/fetches,
+/// ≤ ~512 B each ⇒ ≤ ~8 MiB at the work cap, two orders below this
+/// const); the transient chunk-reassembly buffer is bounded separately
+/// by [`DRV_REASSEMBLY_CAP`] and is freed (parsed into retained bytes
+/// or dropped) before the next retention.
+///
+/// AGGREGATE: per-walk; the store-process aggregate clause lands with
+/// the walk-admission permits (round-16 bug_080, next commit), which
+/// bound concurrent walks so aggregate = permits × this const.
+///
+/// The `rio_store_ia_proof_arena_bytes` histogram (registered with
+/// this const) records per-walk charged bytes so approach is visible
+/// long before exhaustion.
+pub(crate) const PROOF_WALK_ARENA_BYTES_MAX: usize = 256 * 1024 * 1024;
+
+/// Bytes one arena retention charges: the retained `.drv` bytes, the
+/// path key, the input-path strings, and a fixed per-node bookkeeping
+/// overhead (map entry + Vec/String headers; 64 B upper-bounds the
+/// containers' inline parts on 64-bit).
+fn arena_charge(path: &str, bytes: &[u8], inputs: &[String]) -> usize {
+    bytes.len() + path.len() + inputs.iter().map(String::len).sum::<usize>() + 64
+}
+
 /// Typed work budget (pattern R4). All metered operations in the proof
 /// walk take `&mut WorkBudget` and charge BEFORE doing the work; the
-/// only constructor takes the cap, and exhaustion is a typed signal the
-/// caller must route (never a silent skip).
+/// only constructor takes the caps, and exhaustion is a typed signal
+/// the caller must route (never a silent skip).
+///
+/// TWO LEDGERS, one type: work UNITS (ops — [`PROOF_WALK_WORK_MAX`])
+/// and retained arena BYTES ([`PROOF_WALK_ARENA_BYTES_MAX`]). Both are
+/// charge-only (never refunded): the byte ledger is the cumulative
+/// retention charge, not a live gauge — it upper-bounds live arena
+/// memory by construction, and stays an over-approximation if a future
+/// refactor drains and re-retains.
 pub(crate) struct WorkBudget {
     cap: usize,
     used: usize,
+    arena_cap: usize,
+    arena_used: usize,
 }
 
 /// Charge refusal: the budget is exhausted.
 pub(crate) struct Exhausted;
 
 impl WorkBudget {
-    pub(crate) fn new(cap: usize) -> Self {
-        WorkBudget { cap, used: 0 }
+    pub(crate) fn new(cap: usize, arena_cap: usize) -> Self {
+        WorkBudget {
+            cap,
+            used: 0,
+            arena_cap,
+            arena_used: 0,
+        }
     }
     /// Units consumed so far (histogram + tests).
     pub(crate) fn used(&self) -> usize {
         self.used
+    }
+    /// Arena bytes charged so far (histogram + tests).
+    pub(crate) fn arena_used(&self) -> usize {
+        self.arena_used
     }
     /// Charge `units` or refuse without consuming.
     fn charge(&mut self, units: usize) -> Result<(), Exhausted> {
@@ -429,6 +490,16 @@ impl WorkBudget {
             return Err(Exhausted);
         }
         self.used = next;
+        Ok(())
+    }
+    /// Charge `bytes` of arena retention or refuse without consuming.
+    /// Charged BEFORE the insert, so over-cap bytes are never retained.
+    fn charge_arena(&mut self, bytes: usize) -> Result<(), Exhausted> {
+        let next = self.arena_used.saturating_add(bytes);
+        if next > self.arena_cap {
+            return Err(Exhausted);
+        }
+        self.arena_used = next;
         Ok(())
     }
 }
@@ -596,24 +667,32 @@ pub(crate) async fn prove_drv_modulo(
     chunks: Option<&crate::cas::ChunkCache>,
     drv_path: &str,
 ) -> Result<ProofOutcome, super::MetadataError> {
-    let (outcome, _work) =
-        prove_drv_modulo_with_cap(pool, chunks, drv_path, PROOF_WALK_WORK_MAX).await?;
+    let (outcome, _work) = prove_drv_modulo_with_caps(
+        pool,
+        chunks,
+        drv_path,
+        PROOF_WALK_WORK_MAX,
+        PROOF_WALK_ARENA_BYTES_MAX,
+    )
+    .await?;
     Ok(outcome)
 }
 
-/// [`prove_drv_modulo`] with an explicit cap, returning the work used —
+/// [`prove_drv_modulo`] with explicit caps, returning the work used —
 /// the test seam for budget semantics (production always passes
-/// [`PROOF_WALK_WORK_MAX`]).
-pub(crate) async fn prove_drv_modulo_with_cap(
+/// [`PROOF_WALK_WORK_MAX`] / [`PROOF_WALK_ARENA_BYTES_MAX`]).
+pub(crate) async fn prove_drv_modulo_with_caps(
     pool: &PgPool,
     chunks: Option<&crate::cas::ChunkCache>,
     drv_path: &str,
     cap: usize,
+    arena_cap: usize,
 ) -> Result<(ProofOutcome, usize), super::MetadataError> {
-    let mut budget = WorkBudget::new(cap);
+    let mut budget = WorkBudget::new(cap, arena_cap);
     let result = prove_inner(pool, chunks, drv_path, &mut budget).await;
     let work = budget.used();
     metrics::histogram!("rio_store_ia_proof_work_units").record(work as f64);
+    metrics::histogram!("rio_store_ia_proof_arena_bytes").record(budget.arena_used() as f64);
     if let Ok(outcome) = &result {
         let label = match outcome {
             ProofOutcome::Proven(_) => "proven",
@@ -728,11 +807,36 @@ async fn prove_inner(
                     upsert_drv_modulo(pool, &path, &c.row).await?;
                 }
                 Err(_) => {
+                    seeds = local_seeds;
+                    // Retention is charged BEFORE the insert (bug_079):
+                    // over-cap bytes are never resident.
+                    if budget
+                        .charge_arena(arena_charge(&path, &bytes, &inputs))
+                        .is_err()
+                    {
+                        exit = Some(AbsentReason::OverBudget {
+                            persisted: 0,
+                            work_used: budget.used(),
+                        });
+                        break;
+                    }
                     arena.insert(path, (bytes, inputs));
+                    continue;
                 }
             }
             seeds = local_seeds;
         } else {
+            // Retention is charged BEFORE the insert (bug_079).
+            if budget
+                .charge_arena(arena_charge(&path, &bytes, &inputs))
+                .is_err()
+            {
+                exit = Some(AbsentReason::OverBudget {
+                    persisted: 0,
+                    work_used: budget.used(),
+                });
+                break;
+            }
             arena.insert(path, (bytes, inputs));
         }
     }

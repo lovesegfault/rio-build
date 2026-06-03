@@ -541,7 +541,14 @@ path, and a re-upload of the path carries identical bytes by
 construction. Cyclic input metadata fails the walk closed --- population
 is skipped and the proof stays unverifiable; no PutPath-level cycle
 rejection is introduced (`store.gc.sweep-cycle-reclaim` keeps owning
-cycle reclamation).
+cycle reclamation). The work budget is two-dimensional: operation UNITS
+(`PROOF_WALK_WORK_MAX`, blind to payload size) and retained arena BYTES
+(`PROOF_WALK_ARENA_BYTES_MAX`, charged before each retention) --- the
+unit ledger alone would admit padded-`.drv` byte floods that retain
+GiBs while "within budget" (round-16 bug_079); exhaustion of either
+dimension is the same typed `RESOURCE_EXHAUSTED` monotone exit, and the
+`rio_store_ia_proof_arena_bytes` histogram makes byte-pressure approach
+visible.
 
 #r("store.put.idempotent")[
   *Idempotency:* If `PutPath` is called for a store path that already has a

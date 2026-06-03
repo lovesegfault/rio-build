@@ -513,7 +513,8 @@ pub struct ProofWalkReport {
 /// Run the deriver-proof walk with an explicit work cap. Production
 /// always uses `PROOF_WALK_WORK_MAX` (re-exported as
 /// [`PROOF_WALK_WORK_MAX_FOR_TESTS`]); tests shrink the cap to exercise
-/// over-budget monotone resumption.
+/// over-budget monotone resumption. Arena byte cap stays at the
+/// production const — use [`proof_walk_with_caps`] to shrink it.
 #[cfg(feature = "server")]
 pub async fn proof_walk_for_tests(
     pool: &sqlx::PgPool,
@@ -521,8 +522,29 @@ pub async fn proof_walk_for_tests(
     drv_path: &str,
     cap: usize,
 ) -> anyhow::Result<ProofWalkReport> {
-    use crate::metadata::drv_modulo::{AbsentReason, ProofOutcome, prove_drv_modulo_with_cap};
-    let (outcome, work_used) = prove_drv_modulo_with_cap(pool, chunks, drv_path, cap).await?;
+    proof_walk_with_caps(
+        pool,
+        chunks,
+        drv_path,
+        cap,
+        crate::metadata::drv_modulo::PROOF_WALK_ARENA_BYTES_MAX,
+    )
+    .await
+}
+
+/// [`proof_walk_for_tests`] with BOTH caps explicit (work units, arena
+/// retention bytes) — the seam for byte-flood scale tests (bug_079).
+#[cfg(feature = "server")]
+pub async fn proof_walk_with_caps(
+    pool: &sqlx::PgPool,
+    chunks: Option<&crate::cas::ChunkCache>,
+    drv_path: &str,
+    cap: usize,
+    arena_cap: usize,
+) -> anyhow::Result<ProofWalkReport> {
+    use crate::metadata::drv_modulo::{AbsentReason, ProofOutcome, prove_drv_modulo_with_caps};
+    let (outcome, work_used) =
+        prove_drv_modulo_with_caps(pool, chunks, drv_path, cap, arena_cap).await?;
     Ok(match outcome {
         ProofOutcome::Proven(_) => ProofWalkReport {
             proven: true,
@@ -550,3 +572,8 @@ pub async fn proof_walk_for_tests(
 /// Production work cap, re-exported for scale tests.
 #[cfg(feature = "server")]
 pub const PROOF_WALK_WORK_MAX_FOR_TESTS: usize = crate::metadata::drv_modulo::PROOF_WALK_WORK_MAX;
+
+/// Production arena-retention byte cap, re-exported for scale tests.
+#[cfg(feature = "server")]
+pub const PROOF_WALK_ARENA_BYTES_MAX_FOR_TESTS: usize =
+    crate::metadata::drv_modulo::PROOF_WALK_ARENA_BYTES_MAX;

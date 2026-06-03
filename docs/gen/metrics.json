@@ -201,6 +201,7 @@
     "rio_store_get_path_duration_seconds",
     "rio_store_get_path_total",
     "rio_store_hmac_rejected_total",
+    "rio_store_ia_proof_arena_bytes",
     "rio_store_ia_proof_total",
     "rio_store_ia_proof_work_units",
     "rio_store_integrity_failures_total",
@@ -1242,6 +1243,11 @@
         "name": "rio_store_hmac_rejected_total",
         "kind": "counter",
         "help": "PutPath rejections by HMAC assignment-token check (labeled by reason)"
+      },
+      {
+        "name": "rio_store_ia_proof_arena_bytes",
+        "kind": "histogram",
+        "help": "Arena bytes RETAINED per deriver-proof walk (cap PROOF_WALK_ARENA_BYTES_MAX=256MiB; fetched-but-uncomputed .drv bytes charged before retention). Warm walks record 0. Sustained approach to the cap means real closures are outgrowing the byte budget (or a tenant is byte-flooding the walk with padded .drvs) — see the const's sizing note before raising it"
       },
       {
         "name": "rio_store_ia_proof_total",

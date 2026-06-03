@@ -562,14 +562,28 @@ mod proof_walk {
         minted: &mut HashMap<String, (String, Derivation)>,
         derive_cache: &mut HashMap<String, [u8; 32]>,
     ) -> String {
+        mint_node_padded(tag, inputs, 0, minted, derive_cache)
+    }
+
+    /// [`mint_node`] with `pad` bytes of env padding — the byte-flood
+    /// shape (bug_079): a VALID derivation whose `.drv` text is
+    /// arbitrarily large while costing the same WORK units to walk.
+    fn mint_node_padded(
+        tag: &str,
+        inputs: &[String],
+        pad: usize,
+        minted: &mut HashMap<String, (String, Derivation)>,
+        derive_cache: &mut HashMap<String, [u8; 32]>,
+    ) -> String {
         let inputs_aterm: String = inputs
             .iter()
             .map(|p| format!(r#"("{p}",["out"])"#))
             .collect::<Vec<_>>()
             .join(",");
+        let padding = "p".repeat(pad);
         let build = |out: &str| {
             format!(
-                r#"Derive([("out","{out}","","")],[{inputs_aterm}],[],"x86_64-linux","/bin/sh",["-c","x"],[("name","{tag}"),("out","{out}")])"#
+                r#"Derive([("out","{out}","","")],[{inputs_aterm}],[],"x86_64-linux","/bin/sh",["-c","x"],[("name","{tag}"),("out","{out}"),("pad","{padding}")])"#
             )
         };
         let masked = Derivation::parse(&build("")).expect("masked parses");
@@ -747,6 +761,81 @@ mod proof_walk {
         assert!(
             attempts >= 2,
             "fixture must actually exercise resumption (got {attempts} attempts)"
+        );
+        Ok(())
+    }
+
+    // r[verify store.put.ia-deriver-proof+3]
+    /// THE byte-flood scale test (bug_079, R4 SCALE-PER-DIMENSION): a
+    /// padded mid-tier (8 mids × 1 MiB env padding, each over its own
+    /// leaf) under a 3.5 MiB arena cap. The WORK budget never binds
+    /// (each attempt costs ~20 ops against a 16,384 cap) — only the
+    /// BYTE co-budget catches the retention. Pre-fix the walk retained
+    /// all 8 MiB "within budget"; post-fix each attempt exhausts after
+    /// ~3 retained mids, the monotone exit drain persists every
+    /// leaf-complete mid, and identical retries CONVERGE.
+    #[tokio::test]
+    async fn padded_byte_flood_exhausts_typed_and_resumes() -> TestResult {
+        use rio_store::test_helpers::proof_walk_with_caps;
+        let s = StoreSession::new().await?;
+        let mut minted = HashMap::new();
+        let mut dc = HashMap::new();
+        const PAD: usize = 1024 * 1024;
+        let mids: Vec<String> = (0..8)
+            .map(|i| {
+                let leaf = mint_node(&format!("bfleaf{i}"), &[], &mut minted, &mut dc);
+                mint_node_padded(&format!("bfmid{i}"), &[leaf], PAD, &mut minted, &mut dc)
+            })
+            .collect();
+        let root = mint_node("bf-root", &mids, &mut minted, &mut dc);
+        for (path, (text, _)) in &minted {
+            stage_drv_sql(&s.db.pool, path, text).await?;
+        }
+
+        let arena_cap = 3 * PAD + PAD / 2; // 3.5 MiB: ~3 retained mids/attempt
+        let mut attempts = 0;
+        let mut last_rows = 0i64;
+        loop {
+            attempts += 1;
+            let report = proof_walk_with_caps(
+                &s.db.pool,
+                None,
+                &root,
+                PROOF_WALK_WORK_MAX_FOR_TESTS,
+                arena_cap,
+            )
+            .await?;
+            let rows = cache_rows(&s.db.pool).await;
+            if report.proven {
+                break;
+            }
+            // Typed exhaustion, attributed to the BYTE dimension: the
+            // work ledger is far from its cap when the byte ledger
+            // refuses.
+            assert_eq!(report.reason, Some("over_budget"), "{report:?}");
+            assert!(
+                report.work_used < PROOF_WALK_WORK_MAX_FOR_TESTS / 100,
+                "work units must NOT be what bound this walk \
+                 (got {} of {PROOF_WALK_WORK_MAX_FOR_TESTS})",
+                report.work_used
+            );
+            assert!(
+                rows > last_rows,
+                "every byte-exhausted attempt must persist NEW progress \
+                 (attempt {attempts}: {last_rows} -> {rows})"
+            );
+            last_rows = rows;
+            assert!(attempts < 8, "must converge, not livelock");
+        }
+        assert_eq!(
+            cache_rows(&s.db.pool).await,
+            17,
+            "8 leaves + 8 mids + root all proven"
+        );
+        assert!(
+            attempts >= 2,
+            "fixture must actually exercise byte-pressure resumption \
+             (got {attempts} attempts)"
         );
         Ok(())
     }

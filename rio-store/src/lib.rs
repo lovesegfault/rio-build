@@ -114,6 +114,26 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
             1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 2048.0, 4096.0, 8192.0, 12288.0, 16384.0,
         ],
     ),
+    (
+        // BYTES retained per proof walk (not seconds): warm walks
+        // retain 0; the measured real-world closure retains single-digit
+        // MiB; cap PROOF_WALK_ARENA_BYTES_MAX = 256 MiB. Buckets resolve
+        // "warm vs cold" and "approaching the byte cap" (sizing note in
+        // metadata/drv_modulo.rs; the wipe-deploy runbook watches this
+        // during the post-wipe cold-cache window).
+        "rio_store_ia_proof_arena_bytes",
+        &[
+            0.0,
+            65_536.0,      // 64 KiB
+            1_048_576.0,   // 1 MiB
+            8_388_608.0,   // 8 MiB
+            33_554_432.0,  // 32 MiB
+            67_108_864.0,  // 64 MiB
+            134_217_728.0, // 128 MiB
+            201_326_592.0, // 192 MiB
+            268_435_456.0, // 256 MiB (cap)
+        ],
+    ),
 ];
 
 /// Registers prometheus metric descriptions. The help strings here are
@@ -155,6 +175,16 @@ pub fn describe_metrics() {
          Sustained approach to the cap means real closures are \
          outgrowing the budget — raise the const, do not let \
          RESOURCE_EXHAUSTED retries discover it"
+    );
+    describe_histogram!(
+        "rio_store_ia_proof_arena_bytes",
+        "Arena bytes RETAINED per deriver-proof walk (cap \
+         PROOF_WALK_ARENA_BYTES_MAX=256MiB; fetched-but-uncomputed .drv \
+         bytes charged before retention). Warm walks record 0. \
+         Sustained approach to the cap means real closures are \
+         outgrowing the byte budget (or a tenant is byte-flooding the \
+         walk with padded .drvs) — see the const's sizing note before \
+         raising it"
     );
     describe_counter!(
         "rio_store_drv_modulo_cache_total",
