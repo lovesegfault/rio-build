@@ -996,6 +996,13 @@ rec {
     # r[verify sched.recovery.fetch-max-seed+4]
     quint-leader-election = mkQuintCheck {
       name = "leader-election";
+      # quint-policy P1 exemption (bughunt-2 slot 11; §5-Q13):
+      vacuityExempt = {
+        atMostOneCASWinner = {
+          class = "pre-r2-untwinned";
+          reason = "the falsifier needs an apiserver-fault twin (duplicate resourceVersion admission) — a new fault axis priced in the Q13 burn-down headline list";
+        };
+      };
       spec = "leaderElection";
       main = "leaderElectionBase";
       invariants = [
@@ -1025,6 +1032,13 @@ rec {
     # r[verify sched.lease.generation-claim+2]
     quint-leader-election-deletion = mkQuintCheck {
       name = "leader-election-deletion";
+      # quint-policy P1 exemption (bughunt-2 slot 11; §5-Q13):
+      vacuityExempt = {
+        atMostOneCASWinner = {
+          class = "pre-r2-untwinned";
+          reason = "the falsifier needs an apiserver-fault twin (duplicate resourceVersion admission) — a new fault axis priced in the Q13 burn-down headline list";
+        };
+      };
       spec = "leaderElection";
       main = "leaderElectionDeletion";
       invariants = [
@@ -1065,6 +1079,13 @@ rec {
     # r[verify sched.lease.self-fence+2]
     quint-leader-election-asymmetric = mkQuintCheck {
       name = "leader-election-asymmetric";
+      # quint-policy P1 exemption (bughunt-2 slot 11; §5-Q13):
+      vacuityExempt = {
+        atMostOneCASWinner = {
+          class = "pre-r2-untwinned";
+          reason = "the falsifier needs an apiserver-fault twin (duplicate resourceVersion admission) — a new fault axis priced in the Q13 burn-down headline list";
+        };
+      };
       spec = "leaderElection";
       main = "leaderElectionAsymmetric";
       invariants = [
@@ -1100,6 +1121,13 @@ rec {
     # r[verify sched.lease.generation-claim+2]
     quint-leader-election-pg-faults = mkQuintCheck {
       name = "leader-election-pg-faults";
+      # quint-policy P1 exemption (bughunt-2 slot 11; §5-Q13):
+      vacuityExempt = {
+        atMostOneCASWinner = {
+          class = "pre-r2-untwinned";
+          reason = "the falsifier needs an apiserver-fault twin (duplicate resourceVersion admission) — a new fault axis priced in the Q13 burn-down headline list";
+        };
+      };
       spec = "leaderElection";
       main = "leaderElectionPgFaults";
       invariants = [
@@ -1248,6 +1276,13 @@ rec {
     # r[verify sched.lease.self-fence+2]
     quint-leader-election-suspend = mkQuintCheck {
       name = "leader-election-suspend";
+      # quint-policy P1 exemption (bughunt-2 slot 11; §5-Q13):
+      vacuityExempt = {
+        atMostOneCASWinner = {
+          class = "pre-r2-untwinned";
+          reason = "the falsifier needs an apiserver-fault twin (duplicate resourceVersion admission) — a new fault axis priced in the Q13 burn-down headline list";
+        };
+      };
       spec = "leaderElection";
       main = "leaderElectionSuspend";
       invariants = [
@@ -1275,6 +1310,13 @@ rec {
     # r[verify sched.lease.graceful-release+2]
     quint-leader-election-shutdown = mkQuintCheck {
       name = "leader-election-shutdown";
+      # quint-policy P1 exemption (bughunt-2 slot 11; §5-Q13):
+      vacuityExempt = {
+        atMostOneCASWinner = {
+          class = "pre-r2-untwinned";
+          reason = "the falsifier needs an apiserver-fault twin (duplicate resourceVersion admission) — a new fault axis priced in the Q13 burn-down headline list";
+        };
+      };
       spec = "leaderElection";
       main = "leaderElectionShutdown";
       invariants = [
@@ -2952,6 +2994,14 @@ rec {
     # r[verify store.put.placeholder-claim+2]
     quint-placeholder-claim-main = mkQuintCheck {
       name = "placeholder-claim-main";
+      # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
+      # is the burn-down artifact):
+      vacuityExempt = {
+        boundsOK = {
+          class = "boundsOK";
+          reason = "scope-ceiling tripwire: a violation means the regime misconfigured its bound consts, not a protocol defect — a falsifier would assert a misconfiguration, not a behavior";
+        };
+      };
       spec = "placeholderClaim";
       main = "placeholderClaimMain";
       invariants = [
@@ -3788,6 +3838,14 @@ rec {
     # r[verify ctrl.nodeclaim.budget.per-class+2]
     quint-nodeclaim-lifecycle-base = mkQuintCheck {
       name = "nodeclaim-lifecycle-base";
+      # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
+      # is the burn-down artifact):
+      vacuityExempt = {
+        boundsOK = {
+          class = "boundsOK";
+          reason = "scope-ceiling tripwire: a violation means the regime misconfigured its bound consts, not a protocol defect — a falsifier would assert a misconfiguration, not a behavior";
+        };
+      };
       spec = "nodeclaimLifecycle";
       main = "nodeclaimLifecycleBase";
       invariants = [
@@ -3817,6 +3875,14 @@ rec {
     # r[verify ctrl.nodeclaim.budget.per-class+2]
     quint-nodeclaim-lifecycle-fault-rpc = mkQuintCheck {
       name = "nodeclaim-lifecycle-fault-rpc";
+      # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
+      # is the burn-down artifact):
+      vacuityExempt = {
+        boundsOK = {
+          class = "boundsOK";
+          reason = "scope-ceiling tripwire: a violation means the regime misconfigured its bound consts, not a protocol defect — a falsifier would assert a misconfiguration, not a behavior";
+        };
+      };
       spec = "nodeclaimLifecycle";
       main = "nodeclaimLifecycleFaultRpc";
       invariants = [
@@ -3844,6 +3910,14 @@ rec {
     # r[verify ctrl.nodeclaim.ice-mark-clear]
     quint-nodeclaim-lifecycle-fault-lease = mkQuintCheck {
       name = "nodeclaim-lifecycle-fault-lease";
+      # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
+      # is the burn-down artifact):
+      vacuityExempt = {
+        boundsOK = {
+          class = "boundsOK";
+          reason = "scope-ceiling tripwire: a violation means the regime misconfigured its bound consts, not a protocol defect — a falsifier would assert a misconfiguration, not a behavior";
+        };
+      };
       spec = "nodeclaimLifecycle";
       main = "nodeclaimLifecycleFaultLease";
       invariants = [
@@ -3870,6 +3944,14 @@ rec {
     # r[verify ctrl.nodeclaim.ice-mark-clear]
     quint-nodeclaim-lifecycle-fault-karpenter = mkQuintCheck {
       name = "nodeclaim-lifecycle-fault-karpenter";
+      # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
+      # is the burn-down artifact):
+      vacuityExempt = {
+        boundsOK = {
+          class = "boundsOK";
+          reason = "scope-ceiling tripwire: a violation means the regime misconfigured its bound consts, not a protocol defect — a falsifier would assert a misconfiguration, not a behavior";
+        };
+      };
       spec = "nodeclaimLifecycle";
       main = "nodeclaimLifecycleFaultKarpenter";
       invariants = [
@@ -4360,6 +4442,18 @@ rec {
     # r[verify sched.retry.recovery-projection+3]
     quint-retry-policy-pull = mkQuintCheck {
       name = "retry-policy-pull";
+      # quint-policy P1 exemptions (bughunt-2 slot 11; §5-Q13 — the
+      # retryPolicy-15 burn-down headline):
+      vacuityExempt = {
+        countersRefineHistory = {
+          class = "pre-r2-untwinned";
+          reason = "refinement-map invariant; the falsifier is a history-divergence twin over the spec/live pairing — Q13 headline (retryPolicy)";
+        };
+        noDoubleCount = {
+          class = "pre-r2-untwinned";
+          reason = "the falsifier needs a double-charge injection action on the exec ledger — Q13 headline (retryPolicy)";
+        };
+      };
       spec = "retryPolicy";
       main = "retryPolicyPull";
       step = "pullStep";
@@ -4458,6 +4552,18 @@ rec {
     # r[verify sched.retry.store-degraded-uncharged+2]
     quint-retry-policy-pull-store-degraded = mkQuintCheck {
       name = "retry-policy-pull-store-degraded";
+      # quint-policy P1 exemptions (bughunt-2 slot 11; §5-Q13 — the
+      # retryPolicy-15 burn-down headline):
+      vacuityExempt = {
+        countersRefineHistory = {
+          class = "pre-r2-untwinned";
+          reason = "refinement-map invariant; the falsifier is a history-divergence twin over the spec/live pairing — Q13 headline (retryPolicy)";
+        };
+        noDoubleCount = {
+          class = "pre-r2-untwinned";
+          reason = "the falsifier needs a double-charge injection action on the exec ledger — Q13 headline (retryPolicy)";
+        };
+      };
       spec = "retryPolicy";
       main = "retryPolicyPullStoreDegraded";
       step = "pullStep";
@@ -4585,6 +4691,18 @@ rec {
     # r[verify sched.materialize.routing+5]
     quint-retry-policy-pull-materialization = mkQuintCheck {
       name = "retry-policy-pull-materialization";
+      # quint-policy P1 exemptions (bughunt-2 slot 11; §5-Q13 — the
+      # retryPolicy-15 burn-down headline):
+      vacuityExempt = {
+        countersRefineHistory = {
+          class = "pre-r2-untwinned";
+          reason = "refinement-map invariant; the falsifier is a history-divergence twin over the spec/live pairing — Q13 headline (retryPolicy)";
+        };
+        noDoubleCount = {
+          class = "pre-r2-untwinned";
+          reason = "the falsifier needs a double-charge injection action on the exec ledger — Q13 headline (retryPolicy)";
+        };
+      };
       spec = "retryPolicy";
       main = "retryPolicyPullMat";
       step = "pullStep";
@@ -5472,6 +5590,18 @@ rec {
       step = "calibStep";
       witness = "fenceRefusalAlwaysRetryable";
     };
+    # bughunt-2 bug_358: belowFloorTxNeverMutates' FIRST falsifier — the
+    # admission compare dropped entirely; the snapshotExceedsGen oracle
+    # (computed in the live model's upsertApply seat, never by the
+    # calibration) latches the below-floor mutation.
+    quint-fence-calib-floor-blind = mkQuintWitnessCheck {
+      name = "fence-calib-floor-blind";
+      spec = "calibration/fence-floor-blind";
+      main = "fenceCalibFloorBlind";
+      extraSpecs = [ "fencedWrites" ];
+      step = "calibStep";
+      witness = "belowFloorTxNeverMutates";
+    };
 
     # ------------------------------------------------------------------
     # spawnCoherence PD-7 extension (substitution-replacement Phase B,
@@ -5890,6 +6020,14 @@ rec {
     # r[verify ctrl.nodeclaim.lease-edge-polarity+3]
     quint-nodeclaim-epoch = mkQuintCheck {
       name = "nodeclaim-epoch";
+      # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
+      # is the burn-down artifact):
+      vacuityExempt = {
+        boundsOK = {
+          class = "boundsOK";
+          reason = "scope-ceiling tripwire: a violation means the regime misconfigured its bound consts, not a protocol defect — a falsifier would assert a misconfiguration, not a behavior";
+        };
+      };
       spec = "nodeclaimLifecycle";
       main = "nodeclaimLifecycleEpoch";
       invariants = [
@@ -5929,6 +6067,14 @@ rec {
     # r[verify ctrl.nodeclaim.evidence-ack-latch]
     quint-nodeclaim-clear-buffer = mkQuintCheck {
       name = "nodeclaim-clear-buffer";
+      # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
+      # is the burn-down artifact):
+      vacuityExempt = {
+        boundsOK = {
+          class = "boundsOK";
+          reason = "scope-ceiling tripwire: a violation means the regime misconfigured its bound consts, not a protocol defect — a falsifier would assert a misconfiguration, not a behavior";
+        };
+      };
       spec = "nodeclaimLifecycle";
       main = "nodeclaimLifecycleClearBuffer";
       invariants = [
@@ -5982,6 +6128,14 @@ rec {
     # r[verify sched.snapshot.binding-presence]
     quint-nodeclaim-snapshot-presence = mkQuintCheck {
       name = "nodeclaim-snapshot-presence";
+      # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
+      # is the burn-down artifact):
+      vacuityExempt = {
+        boundsOK = {
+          class = "boundsOK";
+          reason = "scope-ceiling tripwire: a violation means the regime misconfigured its bound consts, not a protocol defect — a falsifier would assert a misconfiguration, not a behavior";
+        };
+      };
       spec = "nodeclaimLifecycle";
       main = "nodeclaimLifecycleSnapshot";
       invariants = [
