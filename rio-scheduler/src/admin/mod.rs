@@ -116,7 +116,7 @@ pub struct AdminServiceImpl {
     /// `[sla].cluster` — written into `interrupt_samples.cluster` so
     /// `CostTable::refresh_lambda`'s `WHERE cluster = $1` matches.
     /// Empty for the single-cluster default (matches the `DEFAULT ''`
-    /// migration-043 column).
+    /// 043_sla_hardening column).
     cluster: String,
     /// Full `[sla]` block — `import_sla_corpus` constructs a
     /// `prior::ValidatedSeedCorpus` against this BEFORE the corpus
@@ -1302,7 +1302,7 @@ pub(crate) fn open_attempt_row_to_proto(
         source_node: r.source_node.unwrap_or_default(),
         generation: r.generation.max(0) as u64,
         assigned_at_age_secs: r.age_secs.max(0.0) as u64,
-        // The dispatched deadline persisted by the pull mint (072).
+        // The dispatched deadline persisted by the pull mint (074_execution_deadline).
         // 0 = unknown (pre-072 rows and NULLs) — the OA2 wedge
         // consumer skips 0. Enriched in the same change set as the
         // consumer's kind gate + first-observation anchor + systemic

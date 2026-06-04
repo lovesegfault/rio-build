@@ -357,6 +357,92 @@ in
         touch $out
       '';
 
+  # merged_bug_353 (lint half): every rio_* token a shipped dashboard
+  # expr or PrometheusRule expr reads must be a LIVE described metric
+  # (docs/gen/metrics.json .names — the describe_*! scrape). Histogram
+  # _bucket/_sum/_count series resolve to their base name. Rule exprs
+  # come from docs/gen/alerts.json (the same line-state scrape the
+  # docs build renders — one parser, two consumers). Label-VALUE
+  # validation is an explicit non-goal: this asserts name liveness,
+  # not series shape. Formal-coverage rationale (none-sensible):
+  # operator-mirror tier; the derived-alternation lint IS the
+  # by-construction artifact.
+  obs-surface-lint =
+    pkgs.runCommand "rio-obs-surface-lint"
+      {
+        nativeBuildInputs = [
+          pkgs.jq
+          pkgs.gnugrep
+        ];
+        dashboards = ../infra/helm/rio-build/dashboards;
+        alertsJson = ../docs/gen/alerts.json;
+        metricsJson = ../docs/gen/metrics.json;
+      }
+      ''
+        fail=0
+        jq -r '.. | .expr? // empty' $dashboards/*.json \
+          | grep -ohE '\brio_[a-z0-9_]+' \
+          | sed -E 's/_(bucket|sum|count)$//' | sort -u > $TMPDIR/dash-tokens
+        jq -r '.rules[].metrics[]' $alertsJson | sort -u > $TMPDIR/rule-tokens
+        jq -r '.names[]' $metricsJson | sort -u > $TMPDIR/live
+        for set in dash rule; do
+          dead=$(comm -23 $TMPDIR/$set-tokens $TMPDIR/live)
+          if [[ -n "$dead" ]]; then
+            echo "FAIL: $set exprs read metrics no describe_*! macro declares (retired or typo'd):" >&2
+            echo "$dead" >&2
+            fail=1
+          fi
+        done
+        [[ $fail -eq 0 ]]
+        touch $out
+      '';
+
+  # bug_030: migration bodies are DDL plus exactly one commentary
+  # pointer. For NNN >= 082: line 1 is verbatim
+  # `-- Commentary: see rio-migrations/src/migrations.rs M_NNN` (NNN
+  # matching the filename), no other line-anchored `--` lines
+  # (trailing inline `-- ...` after DDL is fine), and the M_NNN
+  # doc-const exists. Rationale: sqlx checksums the full body —
+  # commentary edits to a shipped migration brick persistent-DB
+  # deploys with VersionMismatch, so prose lives in migrations.rs
+  # where it can evolve. 082/083 were rewritten (unshipped on this
+  # branch) and re-pinned; 084+ were born compliant. Formal-coverage
+  # rationale (none-sensible): file-format policy; the lint is the
+  # closure.
+  migration-body-policy =
+    pkgs.runCommand "rio-migration-body-policy"
+      {
+        nativeBuildInputs = [ pkgs.gnugrep ];
+        migrations = ../rio-migrations/migrations;
+        commentary = ../rio-migrations/src/migrations.rs;
+      }
+      ''
+        fail=0
+        for f in $migrations/*.sql; do
+          base=$(basename "$f" .sql)
+          nnn=''${base%%_*}
+          [[ "$((10#$nnn))" -ge 82 ]] || continue
+          want="-- Commentary: see rio-migrations/src/migrations.rs M_$nnn"
+          first=$(head -n1 "$f")
+          if [[ "$first" != "$want" ]]; then
+            echo "FAIL: $base.sql line 1 is not the M_$nnn pointer:" >&2
+            echo "  have: $first" >&2
+            echo "  want: $want" >&2
+            fail=1
+          fi
+          if tail -n +2 "$f" | grep -n '^--'; then
+            echo "FAIL: $base.sql carries line-anchored comment lines beyond the pointer — commentary belongs in M_$nnn (rio-migrations/src/migrations.rs)" >&2
+            fail=1
+          fi
+          if ! grep -q "pub const M_$nnn: () = ();" $commentary; then
+            echo "FAIL: M_$nnn doc-const missing in rio-migrations/src/migrations.rs" >&2
+            fail=1
+          fi
+        done
+        [[ $fail -eq 0 ]]
+        touch $out
+      '';
+
   # bug_330 / merged_bug_353 (drift half): the chart's metric
   # semantics are RENDERED from the describe_*! HELP scrape
   # (`xtask regen helm-obs` → generated/metric-help.json + in-place
@@ -846,6 +932,8 @@ in
         };
         metricsJson = ../docs/gen/metrics.json;
         cliJson = ../docs/gen/cli.json;
+        alertsJson = ../docs/gen/alerts.json;
+        migrationsJson = ../docs/gen/migrations.json;
       }
       ''
         set -euo pipefail
@@ -922,6 +1010,25 @@ in
         # CLI but kept appearing in docs (R4: ≥5 instances). One
         # alternation per rename; future renames append here.
         #
+        # Bughunt-wave extension (merged_bug_019/284/203 recurrence;
+        # E2 deletion-campaign): EVERY structural-deletion commit
+        # appends its dead symbols here (see CLAUDE.md). Wave tokens:
+        # the ReadyQueue family (A3 [H]), rearm_materialization_job
+        # (A3), trim_chunk + DEFAULT_PEER_URL_TEMPLATE (B3),
+        # tick_publish_gauges (A2.4), pull_attempt_seen_open (C2),
+        # closure_vouched (A4), FencedWrite (A1), rollback_assignment
+        # (pull-mode sweep), COLLECT_CURSOR/COLLECT_BACKLOG_ESTIMATE
+        # (D1), the retired workers_active/queue_depth metric names,
+        # and the deleted rio-scheduler/src/logs/ tree. Recorded
+        # narrowing: the stream-era CONCEPT tokens (hard_filter,
+        # assign_to_worker, BuildExecution, correlation-TTL) are NOT
+        # blanket-banned — their misleading-as-live narrations were
+        # rewritten to live names (placeable()/the spawn-intent
+        # exclusion/the pull mint), but dozens of legitimate historical
+        # citations remain (incident records, ledger-class provenance
+        # docs, spec retirement framing) and a 30-entry allowlist
+        # would bury the signal.
+        #
         # Split into shared/docs/cross (R7-m025): a single alternation
         # over both scan sets is the structural reason "widen pattern X
         # → false-positive in the other scan set" recurs. deny_shared
@@ -929,7 +1036,7 @@ in
         # phrases (legitimately appear in code as historical context);
         # deny_cross adds case/separator variants needed for nix/infra
         # that would FP docs' "Squid FOD proxy is deleted" prose.
-        deny_shared='\bBuilderPool\b|\bFetcherPools?\b|rio-cli bps\b|`bps`|vm-lifecycle-bps|RIO_TLS__|\bTlsError\b|rio-common/src/tls\.rs|load_client_tls|init_client_tls|spec\.sizing|Sizing::|fuseCacheBudget|logBudget|migration-lock mechanism|trigger-gc|--grace-period-hours|mTLS client[- ]cert|mTLS cert mount|mTLS main port|VMs: mTLS|plaintext-health listener|TLS and plaintext ports|mTLS bypass|mTLS-identified|mTLS identifies|falls? back to mTLS|mTLS peer cert|\bplaintext port\b|CN-allowlist\)|\(gateway cert|dev-mode/dev-mode|TLS is env-only|\bTLS init\b|without relying on service tokens|replacement for the service-HMAC|RIO_JWT_SIGNING_KEY_PATH|rio\.jwt(Verify|Sign)Env|worker\.seccomp|`tls` / `metrics_addr`|\brio-worker\b'
+        deny_shared='\bBuilderPool\b|\bFetcherPools?\b|rio-cli bps\b|`bps`|vm-lifecycle-bps|RIO_TLS__|\bTlsError\b|rio-common/src/tls\.rs|load_client_tls|init_client_tls|spec\.sizing|Sizing::|fuseCacheBudget|logBudget|migration-lock mechanism|trigger-gc|--grace-period-hours|mTLS client[- ]cert|mTLS cert mount|mTLS main port|VMs: mTLS|plaintext-health listener|TLS and plaintext ports|mTLS bypass|mTLS-identified|mTLS identifies|falls? back to mTLS|mTLS peer cert|\bplaintext port\b|CN-allowlist\)|\(gateway cert|dev-mode/dev-mode|TLS is env-only|\bTLS init\b|without relying on service tokens|replacement for the service-HMAC|RIO_JWT_SIGNING_KEY_PATH|rio\.jwt(Verify|Sign)Env|worker\.seccomp|`tls` / `metrics_addr`|\brio-worker\b|\bReadyQueue\b|\bpush_ready\b|\bqueue_priority\b|\bINTERACTIVE_BOOST\b|\bseed_ready_queue\b|\brearm_materialization_job\b|\btrim_chunk\b|\bDEFAULT_PEER_URL_TEMPLATE\b|\btick_publish_gauges\b|\bpull_attempt_seen_open\b|\bclosure_vouched\b|\bFencedWrite\b|\brollback_assignment\b|\bCOLLECT_CURSOR\b|\bCOLLECT_BACKLOG_ESTIMATE\b|rio_scheduler_workers_active|rio_scheduler_queue_depth|rio-scheduler/src/logs/'
         deny_docs="$deny_shared|\bmTLS\b|fod-proxy|bundled into the scheduler|kubectl exec deploy/rio-scheduler -- rio-cli"
         deny_cross="$deny_shared|[Ff][Oo][Dd][- ]proxy"
         # builder.typ's "Formerly `rio-worker`" info-box is the rename
@@ -943,7 +1050,7 @@ in
         # assert, vm-lifecycle-bps-k3s and vm-fod-proxy-k3s" is
         # legitimate history; misc-checks.nix is the lint itself.
         if grep -rn -E "$deny_cross" $crossSrc \
-             | grep -vE 'rio-crds/src/pool\.rs:([4-9]|1[01]):|flake\.nix:.*Before this assert|misc-checks\.nix'; then
+             | grep -vE 'rio-crds/src/pool\.rs:([4-9]|1[01]):|flake\.nix:.*Before this assert|misc-checks\.nix|actor/tests/misc\.rs:.*workers_active'; then
           echo "FAIL: retired identifier in non-doc source" >&2
           fail=1
         fi
@@ -972,6 +1079,55 @@ in
           fi
         done < <(grep -rohE '(^|`)rio-cli [a-z][a-z-]*' $typSrc \
           | sed -E 's/(^|`)rio-cli //' | sort -u)
+        # Raw backtick alert name — must go through #(refs.alert) so
+        # the gen/alerts.json membership assert fires (merged_bug_001
+        # recurrence class; alternation derived from alerts.json so a
+        # new alert auto-extends the lint).
+        anames=$(jq -r '.names | join("|")' $alertsJson)
+        if grep -rn --include='*.typ' -E "\`($anames)\`" $typSrc \
+             | grep -v 'lib/refs\.typ'; then
+          echo "FAIL: raw alert name — use #(refs.alert)(\"…\")" >&2
+          fail=1
+        fi
+        # Operator runbooks must not hand-roll attempt-ledger SQL
+        # (merged_bug_010: the drv_executions join came back NULL for
+        # exactly the establishment rows the runbook clusters).
+        # Maintained SQL functions only (the 094_establishment_clusters
+        # pattern); spec chapters narrate schema freely — ops/ is the
+        # enforced operator tier.
+        if grep -rn -E 'FROM drv_|JOIN drv_' $typSrc/ops; then
+          echo "FAIL: raw drv_* SQL in an ops runbook — wrap it in a maintained SQL function" >&2
+          fail=1
+        fi
+        # Migration references (merged_bug_122 — the +2 renumber made
+        # bare numbers silently wrong):
+        #  (a) ops runbooks: no bare "migration NNN" — slug stems only;
+        #  (b) everywhere: the "(0NN)" paren and "migration-0NN" hyphen
+        #      shorthands are banned (the two shapes the renumber
+        #      corrupted: open_attempts' (071)/(072) meant 073/074;
+        #      "migration-066" meant 068);
+        #  (c) every written 0NN_slug token must prefix-match a real
+        #      migrations/ filename (gen/migrations.json).
+        # Spec chapters keep prose "migration NNN" history (recorded
+        # narrowing: ~140 correct historical citations; the corrupted
+        # classes are (a)/(b)/(c)). rio-migrations/ is exempt (frozen
+        # bodies; the M_NNN module IS the commentary home).
+        if grep -rn -E '\bmigrations?[- ][0-9]{2,3}([^0-9_]|$)' $typSrc/ops; then
+          echo "FAIL: bare migration number in an ops runbook — use the NNN_slug stem" >&2
+          fail=1
+        fi
+        if grep -rn -E '\(0[0-9]{2}\)|\bmigrations?-0[0-9]{2}\b' $typSrc $crossSrc \
+             | grep -vE '/rio-migrations/|misc-checks\.nix'; then
+          echo "FAIL: (0NN)/migration-0NN shorthand — use the NNN_slug stem" >&2
+          fail=1
+        fi
+        while IFS= read -r tok; do
+          if ! jq -e --arg t "$tok" '.stems | map(startswith($t)) | any' $migrationsJson > /dev/null; then
+            echo "FAIL: migration slug token '$tok' matches no migrations/ filename" >&2
+            fail=1
+          fi
+        done < <(grep -rohE '\b0[0-9]{2}_[a-z][a-z0-9_]*' $typSrc $crossSrc \
+          | sort -u)
         # configuration.typ is 100% derived from rust Config::default()
         # via gen/config.json. Rust source citing it as a spec source is
         # inverted-dataflow (R3-m002, R4-003, R5-019). observability.typ

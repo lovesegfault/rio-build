@@ -817,7 +817,7 @@ mod tests {
     }
 
     // r[verify store.substitute.progress-heartbeat]
-    /// The guard\'s heartbeat carries the handle\'s PHASE durably (092):
+    /// The guard\'s heartbeat carries the handle\'s PHASE durably (092_manifests_claim_phase):
     /// stamp BudgetParked on the handle and the next tick mirrors it
     /// to `manifests.claim_phase`.
     #[tokio::test]

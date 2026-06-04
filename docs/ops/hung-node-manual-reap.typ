@@ -14,7 +14,7 @@ clustering described below — a node accumulating expired open attempts for
 two or more distinct derivations inside the 30-minute window is marked
 Dead-equivalent (#(refs.metric)("rio_controller_node_wedge_marked_total"))
 and reaped through the existing capped NodeClaim Dead arm. The
-`RioSchedulerAttemptEstablishmentCluster` alert plus this runbook remain the
+#(refs.alert)("RioSchedulerAttemptEstablishmentCluster") alert plus this runbook remain the
 independent operator-facing tripwire and the manual confirmation/fallback
 procedure (OA2 option C's compensating controls, kept as deliverables).
 

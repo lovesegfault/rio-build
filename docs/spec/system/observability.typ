@@ -27,8 +27,9 @@ Build logs are stored in S3 as immutable, append-only chunks:
 logs/{drv_hash}/{exec_id}/{session_id}/{chunk_seq}.zst
 ```
 
-`exec_id` is a per-execution UUIDv7 minted by the scheduler at dispatch
-(`assign_to_worker`) and recorded in the `drv_executions` lifecycle row.
+`exec_id` is a per-execution UUIDv7 minted by the scheduler at the pull
+mint (`mint_and_deliver`) and recorded in the `drv_executions` lifecycle
+row.
 Time-sortability means "latest execution for a derivation" is a single index
 seek (`ORDER BY exec_id DESC LIMIT 1`). `session_id` is minted per
 `AppendLog` stream, so a builder reconnect or a store-replica failover opens

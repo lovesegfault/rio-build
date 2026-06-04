@@ -400,7 +400,7 @@ pub struct SlaConfig {
     /// regions share one PG; without this every scheduler upserts the
     /// SAME `key` and reads every region's interrupt rows. Helm sets
     /// `scheduler.sla.cluster = .Values.karpenter.clusterName`.
-    /// Empty (single-cluster default) matches the migration-043
+    /// Empty (single-cluster default) matches the 043_sla_hardening
     /// `DEFAULT ''` so greenfield deploys need no config.
     #[serde(default)]
     pub cluster: String,

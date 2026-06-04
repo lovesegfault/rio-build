@@ -21,7 +21,7 @@ use uuid::Uuid;
 /// zstd compression level for log chunks.
 ///
 /// Ported verbatim from the scheduler's flusher
-/// (`rio-scheduler/src/logs/flush.rs::compress_with_prefix`, level 6):
+/// (ported from the retired scheduler-side log-flush codec, level 6):
 /// build logs are highly compressible (~10:1 on typical compiler
 /// output), and level 6 is the knee of the ratio/CPU curve for few-MiB
 /// payloads.

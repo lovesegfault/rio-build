@@ -570,7 +570,7 @@ pub enum AttemptEvent<Id> {
     /// stays uncharged.
     EstablishedCrash { at: AbsTime, executor: Option<Id> },
     /// A successful dispatch. Clears `backoff_until`
-    /// (`assign_to_worker`).
+    /// (the pull-mint delivery).
     Dispatched { at: AbsTime, executor: Option<Id> },
     /// The `dag::merge` resubmit reset of a retriable terminal node:
     /// fresh per-cycle state, `resubmit_cycles` incremented. The event is
@@ -631,8 +631,9 @@ pub struct Counters<Id> {
     /// (`RetryState::exempt_infra_count`).
     pub exempt_infra_count: u32,
     /// The per-executor exclusion set (`RetryState::failed_builders`).
-    /// Drives `hard_filter`'s placement exclusion, the distinct-workers
-    /// poison threshold, and the fleet-exhaust check.
+    /// Drives the placement exclusion ([`placeable`] / the spawn-intent
+    /// exclusion), the distinct-workers poison threshold, and the
+    /// fleet-exhaust check.
     pub failed_builders: IdSet<Id>,
     /// Flat failure count for `require_distinct_workers = false`
     /// (`RetryState::failure_count`).
@@ -1084,7 +1085,7 @@ fn apply<Id: Ord + Clone>(
             }
         }
 
-        // ── assign_to_worker ────────────────────────────────────────
+        // ── dispatched (pull-mint delivery) ─────────────────────────
         AttemptEvent::Dispatched { .. } => {
             c.backoff_until = None;
             Verdict::Requeue
@@ -1308,9 +1309,9 @@ pub struct Decision<Id> {
     pub verdict: Verdict,
     /// The per-executor exclusion set (the fold's `failed_builders`).
     /// E1's fleet-exhaust arm and the E9 dispatch backstop intersect it
-    /// with the live eligible fleet via [`placeable`]; `hard_filter`
-    /// consumes the same set through the fold-refreshed cached view
-    /// (`RetryState::failed_builders`).
+    /// with the live eligible fleet via [`placeable`]; the spawn-intent
+    /// exclusion consumes the same set through the fold-refreshed cached
+    /// view (`RetryState::failed_builders`).
     pub exclusion: IdSet<Id>,
     /// The deterministic backoff deadline (no jitter — the dispatch site
     /// applies the production jitter exactly as today).
@@ -1741,7 +1742,7 @@ pub fn materialization_decide<Id: Ord + Clone>(
 /// scheduler's flat per-class history counts are deleted in favor of
 /// this fold). All three counts share ONE window: the suffix after the
 /// last materialization-kind reset row (same cut as
-/// [`materialization_decide`]; a migration-085 job-creation reset
+/// [`materialization_decide`]; a 085_materialization_reset_class job-creation reset
 /// re-zeros all three at once). Build-kind rows neither count nor cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MatCounters {

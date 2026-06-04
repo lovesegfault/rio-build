@@ -96,7 +96,8 @@
       <sched>,
       <pods>,
       "-|>",
-      [gRPC `BuildExecution`],
+      [gRPC pull
+        (`PullAssignment`)],
       label-size: 0.75em,
       label-side: right,
     ),
@@ -164,8 +165,9 @@ builders or other components --- it watches CRDs and reconciles desired state.
 
 #figure(
   caption: [Component topology. Gateway terminates ssh-ng and fans out to
-    scheduler/store via gRPC; builders pull work over the bidirectional
-    `BuildExecution` stream; controller reconciles builder pods via the
+    scheduler/store via gRPC; builder and store-executor pods pull work
+    over the unary pull protocol (`PullAssignment` /
+    `ReportAttemptOutcome`); controller reconciles builder pods via the
     Kubernetes API.],
   diagram(
     spacing: (16mm, 12mm),
@@ -199,7 +201,7 @@ builders or other components --- it watches CRDs and reconciles desired state.
       <builders>,
       <sched>,
       "-|>",
-      [BuildExecution],
+      [pull RPCs],
       label-size: 0.75em,
       label-side: left,
       label-pos: 0.35,
@@ -347,7 +349,7 @@ and #cross-link("/spec/components/store.typ")[rio-store] for the chunked CAS.
       _seq(
         "Sched",
         "Builder",
-        comment: [`WorkAssignment` (via `BuildExecution`)#pin("rs-assign")],
+        comment: [`PullAssignment` delivery (pull mode)#pin("rs-assign")],
       )
       _seq("Builder", "Store", comment: [`GetPath` (FUSE fetch)])
       _seq("Builder", "Builder", comment: [nix sandbox build])
@@ -483,8 +485,8 @@ and #cross-link("/spec/components/store.typ")[rio-store] for the chunked CAS.
 + New leader reconstructs in-memory state from PostgreSQL (see the
   #cross-link("/spec/components/scheduler.typ")[scheduler spec] State Recovery
   section). Dispatch is gated on `recovery_complete`.
-+ Executors detect stream break and reconnect `BuildExecution` streams to the
-  new leader.
++ Executor pulls fail over to the new leader: there are no streams to
+  reconnect — the next `PullAssignment` poll simply lands there.
 + For gateway connections with active `SubmitBuild` streams:
   + The `BuildEvent` response stream breaks with a gRPC Transport error.
   + Gateway's `process_stream` classifies the error as

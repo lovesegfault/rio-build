@@ -119,7 +119,7 @@ pkgs.testers.runNixOSTest {
         (${gatewayHost}, 9091, "scheduler"): [
             # Pull-era fleet observable (set every establishment-sweep
             # tick, so present even at 0); replaces the stream-era
-            # rio_scheduler_workers_active registration gauge here —
+            # the retired stream-era busy-fleet registration gauge here —
             # standalone workers deliver over the pull path since the
             # T-1c.2b re-point and never register.
             "rio_scheduler_open_attempts",

@@ -493,8 +493,8 @@ impl DerivationStatus {
 /// state — the production jitter is applied at the failure site and
 /// the clear-on-dispatch has no ledger event). The durable source of
 /// truth for every verdict is the appending transaction's suffix read;
-/// this view only feeds the dispatch-time readers (`hard_filter`'s
-/// exclusion, the backoff defer), diagnostics, and the resubmit-bound
+/// this view only feeds the dispatch-time readers (the placement
+/// exclusion via `placeable`, the backoff defer), diagnostics, and the resubmit-bound
 /// check.
 #[derive(Debug, Clone, Default)]
 pub struct RetryState {
@@ -580,7 +580,7 @@ pub struct RetryState {
     /// it. Cost: one Instant::now() comparison per Ready-pop for
     /// derivations that have backoff set (only transient-failures).
     ///
-    /// Cleared on successful dispatch (assign_to_worker).
+    /// Cleared on successful dispatch (the pull-mint delivery).
     pub backoff_until: Option<Instant>,
 }
 
@@ -682,7 +682,7 @@ db_str_enum! {
         StoreDegraded = "store_degraded",
     }
     parse_err(_s) = &'static str:
-        "invalid outcome class (not in the migration-066 alphabet)";
+        "invalid outcome class (not in the 068_drv_attempts alphabet)";
 }
 
 db_str_enum! {
@@ -750,7 +750,7 @@ db_str_enum! {
         Reprobe = "reprobe",
     }
     parse_err(_s) = &'static str:
-        "invalid materialization-job origin (not in the migration-078 alphabet)";
+        "invalid materialization-job origin (not in the 078_materialization_jobs alphabet)";
 }
 
 db_str_enum! {
@@ -776,7 +776,7 @@ db_str_enum! {
         Cancelled = "cancelled",
     }
     parse_err(_s) = &'static str:
-        "invalid materialization-job state (not in the migration-078 alphabet)";
+        "invalid materialization-job state (not in the 078_materialization_jobs alphabet)";
 }
 
 /// In-memory mirror of one `drv_attempts` row — the per-node attempt
@@ -942,8 +942,8 @@ pub struct ResourceFloor {
 /// Output of `solve_intent_for`: per-derivation `(cores, mem, disk,
 /// deadline)` SpawnIntent shape + the dispatch-time SLA prediction
 /// snapshot + the cost-routed nodeSelector. Stored on
-/// [`SchedHint::last_intent`] at dispatch so `hard_filter` /
-/// `build_assignment_proto` / `bump_floor_or_count` /
+/// [`SchedHint::last_intent`] at dispatch so the spawn-intent solve /
+/// the mint profile / `bump_floor_or_count` /
 /// `record_build_sample` all read the SAME solve.
 #[derive(Debug, Clone, Default)]
 pub struct SolvedIntent {
@@ -989,9 +989,9 @@ pub struct SolvedIntent {
 pub struct SchedHint {
     /// D4: per-dimension reactive floor. See [`ResourceFloor`].
     pub resource_floor: ResourceFloor,
-    /// Dispatch-time `solve_intent_for` output. `hard_filter` reads
-    /// `mem_bytes` (resource-fit), `build_assignment_proto` reads
-    /// `cores` (`WorkAssignment.assigned_cores`), `bump_floor_or_count`
+    /// Dispatch-time `solve_intent_for` output. The spawn-intent solve
+    /// reads `mem_bytes` (resource-fit), the mint profile reads
+    /// `cores` (the assigned-cores carry), `bump_floor_or_count`
     /// reads `mem/disk/deadline` as the doubling base,
     /// `record_build_sample` reads `predicted` for actual-vs-predicted
     /// scoring.
@@ -999,7 +999,7 @@ pub struct SchedHint {
     /// Populated at DISPATCH time (`dispatch_ready`), not merge time —
     /// the estimator refreshes on Tick, so a long-queued derivation
     /// picks up fresh history. `None` = never dispatched (cold start /
-    /// recovery) — `hard_filter` treats it as "any worker fits".
+    /// recovery) — placement treats it as "any worker fits".
     /// In-memory only.
     pub last_intent: Option<SolvedIntent>,
     /// Estimated build duration (from Estimator). Set at merge time;
@@ -1072,14 +1072,15 @@ pub struct DerivationState {
     pub interested_builds: HashSet<Uuid>,
     /// Worker currently assigned/running this derivation.
     pub assigned_executor: Option<ExecutorId>,
-    /// Per-execution identifier minted by `assign_to_worker` for the
+    /// Per-execution identifier minted at the pull mint
+    /// (`mint_and_deliver` → `mint_pull_attempt_fenced`) for the
     /// active assignment. UUIDv7 — keys the `drv_executions` PG row and
     /// rio-store's `logs/{drv_hash}/{exec_id}/...` chunk objects.
     /// Mirrors `assignments.exec_id` (the recovery carrier).
     ///
-    /// `None` on construction. Set by `assign_to_worker`; cleared by
-    /// `reset_to_ready` (worker disconnect, phantom drain, orphan
-    /// reconcile, infra/timeout retry below cap, and `rollback_assignment`)
+    /// `None` on construction. Set at the pull mint; cleared by
+    /// `reset_after_attempt` (lost worker, establishment, infra/timeout
+    /// retry below cap)
     /// and by `transition()` on any
     /// terminal → non-terminal reset (I-094 reprobe, I-047 stale-output
     /// reset — the prior execution was already finalized at its
@@ -1515,8 +1516,8 @@ impl DerivationState {
     /// the `set_required_features` write-gate). EVERY routing
     /// consumer reads this — `passes_intent_filter`, `h_all`
     /// partition, `override_hash` memo key, `retain_hosting_cells`,
-    /// `bypass_cells` cold-start, `hard_filter`/`rejection_reason`,
-    /// `statically_eligible`, the wire `SpawnIntent.required_features`.
+    /// `bypass_cells` cold-start, the candidate `admits()` axes,
+    /// the wire `SpawnIntent.required_features`.
     /// The TWO intentional bypasses read the in-memory normalized set
     /// via [`Self::required_features`]: `actor/snapshot.rs::
     /// handle_inspect_build_dag` and `actor/dispatch.rs`'s

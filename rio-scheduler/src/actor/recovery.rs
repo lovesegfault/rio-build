@@ -976,8 +976,8 @@ impl DagActor {
     /// Also zeros the leader-only state gauges (one-shot). A fresh
     /// standby never sets them; a was-leader-now-standby would
     /// otherwise export its frozen last-tick values forever (the
-    /// `tick_publish_gauges` call is unreachable on standby via the
-    /// `handle_tick` gate). Prometheus then sees two series per
+    /// snapshot-sourced gauge re-emit is unreachable on standby via
+    /// the `handle_tick` gate). Prometheus then sees two series per
     /// gauge until this pod restarts.
     // r[impl sched.lease.standby-tick-noop+2]
     // r[impl obs.metric.scheduler-leader-gate+5]

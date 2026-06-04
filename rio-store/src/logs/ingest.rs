@@ -33,8 +33,8 @@ use super::kernel::{AcceptVerdict, accept_verdict};
 /// Max bytes per stored line. Longer lines are truncated at accept so a
 /// single line cannot dominate the buffer or a chunk.
 ///
-/// Ported verbatim from the scheduler's ring buffer
-/// (`rio-scheduler/src/logs/mod.rs::MAX_LINE_LEN`); the value is part of
+/// Ported verbatim from the retired scheduler-side ring buffer's
+/// MAX_LINE_LEN; the value is part of
 /// the worker-facing contract (the builder's `LogBatcher` does not
 /// pre-truncate, it relies on the server doing so).
 pub const MAX_LINE_LEN: usize = 64 * 1024;

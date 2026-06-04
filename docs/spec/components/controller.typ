@@ -1337,7 +1337,8 @@ the proto, and the union arm stays a no-op, until the 1d sweep). The
 #(refs.metric)("rio_controller_node_wedge_marked_total") counter records each
 not-wedged→wedged transition and
 #(refs.metric)("rio_controller_wedge_systemic_suppressed_total") each tick the
-systemic guard refused to mark; the `RioSchedulerAttemptEstablishmentCluster`
+systemic guard refused to mark; the
+#(refs.alert)("RioSchedulerAttemptEstablishmentCluster")
 alert and the manual-reap runbook remain the independent operator-facing
 tripwire and confirmation procedure --- the automation now applies the
 runbook's systemic-vs-per-node discrimination itself before feeding the Dead

@@ -170,7 +170,7 @@ pub(crate) struct OpenAttemptRow {
     /// builder/fetcher `kind` on the re-pointed `ListExecutors`
     /// surface (one-shot pods build exactly the drv they pulled).
     pub is_fixed_output: bool,
-    /// Controller-authoritative node binding, when known (071).
+    /// Controller-authoritative node binding, when known (073_attempt_source_node).
     pub source_node: Option<String>,
     /// Lease generation the assignment row carries.
     pub generation: i64,
@@ -181,7 +181,7 @@ pub(crate) struct OpenAttemptRow {
     /// Age of the assignment row in seconds (PG clock, non-negative).
     pub age_secs: f64,
     /// The deadline (seconds) this attempt was dispatched under,
-    /// persisted by the pull mint (072). The establishment sweep's
+    /// persisted by the pull mint (074_execution_deadline). The establishment sweep's
     /// window anchor: the window may widen via the sweep-time re-solve
     /// but never shrink below this. `None` for rows minted before 072.
     pub deadline_secs: Option<f64>,
@@ -292,8 +292,8 @@ impl SchedulerDb {
             return Ok(super::FencedOutcome::Fenced);
         }
         // The execution lifecycle row carries the controller-
-        // authoritative source attribution (071), the dispatched-
-        // deadline anchor for the establishment window (072), and the
+        // authoritative source attribution (073_attempt_source_node), the dispatched-
+        // deadline anchor for the establishment window (074_execution_deadline), and the
         // work class (078, substitution-replacement: 'build' for build
         // pulls — value-identical to the column default — and
         // 'materialization' for store-replica claims; the kind

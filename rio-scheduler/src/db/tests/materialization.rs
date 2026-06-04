@@ -699,7 +699,7 @@ async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<(
     Ok(())
 }
 
-/// The Rust-side `JobOrigin`/`JobState` alphabets and the migration-078
+/// The Rust-side `JobOrigin`/`JobState` alphabets and the 078_materialization_jobs
 /// CHECK constraints stay in lockstep: every enum variant is accepted
 /// by PG, and every literal PG accepts has an enum variant (the
 /// `OutcomeClass` lockstep pattern).

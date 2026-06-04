@@ -36,8 +36,8 @@ leader-gating, and histogram bucket policy are specified normatively in
 
 #info[
   Per ADR-019 §Observability, the former `rio_worker_*` metrics are now
-  `rio_builder_*`. (The scheduler-side rio_scheduler_queue_depth and
-  rio_scheduler_utilization `{kind}` gauges that used to track the
+  `rio_builder_*`. (The scheduler-side per-kind queue-depth and
+  utilization `{kind}` gauges that used to track the
   builder/fetcher split retired with the placement layer; the
   per-system backlog split is `queued_by_system` on
   `ClusterStatus`/`GetSpawnIntents`.)

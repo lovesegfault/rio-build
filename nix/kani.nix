@@ -312,8 +312,8 @@ in
   };
 
   # rio-evidence-kernel: the scheduler's closure-evidence decision kernel
-  # (the ClosureEvidence classifier, the must_substitute()/
-  # closure_vouched() predicates, and the pull-admission decision
+  # (the ClosureEvidence classifier, the merge/establishment
+  # predicates, and the pull-admission decision
   # admit_pull()), extracted from rio-scheduler/src/dag/mod.rs +
   # actor/merge.rs + actor/pull.rs into a dependency-free crate so the
   # harnesses' goto model closes over the kernel alone — the
@@ -325,21 +325,19 @@ in
   # lifecycle protocol over these predicates, these harnesses prove the
   # predicates themselves over their full bounded input domain.
   #
-  # Nine harnesses, measured at ~0.05–0.65 s CBMC time each (~3 s
-  # total, ~15 s wall with the kani-compiler build) on the dev builder.
+  # Measured at ~0.05–0.65 s CBMC time per harness (the count is
+  # pinned by expectedHarnesses below) on the dev builder.
   #
   # Classifier (rio-evidence-kernel/src/lib.rs `mod proofs` — reduced
   # to the 2-input domain in T-D5.2: the walk-era hole/mark inputs and
   # the must_substitute predicate died with the evidence columns):
   #   - check_classifier_exhaustive_case_analysis: the classifier's
-  #     four-case partition (absent/childless → Broken; non-empty
-  #     all-produced → Vouched; otherwise Pending) is exact, total, and
-  #     panic-free over every bounded child set.
+  #     four-cell partition (absent → Holed; empty → ChildlessLeaf;
+  #     non-empty all-produced → Vouched; otherwise Pending) is exact,
+  #     total, and panic-free over every bounded child set.
   #   - check_vouched_iff_nonempty_all_produced: Vouched exactly when
   #     present ∧ non-empty ∧ all children produced — the criterion the
   #     pruned-origin exemption keys on.
-  #   - check_closure_vouched_contract: proof_for_contract over the
-  #     predicate's #[kani::ensures] clause, full evidence alphabet.
   #
   # Pull admission (rio-evidence-kernel/src/pull.rs `mod proofs`):
   #   - check_admit_pull_partition: the base table's exhaustive
@@ -386,8 +384,8 @@ in
     # 11 → 12: + check_no_build_mint_inside_backoff_window (A3/282 —
     # the named (Build, None) backoff cell; the wide partition proofs
     # already cover it, the named harness pins the conjunct).
-    # 13 → 12: − check_closure_vouched_contract (A4/bug_390 — the
-    # closure_vouched predicate is DELETED with its sole caller, the
+    # 13 → 12: − check_the deleted in-memory closure-vouch shim_contract (A4/bug_390 — the
+    # the deleted in-memory closure-vouch shim predicate is DELETED with its sole caller, the
     # in-memory merge gate; every consumer reads the durable
     # classifier's 4-cell verdict now; recount composed over B1-s2's
     # 12 → 13 resume-token harness, second-lander reconcile).

@@ -76,7 +76,7 @@ pub(crate) type FleetView = rio_retry_kernel::FleetView<String>;
 ///
 /// This is the kernel's `Decision` translated into the actor's
 /// identifier vocabulary: the exclusion set is keyed by [`ExecutorId`]
-/// (what `placeable()` and `hard_filter` consume), while the full
+/// (what `placeable()` and the spawn-intent exclusion consume), while the full
 /// counter view keeps the fold's `String` keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Decision {
@@ -85,8 +85,8 @@ pub(crate) struct Decision {
     /// The per-executor exclusion set (the fold's `failed_builders`) in
     /// the actor's identifier vocabulary. E1's fleet-exhaust arm and the
     /// E9 dispatch backstop intersect it with the live eligible fleet via
-    /// [`placeable`]; `hard_filter` consumes the same set through the
-    /// fold-refreshed cached view (`RetryState::failed_builders`).
+    /// [`placeable`]; the spawn-intent exclusion consumes the same set
+    /// through the fold-refreshed cached view (`RetryState::failed_builders`).
     pub exclusion: BTreeSet<ExecutorId>,
     /// The deterministic backoff deadline (no jitter — the dispatch site
     /// applies the production jitter exactly as today).

@@ -155,7 +155,7 @@ async fn drain_one_row(
     // otherwise be re-selected; the original batch-tx held all rows
     // FOR UPDATE so this was implicit).
     //
-    // blake3_hash is nullable: pre-migration-006 rows have NULL
+    // blake3_hash is nullable: pre-006_gc_safety rows have NULL
     // → drain proceeds unconditionally (old behavior). New rows
     // have the hash → re-check `chunks` before S3 delete.
     let Some((id, key, blake3_hash)): Option<(i64, String, Option<Vec<u8>>)> = sqlx::query_as(
@@ -439,7 +439,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_proceeds_on_null_blake3_hash() {
-        // Pre-migration-006 rows have NULL blake3_hash → no re-check,
+        // Pre-006_gc_safety rows have NULL blake3_hash → no re-check,
         // proceed unconditionally (old behavior).
         let db = TestDb::new(&crate::MIGRATOR).await;
         let backend: Arc<dyn ChunkBackend> = mem_backend();

@@ -936,7 +936,7 @@ async fn test_topdown_stamp_skips_kept_node_whose_children_are_already_produced(
         "fixture premise: B1 took the roots-only prune path"
     );
 
-    // R's children are all produced (closure_vouched) → the pruned arm
+    // R's children are all produced (⇒ Vouched) → the pruned arm
     // must skip it; the reprobe lane still queues its job, with the
     // non-doomed origin.
     let (origin,): (String,) =

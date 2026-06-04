@@ -1766,10 +1766,6 @@ async fn batch_probe_locally_present_batches_pg() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// rollback_assignment is a complete inverse of record_assignment
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // I-139/I-140: batch-probe truncated tail must NOT hit per-drv FMP fallback
 // ---------------------------------------------------------------------------
 

@@ -404,7 +404,7 @@ pub async fn resolve_exec(
 
     let drv_hash = drv_log_hash(derivation);
     // r[impl store.log.read-authority]
-    // The kind-filtered view (089) is THE unpinned resolver; the
+    // The kind-filtered view (089_log_authority) is THE unpinned resolver; the
     // `log-no-raw-latest-exec` policy check bans new raw
     // `ORDER BY exec_id DESC` reads of `drv_executions` so a second
     // kind-blind copy of this resolution cannot grow back. Runtime

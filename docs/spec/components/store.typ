@@ -1852,7 +1852,7 @@ CREATE TABLE chunks (
     size               BIGINT NOT NULL,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     uploaded_at        TIMESTAMPTZ,            -- confirmed backend presence (M_033)
-    last_referenced_at TIMESTAMPTZ,            -- upsert conflict-arm touch (068)
+    last_referenced_at TIMESTAMPTZ,            -- upsert conflict-arm touch (070_chunks_last_referenced_at)
     deleted            BOOLEAN NOT NULL DEFAULT FALSE
 );
 -- (the historical refcount column, its CHECK, and idx_chunks_gc are

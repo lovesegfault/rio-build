@@ -2171,7 +2171,7 @@ in
     # decrement/token machinery; the collector of
     # rio-store/src/gc/collect.rs (snapshot → fail-closed mark →
     # per-batch sweep → finish) modeled with its live (soft-delete +
-    # enqueue) arm, the migration-068 last_referenced_at touch, the
+    # enqueue) arm, the 068-era last_referenced_at touch, the
     # T-pre.1 deleted-guard on the presence commit, reap/path-sweep as
     # path-row janitors, and the deleted-only drain re-check. Four
     # exhaustive regimes mirror the as-built model's; two further

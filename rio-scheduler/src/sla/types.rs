@@ -194,7 +194,7 @@ pub struct FittedParams {
     /// build-time — `fleet_median` excludes these so a tenant's
     /// `fetchurl` corpus can't drag the cross-tenant prior. Derived
     /// from `build_samples.is_fixed_output` at refit time; `false` for
-    /// pre-migration-057 rows (NULL → not-FOD is the safe default since
+    /// pre-057_build_samples_is_fixed_output rows (NULL → not-FOD is the safe default since
     /// the old behavior was no exclusion at all).
     pub is_fod: bool,
 }

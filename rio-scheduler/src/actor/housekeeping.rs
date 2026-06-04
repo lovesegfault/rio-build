@@ -170,8 +170,8 @@ impl DagActor {
             .set(f64::from(snapshot.substituting_derivations));
         // A2.4 (bug_217): the state gauges are single-sourced from the
         // SAME snapshot the proto fields serve — gauge and
-        // `ClusterStatus` cannot diverge (pre-fix tick_publish_gauges
-        // recomputed them independently and counted pending-job Ready
+        // `ClusterStatus` cannot diverge (the pre-fix standalone gauge
+        // publisher recomputed them independently and counted pending-job Ready
         // nodes as builder-queue depth, the has_pending_unclaimed_job
         // omission). Leader-gated by the handle_tick early-return;
         // zeroed by handle_leader_lost.

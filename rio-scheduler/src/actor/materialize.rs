@@ -702,7 +702,7 @@ impl DagActor {
         }
     }
 
-    /// Mirror the migration-085 job-creation reset row into the node's
+    /// Mirror the 085_materialization_reset_class job-creation reset row into the node's
     /// in-memory history (the durable row was written inside the
     /// creating transaction): the in-memory [`Self::mat_counters`]
     /// re-window immediately, identically to a post-failover suffix
@@ -1942,8 +1942,8 @@ impl DagActor {
     ///      (gauge) is set to the ground-truth count of jobs still
     ///      parked after the pass — the §2.5 operator signal ("a
     ///      genuinely dead upstream makes builds wait visibly"). Set
-    ///      from truth every tick (the `tick_publish_gauges`
-    ///      self-healing discipline), so resolutions, re-arms, and
+    ///      from truth every tick (the handle_tick snapshot-sourced
+    ///      re-emit self-healing discipline), so resolutions, re-arms, and
     ///      cancellations are never missed decrements.
     ///
     /// Leader-only by construction (`handle_tick` returns early on

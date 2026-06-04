@@ -1531,7 +1531,7 @@ the falsifiability pair.
 
 The knob is the Item T strictness half (harden-store reconciliation memo
 §6.2(b)); the observability half (the conversion counter and the
-`RioSchedulerMaterializationConversions` alert) landed first, and flipping
+#(refs.alert)("RioSchedulerMaterializationConversions") alert) landed first, and flipping
 either field's default ON in deployment is an operational act gated on that
 alert's evidence (owner ruling 2026-06-02). Knob-ON defers --- never
 forecloses --- the settlement rule's "resolves from-source the moment its
@@ -3141,7 +3141,7 @@ resurrection writer exists for a closed assignment. The orphan arm rests on
 referential unreachability, not the fold: a re-submitted `drv_hash` mints a
 FRESH derivation UUID after GC, so an orphaned history's `derivation_id` can
 never be named by any loader again (the active-assignment conjunct is
-vacuous there --- the migration-034 cascade removed the assignments rows with
+vacuous there --- the 034_assignments_terminal_backfill cascade removed the assignments rows with
 the derivation). Accepted narrowing: `ListPoisoned`'s display aggregates
 failed executors over full history, so pre-reset entries older than the
 horizon disappear from the operator display (decisions unaffected). The
@@ -3218,7 +3218,7 @@ CREATE TABLE derivations (
     required_features   TEXT[] NOT NULL DEFAULT '{}',
     assigned_builder_id TEXT,
     -- assignment_gen lives on assignments table (as generation), not here
-    -- retry/poison counters live in the drv_attempts ledger (066), not here
+    -- retry/poison counters live in the drv_attempts ledger (068_drv_attempts), not here
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT derivations_drv_hash_uq UNIQUE (drv_hash)

@@ -292,7 +292,7 @@ async fn test_attempt_suffix_unknown_derivations_absent() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// The Rust-side alphabets and the migration-066 CHECK constraints stay
+/// The Rust-side alphabets and the 068_drv_attempts CHECK constraints stay
 /// in lockstep: every enum variant is accepted by PG, and every literal
 /// PG accepts has an enum variant.
 #[tokio::test]
@@ -518,7 +518,7 @@ async fn test_suffix_load_carries_attempt_kind_and_partition() -> anyhow::Result
     Ok(())
 }
 
-/// The Rust-side `AttemptKind` alphabet and the migration-078
+/// The Rust-side `AttemptKind` alphabet and the 078_materialization_jobs
 /// `drv_executions.attempt_kind` CHECK constraint stay in lockstep —
 /// the same discipline as the outcome-class alphabet test above.
 #[tokio::test]
@@ -574,7 +574,7 @@ async fn append_committed(db: &SchedulerDb, rows: &[AttemptRow]) -> anyhow::Resu
 }
 
 /// Backdate `recorded_at` of the given rows by 3 days (past the 24 h
-/// horizon). `recorded_at` is `DEFAULT now()` at insert (068), so tests
+/// horizon). `recorded_at` is `DEFAULT now()` at insert (068_drv_attempts), so tests
 /// age rows explicitly.
 async fn backdate(db: &SchedulerDb, ids: &[Uuid]) -> anyhow::Result<()> {
     sqlx::query(
@@ -1332,7 +1332,7 @@ async fn test_gc_exec_rows_spares_referenced_and_live() -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// establishment_clusters() — the runbook's per-node clustering (094)
+// establishment_clusters() — the runbook's per-node clustering (094_establishment_clusters)
 // ---------------------------------------------------------------------------
 
 /// merged_bug_010: the hung-node runbook's prose SQL joined

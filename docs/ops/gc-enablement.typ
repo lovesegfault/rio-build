@@ -182,9 +182,9 @@ chunks keep their counts until Release B). Anything else is
 unexplained --- stop before the Release-B stage and investigate.
 
 *Staged order (D0).* Deploy the additive/Release-A tree first
-(migration 070, the upsert touch, the live collector); only after rows
+(070_chunks_last_referenced_at, the upsert touch, the live collector); only after rows
 D1--D5 pass deploy the Release-B tree (069 + writer deletion). The
-current tree carries migration 072 (the `chunks.refcount` column drop)
+current tree carries 072_drop_chunks_refcount (the `chunks.refcount` column drop)
 in-tree per the 2026-05-27 owner clarification (no staged rollout, no
 existing clusters or databases --- deployments are fresh), so a fresh
 deployment simply runs 068--070 with the rest of the migration chain
@@ -230,7 +230,7 @@ validate the collector against real data, not against a fleet shape).
   #(refs.metric)("rio_store_gc_collect_cycles_capped_total"),
   #(refs.metric)("rio_store_gc_chunks_collected_total"), and per-cycle
   durations after the live cutover. The three collect gauges are
-  CLUSTER-CONVERGED since migration 090: every replica publishes the
+  CLUSTER-CONVERGED since 090_gc_collect_state: every replica publishes the
   durable `gc_collect_state` value within one 60 s period --- aggregate
   with `max()` across pods, never `sum()` (which now inflates by the
   replica count). Pass: the backlog gauge trends to
@@ -253,7 +253,7 @@ validate the collector against real data, not against a fleet shape).
   steady, no `GetPath` regressions. Lever: redeploy Release-A binaries
   (recorded safe: nothing names the dropped CHECK/index; the column
   still exists until 070); investigate before re-attempting.
-+ *D7 --- migration 072 (the `chunks.refcount` column drop).* 072
++ *D7 --- 072_drop_chunks_refcount (the `chunks.refcount` column drop).* 072
   ships in-tree (2026-05-27 owner clarification) and runs with the
   rest of the migration chain at pod startup --- on a fresh
   fleet/database this row is the ordinary "migrations run on deploy"

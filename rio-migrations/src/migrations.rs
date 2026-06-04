@@ -1080,7 +1080,7 @@ pub const M_062: () = ();
 /// closure hole — has its closure in the store; childless kept nodes
 /// ARE marked, present-but-unbuilt children do not exempt a node, and
 /// a closure-holed node is stamped even if its surviving children are
-/// all produced — see `closure_vouched` in `actor/merge.rs`);
+/// all produced — see the durable 4-cell classifier `classify_durable_evidence_in_tx`);
 /// **OR-combined on conflict**
 /// (`derivations.topdown_pruned OR EXCLUDED.topdown_pruned`) so an
 /// unrelated non-pruned merge of the same drv never clears it; cleared

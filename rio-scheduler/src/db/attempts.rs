@@ -59,7 +59,7 @@ const _: () = assert!(
 
 /// One `drv_attempts` row, as written by the appending sites and as
 /// read back by [`SchedulerDb::load_attempt_suffix`]. Field-for-field
-/// the migration-066 schema; `recorded_at_epoch_secs` is PG-assigned
+/// the 068_drv_attempts schema; `recorded_at_epoch_secs` is PG-assigned
 /// (`DEFAULT now()`) and meaningful only on rows read back from the
 /// ledger.
 #[derive(Debug, Clone)]

@@ -258,8 +258,8 @@ builder pods"; two kinds keep the trust boundaries in the type system.
 *Consequences.* Migration was big-bang: proto, CRD, and crate renames landed
 together. Four namespaces means cross-namespace RBAC for the controller and
 `namespaceSelector`-based NetworkPolicies. `rio_worker_*` metrics became
-`rio_builder_*`; rio_scheduler_queue_depth and
-rio_scheduler_utilization (both retired with the placement layer) gained a `{kind}` label
+`rio_builder_*`; the stream-era per-kind queue-depth and
+utilization gauges (both retired with the placement layer) gained a `{kind}` label
 (`builder`/`fetcher`) to track the split. The fetcher @seccomp
 profile may be too strict for exotic fetchers (git-lfs, Mercurial, Subversion)
 --- the profile starts as builder-profile-plus-denies and the allowlist widens

@@ -304,7 +304,7 @@ impl DagActor {
                 // whose dependency closure this prune is about to drop.
                 // Only these (∩ the kept set, and only when the closure
                 // classifier does not vouch for their existing children
-                // — see closure_vouched) get the pruned-origin
+                // — see classify_durable_evidence_in_tx) get the pruned-origin
                 // materialization job — a dep-less demanded leaf never
                 // had a closure to drop, a from-source dispatch of it
                 // would succeed, and the pruned classification would
@@ -531,7 +531,7 @@ impl DagActor {
     /// They get `origin = 'pruned'` materialization jobs inside the
     /// persist transaction, additionally gated on the closure
     /// classifier not vouching for the node's existing children
-    /// (`closure_vouched`).
+    /// (`classify_durable_evidence_in_tx`).
     ///
     /// The PG side of Pending→Active rides the SAME transaction
     /// (`activate_build_tx`, the last statement before commit), so a

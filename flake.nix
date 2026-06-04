@@ -1552,7 +1552,7 @@
                   # scheduler's closure-evidence decision kernel
                   # (rio-evidence-kernel) — the ClosureEvidence
                   # classifier's exhaustive case analysis and the
-                  # closure_vouched() predicate contract (reduced to
+                  # the closure-vouch predicate contract (reduced to
                   # the 2-input domain in T-D5.2). Seconds-class
                   # harnesses (the kernel is a case analysis over
                   # bools, not a fold); the formal survivors core

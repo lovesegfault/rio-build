@@ -1,6 +1,6 @@
 # Dependency-free home for the scheduler's closure-evidence decision
 # kernel: the ClosureEvidence classifier (closure_evidence()) and the
-# two predicates layered on it (must_substitute()/closure_vouched()).
+# two predicates layered on it (the merge/establishment predicates).
 # Extracted from rio-scheduler/src/dag/mod.rs and actor/merge.rs so the
 # kani goto model for the proof harnesses closes over THIS crate only —
 # inside rio-scheduler's artifact context the same harnesses would

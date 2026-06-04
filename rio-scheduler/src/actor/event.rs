@@ -218,8 +218,8 @@ impl DagActor {
         // >100% actor utilization → mailbox grows unboundedly → admin
         // RPCs timeout → builders idle-timeout with no assignment.
         // 250ms ≈ 4/s max; the dashboard's poll cadence is ~1s anyway.
-        // The Tick-driven `tick_publish_gauges` provides the floor for
-        // metrics; this is the per-watcher event stream.
+        // The Tick-driven snapshot-sourced gauge re-emit provides the
+        // floor for metrics; this is the per-watcher event stream.
         if self.events.progress_debounced(build_id) {
             return;
         }

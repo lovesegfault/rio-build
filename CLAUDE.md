@@ -147,6 +147,16 @@ Commit BOTH the regenerated fixture(s) AND `docs/gen/config.json`. The `docs-dat
 
 When the gate is red and the cause isn't obvious from the log, see `.claude/rules/ci-failure-patterns.md` — it catalogs every failure signature that has bitten this project before.
 
+### Structural deletions feed the docs-lint deny lists
+
+When a commit deletes a mechanism (a fn, type, metric, RPC, or file
+tree), append its dead symbols to the deny lists in
+`nix/misc-checks.nix` `docs-lint` (`deny_shared`/`deny_docs`/
+`deny_cross`) in the same series. The deletion-campaign lint keeps
+retired names from re-rooting in docs and comments; deliberate
+retirement records get a why-commented allowlist entry beside the
+existing ones.
+
 ## Fuzzing
 
 Fuzz targets live in per-crate `fuzz/<crate>` workspaces (excluded from the main workspace, separate `Cargo.lock` each). Currently: `fuzz/rio-nix/` (protocol/wire parsers) and `fuzz/rio-store/` (manifest parser). The default dev shell is nightly, so `cargo fuzz` works without extra setup:

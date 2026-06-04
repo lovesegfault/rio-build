@@ -36,7 +36,7 @@ rio-proto = { workspace = true }
 # the kernels so their goto model stays dependency-light.
 rio-retry-kernel = { workspace = true }
 # The closure-evidence decision kernel (the ClosureEvidence classifier
-# and the must_substitute()/closure_vouched() predicates) and its CBMC
+# and the merge/establishment predicates) and its CBMC
 # contracts. DerivationDag::closure_evidence and the merge/dispatch
 # predicates are the projection shims over this crate.
 rio-evidence-kernel = { workspace = true }
