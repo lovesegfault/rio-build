@@ -150,4 +150,31 @@ mod tests {
         union_wanted_saturating(&mut dst, &s(&["a"]));
         assert_eq!(dst, s(&["a", "b"]));
     }
+
+    proptest::proptest! {
+        /// bughunt wave A4: the None-on-empty contract — the
+        /// establishment kernel treats `None` as "nothing verifiable"
+        /// and `Some(paths)` as "check these"; `Some(vec![])` would
+        /// make the all-present conjunction vacuously TRUE and adopt a
+        /// completion with zero verified paths. For ANY inputs, the
+        /// result is never `Some` of an empty (or empty-string) set.
+        #[test]
+        fn prop_verifiable_wanted_never_some_empty(
+            names in proptest::collection::vec("[a-z]{1,4}", 0..6),
+            paths in proptest::collection::vec(
+                proptest::option::weighted(0.7, "/nix/store/[a-z]{4}"), 0..6),
+            wanted in proptest::collection::vec("[a-z]{1,4}", 0..6),
+        ) {
+            let paths: Vec<String> =
+                paths.into_iter().map(Option::unwrap_or_default).collect();
+            let got = verifiable_wanted_paths(&names, &paths, &wanted);
+            if let Some(v) = got {
+                proptest::prop_assert!(!v.is_empty(), "Some(empty) is forbidden");
+                proptest::prop_assert!(
+                    v.iter().all(|p| !p.is_empty()),
+                    "empty-string paths must be filtered"
+                );
+            }
+        }
+    }
 }

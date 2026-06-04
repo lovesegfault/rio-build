@@ -608,7 +608,7 @@ in
   #   cross-process progress witness); the netem wedge freezing it
   #   while the connection stays alive is the stuck≠slow
   #   discrimination.
-  # r[verify store.substitute.stall-abort]
+  # r[verify store.substitute.stall-abort+2]
   #   substitute-stall-abort: loss-100% wedge on a live ~96MiB
   #   transfer → owner-side abort at the 15s fixture window — journal
   #   warn pair, stale_reclaimed_total{reason="stall_abort"} == 1, row

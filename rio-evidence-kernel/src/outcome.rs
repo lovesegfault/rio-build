@@ -109,10 +109,81 @@ pub fn fold_tenant_reprobes(
     }
 }
 
+/// The post-loop verdict of one `do_substitute` upstream iteration that
+/// produced no hit (bughunt wave A4, bug_081).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubstituteLoopVerdict {
+    /// Every upstream gave a definitive miss — cacheable.
+    CleanMiss,
+    /// ≥1 upstream stalled (and none served). The stall dominates a
+    /// concurrent 429: its strike is already durably recorded and the
+    /// executor's classification charges it as infrastructure
+    /// evidence — surfacing `RateLimited` instead would hide the
+    /// recorded strike behind back-off advice.
+    Stalled {
+        /// The widest stall window observed across upstreams.
+        window: core::time::Duration,
+    },
+    /// ≥1 upstream 429'd (and none served, none stalled). Uncached so
+    /// a retry can re-ask the rate-limited upstream.
+    RateLimited {
+        /// Max parsed `Retry-After` across the 429ing upstreams.
+        retry_after: Option<core::time::Duration>,
+    },
+}
+
+/// bug_081's pure post-loop fold: a stall on ONE upstream is an
+/// upstream-local failure — the loop records it and fails over
+/// (mirroring the 429 arm); only after every upstream has been tried
+/// does the recorded evidence pick the attempt outcome. Total over
+/// both observation axes; precedence `Stalled > RateLimited >
+/// CleanMiss` (charging evidence outranks back-off advice outranks a
+/// cacheable miss).
+// r[impl store.substitute.stall-abort+2]
+pub fn fold_substitute_loop(
+    any_stall: Option<core::time::Duration>,
+    any_429: Option<Option<core::time::Duration>>,
+) -> SubstituteLoopVerdict {
+    match (any_stall, any_429) {
+        (Some(window), _) => SubstituteLoopVerdict::Stalled { window },
+        (None, Some(retry_after)) => SubstituteLoopVerdict::RateLimited { retry_after },
+        (None, None) => SubstituteLoopVerdict::CleanMiss,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::routing::ReprobeAnswer;
+
+    /// bug_081: the post-loop fold's precedence, all four cells.
+    #[test]
+    fn substitute_loop_fold_precedence() {
+        use core::time::Duration;
+        assert_eq!(
+            fold_substitute_loop(None, None),
+            SubstituteLoopVerdict::CleanMiss
+        );
+        assert_eq!(
+            fold_substitute_loop(None, Some(Some(Duration::from_secs(7)))),
+            SubstituteLoopVerdict::RateLimited {
+                retry_after: Some(Duration::from_secs(7))
+            }
+        );
+        assert_eq!(
+            fold_substitute_loop(Some(Duration::from_secs(180)), None),
+            SubstituteLoopVerdict::Stalled {
+                window: Duration::from_secs(180)
+            }
+        );
+        // Both observed → the stall dominates.
+        assert_eq!(
+            fold_substitute_loop(Some(Duration::from_secs(180)), Some(None)),
+            SubstituteLoopVerdict::Stalled {
+                window: Duration::from_secs(180)
+            }
+        );
+    }
 
     /// The full table, row by row (merged_bug_178's enumeration pin).
     #[test]

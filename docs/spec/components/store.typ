@@ -1032,7 +1032,7 @@ by the owner itself: a slow owner advances `last_progress_at` every heartbeat;
 a wedged one keeps `updated_at` (liveness) fresh while the progress clock
 freezes (#rref("store.substitute.stale-reclaim")).
 
-#r("store.substitute.stall-abort")[
+#r("store.substitute.stall-abort+2")[
   A substitution download with no NAR body bytes for `RIO_SUBSTITUTE_STALL_SECS`
   (config `substitute_stall_secs`, default 180 s) MUST be aborted by its own
   owner (`fetch_nar`'s per-read watchdog; the NAR GET carries no request-level
@@ -1043,9 +1043,16 @@ freezes (#rref("store.substitute.stale-reclaim")).
   (#rref("store.substitute.stale-reclaim")). The release is claim-guarded on
   the aborting owner's `claim_id`: racing a competing stall-reclaim of the same
   stall event, whichever lands first wins and `stall_count` increments exactly
-  once. The error surfaces to every coalesced singleflight waiter as `Stalled`
-  (never cached, never folded into a miss); the in-process materialization
-  executor classifies it as retryable infrastructure trouble. Counted as
+  once. The abort ends only THAT upstream's fetch: the upstream loop MUST
+  fail over to the remaining upstreams (mirroring the 429 failover --- the
+  strike is already durably recorded, so trying the next upstream loses no
+  evidence), and a later upstream serving the path turns the attempt into a
+  hit (the released row is immediately re-claimable in the same iteration).
+  Only when NO upstream serves does the recorded stall surface to every
+  coalesced singleflight waiter as `Stalled` (never cached, never folded into
+  a miss, and dominating a concurrently observed 429: charging evidence
+  outranks back-off advice); the in-process materialization executor
+  classifies it as retryable infrastructure trouble. Counted as
   #(refs.metric)("rio_store_substitute_stale_reclaimed_total")`{reason="stall_abort"}`.
 ]
 The owner-side abort is what makes stall recovery reach the singleflight

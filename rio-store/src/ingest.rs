@@ -1138,7 +1138,7 @@ mod tests {
     // ── Release-in-place / strike-once / reset ──
 
     // r[verify store.substitute.stale-reclaim+3]
-    // r[verify store.substitute.stall-abort]
+    // r[verify store.substitute.stall-abort+2]
     /// A released-in-place row (the owner-side stall abort's leavings:
     /// `claim_id` NULL, `stall_count` recorded) is claimable
     /// IMMEDIATELY by any caller — no staleness threshold — with the
@@ -1175,7 +1175,7 @@ mod tests {
     }
 
     // r[verify store.substitute.stale-reclaim+3]
-    // r[verify store.substitute.stall-abort]
+    // r[verify store.substitute.stall-abort+2]
     /// Claim-guarded strike-once, both interleavings:
     /// (a) a competing stall-reclaim lands first → the owner's late
     ///     release matches zero rows (claim changed) → stall_count

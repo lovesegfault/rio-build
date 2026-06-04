@@ -1398,7 +1398,7 @@ mod tests {
     }
 
     // r[verify store.materialize.executor+4]
-    // r[verify store.substitute.stall-abort]
+    // r[verify store.substitute.stall-abort+2]
     /// (6b) A WEDGED upstream download (headers, then no body bytes)
     /// is ended by the substituter's owner-side stall abort and
     /// surfaces to the executor as **InfraFailure** — the retryable

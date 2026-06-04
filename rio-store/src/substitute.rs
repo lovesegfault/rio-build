@@ -721,6 +721,12 @@ impl Substituter {
         // semantics (`probe_one`): a tenant with [rate-limited-A,
         // healthy-B] configured should hit B, not propagate A's 429.
         let mut any_429: Option<Option<Duration>> = None;
+        // Track stalls the same way (bug_081): a stall on upstream A is
+        // A-local — its strike is already durably recorded by the
+        // in-place release, so the loop fails over to B instead of
+        // aborting the whole attempt. The post-loop fold surfaces the
+        // stall only when nothing served.
+        let mut any_stall: Option<Duration> = None;
         for upstream in &upstreams {
             match self
                 .try_upstream(http, tenant_id, upstream, store_path, &hash_part, progress)
@@ -757,18 +763,22 @@ impl Substituter {
                     debug!(upstream = %upstream.url, "concurrent uploader, stopping");
                     return Err(SubstituteError::Raced);
                 }
-                Err(e @ SubstituteError::Stalled { .. }) => {
-                    // r[impl store.substitute.stall-abort]
-                    // Owner-side stall abort: STOP the upstream loop —
-                    // the claim was released in place with the strike
-                    // recorded, and the stall must surface to every
-                    // coalesced waiter as the attempt's outcome (moka
-                    // does not cache the Err). Trying the next upstream
-                    // here would silently swallow the stall evidence
-                    // the re-attempt machinery keys on; the next
-                    // attempt re-claims the released row immediately.
-                    warn!(upstream = %upstream.url, "download stalled, stopping");
-                    return Err(e);
+                Err(SubstituteError::Stalled { window }) => {
+                    // r[impl store.substitute.stall-abort+2]
+                    // Owner-side stall abort: the claim was released in
+                    // place with the strike durably recorded — the
+                    // stall is THIS upstream's failure, so CONTINUE to
+                    // the next (mirroring the 429 failover; bug_081).
+                    // The post-loop fold surfaces `Stalled` to every
+                    // coalesced waiter only if no later upstream
+                    // serves the path (moka does not cache the Err);
+                    // failing over loses no evidence and a healthy
+                    // second upstream turns the attempt into a hit.
+                    warn!(upstream = %upstream.url, "download stalled, trying next");
+                    any_stall = Some(match any_stall {
+                        Some(prev) => prev.max(window),
+                        None => window,
+                    });
                 }
                 Err(SubstituteError::RateLimited { retry_after }) => {
                     // Upstream 429'd the narinfo or NAR GET. CONTINUE
@@ -814,14 +824,21 @@ impl Substituter {
             }
         }
 
-        // No upstream had it. If ≥1 upstream 429'd, propagate
-        // `RateLimited` so moka does NOT cache a definitive miss (the
-        // rate-limited upstream may have it on retry). Clean miss only
-        // when every upstream gave a definitive verdict.
-        if let Some(retry_after) = any_429 {
-            return Err(SubstituteError::RateLimited { retry_after });
+        // No upstream had it. The pure post-loop fold picks the
+        // attempt outcome from the recorded evidence: a stall
+        // dominates (its strike must reach the executor's
+        // classification), then 429 (uncached so a retry re-asks),
+        // then a cacheable clean miss — only when every upstream gave
+        // a definitive verdict.
+        match rio_evidence_kernel::outcome::fold_substitute_loop(any_stall, any_429) {
+            rio_evidence_kernel::outcome::SubstituteLoopVerdict::Stalled { window } => {
+                Err(SubstituteError::Stalled { window })
+            }
+            rio_evidence_kernel::outcome::SubstituteLoopVerdict::RateLimited { retry_after } => {
+                Err(SubstituteError::RateLimited { retry_after })
+            }
+            rio_evidence_kernel::outcome::SubstituteLoopVerdict::CleanMiss => Ok(None),
         }
-        Ok(None)
     }
 
     /// Steps 2-6 for one upstream.
@@ -1107,7 +1124,7 @@ impl Substituter {
                 placeholder_guard.defuse();
                 Ok(UpstreamOutcome::Hit(Box::new(info)))
             }
-            // r[impl store.substitute.stall-abort]
+            // r[impl store.substitute.stall-abort+2]
             // Owner-side stall abort: release the claim IN PLACE —
             // claim cleared, progress NULLed, durable stall_count
             // incremented — instead of deleting the row, so the next
@@ -1179,7 +1196,7 @@ impl Substituter {
         progress: Option<&SubstProgressFn>,
         progress_handle: Option<&ingest::ProgressHandle>,
     ) -> Result<(Bytes, Vec<OwnedSemaphorePermit>), SubstituteError> {
-        // r[impl store.substitute.stall-abort]
+        // r[impl store.substitute.stall-abort+2]
         // Owner-side stall watchdog: the NAR GET deliberately has no
         // request-level timeout (a multi-GB body legitimately runs
         // long), so the only abort clock is THIS one — no response
@@ -1258,7 +1275,7 @@ impl Substituter {
         let mut buf = vec![0u8; 64 * 1024];
         let mut last_progress = 0u64;
         loop {
-            // r[impl store.substitute.stall-abort]
+            // r[impl store.substitute.stall-abort+2]
             // Per-read stall clock: each successful read restarts it,
             // so a slow-but-advancing stream never trips — only a
             // wedged one (no bytes for the whole window) does.
@@ -2122,7 +2139,7 @@ mod tests {
         }
     }
 
-    // r[verify store.substitute.stall-abort]
+    // r[verify store.substitute.stall-abort+2]
     /// Owner-side stall abort end-to-end: a wedged upstream (headers,
     /// then no body bytes) makes the OWNER abort its own download
     /// after the stall window — effective even with every caller
@@ -2926,6 +2943,118 @@ mod tests {
             matches!(got2, Err(SubstituteError::RateLimited { .. })),
             "all-429 must propagate RateLimited (uncached), not Ok(None); got {got2:?}"
         );
+    }
+
+    // r[verify store.substitute.stall-abort+2]
+    /// bug_081: a stall on the FIRST upstream is an upstream-local
+    /// failure — the loop must CONTINUE to the second upstream
+    /// (mirroring the 429 failover) and serve the path. The strike
+    /// was already durably recorded by the in-place release; failing
+    /// over loses nothing. Stalled surfaces as the attempt outcome
+    /// only when NO later upstream serves, and it dominates a
+    /// concurrent 429 (charging evidence outranks back-off advice).
+    /// RED (pre-fix): the Stalled arm aborted the loop — got
+    /// Err(Stalled) with healthy-B never consulted.
+    #[tokio::test]
+    async fn do_substitute_stall_first_upstream_tries_second() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-stall-then-hit").await;
+        let (path, nar) = make_path();
+        // Upstream A: narinfo OK, NAR wedges forever (every request).
+        let a = spawn_fake_upstream_hang_then_serve(&path, nar.clone(), "cache.stall-a", u32::MAX)
+            .await;
+        // Upstream B: serves the path.
+        let b = spawn_fake_upstream(&path, nar, "cache.stall-b").await;
+        // Priority: A=10 (tried first), B=50 (tried second).
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &a.url,
+            10,
+            std::slice::from_ref(&a.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &b.url,
+            50,
+            std::slice::from_ref(&b.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let sub = test_substituter(db.pool.clone()).with_stall_window(Duration::from_secs(1));
+        let got = tokio::time::timeout(Duration::from_secs(60), sub.try_substitute(tid, &path))
+            .await
+            .expect("attempt must end within budget");
+        assert!(
+            matches!(&got, Ok(Some(_))),
+            "a stall on the first upstream must fail over to the second, got {got:?}"
+        );
+
+        // Precedence: stall-A + 429-C (no server) → the stall dominates
+        // the 429 as the attempt outcome (charging evidence outranks
+        // back-off advice; the 429 path would hide the recorded strike
+        // from the executor's classification). A FRESH path: leg 1
+        // ingested `path` locally, which would short-circuit upstreams.
+        let path2 = rio_test_support::fixtures::test_store_path("stall-vs-429");
+        let (nar2, _) = rio_test_support::fixtures::make_nar(b"stall-vs-429");
+        let a2 =
+            spawn_fake_upstream_hang_then_serve(&path2, nar2, "cache.stall-a2", u32::MAX).await;
+        let tid2 = seed_tenant(&db.pool, "sub-stall-vs-429").await;
+        let c = spawn_status_upstream(axum::http::StatusCode::TOO_MANY_REQUESTS).await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid2,
+            &a2.url,
+            10,
+            std::slice::from_ref(&a2.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+        metadata::upstreams::insert(&db.pool, tid2, &c.url, 50, &[], SigMode::Keep)
+            .await
+            .unwrap();
+        let got2 = tokio::time::timeout(Duration::from_secs(60), sub.try_substitute(tid2, &path2))
+            .await
+            .expect("attempt must end within budget");
+        assert!(
+            matches!(got2, Err(SubstituteError::Stalled { .. })),
+            "stall + 429 with no hit must surface Stalled (dominates RateLimited), got {got2:?}"
+        );
+    }
+
+    proptest::proptest! {
+        /// bug_081 failover-totality: for ANY combination of recorded
+        /// stall/429 evidence the post-loop fold is total and honors
+        /// the precedence Stalled > RateLimited > CleanMiss — the
+        /// failover loop can never fall through without a verdict, and
+        /// recorded charging evidence is never shadowed by back-off
+        /// advice.
+        #[test]
+        fn prop_substitute_loop_fold_total(
+            stall_secs in proptest::option::of(0u64..1_000_000),
+            had_429 in proptest::bool::ANY,
+            retry_secs in proptest::option::of(0u64..1_000_000),
+        ) {
+            use rio_evidence_kernel::outcome::{SubstituteLoopVerdict, fold_substitute_loop};
+            let any_stall = stall_secs.map(Duration::from_secs);
+            let any_429 = had_429.then(|| retry_secs.map(Duration::from_secs));
+            let got = fold_substitute_loop(any_stall, any_429);
+            match (any_stall, any_429) {
+                (Some(w), _) => proptest::prop_assert_eq!(
+                    got, SubstituteLoopVerdict::Stalled { window: w }),
+                (None, Some(ra)) => proptest::prop_assert_eq!(
+                    got, SubstituteLoopVerdict::RateLimited { retry_after: ra }),
+                (None, None) => proptest::prop_assert_eq!(
+                    got, SubstituteLoopVerdict::CleanMiss),
+            }
+        }
     }
 
     #[tokio::test]

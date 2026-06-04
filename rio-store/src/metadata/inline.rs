@@ -244,7 +244,7 @@ pub(crate) const STALL_TAKEOVER_PREDICATE: &str = "AND claim_phase = 'downloadin
 /// stall-reclaim already took the row over, this matches zero rows and
 /// the stall event still increments `stall_count` exactly once.
 /// Returns whether the release applied.
-// r[impl store.substitute.stall-abort]
+// r[impl store.substitute.stall-abort+2]
 #[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
 pub(crate) async fn release_placeholder_in_place(
     pool: &PgPool,
