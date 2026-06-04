@@ -35,7 +35,7 @@
 //!
 //! Spec: `store.materialize.executor`; design §2.2 (store as pull
 //! client), §5 (pin-at-ingest).
-// r[impl store.materialize.executor+4]
+// r[impl store.materialize.executor+5]
 
 pub mod client;
 pub mod executor;
@@ -71,7 +71,7 @@ const POLL_JITTER: rio_common::backoff::Jitter = rio_common::backoff::Jitter::Pr
 /// also 0 when the scheduler address is malformed — logged, never
 /// fatal: a broken materialization executor must not take down the
 /// store data plane).
-// r[impl store.materialize.executor+4]
+// r[impl store.materialize.executor+5]
 pub fn spawn_materialization_executor(
     cfg: crate::config::MaterializationConfig,
     pool: sqlx::PgPool,
@@ -302,7 +302,7 @@ async fn claim_loop<T>(
 /// or dotted hostnames) are sanitized: lowercased, invalid bytes
 /// replaced with `-`, trimmed to 63 chars, stripped of edge hyphens.
 /// Empty/unset falls back to `"rio-store-dev"`.
-// r[impl store.materialize.executor+4]
+// r[impl store.materialize.executor+5]
 pub fn executor_instance() -> String {
     let raw = std::env::var("HOSTNAME").unwrap_or_default();
     sanitize_dns1123_label(&raw)
@@ -371,7 +371,7 @@ fn sanitize_dns1123_label(raw: &str) -> String {
 mod tests {
     use super::*;
 
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     /// PD-D2 spawn condition: no `scheduler_addr` → zero claim loops
     /// (the schedulerless pure-store deployment); a configured address
     /// spawns exactly `executor_concurrency` loops (connect_lazy — no
@@ -415,7 +415,7 @@ mod tests {
     /// falls back to the dev constant. (The Wave-4 instance-attestation
     /// obligation, Phase-A form: identity from the pod's own
     /// environment, alphabet-validated on both sides.)
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     #[test]
     fn executor_instance_is_always_a_dns1123_label() {
         let is_label = |s: &str| {
@@ -480,7 +480,7 @@ mod tests {
     /// attempt, then the loop exits. (The pre-fix loop had no shutdown
     /// arm around execute at all and report_until_acked took no
     /// shutdown — this shape was unexpressible: compile-level red.)
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     #[tokio::test]
     async fn claim_loop_sigterm_aborts_walk_and_reports_aborted() {
         use std::sync::{Arc, Mutex};

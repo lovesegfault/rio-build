@@ -5,7 +5,7 @@
 //! runtime's `PullTransport` precedent — copied shape, not shared code)
 //! so the claim/report state machines are unit-testable against a
 //! scripted mock with no wire and no scheduler.
-// r[impl store.materialize.executor+4]
+// r[impl store.materialize.executor+5]
 
 use std::time::Duration;
 
@@ -98,7 +98,7 @@ pub struct ClaimedJob {
 /// between list and claim — never an error and never retried within
 /// the pass (the next poll re-lists). `Gone` likewise. Per-RPC errors
 /// are logged and skipped; a failed listing yields an empty pass.
-// r[impl store.materialize.executor+4]
+// r[impl store.materialize.executor+5]
 pub async fn poll_and_claim<T: MaterializeTransport>(
     transport: &mut T,
     executor_instance: &str,
@@ -247,7 +247,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
 /// permanent rejections (auth / invalid-argument / unimplemented) give
 /// up after one call — retrying cannot succeed and the establishment
 /// sweep remains the scheduler-side backstop for the open attempt.
-// r[impl store.materialize.executor+4]
+// r[impl store.materialize.executor+5]
 pub async fn report_until_acked<T: MaterializeTransport>(
     transport: &mut T,
     exec_id: &str,
@@ -696,7 +696,7 @@ mod tests {
     /// (a) The happy path: 2 listed jobs, both claims deliver → 2
     /// ClaimedJobs carrying the descriptors' identity joined with the
     /// assignments' exec ids.
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     #[tokio::test]
     async fn poll_and_claim_claims_listed_jobs() {
         let d1 = descriptor(1);
@@ -733,7 +733,7 @@ mod tests {
     /// (LIMIT-1 oldest-first); the pass claimed nothing, every pass —
     /// the younger job starved behind the refused head until the head
     /// left the listing.
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     #[tokio::test]
     async fn refused_head_does_not_hide_younger_jobs() {
         let head = descriptor(1);
@@ -789,7 +789,7 @@ mod tests {
     /// as a UUID is REFUSED before any claim is attempted — no
     /// ClaimedJob, no PullAssignment RPC (claiming an attempt we cannot
     /// attribute to a job would mint the immortal NULL-job pin class).
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     #[tokio::test]
     async fn malformed_job_id_refuses_the_claim() {
         let mut bad = descriptor(9);
@@ -813,7 +813,7 @@ mod tests {
     /// (b) NotYetReady on a claim is race tolerance, not an error: the
     /// pass returns the claims that DID deliver and never retries the
     /// lost one (the next poll re-lists).
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     #[tokio::test]
     async fn poll_and_claim_tolerates_not_yet_ready() {
         let mut t = MockTransport::new(
@@ -838,7 +838,7 @@ mod tests {
     }
 
     /// (c) The slot bound: 5 listed, 2 slots → exactly 2 pulls.
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     #[tokio::test]
     async fn poll_and_claim_respects_slots() {
         let mut t = MockTransport::new(
@@ -863,7 +863,7 @@ mod tests {
     /// (d) The BC-1 wire obligation: every claim carries
     /// kind=MATERIALIZATION + the configured executor_instance, no
     /// executor token, and the listed job's drv hash as the intent.
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     #[tokio::test]
     async fn claim_carries_kind_and_instance() {
         let d1 = descriptor(1);
@@ -900,7 +900,7 @@ mod tests {
     /// (e) The report loop: two transient failures then an ack → 3
     /// calls, returns true. A permanent rejection gives up after one
     /// call. Budget exhaustion gives up.
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     #[tokio::test(start_paused = true)]
     async fn report_until_acked_retries() {
         let outcome = MaterializationOutcome {
@@ -976,7 +976,7 @@ mod tests {
     /// signature change is the compile-level red, and the runtime red
     /// for the identical loop shape is recorded in the builder's
     /// report_black_hole_exhausts_budget_without_sigterm.)
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     #[tokio::test(start_paused = true)]
     async fn report_black_hole_times_out_within_budget() {
         struct BlackHole {
@@ -1033,7 +1033,7 @@ mod tests {
     }
 
     /// SIGTERM mid-report: exactly one bounded best-effort attempt.
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     #[tokio::test(start_paused = true)]
     async fn report_after_sigterm_is_a_single_bounded_attempt() {
         let mut t = MockTransport::new(
@@ -1063,7 +1063,7 @@ mod tests {
     /// SIGTERM mid-pass: poll_and_claim returns the claims already won
     /// so the caller can settle them under the grace, instead of
     /// continuing the pass.
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     #[tokio::test(start_paused = true)]
     async fn poll_and_claim_sigterm_ends_pass_with_claims_so_far() {
         struct CancelOnFirstPull {
@@ -1243,7 +1243,7 @@ mod tests {
         (addr, backend)
     }
 
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     /// FINDING 18 (the transition claim stall; red-first): the executor
     /// transport must abandon a connection pinned to a standby scheduler
     /// replica and reach the leader within a bounded number of poll
@@ -1310,7 +1310,7 @@ mod tests {
     /// retried against a standby-pinned connection burns its whole
     /// budget without ever landing. With reconnect-on-UNAVAILABLE the
     /// retry envelope converges on the leader and the report acks.
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     #[tokio::test]
     async fn report_abandons_connection_pinned_to_standby_replica() {
         let standby_addr = spawn_executor_service(StandbyExecutorService).await;
@@ -1358,7 +1358,7 @@ mod tests {
     /// sharing the transport) redials toward the leader. Pre-fix the
     /// standby ACKed progress (Ok), the connection stayed pinned, and
     /// the client never learned it was talking to a wall.
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     #[tokio::test]
     async fn progress_abandons_connection_pinned_to_standby_replica() {
         let standby_addr = spawn_executor_service(StandbyExecutorService).await;

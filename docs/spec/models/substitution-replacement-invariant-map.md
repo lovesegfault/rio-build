@@ -1658,7 +1658,7 @@ this table does not restate their bodies.
 |---|---|---|
 | 1 | **Floating-CA stale-reset carrier gap** — the stale-verify reset clears `output_paths`; job assignments carry expected paths `== [""]`; pre-existing Phase B shape, and the walk's stash that papered over it is deleted | CLOSED (2026-06-02, this commit): red-first carrier fix landed `1cedf8957` (owner option (a) 2026-06-02: durable `carried_realized_paths` column, migration 082, `stale_reset`-origin-only writes) — realized paths carried across the stale-Completed reset into the stale_reset lane; executor wanted set non-empty for floating-CA; coverage non-vacuity scoped to the empty-expected-slot shape; spec sentence + markers in the same commit |
 | 2 | **FailoverDuo B9 corner** — the predecessor encoding's post-failover stored-union widening violates B9 at the two-builds+failover scope (full alphabet, reproduced; seed `0xffbfc9ac0c85df5b`; transcript in the T-D7.1 commit body and the module scope note). History — production deleted the lossy fallback at D2.3; the corner documents WHY the 062 semantics had to die | CLOSED (2026-06-02, this commit): wired as the permanent seeded expect-violation check `quint-closure-corner-failover-duo-b9` (`mkQuintSimWitnessCheck` gained an optional `--seed`; the check replays the discovery configuration — survivors-restricted alphabet at the FailoverDuo constants, module `closureEvidenceCornerFailoverDuo`; the full-alphabet form's hit rate is below a bounded budget, its status stays the trace-inclusion corollary in the module SCOPE NOTE; red means the predecessor encoding drifted — route to row 3's archive record, never silently delete). The check is the seed-carrier row 3 inherits; retroactive validation of the replacement stands |
-| 3 | **`closureEvidence.qnt` archive** — deliberately NOT archived at this close-out: the survivors core (A14/A15/A22/B9/B10/L3 + 2 kept pins) soaks one integration first; the archive then carries the survivors core forward and the B9 corner with its seed | CLOSED (2026-06-02, this commit): archived IN PLACE under the owner's 2026-06-02 waiver of the post-soak precondition — the file stays at `docs/spec/models/closureEvidence.qnt` as the full predecessor record (header banner records the archival; zero model text deleted, zero checks removed); survivors core + 2 kept pins carried forward unchanged; the B9 corner carried with seed `0xffbfc9ac0c85df5b`, machine-checked via `quint-closure-corner-failover-duo-b9` (row 2); the 15 unwired calibration retirement notes remain valid as-is; pre-prune wiring at D7 commit `94996482b` (identify by subject after rebases) |
+| 3 | **`closureEvidence.qnt` archive** — deliberately NOT archived at this close-out: the survivors core (A14/A15/A22/B9/B10/L3 + 2 kept pins) soaks one integration first; the archive then carries the survivors core forward and the B9 corner with its seed | CLOSED (2026-06-02, this commit): archived IN PLACE under the owner's 2026-06-02 waiver of the post-soak precondition — the file stays at `docs/spec/models/closureEvidence.qnt` as the full predecessor record (header banner records the archival; zero model text deleted, zero checks removed); survivors core + 2 kept pins carried forward unchanged; the B9 corner carried with seed `0xffbfc9ac0c85df5b`, machine-checked via `quint-closure-corner-failover-duo-b9` (row 2); the 15 unwired calibration retirement notes remain valid as-is; pre-prune wiring at D7 commit `94996482b` (identify by subject after rebases). **RDC-5 addition rider (A4, bughunt wave, 2026-06-03):** one standalone module `closureEvidenceReapTruncate` APPENDED to the archived file (additions-only; archived module text verbatim) — the reap-truncation invariant `vouchedImpliesAllDurableChildrenProduced` + pre-fix flip `calibReapNoTruncate`, wired `quint-closure-reap-truncate-{holds,calib}` (calib seed `0xc214b66a0b0eb6b0`); posture note at the closure-evidence map's A6-archive block |
 | 4 | **Frozen-contract addendum** — `executor-invariant-map.md`'s frozen pull-protocol contract (:2361–2536) records the materialization PullAssignment kind/`executor_instance` addendum in FINAL form | CLOSED (2026-06-02, this commit): the "Materialization addendum (final, post-D′)" subsection appended to the T-0e.6 contract section — the wire-deltas table, the four semantic rules (BC-1 identity, kind authorization, establishment kind-partition, one-winner arbitration) with record pointers into this map + `sched.materialize.*` / `store.materialize.executor`, and the extends-never-modifies statement (pre-existing rows unchanged) |
 | 5 | **Item I — decision-5 store scaling** | LANDED/INTEGRATED (Items I/S/T integrated 2026-06-02; commissioned owner 2026-06-01): the full scope — backlog gauge `c64ba82e6`, KEDA ScaledObject (three triggers, `open_attempts` re-key) + ComponentScaler CR removal + the vm-substitute-scale decoupling `ebd7def0f`, the controller-map delta entry (controller-invariant-map.md "Item I entry") (harden-store memo §6.2); CLOSED (2026-06-02, this commit): landed form counter-signed at the item-I landing review (controller map delta entry SIGNED 2026-06-02); lineage re-resolution of the cell's pre-rebase hashes — backlog gauge = `1bd2ecf5c`, CR removal = `c9a9d163e` |
 | 6 | **Item S — store ingest progress/stall hardening** | LANDED/INTEGRATED (Items I/S/T integrated 2026-06-02; commissioned owner 2026-06-01): store-side only as scoped — manifests progress columns `cb98b09eb`, placeholder-heartbeat download progress `84c699e2e`, owner-side stall abort + download-scoped reclaim `26c59ff7d` (harden-store memo §6.2); CLOSED (2026-06-02, this commit): Item S follow-through complete — §6.2 forced-stall VM subtest (tc-netem) landed `954989dd8`; helm values-gated RIO_SUBSTITUTE_STALL_SECS landed `045ddcdd5` (memo §3.1 row 26 helm half) |
@@ -2021,9 +2021,81 @@ polarity of the wave's done criteria):
   covered the cell — the named harness pins the conjunct).
 
 **Manual exhaustive targets** (TLC, 60 workers, NOT gate checks — the
-C′ posture): the 31-invariant conjunction over the -Ex reduced scopes
-remains the documented manual sweep
+C′ posture): the full conjunction (36 invariants post-A4) over the -Ex
+reduced scopes remains the documented manual sweep
 (`quint verify --backend=tlc --main=materializationJob{Base,CrashLoop,…}Ex
 --invariant=<conjunction>`); the bounded-simulation holds checks plus
 the calibration pins above are the gate-wired deliverable, unchanged in
 shape from C′.
+
+### A4 formal delta (bughunt wave — evidence-classification cells; landed with this commit)
+
+The A4 model deltas re-target `materializationJob.qnt` to the
+classification-cell fixes (193/042/178/028/195/194b/081 + the C1-shared
+establishment kernel), 31 → **36 invariants** in the §9.1 conjunction
+across all five regimes:
+
+- **Model re-derivations (as-built):**
+  `consumeUnobtainable` gains the `refsMissing` input axis (the
+  193 cell split — pre-delta `missing ⊆ OUTPUTS` made a pure
+  reference-closure miss UNREPRESENTABLE; the moot arm now requires
+  both cells clean); `consumeSuccess` gains the report-evidence guard
+  (194b: a zero-wanted zero-evidence walk is InfraFailure at the
+  store, never Success-with-nothing); NEW `reportTransient` +
+  `deferExpires` actions (the RetryLater class: charge-free close,
+  view-only `deferUntil` that ONLY `claimJob` admission reads —
+  park/PD-20/stalled stay blind); `recordWantedRelation` re-derived to
+  the union-saturating upsert (fork-11 commit 1) with the
+  `everContrib` ghost; `DurableRelation` split
+  `RBroken → RChildlessLeaf | RHoled` with `parkReevaluate` re-derived
+  to release every from-source-VIABLE park (Vouched, Pending,
+  unmarked childless leaf) and `stalledJobs` re-keyed to Holed-only.
+- **The five invariants + falsifiability pairs** (each pre-fix flip
+  found by the simulator; union-dropped additionally TLC-verified
+  locally, 966 ms):
+  | Invariant | Pre-fix flip (calibration) | Verdict |
+  |---|---|---|
+  | `closureCompleteResolution` | `mat-a4-refs-folded` (moot arm ignores the refs cell) | falsifies; as-built holds |
+  | `noVacuousCoverage` | `mat-a4-vacuous-success` (no report-evidence guard) | falsifies; as-built holds |
+  | `transientOutcomesNeverCharge` | `mat-a4-transient-as-infra` (429/raced charged as infra, parked at budget) | falsifies; as-built holds |
+  | `durableUnionWidensOrEqualsLive` | `mat-a4-union-dropped` (overwrite upsert narrows below a recorded contribution) | falsifies (TLC 966 ms); as-built holds |
+  | `parkNeverOutlivesFromSourceViability` | `mat-a4-leaf-park-forever` (V\|P-only re-evaluation guard + the collapsed stalled population) | `calibParkViability` falsifies; the leaf-release witness `noLeafParkReevalResolve` is the recorded DEAD-END under the override (violates as-built, [ok] under calibStep — the b3-no-redial pattern, manual command in the module header) |
+- **Witnesses:** `noTransientClose` + `noLeafParkReevalResolve` wired
+  (`quint-materialization-witness-{transient-close,leaf-park-reeval}`);
+  all 13 pre-existing witnesses re-verified violating post-delta; the
+  12 deterministic runs pass unchanged (8 base + 2 failover +
+  1 adversarial + 1 crash-loop).
+- **The reap-truncation corner:** standalone
+  `closureEvidenceReapTruncate` module (RDC-5 additions-only — ledger
+  row 3 rider) — `vouchedImpliesAllDurableChildrenProduced` holds
+  as-built, `calibReapNoTruncate` falsifies (seed
+  `0xc214b66a0b0eb6b0`), wired `quint-closure-reap-truncate-{holds,calib}`.
+- **Kani:** rio-evidence-kernel 11 → **18** (tripwire same-commit):
+  the routing battery over the NEW set-free `route_from_classes` core
+  (`check_route_no_vacuous_complete`,
+  `check_route_total_and_cells_reachable`,
+  `check_childless_leaf_non_pruned_never_failfast`), the outcome
+  battery (`check_substitute_failure_truth_table` — 178 table + 081
+  fold precedence; `check_confirmed_missing_is_all_tenant_conjunction`
+  — 028/Q2 bitmask sweep ≤ 4 tenants), and the establishment-window
+  pair (`check_establishment_unavailable_defers`,
+  `check_establishment_materialization_never_adopts_or_crash_charges`).
+
+**The two A4 scope-narrowings (recorded, deliberate — NOT bugs):**
+
+1. **`Stalled` and `AdmissionSaturated` STAY `ChargeInfra`** in the
+   substitute-failure table (`classify_substitute_failure`): the
+   stall-abort contract (`store.substitute.stall-abort+2`)
+   deliberately reports infrastructure failure so the strike ladder
+   and the park budget see stalls (the durable `stall_count` evidence
+   must reach the charge surface), and a saturated per-replica
+   admission gate is CAPACITY evidence, not a politeness signal.
+   Only `Raced`/`RateLimited` — transient by the substituter's own
+   contract — close uncharged (`RetryLater`).
+2. **`StoreProbe::NoClient` KEEPS charging** in the establishment
+   window (`establish_from_classes`: `NoStoreConfigured` routes the
+   live-build row to `ChargeExecutorCrash`, never `Defer`): a missing
+   store client is a deployment defect on the scheduler's own side —
+   deferring would idle the attempt forever with zero operator
+   signal; the charge surfaces it on the crash ledger where the
+   existing alerting looks.

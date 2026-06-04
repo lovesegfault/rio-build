@@ -426,7 +426,7 @@ async fn dispatch_time_substitutable_routes_to_job(#[case] is_fod: bool) -> Test
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// merged_bug_028 (028a, dispatch leg): presence and substitutability
 /// are PER-TENANT facts — the batch probe asks once per live tenant
 /// and folds per candidate. A path visible under tenant A but

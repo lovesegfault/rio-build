@@ -232,7 +232,12 @@ module materializationJob {
 
   /// The durable declared-relation classification the routing arms read
   /// (§2.4 arms 1/2: Vouched / Pending; Broken = childless or holed).
-  type DurableRelation = | RVouched | RPending | RBroken
+  type DurableRelation = | RVouched | RPending | RChildlessLeaf | RHoled
+  // A4 (bughunt wave): RBroken split into the two broken cells the
+  // 4-cell classifier persists — RChildlessLeaf (broken by structure:
+  // no declared children; from-source viable while unmarked) and
+  // RHoled (missing produced children: the genuine closure hole, the
+  // stalled population's cell, never from-source viable by itself).
 
   /// The in-memory job view per derivation (delta 5) — the kernel
   /// admission's JobView input. VPending carries the parked flag;
@@ -506,6 +511,32 @@ module materializationJob {
   /// violation.
   var abortChargeFree: bool
 
+  /// A4: the view-only deferral (RetryLater) — pull admission reads it
+  /// (claim blocked while armed), the park decision, the park
+  /// re-evaluation and the stalled gauge NEVER do (a 429 wave must not
+  /// walk a healthy job toward the from-source settlement).
+  var deferUntil: str -> bool
+  /// A4 latch: every transient (RetryLater) close left both
+  /// materialization ledgers, the crash ledgers and the park flag
+  /// untouched (charge-free by construction).
+  var transientChargeFreeAll: bool
+  /// A4 latch (merged_bug_193's cell split): no completed resolution
+  /// while a confirmed reference hole was on the table.
+  var closureCompleteAll: bool
+  /// A4 latch (merged_bug_194's store leg): every covered Success
+  /// consumption carried a non-empty live wanted set or actual store
+  /// evidence — never a vacuous all-empty completion.
+  var noVacuousCoverageAll: bool
+  /// A4 ghost: the union of every wanted contribution each build ever
+  /// recorded for d — the durable row must never narrow below it (the
+  /// union upsert, fork-11 commit 1's surface).
+  var everContrib: (str, str) -> Set[str]
+  /// A4 ghost (latch-up): the park re-evaluation released a
+  /// CHILDLESS-LEAF park at least once — the noLeafParkReevalResolve
+  /// witness reads this (a state-shape witness would be polluted by
+  /// post-resolution evidence drift).
+  var leafReevalReleased: bool
+
   // --- 5. derived state -------------------------------------------------------
 
   /// In-memory interest (the DAG's interested_builds x liveness):
@@ -552,8 +583,27 @@ module materializationJob {
         | NoJob => false
         | SomeJob(j) => j.state == JPending and j.parked
       },
-      durableRel.get(d) == RBroken,
+      // A4 re-derivation: the gauge counts HOLED parks only — a
+      // childless leaf's park is a re-evaluation transient exactly
+      // like Vouched/Pending (parkNeverOutlivesFromSourceViability).
+      durableRel.get(d) == RHoled,
     })
+
+  /// A4: d is parked (job pending + parked flag).
+  def parkedAt(d: str): bool =
+    match jobs.get(d) {
+      | NoJob => false
+      | SomeJob(j) => j.state == JPending and j.parked
+    }
+
+  /// A4: from-source viability of the durable evidence — Vouched and
+  /// Pending always; a childless leaf only while UNMARKED (the arm-3fs
+  /// release row); Holed never.
+  def fromSourceViable(d: str): bool = or {
+    durableRel.get(d) == RVouched,
+    durableRel.get(d) == RPending,
+    durableRel.get(d) == RChildlessLeaf and not(topdownPruned.get(d)),
+  }
 
   // --- 6. properties (the §9.1 successor table, C-prime re-encodes) ---------
 
@@ -834,6 +884,37 @@ module materializationJob {
     establishCount.get(d) <= matInfraLedger.get(d)
   )
 
+  /// A4 (merged_bug_193): the latch — no completed resolution over a
+  /// confirmed reference hole. Falsifiability: mat-a4-refs-folded.
+  val closureCompleteResolution = closureCompleteAll
+
+  /// A4 (merged_bug_194 store leg): the latch — no vacuous Success.
+  /// Falsifiability: mat-a4-vacuous-success.
+  val noVacuousCoverage = noVacuousCoverageAll
+
+  /// A4 (merged_bug_178/195 transient axis): the latch — RetryLater
+  /// closes are charge-free and park-blind. Falsifiability:
+  /// mat-a4-transient-as-infra.
+  val transientOutcomesNeverCharge = transientChargeFreeAll
+
+  /// A4 (fork-11 commit 1's union upsert): the durable wanted row per
+  /// (build, drv) covers every contribution that build ever recorded —
+  /// the upsert may only widen. Falsifiability: mat-a4-union-dropped.
+  val durableUnionWidensOrEqualsLive = BUILDS.forall(b => DRVS.forall(d =>
+    everContrib.get((b, d)).subseteq(wanted.get((b, d)))
+  ))
+
+  /// A4 (the RBroken split): a parked job whose evidence is
+  /// from-source viable is a re-evaluation TRANSIENT — never part of
+  /// the stalled population the MD-D1 gauge alerts on. The pre-fix
+  /// collapse (stalled = parked ∧ Broken, leaves included) is the
+  /// recorded flip in mat-a4-leaf-park-forever (with the re-derived
+  /// parkReevaluate guard's enabledness as the liveness half — the
+  /// noLeafParkReevalResolve witness).
+  val parkNeverOutlivesFromSourceViability = DRVS.forall(d =>
+    (parkedAt(d) and fromSourceViable(d)) implies not(stalledJobs.contains(d))
+  )
+
   /// F5 (PP-5 i): a build's wanted row is exactly its own last write —
   /// no other build's write ever replaced it (the PK isolation).
   val crossBuildWantedIsolation = BUILDS.forall(b => DRVS.forall(d =>
@@ -897,7 +978,7 @@ module materializationJob {
   val noUnmarkedArm3FromSource = DRVS.forall(d =>
     not(and {
       not(topdownPruned.get(d)),
-      durableRel.get(d) == RBroken,
+      durableRel.get(d) == RChildlessLeaf or durableRel.get(d) == RHoled,
       match jobs.get(d) {
         | NoJob => false
         | SomeJob(j) => j.state == JResolvedFromSource and j.resolutionExec > 0
@@ -942,9 +1023,18 @@ module materializationJob {
       },
     })
   )
-  /// Delta 3: a Broken-evidence parked job (the stalled population) is
+  /// Delta 3: a Holed-evidence parked job (the stalled population) is
   /// reachable — the MD-D1 alert constrains a real state.
   val noStalledBrokenPark = stalledJobs == Set()
+  /// A4: a transient (RetryLater) close happens — the charge-free
+  /// invariant constrains a reachable edge.
+  val noTransientClose = DRVS.forall(d => not(deferUntil.get(d)))
+  /// A4: a CHILDLESS-LEAF park is resolved by the re-evaluation arm
+  /// (resolutionExec == 0 marks the re-eval resolution; the leaf cell
+  /// distinguishes it from the Vouched/Pending transients). Pre-fix
+  /// (Vouched|Pending-only guard) this is UNREACHABLE — the recorded
+  /// flip in mat-a4-leaf-park-forever.
+  val noLeafParkReevalResolve = not(leafReevalReleased)
   /// §5.3: the pin release fires (job resolved, all interest terminal)
   /// — observed at the released-path footprint: a still-present,
   /// now-unpinned output of a resolved-job derivation (presence only
@@ -1034,6 +1124,16 @@ module materializationJob {
     budgetSoundAll' = budgetSoundAll,
     abortChargeFree' = abortChargeFree,
   }
+  /// A4 vars unchanged (the deferral flag, the three A4 latches and
+  /// the contribution ghost).
+  action a4Unchanged = all {
+    deferUntil' = deferUntil,
+    transientChargeFreeAll' = transientChargeFreeAll,
+    closureCompleteAll' = closureCompleteAll,
+    noVacuousCoverageAll' = noVacuousCoverageAll,
+    everContrib' = everContrib,
+    leafReevalReleased' = leafReevalReleased,
+  }
   /// Job-core vars unchanged.
   action jobCoreUnchanged = all {
     jobs' = jobs, dupJob' = dupJob, view' = view, attempts' = attempts,
@@ -1052,11 +1152,22 @@ module materializationJob {
     buildLive.get(b),
     outs != Set(),
     outs.subseteq(OUTPUTS),
-    wanted.get((b, d)) != outs,
-    wanted' = wanted.put((b, d), outs),
-    lastWritten' = lastWritten.put((b, d), outs),
+    // A4 re-derivation (fork-11 commit 1): the upsert UNIONS — a
+    // re-merge can only widen its own row (the F5 overwrite is the
+    // mat-a4-union-dropped calibration). Guard: the union must move.
+    not(outs.subseteq(wanted.get((b, d)))),
+    val applied = wanted.get((b, d)).union(outs)
+    all {
+      wanted' = wanted.put((b, d), applied),
+      lastWritten' = lastWritten.put((b, d), applied),
+      everContrib' = everContrib.put((b, d), everContrib.get((b, d)).union(outs)),
+    },
     legacyInterest' = legacyInterest.put((b, d), false),
     legacyBudget' = legacyBudget,
+    deferUntil' = deferUntil, transientChargeFreeAll' = transientChargeFreeAll,
+    closureCompleteAll' = closureCompleteAll,
+    noVacuousCoverageAll' = noVacuousCoverageAll,
+    leafReevalReleased' = leafReevalReleased,
     jobCoreUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
     tenureUnchanged, ghostsUnchanged,
   }
@@ -1073,7 +1184,7 @@ module materializationJob {
     legacyBudget' = legacyBudget - 1,
     wanted' = wanted, lastWritten' = lastWritten,
     jobCoreUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   /// §2.1: a scheduler classification site creates a job for d — FIVE
@@ -1156,6 +1267,14 @@ module materializationJob {
     carried' = if (origin == OStaleReset) carried.put(d, true) else carried,
     budgetSoundAll' = budgetSoundAll,
     abortChargeFree' = abortChargeFree,
+    // A4: a fresh job admits immediately — any stale deferral from a
+    // predecessor job is reset at creation.
+    deferUntil' = deferUntil.put(d, false),
+    transientChargeFreeAll' = transientChargeFreeAll,
+    closureCompleteAll' = closureCompleteAll,
+    noVacuousCoverageAll' = noVacuousCoverageAll,
+    everContrib' = everContrib,
+    leafReevalReleased' = leafReevalReleased,
   }
 
   /// Delta 5: the dispatch-probe dedup re-encounters an existing
@@ -1179,7 +1298,7 @@ module materializationJob {
     },
     legacyBudget' = legacyBudget,
     jobCoreUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   /// PD-D1 (Wave D2.1, encoded at T-D7.2): a pruned merge's creation
@@ -1210,7 +1329,7 @@ module materializationJob {
     dupJob' = dupJob, view' = view, attempts' = attempts,
     nodeStatus' = nodeStatus, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   /// §2.2/§2.3: a store replica claims d's pending job — the kinded
@@ -1223,6 +1342,9 @@ module materializationJob {
     REPLICAS.contains(replica),
     execsMinted < MAX_EXECS,
     not(channelStale.get(replica)),
+    // A4: pull admission honors the view-only deferral (RetryLater) —
+    // the ONLY reader of deferUntil (park/PD-20/stalled never read it).
+    not(deferUntil.get(d)),
     view.get(d) == VPending(false),
     match jobs.get(d) {
       | NoJob => false
@@ -1246,6 +1368,7 @@ module materializationJob {
       // NRunning overwrite above.
       claimOrigin' = claimOrigin.put(d, nodeStatus.get(d)),
     },
+    a4Unchanged,
     dupJob' = dupJob, topdownPruned' = topdownPruned,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
     leaseGen' = leaseGen, staleWriteDiscarded' = staleWriteDiscarded,
@@ -1280,7 +1403,7 @@ module materializationJob {
     pins' = pins.put((d, o), PinMaterialization),
     ingested' = ingested.put((d, o), true),
     jobCoreUnchanged, relUnchanged, ledgerUnchanged, envUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   /// §2.4: the executor's Success report + the consumption
@@ -1294,6 +1417,14 @@ module materializationJob {
       | OpenAttempt(a) => a.kind == KMaterialization and not(channelStale.get(a.instance))
     },
     match jobs.get(d) { | NoJob => false | SomeJob(j) => j.state == JClaimed },
+    // A4 (merged_bug_194 store leg): the executor never REPORTS a
+    // Success with nothing behind it — a zero-wanted zero-evidence
+    // walk is InfraFailure at the store. The report carries a
+    // non-empty live wanted set or actual store evidence.
+    or {
+      liveWanted(d) != Set(),
+      OUTPUTS.exists(o => ingested.get((d, o)) or present.get((d, o))),
+    },
     val covered = liveWantedCovered(d)
     val execId = match attempts.get(d) { | NoAttempt => 0 | OpenAttempt(a) => a.execId }
     all {
@@ -1312,7 +1443,21 @@ module materializationJob {
       // the decision ranged over the live-only union (structural).
       covAtResolveAll' = and { covAtResolveAll, covered implies covered },
       covLiveOnlyAll' = covLiveOnlyAll,
+      // A4 latch: the covered completion carried real width or real
+      // evidence (the guard above is the as-built fact; the
+      // mat-a4-vacuous-success override drops the guard and this latch
+      // records the vacuous completion).
+      noVacuousCoverageAll' = and {
+        noVacuousCoverageAll,
+        covered implies or {
+          liveWanted(d) != Set(),
+          OUTPUTS.exists(o => ingested.get((d, o)) or present.get((d, o))),
+        },
+      },
     },
+    deferUntil' = deferUntil, transientChargeFreeAll' = transientChargeFreeAll,
+    closureCompleteAll' = closureCompleteAll, everContrib' = everContrib,
+    leafReevalReleased' = leafReevalReleased,
     dupJob' = dupJob, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
     tenureUnchanged,
@@ -1344,8 +1489,14 @@ module materializationJob {
   /// count_materialization_rows_in_history — NOT the per-job count).
   /// The report precondition (missing paths verified absent AND
   /// unavailable) is the evidence the fsReportSound latch records.
-  action consumeUnobtainable(d: str, missing: Set[str]): bool = all {
-    missing != Set(),
+  action consumeUnobtainable(d: str, missing: Set[str], refsMissing: bool): bool = all {
+    // A4 (merged_bug_193): the report splits the miss cells — wanted
+    // misses (`missing`, ⊆ OUTPUTS) and confirmed reference-closure
+    // misses (`refsMissing` — modeled as the non-empty bit of the
+    // missing_reference_paths field). A reference hole alone is a
+    // reportable Unobtainable (pre-fix it was UNREPRESENTABLE here:
+    // missing ⊆ OUTPUTS forced every report into the wanted cell).
+    or { missing != Set(), refsMissing },
     missing.subseteq(OUTPUTS),
     match attempts.get(d) {
       | NoAttempt => false
@@ -1366,7 +1517,11 @@ module materializationJob {
     val oneShotSpent = match jobs.get(d) { | NoJob => false | SomeJob(j) => j.matUnobtainableCount > 0 }
     val ownShotSpent = oneShotSpent
     val arm0 = missingLive == Set()
-    val arm0covered = arm0 and liveWantedCovered(d)
+    // A4 (merged_bug_193): the moot arm completes ONLY when BOTH cells
+    // are clean — no live-wanted miss AND no confirmed reference hole.
+    // A reference hole over a covered wanted set re-arms (the closure
+    // is incomplete; completing would launder the hole).
+    val arm0covered = arm0 and liveWantedCovered(d) and not(refsMissing)
     val arm12 = not(arm0) and (durableRel.get(d) == RVouched or durableRel.get(d) == RPending)
     val reprobeAllObtainable = w.forall(o => present.get((d, o)) or upstreamAvail.get((d, o)))
     val arm3rearm = not(arm0) and not(arm12) and reprobeAllObtainable and not(oneShotSpent)
@@ -1425,7 +1580,10 @@ module materializationJob {
       fsJustifiedAll' = and {
         fsJustifiedAll,
         arm12 implies (durableRel.get(d) == RVouched or durableRel.get(d) == RPending),
-        arm3fs implies (durableRel.get(d) == RBroken and not(marked)),
+        arm3fs implies (and {
+          durableRel.get(d) == RChildlessLeaf or durableRel.get(d) == RHoled,
+          not(marked),
+        }),
       },
       // C2: the from-source routing consumed evidence-backed missing
       // paths (verified absent-and-unavailable at this decision).
@@ -1437,7 +1595,18 @@ module materializationJob {
       // CE-17 latch: the moot-covered arm is a success resolution.
       covAtResolveAll' = and { covAtResolveAll, arm0covered implies liveWantedCovered(d) },
       covLiveOnlyAll' = covLiveOnlyAll,
+      // A4 latch (193): no completed resolution over a confirmed
+      // reference hole — structurally true as-built (arm0covered
+      // carries not(refsMissing)); the mat-a4-refs-folded override
+      // re-introduces the fold and this latch records it.
+      closureCompleteAll' = and {
+        closureCompleteAll,
+        arm0covered implies not(refsMissing),
+      },
     },
+    deferUntil' = deferUntil, transientChargeFreeAll' = transientChargeFreeAll,
+    noVacuousCoverageAll' = noVacuousCoverageAll, everContrib' = everContrib,
+    leafReevalReleased' = leafReevalReleased,
     dupJob' = dupJob, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, envUnchanged,
     matInfraLedger' = matInfraLedger, buildCrashLedger' = buildCrashLedger,
@@ -1500,6 +1669,64 @@ module materializationJob {
     claimOrigin' = claimOrigin,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
     carried' = carried,
+    a4Unchanged,
+  }
+
+  /// A4 (merged_bug_178/195): the executor's RetryLater report — a
+  /// transient substitution failure (raced placeholder slot, upstream
+  /// 429) closes the attempt CHARGE-FREE: no ledger row of any class,
+  /// no park-counter movement, and the only durable footprint is the
+  /// VIEW-ONLY deferral that pull admission reads (claimJob's guard).
+  /// The park decision, the park re-evaluation and the stalled gauge
+  /// never read it — a 429 wave cannot walk a healthy job toward the
+  /// from-source settlement. (A failover rebuilds the view without the
+  /// deferral — the job loses at most one uncharged wait window.)
+  action reportTransient(d: str): bool = all {
+    match attempts.get(d) {
+      | NoAttempt => false
+      | OpenAttempt(a) => a.kind == KMaterialization and not(channelStale.get(a.instance))
+    },
+    match jobs.get(d) { | NoJob => false | SomeJob(j) => j.state == JClaimed },
+    all {
+      jobs' = jobs.put(d, match jobs.get(d) {
+        | NoJob => NoJob
+        | SomeJob(j) => SomeJob({ ...j, state: JPending })
+      }),
+      view' = view.put(d, VPending(false)),
+      nodeStatus' = nodeStatus.put(d, NQueued),
+      attempts' = attempts.put(d, NoAttempt),
+      deferUntil' = deferUntil.put(d, true),
+      // The charge-free latch: both materialization ledgers, the crash
+      // ledgers and the park flag are untouched at this edge — the
+      // facts are recorded HERE (the override charges and records the
+      // divergence).
+      transientChargeFreeAll' = and {
+        transientChargeFreeAll,
+        match jobs.get(d) { | NoJob => true | SomeJob(j) => not(j.parked) },
+      },
+    },
+    dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
+    relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged, ghostsUnchanged,
+    closureCompleteAll' = closureCompleteAll,
+    noVacuousCoverageAll' = noVacuousCoverageAll,
+    everContrib' = everContrib,
+    leafReevalReleased' = leafReevalReleased,
+  }
+
+  /// A4: the deferral window lapses — the job is claimable again.
+  /// (Production: defer_until is a timestamp the admission read
+  /// compares to now(); the model's bool flips back.)
+  action deferExpires(d: str): bool = all {
+    deferUntil.get(d),
+    deferUntil' = deferUntil.put(d, false),
+    transientChargeFreeAll' = transientChargeFreeAll,
+    closureCompleteAll' = closureCompleteAll,
+    noVacuousCoverageAll' = noVacuousCoverageAll,
+    everContrib' = everContrib,
+    leafReevalReleased' = leafReevalReleased,
+    jobCoreUnchanged, relUnchanged, storeUnchanged, ledgerUnchanged,
+    envUnchanged, tenureUnchanged, ghostsUnchanged,
   }
 
   /// §2.4 establishment (BC-2/BC-3/PP-4): a crashed worker's open
@@ -1585,6 +1812,7 @@ module materializationJob {
     // structurally, not merely framed.
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
     carried' = carried,
+    a4Unchanged,
   }
 
   /// §2.4 / BC-2: zero live in-memory interest cancels the job and
@@ -1614,7 +1842,7 @@ module materializationJob {
     topdownPruned' = topdownPruned.put(d, false),
     dupJob' = dupJob, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   /// A1 resolve-fault arms (ENABLE_RESOLVE_FAULTS; the view-settlement
@@ -1638,7 +1866,7 @@ module materializationJob {
     hasUnresolvedJob(d),
     jobCoreUnchanged,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   action resolveErr(d: str): bool = all {
@@ -1646,7 +1874,7 @@ module materializationJob {
     hasUnresolvedJob(d),
     jobCoreUnchanged,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   /// §2.4: the node was Produced by other means: the job goes
@@ -1666,7 +1894,7 @@ module materializationJob {
     topdownPruned' = topdownPruned.put(d, false),
     dupJob' = dupJob, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   /// B1 bounded-await-transport (merged_bug_189 / owner Q3): the store
@@ -1697,7 +1925,7 @@ module materializationJob {
     topdownPruned' = topdownPruned,
     dupJob' = dupJob, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   /// Delta 3 arm 1: the per-tick park RE-EVALUATION
@@ -1711,7 +1939,13 @@ module materializationJob {
       | NoJob => false
       | SomeJob(j) => j.state == JPending and j.parked
     },
-    durableRel.get(d) == RVouched or durableRel.get(d) == RPending,
+    // A4 re-derivation (the RBroken split): the re-evaluation releases
+    // every from-source-VIABLE park — Vouched, Pending, and the
+    // childless leaf while unmarked (pre-fix the leaf was collapsed
+    // into Broken and could only cycle backoff→claim→infra→park; the
+    // recorded flip is mat-a4-leaf-park-forever). Holed parks have
+    // only the backoff arm — they ARE the stalled population.
+    fromSourceViable(d),
     jobs' = jobs.put(d, match jobs.get(d) {
       | NoJob => NoJob
       | SomeJob(j) => SomeJob({ ...j, state: JResolvedFromSource, parked: false })
@@ -1727,7 +1961,7 @@ module materializationJob {
     ffJustifiedAll' = ffJustifiedAll,
     fsJustifiedAll' = and {
       fsJustifiedAll,
-      durableRel.get(d) == RVouched or durableRel.get(d) == RPending,
+      fromSourceViable(d),
     },
     fsReportSoundAll' = fsReportSoundAll, covAtResolveAll' = covAtResolveAll,
     covLiveOnlyAll' = covLiveOnlyAll,
@@ -1738,6 +1972,17 @@ module materializationJob {
     carried' = carried,
     budgetSoundAll' = budgetSoundAll,
     abortChargeFree' = abortChargeFree,
+    deferUntil' = deferUntil,
+    transientChargeFreeAll' = transientChargeFreeAll,
+    closureCompleteAll' = closureCompleteAll,
+    noVacuousCoverageAll' = noVacuousCoverageAll,
+    everContrib' = everContrib,
+    // the leaf-release reachability latch (the noLeafParkReevalResolve
+    // witness; a Vouched/Pending release leaves it unchanged).
+    leafReevalReleased' = or {
+      leafReevalReleased,
+      durableRel.get(d) == RChildlessLeaf,
+    },
   }
 
   /// Delta 3 arm 2: the durable backoff lapses — the job un-parks for
@@ -1759,7 +2004,7 @@ module materializationJob {
     attempts' = attempts, nodeStatus' = nodeStatus,
     dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   /// A build reaches a terminal state: it leaves the live set; its
@@ -1771,7 +2016,7 @@ module materializationJob {
     upstreamAvail' = upstreamAvail, upstreamFlipsLeft' = upstreamFlipsLeft,
     durableRel' = durableRel,
     jobCoreUnchanged, relUnchanged, storeUnchanged, ledgerUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   /// §2.3 / delta 6 (post-D-prime): a builder pull for d — the BUILD
@@ -1795,7 +2040,7 @@ module materializationJob {
     },
     jobs' = jobs, dupJob' = dupJob, view' = view, topdownPruned' = topdownPruned,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   /// The from-source dispatch completes: the node completes, outputs
@@ -1815,7 +2060,7 @@ module materializationJob {
     jobs' = jobs, dupJob' = dupJob, view' = view, topdownPruned' = topdownPruned,
     execsMinted' = execsMinted,
     relUnchanged, ledgerUnchanged, envUnchanged, tenureUnchanged,
-    ghostsUnchanged,
+    ghostsUnchanged, a4Unchanged,
   }
 
   /// The dispatch-time store short-circuit (the D16 probe partition's
@@ -1834,7 +2079,7 @@ module materializationJob {
     jobs' = jobs, dupJob' = dupJob, view' = view, topdownPruned' = topdownPruned,
     attempts' = attempts, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   /// Leader failover (delta 5 + delta 2a): the lease generation bumps;
@@ -1860,7 +2105,7 @@ module materializationJob {
     staleWriteDiscarded' = staleWriteDiscarded,
     staleJobWriteApplied' = staleJobWriteApplied,
     claimAfterFailover' = claimAfterFailover,
-    ghostsUnchanged,
+    ghostsUnchanged, a4Unchanged,
   }
 
   /// Delta 2a: the executor abandons its standby-pinned channel and
@@ -1878,7 +2123,7 @@ module materializationJob {
     failedOver' = failedOver, claimAfterFailover' = claimAfterFailover,
     failoverDroppedJobs' = failoverDroppedJobs,
     jobCoreUnchanged, relUnchanged, storeUnchanged, ledgerUnchanged,
-    envUnchanged, ghostsUnchanged,
+    envUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   /// A job write from a previous lease generation arrives (stale
@@ -1898,7 +2143,7 @@ module materializationJob {
     claimAfterFailover' = claimAfterFailover,
     failoverDroppedJobs' = failoverDroppedJobs,
     jobCoreUnchanged, relUnchanged, storeUnchanged, ledgerUnchanged,
-    envUnchanged, ghostsUnchanged,
+    envUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   /// §5.3: the pin release — job resolved (or none) AND all in-memory
@@ -1920,7 +2165,7 @@ module materializationJob {
       if (pins.get((d, o)) == PinMaterialization) acc.put((d, o), false) else acc),
     present' = present,
     jobCoreUnchanged, relUnchanged, ledgerUnchanged, envUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   /// Store GC visits a (derivation, output) path: deletion is blocked
@@ -1933,7 +2178,7 @@ module materializationJob {
     present' = present.put((d, o), false),
     pins' = pins, ingested' = ingested,
     jobCoreUnchanged, relUnchanged, ledgerUnchanged, envUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   /// The upstream world changes (bounded).
@@ -1944,7 +2189,7 @@ module materializationJob {
     upstreamFlipsLeft' = upstreamFlipsLeft - 1,
     buildLive' = buildLive, durableRel' = durableRel,
     jobCoreUnchanged, relUnchanged, storeUnchanged, ledgerUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   /// The durable declared-relation classification changes (deps
@@ -1955,7 +2200,7 @@ module materializationJob {
     buildLive' = buildLive, upstreamAvail' = upstreamAvail,
     upstreamFlipsLeft' = upstreamFlipsLeft,
     jobCoreUnchanged, relUnchanged, storeUnchanged, ledgerUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   // --- 9. init ------------------------------------------------------------------
@@ -1994,7 +2239,7 @@ module materializationJob {
     buildLive' = BUILDS.mapBy(b => true),
     upstreamAvail' = tuples(DRVS, OUTPUTS).mapBy(p => true),
     upstreamFlipsLeft' = MAX_UPSTREAM_FLIPS,
-    durableRel' = DRVS.mapBy(d => RBroken),
+    durableRel' = DRVS.mapBy(d => RHoled),
     execsMinted' = 0,
     failFastCount' = DRVS.mapBy(d => 0),
     ffJustifiedAll' = true,
@@ -2005,6 +2250,12 @@ module materializationJob {
     creationResolvableAll' = true,
     claimOrigin' = DRVS.mapBy(d => NQueued),
     requeueReadyJustifiedAll' = true,
+    deferUntil' = DRVS.mapBy(d => false),
+    transientChargeFreeAll' = true,
+    closureCompleteAll' = true,
+    noVacuousCoverageAll' = true,
+    everContrib' = tuples(BUILDS, DRVS).mapBy(p => Set()),
+    leafReevalReleased' = false,
   }
 
   // --- 10. step --------------------------------------------------------------------
@@ -2018,7 +2269,8 @@ module materializationJob {
     nondet origin = Set(OProbe, OMerge, OPruned, OReprobe, OStaleReset).oneOf()
     nondet outs = OUTPUTS.powerset().oneOf()
     nondet missing = OUTPUTS.powerset().oneOf()
-    nondet rel = Set(RVouched, RPending, RBroken).oneOf()
+    nondet rel = Set(RVouched, RPending, RChildlessLeaf, RHoled).oneOf()
+    nondet refsMissing = Set(true, false).oneOf()
     any {
       recordWantedRelation(b, d, outs),
       legacyBuildArrives(b, d),
@@ -2028,8 +2280,10 @@ module materializationJob {
       claimJob(d, replica),
       executeStep(d, o),
       consumeSuccess(d),
-      consumeUnobtainable(d, missing),
+      consumeUnobtainable(d, missing, refsMissing),
       workerAborted(d),
+      reportTransient(d),
+      deferExpires(d),
       reportInfra(d),
       establishCrashedAttempt(d),
       cancelOnZeroInterest(d),
@@ -2130,7 +2384,7 @@ module materializationJob {
       .expect(topdownPruned.get("d1"))
       .then(upstreamChange("d1", "o1"))
       .then(claimJob("d1", "r1"))
-      .then(consumeUnobtainable("d1", Set("o1")))
+      .then(consumeUnobtainable("d1", Set("o1"), false))
       .expect(and {
         nodeStatus.get("d1") == NFailed,
         failFastCount.get("d1") == 1,
@@ -2152,7 +2406,7 @@ module materializationJob {
       .then(createJob("d1", OProbe, "b1"))
       .then(upstreamChange("d1", "o1"))
       .then(claimJob("d1", "r1"))
-      .then(consumeUnobtainable("d1", Set("o1")))
+      .then(consumeUnobtainable("d1", Set("o1"), false))
       .expect(and {
         nodeStatus.get("d1") == NReady,
         failFastCount.get("d1") == 0,
@@ -2251,7 +2505,7 @@ module materializationJob {
       // RBroken + unmarked).
       .then(upstreamChange("d1", "o1"))
       .then(claimJob("d1", "r1"))
-      .then(consumeUnobtainable("d1", Set("o1")))
+      .then(consumeUnobtainable("d1", Set("o1"), false))
       .expect(match jobs.get("d1") {
         | NoJob => false
         | SomeJob(j) => j.state == JResolvedFromSource

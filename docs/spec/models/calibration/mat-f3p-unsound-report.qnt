@@ -108,7 +108,10 @@ module matCalibF3pUnsoundReport {
       fsJustifiedAll' = and {
         fsJustifiedAll,
         arm12 implies (durableRel.get(d) == RVouched or durableRel.get(d) == RPending),
-        arm3fs implies (durableRel.get(d) == RBroken and not(marked)),
+        arm3fs implies (and {
+          durableRel.get(d) == RChildlessLeaf or durableRel.get(d) == RHoled,
+          not(marked),
+        }),
       },
       fsReportSoundAll' = and {
         fsReportSoundAll,
@@ -131,6 +134,7 @@ module matCalibF3pUnsoundReport {
     budgetSoundAll' = budgetSoundAll,
     abortChargeFree' = abortChargeFree,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
+    a4Unchanged,
   }
 
   action calibStep = {
@@ -142,7 +146,7 @@ module matCalibF3pUnsoundReport {
     nondet origin = Set(OProbe, OMerge, OPruned, OReprobe, OStaleReset).oneOf()
     nondet outs = OUTPUTS.powerset().oneOf()
     nondet missing = OUTPUTS.powerset().oneOf()
-    nondet rel = Set(RVouched, RPending, RBroken).oneOf()
+    nondet rel = Set(RVouched, RPending, RChildlessLeaf, RHoled).oneOf()
     any {
       recordWantedRelation(b, d, outs),
       legacyBuildArrives(b, d),

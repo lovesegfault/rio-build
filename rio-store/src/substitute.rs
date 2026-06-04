@@ -519,7 +519,7 @@ impl Substituter {
     /// **One path, one answer.** The store does NOT walk
     /// `info.references` here; closure completeness is the caller's
     /// responsibility (the materialization executor's own walk,
-    /// `r[store.materialize.executor+4]`; the nix client for the
+    /// `r[store.materialize.executor+5]`; the nix client for the
     /// gateway). Matches upstream
     /// Nix's `BinaryCacheStore::queryPathInfo` contract.
     #[instrument(skip(self), fields(tenant = %tenant_id, path = store_path))]

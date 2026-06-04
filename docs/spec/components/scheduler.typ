@@ -1381,7 +1381,7 @@ is the successor of the walk-era must-substitute pull interlock (kind-aware:
 materialization-kind claims are the one exception,
 #rref("sched.state.machine")).
 
-#r("sched.materialize.routing+4")[
+#r("sched.materialize.routing+5")[
   A materialization outcome MUST be consumed in exactly one fenced transaction
   keyed by its exec_id, and that transaction MUST re-read live interest and the
   live effective wanted set before acting: a Success outcome completes the node
@@ -1400,7 +1400,11 @@ materialization-kind claims are the one exception,
   durable-Vouched arm (declared closure produced → from-source), the
   durable-Pending arm (deps still buildable → from-source via normal gating),
   and only then --- after a same-transaction store re-probe of the live wanted
-  set confirms a live-wanted path missing-and-unsubstitutable, or after the
+  set confirms a live-wanted path missing-and-unsubstitutable under EVERY
+  live interested tenant (the re-probe asks once per live tenant; the
+  confirmed-missing verdict is the all-tenant conjunction over a non-empty
+  answer set, any failed or indeterminate tenant view re-arms instead ---
+  the job fails only when NO interested tenant can obtain), or after the
   per-job re-probe one-shot is spent --- the settlement arm, which MUST
   discriminate on the job's pruned origin (`origin = 'pruned'`, set at pruned
   creation or by the pruned-wins dedup upgrade and read from the job row at
@@ -1417,7 +1421,13 @@ materialization-kind claims are the one exception,
   builds classify Broken --- stale evidence never launders a from-source
   dispatch). An InfraFailure
   outcome MUST never fail-fast and never route from-source; it re-arms the job
-  within the materialization budget and parks it on exhaustion.
+  within the materialization budget and parks it on exhaustion. The same
+  per-tenant discipline governs the dispatch-time batch probe that routes
+  Ready nodes: presence and substitutability are asked once per live
+  interested tenant, inline completion requires present-and-visible under
+  EVERY interested tenant, and a materialization job is created when every
+  wanted path is obtainable under SOME tenant (a failed tenant probe drops
+  out of both folds; all probes failing keeps the fail-open dispatch shape).
 ]
 The four-arm routing is the C3-settlement successor (design §2.4; review
 findings AS-2/PP-1/PP-3/BC-5). The same-transaction re-probe preserves CE-D4's

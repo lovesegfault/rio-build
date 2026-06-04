@@ -109,6 +109,7 @@ module matCalibF9DivergentEvidence {
     budgetSoundAll' = budgetSoundAll,
     abortChargeFree' = abortChargeFree,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
+    a4Unchanged,
   }
 
   action calibStep = {
@@ -120,7 +121,7 @@ module matCalibF9DivergentEvidence {
     nondet origin = Set(OProbe, OMerge, OPruned, OReprobe, OStaleReset).oneOf()
     nondet outs = OUTPUTS.powerset().oneOf()
     nondet missing = OUTPUTS.powerset().oneOf()
-    nondet rel = Set(RVouched, RPending, RBroken).oneOf()
+    nondet rel = Set(RVouched, RPending, RChildlessLeaf, RHoled).oneOf()
     any {
       recordWantedRelation(b, d, outs),
       legacyBuildArrives(b, d),

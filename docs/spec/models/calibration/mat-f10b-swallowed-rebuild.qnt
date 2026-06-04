@@ -80,6 +80,7 @@ module matCalibF10bSwallowedRebuild {
     staleJobWriteApplied' = staleJobWriteApplied,
     claimAfterFailover' = claimAfterFailover,
     ghostsUnchanged,
+    a4Unchanged,
   }
 
   action calibStep = {
@@ -91,7 +92,8 @@ module matCalibF10bSwallowedRebuild {
     nondet origin = Set(OProbe, OMerge, OPruned, OReprobe, OStaleReset).oneOf()
     nondet outs = OUTPUTS.powerset().oneOf()
     nondet missing = OUTPUTS.powerset().oneOf()
-    nondet rel = Set(RVouched, RPending, RBroken).oneOf()
+    nondet rel = Set(RVouched, RPending, RChildlessLeaf, RHoled).oneOf()
+    nondet refsMissing = Set(true, false).oneOf()
     nondet swallowed = DRVS.powerset().oneOf()
     any {
       recordWantedRelation(b, d, outs),
@@ -101,7 +103,7 @@ module matCalibF10bSwallowedRebuild {
       claimJob(d, replica),
       executeStep(d, o),
       consumeSuccess(d),
-      consumeUnobtainable(d, missing),
+      consumeUnobtainable(d, missing, refsMissing),
       reportInfra(d),
       establishCrashedAttempt(d),
       cancelOnZeroInterest(d),

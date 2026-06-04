@@ -47,7 +47,7 @@ const STORE_TRANSIENT_BACKOFF: rio_common::backoff::Backoff = rio_common::backof
 /// `r[store.substitute.admission+2]` server-side, which returns
 /// `ResourceExhausted` after its bounded wait under saturation. The
 /// in-process materialization executor re-arms through its job budget
-/// (`r[store.materialize.executor+4]`); without this retry the gateway
+/// (`r[store.materialize.executor+5]`); without this retry the gateway
 /// surfaced a hard `STDERR_ERROR` → client sees
 /// "store error: ResourceExhausted" on a momentary overload.
 ///

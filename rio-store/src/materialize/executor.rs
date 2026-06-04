@@ -8,7 +8,7 @@
 //! the admission gate). The store substitutes ONE path per
 //! `try_substitute` call (no closure walk — that is its documented
 //! contract), so this module owns closure completeness.
-// r[impl store.materialize.executor+4]
+// r[impl store.materialize.executor+5]
 
 use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
@@ -66,7 +66,7 @@ pub struct ExecutorContext {
 /// 4. **Final verification pass**: the wanted set is RE-READ after the
 ///    walk; growth re-enters the walk (the loop), so the reported
 ///    coverage is against execution-end live wanted, not a snapshot.
-// r[impl store.materialize.executor+4]
+// r[impl store.materialize.executor+5]
 // r[impl sched.materialize.pinning]
 pub async fn execute_job(ctx: &ExecutorContext, claimed: &ClaimedJob) -> MaterializationOutcome {
     execute_job_with_progress(ctx, claimed, |_, _, _| {}).await
@@ -82,7 +82,7 @@ pub async fn execute_job(ctx: &ExecutorContext, claimed: &ClaimedJob) -> Materia
 /// the whole closure. Display-only and droppable: the callback must be
 /// cheap and non-blocking (it runs on the walk); the caller forwards it
 /// to `ReportMaterializationProgress` fire-and-forget.
-// r[impl store.materialize.executor+4]
+// r[impl store.materialize.executor+5]
 // r[impl obs.metric.store]
 pub async fn execute_job_with_progress(
     ctx: &ExecutorContext,
@@ -1006,7 +1006,7 @@ mod tests {
 
     // ── The battery ───────────────────────────────────────────────────
 
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     // r[verify sched.materialize.pinning]
     /// (1) The walk: BFS over narinfo references from the wanted seed
     /// path; every closure member try_substitute'd in-process; every
@@ -1092,7 +1092,7 @@ mod tests {
         }
     }
 
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     /// (2) The wanted set is read at execution time and RE-READ at the
     // r[verify sched.merge.stale-substitutable+3]
     /// Floating-CA stale-reset carrier (migration 082): a job whose
@@ -1237,7 +1237,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     /// (3) Tenant resolution (AS-4): job tenant NULL + no live
     /// interested build with a tenant → InfraFailure{no-tenant-context}.
     /// Never Unobtainable, never silent success.
@@ -1275,7 +1275,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     /// (4) Stale recorded tenant (PDQ-8): the creating build is
     /// TERMINAL (its recorded tenant no longer carries live interest)
     /// while a live interested build with a DIFFERENT tenant remains →
@@ -1349,7 +1349,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     /// (5) A confirmed-404 wanted path (every upstream definitively
     /// answers "not present") → Unobtainable{missing_paths=[it]},
     /// with whatever WAS obtained in verified_paths.
@@ -1397,7 +1397,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     // r[verify store.substitute.stall-abort+2]
     /// (6b) A WEDGED upstream download (headers, then no body bytes)
     /// is ended by the substituter's owner-side stall abort and
@@ -1519,7 +1519,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     /// (6) Upstream 5xx → InfraFailure (B3's executor half): nothing is
     /// confirmed, so the verdict must be infrastructure trouble — never
     /// Unobtainable (which would route from-source), never Success.
@@ -1559,7 +1559,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     /// (7) T-1.2 / BC-4: the executor reports cumulative, monotone byte
     /// progress through the callback while walking a multi-path closure.
     /// Every call satisfies done ≤ expected; done never decreases; the
@@ -1663,7 +1663,7 @@ mod tests {
     }
 
     // r[verify obs.metric.store]
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     /// T-6.2 (red-first): the execution-outcome and pin counters the
     /// dashboards consume —
     ///
@@ -1836,7 +1836,7 @@ mod tests {
         }
     }
 
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     /// merged_bug_193 (193a): a REFERENCE dep that 404s everywhere
     /// lands in `missing_reference_paths`, NOT `missing_paths` — the
     /// wanted root itself was obtained and rides `verified_paths`.
@@ -1891,7 +1891,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     /// bug_042: paths LOCALLY present (complete manifests) verify and
     /// extend the walk from the LOCAL row's references — upstream
     /// absence is irrelevant. RED (pre-fix): all-404 upstreams turned
@@ -2008,7 +2008,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     /// merged_bug_178 (178a): an upstream 429 with Retry-After is a
     /// transient, UNCHARGED RetryLater — class and parsed delay ride
     /// the outcome. RED (pre-fix): `Err(RateLimited)` fell into the
@@ -2071,7 +2071,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     /// merged_bug_178 (178a): a placeholder race (another uploader
     /// holds the slot) is RetryLater too — the in-flight upload will
     /// land; charging would burn budget on our own concurrency. RED
@@ -2125,7 +2125,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     /// merged_bug_194 (store leg): a FIRST iteration that resolves no
     /// verifiable wanted path reports infra — never "Success with
     /// nothing verified". RED (pre-fix): the empty-seed break produced
@@ -2156,7 +2156,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     /// merged_bug_028 / owner Q2 (executor leg): when the FIRST
     /// tenant's upstreams 404 a path, the walk tries the NEXT
     /// interested tenant's upstreams and succeeds — the job fails only
@@ -2224,7 +2224,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor+4]
+    // r[verify store.materialize.executor+5]
     /// merged_bug_028 (conjunction leg): a confirmed-absent verdict
     /// requires the miss to be confirmed under EVERY interested
     /// tenant — when one tenant's probe is indeterminate (its upstream

@@ -65,7 +65,7 @@ pub enum FailureDisposition {
 
 /// The total classification table (no catch-all: adding a
 /// [`SubstituteFailureClass`] variant breaks this build).
-// r[impl store.materialize.executor+4]
+// r[impl store.materialize.executor+5]
 pub fn classify_substitute_failure(class: SubstituteFailureClass) -> FailureDisposition {
     match class {
         SubstituteFailureClass::Raced | SubstituteFailureClass::RateLimited => {
@@ -93,7 +93,7 @@ pub fn classify_substitute_failure(class: SubstituteFailureClass) -> FailureDisp
 /// RPC failures never reach this fold — the caller maps them to its
 /// B3 ReArm before folding (same posture as `route_unobtainable`'s
 /// `None` reprobe).
-// r[impl sched.materialize.routing+4]
+// r[impl sched.materialize.routing+5]
 pub fn fold_tenant_reprobes(
     answers: &[crate::routing::ReprobeAnswer],
 ) -> crate::routing::ReprobeAnswer {
@@ -218,6 +218,108 @@ mod tests {
         assert_eq!(
             fold_tenant_reprobes(&[ConfirmedMissing, ConfirmedMissing]),
             ConfirmedMissing
+        );
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+    use crate::routing::ReprobeAnswer;
+
+    /// merged_bug_178: the classification table, swept — transient by
+    /// the substituter's own contract (Raced/RateLimited) closes
+    /// uncharged; everything else (including the two deliberate
+    /// scope-narrowings, Stalled and AdmissionSaturated) charges. Total
+    /// over the class alphabet by construction (no catch-all).
+    #[kani::proof]
+    fn check_substitute_failure_truth_table() {
+        let class = match kani::any::<u8>() {
+            0 => SubstituteFailureClass::Raced,
+            1 => SubstituteFailureClass::RateLimited,
+            2 => SubstituteFailureClass::Stalled,
+            3 => SubstituteFailureClass::AdmissionSaturated,
+            4 => SubstituteFailureClass::Fetch,
+            5 => SubstituteFailureClass::Integrity,
+            _ => SubstituteFailureClass::Ingest,
+        };
+        let disposition = classify_substitute_failure(class);
+        let transient = matches!(
+            class,
+            SubstituteFailureClass::Raced | SubstituteFailureClass::RateLimited
+        );
+        assert_eq!(disposition == FailureDisposition::RetryUncharged, transient);
+        // bug_081's loop fold rides the same table: Stalled dominates
+        // RateLimited dominates CleanMiss, total over both axes.
+        let any_stall = if kani::any() {
+            Some(core::time::Duration::from_secs(kani::any::<u32>() as u64))
+        } else {
+            None
+        };
+        let any_429 = if kani::any() {
+            Some(if kani::any() {
+                Some(core::time::Duration::from_secs(kani::any::<u32>() as u64))
+            } else {
+                None
+            })
+        } else {
+            None
+        };
+        let verdict = fold_substitute_loop(any_stall, any_429);
+        match (any_stall, any_429) {
+            (Some(w), _) => assert_eq!(verdict, SubstituteLoopVerdict::Stalled { window: w }),
+            (None, Some(ra)) => {
+                assert_eq!(
+                    verdict,
+                    SubstituteLoopVerdict::RateLimited { retry_after: ra }
+                )
+            }
+            (None, None) => assert_eq!(verdict, SubstituteLoopVerdict::CleanMiss),
+        }
+    }
+
+    /// merged_bug_028 / owner Q2: `ConfirmedMissing` is the ALL-tenant
+    /// conjunction over a NON-EMPTY answer set — one obtainable tenant
+    /// view (or an empty set) keeps the job armed. Swept over every
+    /// answer vector up to four tenants (bitmask representation; stack
+    /// array — no heap under CBMC).
+    #[kani::proof]
+    fn check_confirmed_missing_is_all_tenant_conjunction() {
+        let mask: u8 = kani::any();
+        let mk = |i: usize| {
+            if mask & (1 << i) != 0 {
+                ReprobeAnswer::ConfirmedMissing
+            } else {
+                ReprobeAnswer::Obtainable
+            }
+        };
+        let arr = [mk(0), mk(1), mk(2), mk(3)];
+        // One concrete-length call per width (0..=4): symbolic slice
+        // lengths make CBMC's fat-pointer + iterator reasoning blow up
+        // (observed: the symbolic-len form ran past 19 CPU-minutes;
+        // this form completes in seconds). The mask still sweeps every
+        // answer VECTOR at each width — 2^4 × 5 widths = the full
+        // bounded space.
+        let confirmed = |i: usize| mask & (1 << i) != 0;
+        assert_eq!(
+            fold_tenant_reprobes(&arr[..0]) == ReprobeAnswer::ConfirmedMissing,
+            false
+        );
+        assert_eq!(
+            fold_tenant_reprobes(&arr[..1]) == ReprobeAnswer::ConfirmedMissing,
+            confirmed(0)
+        );
+        assert_eq!(
+            fold_tenant_reprobes(&arr[..2]) == ReprobeAnswer::ConfirmedMissing,
+            confirmed(0) && confirmed(1)
+        );
+        assert_eq!(
+            fold_tenant_reprobes(&arr[..3]) == ReprobeAnswer::ConfirmedMissing,
+            confirmed(0) && confirmed(1) && confirmed(2)
+        );
+        assert_eq!(
+            fold_tenant_reprobes(&arr[..4]) == ReprobeAnswer::ConfirmedMissing,
+            confirmed(0) && confirmed(1) && confirmed(2) && confirmed(3)
         );
     }
 }

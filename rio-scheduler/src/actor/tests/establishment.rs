@@ -466,6 +466,7 @@ async fn establishment_mat_arm_charges_with_failing_probe() -> TestResult {
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-test-0".into()),
             reply,
+            resume_exec_id: None,
         })
         .await
         .expect("actor alive");

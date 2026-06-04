@@ -296,3 +296,71 @@ mod proofs {
         );
     }
 }
+
+#[cfg(kani)]
+mod establishment_window_proofs {
+    use super::*;
+
+    fn any_kind() -> PullKind {
+        if kani::any() {
+            PullKind::Build
+        } else {
+            PullKind::Materialization
+        }
+    }
+
+    fn any_node() -> NodeDisposition {
+        match kani::any::<u8>() {
+            0 => NodeDisposition::WantedLive,
+            1 => NodeDisposition::Cancelled,
+            _ => NodeDisposition::Absent,
+        }
+    }
+
+    fn any_probe() -> ProbeClass {
+        match kani::any::<u8>() {
+            0 => ProbeClass::VerifiedAllWantedPresent,
+            1 => ProbeClass::VerifiedMissingWanted,
+            2 => ProbeClass::VerifiedNothingVerifiable,
+            3 => ProbeClass::Unavailable,
+            _ => ProbeClass::NoStoreConfigured,
+        }
+    }
+
+    /// A4 step 3 (the C1 fix's kernel pin): a live build attempt whose
+    /// store probe came back UNAVAILABLE defers — never a charge,
+    /// never an adoption (the probe said nothing about the store's
+    /// content; B3: unknown never demotes).
+    #[kani::proof]
+    fn check_establishment_unavailable_defers() {
+        assert_eq!(
+            establish_from_classes(
+                PullKind::Build,
+                NodeDisposition::WantedLive,
+                ProbeClass::Unavailable
+            ),
+            EstablishmentDisposition::Defer
+        );
+    }
+
+    /// The materialization row of the establishment table, swept over
+    /// EVERY node disposition and probe class: a materialization
+    /// attempt's expiry NEVER adopts a completion and NEVER charges
+    /// the executor-crash (build) ledger — its only verdicts are the
+    /// materialization-infra charge (live) and the charge-free close
+    /// (cancelled/absent).
+    #[kani::proof]
+    fn check_establishment_materialization_never_adopts_or_crash_charges() {
+        let node = any_node();
+        let probe = any_probe();
+        let disposition = establish_from_classes(PullKind::Materialization, node, probe);
+        assert!(disposition != EstablishmentDisposition::AdoptCompleted);
+        assert!(disposition != EstablishmentDisposition::ChargeExecutorCrash);
+        // Both reachable cells covered.
+        kani::cover!(disposition == EstablishmentDisposition::ChargeMaterializationInfra);
+        kani::cover!(disposition == EstablishmentDisposition::CloseChargeFree);
+        // Totality note: any_kind/any_node sweeps keep the two helper
+        // fns live under cfg(kani).
+        let _ = any_kind();
+    }
+}

@@ -54,7 +54,7 @@ module matCalib133DiscardedOutcome {
     dupJob' = dupJob,
     execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   action calibStep = {

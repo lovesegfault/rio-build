@@ -955,7 +955,7 @@ pub(crate) use rio_evidence_kernel::routing::{
 };
 
 impl DagActor {
-    // r[impl sched.materialize.routing+4]
+    // r[impl sched.materialize.routing+5]
     /// Consume one materialization outcome (the §2.4 consumption
     /// transaction). Reachable only flag-on in practice (no
     /// materialization attempt can exist otherwise) — but ALWAYS wired
@@ -1427,7 +1427,7 @@ impl DagActor {
     /// channel without the decision no longer exists. Park backs off
     /// the job durably (and the node is requeued either way: claimable
     /// again / from-source dispatchable per the admission table).
-    // r[impl sched.materialize.routing+4]
+    // r[impl sched.materialize.routing+5]
     #[allow(clippy::too_many_arguments)]
     async fn charge_materialization_infra(
         &mut self,
@@ -1881,7 +1881,7 @@ impl DagActor {
     /// mid-walk crash leaves outputs present but the closure
     /// incomplete) and never `executor_crash` (BC-2: the charge feeds
     /// the materialization budget and nothing else).
-    // r[impl sched.materialize.routing+4]
+    // r[impl sched.materialize.routing+5]
     pub(super) async fn establish_materialization_attempt(
         &mut self,
         attempt: &crate::db::open_attempts::OpenAttemptRow,
@@ -1921,7 +1921,7 @@ impl DagActor {
     }
 
     // r[impl obs.metric.materialization-stalled+2]
-    // r[impl sched.materialize.routing+4]
+    // r[impl sched.materialize.routing+5]
     /// PD-20 (design §2.5, Phase B T-6.1): the parked-job housekeeping
     /// arm. Every tick, flag-on, leader-only:
     ///

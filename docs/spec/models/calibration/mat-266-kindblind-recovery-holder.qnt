@@ -85,6 +85,7 @@ module matCalib266KindblindRecoveryHolder {
     attempts' = attempts, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
     tenureUnchanged, ghostsUnchanged,
+    a4Unchanged,
   }
 
   /// PRE-FIX recovery: the failover view rebuild with the kind-blind
@@ -105,6 +106,7 @@ module matCalib266KindblindRecoveryHolder {
     staleJobWriteApplied' = staleJobWriteApplied,
     claimAfterFailover' = claimAfterFailover,
     ghostsUnchanged,
+    a4Unchanged,
   }
 
   action calibStep = {
@@ -116,7 +118,8 @@ module matCalib266KindblindRecoveryHolder {
     nondet origin = Set(OProbe, OMerge, OPruned, OReprobe, OStaleReset).oneOf()
     nondet outs = OUTPUTS.powerset().oneOf()
     nondet missing = OUTPUTS.powerset().oneOf()
-    nondet rel = Set(RVouched, RPending, RBroken).oneOf()
+    nondet rel = Set(RVouched, RPending, RChildlessLeaf, RHoled).oneOf()
+    nondet refsMissing = Set(true, false).oneOf()
     any {
       recordWantedRelation(b, d, outs),
       legacyBuildArrives(b, d),
@@ -125,7 +128,7 @@ module matCalib266KindblindRecoveryHolder {
       claimJob(d, replica),
       executeStep(d, o),
       consumeSuccess(d),
-      consumeUnobtainable(d, missing),
+      consumeUnobtainable(d, missing, refsMissing),
       reportInfra(d),
       establishCrashedAttempt(d),
       cancelOnZeroInterest(d),

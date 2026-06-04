@@ -200,7 +200,7 @@ fn live_wanted(v: &[&str]) -> LiveWanted {
     LiveWanted::new(paths(v)).expect("test live-wanted sets are non-empty")
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// Arm 0 (moot-failure / the C3 arm): missing ∩ live-wanted = ∅ and
 /// verified ⊇ live-wanted → CompleteForLiveInterest. The design's
 /// §2.4 confirmed-C3-trace replay, steps 4–5: b2 cancelled in the
@@ -303,7 +303,7 @@ fn routing_broken_with_obtainable_reprobe_rearms_once() {
     );
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// FINDING 11 (the C3-class equivalence divergence, orchestrator
 /// ruling): the arm-3 settlement MUST discriminate on the
 /// topdown-pruned mark. An UNMARKED node — a genuine leaf whose
@@ -488,7 +488,7 @@ fn infra_failure_never_failfasts_never_routes_from_source() {
 
 // ── The consumption transaction (handler level, PG-backed) ─────────────
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// A BUILD attempt receiving a payload with materialization_outcome set
 /// is acknowledged-and-ignored: no ledger row appended, no status
 /// change, no job state touched. Reachable FLAG-OFF (any builder could
@@ -558,7 +558,7 @@ async fn build_attempt_with_materialization_payload_acked_and_ignored() -> TestR
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// FLAG ON: an InfraFailure consumption charges materialization_infra
 /// (kind=materialization — invisible to every build budget), the job
 /// stays pending and claimable (under budget — never a fail-fast, B3),
@@ -662,7 +662,7 @@ async fn flag_on_infra_failure_charges_and_rearms() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// merged_bug_189 / owner Q3 (charge-free Aborted): a worker-aborted
 /// walk (SIGTERM during a store rollout) closes the attempt with ZERO
 /// ledger rows of any class, the job returns to pending claimable, and
@@ -762,7 +762,7 @@ async fn aborted_outcome_closes_attempt_uncharged() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// merged_bug_178 (178b): a RetryLater outcome (raced placeholder /
 /// upstream 429) closes the attempt with ZERO ledger rows, sets the
 /// VIEW-ONLY deferral, re-arms the node — and admission refuses the
@@ -791,6 +791,7 @@ async fn retry_later_consumption_closes_uncharged_and_defers() -> TestResult {
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-0-w0".into()),
             reply,
+            resume_exec_id: None,
         })
         .await
         .expect("actor alive");
@@ -859,6 +860,7 @@ async fn retry_later_consumption_closes_uncharged_and_defers() -> TestResult {
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-1-w0".into()),
             reply,
+            resume_exec_id: None,
         })
         .await
         .expect("actor alive");
@@ -878,7 +880,7 @@ async fn retry_later_consumption_closes_uncharged_and_defers() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// merged_bug_028 (028b, settlement leg / owner Q2): the arm-3
 /// re-probe asks EVERY live tenant and `ConfirmedMissing` is the
 /// all-tenant conjunction — one tenant confirming missing while
@@ -999,7 +1001,7 @@ async fn reprobe_confirmed_missing_requires_all_tenants() -> TestResult {
 
 // ── Establishment + cancellation (T-3.6) ───────────────────────────────
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// A dead store replica's open materialization attempt is established
 /// as materialization_infra — never executor_crash, never adopted —
 /// and the job returns to pending (claimable again). BC-2/BC-3: no
@@ -1273,7 +1275,7 @@ async fn list_materialization_jobs(
 }
 
 // r[verify sched.materialize.job+2]
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 // r[verify sched.materialize.pinning]
 /// THE Phase A keystone: one materialization job, end-to-end, flag-on,
 /// exercising every dormant mechanism this campaign added in one
@@ -1469,7 +1471,7 @@ async fn flag_on_materialization_job_end_to_end() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// The Unobtainable moot arm (the C3 trace), flag-on, end-to-end through
 /// the actor: report Unobtainable for a path no LIVE build wants → the
 /// node completes for live interest, NEVER fail-fasts. The design §2.4
@@ -1596,7 +1598,7 @@ async fn flag_on_moot_unobtainable_never_fail_fasts() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 // r[verify sched.materialize.job+2]
 /// T-4.1 (Phase B): the FULL §2.4 C3 two-build dedup trace, flag-on —
 /// the materialization-path twin of
@@ -1776,7 +1778,7 @@ async fn flag_on_stale_unobtainable_two_build_dedup_never_fails() -> TestResult 
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// FINDING 11 (the C3-class equivalence divergence; orchestrator ruling,
 /// red-first), actor level: an UNMARKED genuine leaf — childless, so its
 /// closure evidence is structurally `Broken` — whose wanted output the
@@ -2911,7 +2913,7 @@ async fn flag_on_stale_reset_floating_ca_carries_realized_path() -> TestResult {
 // origin row is the only durable pruned fact and resolution itself is
 // the settlement) ──
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// Arm 2 at the actor level: a PRUNED-origin job whose node's
 /// re-declared child is NOT yet produced (durable evidence Pending)
 /// gets an Unobtainable report → the routing resolves from-source —
@@ -2994,7 +2996,7 @@ async fn pruned_origin_pending_evidence_resolves_from_source() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// Resolution is terminal (the FP-4(a) class, re-framed for the
 /// origin-only world): a node whose pruned-origin job resolved
 /// SUCCESSFULLY, then lost its outputs to GC, must dispatch from source
@@ -3466,7 +3468,7 @@ async fn recovery_sweep_releases_orphaned_materialization_pins() -> TestResult {
 // ── T-4.2 (Phase B): settlement totality — the D16-class limbo is
 //    structurally impossible flag-on ─────────────────────────────────────
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 // r[verify sched.materialize.job+2]
 /// T-4.2: every non-terminal materialization-job state has an armed
 /// action, and that action FIRES. The D16 limbo (flag-off: a
@@ -4344,7 +4346,7 @@ async fn flag_on_probe_matrix_routes_to_jobs() -> TestResult {
 }
 
 // r[verify sched.materialize.job+2]
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// T-4.4 test 2: noFromSourceWhileJobUnresolved at the actor level (the
 /// F8/F13 anchor's production half), both mark states:
 ///
@@ -4603,7 +4605,7 @@ async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// T-4.4 test 3: arm 3's genuine fail-fast — a PRUNED-ORIGIN
 /// root whose live-wanted output the consumption re-probe confirms
 /// missing-and-unsubstitutable fails every live DAG-interested build
@@ -4734,7 +4736,7 @@ async fn flag_on_genuine_unobtainable_fail_fasts_with_resubmit_error() -> TestRe
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// T-4.4 test 4: Success coverage is over the LIVE WANTED set, not the
 /// declared output set — the batch_probe_completes_on_missing_unwanted_
 /// output walk twin. A Success report covering the wanted output but
@@ -4972,7 +4974,7 @@ fn counter_value(
 }
 
 // r[verify obs.metric.materialization-stalled+2]
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// PD-20 (design §2.5, red-first): parked materialization jobs are
 /// VISIBLE (the `rio_scheduler_materialization_stalled` gauge, set from
 /// ground truth every housekeeping tick) and RE-EVALUABLE (a parked job
@@ -5715,7 +5717,7 @@ async fn job_lifecycle_metrics_count_claims_and_resolutions() -> TestResult {
 // materialization_jobs.origin (+ pruned-wins dedup upgrade)
 // ════════════════════════════════════════════════════════════════════
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// The arm-3 settlement discriminator reads the consumed job's ORIGIN
 /// (the durable successor of the walk-era pruned mark — design §4/A2/
 /// A13) and nothing else. Both directions:
@@ -5888,7 +5890,7 @@ async fn routing_reads_origin_not_column() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 // r[verify sched.materialize.job+2]
 /// The dedup-then-prune corner end-to-end (PD-D1): a node gets a
 /// cache_opportunity job from an earlier merge; a LATER pruned merge
@@ -6194,7 +6196,7 @@ async fn pg_edge(pool: &sqlx::PgPool, parent: Uuid, child: Uuid) -> anyhow::Resu
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// The routing classification must survive in-memory truncation: the
 /// consumption transaction classifies over the DURABLE relation
 /// (pg.edges + pg.status + live co-owning build links), not the
@@ -6294,7 +6296,7 @@ async fn routing_evidence_survives_inmemory_truncation() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// The park re-evaluation classifies over the durable relation too: a
 /// parked job whose node's PG closure is fully produced AND vouched by
 /// a live co-owning build resolves from-source at the next tick, even
@@ -6363,7 +6365,7 @@ async fn park_reevaluation_resolves_on_durable_vouch() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// The THIRD conjunct's own pin (the stale-evidence direction, RS-1):
 /// produced children whose only voucher is a TERMINAL build — the
 /// previous-generation shape — must classify Broken, NOT Vouched. PG
@@ -6713,7 +6715,7 @@ async fn unknown_contribution_saturates_conservatively() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// The consumption None-arm (step 4's red test, RS-2): a job's
 /// consumption where `effective_wanted_union` returns None (zero live
 /// relation rows — the legacy shape) must saturate `live_wanted_paths`
@@ -7301,7 +7303,7 @@ async fn cluster_snapshot_executors_exclude_materialization_claims() -> TestResu
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// merged_bug_318 (A2.5 kinded release edge): requeueing a DEP-RACING
 /// (Queued-origin) materialization claim must return the node to its
 /// DEP-DERIVED status — Queued while its deps are unbuilt — never
@@ -7383,7 +7385,7 @@ async fn requeued_dep_racing_claim_returns_to_queued() -> TestResult {
 /// row, PARKS (durable `park_until`; excluded from the listing; claim
 /// refused) instead of re-listing forever as an armed-cycle crash-loop
 /// invisible to the MD-D1 stalled population.
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 #[tokio::test]
 async fn establishment_only_charges_park_at_max_attempts() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -7578,7 +7580,7 @@ async fn second_job_budget_window_starts_fresh() -> TestResult {
 // (merged_bug_015 / merged_bug_307 a+b / merged_bug_055 / merged_bug_257).
 // ---------------------------------------------------------------------------
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// merged_bug_015 / merged_bug_307(a)(b): an uncovered arm-0 ReArm
 /// consumption must RELEASE the claim — view re-armed AND the node
 /// requeued off the mint's Assigned/Running bookkeeping — so a SECOND
@@ -7634,7 +7636,7 @@ async fn unobtainable_uncovered_rearm_releases_claim_for_second_replica() -> Tes
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 // r[verify sched.merge.stale-substitutable+3]
 /// merged_bug_055: the CompleteForLiveInterest arm must stamp the
 /// carried realized paths through the SAME completion chokepoint the
@@ -8350,7 +8352,7 @@ async fn failover_preserves_job_budget_window() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// merged_bug_301 (bughunt wave, A4): a parked CHILDLESS LEAF with a
 /// non-pruned origin must CONVERT at the park re-evaluation — a
 /// structural leaf has no closure to be missing, so from-source is
@@ -8421,7 +8423,7 @@ async fn parked_childless_leaf_non_pruned_converts() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// merged_bug_301 green guard: a parked childless job whose origin IS
 /// `pruned` stays parked — the prune dropped its closure on purpose;
 /// converting it would dispatch the doomed from-source build the
@@ -8480,7 +8482,7 @@ async fn parked_pruned_childless_stays_parked() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// merged_bug_301 green guard: the HOLED cell (produced children whose
 /// only voucher is a terminal build — the stale-evidence shape) stays
 /// parked at the re-evaluation, exactly as the dead-voucher
@@ -8548,7 +8550,7 @@ async fn parked_holed_stays_parked() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+4]
+// r[verify sched.materialize.routing+5]
 /// merged_bug_194 (bughunt wave, A4): wanted names that match NO
 /// declared output resolve to an EMPTY live-wanted path set — coverage
 /// over the empty set is vacuously true, and pre-fix the consumption

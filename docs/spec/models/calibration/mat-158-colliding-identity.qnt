@@ -69,6 +69,7 @@ module matCalibCollidingIdentity {
     execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
     tenureUnchanged, ghostsUnchanged,
+    a4Unchanged,
   }
 
   action calibStep = {
@@ -80,7 +81,8 @@ module matCalibCollidingIdentity {
     nondet origin = Set(OProbe, OMerge, OPruned, OReprobe, OStaleReset).oneOf()
     nondet outs = OUTPUTS.powerset().oneOf()
     nondet missing = OUTPUTS.powerset().oneOf()
-    nondet rel = Set(RVouched, RPending, RBroken).oneOf()
+    nondet refsMissing = Set(true, false).oneOf()
+    nondet rel = Set(RVouched, RPending, RChildlessLeaf, RHoled).oneOf()
     any {
       recordWantedRelation(b, d, outs),
       legacyBuildArrives(b, d),
@@ -91,7 +93,7 @@ module matCalibCollidingIdentity {
       calibCollidingRedeliver(d),
       executeStep(d, o),
       consumeSuccess(d),
-      consumeUnobtainable(d, missing),
+      consumeUnobtainable(d, missing, refsMissing),
       reportInfra(d),
       establishCrashedAttempt(d),
       cancelOnZeroInterest(d),

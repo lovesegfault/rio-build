@@ -1030,7 +1030,7 @@ async fn report_materialization_progress_requires_store_credential() -> anyhow::
 //    PD-14 as amended) ────────────────────────────────────────────────────
 
 // r[verify sched.materialize.job+2]
-// r[verify store.materialize.executor+4]
+// r[verify store.materialize.executor+5]
 /// The store-to-scheduler seam, flag-on, through the REAL wire: a real
 /// in-process tonic `ExecutorService` server with BOTH HMAC key families
 /// configured (the production posture), driven by a real tonic client

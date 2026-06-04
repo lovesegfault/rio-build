@@ -1113,7 +1113,7 @@ local NAR-bytes budget is exempt as durable data --- the owner stamps
   indicates under-sized fetcher pods (I-207/I-208).
 ]
 
-#r("store.materialize.executor+4")[
+#r("store.materialize.executor+5")[
   Whenever a scheduler address is configured, each store replica
   MUST execute materialization jobs as a pull-protocol client: discover jobs by
   polling the scheduler, claim exactly one open attempt per job through
@@ -1122,11 +1122,18 @@ local NAR-bytes budget is exempt as durable data --- the owner stamps
   own substitution machinery (never via per-path RPC to another component),
   pin every ingested or verified path at ingest, and report the outcome through
   ReportOutcome retried until acknowledged. The executor MUST re-resolve the
-  job's tenant context against live interest at execution start (the recorded
-  creating-build tenant is honored only while a live interested build carries
-  it) before fetching: a job whose tenant cannot be resolved or has no
-  configured upstreams MUST be reported as InfraFailure, never as Unobtainable
-  and never silently completed. The walk MUST classify its verdicts through
+  job's tenant context against live interest at execution start as the FULL
+  set of live interested tenants (the recorded creating-build tenant is
+  honored first only while a live interested build carries it; the remaining
+  live tenants follow in stable order), and the walk MUST consult every
+  resolved tenant's upstream view per path: any tenant's upstream serving a
+  path satisfies it (the fetch ingests under the serving tenant; per-tenant
+  read visibility stays gated elsewhere), a missing-path verdict requires a
+  clean confirmed miss under EVERY resolved tenant, and an indeterminate view
+  under any tenant degrades the verdict to InfraFailure --- a job fails only
+  when NO interested tenant can obtain. A job whose tenant set resolves empty
+  or has no configured upstreams MUST be reported as InfraFailure, never as
+  Unobtainable and never silently completed. The walk MUST classify its verdicts through
   total, witness-carrying cells: a missing-path verdict requires a local-
   presence miss (a path with a complete local manifest verifies, is pinned,
   and extends the walk from the LOCAL row's references — upstream absence

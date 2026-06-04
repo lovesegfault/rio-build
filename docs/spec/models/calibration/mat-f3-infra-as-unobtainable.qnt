@@ -112,7 +112,10 @@ module matCalibF3InfraAsUnobtainable {
       fsJustifiedAll' = and {
         fsJustifiedAll,
         arm12 implies (durableRel.get(d) == RVouched or durableRel.get(d) == RPending),
-        arm3fs implies (durableRel.get(d) == RBroken and not(marked)),
+        arm3fs implies (and {
+          durableRel.get(d) == RChildlessLeaf or durableRel.get(d) == RHoled,
+          not(marked),
+        }),
       },
       fsReportSoundAll' = and {
         fsReportSoundAll,
@@ -134,6 +137,7 @@ module matCalibF3InfraAsUnobtainable {
     budgetSoundAll' = budgetSoundAll,
     abortChargeFree' = abortChargeFree,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
+    a4Unchanged,
   }
 
   action calibStep = {
@@ -145,7 +149,8 @@ module matCalibF3InfraAsUnobtainable {
     nondet origin = Set(OProbe, OMerge, OPruned, OReprobe, OStaleReset).oneOf()
     nondet outs = OUTPUTS.powerset().oneOf()
     nondet missing = OUTPUTS.powerset().oneOf()
-    nondet rel = Set(RVouched, RPending, RBroken).oneOf()
+    nondet rel = Set(RVouched, RPending, RChildlessLeaf, RHoled).oneOf()
+    nondet refsMissing = Set(true, false).oneOf()
     any {
       recordWantedRelation(b, d, outs),
       legacyBuildArrives(b, d),
@@ -154,7 +159,7 @@ module matCalibF3InfraAsUnobtainable {
       claimJob(d, replica),
       executeStep(d, o),
       consumeSuccess(d),
-      consumeUnobtainable(d, missing),
+      consumeUnobtainable(d, missing, refsMissing),
       calibInfraChargedAsUnobtainable(d),
       establishCrashedAttempt(d),
       cancelOnZeroInterest(d),

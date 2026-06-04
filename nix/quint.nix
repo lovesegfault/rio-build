@@ -136,6 +136,19 @@ let
     "claimedImpliesOpenAttempt"
     "claimedByOnlyMatHolders"
     "readyImpliesDepsProducedOnRequeue"
+    # A4 evidence-classification cells (bughunt wave): the five §2
+    # invariants — the 193 reference-cell completion latch, the 194b
+    # vacuity latch, the 178/195 charge-free transient latch, the
+    # union-upsert widening pin, and the park-viability split (the
+    # RBroken→ChildlessLeaf|Holed re-derivation). Calibration pairs:
+    # quint-materialization-calib-a4-{refs-folded,vacuous-success,
+    # transient-as-infra,union-dropped,leaf-park-forever}; reachability
+    # witnesses: noTransientClose, noLeafParkReevalResolve.
+    "closureCompleteResolution"
+    "noVacuousCoverage"
+    "transientOutcomesNeverCharge"
+    "durableUnionWidensOrEqualsLive"
+    "parkNeverOutlivesFromSourceViability"
     # A3 materialization-lifecycle-kernel (bughunt wave) — the
     # contract re-derivation: budget verdicts are per-job-window sound
     # on BOTH charge channels (067 — the owner-signed Q5 reversal of
@@ -3867,7 +3880,7 @@ in
     # partition invariants: the pre-existing invariants are re-proven
     # over materialization interleavings (a materialization action
     # between any two build events must not perturb any of them).
-    # r[verify sched.materialize.routing+4]
+    # r[verify sched.materialize.routing+5]
     quint-retry-policy-pull-materialization = mkQuintCheck {
       name = "retry-policy-pull-materialization";
       spec = "retryPolicy";
@@ -3984,7 +3997,7 @@ in
     # + the marked-claim / post-failover-claim witnesses (the B1/B3
     # liveness flips).
     # r[verify sched.materialize.job+2]
-    # r[verify sched.materialize.routing+4]
+    # r[verify sched.materialize.routing+5]
     quint-materialization-holds-base = mkQuintSimHoldsCheck {
       name = "materialization-holds-base";
       spec = "materializationJob";
@@ -3993,7 +4006,7 @@ in
       maxSamples = 2000000;
       maxSteps = 15;
     };
-    # r[verify store.materialize.executor+4]
+    # r[verify store.materialize.executor+5]
     # r[verify sched.materialize.settlement]
     quint-materialization-holds-failover = mkQuintSimHoldsCheck {
       name = "materialization-holds-failover";
@@ -4098,6 +4111,26 @@ in
       spec = "materializationJob";
       main = "materializationJobFailover";
       witness = "noPostFailoverClaim";
+    };
+    # A4: a transient (RetryLater) close fires — the charge-free
+    # invariant constrains a reachable edge (the deferral flag is the
+    # close's only footprint).
+    quint-materialization-witness-transient-close = mkQuintSimWitnessCheck {
+      name = "materialization-witness-transient-close";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      witness = "noTransientClose";
+    };
+    # A4 (the RBroken split): a CHILDLESS-LEAF park is released by the
+    # park re-evaluation arm. Pre-fix (Vouched|Pending-only guard) this
+    # is UNREACHABLE — mat-a4-leaf-park-forever is the recorded flip
+    # (the b3-no-redial dead-end pattern; manual command in its
+    # header).
+    quint-materialization-witness-leaf-park-reeval = mkQuintSimWitnessCheck {
+      name = "materialization-witness-leaf-park-reeval";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      witness = "noLeafParkReevalResolve";
     };
     # The budget park fires (delta 3: rides the InfraFailure
     # consumption).
@@ -4356,6 +4389,59 @@ in
       extraSpecs = [ "materializationJob" ];
       step = "calibStep";
       witness = "crossBuildWantedIsolation";
+    };
+    # A4 (merged_bug_178/195): the pre-fix transient-as-infra charge —
+    # a 429/raced close moved the materialization ledger and parked at
+    # the budget.
+    quint-materialization-calib-a4-transient-as-infra = mkQuintWitnessCheck {
+      name = "materialization-calib-a4-transient-as-infra";
+      spec = "calibration/mat-a4-transient-as-infra";
+      main = "matCalibTransientAsInfra";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "transientOutcomesNeverCharge";
+    };
+    # A4 (merged_bug_193): the pre-fix refs fold — the moot arm
+    # completed a node over a confirmed reference hole.
+    quint-materialization-calib-a4-refs-folded = mkQuintWitnessCheck {
+      name = "materialization-calib-a4-refs-folded";
+      spec = "calibration/mat-a4-refs-folded";
+      main = "matCalibRefsFolded";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "closureCompleteResolution";
+    };
+    # A4 (merged_bug_194 store leg): the pre-fix vacuous Success — a
+    # zero-wanted zero-evidence walk completed the node.
+    quint-materialization-calib-a4-vacuous-success = mkQuintWitnessCheck {
+      name = "materialization-calib-a4-vacuous-success";
+      spec = "calibration/mat-a4-vacuous-success";
+      main = "matCalibVacuousSuccess";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "noVacuousCoverage";
+    };
+    # A4 (fork-11 commit 1): the pre-fix wanted overwrite — a re-merge
+    # narrowed the durable row below an earlier contribution.
+    quint-materialization-calib-a4-union-dropped = mkQuintWitnessCheck {
+      name = "materialization-calib-a4-union-dropped";
+      spec = "calibration/mat-a4-union-dropped";
+      main = "matCalibUnionDropped";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "durableUnionWidensOrEqualsLive";
+    };
+    # A4 (the RBroken split): the pre-fix park-viability collapse — a
+    # parked from-source-viable childless leaf in the collapsed
+    # stalled population (the leaf-release dead-end is the manual half,
+    # recorded in the module header).
+    quint-materialization-calib-a4-leaf-park-forever = mkQuintWitnessCheck {
+      name = "materialization-calib-a4-leaf-park-forever";
+      spec = "calibration/mat-a4-leaf-park-forever";
+      main = "matCalibLeafParkForever";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "calibParkViability";
     };
     # F4 B4-half + the C5/CE-7 closure evidence: the dead-inclusive
     # stored-union coverage read (a terminal build's stale wants drive
@@ -5563,6 +5649,37 @@ in
       step = "survivorsStep";
       witness = "staleProducedNeverUnlocksDependents";
       seed = "0xffbfc9ac0c85df5b";
+      maxSamples = 2000000;
+      maxSteps = 15;
+    };
+
+    # A4 (bughunt wave): the reap-truncation corner — the standalone
+    # closureEvidenceReapTruncate module (RDC-5 additions-only; the
+    # FailoverDuo-corner pattern). The invariant pins that terminal-
+    # build cleanup truncates the evidence the classifier reads (the
+    # F9-class guard's archived-model twin): outside the bounded
+    # pre-reap window, a live Vouched parent's children are Produced
+    # under live interest.
+    quint-closure-reap-truncate-holds = mkQuintSimHoldsCheck {
+      name = "closure-reap-truncate-holds";
+      spec = "closureEvidence";
+      main = "closureEvidenceReapTruncate";
+      invariants = [ "vouchedImpliesAllDurableChildrenProduced" ];
+      maxSamples = 2000000;
+      maxSteps = 15;
+    };
+    # The pre-fix flip: calibReapNoTruncate clears interest without the
+    # removal/hole/settlement pass — stale produced children keep
+    # vouching. Pinned seed replays the recorded discovery; the budget
+    # is the unseeded re-find backstop (violated in <400 K samples at
+    # this scope).
+    quint-closure-reap-truncate-calib = mkQuintSimWitnessCheck {
+      name = "closure-reap-truncate-calib";
+      spec = "closureEvidence";
+      main = "closureEvidenceReapTruncate";
+      step = "calibStep";
+      witness = "vouchedImpliesAllDurableChildrenProduced";
+      seed = "0xc214b66a0b0eb6b0";
       maxSamples = 2000000;
       maxSteps = 15;
     };

@@ -391,6 +391,24 @@ in
     # in-memory merge gate; every consumer reads the durable
     # classifier's 4-cell verdict now; recount composed over B1-s2's
     # 12 → 13 resume-token harness, second-lander reconcile).
-    expectedHarnesses = 12;
+    # 12 → 19: + the A4 step-7 battery (bughunt wave):
+    #   routing.rs (over the new set-free route_from_classes core —
+    #   the establish.rs discipline):
+    #   - check_route_no_vacuous_complete (193/194: completion only
+    #     from the clean-and-covered cell)
+    #   - check_route_total_and_cells_reachable (totality + no dead
+    #     arm — the 178-class catch-all regression shape)
+    #   - check_childless_leaf_non_pruned_never_failfast (finding 11
+    #     generalized: non-pruned never fail-fasts)
+    #   outcome.rs:
+    #   - check_substitute_failure_truth_table (178 table + 081 loop
+    #     fold precedence Stalled > RateLimited > CleanMiss)
+    #   - check_confirmed_missing_is_all_tenant_conjunction (028/Q2:
+    #     bitmask sweep ≤4 tenants, stack array — no heap under CBMC)
+    #   establish.rs:
+    #   - check_establishment_unavailable_defers (the C1 fix's pin)
+    #   - check_establishment_materialization_never_adopts_or_crash_charges
+    #     (the materialization row swept over node × probe).
+    expectedHarnesses = 19;
   };
 }

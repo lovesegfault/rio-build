@@ -3443,3 +3443,111 @@ module closureEvidenceCornerFailoverDuo {
     recoverAsLeader
   }
 }
+
+// ===========================================================================
+// A4 (bughunt wave): the reap-truncation corner — STANDALONE module per
+// RDC-5 (the archived module above is an owner-waivered verbatim
+// predecessor record; extensions land as appended modules importing the
+// archived definitions — the FailoverDuo-corner pattern, 15c9ef076).
+// Addition recorded in closure-evidence-invariant-map.md (the RDC-5
+// posture note) and substitution-replacement-invariant-map.md ledger
+// row 3.
+//
+// The pin: terminal-build cleanup TRUNCATES the in-memory evidence the
+// classifier reads — exclusively-owned members removed, hole stamps on
+// surviving parents that lost an un-produced child, settlement on the
+// post-removal state. Production's decision-time classifier
+// (classify_durable_evidence_in_tx, fork-11 commit 2) additionally
+// requires a live co-owning build link for every produced child (the
+// F9-class guard); in this archived model the same end is reached
+// structurally BY the truncation. The invariant pins that lockstep:
+// outside the bounded pre-reap window (a terminal build whose cleanup
+// has not yet run), a live-interest Vouched parent's children are all
+// Produced under live interest — stale evidence never survives the
+// reap to vouch a from-source dispatch.
+//
+// Falsifiability (the pre-fix flip): calibReapNoTruncate clears the
+// terminal build's interest WITHOUT the removal/hole/settlement pass —
+// the dead build's produced children keep vouching the parent with no
+// live co-owner. PREDICTED: vouchedImpliesAllDurableChildrenProduced
+// falsifies under calibStep; HOLDS under the archived step.
+module closureEvidenceReapTruncate {
+  import closureEvidence(
+    DRVS = Set("d1", "d2"),
+    BUILDS = Set("b1", "b2"),
+    REFS = Set(("d1", "d2")),
+    SUBMISSION_BUDGET = 3,
+    FAILOVERS = 0,
+    PGDROP_BUDGET = 0,
+    STALE_APPLY = false,
+    CROSS_TENURE_WALKS = false,
+    STORE_GC_BUDGET = 0,
+    ROW_GC_BUDGET = 0,
+    PURGE_BUDGET = 0,
+    POISON_BUDGET = 0,
+    CANCEL_BUDGET = 1,
+    WALK_CONSUME_CEIL = 2,
+    ATTEMPT_CYCLE_CEIL = 1,
+    INTENT_CEIL = 3,
+    WALKS_PER_NODE = 1,
+    STORE_PER_OUTPUT = true
+  ).*
+
+  /// A4: outside the pre-reap window, a live Vouched parent's children
+  /// are Produced AND live-co-owned — the truncation keeps the
+  /// classifier honest.
+  val vouchedImpliesAllDurableChildrenProduced = DRVS.forall(p =>
+    and {
+      pLiveInterest(blds, BUILDS, p),
+      pVouched(drv, memEdges, p),
+      // the bounded pre-reap window: a terminal-but-unreaped build
+      // still holding a child of p (the as-built reap closes it).
+      not(BUILDS.exists(b => and {
+        blds.get(b).cleanup,
+        pKids(memEdges, p).exists(c => blds.get(b).interest.contains(c)),
+      })),
+    } implies
+      pKids(memEdges, p).forall(c => and {
+        drv.get(c).mSt == MProduced,
+        pLiveInterest(blds, BUILDS, c),
+      })
+  )
+
+  /// PRE-FIX reap: interest cleared, truncation DROPPED — no member
+  /// removal, no hole stamps, no survivor settlement. The dead build's
+  /// produced children keep vouching.
+  action calibReapNoTruncate(b: str): bool = all {
+    leaderActive,
+    blds.get(b).cleanup,
+    blds.get(b).phase == BpDoneOk or blds.get(b).phase == BpFailed or blds.get(b).phase == BpCancelled,
+    blds' = blds.set(b, { ...blds.get(b), interest: Set(), cleanup: false }),
+    drv' = drv, memEdges' = memEdges, intents' = intents,
+    store' = store, pgEdges' = pgEdges, lead' = lead, budget' = budget,
+    viol' = viol, reach' = reach,
+  }
+
+  /// The pre-fix relation: the archived alphabet with the reap swapped
+  /// for the truncation-less override.
+  action calibStepBuild = {
+    nondet b = BUILDS.oneOf()
+    any {
+      mergeCommit(b),
+      mergeRollback(b),
+      cancelBuild(b),
+      buildCompletes(b),
+      buildFails(b),
+      // the override REPLACES reapTerminalBuild
+      calibReapNoTruncate(b),
+      buildsRowPurge(b)
+    }
+  }
+  action calibStep = any {
+    stepStore,
+    calibStepBuild,
+    stepDrv,
+    pgApplyAny,
+    pgDropAny,
+    leaderLost,
+    recoverAsLeader
+  }
+}

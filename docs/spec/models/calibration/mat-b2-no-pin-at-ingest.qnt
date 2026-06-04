@@ -56,7 +56,7 @@ module matCalibB2NoPinAtIngest {
     pins' = pins,
     ingested' = ingested.put((d, o), true),
     jobCoreUnchanged, relUnchanged, ledgerUnchanged, envUnchanged,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged, ghostsUnchanged, a4Unchanged,
   }
 
   action calibStep = {
@@ -68,7 +68,8 @@ module matCalibB2NoPinAtIngest {
     nondet origin = Set(OProbe, OMerge, OPruned, OReprobe, OStaleReset).oneOf()
     nondet outs = OUTPUTS.powerset().oneOf()
     nondet missing = OUTPUTS.powerset().oneOf()
-    nondet rel = Set(RVouched, RPending, RBroken).oneOf()
+    nondet rel = Set(RVouched, RPending, RChildlessLeaf, RHoled).oneOf()
+    nondet refsMissing = Set(true, false).oneOf()
     any {
       recordWantedRelation(b, d, outs),
       legacyBuildArrives(b, d),
@@ -77,7 +78,7 @@ module matCalibB2NoPinAtIngest {
       claimJob(d, replica),
       calibExecuteStepNoPin(d, o),
       consumeSuccess(d),
-      consumeUnobtainable(d, missing),
+      consumeUnobtainable(d, missing, refsMissing),
       reportInfra(d),
       establishCrashedAttempt(d),
       cancelOnZeroInterest(d),

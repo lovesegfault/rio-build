@@ -2318,6 +2318,24 @@ carried unchanged):
 > and prune superseded checks"; identify by subject after rebases). The
 > 15 unwired calibration overrides' retirement notes remain valid as-is.
 
+> **RDC-5 addition (A4, bughunt wave, 2026-06-03 — additions-only.)**
+> The archived module text above remains VERBATIM; the file gained one
+> appended standalone module, `closureEvidenceReapTruncate` (the
+> FailoverDuo-corner pattern, `15c9ef076` precedent): the
+> reap-truncation invariant `vouchedImpliesAllDurableChildrenProduced`
+> — outside the bounded pre-reap window, a live Vouched parent's
+> children are Produced under live interest (the F9-class guard's
+> archived-model twin; production's decision-time
+> `classify_durable_evidence_in_tx` reaches the same end by the
+> live-co-owner conjunct) — plus its pre-fix flip
+> `calibReapNoTruncate` (interest cleared, truncation dropped — stale
+> produced children keep vouching). Wired:
+> `quint-closure-reap-truncate-holds` (sim, archived `step`) and
+> `quint-closure-reap-truncate-calib` (seeded expect-violation, seed
+> `0xc214b66a0b0eb6b0`, `calibStep`). Justification ledger:
+> substitution-replacement-invariant-map.md follow-up row 3 (the
+> archive record this addition rides).
+
 ### Owner-decision provenance
 
 Every owner decision this campaign executed under, with date and Phase-1 outcome:

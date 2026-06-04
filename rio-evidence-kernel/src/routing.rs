@@ -104,7 +104,7 @@ pub struct RoutingInputs<'a> {
     pub pruned_origin: bool,
 }
 
-// r[impl sched.materialize.routing+4]
+// r[impl sched.materialize.routing+5]
 /// The four-arm routing core. PURE (no IO, no clocks); the FMP
 /// re-probe answer is an input.
 ///
@@ -117,21 +117,46 @@ pub fn route_unobtainable(inputs: &RoutingInputs<'_>) -> UnobtainableRouting {
         .missing_paths
         .iter()
         .any(|p| inputs.live_wanted_paths.contains(p));
-    // Arm 0 — moot-failure (the C3 arm). The witness type guarantees
-    // the wanted set is non-empty, so `covered` cannot be vacuous.
-    // merged_bug_193: arm 0 additionally requires NO confirmed
-    // reference miss — a hole in the dependency closure is never moot,
-    // even when every live-wanted root is itself covered (the covered
-    // root's closure is exactly what the reference miss punctured).
-    // With a reference miss the decision falls through to arms 1–3,
-    // where Vouched/Pending route from-source and the leaf/holed arm
-    // settles on the origin discriminator.
-    if !missing_live && inputs.missing_references.is_empty() {
-        let covered = inputs
-            .live_wanted_paths
-            .paths()
-            .iter()
-            .all(|w| inputs.verified_paths.contains(w));
+    let covered = inputs
+        .live_wanted_paths
+        .paths()
+        .iter()
+        .all(|w| inputs.verified_paths.contains(w));
+    route_from_classes(
+        missing_live,
+        !inputs.missing_references.is_empty(),
+        covered,
+        inputs.durable_evidence,
+        inputs.prior_unobtainable_count > 0,
+        inputs.reprobe,
+        inputs.pruned_origin,
+    )
+}
+
+/// The set-free routing core (the establish.rs discipline: heap
+/// collections under CBMC reach `getrandom`, so the kani sweep targets
+/// THIS — `route_unobtainable` only collapses its slice inputs to the
+/// three predicates, each pinned by the unit tests above it).
+///
+/// Arm 0 — moot-failure (the C3 arm). The witness type guarantees the
+/// wanted set is non-empty, so `covered` cannot be vacuous.
+/// merged_bug_193: arm 0 additionally requires NO confirmed reference
+/// miss — a hole in the dependency closure is never moot, even when
+/// every live-wanted root is itself covered (the covered root's
+/// closure is exactly what the reference miss punctured). With a
+/// reference miss the decision falls through to arms 1–3, where
+/// Vouched/Pending route from-source and the leaf/holed arm settles on
+/// the origin discriminator.
+pub(crate) fn route_from_classes(
+    missing_live: bool,
+    refs_missing: bool,
+    covered: bool,
+    durable_evidence: ClosureEvidence,
+    one_shot_spent: bool,
+    reprobe: Option<ReprobeAnswer>,
+    pruned_origin: bool,
+) -> UnobtainableRouting {
+    if !missing_live && !refs_missing {
         return if covered {
             UnobtainableRouting::CompleteForLiveInterest
         } else {
@@ -139,7 +164,7 @@ pub fn route_unobtainable(inputs: &RoutingInputs<'_>) -> UnobtainableRouting {
         };
     }
     // Arms 1/2 — durable Vouched / Pending: from-source.
-    match inputs.durable_evidence {
+    match durable_evidence {
         ClosureEvidence::Vouched | ClosureEvidence::Pending => {
             return UnobtainableRouting::ResolveFromSource;
         }
@@ -147,10 +172,8 @@ pub fn route_unobtainable(inputs: &RoutingInputs<'_>) -> UnobtainableRouting {
     }
     // Arm 3 — leaf/holed evidence + live-wanted missing: the re-probe
     // gate.
-    match inputs.reprobe {
-        Some(ReprobeAnswer::Obtainable) if inputs.prior_unobtainable_count == 0 => {
-            UnobtainableRouting::ReArm
-        }
+    match reprobe {
+        Some(ReprobeAnswer::Obtainable) if !one_shot_spent => UnobtainableRouting::ReArm,
         // Re-probe confirms missing, or the one-shot is spent. (A
         // missing probe is mapped to ReArm by the caller before this
         // core runs — see the doc above.)
@@ -165,7 +188,7 @@ pub fn route_unobtainable(inputs: &RoutingInputs<'_>) -> UnobtainableRouting {
         // broken by structure (childless) or holed — releases to
         // from-source dispatch instead; non-pruned nodes are never
         // affected, whatever their evidence.
-        _ if inputs.pruned_origin => UnobtainableRouting::FailFast,
+        _ if pruned_origin => UnobtainableRouting::FailFast,
         _ => UnobtainableRouting::ResolveFromSource,
     }
 }
@@ -173,7 +196,7 @@ pub fn route_unobtainable(inputs: &RoutingInputs<'_>) -> UnobtainableRouting {
 /// Success-consumption coverage check (the CE-17 closer): the live
 /// wanted set is covered by what the execution ingested or verified.
 /// The witness type makes the check non-vacuous by construction.
-// r[impl sched.materialize.routing+4]
+// r[impl sched.materialize.routing+5]
 pub fn success_covers_live_wanted(
     ingested_paths: &[String],
     verified_paths: &[String],
@@ -297,5 +320,97 @@ mod tests {
             pruned_origin: false,
         });
         assert_eq!(routing, UnobtainableRouting::CompleteForLiveInterest);
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    fn any_evidence() -> ClosureEvidence {
+        match kani::any::<u8>() {
+            0 => ClosureEvidence::Vouched,
+            1 => ClosureEvidence::Pending,
+            2 => ClosureEvidence::ChildlessLeaf,
+            _ => ClosureEvidence::Holed,
+        }
+    }
+
+    fn any_reprobe() -> Option<ReprobeAnswer> {
+        match kani::any::<u8>() {
+            0 => None,
+            1 => Some(ReprobeAnswer::Obtainable),
+            _ => Some(ReprobeAnswer::ConfirmedMissing),
+        }
+    }
+
+    /// merged_bug_193/194 (the no-vacuous-completion law): the routing
+    /// completes ONLY from the clean-and-covered cell — no live-wanted
+    /// miss, no confirmed reference hole, full coverage. Every other
+    /// cell is structurally unable to produce
+    /// `CompleteForLiveInterest`. (The covered-over-nothing half is
+    /// unrepresentable at the type level: `LiveWanted` witnesses a
+    /// non-empty set.)
+    #[kani::proof]
+    fn check_route_no_vacuous_complete() {
+        let missing_live: bool = kani::any();
+        let refs_missing: bool = kani::any();
+        let covered: bool = kani::any();
+        let routing = route_from_classes(
+            missing_live,
+            refs_missing,
+            covered,
+            any_evidence(),
+            kani::any(),
+            any_reprobe(),
+            kani::any(),
+        );
+        if routing == UnobtainableRouting::CompleteForLiveInterest {
+            assert!(covered && !missing_live && !refs_missing);
+        }
+    }
+
+    /// Totality + cell reachability: the core never panics over the
+    /// full bounded input space, and every one of the four routing
+    /// verdicts is reachable (a dead arm means an input axis collapsed
+    /// — the 178-class catch-all regression shape).
+    #[kani::proof]
+    fn check_route_total_and_cells_reachable() {
+        let routing = route_from_classes(
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            any_evidence(),
+            kani::any(),
+            any_reprobe(),
+            kani::any(),
+        );
+        kani::cover!(routing == UnobtainableRouting::CompleteForLiveInterest);
+        kani::cover!(routing == UnobtainableRouting::ReArm);
+        kani::cover!(routing == UnobtainableRouting::ResolveFromSource);
+        kani::cover!(routing == UnobtainableRouting::FailFast);
+    }
+
+    /// Finding 11 / the B2 walk equivalence, generalized: a NON-PRUNED
+    /// job never fail-fasts, whatever its evidence, coverage, or
+    /// re-probe answer — the childless leaf (broken by structure) is
+    /// the named cover.
+    #[kani::proof]
+    fn check_childless_leaf_non_pruned_never_failfast() {
+        let evidence = any_evidence();
+        let routing = route_from_classes(
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            evidence,
+            kani::any(),
+            any_reprobe(),
+            false,
+        );
+        assert!(routing != UnobtainableRouting::FailFast);
+        kani::cover!(
+            evidence == ClosureEvidence::ChildlessLeaf
+                && routing == UnobtainableRouting::ResolveFromSource
+        );
     }
 }

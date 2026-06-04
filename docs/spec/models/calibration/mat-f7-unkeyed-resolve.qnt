@@ -53,6 +53,7 @@ module matCalibF7UnkeyedResolve {
     dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
     tenureUnchanged, ghostsUnchanged,
+    a4Unchanged,
   }
 
   action calibStep = {
@@ -64,7 +65,8 @@ module matCalibF7UnkeyedResolve {
     nondet origin = Set(OProbe, OMerge, OPruned, OReprobe, OStaleReset).oneOf()
     nondet outs = OUTPUTS.powerset().oneOf()
     nondet missing = OUTPUTS.powerset().oneOf()
-    nondet rel = Set(RVouched, RPending, RBroken).oneOf()
+    nondet rel = Set(RVouched, RPending, RChildlessLeaf, RHoled).oneOf()
+    nondet refsMissing = Set(true, false).oneOf()
     any {
       recordWantedRelation(b, d, outs),
       legacyBuildArrives(b, d),
@@ -73,7 +75,7 @@ module matCalibF7UnkeyedResolve {
       claimJob(d, replica),
       executeStep(d, o),
       calibResolveUnkeyed(d),
-      consumeUnobtainable(d, missing),
+      consumeUnobtainable(d, missing, refsMissing),
       reportInfra(d),
       establishCrashedAttempt(d),
       cancelOnZeroInterest(d),
