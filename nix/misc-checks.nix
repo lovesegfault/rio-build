@@ -16,6 +16,10 @@
   # `workspaceFileset` made it rebuild on every `.rs` edit.
   manifestsFileset,
   stubTargetFiles,
+  # Derived fuzz workspace list (nix/lib/filesets.nix) — one
+  # crate2nix-drift-fuzz-<ws> check per workspace, so adding a fuzz
+  # workspace extends the gate without editing this file.
+  fuzzWorkspaces,
   # crate2nix CLI (flake input build) — crate2nix-drift regenerates
   # Cargo.json hermetically with it.
   crate2nixCli,
@@ -123,7 +127,11 @@ let
         mkdir -p fuzz/${ws}/fuzz_targets
         ${stubFuzzTargets}
         ( cd fuzz/${ws} && crate2nix generate --format json -o Cargo.json.check )
-        echo >> fuzz/${ws}/Cargo.json.check  # match end-of-file-fixer
+        # Newline-terminate ONLY if crate2nix didn't — mirrors
+        # xtask/src/regen/cargo_json.rs's conditional append, so a
+        # future crate2nix that emits its own trailing newline can't
+        # double-append here and spuriously drift-fail every gate.
+        [ -z "$(tail -c1 fuzz/${ws}/Cargo.json.check)" ] || echo >> fuzz/${ws}/Cargo.json.check
         diff -u fuzz/${ws}/Cargo.json fuzz/${ws}/Cargo.json.check || {
           echo 'error: fuzz/${ws}/Cargo.json is stale — run `cargo xtask regen cargo-json`'
           exit 1
@@ -299,7 +307,11 @@ in
       export CARGO_NET_OFFLINE=true
       ${stubTargetFiles}
       crate2nix generate --format json -o Cargo.json.check
-      echo >> Cargo.json.check  # match end-of-file-fixer
+      # Newline-terminate ONLY if crate2nix didn't — mirrors
+      # xtask/src/regen/cargo_json.rs's conditional append, so a future
+      # crate2nix that emits its own trailing newline can't
+      # double-append here and spuriously drift-fail every gate.
+      [ -z "$(tail -c1 Cargo.json.check)" ] || echo >> Cargo.json.check
       diff -u Cargo.json Cargo.json.check || {
         echo 'error: Cargo.json is stale — run `cargo xtask regen cargo-json`'
         exit 1
@@ -309,12 +321,6 @@ in
       touch $out
     '';
   };
-
-  # Fuzz-workspace Cargo.json drift — see mkFuzzCrate2nixDrift above
-  # for why these exist (the fuzz derivations would otherwise build a
-  # stale graph silently).
-  crate2nix-drift-fuzz-rio-nix = mkFuzzCrate2nixDrift "rio-nix";
-  crate2nix-drift-fuzz-rio-store = mkFuzzCrate2nixDrift "rio-store";
 
   # Spec-coverage validation: fails on broken r[...]
   # references, duplicate requirement IDs, or unparseable
@@ -877,6 +883,15 @@ in
         touch $out
       '';
 }
+# Fuzz-workspace Cargo.json drift — one check per derived workspace
+# (attr names: crate2nix-drift-fuzz-<ws>). See mkFuzzCrate2nixDrift
+# above for why these exist (the fuzz derivations would otherwise
+# build a stale graph silently).
+// builtins.listToAttrs (
+  map (
+    ws: pkgs.lib.nameValuePair "crate2nix-drift-fuzz-${ws}" (mkFuzzCrate2nixDrift ws)
+  ) fuzzWorkspaces
+)
 // {
   # Seed↔ECR-push layer-digest parity. The seed warms
   # containerd's content store; the warm only works if the

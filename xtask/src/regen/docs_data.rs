@@ -476,10 +476,12 @@ fn workspace() -> Result<serde_json::Value> {
         // [build-dependencies] — edges that link into the consumer's
         // build.rs (rio-buildhash's consumers). Optional build-deps
         // fold into the same set: edge KIND outranks activation (see
-        // the precedence comment below). The fold's `o` leg is
-        // currently a no-op — the only in-tree optional build-dep
-        // (rio-test-support → rio-proto) is default-feature-reachable
-        // and lands in `r`.
+        // the precedence comment below). The fold's `o` leg exists
+        // for optional build-deps NOT activated by default features;
+        // zero in-tree edges exercise it today — the only optional
+        // build-dep, rio-test-support → rio-proto, is activated via
+        // `default = ["full"]` → `dep:rio-proto` and flows through
+        // the `r` leg.
         if let Some(d) = t.get("build-dependencies").and_then(|v| v.as_table()) {
             let (r, o) = internal(d);
             build.extend(r);
@@ -517,10 +519,12 @@ fn workspace() -> Result<serde_json::Value> {
         // by edge KIND, not by certainty: a build edge means "links
         // into the consumer's build.rs", and hiding that linkage
         // behind a dotted runtime-"maybe" edge or a dashed test-only
-        // edge would misstate what the dep touches. An optional,
-        // non-default build-dep (rio-test-support's rio-proto shape)
-        // is NOT unconditional — the caption says the dash-dotted
-        // style absorbs those.
+        // edge would misstate what the dep touches. A hypothetical
+        // optional build-dep NOT activated by default features (the
+        // `o` leg above — no in-tree edge has that shape today;
+        // rio-test-support's rio-proto IS default-activated and flows
+        // through `r`) would not be unconditional either — the
+        // caption says the dash-dotted style absorbs those too.
         let build: Vec<_> = build.difference(&prod).cloned().collect();
         // difference(&prod): internal() partitions one table at a
         // time, so a dep optional in [dependencies] but required in

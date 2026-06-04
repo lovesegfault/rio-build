@@ -31,6 +31,29 @@ rec {
   # top in memberBinFilesets below, not encoded here.
   memberFilesets = lib.genAttrs members (n: unfilteredRoot + "/${n}");
 
+  # Fuzz sub-workspaces, derived from disk: directories under fuzz/
+  # that contain a Cargo.toml (stray files and corpus-only dirs are
+  # tolerated). Single source for the three consumers that previously
+  # hand-mirrored the list: nix/fuzz.nix (whose tri-source assert also
+  # checks Cargo.toml's `[workspace] exclude` — the list xtask's
+  # discover_dirs() iterates for `regen cargo-json`/`regen fuzz-lock`),
+  # nix/misc-checks.nix (one crate2nix-drift-fuzz-<ws> check per
+  # workspace), and nix/pre-commit-hooks.nix (crate2nix-check's
+  # workspace loop).
+  #
+  # Honest residual: dirty-tree flake sources contain TRACKED files
+  # only, so a freshly created fuzz workspace is invisible to readDir
+  # until `git add` — same class as the known new-crate-untracked eval
+  # failure (.claude/rules/ci-failure-patterns.md). The fuzz.nix assert
+  # then fires on the *staged* tree, not the unstaged one.
+  fuzzWorkspaces =
+    let
+      entries = builtins.readDir (unfilteredRoot + "/fuzz");
+    in
+    lib.filter (
+      n: entries.${n} == "directory" && builtins.pathExists (unfilteredRoot + "/fuzz/${n}/Cargo.toml")
+    ) (builtins.attrNames entries);
+
   # Per-member fileset for the lib/bin compile — memberFilesets
   # MINUS tests/ and proptest-regressions/. buildRustCrate never
   # reads tests/ when buildTests=false (the entire `find tests/`

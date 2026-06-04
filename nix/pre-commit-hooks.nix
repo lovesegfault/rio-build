@@ -5,8 +5,37 @@
 {
   pkgs,
   crate2nixCli,
+  # Derived fuzz workspace list (nix/lib/filesets.nix) — interpolated
+  # into crate2nix-check's workspace loop so the hook and the hermetic
+  # crate2nix-drift-fuzz-<ws> checks gate the same set.
+  fuzzWorkspaces,
 }:
 let
+  inherit (pkgs) lib;
+
+  # Local crates whose RESOLVED dependency graph includes sqlx —
+  # membership for sqlx-prepare-check's REFUSE arm, derived from the
+  # committed Cargo.json instead of the previous [dependencies]-section
+  # awk over Cargo.toml. The awk was form-sensitive: blind to dotted
+  # tables (`[dependencies.sqlx]` + `workspace = true` fails its
+  # `/^\[dependencies\]/` header match) and to
+  # `[target."cfg(...)".dependencies]` — both of which crate2nix folds
+  # into the resolved `dependencies` array, so this list sees them by
+  # construction. devDependencies are deliberately excluded (test-only
+  # query! in a dev-dep-only crate skips, as before); `optional` deps
+  # are included — conservative-correct: a feature-gated query! still
+  # needs the tracker. 2026-06 census: rio-builder rio-controller
+  # rio-migrations rio-scheduler rio-store rio-test-support xtask.
+  resolvedCargoJson = builtins.fromJSON (builtins.readFile ../Cargo.json);
+  sqlxDepCrates = lib.naturalSort (
+    lib.unique (
+      map (c: c.crateName) (
+        lib.filter (
+          c: (c.source.type or "") == "local" && lib.any (d: (d.name or "") == "sqlx") (c.dependencies or [ ])
+        ) (lib.attrValues resolvedCargoJson.crates)
+      )
+    )
+  );
   # Shared guard for every hook that spawns cargo (directly or via a
   # tool that runs `cargo metadata`). Two tests, in order:
   #
@@ -119,19 +148,40 @@ in
         # `//`-to-EOL is stripped BEFORE matching, so both full-line
         # and trailing inline comments (`foo(); // see sqlx::query!`)
         # are invisible — the latter would otherwise refuse spuriously
-        # in a tracker-less sqlx crate. Residuals, accepted, all of
-        # which fail OPEN (skip, never block): a `//` inside a string
-        # literal on a real callsite line hides that line; a block
-        # comment or string literal shaped like `sqlx::query…!` still
-        # trips the trigger (harmless: tracker-wired crates just get
-        # checked, and no tracker-less crate can reach the REFUSE arm
-        # without a non-comment match); a future UNqualified `query!(`
-        # behind a use-import under-triggers. CI clippy/nextest
-        # remains the staleness backstop either way (this hook is
-        # dev-ergonomics, per the header above).
+        # in a tracker-less sqlx crate.
+        #
+        # Residuals, accepted, by FAIL DIRECTION:
+        # - fail OPEN (skip, never block): a `//` inside a string
+        #   literal on a real callsite line hides that line; a future
+        #   UNqualified `query!(` behind a use-import under-triggers;
+        #   and the sqlxDepCrates membership list below is BAKED into
+        #   this store script at config eval — a crate gaining sqlx +
+        #   its first query! in the same commit passes vacuously until
+        #   a devshell re-entry relinks the config. CI clippy/nextest
+        #   remains the staleness backstop for all of these (this hook
+        #   is dev-ergonomics, per the header above).
+        # - fail CLOSED (block, remediation in the REFUSE message): a
+        #   block comment or string literal shaped like `sqlx::query…!`
+        #   in a crate that IS in sqlxDepCrates but wires no tracker —
+        #   the //-strip cannot see block comments or strings, so the
+        #   REFUSE arm fires on prose there. (In tracker-WIRED crates
+        #   the same shape just costs a vacuous cargo check; in crates
+        #   without the sqlx dep it skips silently.)
         real_callsite() {
           sed 's@//.*@@' -- "$1" 2>/dev/null \
             | grep -Eq 'sqlx::query[a-z_]*!'
+        }
+        # Tracker wiring = a CALL-shaped `track_sqlx(` with //-comments
+        # stripped — same discipline as real_callsite, so a doc-comment
+        # mention of track_sqlx() in a build.rs cannot count as wiring
+        # (the bare-substring grep this replaces would have). The
+        # tracker⟺consumer pairing itself (build.rs call ⟺ lib.rs
+        # env!("RIO_SQLX_HASH") read) is enforced at EVAL by
+        # nix/crate2nix.nix's pairing asserts on every flake eval — not
+        # here, where it only ran on query!-touching commits.
+        tracker_wired() {
+          sed 's@//.*@@' -- "$1" 2>/dev/null \
+            | grep -q 'track_sqlx[[:space:]]*('
         }
         # Owning crate = nearest ancestor dir with a Cargo.toml.
         # Walking up (instead of `cut -d/ -f1`) maps nested crates to
@@ -167,8 +217,9 @@ in
             {
               printf '%s\n' "$crates"
               git ls-files '*build.rs' \
-                | xargs -r grep -l track_sqlx 2>/dev/null \
-                | xargs -r -n1 dirname
+                | while IFS= read -r b; do
+                    tracker_wired "$b" && dirname -- "$b"
+                  done
             } | sort -u | grep -v '^$'
           )
         fi
@@ -176,31 +227,31 @@ in
         args=""
         for c in $crates; do
           [ -f "$c/Cargo.toml" ] || continue
-          if [ -f "$c/build.rs" ] && grep -q track_sqlx "$c/build.rs"; then
-            # The tracker is only half the contract: without a
-            # consumer-side `const _: &str = env!("RIO_SQLX_HASH");`
-            # rustc records no env-dep and the tracking silently does
-            # nothing (rio-buildhash docs) — refuse the same way as a
-            # missing tracker, naming the missing half.
-            if ! grep -rq 'env!("RIO_SQLX_HASH")' "$c/src" 2>/dev/null; then
-              echo "sqlx-prepare-check: $c wires track_sqlx() but no source file reads env!(\"RIO_SQLX_HASH\") — without the read, rustc records no env-dep and the tracking silently does nothing; add the const (see rio-buildhash docs)" >&2
-              exit 1
-            fi
-            # CHECK arm. -p takes the package name from the manifest —
-            # the directory name is convention, not contract.
+          if [ -f "$c/build.rs" ] && tracker_wired "$c/build.rs"; then
+            # CHECK arm. (The consumer half of the tracker contract —
+            # the lib.rs env!("RIO_SQLX_HASH") read — is asserted at
+            # eval by nix/crate2nix.nix, not re-checked here.)
+            # -p takes the package name from the manifest — the
+            # directory name is convention, not contract.
             args="$args -p $(awk -F'"' '/^name[[:space:]]*=/{print $2; exit}' "$c/Cargo.toml")"
-          elif awk '/^\[dependencies\]/{f=1;next} /^\[/{f=0} f && /^sqlx[[:space:]]*[.=]/{found=1} END{exit !found}' "$c/Cargo.toml"; then
-            # REFUSE arm: real callsites + sqlx in [dependencies] but
-            # no tracker — kache would replay compiles against an
-            # unobserved .sqlx. (sqlx only in [dev-dependencies] with
-            # test-only query! would skip instead of refuse; no such
-            # crate exists.)
-            echo "sqlx-prepare-check: $c has sqlx in [dependencies] and real query! callsites but no track_sqlx() in build.rs — kache would replay compiles against an unobserved .sqlx; wire rio-buildhash::track_sqlx() (see CLAUDE.md, out-of-band macro inputs)" >&2
-            exit 1
+          else
+            # REFUSE arm: real callsite shape + sqlx in the crate's
+            # RESOLVED [dependencies] (sqlxDepCrates, baked from
+            # Cargo.json at config eval — see the membership comment in
+            # this file's let block) but no tracker — kache would
+            # replay compiles against an unobserved .sqlx. dev-only
+            # sqlx consumers are not in the list and skip instead of
+            # refuse, as before.
+            case " ${toString sqlxDepCrates} " in
+              *" $c "*)
+                echo "sqlx-prepare-check: $c has sqlx in its resolved [dependencies] (Cargo.json) and a real query! callsite shape but no track_sqlx() in build.rs — kache would replay compiles against an unobserved .sqlx; wire rio-buildhash::track_sqlx() (see CLAUDE.md, out-of-band macro inputs). If the only match is inside a block comment or string literal (the //-strip can't see those), break the \`sqlx::query\` token — e.g. split the string — or wire the tracker anyway" >&2
+                exit 1
+                ;;
+            esac
+            # No sqlx in the resolved runtime deps: callsite-shaped
+            # text in a tool crate (string literal / block comment) —
+            # cannot be a compiled query!, skip silently.
           fi
-          # else: callsite-shaped text in a crate without the sqlx
-          # runtime dep (string literal / block comment in a tool
-          # crate) — cannot be a compiled query!, skip silently.
         done
         [ -n "$args" ] || exit 0
         # --all-targets: cfg(test)/tests/ query! sites are in the
@@ -220,6 +271,16 @@ in
       ''
     );
     files = "(\\.rs$|^\\.sqlx/)";
+    # The framework's staged-file list uses --diff-filter=ACMRTUXB
+    # ("everything except D"), so a deletion-ONLY .sqlx commit matches
+    # `files` yet yields zero filenames and the hook is skipped before
+    # its own deletion-aware `git diff --cached` widen arm can run — a
+    # deleted cache entry still referenced by a query! is exactly the
+    # staleness this hook pre-empts. always_run fires it on every
+    # commit instead; the trigger derivation above exits 0 in
+    # milliseconds when nothing sqlx-shaped is staged. (`files` is kept
+    # as documentation of the trigger surface.)
+    always_run = true;
     language = "system";
     pass_filenames = false;
   };
@@ -233,8 +294,9 @@ in
   # Cargo.toml/Cargo.lock so unrelated commits don't pay
   # the ~10s regeneration cost. The hermetic backstops are
   # `checks.<system>.crate2nix-drift` for the ROOT Cargo.json and
-  # `crate2nix-drift-fuzz-{rio-nix,rio-store}` for the fuzz ones
-  # (all nix/misc-checks.nix) — the fuzz derivations never read
+  # `crate2nix-drift-fuzz-<ws>` for the fuzz ones (all
+  # nix/misc-checks.nix, derived from the same fuzzWorkspaces
+  # list as the loop below) — the fuzz derivations never read
   # the fuzz Cargo.locks, so a stale json builds the old graph
   # silently; only a newly-added dep fails loudly.
   crate2nix-check = {
@@ -248,28 +310,51 @@ in
         # check derivation (pre-commit run --all-files on a
         # clean checkout), nothing is staged → no-op. This
         # also keeps the hook off the hot path for commits
-        # that don't touch the dep graph.
+        # that don't touch the dep graph. The UNFILTERED
+        # `git diff --cached` here sees deletions too — it is
+        # always_run below that stops the framework's
+        # deletion-blind staged list from skipping the hook
+        # before this gate runs.
         if ! git diff --cached --name-only \
            | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
           exit 0
         fi
         tmp=$(mktemp -d)
         trap 'rm -rf "$tmp"' EXIT
-        # Three workspaces: root + the two fuzz subworkspaces
-        # (each has its own Cargo.lock + Cargo.json consumed by
-        # nix/fuzz.nix). crate2nix emits path fields relative to
-        # the output file's directory, so -o $tmp/... would
+        # Workspaces: root + the fuzz subworkspaces (each has its
+        # own Cargo.lock + Cargo.json consumed by nix/fuzz.nix).
+        # The fuzz list is interpolated from the derived
+        # fuzzWorkspaces (nix/lib/filesets.nix) at config eval;
+        # the -f guard skips a baked-but-stale entry so a
+        # workspace-removal commit isn't hard-failed by
+        # yesterday's list. crate2nix emits path fields relative
+        # to the output file's directory, so -o $tmp/... would
         # produce ../../root/... paths that never match — generate
         # in-place under .check, diff, then clean up.
-        for dir in . fuzz/rio-nix fuzz/rio-store; do
+        for dir in . ${lib.concatMapStringsSep " " (ws: "fuzz/${ws}") fuzzWorkspaces}; do
+          [ -f "$dir/Cargo.lock" ] || continue
           # Snapshot Cargo.lock — `cargo metadata` inside
           # crate2nix can bump transitive deps if the local
-          # cache is cold. Restore so the check has no side
-          # effects even if crate2nix fails under set -e.
+          # cache is cold. The restore must run on BOTH paths:
+          # under set -e a bare failing generate would abort
+          # before an unconditional restore line and the EXIT
+          # trap would delete the only backup, leaving any
+          # crate2nix lock mutation in the worktree — so the
+          # failure arm restores the lock and removes the
+          # partial .check before exiting.
           cp "$dir/Cargo.lock" "$tmp/Cargo.lock.orig"
-          ( cd "$dir" && ${crate2nixCli}/bin/crate2nix generate --format json -o Cargo.json.check )
+          if ! ( cd "$dir" && ${crate2nixCli}/bin/crate2nix generate --format json -o Cargo.json.check ); then
+            cp "$tmp/Cargo.lock.orig" "$dir/Cargo.lock"
+            rm -f "$dir/Cargo.json.check"
+            exit 1
+          fi
           cp "$tmp/Cargo.lock.orig" "$dir/Cargo.lock"
-          echo >> "$dir/Cargo.json.check"  # match end-of-file-fixer
+          # Newline-terminate ONLY if crate2nix didn't — mirrors
+          # xtask/src/regen/cargo_json.rs's conditional append, so
+          # a future crate2nix that emits its own trailing newline
+          # can't double-append on the check side and spuriously
+          # report drift.
+          [ -z "$(tail -c1 "$dir/Cargo.json.check")" ] || echo >> "$dir/Cargo.json.check"
           if ! diff -q "$dir/Cargo.json" "$dir/Cargo.json.check" >/dev/null; then
             rm -f "$dir/Cargo.json.check"
             echo "error: $dir/Cargo.json is stale — run \`cargo xtask regen cargo-json\`"
@@ -280,6 +365,13 @@ in
       ''
     );
     files = "(^|/)Cargo\\.(toml|lock)$";
+    # Framework gap (same as sqlx-prepare-check): the staged-file list
+    # is --diff-filter=ACMRTUXB, no deletions — and a deletion-only
+    # Cargo.{toml,lock} commit is reachable here (fuzz workspaces live
+    # outside the root workspace; removing one deletes its lock
+    # without touching the root lock). The inner unfiltered git-diff
+    # gate above is deletion-aware and fast-exits for everything else.
+    always_run = true;
     language = "system";
     pass_filenames = false;
   };
@@ -316,6 +408,11 @@ in
       ''
     );
     files = "(^|/)Cargo\\.(toml|lock)$";
+    # Framework gap (same shape as crate2nix-check): a deletion-only
+    # Cargo.{toml,lock} commit is invisible to the framework's
+    # --diff-filter=ACMRTUXB staged list; the inner unfiltered
+    # git-diff gate is deletion-aware and fast-exits otherwise.
+    always_run = true;
     language = "system";
     pass_filenames = false;
   };

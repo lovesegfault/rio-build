@@ -283,6 +283,7 @@
                 memberSrcs
                 manifestsFileset
                 stubTargetFiles
+                fuzzWorkspaces
                 ;
 
               # Prefix every key in an attrset. Used to surface per-member
@@ -328,9 +329,16 @@
                   sysCrateEnv
                   unfilteredRoot
                   memberSrcs
+                  fuzzWorkspaces
                   ;
                 inherit (pkgs) lib;
                 crate2nixSrc = inputs.crate2nix;
+                # Cargo.toml's `[workspace] exclude` — what xtask's
+                # discover_dirs() iterates for `regen cargo-json` /
+                # `regen fuzz-lock`. fuzz.nix asserts its own per-ws
+                # config, the on-disk fuzzWorkspaces, and this list all
+                # agree, so the three views cannot diverge silently.
+                workspaceExclude = cargoToml.workspace.exclude;
               };
 
               # Spec-coverage CLI + web dashboard. The SPA is built via
@@ -562,6 +570,7 @@
                   workspaceFileset
                   manifestsFileset
                   stubTargetFiles
+                  fuzzWorkspaces
                   crate2nixCli
                   rustStable
                   rustPlatformStable
@@ -950,7 +959,7 @@
                 }
                 # Custom writeShellScript hooks (check-mutants-marker,
                 # sqlx-prepare-check, crate2nix-check, hakari-check).
-                // import ./nix/pre-commit-hooks.nix { inherit pkgs crate2nixCli; };
+                // import ./nix/pre-commit-hooks.nix { inherit pkgs crate2nixCli fuzzWorkspaces; };
               };
 
               # --------------------------------------------------------------
@@ -1239,7 +1248,8 @@
                 # Design-book builds (`docs-pdf`, `docs-html` + smokes).
                 // docsLib.checks
                 # 2min fuzz runs (Linux-only). Compiled binaries shared
-                # across targets via rio-{nix,store}-fuzz-build.
+                # across a workspace's targets via fuzz.nix's per-ws
+                # crate2nix builds.
                 // fuzz.runs
                 # Per-phase milestone VM tests (Linux-only, need KVM).
                 # Debug interactively:
