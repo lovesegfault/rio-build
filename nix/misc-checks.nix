@@ -2196,4 +2196,56 @@ in
         [ "$fail" = 0 ] || exit 1
         touch $out
       '';
+  # Round-17 merged_bug_001 (RC17-15 c8 — third recurrence of the
+  # mangled-wrap class on this branch, so it gets the class gate):
+  # a wrapped Rust string literal missing its backslash continuations
+  # ships embedded multi-space runs to clients/operators (gRPC status
+  # messages, basis labels, assertion text). Pattern: a run of 5+
+  # spaces with non-space on BOTH sides inside ONE double-quoted
+  # literal on a single source line (between-literal alignment and
+  # multi-line raw SQL do not match). Carve-outs are count-pinned
+  # per file: deliberate column alignment (CLI/banner output, where
+  # the run is the format) and source-shape test fixtures.
+  string-space-runs =
+    pkgs.runCommand "rio-string-space-runs"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = workspaceFileset;
+        };
+        nativeBuildInputs = [ pkgs.ripgrep ];
+      }
+      ''
+        cd $src
+        pat='"[^"]*[^" ][ ]{5,}[^" ][^"]*"'
+        fail=0
+
+        # Per-file pins: alignment families stay, anything else fails.
+        declare -A allow=(
+          [rio-builder/src/banner.rs]=4        # exec-id banner column alignment
+          [rio-cli/src/sla.rs]=10              # CLI key/value column alignment
+          [rio-cli/src/invalidate_path.rs]=5   # CLI key/value column alignment
+          [rio-cli/src/pool.rs]=2              # CLI key/value column alignment
+          [rio-cli/src/workers.rs]=1           # CLI key/value column alignment
+          [rio-scheduler/src/sla/metrics.rs]=1 # source-shape fixture (gauge! grep)
+          [rio-store/src/gc/sweep.rs]=1        # SQL-shape assertion fixture
+        )
+
+        while IFS=: read -r f n; do
+          f=$(printf '%s' "$f" | sed 's|^\./||')
+          want=''${allow[$f]:-0}
+          if [ "$n" != "$want" ]; then
+            echo "FAIL: $f has $n in-literal space runs (pinned: $want)." >&2
+            rg -n "$pat" "$f" | head -5 >&2
+            echo "  A wrapped string literal needs backslash continuations: \"...text \\" >&2
+            echo "       more text\" — otherwise the indentation ships to the client." >&2
+            echo "  Deliberate alignment goes in the pin table" >&2
+            echo "  (nix/misc-checks.nix string-space-runs) with a reason." >&2
+            fail=1
+          fi
+        done < <(rg -c "$pat" --type rust . || true)
+
+        [ "$fail" = 0 ] || exit 1
+        touch $out
+      '';
 }

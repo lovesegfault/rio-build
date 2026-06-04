@@ -278,6 +278,23 @@ async fn test_submit_build_rejects_misaligned_output_arity() {
         "error names the arity mismatch: {}",
         status.message()
     );
+    // Wrap-spanning assert (round-17 merged_bug_001): the remediation
+    // clause spans the source-level line wraps — if a continuation
+    // backslash is dropped, the embedded space run breaks this
+    // contains() and the no-double-space check below names the class.
+    assert!(
+        status
+            .message()
+            .contains("the lists are positionally paired (declare equal arity"),
+        "remediation text must read as one sentence across wraps: {}",
+        status.message()
+    );
+    assert!(
+        !status.message().contains("  "),
+        "client-facing message must not contain literal space runs \
+         (missing backslash continuation): {:?}",
+        status.message()
+    );
 
     // Long path list (extra unpaired path).
     let mut long = make_node("arity-long");

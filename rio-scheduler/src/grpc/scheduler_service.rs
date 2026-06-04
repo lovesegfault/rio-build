@@ -253,7 +253,10 @@ impl SchedulerService for SchedulerGrpc {
                 && node.expected_output_paths.len() != node.output_names.len()
             {
                 return Err(Status::invalid_argument(format!(
-                    "node {} declares {} output_names but {} expected_output_paths;                      the lists are positionally paired (declare equal arity, with                      empty strings for floating slots, or omit the path list                      entirely)",
+                    "node {} declares {} output_names but {} \
+                     expected_output_paths; the lists are positionally \
+                     paired (declare equal arity, with empty strings \
+                     for floating slots, or omit the path list entirely)",
                     node.drv_hash,
                     node.output_names.len(),
                     node.expected_output_paths.len()

@@ -698,7 +698,8 @@ mod tests {
         let e = e_fitting_cores(&cell_placeable, 32);
         assert!(
             (e - 32.0).abs() < 1e-9,
-            "per-cell E[c_fit] for hi-ebs-x86 should be 32, got {e}              (global mean would be ≈6.17)"
+            "per-cell E[c_fit] for hi-ebs-x86 should be 32, got {e} \
+             (global mean would be ≈6.17)"
         );
         // The fetcher cell sees only the 10 fetcher intents.
         let fetcher_cell = Cell("fetcher-x86".into(), CapacityType::Spot);

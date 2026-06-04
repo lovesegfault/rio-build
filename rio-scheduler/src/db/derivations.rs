@@ -661,7 +661,9 @@ impl SchedulerDb {
         needs_resolve: Option<bool>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE derivations SET evidence_rank = $2,              needs_resolve = COALESCE($3, needs_resolve),              updated_at = now() WHERE drv_hash = $1",
+            "UPDATE derivations SET evidence_rank = $2, \
+             needs_resolve = COALESCE($3, needs_resolve), \
+             updated_at = now() WHERE drv_hash = $1",
         )
         .bind(drv_hash)
         .bind(rank.as_str())

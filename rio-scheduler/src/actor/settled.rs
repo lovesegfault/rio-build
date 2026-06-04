@@ -106,10 +106,12 @@ impl SettledMatchBasis {
             Self::HashMatch => "byte-equal live ca_modular_hash",
             Self::PreservedClaim => "byte-equal preserved stripped claim (M_070)",
             Self::StrippedHashMatch => {
-                "ingress text-CA byte binding on both sides                  (byte-anchored row rank x inline-bound incoming)"
+                "ingress text-CA byte binding on both sides \
+                 (byte-anchored row rank x inline-bound incoming)"
             }
             Self::DualAnchor => {
-                "byte-anchored row rank x incoming identity-silence                  (no submitter-controlled identity content enters)"
+                "byte-anchored row rank x incoming identity-silence \
+                 (no submitter-controlled identity content enters)"
             }
         }
     }
