@@ -189,13 +189,23 @@ pub(crate) async fn load_drv_modulo(
 }
 
 /// Idempotent upsert. Rows are content-derived immutable facts about
-/// text-CA-bound bytes, so `DO NOTHING` on conflict is exact (a
-/// re-upload of the same path carries identical bytes by construction).
+/// text-CA-bound bytes, so the value columns never change on conflict
+/// — but the conflict arm is NOT a `DO NOTHING`: since M_073 it is the
+/// load-bearing `DO UPDATE SET orphaned_at = NULL` orphan-stamp clear
+/// (re-population is residency evidence; see the in-query comment and
+/// the M_073 doc-const). Round-17 merged_bug_090 site 5: the previous
+/// sentence here described the pre-M_073 shape.
+///
+/// Returns whether THIS call made a row durable or re-live:
+/// `true` for a fresh insert or an orphan-stamp clear (rows_affected
+/// = 1), `false` for the conflict no-op on a live row (the WHERE
+/// guard keeps it write-free). Callers counting durable work gate on
+/// this (round-17 merged_bug_032).
 pub(crate) async fn upsert_drv_modulo(
     pool: &PgPool,
     drv_path: &str,
     row: &DrvModuloRow,
-) -> Result<(), sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     let paths_json = sqlx::types::JsonValue::Object(
         row.ia_output_paths
             .iter()
@@ -220,8 +230,8 @@ pub(crate) async fn upsert_drv_modulo(
     .bind(&paths_json)
     .bind(row.deferred)
     .execute(pool)
-    .await?;
-    Ok(())
+    .await
+    .map(|r| r.rows_affected() > 0)
 }
 
 /// What one best-effort population attempt did — the batch ingestion
@@ -797,10 +807,12 @@ pub(crate) enum AbsentReason {
     /// The walk exhausted its budget (work units or arena bytes).
     /// `persisted` is the TOTAL rows this attempt made durable — eager
     /// mid-flight computes and the exit drain both route through the
-    /// walk owner's sole [`ProofWalk::persist`] chokepoint, so the
-    /// count equals the SQL row delta by construction (round-16
-    /// merged_bug_086; pinned by the row-delta test). A retry resumes
-    /// from those rows.
+    /// walk owner's sole [`ProofWalk::persist`] chokepoint, and the
+    /// count is gated on `rows_affected` (round-17 merged_bug_032), so
+    /// it equals the SQL row delta by construction EVEN UNDER
+    /// concurrent walks — a losing walk's conflict no-op counts zero
+    /// (round-16 merged_bug_086; pinned by the row-delta test). A
+    /// retry resumes from those rows.
     OverBudget { persisted: usize, work_used: usize },
     /// The input metadata forms a cycle: no topological order exists,
     /// so no row in the cyclic remainder is derivable. Fail-closed
@@ -904,9 +916,12 @@ async fn own_drv_bytes(
 /// introduces, same commit, the type that owns its transitions):
 ///
 /// - [`Self::persist`] is the SOLE row-upsert site of the walk: eager
-///   mid-flight computes and the exit drain both route through it, so
-///   `persisted` equals the SQL row delta BY CONSTRUCTION — a persist
-///   the count doesn't see is unwritable (merged_bug_086's
+///   mid-flight computes and the exit drain both route through it,
+///   and the count is gated on `rows_affected` (round-17
+///   merged_bug_032), so `persisted` equals the SQL row delta BY
+///   CONSTRUCTION even under the module's own concurrency — a persist
+///   the count doesn't see is unwritable, and a conflict no-op the
+///   row table doesn't see counts zero (merged_bug_086's
 ///   dual-persist-site drift class dies here).
 /// - [`Self::finish`] and [`Self::fail`] CONSUME the walk and BOTH run
 ///   the exit [`Self::drain`], and they are the only ways out of
@@ -948,15 +963,23 @@ impl<'a> ProofWalk<'a> {
     }
 
     /// THE persist chokepoint: upsert + seed + count, in one place.
-    /// Every row this walk makes durable goes through here.
+    /// Every row this walk makes durable goes through here. The count
+    /// is gated on `rows_affected` (round-17 merged_bug_032): under
+    /// the module's own concurrency (PROOF_WALK_CONCURRENCY overlapping
+    /// walks; populate_on_ingest racing between discover() and here) a
+    /// losing walk's conflict no-op must not claim rows it did not
+    /// make durable — "persisted equals the SQL row delta" holds BY
+    /// CONSTRUCTION across concurrent walks, not just in isolation.
     async fn persist(
         &mut self,
         path: &str,
         row: &DrvModuloRow,
     ) -> Result<(), super::MetadataError> {
-        upsert_drv_modulo(self.pool, path, row).await?;
+        let durable = upsert_drv_modulo(self.pool, path, row).await?;
         self.seeds.insert(path.to_string(), row.modulo_hash);
-        self.persisted += 1;
+        if durable {
+            self.persisted += 1;
+        }
         Ok(())
     }
 
@@ -1731,6 +1754,64 @@ mod tests {
         assert!(
             !reference.is_empty(),
             "fixture precondition: parent derives outputs"
+        );
+    }
+}
+
+#[cfg(test)]
+mod upsert_tests {
+    use super::*;
+    use rio_test_support::TestDb;
+
+    fn row(hash_byte: u8) -> DrvModuloRow {
+        DrvModuloRow {
+            modulo_hash: [hash_byte; 32],
+            ia_output_paths: std::collections::HashMap::new(),
+            deferred: false,
+        }
+    }
+
+    /// Tri-state upsert pin (round-17 merged_bug_032): the returned
+    /// bool IS "this call made the row durable or re-live".
+    /// - fresh insert -> true (row created);
+    /// - conflict on a LIVE row -> false (WHERE guard: write-free
+    ///   no-op — the cell that previously over-counted under
+    ///   concurrent walks);
+    /// - conflict on an ORPHANED row -> true (the M_073 stamp clear
+    ///   is durable work: the row is re-live).
+    #[tokio::test]
+    async fn upsert_reports_durability_per_conflict_state() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let p = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-tri.drv";
+
+        assert!(
+            upsert_drv_modulo(&db.pool, p, &row(1)).await.unwrap(),
+            "fresh insert is durable"
+        );
+        assert!(
+            !upsert_drv_modulo(&db.pool, p, &row(1)).await.unwrap(),
+            "conflict on a live row is the write-free no-op"
+        );
+        sqlx::query("UPDATE drv_modulo_cache SET orphaned_at = now() WHERE drv_path = $1")
+            .bind(p)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(
+            upsert_drv_modulo(&db.pool, p, &row(1)).await.unwrap(),
+            "conflict on an orphaned row clears the stamp — durable"
+        );
+        let (stamped,): (bool,) = sqlx::query_as(
+            "SELECT orphaned_at IS NOT NULL FROM drv_modulo_cache WHERE drv_path = $1",
+        )
+        .bind(p)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(!stamped, "stamp cleared");
+        assert!(
+            !upsert_drv_modulo(&db.pool, p, &row(1)).await.unwrap(),
+            "re-live row conflicts back to the no-op"
         );
     }
 }
