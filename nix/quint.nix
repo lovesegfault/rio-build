@@ -5822,6 +5822,8 @@ in
     # r[verify gw.resync.loss-signal+1]
     # r[verify sched.pull.kinded-running-surface]
     # r[verify sched.watch.terminal-from-durable-row]
+    # r[verify gw.resync.reattach-budget]
+    # r[verify gw.resync.snapshot-owed]
     quint-gw-build-resync = mkQuintCheck {
       name = "gw-build-resync";
       spec = "gwBuildResync";
@@ -5830,6 +5832,21 @@ in
         "noStuckDisplay"
         "tailCoverage"
         "terminalVerdictNeverFabricated"
+        "boundedResyncStreak"
+        "snapshotOwedNoConsume"
+      ];
+    };
+
+    # The tail reader loop: re-open pacing keyed on chunk VERDICTS (not
+    # receipts) and the orphan exit freeze (merged_bug_054 /
+    # merged_bug_130). Tier-1, exhausts instantly.
+    # r[verify dash.stream.reopen-pacing]
+    quint-tail-reader-loop = mkQuintCheck {
+      name = "tail-reader-loop";
+      spec = "tailReaderLoop";
+      invariants = [
+        "orphanNeverReopens"
+        "pacingEscalatesAbsentProgress"
       ];
     };
 
@@ -5870,6 +5887,41 @@ in
       spec = "calibration/gwresync-no-pg-fallback";
       main = "gwResyncNoPgFallback";
       witness = "terminalVerdictNeverFabricated";
+    };
+    # r[verify gw.resync.reattach-budget]
+    quint-gwresync-calib-reset-on-snapshot = mkQuintWitnessCheck {
+      name = "gwresync-calib-reset-on-snapshot";
+      spec = "calibration/gwresync-reset-on-snapshot";
+      main = "gwResyncCalibResetOnSnapshot";
+      extraSpecs = [ "gwBuildResync" ];
+      step = "calibStep";
+      witness = "boundedResyncStreak";
+    };
+    # r[verify gw.resync.snapshot-owed]
+    quint-gwresync-calib-consume-while-owed = mkQuintWitnessCheck {
+      name = "gwresync-calib-consume-while-owed";
+      spec = "calibration/gwresync-consume-while-owed";
+      main = "gwResyncCalibConsumeWhileOwed";
+      extraSpecs = [ "gwBuildResync" ];
+      step = "calibStep";
+      witness = "snapshotOwedNoConsume";
+    };
+    quint-tailreader-calib-orphan-hotloop = mkQuintWitnessCheck {
+      name = "tailreader-calib-orphan-hotloop";
+      spec = "calibration/tailreader-orphan-hotloop";
+      main = "tailReaderCalibOrphanHotloop";
+      extraSpecs = [ "tailReaderLoop" ];
+      step = "calibStep";
+      witness = "orphanNeverReopens";
+    };
+    # r[verify dash.stream.reopen-pacing]
+    quint-tailreader-calib-reset-on-receipt = mkQuintWitnessCheck {
+      name = "tailreader-calib-reset-on-receipt";
+      spec = "calibration/tailreader-reset-on-receipt";
+      main = "tailReaderCalibResetOnReceipt";
+      extraSpecs = [ "tailReaderLoop" ];
+      step = "calibStep";
+      witness = "pacingEscalatesAbsentProgress";
     };
     quint-openattempts-calib-charge-blind = mkQuintWitnessCheck {
       name = "openattempts-calib-charge-blind";
