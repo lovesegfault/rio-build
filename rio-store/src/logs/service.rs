@@ -107,14 +107,24 @@ const PROXIED_METADATA_KEY: &str = "x-rio-log-proxied";
 
 /// How long the cross-replica `TailLog` proxy waits to establish a TCP
 /// connection to the replica that owns an execution's live ingest
-/// session before giving up and serving the history-only view. Bounds
-/// the worst case for a stale session row pointing at a dead pod: every
-/// read for that execution pays up to this long for at most the lease's
+/// session before giving up and serving the history-only view. The
+/// TCP connect is only half the story — the stream *open* has its own
+/// bound, [`PROXY_OPEN_TIMEOUT`] — and only the pair bounds the worst
+/// case for a stale session row pointing at a dead pod: every read for
+/// that execution pays up to connect+open for at most the lease's
 /// 30 s staleness window, after which `lookup_live` stops returning the
-/// dead owner. Accepted rather than cached — a 30 s × 2 s worst case is
-/// bounded and self-healing, and a failure cache is more state to get
-/// wrong.
+/// dead owner. Accepted rather than cached — the worst case is bounded
+/// and self-healing, and a failure cache is more state to get wrong.
 const PROXY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long the cross-replica proxy waits for the `TailLog` *open*
+/// (HTTP/2 stream establishment + the owner's first response headers)
+/// after the TCP connect succeeded. [`PROXY_CONNECT_TIMEOUT`] alone
+/// never bounded this: a half-open owner pod (TCP accepting, process
+/// wedged) parked the forwarding reader indefinitely. Together the two
+/// bounds cap the worst case for a stale session row at
+/// connect+open ≈ 7 s, for at most the lease's 30 s staleness window.
+const PROXY_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Turns the owning replica's self-identity (the
 /// `log_ingest_sessions.replica_pod` value it registered at
@@ -718,10 +728,12 @@ impl LogServiceImpl {
     /// matter what the session table says.
     ///
     /// Failure is returned (not swallowed) so the caller can count it
-    /// and fall back to the history-only view. The connect is bounded by
-    /// [`PROXY_CONNECT_TIMEOUT`]; a stale session row pointing at a dead
-    /// pod therefore costs each reader at most that long, for at most
-    /// the lease's 30 s staleness window.
+    /// and fall back to the history-only view. The connect is bounded
+    /// by [`PROXY_CONNECT_TIMEOUT`] AND the open by
+    /// [`PROXY_OPEN_TIMEOUT`] — the connect bound alone never covered a
+    /// half-open owner — so a stale session row pointing at a dead pod
+    /// costs each reader at most connect+open, for at most the lease's
+    /// 30 s staleness window.
     async fn proxy_tail(
         &self,
         owner_pod: &str,
@@ -753,11 +765,20 @@ impl LogServiceImpl {
                 .metadata_mut()
                 .insert(rio_common::grpc::TENANT_TOKEN_HEADER, token);
         }
-        Ok(client
-            .tail_log(request)
-            .await
-            .map_err(|e| anyhow::anyhow!("forwarded TailLog to {uri}: {e}"))?
-            .into_inner())
+        // The connect above is bounded, but the *open* (HTTP/2 +
+        // server processing) used to be a naked await: a half-open
+        // owner (TCP up, HTTP/2 dead) parked every reader of this
+        // execution forever. Bounded per streaming-open-ban; a timeout
+        // surfaces as a Status and flows into the same proxy-failure
+        // counter + history-only fallback as any other open error.
+        Ok(rio_common::grpc::with_timeout_status(
+            "proxy TailLog",
+            PROXY_OPEN_TIMEOUT,
+            client.tail_log(request),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("forwarded TailLog to {uri}: {e}"))?
+        .into_inner())
     }
 }
 

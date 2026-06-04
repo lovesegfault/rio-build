@@ -110,10 +110,12 @@ pub async fn run(
     shutdown: rio_common::signal::Token,
 ) {
     info!(store_addr = %store_addr, tick_secs = tick.as_secs(), "GC cron starting");
+    let open_shutdown = shutdown.clone();
     run_loop(tick, shutdown, move || {
         let addr = store_addr.clone();
         let int = service_interceptor.clone();
-        async move { tick_once(&addr, int).await }
+        let sd = open_shutdown.clone();
+        async move { tick_once(&addr, int, sd).await }
     })
     .await;
     info!("GC cron stopped");
@@ -196,6 +198,7 @@ pub(crate) async fn run_loop<F, Fut>(
 async fn tick_once(
     store_addr: &str,
     service_interceptor: rio_auth::hmac::ServiceTokenInterceptor,
+    shutdown: rio_common::signal::Token,
 ) -> TickResult {
     // Connect with timeout. The inner connect_channel has a 10s
     // connect_timeout on the Channel builder, but wrap again:
@@ -226,10 +229,32 @@ async fn tick_once(
         grace_period_hours: None, // store default (2h)
         extra_roots: Vec::new(),
     };
-    let mut stream = match client.trigger_gc(req).await {
-        Ok(resp) => resp.into_inner(),
-        Err(e) => {
+    // Bounded open (streaming-open-ban): the caller's GC_TICK_TIMEOUT
+    // already fences the whole tick; this names the open's own bound
+    // and lets shutdown interrupt a wedged open immediately instead of
+    // at the tick budget.
+    let open = rio_common::transport::bounded_open(
+        shutdown.cancelled(),
+        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+        client.trigger_gc(req),
+    )
+    .await;
+    let mut stream = match open {
+        rio_common::transport::OpenOutcome::Opened(Ok(resp)) => resp.into_inner(),
+        rio_common::transport::OpenOutcome::Opened(Err(e)) => {
             warn!(error = %e, "GC cron: TriggerGC rpc failed");
+            return TickResult::RpcFailure;
+        }
+        rio_common::transport::OpenOutcome::TimedOut { after } => {
+            warn!(
+                timeout_secs = after.as_secs(),
+                "GC cron: TriggerGC open timed out"
+            );
+            return TickResult::RpcFailure;
+        }
+        rio_common::transport::OpenOutcome::Aborted => {
+            // Shutdown mid-open: not a store failure; the loop shell
+            // observes cancellation on its next select.
             return TickResult::RpcFailure;
         }
     };

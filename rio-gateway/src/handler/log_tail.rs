@@ -39,6 +39,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use rio_common::transport::{OpenOutcome, bounded_open};
 use rio_log_kernel::{ChunkVisit, TailNext, TailStopCause, tail_next, visit_chunk};
 use rio_proto::LogServiceClient;
 use rio_proto::store::{TailLogChunk, TailLogRequest};
@@ -55,6 +56,15 @@ use tracing::{Instrument, debug, info_span, warn};
 /// so a fixed backoff is enough; the scheduler-stream reconnect's
 /// exponential ladder would just delay the live tail's recovery.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Bound on the `TailLog` *open* itself. A half-open store replica
+/// (TCP up, HTTP/2 dead) used to park the subscription in the open
+/// await forever — invisible to the drain signal and to the grace
+/// clock. The open is raced (via
+/// [`rio_common::transport::bounded_open`]) against the drain edge and
+/// this bound; `TimedOut` maps to `OpenFailed` and the exit law
+/// decides, exactly as for an answered open error.
+const TAIL_OPEN_BOUND: Duration = Duration::from_secs(10);
 
 /// How long a subscription keeps draining its current stream after the
 /// derivation goes terminal. The builder finishes its log upload (with
@@ -373,8 +383,18 @@ async fn run_tail(
                 .metadata_mut()
                 .insert(rio_proto::TENANT_TOKEN_HEADER, value);
         }
-        let cause = match client.tail_log(request).await {
-            Ok(resp) => {
+        // The open is the one await the drain signal and grace clock
+        // cannot see: race it against the drain edge (a signal or
+        // sender death mid-open aborts with zero stream consumed; the
+        // re-check below reads the fresh watch state) and a hard bound.
+        let open = bounded_open(
+            async { _ = drain.changed().await },
+            TAIL_OPEN_BOUND,
+            client.tail_log(request),
+        )
+        .await;
+        let cause = match open {
+            OpenOutcome::Opened(Ok(resp)) => {
                 warned_open_failure = false;
                 match drive_stream(
                     resp.into_inner(),
@@ -405,7 +425,7 @@ async fn run_tail(
                     }
                 }
             }
-            Err(status) => {
+            OpenOutcome::Opened(Err(status)) => {
                 // Open failed (store unreachable, NotFound because the
                 // execution hasn't recorded anything yet, ...). All of
                 // these are retryable from the live tail's perspective
@@ -431,6 +451,32 @@ async fn run_tail(
                         config.reconnect_backoff
                     );
                 }
+                TailStopCause::OpenFailed
+            }
+            OpenOutcome::TimedOut { after } => {
+                // A half-open replica: TCP up, nobody home. Same
+                // retryability as an answered open error — the lines
+                // are durable in the store regardless.
+                if warned_open_failure {
+                    debug!(?after, "TailLog open timed out");
+                } else {
+                    warned_open_failure = true;
+                    warn!(
+                        ?after,
+                        since_line,
+                        "TailLog open timed out; live tail degraded until the store answers \
+                         (retrying every {:?})",
+                        config.reconnect_backoff
+                    );
+                }
+                TailStopCause::OpenFailed
+            }
+            OpenOutcome::Aborted => {
+                // The drain watch fired (signal or sender death) while
+                // the open was in flight; zero stream consumed.
+                // OpenFailed is neutral here — the orphan/terminal
+                // re-check directly below re-reads the watch and the
+                // exit law decides.
                 TailStopCause::OpenFailed
             }
         };

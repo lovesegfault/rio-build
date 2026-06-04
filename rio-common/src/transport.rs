@@ -59,6 +59,54 @@ impl<T> BoundedOutcome<T> {
     }
 }
 
+/// The three outcomes of a bounded streaming-RPC *open*. Same shape as
+/// [`BoundedOutcome`], named separately because the abort signal is a
+/// caller-chosen future (a drain edge, a shutdown token, a watch
+/// receiver dying) rather than always a [`CancellationToken`], and
+/// because the payload is the opened response stream, not a unary
+/// answer.
+#[must_use = "a bounded open's Aborted/TimedOut outcomes carry control flow"]
+#[derive(Debug)]
+pub enum OpenOutcome<T> {
+    /// The open resolved (with the RPC's own success or error).
+    Opened(Result<T, tonic::Status>),
+    /// The abort future fired while the open was in flight. The
+    /// in-flight request is dropped (tonic cancels the HTTP/2 stream).
+    Aborted,
+    /// The bound elapsed with no answer. The in-flight request is
+    /// dropped; `after` is the bound that elapsed (for logging).
+    TimedOut {
+        /// The bound that elapsed.
+        after: Duration,
+    },
+}
+
+/// Await one streaming-RPC open, racing it (biased, in order) against
+/// an abort future and a deadline. The only sanctioned way to open a
+/// generated streaming RPC from a daemon crate — see the
+/// `streaming-open-ban` policy check, whose banned-method list is
+/// derived from the proto descriptor set at check time, so a NEW
+/// streaming rpc is born banned by protoc's own parse.
+///
+/// The abort future is caller-chosen: a `CancellationToken::cancelled`,
+/// a drain watch edge, a peer-death signal. It must be cancel-safe
+/// (it is dropped if the open resolves first).
+// r[impl proto.client.streaming-open-bounded]
+pub async fn bounded_open<T>(
+    abort: impl Future<Output = ()>,
+    bound: Duration,
+    open: impl Future<Output = Result<T, tonic::Status>>,
+) -> OpenOutcome<T> {
+    tokio::select! {
+        biased;
+        () = abort => OpenOutcome::Aborted,
+        resolved = tokio::time::timeout(bound, open) => match resolved {
+            Ok(result) => OpenOutcome::Opened(result),
+            Err(_elapsed) => OpenOutcome::TimedOut { after: bound },
+        },
+    }
+}
+
 /// Await one unary RPC, racing it (biased, in order) against shutdown
 /// and a deadline. The only sanctioned way to await a generated unary
 /// in a retry loop — see the `transport-unary-ban` policy check.
@@ -349,5 +397,41 @@ mod tests {
     #[should_panic(expected = "non-empty abort-drain slice")]
     fn grace_budget_rejects_inverted_partition() {
         let _ = GraceBudget::new(Duration::from_secs(10), Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_open_resolves_an_answered_open() {
+        let out = bounded_open(std::future::pending(), Duration::from_secs(10), async {
+            Ok::<_, tonic::Status>(7)
+        })
+        .await;
+        assert!(matches!(out, OpenOutcome::Opened(Ok(7))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_open_times_out_a_black_hole() {
+        let out = bounded_open(
+            std::future::pending(),
+            Duration::from_secs(10),
+            std::future::pending::<Result<(), tonic::Status>>(),
+        )
+        .await;
+        assert!(matches!(
+            out,
+            OpenOutcome::TimedOut {
+                after
+            } if after == Duration::from_secs(10)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_open_abort_is_biased_first() {
+        // Both ready: the abort future wins by the biased ordering, so
+        // an orphaned/drained caller never consumes a fresh stream.
+        let out = bounded_open(std::future::ready(()), Duration::from_secs(10), async {
+            Ok::<_, tonic::Status>(())
+        })
+        .await;
+        assert!(matches!(out, OpenOutcome::Aborted));
     }
 }

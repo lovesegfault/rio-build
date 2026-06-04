@@ -1423,7 +1423,16 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                     },
                     jwt_token,
                 )?;
-                match scheduler_client.watch_build(watch_req).await {
+                // Bounded open (streaming-open-ban): a wedged
+                // scheduler must surface as a retryable Err, not park
+                // the reconnect loop forever past MAX_RECONNECT.
+                match rio_common::grpc::with_timeout_status(
+                    "WatchBuild",
+                    rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+                    scheduler_client.watch_build(watch_req),
+                )
+                .await
+                {
                     Ok(resp) => {
                         tracing::info!(%build_id, "reconnected via WatchBuild");
                         event_stream = resp.into_inner();

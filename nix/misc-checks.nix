@@ -627,6 +627,64 @@ in
         touch $out
       '';
 
+  # Streaming-open ban: no naked generated streaming-RPC open in a
+  # daemon crate. The banned-method list is DERIVED AT CHECK TIME from
+  # the FileDescriptorSet — protoc's own parse over rio-proto/proto —
+  # so a NEW streaming rpc is born banned (multi-line declarations,
+  # commented-out rpcs, and request-side-only streams are classified by
+  # descriptor flags, not regex). Vehicle: misc-check source scan, NOT
+  # clippy (disallowed-methods cannot name tonic-generated generic
+  # methods — transport-unary-ban's recorded rationale) and NOT a
+  # client seal (tonic emits one client struct per service; a seal
+  # would still need this descriptor check to force bounding of new
+  # methods — the sanctioned-combinator lookbehind is the soft seal).
+  # A hit is allowed iff a sanctioned bounding combinator appears
+  # within the preceding 6 lines (bounded_open / with_timeout_status /
+  # with_timeout / transport::bounded) or the file is a sanctioned
+  # wrapper (rio-builder/src/log_upload.rs — its AppendLog conformance
+  # test is named in the allowlist below). Residual: a caller could
+  # evade the 6-line lookbehind by spacing the combinator further away;
+  # recorded, accepted (the combinator and the open read together in
+  # every sanctioned shape). Test code is out of scope (cfg(test)
+  # trailing modules stripped; /tests/ submodule dirs and
+  # test_helpers.rs are cfg(test)-compiled). Homonym filter: FuseCache
+  # get_path in rio-builder/src/fuse/ is not a gRPC open.
+  # Born red on 5 census sites (2026-06-04): gateway log_tail.rs
+  # tail_log + build.rs watch_build, store logs/service.rs proxy
+  # tail_log, controller gc_schedule.rs trigger_gc, scheduler
+  # admin/gc.rs trigger_gc — the hand census had missed the fifth;
+  # the lint caught it, which is this chokepoint's own argument.
+  # r[verify proto.client.streaming-open-bounded]
+  streaming-open-ban =
+    pkgs.runCommand "rio-streaming-open-ban"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-gateway/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-store/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-controller/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-builder/src)
+            ../rio-proto/proto
+          ];
+        };
+        nativeBuildInputs = [
+          pkgs.protobuf
+          (pkgs.python3.withPackages (ps: [ ps.protobuf ]))
+        ];
+      }
+      ''
+        # 1. The banned list, from protoc's own parse.
+        protoc -I $src/rio-proto/proto \
+          --descriptor_set_out=fds.pb \
+          $src/rio-proto/proto/*.proto
+
+        # 2. Decode + scan + negative self-test.
+        python3 ${../nix/streaming_open_ban.py} fds.pb $src
+        touch $out
+      '';
+
   # CRD drift: crdgen output (one file per CRD) must equal the
   # committed infra/helm/crds/. Catches the "Rust CRD struct
   # changed but nobody ran cargo xtask regen crds" drift — the committed

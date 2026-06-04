@@ -21,6 +21,21 @@ applies it after the explicit initial-window calls, so setting both silently
 discards the 1 MiB. A fixed 1 MiB gives ≥100 MB/s at RTT ≤10 ms --- no BDP
 needed for in-cluster or cross-AZ.
 
+#r("proto.client.streaming-open-bounded")[
+  Every generated streaming-RPC open performed by a daemon crate MUST be
+  raced against a deadline (and, where one exists, an abort signal) via a
+  sanctioned bounding combinator; a naked `.method(req).await` open is
+  forbidden.
+]
+
+A streaming *open* is the one await a caller's drain signal, grace clock,
+or tick budget cannot see: a half-open peer (TCP up, HTTP/2 dead) parks
+the task indefinitely. The `streaming-open-ban` policy check enforces
+this with a banned-method list derived at check time from the proto
+`FileDescriptorSet` --- protoc's own parse --- so a new streaming rpc is
+born banned; sanctioned combinators are `rio_common::transport::bounded_open`,
+`with_timeout_status`, and `with_timeout`.
+
 == gRPC Metadata Keys
 
 `x-rio-*` header constants live in `rio_common::grpc` (proto-agnostic,

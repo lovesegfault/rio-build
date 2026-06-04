@@ -118,11 +118,28 @@ pub(super) async fn trigger_gc(
     // `.status_internal(..)` here squashed the store's
     // `InvalidArgument: too many extra_roots: N (max …)` into an
     // opaque INTERNAL.
-    let store_stream = store_admin
-        .trigger_gc(tonic_req)
-        .await
-        .map_err(|s| Status::new(s.code(), format!("store TriggerGC: {}", s.message())))?
-        .into_inner();
+    // Bounded open (streaming-open-ban): a wedged store must answer
+    // the admin caller with a Status, not park the proxy handler; the
+    // handler's shutdown token aborts an in-flight open at step-down.
+    let store_stream = match rio_common::transport::bounded_open(
+        shutdown.cancelled(),
+        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+        store_admin.trigger_gc(tonic_req),
+    )
+    .await
+    {
+        rio_common::transport::OpenOutcome::Opened(result) => result
+            .map_err(|s| Status::new(s.code(), format!("store TriggerGC: {}", s.message())))?
+            .into_inner(),
+        rio_common::transport::OpenOutcome::TimedOut { after } => {
+            return Err(Status::deadline_exceeded(format!(
+                "store TriggerGC: open timed out after {after:?}"
+            )));
+        }
+        rio_common::transport::OpenOutcome::Aborted => {
+            return Err(Status::unavailable("store TriggerGC: shutting down"));
+        }
+    };
 
     // Forward store's progress stream to the client. A small
     // channel + forwarding task: the store stream isn't
