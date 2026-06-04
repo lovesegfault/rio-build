@@ -684,13 +684,19 @@ in
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-gateway/src)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-cli/src)
+            # merged_bug_293: the offline query cache is a source tree
+            # too — an orphaned .sqlx entry caching the banned resolver
+            # is a ready-made revival kit (two such orphans shipped:
+            # the retired kind-blind resolver + the assignments-join
+            # lookup). Scan it with the same pattern.
+            ../.sqlx
           ];
         };
         nativeBuildInputs = [ pkgs.ripgrep ];
       }
       ''
         set +o pipefail
-        hits=$(rg -n -i 'FROM drv_executions[^;]*ORDER BY exec_id DESC' --multiline           $src/rio-store/src $src/rio-scheduler/src $src/rio-gateway/src $src/rio-cli/src           || true)
+        hits=$(rg -n -i 'FROM drv_executions[^;]*ORDER BY exec_id DESC' --multiline           $src/rio-store/src $src/rio-scheduler/src $src/rio-gateway/src $src/rio-cli/src $src/.sqlx           || true)
         if [[ -n "$hits" ]]; then
           echo "FAIL: raw latest-exec resolution over drv_executions —" >&2
           echo "read the kind-filtered latest_build_exec view instead (M_089):" >&2

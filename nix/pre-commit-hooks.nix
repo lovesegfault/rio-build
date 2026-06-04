@@ -55,18 +55,20 @@
     name = "sqlx-prepare-check";
     entry = toString (
       pkgs.writeShellScript "sqlx-prepare-check" ''
-        # Only check if any staged .rs file touches a query! macro.
-        # Otherwise this is a no-op (e.g. pure-refactor commits
-        # that don't change SQL).
-        if git diff --cached --name-only -- '*.rs' \
-           | xargs -r grep -l 'query!\|query_as!\|query_scalar!' \
-           | grep -q .; then
+        # Check when a staged .rs file touches a query! macro OR the
+        # cache itself is edited (merged_bug_293: cache-only commits
+        # were a hook no-op, so orphaned/hand-edited .sqlx entries
+        # sailed through unverified).
+        if git diff --cached --name-only -- '.sqlx/*' | grep -q . \
+           || git diff --cached --name-only -- '*.rs' \
+              | xargs -r grep -l 'query!\|query_as!\|query_scalar!' \
+              | grep -q .; then
           SQLX_OFFLINE=true cargo check --quiet -p rio-scheduler -p rio-store -p rio-controller \
             || { echo 'sqlx query cache stale — run `cargo xtask regen sqlx`'; exit 1; }
         fi
       ''
     );
-    files = "\\.rs$";
+    files = "\\.rs$|^\\.sqlx/";
     language = "system";
     pass_filenames = false;
   };
