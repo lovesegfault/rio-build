@@ -1395,13 +1395,26 @@ pull pool pointed at a pre-pull scheduler shows up as a promptly Failed Job
 with a clear log line instead of a node silently held until
 `activeDeadlineSeconds`.
 
-#r("builder.pull.exit-codes")[
-  In pull mode exit code 0 is reserved for exactly three cases: a `Gone`
-  response, a `ReportOutcome` acknowledged by the scheduler, and the
+#r("builder.pull.exit-codes+1")[
+  In pull mode exit code 0 is reserved for exactly four cases: a `Gone`
+  response, a `ReportOutcome` acknowledged by the scheduler, the
   charge-free idle exit after receiving only `NotYetReady` for the
-  `idle_timeout` bound; every other termination MUST exit nonzero so the Job
-  goes Failed and classification arrives via the pod-terminal path.
+  `idle_timeout` bound, and a shutdown with provably nothing minted —
+  every pull this process sent was answered, or none was sent (the
+  wire-effect latch is clear). A shutdown with a maybe-minted pull (a
+  pull that reached the wire and was never answered) MUST resolve before
+  exit 0: exactly one bounded confirm pull inside the termination grace —
+  `NotYetReady`/`Gone` confirm nothing is held; a delivered `Assignment`
+  is closed with a synthesized `Cancelled` report that must be
+  acknowledged. Every other termination, including a maybe-minted
+  shutdown left unresolved, MUST exit nonzero so the Job goes Failed and
+  classification arrives via the pod-terminal path.
 ]
+
+*Owner counter-signature (Q6, bughunt-2 §5-S packet): SIGNED 2026-06-04 —
+confirm-then-#[{0|nonzero}]: shutdown-with-provably-nothing-minted is the
+named fourth exit-0 case; one bounded follow-up pull inside the 45s grace
+is blessed; maybe-minted-unresolved exits nonzero (Failed Job).*
 
 = Shutdown
 
@@ -1419,7 +1432,7 @@ of #rref("builder.shutdown.sigint") below; and teardown ordering is
 #rref("builder.shutdown.fuse-abort") (there is no heartbeat task left to
 abort first).
 
-#r("builder.shutdown.sigint+4")[
+#r("builder.shutdown.sigint+5")[
   The builder handles both SIGTERM and SIGINT by leaving the pull loop,
   running teardown (FUSE abort), and returning from `main()`. Local
   development (`cargo run` → Ctrl+C) and Kubernetes pod deletion (kubelet →
@@ -1429,9 +1442,17 @@ abort first).
   in-flight build is cgroup-killed (#rref("builder.cancel.cgroup-kill")), the
   `Cancelled` completion gets exactly one bounded best-effort `ReportOutcome`
   attempt, the pull/report retry loops stop waiting, and the process exits
-  within the pull-mode grace; a signal while still waiting for work exits 0
-  without building (nothing started, nothing owed).
+  within the pull-mode grace. A signal while still waiting for work exits 0
+  without building only when the wire-effect latch is clear (nothing
+  started, nothing owed); a maybe-minted pull is first resolved with the
+  single bounded confirm pull of #rref("builder.pull.exit-codes") — both
+  bounded RPCs fit the grace by construction (2 × the final-attempt bound
+  ≤ the pull-mode termination grace, compile-asserted).
 ]
+
+*Owner counter-signature (Q6, bughunt-2 §5-S packet): SIGNED 2026-06-04 —
+the sigint abort law amended in lockstep with the exit-code law's fourth
+case and confirm path.*
 
 #r("builder.shutdown.fuse-abort")[
   On the shutdown path, the builder MUST abort the FUSE connection (write `1`

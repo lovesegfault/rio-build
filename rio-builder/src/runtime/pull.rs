@@ -16,7 +16,7 @@
 //! path inside `execute_build`; there are no scheduler-pushed
 //! prefetch hints.
 //!
-//! Exit codes (`builder.pull.exit-codes`): 0 only for `Gone`, for an
+//! Exit codes (`builder.pull.exit-codes+1`): 0 only for `Gone`, for an
 //! acknowledged `ReportOutcome`, and for the charge-free idle exit
 //! after receiving only `NotYetReady` for the `idle_timeout` bound.
 //! Every other termination exits nonzero so the Job goes Failed and
@@ -47,7 +47,8 @@ use rio_proto::types::{
 
 use rio_common::grpc::DEFAULT_GRPC_TIMEOUT;
 use rio_common::transport::{
-    AttemptBudget, BoundedOutcome, GraceBudget, SIGTERM_FINAL_ATTEMPT, bounded,
+    AttemptBudget, BoundedOutcome, EffectfulOutcome, GraceBudget, SIGTERM_FINAL_ATTEMPT, bounded,
+    bounded_effectful,
 };
 
 use super::idle::IdleClock;
@@ -97,6 +98,12 @@ const PULL_GRACE: GraceBudget = GraceBudget::new(
 );
 // The reserved report slice always covers the SIGTERM final attempt.
 const _: () = assert!(PULL_GRACE.report().as_secs() >= SIGTERM_FINAL_ATTEMPT.as_secs());
+// merged_bug_270: the maybe-minted shutdown resolution spends at most
+// one bounded confirm pull plus one bounded report attempt — both must
+// fit inside the pod's termination grace.
+const _: () = assert!(
+    2 * SIGTERM_FINAL_ATTEMPT.as_secs() <= rio_common::limits::PULL_MODE_TERMINATION_GRACE_SECS
+);
 
 /// What the pull phase resolved to.
 #[derive(Debug)]
@@ -108,9 +115,15 @@ pub(super) enum PullPhaseOutcome {
     /// Received only `NotYetReady` for the idle bound: exit 0
     /// charge-free (the OA6 pod-side bounded retry loop).
     IdleExit,
-    /// Shutdown fired while still waiting for work: exit 0 (nothing
-    /// started, nothing to report).
-    Shutdown,
+    /// Shutdown fired while still waiting for work. `maybe_minted` is
+    /// the sticky wire-effect latch: false = every pull this process
+    /// ever sent was answered (or none was sent) — provably nothing is
+    /// held for this pod, exit 0 with zero further RPCs; true = some
+    /// pull reached the wire and was never answered (timed out, or
+    /// abandoned mid-flight by the shutdown race) — the scheduler MAY
+    /// have minted an assignment, so the caller must confirm before it
+    /// may exit 0 (merged_bug_270).
+    Shutdown { maybe_minted: bool },
     /// The scheduler rejected the pull with a permanent,
     /// non-retryable status (identity/auth rejection, unimplemented
     /// RPC, invalid request): exit nonzero promptly instead of holding
@@ -229,9 +242,16 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
     // whole cohorts through a 5-minute failover and exited them en
     // masse on the first post-recovery answer).
     let mut idle = IdleClock::default();
+    // merged_bug_270: sticky wire-effect latch. Set by any timed-out
+    // pull and by a shutdown that abandoned an in-flight (sent) pull;
+    // cleared by every protocol ANSWER (Assignment/Gone/NotYetReady —
+    // pull idempotency makes a later answer authoritative about held
+    // attempts). Transport errors and empty oneofs are not answers and
+    // leave the latch alone.
+    let mut maybe_minted = false;
     loop {
         if shutdown.is_cancelled() {
-            return PullPhaseOutcome::Shutdown;
+            return PullPhaseOutcome::Shutdown { maybe_minted };
         }
         let req = PullAssignmentRequest {
             executor_token: executor_token.to_owned(),
@@ -246,67 +266,80 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
         // a retryable timeout instead of pinning the pod, and race it
         // against SIGTERM so an in-flight pull yields to shutdown
         // (merged_bug_167's pull half).
-        let delay = match bounded(shutdown, DEFAULT_GRPC_TIMEOUT, transport.pull(req)).await {
-            BoundedOutcome::Shutdown => return PullPhaseOutcome::Shutdown,
-            BoundedOutcome::TimedOut { after } => {
-                warn!(
-                    after_secs = after.as_secs(),
-                    "PullAssignment unanswered; retrying"
-                );
-                idle.on_non_answer();
-                attempt = attempt.saturating_add(1);
-                RETRY_ENVELOPE.duration(attempt - 1)
-            }
-            BoundedOutcome::Resolved(Ok(resp)) => match resp.outcome {
-                Some(pull_assignment_response::Outcome::Assignment(a)) => {
-                    return PullPhaseOutcome::Assigned(Box::new(a));
+        let delay =
+            match bounded_effectful(shutdown, DEFAULT_GRPC_TIMEOUT, transport.pull(req)).await {
+                // Never polled: this request provably did nothing; the
+                // latch keeps whatever earlier attempts established.
+                EffectfulOutcome::ShutdownBeforeSend => {
+                    return PullPhaseOutcome::Shutdown { maybe_minted };
                 }
-                Some(pull_assignment_response::Outcome::Gone(_)) => {
-                    return PullPhaseOutcome::Gone;
+                // Polled then abandoned: the request may be on the wire.
+                EffectfulOutcome::ShutdownAfterSend => {
+                    return PullPhaseOutcome::Shutdown { maybe_minted: true };
                 }
-                Some(pull_assignment_response::Outcome::NotYetReady(nyr)) => {
-                    // A NotYetReady answer is contact with the leader:
-                    // reset the unservable backoff curve.
-                    attempt = 0;
-                    let suggested = if nyr.retry_after_seconds == 0 {
-                        DEFAULT_RETRY_AFTER
-                    } else {
-                        Duration::from_secs(u64::from(nyr.retry_after_seconds))
-                    };
-                    idle.on_answer(tokio::time::Instant::now(), suggested);
-                    if idle.idle_for() >= idle_timeout {
-                        return PullPhaseOutcome::IdleExit;
-                    }
-                    RETRY_AFTER_JITTER.apply(suggested)
-                }
-                // Defensive: an empty oneof from a newer/older server is
-                // not an answer — treat like an unservable pull.
-                None => {
-                    warn!("PullAssignment returned an empty outcome; retrying");
+                EffectfulOutcome::TimedOut { after } => {
+                    warn!(
+                        after_secs = after.as_secs(),
+                        "PullAssignment unanswered; retrying"
+                    );
+                    maybe_minted = true;
                     idle.on_non_answer();
                     attempt = attempt.saturating_add(1);
                     RETRY_ENVELOPE.duration(attempt - 1)
                 }
-            },
-            BoundedOutcome::Resolved(Err(status)) if is_fatal_rejection(status.code()) => {
-                tracing::error!(code = ?status.code(), msg = status.message(),
+                EffectfulOutcome::Resolved(Ok(resp)) => match resp.outcome {
+                    Some(pull_assignment_response::Outcome::Assignment(a)) => {
+                        return PullPhaseOutcome::Assigned(Box::new(a));
+                    }
+                    Some(pull_assignment_response::Outcome::Gone(_)) => {
+                        return PullPhaseOutcome::Gone;
+                    }
+                    Some(pull_assignment_response::Outcome::NotYetReady(nyr)) => {
+                        // A NotYetReady answer is contact with the leader:
+                        // reset the unservable backoff curve AND the
+                        // wire-effect latch (an answer is authoritative —
+                        // nothing unconfirmed is held for this pod).
+                        attempt = 0;
+                        maybe_minted = false;
+                        let suggested = if nyr.retry_after_seconds == 0 {
+                            DEFAULT_RETRY_AFTER
+                        } else {
+                            Duration::from_secs(u64::from(nyr.retry_after_seconds))
+                        };
+                        idle.on_answer(tokio::time::Instant::now(), suggested);
+                        if idle.idle_for() >= idle_timeout {
+                            return PullPhaseOutcome::IdleExit;
+                        }
+                        RETRY_AFTER_JITTER.apply(suggested)
+                    }
+                    // Defensive: an empty oneof from a newer/older server is
+                    // not an answer — treat like an unservable pull.
+                    None => {
+                        warn!("PullAssignment returned an empty outcome; retrying");
+                        idle.on_non_answer();
+                        attempt = attempt.saturating_add(1);
+                        RETRY_ENVELOPE.duration(attempt - 1)
+                    }
+                },
+                EffectfulOutcome::Resolved(Err(status)) if is_fatal_rejection(status.code()) => {
+                    tracing::error!(code = ?status.code(), msg = status.message(),
                     "PullAssignment permanently rejected; exiting instead of holding the node");
-                return PullPhaseOutcome::Rejected(status);
-            }
-            BoundedOutcome::Resolved(Err(status)) => {
-                warn!(code = ?status.code(), msg = status.message(),
+                    return PullPhaseOutcome::Rejected(status);
+                }
+                EffectfulOutcome::Resolved(Err(status)) => {
+                    warn!(code = ?status.code(), msg = status.message(),
                     "PullAssignment unservable; retrying");
-                idle.on_non_answer();
-                attempt = attempt.saturating_add(1);
-                RETRY_ENVELOPE.duration(attempt - 1)
-            }
-        };
+                    idle.on_non_answer();
+                    attempt = attempt.saturating_add(1);
+                    RETRY_ENVELOPE.duration(attempt - 1)
+                }
+            };
         // Sleep, but wake immediately on SIGTERM (nothing is running
         // yet — exiting promptly is strictly better than waiting out a
         // backoff under a deletion grace period).
         tokio::select! {
             biased;
-            _ = shutdown.cancelled() => return PullPhaseOutcome::Shutdown,
+            _ = shutdown.cancelled() => return PullPhaseOutcome::Shutdown { maybe_minted },
             _ = tokio::time::sleep(delay) => {}
         }
     }
@@ -434,7 +467,7 @@ async fn wait_for_completion(
 }
 
 // r[impl builder.cancel.cgroup-kill+2]
-// r[impl builder.shutdown.sigint+4]
+// r[impl builder.shutdown.sigint+5]
 /// AD5 abort phase: wait for the single build's completion, aborting
 /// the build if SIGTERM arrives first. The abort is the same
 /// cancel-honor path `CancelSignal` uses (`try_cancel_build`: slot
@@ -493,9 +526,84 @@ async fn build_phase_with_abort(
     }
 }
 
+/// merged_bug_270: resolve a maybe-minted shutdown before the process
+/// may exit 0.
+///
+/// Exactly ONE confirm pull, bounded by `SIGTERM_FINAL_ATTEMPT` (plain
+/// timeout — the shutdown token has already fired). Pull idempotency
+/// makes the answer authoritative:
+/// - `NotYetReady`/`Gone`: nothing is held for this pod → clean (the
+///   timed-out request either never minted or was already released).
+/// - `Assignment`: the abandoned pull DID mint. The build never
+///   started; synthesize a `Cancelled` completion and push it through
+///   [`report_until_acked`] (under a fired shutdown that is the single
+///   bounded best-effort attempt). Acked → clean; the scheduler closes
+///   the attempt charge-free (AD5 semantics, bounded scheduler-side by
+///   the worker-abort admission).
+/// - Timeout / transport error / empty outcome: UNRESOLVED → the
+///   caller exits nonzero so the Job goes Failed and the establishment
+///   sweep reaps the open attempt against a Failed pod, not a lying
+///   `Succeeded` one.
+///
+/// Returns true iff the maybe-minted state was resolved clean.
+async fn resolve_shutdown<T: PullTransport>(
+    transport: &mut T,
+    intent_id: &str,
+    executor_token: &str,
+    shutdown: &rio_common::signal::Token,
+) -> bool {
+    let req = PullAssignmentRequest {
+        executor_token: executor_token.to_owned(),
+        intent_id: intent_id.to_owned(),
+        ..Default::default()
+    };
+    let resp = match tokio::time::timeout(SIGTERM_FINAL_ATTEMPT, transport.pull(req)).await {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(status)) => {
+            warn!(code = ?status.code(), msg = status.message(),
+                "maybe-minted confirm pull failed; exiting nonzero");
+            return false;
+        }
+        Err(_elapsed) => {
+            warn!("maybe-minted confirm pull unanswered; exiting nonzero");
+            return false;
+        }
+    };
+    match resp.outcome {
+        Some(pull_assignment_response::Outcome::NotYetReady(_))
+        | Some(pull_assignment_response::Outcome::Gone(_)) => {
+            info!("maybe-minted shutdown resolved: nothing held for this pod");
+            true
+        }
+        Some(pull_assignment_response::Outcome::Assignment(a)) => {
+            info!(
+                drv_path = %a.drv_path,
+                exec_id = %a.exec_id,
+                "abandoned pull HAD minted; reporting synthesized Cancelled"
+            );
+            let report = CompletionReport {
+                drv_path: a.drv_path.clone(),
+                result: Some(rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::Cancelled.into(),
+                    error_msg: "SIGTERM before build start; assignment minted by an                                 abandoned pull (merged_bug_270 confirm path)"
+                        .into(),
+                    ..Default::default()
+                }),
+                assignment_token: a.assignment_token.clone(),
+                ..Default::default()
+            };
+            report_until_acked(transport, &a.exec_id, report, PULL_GRACE.report(), shutdown).await
+        }
+        None => {
+            warn!("maybe-minted confirm pull returned an empty outcome; exiting nonzero");
+            false
+        }
+    }
+}
+
 /// The pull lifecycle: pull → build (existing machinery) → report →
 /// exit. The builder runtime's only delivery path.
-// r[impl builder.pull.exit-codes]
+// r[impl builder.pull.exit-codes+1]
 // r[impl sched.executor.one-shot+2]
 pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -531,10 +639,26 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
             run_teardown(rt);
             return Ok(());
         }
-        PullPhaseOutcome::Shutdown => {
+        PullPhaseOutcome::Shutdown {
+            maybe_minted: false,
+        } => {
+            // Provably nothing minted: the named fourth exit-0 case
+            // (builder.pull.exit-codes+1) — zero further RPCs.
             info!(intent_id = %rt.intent_id, "shutdown while waiting for work; exiting 0");
             run_teardown(rt);
             return Ok(());
+        }
+        PullPhaseOutcome::Shutdown { maybe_minted: true } => {
+            let resolved =
+                resolve_shutdown(&mut transport, &rt.intent_id, &executor_token, &rt.shutdown)
+                    .await;
+            run_teardown(rt);
+            if resolved {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "shutdown with a maybe-minted pull left unresolved; exiting nonzero                  so the Job goes Failed (the establishment sweep reaps the attempt)"
+            );
         }
         PullPhaseOutcome::Rejected(status) => {
             // Permanent rejection: nothing was started and nothing is
@@ -744,9 +868,170 @@ mod tests {
         assert_eq!(t.pull_calls, 3);
     }
 
+    /// merged_bug_270 (R7 quadruple). Pre-fix red recorded by the
+    /// probe this battery superseded: a SENT pull abandoned by SIGTERM
+    /// returned plain `Shutdown` with zero follow-up RPCs and run_pull
+    /// exited 0 (the forbidden fourth exit-0 case before the law named
+    /// it confirm-then-{0|nonzero}).
+    ///
+    /// (1) shutdown mid-flight (sent, unanswered) → maybe_minted.
+    // r[verify builder.pull.exit-codes+1]
+    // r[verify builder.shutdown.sigint+5]
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_mid_flight_is_maybe_minted() {
+        struct Hang;
+        impl PullTransport for Hang {
+            async fn pull(
+                &mut self,
+                _req: PullAssignmentRequest,
+            ) -> Result<PullAssignmentResponse, tonic::Status> {
+                std::future::pending().await
+            }
+            async fn report(&mut self, _req: ReportOutcomeRequest) -> Result<(), tonic::Status> {
+                Err(tonic::Status::unavailable("unused"))
+            }
+        }
+        let mut t = Hang;
+        let shutdown = token();
+        let sd = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            sd.cancel();
+        });
+        let outcome = pull_until_resolved(&mut t, "intent-a", "tok", IDLE, &shutdown).await;
+        assert!(matches!(
+            outcome,
+            PullPhaseOutcome::Shutdown { maybe_minted: true }
+        ));
+    }
+
+    /// (2) timed-out pull, then SIGTERM in the backoff → maybe_minted
+    /// (the sticky latch survives the non-answer gap).
+    // r[verify builder.pull.exit-codes+1]
+    #[tokio::test(start_paused = true)]
+    async fn timeout_then_sigterm_in_backoff_is_maybe_minted() {
+        struct HangForever;
+        impl PullTransport for HangForever {
+            async fn pull(
+                &mut self,
+                _req: PullAssignmentRequest,
+            ) -> Result<PullAssignmentResponse, tonic::Status> {
+                std::future::pending().await
+            }
+            async fn report(&mut self, _req: ReportOutcomeRequest) -> Result<(), tonic::Status> {
+                Err(tonic::Status::unavailable("unused"))
+            }
+        }
+        let mut t = HangForever;
+        let shutdown = token();
+        let sd = shutdown.clone();
+        tokio::spawn(async move {
+            // Past the pull bound (timeout latches maybe_minted) and a
+            // beat into the unservable backoff.
+            tokio::time::sleep(DEFAULT_GRPC_TIMEOUT + Duration::from_millis(50)).await;
+            sd.cancel();
+        });
+        let outcome = pull_until_resolved(&mut t, "intent-a", "tok", IDLE, &shutdown).await;
+        assert!(matches!(
+            outcome,
+            PullPhaseOutcome::Shutdown { maybe_minted: true }
+        ));
+    }
+
+    /// (3) shutdown before any pull was sent → provably nothing minted.
+    // r[verify builder.pull.exit-codes+1]
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_before_send_is_clean() {
+        let mut t = ScriptedTransport::new(vec![], vec![]);
+        let shutdown = token();
+        shutdown.cancel();
+        let outcome = pull_until_resolved(&mut t, "intent-a", "tok", IDLE, &shutdown).await;
+        assert!(matches!(
+            outcome,
+            PullPhaseOutcome::Shutdown {
+                maybe_minted: false
+            }
+        ));
+        assert_eq!(t.pull_calls, 0, "nothing may be sent after shutdown");
+    }
+
+    /// (4) a timed-out pull followed by a NotYetReady ANSWER clears the
+    /// latch — the answer is authoritative (pull idempotency), so a
+    /// later SIGTERM exits clean.
+    // r[verify builder.pull.exit-codes+1]
+    #[tokio::test(start_paused = true)]
+    async fn answer_after_timeout_clears_the_latch() {
+        struct HangThenAnswer {
+            calls: u32,
+        }
+        impl PullTransport for HangThenAnswer {
+            async fn pull(
+                &mut self,
+                _req: PullAssignmentRequest,
+            ) -> Result<PullAssignmentResponse, tonic::Status> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    std::future::pending().await
+                } else {
+                    Ok(not_yet_ready_resp(600))
+                }
+            }
+            async fn report(&mut self, _req: ReportOutcomeRequest) -> Result<(), tonic::Status> {
+                Err(tonic::Status::unavailable("unused"))
+            }
+        }
+        let mut t = HangThenAnswer { calls: 0 };
+        let shutdown = token();
+        let sd = shutdown.clone();
+        tokio::spawn(async move {
+            // Past the first pull's timeout + its backoff + the second
+            // pull's answer, into the NotYetReady-paced sleep.
+            tokio::time::sleep(DEFAULT_GRPC_TIMEOUT + Duration::from_secs(40)).await;
+            sd.cancel();
+        });
+        let outcome = pull_until_resolved(&mut t, "intent-a", "tok", IDLE, &shutdown).await;
+        assert!(
+            matches!(
+                outcome,
+                PullPhaseOutcome::Shutdown {
+                    maybe_minted: false
+                }
+            ),
+            "a protocol answer must clear the wire-effect latch, got {outcome:?}"
+        );
+    }
+
+    /// resolve_shutdown: confirm answers map to the law — NotYetReady →
+    /// clean; minted Assignment → synthesized Cancelled acked → clean;
+    /// confirm failure → unresolved (nonzero at the caller).
+    // r[verify builder.pull.exit-codes+1]
+    // r[verify builder.shutdown.sigint+5]
+    #[tokio::test(start_paused = true)]
+    async fn resolve_shutdown_confirm_table() {
+        let shutdown = token();
+        shutdown.cancel();
+        // NotYetReady → clean, exactly one RPC.
+        let mut t = ScriptedTransport::new(vec![Ok(not_yet_ready_resp(5))], vec![]);
+        assert!(resolve_shutdown(&mut t, "i", "tok", &shutdown).await);
+        assert_eq!((t.pull_calls, t.report_calls), (1, 0));
+        // Minted → synthesized Cancelled, acked → clean.
+        let mut t = ScriptedTransport::new(vec![Ok(assignment_resp("exec-9"))], vec![Ok(())]);
+        assert!(resolve_shutdown(&mut t, "i", "tok", &shutdown).await);
+        assert_eq!((t.pull_calls, t.report_calls), (1, 1));
+        // Confirm pull errors → unresolved.
+        let mut t = ScriptedTransport::new(vec![Err(tonic::Status::unavailable("gone"))], vec![]);
+        assert!(!resolve_shutdown(&mut t, "i", "tok", &shutdown).await);
+        // Minted but the report is never acked → unresolved.
+        let mut t = ScriptedTransport::new(
+            vec![Ok(assignment_resp("exec-9"))],
+            vec![Err(tonic::Status::unavailable("no leader"))],
+        );
+        assert!(!resolve_shutdown(&mut t, "i", "tok", &shutdown).await);
+    }
+
     /// (b) `Gone` resolves immediately: exit 0 without building, no
     /// further pulls.
-    // r[verify builder.pull.exit-codes]
+    // r[verify builder.pull.exit-codes+1]
     #[tokio::test(start_paused = true)]
     async fn gone_resolves_without_building() {
         let mut t = ScriptedTransport::new(vec![Ok(gone_resp())], vec![]);
@@ -760,7 +1045,7 @@ mod tests {
     /// pod that receives only `NotYetReady` for `idle_timeout` exits
     /// charge-free (the OA6 pod-side bounded retry loop).
     // r[verify builder.pull.retry-loop+2]
-    // r[verify builder.pull.exit-codes]
+    // r[verify builder.pull.exit-codes+1]
     #[tokio::test(start_paused = true)]
     async fn not_yet_ready_repulls_and_idle_bounds() {
         let mut t = ScriptedTransport::new(vec![Ok(not_yet_ready_resp(5))], vec![]);
@@ -808,7 +1093,7 @@ mod tests {
     /// (d) The report is retried until acknowledged, then the loop
     /// stops (exit 0 follows at the caller).
     // r[verify builder.pull.retry-loop+2]
-    // r[verify builder.pull.exit-codes]
+    // r[verify builder.pull.exit-codes+1]
     // r[verify builder.completion.exactly-once-or-death+2]
     #[tokio::test(start_paused = true)]
     async fn report_retries_until_acked() {
@@ -836,7 +1121,7 @@ mod tests {
     /// (e) A report that is never acknowledged within the budget gives
     /// up with `false` — the caller exits nonzero so the Job goes
     /// Failed and the pod-terminal path classifies it.
-    // r[verify builder.pull.exit-codes]
+    // r[verify builder.pull.exit-codes+1]
     // r[verify builder.completion.exactly-once-or-death+2]
     #[tokio::test(start_paused = true)]
     async fn report_budget_exhausted_is_nonzero_exit() {
@@ -1050,7 +1335,12 @@ mod tests {
             .await
             .expect("an in-flight pull must yield to SIGTERM, not hang")
             .expect("task not panicked");
-        assert!(matches!(outcome, PullPhaseOutcome::Shutdown));
+        // merged_bug_270 re-pin: the abandoned pull was SENT — the
+        // outcome must carry the maybe-minted latch.
+        assert!(matches!(
+            outcome,
+            PullPhaseOutcome::Shutdown { maybe_minted: true }
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -1104,7 +1394,7 @@ mod tests {
     /// answered told-not-deliverable time counts; afterwards ~120 s of
     /// paced answers exits charge-free.
     // r[verify builder.pull.retry-loop+2]
-    // r[verify builder.pull.exit-codes]
+    // r[verify builder.pull.exit-codes+1]
     #[tokio::test(start_paused = true)]
     async fn idle_outage_gap_does_not_count() {
         // Script: NYR(5), then ~300s of unavailable answers, then NYR(5)
@@ -1160,7 +1450,7 @@ mod abort_tests {
     }
 
     // r[verify builder.cancel.cgroup-kill+2]
-    // r[verify builder.shutdown.sigint+4]
+    // r[verify builder.shutdown.sigint+5]
     /// SIGTERM with a build in flight: the abort fires through the
     /// cancel-honor path (the slot's cancel flag is set — the same flag
     /// the cgroup-kill path keys on), the build task's `Cancelled`
@@ -1304,7 +1594,7 @@ mod abort_tests {
     /// Cancelled completion within the abort-drain slice so the report
     /// phase structurally runs inside the grace.
     // r[verify builder.cancel.cgroup-kill+2]
-    // r[verify builder.shutdown.sigint+4]
+    // r[verify builder.shutdown.sigint+5]
     #[tokio::test(start_paused = true)]
     async fn sigterm_with_parked_build_synthesizes_cancelled_within_grace() {
         let drv = "/nix/store/cccccccccccccccccccccccccccccccc-z.drv";

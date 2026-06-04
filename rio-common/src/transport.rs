@@ -77,6 +77,68 @@ pub async fn bounded<T>(
     }
 }
 
+/// Outcome of [`bounded_effectful`]: like [`BoundedOutcome`], but the
+/// shutdown arm distinguishes whether the RPC future was ever polled.
+///
+/// Rust futures are lazy — an RPC future that has never been polled has
+/// provably done nothing (tonic serializes and writes the request on
+/// first poll). Once polled, the request MAY be on the wire and the
+/// callee MAY have acted on it (e.g. the scheduler minted an
+/// assignment), even though the caller abandoned the await. Callers
+/// that must reconcile side effects on shutdown (merged_bug_270's
+/// maybe-minted pull) branch on that distinction; callers indifferent
+/// to it keep using [`bounded`].
+#[must_use = "the shutdown arms carry the maybe-minted distinction"]
+#[derive(Debug)]
+pub enum EffectfulOutcome<T> {
+    /// The RPC resolved (with the callee's answer or a transport error).
+    Resolved(T),
+    /// Shutdown fired before the future was first polled: the request
+    /// never reached the wire; no side effect exists.
+    ShutdownBeforeSend,
+    /// Shutdown fired after at least one poll: the request may have
+    /// been sent and acted on — the side effect is UNKNOWN.
+    ShutdownAfterSend,
+    /// The bound elapsed after at least one poll — sent, never
+    /// answered. Side effect unknown (same epistemic state as
+    /// `ShutdownAfterSend`; a separate variant so retry loops keep
+    /// their pacing arm).
+    TimedOut { after: Duration },
+}
+
+/// [`bounded`] with a polled-once latch (merged_bug_270).
+///
+/// Identical race structure (biased shutdown, then a timeout-wrapped
+/// await), but the shutdown arm reports whether the RPC future was
+/// polled at least once before abandonment — the boundary between
+/// "provably nothing happened" and "maybe the callee acted".
+pub async fn bounded_effectful<T>(
+    shutdown: &CancellationToken,
+    bound: Duration,
+    rpc: impl Future<Output = Result<T, tonic::Status>>,
+) -> EffectfulOutcome<Result<T, tonic::Status>> {
+    let mut polled = false;
+    tokio::pin!(rpc);
+    let tracked = std::future::poll_fn(|cx| {
+        polled = true;
+        rpc.as_mut().poll(cx)
+    });
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {
+            if polled {
+                EffectfulOutcome::ShutdownAfterSend
+            } else {
+                EffectfulOutcome::ShutdownBeforeSend
+            }
+        }
+        resolved = tokio::time::timeout(bound, tracked) => match resolved {
+            Ok(result) => EffectfulOutcome::Resolved(result),
+            Err(_elapsed) => EffectfulOutcome::TimedOut { after: bound },
+        },
+    }
+}
+
 /// A phase-scoped retry budget: started at phase entry, spent by both
 /// answered failures AND unanswered (timed-out) attempts.
 #[derive(Debug)]

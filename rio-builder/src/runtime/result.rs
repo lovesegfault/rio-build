@@ -283,7 +283,7 @@ pub(super) fn outcome_label(completion: &CompletionReport) -> &'static str {
 /// The sink's consumer is the pull loop, which forwards the report
 /// through `ReportOutcome` until the scheduler acknowledges it
 /// (`r[builder.pull.retry-loop+2]`); the pod's exit code is the only
-/// other delivery signal (`r[builder.pull.exit-codes]`).
+/// other delivery signal (`r[builder.pull.exit-codes+1]`).
 // r[impl builder.completion.exactly-once-or-death+2]
 pub(super) async fn send_completion(
     stream_tx: &mpsc::Sender<BuildTaskMessage>,

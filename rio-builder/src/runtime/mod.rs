@@ -799,7 +799,7 @@ pub struct BuilderRuntime {
 /// stream session client (registration, heartbeat, bidi dispatch
 /// stream, relay/drain machinery) was removed with the
 /// executor-lifecycle collapse; SIGTERM/SIGINT abort semantics live in
-/// the pull loop (`r[builder.shutdown.sigint+4]`).
+/// the pull loop (`r[builder.shutdown.sigint+5]`).
 pub async fn run(rt: BuilderRuntime) -> anyhow::Result<()> {
     pull::run_pull(rt).await
 }
