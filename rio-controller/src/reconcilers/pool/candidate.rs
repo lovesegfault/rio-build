@@ -6,7 +6,7 @@
 //! the spawn gate read exclusions against a Ready-only node list (over-
 //! fire), FFD packing ignored exclusions entirely (under-mint), and the
 //! drift fingerprint covered placement only (silent drift on exclusion/
-//! resource/deadline re-solves). [`RenderInputs`] is the complete axis
+//! resource/deadline re-solves). `RenderInputs` is the complete axis
 //! set, constructed once per intent; every destructive verdict that
 //! depends on "where can this intent run / what did we render" goes
 //! through it. A future axis added to the render but not here fails
@@ -233,13 +233,13 @@ impl PoolStreaks {
     // r[impl ctrl.pool.no-eligible-persist+2]
     /// Fold one pool's gated tick: prune THIS pool's entries that left
     /// the gated set, expire ORPHANED entries (any pool, untouched for
-    /// [`POOL_STREAK_ORPHAN_EXPIRY_SECS`] — a removed pool never ticks
+    /// `POOL_STREAK_ORPHAN_EXPIRY_SECS` — a removed pool never ticks
     /// again), step each gated intent's streak, and return the intent
-    /// ids whose exhaustion persisted [`NO_ELIGIBLE_SOURCE_PERSIST_TICKS`]
+    /// ids whose exhaustion persisted `NO_ELIGIBLE_SOURCE_PERSIST_TICKS`
     /// consecutive ticks OF THIS POOL (overlapping pools count their
     /// OWN observations; an already-reported streak keeps reporting
     /// harmlessly — duplicate reports are server-side no-ops).
-    pub(crate) fn step_and_prune(
+    pub fn step_and_prune(
         &mut self,
         pool: &str,
         gated_ids: &std::collections::HashSet<&str>,
