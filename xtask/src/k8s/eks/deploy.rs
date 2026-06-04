@@ -91,6 +91,10 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     let store_arn = tf.get("store_iam_role_arn")?;
     let scheduler_arn = tf.get("scheduler_iam_role_arn")?;
     let bootstrap_arn = tf.get("bootstrap_iam_role_arn")?;
+    // Optional: tfstate from before the controller IRSA module
+    // (rds-db:connect for IAM-mode postgres) just skips the annotation
+    // — password-mode controller needs no AWS access.
+    let controller_arn = tf.get_opt("controller_iam_role_arn");
     let db_arn = tf.get("db_secret_arn")?;
     let db_host = tf.get("db_endpoint")?;
     let vpc_ipv6_cidr = tf.get("vpc_ipv6_cidr_block")?;
@@ -306,7 +310,7 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         // cold start that's 3-4min of nothing. Side-task prints
         // not-yet-Ready Deployments every 15s; aborted when helm exits.
         let progress = shared::spawn_helm_wait_progress(&client);
-        let r = helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
+        let mut helm_cmd = helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
             .namespace(NS)
             .set("namespaces.create", "false")
             .set("global.image.registry", &ecr)
@@ -448,9 +452,14 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // we're trying to deploy to test. --deploy-no-hooks skips
             // the hook so the chart lands; operator runs `k8s qa --health`
             // manually once nodes are up.
-            .no_hooks(no_hooks)
-            .run()
-            .await;
+            .no_hooks(no_hooks);
+        if let Some(arn) = &controller_arn {
+            helm_cmd = helm_cmd.set(
+                r"controller.serviceAccount.annotations.eks\.amazonaws\.com/role-arn",
+                arn,
+            );
+        }
+        let r = helm_cmd.run().await;
         progress.abort();
         r
     })

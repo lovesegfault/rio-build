@@ -8,13 +8,16 @@
 # first one wins, second one sees its migrations already applied.
 #
 # Connection string (templated by ESO in the rio-postgres ExternalSecret):
-#   postgres://rio:<pw>@<endpoint>:5432/rio?sslmode=require
+#   postgres://rio:<pw>@<endpoint>:5432/rio?sslmode=verify-full&sslrootcert=<bundle>
 #
-# sslmode=require because Aurora PG 15+ has rds.force_ssl=1 by
-# default. sqlx's tls-rustls-aws-lc-rs feature (added in C1 of
-# this work) handles the TLS handshake. `require` encrypts but
-# doesn't verify the cert — fine for in-VPC + SG-restricted.
-# `verify-full` would need the RDS CA bundle mounted into pods.
+# Aurora PG 15+ has rds.force_ssl=1 by default; sqlx's
+# tls-rustls-aws-lc-rs feature handles the TLS handshake.
+# sslmode=verify-full verifies the server cert against the vendored
+# RDS trust bundle the chart mounts into every PG-consumer pod
+# (infra/helm/rio-build/files/rds-global-bundle.pem). Verification is
+# mandatory for IAM auth — the 15-minute token is a replayable bearer
+# credential and must only be sent to a verified server — and a strict
+# win for password mode too.
 
 # Subnet group: dual-stack database tier (NOT private_subnets — those
 # are ipv6_native and AWS rejects a DB subnet group whose subnets lack
@@ -122,8 +125,20 @@ resource "aws_rds_cluster" "rio" {
   # manage_master_user_password: Aurora generates a password and
   # stores it in Secrets Manager. No sensitive values in tfstate.
   # ESO syncs it into the rio-postgres Secret (see secrets.tf + the
-  # chart's external-secrets.yaml template).
+  # chart's external-secrets.yaml template). CAVEAT: AWS rotates it
+  # every 7 days, and pods read the synced Secret as env frozen at
+  # pod start — every rotation broke DB auth until pods restarted.
+  # That incident is why IAM auth (below) exists.
   manage_master_user_password = true
+
+  # RDS IAM database authentication: pods mint 15-minute SigV4 tokens
+  # from their IRSA roles (rds-db:connect — main.tf rio_rds_connect)
+  # and connect as DB user rio_app (migration 065 creates it with
+  # rds_iam membership) — no static credential to rotate out from
+  # under a running pod. Enabling this flag is a no-op for
+  # password-mode clients; helm postgres.authMode is the actual
+  # switch.
+  iam_database_authentication_enabled = true
 
   db_subnet_group_name   = aws_db_subnet_group.rio.name
   vpc_security_group_ids = [aws_security_group.aurora.id]
