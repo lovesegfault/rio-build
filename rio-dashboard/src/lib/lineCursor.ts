@@ -117,3 +117,57 @@ export function tailNext(
 export function assertNever(x: never): never {
   throw new Error(`lineCursor: unreachable variant ${JSON.stringify(x)}`);
 }
+
+/// Re-open pacing for the dashboard's follow loop (merged_bug_054).
+///
+/// The pre-fix loop reset its backoff on `receivedThisAttempt` — ANY
+/// chunk receipt, keep-alives and fully-resent chunks included. A
+/// store session with no live ingest ends immediately by contract
+/// after serving one final (often zero-line) chunk, so every re-open
+/// looked "productive" and the loop polled the store at a flat ~4 Hz
+/// forever.
+///
+/// The pacer consumes the [`ChunkVisit`] VERDICT instead of a receipt
+/// boolean — "reset on a non-productive receipt" is untypeable:
+/// `noteVisit` matches the verdict exhaustively and only the two
+/// arms that yield lines (`serve`, `gapThenServe`) reset the delay;
+/// `skip` (keep-alive / fully-resent) escalates exactly like a failed
+/// open. Ladder: 250 → 500 → 1000 → 2000 ms (cap).
+///
+/// The gateway relay deliberately keeps a FIXED 1 s reconnect backoff
+/// instead of this ladder (log_tail.rs `RECONNECT_BACKOFF`): its
+/// subscriptions are bounded per-derivation by the drain signal + the
+/// post-terminal grace window, and its per-build fan-out makes a
+/// predictable cadence worth more than a lower floor. The dashboard
+/// tab has neither bound — a wedged store would otherwise hold every
+/// open tab at 4 Hz indefinitely.
+// r[impl dash.stream.reopen-pacing]
+export const REOPEN_BASE_MS = 250;
+export const REOPEN_MAX_MS = 2_000;
+
+export class ReopenPacer {
+  #delayMs: number = REOPEN_BASE_MS;
+
+  /// A chunk verdict from the open stream. Productive verdicts reset
+  /// the ladder; `skip` is NOT progress.
+  noteVisit(visit: ChunkVisit): void {
+    switch (visit.kind) {
+      case 'serve':
+      case 'gapThenServe':
+        this.#delayMs = REOPEN_BASE_MS;
+        break;
+      case 'skip':
+        break;
+      default:
+        assertNever(visit);
+    }
+  }
+
+  /// The delay to sleep before the NEXT re-open, escalating the ladder
+  /// for the one after it. Called once per stream end.
+  nextDelayMs(): number {
+    const d = this.#delayMs;
+    this.#delayMs = Math.min(this.#delayMs * 2, REOPEN_MAX_MS);
+    return d;
+  }
+}

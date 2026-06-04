@@ -201,4 +201,77 @@ describe('createLogStream follow mode', () => {
     expect(s.done).toBe(true);
     s.destroy();
   });
+
+  // r[verify dash.stream.reopen-pacing]
+  // THE FALSIFY TWIN for merged_bug_054: under keep-alive-only
+  // sessions (a follow with no live ingest ends immediately after one
+  // zero-line final — receipt without progress), the re-open ladder
+  // MUST escalate 250 -> 500 -> 1000 -> 2000. Pre-fix, the loop reset
+  // its backoff on receivedThisAttempt, so this exact scenario
+  // re-opened at a flat 250 ms (~4 Hz) forever — this test recorded
+  // that red (extra opens at the 500/1000 boundaries) before the
+  // ReopenPacer rewire and stays as the regression pin.
+  it('reopen_pacing_escalates: keep-alive receipts do not reset the ladder', async () => {
+    tailLog.mockImplementation(async function* () {
+      // One zero-line keep-alive/final chunk, then natural end: the
+      // store's always-final arm for a session with no live ingest.
+      yield chunk([], { firstLineNumber: 0n });
+    });
+    // Never terminal: no grace window, the loop re-opens indefinitely
+    // (bounded here by destroy()).
+    const s = createLogStream('/nix/store/x.drv', 'exec-1', {
+      isTerminal: () => false,
+    });
+    await flush();
+    expect(tailLog).toHaveBeenCalledTimes(1);
+
+    // 250 ms: second open.
+    await vi.advanceTimersByTimeAsync(250);
+    await flush();
+    expect(tailLog).toHaveBeenCalledTimes(2);
+
+    // +250 ms: the pre-fix loop opened AGAIN here (flat ladder). The
+    // pacer is now at 500 ms, so NO new open yet.
+    await vi.advanceTimersByTimeAsync(250);
+    await flush();
+    expect(tailLog).toHaveBeenCalledTimes(2);
+
+    // +250 ms (=500 since open 2): third open.
+    await vi.advanceTimersByTimeAsync(250);
+    await flush();
+    expect(tailLog).toHaveBeenCalledTimes(3);
+
+    // 1000 ms rung: nothing at +999, the fourth open at +1000.
+    await vi.advanceTimersByTimeAsync(999);
+    await flush();
+    expect(tailLog).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(1);
+    await flush();
+    expect(tailLog).toHaveBeenCalledTimes(4);
+
+    // 2000 ms cap from here on.
+    await vi.advanceTimersByTimeAsync(1999);
+    await flush();
+    expect(tailLog).toHaveBeenCalledTimes(4);
+    await vi.advanceTimersByTimeAsync(1);
+    await flush();
+    expect(tailLog).toHaveBeenCalledTimes(5);
+    await vi.advanceTimersByTimeAsync(2000);
+    await flush();
+    expect(tailLog).toHaveBeenCalledTimes(6);
+
+    // A productive serve resets the ladder back to 250 ms.
+    tailLog.mockImplementationOnce(async function* () {
+      yield chunk(['l0']);
+    });
+    await vi.advanceTimersByTimeAsync(2000);
+    await flush();
+    expect(tailLog).toHaveBeenCalledTimes(7);
+    await vi.advanceTimersByTimeAsync(250);
+    await flush();
+    expect(tailLog).toHaveBeenCalledTimes(8);
+
+    s.destroy();
+  });
+
 });

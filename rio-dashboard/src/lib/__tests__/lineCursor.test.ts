@@ -10,6 +10,9 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  ReopenPacer,
+  REOPEN_BASE_MS,
+  REOPEN_MAX_MS,
   tailNext,
   visitChunk,
   type ChunkVisit,
@@ -132,6 +135,47 @@ describe('tailNext', () => {
           }
         }
       }
+    }
+  });
+});
+
+// r[verify dash.stream.reopen-pacing]
+describe('ReopenPacer', () => {
+  it('escalates 250 -> 500 -> 1000 -> 2000 and caps, absent productive visits', () => {
+    const p = new ReopenPacer();
+    expect(p.nextDelayMs()).toBe(REOPEN_BASE_MS);
+    expect(p.nextDelayMs()).toBe(500);
+    expect(p.nextDelayMs()).toBe(1000);
+    expect(p.nextDelayMs()).toBe(REOPEN_MAX_MS);
+    expect(p.nextDelayMs()).toBe(REOPEN_MAX_MS);
+  });
+
+  it('does NOT reset on skip — receipt is not progress (merged_bug_054)', () => {
+    const p = new ReopenPacer();
+    p.nextDelayMs(); // 250 consumed, ladder at 500
+    p.noteVisit({ kind: 'skip', nextLine: 0n });
+    expect(p.nextDelayMs()).toBe(500);
+    p.noteVisit({ kind: 'skip', nextLine: 0n });
+    expect(p.nextDelayMs()).toBe(1000);
+  });
+
+  it('resets only on serve / gapThenServe', () => {
+    for (const visit of [
+      { kind: 'serve', yieldFrom: 0n, yieldUntil: 1n, nextLine: 1n } as const,
+      {
+        kind: 'gapThenServe',
+        gapFrom: 0n,
+        gapUntil: 2n,
+        yieldFrom: 2n,
+        yieldUntil: 3n,
+        nextLine: 3n,
+      } as const,
+    ]) {
+      const p = new ReopenPacer();
+      p.nextDelayMs();
+      p.nextDelayMs(); // ladder at 1000
+      p.noteVisit(visit);
+      expect(p.nextDelayMs(), `reset on ${visit.kind}`).toBe(REOPEN_BASE_MS);
     }
   });
 });

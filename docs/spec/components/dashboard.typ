@@ -232,6 +232,23 @@ stack can't give you.
   (a stream truly quiet for an hour means the build is stuck).
 ]
 
+#r("dash.stream.reopen-pacing")[
+  The follow loop's re-open delay MUST escalate (250 → 500 → 1000 → 2000 ms
+  cap) whenever a stream ends without a productive chunk verdict, and MUST
+  reset only on `serve`/`gapThenServe` visits --- bare receipt (a zero-line
+  keep-alive or a fully-resent chunk, the `skip` verdict) is not progress.
+]
+A follow stream opened against a session with no live ingest ends
+immediately by contract after one final (often zero-line) chunk. The
+pre-fix loop reset its backoff on any receipt, so every such re-open looked
+productive and an idle tab polled the store at a flat \~4 Hz indefinitely.
+The pacer consumes the `ChunkVisit` verdict itself (`ReopenPacer.noteVisit`
+in `lineCursor.ts`), so "reset on a non-productive receipt" is untypeable.
+The gateway relay deliberately keeps its FIXED 1 s reconnect backoff: its
+subscriptions are bounded per-derivation by the drain signal and the
+post-terminal grace window, so a predictable cadence is worth more than a
+lower floor there; the dashboard tab has neither bound.
+
 #r("dash.log.cap")[
   The log stream's reactive line buffer MUST be capped client-side. At
   `MAX_LINES = 50_000` the store splices the oldest

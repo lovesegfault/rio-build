@@ -26,7 +26,7 @@
 import { Code, ConnectError } from '@connectrpc/connect';
 
 import { logs } from '../api/logs';
-import { assertNever, tailNext, visitChunk, type TailStopCause } from './lineCursor';
+import { ReopenPacer, assertNever, tailNext, visitChunk, type TailStopCause } from './lineCursor';
 
 // r[impl dash.stream.log-tail+3]
 // r[impl dash.log.cap]
@@ -53,13 +53,12 @@ const decoder = new TextDecoder('utf-8', { fatal: false });
 const MAX_ROWS = 50_000;
 const DROP_ROWS = 10_000;
 
-// Reconnect-loop budget, mirroring the gateway relay's run_tail shape:
-// exponential backoff between re-opens (reset after any productive
-// stream), and an armed-once post-terminal grace window — once the
-// derivation is terminal we keep draining for GRACE_MS and then stop,
-// flagging the log incomplete if the store never stamped completion.
-const BACKOFF_BASE_MS = 250;
-const BACKOFF_MAX_MS = 2_000;
+// Reconnect-loop budget: re-open pacing delegated to ReopenPacer
+// (lineCursor.ts) — the ladder resets ONLY on productive chunk
+// verdicts (serve/gapThenServe), never on bare receipt — plus an
+// armed-once post-terminal grace window: once the derivation is
+// terminal we keep draining for GRACE_MS and then stop, flagging the
+// log incomplete if the store never stamped completion.
 const GRACE_MS = 5_000;
 
 // One rendered row. MONOMORPHIC ON PURPOSE: every row carries all four
@@ -171,7 +170,7 @@ export function createLogStream(
     // Armed once, at the first post-terminal exit decision. `null`
     // until armed; epoch ms after.
     let graceDeadline: number | null = null;
-    let backoff = BACKOFF_BASE_MS;
+    const pacer = new ReopenPacer();
     let lastErr: Error | null = null;
     let everReceived = false;
 
@@ -202,6 +201,11 @@ export function createLogStream(
             chunk.firstLineNumber,
             BigInt(chunk.lines.length),
           );
+          // r[impl dash.stream.reopen-pacing]
+          // The pacer sees the VERDICT, not the receipt: a keep-alive
+          // or fully-resent chunk (skip) is not progress and must not
+          // reset the re-open ladder (merged_bug_054's flat 4 Hz poll).
+          pacer.noteVisit(visit);
           switch (visit.kind) {
             case 'skip':
               // Zero-line keep-alive/final, or a fully-resent chunk:
@@ -265,8 +269,6 @@ export function createLogStream(
           cause = receivedThisAttempt ? 'transportErr' : 'openFailed';
         }
       }
-      if (receivedThisAttempt) backoff = BACKOFF_BASE_MS;
-
       const terminal = isTerminal();
       if (terminal && graceDeadline === null) {
         graceDeadline = Date.now() + GRACE_MS;
@@ -286,10 +288,10 @@ export function createLogStream(
         done = true;
         return;
       }
-      // Re-open after a backoff, capped at the remaining grace so the
-      // last drain attempt lands before the deadline rather than
-      // sleeping through it.
-      let delay = backoff;
+      // Re-open after the pacer's delay, capped at the remaining grace
+      // so the last drain attempt lands before the deadline rather
+      // than sleeping through it.
+      let delay = pacer.nextDelayMs();
       if (graceDeadline !== null) {
         delay = Math.min(delay, Math.max(0, graceDeadline - Date.now()));
       }
@@ -298,7 +300,6 @@ export function createLogStream(
         done = true;
         return;
       }
-      backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
     }
   })();
 
