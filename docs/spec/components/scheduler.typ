@@ -2408,6 +2408,31 @@ deadline. Non-K8s single-scheduler deployments construct their leader state
 with recovery already complete and never run the lease loop, so no
 confirmation is ever required there.
 
+#r("sched.recovery.step-down")[
+  A tenure whose state recovery fails MUST NOT be completed: the replica
+  MUST NOT mark recovery complete, MUST NOT treat its in-memory DAG as
+  authoritative, and MUST request a cooperative lease step-down so a healthy
+  replica can acquire. The lease loop MUST consume the step-down request at
+  its next tick, releasing the lease (holder-guarded, bounded by the renew
+  deadline) and firing the full lose-edge effects --- leader-state clear,
+  consumer on-lose hook, leader-marks reconciliation --- before resuming
+  candidacy on the following tick. The durable generation claim recorded for
+  the failed tenure is NOT released: the floor only grows, and an unserved
+  claim is a harmless over-claim. Failed recoveries MUST be operator-visible
+  --- the recovery-failure outcome alertable and every step-down counted.
+]
+Failure mode under a persistent PG outage: acquire → recovery fails →
+step-down → re-acquire cycles at lease cadence across the replica set. This
+is deliberate --- each cycle re-probes PG from a fresh tenure, the monotone
+floor growth is harmless, and the cycling is exactly what the step-down
+counter and the recovery-failure alert make operator-visible; a bounded
+retry-before-step-down knob was considered and deliberately not taken
+(per-replica retries add zombie window without adding information --- the
+next acquire IS the retry). Non-K8s single-scheduler deployments run no
+lease loop, so the request is a recorded dead letter there: the tenure
+stays incomplete (dispatch remains gated) and the operator signal is the
+same failure counter; there is no healthy peer a step-down could yield to.
+
 #r("sched.reconcile.leader-gate")[
   The post-recovery reconcile pass (`ReconcileAssignments`) MUST early-return
   when `is_leader()` is false. The 45s reconcile timer is fire-and-forget and
@@ -3463,6 +3488,23 @@ a fresh INSERT below the floor when no active conflict row exists to
 evaluate against — cannot regress any newer row by construction; it is
 priced in `fence-invariant-map.md` and bounded in `fencedWrites.qnt`
 (`activeRowGenMonotonic` holds even with the residual reachable).
+
+#r("sched.lease.tenure-stamp-type")[
+  Every fenced evidence write MUST take its generation from the tenure stamp
+  recorded by the recovery claim step --- the typed serving-generation
+  capability whose sole constructor is the claim-stamp site --- never from a
+  fresh read of the live lease atomic. The fenced database entry points MUST
+  accept only the stamp type, so an actor-side write path structurally cannot
+  relabel an in-flight transaction with a generation produced by a mid-tenure
+  lease bump that the claims ledger has not vouched for.
+]
+The stamp type is the compile-time carrier of the write-ahead claim
+discipline (#rref("sched.lease.generation-claim")): the claims floor vouches
+for exactly the generation the claim step recorded, and a fresh atomic read
+taken between the claim and the write can exceed it (lease bump, rebound),
+producing a write the floor never covered. The policy census pins the two
+production constructor sites and zero fresh-atomic reads in actor write
+paths.
 
 #r("sched.grpc.fence-retryable")[
   Every refusal a fence or leadership guard produces MUST surface to clients
