@@ -8,7 +8,7 @@
 //!      the ceiling).
 //!   3. Each Job runs one rio-builder pod → worker exits after one
 //!      build → pod terminates → `ttlSecondsAfterFinished`
-//!      ([`JOB_TTL_SECS`]) reaps the Job.
+//!      (`JOB_TTL_SECS`) reaps the Job.
 //!
 //! From the scheduler's perspective a Job pod is just an executor:
 //! it heartbeats in, gets a dispatch, sends CompletionReport,
@@ -917,7 +917,7 @@ fn intent_suffix(intent_id: &str) -> String {
 ///
 ///   - **Terminal** (Complete/Failed): the deterministic `intent_
 ///     suffix` makes a finished Job for drv X block respawn of X for
-///     [`JOB_TTL_SECS`]; clear that window so the immediate
+///     `JOB_TTL_SECS`; clear that window so the immediate
 ///     `spawn_for_each` (or worst-case next tick) succeeds.
 ///     Background-propagation delete — terminal ⇒ `status.{succeeded,
 ///     failed} > 0` ⇒ the Job controller has already cleared the

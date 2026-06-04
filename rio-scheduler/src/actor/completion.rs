@@ -146,7 +146,7 @@ impl DagActor {
 
     /// The 1a appending transaction for a poison persist: append `row`
     /// (when there is one) and run
-    /// [`SchedulerDb::persist_poisoned_in_tx`] on the same connection,
+    /// `SchedulerDb::persist_poisoned_in_tx` on the same connection,
     /// then push the in-memory mirror after the commit. `row = None`
     /// degrades to the plain best-effort poison persist (the reportless
     /// poison triggers whose own rows land at their observation sites).
@@ -301,7 +301,7 @@ impl DagActor {
 
     /// 1a appending transaction for a single-derivation poison-clear /
     /// cache-hit reset: append the reset row (when there is one) and
-    /// run [`SchedulerDb::clear_poison_in_tx`] on the same connection.
+    /// run `SchedulerDb::clear_poison_in_tx` on the same connection.
     /// Returns the transaction's result so call sites keep their
     /// existing PG-first error contracts (admin clear returns false on
     /// failure; the TTL/cache-hit sites log and continue). The
@@ -865,7 +865,7 @@ impl DagActor {
 
     // r[impl sched.sla.reactive-floor+3]
     /// Double the relevant `resource_floor` dimension for `drv_hash`
-    /// (D4). Thin wrapper around [`floor::bump_floor_or_count`] that
+    /// (D4). Thin wrapper around `floor::bump_floor_or_count` that
     /// handles the dag-node lookup, metric, log, and best-effort PG
     /// persist.
     ///
@@ -2294,7 +2294,7 @@ impl DagActor {
     /// Transition a derivation to Poisoned, persist, cascade
     /// DependencyFailed to ancestors, and propagate to interested
     /// builds. Called when the poison threshold is reached (see
-    /// [`PoisonConfig::is_poisoned`]) or max_retries is hit.
+    /// `PoisonConfig::is_poisoned`) or max_retries is hit.
     ///
     /// **Precondition:** status must be Ready, Assigned, or Running.
     /// Enforced via debug_assert! (tests catch violations) +

@@ -5,7 +5,7 @@
 //! contexts so it uses blocking `Read`/`Write`; the byte layout is identical.
 //!
 //! The shared, IO-free core lives in `protocol::wire`: [`padding_len`] and
-//! [`ZERO_PAD`](crate::protocol::wire::ZERO_PAD). Only the
+//! [`ZERO_PAD`]. Only the
 //! `read_exact`/`write_all` adapter layer is duplicated here — Rust has no
 //! ergonomic abstraction over sync vs async I/O, and these bodies are ~4
 //! lines each.

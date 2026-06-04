@@ -106,7 +106,7 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
 }
 
 // r[impl sched.grpc.fence-retryable]
-/// The shared status mapping for [`PullRejection`] — every executor-
+/// The shared status mapping for `PullRejection` — every executor-
 /// facing handler derives its refusal Status here (the per-RPC metrics
 /// stay at the call sites). Same class law as
 /// [`actor_error_to_status`].

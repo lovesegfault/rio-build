@@ -507,7 +507,7 @@ pub(super) fn sim_packs(
 /// is the placed-on node's cell (not the intent's `A_open` — an intent
 /// may target multiple cells; the placement is on exactly one).
 /// Placements on nodes absent from `live` (race) or cell-less nodes are
-/// dropped. Feeds [`CellState::observe_hit_ratio`](super::sketch::
+/// dropped. Feeds `CellState::observe_hit_ratio`(super::sketch::
 /// CellState::observe_hit_ratio).
 pub fn per_cell_hit_ratio(placeable: &[Placement], live: &[LiveNode]) -> HashMap<Cell, (u64, u64)> {
     let by_name: HashMap<&str, &LiveNode> = live.iter().map(|n| (n.name.as_str(), n)).collect();

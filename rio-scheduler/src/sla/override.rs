@@ -146,9 +146,7 @@ impl From<&SlaOverrideRow> for ResolvedTarget {
 /// the shared-PG topology a per-cluster pin must not be silently
 /// shadowed by a later all-clusters pin. Rows for OTHER clusters are
 /// already filtered out at SQL read time
-/// ([`SchedulerDb::read_sla_overrides`]).
-///
-/// [`SchedulerDb::read_sla_overrides`]: crate::db::SchedulerDb::read_sla_overrides
+/// (`SchedulerDb::read_sla_overrides`).
 fn specificity(r: &SlaOverrideRow) -> u8 {
     u8::from(r.cluster.is_some()) + u8::from(r.system.is_some()) + u8::from(r.tenant.is_some())
 }
@@ -158,7 +156,7 @@ fn specificity(r: &SlaOverrideRow) -> u8 {
 ///
 /// Match rule: `pname` exact; `system`/`tenant` exact-or-NULL (NULL is
 /// a wildcard). Expiry is filtered at read time
-/// ([`SchedulerDb::read_sla_overrides`]); this function does not read
+/// (`SchedulerDb::read_sla_overrides`); this function does not read
 /// the clock.
 ///
 /// Precedence: highest `specificity` wins. Ties (e.g. two
@@ -168,8 +166,6 @@ fn specificity(r: &SlaOverrideRow) -> u8 {
 ///
 /// O(n) over the cached override slice; n is operator-written (tens of
 /// rows), refreshed once per estimator tick.
-///
-/// [`SchedulerDb::read_sla_overrides`]: crate::db::SchedulerDb::read_sla_overrides
 pub fn resolve(key: &ModelKey, overrides: &[SlaOverrideRow]) -> Option<ResolvedTarget> {
     resolve_row(key, overrides).map(ResolvedTarget::from)
 }

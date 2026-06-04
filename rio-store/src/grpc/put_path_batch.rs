@@ -15,7 +15,7 @@
 //!
 //! S3 uploads can't live inside a DB transaction (the spec says
 //! "blob-store writes are NOT rolled back"). Outputs ≥
-//! `INLINE_THRESHOLD` are staged via [`cas::stage_chunked`] BEFORE the
+//! `INLINE_THRESHOLD` are staged via `cas::stage_chunked` BEFORE the
 //! atomic tx (chunks uploaded + chunk rows written, manifest still
 //! `status='uploading'`); the tx then flips inline AND chunked outputs
 //! to `'complete'` together. On batch failure the staged chunks orphan

@@ -254,7 +254,7 @@ impl JobViewState {
 /// STRUCTURAL: [`JobView::remove_settled`] is the only per-entry
 /// removal and demands the durable write's [`WriteDisposition`] — an
 /// unconditional `.remove()` no longer typechecks. Whole-view
-/// transitions are [`JobView::wipe`] (LeaderLost — the cache drops
+/// transitions are `JobView::wipe` (LeaderLost — the cache drops
 /// with the tenure) and [`JobView::rebuild`] (recovery — re-read from
 /// the durable authority). Availability (hydrated vs absent) is the
 /// enclosing [`JobViewState`]'s concern.

@@ -61,7 +61,7 @@ impl DagActor {
     ///
     /// I-070: batched form — collect every unprobed Ready node's
     /// expected outputs, ONE `FindMissingPaths`, then
-    /// [`Self::complete_ready_from_store`] each whose outputs are all
+    /// `Self::complete_ready_from_store` each whose outputs are all
     /// present. Fail-open: store unreachable → no-op (per-drv
     /// fallback in the dispatch loop covers it next pass).
     ///
@@ -387,7 +387,7 @@ impl DagActor {
     /// error and park the node instead of leaving it dispatchable.
     ///
     /// `cause` is the user-facing reason spliced into the build's
-    /// error summary ("topdown-pruned root <hash>: <cause>; resubmit
+    /// error summary ("topdown-pruned root `<hash>`: `<cause>`; resubmit
     /// to re-probe or full-merge").
     ///
     /// Sole caller: the materialization consumption routing's arm 3
@@ -559,9 +559,9 @@ impl DagActor {
     // r[impl gw.activity.subst-progress]
     /// Relay byte-progress from a store replica's materialization
     /// execution to every interested build via
-    /// [`Event::SubstituteProgress`] (BC-4: the
+    /// `Event::SubstituteProgress` (BC-4: the
     /// `ReportMaterializationProgress` RPC posts the
-    /// [`ActorCommand::SubstituteProgress`] this handles — the walk
+    /// `ActorCommand::SubstituteProgress` this handles — the walk
     /// producer this relay was built for is deleted). Display-only
     /// (routed through the log broadcast ring, not persisted, reuses
     /// last seq); the gateway translates to `actCopyPath` +
@@ -592,7 +592,7 @@ impl DagActor {
         }
     }
 
-    /// Batched [`complete_ready_from_store`](Self::complete_ready_from_store):
+    /// Batched `complete_ready_from_store`:
     /// transition + `output_paths` set in-mem first (no await), then one
     /// `persist_status_batch(Completed)`, one `upsert_path_tenants_for_
     /// batch`, one batched newly-ready promote, then per-BUILD (not
@@ -715,7 +715,8 @@ impl DagActor {
         }
     }
 
-    /// Phase 4 of [`assign_to_worker`](Self::assign_to_worker): emit
+    /// The post-assignment emit phase (phase 4 of the retired
+    /// stream-era `assign_to_worker` flow): emit
     /// `DerivationStarted` + progress to interested gateways.
     pub(super) fn emit_assignment_started(&mut self, drv_hash: &DrvHash, executor_id: &ExecutorId) {
         let drv_path = self.dag.path_or_hash_fallback(drv_hash);
@@ -1085,7 +1086,7 @@ impl DagActor {
     /// regular file, so [`rio_nix::nar::extract_single_file`] unwraps
     /// it to the raw ATerm. This is the same path the worker takes
     /// when `WorkAssignment.drv_content` is empty
-    /// ([`rio-builder/src/executor/inputs.rs::fetch_drv_from_store`]).
+    /// (`rio-builder/src/executor/inputs.rs::fetch_drv_from_store`).
     ///
     /// Returns `None` on any failure: store unconfigured
     /// (`store_client = None`, test mode), `GetPath` error, timeout,

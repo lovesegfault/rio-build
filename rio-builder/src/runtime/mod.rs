@@ -1,7 +1,7 @@
 //! Worker runtime: the pull-mode lifecycle and build-task spawning.
 //!
 //! Glue between main.rs's bootstrap and the executor/FUSE/upload
-//! subsystems. [`setup`] wires up cgroups, gRPC clients, FUSE mount and
+//! subsystems. `setup` wires up cgroups, gRPC clients, FUSE mount and
 //! the build context; [`run`] hands off to the pull loop (pull → build
 //! → report → exit).
 //!
@@ -162,7 +162,7 @@ pub struct BuildSpawnContext {
 }
 
 impl BuildSpawnContext {
-    /// Per-worker fields stamped onto every [`CompletionReport`]
+    /// Per-worker fields stamped onto every `CompletionReport`
     /// (success, error, and panic paths).
     ///
     /// `final_resources`: the shared snapshot is the cgroup
@@ -172,7 +172,7 @@ impl BuildSpawnContext {
     /// and `peak_disk_bytes` (running-max over CURRENT `dqb_curspace`)
     /// would systematically under-report into `build_samples`, biasing
     /// the SLA p̄ fit and disk_p90 low for short builds.
-    /// [`cgroup::final_sample`] forces one synchronous read on top.
+    /// `cgroup::final_sample` forces one synchronous read on top.
     ///
     /// `peak_disk_bytes` is the prjquota sample `execute_build` took
     /// BEFORE `teardown_overlay` — by the time this runs, the upper
@@ -736,7 +736,7 @@ pub async fn spawn_build_task(
     });
 }
 
-/// Fully-wired worker runtime. Built by [`setup`]; consumed by [`run`].
+/// Fully-wired worker runtime. Built by `setup`; consumed by `run`.
 /// Holds every long-lived handle the pull loop needs so `main()`
 /// reduces to bootstrap → setup → run → teardown.
 pub struct BuilderRuntime {

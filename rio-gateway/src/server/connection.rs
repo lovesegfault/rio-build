@@ -715,12 +715,12 @@ pub struct ConnectionHandler {
     /// work. Underscore-prefixed: never read directly, only dropped.
     /// The option-ness IS read (`ensure_permit`).
     pub(super) conn_permit: Option<OwnedSemaphorePermit>,
-    /// Shared with [`GatewayServer::active_conns`]. Bumped in
+    /// Shared with `GatewayServer::active_conns`. Bumped in
     /// [`Self::mark_real_connection`], decremented in `Drop` — same
     /// gate as the `connections_active` gauge so TCP probes don't
     /// count toward session-drain.
     pub(super) active_conns: Arc<AtomicUsize>,
-    /// Clone of [`GatewayServer::sessions_shutdown`]. Each channel's
+    /// Clone of `GatewayServer::sessions_shutdown`. Each channel's
     /// `ChannelSession::shutdown` is `child_token()` of this, so
     /// cancelling the server-wide parent reaches every proto_task
     /// regardless of which connection/channel owns it.

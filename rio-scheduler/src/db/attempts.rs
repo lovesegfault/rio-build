@@ -293,7 +293,7 @@ impl SchedulerDb {
     /// disconnect→report, report→disconnect (race-ahead), and
     /// duplicate-report orders are idempotent by construction.
     /// Classification updates go only through
-    /// [`Self::fill_termination`]'s `WHERE termination_reason IS NULL`
+    /// [`Self::fill_termination_reason_only`]'s `WHERE termination_reason IS NULL`
     /// guard — there is deliberately no `DO UPDATE` arm here.
     /// NULL-exec_id rows never conflict and always insert.
     pub(crate) async fn append_attempt(

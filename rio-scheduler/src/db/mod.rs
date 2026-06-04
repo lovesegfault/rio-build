@@ -58,7 +58,7 @@ pub use history::{BuildSampleRow, SlaOverrideRow};
 /// the planner doesn't know what `$1` will contain — so the partial
 /// index is never chosen and recovery seq-scans the whole table.
 ///
-/// The drift test [`tests::transactions::test_terminal_statuses_match_is_terminal`]
+/// The drift test `tests::transactions::test_terminal_statuses_match_is_terminal`
 /// iterates all `DerivationStatus` variants and asserts that
 /// `is_terminal() ⇔ as_str() ∈ TERMINAL_STATUSES` (via
 /// `TERMINAL_STATUS_SQL`, which is derived from this macro). Adding a

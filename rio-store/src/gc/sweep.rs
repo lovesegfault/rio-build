@@ -73,7 +73,7 @@ pub const CHUNK_GRACE_SECS: i64 = 300;
 /// Populate the session-scoped `sweep_unreachable` temp table used by
 /// the reference re-check anti-join.
 ///
-/// Before P0449 the re-check bound the WHOLE `unreachable` Vec<bytea>
+/// Before P0449 the re-check bound the WHOLE `unreachable` `Vec<bytea>`
 /// as $2 inside the per-path loop: N paths × N-element bytea[] = O(N²)
 /// wire bytes. A 10k-path sweep sent ~3GB of $2 traffic, and
 /// `<> ALL(array_param)` is an unindexed linear scan PG-side.

@@ -137,7 +137,7 @@ pub(super) async fn trigger_gc(
 /// Forward `GcProgress` items from `store_stream` to `tx`, exiting
 /// promptly on `shutdown`. Extracted from the `tokio::spawn` body so the
 /// shutdown-exit regression test
-/// ([`tests::gc_tests::trigger_gc_forward_exits_on_shutdown`]) calls
+/// (`tests::gc_tests::trigger_gc_forward_exits_on_shutdown`) calls
 /// PRODUCTION code — previously the test inlined a hand-copy and a
 /// refactor that dropped the `shutdown.cancelled()` arm passed it.
 ///

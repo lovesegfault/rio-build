@@ -454,7 +454,7 @@ impl SchedulerDb {
         Ok(FencedOutcome::Applied(cleared))
     }
 
-    /// Transaction-joining body of [`Self::clear_poison_batch`] — the
+    /// Transaction-joining body of `Self::clear_poison_batch` — the
     /// resubmit-reset site carries this clear in the same transaction
     /// as its `drv_attempts` reset rows.
     pub(crate) async fn clear_poison_batch_in_tx(

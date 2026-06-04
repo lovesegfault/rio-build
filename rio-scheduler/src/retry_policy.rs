@@ -85,7 +85,7 @@ pub(crate) struct Decision {
     /// The per-executor exclusion set (the fold's `failed_builders`) in
     /// the actor's identifier vocabulary. E1's fleet-exhaust arm and the
     /// E9 dispatch backstop intersect it with the live eligible fleet via
-    /// [`placeable`]; the spawn-intent exclusion consumes the same set
+    /// `placeable`; the spawn-intent exclusion consumes the same set
     /// through the fold-refreshed cached view (`RetryState::failed_builders`).
     pub exclusion: BTreeSet<ExecutorId>,
     /// The deterministic backoff deadline (no jitter — the dispatch site

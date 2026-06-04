@@ -306,7 +306,7 @@ impl Sketch {
         buf
     }
 
-    /// Inverse of [`to_v2_bytes`]. `None` on any decode error — caller
+    /// Inverse of `to_v2_bytes`. `None` on any decode error — caller
     /// falls back to an empty sketch / seed.
     fn from_v2_bytes(bytes: &[u8]) -> Option<Self> {
         Deserializer::new()

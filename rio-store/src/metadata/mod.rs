@@ -255,7 +255,7 @@ pub(super) async fn update_narinfo_complete(
 /// [`complete_manifest_inline`] / [`complete_manifest_chunked`] each
 /// wrap a single call.
 ///
-/// `claim` is the ownership token from [`insert_manifest_uploading`].
+/// `claim` is the ownership token from `insert_manifest_uploading`.
 /// The manifests UPDATE filters on it so a stale uploader whose row
 /// was reaped (and replaced by a fresh re-upload at the same
 /// `store_path_hash`) gets `rows_affected==0 → PlaceholderMissing`

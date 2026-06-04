@@ -504,7 +504,7 @@ impl DagActor {
         self.update_build_counts_with(build_id, &summary).await;
     }
 
-    /// [`update_build_counts`] with a precomputed summary — for callers
+    /// `update_build_counts` with a precomputed summary — for callers
     /// that also `emit_progress_with` so the O(dag_nodes) `build_summary`
     /// scan runs once, not twice (I-140).
     pub(super) async fn update_build_counts_with(

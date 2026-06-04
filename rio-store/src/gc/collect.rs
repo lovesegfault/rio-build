@@ -170,7 +170,7 @@ pub(crate) const MARK_EXPANSION_SQL: &str = "CREATE TEMP TABLE live_chunks AS \
 
 /// The fail-closed validation pass over every `chunk_list` joined to an
 /// existing manifests row. Mirrors the acceptance criteria of
-/// [`super::try_parse_unique_chunk_hashes`] (the Rust parser remains
+/// `super::try_parse_unique_chunk_hashes` (the Rust parser remains
 /// the definition of corrupt-vs-valid; the differential pinning test
 /// holds the SQL expansion to it): version byte, 36-byte entry
 /// alignment, `MAX_CHUNKS`. The version probe uses `substring` (empty

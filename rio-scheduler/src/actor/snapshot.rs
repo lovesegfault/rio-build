@@ -13,7 +13,7 @@ use super::{
 };
 
 /// §13e + r35: thin accessor for the drv's stored
-/// [`DerivationState::effective_features`] field. The derivation moved
+/// `DerivationState::effective_features` field. The derivation moved
 /// from this free fn (called at 5 spawn-intent-path sites) to a
 /// constructor invariant on `DerivationState` (§nth-strike STRIKE-3:
 /// each round of "the chokepoint isn't total" added another caller of
@@ -1051,11 +1051,11 @@ impl DagActor {
     /// spawns and the scheduler accepts the SAME shape.
     ///
     /// When the hw-factor table is populated, the fitted-key branch
-    /// routes through the memoized [`solve::solve_full`]
+    /// routes through the memoized `solve::solve_full`
     /// (admissible-set), draws ε_h, applies the read-time ICE mask,
     /// and returns `nodeAffinity` over `A' \ masked`. Otherwise — or
     /// for override/probe/explore branches — it routes through
-    /// [`solve::intent_for`] (hw-agnostic `solve_tier`) and returns an
+    /// `solve::intent_for` (hw-agnostic `solve_tier`) and returns an
     /// empty affinity.
     // r[impl sched.sla.hw-class.epsilon-explore+6]
     // r[impl sched.sla.hw-class.ice-mask]

@@ -195,7 +195,7 @@ pub async fn scan_once(pool: &PgPool) -> Result<(u64, u64), sqlx::Error> {
 /// # History (I-040) and what reaping does today
 ///
 /// Substitution's hot-path reclaim and its cleanup-on-failure both
-/// previously called [`crate::metadata::delete_manifest_uploading`]
+/// previously called `crate::metadata::delete_manifest_uploading`
 /// (the inline variant), which deletes `manifests` (CASCADE →
 /// `manifest_data`) without touching chunk accounting; the counter
 /// drift that left behind became a data-loss hazard while the upload

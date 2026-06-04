@@ -108,7 +108,7 @@ impl BuildEventBus {
 
     /// `true` if a Progress event for `build_id` was emitted within
     /// [`PROGRESS_DEBOUNCE`]. The `mark_progress` half is folded into
-    /// [`emit_progress_with`].
+    /// `emit_progress_with`.
     pub(super) fn progress_debounced(&self, build_id: Uuid) -> bool {
         self.progress_at
             .get(&build_id)
@@ -151,7 +151,7 @@ impl BuildEventBus {
     }
 
     /// Emit a `BuildProgress` from a precomputed summary, marking the
-    /// debounce timestamp. Bypasses [`progress_debounced`] — the caller
+    /// debounce timestamp. Bypasses `progress_debounced` — the caller
     /// paid for the O(dag_nodes) scan, so emit unconditionally.
     ///
     /// Callers inside [`DagActor`] must go through

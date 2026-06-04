@@ -49,7 +49,7 @@ pub(crate) async fn insert_manifest_uploading(
     insert_manifest_uploading_as(pool, store_path_hash, store_path, references, None).await
 }
 
-/// [`insert_manifest_uploading`] with owner attribution: `claimed_by`
+/// `insert_manifest_uploading` with owner attribution: `claimed_by`
 /// (the substituting pod's name) is stamped on the placeholder row for
 /// operator-side stall/takeover diagnosis. Substitution claims pass
 /// `Some(pod)`; PutPath and every legacy caller pass `None` via the

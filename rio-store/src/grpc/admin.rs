@@ -63,8 +63,8 @@ pub struct StoreAdminServiceImpl {
     /// substitution path. See `r[store.admin.service-gate]`.
     service_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
     /// SAME [`AdmissionGate`] instance as
-    /// [`super::StoreServiceImpl::substitute_admission`] (main.rs
-    /// clones one gate into both). [`get_load`](Self::get_load) reads
+    /// `super::StoreServiceImpl::substitute_admission` (main.rs
+    /// clones one gate into both). `get_load` reads
     /// its utilization so the ComponentScaler sees substitution
     /// saturation independently of PG-pool saturation — upstream HTTP
     /// can bottleneck while PG sits idle. Default is a fresh 128-slot

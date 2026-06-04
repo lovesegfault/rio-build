@@ -177,7 +177,7 @@ impl StoreServiceImpl {
     /// ≤3 PG round-trips regardless of `present.len()`: one
     /// `path_tenants` GROUP BY (built-set), one batched
     /// `narinfo.signatures` fetch (substitution-only subset), trusted
-    /// set is two queries via [`tenant_trusted_set`]. Without batching,
+    /// set is two queries via `tenant_trusted_set`. Without batching,
     /// FindMissingPaths gating would be O(paths) PG hits and defeat
     /// I-110.
     ///
@@ -298,7 +298,7 @@ impl StoreServiceImpl {
         Ok(visible)
     }
 
-    /// Sync signing given a pre-resolved [`Signer`]. No DB hit.
+    /// Sync signing given a pre-resolved `Signer`. No DB hit.
     ///
     /// Extracted so PutPathBatch can resolve once + sign N times without
     /// N `get_active_signer` queries inside its phase-3 transaction.
@@ -307,7 +307,7 @@ impl StoreServiceImpl {
     /// key-label debug line, push onto `info.signatures`.
     ///
     /// `was_tenant` drives the `key=tenant` vs `key=cluster` debug line;
-    /// the caller passes whatever [`TenantSigner::resolve_once`] returned.
+    /// the caller passes whatever `TenantSigner::resolve_once` returned.
     pub(super) fn sign_with_resolved(
         &self,
         signer: &crate::signing::Signer,
@@ -349,7 +349,7 @@ impl StoreServiceImpl {
     // r[impl store.tenant.sign-key]
     /// If a signer is configured, compute the narinfo fingerprint and
     /// push a signature onto `info.signatures` using the tenant's key
-    /// (or cluster fallback — see [`TenantSigner::resolve_once`]).
+    /// (or cluster fallback — see `TenantSigner::resolve_once`).
     ///
     /// Called just before complete_manifest_* writes narinfo to PG —
     /// the signature goes into the DB, and the HTTP cache server serves
@@ -365,7 +365,7 @@ impl StoreServiceImpl {
     /// Async because tenant-key resolution hits PG for the `tenant_keys`
     /// lookup when `tenant_id` is `Some`. For single-output paths
     /// (PutPath) that's fine — one query, not in a hot loop. Batch
-    /// callers (PutPathBatch) should use [`TenantSigner::resolve_once`]
+    /// callers (PutPathBatch) should use `TenantSigner::resolve_once`
     /// then [`sign_with_resolved`](Self::sign_with_resolved) instead so
     /// the lookup happens once outside the transaction, not N times
     /// inside it.

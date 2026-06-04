@@ -4,7 +4,7 @@
 //! [`restore_path_streaming`] (NAR source → fs). Both work in 256 KiB
 //! chunks; peak heap is O(chunk) regardless of NAR size.
 //!
-//! [`dump_path`] / [`extract_to_path`] are eager in-memory oracles kept
+//! `dump_path` / `extract_to_path` are eager in-memory oracles kept
 //! under `cfg(test-oracle)` for fuzz/property testing.
 
 use std::io::{self, Read, Write};
@@ -238,7 +238,7 @@ fn stream_node(w: &mut impl Write, path: &std::path::Path, depth: usize) -> Resu
 /// are `io::copy`'d in fixed-size pieces — peak heap is O(chunk size),
 /// not O(NAR size). **Semantically equivalent to
 /// `extract_to_path(&parse(r)?, dest)`** without the intermediate
-/// [`NarNode`] tree.
+/// `NarNode` tree.
 ///
 /// Unlike [`parse`](super::parse), there is no per-file `MAX_CONTENT_SIZE`
 /// cap — the caller bounds total size upstream (e.g., `MAX_NAR_SIZE` on the

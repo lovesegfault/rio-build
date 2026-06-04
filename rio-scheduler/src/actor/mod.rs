@@ -341,7 +341,7 @@ pub struct DagActor {
     /// QueryPathInfo). Defaults to [`rio_common::grpc::DEFAULT_GRPC_TIMEOUT`]
     /// (30s). Tests that arm a hung MockStore to prove the timeout wrapper
     /// exists override to 3s via
-    /// [`with_grpc_timeout`](Self::with_grpc_timeout) — same
+    /// `with_grpc_timeout` — same
     /// wrapper-exists proof at 10× less wall-clock. Plumbed as a field
     /// (not `cfg(test)` on the const) because `cfg(test)` is per-crate:
     /// rio-scheduler's test build links against rio-common built WITHOUT
@@ -530,7 +530,7 @@ pub struct DagActor {
     hmac_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
     /// HMAC signer for `x-rio-service-token`. When Some, the
     /// dispatch-time store-check
-    /// ([`dispatch::DagActor::batch_probe_cached_ready`]) sets
+    /// (`dispatch::DagActor::batch_probe_cached_ready`) sets
     /// `x-rio-service-token` + `x-rio-probe-tenant-id` so the store's
     /// upstream-substitution probe fires —
     /// `r[sched.dispatch.fod-substitute]`. None = local-presence-only

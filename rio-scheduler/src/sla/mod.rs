@@ -536,7 +536,7 @@ impl SlaEstimator {
     }
 
     /// Drop one cached fit. Pairs with
-    /// [`SchedulerDb::delete_build_samples_for_key`] for `ResetSlaModel`
+    /// `SchedulerDb::delete_build_samples_for_key` for `ResetSlaModel`
     /// — next dispatch falls back to the cold-start probe path. Returns
     /// whether an entry was present.
     pub fn evict(&self, key: &types::ModelKey) -> bool {

@@ -105,7 +105,7 @@ pub(crate) fn storage_error(context: &str, e: anyhow::Error) -> Status {
     }
 }
 
-/// Map a [`MetadataError`] to a gRPC status with a precise code.
+/// Map a `MetadataError` to a gRPC status with a precise code.
 ///
 /// The key value of the typed error: retriable failures
 /// (connection/serialization/placeholder-race) get retriable codes

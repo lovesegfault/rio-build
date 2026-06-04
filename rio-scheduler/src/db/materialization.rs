@@ -13,8 +13,8 @@
 //!     [`SchedulerDb::create_materialization_job_fenced`], serves
 //!     non-merge callers (the dispatch-probe partition, tests): it
 //!     opens its own tx, performs the floor check via the canonical
-//!     [`SchedulerDb::claims_floor`] /
-//!     [`SchedulerDb::at_or_above_floor`] helpers, and calls the
+//!     `SchedulerDb::claims_floor` /
+//!     `SchedulerDb::at_or_above_floor` helpers, and calls the
 //!     in-tx core.
 // r[impl sched.materialize.job+2]
 

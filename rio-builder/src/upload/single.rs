@@ -180,7 +180,7 @@ pub(super) fn is_concurrent_put_path(status: &tonic::Status) -> bool {
         && status.message().contains(rio_proto::CONCURRENT_PUTPATH_MSG)
 }
 
-/// I-125b: poll [`query_path_info_opt`] with exponential backoff until
+/// I-125b: poll `query_path_info_opt` with exponential backoff until
 /// the path appears or [`CONCURRENT_PUT_POLL_ATTEMPTS`] is exhausted.
 /// Returns the store's `PathInfo` if found (caller adopts it as the
 /// upload result), `None` if the path never appeared (caller retries

@@ -230,11 +230,16 @@ let
     # -Dwarnings: broken intra-doc links, unclosed HTML tags fail the
     # build. Deps are not affected — the wrapper only runs on
     # workspace members; dep rlibs are cached from the base build.
-    # No --document-private-items: matches cargo doc's public-items-
-    # only default. Enabling it would surface private-fn doc warnings
-    # the existing docs were never written against.
+    # --document-private-items (merged_bug_019/203, E2 layer C):
+    # broken intra-doc links in PRIVATE docs fail mechanically — the
+    # ghost-narration class ([assign_to_worker](Self::assign_to_worker)
+    # pointing at a deleted fn) cannot survive a doc build. The
+    # pre-authorized fallback if collateral noise ever overwhelms:
+    # allow rustdoc::bare-urls / rustdoc::invalid-html-tags ONLY;
+    # broken_intra_doc_links stays denied.
     exec ${rustStable}/bin/rustdoc "''${args[@]}" \
       --out-dir target/doc \
+      --document-private-items \
       -Dwarnings
     EOF
     chmod +x $out/bin/rustc

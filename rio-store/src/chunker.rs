@@ -43,7 +43,7 @@ pub const CHUNK_MAX: usize = 256 * 1024;
 /// The slice borrows from the input `&[u8]` — no copy. Callers that need
 /// owned data (S3 upload) convert to `Bytes::copy_from_slice()` at the
 /// use site, which is one copy total (unavoidable: the input is a
-/// contiguous Vec<u8>, S3 wants owned Bytes).
+/// contiguous `Vec<u8>`, S3 wants owned Bytes).
 #[derive(Debug)]
 pub struct Chunk<'a> {
     /// BLAKE3 hash of `data`. This is the chunk's storage key.

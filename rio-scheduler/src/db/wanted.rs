@@ -3,8 +3,8 @@
 //! migration 078 `build_wanted_outputs`).
 //!
 //! Every standalone write is claims-floor fenced (the Phase-1 Wave-3
-//! pattern from `db/batch.rs`, reusing [`SchedulerDb::claims_floor`] /
-//! [`SchedulerDb::at_or_above_floor`] verbatim): a deposed leader's
+//! pattern from `db/batch.rs`, reusing `SchedulerDb::claims_floor` /
+//! `SchedulerDb::at_or_above_floor` verbatim): a deposed leader's
 //! writes are discarded, never applied. The in-tx form rides the
 //! caller's transaction (the merge tx), which already carries the
 //! merge fence — one fence per transaction, no second floor read.
