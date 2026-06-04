@@ -959,7 +959,7 @@
                 }
                 # Custom writeShellScript hooks (check-mutants-marker,
                 # sqlx-prepare-check, crate2nix-check, hakari-check).
-                // import ./nix/pre-commit-hooks.nix { inherit pkgs crate2nixCli fuzzWorkspaces; };
+                // import ./nix/pre-commit-hooks.nix { inherit pkgs crate2nixCli; };
               };
 
               # --------------------------------------------------------------

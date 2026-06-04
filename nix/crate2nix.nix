@@ -115,6 +115,15 @@ let
   allCrates = lib.attrValues resolved.crates;
   localCrates = lib.filter (c: (c.source.type or "") == "local") allCrates;
   localNames = map (c: c.crateName) localCrates;
+  # crateName → resolved crate record. Shared by buildDepOnlyCrates
+  # (closure walk) and sqlxQueryCrates (explicit `[package] build`
+  # path consult) so they cannot index divergent copies.
+  localByName = lib.listToAttrs (
+    map (c: {
+      name = c.crateName;
+      value = c;
+    }) localCrates
+  );
   depNames = kind: lib.unique (lib.concatMap (c: map (d: d.name) (c.${kind} or [ ])) allCrates);
   buildNames = depNames "buildDependencies";
   runtimeNames = depNames "dependencies" ++ depNames "devDependencies";
@@ -153,19 +162,13 @@ let
   # hand-mirroring the list.
   buildDepOnlyCrates =
     let
-      crateByName = lib.listToAttrs (
-        map (c: {
-          name = c.crateName;
-          value = c;
-        }) localCrates
-      );
       roots = lib.filter (n: lib.elem n buildNames && !lib.elem n runtimeNames) localNames;
       closure = builtins.genericClosure {
         startSet = map (n: { key = n; }) roots;
         operator =
           item:
           map (d: { key = d.name; }) (
-            lib.filter (d: lib.elem d.name localNames) ((crateByName.${item.key} or { }).dependencies or [ ])
+            lib.filter (d: lib.elem d.name localNames) ((localByName.${item.key} or { }).dependencies or [ ])
           );
       };
       exempt = map (i: i.key) closure;
@@ -387,25 +390,47 @@ let
     SQLX_OFFLINE_DIR = "${sqlxCacheFileset}/.sqlx";
   };
 
-  # Comment-aware call-shape matcher for the tracker scans below: drop
-  # full-line //-comments (the [[:space:]]*// match also covers ///
-  # and //! doc comments), then substring-match the call shape on what
-  # remains. A bare hasInfix over the whole file would count a
+  # Comment-aware CALL-SHAPE matcher for the tracker scans below.
+  # SHARED PATTERN (stated once; keep in lockstep with tracker_wired()
+  # in nix/pre-commit-hooks.nix, which greps the same shape after its
+  # sed comment-strip): `<fn>[[:space:]]*\(` on non-comment lines —
+  # whitespace tolerated between name and paren, so `track_sqlx ();`
+  # counts as wired on both the eval side and the commit side. Drop
+  # full-line //-comments first (the [[:space:]]*// match also covers
+  # /// and //! doc comments): a bare whole-file match would count a
   # doc-comment MENTION as a real call (rio-migrations/build.rs
   # discusses the sibling tracker in prose). Documented residuals: a
   # trailing INLINE comment containing the pattern on a code line, and
   # a string literal naming it ("see track_sqlx( ..."), each on a code
-  # line
-  # still matches — full-line stripping only — but that over-inclusion
-  # is loud, not silent: spurious membership immediately trips the
-  # pairing assert below.
+  # line still matches — full-line stripping only — but that
+  # over-inclusion is loud, not silent: spurious membership
+  # immediately trips the pairing assert below.
   isCommentLine = l: builtins.match "[[:space:]]*//.*" l != null;
-  codeHasInfix =
-    pat: file:
+  hasTrackerCall =
+    fn: file:
     builtins.pathExists file
-    && lib.any (l: !isCommentLine l && lib.hasInfix pat l) (
+    && lib.any (l: !isCommentLine l && builtins.match ".*${fn}[[:space:]]*\\(.*" l != null) (
       lib.splitString "\n" (builtins.readFile file)
     );
+
+  # Anchored consumer-side matcher for the pairing asserts below: the
+  # exact statement `const _: &str = env!("<ENV>");`, column-agnostic
+  # (leading/trailing whitespace tolerated, optional trailing
+  # //-comment; no isCommentLine needed — the anchor already rejects
+  # comment lines). Anchoring is what defeats the single-line
+  # block-comment evasion: `/* const _: &str = env!("…"); */` carries
+  # the full statement as a SUBSTRING (an infix matcher accepts it
+  # while rustc records no env-dep — silent tracking death), but
+  # "/* " is not whitespace, so the anchored form rejects it. Honest
+  # residual: a MULTI-line block comment (`/*` on its own line, the
+  # const inside) still fools the anchored form — accepted; the
+  # single-line shape was the demonstrated evasion.
+  hasConstRead =
+    env: file:
+    builtins.pathExists file
+    && lib.any (
+      l: builtins.match "[[:space:]]*const _: &str = env!\\(\"${env}\"\\);[[:space:]]*(//.*)?" l != null
+    ) (lib.splitString "\n" (builtins.readFile file));
 
   # Local crates wired to rio-buildhash::track_sqlx() in build.rs —
   # exactly the crates whose query!()/query_as!() macros read the
@@ -427,11 +452,16 @@ let
   # build.rs call is only half the contract — without a
   # `const _: &str = env!("…");` read in the crate, rustc records no
   # env-dep and the tracking silently does nothing (rio-buildhash
-  # docs). Scan scope is src/lib.rs ONLY (where all four consts live
-  # today) and the throw says so: a const moved elsewhere fails LOUD
-  # with remediation, never silently. Forced through this binding —
-  # consumed by defaultCrateOverrides, hence by every eval that
-  # evaluates ANY Rust crate derivation (all clippy/nextest/doc
+  # docs). Scan scope is src/lib.rs OR src/main.rs (existence-tolerant
+  # OR, so a bin-only tracker crate puts the const in src/main.rs and
+  # satisfies the assert) and the throw says so: a const moved
+  # elsewhere fails LOUD with remediation, never silently. The wired
+  # scan reads the crate's recorded `[package] build` path when the
+  # manifest sets one (Cargo.json records the field only then; absent
+  # = implicit build.rs — all 17 local crates today), so a custom
+  # build path is consulted, not assumed away. Forced through this
+  # binding — consumed by defaultCrateOverrides, hence by every eval
+  # that evaluates ANY Rust crate derivation (all clippy/nextest/doc
   # checks; a non-Rust-only eval like .#checks.<sys>.deny does not
   # force it, but no CI path evaluates Rust-free) — so a
   # const-deletion commit fails eval even though the pre-commit hook
@@ -439,21 +469,28 @@ let
   # query!-shaped .rs edits).
   sqlxQueryCrates =
     let
-      wired = lib.filter (n: codeHasInfix "track_sqlx(" (../. + "/${n}/build.rs")) localNames;
+      # Stays crateName-keyed (NOT source.path-keyed) deliberately:
+      # this file is instantiated four times (main, coverage, two fuzz
+      # trees) and the fuzz JSONs' local source.paths are "." /
+      # "../../rio-nix"-shaped — the crateName == repo-root-dir
+      # contract (see the membership comment above) is what makes the
+      # scan correct in every instantiation; fuzz member crates keep
+      # dropping out via pathExists.
+      buildScriptPath = n: ../. + "/${n}/${localByName.${n}.build or "build.rs"}";
+      wired = lib.filter (n: hasTrackerCall "track_sqlx" (buildScriptPath n)) localNames;
       migrationsTrackCrates = lib.filter (
-        n: codeHasInfix "track_migrations(" (../. + "/${n}/build.rs")
+        n: hasTrackerCall "track_migrations" (buildScriptPath n)
       ) localNames;
-      unpairedSqlx = lib.filter (
-        n: !codeHasInfix "env!(\"RIO_SQLX_HASH\")" (../. + "/${n}/src/lib.rs")
-      ) wired;
-      unpairedMigrations = lib.filter (
-        n: !codeHasInfix "env!(\"RIO_MIGRATIONS_HASH\")" (../. + "/${n}/src/lib.rs")
-      ) migrationsTrackCrates;
+      hasEnvRead =
+        env: n:
+        hasConstRead env (../. + "/${n}/src/lib.rs") || hasConstRead env (../. + "/${n}/src/main.rs");
+      unpairedSqlx = lib.filter (n: !hasEnvRead "RIO_SQLX_HASH" n) wired;
+      unpairedMigrations = lib.filter (n: !hasEnvRead "RIO_MIGRATIONS_HASH" n) migrationsTrackCrates;
     in
     if unpairedSqlx != [ ] then
-      throw "crate2nix.nix: crate(s) [${toString unpairedSqlx}] wire rio_buildhash::track_sqlx() in build.rs but src/lib.rs has no non-comment env!(\"RIO_SQLX_HASH\") read — without the read, rustc records no env-dep and the tracking silently does nothing. Keep the `const _: &str = env!(\"RIO_SQLX_HASH\");` in src/lib.rs (the eval assert scans ONLY src/lib.rs; a read moved to another file must move back), or remove the tracker call."
+      throw "crate2nix.nix: crate(s) [${toString unpairedSqlx}] wire rio_buildhash::track_sqlx() in build.rs but neither src/lib.rs nor src/main.rs has the statement `const _: &str = env!(\"RIO_SQLX_HASH\");` at column start (modulo whitespace; optional trailing //-comment) — without the read, rustc records no env-dep and the tracking silently does nothing. Keep exactly that statement in src/lib.rs or src/main.rs (the eval assert scans ONLY those two files and matches the anchored statement shape), or remove the tracker call."
     else if unpairedMigrations != [ ] then
-      throw "crate2nix.nix: crate(s) [${toString unpairedMigrations}] wire rio_buildhash::track_migrations() in build.rs but src/lib.rs has no non-comment env!(\"RIO_MIGRATIONS_HASH\") read — without the read, rustc records no env-dep and the tracking silently does nothing. Keep the `const _: &str = env!(\"RIO_MIGRATIONS_HASH\");` in src/lib.rs (the eval assert scans ONLY src/lib.rs; a read moved to another file must move back), or remove the tracker call."
+      throw "crate2nix.nix: crate(s) [${toString unpairedMigrations}] wire rio_buildhash::track_migrations() in build.rs but neither src/lib.rs nor src/main.rs has the statement `const _: &str = env!(\"RIO_MIGRATIONS_HASH\");` at column start (modulo whitespace; optional trailing //-comment) — without the read, rustc records no env-dep and the tracking silently does nothing. Keep exactly that statement in src/lib.rs or src/main.rs (the eval assert scans ONLY those two files and matches the anchored statement shape), or remove the tracker call."
     else
       wired;
 

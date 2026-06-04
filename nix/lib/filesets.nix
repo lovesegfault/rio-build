@@ -33,26 +33,41 @@ rec {
 
   # Fuzz sub-workspaces, derived from disk: directories under fuzz/
   # that contain a Cargo.toml (stray files and corpus-only dirs are
-  # tolerated). Single source for the three consumers that previously
-  # hand-mirrored the list: nix/fuzz.nix (whose tri-source assert also
-  # checks Cargo.toml's `[workspace] exclude` — the list xtask's
-  # discover_dirs() iterates for `regen cargo-json`/`regen fuzz-lock`),
-  # nix/misc-checks.nix (one crate2nix-drift-fuzz-<ws> check per
-  # workspace), and nix/pre-commit-hooks.nix (crate2nix-check's
-  # workspace loop).
+  # tolerated). Single source for the two eval-time consumers that
+  # previously hand-mirrored the list: nix/fuzz.nix (whose bi-source
+  # assert also checks Cargo.toml's `[workspace] exclude` — the list
+  # xtask's discover_dirs() iterates for `regen cargo-json`/`regen
+  # fuzz-lock`) and nix/misc-checks.nix (one crate2nix-drift-fuzz-<ws>
+  # check per workspace). The pre-commit crate2nix-check hook no
+  # longer consumes this — it discovers fuzz workspaces at RUN TIME
+  # (fuzz/*/ glob), so it stays addition-aware without a config
+  # relink.
   #
   # Honest residual: dirty-tree flake sources contain TRACKED files
   # only, so a freshly created fuzz workspace is invisible to readDir
   # until `git add` — same class as the known new-crate-untracked eval
   # failure (.claude/rules/ci-failure-patterns.md). The fuzz.nix assert
   # then fires on the *staged* tree, not the unstaged one.
+  #
+  # Removal direction: no fuzz/ at all (last workspace deleted along
+  # with the directory, or the dirty-tree state above where nothing
+  # under fuzz/ is tracked) degrades to [ ] — zero fuzz checks, zero
+  # drift checks — instead of an unnamed readDir eval error. If
+  # Cargo.toml's `[workspace] exclude` still lists a fuzz/<ws>,
+  # fuzz.nix's membership assert fires with its named error.
   fuzzWorkspaces =
     let
-      entries = builtins.readDir (unfilteredRoot + "/fuzz");
+      fuzzDir = unfilteredRoot + "/fuzz";
     in
-    lib.filter (
-      n: entries.${n} == "directory" && builtins.pathExists (unfilteredRoot + "/fuzz/${n}/Cargo.toml")
-    ) (builtins.attrNames entries);
+    if !builtins.pathExists fuzzDir then
+      [ ]
+    else
+      let
+        entries = builtins.readDir fuzzDir;
+      in
+      lib.filter (n: entries.${n} == "directory" && builtins.pathExists (fuzzDir + "/${n}/Cargo.toml")) (
+        builtins.attrNames entries
+      );
 
   # Per-member fileset for the lib/bin compile — memberFilesets
   # MINUS tests/ and proptest-regressions/. buildRustCrate never

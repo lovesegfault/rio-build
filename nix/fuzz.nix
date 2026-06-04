@@ -8,10 +8,11 @@
 #   fuzz/rio-nix    — protocol/wire parsers
 #   fuzz/rio-store  — manifest parser (pulls rio-store's full dep
 #                     tree, so its sancov closure is much larger)
-# Membership is NOT free-floating: fuzzWorkspaceConfig below is
-# asserted equal to the derived on-disk set (filesets.nix
-# fuzzWorkspaces) and to Cargo.toml's `[workspace] exclude` — the
-# three views (nix config, disk, cargo/xtask) cannot diverge silently.
+# Membership is NOT free-floating: the derived on-disk set
+# (filesets.nix fuzzWorkspaces) is asserted equal to Cargo.toml's
+# `[workspace] exclude` — the two views (disk, cargo/xtask) cannot
+# diverge silently. Per-workspace config (member crate + targets) is
+# DERIVED from the committed fuzz/<ws>/Cargo.json, not hand-listed.
 #
 # Build: per-crate via crate2nix (third + fourth instantiations
 # alongside the main + coverage trees). Same `localExtraRustcOpts`
@@ -38,7 +39,7 @@
   memberSrcs,
   # Derived on-disk fuzz workspace list (nix/lib/filesets.nix:
   # fuzz/<dir> entries containing a Cargo.toml). One leg of the
-  # tri-source membership assert below.
+  # bi-source membership assert below.
   fuzzWorkspaces,
   # Cargo.toml `[workspace] exclude` — the list xtask's discover_dirs()
   # iterates for `regen cargo-json`/`regen fuzz-lock`. Second assert leg.
@@ -106,61 +107,65 @@ let
       stripBins = false;
     };
 
-  # Per-workspace fuzz config, keyed by fuzz/<ws> directory name.
-  # `fuzzCrateName` is the workspace member crate ([package] name in
-  # fuzz/<ws>/Cargo.toml); `targets` are its [[bin]] fuzz targets
-  # (names must be unique ACROSS workspaces — they become the
-  # `fuzz-<target>` attr names in `runs` below).
-  fuzzWorkspaceConfig = {
-    rio-nix = {
-      fuzzCrateName = "rio-nix-fuzz";
-      targets = [
-        "wire_primitives"
-        "opcode_parsing"
-        "derivation_parsing"
-        "nar_parsing"
-        "derived_path_parsing"
-        "narinfo_parsing"
-        "build_result_parsing"
-        "refscan"
-        "stderr_message_parsing"
-      ];
-    };
-    rio-store = {
-      fuzzCrateName = "rio-store-fuzz";
-      targets = [ "manifest_deserialize" ];
-    };
-  };
-
-  # Tri-source membership assert: the hand config above must equal the
-  # derived on-disk set AND the fuzz/-prefixed `[workspace] exclude`
-  # entries. Forced through every consumer (builds/targets/runs all
-  # read checkedFuzzWorkspaceConfig), so a divergence fails EVAL with
-  # this named error instead of a workspace silently fuzzing stale (or
-  # not at all).
-  checkedFuzzWorkspaceConfig =
+  # Bi-source membership assert: the derived on-disk set must equal
+  # the fuzz/-prefixed `[workspace] exclude` entries. Forced through
+  # every consumer (fuzzWorkspaceConfig below is genAttrs over this
+  # list, and builds/targets/runs all read it), so a divergence fails
+  # EVAL with this named error instead of a workspace silently fuzzing
+  # stale (or not at all).
+  checkedFuzzWorkspaces =
     let
-      configSet = lib.naturalSort (lib.attrNames fuzzWorkspaceConfig);
       diskSet = lib.naturalSort fuzzWorkspaces;
       excludeSet = lib.naturalSort (
         map (lib.removePrefix "fuzz/") (lib.filter (lib.hasPrefix "fuzz/") workspaceExclude)
       );
     in
-    if configSet != diskSet || configSet != excludeSet then
+    if diskSet != excludeSet then
       throw ''
         nix/fuzz.nix: fuzz workspace sets diverged —
-          fuzzWorkspaceConfig (nix/fuzz.nix):     [${toString configSet}]
           fuzz/<dir>/Cargo.toml on disk:          [${toString diskSet}]
           Cargo.toml [workspace] exclude (fuzz/): [${toString excludeSet}]
-        Adding/removing a fuzz workspace needs all three: the fuzz/<ws>/
+        Adding/removing a fuzz workspace needs both: the fuzz/<ws>/
         directory (Cargo.{toml,lock,json} + fuzz_targets/, tracked by
-        git — an un-added dir is invisible to flake eval), a
-        fuzzWorkspaceConfig entry here (crate name + targets), and the
+        git — an un-added dir is invisible to flake eval) and the
         `fuzz/<ws>` line in Cargo.toml's [workspace] exclude (what
         `cargo xtask regen cargo-json`/`regen fuzz-lock` discover).
       ''
     else
-      fuzzWorkspaceConfig;
+      diskSet;
+
+  # Per-workspace fuzz config, keyed by fuzz/<ws> directory name —
+  # DERIVED from the workspace's committed Cargo.json (the same file
+  # fuzzBuilds consumes for the build graph, so the json is the single
+  # source for both graph and target membership; the
+  # crate2nix-drift-fuzz-<ws> checks and the crate2nix-check hook gate
+  # its staleness). `fuzzCrateName` is the sole `workspaceMembers` key
+  # (a fuzz workspace contains exactly one member crate); `targets`
+  # are that crate's `crateBin[].name` — the [[bin]] fuzz targets,
+  # which become the `fuzz-<target>` attr names in `runs` below
+  # (uniqueness ACROSS workspaces is enforced at fuzzTargets). A
+  # [[bin]] added to fuzz/<ws>/Cargo.toml reaches `runs` via
+  # `cargo xtask regen cargo-json` — no hand mirror to forget.
+  fuzzWorkspaceConfig = lib.genAttrs checkedFuzzWorkspaces (
+    ws:
+    let
+      json = builtins.fromJSON (builtins.readFile (unfilteredRoot + "/fuzz/${ws}/Cargo.json"));
+      memberNames = lib.attrNames json.workspaceMembers;
+      fuzzCrateName =
+        if lib.length memberNames == 1 then
+          lib.head memberNames
+        else
+          throw "nix/fuzz.nix: fuzz/${ws}/Cargo.json has ${toString (lib.length memberNames)} workspace members [${toString memberNames}] — a fuzz workspace must contain exactly one member crate (one [package] per fuzz/<ws>; then `cargo xtask regen cargo-json`)";
+      member =
+        lib.findFirst (c: c.crateName == fuzzCrateName && (c.source.type or "") == "local")
+          (throw "nix/fuzz.nix: fuzz/${ws}/Cargo.json workspace member ${fuzzCrateName} has no local crate entry — regenerate with `cargo xtask regen cargo-json`")
+          (lib.attrValues json.crates);
+    in
+    {
+      inherit fuzzCrateName;
+      targets = lib.naturalSort (map (b: b.name) (member.crateBin or [ ]));
+    }
+  );
 
   # One crate2nix instantiation per fuzz workspace.
   fuzzBuilds = lib.mapAttrs (
@@ -176,22 +181,37 @@ let
         ];
       };
     }
-  ) checkedFuzzWorkspaceConfig;
+  ) fuzzWorkspaceConfig;
 
   # Flat list of (target, fuzzBins, corpusRoot) for generating the
   # per-target run derivations, derived from the keyed config.
   # `fuzzBins` is the workspace member's built crate — buildRustCrate
   # puts every `[[bin]]` under $out/bin/.
-  fuzzTargets = lib.concatLists (
-    lib.mapAttrsToList (
-      ws: cfg:
-      map (t: {
-        target = t;
-        fuzzBins = fuzzBuilds.${ws}.members.${cfg.fuzzCrateName};
-        corpusRoot = unfilteredRoot + "/fuzz/${ws}/corpus";
-      }) cfg.targets
-    ) checkedFuzzWorkspaceConfig
-  );
+  #
+  # Checked binding: target names must be unique ACROSS workspaces —
+  # `runs` keys are `fuzz-<target>` and builtins.listToAttrs is
+  # silently first-wins on duplicates, so without this throw a
+  # cross-workspace duplicate would drop one workspace's run from
+  # checks and from the CI fuzz matrix (flake.nix `fuzz = fuzz.runs`).
+  fuzzTargets =
+    let
+      flat = lib.concatLists (
+        lib.mapAttrsToList (
+          ws: cfg:
+          map (t: {
+            target = t;
+            fuzzBins = fuzzBuilds.${ws}.members.${cfg.fuzzCrateName};
+            corpusRoot = unfilteredRoot + "/fuzz/${ws}/corpus";
+          }) cfg.targets
+        ) fuzzWorkspaceConfig
+      );
+      names = lib.naturalSort (map (t: t.target) flat);
+      dups = lib.unique (lib.filter (n: lib.count (x: x == n) names > 1) names);
+    in
+    if dups != [ ] then
+      throw "nix/fuzz.nix: duplicate fuzz target name(s) [${toString dups}] across fuzz workspaces — runs keys are fuzz-<target> and builtins.listToAttrs is silently first-wins, so a duplicate would drop one workspace's run from checks and the CI fuzz matrix (flake.nix `fuzz = fuzz.runs`). Rename the [[bin]] in one workspace, then `cargo xtask regen cargo-json`."
+    else
+      flat;
 
   # Per-target fuzz run: 2 minutes, seed-corpus only. Cheap
   # runCommand wrapper over the prebuilt binary. For deep runs
