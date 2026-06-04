@@ -6,7 +6,7 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
 = Prerequisites
 
 - Kubernetes 1.33+ (EKS, GKE, or self-managed) --- required for user namespace isolation (`hostUsers: false`), see #cross-link("/spec/system/security.typ")[Security §Rationale]
-- PostgreSQL 15+ (managed service recommended: RDS, Cloud SQL, or CloudNativePG). Aurora/RDS PG 15+ have `rds.force_ssl=1` by default --- the connection string must include `?sslmode=require` (sqlx has `tls-rustls-aws-lc-rs` enabled for this)
+- PostgreSQL 15+ (managed service recommended: RDS, Cloud SQL, or CloudNativePG). Aurora/RDS PG 15+ have `rds.force_ssl=1` by default --- the EKS chart connects with `?sslmode=verify-full&sslrootcert=<vendored RDS trust bundle>` (sqlx has `tls-rustls-aws-lc-rs` enabled for this). Optionally `postgres.authMode=iam` replaces the static password with 15-minute RDS IAM auth tokens minted from the pod's IRSA role; verify-full is mandatory there
 - S3-compatible object storage (AWS S3, MinIO, GCS with S3 compatibility)
 - `kubectl` configured for the target cluster
 

@@ -12,7 +12,7 @@
 # nothing else in this chart is enabled); the Pool reconciler references
 # them from the per-build Jobs it creates.
 {{- range $sa := list
-      (dict "name" "rio-controller" "ns" $ns                              "comp" "controller" "on" .Values.controller.enabled "automount" true)
+      (dict "name" "rio-controller" "ns" $ns                              "comp" "controller" "on" .Values.controller.enabled "automount" true  "annot" .Values.controller.serviceAccount.annotations)
       (dict "name" "rio-gateway"    "ns" $ns                              "comp" "gateway"    "on" .Values.gateway.enabled    "automount" false)
       (dict "name" "rio-store"      "ns" .Values.namespaces.store.name    "comp" "store"      "on" .Values.store.enabled      "automount" false "annot" .Values.store.serviceAccount.annotations)
       (dict "name" "rio-builder"    "ns" .Values.namespaces.builders.name "comp" "worker"     "on" true                       "automount" false)

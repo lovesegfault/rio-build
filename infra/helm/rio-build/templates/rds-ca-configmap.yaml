@@ -1,0 +1,28 @@
+{{- if .Values.externalSecrets.enabled }}
+{{- /*
+Vendored AWS RDS trust bundle (files/rds-global-bundle.pem — source URL,
+retrieval date and sha256 in the file header). RDS server certs chain to
+Amazon-PRIVATE CAs, so sslmode=verify-full cannot use system roots; the
+deployments mount this ConfigMap (rdsCa family in _helpers.tpl) and the
+postgres URLs reference it via sslrootcert. Vendored, NOT fetched at pod
+runtime: a trust anchor downloaded over the network at startup defeats
+the point of pinning one.
+
+Duplicated into both PG-consumer namespaces (scheduler+controller in
+rio-system, store in rio-store) — ConfigMaps are namespace-scoped, same
+pattern as the ESO secrets in external-secrets.yaml.
+*/}}
+{{- range $targetNs := list .Values.namespaces.system.name .Values.namespaces.store.name }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rio-rds-ca
+  namespace: {{ $targetNs }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+data:
+  {{ base $.Values.postgres.caBundlePath }}: |
+{{ $.Files.Get "files/rds-global-bundle.pem" | indent 4 }}
+{{- end }}
+{{- end }}
