@@ -201,6 +201,16 @@ spec:
             k8s:app.kubernetes.io/name: postgresql
       toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
     {{- end }}
+    {{- if eq .Values.postgres.authMode "iam" }}
+    # RDS IAM auth: rio_common::pg_iam resolves IRSA web-identity
+    # credentials against STS (HTTPS) before each token mint. world:443
+    # mirrors the store-egress AWS-API rule — STS has no stable CIDR,
+    # and an STS VPC endpoint classifies as world too. Gated on iam so
+    # the password-mode controller keeps its tighter no-internet
+    # posture.
+    - toEntities: [world]
+      toPorts: [{ports: [{port: "443", protocol: TCP}]}]
+    {{- end }}
 {{- if .Values.buildScheduler.enabled }}
 ---
 # kube-build-scheduler second kube-scheduler egress: DNS + kube-apiserver

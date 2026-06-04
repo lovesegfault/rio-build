@@ -88,11 +88,7 @@ spec:
             - name: RIO_SUBSTITUTE_ADMISSION_PERMITS
               value: {{ $s.substituteAdmissionPermits | quote }}
             {{- end }}
-            - name: RIO_DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: rio-postgres
-                  key: url
+            {{- include "rio.pgEnv" (dict "root" . "authEnv" "RIO_PG_AUTH" "urlEnv" "RIO_DATABASE_URL") | nindent 12 }}
             {{- with $s.chunkBackend }}
             {{- if .kind }}
             - name: RIO_CHUNK_BACKEND__KIND
@@ -119,7 +115,7 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
-            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac" "rdsCa")) | nindent 12 }}
             {{- if $fsChunks }}
             # readOnlyRootFilesystem (rio.containerSecurityContext)
             # makes the image filesystem immutable — the filesystem
@@ -142,7 +138,7 @@ spec:
           resources:
             {{- toYaml $s.resources | nindent 12 }}
       volumes:
-        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac")) | nindent 8 }}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac" "rdsCa")) | nindent 8 }}
         {{- if $fsChunks }}
         - name: chunks
           persistentVolumeClaim:
