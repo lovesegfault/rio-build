@@ -3,6 +3,7 @@
 //! with the caller's transaction (B6), the claimable-list anti-join,
 //! exec_id-keyed at-most-once resolution, parking, and cancellation.
 
+use crate::db::ServingGeneration;
 use rio_test_support::TestDb;
 use uuid::Uuid;
 
@@ -39,7 +40,14 @@ async fn job_creation_is_dedup_idempotent() -> anyhow::Result<()> {
     let (test_db, db, drv) = setup("job-dedup-hash").await?;
 
     let first = db
-        .create_materialization_job_fenced(drv, "job-dedup-hash", None, JobOrigin::Pruned, None, 1)
+        .create_materialization_job_fenced(
+            drv,
+            "job-dedup-hash",
+            None,
+            JobOrigin::Pruned,
+            None,
+            ServingGeneration::stamp_from_claim(1),
+        )
         .await?;
     let FencedJobCreate::Applied {
         job_id: first_id,
@@ -59,7 +67,7 @@ async fn job_creation_is_dedup_idempotent() -> anyhow::Result<()> {
             None,
             JobOrigin::CacheOpportunity,
             None,
-            1,
+            ServingGeneration::stamp_from_claim(1),
         )
         .await?;
     let FencedJobCreate::Applied {
@@ -87,12 +95,19 @@ async fn job_creation_is_dedup_idempotent() -> anyhow::Result<()> {
             first_id,
             Some(Uuid::now_v7()),
             JobState::ResolvedSuccess,
-            1,
+            ServingGeneration::stamp_from_claim(1),
         )
         .await?;
     assert_eq!(resolved, FencedOutcome::Applied(1));
     let third = db
-        .create_materialization_job_fenced(drv, "job-dedup-hash", None, JobOrigin::Pruned, None, 1)
+        .create_materialization_job_fenced(
+            drv,
+            "job-dedup-hash",
+            None,
+            JobOrigin::Pruned,
+            None,
+            ServingGeneration::stamp_from_claim(1),
+        )
         .await?;
     let FencedJobCreate::Applied {
         job_id: third_id,
@@ -125,7 +140,14 @@ async fn job_creation_below_floor_is_fenced() -> anyhow::Result<()> {
 
     // The deposed tenure's late create (serving generation 1).
     let outcome = db
-        .create_materialization_job_fenced(drv, "job-fence-hash", None, JobOrigin::Pruned, None, 1)
+        .create_materialization_job_fenced(
+            drv,
+            "job-fence-hash",
+            None,
+            JobOrigin::Pruned,
+            None,
+            ServingGeneration::stamp_from_claim(1),
+        )
         .await?;
     assert_eq!(
         outcome,
@@ -140,7 +162,14 @@ async fn job_creation_below_floor_is_fenced() -> anyhow::Result<()> {
 
     // Positive control: the current tenure (at the floor) creates.
     let outcome = db
-        .create_materialization_job_fenced(drv, "job-fence-hash", None, JobOrigin::Pruned, None, 2)
+        .create_materialization_job_fenced(
+            drv,
+            "job-fence-hash",
+            None,
+            JobOrigin::Pruned,
+            None,
+            ServingGeneration::stamp_from_claim(2),
+        )
         .await?;
     assert!(
         matches!(outcome, FencedJobCreate::Applied { created: true, .. }),
@@ -172,7 +201,7 @@ async fn list_claimable_excludes_claimed_and_parked() -> anyhow::Result<()> {
                 None,
                 JobOrigin::CacheOpportunity,
                 None,
-                1,
+                ServingGeneration::stamp_from_claim(1),
             )
             .await?;
         let FencedJobCreate::Applied { job_id, .. } = created else {
@@ -265,7 +294,7 @@ async fn job_resolution_is_fenced_and_at_most_once() -> anyhow::Result<()> {
             None,
             JobOrigin::Pruned,
             None,
-            1,
+            ServingGeneration::stamp_from_claim(1),
         )
         .await?;
     let FencedJobCreate::Applied { job_id, .. } = created else {
@@ -274,7 +303,12 @@ async fn job_resolution_is_fenced_and_at_most_once() -> anyhow::Result<()> {
 
     let exec_id = Uuid::now_v7();
     let resolved = db
-        .resolve_materialization_job_fenced(job_id, Some(exec_id), JobState::ResolvedSuccess, 1)
+        .resolve_materialization_job_fenced(
+            job_id,
+            Some(exec_id),
+            JobState::ResolvedSuccess,
+            ServingGeneration::stamp_from_claim(1),
+        )
         .await?;
     assert_eq!(resolved, FencedOutcome::Applied(1), "first resolve applies");
 
@@ -300,7 +334,7 @@ async fn job_resolution_is_fenced_and_at_most_once() -> anyhow::Result<()> {
             job_id,
             Some(Uuid::now_v7()),
             JobState::ResolvedUnobtainable,
-            1,
+            ServingGeneration::stamp_from_claim(1),
         )
         .await?;
     assert_eq!(
@@ -326,7 +360,7 @@ async fn job_resolution_is_fenced_and_at_most_once() -> anyhow::Result<()> {
             None,
             JobOrigin::Pruned,
             None,
-            1,
+            ServingGeneration::stamp_from_claim(1),
         )
         .await?;
     let FencedJobCreate::Applied { job_id: job2, .. } = created else {
@@ -339,7 +373,12 @@ async fn job_resolution_is_fenced_and_at_most_once() -> anyhow::Result<()> {
     .execute(&test_db.pool)
     .await?;
     let fenced = db
-        .resolve_materialization_job_fenced(job2, None, JobState::Cancelled, 1)
+        .resolve_materialization_job_fenced(
+            job2,
+            None,
+            JobState::Cancelled,
+            ServingGeneration::stamp_from_claim(1),
+        )
         .await?;
     assert_eq!(
         fenced,
@@ -364,7 +403,14 @@ async fn parked_job_excluded_until_backoff_expires() -> anyhow::Result<()> {
     let (test_db, db, drv) = setup("job-park-hash").await?;
 
     let created = db
-        .create_materialization_job_fenced(drv, "job-park-hash", None, JobOrigin::Pruned, None, 1)
+        .create_materialization_job_fenced(
+            drv,
+            "job-park-hash",
+            None,
+            JobOrigin::Pruned,
+            None,
+            ServingGeneration::stamp_from_claim(1),
+        )
         .await?;
     let FencedJobCreate::Applied { job_id, .. } = created else {
         anyhow::bail!("create must apply");
@@ -380,7 +426,11 @@ async fn parked_job_excluded_until_backoff_expires() -> anyhow::Result<()> {
         .fetch_one(&test_db.pool)
         .await?;
     let parked = db
-        .park_materialization_job_fenced(job_id, now_epoch + 3600.0, 1)
+        .park_materialization_job_fenced(
+            job_id,
+            now_epoch + 3600.0,
+            ServingGeneration::stamp_from_claim(1),
+        )
         .await?;
     assert_eq!(parked, FencedOutcome::Applied(1));
     assert!(
@@ -396,7 +446,11 @@ async fn parked_job_excluded_until_backoff_expires() -> anyhow::Result<()> {
 
     // Re-park with an already-expired backoff: claimable again.
     let parked = db
-        .park_materialization_job_fenced(job_id, now_epoch - 1.0, 1)
+        .park_materialization_job_fenced(
+            job_id,
+            now_epoch - 1.0,
+            ServingGeneration::stamp_from_claim(1),
+        )
         .await?;
     assert_eq!(parked, FencedOutcome::Applied(1));
     assert_eq!(
@@ -419,7 +473,14 @@ async fn job_cancellation_marks_cancelled_and_closes_attempt() -> anyhow::Result
     let (test_db, db, drv) = setup("job-cancel-hash").await?;
 
     let created = db
-        .create_materialization_job_fenced(drv, "job-cancel-hash", None, JobOrigin::Pruned, None, 1)
+        .create_materialization_job_fenced(
+            drv,
+            "job-cancel-hash",
+            None,
+            JobOrigin::Pruned,
+            None,
+            ServingGeneration::stamp_from_claim(1),
+        )
         .await?;
     let FencedJobCreate::Applied { job_id, .. } = created else {
         anyhow::bail!("create must apply");
@@ -438,7 +499,9 @@ async fn job_cancellation_marks_cancelled_and_closes_attempt() -> anyhow::Result
     .execute(&test_db.pool)
     .await?;
 
-    let cancelled = db.cancel_job_and_close_attempt_fenced(job_id, 1).await?;
+    let cancelled = db
+        .cancel_job_and_close_attempt_fenced(job_id, ServingGeneration::stamp_from_claim(1))
+        .await?;
     assert_eq!(
         cancelled,
         FencedOutcome::Applied(1),
@@ -469,14 +532,18 @@ async fn job_cancellation_marks_cancelled_and_closes_attempt() -> anyhow::Result
     assert_eq!(charges, 0, "charge-free (BC-2)");
 
     // Cancelling again (nothing pending): idempotent re-entry.
-    let again = db.cancel_job_and_close_attempt_fenced(job_id, 1).await?;
+    let again = db
+        .cancel_job_and_close_attempt_fenced(job_id, ServingGeneration::stamp_from_claim(1))
+        .await?;
     assert_eq!(again, FencedOutcome::AlreadyResolved);
 
     // Below the floor: fenced.
     sqlx::query("INSERT INTO leader_generation_claims (generation, holder_id) VALUES (5, 'succ')")
         .execute(&test_db.pool)
         .await?;
-    let fenced = db.cancel_job_and_close_attempt_fenced(job_id, 1).await?;
+    let fenced = db
+        .cancel_job_and_close_attempt_fenced(job_id, ServingGeneration::stamp_from_claim(1))
+        .await?;
     assert_eq!(fenced, FencedOutcome::Fenced);
     Ok(())
 }
@@ -592,7 +659,7 @@ async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<(
                 None,
                 JobOrigin::CacheOpportunity,
                 None,
-                1,
+                ServingGeneration::stamp_from_claim(1),
             )
             .await
     });
@@ -643,7 +710,7 @@ async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<(
             None,
             JobOrigin::CacheOpportunity,
             None,
-            1,
+            ServingGeneration::stamp_from_claim(1),
         )
         .await?;
     let FencedJobCreate::Applied {
@@ -789,7 +856,7 @@ async fn dedup_upgrade_is_pruned_wins_and_monotone() -> anyhow::Result<()> {
             None,
             JobOrigin::CacheOpportunity,
             None,
-            1,
+            ServingGeneration::stamp_from_claim(1),
         )
         .await?;
     let FencedJobCreate::Applied {
@@ -810,7 +877,7 @@ async fn dedup_upgrade_is_pruned_wins_and_monotone() -> anyhow::Result<()> {
             None,
             JobOrigin::Pruned,
             None,
-            1,
+            ServingGeneration::stamp_from_claim(1),
         )
         .await?;
     let FencedJobCreate::Applied {
@@ -837,7 +904,7 @@ async fn dedup_upgrade_is_pruned_wins_and_monotone() -> anyhow::Result<()> {
             None,
             JobOrigin::CacheOpportunity,
             None,
-            1,
+            ServingGeneration::stamp_from_claim(1),
         )
         .await?;
     assert!(
@@ -858,12 +925,19 @@ async fn dedup_upgrade_is_pruned_wins_and_monotone() -> anyhow::Result<()> {
         None,
         JobOrigin::CacheOpportunity,
         None,
-        1,
+        ServingGeneration::stamp_from_claim(1),
     )
     .await?;
     for origin in [JobOrigin::Reprobe, JobOrigin::StaleReset] {
         let r = db
-            .create_materialization_job_fenced(drv2, "job-upgrade-hash-2", None, origin, None, 1)
+            .create_materialization_job_fenced(
+                drv2,
+                "job-upgrade-hash-2",
+                None,
+                origin,
+                None,
+                ServingGeneration::stamp_from_claim(1),
+            )
             .await?;
         assert!(
             matches!(r, FencedJobCreate::Applied { created: false, .. }),
@@ -894,7 +968,14 @@ async fn gc_resolved_jobs_sweeps_only_unreferenced_resolved() -> anyhow::Result<
         let db = db.clone();
         async move {
             let FencedJobCreate::Applied { job_id, .. } = db
-                .create_materialization_job_fenced(drv, hash, None, JobOrigin::Pruned, None, 1)
+                .create_materialization_job_fenced(
+                    drv,
+                    hash,
+                    None,
+                    JobOrigin::Pruned,
+                    None,
+                    ServingGeneration::stamp_from_claim(1),
+                )
                 .await?
             else {
                 anyhow::bail!("create must apply");
@@ -962,7 +1043,7 @@ async fn gc_resolved_jobs_sweeps_only_unreferenced_resolved() -> anyhow::Result<
     .await?;
 
     let deleted = db
-        .gc_resolved_materialization_jobs(86_400.0, 1000, 1)
+        .gc_resolved_materialization_jobs(86_400.0, 1000, ServingGeneration::stamp_from_claim(1))
         .await?;
     assert_eq!(deleted, 1, "exactly the unreferenced resolved-old job");
     assert_eq!(job_count(&test_db.pool, drv_swept).await?, 0, "swept");
@@ -1004,7 +1085,7 @@ async fn unresolved_job_view_ignores_build_kind_assignments() -> anyhow::Result<
         None,
         JobOrigin::Pruned,
         None,
-        1,
+        ServingGeneration::stamp_from_claim(1),
     )
     .await?;
     // An ACTIVE build-kind attempt on the same derivation — the
@@ -1014,7 +1095,7 @@ async fn unresolved_job_view_ignores_build_kind_assignments() -> anyhow::Result<
         .mint_pull_attempt_fenced(
             drv,
             &crate::state::ExecutorId::from("job-kindblind-hash"),
-            1,
+            ServingGeneration::stamp_from_claim(1),
             Uuid::now_v7(),
             "kindblindloghash",
             None,
@@ -1042,7 +1123,7 @@ async fn unresolved_job_view_ignores_build_kind_assignments() -> anyhow::Result<
         None,
         JobOrigin::Pruned,
         None,
-        1,
+        ServingGeneration::stamp_from_claim(1),
     )
     .await?;
     let holder = crate::state::ExecutorId::from("job-kindheld-hash@store-0");
@@ -1050,7 +1131,7 @@ async fn unresolved_job_view_ignores_build_kind_assignments() -> anyhow::Result<
         .mint_pull_attempt_fenced(
             drv2,
             &holder,
-            1,
+            ServingGeneration::stamp_from_claim(1),
             Uuid::now_v7(),
             "kindheldloghash",
             None,

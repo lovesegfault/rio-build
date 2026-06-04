@@ -3,6 +3,7 @@
 //! isolation, the live-only saturating union, the claims-floor fence,
 //! and build purge.
 
+use crate::db::ServingGeneration;
 use rio_test_support::TestDb;
 use uuid::Uuid;
 
@@ -64,7 +65,7 @@ async fn wanted_rows_recorded_and_isolated_per_build() -> anyhow::Result<()> {
     // b1 contributes for both derivations; b2 for d1 only.
     let applied = db
         .record_wanted_fenced(
-            1,
+            ServingGeneration::stamp_from_claim(1),
             &[
                 WantedRow {
                     build_id: b1,
@@ -82,7 +83,7 @@ async fn wanted_rows_recorded_and_isolated_per_build() -> anyhow::Result<()> {
     assert_eq!(applied, FencedOutcome::Applied(2), "two rows recorded");
     let applied = db
         .record_wanted_fenced(
-            1,
+            ServingGeneration::stamp_from_claim(1),
             &[WantedRow {
                 build_id: b2,
                 derivation_id: d1,
@@ -95,7 +96,7 @@ async fn wanted_rows_recorded_and_isolated_per_build() -> anyhow::Result<()> {
     // Re-record b1's d1 contribution: replaces b1's row only.
     let fenced_outcome = db
         .record_wanted_fenced(
-            1,
+            ServingGeneration::stamp_from_claim(1),
             &[WantedRow {
                 build_id: b1,
                 derivation_id: d1,
@@ -162,7 +163,7 @@ async fn effective_wanted_union_is_live_only_and_saturating() -> anyhow::Result<
     ] {
         let fenced_outcome = db
             .record_wanted_fenced(
-                1,
+                ServingGeneration::stamp_from_claim(1),
                 &[WantedRow {
                     build_id: b,
                     derivation_id: d,
@@ -186,7 +187,7 @@ async fn effective_wanted_union_is_live_only_and_saturating() -> anyhow::Result<
     // An empty contribution saturates the union to "all declared".
     let fenced_outcome = db
         .record_wanted_fenced(
-            1,
+            ServingGeneration::stamp_from_claim(1),
             &[WantedRow {
                 build_id: b2,
                 derivation_id: d,
@@ -244,7 +245,7 @@ async fn wanted_write_below_floor_is_fenced() -> anyhow::Result<()> {
     // fenced: rolled back, nothing written.
     let outcome = db
         .record_wanted_fenced(
-            1,
+            ServingGeneration::stamp_from_claim(1),
             &[WantedRow {
                 build_id: b,
                 derivation_id: d,
@@ -265,7 +266,7 @@ async fn wanted_write_below_floor_is_fenced() -> anyhow::Result<()> {
     // Positive control: the current tenure (at the floor) applies.
     let outcome = db
         .record_wanted_fenced(
-            2,
+            ServingGeneration::stamp_from_claim(2),
             &[WantedRow {
                 build_id: b,
                 derivation_id: d,
@@ -295,7 +296,7 @@ async fn wanted_rows_purged_with_build() -> anyhow::Result<()> {
 
     let fenced_outcome = db
         .record_wanted_fenced(
-            1,
+            ServingGeneration::stamp_from_claim(1),
             &[
                 WantedRow {
                     build_id: b1,
@@ -348,7 +349,10 @@ async fn wanted_rows_purged_with_build() -> anyhow::Result<()> {
     );
 
     // Purge b1's contributions.
-    let deleted = match db.delete_build(b1, 1).await? {
+    let deleted = match db
+        .delete_build(b1, ServingGeneration::stamp_from_claim(1))
+        .await?
+    {
         crate::db::FencedOutcome::Applied(n) => n,
         other => panic!("expected Applied, got {other:?}"),
     };
@@ -405,7 +409,9 @@ async fn gc_dead_wanted_sweeps_terminal_and_orphans() -> anyhow::Result<()> {
         .execute(&test_db.pool)
         .await?;
 
-    let deleted = db.gc_dead_build_wanted_outputs(86_400.0, 1000, 1).await?;
+    let deleted = db
+        .gc_dead_build_wanted_outputs(86_400.0, 1000, ServingGeneration::stamp_from_claim(1))
+        .await?;
     assert_eq!(deleted, 2, "terminal-old + orphan");
     let remaining: Vec<Uuid> =
         sqlx::query_scalar("SELECT build_id FROM build_wanted_outputs ORDER BY build_id")
@@ -437,7 +443,8 @@ async fn delete_build_purges_wanted_rows_same_fenced_tx() -> anyhow::Result<()> 
     .await?;
 
     assert_eq!(
-        db.delete_build(b, 1).await?,
+        db.delete_build(b, ServingGeneration::stamp_from_claim(1))
+            .await?,
         FencedOutcome::Applied(1),
         "one wanted row purged with the build"
     );
@@ -473,7 +480,7 @@ async fn effective_wanted_union_saturates_for_rowless_live_build() -> anyhow::Re
     // b1 contributes a narrow row; b2 is a member with NO wanted row.
     let fenced_outcome = db
         .record_wanted_fenced(
-            1,
+            ServingGeneration::stamp_from_claim(1),
             &[WantedRow {
                 build_id: b1,
                 derivation_id: d1,
@@ -525,7 +532,7 @@ async fn record_wanted_upsert_unions_not_replaces() -> anyhow::Result<()> {
     for names in [&["out".to_string()][..], &["doc".to_string()][..]] {
         let fenced_outcome = db
             .record_wanted_fenced(
-                1,
+                ServingGeneration::stamp_from_claim(1),
                 &[WantedRow {
                     build_id: b1,
                     derivation_id: d1,
@@ -546,7 +553,7 @@ async fn record_wanted_upsert_unions_not_replaces() -> anyhow::Result<()> {
     // Either side '{}' saturates the stored row to '{}' (= all).
     let fenced_outcome = db
         .record_wanted_fenced(
-            1,
+            ServingGeneration::stamp_from_claim(1),
             &[WantedRow {
                 build_id: b1,
                 derivation_id: d1,

@@ -3,6 +3,7 @@
 //! materialization pins; materialization pins are released only by
 //! the all-interest-terminal rule (PP-2).
 
+use crate::db::ServingGeneration;
 use rio_test_support::TestDb;
 use uuid::Uuid;
 
@@ -152,7 +153,7 @@ async fn materialization_pins_released_only_after_all_interest_terminal() -> any
         .await?;
     let fenced_outcome = db
         .record_wanted_fenced(
-            1,
+            ServingGeneration::stamp_from_claim(1),
             &[WantedRow {
                 build_id,
                 derivation_id: drv_id,
@@ -170,7 +171,7 @@ async fn materialization_pins_released_only_after_all_interest_terminal() -> any
             None,
             JobOrigin::Pruned,
             None,
-            1,
+            ServingGeneration::stamp_from_claim(1),
         )
         .await?
     else {
@@ -201,7 +202,7 @@ async fn materialization_pins_released_only_after_all_interest_terminal() -> any
             job_id,
             Some(Uuid::now_v7()),
             JobState::ResolvedSuccess,
-            1,
+            ServingGeneration::stamp_from_claim(1),
         )
         .await?;
     assert!(fenced_outcome.settled());
@@ -257,7 +258,14 @@ async fn pin_kinds_are_disjoint_rows() -> anyhow::Result<()> {
     // The drv is re-minted as a materialization job; its execution
     // ingests/verifies the same path and pins at ingest.
     let FencedJobCreate::Applied { job_id, .. } = db
-        .create_materialization_job_fenced(drv_id, "fs-seq-drv", None, JobOrigin::Reprobe, None, 1)
+        .create_materialization_job_fenced(
+            drv_id,
+            "fs-seq-drv",
+            None,
+            JobOrigin::Reprobe,
+            None,
+            ServingGeneration::stamp_from_claim(1),
+        )
         .await?
     else {
         anyhow::bail!("job create must apply");
@@ -285,7 +293,7 @@ async fn pin_kinds_are_disjoint_rows() -> anyhow::Result<()> {
             job_id,
             Some(Uuid::now_v7()),
             JobState::ResolvedSuccess,
-            1,
+            ServingGeneration::stamp_from_claim(1),
         )
         .await?;
     assert_eq!(
@@ -442,7 +450,7 @@ async fn pins_survive_rowless_live_interest() -> anyhow::Result<()> {
             None,
             JobOrigin::Pruned,
             None,
-            1,
+            ServingGeneration::stamp_from_claim(1),
         )
         .await?
     else {
@@ -460,7 +468,7 @@ async fn pins_survive_rowless_live_interest() -> anyhow::Result<()> {
             job_id,
             Some(Uuid::now_v7()),
             JobState::ResolvedSuccess,
-            1,
+            ServingGeneration::stamp_from_claim(1),
         )
         .await?;
     assert!(fenced_outcome.settled());

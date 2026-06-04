@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use super::{FencedBegin, FencedOutcome, SchedulerDb};
+use super::{FencedBegin, FencedOutcome, SchedulerDb, ServingGeneration};
 use crate::db::attempts::AttemptRow;
 use crate::state::{JobOrigin, JobState};
 
@@ -306,7 +306,7 @@ impl SchedulerDb {
         tenant_id: Option<Uuid>,
         origin: JobOrigin,
         carried_realized_paths: Option<&[String]>,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
     ) -> Result<FencedJobCreate, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
             FencedBegin::Fenced { .. } => return Ok(FencedJobCreate::Fenced),
@@ -321,7 +321,7 @@ impl SchedulerDb {
                 origin,
                 carried_realized_paths,
             }],
-            serving_generation,
+            serving_generation.as_i64(),
         )
         .await?;
         tx.commit().await?;
@@ -375,7 +375,7 @@ impl SchedulerDb {
         job_id: Uuid,
         resolution_exec_id: Option<Uuid>,
         to_state: JobState,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
     ) -> Result<FencedOutcome, sqlx::Error> {
         debug_assert!(
             to_state != JobState::Pending,
@@ -406,7 +406,7 @@ impl SchedulerDb {
         &self,
         job_id: Uuid,
         park_until_epoch: f64,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
     ) -> Result<FencedOutcome, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
             FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
@@ -442,7 +442,7 @@ impl SchedulerDb {
     pub(crate) async fn cancel_job_and_close_attempt_fenced(
         &self,
         job_id: Uuid,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
     ) -> Result<FencedOutcome, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
             FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
@@ -541,7 +541,7 @@ impl SchedulerDb {
         &self,
         horizon_secs: f64,
         limit: i64,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
     ) -> Result<u64, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
             crate::db::FencedBegin::Fenced { .. } => return Ok(0),

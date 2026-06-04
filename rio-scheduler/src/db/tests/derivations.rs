@@ -1,5 +1,6 @@
 //! Poison/retry/status transition tests.
 
+use crate::db::ServingGeneration;
 use rio_test_support::TestDb;
 use uuid::Uuid;
 
@@ -25,7 +26,9 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
     // AND assigned_builder_id=NULL. No separate status update needed.
     // (No claims rows in this test -> any serving generation passes the
     // claims-floor fence; same for every write below.)
-    let fenced_outcome = db.persist_poisoned(&drv_hash, 1).await?;
+    let fenced_outcome = db
+        .persist_poisoned(&drv_hash, ServingGeneration::stamp_from_claim(1))
+        .await?;
     assert!(fenced_outcome.settled());
 
     // Verify all three columns updated in one statement.
@@ -51,7 +54,9 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
     );
 
     // clear_poison → no longer loadable; status reset to 'created'.
-    let fenced_outcome = db.clear_poison(&drv_hash, 1).await?;
+    let fenced_outcome = db
+        .clear_poison(&drv_hash, ServingGeneration::stamp_from_claim(1))
+        .await?;
     assert!(fenced_outcome.settled());
     let rows = db.load_poisoned_derivations().await?;
     assert!(
@@ -90,7 +95,9 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
         .collect();
     for h in &hashes {
         insert_test_derivation(&db, h.as_str()).await?;
-        let fenced_outcome = db.persist_poisoned(h, 1).await?;
+        let fenced_outcome = db
+            .persist_poisoned(h, ServingGeneration::stamp_from_claim(1))
+            .await?;
         assert!(fenced_outcome.settled());
     }
     assert_eq!(db.load_poisoned_derivations().await?.len(), 100);
@@ -98,7 +105,9 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
     // One call → 100 rows affected. The single-round-trip property is
     // structural (one `execute()`), so the assertion is on
     // `rows_affected`, not a query-count mock.
-    let affected = db.clear_poison_batch(&hashes, 1).await?;
+    let affected = db
+        .clear_poison_batch(&hashes, ServingGeneration::stamp_from_claim(1))
+        .await?;
     assert_eq!(
         affected,
         FencedOutcome::Applied(100),
@@ -123,7 +132,8 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
 
     // Empty input: no-op, no PG round-trip.
     assert_eq!(
-        db.clear_poison_batch(&[], 1).await?,
+        db.clear_poison_batch(&[], ServingGeneration::stamp_from_claim(1))
+            .await?,
         FencedOutcome::Applied(0)
     );
     Ok(())
@@ -332,7 +342,10 @@ async fn test_sweep_stale_assignments_repairs_torn_terminal() -> anyhow::Result<
     );
 
     // Sweep repairs the torn row only.
-    let swept = match db.sweep_stale_assignments(1).await? {
+    let swept = match db
+        .sweep_stale_assignments(ServingGeneration::stamp_from_claim(1))
+        .await?
+    {
         crate::db::FencedOutcome::Applied(n) => n,
         other => panic!("expected Applied, got {other:?}"),
     };
@@ -358,7 +371,8 @@ async fn test_sweep_stale_assignments_repairs_torn_terminal() -> anyhow::Result<
     );
     // Idempotent.
     assert_eq!(
-        db.sweep_stale_assignments(1).await?,
+        db.sweep_stale_assignments(ServingGeneration::stamp_from_claim(1))
+            .await?,
         crate::db::FencedOutcome::Applied(0)
     );
     Ok(())
@@ -412,33 +426,47 @@ async fn stale_tenure_status_and_poison_writes_are_fenced() -> anyhow::Result<()
     // --- The deposed tenure-1 replica's late writes: all must be fenced ---
     // Terminal status persist (would also close assignment rows).
     assert_eq!(
-        db.update_derivation_status(&plain, DerivationStatus::Cancelled, None, 1)
-            .await?,
+        db.update_derivation_status(
+            &plain,
+            DerivationStatus::Cancelled,
+            None,
+            ServingGeneration::stamp_from_claim(1)
+        )
+        .await?,
         FencedOutcome::Fenced,
         "the status persist must be fenced below the floor"
     );
     // Batch status persist.
     assert_eq!(
-        db.update_derivation_status_batch(&[plain.as_str()], DerivationStatus::DependencyFailed, 1)
-            .await?,
+        db.update_derivation_status_batch(
+            &[plain.as_str()],
+            DerivationStatus::DependencyFailed,
+            ServingGeneration::stamp_from_claim(1)
+        )
+        .await?,
         FencedOutcome::Fenced,
         "the batch status persist must be fenced below the floor"
     );
     // Poison stamp on the plain row.
     assert_eq!(
-        db.persist_poisoned(&plain, 1).await?,
+        db.persist_poisoned(&plain, ServingGeneration::stamp_from_claim(1))
+            .await?,
         FencedOutcome::Fenced,
         "the poison stamp must be fenced below the floor"
     );
     // Poison clear (single + batch) on the successor's poisoned row.
     assert_eq!(
-        db.clear_poison(&poisoned, 1).await?,
+        db.clear_poison(&poisoned, ServingGeneration::stamp_from_claim(1))
+            .await?,
         FencedOutcome::Fenced,
         "the poison clear must be fenced below the floor"
     );
     assert_eq!(
-        db.clear_poison_batch(std::slice::from_ref(&poisoned), 1)
-            .await?,
+        db.clear_poison_batch(
+            std::slice::from_ref(&poisoned),
+            ServingGeneration::stamp_from_claim(1)
+        )
+        .await?,
         FencedOutcome::Fenced,
         "the batch poison clear must be fenced below the floor"
     );
@@ -490,7 +518,11 @@ async fn current_tenure_status_and_poison_writes_apply() -> anyhow::Result<()> {
     insert_test_derivation(&db, h.as_str()).await?;
 
     // Fresh cluster (no claims): everything applies.
-    assert_eq!(db.persist_poisoned(&h, 1).await?, FencedOutcome::Applied(0));
+    assert_eq!(
+        db.persist_poisoned(&h, ServingGeneration::stamp_from_claim(1))
+            .await?,
+        FencedOutcome::Applied(0)
+    );
     let (status,): (String,) = sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = $1")
         .bind(h.as_str())
         .fetch_one(&test_db.pool)
@@ -503,10 +535,19 @@ async fn current_tenure_status_and_poison_writes_apply() -> anyhow::Result<()> {
     )
     .execute(&test_db.pool)
     .await?;
-    assert_eq!(db.clear_poison(&h, 3).await?, FencedOutcome::Applied(0));
     assert_eq!(
-        db.update_derivation_status(&h, DerivationStatus::Ready, None, 3)
+        db.clear_poison(&h, ServingGeneration::stamp_from_claim(3))
             .await?,
+        FencedOutcome::Applied(0)
+    );
+    assert_eq!(
+        db.update_derivation_status(
+            &h,
+            DerivationStatus::Ready,
+            None,
+            ServingGeneration::stamp_from_claim(3)
+        )
+        .await?,
         FencedOutcome::Applied(0)
     );
     let (status, poisoned_at): (String, Option<f64>) = sqlx::query_as(

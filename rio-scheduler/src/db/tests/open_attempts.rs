@@ -1,5 +1,6 @@
 //! Open attempt view tests (the OA5 / busy-bridge read).
 
+use crate::db::ServingGeneration;
 use rio_test_support::TestDb;
 use uuid::Uuid;
 
@@ -186,7 +187,7 @@ async fn mint_persists_dispatched_deadline_and_view_returns_it() -> anyhow::Resu
         .mint_pull_attempt_fenced(
             drv,
             &ExecutorId::from("oa-deadline"),
-            1,
+            ServingGeneration::stamp_from_claim(1),
             exec,
             &log_hash("oadeadline"),
             Some("node-1"),

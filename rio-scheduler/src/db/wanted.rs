@@ -17,7 +17,7 @@
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use super::{FencedBegin, FencedOutcome, SchedulerDb, encode_pg_text_array};
+use super::{FencedBegin, FencedOutcome, SchedulerDb, ServingGeneration, encode_pg_text_array};
 
 /// One (build, derivation) wanted contribution, as the merge records it.
 pub(crate) struct WantedRow<'a> {
@@ -93,7 +93,7 @@ impl SchedulerDb {
     #[cfg(test)]
     pub(crate) async fn record_wanted_fenced(
         &self,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
         rows: &[WantedRow<'_>],
     ) -> Result<FencedOutcome, sqlx::Error> {
         if rows.is_empty() {
@@ -159,7 +159,7 @@ impl SchedulerDb {
     /// rows are the AW4 fix; the backfill only fills legacy gaps).
     pub(crate) async fn backfill_wanted_fenced(
         &self,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
         build_id: Uuid,
         derivation_id: Uuid,
     ) -> Result<FencedOutcome, sqlx::Error> {
@@ -215,7 +215,7 @@ impl SchedulerDb {
         &self,
         horizon_secs: f64,
         limit: i64,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
     ) -> Result<u64, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
             FencedBegin::Fenced { .. } => return Ok(0),

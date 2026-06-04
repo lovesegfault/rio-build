@@ -1,5 +1,6 @@
 //! Batch upsert tests — UNNEST scaling + text-array encoding.
 
+use crate::db::ServingGeneration;
 use rio_test_support::TestDb;
 use uuid::Uuid;
 
@@ -321,7 +322,12 @@ async fn same_generation_write_at_floor_applies() -> anyhow::Result<()> {
     // contract — it does not propagate the row count — so the SELECT
     // below is the actually-changed proof.)
     let outcome = db
-        .update_derivation_status(&hash, DerivationStatus::Queued, None, 5)
+        .update_derivation_status(
+            &hash,
+            DerivationStatus::Queued,
+            None,
+            ServingGeneration::stamp_from_claim(5),
+        )
         .await?;
     assert!(
         matches!(outcome, FencedOutcome::Applied(_)),
@@ -351,7 +357,12 @@ async fn empty_floor_write_applies() -> anyhow::Result<()> {
     let hash: crate::state::DrvHash = "fence-fresh".into();
     insert_test_derivation(&db, hash.as_str()).await?;
     let outcome = db
-        .update_derivation_status(&hash, DerivationStatus::Queued, None, 1)
+        .update_derivation_status(
+            &hash,
+            DerivationStatus::Queued,
+            None,
+            ServingGeneration::stamp_from_claim(1),
+        )
         .await?;
     assert!(
         matches!(outcome, FencedOutcome::Applied(_)),

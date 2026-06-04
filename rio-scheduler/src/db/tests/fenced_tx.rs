@@ -7,6 +7,7 @@
 //! READ-COMMITTED TOCTOU the begin-time floor read leaves open
 //! (bug_261).
 
+use crate::db::ServingGeneration;
 use rio_test_support::TestDb;
 use uuid::Uuid;
 
@@ -35,7 +36,10 @@ async fn begin_fenced_below_floor_writes_nothing() -> anyhow::Result<()> {
     let db = SchedulerDb::new(test_db.pool.clone());
     insert_claim(&test_db.pool, 5).await?;
 
-    match db.begin_fenced(4).await? {
+    match db
+        .begin_fenced(ServingGeneration::stamp_from_claim(4))
+        .await?
+    {
         FencedBegin::Fenced { floor } => assert_eq!(floor, 5),
         FencedBegin::Open(_) => panic!("generation 4 must not pass a floor of 5"),
     }
@@ -49,7 +53,10 @@ async fn begin_fenced_equal_generation_passes() -> anyhow::Result<()> {
     let db = SchedulerDb::new(test_db.pool.clone());
     insert_claim(&test_db.pool, 5).await?;
 
-    match db.begin_fenced(5).await? {
+    match db
+        .begin_fenced(ServingGeneration::stamp_from_claim(5))
+        .await?
+    {
         FencedBegin::Open(ftx) => ftx.commit().await?,
         FencedBegin::Fenced { .. } => panic!("equal generation must pass (>= comparison)"),
     }
@@ -62,7 +69,10 @@ async fn begin_fenced_equal_generation_passes() -> anyhow::Result<()> {
 async fn begin_fenced_fresh_cluster_passes() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
     let db = SchedulerDb::new(test_db.pool.clone());
-    match db.begin_fenced(1).await? {
+    match db
+        .begin_fenced(ServingGeneration::stamp_from_claim(1))
+        .await?
+    {
         FencedBegin::Open(ftx) => ftx.commit().await?,
         FencedBegin::Fenced { .. } => panic!("fresh cluster must admit"),
     }
@@ -80,7 +90,7 @@ async fn fenced_tx_drop_rolls_back() -> anyhow::Result<()> {
         .mint_pull_attempt_fenced(
             drv_id,
             &ExecutorId::from("w-drop"),
-            1,
+            ServingGeneration::stamp_from_claim(1),
             exec_id,
             "droproll",
             None,
@@ -91,7 +101,10 @@ async fn fenced_tx_drop_rolls_back() -> anyhow::Result<()> {
     assert!(outcome.settled());
 
     {
-        let mut ftx = match db.begin_fenced(1).await? {
+        let mut ftx = match db
+            .begin_fenced(ServingGeneration::stamp_from_claim(1))
+            .await?
+        {
             FencedBegin::Open(ftx) => ftx,
             FencedBegin::Fenced { .. } => panic!("must admit"),
         };
@@ -121,7 +134,10 @@ async fn commit_refenced_refuses_on_mid_tx_claim() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
     let db = SchedulerDb::new(test_db.pool.clone());
 
-    let ftx = match db.begin_fenced(1).await? {
+    let ftx = match db
+        .begin_fenced(ServingGeneration::stamp_from_claim(1))
+        .await?
+    {
         FencedBegin::Open(ftx) => ftx,
         FencedBegin::Fenced { .. } => panic!("must admit at begin"),
     };
@@ -158,7 +174,10 @@ async fn mint_statement_guard_blocks_generation_regression() -> anyhow::Result<(
     let drv_id = insert_test_derivation(&db, "guardrace").await?;
 
     // Deposed replica at generation 4: floor read sees the gen-4 world.
-    let mut deposed = match db.begin_fenced(4).await? {
+    let mut deposed = match db
+        .begin_fenced(ServingGeneration::stamp_from_claim(4))
+        .await?
+    {
         FencedBegin::Open(ftx) => ftx,
         FencedBegin::Fenced { .. } => panic!("gen 4 must admit in a gen-4 world"),
     };
@@ -172,7 +191,7 @@ async fn mint_statement_guard_blocks_generation_regression() -> anyhow::Result<(
         .mint_pull_attempt_fenced(
             drv_id,
             &ExecutorId::from("w-successor"),
-            5,
+            ServingGeneration::stamp_from_claim(5),
             successor_exec,
             "guardrace",
             None,
@@ -225,7 +244,7 @@ async fn mint_same_generation_remint_applies() -> anyhow::Result<()> {
         .mint_pull_attempt_fenced(
             drv_id,
             &ExecutorId::from("w-1"),
-            3,
+            ServingGeneration::stamp_from_claim(3),
             first,
             "remint",
             None,
@@ -240,7 +259,7 @@ async fn mint_same_generation_remint_applies() -> anyhow::Result<()> {
         .mint_pull_attempt_fenced(
             drv_id,
             &ExecutorId::from("w-2"),
-            3,
+            ServingGeneration::stamp_from_claim(3),
             second,
             "remint",
             None,
@@ -278,7 +297,7 @@ async fn resource_floor_is_fenced_and_monotone() -> anyhow::Result<()> {
         deadline_secs: 0,
     };
     assert!(
-        db.update_resource_floor(&drv_hash, &promoted, 2)
+        db.update_resource_floor(&drv_hash, &promoted, ServingGeneration::stamp_from_claim(2))
             .await?
             .settled()
     );
@@ -290,7 +309,8 @@ async fn resource_floor_is_fenced_and_monotone() -> anyhow::Result<()> {
         deadline_secs: 0,
     };
     assert_eq!(
-        db.update_resource_floor(&drv_hash, &stale, 1).await?,
+        db.update_resource_floor(&drv_hash, &stale, ServingGeneration::stamp_from_claim(1))
+            .await?,
         FencedOutcome::Fenced
     );
     let mem: i64 =
@@ -304,7 +324,7 @@ async fn resource_floor_is_fenced_and_monotone() -> anyhow::Result<()> {
     // but the GREATEST ratchet keeps 16G — the same-tenure regression
     // the fence cannot see.
     assert!(
-        db.update_resource_floor(&drv_hash, &stale, 2)
+        db.update_resource_floor(&drv_hash, &stale, ServingGeneration::stamp_from_claim(2))
             .await?
             .settled()
     );
@@ -322,7 +342,7 @@ async fn resource_floor_is_fenced_and_monotone() -> anyhow::Result<()> {
         deadline_secs: 0,
     };
     assert!(
-        db.update_resource_floor(&drv_hash, &bigger, 2)
+        db.update_resource_floor(&drv_hash, &bigger, ServingGeneration::stamp_from_claim(2))
             .await?
             .settled()
     );

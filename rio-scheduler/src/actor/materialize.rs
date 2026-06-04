@@ -1440,7 +1440,7 @@ impl DagActor {
         error_detail: Option<String>,
         source_node: Option<String>,
         termination_reason: Option<&'static str>,
-        serving_generation: i64,
+        serving_generation: crate::db::ServingGeneration,
     ) -> WriteDisposition {
         let mut row = crate::db::attempts::AttemptRow::new(
             derivation_id,
@@ -1502,7 +1502,7 @@ impl DagActor {
         job_id: Option<Uuid>,
         exec_id: Uuid,
         carried_paths: &[String],
-        serving_generation: i64,
+        serving_generation: crate::db::ServingGeneration,
     ) {
         let d = match job_id {
             Some(job_id) => {
@@ -1542,7 +1542,7 @@ impl DagActor {
         exec_id: Uuid,
         drv_hash: &DrvHash,
         charge_row: Option<crate::db::attempts::AttemptRow>,
-        serving_generation: i64,
+        serving_generation: crate::db::ServingGeneration,
     ) -> WriteDisposition {
         let result: Result<Option<(u64, bool)>, sqlx::Error> = async {
             let mut tx = match self.db.begin_fenced(serving_generation).await? {
@@ -1600,7 +1600,7 @@ impl DagActor {
         job_id: Uuid,
         exec_id: Option<Uuid>,
         to_state: crate::state::JobState,
-        serving_generation: i64,
+        serving_generation: crate::db::ServingGeneration,
     ) -> WriteDisposition {
         match self
             .db
@@ -1745,7 +1745,7 @@ impl DagActor {
         job_id: Option<Uuid>,
         infra_count: u32,
         executor: Option<&ExecutorId>,
-        serving_generation: i64,
+        serving_generation: crate::db::ServingGeneration,
     ) {
         let base = self.materialization_cfg.park_backoff_base_secs;
         let cap = self.materialization_cfg.park_backoff_cap_secs;

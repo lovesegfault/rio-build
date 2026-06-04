@@ -18,6 +18,7 @@
 use uuid::Uuid;
 
 use super::SchedulerDb;
+use super::ServingGeneration;
 
 /// One attempt resolved by `exec_id` (the `ReportOutcome` lookup).
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -264,7 +265,7 @@ impl SchedulerDb {
         &self,
         derivation_id: Uuid,
         executor_id: &crate::state::ExecutorId,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
         exec_id: Uuid,
         log_hash: &str,
         source_node: Option<&str>,
@@ -279,7 +280,7 @@ impl SchedulerDb {
             tx.conn(),
             derivation_id,
             executor_id.as_str(),
-            serving_generation,
+            serving_generation.as_i64(),
             exec_id,
         )
         .await?;

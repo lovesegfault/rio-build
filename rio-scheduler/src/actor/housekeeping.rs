@@ -1011,7 +1011,7 @@ impl DagActor {
                 DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
             )
         });
-        let serving_generation = self.leader.generation() as i64;
+        let serving_generation = self.serving_generation;
         let mut row = crate::db::attempts::AttemptRow::new(
             attempt.derivation_id,
             OutcomeClass::ExecutorCrash,
@@ -1057,7 +1057,7 @@ impl DagActor {
         let (won, decision) = match result {
             Ok(Some(pair)) => pair,
             Ok(None) => {
-                info!(drv_hash = %drv_hash, serving_generation,
+                info!(drv_hash = %drv_hash, serving_generation = serving_generation.as_i64(),
                       "establishment sweep: serving generation below the claims floor; nothing written");
                 return;
             }

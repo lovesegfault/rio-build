@@ -4,7 +4,7 @@ use sqlx::PgConnection;
 
 use super::{
     AssignmentStatus, FencedBegin, FencedOutcome, PoisonedDerivationRow, SchedulerDb,
-    terminal_status_sql,
+    ServingGeneration, terminal_status_sql,
 };
 use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 
@@ -100,7 +100,7 @@ impl SchedulerDb {
         drv_hash: &DrvHash,
         status: DerivationStatus,
         assigned_executor: Option<&ExecutorId>,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
     ) -> Result<FencedOutcome, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
             FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
@@ -181,7 +181,7 @@ impl SchedulerDb {
         &self,
         drv_hashes: &[&str],
         status: DerivationStatus,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
     ) -> Result<FencedOutcome, sqlx::Error> {
         if drv_hashes.is_empty() {
             return Ok(FencedOutcome::Applied(0));
@@ -221,7 +221,7 @@ impl SchedulerDb {
         &self,
         drv_hash: &DrvHash,
         floor: &crate::state::ResourceFloor,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
     ) -> Result<FencedOutcome, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
             FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
@@ -303,7 +303,7 @@ impl SchedulerDb {
     pub(crate) async fn persist_poisoned(
         &self,
         drv_hash: &DrvHash,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
     ) -> Result<FencedOutcome, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
             FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
@@ -334,7 +334,7 @@ impl SchedulerDb {
     /// writes nothing.
     pub(crate) async fn sweep_stale_assignments(
         &self,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
     ) -> Result<FencedOutcome, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
             FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
@@ -394,7 +394,7 @@ impl SchedulerDb {
     pub(crate) async fn clear_poison(
         &self,
         drv_hash: &DrvHash,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
     ) -> Result<FencedOutcome, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
             FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
@@ -440,7 +440,7 @@ impl SchedulerDb {
     pub(crate) async fn clear_poison_batch(
         &self,
         drv_hashes: &[DrvHash],
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
     ) -> Result<FencedOutcome, sqlx::Error> {
         if drv_hashes.is_empty() {
             return Ok(FencedOutcome::Applied(0));

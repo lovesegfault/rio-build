@@ -7,7 +7,9 @@
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use super::{BuildListRow, FencedBegin, FencedOutcome, SchedulerDb, list_builds_select};
+use super::{
+    BuildListRow, FencedBegin, FencedOutcome, SchedulerDb, ServingGeneration, list_builds_select,
+};
 use crate::state::{BuildState, BuildStateExt};
 
 impl SchedulerDb {
@@ -206,7 +208,7 @@ impl SchedulerDb {
     pub(crate) async fn delete_build(
         &self,
         build_id: Uuid,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
     ) -> Result<FencedOutcome, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
             FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),

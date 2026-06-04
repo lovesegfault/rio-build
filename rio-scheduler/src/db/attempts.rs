@@ -26,6 +26,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::SchedulerDb;
+use super::ServingGeneration;
 use crate::state::{
     AttemptEventKind, AttemptKind, AttemptRecord, ExecutorId, OutcomeClass, POISON_TTL,
     ReportingParty,
@@ -445,7 +446,7 @@ impl SchedulerDb {
         exec_id: Uuid,
         termination_reason: &str,
         source_node: Option<&str>,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
     ) -> Result<super::FencedOutcome, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
             super::FencedBegin::Fenced { .. } => return Ok(super::FencedOutcome::Fenced),

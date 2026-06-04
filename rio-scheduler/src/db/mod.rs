@@ -450,6 +450,47 @@ impl FencedOutcome {
     }
 }
 
+/// Claim-stamped tenure authority (merged_bug_338 class close).
+///
+/// The generation this leader STAMPED at claim time — as opposed to
+/// the live lease atomic (`leader.generation()`), which a re-acquire
+/// can advance MID-MAILBOX. A fenced write stamped from a fresh atomic
+/// read can carry a tenure the actor never recovered under: the floor
+/// admits it (the new claim just became the floor) while the in-memory
+/// DAG still reflects the old tenure. Every fenced db entry point
+/// therefore takes `ServingGeneration`, and the only constructors are
+/// the boot stamp and the claim stamp (`stamp_from_claim` — exactly
+/// two production call sites, pinned by
+/// `tenure_stamp_exactly_two_production_sites`). The three historical
+/// fresh-atomic-read sites are uncompilable against these signatures
+/// and pinned to zero by
+/// `tenure_authority_no_fresh_atomic_reads_in_write_paths`.
+// r[impl sched.lease.tenure-stamp-type]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ServingGeneration(i64);
+
+impl ServingGeneration {
+    /// Sole constructor: stamp from a durable generation claim.
+    /// Saturating — claims above `i64::MAX` pin to `i64::MAX` (the
+    /// fence compares in i64 domain; saturation can only under-claim,
+    /// never over-claim — fail-closed).
+    pub fn stamp_from_claim(generation: u64) -> Self {
+        Self(i64::try_from(generation).unwrap_or(i64::MAX))
+    }
+
+    /// Kernel-facing projection. Negative stamps are impossible via
+    /// the constructor but the projection still saturates to 0 —
+    /// 0 is below every floor, i.e. always-fenced fail-closed.
+    pub fn to_kernel_u64(self) -> u64 {
+        u64::try_from(self.0).unwrap_or(0)
+    }
+
+    /// SQL-bind / tracing projection, crate-internal.
+    pub(crate) fn as_i64(self) -> i64 {
+        self.0
+    }
+}
+
 /// The fenced-transaction capability: holding a [`FencedTx`] proves
 /// the claims-floor check ran on this transaction's own connection at
 /// construction time (`SchedulerDb::begin_fenced`). It is the ONLY
@@ -626,8 +667,9 @@ impl SchedulerDb {
     /// against a floor read on a different connection.
     pub(crate) async fn begin_fenced(
         &self,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
     ) -> Result<FencedBegin, sqlx::Error> {
+        let serving_generation = serving_generation.as_i64();
         let mut tx = self.pool.begin().await?;
         let floor = claims_floor(&mut tx).await?;
         if !at_or_above_floor(floor, serving_generation) {
@@ -652,7 +694,7 @@ impl SchedulerDb {
         &self,
         exec_id: Uuid,
         status: AssignmentCloseStatus,
-        serving_generation: i64,
+        serving_generation: ServingGeneration,
     ) -> Result<FencedOutcome, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
             FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),

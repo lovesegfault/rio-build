@@ -372,7 +372,7 @@ impl DagActor {
                     "recovery fenced write (expired-at-load poison clear) ran before the \
                      generation claim stamped serving_generation (currently {}) — the \
                      claim-before-recovery-writes ordering is broken",
-                    self.serving_generation
+                    self.serving_generation.as_i64()
                 );
                 match self.db.clear_poison(&hash, self.serving_generation()).await {
                     Ok(crate::db::FencedOutcome::Fenced) => {
@@ -1610,7 +1610,7 @@ impl DagActor {
         // stays at the post-gate tail — writing the lease atomic here
         // would false-positive the TOCTOU gate; the fence reads THIS
         // field, not the atomic.
-        self.serving_generation = i64::try_from(claim_target).unwrap_or(i64::MAX);
+        self.serving_generation = crate::db::ServingGeneration::stamp_from_claim(claim_target);
         self.recovery_claim_stamped = true;
 
         // --- Recover the DAG from PG, under the claimed generation ---

@@ -193,3 +193,96 @@ fn fence_sql_canonical_homes_only() {
          (open-coded floors are bug_269's class — use begin_fenced)"
     );
 }
+
+/// Actor sources for the tenure-authority net (merged_bug_338 class).
+const ACTOR_SOURCES: &[(&str, &str)] = &[
+    ("mod.rs", include_str!("../../actor/mod.rs")),
+    (
+        "housekeeping.rs",
+        include_str!("../../actor/housekeeping.rs"),
+    ),
+    ("pull.rs", include_str!("../../actor/pull.rs")),
+    ("recovery.rs", include_str!("../../actor/recovery.rs")),
+    ("completion.rs", include_str!("../../actor/completion.rs")),
+    ("materialize.rs", include_str!("../../actor/materialize.rs")),
+    ("merge.rs", include_str!("../../actor/merge.rs")),
+    ("build.rs", include_str!("../../actor/build.rs")),
+    ("dispatch.rs", include_str!("../../actor/dispatch.rs")),
+    ("snapshot.rs", include_str!("../../actor/snapshot.rs")),
+    ("executor.rs", include_str!("../../actor/executor.rs")),
+    ("event.rs", include_str!("../../actor/event.rs")),
+];
+
+/// Tenure authority is single-sourced (merged_bug_338): write paths
+/// must use the claim-stamped `self.serving_generation`
+/// ([`crate::db::ServingGeneration`]) — NEVER a fresh
+/// `leader.generation()` atomic read, which can advance mid-mailbox on
+/// a lease re-acquire and stamp evidence with a tenure the actor never
+/// recovered under. Allowed reads of the live atomic, by exact census:
+///
+/// - `mod.rs`: 1 — the constructor's boot stamp (feeds
+///   `ServingGeneration::stamp_from_claim`; there is no claim yet).
+/// - `recovery.rs`: 3 — TOCTOU gate snapshots (read-only generation
+///   COMPARISONS guarding recovery, not write stamps).
+///
+/// Any other occurrence — even one that plumbs the constructor — is a
+/// fresh-atomic-read regression and fails here by name.
+#[test]
+fn tenure_authority_no_fresh_atomic_reads_in_write_paths() {
+    const ALLOWED: &[(&str, usize)] = &[("mod.rs", 1), ("recovery.rs", 3)];
+    let mut offenders = Vec::new();
+    for (file, src) in ACTOR_SOURCES {
+        let code_hits: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                let t = l.trim_start();
+                !t.starts_with("//") && l.contains("leader.generation()")
+            })
+            .map(|(i, l)| (i + 1, l.trim()))
+            .collect();
+        let allowed = ALLOWED
+            .iter()
+            .find(|(f, _)| f == file)
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        if code_hits.len() != allowed {
+            offenders.push(format!(
+                "{file}: {} fresh leader.generation() reads (allowed {allowed}): {:?}",
+                code_hits.len(),
+                code_hits
+            ));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "fresh lease-atomic reads outside the tenure-stamp census \
+         (merged_bug_338 class — use self.serving_generation):\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// The `ServingGeneration` stamp has exactly TWO production
+/// constructors: the boot stamp (`DagActor::new`) and the
+/// claim stamp (`handle_leader_acquired`). A third
+/// `stamp_from_claim` call site means a new tenure-authority seam —
+/// review it against `sched.lease.tenure-stamp-type`.
+#[test]
+fn tenure_stamp_exactly_two_production_sites() {
+    let count: usize = ACTOR_SOURCES
+        .iter()
+        .map(|(_, src)| {
+            src.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && l.contains("stamp_from_claim(")
+                })
+                .count()
+        })
+        .sum();
+    assert_eq!(
+        count, 2,
+        "ServingGeneration::stamp_from_claim must have exactly two \
+         production call sites (boot stamp + claim stamp), found {count}"
+    );
+}

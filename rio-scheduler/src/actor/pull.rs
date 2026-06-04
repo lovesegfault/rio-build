@@ -262,7 +262,7 @@ impl DagActor {
         if !self.leader.is_leader() {
             return Err(PullRejection::NotLeader);
         }
-        let serving_generation = self.leader.generation();
+        let serving_generation = self.serving_generation;
         let generation_floor = self
             .db
             .max_known_generation()
@@ -315,7 +315,7 @@ impl DagActor {
             status,
             open_attempt: open_attempt.as_ref().map(|(e, x)| (e, *x)),
             pulling_identity: &pulling_identity,
-            serving_generation,
+            serving_generation: serving_generation.to_kernel_u64(),
             generation_floor,
             pull_kind: kind,
             build_backoff_expired,
@@ -362,7 +362,7 @@ impl DagActor {
             PullDecision::RejectStaleGeneration => {
                 info!(
                     intent_id = %intent_id,
-                    serving_generation,
+                    serving_generation = serving_generation.as_i64(),
                     ?generation_floor,
                     "pull rejected: serving generation below the durable claims floor"
                 );
@@ -412,7 +412,7 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         pulling_identity: &ExecutorId,
-        serving_generation: u64,
+        serving_generation: crate::db::ServingGeneration,
         kind: rio_evidence_kernel::pull::PullKind,
     ) -> Result<PullOutcome, PullRejection> {
         let Some(db_id) = self.dag.node(drv_hash).and_then(|s| s.db_id) else {
@@ -517,7 +517,7 @@ impl DagActor {
             .mint_pull_attempt_fenced(
                 db_id,
                 pulling_identity,
-                serving_generation as i64,
+                serving_generation,
                 exec_id,
                 &log_hash,
                 profile.source_node.as_deref(),
@@ -529,7 +529,7 @@ impl DagActor {
         if !minted.settled() {
             info!(
                 drv_hash = %drv_hash,
-                serving_generation,
+                serving_generation = serving_generation.as_i64(),
                 "pull mint aborted by the generation fence; no row written"
             );
             return Err(PullRejection::StaleGeneration);
@@ -1053,7 +1053,7 @@ impl DagActor {
         }
         let drv_hash = &DrvHash::from(attempt.core.drv_hash.as_str());
         let executor_id = &ExecutorId::from(attempt.core.executor_id.as_str());
-        let serving_generation = self.leader.generation() as i64;
+        let serving_generation = self.serving_generation;
         let mut row = crate::db::attempts::AttemptRow::new(
             attempt.core.derivation_id,
             crate::state::OutcomeClass::Disconnected,
@@ -1085,7 +1085,7 @@ impl DagActor {
         let inserted = match result {
             Ok(Some(inserted)) => inserted,
             Ok(None) => {
-                info!(drv_hash = %drv_hash, serving_generation,
+                info!(drv_hash = %drv_hash, serving_generation = serving_generation.as_i64(),
                       "uncharged close: serving generation below the claims floor; nothing written");
                 return;
             }

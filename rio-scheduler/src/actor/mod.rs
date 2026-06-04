@@ -469,7 +469,7 @@ pub struct DagActor {
     /// i64 (not u64 like the lease atomic): this value exists solely to
     /// be compared against PG BIGINT floors; converting once at the
     /// stamp sites keeps every fence comparison cast-free.
-    serving_generation: i64,
+    serving_generation: crate::db::ServingGeneration,
     /// Ordering tripwire for the claim-before-recovery-writes invariant
     /// (`sched.evidence.durability`): false at `handle_leader_acquired`
     /// entry, true once the generation claim has stamped
@@ -794,7 +794,9 @@ impl DagActor {
             // read at construction time. K8s-mode actors re-stamp it at
             // every LeaderAcquired's generation claim; always-leader
             // actors keep this value for the process lifetime.
-            serving_generation: i64::try_from(plumbing.leader.generation()).unwrap_or(i64::MAX),
+            serving_generation: crate::db::ServingGeneration::stamp_from_claim(
+                plumbing.leader.generation(),
+            ),
             // No claim has run for this construction-time stamp; the
             // first handle_leader_acquired sets it before recovery.
             recovery_claim_stamped: false,
@@ -844,7 +846,7 @@ impl DagActor {
     /// of this tenure carries — the tenure-tracking field, never a
     /// fresh `self.leader.generation()` read (see the field doc for why
     /// the distinction is load-bearing).
-    pub(super) fn serving_generation(&self) -> i64 {
+    pub(super) fn serving_generation(&self) -> crate::db::ServingGeneration {
         self.serving_generation
     }
 
@@ -857,7 +859,7 @@ impl DagActor {
     /// the write is garbage the queued LeaderLost wipe discards.
     pub(super) fn note_fenced_evidence_write(&self, write: &'static str) {
         warn!(
-            serving_generation = self.serving_generation,
+            serving_generation = self.serving_generation.as_i64(),
             write,
             "evidence write fenced: serving generation below the durable claims floor \
              (deposed replica; a newer tenure owns the evidence now)"

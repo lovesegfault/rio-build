@@ -1961,7 +1961,7 @@ impl DagActor {
             crate::db::FencedBegin::Fenced { floor } => {
                 self.note_fenced_evidence_write("merge transaction (begin-time check)");
                 return Err(ActorError::StaleGeneration {
-                    serving: serving_generation,
+                    serving: serving_generation.as_i64(),
                     floor,
                 });
             }
@@ -2149,7 +2149,7 @@ impl DagActor {
             let created = crate::db::SchedulerDb::create_materialization_jobs_in_tx(
                 tx.conn(),
                 &job_rows,
-                serving_generation,
+                serving_generation.as_i64(),
             )
             .await?;
 
@@ -2204,7 +2204,7 @@ impl DagActor {
             crate::db::FencedCommit::Refenced { floor } => {
                 self.note_fenced_evidence_write("merge transaction (commit-time check)");
                 return Err(ActorError::StaleGeneration {
-                    serving: serving_generation,
+                    serving: serving_generation.as_i64(),
                     floor,
                 });
             }
