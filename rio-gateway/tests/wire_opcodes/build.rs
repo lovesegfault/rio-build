@@ -3268,13 +3268,28 @@ fn next_payloads(frames: &[StderrMessage]) -> Vec<String> {
 ///   quote);
 /// - already-quoted worker line (`> rio: …`) → byte-identical relay,
 ///   NOT double-quoted into `> > rio: …` (quoting is idempotent because
-///   quoted output starts `>`, outside the reserved grammar).
+///   quoted output starts `>`, outside the reserved grammar);
+/// - embedded-newline entry (`…\nrio: …`) → the grammar-speaking TAIL
+///   segment quotes at its post-split byte 0 while the head relays
+///   untouched — the batcher entry stays ONE payload, and the
+///   observer's split is exactly where the forged byte-0 would appear;
+/// - mid-prefix straddle pair (`rio` ‖ `: …`) → both halves relay
+///   byte-identical (inert): neither speaks the grammar at byte 0, and
+///   the observer's per-payload line discipline never recombines
+///   adjacent payloads into one line.
 #[tokio::test]
 async fn test_build_paths_fallback_relayed_worker_grammar_arrives_quoted() -> anyhow::Result<()> {
     let victim = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv";
     let marker_spoof = BuildResult::lost_terminal_relay_line(victim);
     let announcement_spoof = "rio: build 0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string();
     let prequoted = format!("> {marker_spoof}");
+    // An entry whose embedded newline puts the forgery at the tail: the
+    // observer splits the payload, so without per-line quoting the tail
+    // would land at byte 0 of an observed line.
+    let embedded_newline = format!("phase 1 of 2 complete\n{marker_spoof}");
+    // The reserved prefix split mid-prefix across two batch entries:
+    // `"rio"` + `": terminal lost for '…'"`.
+    let (straddle_head, straddle_tail) = marker_spoof.split_at(3);
 
     let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
@@ -3293,6 +3308,9 @@ async fn test_build_paths_fallback_relayed_worker_grammar_arrives_quoted() -> an
                 announcement_spoof.clone().into_bytes(),
                 b"building foo".to_vec(),
                 prequoted.clone().into_bytes(),
+                embedded_newline.clone().into_bytes(),
+                straddle_head.as_bytes().to_vec(),
+                straddle_tail.as_bytes().to_vec(),
             ],
             first_line_number: 0,
         })),
@@ -3320,9 +3338,13 @@ async fn test_build_paths_fallback_relayed_worker_grammar_arrives_quoted() -> an
             format!("> {announcement_spoof}"),
             "building foo".to_string(),
             prequoted,
+            format!("phase 1 of 2 complete\n> {marker_spoof}"),
+            straddle_head.to_string(),
+            straddle_tail.to_string(),
         ],
-        "reserved-grammar worker lines quote; everything else relays \
-         byte-identical, with no double-quoting"
+        "reserved-grammar worker lines quote (tail segments included); \
+         everything else relays byte-identical — no double-quoting, and \
+         straddle halves stay inert"
     );
     // The consumer-side detector — the same parser the replay engine's
     // capture applies — finds no marker anywhere in the relayed stream.
