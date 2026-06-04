@@ -815,9 +815,9 @@ pub(super) async fn reap_orphan_running(
     }
     // The busy source: the open pull-mode attempt view. Fail-closed —
     // an error here means the ledger view is unavailable, so absence
-    // cannot be proven and nothing is reaped this tick. (No leader-age
-    // arm: the view is durable PG state, not an in-memory map that
-    // refills after failover.)
+    // cannot be proven and nothing is reaped this tick. Freshness is
+    // the leader-age gate below (rationale single-homed in this fn's
+    // doc).
     let resp = match admin_call(
         ctx.admin
             .clone()
@@ -908,39 +908,91 @@ pub(super) async fn reap_orphan_running(
     reaped
 }
 
-// r[impl ctrl.job.cancel-close-cause]
-/// The cancel arm's pure selection fold (unit-tested exhaustively): a
-/// Job is selected iff a `recently_closed` entry for its intent
-/// carries `CLOSE_CAUSE_CANCELLED` AND no open attempt covers it. The
+/// §5-Q19 (signed): PG↔kube-apiserver clock-skew slack for the cancel
+/// arm's generation conjunct. Both clocks are server-side/NTP-
+/// disciplined; ≤ 10 s of skew stands as a deployment guarantee.
+/// Documented const, deliberately not config (config would drag the
+/// BLESS/docs-data schema obligations for a deployment invariant).
+/// A genuine cancel whose Job is younger than `closed_age + slack`
+/// (insta-cancel inside the window) is missed by AT MOST the slack and
+/// falls back to orphan-reap / `activeDeadlineSeconds` — the
+/// documented backstop pair.
+pub(super) const CANCEL_CLOSE_SKEW_SLACK_SECS: u64 = 10;
+
+/// A close bound to a Job it may tear down — the ONLY way the cancel
+/// arm selects (bug_113). [`CancelTarget::bind`] owns ALL FOUR
+/// conjuncts; call sites cannot recombine a subset.
+pub(super) struct CancelTarget<'a> {
+    pub(super) job: &'a Job,
+}
+
+impl<'a> CancelTarget<'a> {
+    // r[impl ctrl.job.cancel-close-cause+2]
+    /// Bind `close` to `job` iff every conjunct holds:
+    ///
+    /// 1. **cause**: the close is `CLOSE_CAUSE_CANCELLED` (a normal
+    ///    completion in the Job-status propagation lag is untouchable
+    ///    by type);
+    /// 2. **intent**: the Job's intent annotation matches the close;
+    /// 3. **generation**: the Job PREDATES the close —
+    ///    `job_older_than(closed_age_secs + CANCEL_CLOSE_SKEW_SLACK_SECS)`.
+    ///    A derivation cancelled and re-submitted respawns the SAME
+    ///    deterministic Job name; the fresh Job is younger than the
+    ///    close and therefore structurally unselectable, whether or
+    ///    not its pod has pulled yet (`closed_age_secs` is already on
+    ///    the wire — PG clock; the slack absorbs PG↔apiserver skew);
+    /// 4. **liveness**: no open attempt covers the Job (a re-dispatch
+    ///    that already pulled is busy, not cancellable evidence).
+    pub(super) fn bind(
+        close: &rio_proto::types::ClosedAttempt,
+        job: &'a Job,
+        open_attempts: &[rio_proto::types::OpenAttempt],
+    ) -> Option<Self> {
+        if close.cause != rio_proto::types::CloseCause::Cancelled as i32 {
+            return None;
+        }
+        let intent = job_intent_id(job)?;
+        if intent.is_empty() || intent != close.intent_id {
+            return None;
+        }
+        let min_age = Duration::from_secs(
+            close
+                .closed_age_secs
+                .saturating_add(CANCEL_CLOSE_SKEW_SLACK_SECS),
+        );
+        if !job_older_than(job, min_age) {
+            return None;
+        }
+        if covered_by_open_pull_attempt(job, open_attempts) {
+            return None;
+        }
+        Some(Self { job })
+    }
+}
+
+/// The cancel arm's pure selection fold: a Job is selected iff some
+/// `recently_closed` entry binds to it through [`CancelTarget::bind`]
+/// (all four conjuncts — cause, intent, generation, liveness). The
 /// cause travels WITH the close on the wire — closed-ness alone (the
 /// retired closed→active edge inference over tick-local `seen_open`
-/// evidence) stopped being a verdict: a normal completion sitting in
-/// the Job-status propagation lag window has cause `COMPLETED` and is
-/// untouchable BY TYPE, and bare absence (a pod that never pulled)
-/// matches no entry at all. The open-attempt guard covers re-dispatch:
-/// a derivation cancelled and re-submitted inside the window has a
-/// fresh open attempt, and the new Job (deterministic name — there is
-/// never a second Job per intent) is never selected.
+/// evidence) stopped being a verdict, and bare absence (a pod that
+/// never pulled) matches no entry at all. Re-dispatch is covered
+/// structurally: the respawned Job postdates the close (conjunct 3)
+/// and, once pulled, is covered by its fresh open attempt (conjunct
+/// 4) — the guarantee no longer leans on pull timing.
 pub(super) fn select_closed_attempt_jobs<'a>(
     active: &[&'a Job],
     open_attempts: &[rio_proto::types::OpenAttempt],
     recently_closed: &[rio_proto::types::ClosedAttempt],
 ) -> Vec<&'a Job> {
-    let cancelled: HashSet<&str> = recently_closed
-        .iter()
-        .filter(|c| c.cause == rio_proto::types::CloseCause::Cancelled as i32)
-        .map(|c| c.intent_id.as_str())
-        .collect();
-    if cancelled.is_empty() {
-        return Vec::new();
-    }
     active
         .iter()
-        .filter(|j| {
-            job_intent_id(j).is_some_and(|i| !i.is_empty() && cancelled.contains(i))
-                && !covered_by_open_pull_attempt(j, open_attempts)
+        .filter_map(|j| {
+            recently_closed
+                .iter()
+                .find_map(|c| CancelTarget::bind(c, j, open_attempts))
         })
-        .copied()
+        .map(|t| t.job)
         .collect()
 }
 
@@ -2442,5 +2494,79 @@ mod tests {
             assert_eq!(orphan_reap_grace(), ORPHAN_REAP_GRACE);
             Ok(())
         });
+    }
+
+    /// bug_113 red: a Job created AFTER its intent's cancelled close
+    /// (cancel + fast re-submit respawns the deterministic name) must
+    /// be structurally unselectable — today the selection has no
+    /// generation conjunct and tears down the fresh Job.
+    #[test]
+    fn cancel_never_selects_a_job_created_after_the_close() {
+        // The close happened 60s ago; the respawned Job is 5s old.
+        let fresh = job_with_intent("respawn", "drv-x", Some(1), None, 5);
+        let close = rio_proto::types::ClosedAttempt {
+            intent_id: "drv-x".into(),
+            exec_id: "0198c0de-0000-7000-8000-00000000cafe".into(),
+            cause: rio_proto::types::CloseCause::Cancelled as i32,
+            closed_age_secs: 60,
+        };
+        let active = vec![&fresh];
+        let selected = select_closed_attempt_jobs(&active, &[], &[close]);
+        assert!(
+            selected.is_empty(),
+            "a Job younger than its close must never be cancel-selected: {:?}",
+            selected.iter().map(|j| j.name_any()).collect::<Vec<_>>()
+        );
+    }
+
+    // r[verify ctrl.job.cancel-close-cause+2]
+    /// The four-conjunct bind battery: selected iff cause=Cancelled ∧
+    /// intent match ∧ job-predates-close ∧ ¬covered.
+    #[test]
+    fn cancel_bind_requires_all_four_conjuncts() {
+        let old_job = job_with_intent("old", "drv-x", Some(1), None, 600);
+        let close = |cause: rio_proto::types::CloseCause| rio_proto::types::ClosedAttempt {
+            intent_id: "drv-x".into(),
+            exec_id: "0198c0de-0000-7000-8000-00000000beef".into(),
+            cause: cause as i32,
+            closed_age_secs: 60,
+        };
+        let cancelled = close(rio_proto::types::CloseCause::Cancelled);
+        // All four hold → selected.
+        let active = vec![&old_job];
+        assert_eq!(
+            select_closed_attempt_jobs(&active, &[], std::slice::from_ref(&cancelled)).len(),
+            1
+        );
+        // Cause: a COMPLETED close is untouchable by type.
+        let completed = close(rio_proto::types::CloseCause::Completed);
+        assert!(select_closed_attempt_jobs(&active, &[], &[completed]).is_empty());
+        // Intent: no match, no bind.
+        let other = job_with_intent("other", "drv-y", Some(1), None, 600);
+        let active_other = vec![&other];
+        assert!(
+            select_closed_attempt_jobs(&active_other, &[], std::slice::from_ref(&cancelled))
+                .is_empty()
+        );
+        // Liveness: a covering open attempt blocks the bind.
+        let covering = open_attempt("drv-x");
+        assert!(
+            select_closed_attempt_jobs(&active, &[covering], std::slice::from_ref(&cancelled))
+                .is_empty()
+        );
+        // Generation borderline: a Job exactly inside the skew slack
+        // (age between closed_age and closed_age+slack) is NOT selected
+        // — misses fall to orphan-reap / activeDeadlineSeconds (Q19).
+        let borderline = job_with_intent(
+            "borderline",
+            "drv-x",
+            Some(1),
+            None,
+            60 + (CANCEL_CLOSE_SKEW_SLACK_SECS as i64) - 2,
+        );
+        let active_b = vec![&borderline];
+        assert!(
+            select_closed_attempt_jobs(&active_b, &[], std::slice::from_ref(&cancelled)).is_empty()
+        );
     }
 }

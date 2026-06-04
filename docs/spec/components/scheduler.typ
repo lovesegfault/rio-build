@@ -3022,7 +3022,7 @@ charge-free arm, the sweep then established it as `executor_crash` ---
 seeding the exclusion ledger and the OA2 wedge clustering with verdicts
 about work nobody wanted.
 
-#r("sched.admin.list-open-attempts+3")[
+#r("sched.admin.list-open-attempts+4")[
   `AdminService.ListOpenAttempts` MUST return every open attempt --- an
   active `assignments` row joined to its `drv_executions` row with no
   terminal `drv_attempts` fill. Each entry carries the intent id (drv
@@ -3033,11 +3033,15 @@ about work nobody wanted.
   0 = unknown, and consumers MUST treat 0 as not-expirable); the response
   carries `leader_for_secs` with the same fail-closed freshness semantics as
   #rref("sched.admin.list-executors-leader-age+2"), and `recently_closed`
-  --- every attempt whose assignment reached a terminal status within the
-  recent window (120s), each entry carrying its close cause
+  --- every BUILD-lane attempt whose assignment reached a terminal status
+  within the recent window (120s), each entry carrying its close cause
   (`completed`/`failed`/`cancelled`) so consumers select on CAUSE rather
-  than re-inferring it from the absence of an open row. The RPC is
-  leader-served.
+  than re-inferring it from the absence of an open row. The window MUST
+  carry only closes whose execution row witnesses
+  `attempt_kind = 'build'` (the controller cancel arm's teardown target
+  is a builder Job; a materialization close is store-side work, and an
+  assignment with no execution row has an unknowable kind --- both are
+  denied by default). The RPC is leader-served.
 ]
 The same view feeds the #(refs.metric)("rio_scheduler_open_attempts") gauge
 (the busy-fleet gauge; the stream fleet's `workers_active` is retired) and

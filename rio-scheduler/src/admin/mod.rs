@@ -505,7 +505,7 @@ impl AdminService for AdminServiceImpl {
     /// pull transaction (the only execution writer left). Leader-read
     /// with the same `ensure_leader` discipline as `ListExecutors`;
     /// `leader_for_secs` carries the same fail-closed freshness input.
-    // r[impl sched.admin.list-open-attempts+3]
+    // r[impl sched.admin.list-open-attempts+4]
     #[instrument(skip(self, request), fields(rpc = "ListOpenAttempts"))]
     async fn list_open_attempts(
         &self,

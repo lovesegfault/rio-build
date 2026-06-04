@@ -4944,14 +4944,14 @@ in
     # C2/120 (area C): the AD5 cancel arm selects on CLOSE CAUSE — a
     # CANCELLED entry in the recently_closed window with no covering
     # open attempt — never on the absence of an open row.
-    # r[verify ctrl.job.cancel-close-cause]
+    # r[verify ctrl.job.cancel-close-cause+2]
     quint-spawn-coherence-falsify-cancel-asbuilt = mkQuintWitnessCheck {
       name = "spawn-coherence-falsify-cancel-asbuilt";
       spec = "spawnCoherence";
       main = "spawnCoherenceCancelAsBuilt";
       witness = "cancelArmDeletesOnlyCancelled";
     };
-    # r[verify ctrl.job.cancel-close-cause]
+    # r[verify ctrl.job.cancel-close-cause+2]
     quint-spawn-coherence-cancel-cause = mkQuintCheck {
       name = "spawn-coherence-cancel-cause";
       spec = "spawnCoherence";

@@ -39,7 +39,7 @@ fn log_hash(tag: &str) -> String {
     format!("{tag:0>32}")
 }
 
-// r[verify sched.admin.list-open-attempts+3]
+// r[verify sched.admin.list-open-attempts+4]
 /// The open-attempt view returns exactly the open attempt — not the
 /// terminal-filled one, and not an assignment that never got its
 /// execution row (the join requires the pull-minted pair).
@@ -260,8 +260,8 @@ async fn attempt_resolution_requires_the_execution_row() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify ctrl.job.cancel-close-cause]
-// r[verify sched.admin.list-open-attempts+3]
+// r[verify ctrl.job.cancel-close-cause+2]
+// r[verify sched.admin.list-open-attempts+4]
 /// C2/120: a terminal close inside the window travels on
 /// `recently_closed` WITH its cause — the controller's cancel arm
 /// selects on `CLOSE_CAUSE_CANCELLED`, never on the absence of an
@@ -321,5 +321,60 @@ async fn recently_closed_window_carries_the_close_cause() -> anyhow::Result<()> 
         "the close cause travels with the close"
     );
     assert!(!proto.intent_id.is_empty());
+    Ok(())
+}
+
+/// bug_113 red (scheduler half): the recently-closed window is the
+/// controller cancel arm's evidence feed — a MATERIALIZATION close
+/// (store-side fetch) for a drv whose builder Job is active must not
+/// appear in it, or the cancel arm tears down the builder Job.
+#[tokio::test]
+async fn recently_closed_window_is_build_lane_only() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // A cancelled MATERIALIZATION close moments ago.
+    let drv = insert_test_derivation(&db, "rc-mat").await?;
+    let exec = Uuid::now_v7();
+    db.insert_assignment(drv, &ExecutorId::from("rc-mat"), 1, exec)
+        .await?;
+    sqlx::query(
+        "INSERT INTO drv_executions \
+             (exec_id, drv_hash, executor_id, started_at, attempt_kind) \
+         VALUES ($1, $2, $3, now(), 'materialization')",
+    )
+    .bind(exec)
+    .bind(log_hash("rcmat"))
+    .bind("rc-mat")
+    .execute(&test_db.pool)
+    .await?;
+    sqlx::query(
+        "UPDATE assignments SET status = 'cancelled', completed_at = now() \
+         WHERE exec_id = $1",
+    )
+    .bind(exec)
+    .execute(&test_db.pool)
+    .await?;
+
+    // An assignment with NO execution row at all (kind unknowable):
+    // deny-by-default, same absence-as-verdict law as
+    // `attempt_resolution_requires_the_execution_row`.
+    let rowless = insert_test_derivation(&db, "rc-rowless").await?;
+    let rowless_exec = Uuid::now_v7();
+    db.insert_assignment(rowless, &ExecutorId::from("rc-rowless"), 1, rowless_exec)
+        .await?;
+    sqlx::query(
+        "UPDATE assignments SET status = 'cancelled', completed_at = now() \
+         WHERE exec_id = $1",
+    )
+    .bind(rowless_exec)
+    .execute(&test_db.pool)
+    .await?;
+
+    let closed = db.list_recently_closed_pull_attempts().await?;
+    assert!(
+        closed.is_empty(),
+        "non-build closes must not feed the cancel arm: {closed:?}"
+    );
     Ok(())
 }

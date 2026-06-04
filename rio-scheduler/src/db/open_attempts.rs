@@ -499,6 +499,13 @@ impl SchedulerDb {
     /// absence by the consumer (C2/120).
     ///
     /// Runtime-bound (not `query!`) per the wave's regen rule.
+    /// **Kind discipline (bug_113, the bug_266 predicate shape).** The
+    /// window is the controller cancel arm's evidence feed — BUILD-lane
+    /// closes only. A materialization close is store-side work whose
+    /// teardown target is never a builder Job, and an assignment with
+    /// no execution row has an unknowable kind: both are denied by the
+    /// `EXISTS … attempt_kind = 'build'` witness (deny-by-default,
+    /// absence-as-verdict).
     pub(crate) async fn list_recently_closed_pull_attempts(
         &self,
     ) -> Result<Vec<ClosedAttemptRow>, sqlx::Error> {
@@ -510,6 +517,9 @@ impl SchedulerDb {
              JOIN derivations d ON d.derivation_id = a.derivation_id \
              WHERE a.status IN ('completed', 'failed', 'cancelled') \
                AND a.completed_at > now() - make_interval(secs => $1::float8) \
+               AND EXISTS (SELECT 1 FROM drv_executions e \
+                           WHERE e.exec_id = a.exec_id \
+                             AND e.attempt_kind = 'build') \
              ORDER BY a.completed_at DESC, a.exec_id",
         )
         .bind(RECENTLY_CLOSED_WINDOW_SECS as f64)

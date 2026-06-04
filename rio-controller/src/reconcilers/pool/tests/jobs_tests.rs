@@ -1346,7 +1346,7 @@ fn report_intent_id_carries_the_intent_annotation() {
 // AD5 cancel arm (pull-mode pools only)
 // ───────────────────────────────────────────────────────────────────
 
-// r[verify ctrl.job.cancel-close-cause]
+// r[verify ctrl.job.cancel-close-cause+2]
 /// The cancel arm's selection rule, exhaustively over the close-cause
 /// witness: a CANCELLED entry for an uncovered active Job selects it;
 /// COMPLETED and FAILED entries never select (the Job-status
@@ -1408,7 +1408,7 @@ fn cancel_arm_selects_only_cancelled_close_causes() {
     );
 }
 
-// r[verify ctrl.job.cancel-close-cause]
+// r[verify ctrl.job.cancel-close-cause+2]
 /// merged_bug_120's recorded red, kept as the regression pin: a build
 /// whose attempt closed COMPLETED and whose Job status has not
 /// propagated yet (the teardown-lag window) is NOT selected — the old
@@ -1435,7 +1435,7 @@ fn cancel_arm_normal_completion_in_lag_window_not_selected() {
     );
 }
 
-// r[verify ctrl.job.cancel-close-cause]
+// r[verify ctrl.job.cancel-close-cause+2]
 /// End-to-end over the wire mocks: a CANCELLED entry in the served
 /// `recently_closed` window gets its (uncovered) Job
 /// foreground-deleted, and only that Job.
@@ -1462,7 +1462,7 @@ async fn cancel_arm_deletes_job_on_cancelled_close() {
     assert_eq!(cancelled, 1, "exactly the cancelled-close Job is deleted");
 }
 
-// r[verify ctrl.job.cancel-close-cause]
+// r[verify ctrl.job.cancel-close-cause+2]
 /// Fail-closed: a failed `ListOpenAttempts` read produces no cancel
 /// decisions, exactly like the orphan reap's posture.
 #[tokio::test]

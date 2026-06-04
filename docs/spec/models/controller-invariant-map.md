@@ -1748,16 +1748,23 @@ in 56 s on the CI builder — inside the per-check budget with margin.
   compare-and-swap on report arrival order) re-introduces the
   cross-component ordering oracle the wave removed. The charge-free
   idempotent close + requeue make the worst case a redundant rebuild.
-- **120 stale-window respawn (bounded):** a derivation cancelled and
-  RE-SUBMITTED inside the 120 s `recently_closed` window whose fresh
-  Job has not yet pulled matches the stale CANCELLED entry and is
-  cancel-selected once per tick until the window expires or the pull
-  opens (the open-attempt guard then covers it). Bounded by the window
-  (≤120 s of respawn churn, no charge, no poison). The
-  `spawnCoherenceCancelCause` regime contains this trace and the
-  invariant correctly does NOT flag it (the cause IS cancelled);
+- **120 stale-window respawn — SUPERSEDED 2026-06-04 (bughunt-2
+  slot 5, bug_113):** the original residual read: "a derivation
+  cancelled and RE-SUBMITTED inside the 120 s `recently_closed` window
+  whose fresh Job has not yet pulled matches the stale CANCELLED entry
+  and is cancel-selected once per tick until the window expires or the
+  pull opens (the open-attempt guard then covers it). Bounded by the
+  window (≤120 s of respawn churn, no charge, no poison). […]
   re-keying the window by exec generation would shrink it and is
-  recorded as a non-goal (needs resubmit_cycle on the close row).
+  recorded as a non-goal (needs resubmit_cycle on the close row)."
+  The non-goal call was wrong in its premise: no close-row re-key was
+  needed — `closed_age_secs` was ALREADY on the wire, and
+  `CancelTarget::bind`'s generation conjunct
+  (`job_older_than(closed_age + CANCEL_CLOSE_SKEW_SLACK_SECS)`) makes
+  the respawned Job structurally unselectable from tick one. The
+  `ENABLE_CANCEL_GENERATION` spawnCoherence axis promotes the
+  previously-contained respawn trace to a flagged violation
+  (`cancelNeverDeletesPostCloseJob`).
 - **007 ack-failure drain loss:** the evidence buffer drains into the
   healthy tick's Ack BEFORE the RPC; an ack failure on exactly that
   tick loses the batch (same loss class as fresh same-tick edges,

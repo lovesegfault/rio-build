@@ -891,16 +891,23 @@ The open-attempt ledger is the only busy carrier --- the stream-mode
 needed retired with the stream protocol, and at no point may the reap infer
 busyness (or its absence) from anything other than the durable view.
 
-#r("ctrl.job.cancel-close-cause")[
-  The AD5 cancel arm MUST select a Job for teardown only when the
-  scheduler's `ListOpenAttempts.recently_closed` window lists the Job's
-  intent with `CLOSE_CAUSE_CANCELLED` and no open attempt covers the intent.
-  The close cause travels WITH the close on the wire; the absence of an open
-  attempt is never, by itself, cancellation evidence. A normal completion
-  sitting in the Job-status propagation lag window carries
+#r("ctrl.job.cancel-close-cause+2")[
+  The AD5 cancel arm MUST select a Job for teardown only through the
+  four-conjunct binding: the scheduler's
+  `ListOpenAttempts.recently_closed` window lists the Job's intent with
+  `CLOSE_CAUSE_CANCELLED`, the Job PREDATES the close (the Job is older
+  than the close's wire-carried age plus the documented clock-skew
+  slack --- a re-submitted derivation's respawned Job postdates its
+  cancelled close and is structurally unselectable, whether or not its
+  pod has pulled), and no open attempt covers the intent. The close
+  cause travels WITH the close on the wire; the absence of an open
+  attempt is never, by itself, cancellation evidence. A normal
+  completion sitting in the Job-status propagation lag window carries
   `CLOSE_CAUSE_COMPLETED` and is untouchable by type; a pod that never
   pulled matches no entry at all and is covered only by the grace-gated
-  orphan reap and `activeDeadlineSeconds`.
+  orphan reap and `activeDeadlineSeconds`; a genuine cancel younger
+  than the slack is missed by at most the slack and falls to the same
+  backstop pair.
 ]
 The window (120s server-side) bounds the arm's latency: cancel-to-teardown
 is at most the controller tick plus propagation, and a close that ages out
