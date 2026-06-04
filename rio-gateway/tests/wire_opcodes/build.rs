@@ -101,11 +101,12 @@ async fn test_build_paths_eof_triggers_reconnect_not_error() -> anyhow::Result<(
     h.scheduler.set_submit_outcome(SubmitOutcome::close_early());
     // WatchBuild: deliver Completed on the retry.
     h.scheduler.set_watch_outcome(WatchOutcome {
-        scripted_events: Some(vec![ev(build_event::Event::Completed(
-            types::BuildCompleted {
+        scripted_events: Some(vec![
+            active_snapshot(1),
+            ev(build_event::Event::Completed(types::BuildCompleted {
                 output_paths: vec!["/nix/store/zzz-out".into()],
-            },
-        ))]),
+            })),
+        ]),
         ..Default::default()
     });
 
@@ -671,6 +672,20 @@ fn ev(e: build_event::Event) -> types::BuildEvent {
         timestamp: None,
         event: Some(e),
     }
+}
+
+/// An ACTIVE snapshot with `total` derivations and nothing running —
+/// the first message every `WatchBuild` stream must carry
+/// (`sched.watch.snapshot-first`). The gateway's re-attach arm now
+/// consumes and reconciles it BEFORE treating the stream as live
+/// (`gw.resync.snapshot-owed`), so watch scripts that skip it are
+/// rejected as protocol violations.
+fn active_snapshot(total: u32) -> types::BuildEvent {
+    ev(build_event::Event::Snapshot(types::BuildSnapshot {
+        state: types::BuildState::Active as i32,
+        total_derivations: total,
+        ..Default::default()
+    }))
 }
 
 /// Seed a minimal .drv and return its store path. Every scripted-event test
@@ -1610,7 +1625,7 @@ async fn test_build_paths_first_event_cancelled_short_circuit() -> anyhow::Resul
     Ok(())
 }
 
-// r[verify gw.reconnect.backoff+2]
+// r[verify gw.reconnect.backoff+3]
 /// Phase4a remediation 20: scheduler accepts SubmitBuild (MergeDag
 /// committed, build_id in header) then drops the stream before event 0.
 /// Gateway reads build_id from initial metadata → enters reconnect loop
@@ -1637,11 +1652,12 @@ async fn test_build_paths_empty_stream_reconnects_via_header() -> anyhow::Result
     // (gateway's initial insert for header path), so it passes the
     // mock's since-filter.
     h.scheduler.set_watch_outcome(WatchOutcome {
-        scripted_events: Some(vec![ev(build_event::Event::Completed(
-            types::BuildCompleted {
+        scripted_events: Some(vec![
+            active_snapshot(1),
+            ev(build_event::Event::Completed(types::BuildCompleted {
                 output_paths: vec!["/nix/store/zzz-out".into()],
-            },
-        ))]),
+            })),
+        ]),
         ..Default::default()
     });
     let drv_path = seed_minimal_drv(&h);
@@ -1727,7 +1743,7 @@ async fn test_build_paths_submit_rpc_fail_diagnostic() -> anyhow::Result<()> {
 // Reconnect loop tests (gateway/src/handler/build.rs reconnect backoff)
 // ===========================================================================
 //
-// r[verify gw.reconnect.backoff+2]
+// r[verify gw.reconnect.backoff+3]
 //
 // Paused-time auto-advance fires gRPC timeout wrappers prematurely
 // while real-TCP I/O to the in-process mocks is pending. Both tests
@@ -1768,11 +1784,12 @@ async fn test_build_paths_reconnect_on_transport_error() -> anyhow::Result<()> {
     // WatchBuild: deliver Completed. Gateway's process_build_events
     // reads from this fresh stream after the reconnect.
     h.scheduler.set_watch_outcome(WatchOutcome {
-        scripted_events: Some(vec![ev(build_event::Event::Completed(
-            types::BuildCompleted {
+        scripted_events: Some(vec![
+            active_snapshot(1),
+            ev(build_event::Event::Completed(types::BuildCompleted {
                 output_paths: vec!["/nix/store/zzz-output".into()],
-            },
-        ))]),
+            })),
+        ]),
         ..Default::default()
     });
     let drv_path = seed_minimal_drv(&h);
@@ -1801,7 +1818,7 @@ async fn test_build_paths_reconnect_on_transport_error() -> anyhow::Result<()> {
 }
 
 // r[verify gw.reconnect.snapshot-resync]
-// r[verify gw.reconnect.backoff+2]
+// r[verify gw.reconnect.backoff+3]
 /// THE snapshot-first reconnect property: a gateway that reconnects after
 /// missing events sees correct state from the WatchBuild snapshot, not from
 /// replay.
@@ -2005,7 +2022,7 @@ async fn test_build_paths_reconnect_terminal_snapshot_short_circuits() -> anyhow
 /// instantly → `resolve_built_dag` `Err` → `MiscFailure(9)` at
 /// build.rs:1300. The test then asserted `status==9` and "passed" —
 /// vacuously, never reaching the reconnect loop it claims to cover.
-// r[verify gw.reconnect.backoff+2]
+// r[verify gw.reconnect.backoff+3]
 #[tokio::test(flavor = "current_thread")]
 async fn test_build_paths_reconnect_exhausted_returns_failure() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -2091,6 +2108,99 @@ async fn test_build_paths_reconnect_exhausted_returns_failure() -> anyhow::Resul
     assert!(
         error_msg.contains("reconnect exhausted"),
         "error_msg must prove the reconnect-exhausted arm was reached, got: {error_msg}"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.resync.reattach-budget]
+// r[verify gw.resync.snapshot-owed]
+/// merged_bug_056: a scheduler stuck in a snapshot→resync storm (every
+/// re-attach serves the snapshot and then immediately signals loss
+/// again) must EXHAUST the re-attach budget, not refresh it.
+///
+/// RECORDED RED (pre-fix): the watch loop reset `reconnect_attempts`
+/// on ANY event — the snapshot each cycle delivered reset the cap, so
+/// this scenario looped at zero backoff forever and the test timed out
+/// (killed at 90s; watch_build call count in the hundreds). Post-fix:
+/// snapshots/resync signals never reset the budget (`ReattachBudget`),
+/// so the storm burns through MAX_RECONNECT bounded cycles and fails
+/// the build with TransientFailure.
+///
+/// Same real-then-paused time shape as
+/// `test_build_paths_reconnect_exhausted_returns_failure` (bug_230:
+/// fully-paused time fires the submit-phase gRPC timeout wrappers
+/// while TCP I/O pends). The resync path emits no stderr, so the
+/// pause anchor is the first stderr frame of any kind. Under paused
+/// time a spurious bounded-open/snapshot-read timeout only converts a
+/// resync cycle into a failed-open cycle — both charge the budget, so
+/// the bound under test is unaffected.
+#[tokio::test(flavor = "current_thread")]
+async fn test_build_paths_resync_storm_exhausts_budget() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::Scripted {
+        events: vec![ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 1,
+            cached_derivations: 0,
+        }))],
+        error_after_n: Some((1, tonic::Code::Unavailable)),
+        interval: None,
+    });
+    // EVERY WatchBuild attach: the snapshot, then the loss signal again.
+    h.scheduler.set_watch_outcome(WatchOutcome {
+        scripted_events: Some(vec![
+            active_snapshot(1),
+            ev(build_event::Event::ResyncRequired(
+                types::ResyncRequired::default(),
+            )),
+        ]),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let first = read_stderr_message(&mut h.stream)
+        .await
+        .expect("first stderr frame");
+    tokio::time::pause();
+    let mut frames = vec![first];
+    loop {
+        let msg = read_stderr_message(&mut h.stream)
+            .await
+            .expect("read stderr");
+        if matches!(msg, StderrMessage::Last) {
+            break;
+        }
+        frames.push(msg);
+    }
+    tokio::time::resume();
+
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1);
+    let _derived_path = wire::read_string(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    assert_eq!(
+        status, 6,
+        "TransientFailure after the storm exhausts the budget"
+    );
+    assert!(
+        error_msg.contains("reconnect exhausted"),
+        "error_msg must prove the exhausted arm was reached, got: {error_msg}"
+    );
+    // The budget is the bound: at most MAX_RECONNECT (10) re-attach
+    // cycles, each at most one WatchBuild call (+1 slack for an
+    // off-by-one in either direction). Pre-fix this grew without bound.
+    let watch_calls = h.scheduler.watch_calls.read().unwrap().len();
+    assert!(
+        watch_calls <= 11,
+        "watch_build calls must be budget-bounded, got {watch_calls}"
     );
 
     h.finish().await;
@@ -2724,11 +2834,12 @@ async fn test_reconnect_propagates_jwt() -> anyhow::Result<()> {
     h.scheduler
         .set_submit_outcome(SubmitOutcome::scripted(vec![]));
     h.scheduler.set_watch_outcome(WatchOutcome {
-        scripted_events: Some(vec![ev(build_event::Event::Completed(
-            types::BuildCompleted {
+        scripted_events: Some(vec![
+            active_snapshot(1),
+            ev(build_event::Event::Completed(types::BuildCompleted {
                 output_paths: vec!["/nix/store/zzz-out".into()],
-            },
-        ))]),
+            })),
+        ]),
         ..Default::default()
     });
     let drv_path = seed_minimal_drv(&h);

@@ -323,7 +323,7 @@ pub(crate) async fn resolve_tenant_name(
 /// one in-stream `ResyncRequired` per Lagged streak (re-armed by the
 /// next successfully forwarded state event), and the gateway re-attaches
 /// via a fresh `WatchBuild` whose snapshot reconcile recovers ALL display
-/// state (`r[gw.resync.loss-signal]`) — no per-event-type gap
+/// state (`r[gw.resync.loss-signal+1]`) — no per-event-type gap
 /// compensation anywhere. Terminals stay covered even without the
 /// signal: snapshot while resident, durable builds row after cleanup
 /// (`r[sched.watch.terminal-from-durable-row]`).
@@ -410,7 +410,7 @@ pub(crate) fn bridge_build_events(
                     );
                     metrics::counter!("rio_scheduler_broadcast_lagged_total", "kind" => "state")
                         .increment(n);
-                    // r[impl gw.resync.loss-signal]
+                    // r[impl gw.resync.loss-signal+1]
                     // Tell THIS watcher its event stream has a gap:
                     // one in-stream ResyncRequired per streak. The
                     // gateway re-attaches with zero backoff and

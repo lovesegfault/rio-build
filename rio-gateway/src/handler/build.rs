@@ -961,7 +961,7 @@ async fn apply_snapshot<W: AsyncWrite + Unpin>(
 async fn process_build_events<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     event_stream: &mut tonic::codec::Streaming<types::BuildEvent>,
-    reconnect_attempts: &mut u32,
+    budget: &mut ReattachBudget,
     act: &mut BuildActivityState,
     tails: &mut LogTailSet,
     log_rx: &mut tokio::sync::mpsc::Receiver<TaggedLogChunk>,
@@ -1011,15 +1011,17 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
             }
         };
 
-        // Reset reconnect counter on first SUCCESSFUL event from
-        // the stream (not on WatchBuild Ok() — that only proves
-        // the scheduler accepted the RPC, not that the stream is
-        // healthy). Without this, a scheduler that accepts but
-        // immediately drops the stream would cause an infinite
-        // 1s-sleep loop: 0→1→Ok()→reset→0→1→... Matches the
-        // controller's reconnect pattern (reset on Ok(Some(ev)),
-        // not on stream-open Ok()).
-        *reconnect_attempts = 0;
+        // Note the event against the re-attach budget. ORGANIC events
+        // reset it (not WatchBuild Ok() — that only proves the
+        // scheduler accepted the RPC; and not Snapshot/ResyncRequired —
+        // connection machinery must consume the budget, or a
+        // snapshot-then-resync storm refreshes its own cap forever at
+        // zero backoff, which is exactly the pre-fix bug). A scheduler
+        // that accepts and immediately drops the stream charges one
+        // cycle per drop and exhausts within MAX_RECONNECT.
+        if let Some(ref ev) = event.event {
+            budget.note_event(ev);
+        }
 
         use types::build_event::Event;
         match event.event {
@@ -1090,7 +1092,7 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
                     reason: cancelled.reason,
                 });
             }
-            // r[impl gw.resync.loss-signal]
+            // r[impl gw.resync.loss-signal+1]
             Some(Event::ResyncRequired(_)) => {
                 // The scheduler dropped events for THIS watcher
                 // (broadcast lag). Everything reconciles from a fresh
@@ -1114,6 +1116,131 @@ enum BuildEventOutcome {
     Cancelled {
         reason: String,
     },
+}
+
+// r[impl gw.reconnect.backoff+3]
+/// Re-attach budget and ladder shared by the watch loop and
+/// [`ReattachBudget`]. See the rationale comment at the loop in
+/// [`submit_and_process_build`] for why 10.
+const MAX_RECONNECT: u32 = 10;
+const RECONNECT_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
+    base: std::time::Duration::from_secs(1),
+    mult: 2.0,
+    cap: std::time::Duration::from_secs(16),
+    jitter: rio_common::backoff::Jitter::None,
+};
+
+/// Where the next scheduler `BuildEvent` comes from.
+///
+/// The moment a loss signal (`ResyncRequired`) or a stream death
+/// (`Transport`/`EofWithoutTerminal`) is observed, the prior stream is
+/// DROPPED by moving to [`EventSource::NeedsReattach`] — consuming
+/// post-gap events from a dead stream is unrepresentable, because
+/// [`process_build_events`] is only ever handed the stream owned by
+/// [`EventSource::Live`], and the only transition back to `Live` is a
+/// successful `WatchBuild` re-attach whose FIRST message is the
+/// snapshot (consumed and reconciled before `Live` is constructed).
+///
+/// The pre-fix shape this forecloses (merged_bug_056): a failed
+/// `WatchBuild` left the old `event_stream` binding in place and the
+/// next loop iteration re-entered `process_build_events` on it — a
+/// dead-but-buffered stream could serve events recorded BEFORE the
+/// loss signal as if the display were whole.
+// r[impl gw.resync.snapshot-owed]
+enum EventSource {
+    /// A healthy stream: either the initial `SubmitBuild` response
+    /// stream, or a re-attached `WatchBuild` stream whose snapshot has
+    /// already been consumed and reconciled. Boxed: the streaming
+    /// decoder is large and `NeedsReattach` is a unit
+    /// (clippy::large_enum_variant).
+    Live(Box<tonic::codec::Streaming<types::BuildEvent>>),
+    /// The previous stream is gone (loss signal, transport error, or
+    /// clean EOF without a terminal). The owed snapshot has not yet
+    /// arrived: no event may be consumed until a fresh `WatchBuild`
+    /// open succeeds AND its first message is the snapshot.
+    NeedsReattach,
+}
+
+/// Bounds consecutive re-attach cycles, resetting ONLY on organic
+/// build events.
+///
+/// "Organic" = an event produced by build progress itself (started,
+/// progress, derivation, phase, substitute-progress, inputs-resolved,
+/// or a terminal). `Snapshot` and `ResyncRequired` are
+/// connection-machinery events: a scheduler that serves every
+/// re-attach a snapshot and then immediately signals loss again must
+/// CONSUME the budget, not refresh it — pre-fix, the reset on any
+/// event made `MAX_RECONNECT` vacuous for exactly that storm
+/// (counter: 0 → 1 → snapshot resets → 0 → … forever, at zero
+/// backoff).
+// r[impl gw.resync.reattach-budget]
+#[derive(Default)]
+struct ReattachBudget {
+    /// Consecutive re-attach cycles since the last organic event.
+    attempts: u32,
+}
+
+impl ReattachBudget {
+    /// Re-attach cycles that proceed with ZERO backoff after a loss
+    /// signal. Past this streak the scheduler is evidently not making
+    /// progress on our behalf (every cycle yielded only
+    /// snapshot/resync machinery), so the standard reconnect ladder
+    /// applies — a lagging-but-healthy scheduler stays invisible to
+    /// the client, a resync storm degrades into bounded, paced
+    /// retries.
+    const ZERO_BACKOFF_STREAK: u32 = 3;
+
+    /// An event arrived on the live stream. Organic events reset the
+    /// budget; connection-machinery events (`Snapshot`,
+    /// `ResyncRequired`) do not. Exhaustive on purpose: a NEW event
+    /// variant fails compilation here and forces the organic/machinery
+    /// classification to be made explicitly.
+    fn note_event(&mut self, event: &types::build_event::Event) {
+        use types::build_event::Event;
+        match event {
+            Event::Started(_)
+            | Event::Progress(_)
+            | Event::Derivation(_)
+            | Event::Completed(_)
+            | Event::Failed(_)
+            | Event::Cancelled(_)
+            | Event::InputsResolved(_)
+            | Event::Phase(_)
+            | Event::SubstituteProgress(_) => self.attempts = 0,
+            Event::Snapshot(_) | Event::ResyncRequired(_) => {}
+        }
+    }
+
+    /// Charge one re-attach cycle (stream death, loss signal, or a
+    /// failed `WatchBuild`/snapshot read). Returns the cycle number
+    /// for logging.
+    fn note_reattach(&mut self) -> u32 {
+        self.attempts += 1;
+        self.attempts
+    }
+
+    /// The budget is spent: too many consecutive cycles without an
+    /// organic event.
+    fn exhausted(&self) -> bool {
+        self.attempts > MAX_RECONNECT
+    }
+
+    /// Backoff before the next zero-backoff-eligible (resync-signalled)
+    /// re-attach: `None` (immediate) within the zero-backoff streak,
+    /// the standard ladder past it.
+    fn resync_backoff(&self) -> Option<std::time::Duration> {
+        if self.attempts <= Self::ZERO_BACKOFF_STREAK {
+            None
+        } else {
+            Some(RECONNECT_BACKOFF.duration(self.attempts - 1))
+        }
+    }
+
+    /// Backoff before the next failure-path re-attach (transport
+    /// error, EOF, failed open): always the ladder.
+    fn failure_backoff(&self) -> std::time::Duration {
+        RECONNECT_BACKOFF.duration(self.attempts.saturating_sub(1))
+    }
 }
 
 /// Issue the `SubmitBuild` RPC and read its initial response metadata
@@ -1293,7 +1420,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // scheduler spans are orphaned root traces.
     let request = with_jwt(request, jwt_token)?;
 
-    let (build_id, mut event_stream) =
+    let (build_id, event_stream) =
         submit_initial(stderr, scheduler_client, request, active_build_ids).await?;
 
     // Process remaining events, with reconnect on stream error.
@@ -1314,15 +1441,9 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // needs ~20-30s (start + lease acquire on 5s
     // tick). Found by vm-le-build-k3s under the replacement-wins-race
     // path — standby-wins was fast enough to mask it.
-    // r[impl gw.reconnect.backoff+2]
-    const MAX_RECONNECT: u32 = 10;
-    const RECONNECT_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
-        base: std::time::Duration::from_secs(1),
-        mult: 2.0,
-        cap: std::time::Duration::from_secs(16),
-        jitter: rio_common::backoff::Jitter::None,
-    };
-    let mut reconnect_attempts = 0u32;
+    // (MAX_RECONNECT / RECONNECT_BACKOFF live at module scope so the
+    // ReattachBudget methods can read them.)
+    let mut budget = ReattachBudget::default();
     // Activity-ID state survives reconnects so a WatchBuild resume can
     // stop_activity derivations whose Started arrived on the prior
     // stream and keep attaching log lines / phase to the right aid.
@@ -1334,76 +1455,116 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // from line 0).
     let (mut tails, mut log_rx) = LogTailSet::new(log_client.clone(), jwt_token.map(str::to_owned));
 
+    // The watch loop, typed by event source. `Live` consumes events;
+    // any stream death or loss signal drops the stream (moving to
+    // `NeedsReattach`) and only a successful WatchBuild whose first
+    // message is the snapshot re-enters `Live`. The re-attach budget
+    // resets ONLY on organic events — see `ReattachBudget`.
+    let mut source = EventSource::Live(Box::new(event_stream));
+    // The most recent stream error, reported to the caller when the
+    // re-attach budget is exhausted (re-attach failures themselves are
+    // open errors, not stream errors — the original cause is the
+    // truthful one).
+    let mut last_stream_err = StreamProcessError::EofWithoutTerminal;
     let outcome = loop {
-        match process_build_events(
-            stderr,
-            &mut event_stream,
-            &mut reconnect_attempts,
-            &mut act,
-            &mut tails,
-            &mut log_rx,
-        )
-        .await
-        {
-            Ok(outcome) => break Ok(outcome),
-            // Wire error: NOT reconnect-worthy. Client disconnected
-            // (SSH closed) — scheduler is fine, there's no one to
-            // send the result to. Surface immediately.
-            Err(e @ StreamProcessError::Wire(_)) => {
-                break Err(e);
+        match source {
+            EventSource::Live(ref mut event_stream) => {
+                match process_build_events(
+                    stderr,
+                    event_stream,
+                    &mut budget,
+                    &mut act,
+                    &mut tails,
+                    &mut log_rx,
+                )
+                .await
+                {
+                    Ok(outcome) => break Ok(outcome),
+                    // Wire error: NOT reconnect-worthy. Client disconnected
+                    // (SSH closed) — scheduler is fine, there's no one to
+                    // send the result to. Surface immediately.
+                    Err(e @ StreamProcessError::Wire(_)) => {
+                        break Err(e);
+                    }
+                    // Transport OR EofWithoutTerminal: both are failover
+                    // signatures. Transport = RST / tonic connection error.
+                    // EofWithoutTerminal = scheduler cleanly closed the
+                    // stream mid-build — THIS is what k8s pod kill looks
+                    // like (SIGTERM → graceful shutdown → TCP FIN →
+                    // Ok(None), not Err). vm-le-build-k3s proved the
+                    // prior "crash = Transport" assumption wrong.
+                    // ResyncRequired = server-signalled watcher lag.
+                    //
+                    // All three kill the stream HERE: `source` moves to
+                    // `NeedsReattach`, so the dead stream can never be
+                    // polled again (pre-fix, a failed WatchBuild left it
+                    // in place and the next iteration consumed its
+                    // buffered post-gap events as if live).
+                    Err(
+                        e @ (StreamProcessError::Transport(_)
+                        | StreamProcessError::EofWithoutTerminal
+                        | StreamProcessError::ResyncRequired),
+                    ) => {
+                        let resync = matches!(e, StreamProcessError::ResyncRequired);
+                        let attempt = budget.note_reattach();
+                        if budget.exhausted() {
+                            break Err(e);
+                        }
+                        if resync {
+                            // r[impl gw.resync.loss-signal+1]
+                            // Server-signalled watcher lag: the scheduler is
+                            // healthy, so re-attach silently — the snapshot
+                            // reconcile is invisible to the nix client —
+                            // with zero backoff for the first
+                            // ZERO_BACKOFF_STREAK consecutive non-organic
+                            // cycles and the standard ladder past that.
+                            // The budget (reset only on organic events)
+                            // bounds the storm: snapshot + resync cycling
+                            // forever now burns through MAX_RECONNECT
+                            // instead of refreshing it.
+                            match budget.resync_backoff() {
+                                None => {
+                                    tracing::debug!(
+                                        %build_id,
+                                        attempt,
+                                        "scheduler signalled event loss (broadcast lag); resyncing via WatchBuild snapshot"
+                                    );
+                                }
+                                Some(backoff) => {
+                                    tracing::warn!(
+                                        %build_id,
+                                        attempt,
+                                        backoff_secs = backoff.as_secs(),
+                                        "scheduler resync-signal streak with no organic events; pacing re-attach"
+                                    );
+                                    tokio::time::sleep(backoff).await;
+                                }
+                            }
+                        } else {
+                            let backoff = budget.failure_backoff();
+                            tracing::warn!(
+                                %build_id,
+                                error = %e,
+                                attempt,
+                                backoff_secs = backoff.as_secs(),
+                                "BuildEvent stream error; reconnecting via WatchBuild"
+                            );
+                            // Also surface to the client via STDERR — they see
+                            // "reconnecting..." instead of a hang.
+                            let _ = stderr
+                                .log(&format!(
+                                    "scheduler connection lost (attempt {}/{}); reconnecting...",
+                                    attempt, MAX_RECONNECT
+                                ))
+                                .await;
+                            tokio::time::sleep(backoff).await;
+                        }
+                        last_stream_err = e;
+                        source = EventSource::NeedsReattach;
+                    }
+                }
             }
-            // Transport OR EofWithoutTerminal: both are failover
-            // signatures. Transport = RST / tonic connection error.
-            // EofWithoutTerminal = scheduler cleanly closed the
-            // stream mid-build — THIS is what k8s pod kill looks
-            // like (SIGTERM → graceful shutdown → TCP FIN →
-            // Ok(None), not Err). vm-le-build-k3s proved the
-            // prior "crash = Transport" assumption wrong.
-            Err(
-                e @ (StreamProcessError::Transport(_)
-                | StreamProcessError::EofWithoutTerminal
-                | StreamProcessError::ResyncRequired),
-            ) => {
-                let resync = matches!(e, StreamProcessError::ResyncRequired);
-                reconnect_attempts += 1;
-                if reconnect_attempts > MAX_RECONNECT {
-                    break Err(e);
-                }
-
-                if resync {
-                    // r[impl gw.resync.loss-signal]
-                    // Server-signalled watcher lag: the scheduler is
-                    // healthy, so re-attach IMMEDIATELY (zero backoff)
-                    // and silently — the snapshot reconcile is invisible
-                    // to the nix client. Storm-bounded by the bridge's
-                    // per-streak debounce + MAX_RECONNECT above (the
-                    // counter still resets only on a successfully
-                    // forwarded event).
-                    tracing::debug!(
-                        %build_id,
-                        attempt = reconnect_attempts,
-                        "scheduler signalled event loss (broadcast lag); resyncing via WatchBuild snapshot"
-                    );
-                } else {
-                    let backoff = RECONNECT_BACKOFF.duration(reconnect_attempts - 1);
-                    tracing::warn!(
-                        %build_id,
-                        error = %e,
-                        attempt = reconnect_attempts,
-                        backoff_secs = backoff.as_secs(),
-                        "BuildEvent stream error; reconnecting via WatchBuild"
-                    );
-                    // Also surface to the client via STDERR — they see
-                    // "reconnecting..." instead of a hang.
-                    let _ = stderr
-                        .log(&format!(
-                            "scheduler connection lost (attempt {}/{}); reconnecting...",
-                            reconnect_attempts, MAX_RECONNECT
-                        ))
-                        .await;
-                    tokio::time::sleep(backoff).await;
-                }
-
+            EventSource::NeedsReattach => {
                 // Reconnect: need a fresh scheduler client. The
                 // original was moved into this function; we can't
                 // easily get the address here. Clone the existing
@@ -1426,28 +1587,70 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                 // Bounded open (streaming-open-ban): a wedged
                 // scheduler must surface as a retryable Err, not park
                 // the reconnect loop forever past MAX_RECONNECT.
-                match rio_common::grpc::with_timeout_status(
+                let opened = rio_common::grpc::with_timeout_status(
                     "WatchBuild",
                     rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
                     scheduler_client.watch_build(watch_req),
                 )
-                .await
-                {
+                .await;
+                // r[impl gw.resync.snapshot-owed]
+                // The first message of a re-attached stream MUST be the
+                // snapshot (sched.watch.snapshot-first) — `Live` is only
+                // constructed after it has been consumed and reconciled,
+                // so a half-open stream can never serve organic events
+                // ahead of the reconcile. The read is bounded like the
+                // open: an accepted-but-silent WatchBuild charges the
+                // budget instead of parking forever.
+                let reattached = match opened {
                     Ok(resp) => {
-                        tracing::info!(%build_id, "reconnected via WatchBuild");
-                        event_stream = resp.into_inner();
-                        // DON'T reset reconnect_attempts here —
-                        // WatchBuild Ok() only proves the scheduler
-                        // accepted the RPC. The stream might error
-                        // immediately (scheduler accepts, then drops
-                        // — infinite 1s-loop). Reset happens on
-                        // FIRST EVENT inside process_build_events.
-                        // Loop continues: next process_build_events
-                        // reads from the new stream.
+                        let mut stream = resp.into_inner();
+                        match tokio::time::timeout(
+                            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+                            stream.message(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(Some(types::BuildEvent {
+                                event: Some(types::build_event::Event::Snapshot(snap)),
+                                ..
+                            }))) => {
+                                // A snapshot is connection machinery, not an
+                                // organic event: the budget is NOT reset here.
+                                // It resets on the first organic event the new
+                                // stream yields (inside process_build_events).
+                                match apply_snapshot(stderr, &mut act, &mut tails, snap).await? {
+                                    Some(outcome) => break Ok(outcome),
+                                    None => {
+                                        tracing::info!(%build_id, "reconnected via WatchBuild (snapshot reconciled)");
+                                        Some(stream)
+                                    }
+                                }
+                            }
+                            Ok(Ok(Some(other))) => {
+                                tracing::warn!(
+                                    %build_id,
+                                    event = ?other.event.as_ref().map(std::mem::discriminant),
+                                    "WatchBuild first message was not the snapshot; discarding stream"
+                                );
+                                None
+                            }
+                            Ok(Ok(None)) => {
+                                tracing::warn!(%build_id, "WatchBuild stream closed before the snapshot");
+                                None
+                            }
+                            Ok(Err(status)) => {
+                                tracing::warn!(%build_id, error = %status, "WatchBuild stream errored before the snapshot");
+                                None
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!(%build_id, "WatchBuild accepted but served no snapshot in time");
+                                None
+                            }
+                        }
                     }
                     Err(wb_err) => {
                         // WatchBuild failed. Could be: scheduler
-                        // still down (transient — next loop iter
+                        // still down (transient — next cycle
                         // retries), OR build not found (recovery
                         // didn't reconstruct it — terminal). We
                         // can't distinguish without the error code
@@ -1455,10 +1658,30 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                         // retryable and let MAX_RECONNECT cap it.
                         tracing::warn!(%build_id, error = %wb_err,
                                       "WatchBuild reconnect attempt failed");
-                        // Don't break yet — next iteration of the
-                        // loop will try process_build_events on the
-                        // DEAD stream, which immediately Errs →
-                        // another backoff+retry. After MAX we exit.
+                        None
+                    }
+                };
+                match reattached {
+                    Some(stream) => source = EventSource::Live(Box::new(stream)),
+                    None => {
+                        // The cycle failed before any stream existed:
+                        // charge the budget and pace the next attempt.
+                        // `source` stays NeedsReattach — the dead
+                        // stream from before this cycle is long gone
+                        // and CANNOT be re-entered (no Live to fall
+                        // back to).
+                        let attempt = budget.note_reattach();
+                        if budget.exhausted() {
+                            break Err(last_stream_err);
+                        }
+                        let backoff = budget.failure_backoff();
+                        tracing::debug!(
+                            %build_id,
+                            attempt,
+                            backoff_secs = backoff.as_secs(),
+                            "re-attach cycle failed; backing off"
+                        );
+                        tokio::time::sleep(backoff).await;
                     }
                 }
             }
@@ -3272,5 +3495,112 @@ mod tests {
             [4, 10, 1, 5],
             "resProgress [done, expected, running, failed] — failed must carry the scheduler's count"
         );
+    }
+
+    // ---- ReattachBudget (merged_bug_056) ----
+    //
+    // RECORDED RED (pre-fix semantics): the watch loop reset its
+    // reconnect counter on ANY event from the stream, snapshot
+    // included. Probe: re-adding `Event::Snapshot(_) => self.attempts
+    // = 0` to `note_event` (the one-line pre-fix equivalent) fails
+    // `resync_storm_exhausts_the_budget` with
+    // `assertion failed: budget.exhausted()` after MAX_RECONNECT+1
+    // snapshot-cycles — the storm refreshes its own cap forever.
+    // Probe applied + reverted, see commit body.
+
+    // r[verify gw.resync.reattach-budget]
+    /// A snapshot-then-resync storm consumes the budget: snapshots do
+    /// NOT reset it, so MAX_RECONNECT cycles exhaust the watch instead
+    /// of looping forever at zero backoff.
+    #[test]
+    fn resync_storm_exhausts_the_budget() {
+        let mut budget = super::ReattachBudget::default();
+        for cycle in 0..=super::MAX_RECONNECT {
+            assert!(
+                !budget.exhausted(),
+                "budget exhausted early, at cycle {cycle}"
+            );
+            budget.note_reattach();
+            // Every cycle serves the snapshot — connection machinery,
+            // never a reset.
+            budget.note_event(&types::build_event::Event::Snapshot(
+                types::BuildSnapshot::default(),
+            ));
+            budget.note_event(&types::build_event::Event::ResyncRequired(
+                types::ResyncRequired::default(),
+            ));
+        }
+        assert!(
+            budget.exhausted(),
+            "MAX_RECONNECT+1 non-organic cycles must exhaust"
+        );
+    }
+
+    // r[verify gw.resync.reattach-budget]
+    /// Organic events — and ONLY organic events — reset the budget.
+    /// Exhaustive over the event alphabet so a new variant must be
+    /// classified here as well as in `note_event` itself.
+    #[test]
+    fn budget_resets_only_on_organic_events() {
+        use types::build_event::Event;
+        let organic: Vec<Event> = vec![
+            Event::Started(types::BuildStarted::default()),
+            Event::Progress(types::BuildProgress::default()),
+            Event::Derivation(types::DerivationEvent::default()),
+            Event::Completed(types::BuildCompleted::default()),
+            Event::Failed(types::BuildFailed::default()),
+            Event::Cancelled(types::BuildCancelled::default()),
+            Event::InputsResolved(types::BuildInputsResolved::default()),
+            Event::Phase(types::BuildPhase::default()),
+            Event::SubstituteProgress(types::SubstituteProgress::default()),
+        ];
+        for ev in &organic {
+            let mut budget = super::ReattachBudget::default();
+            budget.note_reattach();
+            budget.note_reattach();
+            budget.note_event(ev);
+            assert_eq!(budget.attempts, 0, "organic event must reset: {ev:?}");
+        }
+        let machinery: Vec<Event> = vec![
+            Event::Snapshot(types::BuildSnapshot::default()),
+            Event::ResyncRequired(types::ResyncRequired::default()),
+        ];
+        for ev in &machinery {
+            let mut budget = super::ReattachBudget::default();
+            budget.note_reattach();
+            budget.note_reattach();
+            budget.note_event(ev);
+            assert_eq!(budget.attempts, 2, "machinery event must NOT reset: {ev:?}");
+        }
+    }
+
+    // r[verify gw.resync.loss-signal+1]
+    /// The resync ladder: zero backoff within ZERO_BACKOFF_STREAK
+    /// consecutive non-organic cycles, the standard ladder past it.
+    /// Failure-path cycles always pace.
+    #[test]
+    fn resync_backoff_ladders_past_the_streak() {
+        let mut budget = super::ReattachBudget::default();
+        for _ in 0..super::ReattachBudget::ZERO_BACKOFF_STREAK {
+            budget.note_reattach();
+            assert_eq!(budget.resync_backoff(), None, "within streak: immediate");
+        }
+        budget.note_reattach(); // 4th
+        assert_eq!(
+            budget.resync_backoff(),
+            Some(std::time::Duration::from_secs(8)),
+            "4th cycle joins the ladder at its own rung (2^3)"
+        );
+        assert_eq!(
+            budget.failure_backoff(),
+            std::time::Duration::from_secs(8),
+            "failure path paces at the same rung"
+        );
+        // An organic receipt restores zero-backoff resyncs.
+        budget.note_event(&types::build_event::Event::Progress(
+            types::BuildProgress::default(),
+        ));
+        budget.note_reattach();
+        assert_eq!(budget.resync_backoff(), None);
     }
 }

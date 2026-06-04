@@ -333,7 +333,7 @@ pub struct SessionContext {
     /// Builds this session has submitted that have not yet reached a
     /// terminal outcome. Drives CancelBuild-on-disconnect
     /// (`r[gw.conn.cancel-on-disconnect+3]`) and WatchBuild reconnect
-    /// after scheduler failover (`r[gw.reconnect.backoff+2]`) — the
+    /// after scheduler failover (`r[gw.reconnect.backoff+3]`) — the
     /// reconnect needs only the build_id; the scheduler's snapshot-first
     /// attach replaces the per-event sequence cursor that used to live
     /// in this map's values.

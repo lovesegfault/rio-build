@@ -1999,7 +1999,7 @@ every established session on the instance with it.
 - Builds that were already in progress continue in the scheduler; only the
   log-streaming link is lost.
 
-#r("gw.reconnect.backoff+2")[
+#r("gw.reconnect.backoff+3")[
   *WatchBuild reconnect:* When the `SubmitBuild` / `WatchBuild` response stream
   breaks (scheduler failover, transient network), the gateway's
   `process_stream` distinguishes error classes via `StreamProcessError`:
@@ -2013,24 +2013,58 @@ every established session on the instance with it.
     no event cursor and no replay.
   - `Wire` → *not* retried; the gateway returns `MiscFailure` to the Nix
     client immediately. #(refs.error-doc)("StreamProcessError", "Wire")
-  The reconnect counter resets on the first successful `BuildEvent` received
-  after a reconnect (NOT on `WatchBuild` returning `Ok` --- accepting the RPC
-  doesn't prove the stream will yield events).
+  The reconnect counter resets on the first ORGANIC `BuildEvent` received
+  after a reconnect --- build progress: started, progress, derivation, phase,
+  substitute-progress, inputs-resolved, or a terminal. It does NOT reset on
+  `WatchBuild` returning `Ok` (accepting the RPC doesn't prove the stream
+  will yield events), and it does NOT reset on `snapshot` or
+  `resync_required` (connection machinery; see
+  #rref("gw.resync.reattach-budget")).
 ]
 
-#r("gw.resync.loss-signal")[
+#r("gw.resync.loss-signal+1")[
   On receiving the scheduler's `resync_required` event (server-signalled
   irrecoverable event loss for this watcher), the gateway MUST re-attach via
-  a fresh `WatchBuild` with ZERO backoff and no client-visible error, and
-  recover ALL display state from the snapshot reconcile --- no per-event-type
-  gap compensation is permitted.
+  a fresh `WatchBuild` with no client-visible error and recover ALL display
+  state from the snapshot reconcile --- no per-event-type gap compensation
+  is permitted. The re-attach is immediate (zero backoff) only while the
+  re-attach budget's consecutive non-organic streak is within
+  `ZERO_BACKOFF_STREAK`; past it the standard reconnect ladder applies.
 ]
 The signal replaces guesswork about which event types a broadcast-lag gap
 may have contained: the snapshot reconcile (running set, kinded display
-entries, tails, counters) is the single recovery path. The reconnect counter
-still increments (so a pathological resync loop is bounded by
-#(refs.const)("MAX_RECONNECT")) and still resets only on a successfully
-forwarded event.
+entries, tails, counters) is the single recovery path. A lagging-but-healthy
+scheduler is healed invisibly within the streak; a scheduler that serves
+every re-attach a snapshot and then immediately signals loss again (a
+resync storm) degrades into bounded, paced retries instead of a
+zero-backoff hot loop --- the pre-fix reset-on-any-event made
+#(refs.const)("MAX_RECONNECT") vacuous for exactly that storm, because the
+snapshot each cycle delivered refreshed the cap.
+
+#r("gw.resync.reattach-budget")[
+  The gateway MUST bound consecutive `WatchBuild` re-attach cycles with a
+  budget that resets ONLY on organic build events; `snapshot` and
+  `resync_required` events MUST NOT reset it; when the budget exceeds
+  `MAX_RECONNECT` the watch MUST fail to the client.
+]
+"Organic" is the same classification #rref("gw.reconnect.backoff") uses:
+events produced by build progress itself. The classification is exhaustive
+in code (`ReattachBudget::note_event` matches every `BuildEvent` variant),
+so a new event variant cannot silently default into either class.
+
+#r("gw.resync.snapshot-owed")[
+  After a loss signal or stream death the gateway MUST stop consuming the
+  prior stream immediately; events MUST next be consumed only from a
+  successfully re-attached `WatchBuild` stream whose first message is the
+  snapshot, consumed and reconciled before any live event.
+]
+The typed event source makes the stale-consume shape unrepresentable: the
+dead stream is dropped when `NeedsReattach` is entered, so post-gap events
+it may still have buffered cannot be served as if the display were whole
+(pre-fix, a failed re-attach left the dead stream bound and the next loop
+iteration consumed from it). The snapshot-first read is bounded like the
+open itself: an accepted-but-silent `WatchBuild` charges the budget instead
+of parking the loop.
 
 #r("gw.display.single-map")[
   The gateway MUST track every derivation's client display through ONE

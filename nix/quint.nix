@@ -5819,7 +5819,7 @@ in
     # and the durable terminal row (merged_bug_323). Tier-1: TLC
     # exhausts the 2-drv space in seconds.
     # r[verify gw.display.single-map]
-    # r[verify gw.resync.loss-signal]
+    # r[verify gw.resync.loss-signal+1]
     # r[verify sched.pull.kinded-running-surface]
     # r[verify sched.watch.terminal-from-durable-row]
     quint-gw-build-resync = mkQuintCheck {

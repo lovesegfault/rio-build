@@ -392,7 +392,7 @@ fn is_resync(ev: &rio_proto::types::BuildEvent) -> bool {
     )
 }
 
-// r[verify gw.resync.loss-signal]
+// r[verify gw.resync.loss-signal+1]
 /// A state-channel Lagged streak emits exactly ONE in-stream
 /// `ResyncRequired` before the post-lag events; a successful forward
 /// re-arms the signal so the NEXT streak emits exactly one more.
