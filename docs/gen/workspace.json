@@ -69,6 +69,10 @@
       "description": "Pure log chunk-range/dedup/gate decision kernels for the rio-build store (CBMC-verified)"
     },
     {
+      "name": "rio-authz-kernel",
+      "description": "Pure credential-class authorization decision kernel for the rio-build store (CBMC-verified)"
+    },
+    {
       "name": "xtask",
       "description": "Dev/ops tooling: codegen, local cluster lifecycle, AMI build, helm/k8s helpers"
     }
@@ -78,6 +82,11 @@
       "prod": [
         "rio-common"
       ],
+      "optional": [],
+      "dev": []
+    },
+    "rio-authz-kernel": {
+      "prod": [],
       "optional": [],
       "dev": []
     },

@@ -6170,6 +6170,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio-authz-kernel"
+version = "0.1.0"
+
+[[package]]
 name = "rio-builder"
 version = "0.1.0"
 dependencies = [

@@ -17,6 +17,7 @@ members = [
   "rio-retry-kernel",
   "rio-evidence-kernel",
   "rio-log-kernel",
+  "rio-authz-kernel",
   "workspace-hack",
   "xtask",
 ]

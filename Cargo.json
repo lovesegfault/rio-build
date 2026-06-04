@@ -3,6 +3,7 @@
   "root": null,
   "workspaceMembers": {
     "rio-auth": "rio-auth",
+    "rio-authz-kernel": "rio-authz-kernel",
     "rio-builder": "rio-builder",
     "rio-cli": "rio-cli",
     "rio-common": "rio-common",
@@ -19337,6 +19338,21 @@
           "packageId": "tempfile"
         }
       ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
+    "rio-authz-kernel": {
+      "crateName": "rio-authz-kernel",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-authz-kernel"
+      },
       "libCrateTypes": [
         "lib"
       ],

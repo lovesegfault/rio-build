@@ -36,6 +36,7 @@ workspace-members = [
   "rio-retry-kernel",
   "rio-evidence-kernel",
   "rio-log-kernel",
+  "rio-authz-kernel",
 ]
 
 # aws-smithy-runtime[test-util] → legacy-test-util → connector-hyper-0-14-x

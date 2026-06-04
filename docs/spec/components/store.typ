@@ -1560,6 +1560,38 @@ keyless dev/VM deployments keep working. Builder/fetcher network policy
 additionally pins an L7 allow-list that omits `TailLog` — an untrusted
 build cannot reach the method even with a stolen token.
 
+#r("store.authz.declared-verifier")[
+  A credential class's transport verdict MUST be derived only from the
+  verifier family the class declares: the verdict arms receive single-knob
+  projections of the verifier configuration, and two configurations that
+  agree on the declared family MUST produce identical verdicts for that
+  class. Tenant claims MUST NOT admit a service-class method.
+]
+
+The round-2 audit found the admin class keyed on the JWT knob it never
+declared: the half-configured state (JWT on, service key off) admitted any
+tenant's claims to every admin method, whose handlers then passed the
+caller through as a service caller — any tenant was a cluster admin, and
+the class's own documentation certified the state as safe. The kernel
+(`rio-authz-kernel`) makes the failure unwritable rather than merely
+fixed: arms cannot name a foreign knob (the projection types carry exactly
+one), and the projection-constructing dispatch is pinned by a CBMC proof
+of foreign-knob independence.
+
+#r("store.authz.key-coherence")[
+  The store MUST refuse to serve when the JWT pubkey is configured but the
+  service HMAC key or the assignment HMAC key is not
+  (`jwt ⇒ (service ∧ hmac)`), naming the missing knob in the refusal. All
+  other verifier configurations MUST boot.
+]
+
+The refused states are exactly the exploitable half-configurations: with
+JWT on and a key missing, some keyed class is silently unenforced while
+the deployment believes itself authenticated. Dev mode (no keys), the
+helm default (both HMAC keys, no JWT), and the fully-keyed production
+posture all keep booting — dual-mode is permanent doctrine; half-keyed
+authentication is not a mode.
+
 #r("store.log.completeness-gate")[
   An execution's log is complete when its lifecycle row is terminal, its
   builder-reported `final_line_count` is known, and its chunk manifest

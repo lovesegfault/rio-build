@@ -21,6 +21,13 @@
       "doc": "Tenant JWT + assignment HMAC token sign/verify, and the gRPC"
     }
   ],
+  "rio-authz-kernel": [
+    {
+      "path": "lib.rs",
+      "depth": 0,
+      "doc": "Pure authorization decision kernel for the store's per-method"
+    }
+  ],
   "rio-builder": [
     {
       "path": "banner.rs",

@@ -1,0 +1,39 @@
+# Dependency-free home for the store's transport authorization
+# decision kernel: the per-method credential-class vocabulary, the
+# pure `decide()` verdict over (class, verifier config, presented
+# credential), and the startup key-coherence predicate. Extracted so
+# (a) the kani goto model for the proof harnesses closes over THIS
+# crate only (the rio-log-kernel/rio-retry-kernel precedent — inside
+# rio-store's artifact context the harnesses would re-verify on every
+# transitive-dep edit and sit one std-machinery growth spurt away from
+# the blowup class recorded at nix/kani.nix), and (b) enforcement is
+# derived ONLY from each class's declared verifier family: the class
+# arms receive single-knob projections, so a foreign-knob read does
+# not compile (bughunt2 bug_237 — the half-config cross-tenant-admin
+# state was exactly an arm reading a knob it never declared).
+# Keep it that way: no dependencies. The wire vocabulary (headers,
+# TenantClaims, HMAC verifiers) stays in rio-store/rio-auth;
+# rio_store::authz owns classification and delegates verdicts here.
+[package]
+name = "rio-authz-kernel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Pure credential-class authorization decision kernel for the rio-build store (CBMC-verified)"
+
+[lints.rust]
+# `cfg(kani)` is set by kani-compiler (nix `crateBuildKani` passes
+# `--cfg=kani --check-cfg=cfg(kani)`); register it here so the regular
+# cargo build doesn't warn `unexpected_cfgs` on the `#[cfg(kani)]`
+# proofs module.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+# No [dependencies]: the whole point of this crate is that the CBMC
+# proof harnesses' call graph stays inside core. It is also excluded
+# from hakari's workspace-hack unification (.config/hakari.toml
+# [final-excludes]) so it does not even carry the feature-unification
+# stub.
+[dependencies]

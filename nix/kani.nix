@@ -211,6 +211,30 @@ in
     expectedHarnesses = 11;
   };
 
+  # rio-authz-kernel: the store's transport authorization decision
+  # kernel (the credential-class vocabulary, the pure decide() verdict,
+  # and the boot key-coherence predicate), born dependency-free per the
+  # rio-log-kernel precedent so the goto model closes over the kernel
+  # alone. Four harnesses (rio-authz-kernel/src/lib.rs `mod proofs`):
+  #   - check_foreign_knob_independence: configs agreeing on the
+  #     class's declared verifier family produce identical verdicts --
+  #     the projection-dispatch pin (bughunt2 bug_237: the half-config
+  #     cross-tenant-admin state was an arm reading a foreign knob).
+  #   - check_key_coherence_partition: refused boot states are exactly
+  #     jwt && !(service && hmac), each naming a truly-missing knob.
+  #   - check_no_undeclared_admit: a keyed class with its knob ON
+  #     admits only its declared accepting presentation (the dead
+  #     tenant leg on Service methods stays dead).
+  #   - check_decide_total: decide() is panic-free over the full
+  #     domain and unkeyed knobs always admit (dual-mode doctrine).
+  # r[verify store.authz.declared-verifier]
+  # r[verify store.authz.key-coherence]
+  kani-rio-authz-kernel = mkKaniCheck {
+    name = "rio-authz-kernel";
+    crate = crateBuildKani.members.rio-authz-kernel;
+    expectedHarnesses = 4;
+  };
+
   # rio-retry-kernel: the scheduler's retry/poison decision kernels
   # (decide()/classify()/placeable() and the reference fold's counter
   # arithmetic), extracted from rio-scheduler/src/retry_policy.rs into a
