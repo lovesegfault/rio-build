@@ -990,6 +990,25 @@ mod tests {
     }
 
     #[test]
+    fn churn_warning_vanished_prior_then_agreeing_hash_is_prior_mismatch() {
+        // A dangling entry observed during the fallthrough comparison
+        // that HEALS before settling (both passes agree on a hash) must
+        // route to the prior-mismatch arm — the state did change in the
+        // window — and, per settled_hash_against, never emit that hash.
+        let dir = PathBuf::from("/cache/.sqlx");
+        let msg = churn_warning(
+            &dir,
+            Some(&DirHash::FileVanished(dir.join("query-aa.json"))),
+            &DirHash::Hash("bbbb".into()),
+            &DirHash::Hash("bbbb".into()),
+        );
+        assert!(
+            msg.contains("changed between the fallthrough comparison and settling"),
+            "{msg}"
+        );
+    }
+
+    #[test]
     fn churn_warning_prior_mismatch_names_the_window() {
         let dir = PathBuf::from("/cache/.sqlx");
         // Passes agree with each other but contradict the snapshot the
