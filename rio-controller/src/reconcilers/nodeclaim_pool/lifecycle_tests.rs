@@ -304,6 +304,7 @@ impl Lab {
             reloaded_epoch: 0,
             tick_counter: 0,
             wedge: wedge::WedgeTracker::default(),
+            pending_wedge_evictions: std::collections::BTreeSet::new(),
         };
         Self {
             r,

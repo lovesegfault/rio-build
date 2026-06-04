@@ -262,14 +262,29 @@ pub fn detect_vanished(inflight: &mut HashMap<String, Cell>, live: &[LiveNode]) 
     ice
 }
 
-/// Reap unhealthy/ICE-stuck NodeClaims. Returns `(ice_cells, reaped_names)`:
-/// cells hit by ICE this tick (fed to `report_unfulfillable` →
-/// `AckSpawnedIntents.unfulfillable_cells`), and the `metadata.name`s
-/// the controller `delete()`d (so the caller can drop them from
-/// `inflight_created` — they're the controller's own reaps, not
-/// Karpenter GC, and must NOT feed `detect_vanished`'s ICE path on the
-/// next tick). `Api::delete` 404 is ignored; other errors warn + skip
-/// (next tick retries).
+/// One `reap_unhealthy` tick's outcome.
+///
+/// - `ice_cells`: cells hit by ICE this tick (fed to
+///   `report_unfulfillable` → `AckSpawnedIntents.unfulfillable_cells`).
+/// - `reaped_claims`: the NodeClaim `metadata.name`s the controller
+///   `delete()`d (dropped from `inflight_created` — the controller's
+///   own reaps, not Karpenter GC, must NOT feed `detect_vanished`'s
+///   ICE path next tick).
+/// - `reaped_nodes`: the backing `Node` names of those claims (where
+///   known) — the wedge tracker's REQUIRED eviction feed
+///   (merged_bug_009): a reaped node's expiry evidence is dead and
+///   must not re-feed the Dead arm or inflate the systemic
+///   populations.
+///
+/// `Api::delete` 404 is ignored; other errors warn + skip (next tick
+/// retries).
+#[derive(Debug, Default)]
+pub struct ReapOutcome {
+    pub ice_cells: Vec<Cell>,
+    pub reaped_claims: Vec<String>,
+    pub reaped_nodes: Vec<String>,
+}
+
 pub async fn reap_unhealthy(
     nodeclaims: &Api<NodeClaim>,
     live: &[LiveNode],
@@ -277,7 +292,7 @@ pub async fn reap_unhealthy(
     sketches: &CellSketches,
     cfg: &NodeClaimPoolConfig,
     now_secs: f64,
-) -> anyhow::Result<(Vec<Cell>, Vec<String>)> {
+) -> anyhow::Result<ReapOutcome> {
     let dead: HashSet<&str> = dead_nodes.iter().map(String::as_str).collect();
     let to_reap = classify(live, &dead, sketches, cfg, now_secs);
     // Cap the dead-reap rate against the population it can actually reap
@@ -289,8 +304,7 @@ pub async fn reap_unhealthy(
         .count();
     let cap = dead_reap_cap(registered_count);
     let mut dead_reaped = 0usize;
-    let mut ice_cells = Vec::new();
-    let mut reaped_names = Vec::new();
+    let mut out = ReapOutcome::default();
     for (i, reason) in to_reap {
         let n = &live[i];
         if reason == ReapReason::Dead {
@@ -303,21 +317,35 @@ pub async fn reap_unhealthy(
         match nodeclaims.delete(&n.name, &DeleteParams::default()).await {
             Ok(_) => {
                 debug!(name = %n.name, %cell, reason = reason.as_str(), "reaped unhealthy NodeClaim");
-                record_reap(reason, cell, &n.name, &mut ice_cells, &mut reaped_names);
+                record_reap(
+                    reason,
+                    cell,
+                    &n.name,
+                    &mut out.ice_cells,
+                    &mut out.reaped_claims,
+                );
+                out.reaped_nodes.extend(n.node_name.clone());
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
                 // Already gone (Karpenter GC raced us). Apply the FULL
                 // `Ok(_)` consequence — the claim *was* reaped, just not
                 // by us. See `record_reap` doc.
                 debug!(name = %n.name, %cell, reason = reason.as_str(), "unhealthy NodeClaim already gone (GC raced); recorded reap");
-                record_reap(reason, cell, &n.name, &mut ice_cells, &mut reaped_names);
+                record_reap(
+                    reason,
+                    cell,
+                    &n.name,
+                    &mut out.ice_cells,
+                    &mut out.reaped_claims,
+                );
+                out.reaped_nodes.extend(n.node_name.clone());
             }
             Err(e) => {
                 warn!(name = %n.name, error = %e, "unhealthy NodeClaim delete failed; skipping");
             }
         }
     }
-    Ok((ice_cells, reaped_names))
+    Ok(out)
 }
 
 #[cfg(test)]

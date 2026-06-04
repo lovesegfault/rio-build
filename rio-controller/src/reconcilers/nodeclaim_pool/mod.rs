@@ -853,6 +853,11 @@ pub struct NodeClaimPoolReconciler {
     /// a fresh process under-detects for at most one window — the same
     /// safe direction as the heartbeat detector it succeeds.
     wedge: wedge::WedgeTracker,
+    /// Backing-node names reaped since the last wedge update — the
+    /// tracker's REQUIRED eviction feed (consumed each tick). Reaps
+    /// happen after the wedge verdict in the tick order, so feedback
+    /// lands on the NEXT tick's update.
+    pending_wedge_evictions: std::collections::BTreeSet<String>,
 }
 
 /// Cells `emit_live_gauges` must write this tick. r41 bug_025: a live
@@ -985,6 +990,7 @@ impl NodeClaimPoolReconciler {
             reloaded_epoch: 0,
             tick_counter: 0,
             wedge: wedge::WedgeTracker::default(),
+            pending_wedge_evictions: std::collections::BTreeSet::new(),
         }
     }
 
@@ -1430,8 +1436,11 @@ impl NodeClaimPoolReconciler {
         // The controller derives the Dead-equivalent signal from the
         // open-attempt ledger view (deadline expiries clustered per
         // source node). RPC failure is fail-open for observation
-        // only: the tick skips new evidence, previously accumulated
-        // evidence stays, and no node is marked from stale data.
+        // only: `update(None, ..)` skips the tick's observation AND
+        // verdict — previously accumulated evidence stays, and no node
+        // is marked from stale data (the retired empty-view path ran
+        // the verdict over an empty fleet, mass-marking every
+        // retained-evidence node right after a systemic episode).
         // r[impl ctrl.nodeclaim.wedge-cluster+1]
         let open_attempts = match admin_call(
             self.admin
@@ -1440,19 +1449,21 @@ impl NodeClaimPoolReconciler {
         )
         .await
         {
-            Ok(r) => r.into_inner().attempts,
+            Ok(r) => Some(r.into_inner().attempts),
             Err(e) => {
                 warn!(error = %e, "ListOpenAttempts failed; node-wedge clustering skips this tick's observation");
-                Vec::new()
+                None
             }
         };
-        // r[impl ctrl.nodeclaim.wedge-two-axis]
+        // r[impl ctrl.nodeclaim.wedge-two-axis+2]
         // Only per-node verdicts may feed the Dead arm; a systemic
         // pattern marks nothing (the warn + suppression counter fired
-        // inside the classifier fold).
-        let dead_input = match self.wedge.update(&open_attempts, now) {
-            wedge::WedgeVerdict::NodeWedged(nodes) => nodes,
-            wedge::WedgeVerdict::Systemic { affected, of } => {
+        // inside the sealed single-exit verdict). Last tick's reaps are
+        // the REQUIRED eviction feed — a reaped node's evidence is dead.
+        let evictions = std::mem::take(&mut self.pending_wedge_evictions);
+        let dead_input = match self.wedge.update(open_attempts.as_deref(), &evictions, now) {
+            wedge::WedgeVerdict::NodeWedged(nodes, _) => nodes,
+            wedge::WedgeVerdict::Systemic { affected, of, .. } => {
                 debug!(
                     affected,
                     of, "wedge verdict systemic; Dead arm receives no wedge input this tick"
@@ -1468,7 +1479,11 @@ impl NodeClaimPoolReconciler {
         // `live`; `detect_vanished` catches claims Karpenter already
         // GC'd between ticks (the ~1s GC < 10s tick race the live
         // Part-B finding hit).
-        let (mut ice_cells, reaped) = health::reap_unhealthy(
+        let health::ReapOutcome {
+            mut ice_cells,
+            reaped_claims: reaped,
+            reaped_nodes,
+        } = health::reap_unhealthy(
             &self.nodeclaims,
             &live,
             &dead_input,
@@ -1477,6 +1492,9 @@ impl NodeClaimPoolReconciler {
             now,
         )
         .await?;
+        // All reap reasons feed the wedge eviction stash (consumed by
+        // the NEXT tick's update — reaps run after this tick's verdict).
+        self.pending_wedge_evictions.extend(reaped_nodes);
         // r[impl ctrl.nodeclaim.inflight-conservation+2]
         // r40 bug_020: drop the controller's own reaps from inflight_created
         // BEFORE detect_vanished scans, so they're not misread as Karpenter
@@ -1606,9 +1624,11 @@ impl NodeClaimPoolReconciler {
         // ICE-timeout detection still runs on `live`. The returned
         // ice_cells are dropped — `report_unfulfillable` needs the
         // scheduler reachable.
-        let (_, reaped) =
+        let outcome =
             health::reap_unhealthy(&self.nodeclaims, &live, &[], &self.sketches, &self.cfg, now)
                 .await?;
+        let reaped = outcome.reaped_claims;
+        self.pending_wedge_evictions.extend(outcome.reaped_nodes);
         // r[impl ctrl.nodeclaim.inflight-conservation+2]
         // r[impl ctrl.nodeclaim.consolidate-only-degraded+3]
         // r40 bug_012: prune inflight_created against this tick's `live`
