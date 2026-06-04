@@ -9,8 +9,9 @@ metadata:
     {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
 spec:
   {{- if not .Values.componentScaler.store.enabled }}
-  # Stateless at runtime (PG + S3 hold everything). sqlx::migrate! takes
-  # a PG advisory lock, so concurrent replica startup is safe.
+  # Stateless at runtime (PG + S3 hold everything). Replicas don't
+  # migrate (the rio-migrate Job does); startup only verifies the
+  # schema, so concurrent replica startup is safe.
   #
   # OMITTED when componentScaler.store.enabled=true: the ComponentScaler
   # reconciler patches deployments/scale; if helm also rendered
@@ -100,8 +101,9 @@ spec:
             {{- end }}
           volumeMounts:
             {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac" "rdsCa")) | nindent 12 }}
-          # tonic-health set_serving() runs AFTER migrations in main.rs —
-          # "PG connected + migrations done" = Ready.
+          # tonic-health set_serving() runs AFTER the schema check in
+          # main.rs — "PG connected + schema current" = Ready. Pods
+          # crash-restart until the rio-migrate Job has run.
           readinessProbe:
             grpc:
               port: 9002

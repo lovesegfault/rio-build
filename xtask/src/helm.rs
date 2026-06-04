@@ -216,8 +216,15 @@ impl Helm {
             args.extend(["--set-json".into(), format!("{k}={v}")]);
         }
         if let Some(t) = self.wait {
+            // --wait-for-jobs (helm >= 3.5): --wait alone does NOT
+            // watch Jobs. Without it, when the migration set is
+            // unchanged (most upgrades) app pods pass their schema
+            // check, --wait goes green, and a FAILED rio-migrate Job
+            // (e.g. ESO refreshInterval lagging a master-password
+            // rotation) is silently invisible.
             args.extend([
                 "--wait".into(),
+                "--wait-for-jobs".into(),
                 "--timeout".into(),
                 format!("{}s", t.as_secs()),
             ]);
@@ -309,6 +316,35 @@ mod tests {
             description: "Upgrade complete".into(),
             image_tag: Some("2c491f0".into()),
         }
+    }
+
+    /// --wait must always travel with --wait-for-jobs and --timeout:
+    /// --wait alone does not watch Jobs, so a failed rio-migrate Job
+    /// hides behind green Deployments whenever the schema is already
+    /// current; --timeout without --wait is silently ignored by helm.
+    #[test]
+    fn wait_emits_wait_for_jobs_and_timeout_together() {
+        let args = Helm::upgrade_install("rio", "chart")
+            .wait(std::time::Duration::from_secs(900))
+            .into_args();
+        let i = args.iter().position(|a| a == "--wait").unwrap();
+        assert_eq!(args[i + 1], "--wait-for-jobs");
+        assert_eq!(args[i + 2], "--timeout");
+        assert_eq!(args[i + 3], "900s");
+    }
+
+    /// No `.wait()` → none of the wait family (the k3s deploy path
+    /// relies on this: it waits on the migrate Job itself via kubectl
+    /// instead of holding the whole release hostage).
+    #[test]
+    fn no_wait_emits_no_wait_family_flags() {
+        let args = Helm::upgrade_install("rio", "chart").into_args();
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "--wait" || a == "--wait-for-jobs" || a == "--timeout"),
+            "got: {args:?}"
+        );
     }
 
     #[test]

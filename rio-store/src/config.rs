@@ -202,12 +202,33 @@ pub fn derive_substitute_admission_cap(pg_max: u32) -> usize {
     (pg_max as usize * 3).clamp(64, 128)
 }
 
+/// One-shot subcommands sharing the rio-store binary. `migrate` exists
+/// so the migration runners (helm `rio-migrate` Job, NixOS
+/// `rio-migrate` systemd oneshot) need no dedicated docker image —
+/// they reuse the store image with `args: ["migrate"]`.
+#[derive(clap::Subcommand, Clone, Copy)]
+pub enum StoreCommand {
+    /// Apply database migrations (`RIO_DATABASE_URL`) and exit.
+    Migrate,
+}
+
 #[derive(Parser, Serialize, Default)]
 #[command(
     name = "rio-store",
     about = "NAR content-addressable store for rio-build"
 )]
 pub struct CliArgs {
+    /// No subcommand → serve. Handled in main() BEFORE
+    /// `rio_common::server::bootstrap` — a migrate run needs no
+    /// metrics exporter, no full Config (which would demand
+    /// store-specific fields a migration never touches), just the
+    /// database URL. `serde(skip)`: CliArgs doubles as the CLI
+    /// overlay layer of `rio_common::config::load`; a subcommand is
+    /// not config.
+    #[command(subcommand)]
+    #[serde(skip)]
+    pub command: Option<StoreCommand>,
+
     /// gRPC listen address
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]

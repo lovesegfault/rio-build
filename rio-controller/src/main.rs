@@ -305,8 +305,8 @@ async fn main() -> anyhow::Result<()> {
     // ---- NodeClaim pool (ADR-023 §13b) ----
     // Lease-elected: only the leader replica reconciles. Lease + PG
     // connect run AFTER the scheduler `connect_forever` above so the
-    // table is migrated by the time `CellSketches::load_seeded` reads it
-    // (scheduler/store own the migrator).
+    // table is migrated by the time `CellSketches::load_seeded` reads
+    // it (the rio-migrate Job runs `rio-store migrate` at deploy).
     // r[impl ctrl.nodeclaim.shim-nodepool]
     if nodeclaim_crd {
         // TokenSource construction is the PG config preflight (bad

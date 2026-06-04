@@ -195,25 +195,6 @@ let
       rio-gateway.environment =
         (lib.optionalAttrs withHmac (lib.mapAttrs (_: lib.mkForce) gatewayHmacEnv)) // extraGatewayEnv;
 
-      # Serialize migration runs — migration 011's CREATE INDEX
-      # CONCURRENTLY deadlocks with sqlx's pg_advisory_lock when store
-      # and scheduler race on a fresh DB. The module-level
-      # After=rio-store.service (scheduler.nix) only orders the fork
-      # (Type=simple), not readiness — both still hit migrate!() near-
-      # simultaneously. Block scheduler until store's gRPC port is open,
-      # which happens post-migration. k8s deployments dodge this via
-      # pod startup jitter; standalone VM boot is deterministic enough
-      # to trigger the race reliably. Restart=always (module-level)
-      # covers any residual window.
-      rio-scheduler.preStart = ''
-        for _ in $(seq 1 60); do
-          ${pkgs.netcat}/bin/nc -z localhost 9002 && exit 0
-          sleep 0.5
-        done
-        echo "rio-store port 9002 not open after 30s" >&2
-        exit 1
-      '';
-
       # OTel ordering: rio-* services on control must start AFTER
       # otelcol. Without this, the services boot, try to connect to
       # each other during boot churn, and the restart dance adds ~10s

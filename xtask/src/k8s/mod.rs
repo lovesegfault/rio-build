@@ -37,6 +37,12 @@ use tracing::{debug, info};
 /// code iterates NAMESPACES.
 pub const NS: &str = "rio-system";
 
+/// Label selector for the per-render-named rio-migrate Jobs. The Job
+/// NAME carries a pod-template hash (migrate-job.yaml), so every
+/// kubectl interaction — k3s pre-delete/wait, EKS failure diagnostics
+/// — selects by this stable label instead.
+pub const MIGRATE_JOB_LABEL: &str = "app.kubernetes.io/name=rio-migrate";
+
 /// Store namespace. ADR-019: store moved out of rio-system to run at
 /// PSA baseline. Secrets the store reads (rio-postgres) need a copy
 /// here.

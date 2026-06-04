@@ -19522,6 +19522,10 @@
           "packageId": "rio-lease"
         },
         {
+          "name": "rio-migrations",
+          "packageId": "rio-migrations"
+        },
+        {
           "name": "rio-proto",
           "packageId": "rio-proto"
         },
@@ -19574,10 +19578,6 @@
         {
           "name": "prost",
           "packageId": "prost"
-        },
-        {
-          "name": "rio-migrations",
-          "packageId": "rio-migrations"
         },
         {
           "name": "rio-test-support",
@@ -19889,6 +19889,10 @@
         "path": "rio-migrations"
       },
       "dependencies": [
+        {
+          "name": "anyhow",
+          "packageId": "anyhow"
+        },
         {
           "name": "sqlx",
           "packageId": "sqlx"

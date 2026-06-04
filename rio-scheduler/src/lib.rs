@@ -46,10 +46,11 @@ pub use state::{PoisonConfig, RetryPolicy};
 pub use actor::DEFAULT_SUBSTITUTE_CONCURRENCY;
 
 /// Re-export of the shared embedded migrator from `rio-migrations`.
-/// Test-only (`TestDb::new(&MIGRATOR)`) — production goes through
-/// `rio_migrations::migrate::run(&pool, rio_migrations::migrator())` in
-/// `main.rs`. Same migration set as rio-store; both consume the single
-/// `rio-migrations` source of truth.
+/// Test-only (`TestDb::new(&MIGRATOR)`) — production migrates via
+/// `rio-store migrate` (helm rio-migrate Job / NixOS oneshot);
+/// `main.rs` only verifies with
+/// `rio_migrations::migrate::assert_current`. Same migration set as
+/// rio-store; both consume the single `rio-migrations` source of truth.
 #[cfg(test)]
 pub use rio_migrations::MIGRATOR;
 

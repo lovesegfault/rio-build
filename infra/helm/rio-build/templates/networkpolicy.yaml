@@ -217,6 +217,49 @@ spec:
     - toEntities: [world]
       toPorts: [{ports: [{port: "443", protocol: TCP}]}]
     {{- end }}
+---
+# rio-migrate egress: DNS + postgres, nothing else (no world — the
+# master-password runner makes no AWS calls; no kube-apiserver). The
+# label selector matches every per-render Job name (the hash suffix
+# never touches labels). Mirrors store-egress's dual postgres shape:
+# toCIDRSet for external PG (classifies as a world subspace under
+# Cilium), toEndpoints for the in-cluster bitnami subchart (release/
+# system namespace — see the corrective comments above/below). NOTE:
+# networkPolicy.enabled is false in values/dev.yaml and
+# values/vmtest-full.yaml, so this CNP renders on the EKS profile
+# only; the bitnami arm is untested parity config.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: rio-migrate-egress
+  namespace: {{ $ns.system.name }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: rio-migrate
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - {port: "53", protocol: UDP}
+            - {port: "53", protocol: TCP}
+    {{- if .Values.global.postgresCidr }}
+    - toCIDRSet:
+        - {cidr: {{ .Values.global.postgresCidr | quote }}}
+      toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
+    {{- end }}
+    {{- if .Values.postgresql.enabled }}
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns.system.name }}
+            k8s:app.kubernetes.io/name: postgresql
+      toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
+    {{- end }}
 {{- if .Values.buildScheduler.enabled }}
 ---
 # kube-build-scheduler second kube-scheduler egress: DNS + kube-apiserver

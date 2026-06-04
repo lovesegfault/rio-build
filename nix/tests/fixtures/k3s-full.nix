@@ -974,9 +974,22 @@ rec {
         timeout=200,
     )
 
+    # ── Migrations applied (rio-migrate Job) ────────────────────────
+    # migrate-job.yaml is a plain Job applied alongside everything
+    # else; its pod polls PG until reachable (rio-store migrate's
+    # in-process connect loop — no CrashLoop backoff amplification),
+    # then applies rio-migrations + ensure_roles. Waited by LABEL: the
+    # Job name carries a per-render pod-template hash.
+    k3s_server.wait_until_succeeds(
+        "k3s kubectl -n ${ns} wait --for=condition=Complete "
+        "job -l app.kubernetes.io/name=rio-migrate --timeout=120s",
+        timeout=140,
+    )
+
     # ── rio deployments Available ───────────────────────────────────
-    # store + scheduler crash-loop until PG is up (sqlx migrate retry),
-    # then come clean. controller just needs apiserver.
+    # store + scheduler crash-restart on the startup schema check
+    # until the rio-migrate Job (waited above) completes, then come
+    # clean. controller just needs apiserver.
     #
     # Gateway NOT waited here: 03-gateway-ssh-placeholder seeds a
     # throwaway key (private half discarded, authorizes nothing) so
