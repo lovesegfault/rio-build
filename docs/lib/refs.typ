@@ -73,9 +73,31 @@
   // expr is now data — a rule re-key propagates here or fails
   // docs-data-fresh).
   alert-expr: name => {
-    let r = _alert-rules.find(r => r.name == name)
-    assert(r != none, message: "unknown alert: " + name)
-    raw(block: true, lang: "promql", r.expr)
+    let matches = _alert-rules.filter(r => r.name == name)
+    assert(matches.len() > 0, message: "unknown alert: " + name)
+    // merged_bug_015: alert names may carry several severity arms
+    // (RioStoreChunkUpgradeTxSlow ships warning AND critical rules);
+    // find-first silently rendered an arbitrary arm. Ambiguity is a
+    // hard error directing to the severity-keyed accessor.
+    assert(
+      matches.len() == 1,
+      message: "ambiguous alert "
+        + name
+        + " (severities: "
+        + matches.map(r => r.severity).join(", ")
+        + ") — use refs.alert-expr-sev((name, severity))",
+    )
+    raw(block: true, lang: "promql", matches.first().expr)
+  },
+  // Severity-keyed twin of alert-expr for multi-arm alert names.
+  alert-expr-sev: pair => {
+    let (name, sev) = pair
+    let matches = _alert-rules.filter(r => r.name == name and r.severity == sev)
+    assert(
+      matches.len() == 1,
+      message: "unknown alert arm: " + name + " [" + sev + "]",
+    )
+    raw(block: true, lang: "promql", matches.first().expr)
   },
   // Migration reference by `NNN_slug` stem, validated against the
   // on-disk chain (merged_bug_122: prose cited bare numbers that the
