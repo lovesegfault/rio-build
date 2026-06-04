@@ -727,14 +727,16 @@ pub async fn execute(
         }
     }
     tree.place_principal(principal_pidfd);
-    if let Err(e) = nix::unistd::write(&go_w, &[1u8])
-        && !(e == Errno::EPIPE && tree.was_killed())
-    {
-        // EPIPE with a kill already recorded is the benign race — a
-        // deadline fired inside [placement, release] and the kill took
-        // the gated child (the pipe's only remaining read end) with
-        // it. The relay is about to forward the verdict; fall through
-        // to supervision instead of aborting it away.
+    // ANY release-write failure aborts. There is no benign-EPIPE
+    // carve-out here because no kill source exists yet at this
+    // statement: every `killed` writer is (a) the LimitWatchdog,
+    // spawned strictly below, (b) the supervision loop's safety-net
+    // kill, entered strictly below, or (c) the guard's Drop, which
+    // cannot run while execute() holds the guard — so a kill-induced
+    // EPIPE race with the release write is unconstructible (round-17
+    // merged_bug_090 site 7 deleted the dead tolerance that described
+    // it).
+    if let Err(e) = nix::unistd::write(&go_w, &[1u8]) {
         return Err(sandbox
             .abort(
                 std::io::Error::from(e),
@@ -1202,13 +1204,6 @@ impl TreeState {
     /// reaped, or never adopted because the caller vanished first?
     fn is_settled(&self) -> bool {
         matches!(*self.lock(), TreePhase::Reaped | TreePhase::Dead)
-    }
-
-    /// Has a kill already acted on the adopted tree? (Used to
-    /// recognize the benign release-EPIPE race: the kill destroyed
-    /// the gated child holding the pipe's only read end.)
-    fn was_killed(&self) -> bool {
-        matches!(*self.lock(), TreePhase::Adopted { killed: true, .. })
     }
 
     /// Publish a freshly forked pid. **The only path by which a pid
