@@ -25,8 +25,6 @@ pub use store::{
     query_path_info_opt,
 };
 
-use std::time::Duration;
-
 use rio_common::grpc::{H2_INITIAL_CONN_WINDOW, H2_INITIAL_STREAM_WINDOW, max_message_size};
 use tonic::transport::Channel;
 
@@ -66,8 +64,8 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// `connect_store_lazy` and went 7 minutes dark on scheduler SIGKILL.
 pub(crate) fn with_h2_keepalive(ep: tonic::transport::Endpoint) -> tonic::transport::Endpoint {
     with_h2_throughput(ep)
-        .http2_keep_alive_interval(Duration::from_secs(30))
-        .keep_alive_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(rio_common::grpc::H2_KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(rio_common::grpc::H2_KEEPALIVE_TIMEOUT)
         .keep_alive_while_idle(true)
 }
 

@@ -120,6 +120,16 @@ pub const PROBE_TENANT_ID_HEADER: &str = "x-rio-probe-tenant-id";
 /// constant here would be invisible to it.
 pub const DEFAULT_GRPC_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// h2 keepalive PING interval, shared by every server
+/// (`rio_common::server::tonic_builder`) and the client endpoints
+/// (`rio-proto::client::with_h2_keepalive`) so the two sides cannot
+/// drift. 30 s proven in production; detects a half-open peer in
+/// ~interval+timeout instead of the kernel's 2 h TCP default.
+pub const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// h2 keepalive PONG timeout (see [`H2_KEEPALIVE_INTERVAL`]).
+pub const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Timeout for NAR streaming calls (GetPath, PutPath).
 ///
 /// At `MAX_NAR_SIZE` = 4 GiB and ~15 MB/s, a full transfer is ~270s. 300s

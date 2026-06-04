@@ -71,11 +71,38 @@ pub async fn health_reporter_not_serving() -> (
 /// streams. The h2 default 64 KiB was the 30 MB/s wall on builder NAR
 /// fetch (I-180). Mirrored client-side in `rio-proto::client`; see
 /// [`H2_INITIAL_STREAM_WINDOW`] for the rationale.
+/// h2 + TCP keepalive ride here too (the single server-construction
+/// chokepoint): every daemon's long-lived server streams (WatchBuild,
+/// TriggerGC, TailLog, AppendLog acks) survive proxy idle-timeouts and
+/// detect vanished peers in ~40 s instead of the kernel's 2 h TCP
+/// default. The values are the shared
+/// [`rio_common::grpc::H2_KEEPALIVE_INTERVAL`]/`_TIMEOUT` consts —
+/// re-used by the client side (`rio-proto::client::with_h2_keepalive`)
+/// so the two directions cannot drift; the `h2-keepalive-single-source`
+/// policy check pins that no daemon hand-chains its own values.
 // r[impl proto.h2.adaptive-window+2]
+// r[impl proto.h2.keepalive-server]
 pub fn tonic_builder() -> tonic::transport::Server {
+    tonic_builder_tuned(
+        crate::grpc::H2_KEEPALIVE_INTERVAL,
+        crate::grpc::H2_KEEPALIVE_TIMEOUT,
+    )
+}
+
+/// [`tonic_builder`] with caller-chosen keepalive values. Production
+/// callers use [`tonic_builder`]; this exists for the valve
+/// conformance test (200 ms/100 ms) so a half-open-peer detection can
+/// be observed in test time rather than 40 s.
+pub fn tonic_builder_tuned(
+    keepalive_interval: std::time::Duration,
+    keepalive_timeout: std::time::Duration,
+) -> tonic::transport::Server {
     tonic::transport::Server::builder()
         .initial_stream_window_size(Some(H2_INITIAL_STREAM_WINDOW))
         .initial_connection_window_size(Some(H2_INITIAL_CONN_WINDOW))
+        .http2_keepalive_interval(Some(keepalive_interval))
+        .http2_keepalive_timeout(Some(keepalive_timeout))
+        .tcp_keepalive(Some(keepalive_interval))
 }
 
 /// Projects the crate-local `Config` to its embedded
@@ -796,5 +823,122 @@ mod tests {
             "should give up at ~max_wait, got {elapsed:?}"
         );
         assert_eq!(active.load(Ordering::Relaxed), 1, "counter untouched");
+    }
+
+    /// The keepalive valve, observed end-to-end against a HALF-OPEN
+    /// peer (TCP up, h2 silent — simulated by a local proxy that
+    /// black-holes the client→server direction after the handshake).
+    ///
+    /// RED (recorded in the arm below): a server built WITHOUT the
+    /// keepalive — yesterday's bare `Server::builder()` — never
+    /// notices; the connection outlives a 3 s window. GREEN: the tuned
+    /// 200 ms/100 ms valve tears the connection down well inside it.
+    /// Production uses `tonic_builder()` = the same code path at
+    /// 30 s/10 s (proven values; ~40 s worst-case detection).
+    // r[verify proto.h2.keepalive-server]
+    #[tokio::test]
+    async fn keepalive_valve_tears_down_a_half_open_peer() {
+        use std::sync::atomic::AtomicBool;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        async fn spawn_server(tuned: bool) -> std::net::SocketAddr {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let health = tonic_health::server::health_reporter().1;
+            let mut builder = if tuned {
+                tonic_builder_tuned(Duration::from_millis(200), Duration::from_millis(100))
+            } else {
+                tonic::transport::Server::builder()
+            };
+            tokio::spawn(
+                builder
+                    .add_service(health)
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+            );
+            addr
+        }
+
+        /// Returns true iff the SERVER closed its side of the
+        /// connection within `wait` of the peer going half-open.
+        async fn server_closed_within(tuned: bool, wait: Duration) -> bool {
+            let saddr = spawn_server(tuned).await;
+            let blackhole = Arc::new(AtomicBool::new(false));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let paddr = listener.local_addr().unwrap();
+            let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+            let bh = blackhole.clone();
+            tokio::spawn(async move {
+                let (client, _) = listener.accept().await.unwrap();
+                let upstream = TcpStream::connect(saddr).await.unwrap();
+                let (mut cr, mut cw) = client.into_split();
+                let (mut ur, mut uw) = upstream.into_split();
+                // client → server: dropped on the floor once black-holed
+                // (the client keeps writing happily; its PONGs and
+                // window updates simply never arrive).
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 16 * 1024];
+                    loop {
+                        match cr.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if !bh.load(Ordering::Relaxed)
+                                    && uw.write_all(&buf[..n]).await.is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+                // server → client: a read of 0/Err means the server
+                // tore the connection down — the observable verdict.
+                let mut buf = [0u8; 16 * 1024];
+                loop {
+                    match ur.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if cw.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = closed_tx.send(());
+            });
+            let channel = tonic::transport::Endpoint::from_shared(format!("http://{paddr}"))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            // Hold one server-streaming call open (hyper's server-side
+            // keepalive PINGs accompany active streams — which is also
+            // the production shape: the hazard is a wedged peer holding
+            // a long-lived WatchBuild/TailLog stream).
+            let mut health = tonic_health::pb::health_client::HealthClient::new(channel.clone());
+            let watch = health
+                .watch(tonic_health::pb::HealthCheckRequest {
+                    service: String::new(),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            // h2 + stream established end-to-end; now go half-open.
+            blackhole.store(true, Ordering::Relaxed);
+            let closed = tokio::time::timeout(wait, closed_rx).await.is_ok();
+            drop(watch);
+            drop(channel);
+            closed
+        }
+
+        assert!(
+            !server_closed_within(false, Duration::from_secs(3)).await,
+            "un-tuned builder unexpectedly tore down the half-open peer \
+             (the recorded red would be stale)"
+        );
+        assert!(
+            server_closed_within(true, Duration::from_secs(3)).await,
+            "tuned keepalive failed to tear down a half-open peer"
+        );
     }
 }

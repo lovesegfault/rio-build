@@ -654,6 +654,47 @@ in
   # tail_log, controller gc_schedule.rs trigger_gc, scheduler
   # admin/gc.rs trigger_gc — the hand census had missed the fifth;
   # the lint caught it, which is this chokepoint's own argument.
+  # Keepalive single source: the h2/TCP keepalive knobs appear ONLY at
+  # the two chokepoints (server: rio-common/src/server.rs; client:
+  # rio-proto/src/client/mod.rs). A future per-daemon hand-chained
+  # override (the rio-scheduler main.rs shape this check was born red
+  # on) is CI-red, not review-caught.
+  # r[verify proto.h2.keepalive-server]
+  h2-keepalive-single-source =
+    pkgs.runCommand "rio-h2-keepalive-single-source"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-gateway/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-store/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-controller/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-builder/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-common/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-proto/src)
+          ];
+        };
+        nativeBuildInputs = [ pkgs.ripgrep ];
+      }
+      ''
+        set +o pipefail
+        hits=$(rg -n 'http2_keep_?alive_|keep_alive_timeout|keep_alive_while_idle|tcp_keepalive'           $src --glob '*.rs'           | grep -v 'rio-common/src/server\.rs'           | grep -v 'rio-proto/src/client/mod\.rs'           | grep -v 'rio-common/src/grpc\.rs' || true)
+        if [[ -n "$hits" ]]; then
+          echo "FAIL: keepalive knob outside the two chokepoints — use" >&2
+          echo "rio_common::server::tonic_builder / rio-proto with_h2_keepalive:" >&2
+          echo "$hits" >&2
+          exit 1
+        fi
+        # Negative self-test: a planted override MUST fire.
+        mkdir -p planted && echo '.http2_keepalive_interval(Some(d))' > planted/sample.rs
+        if ! rg -q 'http2_keep_?alive_' planted/sample.rs; then
+          echo "FAIL: self-test — pattern missed a planted override" >&2
+          exit 1
+        fi
+        touch $out
+      '';
+
   # r[verify proto.client.streaming-open-bounded]
   streaming-open-ban =
     pkgs.runCommand "rio-streaming-open-ban"

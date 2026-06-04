@@ -36,6 +36,20 @@ this with a banned-method list derived at check time from the proto
 born banned; sanctioned combinators are `rio_common::transport::bounded_open`,
 `with_timeout_status`, and `with_timeout`.
 
+#r("proto.h2.keepalive-server")[
+  Every component's gRPC server MUST be constructed via
+  `rio_common::server::tonic_builder` (or its tuned test variant), which
+  applies the shared h2 PING keepalive interval/timeout and TCP
+  keepalive; hand-chained per-daemon keepalive overrides are forbidden.
+]
+
+Keepalive is a connection-liveness property, not a per-daemon tuning
+knob: a vanished peer (SIGKILL, netsplit) must be detected in
+\~interval+timeout everywhere, and the client mirrors the same consts
+(`rio_common::grpc::H2_KEEPALIVE_INTERVAL`/`_TIMEOUT`) so the directions
+cannot drift. The `h2-keepalive-single-source` policy check pins the
+knobs to the two chokepoints.
+
 == gRPC Metadata Keys
 
 `x-rio-*` header constants live in `rio_common::grpc` (proto-agnostic,

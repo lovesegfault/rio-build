@@ -512,14 +512,15 @@ async fn main() -> anyhow::Result<()> {
     // fetch(); GrpcWebLayer needs the h1 codec enabled. Native gRPC
     // clients keep negotiating h2 — both protocols on one port.
     // r[impl dash.stream.idle-timeout+3]
-    // http2_keep_alive_interval: 30s server-initiated PING keeps
-    // long-lived server streams (WatchBuild, TriggerGC) alive
-    // through any proxy's idle-timeout. Replaces the Envoy Gateway
-    // ClientTrafficPolicy `streamIdleTimeout: 1h` — the stream is
-    // never idle from the proxy's view.
+    // Server-initiated h2 PINGs keep long-lived server streams
+    // (WatchBuild, TriggerGC) alive through any proxy's idle-timeout
+    // (replacing the Envoy Gateway ClientTrafficPolicy
+    // `streamIdleTimeout: 1h`) — supplied by `tonic_builder()` itself
+    // since the keepalive hoist; the hand-chained override that used
+    // to live here is exactly what the `h2-keepalive-single-source`
+    // check now forbids.
     rio_common::server::tonic_builder()
         .accept_http1(true)
-        .http2_keepalive_interval(Some(std::time::Duration::from_secs(30)))
         // Layer order: first .layer() = outermost. CORS must see the
         // OPTIONS preflight before GrpcWebLayer (which would reject
         // a non-grpc-web content-type). GrpcWebLayer translates

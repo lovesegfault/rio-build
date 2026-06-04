@@ -424,6 +424,14 @@ impl IngestSession {
         self.lock_shared().buffer_bytes >= self.config.cut_threshold_bytes
     }
 
+    /// True iff nothing is buffered. The AppendLog driver's
+    /// inbound-idle abort is gated on this: with an empty buffer an
+    /// idle-abort can lose nothing, while a non-empty buffer's
+    /// liveness is owned by the cut path's bounded ack send.
+    pub fn buffer_is_empty(&self) -> bool {
+        self.lock_shared().buffer_bytes == 0
+    }
+
     /// How many chunk-cut attempts this session has made (== the number
     /// of S3 keys it may have created — a failed attempt's PUT may have
     /// committed even though its manifest row was never written). The

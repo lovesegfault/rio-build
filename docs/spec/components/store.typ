@@ -1669,6 +1669,20 @@ path enforced a 16 MiB decompression ceiling --- a multi-MiB contiguous run
 committed a chunk the read path then refused, making the tail of that log
 unreadable while the manifest claimed coverage.
 
+#r("store.log.ingest-idle-abort")[
+  An AppendLog ingest driver whose buffer is empty and whose inbound
+  stream has been silent for at least four heartbeat intervals MUST
+  abort the stream (counted, `reason="inbound_idle"`) rather than
+  continue renewing the ingest lease.
+]
+
+Lease renewal is thereby structurally coupled to observed stream
+liveness: a builder that vanished without a FIN cannot hold its
+execution's ingest lease indefinitely through a driver that heartbeats
+PG forever. The empty-buffer gate makes the abort loss-free by
+construction; a non-empty buffer's liveness is owned by the cut path's
+bounded ack send.
+
 #r("store.log.tail-reconnect")[
   A `follow`-mode `TailLog` stream ends when the ingest session it is
   attached to closes, which does not imply the execution is finished. A

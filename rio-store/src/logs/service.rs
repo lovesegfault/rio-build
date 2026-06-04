@@ -126,6 +126,14 @@ const PROXY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// connect+open ≈ 7 s, for at most the lease's 30 s staleness window.
 const PROXY_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Inbound-silence bound for an AppendLog driver with an EMPTY buffer:
+/// 4 × [`sessions::HEARTBEAT_INTERVAL`]. Past this the driver aborts
+/// (counted `reason="inbound_idle"`) instead of renewing the ingest
+/// lease forever on behalf of a builder that no longer exists. Lease
+/// renewal is thereby structurally coupled to observed stream
+/// liveness; an asserting test pins the 4× relationship.
+const INBOUND_IDLE_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Turns the owning replica's self-identity (the
 /// `log_ingest_sessions.replica_pod` value it registered at
 /// `sessions::acquire` time) into a URI the cross-replica `TailLog`
@@ -1021,11 +1029,13 @@ impl AppendDriver {
         let mut heartbeat_interval = tokio::time::interval(sessions::HEARTBEAT_INTERVAL);
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeat_interval.tick().await;
+        let mut last_inbound = tokio::time::Instant::now();
 
         loop {
             tokio::select! {
                 msg = inbound.message() => match msg {
                     Ok(Some(AppendLogRequest { msg: Some(append_log_request::Msg::Batch(b)) })) => {
+                        last_inbound = tokio::time::Instant::now();
                         match self.session.accept(b) {
                             Ok(AcceptOutcome::Accepted { cut_due }) => {
                                 if cut_due
@@ -1089,6 +1099,35 @@ impl AppendDriver {
                     return LoopExit::Displaced;
                 }
                 _ = heartbeat_interval.tick() => {
+                    // A silently-vanished builder (the pod was SIGKILLed,
+                    // a netsplit ate the FIN) leaves this stream mute
+                    // forever while these PG heartbeats keep renewing the
+                    // ingest lease — an immortal driver pinned to a dead
+                    // peer. With an EMPTY buffer and inbound silence past
+                    // four heartbeats, abort: nothing buffered can be
+                    // lost, and the server h2 keepalive has had two full
+                    // PING windows to vouch for a live-but-quiet peer
+                    // (a live tonic connection answers PINGs at the
+                    // transport layer without sending batches — but a
+                    // half-open one is torn down, which surfaces here as
+                    // an inbound Err first; this arm is the backstop for
+                    // the in-between, lease-renewing zombie). The
+                    // non-empty-buffer case is covered by the bounded
+                    // ack send on the cut path, not this arm.
+                    // r[impl store.log.ingest-idle-abort]
+                    if self.session.buffer_is_empty()
+                        && last_inbound.elapsed() >= INBOUND_IDLE_BOUND
+                    {
+                        metrics::counter!(
+                            "rio_store_log_ingest_streams_aborted_total",
+                            "reason" => "inbound_idle"
+                        )
+                        .increment(1);
+                        return LoopExit::Abort(Status::aborted(
+                            "AppendLog: no inbound traffic for 60s with an empty buffer; \
+                             reconnect and resume from the last ack",
+                        ));
+                    }
                     match sessions::heartbeat(&self.pool, self.session.exec_id, self.session.session_id).await {
                         Ok(HeartbeatOutcome::Renewed) => {
                             // Piggyback the completeness-ceiling refresh
@@ -2036,6 +2075,50 @@ mod tests {
             !is_complete,
             "no terminal drv_executions row yet => the log cannot be complete"
         );
+    }
+
+    /// The inbound-idle abort, end to end: a builder that opens the
+    /// stream and then vanishes without a FIN (here: simply never
+    /// sends) is aborted (`reason="inbound_idle"`) once the buffer is
+    /// empty and four heartbeats pass with no inbound traffic — the
+    /// driver does NOT renew the ingest lease forever.
+    ///
+    /// `#[ignore]`: 60–75 s of real time (HEARTBEAT_INTERVAL is a
+    /// const). Run manually: `cargo nextest run -p rio-store \
+    /// -E 'test(idle_inbound)' --run-ignored all`. RED RECORDED
+    /// (2026-06-04, fix neutralized via `if false &&`): the await
+    /// below outlived a 100 s timeout — the driver renewed the lease
+    /// forever. GREEN: Aborted("no inbound traffic") at ~75 s.
+    // r[verify store.log.ingest-idle-abort]
+    #[tokio::test]
+    #[ignore = "60-75s real time (HEARTBEAT_INTERVAL is a const); run with --run-ignored all"]
+    async fn idle_inbound_with_empty_buffer_aborts() {
+        let mut h = harness().await;
+        let exec = seed_assignment(&h.db.pool, "builder-0").await;
+        let tok = token("builder-0", DRV);
+
+        let (tx, mut acks) = open_append(&mut h.client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("open");
+        // Keep tx alive (no half-close) and send NOTHING: the
+        // silently-vanished-builder shape from the server's view.
+        let verdict =
+            tokio::time::timeout(std::time::Duration::from_secs(100), acks.message()).await;
+        drop(tx);
+        let status = verdict
+            .expect("driver must abort within the idle bound; pre-fix this timed out (RED)")
+            .expect_err("an idle abort is an in-stream error, not a clean close");
+        assert_eq!(status.code(), tonic::Code::Aborted);
+        assert!(
+            status.message().contains("no inbound traffic"),
+            "got: {status:?}"
+        );
+    }
+
+    /// The 4x relationship the idle bound's doc promises.
+    #[test]
+    fn inbound_idle_bound_is_four_heartbeats() {
+        assert_eq!(INBOUND_IDLE_BOUND, sessions::HEARTBEAT_INTERVAL * 4);
     }
 
     /// store.log.completeness-gate, the per-append half: a builder
