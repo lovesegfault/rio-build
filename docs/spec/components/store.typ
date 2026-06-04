@@ -1760,16 +1760,20 @@ a compromised builder holding a valid token could exhaust the replica's
 memory, and without the monotone gate it could corrupt the manifest's line
 arithmetic for its own execution.
 
-#r("store.log.sweep-ownership")[
+#r("store.log.sweep-ownership+1")[
   The store's log TTL sweep owns log artifacts ONLY: it deletes
   `drv_log_chunks` rows, their backing objects, and stale
   `log_ingest_sessions` rows for executions past `log_retention_days`,
   and MUST NOT delete `drv_executions` rows. The execution lifecycle row
   is collected by the scheduler's execution-row GC, and only when the
   row is terminal, has no active assignment, is referenced by no
-  `drv_attempts` row, and is older than `exec_retention_days` --- the
-  pure conjunction `exec_row_sweep_eligible`, every conjunct a distinct
-  safety guard.
+  `drv_attempts` row, has no surviving `drv_log_chunks` row and no
+  `log_ingest_sessions` row (artifact-before-row: the lifecycle row
+  MUST outlive every log artifact keyed on it, under ANY retention
+  configuration --- the deletion order is data-structural, never
+  schedule- or config-dependent), and is older than
+  `exec_retention_days` --- the pure conjunction
+  `exec_row_sweep_eligible`, every conjunct a distinct safety guard.
 ]
 The store-side sweep selected victims by age alone; `drv_executions` is
 scheduler-owned cross-service state (terminality, report idempotency,

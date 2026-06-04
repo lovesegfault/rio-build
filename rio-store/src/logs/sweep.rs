@@ -146,7 +146,7 @@ pub async fn sweep_expired_logs(
             .execute(pool)
             .await?;
 
-        // r[impl store.log.sweep-ownership]
+        // r[impl store.log.sweep-ownership+1]
         // The drv_executions row is NOT deleted: scheduler-owned
         // lifecycle state (see the module doc). The candidate SELECT's
         // EXISTS disjunction keeps a stripped row out of every later
@@ -276,7 +276,7 @@ mod tests {
         (execs, chunks, sessions)
     }
 
-    // r[verify store.log.sweep-ownership]
+    // r[verify store.log.sweep-ownership+1]
     /// merged_bug_086 (red-first): the log TTL sweep owns store-side
     /// log artifacts ONLY — chunks, objects, stale session rows.
     /// `drv_executions` is the scheduler-owned execution lifecycle row:

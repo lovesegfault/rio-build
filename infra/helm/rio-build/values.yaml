@@ -161,10 +161,13 @@ controller:
   storeAddr: rio-store.rio-store:9002
   # drv_executions lifecycle-row retention (days) for the
   # scheduler-owned execution-row GC (store.log.sweep-ownership).
-  # Keep >= store.logRetentionDays: the row must not die before the
-  # log chunks it anchors (a reclaimed row reads the log incomplete
-  # even while chunks remain). Rows are reclaimed only when terminal,
-  # assignment-closed, and unreferenced by the attempt ledger.
+  # The artifact-before-row order is enforced structurally: the GC
+  # refuses rows with surviving log chunks or a live ingest session,
+  # under ANY value here. Keeping this >= store.logRetentionDays is
+  # an efficiency choice (rows age out right as their chunks do), not
+  # a correctness requirement. Rows are reclaimed only when terminal,
+  # assignment-closed, unreferenced by the attempt ledger, and
+  # artifact-free.
   execRetentionDays: 30
   # Balanced-channel config also passed through to workers. Workers
   # DNS-resolve the headless Service, health-probe pod IPs, route to leader.
@@ -468,10 +471,13 @@ scheduler:
   storeAddr: rio-store.rio-store:9002
   # drv_executions lifecycle-row retention (days) for the
   # scheduler-owned execution-row GC (store.log.sweep-ownership).
-  # Keep >= store.logRetentionDays: the row must not die before the
-  # log chunks it anchors (a reclaimed row reads the log incomplete
-  # even while chunks remain). Rows are reclaimed only when terminal,
-  # assignment-closed, and unreferenced by the attempt ledger.
+  # The artifact-before-row order is enforced structurally: the GC
+  # refuses rows with surviving log chunks or a live ingest session,
+  # under ANY value here. Keeping this >= store.logRetentionDays is
+  # an efficiency choice (rows age out right as their chunks do), not
+  # a correctness requirement. Rows are reclaimed only when terminal,
+  # assignment-closed, unreferenced by the attempt ledger, and
+  # artifact-free.
   execRetentionDays: 30
   # I-204: requiredSystemFeatures values that are CAPABILITY HINTS, not
   # hardware gates. Stripped at DAG-insert so spawn/dispatch ignore them.
@@ -958,10 +964,13 @@ gateway:
   storeAddr: rio-store.rio-store:9002
   # drv_executions lifecycle-row retention (days) for the
   # scheduler-owned execution-row GC (store.log.sweep-ownership).
-  # Keep >= store.logRetentionDays: the row must not die before the
-  # log chunks it anchors (a reclaimed row reads the log incomplete
-  # even while chunks remain). Rows are reclaimed only when terminal,
-  # assignment-closed, and unreferenced by the attempt ledger.
+  # The artifact-before-row order is enforced structurally: the GC
+  # refuses rows with surviving log chunks or a live ingest session,
+  # under ANY value here. Keeping this >= store.logRetentionDays is
+  # an efficiency choice (rows age out right as their chunks do), not
+  # a correctness requirement. Rows are reclaimed only when terminal,
+  # assignment-closed, unreferenced by the attempt ledger, and
+  # artifact-free.
   execRetentionDays: 30
   # Balanced-channel: gateway DNS-resolves headless to pod IPs, probes
   # grpc.health.v1 on each, routes to leader.

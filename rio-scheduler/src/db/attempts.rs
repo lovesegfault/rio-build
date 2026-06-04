@@ -602,13 +602,19 @@ impl SchedulerDb {
     ///    derivation parked past retention keeps its post-reset charge
     ///    rows, those rows keep their exec rows, the kind survives the
     ///    park),
-    /// 4. and **older than `retention_secs`**.
+    /// 4. with **no surviving `drv_log_chunks` rows** (artifact before
+    ///    row: deleting the lifecycle row first orphans its chunks
+    ///    forever — the store's TTL sweep selects victims through this
+    ///    row; data-structural, holds under ANY retention config),
+    /// 5. with **no live `log_ingest_sessions` row** (still producing
+    ///    artifacts; the row anchors the routing registry),
+    /// 6. and **older than `retention_secs`**.
     ///
     /// One statement, one MVCC snapshot, for the same stability
     /// argument as [`Self::gc_attempt_ledger`] below; subselect-LIMIT
     /// per the same precedent. Deliberately stronger than
     /// "not-in-suffix" — see the kernel doc.
-    // r[impl store.log.sweep-ownership]
+    // r[impl store.log.sweep-ownership+1]
     pub(crate) async fn gc_exec_rows(
         &self,
         retention_secs: f64,
@@ -625,6 +631,10 @@ impl SchedulerDb {
                                      AND a.status IN ('pending', 'acknowledged')) \
                    AND NOT EXISTS (SELECT 1 FROM drv_attempts t \
                                    WHERE t.exec_id = v.exec_id) \
+                   AND NOT EXISTS (SELECT 1 FROM drv_log_chunks c \
+                                   WHERE c.exec_id = v.exec_id) \
+                   AND NOT EXISTS (SELECT 1 FROM log_ingest_sessions s \
+                                   WHERE s.exec_id = v.exec_id) \
                  LIMIT $2)",
         )
         .bind(retention_secs)

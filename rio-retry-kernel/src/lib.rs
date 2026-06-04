@@ -2027,19 +2027,35 @@ pub fn admit_store_degraded<Id>(rows: &[LedgerRow<Id>], bound: u32) -> WorkerAbo
 ///   lifetime, so exec rows stay eventually collectable: parked >30 d
 ///   derivations keep their charge rows in the post-reset suffix,
 ///   those rows keep their exec rows, and the kind survives the park.
+/// - `!has_log_chunks`: artifact-before-row — a `drv_log_chunks` row
+///   keys its existence on this exec row; deleting the row first
+///   orphans the chunks forever (the store's TTL sweep selects its
+///   victims through this row). The ordering is data-structural: it
+///   holds under ANY retention configuration, not just
+///   `exec_retention_days >= log_retention_days`.
+/// - `!has_live_ingest_session`: a registered `log_ingest_sessions`
+///   row means the execution is still producing artifacts; the
+///   lifecycle row anchors the routing registry.
 /// - `aged_out`: past `exec_retention_days` (the SQL twin binds the
 ///   configured value).
 ///
 /// The SQL twin is `gc_exec_rows` in rio-scheduler `db/attempts.rs`;
-/// its DB tests pin all four conjuncts against real rows.
-// r[impl store.log.sweep-ownership]
+/// its DB tests pin all six conjuncts against real rows.
+// r[impl store.log.sweep-ownership+1]
 pub fn exec_row_sweep_eligible(
     terminal: bool,
     has_active_assignment: bool,
     referenced_by_ledger: bool,
+    has_log_chunks: bool,
+    has_live_ingest_session: bool,
     aged_out: bool,
 ) -> bool {
-    terminal && !has_active_assignment && !referenced_by_ledger && aged_out
+    terminal
+        && !has_active_assignment
+        && !referenced_by_ledger
+        && !has_log_chunks
+        && !has_live_ingest_session
+        && aged_out
 }
 
 /// The floor-bump outcome as [`classify`] consumes it — a leaf-local
@@ -3862,28 +3878,35 @@ mod proofs {
         assert!(trailing_paced_run(&rows[..n + 1]) == run + 1);
     }
 
-    // r[verify store.log.sweep-ownership]
-    /// [`exec_row_sweep_eligible`] is exactly the four-conjunct guard:
+    // r[verify store.log.sweep-ownership+1]
+    /// [`exec_row_sweep_eligible`] is exactly the six-conjunct guard:
     /// eligibility implies every safety conjunct (terminal, no active
-    /// assignment, no ledger reference, aged out), and any single
-    /// violated conjunct vetoes — the second deleter of execution rows
-    /// can never weaken to a disjunction or drop a guard without this
-    /// harness failing.
+    /// assignment, no ledger reference, no surviving log chunks, no
+    /// live ingest session, aged out), and any single violated conjunct
+    /// vetoes — the second deleter of execution rows can never weaken
+    /// to a disjunction or drop a guard without this harness failing.
+    /// `kani::cover!` proves the predicate is satisfiable: a harness
+    /// over an unsatisfiable conjunction would certify vacuously.
     #[kani::proof]
     fn check_exec_row_sweep_guards() {
         let terminal: bool = kani::any();
         let active: bool = kani::any();
         let referenced: bool = kani::any();
+        let chunks: bool = kani::any();
+        let session: bool = kani::any();
         let aged: bool = kani::any();
 
-        let eligible = exec_row_sweep_eligible(terminal, active, referenced, aged);
+        let eligible = exec_row_sweep_eligible(terminal, active, referenced, chunks, session, aged);
+        kani::cover!(eligible, "the sweep predicate is satisfiable");
         if eligible {
             assert!(terminal);
             assert!(!active);
             assert!(!referenced);
+            assert!(!chunks);
+            assert!(!session);
             assert!(aged);
         }
-        if !terminal || active || referenced || !aged {
+        if !terminal || active || referenced || chunks || session || !aged {
             assert!(!eligible);
         }
     }

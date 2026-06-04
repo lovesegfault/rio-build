@@ -1264,7 +1264,7 @@ async fn insert_aged_execution(
     Ok(())
 }
 
-// r[verify store.log.sweep-ownership]
+// r[verify store.log.sweep-ownership+1]
 /// The four-conjunct guard against real rows, one fixture per conjunct:
 /// (A) non-terminal + aged → KEPT (may still report; live idempotency
 /// key); (B) terminal + aged + ACTIVE assignment → KEPT (E4 shape);
@@ -1327,6 +1327,66 @@ async fn test_gc_exec_rows_spares_referenced_and_live() -> anyhow::Result<()> {
     assert!(
         !survivors.contains(&exec_d),
         "the eligible row is collected"
+    );
+    Ok(())
+}
+
+// r[verify store.log.sweep-ownership+1]
+/// merged_bug_007: artifact-before-row ordering is data-structural, not
+/// schedule-dependent. An exec row with surviving log artifacts — a
+/// `drv_log_chunks` row (F) or a live `log_ingest_sessions` row (G) —
+/// is NOT sweepable regardless of age/terminality: deleting the
+/// lifecycle row first would orphan the chunks forever (the store's
+/// log TTL sweep keys its victims off this row). The 30d/30d retention
+/// tie and the helm `>=` ordering comment are no longer load-bearing.
+#[tokio::test]
+async fn test_gc_exec_rows_waits_for_log_artifacts() -> anyhow::Result<()> {
+    let (_test_db, db, _drv_id) = setup("exec-gc-artifacts").await?;
+
+    let exec_f = Uuid::now_v7(); // terminal, aged, has a log chunk
+    let exec_g = Uuid::now_v7(); // terminal, aged, has a live ingest session
+    let exec_h = Uuid::now_v7(); // terminal, aged, artifact-free → victim
+
+    insert_aged_execution(&db.pool, exec_f, Some("succeeded"), 60.0).await?;
+    insert_aged_execution(&db.pool, exec_g, Some("failed"), 60.0).await?;
+    insert_aged_execution(&db.pool, exec_h, Some("succeeded"), 60.0).await?;
+
+    sqlx::query(
+        "INSERT INTO drv_log_chunks \
+             (exec_id, session_id, chunk_seq, first_line, line_count, \
+              byte_size, s3_key) \
+         VALUES ($1, $2, 0, 0, 10, 100, 'logs/test/chunk-0')",
+    )
+    .bind(exec_f)
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO log_ingest_sessions (exec_id, session_id, replica_pod) \
+         VALUES ($1, $2, 'store-0')",
+    )
+    .bind(exec_g)
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+
+    let deleted = db.gc_exec_rows(30.0 * 86_400.0, 1000).await?;
+    assert_eq!(deleted, 1, "only the artifact-free row is eligible");
+
+    let survivors: Vec<Uuid> = sqlx::query_scalar("SELECT exec_id FROM drv_executions")
+        .fetch_all(&db.pool)
+        .await?;
+    assert!(
+        survivors.contains(&exec_f),
+        "a row with surviving log chunks must outlive them (orphan-chunk guard)"
+    );
+    assert!(
+        survivors.contains(&exec_g),
+        "a row with a live ingest session is still producing artifacts"
+    );
+    assert!(
+        !survivors.contains(&exec_h),
+        "artifact-free row is collected"
     );
     Ok(())
 }
