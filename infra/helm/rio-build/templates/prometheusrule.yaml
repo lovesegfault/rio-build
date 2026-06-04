@@ -459,12 +459,15 @@ spec:
 
         # Substitution-replacement Phase B (PD-20 / design §2.5): the
         # parked-materialization backlog. The housekeeping re-evaluation
-        # arm resolves every parked job whose node has a buildable
-        # dependency closure from-source within one tick, so every job
-        # this gauge counts has NO from-source fallback (Broken closure
-        # evidence) — a dead or misconfigured upstream is the only thing
-        # between its builds and progress. Builds WAIT (never fail) while
-        # parked; this alert is the operator's cue to fix the upstream.
+        # arm resolves parked jobs whose nodes have buildable dependency
+        # closures from-source within one tick — when the conversion-
+        # strictness knobs admit it (conversion_requires_worker_charge /
+        # conversion_min_park_dwell_secs; establishment-only-parked jobs
+        # never convert while the charge knob is ON). A counted job has
+        # either no from-source fallback (Holed/Pending closure
+        # evidence) or convertible work the knobs deliberately hold.
+        # Builds WAIT (never fail) while parked; this alert is the
+        # operator's cue to fix the upstream or review the knobs.
         # The gauge is a leader-gauge family member: every replica
         # births it at its declared reset (0) at boot, the leader
         # publishes ground truth each tick, and leadership loss sweeps
@@ -482,15 +485,17 @@ spec:
             severity: warning
           annotations:
             summary: materialization jobs parked >15m (upstream dead or misconfigured)
+            # Semantics sentence rendered from the canonical describe_*!
+            # HELP (generated/metric-help.json via `xtask regen helm-obs`
+            # — bug_330); the hand-written tail is operator ACTION only.
             description: >-
-              {{`{{ $value | humanize }}`}} materialization job(s) have been
-              parked for over 15 minutes. These jobs' derivations have no
-              buildable dependency closure, so only upstream recovery can
-              unblock them; their builds wait (never fail) while parked.
-              Check the tenant's upstream cache configuration and health
+              {{ get (($.Files.Get "generated/metric-help.json") | fromJson) "rio_scheduler_materialization_stalled" }}
+              Right now: {{`{{ $value | humanize }}`}} job(s) parked over 15
+              minutes. Check the conversion-strictness knobs and the
+              tenant's upstream cache configuration and health
               (rio_store_substitute_total{result="error"} rate, the store
-              logs for the upstream URL), then either fix the upstream or
-              cancel the affected builds.
+              logs for the upstream URL), then fix the upstream, adjust
+              the knobs, or cancel the affected builds — in that order.
 
         # Substitution-replacement Phase B (T-6.2; the CE-D1 deployment-
         # checklist row's alert, extended to the materialization tables):

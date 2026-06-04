@@ -335,13 +335,17 @@ pub fn describe_metrics() {
     );
     describe_gauge!(
         "rio_scheduler_materialization_stalled",
-        "Parked materialization jobs (infra budget exhausted; waiting on upstream \
-         recovery or park-backoff expiry). Leader-published every housekeeping tick \
-         from ground truth. Jobs whose nodes have buildable dependency closures are \
-         re-evaluated and resolved from-source instead of staying parked (PD-20), so \
-         a sustained nonzero value means a dead/misconfigured upstream is stalling \
-         work that has NO from-source fallback — the operator signal to check \
-         upstream cache health and tenant upstream configuration."
+        "Parked materialization jobs (park budget exhausted — worker-charged \
+         infra failures or establishment charges; waiting on upstream recovery or \
+         park-backoff expiry). Leader-published every housekeeping tick from ground \
+         truth. The PD-20 re-evaluation converts parked jobs with buildable \
+         dependency closures from-source ONLY when the conversion-strictness knobs \
+         admit it (conversion_requires_worker_charge: establishment-only-parked \
+         jobs never convert while ON; conversion_min_park_dwell_secs: minimum dwell \
+         since the most recent park). A sustained nonzero value therefore means \
+         either a dead/misconfigured upstream stalling work with no from-source \
+         fallback, OR convertible work the knobs are deliberately holding — check \
+         the strictness knobs before cancelling builds."
     );
     describe_counter!(
         "rio_scheduler_materialization_claims_total",

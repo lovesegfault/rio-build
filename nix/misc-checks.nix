@@ -357,6 +357,51 @@ in
         touch $out
       '';
 
+  # bug_330 / merged_bug_353 (drift half): the chart's metric
+  # semantics are RENDERED from the describe_*! HELP scrape
+  # (`xtask regen helm-obs` → generated/metric-help.json + in-place
+  # rioMetric panel descriptions). This re-runs the regen hermetically
+  # (docsData runCommand shape, nix/docs.nix) and diffs — a HELP edit
+  # without regen, or a hand-edited generated description, fails the
+  # merge gate. Formal-coverage rationale (none-sensible): operator
+  # mirror tier — the generation+drift pipeline IS the by-construction
+  # artifact; a model would verify a transcription of the same scrape.
+  helm-obs-drift =
+    pkgs.runCommand "rio-helm-obs-drift"
+      {
+        nativeBuildInputs = [
+          xtaskBin
+          pkgs.diffutils
+        ];
+        src = pkgs.lib.fileset.toSource {
+          root = unfilteredRoot;
+          fileset = pkgs.lib.fileset.unions (
+            [
+              ../infra/helm/rio-build/dashboards
+              ../infra/helm/rio-build/generated
+            ]
+            ++ map (m: pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") (../. + "/${m}/src")) (
+              builtins.filter (m: pkgs.lib.hasPrefix "rio-" m)
+                (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.members
+            )
+          );
+        };
+      }
+      ''
+        cp -r --no-preserve=mode $src work
+        export RIO_REPO_ROOT=$PWD/work
+        xtask regen helm-obs
+        for d in generated dashboards; do
+          diff -r work/infra/helm/rio-build/$d $src/infra/helm/rio-build/$d > $TMPDIR/diff-$d || {
+            echo "FAIL: infra/helm/rio-build/$d is stale vs the describe_*! HELP scrape" >&2
+            echo "Run: cargo xtask regen helm-obs" >&2
+            cat $TMPDIR/diff-$d >&2
+            exit 1
+          }
+        done
+        touch $out
+      '';
+
   # proxy_buffering off in dashboardNginxConf is LOAD-BEARING
   # (docker.nix:349): nginx default-buffers upstream → WatchBuild /
   # TailLog streams arrive as one blob at close. The config is a

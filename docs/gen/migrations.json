@@ -90,6 +90,7 @@
     "090_gc_collect_state",
     "091_chunks_deleted_at",
     "092_manifests_claim_phase",
-    "093_live_pins_kind_key"
+    "093_live_pins_kind_key",
+    "094_establishment_clusters"
   ]
 }

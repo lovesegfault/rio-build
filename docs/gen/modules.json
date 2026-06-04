@@ -2095,6 +2095,11 @@
       "doc": "Regenerate the workspace-hack crate."
     },
     {
+      "path": "regen/helm_obs.rs",
+      "depth": 1,
+      "doc": "`xtask regen helm-obs` — render the canonical `describe_*!` HELP"
+    },
+    {
       "path": "regen/seccomp.rs",
       "depth": 1,
       "doc": "Diff the worker seccomp profile against upstream moby."

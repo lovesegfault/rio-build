@@ -57,7 +57,9 @@ pub struct Report {
     /// InsufficientCapacity, etc.
     stuck_nodeclaims: Vec<StuckNodeClaim>,
     /// Scheduler Prometheus scrape via port-forward (leader pod :9091).
-    /// The I-025 signal — queue_depth{kind} + utilization{kind}.
+    /// The I-025 signal, pull-mode form — queued backlog vs open
+    /// attempts (the per-kind queue_depth/utilization gauges retired
+    /// with the placement layer).
     scheduler_metrics: Option<SchedulerMetrics>,
     /// Pods with FailedCreatePodSandBox events in the last 5min.
     /// The I-022/I-027 signal — aws-cni IP assignment failures.
@@ -109,13 +111,13 @@ pub struct StuckNodeClaim {
 
 #[derive(Serialize)]
 pub struct SchedulerMetrics {
-    pub fetcher_queue_depth: f64,
-    pub fetcher_utilization: f64,
-    pub builder_queue_depth: f64,
-    pub builder_utilization: f64,
     pub derivations_queued: f64,
-    /// queue_depth{kind=fetcher} > 0 && utilization{kind=fetcher} == 0.
-    /// The I-025 check — FODs queued but no fetcher streams.
+    pub derivations_running: f64,
+    /// Open pull-mode build attempts (the busy-fleet gauge — successor
+    /// of the retired stream-era workers_active).
+    pub open_attempts: f64,
+    /// derivations_queued > 0 && open_attempts == 0. The I-025 check,
+    /// pull-mode form — work queued but nothing claiming it.
     pub possible_freeze: bool,
 }
 
@@ -308,25 +310,13 @@ pub(crate) async fn gather_scheduler_metrics(client: &k::Client) -> Option<Sched
             .inspect_err(|e| debug!("scrape: {e:#}"))
             .ok()?,
     );
-    let fetcher_queue_depth = s
-        .labeled("rio_scheduler_queue_depth", "kind", "EXECUTOR_KIND_FETCHER")
-        .unwrap_or(0.0);
-    let fetcher_utilization = s
-        .labeled("rio_scheduler_utilization", "kind", "EXECUTOR_KIND_FETCHER")
-        .unwrap_or(0.0);
-    let builder_queue_depth = s
-        .labeled("rio_scheduler_queue_depth", "kind", "EXECUTOR_KIND_BUILDER")
-        .unwrap_or(0.0);
-    let builder_utilization = s
-        .labeled("rio_scheduler_utilization", "kind", "EXECUTOR_KIND_BUILDER")
-        .unwrap_or(0.0);
+    let derivations_queued = s.first("rio_scheduler_derivations_queued").unwrap_or(0.0);
+    let open_attempts = s.first("rio_scheduler_open_attempts").unwrap_or(0.0);
     Some(SchedulerMetrics {
-        fetcher_queue_depth,
-        fetcher_utilization,
-        builder_queue_depth,
-        builder_utilization,
-        derivations_queued: s.first("rio_scheduler_derivations_queued").unwrap_or(0.0),
-        possible_freeze: fetcher_queue_depth > 0.0 && fetcher_utilization == 0.0,
+        derivations_queued,
+        derivations_running: s.first("rio_scheduler_derivations_running").unwrap_or(0.0),
+        open_attempts,
+        possible_freeze: derivations_queued > 0.0 && open_attempts == 0.0,
     })
 }
 
@@ -448,9 +438,11 @@ async fn print_metrics_detail(client: &k::Client) {
         ("rio_scheduler_derivations_queued", "derivations_queued"),
         ("rio_scheduler_derivations_running", "derivations_running"),
         ("rio_scheduler_open_attempts", "open_attempts"),
+        (
+            "rio_scheduler_open_materialization_attempts",
+            "open_mat_attempts",
+        ),
         ("rio_scheduler_builds_active", "builds_active"),
-        ("rio_scheduler_queue_depth", "queue_depth"),
-        ("rio_scheduler_utilization", "utilization"),
     ];
     const STORE_GAUGES: &[(&str, &str)] = &[
         ("rio_store_pg_pool_utilization", "pg_pool_util"),
@@ -1015,13 +1007,11 @@ fn render_human(r: &Report) {
             String::new()
         };
         eprintln!(
-            "  {} fetcher_queue={}  fetcher_util={:.2}  builder_queue={}  builder_util={:.2}  queued={}{}",
+            "  {} queued={}  running={}  open_attempts={}{}",
             glyph(!m.possible_freeze),
-            m.fetcher_queue_depth,
-            m.fetcher_utilization,
-            m.builder_queue_depth,
-            m.builder_utilization,
             m.derivations_queued,
+            m.derivations_running,
+            m.open_attempts,
             freeze
         );
     }

@@ -1,12 +1,18 @@
 {
   "uid": "rio-dispatch-flow",
   "title": "rio-build: Dispatch Flow",
-  "tags": ["rio-build", "scheduler"],
+  "tags": [
+    "rio-build",
+    "scheduler"
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
   "refresh": "30s",
-  "time": {"from": "now-1h", "to": "now"},
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "templating": {
     "list": [
       {
@@ -23,10 +29,18 @@
     {
       "id": 1,
       "type": "timeseries",
-      "title": "Queue / running / workers",
-      "description": "Derivations queued vs running, overlaid with active workers. Queued > workers with running < workers = dispatch stall.",
-      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 9},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "title": "Queue / running / open attempts",
+      "description": "Derivations queued vs running, overlaid with active open attempts. Queued > open attempts with running < open attempts = dispatch stall.",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "targets": [
         {
           "expr": "rio_scheduler_derivations_queued",
@@ -39,127 +53,141 @@
           "refId": "B"
         },
         {
-          "expr": "rio_scheduler_workers_active",
-          "legendFormat": "workers active",
+          "expr": "rio_scheduler_open_attempts",
+          "legendFormat": "open attempts",
           "refId": "C"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
         },
         "overrides": [
           {
-            "matcher": {"id": "byName", "options": "workers active"},
+            "matcher": {
+              "id": "byName",
+              "options": "workers active"
+            },
             "properties": [
-              {"id": "custom.drawStyle", "value": "line"},
-              {"id": "custom.lineStyle", "value": {"dash": [10, 10], "fill": "dash"}},
-              {"id": "custom.fillOpacity", "value": 0}
+              {
+                "id": "custom.drawStyle",
+                "value": "line"
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    10,
+                    10
+                  ],
+                  "fill": "dash"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
             ]
           }
         ]
       },
       "options": {
-        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]},
-        "tooltip": {"mode": "multi", "sort": "desc"}
-      }
-    },
-    {
-      "id": 2,
-      "type": "timeseries",
-      "title": "Dispatch wait p50/p99",
-      "description": "rio_scheduler_dispatch_wait_seconds — time a Ready derivation waits for a worker slot. (Metric lands in P0539c; shows No Data until then.)",
-      "gridPos": {"x": 0, "y": 9, "w": 12, "h": 8},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(rio_scheduler_dispatch_wait_seconds_bucket[5m])))",
-          "legendFormat": "p50",
-          "refId": "A"
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
-        {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(rio_scheduler_dispatch_wait_seconds_bucket[5m])))",
-          "legendFormat": "p99",
-          "refId": "B"
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
         }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "none"}
-      }
-    },
-    {
-      "id": 3,
-      "type": "heatmap",
-      "title": "Dispatch wait heatmap",
-      "description": "rio_scheduler_dispatch_wait_seconds bucket distribution. (Metric lands in P0539c.)",
-      "gridPos": {"x": 12, "y": 9, "w": 12, "h": 8},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
-      "targets": [
-        {
-          "expr": "sum by (le) (increase(rio_scheduler_dispatch_wait_seconds_bucket[$__rate_interval]))",
-          "format": "heatmap",
-          "legendFormat": "{{le}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {"custom": {"hideFrom": {"legend": false, "tooltip": false, "viz": false}}},
-        "overrides": []
-      },
-      "options": {
-        "calculate": false,
-        "yAxis": {"unit": "s", "axisPlacement": "left"},
-        "color": {"mode": "scheme", "scheme": "Spectral", "steps": 128},
-        "cellGap": 1,
-        "tooltip": {"show": true, "yHistogram": false},
-        "legend": {"show": true}
       }
     },
     {
       "id": 4,
       "type": "timeseries",
-      "title": "Per-kind queue depth",
-      "description": "rio_scheduler_queue_depth — Ready derivations broken down by executor kind (builder/fetcher). One kind starving while the other drains = pool misconfigured.",
-      "gridPos": {"x": 0, "y": 17, "w": 24, "h": 7},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "title": "Queued derivations",
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 24,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "targets": [
         {
-          "expr": "rio_scheduler_queue_depth",
-          "legendFormat": "{{kind}}",
+          "expr": "rio_scheduler_derivations_queued",
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false, "stacking": {"mode": "normal", "group": "A"}}
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 20,
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
         },
         "overrides": []
       },
       "options": {
-        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull"]},
-        "tooltip": {"mode": "multi", "sort": "desc"}
-      }
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "rioMetric": "rio_scheduler_derivations_queued",
+      "rioNote": "The per-kind queue_depth split retired with the placement layer; per-system backlog is queued_by_system on ClusterStatus/GetSpawnIntents.",
+      "description": "Ready derivations waiting for a worker (DAG-status count; the per-system split is queued_by_system on ClusterStatus/GetSpawnIntents) — The per-kind queue_depth split retired with the placement layer; per-system backlog is queued_by_system on ClusterStatus/GetSpawnIntents."
     },
     {
       "id": 5,
       "type": "timeseries",
       "title": "Materialization job lifecycle",
       "description": "Substitution-replacement (Phase B): jobs created (by origin) vs claims delivered to store replicas vs terminal resolutions (by outcome). created >> claimed = store executors not keeping up or partitioned from the leader; claimed >> resolved = executions failing or reports not landing; a rising unobtainable/from_source share = upstream losing paths.",
-      "gridPos": {"x": 0, "y": 24, "w": 12, "h": 8},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "targets": [
         {
           "expr": "sum(rate(rio_scheduler_materialization_jobs_created_total[5m]))",
@@ -180,23 +208,48 @@
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
         },
         "overrides": []
       },
       "options": {
-        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]},
-        "tooltip": {"mode": "multi", "sort": "desc"}
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       }
     },
     {
       "id": 6,
       "type": "timeseries",
       "title": "Materialization: stalled (parked) jobs + store executions",
-      "description": "rio_scheduler_materialization_stalled — parked jobs with NO from-source fallback (only upstream recovery unblocks them; the RioSchedulerMaterializationStalled alert fires at >0 for 15m). Overlaid with the store-side execution outcome rates (rio_store_materialization_executions_total): a rising infra share explains parks; a rising unobtainable share means paths left the upstreams.",
-      "gridPos": {"x": 12, "y": 24, "w": 12, "h": 8},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "targets": [
         {
           "expr": "max(rio_scheduler_materialization_stalled)",
@@ -212,23 +265,56 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
         },
         "overrides": [
           {
-            "matcher": {"id": "byName", "options": "stalled (parked)"},
+            "matcher": {
+              "id": "byName",
+              "options": "stalled (parked)"
+            },
             "properties": [
-              {"id": "custom.fillOpacity", "value": 40},
-              {"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}
+              {
+                "id": "custom.fillOpacity",
+                "value": 40
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
             ]
           }
         ]
       },
       "options": {
-        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]},
-        "tooltip": {"mode": "multi", "sort": "desc"}
-      }
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "rioMetric": "rio_scheduler_materialization_stalled",
+      "rioNote": "Action: check the conversion-strictness knobs (conversion_requires_worker_charge / conversion_min_park_dwell_secs) and upstream cache health before cancelling builds.",
+      "description": "Parked materialization jobs (park budget exhausted — worker-charged infra failures or establishment charges; waiting on upstream recovery or park-backoff expiry). Leader-published every housekeeping tick from ground truth. The PD-20 re-evaluation converts parked jobs with buildable dependency closures from-source ONLY when the conversion-strictness knobs admit it (conversion_requires_worker_charge: establishment-only-parked jobs never convert while ON; conversion_min_park_dwell_secs: minimum dwell since the most recent park). A sustained nonzero value therefore means either a dead/misconfigured upstream stalling work with no from-source fallback, OR convertible work the knobs are deliberately holding — check the strictness knobs before cancelling builds. — Action: check the conversion-strictness knobs (conversion_requires_worker_charge / conversion_min_park_dwell_secs) and upstream cache health before cancelling builds."
     }
   ]
 }

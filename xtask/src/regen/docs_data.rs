@@ -89,6 +89,26 @@ fn write(dir: &Path, name: &str, v: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// The raw name → HELP map of every `describe_*!` callsite — shared
+/// with `regen helm-obs`, which renders the SAME canonical strings
+/// into the chart (bug_330: chart descriptions restated HELP by hand
+/// and drifted; one scrape, two renderers).
+pub(crate) fn metrics_help_map() -> Result<BTreeMap<String, String>> {
+    let re = Regex::new(METRICS_RE)?;
+    let mut seen = BTreeMap::<String, String>::new();
+    visit_rio_crates(&mut |_crate, body| {
+        for c in re.captures_iter(body) {
+            seen.entry(c[2].to_string()).or_insert_with(|| {
+                unescape_rust_str(&c[3])
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            });
+        }
+    })?;
+    Ok(seen)
+}
+
 /// Scrape `describe_{counter,gauge,histogram}!` callsites into
 /// `gen/metrics.json`. The `describe_*!()` help strings in each
 /// component's `lib.rs::describe_metrics()` are the source of truth;

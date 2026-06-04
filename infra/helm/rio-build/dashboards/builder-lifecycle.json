@@ -1,12 +1,18 @@
 {
   "uid": "rio-builder-lifecycle",
   "title": "rio-build: Builder Lifecycle",
-  "tags": ["rio-build", "builder"],
+  "tags": [
+    "rio-build",
+    "builder"
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
   "refresh": "30s",
-  "time": {"from": "now-1h", "to": "now"},
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "templating": {
     "list": [
       {
@@ -21,39 +27,19 @@
   },
   "panels": [
     {
-      "id": 1,
-      "type": "timeseries",
-      "title": "Worker disconnects",
-      "description": "rate(rio_scheduler_worker_disconnects_total[1m]) — workers dropping their scheduler stream. With ephemeral builders this tracks 1:1 with build completion; spikes above the assignment rate indicate crashes/evictions.",
-      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
-      "targets": [
-        {
-          "expr": "sum(rate(rio_scheduler_worker_disconnects_total[1m]))",
-          "legendFormat": "disconnects/s",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "single", "sort": "none"}
-      }
-    },
-    {
       "id": 2,
       "type": "timeseries",
       "title": "Disruption drains",
-      "description": "rio_controller_disruption_drains_total — workers cordoned + drained by the disruption controller (node preemption, scale-down).",
-      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "targets": [
         {
           "expr": "sum by (result) (rate(rio_controller_disruption_drains_total[5m]))",
@@ -64,23 +50,48 @@
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 20,
+            "spanNulls": false
+          }
         },
         "overrides": []
       },
       "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "desc"}
-      }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "rioMetric": "rio_controller_disruption_drains_total",
+      "rioNote": "Pull-mode preemption is synthesized by the controller, not heartbeat loss: a preempted executor never reports, the controller files the report for it.",
+      "description": "DisruptionTarget watcher preemption actions: synthesized preempted report + foreground Job delete (result=preempted_pull|preempted_pull_report_failed). Zero rate with evictions happening = watcher dead, falling back to the pod's own SIGTERM abort. — Pull-mode preemption is synthesized by the controller, not heartbeat loss: a preempted executor never reports, the controller files the report for it."
     },
     {
       "id": 4,
       "type": "timeseries",
       "title": "Scaling decisions",
       "description": "rio_controller_scaling_decisions_total — how often the controller patched /scale (direction=up|down).",
-      "gridPos": {"x": 0, "y": 17, "w": 12, "h": 7},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "targets": [
         {
           "expr": "sum by (direction) (rate(rio_controller_scaling_decisions_total[5m]))",
@@ -91,14 +102,31 @@
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
         },
         "overrides": []
       },
       "options": {
-        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull"]},
-        "tooltip": {"mode": "multi", "sort": "desc"}
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       }
     }
   ]
