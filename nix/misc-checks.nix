@@ -2248,4 +2248,111 @@ in
         [ "$fail" = 0 ] || exit 1
         touch $out
       '';
+  # Round-17 merged_bug_024 / RC17-13 (closure-witness producers — the
+  # F2 TRIGGER DEFINITION for the closure-witness family): every DAG
+  # truncation primitive call site and every closure-hole stamp site
+  # must appear here with a disposition. The witness contract is
+  # cumulative since the hole was last whole, and round-17 found two of
+  # four producers applying it at their original trigger only — a NEW
+  # truncation site landing without a same-commit registry entry (and a
+  # stamp disposition) is the "in-governance recurrence" that activates
+  # the family's pre-registered F2 scope: hole-stamping moves INTO the
+  # DAG truncation chokepoint (remove_node/edge-drop own the stamp) and
+  # per-call-site stamp policy ceases to exist. Patterns are rg -U
+  # multiline-tolerant: rustfmt splits method chains, and a wrapped
+  # `.closure_hole\n.stamp(` site is invisible to single-line grep.
+  # Dispositions:
+  #   REAP        — remove_build_interest_and_reap: stamps via the
+  #                 un-produced trigger ∪ witness_watched (produced
+  #                 removals from already-holed parents), full-set
+  #                 capture for triggered parents.
+  #   TTL-SWEEP   — poison-TTL housekeeping: removes Poisoned (un-
+  #                 produced by definition) children, stamps every
+  #                 surviving parent at the call site.
+  #   CLEARPOISON — admin ClearPoison: same capture-stamp-persist
+  #                 sequence at its call site.
+  #   RECOVERY    — load-time edge-drop: trigger = un-produced drop OR
+  #                 restored watched flag; content = ALL dropped
+  #                 terminal children.
+  #   PRUNE       — merge-time top-down prune: kept nodes born holed
+  #                 with the dropped closure as the witness (the
+  #                 in-memory half of Batch 1b's paired write).
+  #   EPOCH       — scrub_dependency_edges callers (displacement /
+  #                 authority takeover): definition REPLACEMENT, not
+  #                 closure truncation — the witness lifecycle is owned
+  #                 by the epoch machinery (carry_across / clear) at
+  #                 the same sites.
+  #   DEFINITION  — the primitive's own fn body.
+  #   TEST        — test fixtures staging holes directly.
+  closure-witness-producers =
+    pkgs.runCommand "rio-closure-witness-producers"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = workspaceFileset;
+        };
+        nativeBuildInputs = [ pkgs.ripgrep ];
+      }
+      ''
+        cd $src/rio-scheduler/src
+        fail=0
+
+        check_registry() {
+          # $1 = label, $2 = rg -U pattern, $3 = name of assoc array
+          local label=$1 pat=$2
+          local -n pins=$3
+          declare -A seen=()
+          while IFS=: read -r f n; do
+            f=$(printf '%s' "$f" | sed 's|^\./||')
+            seen[$f]=$n
+            local want=''${pins[$f]:-0}
+            if [ "$n" != "$want" ]; then
+              echo "FAIL($label): $f has $n sites, registry pins $want." >&2
+              rg -Un "$pat" "$f" | head -6 >&2
+              fail=1
+            fi
+          done < <(rg -Uc "$pat" . || true)
+          for f in "''${!pins[@]}"; do
+            if [ -z "''${seen[$f]:-}" ] && [ "''${pins[$f]}" != "0" ]; then
+              echo "FAIL($label): registry pins ''${pins[$f]} sites in $f but rg found none (stale registry)." >&2
+              fail=1
+            fi
+          done
+        }
+
+        # Truncation primitive: node removal.
+        declare -A rm_pins=(
+          [dag/mod.rs]=1            # REAP
+          [actor/housekeeping.rs]=1 # TTL-SWEEP
+          [actor/completion.rs]=1   # CLEARPOISON
+          [dag/tests.rs]=6          # TEST
+        )
+        check_registry remove_node '\.\s*\n?\s*remove_node\(' rm_pins
+
+        # Truncation primitive: dependency-edge scrub.
+        declare -A scrub_pins=(
+          [dag/mod.rs]=3 # 1 DEFINITION + 2 EPOCH (displacement, takeover)
+        )
+        check_registry scrub_dependency_edges 'scrub_dependency_edges\s*\(' scrub_pins
+
+        # Witness stamp sites (the producers' write half).
+        declare -A stamp_pins=(
+          [dag/mod.rs]=1            # REAP
+          [actor/housekeeping.rs]=1 # TTL-SWEEP
+          [actor/completion.rs]=1   # CLEARPOISON
+          [actor/recovery.rs]=1     # RECOVERY
+          [actor/merge.rs]=1        # PRUNE (born-holed; found by THIS check's first run)
+          [dag/tests.rs]=9          # TEST
+        )
+        check_registry closure_hole.stamp 'closure_hole\s*\n?\s*\.stamp\(' stamp_pins
+
+        if [ "$fail" != 0 ]; then
+          echo "remediation: a DAG truncation site must stamp the closure witness (or carry" >&2
+          echo "  an EPOCH/TEST disposition) and register here in the SAME commit:" >&2
+          echo "  nix/misc-checks.nix closure-witness-producers. An unregistered truncation" >&2
+          echo "  is the closure-witness family's F2 trigger (round-17 plan section A.2)." >&2
+          exit 1
+        fi
+        touch $out
+      '';
 }
