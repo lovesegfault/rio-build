@@ -2835,7 +2835,7 @@ async fn test_fleet_exhaustion_spare_eligible_defers() -> TestResult {
 // queue_depth / unroutable_ready gauge exactness under active dispatch
 // ---------------------------------------------------------------------------
 
-// r[verify obs.metric.scheduler]
+// r[verify obs.metric.scheduler+2]
 /// `queue_depth` / `unroutable_ready` gauges report the FINAL-iteration
 /// deferral count, not the sum across outer-loop iterations. Regression
 /// for the per-iteration accumulator never being cleared: with 1 idle

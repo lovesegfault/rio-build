@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
     // → actor exits → drops event_persist_tx → event-persister also
     // exits (channel-close). event_log::spawn doesn't need a token.
 
-    let (pool, db) = init_db_pool(&cfg.database_url, &shutdown).await?;
+    let (pool, db) = init_db_pool(&cfg.database_url, cfg.pg_auth, &shutdown).await?;
     // M_058: reference_hw_class change guard. Runs before any
     // ref-second state is read (CostTable, SlaEstimator). On mismatch
     // without --allow-reference-change, abort here — the persisted
@@ -699,28 +699,65 @@ pub(crate) fn parse_cors_origins(raw: &str) -> Vec<http::HeaderValue> {
 /// lazy never fails at creation; first-RPC-connects-or-fails.)
 /// Unlike the store connect, exhaustion here IS fatal — scheduler
 /// without PG can't recover state, can't persist, can't serve.
+/// Retryable = `pg_error::is_transient` only: a PERMANENT error (bad
+/// password 28P01, undefined object) crashes immediately instead of
+/// burning ~5 minutes of exhaustion first — "crash-on-permanent" is
+/// the scheduler's contract, and `connect_with_retry`'s retry-all
+/// predicate would make it false. Each attempt re-mints via
+/// `TokenSource::fresh_options` (in IAM mode a retry loop can outlive
+/// a token; mint failures classify transient and ride the backoff).
 async fn init_db_pool(
     database_url: &str,
+    pg_auth: rio_common::config::PgAuthMode,
     shutdown: &rio_common::signal::Token,
 ) -> anyhow::Result<(sqlx::PgPool, SchedulerDb)> {
-    use rio_proto::client::RetryError;
+    use rio_common::backoff::{Backoff, Jitter, RetryError};
     const MAX_TRIES: u32 = 8;
-    let pool = match rio_proto::client::connect_with_retry(
+    // Same curve as rio_proto::client::connect_with_retry (1s→16s,
+    // ±25% jitter) — only the retryable-predicate differs.
+    const CONNECT_BACKOFF: Backoff = Backoff {
+        base: std::time::Duration::from_secs(1),
+        mult: 2.0,
+        cap: std::time::Duration::from_secs(16),
+        jitter: Jitter::Proportional(0.25),
+    };
+    // Config preflight (bad URL, weak TLS, missing rootcert, missing
+    // AWS region) fails HERE, before any retry — crash-loops visibly.
+    let tokens =
+        std::sync::Arc::new(rio_common::pg_iam::TokenSource::new(database_url, pg_auth).await?);
+    let tokens_for_retry = std::sync::Arc::clone(&tokens);
+    let pool = match rio_common::backoff::retry(
+        &CONNECT_BACKOFF,
+        MAX_TRIES,
         shutdown,
-        || {
-            // r[impl store.db.pool-idle-timeout]
-            // Aurora Serverless v2 scales max_connections with ACU; at
-            // min_capacity=0.5 that's ~105 usable slots. idle_timeout=60s
-            // + min_connections=2 shrinks a burst-grown pool back to
-            // baseline so idle conns don't count against Aurora's limit
-            // (I-171). See rio-store init_db_pool for the full budget.
-            sqlx::postgres::PgPoolOptions::new()
-                .max_connections(10)
-                .min_connections(2)
-                .idle_timeout(std::time::Duration::from_secs(60))
-                .connect(database_url)
+        rio_common::pg_error::is_transient_anyhow,
+        |n, e| {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                tries = n,
+                "PG connect failed; retrying"
+            )
         },
-        Some(MAX_TRIES),
+        || {
+            let tokens = std::sync::Arc::clone(&tokens_for_retry);
+            async move {
+                // r[impl store.db.pool-idle-timeout]
+                // Aurora Serverless v2 scales max_connections with ACU; at
+                // min_capacity=0.5 that's ~105 usable slots. idle_timeout=60s
+                // + min_connections=2 shrinks a burst-grown pool back to
+                // baseline so idle conns don't count against Aurora's limit
+                // (I-171). See rio-store init_db_pool for the full budget
+                // and the IAM connect-rate watch item.
+                let opts = tokens.fresh_options().await?;
+                sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(10)
+                    .min_connections(2)
+                    .idle_timeout(std::time::Duration::from_secs(60))
+                    .connect_with(opts)
+                    .await
+                    .map_err(anyhow::Error::from)
+            }
+        },
     )
     .await
     {
@@ -729,10 +766,11 @@ async fn init_db_pool(
             anyhow::bail!("shutdown during PostgreSQL connect")
         }
         Err(RetryError::Exhausted { last, attempts }) => {
-            anyhow::bail!("PostgreSQL connect failed after {attempts} tries: {last}")
+            anyhow::bail!("PostgreSQL connect failed after {attempts} tries: {last:#}")
         }
     };
     info!("connected to PostgreSQL");
+    tokens.spawn_refresher(pool.clone());
 
     // r[impl store.db.migrate-try-lock] — same try-then-wait advisory
     // lock as rio-store. Both services run the SAME migration set

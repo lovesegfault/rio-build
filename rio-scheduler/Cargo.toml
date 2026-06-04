@@ -23,7 +23,7 @@ default = ["test-fixtures"]
 test-fixtures = []
 
 [dependencies]
-rio-common = { workspace = true, features = ["aws"] }
+rio-common = { workspace = true, features = ["aws", "pg-iam"] }
 rio-auth = { workspace = true }
 # Embedded MIGRATOR + migrator() factory. main.rs runs it at startup;
 # the `pub use rio_migrations::MIGRATOR` re-export keeps the
