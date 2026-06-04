@@ -2119,7 +2119,6 @@ in
         touch $out
       '';
 
-
   # Round-17 bug_043 (RC17-08 mechanism): the M_072 failure-evidence
   # pair (builds.error_summary, builds.failed_derivation) is sealed
   # per COLUMN, not per helper — round-16's R2 sweep keyed to the
