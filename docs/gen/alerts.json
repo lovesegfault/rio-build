@@ -16,6 +16,7 @@
     "RioSchedulerEvidenceWriteFenced",
     "RioSchedulerMaterializationConversions",
     "RioSchedulerMaterializationStalled",
+    "RioSchedulerRecoveryFailing",
     "RioSlaHwCostStale",
     "RioSlaPredictionDrift",
     "RioSlaPriorDivergenceClamped",
@@ -162,6 +163,15 @@
       "severity": "warning",
       "metrics": [
         "rio_scheduler_materialization_stalled"
+      ]
+    },
+    {
+      "name": "RioSchedulerRecoveryFailing",
+      "expr": "sum(increase(rio_scheduler_recovery_total{outcome=\"failure\"}[5m])) > 0",
+      "for": "5m",
+      "severity": "critical",
+      "metrics": [
+        "rio_scheduler_recovery_total"
       ]
     },
     {

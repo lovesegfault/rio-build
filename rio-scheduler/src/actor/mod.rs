@@ -504,18 +504,23 @@ pub struct DagActor {
     /// regime.
     recovery_claim_stamped: bool,
     /// True only while `self.dag` reflects PG: set in
-    /// `handle_leader_acquired`'s Ok arm (this tenure's
-    /// `recover_from_pg` succeeded), cleared by every
+    /// `complete_tenure` (sole writer, reachable only with the
+    /// `RecoveredDag` witness from this tenure's successful
+    /// `recover_from_pg`), cleared by every
     /// [`clear_persisted_state`](Self::clear_persisted_state) caller
     /// (LeaderLost, recovery start, the TOCTOU flap discard, and the
     /// failed-recovery Err arm).
     ///
-    /// NOT the same thing as [`LeaderState::recovery_complete`]: that
-    /// flag is deliberately set true even when recovery FAILS (empty
-    /// DAG — "degrade, don't block", which the pull/admission paths
-    /// want).
-    /// Destructive consumers that infer "stale" from "not in the DAG"
-    /// must check THIS bit instead.
+    /// NOT the same thing as [`LeaderState::recovery_complete`]:
+    /// since bug_155 both are written only by `complete_tenure` (the
+    /// `RecoveredDag` witness path — a failed recovery completes
+    /// nothing and requests a step-down per
+    /// `sched.recovery.step-down`), but they still differ on CLEAR:
+    /// `recovery_complete` is epoch-keyed lease state while this bit
+    /// tracks the in-memory DAG, cleared by every
+    /// `clear_persisted_state` caller. Destructive consumers that
+    /// infer "stale" from "not in the DAG" take the `DagAuthority`
+    /// witness (minted from THIS bit) — never `recovery_complete`.
     ///
     /// Initialized from the `LeaderState` constructor semantics
     /// (`plumbing.leader.recovery_complete()`): `always_leader`

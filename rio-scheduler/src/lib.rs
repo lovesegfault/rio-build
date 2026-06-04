@@ -419,6 +419,19 @@ pub fn describe_metrics() {
          away (discard outcomes take precedence over the load result)"
     );
     describe_counter!(
+        "rio_scheduler_recovery_step_down_total",
+        "Cooperative lease step-downs requested because a tenure's state \
+         recovery FAILED (sched.recovery.step-down): the replica never \
+         completes the tenure, clears partial state, and yields the lease so \
+         a healthy replica can serve. Under a persistent PG outage this \
+         cycles at lease cadence across the replica set (acquire → fail → \
+         step down) — deliberate and operator-visible; pair with \
+         rio_scheduler_recovery_total{outcome=\"failure\"} (the alerting \
+         series). In always-leader (non-K8s) deployments the request is a \
+         dead letter: the counter still increments, the tenure stays \
+         incomplete, and dispatch remains gated."
+    );
+    describe_counter!(
         "rio_scheduler_generation_claim_failed_total",
         "Generation-claim INSERTs that failed during recovery (PG error between the \
          seed read and the claim write). The leader proceeds unclaimed: dispatch is \

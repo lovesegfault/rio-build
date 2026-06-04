@@ -124,6 +124,7 @@
     "rio_scheduler_pull_rejected_total",
     "rio_scheduler_queue_backpressure",
     "rio_scheduler_recovery_duration_seconds",
+    "rio_scheduler_recovery_step_down_total",
     "rio_scheduler_recovery_total",
     "rio_scheduler_resource_floor_bumps_total",
     "rio_scheduler_sla_als_round_cap_hit_total",
@@ -851,6 +852,11 @@
         "name": "rio_scheduler_recovery_duration_seconds",
         "kind": "histogram",
         "help": "Time to reconstruct actor state from PG on LeaderAcquired (labeled by outcome=success|failure)"
+      },
+      {
+        "name": "rio_scheduler_recovery_step_down_total",
+        "kind": "counter",
+        "help": "Cooperative lease step-downs requested because a tenure's state recovery FAILED (sched.recovery.step-down): the replica never completes the tenure, clears partial state, and yields the lease so a healthy replica can serve. Under a persistent PG outage this cycles at lease cadence across the replica set (acquire → fail → step down) — deliberate and operator-visible; pair with rio_scheduler_recovery_total{outcome=\"failure\"} (the alerting series). In always-leader (non-K8s) deployments the request is a dead letter: the counter still increments, the tenure stays incomplete, and dispatch remains gated."
       },
       {
         "name": "rio_scheduler_recovery_total",

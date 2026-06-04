@@ -277,19 +277,23 @@ async fn test_recovery_transitive_failed_dep_persisted() -> TestResult {
 }
 
 /// Recovery failure with PG fully down (pool closed: BOTH the DAG load
-/// and the independent PG-floor read fail) still requires the PG-free
-/// post-claim leadership confirmation, then completes at the
-/// recovery-entry generation with an EMPTY DAG — degrade after
-/// confirmation, don't block. The alternative (never completing) would
-/// block dispatch forever while the scheduler holds the lease and the
-/// standby cannot take over. The unconfirmed direction of the same
-/// fallback is pinned by
+/// and the independent PG-floor read fail): the tenure is NEVER
+/// completed — the replica clears its partial state and requests a
+/// cooperative step-down so a healthy replica (or its own next
+/// tenure, against a healed PG) can serve. The old doctrine
+/// ("degrade, don't block": complete with an empty DAG) made the
+/// zombie permanent — an empty-but-serving leader cancelled every
+/// recovered build as orphaned and answered pulls from nothing while
+/// healthy standbys waited. Blocking is not the alternative: the
+/// step-down IS the unblock (the lease moves). The unconfirmed
+/// direction of the floor-unreadable fallback is pinned by
 /// `test_recovery_floor_unreadable_unconfirmed_is_discarded`; the
 /// floored load-failure path is pinned by
-/// `test_recovery_load_failure_still_floors_claims_and_confirms`.
+/// `test_recovery_load_failure_claims_then_steps_down`.
 // r[verify sched.recovery.gate-dispatch]
+// r[verify sched.recovery.step-down]
 #[tokio::test]
-async fn test_recovery_failure_degrades_to_empty_dag() -> TestResult {
+async fn test_recovery_failure_steps_down_never_serves() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
 
     // Keep a clone of the LeaderState so the completion is observable
@@ -326,15 +330,22 @@ async fn test_recovery_failure_degrades_to_empty_dag() -> TestResult {
     barrier(&handle).await;
 
     assert!(
-        leader.recovery_complete(),
-        "a confirmed floor-unreadable term completes (degrade after confirmation, \
-         don't block dispatch)"
+        !leader.recovery_complete(),
+        "a failed-recovery tenure must never complete (the zombie window: \
+         an empty-but-serving leader destroys recovered state)"
+    );
+    assert!(
+        leader.step_down_requested(),
+        "a failed-recovery tenure requests a cooperative step-down"
+    );
+    assert!(
+        !leader.step_down_requested(),
+        "the request is consume-once (the loop-tick swap)"
     );
     assert_eq!(
         leader.generation(),
         1,
-        "with the floor unreadable the term completes at the recovery-entry \
-         generation (no floor to seed from, nothing to claim)"
+        "no seed on the failed tenure (the atomic stays at entry)"
     );
     let info = handle.debug_query_derivation("anything").await?;
     assert!(info.is_none(), "DAG should be empty after recovery failure");
@@ -1360,24 +1371,27 @@ async fn test_recovery_confirmed_bump_seeds_and_completes() -> TestResult {
     Ok(())
 }
 
-/// A DAG-load failure must not skip the floor: the term still reads the
-/// PG floor, claims its target, and (the target exceeds the entry
-/// generation here) waits for the post-claim confirmation before
-/// ungating dispatch — only the builds are lost. Saturated regime: the
-/// durable floor sits well above the lease-derived entry generation, so
-/// completing at the entry generation would advertise a generation
-/// below every long-lived executor's `fetch_max` latch and its
-/// dispatches would be silently rejected (the inversion this pins
-/// against). Pairs with `test_recovery_failure_degrades_to_empty_dag`,
-/// which closes the pool so the floor read fails too and pins the
-/// floor-unreadable fallback's confirmed completion. Also pairs with
+/// A DAG-load failure must not skip the write-ahead claim: the term
+/// still reads the PG floor and durably claims its floored target
+/// BEFORE the load runs (claim-before-load is the fence's
+/// prerequisite, and the failed tenure's claim row is the documented
+/// harmless over-claim — the floor only grows). But the tenure itself
+/// is NEVER completed: no seed, no advertisement, no
+/// recovery-complete stamp — the replica requests a cooperative
+/// step-down instead (`sched.recovery.step-down`). Saturated regime:
+/// the durable floor sits well above the lease-derived entry
+/// generation, so the old complete-with-empty-DAG doctrine would have
+/// advertised and served at a generation only this broken replica
+/// could mint. Pairs with `test_recovery_failure_steps_down_never_serves`
+/// (the pool-closed shape) and with
 /// `test_recovery_load_failure_unconfirmed_bump_is_discarded` (the
-/// unconfirmed direction).
-// r[verify sched.recovery.fetch-max-seed+4]
+/// unconfirmed direction — discarded, not stepped down: leadership
+/// already moved).
 // r[verify sched.lease.generation-claim+2]
 // r[verify sched.recovery.bump-confirm+3]
+// r[verify sched.recovery.step-down]
 #[tokio::test]
-async fn test_recovery_load_failure_still_floors_claims_and_confirms() -> TestResult {
+async fn test_recovery_load_failure_claims_then_steps_down() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     // Saturated regime: a dead predecessor's claim row far above the
     // lease-derived entry generation (2).
@@ -1416,12 +1430,6 @@ async fn test_recovery_load_failure_still_floors_claims_and_confirms() -> TestRe
     release_tx.send(()).expect("actor still listening");
     barrier(&handle).await;
 
-    assert_eq!(
-        generation.load(Ordering::Acquire),
-        41,
-        "a load-failure term must still seed one past the durable floor, \
-         not complete at the under-floor entry generation"
-    );
     let claim: Option<(i64, String)> = sqlx::query_as(
         "SELECT generation, holder_id FROM leader_generation_claims \
          WHERE generation = 41",
@@ -1431,18 +1439,31 @@ async fn test_recovery_load_failure_still_floors_claims_and_confirms() -> TestRe
     assert_eq!(
         claim,
         Some((41, "pod-us".to_string())),
-        "a load-failure term must durably claim its floored target"
+        "the write-ahead claim precedes the load — the failed tenure's \
+         claim row remains as the documented harmless over-claim"
     );
     assert!(
-        leader.recovery_complete(),
-        "floored, claimed, and confirmed: the load-failure term completes \
-         (degrade, don't block — builds lost only)"
+        !leader.recovery_complete(),
+        "a failed-recovery tenure must never complete — the old \
+         'degrade, don't block' doctrine is retired \
+         (sched.recovery.step-down)"
+    );
+    assert!(
+        leader.step_down_requested(),
+        "the failed tenure requests a cooperative step-down"
+    );
+    assert_eq!(
+        generation.load(Ordering::Acquire),
+        2,
+        "no seed on the failed tenure: the atomic stays at the entry \
+         generation (the claimed 41 is seeded only by a tenure that \
+         completes)"
     );
     assert_eq!(
         handle.generation.advertised(),
-        41,
-        "heartbeats advertise the floored, claimed generation — not the \
-         under-floor entry generation"
+        0,
+        "heartbeats advertise NOTHING from an incomplete tenure (the \
+         advertised() recovery-complete gate, claim-before-advertise)"
     );
     Ok(())
 }

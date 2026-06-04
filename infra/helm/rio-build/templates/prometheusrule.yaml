@@ -531,6 +531,35 @@ spec:
               serving_generation log lines, and the
               leader_generation_claims table.
 
+        # bug_155 (bughunt-2 wave): recovery failure is alertable —
+        # before this alert, NO rule referenced
+        # rio_scheduler_recovery_total, so a scheduler that could not
+        # load its state was invisible until builds stalled. A failed
+        # recovery now steps the leader down (sched.recovery.step-down),
+        # so under a persistent PG outage the replica set cycles
+        # acquire → fail → step-down at lease cadence: outcome="failure"
+        # increments on every cycle, exactly the sustained signature
+        # this catches. One transient blip (PG restart at failover
+        # time) self-clears inside the for-window; sustained failures
+        # mean the scheduler cannot serve and the lease is ping-ponging
+        # — check PG health first, then the recovery error log lines
+        # (rio_scheduler_recovery_step_down_total tracks the yields).
+        - alert: RioSchedulerRecoveryFailing
+          expr: sum(increase(rio_scheduler_recovery_total{outcome="failure"}[5m])) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: scheduler state recovery is failing (leader cycling via step-down)
+            description: >-
+              rio_scheduler_recovery_total{outcome="failure"} increased for
+              over 5 minutes ({{`{{ $value | humanize }}`}} failures/5m).
+              Failed recoveries never serve — each one steps the leader
+              down and the next acquire retries, so no replica is
+              dispatching while this fires. Check PG availability and the
+              "state recovery FAILED" error lines on the scheduler pods;
+              rio_scheduler_recovery_step_down_total counts the yields.
+
         # Item T (harden-store reconciliation memo §6.2 / §3 row 32):
         # conversion visibility for the Vouched/Pending evidence class.
         # rio_scheduler_materialization_converted_total counts PD-20 park

@@ -453,6 +453,16 @@ pub struct LeaderState {
     /// `Instant` is 16B; reads are on a slow admin path,
     /// acquire/lose are rare.
     became_leader_at: Arc<parking_lot::RwLock<Option<Instant>>>,
+    /// Cooperative step-down request (`sched.recovery.step-down`):
+    /// set by a consumer that cannot serve its tenure (failed
+    /// recovery), consumed (swap-false) by the lease loop at its next
+    /// tick, which then releases the lease and fires the full
+    /// lose-edge effects before resuming candidacy on the following
+    /// tick. In deployments with no lease loop (`always_leader`) the
+    /// request is a recorded dead letter — there is no healthy peer a
+    /// step-down could yield to; the operator signal is the
+    /// recovery-failure counter/alert.
+    step_down: Arc<AtomicBool>,
 }
 
 impl Default for LeaderState {
@@ -628,6 +638,28 @@ impl LeaderState {
         self.generation.fetch_max(target, Ordering::Release)
     }
 
+    /// Request a cooperative step-down (`sched.recovery.step-down`):
+    /// sets an internal flag consumed at the next election-loop tick.
+    /// The loop releases the lease (holder-guarded, bounded by the
+    /// renew deadline), runs the full lose-edge effects
+    /// (`on_lose` + the consumer hook + leader-marks reconciliation),
+    /// then resumes candidacy on the following tick. The durable
+    /// generation claim is NOT released — an unserved claim is a
+    /// documented harmless over-claim (the floor only grows). With no
+    /// lease loop (`always_leader` deployments) the request is a dead
+    /// letter: the tenure stays incomplete and the operator signal is
+    /// the caller's failure counter.
+    pub fn request_step_down(&self) {
+        self.step_down.store(true, Ordering::Release);
+    }
+
+    /// Consume a pending step-down request (the loop-tick check):
+    /// returns `true` at most once per request. Acquire/swap-false so
+    /// a request is never double-served and never lost.
+    pub fn step_down_requested(&self) -> bool {
+        self.step_down.swap(false, Ordering::AcqRel)
+    }
+
     /// Construct from pre-existing shared Arcs plus the initial
     /// recovery-completion state. Test fixtures that need to drive the
     /// flags from outside the lease loop (e.g. rio-scheduler's actor
@@ -658,6 +690,7 @@ impl LeaderState {
             renew_rounds_started: Arc::new(AtomicU64::new(0)),
             last_leading_round: Arc::new(AtomicU64::new(0)),
             became_leader_at: Arc::new(parking_lot::RwLock::new(became_leader_at)),
+            step_down: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -683,6 +716,7 @@ impl LeaderState {
             // forever (which the controller treats as "young leader,
             // fail-closed").
             became_leader_at: Arc::new(parking_lot::RwLock::new(Some(Instant::now()))),
+            step_down: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -703,6 +737,7 @@ impl LeaderState {
             renew_rounds_started: Arc::new(AtomicU64::new(0)),
             last_leading_round: Arc::new(AtomicU64::new(0)),
             became_leader_at: Arc::new(parking_lot::RwLock::new(None)),
+            step_down: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1052,6 +1087,52 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
             blind.blind_for(fence_now()),
         ) {
             hooks.on_lose();
+        }
+
+        // r[impl sched.recovery.step-down]
+        // Cooperative step-down: a
+        // consumer that cannot serve its tenure (failed recovery)
+        // requested a local demotion; consume it here — at most one
+        // service per request — and only act while still believing
+        // (a lose/self-fence that landed first already ran the edge).
+        // The release is holder-guarded and 409/404-tolerant like the
+        // shutdown release; on success the round observably resolved
+        // not-leading (standing.on_observed(false)); on failure the
+        // apiserver state is unknown — believe-clear only, hold kept
+        // (the self-fence posture), so a later shutdown still
+        // releases. Either way the full lose-edge effects run
+        // (state, hook, marks) and the NEXT tick resumes candidacy —
+        // try_acquire_or_renew steals/acquires normally.
+        if state.step_down_requested() && standing.believes() {
+            warn!(
+                holder = %cfg.holder_id,
+                "cooperative step-down requested (tenure cannot serve); releasing the lease"
+            );
+            let deadline = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
+            match tokio::time::timeout(deadline, election.step_down()).await {
+                Ok(Ok(())) => {
+                    info!("step-down: lease released; resuming candidacy next tick");
+                    standing.on_observed(false);
+                }
+                Ok(Err(e)) => {
+                    warn!(error = %e,
+                          "step-down release failed; the next replica will steal in {}s",
+                          STEAL_AFTER.as_secs());
+                    standing.on_self_fence();
+                }
+                Err(_) => {
+                    warn!(
+                        ?deadline,
+                        "step-down release timed out; the next replica will steal in {}s",
+                        STEAL_AFTER.as_secs()
+                    );
+                    standing.on_self_fence();
+                }
+            }
+            state.on_lose();
+            hooks.on_lose();
+            marks_dirty.store(true, Ordering::SeqCst);
+            continue;
         }
 
         let renew_deadline = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
@@ -3558,6 +3639,86 @@ mod tests {
         // inside this paused-clock test — harmless here because the node
         // under test is the lease's creator/holder and never exercises
         // the steal-aging path that clock feeds.
+    }
+
+    /// The cooperative step-down self-heal loop
+    /// (`sched.recovery.step-down`): a consumer that cannot serve its
+    /// tenure (failed recovery) calls `request_step_down`; the NEXT
+    /// loop tick consumes the request — releases the lease and fires
+    /// the FULL lose-edge effects (leader state cleared, `on_lose`
+    /// hook delivered) — and the FOLLOWING tick resumes candidacy and
+    /// re-acquires. Pre-fix there was no such API: a broken tenure
+    /// held the lease until a real lose/fence, serving nothing.
+    // r[verify sched.recovery.step-down]
+    #[tokio::test(start_paused = true)]
+    async fn step_down_consumed_within_one_tick_then_candidacy_resumes() {
+        let (client, _mock) = MockApiServer::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let observer = state.clone();
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state,
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // t=0: immediate first tick acquires (Healthy mock).
+        settle().await;
+        assert_eq!(
+            hooks.acquires.lock().expect("acquires").len(),
+            1,
+            "the immediate first tick must acquire"
+        );
+        assert!(observer.is_leader(), "leading after the first tick");
+
+        // The consumer (e.g. a failed recovery) requests a step-down
+        // mid-tenure. Nothing happens until the next tick — the
+        // request is a flag, not a reentrant call.
+        observer.request_step_down();
+        assert!(observer.is_leader(), "request alone demotes nothing");
+
+        // +5s tick: the request is consumed — release + full
+        // lose-edge effects, exactly once.
+        tokio::time::advance(RENEW_INTERVAL).await;
+        settle().await;
+        assert_eq!(
+            hooks.loses.lock().expect("loses").len(),
+            1,
+            "the step-down request is consumed within one renew tick \
+             (full lose-edge: on_lose hook delivered)"
+        );
+        assert!(!observer.is_leader(), "leader state cleared on step-down");
+        assert!(
+            !observer.step_down_requested(),
+            "consume-once: the loop's swap leaves no residue"
+        );
+
+        // +10s tick: candidacy resumed — the loop re-acquires the
+        // freshly released lease (sole candidate).
+        tokio::time::advance(RENEW_INTERVAL).await;
+        settle().await;
+        assert_eq!(
+            hooks.acquires.lock().expect("acquires").len(),
+            2,
+            "candidacy resumes on the following tick (re-acquire)"
+        );
+        assert!(observer.is_leader(), "leading again after re-acquire");
+
+        shutdown.cancel();
+        loop_task.await.expect("lease loop task exits cleanly");
     }
 
     /// The suspend-blindness regression the boottime fence clock fixes:

@@ -29,21 +29,27 @@
 //!    recovery is done.
 // r[impl sched.recovery.gate-dispatch]
 //!
-//! # Failure mode: degrade, don't block
+//! # Failure mode: step down, never serve broken
 //!
-//! If the DAG load fails (PG hiccup mid-recovery), log error + metric
-//! and continue with an EMPTY DAG — but the term is still floored,
-//! claimed, and (when required) confirmed before `recovery_complete`
-//! is set, so its dispatches stay inside what the durable floor
-//! covers (only the in-flight builds are lost). Only when the PG
-//! floor itself cannot be read does the term skip the claim attempt
-//! entirely and complete — after the post-claim leadership
-//! confirmation, which needs no PG — at the recovery-entry generation
-//! (the floor-unreadable fallback — see the disposition comment in
-//! `handle_leader_acquired`). A panicked
-//! recovery with `is_leader=true` + `recovery_complete=false` would
-//! block dispatch FOREVER while holding the lease — standby can
-//! never take over. Degrading is better.
+//! If the DAG load fails (PG hiccup mid-recovery), the tenure is
+//! NEVER completed (`sched.recovery.step-down`): the replica clears
+//! its partial state, counts the failure, and requests a cooperative
+//! lease step-down — the lease loop consumes the request within one
+//! renew tick (full lose-edge effects), and candidacy resumes on the
+//! following tick, so a healthy replica (or this one's next tenure
+//! against a healed PG) serves instead. The retired "degrade, don't
+//! block" doctrine completed here with an empty DAG; that zombie
+//! answered pulls from nothing and held the lease away from healthy
+//! standbys. Blocking is not the alternative the step-down replaces —
+//! the step-down IS the unblock (the lease moves; a wedged
+//! `is_leader=true` + `recovery_complete=false` replica without it
+//! would gate dispatch forever). The write-ahead claim (below) still
+//! precedes the load, so a failed tenure leaves its claim row behind:
+//! a documented harmless over-claim — the floor only grows. The
+//! floor-unreadable fallback (claim skipped, completion at the entry
+//! generation after the PG-free confirmation) applies only when the
+//! LOAD SUCCEEDED — a successful load under an unreadable floor still
+//! serves; see the disposition comment in `handle_leader_acquired`.
 //!
 //! # Generation seeding and the write-ahead claim
 //!
@@ -126,6 +132,15 @@ const BUMP_CONFIRMATION_CAP: Duration = Duration::from_secs(
 /// responsive to the early-exit conditions.
 const CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Zero-sized completion witness (bug_155): `self.dag` was fully
+/// rebuilt from PG by THIS tenure's [`DagActor::recover_from_pg`] —
+/// minted only at its `Ok` tail, consumed only by
+/// [`DagActor::complete_tenure`], the sole path to
+/// `set_recovery_complete` and `dag_authoritative = true`. A failed
+/// load structurally cannot complete the tenure: there is no other
+/// way to produce the witness (not `Clone`/`Copy`, private field).
+pub(super) struct RecoveredDag(());
+
 /// Cross-phase carrier for [`DagActor::recover_from_pg`]: PG row sets
 /// loaded by [`DagActor::load_dag_from_rows`] that the later phases
 /// (`restore_builds`, `finalize_recovered_builds`) need.
@@ -170,7 +185,7 @@ impl DagActor {
     /// Returns Err on PG failure; the caller still floors, claims, and
     /// (when required) confirms before completing (see module doc —
     /// degrade not block; only the in-flight builds are lost).
-    pub(super) async fn recover_from_pg(&mut self) -> Result<(), ActorError> {
+    pub(super) async fn recover_from_pg(&mut self) -> Result<RecoveredDag, ActorError> {
         info!("starting state recovery from PG");
 
         // --- Clear in-mem state ---
@@ -286,7 +301,10 @@ impl DagActor {
             "state recovery complete"
         );
 
-        Ok(())
+        // The ONLY RecoveredDag mint: every load/restore/recompute
+        // phase above succeeded, so `self.dag` reflects PG for this
+        // tenure.
+        Ok(RecoveredDag(()))
     }
 
     /// Load builds + derivations + poisoned + edges + build_derivations
@@ -1799,60 +1817,84 @@ impl DagActor {
         // set_recovery_complete() INVARIANT above is untouched.
         metrics::counter!("rio_scheduler_recovery_total", "outcome" => outcome).increment(1);
 
-        if let Err(e) = &result {
-            // DAG load failed: continue with an EMPTY DAG (in-flight
-            // builds are lost for this term), but the generation
-            // handling is NOT skipped — the floor was read
-            // independently above, so this term is floored, claimed,
-            // and (when required) confirmed like any other; its
-            // dispatches stay inside what the durable floor covers.
-            // Only when the floor itself was unreadable
-            // (`floored = false` below) does the term proceed —
-            // confirmation-gated, unclaimed — at the entry generation:
-            // in the saturated post-deletion regime that generation
-            // sits below the executors' fetch_max latch, so long-lived
-            // builders silently reject its dispatches until the next
-            // leadership transition. The floor-unreadable operator
-            // signal is the warn plus the floor-read-failure counter
-            // at the claim-target match (they fire whether or not the
-            // load also failed); this error line remains the
-            // load-failure signal. Better than blocking dispatch
-            // forever while holding the lease.
-            error!(
-                error = %e,
-                floored = pg_floor_read.is_ok(),
-                "state recovery FAILED — continuing with empty DAG \
-                 (in-flight builds lost for this term)"
-            );
-            // Explicitly re-clear: recovery may have partially
-            // populated before failing. dag_authoritative stays false
-            // (clear_persisted_state keeps it cleared): destructive
-            // consumers must not treat "not in the (empty) DAG" as
-            // "stale".
-            self.clear_persisted_state();
-        }
-        // Only on a successful load: the DAG was rebuilt from PG by
-        // this tenure's recover_from_pg, so "not in the DAG" means
-        // "stale" again. On the Err path the clear_persisted_state
-        // above keeps the bit false.
-        if result.is_ok() {
-            self.dag_authoritative = true;
-        }
+        let recovered = match result {
+            Err(e) => {
+                // r[impl sched.recovery.step-down]
+                // DAG load failed: this tenure NEVER serves. The old
+                // doctrine completed here with an empty DAG ("degrade,
+                // don't block") — a zombie that answered pulls from
+                // nothing, cancelled every recovered build as
+                // orphaned, and held the lease away from healthy
+                // standbys. Now: clear the partial state, count the
+                // step-down, and request a cooperative demotion — the
+                // lease loop consumes the request at its next tick
+                // (full lose-edge effects, then candidacy resumes; a
+                // healed PG makes the next tenure's recovery succeed).
+                // The durable claim above is NOT released: an unserved
+                // claim is a harmless over-claim — the floor only
+                // grows. No seed, no completion: the atomic stays at
+                // the entry generation. In always-leader deployments
+                // (no lease loop) the request is a recorded dead
+                // letter — the tenure stays incomplete (dispatch
+                // gated) and the failure counter/alert is the
+                // operator signal; there is no healthy peer to yield
+                // to. The floor-unreadable operator signal is the
+                // warn plus the floor-read-failure counter at the
+                // claim-target match (they fire whether or not the
+                // load also failed); this error line remains the
+                // load-failure signal.
+                error!(
+                    error = %e,
+                    floored = pg_floor_read.is_ok(),
+                    "state recovery FAILED — clearing state and requesting a \
+                     cooperative step-down (this tenure will not serve)"
+                );
+                self.clear_persisted_state();
+                metrics::counter!("rio_scheduler_recovery_step_down_total").increment(1);
+                self.leader.request_step_down();
+                return;
+            }
+            Ok(witness) => witness,
+        };
+        self.complete_tenure(
+            recovered,
+            claim_target,
+            pg_high_water,
+            transitions_at_entry,
+            &confirm_started,
+        );
+    }
 
-        // --- Seed the generation, then ungate dispatch ---
-        //
-        // Shared tail for every non-discard outcome. `claim_target`
-        // was computed AND durably claimed in the claim loop above,
-        // inside the gen_at_entry window. Only the ATOMIC WRITE
-        // happens here, after the TOCTOU check — writing the atomic
-        // before the check would make the seed itself look like a
-        // lease flap. fetch_max not store: both writers (the lease
-        // loop and this seed) only ever raise the same Arc. In the
-        // floor-unreadable fallback `claim_target` equals the entry
-        // generation, so the seed is a no-op — kept unconditional so
-        // there is exactly one seed call site (the gate-pass tail).
-        // No awaits from here to set_recovery_complete() — see the
-        // INVARIANT comment at the gen re-check.
+    /// Complete a tenure: the SOLE caller of `set_recovery_complete`
+    /// and the SOLE writer of `dag_authoritative = true`, reachable
+    /// only with the [`RecoveredDag`] witness — a tenure whose load
+    /// failed structurally cannot get here (bug_155;
+    /// `sched.recovery.step-down`).
+    ///
+    /// Seed-then-ungate, the gate-pass tail: `claim_target` was
+    /// computed AND durably claimed in the claim loop, inside the
+    /// gen_at_entry window. Only the ATOMIC WRITE happens here, after
+    /// the TOCTOU check — writing the atomic before the check would
+    /// make the seed itself look like a lease flap. fetch_max not
+    /// store: both writers (the lease loop and this seed) only ever
+    /// raise the same Arc. In the floor-unreadable fallback
+    /// `claim_target` equals the entry generation, so the seed is a
+    /// no-op — kept unconditional so there is exactly one seed call
+    /// site. Synchronous throughout — the no-awaits-before-
+    /// `set_recovery_complete()` INVARIANT at the gen re-check holds.
+    // r[impl sched.recovery.step-down]
+    fn complete_tenure(
+        &mut self,
+        _recovered: RecoveredDag,
+        claim_target: u64,
+        pg_high_water: Option<i64>,
+        transitions_at_entry: u64,
+        confirm_started: &Instant,
+    ) {
+        // The DAG was rebuilt from PG by this tenure's
+        // recover_from_pg (the witness in hand), so "not in the DAG"
+        // means "stale" again.
+        self.dag_authoritative = true;
         let prev = self.leader.seed_generation_from(claim_target);
         if claim_target > prev {
             info!(

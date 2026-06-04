@@ -72,6 +72,15 @@ pub const DIVERGENCE_PARAMS: &[&str] = &[
 /// alert-parity test (`tests/alert_metrics.rs`) fails if a rule
 /// references a counter missing here; the seed loop below births each
 /// label-product series at 0.
+/// Every disposition `handle_leader_acquired` records on
+/// `rio_scheduler_recovery_total` (one increment per attempt).
+const RECOVERY_OUTCOMES: &[&str] = &[
+    "success",
+    "failure",
+    "discarded_flap",
+    "discarded_unconfirmed",
+];
+
 pub const ALERT_SEEDED_COUNTERS: &[SeededSeries] = &[
     // bug_322: the ≥2-establishments-in-30m tripwire missed the
     // series-birth increments — `sum(increase(...))` over an absent
@@ -99,6 +108,21 @@ pub const ALERT_SEEDED_COUNTERS: &[SeededSeries] = &[
     SeededSeries {
         name: "rio_scheduler_materialization_jobs_resolved_total",
         label: Some(("outcome", MAT_OUTCOMES)),
+    },
+    // bug_155: the RioSchedulerRecoveryFailing alert matches
+    // {outcome="failure"}; seed the full attempt-disposition product
+    // so the matcher has a series from boot (the first failed
+    // recovery after a fresh rollout is exactly the burst the alert
+    // exists for). The step-down counter is seeded too — unalerted
+    // today, but it pairs with the failure series on dashboards and
+    // the same birth-gap reasoning applies.
+    SeededSeries {
+        name: "rio_scheduler_recovery_total",
+        label: Some(("outcome", RECOVERY_OUTCOMES)),
+    },
+    SeededSeries {
+        name: "rio_scheduler_recovery_step_down_total",
+        label: None,
     },
     // Item T conversion counter — the RioSchedulerMaterializationConversions
     // alert matches {origin="cache_opportunity"}; the seeded product
