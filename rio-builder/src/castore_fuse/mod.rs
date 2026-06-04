@@ -20,6 +20,10 @@ mod sweep;
 mod testing;
 pub mod tree;
 
+/// Re-export the bench/operator cache-reset entrypoint (`rio-mountd
+/// evict-cache`); the sweep module itself stays private.
+pub use self::sweep::evict_all;
+
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;

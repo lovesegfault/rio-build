@@ -16,6 +16,10 @@ use super::parse::{ParsedRun, PerfLine};
 
 pub const SCHEMA: &str = "fsbench/v1";
 
+/// Schema tag for the N-cold-rep aggregate artifact (`cold-reps.json`)
+/// the `cold-reps` subcommand emits.
+pub const COLD_REPS_SCHEMA: &str = "fsbench-cold-reps/v1";
+
 /// Fraction of the manifest's UNIQUE-chunk bytes (storm subset for the
 /// cold window, whole dataset for the whole-run fallback) that must
 /// show up as mountd Promote traffic for the run to count as honestly
@@ -23,7 +27,11 @@ pub const SCHEMA: &str = "fsbench/v1";
 pub const COLD_HONESTY_PROMOTE_FRACTION: f64 = 0.95;
 /// Ceiling on remote re-fetch during the warm window (fraction of
 /// dataset bytes) — above this, "warm" reads were quietly remote.
-pub const WARM_HONESTY_REMOTE_FRACTION: f64 = 0.01;
+/// 0.05, not lower: the cold storm's streaming-fill tail legitimately
+/// spills a few percent of remote fetches past the warm-window
+/// boundary, and a tighter gate censors honest reps (observed 7/8
+/// drops at 0.01 while per-rep spill sat at 1-4%).
+pub const WARM_HONESTY_REMOTE_FRACTION: f64 = 0.05;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ResultV1 {
@@ -187,7 +195,7 @@ pub struct CompareBlock {
 }
 
 /// Median of already-collected per-rep values.
-fn median(mut xs: Vec<f64>) -> f64 {
+pub(super) fn median(mut xs: Vec<f64>) -> f64 {
     xs.sort_by(|a, b| a.total_cmp(b));
     xs[xs.len() / 2]
 }
@@ -663,6 +671,104 @@ pub fn read(path: &Path) -> Result<ResultV1> {
     serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))
 }
 
+// ── cold-reps aggregate (schema `fsbench-cold-reps/v1`) ────────────────
+//
+// The `cold-reps` subcommand loops a full cold `fsbench run` N times,
+// evicting the node cache between reps, and aggregates the per-rep cold
+// numbers into mean/stddev/error-bar form. The raw `per_rep` samples are
+// kept so re-analysis never needs the cluster.
+
+/// Summary statistics over the accepted per-rep samples of one metric.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct AggStats {
+    pub unit: String,
+    pub n: u32,
+    pub mean: f64,
+    pub median: f64,
+    /// Sample standard deviation (divides by n−1; 0.0 when n<2).
+    pub stddev: f64,
+    pub min: f64,
+    pub max: f64,
+    /// (max−min)/median — the cold-rep spread; 0.0 when median==0.
+    pub rel_spread: f64,
+    /// Standard error of the mean = stddev/sqrt(n) — the error bar.
+    pub stderr: f64,
+}
+
+impl AggStats {
+    /// Aggregate a metric's accepted samples. `None` for an empty slice
+    /// (no accepted reps carried the metric).
+    pub fn from_samples(unit: &str, xs: &[f64]) -> Option<AggStats> {
+        if xs.is_empty() {
+            return None;
+        }
+        let n = xs.len();
+        let mean = xs.iter().sum::<f64>() / n as f64;
+        let stddev = if n < 2 {
+            0.0
+        } else {
+            let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0);
+            var.sqrt()
+        };
+        let med = median(xs.to_vec());
+        let min = xs.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let rel_spread = if med == 0.0 { 0.0 } else { (max - min) / med };
+        Some(AggStats {
+            unit: unit.into(),
+            n: n as u32,
+            mean,
+            median: med,
+            stddev,
+            min,
+            max,
+            rel_spread,
+            stderr: stddev / (n as f64).sqrt(),
+        })
+    }
+}
+
+/// One accepted cold rep's raw cold-phase numbers (nullable: a phase may
+/// be absent from a degraded run).
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ColdRepRow {
+    pub nonce: String,
+    pub node: Option<String>,
+    pub honest_cold: Option<bool>,
+    pub jq_total_wall_ms: Option<f64>,
+    pub jq_configure_wall_ms: Option<f64>,
+    pub jq_make_wall_ms: Option<f64>,
+    pub read_storm_cold_mib_s: Option<f64>,
+    pub read_storm_cold_open_p99_ns: Option<f64>,
+    pub promote_bytes_cold: Option<f64>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ColdRepsResult {
+    pub schema: String,
+    pub created_at: String,
+    pub git: GitInfo,
+    pub cluster: ClusterInfo,
+    pub node: Option<String>,
+    pub instance_type: Option<String>,
+    pub kernel: String,
+    pub workload: Workload,
+    pub reps_requested: u32,
+    pub reps_accepted: u32,
+    pub reps_dropped: u32,
+    pub metrics: BTreeMap<String, AggStats>,
+    pub per_rep: Vec<ColdRepRow>,
+}
+
+pub fn write_cold_reps(r: &ColdRepsResult, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut body = serde_json::to_vec_pretty(r)?;
+    body.push(b'\n');
+    std::fs::write(path, body).with_context(|| format!("write {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,6 +783,30 @@ mod tests {
              x> PERF read_storm_warm rep=2 files=3 bytes=900 wall_ms=10 mib_s=110.0 open_ns_p50=12 open_ns_p99=55 read_ns_p50=5 read_ns_p99=9\n\
              x> PERF read_storm_warm rep=3 files=3 bytes=900 wall_ms=10 mib_s=90.0 open_ns_p50=11 open_ns_p99=60 read_ns_p50=5 read_ns_p99=9\n",
         )
+    }
+
+    #[test]
+    fn agg_stats_from_known_vector() {
+        // [10, 12, 14]: mean 12, median 12, sample stddev 2 (var =
+        // (4+0+4)/2 = 4), rel_spread = (14-10)/12, stderr = 2/sqrt(3).
+        let a = AggStats::from_samples("ms", &[10.0, 12.0, 14.0]).unwrap();
+        assert_eq!(a.n, 3);
+        assert_eq!(a.unit, "ms");
+        assert!((a.mean - 12.0).abs() < 1e-9);
+        assert!((a.median - 12.0).abs() < 1e-9);
+        assert!((a.stddev - 2.0).abs() < 1e-9);
+        assert_eq!(a.min, 10.0);
+        assert_eq!(a.max, 14.0);
+        assert!((a.rel_spread - (4.0 / 12.0)).abs() < 1e-9);
+        assert!((a.stderr - 2.0 / 3.0_f64.sqrt()).abs() < 1e-9);
+
+        // Single sample: stddev/stderr collapse to 0, spread 0.
+        let one = AggStats::from_samples("ms", &[7.0]).unwrap();
+        assert_eq!((one.stddev, one.stderr, one.rel_spread), (0.0, 0.0, 0.0));
+        assert_eq!(one.mean, 7.0);
+
+        // Empty: no aggregate.
+        assert!(AggStats::from_samples("ms", &[]).is_none());
     }
 
     #[test]

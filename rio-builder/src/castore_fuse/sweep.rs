@@ -13,7 +13,7 @@
 //! path, but a `remove_dir_all` it lost to an unmount race (`EBUSY`)
 //! would otherwise leak the tree until the next daemon restart.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -255,6 +255,23 @@ fn evict_from(candidates: Vec<Candidate>, bytes_needed: u64) -> u64 {
     freed
 }
 
+/// Evict EVERY entry under the chunk and backing caches, returning bytes
+/// freed per dir (`chunks`/`cache`). Never touches `staging/` or
+/// `castore/`. Reuses the LRU primitives with no deficit cap, so it
+/// inherits the `.promoting`/`.tmp` skip (`collect_candidates`) that
+/// keeps unlinking safe under live builds (`evict_from`): a still-open
+/// backing fd keeps its inode, and the next miss re-promotes.
+pub fn evict_all(cache_dir: &Path, chunks_dir: &Path) -> BTreeMap<String, u64> {
+    let mut freed = BTreeMap::new();
+    for (root, label) in [(chunks_dir, "chunks"), (cache_dir, "cache")] {
+        freed.insert(
+            label.to_string(),
+            evict_from(collect_candidates(root), u64::MAX),
+        );
+    }
+    freed
+}
+
 /// Remove staging trees whose `build_id` is not (or no longer) live.
 ///
 /// Connection teardown is the primary cleanup path; this is the
@@ -449,6 +466,39 @@ mod tests {
         reap_dead_staging(tmp.path(), &Mutex::new(HashSet::new()));
 
         assert!(!tmp.path().join(&leftover).exists());
+    }
+
+    /// `evict_all` returns BOTH caches to a cold state — every final
+    /// entry under chunks/ and cache/ gone — while sparing a live
+    /// promote's `.promoting` placeholder and the staging tree entirely
+    /// (deleting either fails an in-flight build). The reported byte map
+    /// counts only what was actually unlinked.
+    #[test]
+    fn evict_all_empties_both_caches_sparing_placeholders_and_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let chunks = tmp.path().join("chunks");
+        let cache = tmp.path().join("cache");
+        let staging = tmp.path().join("staging");
+        let c1 = put(&chunks, "aa01", 100, 100);
+        let c2 = put(&chunks, "bb02", 100, 100);
+        let backing = put(&cache, "cc03", 250, 100);
+        let promoting = put(&chunks, "dd04.promoting", 50, 100);
+        fs::create_dir_all(staging.join("build-1/chunks")).unwrap();
+
+        let freed = evict_all(&cache, &chunks);
+
+        assert_eq!(freed["chunks"], 200, "both final chunk entries freed");
+        assert_eq!(freed["cache"], 250, "the backing entry freed");
+        assert!(!c1.exists() && !c2.exists(), "chunk cache emptied");
+        assert!(!backing.exists(), "backing cache emptied");
+        assert!(
+            promoting.exists(),
+            "a live promote's .promoting claim must survive eviction"
+        );
+        assert!(
+            staging.join("build-1/chunks").exists(),
+            "staging trees are never touched by a cache reset"
+        );
     }
 
     /// Above the low watermark the sweep must be a no-op: a tick that
