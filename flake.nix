@@ -338,7 +338,7 @@
                 # `regen fuzz-lock`. fuzz.nix asserts its own per-ws
                 # config, the on-disk fuzzWorkspaces, and this list all
                 # agree, so the three views cannot diverge silently.
-                workspaceExclude = cargoToml.workspace.exclude;
+                workspaceExclude = cargoToml.workspace.exclude or [ ];
               };
 
               # Spec-coverage CLI + web dashboard. The SPA is built via

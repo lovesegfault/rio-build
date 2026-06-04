@@ -163,7 +163,14 @@ let
     in
     {
       inherit fuzzCrateName;
-      targets = lib.naturalSort (map (b: b.name) (member.crateBin or [ ]));
+      targets =
+        let
+          names = lib.naturalSort (map (b: b.name) (member.crateBin or [ ]));
+        in
+        if names == [ ] then
+          throw "nix/fuzz.nix: fuzz/${ws}/Cargo.json records no [[bin]] targets for ${fuzzCrateName} — a fuzz workspace with nothing to fuzz is almost certainly a stale Cargo.json; run `cargo xtask regen cargo-json`"
+        else
+          names;
     }
   );
 

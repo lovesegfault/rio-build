@@ -406,9 +406,12 @@ in
         restore_all() {
           i=0
           while [ "$i" -lt "$n" ]; do
-            dest=$(cat "$tmp/$i.dest")
-            cp "$tmp/$i.lock" "$dest/Cargo.lock"
-            rm -f "$dest/Cargo.json.check"
+            # Per-entry tolerance: a failing cp (full disk, yanked
+            # permissions) must not abort the trap under set -e and
+            # strand the REMAINING dirs unrestored.
+            { dest=$(cat "$tmp/$i.dest") \
+                && cp "$tmp/$i.lock" "$dest/Cargo.lock" \
+                && rm -f "$dest/Cargo.json.check"; } || true
             i=$((i + 1))
           done
           rm -rf "$tmp"
