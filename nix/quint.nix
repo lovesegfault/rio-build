@@ -434,9 +434,9 @@ let
       witness,
       # Same semantics as mkQuintCheck's extraSpecs.
       extraSpecs ? [ ],
-      # Same semantics as mkQuintCheck's step (no current caller; kept
-      # for override modules that select a non-default transition
-      # relation).
+      # Same semantics as mkQuintCheck's step. Used by override modules
+      # that select a non-default transition relation (calibStep and
+      # pullStep callers).
       step ? null,
       # Apalache server heap (MiB) for the quint->TLA+ conversion. The
       # default matches the historical hardcoded value; only the largest
