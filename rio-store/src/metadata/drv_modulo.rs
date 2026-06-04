@@ -402,6 +402,11 @@ pub(crate) async fn heal_if_missing(
         admission_event("heal_skipped_saturated");
         return;
     };
+    // Admitted heals consume the same shared permits as cold walks:
+    // without this event a heal stampede shows heal_skipped_saturated
+    // increments with NO visible permit holders, and the skip-vs-run
+    // ratio is incomputable (round-17 bug_085).
+    admission_event("heal_admitted");
     let mut budget = WorkBudget::new(PROOF_WALK_WORK_MAX, PROOF_WALK_ARENA_BYTES_MAX);
     let outcome = match own_drv_bytes(pool, chunks, drv_path, &mut budget).await {
         Ok(FetchedDrv::Bytes(bytes)) => match populate_on_ingest(pool, drv_path, &bytes).await {
@@ -1271,6 +1276,59 @@ async fn prove_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The admission counter's producer set (every emit literal in
+    /// this file) must equal the
+    /// set the registered HELP text documents — operators read the
+    /// HELP, this file owns the emits, and this test is the bridge
+    /// (round-17 bug_085: `heal_admitted` was missing, so saturation
+    /// skips had no visible permit holders). The HELP clause is
+    /// duplicated verbatim from lib.rs's describe_counter!; if the
+    /// sets drift, one of the assertions names the missing side.
+    #[test]
+    fn admission_event_set_matches_help_text() {
+        let src = include_str!("drv_modulo.rs");
+        // Needle assembled from halves so this test's own source
+        // cannot match it.
+        let needle = concat!("admission_", "event(\"");
+        let mut produced: Vec<&str> = src
+            .match_indices(needle)
+            .map(|(i, pat)| {
+                let start = i + pat.len();
+                let end = src[start..].find('\"').expect("closed literal") + start;
+                &src[start..end]
+            })
+            .collect();
+        produced.sort_unstable();
+        produced.dedup();
+        let mut documented = vec![
+            "fast_path",
+            "admitted",
+            "heal_admitted",
+            "heal_skipped_memo",
+            "heal_skipped_inflight",
+            "heal_skipped_saturated",
+            "heal_skipped_transient",
+        ];
+        documented.sort_unstable();
+        assert_eq!(
+            produced, documented,
+            "admission_event set changed — update the HELP text in \
+             lib.rs AND this list"
+        );
+        let help = "labeled by event: fast_path (cached row, no permit consumed) | \
+                    admitted (cold walk holds a permit) | heal_admitted \
+                    (best-effort heal holds a permit — the visible holder when \
+                    saturation skips fire; round-17 bug_085) | heal_skipped_memo";
+        for name in [
+            "fast_path",
+            "admitted",
+            "heal_admitted",
+            "heal_skipped_memo",
+        ] {
+            assert!(help.contains(name), "HELP clause lost {name}");
+        }
+    }
 
     /// Admission semantics (bug_080), unit-level: memo TTL freshness,
     /// capacity fail-open, singleflight claim/release, permit count.

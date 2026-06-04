@@ -181,7 +181,9 @@ pub fn describe_metrics() {
         "Proof-walk/heal admission decisions (PROOF_WALK_CONCURRENCY=4 \
          shared permits; round-16 bug_080), labeled by event: fast_path \
          (cached row, no permit consumed) | admitted (cold walk holds a \
-         permit) | heal_skipped_memo (negative memo fresh — this path \
+         permit) | heal_admitted (best-effort heal holds a permit — the \
+         visible holder when saturation skips fire; round-17 bug_085) | \
+         heal_skipped_memo (negative memo fresh — this path \
          failed to populate within the 10-min TTL) | \
          heal_skipped_inflight (another heal of the same path is \
          running) | heal_skipped_saturated (no permit free; heal is \
