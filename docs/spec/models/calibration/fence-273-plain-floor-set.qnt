@@ -22,7 +22,13 @@ module fenceCalib273PlainFloorSet {
   import fencedWrites(
     MAX_GEN = 3,
     MAX_EXECS = 4,
-    REPLICAS = Set("r1", "r2")
+    REPLICAS = Set("r1", "r2"),
+    // bughunt-2 planes DORMANT: this legacy calibration's state space
+    // stays identical (the plane actions are disabled; the plane vars
+    // are framed by planesUnchanged in the override action below).
+    ENABLE_ATOMIC_REREAD = false,
+    ENABLE_OUTBOX = false,
+    ENABLE_TENURE_LIFECYCLE = false
   ).* from "../fencedWrites"
 
   /// PRE-FIX: the unfenced plain SET — no ratchet, no floor check.
@@ -37,6 +43,7 @@ module fenceCalib273PlainFloorSet {
     txPhase' = txPhase,
     pendingRefusal' = pendingRefusal,
     claimsUnchanged, rowUnchanged,
+    planesUnchanged,
   }
 
   action calibStep = {

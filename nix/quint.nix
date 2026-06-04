@@ -4668,14 +4668,61 @@ in
     # residual is deliberately reachable (priced in
     # fence-invariant-map.md) — activeRowGenMonotonic holds with it.
     # ------------------------------------------------------------------
+    # Bughunt-2 planes (slot 2): the same board gains (1) the
+    # tenure-stamp plane — writesCarryClaimedTenure (merged_bug_338:
+    # the typed ServingGeneration vs a fresh lease-atomic read), (2)
+    # the outbox plane — outboxReplayNeverRegresses +
+    # outboxClosesOnlyLatchedExecs (merged_bug_011: flush-time
+    # re-derivation + exec-scoped close), (3) the tenure-lifecycle
+    # plane — failedRecoveryNeverServes (bug_155: completion only
+    # through the recovered witness; failed tenures step down). All
+    # three planes are LIVE here (ENABLE_* = true in fencedWritesT1):
+    # this run is the baseline-hold pair of the three plane twins
+    # below; the four legacy calibrations bind the planes false and
+    # keep their state space unchanged.
     # r[verify sched.evidence.durability+4]
     # r[verify sched.lease.fence-statement-guard]
     # r[verify sched.grpc.fence-retryable]
+    # r[verify sched.lease.tenure-stamp-type]
+    # r[verify sched.recovery.step-down]
+    # r[verify sched.attempt.cancel-close-driven+1]
     quint-fenced-writes = mkQuintCheck {
       name = "fenced-writes";
       spec = "fencedWrites";
       main = "fencedWritesT1";
       invariants = [ "fencedWritesAll" ];
+    };
+    quint-fence-calib-338-atomic-reread = mkQuintWitnessCheck {
+      name = "fence-calib-338-atomic-reread";
+      spec = "calibration/fence-338-atomic-reread";
+      main = "fenceCalib338AtomicReread";
+      extraSpecs = [ "fencedWrites" ];
+      step = "calibStep";
+      witness = "writesCarryClaimedTenure";
+    };
+    quint-fence-calib-011-absolute-replay = mkQuintWitnessCheck {
+      name = "fence-calib-011-absolute-replay";
+      spec = "calibration/fence-011-absolute-replay";
+      main = "fenceCalib011AbsoluteReplay";
+      extraSpecs = [ "fencedWrites" ];
+      step = "calibStep";
+      witness = "outboxReplayNeverRegresses";
+    };
+    quint-fence-calib-011-foreign-close = mkQuintWitnessCheck {
+      name = "fence-calib-011-foreign-close";
+      spec = "calibration/fence-011-absolute-replay";
+      main = "fenceCalib011AbsoluteReplay";
+      extraSpecs = [ "fencedWrites" ];
+      step = "calibStep";
+      witness = "outboxClosesOnlyLatchedExecs";
+    };
+    quint-fence-calib-155-serve-after-failed-recovery = mkQuintWitnessCheck {
+      name = "fence-calib-155-serve-after-failed-recovery";
+      spec = "calibration/fence-155-serve-after-failed-recovery";
+      main = "fenceCalib155ServeAfterFailedRecovery";
+      extraSpecs = [ "fencedWrites" ];
+      step = "calibStep";
+      witness = "failedRecoveryNeverServes";
     };
     quint-fence-calib-261-unguarded-upsert = mkQuintWitnessCheck {
       name = "fence-calib-261-unguarded-upsert";

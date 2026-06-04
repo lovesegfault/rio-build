@@ -34,7 +34,21 @@
 // re-mint conflicts on the partial-unique index and the in-statement
 // guard then governs).
 //
-// Run (exhaustive, all five invariants — the wired check):
+// BUGHUNT-2 PLANES (slot 2): three axis-gated planes extend the same
+// board — (1) tenure-stamp (merged_bug_338: writes carry the
+// claim-stamped tenure, never a fresh lease-atomic read), (2) outbox
+// replay (merged_bug_011: a latched batch re-derives before replay
+// and closes only its latched exec), (3) tenure lifecycle (bug_155: a
+// tenure completes only through the recovered-DAG witness; a failed
+// recovery steps down). Each plane's actions are gated by an ENABLE_*
+// const so the four legacy calibrations bind them FALSE and keep
+// their state space identical; fencedWritesT1 binds all three TRUE
+// (the live exhaustive check is the twins' baseline-hold pair). The
+// plane latches are LIVE-COMPUTED inside shared parameterized apply
+// sub-actions (the formal-policy P4/P5 conventions: oracles in the
+// live module; twins perturb DECISION parameters only).
+//
+// Run (exhaustive, all eight invariants — the wired check):
 //   quint verify --backend=tlc --main=fencedWritesT1 \
 //     --invariant=fencedWritesAll docs/spec/models/fencedWrites.qnt
 module fencedWrites {
@@ -47,6 +61,15 @@ module fencedWrites {
   const MAX_EXECS: int
   /// Replica ids.
   const REPLICAS: Set[str]
+  /// Plane 1 gate (merged_bug_338): enables the mid-tenure lease-atomic
+  /// bump event. The legacy calibrations bind false.
+  const ENABLE_ATOMIC_REREAD: bool
+  /// Plane 2 gate (merged_bug_011): enables the outbox latch/advance/
+  /// flush actions. The legacy calibrations bind false.
+  const ENABLE_OUTBOX: bool
+  /// Plane 3 gate (bug_155): enables the recovery/complete/step-down
+  /// lifecycle actions. The legacy calibrations bind false.
+  const ENABLE_TENURE_LIFECYCLE: bool
 
   // --- 2. types --------------------------------------------------------------
 
@@ -92,6 +115,33 @@ module fencedWrites {
   /// gave up (bug_393).
   var clientGaveUp: bool
 
+  // --- 4b. bughunt-2 plane state ---------------------------------------------
+
+  /// Plane 1: the live lease atomic per replica — can advance AHEAD of
+  /// the claim-stamped tenure (replicaGen) via a mid-tenure
+  /// re-acquire/rebound. The typed ServingGeneration is replicaGen;
+  /// merged_bug_338 was stamping THIS instead.
+  var atomicGen: str -> int
+  /// Plane 1 latch (live-computed in mintApplyAs): a committed write
+  /// carried a generation other than its replica's claim-stamped
+  /// tenure.
+  var staleWriteCommitted: bool
+  /// Plane 2: the outbox-latched exec (0 = empty) and whether the
+  /// derivation has ADVANCED past the latch (resubmit re-mint).
+  var latchedExec: int
+  var latchedStale: bool
+  /// Plane 2 latches (live-computed in flushReplayApply): a stale
+  /// batch was applied; a replay close hit a non-latched exec.
+  var staleReplayApplied: bool
+  var successorExecClosed: bool
+  /// Plane 3: per-replica tenure lifecycle — the recovered-DAG witness
+  /// and the completion stamp. Reset on every new claim (new tenure).
+  var recoveredOk: str -> bool
+  var tenureComplete: str -> bool
+  /// Plane 3 latch (live-computed in completeTenureApply): a tenure
+  /// completed without the recovered witness.
+  var servedWithoutRecovery: bool
+
   // --- 5. helpers --------------------------------------------------------------
 
   pure def maxOf(s: Set[int]): int = s.fold(0, (a, x) => if (x > a) x else a)
@@ -123,6 +173,27 @@ module fencedWrites {
     committedClaims' = committedClaims,
     replicaGen' = replicaGen,
   }
+  /// Plane-state frames (bughunt-2). Split per plane so an action that
+  /// WRITES one plane's state frames the others explicitly.
+  action atomicUnchanged = all { atomicGen' = atomicGen }
+  action stampLatchUnchanged = all { staleWriteCommitted' = staleWriteCommitted }
+  action outboxUnchanged = all {
+    latchedExec' = latchedExec,
+    latchedStale' = latchedStale,
+    staleReplayApplied' = staleReplayApplied,
+    successorExecClosed' = successorExecClosed,
+  }
+  action lifecycleUnchanged = all {
+    recoveredOk' = recoveredOk,
+    tenureComplete' = tenureComplete,
+    servedWithoutRecovery' = servedWithoutRecovery,
+  }
+  /// Everything the bughunt-2 planes own — the frame the legacy
+  /// actions (and the four legacy calibrations' override actions)
+  /// carry.
+  action planesUnchanged = all {
+    atomicUnchanged, stampLatchUnchanged, outboxUnchanged, lifecycleUnchanged,
+  }
 
   // --- 7. init ---------------------------------------------------------------------
 
@@ -142,6 +213,15 @@ module fencedWrites {
     floorRegressed' = false,
     deposedCloseApplied' = false,
     clientGaveUp' = false,
+    atomicGen' = REPLICAS.mapBy(r => if (r == "r1") 1 else 0),
+    staleWriteCommitted' = false,
+    latchedExec' = 0,
+    latchedStale' = false,
+    staleReplayApplied' = false,
+    successorExecClosed' = false,
+    recoveredOk' = REPLICAS.mapBy(r => false),
+    tenureComplete' = REPLICAS.mapBy(r => false),
+    servedWithoutRecovery' = false,
   }
 
   // --- 8. actions --------------------------------------------------------------------
@@ -153,9 +233,18 @@ module fencedWrites {
     maxOf(committedClaims) + 1 <= MAX_GEN,
     committedClaims' = committedClaims.union(Set(maxOf(committedClaims) + 1)),
     replicaGen' = replicaGen.set(r, maxOf(committedClaims) + 1),
+    // The claim stamp seeds the lease atomic too (atomic >= stamp
+    // always; only atomicBumpReacquire moves it further).
+    atomicGen' = atomicGen.set(r, maxOf(committedClaims) + 1),
+    // A claim opens a NEW tenure: its lifecycle restarts un-recovered
+    // and incomplete (plane 3).
+    recoveredOk' = recoveredOk.set(r, false),
+    tenureComplete' = tenureComplete.set(r, false),
+    servedWithoutRecovery' = servedWithoutRecovery,
     txPhase' = txPhase,
     pendingRefusal' = pendingRefusal,
     rowUnchanged, floorUnchanged, latchesUnchanged,
+    stampLatchUnchanged, outboxUnchanged,
   }
 
   /// begin_fenced's floor read: snapshot the floor VISIBLE NOW.
@@ -165,6 +254,7 @@ module fencedWrites {
     txPhase' = txPhase.set(r, TxFloorRead(currentFloor)),
     pendingRefusal' = pendingRefusal,
     claimsUnchanged, rowUnchanged, floorUnchanged, latchesUnchanged,
+    planesUnchanged,
   }
 
   /// begin_fenced refuses: the visible floor exceeds the replica's
@@ -178,40 +268,76 @@ module fencedWrites {
     txPhase' = txPhase.set(r, TxIdle),
     pendingRefusal' = pendingRefusal.set(r, true),
     claimsUnchanged, rowUnchanged, floorUnchanged, latchesUnchanged,
+    planesUnchanged,
   }
 
-  /// The GUARDED mint upsert (sched.lease.fence-statement-guard): the
-  /// advisory floor compare passed at read time; the in-statement
+  /// The GUARDED mint upsert (sched.lease.fence-statement-guard),
+  /// parameterized by the generation the write STAMPS — the shared
+  /// apply sub-action carrying the plane-1 tenure-stamp oracle
+  /// (merged_bug_338, live-computed: any committed write whose stamp
+  /// is not the replica's claim-stamped tenure latches). The fixed
+  /// system stamps `replicaGen` (the typed ServingGeneration); the
+  /// 338 calibration perturbs ONLY this decision (stamps `atomicGen`,
+  /// the fresh lease-atomic read).
+  ///
+  /// The advisory floor compare passed at read time; the in-statement
   /// predicate `assignments.generation <= EXCLUDED.generation`
   /// evaluates against the row's LATEST COMMITTED version
   /// (EvalPlanQual) — NOT the snapshot. Equality passes (same-epoch
   /// re-acquire keep). rows_affected == 0 ⇒ rollback + Fenced.
-  action guardedUpsertCommit(r: str): bool = all {
+  action guardedUpsertCommitAs(r: str, writeGen: int): bool = all {
     match txPhase.get(r) {
       | TxIdle => false
       | TxFloorRead(v) => v <= replicaGen.get(r) // the advisory half passed
     },
     execsMinted < MAX_EXECS,
     txPhase' = txPhase.set(r, TxIdle),
-    val g = replicaGen.get(r)
-    if (activeGen <= g) all {
-      // Applies: fresh insert (activeGen == 0 — the priced
-      // residual: g may sit below a claims-only floor) or guarded
-      // update of an equal-or-older row. Never a regression.
-      activeGen' = g,
-      activeOwner' = r,
-      activeExec' = execsMinted + 1,
-      execsMinted' = execsMinted + 1,
-      pendingRefusal' = pendingRefusal,
-      latchesUnchanged,
-    } else all {
-      // Predicate refused against the newer committed row: zero
-      // rows, rollback, surfaced as the same retryable refusal.
-      rowUnchanged,
-      pendingRefusal' = pendingRefusal.set(r, true),
-      latchesUnchanged,
+    val g = writeGen
+    all {
+      // The tenure-stamp oracle: latches on the COMMIT path only.
+      staleWriteCommitted' = or {
+        staleWriteCommitted,
+        activeGen <= g and g != replicaGen.get(r),
+      },
+      if (activeGen <= g) all {
+        // Applies: fresh insert (activeGen == 0 — the priced
+        // residual: g may sit below a claims-only floor) or guarded
+        // update of an equal-or-older row. Never a regression.
+        activeGen' = g,
+        activeOwner' = r,
+        activeExec' = execsMinted + 1,
+        execsMinted' = execsMinted + 1,
+        pendingRefusal' = pendingRefusal,
+        latchesUnchanged,
+      } else all {
+        // Predicate refused against the newer committed row: zero
+        // rows, rollback, surfaced as the same retryable refusal.
+        rowUnchanged,
+        pendingRefusal' = pendingRefusal.set(r, true),
+        latchesUnchanged,
+      },
     },
     claimsUnchanged, floorUnchanged,
+    atomicUnchanged, outboxUnchanged, lifecycleUnchanged,
+  }
+
+  /// The fixed system's mint: stamps the claim-stamped tenure.
+  action guardedUpsertCommit(r: str): bool =
+    guardedUpsertCommitAs(r, replicaGen.get(r))
+
+  /// Plane 1 environment event: a mid-tenure lease re-acquire/rebound
+  /// raises the live atomic ABOVE the claim-stamped tenure (the
+  /// mid-mailbox window merged_bug_338 lived in). The claim stamp
+  /// does NOT move — only a new claim moves it.
+  action atomicBumpReacquire(r: str): bool = all {
+    ENABLE_ATOMIC_REREAD,
+    atomicGen.get(r) > 0,
+    atomicGen.get(r) < MAX_GEN,
+    atomicGen' = atomicGen.set(r, atomicGen.get(r) + 1),
+    txPhase' = txPhase,
+    pendingRefusal' = pendingRefusal,
+    claimsUnchanged, rowUnchanged, floorUnchanged, latchesUnchanged,
+    stampLatchUnchanged, outboxUnchanged, lifecycleUnchanged,
   }
 
   /// The exec-scoped fenced close (FencedTx::close_assignment): a
@@ -234,6 +360,7 @@ module fencedWrites {
     },
     pendingRefusal' = pendingRefusal,
     claimsUnchanged, floorUnchanged, latchesUnchanged,
+    planesUnchanged,
   }
 
   /// The fenced resource-floor write with the server-side per-
@@ -248,6 +375,7 @@ module fencedWrites {
     resourceFloor' = if (v > resourceFloor) v else resourceFloor,
     pendingRefusal' = pendingRefusal,
     claimsUnchanged, rowUnchanged, latchesUnchanged,
+    planesUnchanged,
   }
 
   /// The client answers a fence refusal as RETRYABLE (UNAVAILABLE
@@ -258,6 +386,159 @@ module fencedWrites {
     pendingRefusal' = pendingRefusal.set(r, false),
     txPhase' = txPhase,
     claimsUnchanged, rowUnchanged, floorUnchanged, latchesUnchanged,
+    planesUnchanged,
+  }
+
+  // --- 8b. bughunt-2 plane actions ------------------------------------------------
+
+  /// Plane 2: a status persist FAILED — the leader latches the batch
+  /// with the derivation's ACTIVE exec (memory is the only source).
+  /// The active row stays open (the failed persist closed nothing).
+  action latchFailedPersist(r: str): bool = all {
+    ENABLE_OUTBOX,
+    latchedExec == 0,
+    activeExec > 0,
+    activeOwner == r,
+    not(deposed(r)),
+    latchedExec' = activeExec,
+    latchedStale' = false,
+    staleReplayApplied' = staleReplayApplied,
+    successorExecClosed' = successorExecClosed,
+    txPhase' = txPhase,
+    pendingRefusal' = pendingRefusal,
+    claimsUnchanged, rowUnchanged, floorUnchanged, latchesUnchanged,
+    atomicUnchanged, stampLatchUnchanged, lifecycleUnchanged,
+  }
+
+  /// Plane 2: the derivation ADVANCES past the latch — the resubmit
+  /// reset re-mints the active row to a FRESH exec (the production
+  /// active-row upsert rewrites exec_id in place).
+  action advanceDerivation(r: str): bool = all {
+    ENABLE_OUTBOX,
+    latchedExec > 0,
+    not(latchedStale),
+    execsMinted < MAX_EXECS,
+    activeOwner == r,
+    not(deposed(r)),
+    activeGen' = replicaGen.get(r),
+    activeOwner' = r,
+    activeExec' = execsMinted + 1,
+    execsMinted' = execsMinted + 1,
+    latchedExec' = latchedExec,
+    latchedStale' = true,
+    staleReplayApplied' = staleReplayApplied,
+    successorExecClosed' = successorExecClosed,
+    txPhase' = txPhase,
+    pendingRefusal' = pendingRefusal,
+    claimsUnchanged, floorUnchanged, latchesUnchanged,
+    atomicUnchanged, stampLatchUnchanged, lifecycleUnchanged,
+  }
+
+  /// Plane 2's shared replay apply — the outbox oracle, live-computed
+  /// from the DECISION parameters: `dropStale` (the flush-time
+  /// re-derivation: stale entries are DROPPED) and `execScoped` (the
+  /// close matches the LATCHED exec only, never the derivation). The
+  /// fixed system calls (true, true); the 011 calibration calls
+  /// (false, false) — the pre-fix absolute replay.
+  action flushReplayApply(r: str, dropStale: bool, execScoped: bool): bool = all {
+    ENABLE_OUTBOX,
+    latchedExec > 0,
+    replicaGen.get(r) > 0,
+    not(deposed(r)),
+    val applied = not(latchedStale and dropStale)
+    val closes = and {
+      applied,
+      if (execScoped) activeExec > 0 and activeExec == latchedExec
+      else activeExec > 0,
+    }
+    all {
+      // The live oracles.
+      staleReplayApplied' = or { staleReplayApplied, latchedStale and applied },
+      successorExecClosed' = or {
+        successorExecClosed,
+        closes and activeExec != latchedExec,
+      },
+      if (closes) all {
+        activeGen' = 0,
+        activeOwner' = "",
+        activeExec' = 0,
+        execsMinted' = execsMinted,
+      } else {
+        rowUnchanged
+      },
+    },
+    latchedExec' = 0,
+    latchedStale' = false,
+    txPhase' = txPhase,
+    pendingRefusal' = pendingRefusal,
+    claimsUnchanged, floorUnchanged, latchesUnchanged,
+    atomicUnchanged, stampLatchUnchanged, lifecycleUnchanged,
+  }
+
+  /// The fixed system's flush: re-derived (stale ⇒ drop) and
+  /// exec-scoped.
+  action flushReplayGuarded(r: str): bool = flushReplayApply(r, true, true)
+
+  /// Plane 3: this tenure's recovery (the DAG load) succeeds — the
+  /// RecoveredDag witness exists.
+  action recoverySucceed(r: str): bool = all {
+    ENABLE_TENURE_LIFECYCLE,
+    replicaGen.get(r) > 0,
+    not(recoveredOk.get(r)),
+    not(tenureComplete.get(r)),
+    recoveredOk' = recoveredOk.set(r, true),
+    tenureComplete' = tenureComplete,
+    servedWithoutRecovery' = servedWithoutRecovery,
+    txPhase' = txPhase,
+    pendingRefusal' = pendingRefusal,
+    claimsUnchanged, rowUnchanged, floorUnchanged, latchesUnchanged,
+    atomicUnchanged, stampLatchUnchanged, outboxUnchanged,
+  }
+
+  /// Plane 3's shared completion apply — the lifecycle oracle,
+  /// live-computed from the DECISION parameter `witnessed` (whether
+  /// the caller holds the recovered witness). The fixed system's
+  /// completeTenure passes `recoveredOk` UNDER its own precondition;
+  /// the 155 calibration calls the apply with no precondition (the
+  /// retired complete-with-empty-DAG doctrine).
+  action completeTenureApply(r: str, witnessed: bool): bool = all {
+    ENABLE_TENURE_LIFECYCLE,
+    replicaGen.get(r) > 0,
+    not(tenureComplete.get(r)),
+    servedWithoutRecovery' = or { servedWithoutRecovery, not(witnessed) },
+    tenureComplete' = tenureComplete.set(r, true),
+    recoveredOk' = recoveredOk,
+    txPhase' = txPhase,
+    pendingRefusal' = pendingRefusal,
+    claimsUnchanged, rowUnchanged, floorUnchanged, latchesUnchanged,
+    atomicUnchanged, stampLatchUnchanged, outboxUnchanged,
+  }
+
+  /// The fixed system's completion: only a recovered tenure completes.
+  action completeTenure(r: str): bool = all {
+    recoveredOk.get(r),
+    completeTenureApply(r, recoveredOk.get(r)),
+  }
+
+  /// Plane 3: a tenure whose recovery has not succeeded steps down
+  /// (sched.recovery.step-down): the replica stops serving its
+  /// generation — the DURABLE CLAIM STAYS (committedClaims untouched:
+  /// the documented harmless over-claim) — and re-enters candidacy.
+  action stepDownFailedTenure(r: str): bool = all {
+    ENABLE_TENURE_LIFECYCLE,
+    replicaGen.get(r) > 0,
+    not(recoveredOk.get(r)),
+    not(tenureComplete.get(r)),
+    committedClaims' = committedClaims,
+    replicaGen' = replicaGen.set(r, 0),
+    atomicGen' = atomicGen.set(r, 0),
+    recoveredOk' = recoveredOk.set(r, false),
+    tenureComplete' = tenureComplete.set(r, false),
+    servedWithoutRecovery' = servedWithoutRecovery,
+    txPhase' = txPhase,
+    pendingRefusal' = pendingRefusal,
+    rowUnchanged, floorUnchanged, latchesUnchanged,
+    stampLatchUnchanged, outboxUnchanged,
   }
 
   // --- 9. step ------------------------------------------------------------------------
@@ -273,6 +554,14 @@ module fencedWrites {
       fencedClose(r),
       floorWriteGreatest(r, v),
       answerRetryable(r),
+      // bughunt-2 planes (gated by their ENABLE_* consts).
+      atomicBumpReacquire(r),
+      latchFailedPersist(r),
+      advanceDerivation(r),
+      flushReplayGuarded(r),
+      recoverySucceed(r),
+      completeTenure(r),
+      stepDownFailedTenure(r),
     }
   }
 
@@ -303,6 +592,27 @@ module fencedWrites {
   /// Falsifiability pair: calibration fence-393-terminal-refusal.
   val fenceRefusalAlwaysRetryable = not(clientGaveUp)
 
+  /// merged_bug_338: every committed write carries its replica's
+  /// claim-stamped tenure — never a fresh lease-atomic read.
+  /// Falsifiability pair: calibration fence-338-atomic-reread.
+  val writesCarryClaimedTenure = not(staleWriteCommitted)
+
+  /// merged_bug_011 (regression half): a latched batch is never
+  /// applied after its derivation advanced past the latch.
+  /// Falsifiability pair: calibration fence-011-absolute-replay.
+  val outboxReplayNeverRegresses = not(staleReplayApplied)
+
+  /// merged_bug_011 (scope half): a replay close only ever lands on
+  /// the LATCHED exec — a successor attempt is untouchable.
+  /// Falsifiability pair: calibration fence-011-absolute-replay.
+  val outboxClosesOnlyLatchedExecs = not(successorExecClosed)
+
+  /// bug_155: no tenure completes without the recovered-DAG witness
+  /// (the previously model-unrepresentable zombie made representable).
+  /// Falsifiability pair: calibration
+  /// fence-155-serve-after-failed-recovery.
+  val failedRecoveryNeverServes = not(servedWithoutRecovery)
+
   /// The wired conjunction.
   val fencedWritesAll = and {
     activeRowGenMonotonic,
@@ -310,14 +620,23 @@ module fencedWrites {
     resourceFloorMonotonic,
     openAttemptViewStableUnderDeposedClose,
     fenceRefusalAlwaysRetryable,
+    writesCarryClaimedTenure,
+    outboxReplayNeverRegresses,
+    outboxClosesOnlyLatchedExecs,
+    failedRecoveryNeverServes,
   }
 }
 
-/// Tier-1 exhaustive scope: 2 replicas, 3 generations, 1 drv.
+/// Tier-1 exhaustive scope: 2 replicas, 3 generations, 1 drv; all
+/// three bughunt-2 planes LIVE (this check is the baseline-hold pair
+/// of the three plane twins).
 module fencedWritesT1 {
   import fencedWrites(
     MAX_GEN = 3,
     MAX_EXECS = 4,
-    REPLICAS = Set("r1", "r2")
+    REPLICAS = Set("r1", "r2"),
+    ENABLE_ATOMIC_REREAD = true,
+    ENABLE_OUTBOX = true,
+    ENABLE_TENURE_LIFECYCLE = true
   ).*
 }

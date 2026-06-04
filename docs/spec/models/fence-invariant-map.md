@@ -30,6 +30,9 @@ authoritative half — `sched.lease.fence-statement-guard`).
 | `floorWriteGreatest` | `update_resource_floor` (db/derivations.rs) — fenced + per-dimension server-side `GREATEST` ratchet | bug_273. The ratchet catches the same-tenure stale-base regression the fence cannot see |
 | `answerRetryable` | `actor_error_to_status` / `pull_rejection_to_status` (grpc/actor_guards.rs) + the gateway's bounded pre-build_id SubmitBuild retry | bug_393 (`sched.grpc.fence-retryable`): Retryable ⟺ code ∈ {UNAVAILABLE, RESOURCE_EXHAUSTED}, pinned by `retry_class_code_consistency` |
 | `successorClaim` | `leader_generation_claims` insert (the lease task's claim stamp) | Claims commit immediately; in-flight snapshots do not see them (READ COMMITTED) |
+| `guardedUpsertCommitAs(r, replicaGen)` vs `atomicGen` (plane 1) | `ServingGeneration` (db/mod.rs) — sole constructor `stamp_from_claim`, boot + claim stamps only; `fence_coverage.rs` census forbids fresh `leader.generation()` reads in write paths | merged_bug_338. The model's `atomicGen` is the live lease atomic; `atomicBumpReacquire` is the mid-mailbox re-acquire window. The fixed system CANNOT pass `atomicGen` — the type has no ambient reader; the calibration passes it explicitly |
+| `latchFailedPersist` / `advanceDerivation` / `flushReplayApply(true, true)` (plane 2) | `StatusBatch.exec_ids` latch (actor/mod.rs), the flush's present-state partition (actor/housekeeping.rs `tick_flush_status_outbox`), `replay_status_batch_guarded` (db/derivations.rs) — close `WHERE exec_id = ANY($latched)` | merged_bug_011. `advanceDerivation` is the resubmit's active-row upsert rewriting exec_id in place; the model's drop-when-stale is the flush-time re-derivation (KEEP present-equal/absent, DROP present-different) |
+| `recoverySucceed` / `completeTenure` / `stepDownFailedTenure` (plane 3) | `RecoveredDag` witness (actor/recovery.rs) — minted at `recover_from_pg`'s Ok tail, consumed by `complete_tenure` (sole `set_recovery_complete` + `dag_authoritative = true` writer); `LeaderState::request_step_down` + the lease-loop consumption (rio-lease) | bug_155. `stepDownFailedTenure` keeps `committedClaims` (the durable claim stays — harmless over-claim) and zeroes the replica's serving state; candidacy resumes via `successorClaim` |
 
 View-settlement pair (`materializationJobResolveFaults` regime):
 
@@ -50,6 +53,10 @@ View-settlement pair (`materializationJobResolveFaults` regime):
 | `quint-fence-calib-393-terminal-refusal` | the refusal answered FAILED_PRECONDITION; the client gives up | `fenceRefusalAlwaysRetryable` |
 | `quint-materialization-calib-133-discarded-outcome` | the fenced/errored resolve still discards the view entry | `viewMatchesDurableUnresolved` |
 | `quint-materialization-calib-276-dag-absent-cancel` | the split cancel leaks the open attempt; the establishment sweep charges it | `chargeFreeCancellation` |
+| `quint-fence-calib-338-atomic-reread` | the mint stamps the fresh lease-atomic read after a mid-tenure bump (the shared apply oracle latches the non-claim stamp) | `writesCarryClaimedTenure` |
+| `quint-fence-calib-011-absolute-replay` | the outbox flush replays a stale batch verbatim after the resubmit advanced past the latch | `outboxReplayNeverRegresses` |
+| `quint-fence-calib-011-foreign-close` | same module/trace: the derivation-scoped close lands on the successor's fresh exec | `outboxClosesOnlyLatchedExecs` |
+| `quint-fence-calib-155-serve-after-failed-recovery` | the retired "degrade, don't block" doctrine: an un-recovered tenure completes and serves (previously model-unrepresentable; the plane makes the zombie expressible) | `failedRecoveryNeverServes` |
 
 Every wired holds/exhaustive check has its falsifiability pair above
 (the constructor's vacuity rule); the baselines (as-built `step`) hold
@@ -99,9 +106,17 @@ domain).
 
 - `quint-fenced-writes` (TLC exhaustive, fencedWritesT1): full state
   space at MAX_GEN=3/2 replicas/1 drv — seconds-class on the wiring
-  measurement host; no step bound (TLC BFS).
-- The four fence calibrations: first-violation TLC, each found in
-  under 2s at the same scope.
+  measurement host; no step bound (TLC BFS). Re-measured at the
+  bughunt-2 plane introduction (all three planes LIVE): 16,643,269
+  states generated, 795,900 distinct, ~10.5s TLC wall-clock — still
+  seconds-class; the three ENABLE_* axes exist so any future plane
+  growth can be split per-regime instead of multiplying one board.
+- The four legacy fence calibrations: first-violation TLC, each found
+  in under 2s at the same scope; re-verified violating with the
+  bughunt-2 planes bound DORMANT (state space unchanged).
+- The three bughunt-2 plane calibrations (338 / 011×2 / 155):
+  first-violation TLC, each found in ~2s with only its own plane
+  enabled.
 - `quint-materialization-holds-resolve-faults`: 2M samples × 15 steps
   (the regime budget every materializationJob holds check uses); the
   two A1 invariants joined `matJobInvariants` for ALL regimes at
