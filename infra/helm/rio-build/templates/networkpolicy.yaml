@@ -195,9 +195,12 @@ spec:
       toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
     {{- end }}
     {{- if .Values.postgresql.enabled }}
+    # Subchart deploys into the helm release namespace (system), not
+    # store — same as the store-egress rule below; a store-ns selector
+    # here matched nothing and silently dropped controller→PG.
     - toEndpoints:
         - matchLabels:
-            k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
+            k8s:io.kubernetes.pod.namespace: {{ $ns.system.name }}
             k8s:app.kubernetes.io/name: postgresql
       toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
     {{- end }}
