@@ -124,10 +124,11 @@ async fn execute_job_inner(
     // lifetime), so the per-path adapters below must OWN their handle
     // to the job-level callback — one Arc, cloned per path.
     let on_progress = std::sync::Arc::new(on_progress);
-    // ── 1. Tenant re-resolution (AS-4, live-interest-first) ──────────
-    let tenant_id = match resolve_tenant(ctx, claimed).await {
-        Ok(Some(t)) => t,
-        Ok(None) => {
+    // ── 1. Tenant re-resolution (AS-4, live-interest-first; PLURAL
+    //    per merged_bug_028 / owner Q2: any interested tenant's
+    //    upstreams may serve, the job fails only when none can) ──────
+    let tenants = match resolve_tenants(ctx, claimed).await {
+        Ok(t) if t.is_empty() => {
             // The AS-4 posture: no resolvable tenant context is an
             // infrastructure condition (upstream selection is
             // impossible), NEVER an Unobtainable verdict and never a
@@ -138,6 +139,7 @@ async fn execute_job_inner(
                 claimed.drv_hash, claimed.tenant_hint
             ));
         }
+        Ok(t) => t,
         Err(e) => {
             return infra_failure(format!("tenant resolution query failed: {e}"));
         }
@@ -261,12 +263,68 @@ async fn execute_job_inner(
                     );
                 }
             };
-            match ctx
-                .substituter
-                .try_substitute_with_progress(tenant_id, &path, &per_path_progress)
-                .await
-            {
-                Ok(Some(path_info)) => {
+            // merged_bug_028 / owner Q2: try EVERY interested tenant's
+            // upstream view until one serves the path. The per-tenant
+            // fold is conservative in this order: any Hit wins; any
+            // charging-class failure is InfraFailure immediately
+            // (stall/capacity evidence outranks politeness); any
+            // transient (raced/429) defers the whole walk only after
+            // no remaining tenant hit; a miss verdict requires a CLEAN
+            // miss under every tenant (and then confirmation below).
+            let mut hit: Option<Box<rio_proto::validated::ValidatedPathInfo>> = None;
+            let mut transient: Option<(&'static str, u64, String)> = None;
+            for &tenant_id in &tenants {
+                match ctx
+                    .substituter
+                    .try_substitute_with_progress(tenant_id, &path, &per_path_progress)
+                    .await
+                {
+                    Ok(Some(path_info)) => {
+                        hit = Some(Box::new(path_info));
+                        break;
+                    }
+                    Ok(None) => {
+                        // Clean miss under this tenant; the next tenant
+                        // may still serve it.
+                        continue;
+                    }
+                    Err(e) => {
+                        // merged_bug_178: total classification through
+                        // the kernel truth table — no catch-all (a
+                        // future SubstituteError variant fails this
+                        // match AND the class table).
+                        let class = substitute_failure_class(&e);
+                        match classify_substitute_failure(class) {
+                            FailureDisposition::RetryUncharged => {
+                                let (label, retry_after_secs) = match &e {
+                                    SubstituteError::RateLimited { retry_after } => (
+                                        "rate_limited",
+                                        retry_after.map(|d| d.as_secs()).unwrap_or(0),
+                                    ),
+                                    _ => ("raced", 0),
+                                };
+                                let prev = transient.take();
+                                transient = Some(match prev {
+                                    Some(p) if p.1 >= retry_after_secs => p,
+                                    _ => (
+                                        label,
+                                        retry_after_secs,
+                                        format!("substitution of {path}: {e}"),
+                                    ),
+                                });
+                                continue;
+                            }
+                            FailureDisposition::ChargeInfra => {
+                                return infra_failure(format!(
+                                    "substitution of {path} failed ({class:?}): {e}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            match hit {
+                Some(path_info) => {
                     // r[impl sched.materialize.pinning]
                     // Pin-at-ingest (design §5.1): the pin lands BEFORE
                     // the path can appear in any Success report. A pin
@@ -295,69 +353,48 @@ async fn execute_job_inner(
                         }
                     }
                 }
-                Ok(None) => {
-                    // try_substitute folds per-upstream errors into a
-                    // clean miss (one bad upstream must not block
-                    // substitution). The executor needs the B3
-                    // distinction — confirmed-absent routes
-                    // Unobtainable, infrastructure trouble routes
-                    // InfraFailure — so classify the miss with the
-                    // HEAD-probe machinery, carrying the local-miss
-                    // witness (bug_042).
-                    match classify_miss(ctx, tenant_id, &path, local_witness).await {
-                        MissClass::ConfirmedAbsent(_w) => {
-                            debug!(path = %path, cell = ?cell,
-                                   "path confirmed absent upstream (and locally)");
-                            match cell {
-                                PathCell::Wanted => missing_wanted.push(path.clone()),
-                                PathCell::Reference => missing_references.push(path.clone()),
-                            }
-                        }
-                        MissClass::Infra(detail) => {
-                            return infra_failure(format!(
-                                "substitution of {path} hit infrastructure trouble: {detail}"
-                            ));
-                        }
-                    }
-                }
-                Err(e) => {
-                    // merged_bug_178: total classification through the
-                    // kernel truth table — no catch-all (a future
-                    // SubstituteError variant fails this match AND the
-                    // class table). Raced/RateLimited are transient by
-                    // the substituter's own contract: report
+                None if transient.is_some() => {
+                    // No tenant hit and at least one was transient:
                     // RetryLater so the scheduler closes UNCHARGED and
                     // defers (a 429 wave must never park a healthy
-                    // job). Everything else keeps the B3 infra
-                    // posture: nothing is confirmed; never routes
-                    // from-source, never fail-fasts.
-                    let class = substitute_failure_class(&e);
-                    match classify_substitute_failure(class) {
-                        FailureDisposition::RetryUncharged => {
-                            let (label, retry_after_secs) = match &e {
-                                SubstituteError::RateLimited { retry_after } => (
-                                    "rate_limited",
-                                    retry_after.map(|d| d.as_secs()).unwrap_or(0),
-                                ),
-                                _ => ("raced", 0),
-                            };
-                            info!(path = %path, class = label,
-                                  "transient substitute failure; reporting retry-later");
-                            return MaterializationOutcome {
-                                outcome: Some(materialization_outcome::Outcome::RetryLater(
-                                    materialization_outcome::RetryLater {
-                                        detail: format!("substitution of {path}: {e}"),
-                                        retry_after_secs,
-                                        class: label.to_string(),
-                                    },
-                                )),
-                            };
+                    // job). The largest Retry-After across tenants
+                    // rides the report.
+                    let (label, retry_after_secs, detail) = transient.expect("checked is_some");
+                    info!(path = %path, class = label,
+                          "transient substitute failure; reporting retry-later");
+                    return MaterializationOutcome {
+                        outcome: Some(materialization_outcome::Outcome::RetryLater(
+                            materialization_outcome::RetryLater {
+                                detail,
+                                retry_after_secs,
+                                class: label.to_string(),
+                            },
+                        )),
+                    };
+                }
+                None => {
+                    // Every tenant cleanly missed. The miss verdict
+                    // additionally requires the HEAD-probe to confirm
+                    // absence under EVERY tenant (merged_bug_028: any
+                    // indeterminate or probe trouble → infra; the
+                    // local-miss witness from above completes the
+                    // proof — bug_042).
+                    for &tenant_id in &tenants {
+                        match probe_miss(ctx, tenant_id, &path).await {
+                            MissProbe::Confirmed => {}
+                            MissProbe::Infra(detail) => {
+                                return infra_failure(format!(
+                                    "substitution of {path} hit infrastructure trouble: {detail}"
+                                ));
+                            }
                         }
-                        FailureDisposition::ChargeInfra => {
-                            return infra_failure(format!(
-                                "substitution of {path} failed ({class:?}): {e}"
-                            ));
-                        }
+                    }
+                    let _witness: LocalMiss = local_witness;
+                    debug!(path = %path, cell = ?cell, tenants = tenants.len(),
+                           "path confirmed absent under every interested tenant (and locally)");
+                    match cell {
+                        PathCell::Wanted => missing_wanted.push(path.clone()),
+                        PathCell::Reference => missing_references.push(path.clone()),
                     }
                 }
             }
@@ -479,23 +516,27 @@ fn infra_failure(detail: impl Into<String>) -> MaterializationOutcome {
     }
 }
 
-/// AS-4 / PDQ-8 tenant re-resolution against live interest.
+/// AS-4 / PDQ-8 tenant re-resolution against live interest — PLURAL
+/// (merged_bug_028 / owner Q2 2026-06-03: the executor may satisfy a
+/// job through ANY interested tenant's upstreams; a job fails only
+/// when NO interested tenant can obtain).
 ///
 /// The recorded creating-build tenant ([`ClaimedJob::tenant_hint`]) is
 /// a preference honored only while a live interested build still
-/// carries it; otherwise any live interested build's tenant; otherwise
-/// `None` (the caller reports InfraFailure). A terminal creating
-/// build's tenant may have been deleted (its `tenant_upstreams`
-/// cascade-removed) or carry sig-trust the live interest cannot see —
-/// re-resolution is the authority, never the recorded value.
-async fn resolve_tenant(
+/// carries it (it sorts FIRST); the rest follow in tenant_id order
+/// (deterministic). Empty = no resolvable tenant context (the caller
+/// reports InfraFailure). A terminal creating build's tenant may have
+/// been deleted (its `tenant_upstreams` cascade-removed) or carry
+/// sig-trust the live interest cannot see — re-resolution is the
+/// authority, never the recorded value.
+async fn resolve_tenants(
     ctx: &ExecutorContext,
     claimed: &ClaimedJob,
-) -> Result<Option<Uuid>, sqlx::Error> {
+) -> Result<Vec<Uuid>, sqlx::Error> {
     // 086: live interest derives from build_derivations membership
     // (the live_wanted_interest view) — a row-less live build's tenant
     // is discoverable (merged_bug_176).
-    let live: Vec<Uuid> = sqlx::query_scalar(
+    let mut live: Vec<Uuid> = sqlx::query_scalar(
         "SELECT DISTINCT i.tenant_id \
            FROM materialization_jobs j \
            JOIN live_wanted_interest i USING (derivation_id) \
@@ -508,11 +549,12 @@ async fn resolve_tenant(
     .await?;
 
     if let Some(hint) = claimed.tenant_hint
-        && live.contains(&hint)
+        && let Some(pos) = live.iter().position(|t| *t == hint)
     {
-        return Ok(Some(hint));
+        live.remove(pos);
+        live.insert(0, hint);
     }
-    Ok(live.first().copied())
+    Ok(live)
 }
 
 /// The live wanted set for the claimed derivation, as store paths.
@@ -623,15 +665,16 @@ async fn pin_materialized_path(
     Ok(())
 }
 
-/// Classification of a `try_substitute` clean miss (B3's executor
-/// half).
-enum MissClass {
-    /// Every configured upstream definitively answered "not present"
-    /// AND the local probe answered absent (the witness — bug_042) →
-    /// the Unobtainable route.
-    ConfirmedAbsent(LocalMiss),
-    /// At least one upstream could not be classified (5xx / timeout /
-    /// 429), or the probe itself failed → the InfraFailure route
+/// One tenant's HEAD-probe answer for a clean substitute miss (B3's
+/// executor half, per-tenant since merged_bug_028). A confirmed-absent
+/// VERDICT additionally requires confirmation under EVERY interested
+/// tenant plus the caller's [`LocalMiss`] witness (bug_042) — this
+/// per-tenant probe alone never constructs one.
+enum MissProbe {
+    /// This tenant's upstreams definitively answered "not present".
+    Confirmed,
+    /// This tenant's probe could not classify (5xx / timeout / 429 /
+    /// present-but-not-ingested / probe failure) → InfraFailure
     /// (nothing is confirmed).
     Infra(String),
 }
@@ -641,15 +684,9 @@ enum MissClass {
 /// ([`Substituter::check_available`]): a path in `indeterminate` could
 /// not be classified (infra); a path in `hits` is present upstream but
 /// substitution did not ingest it (also infra — something is wrong on
-/// our side); a path in neither set is a confirmed miss. The
-/// `ConfirmedAbsent` cell carries the caller's [`LocalMiss`] witness:
-/// only a path proven absent LOCALLY can be missing at all (bug_042).
-async fn classify_miss(
-    ctx: &ExecutorContext,
-    tenant_id: Uuid,
-    store_path: &str,
-    local_witness: LocalMiss,
-) -> MissClass {
+/// our side); a path in neither set is a confirmed miss UNDER THIS
+/// TENANT.
+async fn probe_miss(ctx: &ExecutorContext, tenant_id: Uuid, store_path: &str) -> MissProbe {
     let deadline = tokio::time::Instant::now() + MISS_PROBE_DEADLINE;
     let paths = [store_path.to_string()];
     match ctx
@@ -659,19 +696,19 @@ async fn classify_miss(
     {
         Ok(result) => {
             if result.indeterminate.iter().any(|p| p == store_path) {
-                MissClass::Infra(
+                MissProbe::Infra(
                     "availability probe indeterminate (upstream 5xx/timeout/429)".to_string(),
                 )
             } else if result.hits.iter().any(|p| p == store_path) {
-                MissClass::Infra(
+                MissProbe::Infra(
                     "upstream reports the path present but substitution did not ingest it"
                         .to_string(),
                 )
             } else {
-                MissClass::ConfirmedAbsent(local_witness)
+                MissProbe::Confirmed
             }
         }
-        Err(e) => MissClass::Infra(format!("availability probe failed: {e}")),
+        Err(e) => MissProbe::Infra(format!("availability probe failed: {e}")),
     }
 }
 
@@ -1770,10 +1807,13 @@ mod tests {
             exec_id: Uuid::now_v7().to_string(),
             drv_path: format!("/nix/store/{drv_hash}.drv"),
         };
-        let resolved = resolve_tenant(&ctx, &claimed).await.expect("query ok");
+        // merged_bug_028: the resolution is PLURAL now — the row-less
+        // member's tenant is discoverable AND the deterministic
+        // ordering puts it first absent a live hint.
+        let resolved = resolve_tenants(&ctx, &claimed).await.expect("query ok");
         assert_eq!(
             resolved,
-            Some(tenant),
+            vec![tenant],
             "a row-less live member's tenant is discoverable for the walk"
         );
 
@@ -2113,6 +2153,133 @@ mod tests {
             infra.detail.contains("no-verifiable-wanted-paths"),
             "the vacuous shape names itself: {}",
             infra.detail
+        );
+    }
+
+    // r[verify store.materialize.executor+4]
+    /// merged_bug_028 / owner Q2 (executor leg): when the FIRST
+    /// tenant's upstreams 404 a path, the walk tries the NEXT
+    /// interested tenant's upstreams and succeeds — the job fails only
+    /// when NO interested tenant can obtain. RED (pre-fix): the
+    /// singular resolve_tenant honored the hint tenant exclusively;
+    /// tenant1's 404 became Unobtainable with tenant2's serving
+    /// upstream never consulted.
+    #[tokio::test]
+    async fn second_tenant_upstream_serves_path() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant1 = seed_tenant(&db.pool, "mat-mt-1").await;
+        let tenant2 = seed_tenant(&db.pool, "mat-mt-2").await;
+
+        let path = store_path(27, "multi-tenant");
+        let (nar, _) = rio_test_support::fixtures::make_nar(b"multi-tenant");
+        // tenant1's only upstream 404s everything; tenant2's serves it.
+        let dead = spawn_status_upstream(axum::http::StatusCode::NOT_FOUND).await;
+        wire_upstream(&db.pool, tenant1, &dead).await;
+        let live = spawn_multi_upstream(vec![(path.clone(), nar, vec![])], "cache.mt").await;
+        wire_upstream(&db.pool, tenant2, &live).await;
+
+        // Both tenants interested: the job's hint is tenant1 (the
+        // 404-only one — deterministic pre-fix red), and a SECOND live
+        // build under tenant2 also wants the node.
+        let seeded = seed_job(
+            &db.pool,
+            "mat-mt-drv",
+            &[("out", path.as_str())],
+            Some(tenant1),
+            Some(tenant1),
+            &[],
+        )
+        .await;
+        let build2 = Uuid::new_v4();
+        sqlx::query("INSERT INTO builds (build_id, tenant_id, status) VALUES ($1, $2, 'active')")
+            .bind(build2)
+            .bind(tenant2)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(build2)
+            .bind(seeded.derivation_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO build_wanted_outputs (build_id, derivation_id, wanted_output_names) \
+             VALUES ($1, $2, '{}')",
+        )
+        .bind(build2)
+        .bind(seeded.derivation_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let ctx = make_ctx(db.pool.clone());
+        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let success = outcome_success(&outcome)
+            .unwrap_or_else(|| panic!("expected Success via tenant2, got {outcome:?}"));
+        assert_eq!(
+            success.ingested_paths,
+            vec![path.clone()],
+            "tenant2's upstream served the path after tenant1 missed"
+        );
+    }
+
+    // r[verify store.materialize.executor+4]
+    /// merged_bug_028 (conjunction leg): a confirmed-absent verdict
+    /// requires the miss to be confirmed under EVERY interested
+    /// tenant — when one tenant's probe is indeterminate (its upstream
+    /// 5xxes), the walk reports infrastructure trouble, never
+    /// Unobtainable.
+    #[tokio::test]
+    async fn miss_with_indeterminate_second_tenant_is_infra() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant1 = seed_tenant(&db.pool, "mat-mtind-1").await;
+        let tenant2 = seed_tenant(&db.pool, "mat-mtind-2").await;
+
+        let path = store_path(28, "mt-indeterminate");
+        // tenant1: clean 404; tenant2: 500 (indeterminate probe).
+        let dead = spawn_status_upstream(axum::http::StatusCode::NOT_FOUND).await;
+        wire_upstream(&db.pool, tenant1, &dead).await;
+        let broken = spawn_status_upstream(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
+        wire_upstream(&db.pool, tenant2, &broken).await;
+
+        let seeded = seed_job(
+            &db.pool,
+            "mat-mtind-drv",
+            &[("out", path.as_str())],
+            Some(tenant1),
+            Some(tenant1),
+            &[],
+        )
+        .await;
+        let build2 = Uuid::new_v4();
+        sqlx::query("INSERT INTO builds (build_id, tenant_id, status) VALUES ($1, $2, 'active')")
+            .bind(build2)
+            .bind(tenant2)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(build2)
+            .bind(seeded.derivation_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO build_wanted_outputs (build_id, derivation_id, wanted_output_names) \
+             VALUES ($1, $2, '{}')",
+        )
+        .bind(build2)
+        .bind(seeded.derivation_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let ctx = make_ctx(db.pool.clone());
+        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        assert!(
+            outcome_infra(&outcome).is_some(),
+            "an unconfirmable tenant view must report infra, got {outcome:?}"
         );
     }
 }

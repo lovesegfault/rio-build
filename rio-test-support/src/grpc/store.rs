@@ -51,6 +51,15 @@ pub struct MockStoreState {
     /// succeeds (mirrors "HEAD 429'd but GET works").
     /// `r[sched.merge.substitute-probe-indeterminate+2]`
     pub indeterminate: Arc<RwLock<Vec<String>>>,
+    /// merged_bug_028: per-tenant FMP scripting. Key = the
+    /// `x-rio-probe-tenant-id` header value; the listed paths are
+    /// reported missing-and-unsubstitutable FOR THAT TENANT (forced
+    /// into `missing_paths`, excluded from substitutable/
+    /// indeterminate) regardless of `paths`/`substitutable` — the
+    /// mock twin of the store's per-tenant sig-visibility gate and
+    /// per-tenant upstream view. Requests with no/other tenant header
+    /// answer from the global state as before.
+    pub per_tenant_unobtainable: Arc<RwLock<HashMap<String, Vec<String>>>>,
     /// Per-path `SubstitutePath` shape: `(nar_size, progress_ticks)`.
     /// BLAKE3 digest → chunk bytes. dataplane2: backs the in-memory
     /// `ChunkService.GetChunk` impl. Seed via [`MockStore::seed_chunked`].
@@ -97,6 +106,11 @@ pub struct MockStoreCalls {
     /// proving deferred FODs use the batch pre-pass (1 RPC) and skip
     /// the per-FOD `fod_outputs_in_store` fallback (would be N+1).
     pub find_missing_calls: Arc<AtomicU32>,
+    /// The `x-rio-probe-tenant-id` header of every FMP call, in
+    /// arrival order (`None` = absent). merged_bug_028: asserts the
+    /// dispatch/settlement probes ask once PER LIVE TENANT instead of
+    /// one arbitrarily-picked tenant.
+    pub find_missing_tenants: Arc<RwLock<Vec<Option<String>>>>,
     /// `manifest_hint` from each `get_path` call (None if unset).
     /// I-110c: lets tests assert the FUSE fetch carried the primed
     /// hint.
@@ -852,6 +866,16 @@ impl StoreService for MockStore {
         request: Request<types::FindMissingPathsRequest>,
     ) -> Result<Response<types::FindMissingPathsResponse>, Status> {
         self.calls.find_missing_calls.fetch_add(1, Ordering::SeqCst);
+        let probe_tenant = request
+            .metadata()
+            .get(rio_proto::PROBE_TENANT_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        self.calls
+            .find_missing_tenants
+            .write()
+            .unwrap()
+            .push(probe_tenant.clone());
         if self.faults.fail_find_missing.load(Ordering::SeqCst) {
             return Err(Status::unavailable("mock: injected find_missing failure"));
         }
@@ -861,9 +885,22 @@ impl StoreService for MockStore {
                 .map_err(|e| Status::invalid_argument(format!("mock: invalid store path: {e}")))?;
         }
         let paths = self.state.paths.read().unwrap();
+        // merged_bug_028: the per-tenant unobtainable script overrides
+        // the global state for this request's tenant.
+        let forced: Vec<String> = probe_tenant
+            .as_deref()
+            .and_then(|t| {
+                self.state
+                    .per_tenant_unobtainable
+                    .read()
+                    .unwrap()
+                    .get(t)
+                    .cloned()
+            })
+            .unwrap_or_default();
         let missing: Vec<String> = requested
             .into_iter()
-            .filter(|p| !paths.contains_key(p))
+            .filter(|p| !paths.contains_key(p) || forced.contains(p))
             .collect();
         // Substitutable ⊆ missing: only report paths that were
         // requested-and-missing AND seeded as substitutable. A seeded
@@ -873,12 +910,12 @@ impl StoreService for MockStore {
         let ind = self.state.indeterminate.read().unwrap();
         let substitutable: Vec<String> = missing
             .iter()
-            .filter(|p| subs.contains(p) && !ind.contains(p))
+            .filter(|p| subs.contains(p) && !ind.contains(p) && !forced.contains(p))
             .cloned()
             .collect();
         let indeterminate: Vec<String> = missing
             .iter()
-            .filter(|p| ind.contains(p))
+            .filter(|p| ind.contains(p) && !forced.contains(p))
             .cloned()
             .collect();
         Ok(Response::new(types::FindMissingPathsResponse {

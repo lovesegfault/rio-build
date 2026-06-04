@@ -426,6 +426,111 @@ async fn dispatch_time_substitutable_routes_to_job(#[case] is_fod: bool) -> Test
     Ok(())
 }
 
+// r[verify sched.materialize.routing+4]
+/// merged_bug_028 (028a, dispatch leg): presence and substitutability
+/// are PER-TENANT facts — the batch probe asks once per live tenant
+/// and folds per candidate. A path visible under tenant A but
+/// missing-and-unsubstitutable under tenant B (sig-visibility split)
+/// must NOT inline-complete (the every-tenant conjunction fails) and
+/// MUST route to a materialization job (the some-tenant existential
+/// holds via A — owner Q2). RED (pre-fix): one find_map-picked tenant
+/// answered for both — picking A inline-completed (laundering B's
+/// visibility), picking B left the node Ready from-source; NEITHER
+/// created the job.
+#[tokio::test]
+async fn probe_batch_partitions_by_tenant() -> TestResult {
+    use rio_auth::hmac::HmacSigner;
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let service_key = b"test-028a-dispatch-service-key-32".to_vec();
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, p| {
+            p.service_signer = Some(std::sync::Arc::new(HmacSigner::from_key(service_key)));
+        });
+    let _tasks = (store_task, actor_task);
+    let tenant_a = rio_store::test_helpers::seed_tenant(&db.pool, "028a-tenant-a").await;
+    let tenant_b = rio_store::test_helpers::seed_tenant(&db.pool, "028a-tenant-b").await;
+
+    let out = test_store_path("028a-split-out");
+    // Two builds, one per tenant, both interested in the same node.
+    // (The path is seeded AFTER merge so the merge-time presence check
+    // cannot settle the node before the dispatch batch runs.)
+    let mut n = make_node("028a-split-drv");
+    n.expected_output_paths = vec![out.clone()];
+    n.wanted_output_names = vec!["out".into()];
+    for (build_tenant, n) in [(tenant_a, n.clone()), (tenant_b, n)] {
+        merge_dag_req(
+            &handle,
+            MergeDagRequest {
+                build_id: Uuid::new_v4(),
+                tenant_id: Some(build_tenant),
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![n],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+                traceparent: String::new(),
+                jti: None,
+                jwt_token: None,
+            },
+        )
+        .await?;
+    }
+    barrier(&handle).await;
+
+    // NOW the path appears in the store (global state) but stays
+    // invisible under tenant B (the per-tenant unobtainable script —
+    // the mock twin of the sig-visibility gate).
+    store.seed_with_content(&out, b"028a-split");
+    store
+        .state
+        .per_tenant_unobtainable
+        .write()
+        .unwrap()
+        .insert(tenant_b.to_string(), vec![out.clone()]);
+    // Advance the probe generation so the batch re-probes the node.
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    // The batch asked once per tenant (the partition's structural pin).
+    {
+        let tenants_probed = store.calls.find_missing_tenants.read().unwrap();
+        let mut seen: Vec<&str> = tenants_probed
+            .iter()
+            .flatten()
+            .map(|s| s.as_str())
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        let ta = tenant_a.to_string();
+        let tb = tenant_b.to_string();
+        assert!(
+            seen.contains(&ta.as_str()) && seen.contains(&tb.as_str()),
+            "the probe must ask under EVERY live tenant, probed={tenants_probed:?}"
+        );
+    }
+
+    // Routed to a job (some-tenant obtainable), NOT inline-completed
+    // (every-tenant visibility failed under B).
+    let d = expect_drv(&handle, "028a-split-drv").await;
+    assert_eq!(
+        d.status,
+        DerivationStatus::Ready,
+        "the visibility split must not inline-complete the node"
+    );
+    let jobs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM materialization_jobs WHERE drv_hash = '028a-split-drv'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        jobs, 1,
+        "the some-tenant existential (owner Q2) routes the node to a materialization job"
+    );
+    Ok(())
+}
+
 // r[verify sched.merge.wanted-outputs+3]
 /// `batch_probe_cached_ready` × wanted outputs: a Ready node whose only
 /// missing output is one nothing wants must be completed inline by the

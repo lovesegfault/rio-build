@@ -123,60 +123,95 @@ impl DagActor {
             }
         }
 
-        // Tenant context for the upstream-substitution probe: any
-        // tenant that wants any candidate (substitution is content-
-        // addressed; whose upstream we use is irrelevant to the
-        // result). Without this the store sees tenant_id=None and
-        // substitutable_paths stays empty — the pre-fix behaviour
-        // that dispatched FODs already in cache.nixos.org.
-        let probe = self.probe_service_meta(candidates.iter().map(|(h, _)| h));
-        let probe_meta: Vec<(&'static str, &str)> =
-            probe.iter().map(|(k, v)| (*k, v.as_str())).collect();
-
-        let store_paths: Vec<String> = candidates
+        // merged_bug_028: per-tenant probe plan. Presence and
+        // substitutability are PER-TENANT facts (the store's
+        // sig-visibility gate and `tenant_upstreams` both key on the
+        // request tenant), so the batch asks once per LIVE tenant of
+        // the candidate set and folds per candidate:
+        // inline-completion requires present-and-visible under EVERY
+        // interested tenant (the pre-fix find_map pick laundered one
+        // tenant's visibility onto the rest); a materialization job is
+        // created when EVERY wanted path is obtainable under SOME
+        // tenant (owner Q2: any interested tenant's upstreams may
+        // serve); leave-Ready (from-source) only when no tenant can
+        // obtain. Candidates with NO tenant context probe once
+        // unauthenticated (dev mode — visibility gating is moot).
+        let tenant_sets: Vec<std::collections::BTreeSet<Uuid>> = candidates
             .iter()
-            .flat_map(|(_, p)| p.iter().cloned())
+            .map(|(h, _)| self.live_tenants_of(h))
             .collect();
+        let mut probe_groups: std::collections::BTreeMap<Option<Uuid>, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for ((_, paths), tenants) in candidates.iter().zip(&tenant_sets) {
+            if tenants.is_empty() {
+                probe_groups
+                    .entry(None)
+                    .or_default()
+                    .extend(paths.iter().cloned());
+            } else {
+                for t in tenants {
+                    probe_groups
+                        .entry(Some(*t))
+                        .or_default()
+                        .extend(paths.iter().cloned());
+                }
+            }
+        }
+
+        struct ProbeAnswer {
+            missing: HashSet<String>,
+            substitutable: HashSet<String>,
+            indeterminate: HashSet<String>,
+        }
+        let mut answers: std::collections::BTreeMap<Option<Uuid>, ProbeAnswer> =
+            std::collections::BTreeMap::new();
         // Deliberately NOT gated on `cache_breaker`: dispatch-time
-        // probe failure degrades to cache-miss (per-drv fallback
-        // retries), not StoreUnavailable. The breaker is for merge-time
-        // admission only — here the call IS the work.
-        let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
-        Self::inject_probe_meta(req.metadata_mut(), &probe_meta);
-        let resp =
+        // probe failure degrades to cache-miss (per-drv fallback /
+        // next pass retries), not StoreUnavailable. The breaker is for
+        // merge-time admission only — here the call IS the work.
+        for (tenant, store_paths) in probe_groups {
+            let probe = self.probe_service_meta_for(tenant);
+            let probe_meta: Vec<(&'static str, &str)> =
+                probe.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
+            Self::inject_probe_meta(req.metadata_mut(), &probe_meta);
             match tokio::time::timeout(self.grpc_timeout, store.clone().find_missing_paths(req))
                 .await
             {
-                Ok(Ok(r)) => r.into_inner(),
-                Ok(Err(e)) => {
-                    debug!(
-                        candidates = candidates.len(),
-                        error = %e,
-                        "batched Ready store-check FindMissingPaths failed; \
-                         dispatching fail-open (next pass batch-retries)"
+                Ok(Ok(r)) => {
+                    let r = r.into_inner();
+                    answers.insert(
+                        tenant,
+                        ProbeAnswer {
+                            missing: r.missing_paths.into_iter().collect(),
+                            substitutable: r.substitutable_paths.into_iter().collect(),
+                            indeterminate: r.indeterminate_paths.into_iter().collect(),
+                        },
                     );
-                    // Tail already in `checked`; head protected via the
-                    // probed_generation stamp at `ready_check_or_spawn`.
-                    return checked;
+                }
+                Ok(Err(e)) => {
+                    debug!(?tenant, error = %e,
+                        "per-tenant Ready store-check FindMissingPaths failed; \
+                         that tenant's answers drop from this pass's fold");
                 }
                 Err(_) => {
-                    debug!(
-                        candidates = candidates.len(),
-                        timeout = ?self.grpc_timeout,
-                        "batched Ready store-check timed out; \
-                         dispatching fail-open (next pass batch-retries)"
-                    );
-                    return checked;
+                    debug!(?tenant, timeout = ?self.grpc_timeout,
+                        "per-tenant Ready store-check timed out; \
+                         that tenant's answers drop from this pass's fold");
                 }
-            };
-
-        // Partition: locally-present (not in missing_paths) → complete
-        // inline; missing-but-obtainable (substitutable/indeterminate)
-        // → route to a materialization job; truly-missing → leave Ready
-        // (dispatches normally from source).
-        let missing: HashSet<String> = resp.missing_paths.into_iter().collect();
-        let substitutable: HashSet<String> = resp.substitutable_paths.into_iter().collect();
-        let indeterminate: HashSet<String> = resp.indeterminate_paths.into_iter().collect();
+            }
+        }
+        if answers.is_empty() {
+            // Every probe failed: the pre-028 fail-open shape — tail
+            // already in `checked`; head protected via the
+            // probed_generation stamp at `ready_check_or_spawn`.
+            debug!(
+                candidates = candidates.len(),
+                "all Ready store-check probes failed; \
+                 dispatching fail-open (next pass batch-retries)"
+            );
+            return checked;
+        }
         // I-139: collect-then-batch. The locally-present branch awaited
         // `complete_ready_from_store` per item (≥3 sequential PG RTTs
         // each); on warm-restart of a large closure ~all 2048 candidates
@@ -187,8 +222,27 @@ impl DagActor {
         // owned by `create_materialization_job` — leader-gated,
         // fenced, and dedup'd there).
         let mut to_create_job: Vec<DrvHash> = Vec::new();
-        for (drv_hash, paths) in candidates {
+        for ((drv_hash, paths), tenants) in candidates.into_iter().zip(tenant_sets) {
             checked.insert(drv_hash.clone());
+            // The candidate's answer set: its own tenants' answers (or
+            // the unauthenticated answer for a tenant-less candidate).
+            // A tenant whose probe failed is ABSENT here — it can
+            // satisfy neither the every-tenant visibility conjunction
+            // nor the some-tenant obtainability existential
+            // (conservative both ways); a candidate with NO surviving
+            // answer takes no action this pass (stamped; the next
+            // generation re-probes).
+            let keys: Vec<Option<Uuid>> = if tenants.is_empty() {
+                vec![None]
+            } else {
+                tenants.iter().map(|t| Some(*t)).collect()
+            };
+            let candidate_answers: Vec<&ProbeAnswer> =
+                keys.iter().filter_map(|k| answers.get(k)).collect();
+            let all_answered = candidate_answers.len() == keys.len();
+            if candidate_answers.is_empty() {
+                continue;
+            }
             // r[impl sched.merge.wanted-outputs+3]
             // Demand-driven completeness: only the WANTED outputs must
             // be present (→ complete inline) or present-or-
@@ -219,10 +273,22 @@ impl DagActor {
                     .map(|w| w.into_iter().map(str::to_owned).collect::<Vec<String>>())
                 })
                 .unwrap_or_else(|| paths.clone());
-            if wanted.iter().all(|p| !missing.contains(p)) {
+            if all_answered
+                && wanted
+                    .iter()
+                    .all(|p| candidate_answers.iter().all(|a| !a.missing.contains(p)))
+            {
+                // Present-and-visible under EVERY interested tenant
+                // (merged_bug_028: the inline completion is the
+                // visibility-laundering site — one tenant's view must
+                // not complete another tenant's build).
                 locally_present.push(drv_hash);
             } else if wanted.iter().all(|p| {
-                !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
+                candidate_answers.iter().any(|a| {
+                    !a.missing.contains(p)
+                        || a.substitutable.contains(p)
+                        || a.indeterminate.contains(p)
+                })
             }) {
                 // r[impl sched.materialize.job+2]
                 // r[impl sched.merge.substitute-probe-indeterminate+2]
@@ -255,26 +321,35 @@ impl DagActor {
         checked
     }
 
-    /// Service-token metadata for dispatch-time store probes
-    /// (`FindMissingPaths`): `(service token, probe tenant id)` when
-    /// both `service_signer` and a tenant are resolvable from the
-    /// candidates' interested builds; empty (no-auth, dev mode /
-    /// single-tenant) otherwise. Tenant context matters because the
-    /// store's upstream-substitution probe resolves
-    /// `tenant_upstreams` from it — without it `substitutable_paths`
-    /// stays empty. One-shot mint: the probe is a single bounded gRPC
-    /// call (the re-mintable walk auth died with the walk).
-    #[allow(clippy::extra_unused_lifetimes)] // 'a only in impl-Trait arg
-    pub(super) fn probe_service_meta<'a>(
-        &self,
-        drv_hashes: impl Iterator<Item = &'a DrvHash>,
-    ) -> Vec<(&'static str, String)> {
-        let tid = drv_hashes
-            .filter_map(|h| self.dag.node(h))
+    /// The deterministic LIVE tenant set of a node — the union of its
+    /// interested builds' tenants, BTreeSet-ordered (merged_bug_028:
+    /// every per-tenant probe fact is asked of THIS set; map order can
+    /// never pick the answering tenant).
+    pub(super) fn live_tenants_of(&self, drv_hash: &DrvHash) -> std::collections::BTreeSet<Uuid> {
+        self.dag
+            .node(drv_hash)
+            .into_iter()
             .flat_map(|s| s.interested_builds.iter())
             .filter_map(|bid| self.builds.get(bid))
-            .find_map(|b| b.tenant_id);
-        match (&self.service_signer, tid) {
+            .filter_map(|b| b.tenant_id)
+            .collect()
+    }
+
+    /// Service-token metadata for ONE tenant's store probe
+    /// (`FindMissingPaths`): `(service token, probe tenant id)` when
+    /// `service_signer` is configured; empty (no-auth, dev mode)
+    /// otherwise. Tenant context matters because the store's
+    /// upstream-substitution probe resolves `tenant_upstreams` AND its
+    /// sig-visibility gate from it. One-shot mint: each probe is a
+    /// single bounded gRPC call (the re-mintable walk auth died with
+    /// the walk). Since merged_bug_028 the dispatch and settlement
+    /// probes ask once PER LIVE TENANT and fold — never one
+    /// arbitrarily-picked tenant for a per-tenant fact.
+    pub(super) fn probe_service_meta_for(
+        &self,
+        tenant_id: Option<Uuid>,
+    ) -> Vec<(&'static str, String)> {
+        match (&self.service_signer, tenant_id) {
             (Some(signer), Some(tenant_id)) => {
                 let claims = rio_auth::hmac::ServiceClaims {
                     caller: "rio-scheduler".to_string(),

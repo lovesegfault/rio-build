@@ -878,6 +878,125 @@ async fn retry_later_consumption_closes_uncharged_and_defers() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.materialize.routing+4]
+/// merged_bug_028 (028b, settlement leg / owner Q2): the arm-3
+/// re-probe asks EVERY live tenant and `ConfirmedMissing` is the
+/// all-tenant conjunction — one tenant confirming missing while
+/// another still sees the path substitutable keeps the job armed
+/// (ReArm), never from-source/fail-fast. RED (pre-fix): one
+/// find_map-picked tenant answered alone; structurally, only ONE
+/// probe left the scheduler.
+#[tokio::test]
+async fn reprobe_confirmed_missing_requires_all_tenants() -> TestResult {
+    use rio_auth::hmac::HmacSigner;
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let service_key = b"test-028b-settle-service-key-32-b".to_vec();
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, p| {
+            p.service_signer = Some(Arc::new(HmacSigner::from_key(service_key)));
+        });
+    let _tasks = (store_task, actor_task);
+    let tenant_a = rio_store::test_helpers::seed_tenant(&db.pool, "028b-tenant-a").await;
+    let tenant_b = rio_store::test_helpers::seed_tenant(&db.pool, "028b-tenant-b").await;
+
+    // A childless leaf wanted by two builds under different tenants.
+    let out = test_store_path("028b-leaf-out");
+    let mut leaf = make_node("028b-leaf");
+    leaf.expected_output_paths = vec![out.clone()];
+    leaf.wanted_output_names = vec!["out".into()];
+    for build_tenant in [tenant_a, tenant_b] {
+        merge_dag_req(
+            &handle,
+            MergeDagRequest {
+                build_id: Uuid::new_v4(),
+                tenant_id: Some(build_tenant),
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![leaf.clone()],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+                traceparent: String::new(),
+                jti: None,
+                jwt_token: None,
+            },
+        )
+        .await?;
+    }
+    barrier(&handle).await;
+
+    // The probe blip creates a cache_opportunity job.
+    store.state.substitutable.write().unwrap().push(out.clone());
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let (jobs, _) = sdb(&db.pool).count_materialization_rows().await?;
+    assert_eq!(jobs, 1, "precondition: one job");
+
+    // Claim, then split the tenant views: tenant A now confirms the
+    // path missing-and-unsubstitutable; tenant B still sees it
+    // substitutable (the global seed stands).
+    let assignment = match claim_materialization(&handle, "028b-leaf", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    store
+        .state
+        .per_tenant_unobtainable
+        .write()
+        .unwrap()
+        .insert(tenant_a.to_string(), vec![out.clone()]);
+    let probes_before = store.calls.find_missing_tenants.read().unwrap().len();
+
+    // The executor reports the wanted path Unobtainable.
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "028b-leaf",
+        mat_unobtainable_outcome(
+            vec![out.clone()],
+            vec![],
+            "confirmed absent under the executing tenant",
+        ),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // Structural pin: the settlement re-probe asked BOTH tenants.
+    {
+        let probed = store.calls.find_missing_tenants.read().unwrap();
+        let mut seen: Vec<&str> = probed[probes_before..]
+            .iter()
+            .flatten()
+            .map(|s| s.as_str())
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        let ta = tenant_a.to_string();
+        let tb = tenant_b.to_string();
+        assert!(
+            seen.contains(&ta.as_str()) && seen.contains(&tb.as_str()),
+            "the arm-3 re-probe must ask EVERY live tenant, asked={seen:?}"
+        );
+    }
+
+    // The fold is the all-tenant conjunction: tenant B's obtainable
+    // view keeps the job armed — pending again, never resolved.
+    let (state,): (String,) =
+        sqlx::query_as("SELECT state FROM materialization_jobs WHERE drv_hash = '028b-leaf'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        state, "pending",
+        "one obtainable tenant view must re-arm, not settle from-source/fail-fast"
+    );
+    let drv = expect_drv(&handle, "028b-leaf").await;
+    assert_eq!(drv.status, DerivationStatus::Ready, "the node re-armed");
+    Ok(())
+}
+
 // ── Establishment + cancellation (T-3.6) ───────────────────────────────
 
 // r[verify sched.materialize.routing+4]

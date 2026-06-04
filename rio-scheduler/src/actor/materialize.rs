@@ -1802,15 +1802,21 @@ impl DagActor {
         .await;
     }
 
-    /// The arm-3 FMP re-probe over the live wanted paths. `None` = the
-    /// probe could not answer (no store client / RPC failure / timeout)
-    /// — the caller maps that to ReArm (B3).
+    /// The arm-3 FMP re-probe over the live wanted paths — once per
+    /// LIVE TENANT, folded through the kernel's all-tenant conjunction
+    /// (merged_bug_028 / owner Q2: `ConfirmedMissing` — the verdict
+    /// that can fail-fast a pruned root — requires EVERY interested
+    /// tenant to confirm; one obtainable view keeps the job armed).
+    /// `None` = the probe could not answer (no store client / ANY
+    /// tenant's RPC failure / timeout) — the caller maps that to ReArm
+    /// (B3: an indeterminate answer never fail-fasts).
     ///
     /// Without a service signer the store cannot run its upstream
     /// substitution check (no `x-rio-probe-tenant-id`), so a missing
     /// path is indeterminate, never confirmed-missing — the probe then
     /// cannot produce the fail-fast conjunct (B3's conservative
-    /// direction).
+    /// direction). A node with NO live tenant folds over the empty set
+    /// → `Obtainable` (the kernel's empty-never-confirms row).
     async fn reprobe_live_wanted_paths(
         &mut self,
         drv_hash: &DrvHash,
@@ -1820,37 +1826,45 @@ impl DagActor {
             return Some(ReprobeAnswer::Obtainable);
         }
         let store = self.store_client.clone()?;
-        // One-shot service-token probe metadata (the same mint the
-        // dispatch probe uses); non-empty ⟺ a signer + tenant were
-        // resolvable, which is exactly the can-confirm criterion.
-        let probe = self.probe_service_meta(std::iter::once(drv_hash));
-        let can_confirm = !probe.is_empty();
-        let mut req = tonic::Request::new(rio_proto::types::FindMissingPathsRequest {
-            store_paths: live_wanted.to_vec(),
-        });
-        for (k, v) in probe {
-            if let Ok(mv) = tonic::metadata::MetadataValue::try_from(v.as_str()) {
-                req.metadata_mut().insert(k, mv);
+        let tenants = self.live_tenants_of(drv_hash);
+        let mut per_tenant: Vec<ReprobeAnswer> = Vec::with_capacity(tenants.len());
+        for tenant in tenants {
+            let probe = self.probe_service_meta_for(Some(tenant));
+            let can_confirm = !probe.is_empty();
+            let mut req = tonic::Request::new(rio_proto::types::FindMissingPathsRequest {
+                store_paths: live_wanted.to_vec(),
+            });
+            for (k, v) in probe {
+                if let Ok(mv) = tonic::metadata::MetadataValue::try_from(v.as_str()) {
+                    req.metadata_mut().insert(k, mv);
+                }
             }
+            // ANY tenant's RPC failure poisons the whole answer (B3:
+            // a partial view must not confirm).
+            let resp =
+                tokio::time::timeout(self.grpc_timeout, store.clone().find_missing_paths(req))
+                    .await
+                    .ok()?
+                    .ok()?
+                    .into_inner();
+            let missing: std::collections::HashSet<String> =
+                resp.missing_paths.into_iter().collect();
+            let substitutable: std::collections::HashSet<String> =
+                resp.substitutable_paths.into_iter().collect();
+            let indeterminate: std::collections::HashSet<String> =
+                resp.indeterminate_paths.into_iter().collect();
+            let obtainable = live_wanted.iter().all(|p| {
+                !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
+            });
+            per_tenant.push(if obtainable || !can_confirm {
+                ReprobeAnswer::Obtainable
+            } else {
+                ReprobeAnswer::ConfirmedMissing
+            });
         }
-        let resp = tokio::time::timeout(self.grpc_timeout, store.clone().find_missing_paths(req))
-            .await
-            .ok()?
-            .ok()?
-            .into_inner();
-        let missing: std::collections::HashSet<String> = resp.missing_paths.into_iter().collect();
-        let substitutable: std::collections::HashSet<String> =
-            resp.substitutable_paths.into_iter().collect();
-        let indeterminate: std::collections::HashSet<String> =
-            resp.indeterminate_paths.into_iter().collect();
-        let obtainable = live_wanted.iter().all(|p| {
-            !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
-        });
-        Some(if obtainable || !can_confirm {
-            ReprobeAnswer::Obtainable
-        } else {
-            ReprobeAnswer::ConfirmedMissing
-        })
+        Some(rio_evidence_kernel::outcome::fold_tenant_reprobes(
+            &per_tenant,
+        ))
     }
 }
 
