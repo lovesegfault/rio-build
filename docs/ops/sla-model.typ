@@ -279,13 +279,18 @@ defaults` shows the current probe shape.
 
 == RioSla HwCostStale <riosla-hwcoststale>
 
-#(refs.metric)("rio_scheduler_sla_hw_cost_stale_seconds")` > 1800` for 5m. The spot-price poller
+`min(`#(refs.metric)("rio_scheduler_sla_hw_cost_stale_seconds")`) > 1800` for 5m. The spot-price poller
 hasn't refreshed in >#qty("30", "min") (it ticks every #qty("10", "min"); auto-clamp to helm seed at #qty("60", "min")).
 Not a model-accuracy issue — cost ranking degrades, not sizing. Check
 scheduler leader-lease (`kubectl -n rio-system get lease rio-scheduler-leader`
 — the name is `helm:scheduler.leaseName`, not the Deployment name) and
 `ec2:DescribeSpotPriceHistory` @irsa permissions. Cross-reference
 #(refs.metric)("rio_scheduler_sla_hw_cost_fallback_total")`{reason}`.
+The gauge is per-replica and the standby's copy climbs forever (no
+poller off-leader --- by design); the `min()` keys the alert to the
+*fleet's freshest* snapshot, so a lone healthy replica keeps the alert
+silent. That silence is intentional: one fresh poller is a working
+cost source (merged_bug_235).
 
 == RioNodeclaimPool IceMaskedHigh <rionodeclaimpool-icemaskedhigh>
 

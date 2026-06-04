@@ -136,6 +136,22 @@ fn collect_describes() -> Result<BTreeMap<String, Describe>> {
     }
 }
 
+/// The `leader_gauges!` membership set, scraped from the single
+/// declaration in rio-scheduler/src/observability.rs (the family is
+/// leader-published and swept on leadership loss; everything else is
+/// per-replica — merged_bug_235's aggregation classes).
+fn leader_gauge_roster() -> Result<BTreeSet<String>> {
+    let body = fs::read_to_string(repo_root().join("rio-scheduler/src/observability.rs"))?;
+    let block = Regex::new(r"(?s)leader_gauges!\s*\{(.*?)\n\}")?
+        .captures(&body)
+        .context("no leader_gauges! declaration in observability.rs")?[1]
+        .to_string();
+    Ok(Regex::new(r#""(rio_scheduler_[a-z0-9_]+)""#)?
+        .captures_iter(&block)
+        .map(|c| c[1].to_string())
+        .collect())
+}
+
 /// Pure merge step of [`collect_describes`] — unit-tested directly.
 /// Identical duplicates (per-crate nextest spec floors re-describe
 /// shared metrics) are accepted; divergent (kind, help) duplicates
@@ -181,10 +197,24 @@ fn merge_describe(
 fn metrics() -> Result<serde_json::Value> {
     // Shared scrape with regen helm-obs; divergent cross-crate
     // duplicates are a hard error (bug_364), identical ones legal.
+    // merged_bug_235 (scheduler-only scope, §5-Q14): every scheduler
+    // GAUGE carries an `aggregation` class scraped from the
+    // leader_gauges! roster — members are swept on leadership loss
+    // (`leader-zeroed`, single-writer); non-members are emitted by
+    // every replica (`per-replica`) and an alert expr reading one
+    // must aggregate across the fleet (obs-surface-lint enforces).
+    let leader_family = leader_gauge_roster()?;
     let seen: BTreeMap<String, serde_json::Value> = collect_describes()?
         .into_iter()
         .map(|(name, d)| {
-            let v = json!({"name": name, "kind": d.kind, "help": d.help});
+            let mut v = json!({"name": name, "kind": d.kind, "help": d.help});
+            if d.kind == "gauge" && name.starts_with("rio_scheduler_") {
+                v["aggregation"] = json!(if leader_family.contains(&name) {
+                    "leader-zeroed"
+                } else {
+                    "per-replica"
+                });
+            }
             (name, v)
         })
         .collect();

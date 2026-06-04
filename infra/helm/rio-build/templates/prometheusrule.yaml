@@ -195,7 +195,14 @@ spec:
         # cost-ranking degrades. Not emitted under hwCostSource=static
         # (no live source) so this is a no-op in vmtest-full.
         - alert: RioSlaHwCostStale
-          expr: rio_scheduler_sla_hw_cost_stale_seconds > 1800
+          # min(): the gauge is PER-REPLICA (deliberately outside the
+          # leader_gauges! family — the standby's copy climbs forever,
+          # observability.typ blesses it). The alert keys the FLEET:
+          # it fires only when no replica has a fresh snapshot
+          # (merged_bug_235; contract pair in 34-alert-contracts.sh).
+          # Lone-healthy-replica silence is by design — see the
+          # sla-model runbook.
+          expr: min(rio_scheduler_sla_hw_cost_stale_seconds) > 1800
           for: 5m
           labels:
             severity: warning

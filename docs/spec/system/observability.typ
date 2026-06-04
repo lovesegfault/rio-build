@@ -216,7 +216,14 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
   1.0 --- a 0.0 sweep would itself fire the clamp alert). Counters and
   histograms are unaffected --- the standby's handlers no-op, so its
   counters stay at zero naturally, and `sum(rate(...))` is the idiomatic
-  query form anyway.
+  query form anyway. Scheduler gauges *outside* the family are
+  per-replica by definition (each replica exports its own copy --- the
+  SLA hw-cost staleness gauge deliberately climbs on the standby, which
+  has no poller); an alert expression reading a per-replica gauge MUST
+  aggregate across the fleet (`min()`/`max()`/`sum()`), or the standby's
+  series pages on its own. `gen/metrics.json` carries the
+  `aggregation` class per scheduler gauge and `obs-surface-lint`
+  enforces the rule (merged_bug_235).
 ]
 The stream-era `_workers_active` gauge (and its connection-state exception
 to the leader gate) is retired: it was deprecated and pinned to zero when

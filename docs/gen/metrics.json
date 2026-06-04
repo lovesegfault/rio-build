@@ -616,7 +616,8 @@
       {
         "name": "rio_scheduler_actor_mailbox_depth",
         "kind": "gauge",
-        "help": "ActorCommand mpsc queue depth, sampled once per dequeued command. Growth = commands arriving faster than the single-threaded loop retires them. Pair with actor_cmd_seconds to localize a wedge."
+        "help": "ActorCommand mpsc queue depth, sampled once per dequeued command. Growth = commands arriving faster than the single-threaded loop retires them. Pair with actor_cmd_seconds to localize a wedge.",
+        "aggregation": "per-replica"
       },
       {
         "name": "rio_scheduler_assignments_total",
@@ -661,7 +662,8 @@
       {
         "name": "rio_scheduler_builds_active",
         "kind": "gauge",
-        "help": "Currently active builds"
+        "help": "Currently active builds",
+        "aggregation": "leader-zeroed"
       },
       {
         "name": "rio_scheduler_builds_total",
@@ -726,12 +728,14 @@
       {
         "name": "rio_scheduler_derivations_queued",
         "kind": "gauge",
-        "help": "Ready derivations waiting for a worker (DAG-status count; the per-system split is queued_by_system on ClusterStatus/GetSpawnIntents)"
+        "help": "Ready derivations waiting for a worker (DAG-status count; the per-system split is queued_by_system on ClusterStatus/GetSpawnIntents)",
+        "aggregation": "leader-zeroed"
       },
       {
         "name": "rio_scheduler_derivations_running",
         "kind": "gauge",
-        "help": "Derivations currently building"
+        "help": "Derivations currently building",
+        "aggregation": "leader-zeroed"
       },
       {
         "name": "rio_scheduler_evidence_write_fenced_total",
@@ -821,7 +825,8 @@
       {
         "name": "rio_scheduler_materialization_stalled",
         "kind": "gauge",
-        "help": "Parked materialization jobs (park budget exhausted — worker-charged infra failures or establishment charges; waiting on upstream recovery or park-backoff expiry). Leader-published every housekeeping tick from ground truth. The PD-20 re-evaluation converts parked jobs with buildable dependency closures from-source ONLY when the conversion-strictness knobs admit it (conversion_requires_worker_charge: establishment-only-parked jobs never convert while ON; conversion_min_park_dwell_secs: minimum dwell since the most recent park). A sustained nonzero value therefore means either a dead/misconfigured upstream stalling work with no from-source fallback, OR convertible work the knobs are deliberately holding — check the strictness knobs before cancelling builds."
+        "help": "Parked materialization jobs (park budget exhausted — worker-charged infra failures or establishment charges; waiting on upstream recovery or park-backoff expiry). Leader-published every housekeeping tick from ground truth. The PD-20 re-evaluation converts parked jobs with buildable dependency closures from-source ONLY when the conversion-strictness knobs admit it (conversion_requires_worker_charge: establishment-only-parked jobs never convert while ON; conversion_min_park_dwell_secs: minimum dwell since the most recent park). A sustained nonzero value therefore means either a dead/misconfigured upstream stalling work with no from-source fallback, OR convertible work the knobs are deliberately holding — check the strictness knobs before cancelling builds.",
+        "aggregation": "leader-zeroed"
       },
       {
         "name": "rio_scheduler_materialization_view_node_skew_total",
@@ -836,12 +841,14 @@
       {
         "name": "rio_scheduler_open_attempts",
         "kind": "gauge",
-        "help": "Open pull-mode BUILD attempts (active assignment + execution pair minted by PullAssignment, no terminal classification yet) — one attempt per builder pod. The busy-fleet gauge (successor of the retired stream-era workers_active). Store materialization claims are counted by rio_scheduler_open_materialization_attempts instead (A2.4)."
+        "help": "Open pull-mode BUILD attempts (active assignment + execution pair minted by PullAssignment, no terminal classification yet) — one attempt per builder pod. The busy-fleet gauge (successor of the retired stream-era workers_active). Store materialization claims are counted by rio_scheduler_open_materialization_attempts instead (A2.4).",
+        "aggregation": "leader-zeroed"
       },
       {
         "name": "rio_scheduler_open_materialization_attempts",
         "kind": "gauge",
-        "help": "Open store materialization claims (kind=materialization attempts: active assignment + execution pair, no terminal classification yet). Store-side work — never a builder slot; the build lane is rio_scheduler_open_attempts."
+        "help": "Open store materialization claims (kind=materialization attempts: active assignment + execution pair, no terminal classification yet). Store-side work — never a builder slot; the build lane is rio_scheduler_open_attempts.",
+        "aggregation": "leader-zeroed"
       },
       {
         "name": "rio_scheduler_orphan_builds_cancelled_total",
@@ -896,7 +903,8 @@
       {
         "name": "rio_scheduler_sla_class_ceiling_uncatalogued",
         "kind": "gauge",
-        "help": "§13c-2: 1 per hwClass with NO boot-derived catalog ceiling (labeled `hw_class`). Always 1 for every class under `hwCostSource: static` (no AWS API, expected). Under `spot` a persistent 1 ⇒ `describe_instance_types` failed at boot (check IRSA), or the class's `requirements` match 0 types in the deployment region (operator typo / AWS deprecation). Class falls to the global ceiling — over-permits, never over-strips."
+        "help": "§13c-2: 1 per hwClass with NO boot-derived catalog ceiling (labeled `hw_class`). Always 1 for every class under `hwCostSource: static` (no AWS API, expected). Under `spot` a persistent 1 ⇒ `describe_instance_types` failed at boot (check IRSA), or the class's `requirements` match 0 types in the deployment region (operator typo / AWS deprecation). Class falls to the global ceiling — over-permits, never over-strips.",
+        "aggregation": "per-replica"
       },
       {
         "name": "rio_scheduler_sla_envelope_result_total",
@@ -916,7 +924,8 @@
       {
         "name": "rio_scheduler_sla_hw_cost_stale_seconds",
         "kind": "gauge",
-        "help": "age of the hw-band $/vCPU·hr snapshot. Climbs when the lease-gated spot-price poller is failing or this replica is standby (price is PG-backed; standby reads but doesn't write)"
+        "help": "age of the hw-band $/vCPU·hr snapshot. Climbs when the lease-gated spot-price poller is failing or this replica is standby (price is PG-backed; standby reads but doesn't write)",
+        "aggregation": "per-replica"
       },
       {
         "name": "rio_scheduler_sla_hw_cost_unknown_total",
@@ -956,7 +965,8 @@
       {
         "name": "rio_scheduler_sla_prior_divergence",
         "kind": "gauge",
-        "help": "fleet-median prior parameter ÷ operator-probe basis (labeled `param`); outside [0.5, 2.0] ⇒ clamped to the band edge"
+        "help": "fleet-median prior parameter ÷ operator-probe basis (labeled `param`); outside [0.5, 2.0] ⇒ clamped to the band edge",
+        "aggregation": "leader-zeroed"
       },
       {
         "name": "rio_scheduler_sla_refit_total",
@@ -991,7 +1001,8 @@
       {
         "name": "rio_scheduler_status_outbox_depth",
         "kind": "gauge",
-        "help": "Failed terminal-status persist batches awaiting the housekeeping tick's re-drive. Nonzero means PG persists are failing; a sustained nonzero depth means cancelled derivations' attempts stay open (their close rides the persist) until the flush succeeds."
+        "help": "Failed terminal-status persist batches awaiting the housekeeping tick's re-drive. Nonzero means PG persists are failing; a sustained nonzero depth means cancelled derivations' attempts stay open (their close rides the persist) until the flush succeeds.",
+        "aggregation": "per-replica"
       },
       {
         "name": "rio_scheduler_store_degraded_requeues_total",
@@ -1001,7 +1012,8 @@
       {
         "name": "rio_scheduler_substituting_derivations",
         "kind": "gauge",
-        "help": "Derivations carrying a CLAIMABLE materialization job (unclaimed AND not parked) — the substitution backlog (the same quantity ClusterStatus.substituting_derivations reports). Parked jobs are pacing, not claimable demand: they leave this gauge (bug_252 — KEDA drains while the backlog parks) and stay visible via rio_scheduler_materialization_stalled. Leader-published every housekeeping tick from the freshly computed cluster snapshot. The leading rio-store KEDA scaling signal: backlog is known at merge time, minutes before the store feels the ingest load."
+        "help": "Derivations carrying a CLAIMABLE materialization job (unclaimed AND not parked) — the substitution backlog (the same quantity ClusterStatus.substituting_derivations reports). Parked jobs are pacing, not claimable demand: they leave this gauge (bug_252 — KEDA drains while the backlog parks) and stay visible via rio_scheduler_materialization_stalled. Leader-published every housekeeping tick from the freshly computed cluster snapshot. The leading rio-store KEDA scaling signal: backlog is known at merge time, minutes before the store feels the ingest load.",
+        "aggregation": "leader-zeroed"
       },
       {
         "name": "rio_scheduler_topdown_prune_total",

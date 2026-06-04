@@ -202,7 +202,7 @@
     },
     {
       "name": "RioSlaHwCostStale",
-      "expr": "rio_scheduler_sla_hw_cost_stale_seconds > 1800",
+      "expr": "min(rio_scheduler_sla_hw_cost_stale_seconds) > 1800",
       "for": "5m",
       "severity": "warning",
       "templated": false,

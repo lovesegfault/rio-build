@@ -97,6 +97,32 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: critical
+  # merged_bug_235 contract pair: RioSlaHwCostStale must NOT fire when
+  # ANY replica is fresh (the standby's stale-seconds gauge climbs
+  # forever by design — observability.typ blesses it; the alert must
+  # aggregate). It MUST fire when every replica is stale.
+  - interval: 1m
+    input_series:
+      - series: 'rio_scheduler_sla_hw_cost_stale_seconds{pod="leader"}'
+        values: '300x45'
+      - series: 'rio_scheduler_sla_hw_cost_stale_seconds{pod="standby"}'
+        values: '0+60x45'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: RioSlaHwCostStale
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: 'rio_scheduler_sla_hw_cost_stale_seconds{pod="a"}'
+        values: '0+120x35'
+      - series: 'rio_scheduler_sla_hw_cost_stale_seconds{pod="b"}'
+        values: '0+120x35'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: RioSlaHwCostStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
 EOF
 
 promtool test rules "$tests"

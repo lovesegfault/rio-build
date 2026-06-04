@@ -423,6 +423,24 @@ in
           | sed -E 's/_(bucket|sum|count)$//' | sort -u > $TMPDIR/dash-tokens
         jq -r '.rules[].metrics[]' $alertsJson | sort -u > $TMPDIR/rule-tokens
         jq -r '.names[]' $metricsJson | sort -u > $TMPDIR/live
+        # merged_bug_235 companion: a PER-REPLICA scheduler gauge in an
+        # alert expr must be aggregated across the fleet (min/max/sum/
+        # avg/count), or the standby's copy pages on its own series
+        # (the RioSlaHwCostStale class; contract pair in fragment 34).
+        jq -r '.by_component.scheduler[]?
+               | select(.aggregation? == "per-replica") | .name' \
+          $metricsJson | sort -u > $TMPDIR/per-replica
+        while IFS=$'\t' read -r alert expr; do
+          for m in $(grep -ohE '\brio_scheduler_[a-z0-9_]+' <<<"$expr" | sort -u); do
+            if grep -qx "$m" $TMPDIR/per-replica \
+               && ! grep -qE "(min|max|sum|avg|count)(\s+by\s*\([^)]*\))?\s*\(\s*(rate\(|increase\()?\s*$m" <<<"$expr"; then
+              echo "FAIL: alert $alert reads per-replica gauge $m unaggregated" >&2
+              echo "      (every replica exports its own series; wrap it in" >&2
+              echo "      min()/max()/sum() — merged_bug_235)" >&2
+              fail=1
+            fi
+          done
+        done < <(jq -r '.rules[] | [.name, .expr] | @tsv' $alertsJson)
         for set in dash rule; do
           dead=$(comm -23 $TMPDIR/$set-tokens $TMPDIR/live)
           if [[ -n "$dead" ]]; then
