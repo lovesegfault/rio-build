@@ -75,21 +75,38 @@ pub async fn run() -> Result<()> {
     // content vanished, so deleting them bricks the scratch target.
     //
     // Division of labor with kacheWrapped (nix/devshell.nix): the
-    // RUSTC_WRAPPER now sweeps each compile's own --out-dir on every
-    // disabled/bypassed invocation, INCLUDING nlink-1 reflink restores
-    // (kache tries reflink before hardlink, v0.4.0 link.rs:52, and only
-    // Copy-strategy artifacts get chmodded 0755 — so on a reflink fs a
-    // restore is read-only at nlink 1, invisible to the `-links +1`
-    // signature here, which this scope must keep for the OUT_DIR files
-    // above). This tree-wide pass stays as defense in depth for
-    // invocations that never see the wrapper (bare cargo without
-    // RUSTC_WRAPPER on the scratch target).
+    // RUSTC_WRAPPER sweeps each compile's OWN outputs — anchored by
+    // the unit's `-C extra-filename`, covering all three restore
+    // shapes (hardlink, nlink-1 reflink, post-eviction debris) — out
+    // of its --out-dir on every disabled/bypassed invocation, so any
+    // compile that goes through the wrapper self-heals. Post-eviction
+    // debris is usually already writable anyway (kache's unlink_blob
+    // chmods the inode best-effort before unlinking the store name;
+    // plain rustc just overwrites it). What this tree-wide pass still
+    // defends is exactly one residual: hardlink-shape (nlink >= 2)
+    // read-only restores against spawners that never see the wrapper
+    // — bare cargo without RUSTC_WRAPPER pointed at this scratch
+    // target. It deliberately does NOT cover nlink-1 read-only files:
+    // without a per-unit name anchor, reflink restores and the
+    // legitimate read-only OUT_DIR artifacts above are
+    // indistinguishable, and the OUT_DIR files must survive — the
+    // same reason `-links +1` stays. The rare nlink-1 0444
+    // post-eviction debris is likewise out of scope. Both residuals
+    // are accepted: the wrapper path is the supported one.
     if isolated.exists() {
-        sh::run(cmd!(
+        // Best-effort: find's exit status conflates "couldn't walk
+        // part of the tree" (one unreadable subdir → nonzero, after
+        // deleting everything it could reach) with "did nothing".
+        // This pass is defense in depth, not a gate — log and
+        // continue rather than abort the whole regen.
+        if let Err(e) = sh::run(cmd!(
             sh,
             "find {isolated} -type f -links +1 ! -perm -u+w -delete"
         ))
-        .await?;
+        .await
+        {
+            tracing::debug!("scratch-target pre-clean find failed (continuing): {e:#}");
+        }
     }
 
     // `cargo sqlx prepare` bumps src/{lib,main}.rs mtimes on every

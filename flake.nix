@@ -528,6 +528,27 @@
                 RIO_GOLDEN_FORCE_HERMETIC = "1";
               };
 
+              # Dev shells (nix/devshell.nix), bound here — not inline at
+              # the devShells option below — because the shells passthru
+              # the built kache wrapper + epoch-GC scripts that
+              # misc-checks.nix's kache-wrapper-test / kache-epoch-gc-test
+              # run caller-faithfully.
+              rioDevShells = import ./nix/devshell.nix {
+                inherit
+                  pkgs
+                  rustStable
+                  rustNightly
+                  sysCrateEnv
+                  traceyPkg
+                  crate2nixCli
+                  docsLib
+                  shiroaPkg
+                  ;
+                treefmtWrapper = config.treefmt.build.wrapper;
+                preCommitInstall = config.pre-commit.installationScript;
+                kachePkg = inputs.kache.packages.${system}.default;
+              };
+
               # --------------------------------------------------------------
               # Non-rustc check derivations (shared by checks.* and ci aggregate)
               # --------------------------------------------------------------
@@ -551,6 +572,10 @@
                   docsLib
                   ;
                 xtaskBin = crateBuild.memberBins.xtask;
+                # The devshell's REAL kache scripts (passthru above) —
+                # kache-wrapper-test / kache-epoch-gc-test exercise the
+                # exact store paths the shell exports.
+                inherit (rioDevShells.default) kacheWrapped rioKacheEpochGc kacheEnvSalt;
               };
 
               # Container images (Linux-only — dockerTools uses Linux VM
@@ -929,23 +954,11 @@
               };
 
               # --------------------------------------------------------------
-              # Dev shells (extracted to nix/devshell.nix)
+              # Dev shells (extracted to nix/devshell.nix; imported in the
+              # let block above so misc-checks can consume the passthru'd
+              # kache scripts)
               # --------------------------------------------------------------
-              devShells = import ./nix/devshell.nix {
-                inherit
-                  pkgs
-                  rustStable
-                  rustNightly
-                  sysCrateEnv
-                  traceyPkg
-                  crate2nixCli
-                  docsLib
-                  shiroaPkg
-                  ;
-                treefmtWrapper = config.treefmt.build.wrapper;
-                preCommitInstall = config.pre-commit.installationScript;
-                kachePkg = inputs.kache.packages.${system}.default;
-              };
+              devShells = rioDevShells;
 
               # `nix run .#docs` — serve the post-processed HTML tree via
               # miniserve. The `bin` output of docsLib.docs holds the

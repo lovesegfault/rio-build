@@ -31,14 +31,19 @@ pub fn run() -> Result<()> {
     // normal build reads. Nothing here is ever a useful hit; don't let
     // it evict artifacts that are.
     //
-    // No read-only-restore pre-clean is needed here (unlike regen
-    // sqlx): the cap-lints flag set changes cargo's -Cmetadata, so the
-    // baseline writes NEW filenames rather than overwriting kache's
-    // restored ones. (Cargo's own unlink-before-write covers only
+    // KACHE_DISABLED also routes every mutant compile through the
+    // wrapper's bypass, whose debris sweep is anchored on the
+    // invocation's OWN -C extra-filename: the cap-lints flag set
+    // shifts cargo's unit hashes (-Cmetadata and extra-filename, the
+    // shift verified empirically on both shell toolchains), so mutant
+    // filenames never collide with kache-restored ones — nothing is
+    // ever cached under this keyspace, the sweep finds no read-only
+    // files under the shifted names (a structural no-op), and it can
+    // no longer unlink the NORMAL keyspace's restores (different
+    // hashes; the earlier crate-NAME-anchored sweep did exactly
+    // that). (Cargo's own unlink-before-write covers only
     // hardlink-uplift destinations like target/debug/lib*.rlib, NOT
-    // rustc-written deps/ outputs — which is exactly why the regen
-    // sqlx EACCES is real; the filename shift is what protects this
-    // flow, verified empirically on both shell toolchains.)
+    // rustc-written deps/ outputs.)
     let _env = sh.push_env("KACHE_DISABLED", "1");
     crate::sh::run_interactive(cmd!(
         sh,
