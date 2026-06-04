@@ -19,6 +19,12 @@
 //! - `test-utils`: test fixtures (`test_helpers`, `MIGRATOR`). Implies
 //!   `server`.
 
+// .sqlx/ surfaced as a tracked env-dep (see build.rs): the env! read
+// records a dep-info `# env-dep:` line, so cargo and content-keyed
+// rustc-wrapper caches (kache) re-key this crate when query metadata
+// changes without .rs edits.
+const _: &str = env!("RIO_SQLX_HASH");
+
 // ---------------------------------------------------------------------------
 // Always-on (`schema` feature surface)
 // ---------------------------------------------------------------------------

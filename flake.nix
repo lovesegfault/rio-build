@@ -24,6 +24,15 @@
       flake = false;
     };
 
+    # Dedupe-only, same role as flake-compat: kache and nixhelm both pull
+    # flake-utils (and its `systems` input). Pin one copy at top level and
+    # point both at it so flake.lock doesn't grow `_2` duplicate nodes.
+    flake-utils = {
+      url = "github:numtide/flake-utils";
+      inputs.systems.follows = "systems";
+    };
+    systems.url = "github:nix-systems/default";
+
     # Spec-coverage tool (nix/tracey.nix). Flake input (not fetchFromGitHub)
     # so importCargoLock reads Cargo.lock from a pre-fetched path — no IFD.
     tracey-src = {
@@ -39,6 +48,26 @@
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    # Cross-worktree cargo build cache for the dev shells (content-addressed
+    # RUSTC_WRAPPER; wired local-only in nix/devshell.nix — never `kache
+    # init`). Consumed as a flake input (not flake=false + in-repo build à
+    # la tracey) because upstream's flake owns the annoying packaging bits:
+    # cargoLock outputHashes for its git deps, its own Rust 1.95 MSRV
+    # toolchain via rust-overlay (our nixpkgs rustc is too old), and the
+    # RUSTC_WRAPPER="" anti-self-bootstrap. With the follows below the lock
+    # graph only grows by kache + flake-utils + systems. Tag-pinned; to
+    # bump, edit the tag in this URL and run `nix flake lock` (`nix flake
+    # update kache` only re-resolves the same immutable tag). Bumps may
+    # rotate kache's CACHE_KEY_VERSION — a cold cache, not breakage.
+    kache = {
+      url = "github:kunobi-ninja/kache/v0.4.0";
+      inputs = {
+        nixpkgs.follows = "nixpkgs";
+        rust-overlay.follows = "rust-overlay";
+        flake-utils.follows = "flake-utils";
+      };
     };
 
     # RustSec advisory DB for cargo-deny (hermetic — no network at
@@ -101,6 +130,7 @@
       url = "github:farcaller/nixhelm";
       inputs = {
         nixpkgs.follows = "nixpkgs";
+        flake-utils.follows = "flake-utils";
         # Only chartsDerivations is consumed; the helmupdater Python
         # tool (which these inputs feed) is unused.
         pyproject-nix.follows = "";
@@ -253,6 +283,7 @@
                 memberSrcs
                 manifestsFileset
                 stubTargetFiles
+                fuzzWorkspaces
                 ;
 
               # Prefix every key in an attrset. Used to surface per-member
@@ -276,7 +307,7 @@
               rio-crates = crateBuild.memberBins;
 
               # Coverage-instrumented workspace. crate2nix parallel tree
-              # with globalExtraRustcOpts=["-Cinstrument-coverage"]. Used
+              # with localExtraRustcOpts=["-Cinstrument-coverage"]. Used
               # by vmTestsCov + nix/coverage.nix. NOT stripped (stripping
               # removes the __llvm_covfun/__llvm_covmap sections llvm-cov
               # needs). remap-path-prefix at compile time collapses the
@@ -298,9 +329,16 @@
                   sysCrateEnv
                   unfilteredRoot
                   memberSrcs
+                  fuzzWorkspaces
                   ;
                 inherit (pkgs) lib;
                 crate2nixSrc = inputs.crate2nix;
+                # Cargo.toml's `[workspace] exclude` — what xtask's
+                # discover_dirs() iterates for `regen cargo-json` /
+                # `regen fuzz-lock`. fuzz.nix asserts its own per-ws
+                # config, the on-disk fuzzWorkspaces, and this list all
+                # agree, so the three views cannot diverge silently.
+                workspaceExclude = cargoToml.workspace.exclude or [ ];
               };
 
               # Spec-coverage CLI + web dashboard. The SPA is built via
@@ -498,6 +536,27 @@
                 RIO_GOLDEN_FORCE_HERMETIC = "1";
               };
 
+              # Dev shells (nix/devshell.nix), bound here — not inline at
+              # the devShells option below — because the shells passthru
+              # the built kache wrapper + epoch-GC scripts that
+              # misc-checks.nix's kache-wrapper-test / kache-epoch-gc-test
+              # run caller-faithfully.
+              rioDevShells = import ./nix/devshell.nix {
+                inherit
+                  pkgs
+                  rustStable
+                  rustNightly
+                  sysCrateEnv
+                  traceyPkg
+                  crate2nixCli
+                  docsLib
+                  shiroaPkg
+                  ;
+                treefmtWrapper = config.treefmt.build.wrapper;
+                preCommitInstall = config.pre-commit.installationScript;
+                kachePkg = inputs.kache.packages.${system}.default;
+              };
+
               # --------------------------------------------------------------
               # Non-rustc check derivations (shared by checks.* and ci aggregate)
               # --------------------------------------------------------------
@@ -511,6 +570,8 @@
                   workspaceFileset
                   manifestsFileset
                   stubTargetFiles
+                  fuzzWorkspaces
+                  crate2nixCli
                   rustStable
                   rustPlatformStable
                   traceyPkg
@@ -520,6 +581,10 @@
                   docsLib
                   ;
                 xtaskBin = crateBuild.memberBins.xtask;
+                # The devshell's REAL kache scripts (passthru above) —
+                # kache-wrapper-test / kache-epoch-gc-test exercise the
+                # exact store paths the shell exports.
+                inherit (rioDevShells.default) kacheWrapped rioKacheEpochGc kacheEnvSalt;
               };
 
               # Container images (Linux-only — dockerTools uses Linux VM
@@ -770,12 +835,26 @@
                 # picks runs-on by prefix. Each entry is file-shaped
                 # (the lcov is $out directly) to match perTestLcov.
                 coverage =
-                  pkgs.lib.mapAttrs' (
-                    n: d:
-                    pkgs.lib.nameValuePair "unit-${n}" (
-                      pkgs.runCommand "rio-cov-unit-${n}" { } "ln -s ${d}/lcov.info $out"
+                  pkgs.lib.mapAttrs'
+                    (
+                      n: d:
+                      pkgs.lib.nameValuePair "unit-${n}" (
+                        pkgs.runCommand "rio-cov-unit-${n}" { } "ln -s ${d}/lcov.info $out"
+                      )
                     )
-                  ) crateChecks.covLcovs
+                    (
+                      # Instrumentation-exempt crates (build-dep-only
+                      # closure) are exempt from -Cinstrument-coverage, so
+                      # their unit lcovs are deterministically 0 bytes;
+                      # coverage-upload.py skips empty lcovs, and an
+                      # included entry would leave Codecov waiting at N-1
+                      # of after_n_builds forever. Derived from the SAME
+                      # exported binding that drives the exemption — a
+                      # hand list here re-created the drift the derivation
+                      # exists to kill, one consumer over.
+                      # codecov-matrix-sync keeps the count honest.
+                      removeAttrs crateChecks.covLcovs crateBuild.instrumentationExemptCrates
+                    )
                   // coverage.perTestLcov;
 
               };
@@ -884,22 +963,11 @@
               };
 
               # --------------------------------------------------------------
-              # Dev shells (extracted to nix/devshell.nix)
+              # Dev shells (extracted to nix/devshell.nix; imported in the
+              # let block above so misc-checks can consume the passthru'd
+              # kache scripts)
               # --------------------------------------------------------------
-              devShells = import ./nix/devshell.nix {
-                inherit
-                  pkgs
-                  rustStable
-                  rustNightly
-                  sysCrateEnv
-                  traceyPkg
-                  crate2nixCli
-                  docsLib
-                  shiroaPkg
-                  ;
-                treefmtWrapper = config.treefmt.build.wrapper;
-                preCommitInstall = config.pre-commit.installationScript;
-              };
+              devShells = rioDevShells;
 
               # `nix run .#docs` — serve the post-processed HTML tree via
               # miniserve. The `bin` output of docsLib.docs holds the
@@ -1180,7 +1248,8 @@
                 # Design-book builds (`docs-pdf`, `docs-html` + smokes).
                 // docsLib.checks
                 # 2min fuzz runs (Linux-only). Compiled binaries shared
-                # across targets via rio-{nix,store}-fuzz-build.
+                # across a workspace's targets via fuzz.nix's per-ws
+                # crate2nix builds.
                 // fuzz.runs
                 # Per-phase milestone VM tests (Linux-only, need KVM).
                 # Debug interactively:

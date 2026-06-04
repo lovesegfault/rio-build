@@ -5,6 +5,10 @@
       "description": "Tenant JWT + assignment HMAC token sign/verify and the gRPC interceptor that wires them"
     },
     {
+      "name": "rio-buildhash",
+      "description": "Build-script helper: hash out-of-band macro inputs into tracked rustc env-deps"
+    },
+    {
       "name": "rio-cli",
       "description": "Admin CLI for rio-build — talks to the scheduler's AdminService"
     },
@@ -67,7 +71,8 @@
         "rio-common"
       ],
       "optional": [],
-      "dev": []
+      "dev": [],
+      "build": []
     },
     "rio-builder": {
       "prod": [
@@ -78,7 +83,14 @@
       "optional": [],
       "dev": [
         "rio-test-support"
-      ]
+      ],
+      "build": []
+    },
+    "rio-buildhash": {
+      "prod": [],
+      "optional": [],
+      "dev": [],
+      "build": []
     },
     "rio-cli": {
       "prod": [
@@ -90,12 +102,14 @@
       "optional": [],
       "dev": [
         "rio-test-support"
-      ]
+      ],
+      "build": []
     },
     "rio-common": {
       "prod": [],
       "optional": [],
-      "dev": []
+      "dev": [],
+      "build": []
     },
     "rio-controller": {
       "prod": [
@@ -109,12 +123,16 @@
       "dev": [
         "rio-migrations",
         "rio-test-support"
+      ],
+      "build": [
+        "rio-buildhash"
       ]
     },
     "rio-crds": {
       "prod": [],
       "optional": [],
-      "dev": []
+      "dev": [],
+      "build": []
     },
     "rio-gateway": {
       "prod": [
@@ -128,7 +146,8 @@
         "rio-migrations",
         "rio-store",
         "rio-test-support"
-      ]
+      ],
+      "build": []
     },
     "rio-lease": {
       "prod": [
@@ -138,19 +157,24 @@
       "optional": [],
       "dev": [
         "rio-test-support"
-      ]
+      ],
+      "build": []
     },
     "rio-migrations": {
       "prod": [],
       "optional": [],
       "dev": [
         "rio-test-support"
+      ],
+      "build": [
+        "rio-buildhash"
       ]
     },
     "rio-nix": {
       "prod": [],
       "optional": [],
-      "dev": []
+      "dev": [],
+      "build": []
     },
     "rio-proto": {
       "prod": [
@@ -158,7 +182,8 @@
         "rio-nix"
       ],
       "optional": [],
-      "dev": []
+      "dev": [],
+      "build": []
     },
     "rio-scheduler": {
       "prod": [
@@ -173,6 +198,9 @@
       "optional": [],
       "dev": [
         "rio-test-support"
+      ],
+      "build": [
+        "rio-buildhash"
       ]
     },
     "rio-store": {
@@ -186,7 +214,10 @@
       "optional": [
         "rio-test-support"
       ],
-      "dev": []
+      "dev": [],
+      "build": [
+        "rio-buildhash"
+      ]
     },
     "rio-test-support": {
       "prod": [
@@ -194,7 +225,8 @@
         "rio-proto"
       ],
       "optional": [],
-      "dev": []
+      "dev": [],
+      "build": []
     },
     "xtask": {
       "prod": [
@@ -205,7 +237,8 @@
         "rio-test-support"
       ],
       "optional": [],
-      "dev": []
+      "dev": [],
+      "build": []
     }
   }
 }

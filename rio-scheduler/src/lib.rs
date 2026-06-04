@@ -18,6 +18,12 @@
 //! - [`db`]: PostgreSQL persistence (sqlx)
 //! - [`grpc`]: SchedulerService + ExecutorService gRPC implementations
 
+// .sqlx/ surfaced as a tracked env-dep (see build.rs): the env! read
+// records a dep-info `# env-dep:` line, so cargo and content-keyed
+// rustc-wrapper caches (kache) re-key this crate when query metadata
+// changes without .rs edits.
+const _: &str = env!("RIO_SQLX_HASH");
+
 pub mod actor;
 pub mod admin;
 pub(crate) mod assignment;

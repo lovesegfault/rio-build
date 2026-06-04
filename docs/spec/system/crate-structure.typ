@@ -1,7 +1,7 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: none)
 
-// gen/workspace.json — members + per-crate `deps:{prod,optional,dev}`.
+// gen/workspace.json — members + per-crate `deps:{prod,optional,dev,build}`.
 // Loaded directly (not via refs.typ) so the autograph block can spread
 // `_ws.deps.pairs()`.
 #let _ws = json("/gen/workspace.json")
@@ -73,6 +73,7 @@ derivation is invalidated on `.proto` changes but not on Rust-only commits.
   )
   let dev = (stroke: (paint: muted, dash: "dashed", thickness: 0.6pt))
   let opt = (stroke: (paint: rule-color, dash: "dotted", thickness: 0.6pt))
+  let bld = (stroke: (paint: muted, dash: "dash-dotted", thickness: 0.6pt))
   figure(
     autograph.diagram(
       engine: "twopi",
@@ -83,7 +84,8 @@ derivation is invalidated on `.proto` changes but not on Rust-only commits.
       edge-corner-radius: 8pt,
       // Nodes AND edges derive from gen/workspace.json (each crate's
       // Cargo.toml [dependencies] / [dev-dependencies] /
-      // [target.*.dependencies] rio-* entries). bug_021: the
+      // [build-dependencies] / [target.*.dependencies] (and the
+      // target.<cfg> dev/build forms) rio-* entries). bug_021: the
       // hand-maintained list mis-classified scheduler→store as dev-only
       // and omitted rio-auth/rio-lease nodes entirely.
       .._ws.members.map(m => autograph.node(label(m.name), crate(m.name))),
@@ -95,12 +97,18 @@ derivation is invalidated on `.proto` changes but not on Rust-only commits.
           d.prod.map(t => autograph.edge(label(c), label(t)))
           d.optional.map(t => autograph.edge(label(c), label(t), ..opt))
           d.dev.map(t => autograph.edge(label(c), label(t), ..dev))
+          d
+            .at("build", default: ())
+            .map(t => autograph.edge(label(c), label(t), ..bld))
         })
         .flatten(),
     ),
     caption: [Workspace dependency graph. Solid = prod (default-feature
       reachable); dotted = `optional = true` not enabled by `default`;
-      dashed = `[dev-dependencies]` only.],
+      dashed = `[dev-dependencies]` only; dash-dotted =
+      `[build-dependencies]` (links into the consumer's build script;
+      absorbs optional build-deps, and a dep also reachable at runtime
+      renders solid instead).],
   )
 }
 

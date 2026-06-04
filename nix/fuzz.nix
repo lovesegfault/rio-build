@@ -4,13 +4,18 @@
 # workspace, each with its own Cargo.lock, needing nightly for
 # libfuzzer-sys + `-Zsanitizer`. They depend on in-tree crates by path.
 #
-# Two fuzz workspaces:
+# Two fuzz workspaces today:
 #   fuzz/rio-nix    — protocol/wire parsers
 #   fuzz/rio-store  — manifest parser (pulls rio-store's full dep
 #                     tree, so its sancov closure is much larger)
+# Membership is NOT free-floating: the derived on-disk set
+# (filesets.nix fuzzWorkspaces) is asserted equal to Cargo.toml's
+# `[workspace] exclude` — the two views (disk, cargo/xtask) cannot
+# diverge silently. Per-workspace config (member crate + targets) is
+# DERIVED from the committed fuzz/<ws>/Cargo.json, not hand-listed.
 #
 # Build: per-crate via crate2nix (third + fourth instantiations
-# alongside the main + coverage trees). Same `globalExtraRustcOpts`
+# alongside the main + coverage trees). Same `localExtraRustcOpts`
 # mechanism as crateBuildCov, but with the exact RUSTFLAGS that
 # `cargo fuzz build --release` injects (extracted from cargo-fuzz
 # src/project.rs — see `fuzzRustcOpts` below).
@@ -32,6 +37,13 @@
   # store hashes as the release tree's — editing rio-cli leaves
   # rio-nix-sancov untouched.
   memberSrcs,
+  # Derived on-disk fuzz workspace list (nix/lib/filesets.nix:
+  # fuzz/<dir> entries containing a Cargo.toml). One leg of the
+  # bi-source membership assert below.
+  fuzzWorkspaces,
+  # Cargo.toml `[workspace] exclude` — the list xtask's discover_dirs()
+  # iterates for `regen cargo-json`/`regen fuzz-lock`. Second assert leg.
+  workspaceExclude,
 }:
 let
   inherit (lib) fileset;
@@ -95,60 +107,118 @@ let
       stripBins = false;
     };
 
-  rio-nix-fuzz-build = mkFuzzBuild {
-    resolvedJson = ../fuzz/rio-nix/Cargo.json;
-    fuzzCrateName = "rio-nix-fuzz";
-    fuzzCrateSrc = fileset.toSource {
-      root = ../fuzz/rio-nix;
-      fileset = fileset.unions [
-        ../fuzz/rio-nix/Cargo.toml
-        ../fuzz/rio-nix/fuzz_targets
-      ];
-    };
-  };
+  # Bi-source membership assert: the derived on-disk set must equal
+  # the fuzz/-prefixed `[workspace] exclude` entries. Forced through
+  # every consumer (fuzzWorkspaceConfig below is genAttrs over this
+  # list, and builds/targets/runs all read it), so a divergence fails
+  # EVAL with this named error instead of a workspace silently fuzzing
+  # stale (or not at all).
+  checkedFuzzWorkspaces =
+    let
+      diskSet = lib.naturalSort fuzzWorkspaces;
+      excludeSet = lib.naturalSort (
+        map (lib.removePrefix "fuzz/") (lib.filter (lib.hasPrefix "fuzz/") workspaceExclude)
+      );
+    in
+    if diskSet != excludeSet then
+      throw ''
+        nix/fuzz.nix: fuzz workspace sets diverged —
+          fuzz/<dir>/Cargo.toml on disk:          [${toString diskSet}]
+          Cargo.toml [workspace] exclude (fuzz/): [${toString excludeSet}]
+        Adding/removing a fuzz workspace needs both: the fuzz/<ws>/
+        directory (Cargo.{toml,lock,json} + fuzz_targets/, tracked by
+        git — an un-added dir is invisible to flake eval) and the
+        `fuzz/<ws>` line in Cargo.toml's [workspace] exclude (what
+        `cargo xtask regen cargo-json`/`regen fuzz-lock` discover).
+      ''
+    else
+      diskSet;
 
-  rio-store-fuzz-build = mkFuzzBuild {
-    resolvedJson = ../fuzz/rio-store/Cargo.json;
-    fuzzCrateName = "rio-store-fuzz";
-    fuzzCrateSrc = fileset.toSource {
-      root = ../fuzz/rio-store;
-      fileset = fileset.unions [
-        ../fuzz/rio-store/Cargo.toml
-        ../fuzz/rio-store/fuzz_targets
-      ];
-    };
-  };
+  # Per-workspace fuzz config, keyed by fuzz/<ws> directory name —
+  # DERIVED from the workspace's committed Cargo.json (the same file
+  # fuzzBuilds consumes for the build graph, so the json is the single
+  # source for both graph and target membership; the
+  # crate2nix-drift-fuzz-<ws> checks and the crate2nix-check hook gate
+  # its staleness). `fuzzCrateName` is the sole `workspaceMembers` key
+  # (a fuzz workspace contains exactly one member crate); `targets`
+  # are that crate's `crateBin[].name` — the [[bin]] fuzz targets,
+  # which become the `fuzz-<target>` attr names in `runs` below
+  # (uniqueness ACROSS workspaces is enforced at fuzzTargets). A
+  # [[bin]] added to fuzz/<ws>/Cargo.toml reaches `runs` via
+  # `cargo xtask regen cargo-json` — no hand mirror to forget.
+  fuzzWorkspaceConfig = lib.genAttrs checkedFuzzWorkspaces (
+    ws:
+    let
+      json = builtins.fromJSON (builtins.readFile (unfilteredRoot + "/fuzz/${ws}/Cargo.json"));
+      memberNames = lib.attrNames json.workspaceMembers;
+      fuzzCrateName =
+        if lib.length memberNames == 1 then
+          lib.head memberNames
+        else
+          throw "nix/fuzz.nix: fuzz/${ws}/Cargo.json has ${toString (lib.length memberNames)} workspace members [${toString memberNames}] — a fuzz workspace must contain exactly one member crate (one [package] per fuzz/<ws>; then `cargo xtask regen cargo-json`)";
+      member =
+        lib.findFirst (c: c.crateName == fuzzCrateName && (c.source.type or "") == "local")
+          (throw "nix/fuzz.nix: fuzz/${ws}/Cargo.json workspace member ${fuzzCrateName} has no local crate entry — regenerate with `cargo xtask regen cargo-json`")
+          (lib.attrValues json.crates);
+    in
+    {
+      inherit fuzzCrateName;
+      targets =
+        let
+          names = lib.naturalSort (map (b: b.name) (member.crateBin or [ ]));
+        in
+        if names == [ ] then
+          throw "nix/fuzz.nix: fuzz/${ws}/Cargo.json records no [[bin]] targets for ${fuzzCrateName} — a fuzz workspace with nothing to fuzz is almost certainly a stale Cargo.json; run `cargo xtask regen cargo-json`"
+        else
+          names;
+    }
+  );
 
-  rioNixFuzzTargets = [
-    "wire_primitives"
-    "opcode_parsing"
-    "derivation_parsing"
-    "nar_parsing"
-    "derived_path_parsing"
-    "narinfo_parsing"
-    "build_result_parsing"
-    "refscan"
-    "stderr_message_parsing"
-  ];
+  # One crate2nix instantiation per fuzz workspace.
+  fuzzBuilds = lib.mapAttrs (
+    ws: cfg:
+    mkFuzzBuild {
+      resolvedJson = unfilteredRoot + "/fuzz/${ws}/Cargo.json";
+      inherit (cfg) fuzzCrateName;
+      fuzzCrateSrc = fileset.toSource {
+        root = unfilteredRoot + "/fuzz/${ws}";
+        fileset = fileset.unions [
+          (unfilteredRoot + "/fuzz/${ws}/Cargo.toml")
+          (unfilteredRoot + "/fuzz/${ws}/fuzz_targets")
+        ];
+      };
+    }
+  ) fuzzWorkspaceConfig;
 
   # Flat list of (target, fuzzBins, corpusRoot) for generating the
-  # per-target run derivations. All target names must be unique
-  # across workspaces (they become attr names in `runs` below).
+  # per-target run derivations, derived from the keyed config.
   # `fuzzBins` is the workspace member's built crate — buildRustCrate
   # puts every `[[bin]]` under $out/bin/.
+  #
+  # Checked binding: target names must be unique ACROSS workspaces —
+  # `runs` keys are `fuzz-<target>` and builtins.listToAttrs is
+  # silently first-wins on duplicates, so without this throw a
+  # cross-workspace duplicate would drop one workspace's run from
+  # checks and from the CI fuzz matrix (flake.nix `fuzz = fuzz.runs`).
   fuzzTargets =
-    (map (t: {
-      target = t;
-      fuzzBins = rio-nix-fuzz-build.members.rio-nix-fuzz;
-      corpusRoot = unfilteredRoot + "/fuzz/rio-nix/corpus";
-    }) rioNixFuzzTargets)
-    ++ [
-      {
-        target = "manifest_deserialize";
-        fuzzBins = rio-store-fuzz-build.members.rio-store-fuzz;
-        corpusRoot = unfilteredRoot + "/fuzz/rio-store/corpus";
-      }
-    ];
+    let
+      flat = lib.concatLists (
+        lib.mapAttrsToList (
+          ws: cfg:
+          map (t: {
+            target = t;
+            fuzzBins = fuzzBuilds.${ws}.members.${cfg.fuzzCrateName};
+            corpusRoot = unfilteredRoot + "/fuzz/${ws}/corpus";
+          }) cfg.targets
+        ) fuzzWorkspaceConfig
+      );
+      names = lib.naturalSort (map (t: t.target) flat);
+      dups = lib.unique (lib.filter (n: lib.count (x: x == n) names > 1) names);
+    in
+    if dups != [ ] then
+      throw "nix/fuzz.nix: duplicate fuzz target name(s) [${toString dups}] across fuzz workspaces — runs keys are fuzz-<target> and builtins.listToAttrs is silently first-wins, so a duplicate would drop one workspace's run from checks and the CI fuzz matrix (flake.nix `fuzz = fuzz.runs`). Rename the [[bin]] in one workspace, then `cargo xtask regen cargo-json`."
+    else
+      flat;
 
   # Per-target fuzz run: 2 minutes, seed-corpus only. Cheap
   # runCommand wrapper over the prebuilt binary. For deep runs
@@ -211,8 +281,8 @@ let
 in
 {
   # 2min fuzz runs. Keys: "fuzz-<target>". Spliced into `checks.*`.
-  # The compiled fuzz binaries (rio-{nix,store}-fuzz-build.members.*)
-  # are run-time inputs of these derivations, not re-exported standalone.
+  # The compiled fuzz binaries (fuzzBuilds.<ws>.members.<crate>) are
+  # run-time inputs of these derivations, not re-exported standalone.
   runs = builtins.listToAttrs (
     map (t: {
       name = "fuzz-${t.target}";

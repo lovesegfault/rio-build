@@ -3964,6 +3964,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio-buildhash"
+version = "0.1.0"
+
+[[package]]
 name = "rio-common"
 version = "0.1.0"
 dependencies = [
@@ -3998,6 +4002,7 @@ dependencies = [
 name = "rio-migrations"
 version = "0.1.0"
 dependencies = [
+ "rio-buildhash",
  "sqlx",
  "tokio",
  "tracing",
@@ -4068,6 +4073,7 @@ dependencies = [
  "moka",
  "reqwest",
  "rio-auth",
+ "rio-buildhash",
  "rio-common",
  "rio-migrations",
  "rio-nix",

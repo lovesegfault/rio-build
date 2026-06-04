@@ -25,13 +25,93 @@ pub async fn run() -> Result<()> {
     // without PG. Unset so prepare actually hits the DB.
     let _env = sh.push_env("DATABASE_URL", url);
     let _env2 = sh.push_env("SQLX_OFFLINE", "false");
-    // `cargo sqlx prepare` sets RUSTFLAGS before its internal `cargo
-    // check`, which poisons the main target/ fingerprint — the next
-    // `cargo run` sees different flags and rebuilds everything. Isolate
-    // into a sub-target so the main cache stays warm (build-dir defaults
-    // to the target dir, so this covers intermediates too).
+    // Isolate prepare's inner builds into a sub-target so the main
+    // target/ stays warm: `cargo sqlx prepare` does per-package feature
+    // resolution (different unit graphs than workspace builds) and bumps
+    // source mtimes, both of which would churn the main fingerprints.
+    // (sqlx-cli 0.9 only *forwards* a pre-existing RUSTFLAGS — verified
+    // against its prepare.rs — so the historical "sqlx sets RUSTFLAGS"
+    // poisoning rationale no longer applies; the isolation stays for the
+    // reasons above.)
     let isolated = sh.current_dir().join("target/sqlx-prepare");
     let _env3 = sh.push_env("CARGO_TARGET_DIR", &isolated);
+    // Disable the kache wrapper for every inner build of this flow.
+    // Prepare's compiles are typed against the LIVE database
+    // (DATABASE_URL set, SQLX_OFFLINE=false), but neither variable
+    // reaches a cache key — sqlx-macros read them via plain
+    // std::env::var, invisible to dep-info on stable — and RIO_SQLX_HASH
+    // still hashes the PRE-regen .sqlx (the CLI rewrites it only after
+    // the inner builds finish). Caching such compiles would store
+    // online-typed artifacts under offline-looking keys: today they land
+    // in a parallel keyspace only because CARGO_TARGET_DIR alters the
+    // remap-sentinel set, which is an accident, not a guarantee — and
+    // either way each regen would flood the shared store with a full
+    // parallel workspace build that nothing replays. Disabled mode is
+    // pure passthrough (no lookup, no store, no pre-pass); prepare's
+    // metadata emission is unaffected because the REAL rustc run always
+    // expands the macros.
+    let _env4 = sh.push_env("KACHE_DISABLED", "1");
+    // Earlier kache-ENABLED runs hardlink-restored artifacts into this
+    // scratch target as read-only store inodes (mode 0444, nlink 2).
+    // With the wrapper disabled, kache's pre-clean never runs and plain
+    // rustc EACCESes overwriting them ("output file … is not
+    // writeable"). Unlink them up front — never chmod: the inode is
+    // SHARED with the kache store, so making it writable would let
+    // rustc truncate the store blob in place and poison every future
+    // restore of that entry. Unlinking only drops this target's link;
+    // cargo rebuilds the missing outputs.
+    //
+    // `! -perm -u+w` (mode bits), NOT `! -writable`: -writable is an
+    // access(2) test, vacuous under uid 0 — root would skip the unlink
+    // and rustc's truncating opens would then silently rewrite the
+    // shared store inode (the exact poisoning forbidden above) instead
+    // of EACCESing.
+    // `-links +1` narrows the unlink to the shared-inode signature:
+    // kache restores are hardlinks by construction (nlink >= 2, the
+    // second link being the store blob), while legitimate read-only
+    // OUT_DIR artifacts (build scripts fs::copy'ing from read-only
+    // sources, e.g. nix-vendored bundled bindings) are nlink-1 and must
+    // survive — cargo never re-runs a build script because OUT_DIR
+    // content vanished, so deleting them bricks the scratch target.
+    //
+    // Division of labor with kacheWrapped (nix/devshell.nix): the
+    // RUSTC_WRAPPER sweeps each compile's OWN outputs — anchored by
+    // the unit's `-C extra-filename`, covering all three restore
+    // shapes (hardlink, nlink-1 reflink, post-eviction debris) — out
+    // of its --out-dir on every disabled/bypassed invocation, so any
+    // compile that goes through the wrapper self-heals. Post-eviction
+    // debris is usually already writable anyway (kache's unlink_blob
+    // chmods the inode best-effort before unlinking the store name;
+    // plain rustc just overwrites it). What this tree-wide pass still
+    // defends is exactly one residual: hardlink-shape (nlink >= 2)
+    // read-only restores against spawners that never see the wrapper
+    // — bare cargo without RUSTC_WRAPPER pointed at this scratch
+    // target. It deliberately does NOT cover nlink-1 read-only files:
+    // without a per-unit name anchor, reflink restores and the
+    // legitimate read-only OUT_DIR artifacts above are
+    // indistinguishable, and the OUT_DIR files must survive — the
+    // same reason `-links +1` stays. The rare nlink-1 0444
+    // post-eviction debris is likewise out of scope. Both residuals
+    // are accepted: the wrapper path is the supported one.
+    if isolated.exists() {
+        // Best-effort: find's exit status conflates "couldn't walk
+        // part of the tree" (one unreadable subdir → nonzero, after
+        // deleting everything it could reach) with "did nothing".
+        // This pass is defense in depth, not a gate — log and
+        // continue rather than abort the whole regen. warn!, not
+        // debug!: xtask's EnvFilter is FLOORED at info
+        // (xtask/src/ui.rs build_filter_directive), so a debug-level
+        // line is silent at the default verbosity and the "log and
+        // continue" intent never reached the user.
+        if let Err(e) = sh::run(cmd!(
+            sh,
+            "find {isolated} -type f -links +1 ! -perm -u+w -delete"
+        ))
+        .await
+        {
+            tracing::warn!("scratch-target pre-clean find failed (continuing): {e:#}");
+        }
+    }
 
     // `cargo sqlx prepare` bumps src/{lib,main}.rs mtimes on every
     // workspace crate to force proc-macro re-expansion (stable can't

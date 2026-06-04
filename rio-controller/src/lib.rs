@@ -41,6 +41,12 @@
 //! submission is via SSH (`nix build --store ssh-ng://`) — no
 //! K8s-native submission CRD.
 
+// .sqlx/ surfaced as a tracked env-dep (see build.rs): the env! read
+// records a dep-info `# env-dep:` line, so cargo and content-keyed
+// rustc-wrapper caches (kache) re-key this crate when query metadata
+// changes without .rs edits.
+const _: &str = env!("RIO_SQLX_HASH");
+
 pub mod config;
 pub(crate) mod error;
 #[cfg(test)]

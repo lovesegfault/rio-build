@@ -12526,6 +12526,21 @@
         "Rio Contributors"
       ]
     },
+    "rio-buildhash": {
+      "crateName": "rio-buildhash",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "../../rio-buildhash"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
     "rio-common": {
       "crateName": "rio-common",
       "version": "0.1.0",
@@ -12674,6 +12689,12 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "rio-buildhash",
+          "packageId": "rio-buildhash"
         }
       ],
       "libCrateTypes": [
@@ -12991,6 +13012,12 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "rio-buildhash",
+          "packageId": "rio-buildhash"
         }
       ],
       "resolvedDefaultFeatures": [

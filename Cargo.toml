@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "rio-auth",
+  "rio-buildhash",
   "rio-cli",
   "rio-common",
   "rio-controller",
@@ -30,6 +31,10 @@ repository = "https://github.com/lovesegfault/rio-build"
 [workspace.dependencies]
 # Internal crates
 rio-auth = { path = "rio-auth" }
+# Build-script helper: hashes out-of-band macro inputs (.sqlx/,
+# migrations/) into tracked rustc env-deps so cargo AND content-keyed
+# rustc-wrapper caches re-key when they change without .rs edits.
+rio-buildhash = { path = "rio-buildhash" }
 rio-common = { path = "rio-common" }
 rio-migrations = { path = "rio-migrations" }
 rio-nix = { path = "rio-nix" }

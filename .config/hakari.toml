@@ -25,7 +25,10 @@ platforms = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 # only affects local cargo + the importCargoLock-based checks (mutants/
 # fuzz/deny).
 [final-excludes]
-workspace-members = ["xtask"]
+# rio-buildhash is a dependency-free build-script helper consumed as a
+# build-dependency; giving it workspace-hack would drag the feature-
+# unification hack into every consumer's build-dep graph.
+workspace-members = ["rio-buildhash", "xtask"]
 
 # aws-smithy-runtime[test-util] → legacy-test-util → connector-hyper-0-14-x
 # pulls hyper 0.14 / h2 0.3 / http 0.2 into [dependencies] — exactly the

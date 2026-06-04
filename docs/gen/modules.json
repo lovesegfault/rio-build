@@ -228,6 +228,13 @@
       "doc": "Per-output `PutPath` upload with retry + concurrent-put adoption."
     }
   ],
+  "rio-buildhash": [
+    {
+      "path": "lib.rs",
+      "depth": 0,
+      "doc": "Hash out-of-band proc-macro inputs into tracked rustc env-deps."
+    }
+  ],
   "rio-cli": [
     {
       "path": "builds.rs",

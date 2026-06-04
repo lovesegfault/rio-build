@@ -69,3 +69,8 @@ tokio = { workspace = true, features = ["test-util"] }
 prost = { workspace = true }
 # Counter assertions in nodeclaim_pool tests (intent_dropped_total reasons).
 metrics-util = { workspace = true }
+
+[build-dependencies]
+# Hashes .sqlx/ (and migrations/, where applicable) into tracked rustc
+# env-deps — see build.rs.
+rio-buildhash = { workspace = true }

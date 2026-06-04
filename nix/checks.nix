@@ -35,7 +35,8 @@
   # Output of nix/crate2nix.nix: { cargoNix, workspace, members }
   crateBuild,
   # Coverage-instrumented variant of the crate tree (nix/crate2nix.nix
-  # re-imported with globalExtraRustcOpts=["-Cinstrument-coverage"]).
+  # re-imported with localExtraRustcOpts=["-Cinstrument-coverage"] —
+  # local crates only; dep derivations stay shared with the plain tree).
   # Used to produce test binaries that emit .profraw files at runtime.
   crateBuildCov,
   # lcov --extract patterns (one `<crateName>/*` per workspace member,
@@ -408,14 +409,22 @@ let
   # Coverage-instrumented test binaries
   # ──────────────────────────────────────────────────────────────────
   #
-  # Coverage needs INSTRUMENTED DEPS too for accurate line attribution
-  # (an inlined function from a dep shows up in the caller's profile;
-  # without instrumented dep rlib, llvm-cov can't map it back). The
-  # parallel tree is a second `cargoNix` instantiation (crateBuildCov)
-  # with globalExtraRustcOpts=["-Cinstrument-coverage"] — see
-  # crate2nix.nix. devDepsForCov (defined alongside devDepsFor above)
-  # dereferences crateBuildCov's builtCrates so instrumented rlibs
-  # link together.
+  # Coverage instruments the IN-TREE dep rlibs too: a test binary for
+  # crate X links rio-common/rio-nix/… as rlibs, and only objects
+  # built with -Cinstrument-coverage carry __llvm_covmap/__llvm_covfun
+  # — with plain-tree rlibs, lines a test exercises in another local
+  # crate have no coverage mapping at all and report as permanently
+  # uncovered. Third-party deps stay UNinstrumented on purpose: the
+  # lcov pipeline extracts workspace paths only, and the identical dep
+  # drvs stay shared with the plain tree (crate2nix.nix
+  # localExtraRustcOpts). Build scripts are uninstrumented either way;
+  # the instrumented rlibs they link still resolve — rustc injects
+  # profiler_builtins from the sysroot (see crate2nix.nix
+  # buildDepOnlyCrates). The parallel tree is a second `cargoNix`
+  # instantiation (crateBuildCov) with
+  # localExtraRustcOpts=["-Cinstrument-coverage"] — see crate2nix.nix.
+  # devDepsForCov (defined alongside devDepsFor above) dereferences
+  # crateBuildCov's builtCrates so instrumented rlibs link together.
   covTestMember = mkTestVariant {
     suffix = "cov";
     devDeps = devDepsForCov;

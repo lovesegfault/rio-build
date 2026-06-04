@@ -1,0 +1,18 @@
+[package]
+name = "rio-buildhash"
+description = "Build-script helper: hash out-of-band macro inputs into tracked rustc env-deps"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Intentionally dependency-free (no workspace-hack: it is excluded in
+# .config/hakari.toml). This crate is a build-dependency of the sqlx
+# consumer crates — pulling the feature-unification hack into their
+# build-dep graphs would bloat every build script for zero benefit.
+[dependencies]
+
+[dev-dependencies]
+tempfile = { workspace = true }

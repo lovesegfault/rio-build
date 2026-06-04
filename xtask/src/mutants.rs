@@ -22,6 +22,29 @@ struct Outcome {
 
 pub fn run() -> Result<()> {
     let sh = shell()?;
+    // Mutant compiles are write-only churn for the shared kache store:
+    // every viable mutant is unique source bytes (mutated crate + all
+    // dependents + relinked test binaries under cache_executables), and
+    // .config/mutants.toml's cap_lints makes cargo-mutants inject
+    // --cap-lints=warn via CARGO_ENCODED_RUSTFLAGS — a hashed kache key
+    // input — so even the unmutated baseline lives in a keyspace no
+    // normal build reads. Nothing here is ever a useful hit; don't let
+    // it evict artifacts that are.
+    //
+    // KACHE_DISABLED also routes every mutant compile through the
+    // wrapper's bypass, whose debris sweep is anchored on the
+    // invocation's OWN -C extra-filename: the cap-lints flag set
+    // shifts cargo's unit hashes (-Cmetadata and extra-filename, the
+    // shift verified empirically on both shell toolchains), so mutant
+    // filenames never collide with kache-restored ones — nothing is
+    // ever cached under this keyspace, the sweep finds no read-only
+    // files under the shifted names (a structural no-op), and it can
+    // no longer unlink the NORMAL keyspace's restores (different
+    // hashes; the earlier crate-NAME-anchored sweep did exactly
+    // that). (Cargo's own unlink-before-write covers only
+    // hardlink-uplift destinations like target/debug/lib*.rlib, NOT
+    // rustc-written deps/ outputs.)
+    let _env = sh.push_env("KACHE_DISABLED", "1");
     crate::sh::run_interactive(cmd!(
         sh,
         "cargo mutants --in-place --no-shuffle --config .config/mutants.toml"

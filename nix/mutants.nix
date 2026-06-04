@@ -126,6 +126,13 @@ let
         PROTOC = "${pkgs.protobuf}/bin/protoc";
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         NEXTEST_HIDE_PROGRESS_BAR = "1";
+        # Same shape as crate2nix.nix's sqlxOffline: no DATABASE_URL
+        # exists in the sandbox, so this pins sqlx-macros to the offline
+        # diagnostic path ("run cargo sqlx prepare", not "set
+        # DATABASE_URL"). SQLX_OFFLINE_DIR can't be a static env var
+        # here — the cache lives in the unpacked source, so it's
+        # exported in buildPhase once $PWD is known.
+        SQLX_OFFLINE = "true";
 
         # `--in-place`: mutate the unpacked source in $PWD
         # (cargoSetupHook unpacks to a writable tmpdir). Cheaper
@@ -152,6 +159,27 @@ let
           # auto-detected target file to exist. Synthesize empty stubs for
           # the absent ones (no-op `touch` for the ones that ARE staged).
           ${stubTargetFiles}
+          # Single-channel sqlx contract (rio-buildhash): .sqlx is staged
+          # by workspaceFileset (nix/lib/filesets.nix), but without
+          # SQLX_OFFLINE_DIR the trackers in rio-{scheduler,store,
+          # controller}/build.rs take the Untracked arm — every cargo
+          # invocation gets a per-run-unique RIO_SQLX_HASH plus an
+          # always-stale watch, force-recompiling those crates and their
+          # dependents on each of cargo-mutants' per-mutation build+test
+          # invocations (~2 x ~320 mutations, plus the whole-workspace
+          # baseline) — pure waste in a sandbox with no rustc-wrapper
+          # cache, and 6 cargo:warning lines of spam per invocation
+          # (2 per sqlx tracker: the once-per-script-run store-cost
+          # advisory + the degraded-state line).
+          # Absolute on purpose: the tracker refuses relative paths.
+          # Guarded on existence so it stays inert in mutants-smoke,
+          # which stages no .sqlx and compiles no sqlx crate (rio-auth ->
+          # rio-common -> workspace-hack); if smoke ever grows an sqlx
+          # crate the tracker still fails loud (unkeyed + warning) rather
+          # than silently falling through.
+          if [ -d "$PWD/.sqlx" ]; then
+            export SQLX_OFFLINE_DIR="$PWD/.sqlx"
+          fi
           mkdir -p $out
           cargo mutants \
             --in-place --no-shuffle \

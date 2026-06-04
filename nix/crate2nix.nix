@@ -43,13 +43,15 @@
   # flake.nix's sysCrateEnv — single source of truth so devShell
   # and crate2nix see the same linkage.
   sysCrateEnv,
-  # Extra rustc flags injected into EVERY crate in the tree, deps
-  # included. A non-empty value forks the whole dep graph into a
-  # second derivation set, so nothing uses this today — instrumented
-  # trees (coverage, fuzz) restrict their flags to local crates to
-  # keep the dep derivations shared with the plain tree. Kept as the
-  # escape hatch for a flag that genuinely must reach every crate.
-  # Empty = no wrap.
+  # Extra rustc flags injected into every crate in the tree, deps
+  # included — EXCEPT the buildDepOnlyCrates closure, whose rlibs link
+  # into uninstrumented build_script_build binaries and therefore skip
+  # both opts lists (see effectiveTreeOpts). A non-empty value forks
+  # the dep graph into a second derivation set, so nothing uses this
+  # today — instrumented trees (coverage, fuzz) restrict their flags
+  # to local crates to keep the dep derivations shared with the plain
+  # tree. Kept as the escape hatch for a flag that genuinely must
+  # reach (almost) every crate. Empty = no wrap.
   globalExtraRustcOpts ? [ ],
   # Extra rustc flags applied only to crates listed in `memberSrcs`
   # (= local in-tree crates). Dep derivations stay byte-identical to
@@ -88,10 +90,11 @@ let
   # to glibc/lib:gcc-lib/lib (rust-overlay's rustlib doesn't appear).
   #
   # When a crate is compiled with -Cinstrument-coverage (via either
-  # opts list), also set LLVM_PROFILE_FILE=/dev/null: its build script
-  # and any proc-macro it exports are ALSO instrumented and would
-  # otherwise try to write profraws to the RO sandbox CWD when they
-  # execute during a build. Gated on the specific flag — not on
+  # opts list), also set LLVM_PROFILE_FILE=/dev/null: any proc-macro it
+  # exports is ALSO instrumented and would otherwise try to write
+  # profraws to the RO sandbox CWD when it executes during a dependent
+  # build. (Build scripts are NOT instrumented — buildRustCrate compiles
+  # build_script_build without extraRustcOpts; see buildDepOnlyCrates.) Gated on the specific flag — not on
   # "localExtraRustcOpts is non-empty" — so (a) the fuzz tree's
   # sancov-only members don't pick up a pointless env var, and (b) a
   # local-only coverage tree leaves its dep derivations byte-identical
@@ -103,6 +106,140 @@ let
   # this to work; we arrange that by NOT passing our custom overrides
   # to build-from-json.nix (they're already baked into `base` here).
   remapOpts = [ "--remap-path-prefix=${rust}=/rustc" ];
+
+  # Parsed resolved crate graph — shared by buildDepOnlyCrates (the
+  # instrumentation exemption + the sanitizer dual-use guard) and
+  # sqlxQueryCrates (the offline-cache override set), hoisted so the
+  # consumers cannot parse divergent copies of the same json.
+  resolved = builtins.fromJSON (builtins.readFile resolvedJson);
+  allCrates = lib.attrValues resolved.crates;
+  localCrates = lib.filter (c: (c.source.type or "") == "local") allCrates;
+  localNames = map (c: c.crateName) localCrates;
+  # crateName → resolved crate record. Shared by buildDepOnlyCrates
+  # (closure walk) and sqlxQueryCrates (explicit `[package] build`
+  # path consult) so they cannot index divergent copies.
+  localByName = lib.listToAttrs (
+    map (c: {
+      name = c.crateName;
+      value = c;
+    }) localCrates
+  );
+  depNames = kind: lib.unique (lib.concatMap (c: map (d: d.name) (c.${kind} or [ ])) allCrates);
+  buildNames = depNames "buildDependencies";
+  runtimeNames = depNames "dependencies" ++ depNames "devDependencies";
+
+  # Crates that exist in the workspace ONLY as build-dependencies (their
+  # rlibs link into build_script_build binaries, which buildRustCrate
+  # compiles WITHOUT extraRustcOpts). Excluded from instrumentation
+  # flags in buildRustCrateForPkgs below.
+  #
+  # DERIVED from the resolved Cargo.json instead of hand-listed: a hand
+  # list drifts both ways — the next build-dep-only crate silently
+  # reintroduces the fuzz-tree asan build-script link failure, and a
+  # crate gaining a runtime consumer would silently stay exempt from
+  # instrumenting runtime-reachable code.
+  #
+  # Scanned over ALL local crates' incoming edges, not just workspace
+  # members': the fuzz sub-workspaces have a single member (the fuzz
+  # crate) and reach rio-* as local path deps, so a members-only scan
+  # would derive an EMPTY set there and silently drop the exemption
+  # exactly where it matters most. Membership = a local crate referenced
+  # via [build-dependencies] by some crate in this tree and via NO
+  # crate's [dependencies]/[dev-dependencies], EXTENDED to the
+  # transitive closure over local [dependencies] edges of those roots
+  # (an exempt crate's runtime deps link into the same uninstrumented
+  # build_script_build binaries). A closure member that is ALSO
+  # runtime/dev-consumed by a non-exempt local crate cannot be both
+  # instrumented (for the runtime consumers) and uninstrumented (for
+  # the build scripts that link it) — impossible with one derivation
+  # per crate — so that conflict is policed at EVAL, scoped by what
+  # this tree's flags make of the exemption (see the policy comment at
+  # the binding's tail): throw under -Zsanitizer, warn under other
+  # instrumentation, no-op in plain trees where the exemption is
+  # semantically inert.
+  # Exported from the return attrset so consumers (the coverage-matrix
+  # exclusion in flake.nix) derive from this binding instead of
+  # hand-mirroring the list.
+  buildDepOnlyCrates =
+    let
+      roots = lib.filter (n: lib.elem n buildNames && !lib.elem n runtimeNames) localNames;
+      closure = builtins.genericClosure {
+        startSet = map (n: { key = n; }) roots;
+        operator =
+          item:
+          map (d: { key = d.name; }) (
+            lib.filter (d: lib.elem d.name localNames) ((localByName.${item.key} or { }).dependencies or [ ])
+          );
+      };
+      exempt = map (i: i.key) closure;
+      conflicted = lib.filter (
+        n:
+        lib.any (
+          c:
+          !lib.elem c.crateName exempt
+          && lib.any (d: d.name == n) ((c.dependencies or [ ]) ++ (c.devDependencies or [ ]))
+        ) localCrates
+      ) exempt;
+      # DUAL-USE: local crates consumed BOTH via [build-dependencies]
+      # and via [dependencies]/[dev-dependencies]. By construction not
+      # in `roots` (those exclude runtime-consumed crates), so the
+      # sanitizer-gated `conflicted` throw below — which polices only
+      # the exempt closure — misses any dual-use crate not reached
+      # through that closure (one reachable via an exempt root's
+      # runtime deps IS caught there first; both sanitizer throws are
+      # conservative): such a crate is built
+      # INSTRUMENTED (for its runtime consumers) and its rlib also
+      # links into uninstrumented build_script_build binaries. Fine
+      # for -Cinstrument-coverage (rustc injects profiler_builtins
+      # from the sysroot into every instrumented crate, so the rlib
+      # links into uninstrumented binaries — verified against the
+      # pinned stable toolchain AND by the green cov-smoke closure,
+      # where instrumented rio-proto links into rio-test-support's
+      # plain build script), but fatal for -Zsanitizer: the runtime
+      # lives outside the sysroot dependency graph, so the link dies
+      # with undefined __asan_*/__sanitizer_cov_* deep in a build log.
+      # Guard at eval instead. Today: root/coverage trees have
+      # dualUse=[rio-proto] (rio-test-support's build.rs decodes its
+      # FILE_DESCRIPTOR_SET) but no -Zsanitizer flag; both fuzz trees
+      # carry -Zsanitizer=address but dualUse=[] (rio-test-support is
+      # in neither fuzz tree; rio-buildhash is build-dep-only). The
+      # guard catches both future regressions: rio-test-support
+      # entering a fuzz tree (rio-proto becomes dual-use under asan)
+      # AND rio-buildhash gaining a runtime consumer (its roots entry
+      # collapses out of the exempt set, leaving its build-dep edges
+      # dual-use). Scope limit, documented not widened: a hypothetical
+      # sancov-only tree (only -Cpasses/-Cllvm-args flags, no
+      # -Zsanitizer=*) would slip past the prefix check and still fail
+      # at link.
+      dualUse = lib.filter (n: lib.elem n buildNames && lib.elem n runtimeNames) localNames;
+      sanitizerActive = lib.any (lib.hasPrefix "-Zsanitizer") (
+        globalExtraRustcOpts ++ localExtraRustcOpts
+      );
+      anyInstrumentation = (globalExtraRustcOpts ++ localExtraRustcOpts) != [ ];
+    in
+    # Conflict policing, scoped by failure mode (an unconditional
+    # throw here used to reject even plain trees, where the exemption
+    # changes nothing — both opts lists are empty):
+    # - sanitizer tree → THROW: instrumenting the conflicted crate
+    #   (which its runtime consumers need) breaks the build-script
+    #   link with undefined __asan_*/__sanitizer_cov_*; keeping it
+    #   exempt un-sanitizes runtime-reachable code. Either choice is
+    #   wrong, so the tree is rejected.
+    # - any other instrumentation (coverage-style flags) → WARN: the
+    #   exempt crate links fine everywhere, but its runtime-reachable
+    #   lines read permanently uncovered — a silent coverage-signal
+    #   gap. Deliberate severity choice: warnings do not fail CI; a
+    #   human weighing eval stderr is the intended consumer.
+    # - no instrumentation → no-op: the exemption is semantically
+    #   inert, nothing to police.
+    if sanitizerActive && conflicted != [ ] then
+      throw "crate2nix.nix: -Zsanitizer flags are active in this tree and crate(s) [${toString conflicted}] are in the build-dep-only instrumentation-exempt closure while also runtime-consumed by non-exempt local crates. Instrumenting them (as their runtime consumers require) makes their rlibs fail the uninstrumented build-script link with undefined __asan_*/__sanitizer_cov_*; leaving them exempt ships un-sanitized runtime-reachable code. Restructure the workspace, e.g. split the shared code out of the build-dependency crate."
+    else if sanitizerActive && dualUse != [ ] then
+      throw "crate2nix.nix: -Zsanitizer flags are active in this tree but local crate(s) [${toString dualUse}] are consumed both via [build-dependencies] and via [dependencies]/[dev-dependencies]. buildRustCrate compiles build_script_build uninstrumented, so the sanitized rlib the runtime consumers need would also link into build scripts and fail with undefined __asan_*/__sanitizer_cov_*. (-Cinstrument-coverage trees are exempt: rustc resolves profiler_builtins from the sysroot, so an instrumented rlib links into uninstrumented binaries — verified against the pinned stable toolchain.) Split the build.rs-consumed code into its own crate, or drop the crate from the sanitized tree."
+    else if anyInstrumentation && conflicted != [ ] then
+      lib.warn "crate2nix.nix: crate(s) [${toString conflicted}] are in the build-dep-only instrumentation-exempt closure but also runtime-consumed by non-exempt local crates — under this tree's instrumentation flags ([${toString (globalExtraRustcOpts ++ localExtraRustcOpts)}]) their runtime-reachable lines will read permanently uncovered (silent coverage-signal gap). Split the shared code out of the build-dependency crate to instrument it." exempt
+    else
+      exempt;
 
   buildRustCrateForPkgs =
     cratePkgs:
@@ -164,26 +301,42 @@ let
           crate_ // { src = memberSrcs.${crate_.crateName}; }
         else
           crate_;
+      # Tree-level instrumentation/extra opts for THIS crate, post
+      # buildDepOnlyCrates exclusion — bound once so the extraRustcOpts
+      # payload and the LLVM_PROFILE_FILE gate below cannot diverge.
+      effectiveTreeOpts = lib.optionals (!lib.elem crate_.crateName buildDepOnlyCrates) (
+        globalExtraRustcOpts ++ lib.optionals isLocal localExtraRustcOpts
+      );
     in
     base (
       crate_'
       // {
         extraRustcOpts =
           remapOpts
-          ++ globalExtraRustcOpts
-          ++ lib.optionals isLocal (localExtraRustcOpts ++ [ localRemap ])
+          # Crates consumed exclusively as build-dependencies are HOST
+          # artifacts: buildRustCrate compiles build_script_build without
+          # extraRustcOpts, so instrumentation must not leak into the
+          # rlibs those build scripts link. An asan/sancov rlib (fuzz
+          # tree's localExtraRustcOpts) fails the build-script link with
+          # undefined __asan_*/__sanitizer_cov_* — the binary never gets
+          # the sanitizer runtime — and coverage instrumentation is dead
+          # weight at best. Same reasoning cargo itself applies by never
+          # passing RUSTFLAGS to host units.
+          ++ effectiveTreeOpts
+          ++ lib.optionals isLocal [ localRemap ]
           ++ (crate_'.extraRustcOpts or [ ]);
       }
       //
-        lib.optionalAttrs
-          (lib.elem "-Cinstrument-coverage" (
-            globalExtraRustcOpts ++ lib.optionals isLocal localExtraRustcOpts
-          ))
-          {
-            # Discard build-time profraws. Test runners override at
-            # runtime to collect real data.
-            LLVM_PROFILE_FILE = "/dev/null";
-          }
+        # Gate keyed on the SAME post-exclusion list as the payload above
+        # — a gate on the pre-exclusion list forked the coverage tree's
+        # rio-buildhash drv from the plain tree's byte-identical compile
+        # via a no-op env var, forfeiting exactly the store sharing the
+        # comment below describes.
+        lib.optionalAttrs (lib.elem "-Cinstrument-coverage" effectiveTreeOpts) {
+          # Discard build-time profraws. Test runners override at
+          # runtime to collect real data.
+          LLVM_PROFILE_FILE = "/dev/null";
+        }
     );
 
   # ──────────────────────────────────────────────────────────────────
@@ -200,34 +353,146 @@ let
   # is needed — the per-member fileset already includes `migrations/`.
   #
   # sqlx offline query cache — content-addressed JSON per query!(...)
-  # callsite. maybeMissing: a fresh clone before the first
-  # `cargo xtask regen sqlx` won't have .sqlx/ yet.
+  # callsite. The cache is COMMITTED (a fresh clone has it);
+  # maybeMissing keeps eval green in the only reachable no-.sqlx
+  # states — `rm -rf .sqlx` recovery and mid-regen swaps — so the
+  # failure surfaces at compile with sqlx's own diagnostic instead
+  # of at eval.
   sqlxCacheFileset = pkgs.lib.fileset.toSource {
     root = ../.;
     fileset = pkgs.lib.fileset.maybeMissing ../.sqlx;
   };
 
-  # query! macros read .sqlx/*.json instead of connecting to PG at
-  # compile time. sqlx-macros-core 0.9.x finds the cache by (in order,
-  # short-circuiting — query/mod.rs:97-117 @ 0.9.0):
-  #   1. SQLX_OFFLINE_DIR — real env var or `.env` at $CARGO_MANIFEST_DIR
-  #      (merged in query/metadata.rs:120-155; .env wins only when the
-  #      env var is unset, which is the case here)
+  # query! macros read .sqlx/query-*.json instead of connecting to PG at
+  # compile time. sqlx-macros-core 0.9.0 resolves the cache PER QUERY at
+  # the FILE level: query/mod.rs:97-101 builds the candidate list
+  #   1. SQLX_OFFLINE_DIR — real env var (or a `.env` at
+  #      $CARGO_MANIFEST_DIR when the env var is unset)
   #   2. $CARGO_MANIFEST_DIR/.sqlx
   #   3. workspace_root().join(".sqlx") — spawns `$CARGO metadata`
-  # buildRustCrate calls rustc directly (no cargo, no CARGO env var, no
-  # workspace Cargo.lock), so (3) would need a fake `cargo` shim. (1) is
-  # checked first and short-circuits — write the .env in postUnpack so
-  # the macro never reaches (3). (Setting the env var directly on the
-  # derivation would also work on 0.9; the .env file is kept because it
-  # predates that and is already proven against this fileset layout.)
+  # and :107-108 joins query-<hash>.json onto each candidate, taking the
+  # first FILE that exists — an earlier dir does NOT mask later ones for
+  # files it lacks. buildRustCrate calls rustc directly (no cargo, no
+  # CARGO env var, no workspace Cargo.lock), so (3) would need a fake
+  # `cargo` shim; in the sandbox the fallthrough is structurally
+  # impossible anyway — per-crate sources stage no .sqlx, so (2)/(3)
+  # don't exist. Set (1) as a plain derivation env var. This is also THE
+  # single-channel contract for rio-buildhash's build scripts
+  # (rio-{store,scheduler,controller}/build.rs): both the macros and the
+  # RIO_SQLX_HASH tracker read exactly this variable, and the tracker
+  # unkeys any context where a divergent fallthrough cache DOES exist,
+  # so they can never disagree about which cache is in play. (The
+  # previous postUnpack-written `.env` carried the same value; the env
+  # var replaced it so the in-repo tracker needs no dotenv parser.)
   # Applied to every crate with `query!()`/`query_as!()` callsites.
   sqlxOffline = {
     SQLX_OFFLINE = "true";
-    postUnpack = ''
-      echo "SQLX_OFFLINE_DIR=${sqlxCacheFileset}/.sqlx" > $sourceRoot/.env
-    '';
+    SQLX_OFFLINE_DIR = "${sqlxCacheFileset}/.sqlx";
   };
+
+  # Comment-aware CALL-SHAPE matcher for the tracker scans below.
+  # SHARED PATTERN (stated once; keep in lockstep with tracker_wired()
+  # in nix/pre-commit-hooks.nix, which greps the same shape after its
+  # sed comment-strip): `<fn>[[:space:]]*\(` on non-comment lines —
+  # whitespace tolerated between name and paren, so `track_sqlx ();`
+  # counts as wired on both the eval side and the commit side. Drop
+  # full-line //-comments first (the [[:space:]]*// match also covers
+  # /// and //! doc comments): a bare whole-file match would count a
+  # doc-comment MENTION as a real call (rio-migrations/build.rs
+  # discusses the sibling tracker in prose). Documented residuals: a
+  # trailing INLINE comment containing the pattern on a code line, and
+  # a string literal naming it ("see track_sqlx( ..."), each on a code
+  # line still matches — full-line stripping only — but that
+  # over-inclusion is loud, not silent: spurious membership
+  # immediately trips the pairing assert below.
+  isCommentLine = l: builtins.match "[[:space:]]*//.*" l != null;
+  hasTrackerCall =
+    fn: file:
+    builtins.pathExists file
+    && lib.any (l: !isCommentLine l && builtins.match ".*${fn}[[:space:]]*\\(.*" l != null) (
+      lib.splitString "\n" (builtins.readFile file)
+    );
+
+  # Anchored consumer-side matcher for the pairing asserts below: the
+  # exact statement `const _: &str = env!("<ENV>");`, column-agnostic
+  # (leading/trailing whitespace tolerated, optional trailing
+  # //-comment; no isCommentLine needed — the anchor already rejects
+  # comment lines). Anchoring is what defeats the single-line
+  # block-comment evasion: `/* const _: &str = env!("…"); */` carries
+  # the full statement as a SUBSTRING (an infix matcher accepts it
+  # while rustc records no env-dep — silent tracking death), but
+  # "/* " is not whitespace, so the anchored form rejects it. Honest
+  # residual: a MULTI-line block comment (`/*` on its own line, the
+  # const inside) still fools the anchored form — accepted; the
+  # single-line shape was the demonstrated evasion.
+  hasConstRead =
+    env: file:
+    builtins.pathExists file
+    && lib.any (
+      l: builtins.match "[[:space:]]*const _: &str = env!\\(\"${env}\"\\);[[:space:]]*(//.*)?" l != null
+    ) (lib.splitString "\n" (builtins.readFile file));
+
+  # Local crates wired to rio-buildhash::track_sqlx() in build.rs —
+  # exactly the crates whose query!()/query_as!() macros read the
+  # offline cache. DERIVED from the tracker wiring rather than
+  # hand-listed or inferred from manifests: "has sqlx in [dependencies]
+  # AND rio-buildhash in [build-dependencies]" is the WRONG membership
+  # rule — rio-migrations matches it yet must NOT get the env (its
+  # tracker is track_migrations; sqlx::migrate! reads migrations/,
+  # never .sqlx/). The macro/tracker pair is one contract: a crate gets
+  # SQLX_OFFLINE_DIR exactly when its build script hashes that dir into
+  # the kache key, and the pre-commit sqlx-prepare-check enforces the
+  # converse direction (real query! callsites without track_sqlx refuse
+  # at commit). Fuzz-tree-only local names (rio-{nix,store}-fuzz) have
+  # no <repo-root>/<name>/ dir, fail pathExists, and drop out by
+  # construction; like memberSrcs (below), this relies on
+  # crateName == repo-root dir name.
+  #
+  # The binding also carries the tracker⟺consumer PAIRING asserts: the
+  # build.rs call is only half the contract — without a
+  # `const _: &str = env!("…");` read in the crate, rustc records no
+  # env-dep and the tracking silently does nothing (rio-buildhash
+  # docs). Scan scope is src/lib.rs OR src/main.rs (existence-tolerant
+  # OR, so a bin-only tracker crate puts the const in src/main.rs and
+  # satisfies the assert) and the throw says so: a const moved
+  # elsewhere fails LOUD with remediation, never silently. The wired
+  # scan reads the crate's recorded `[package] build` path when the
+  # manifest sets one (Cargo.json records the field only then; absent
+  # = implicit build.rs — all 17 local crates today), so a custom
+  # build path is consulted, not assumed away. Forced through this
+  # binding — consumed by defaultCrateOverrides, hence by every eval
+  # that evaluates ANY Rust crate derivation (all clippy/nextest/doc
+  # checks; a non-Rust-only eval like .#checks.<sys>.deny does not
+  # force it, but no CI path evaluates Rust-free) — so a
+  # const-deletion commit fails eval even though the pre-commit hook
+  # structurally cannot see it (the hook fires only on staged
+  # query!-shaped .rs edits).
+  sqlxQueryCrates =
+    let
+      # Stays crateName-keyed (NOT source.path-keyed) deliberately:
+      # this file is instantiated four times (main, coverage, two fuzz
+      # trees) and the fuzz JSONs' local source.paths are "." /
+      # "../../rio-nix"-shaped — the crateName == repo-root-dir
+      # contract (see the membership comment above) is what makes the
+      # scan correct in every instantiation; fuzz member crates keep
+      # dropping out via pathExists.
+      buildScriptPath = n: ../. + "/${n}/${localByName.${n}.build or "build.rs"}";
+      wired = lib.filter (n: hasTrackerCall "track_sqlx" (buildScriptPath n)) localNames;
+      migrationsTrackCrates = lib.filter (
+        n: hasTrackerCall "track_migrations" (buildScriptPath n)
+      ) localNames;
+      hasEnvRead =
+        env: n:
+        hasConstRead env (../. + "/${n}/src/lib.rs") || hasConstRead env (../. + "/${n}/src/main.rs");
+      unpairedSqlx = lib.filter (n: !hasEnvRead "RIO_SQLX_HASH" n) wired;
+      unpairedMigrations = lib.filter (n: !hasEnvRead "RIO_MIGRATIONS_HASH" n) migrationsTrackCrates;
+    in
+    if unpairedSqlx != [ ] then
+      throw "crate2nix.nix: crate(s) [${toString unpairedSqlx}] wire rio_buildhash::track_sqlx() in build.rs but neither src/lib.rs nor src/main.rs has the statement `const _: &str = env!(\"RIO_SQLX_HASH\");` at column start (modulo whitespace; optional trailing //-comment) — without the read, rustc records no env-dep and the tracking silently does nothing. Keep exactly that statement in src/lib.rs or src/main.rs (the eval assert scans ONLY those two files and matches the anchored statement shape), or remove the tracker call."
+    else if unpairedMigrations != [ ] then
+      throw "crate2nix.nix: crate(s) [${toString unpairedMigrations}] wire rio_buildhash::track_migrations() in build.rs but neither src/lib.rs nor src/main.rs has the statement `const _: &str = env!(\"RIO_MIGRATIONS_HASH\");` at column start (modulo whitespace; optional trailing //-comment) — without the read, rustc records no env-dep and the tracking silently does nothing. Keep exactly that statement in src/lib.rs or src/main.rs (the eval assert scans ONLY those two files and matches the anchored statement shape), or remove the tracker call."
+    else
+      wired;
 
   # Crates whose build.rs invokes `protoc` (directly or via prost-build/
   # tonic-prost-build). nixpkgs' prost-build override sets PROTOC on
@@ -280,7 +545,12 @@ let
   # ring is Brian Smith's hand-tuned assembly). Vendoring is the only
   # correct option there. nixpkgs' defaultCrateOverrides already
   # supplies cmake for aws-lc-sys.
-  defaultCrateOverrides = pkgs.defaultCrateOverrides // {
+  # Hand-written per-crate overrides. Bound by name (not inlined into
+  # the merge below) so the sqlxQueryCrates merge can police key
+  # collisions at eval — `//` REPLACES on collision, and a tracker-
+  # wired crate landing in both sets would silently lose its manual
+  # attrs (PROTOC, buildInputs, env escape hatches).
+  manualCrateOverrides = {
     # pkg-config + system lib + env-var escape hatch. All three drawn
     # from sysCrateEnv.crates.<name> — same libs the devShell links,
     # same env vars it sets. Changing sysCrateEnv (e.g. sqlite →
@@ -311,14 +581,6 @@ let
     # rio_proto::FILE_DESCRIPTOR_SET via a [build-dependencies] on
     # rio-proto — no protoc, no cross-directory proto reads, no override.
 
-    # sqlx::query!()/query_as!() callsites — need the offline cache.
-    # (sqlx::migrate!() lives only in rio-migrations, which is a leaf
-    # crate and needs no override.)
-    rio-scheduler = _: sqlxOffline;
-    rio-store = _: sqlxOffline;
-    # nodeclaim_pool/sketch.rs uses sqlx::query! (offline cache).
-    rio-controller = _: sqlxOffline;
-
     # build.rs compiles libFuzzer's C++ via the `cc` crate. stdenv's
     # g++ (NOT clang — see below) plus -fsanitize=address so the C++
     # internals (FuzzWithFork's merge step in particular) are
@@ -334,6 +596,23 @@ let
     };
   };
 
+  defaultCrateOverrides =
+    pkgs.defaultCrateOverrides
+    // manualCrateOverrides
+    # sqlx::query!()/query_as!() callsites — need the offline cache.
+    # Membership derived per tree from the build.rs tracker wiring (see
+    # sqlxQueryCrates above); rio-migrations' sqlx::migrate!() reads
+    # migrations/, never .sqlx/, and deliberately gets NO override.
+    // (
+      let
+        clash = lib.intersectLists sqlxQueryCrates (lib.attrNames manualCrateOverrides);
+      in
+      if clash != [ ] then
+        throw "crate2nix.nix: crate(s) [${toString clash}] are in BOTH manualCrateOverrides and the derived sqlxQueryCrates set — this trailing merge would silently REPLACE the manual override, dropping its PROTOC/buildInputs/env attrs. Fix: fold the sqlx env into that crate's manualCrateOverrides entry (`<name> = _: { …manual attrs… } // sqlxOffline;`) and switch this genAttrs to the non-manual remainder (`lib.genAttrs (lib.subtractLists (lib.attrNames manualCrateOverrides) sqlxQueryCrates) …`) so the combined entry survives the merge."
+      else
+        lib.genAttrs sqlxQueryCrates (_: (_: sqlxOffline))
+    );
+
   cargoNix = import "${crate2nixSrc}/lib/build-from-json.nix" {
     inherit pkgs lib;
     inherit (pkgs) stdenv;
@@ -344,7 +623,7 @@ let
     # pkgs.defaultCrateOverrides here makes build-from-json.nix's
     # `defaultCrateOverrides != pkgs.defaultCrateOverrides` check
     # evaluate to false, skipping its `.override` call. This is needed
-    # for the coverage wrap (globalExtraRustcOpts != []) which returns
+    # for the instrumented wraps (localExtraRustcOpts != []) which return
     # a plain function without a `.override` method.
     inherit (pkgs) defaultCrateOverrides;
   };
@@ -398,4 +677,10 @@ in
   memberBins = lib.mapAttrs (
     name: m: scrubBins "${name}-bin${binSuffix}" "${m.build}/bin"
   ) cargoNix.workspaceMembers;
+
+  # Instrumentation-exempt crate names (build-dep-only closure) — the
+  # single source for every consumer that must agree with the exemption
+  # (coverage-matrix exclusion in flake.nix). See the buildDepOnlyCrates
+  # comment above for membership semantics.
+  instrumentationExemptCrates = buildDepOnlyCrates;
 }

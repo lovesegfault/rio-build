@@ -6102,6 +6102,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio-buildhash"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "rio-cli"
 version = "0.1.0"
 dependencies = [
@@ -6177,6 +6184,7 @@ dependencies = [
  "prost",
  "rand 0.10.1",
  "rio-auth",
+ "rio-buildhash",
  "rio-common",
  "rio-crds",
  "rio-lease",
@@ -6269,6 +6277,7 @@ name = "rio-migrations"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "rio-buildhash",
  "rio-test-support",
  "sqlx",
  "tokio",
@@ -6355,6 +6364,7 @@ dependencies = [
  "prost-types",
  "rand 0.10.1",
  "rio-auth",
+ "rio-buildhash",
  "rio-common",
  "rio-lease",
  "rio-migrations",
@@ -6413,6 +6423,7 @@ dependencies = [
  "proptest",
  "reqwest",
  "rio-auth",
+ "rio-buildhash",
  "rio-common",
  "rio-migrations",
  "rio-nix",
