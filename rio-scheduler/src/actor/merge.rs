@@ -809,6 +809,28 @@ fn settle_evidence_verdict(
     }
 }
 
+/// Exit-class label for the unseeded-input row read-through
+/// (`rio_scheduler_claims_row_readthrough_total{result=...}`).
+///
+/// One arm per population (round-17 bug_064 — the HELP text is the
+/// contract; `partial` and `miss` are DIFFERENT failure populations
+/// for an operator chasing post-failover convergence):
+/// - `miss`: NO seedable rows at all (every missing input's row is
+///   absent, hash-less, or below the seed-rank floor).
+/// - `partial`: rows seeded SOME missing inputs, but the verdict is
+///   still unseeded post-read-through.
+/// - `seeded`: rows re-seeded the verification entirely.
+///
+/// The error arm (`result="error"`) is emitted at the PG-failure
+/// site directly — it has no seed/verdict cell to derive from.
+pub(super) fn readthrough_result(seed_empty: bool, fully_seeded: bool) -> &'static str {
+    match (seed_empty, fully_seeded) {
+        (true, _) => "miss",
+        (false, false) => "partial",
+        (false, true) => "seeded",
+    }
+}
+
 impl DagActor {
     // r[impl sched.merge.store-evidence-displacement+3]
     /// Verify a bare store-backed submission node against the store's
@@ -919,7 +941,7 @@ impl DagActor {
                     // post-read-through.
                     metrics::counter!(
                         "rio_scheduler_claims_row_readthrough_total",
-                        "result" => "miss"
+                        "result" => readthrough_result(true, false)
                     )
                     .increment(1);
                     return StoreEvidenceOutcome::UnseededInputs {
@@ -939,9 +961,14 @@ impl DagActor {
                         // Rows seeded SOME inputs but not all — still
                         // post-read-through unseeded; drop the bytes
                         // (no consumer re-classifies past here).
+                        // result="partial", not "miss": operators
+                        // watching post-failover convergence need to
+                        // distinguish "no persisted rows at all" from
+                        // "partial recovery" (round-17 bug_064 — the
+                        // arms are different failure populations).
                         metrics::counter!(
                             "rio_scheduler_claims_row_readthrough_total",
-                            "result" => "miss"
+                            "result" => readthrough_result(false, false)
                         )
                         .increment(1);
                         StoreEvidenceOutcome::UnseededInputs {
@@ -952,7 +979,7 @@ impl DagActor {
                     reseeded => {
                         metrics::counter!(
                             "rio_scheduler_claims_row_readthrough_total",
-                            "result" => "seeded"
+                            "result" => readthrough_result(false, true)
                         )
                         .increment(1);
                         info!(

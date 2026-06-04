@@ -3656,6 +3656,10 @@ async fn test_failover_unseeded_input_reseeds_from_rows_and_dispatches() -> Test
     // Phase 2: fresh leader. The completed child is ROW-ONLY
     // (recovery loads non-terminal rows); the parent is resident and
     // becomes Ready. Pre-fix its first dispatch instant-poisoned.
+    // Recorder installed for the exit-class witness (bug_064): this
+    // path must land in result="seeded", never partial/miss.
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _mguard = metrics::set_default_local_recorder(&recorder);
     let (handle, _task) =
         setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |c, p| {
             c.retry_policy.backoff_base_secs = 0.0;
@@ -3693,6 +3697,16 @@ async fn test_failover_unseeded_input_reseeds_from_rows_and_dispatches() -> Test
             .fetch_one(&db.pool)
             .await?;
     assert_eq!(rank, "path_bound_bytes", "verified standing persisted");
+    // Exit-class witness (bug_064): full re-seed = result="seeded".
+    let m = "rio_scheduler_claims_row_readthrough_total";
+    assert_eq!(
+        recorder.get(&format!("{m}{{result=seeded}}")),
+        1,
+        "rows re-seeded everything -> seeded; keys: {:?}",
+        recorder.all_keys()
+    );
+    assert_eq!(recorder.get(&format!("{m}{{result=partial}}")), 0);
+    assert_eq!(recorder.get(&format!("{m}{{result=miss}}")), 0);
     Ok(())
 }
 
@@ -3794,6 +3808,12 @@ async fn test_unseeded_input_without_row_backs_off_not_poisons() -> TestResult {
     }
 
     // Phase 2: long backoff base — exactly one deferral lands.
+    // Recorder installed for the exit-class witness (bug_064): a
+    // hash-less child means NO seedable rows -> result="miss",
+    // never "partial" (that arm is reserved for rows that seeded
+    // SOME of the missing inputs).
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _mguard = metrics::set_default_local_recorder(&recorder);
     let (handle, _task) =
         setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |c, p| {
             c.retry_policy.backoff_base_secs = 600.0;
@@ -3826,6 +3846,19 @@ async fn test_unseeded_input_without_row_backs_off_not_poisons() -> TestResult {
     assert_eq!(
         d.retry.unseeded_inputs_count, 1,
         "exactly one charge against the dedicated unseeded budget"
+    );
+    // Exit-class witness (bug_064): no seedable rows = result="miss".
+    let m = "rio_scheduler_claims_row_readthrough_total";
+    assert_eq!(
+        recorder.get(&format!("{m}{{result=miss}}")),
+        1,
+        "no seedable rows -> miss; keys: {:?}",
+        recorder.all_keys()
+    );
+    assert_eq!(
+        recorder.get(&format!("{m}{{result=partial}}")),
+        0,
+        "partial is reserved for rows seeding SOME missing inputs"
     );
     Ok(())
 }
@@ -4326,4 +4359,23 @@ fn persisted_row_seed_floors_sub_anchor_and_garbage_ranks() {
         seed.get("/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-junk.drv")
             .is_none()
     );
+}
+
+/// Round-17 bug_064: the read-through exit classes are three distinct
+/// populations, derived from one pure function so an emit site cannot
+/// pick a label the HELP text doesn't define. `partial` ≠ `miss`:
+/// "rows seeded SOME missing inputs" and "no seedable rows at all"
+/// steer an operator to different causes (a specific child lost its
+/// hash vs. rows gone entirely).
+#[test]
+fn readthrough_result_labels_cover_the_three_populations() {
+    use crate::actor::merge::readthrough_result;
+    assert_eq!(readthrough_result(true, false), "miss");
+    assert_eq!(
+        readthrough_result(true, true),
+        "miss",
+        "empty seed dominates"
+    );
+    assert_eq!(readthrough_result(false, false), "partial");
+    assert_eq!(readthrough_result(false, true), "seeded");
 }

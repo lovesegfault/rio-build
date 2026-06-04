@@ -259,10 +259,11 @@ pub fn describe_metrics() {
         "Persisted-row read-throughs for unseeded claim inputs at the \
          check_store_evidence chokepoint (sched.dispatch.claims-derived+5), \
          labeled by result: seeded (rows re-seeded the verification — the \
-         reap/failover recovery path working as designed), miss (no \
-         seedable rows; the verdict stands post-read-through), error (PG \
-         lookup failed; deferred as transient store silence, never a \
-         permanence verdict)."
+         reap/failover recovery path working as designed), partial (rows \
+         seeded SOME missing inputs but not all; still unseeded \
+         post-read-through), miss (NO seedable rows at all; the verdict \
+         stands post-read-through), error (PG lookup failed; deferred as \
+         transient store silence, never a permanence verdict)."
     );
     describe_counter!(
         "rio_scheduler_dispatch_claims_stripped_total",

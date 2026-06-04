@@ -699,7 +699,7 @@
       {
         "name": "rio_scheduler_claims_row_readthrough_total",
         "kind": "counter",
-        "help": "Persisted-row read-throughs for unseeded claim inputs at the check_store_evidence chokepoint (sched.dispatch.claims-derived+5), labeled by result: seeded (rows re-seeded the verification — the reap/failover recovery path working as designed), miss (no seedable rows; the verdict stands post-read-through), error (PG lookup failed; deferred as transient store silence, never a permanence verdict)."
+        "help": "Persisted-row read-throughs for unseeded claim inputs at the check_store_evidence chokepoint (sched.dispatch.claims-derived+5), labeled by result: seeded (rows re-seeded the verification — the reap/failover recovery path working as designed), partial (rows seeded SOME missing inputs but not all; still unseeded post-read-through), miss (NO seedable rows at all; the verdict stands post-read-through), error (PG lookup failed; deferred as transient store silence, never a permanence verdict)."
       },
       {
         "name": "rio_scheduler_cleanup_dropped_total",
