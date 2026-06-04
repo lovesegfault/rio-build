@@ -1,4 +1,5 @@
 // -*- mode: Bluespec; -*-
+// quint-policy-latches: rowRegressed, belowFloorMutation, floorRegressed, deposedCloseApplied, clientGaveUp
 //
 // fencedWrites — the claims-floor fence RE-STATED OVER INTERLEAVED
 // TRANSACTIONS (A1 fenced-write-discipline; bughunt wave).
@@ -98,21 +99,33 @@ module fencedWrites {
   var pendingRefusal: str -> bool
 
   // --- 4. latches (history properties as state invariants) -------------------
+  //
+  // bughunt-2 bug_358: every latch is computed LIVE by the oracle-seated
+  // apply sub-actions in section 8a — never by a calibration override.
+  // A calibration perturbs a DECISION (skips a guard, drops a ratchet,
+  // flips an answer) and routes through the same seat; the oracle
+  // observes the perturbed decision and latches by itself. The
+  // quint-policy lint enforces this: P4 (every latch has a non-identity
+  // writer reachable from this module's step) and P5 (no calibration
+  // action assigns a latch).
 
   /// An EXISTING active row's generation decreased (or its exec was
   /// clobbered by a lower-generation write) — the bug_261 regression.
+  /// Computed in upsertApply.
   var rowRegressed: bool
-  /// A transaction whose visible floor exceeded its replica's
-  /// generation mutated decision state — the open-coded-floor-compare
-  /// bypass class (set only by calibration overrides).
+  /// A transaction whose believed floor (its snapshot; fenceless
+  /// writers believe currentFloor) exceeded its replica's generation
+  /// mutated decision state — the open-coded-floor-compare bypass
+  /// class. Computed in every mutation seat via snapshotExceedsGen.
   var belowFloorMutation: bool
   /// The resource floor decreased (bug_273's plain-SET regression).
+  /// Computed in floorWriteApply.
   var floorRegressed: bool
   /// A deposed replica closed an active row it does not own
-  /// (merged_bug_231's derivation-keyed close).
+  /// (merged_bug_231's derivation-keyed close). Computed in closeApply.
   var deposedCloseApplied: bool
   /// A fence refusal was answered with a terminal code and the client
-  /// gave up (bug_393).
+  /// gave up (bug_393). Computed in answerRefusal.
   var clientGaveUp: bool
 
   // --- 4b. bughunt-2 plane state ---------------------------------------------
@@ -224,6 +237,74 @@ module fencedWrites {
     servedWithoutRecovery' = false,
   }
 
+  // --- 8a. oracle-seated apply sub-actions (bughunt-2 bug_358) ----------------
+  //
+  // The five latches are computed HERE from the same inputs that drive
+  // the state change. Live actions and calibration overrides BOTH route
+  // through these seats; only the admission/decision differs.
+
+  /// The below-floor oracle: the writer's believed floor exceeds its
+  /// generation. Admitted transactions pass their TxFloorRead snapshot;
+  /// fenceless calibration writers pass currentFloor.
+  def snapshotExceedsGen(r: str, snap: int): bool = snap > replicaGen.get(r)
+
+  /// Row upsert apply — the INSERT/DO UPDATE arm. The EvalPlanQual
+  /// re-check (activeGen <= g) is the CALLER's decision; the regression
+  /// truth is computed here from the pre-state.
+  action upsertApply(r: str, snap: int, g: int): bool = all {
+    all {
+      activeGen' = g,
+      activeOwner' = r,
+      activeExec' = execsMinted + 1,
+      execsMinted' = execsMinted + 1,
+      rowRegressed' = or { rowRegressed, activeGen > 0 and g < activeGen },
+    },
+    belowFloorMutation' = or { belowFloorMutation, snapshotExceedsGen(r, snap) },
+    floorRegressed' = floorRegressed,
+    deposedCloseApplied' = deposedCloseApplied,
+    clientGaveUp' = clientGaveUp,
+  }
+
+  /// Row close apply — clears the active row. Owner/exec scoping is the
+  /// CALLER's decision; the deposed-foreign-close truth is computed here.
+  action closeApply(r: str, snap: int): bool = all {
+    deposedCloseApplied' = or {
+      deposedCloseApplied,
+      and { activeGen > 0, activeOwner != r, deposed(r) },
+    },
+    activeGen' = 0,
+    activeOwner' = "",
+    activeExec' = 0,
+    execsMinted' = execsMinted,
+    belowFloorMutation' = or { belowFloorMutation, snapshotExceedsGen(r, snap) },
+    rowRegressed' = rowRegressed,
+    floorRegressed' = floorRegressed,
+    clientGaveUp' = clientGaveUp,
+  }
+
+  /// Floor write apply — writes v VERBATIM. The GREATEST ratchet is the
+  /// CALLER's decision; the regression truth is computed here.
+  action floorWriteApply(r: str, snap: int, v: int): bool = all {
+    floorRegressed' = or { floorRegressed, v < resourceFloor },
+    resourceFloor' = v,
+    belowFloorMutation' = or { belowFloorMutation, snapshotExceedsGen(r, snap) },
+    rowRegressed' = rowRegressed,
+    deposedCloseApplied' = deposedCloseApplied,
+    clientGaveUp' = clientGaveUp,
+  }
+
+  /// Refusal answer apply — the retryable/terminal DECISION is the
+  /// caller's; the give-up truth is computed here.
+  action answerRefusal(r: str, retryable: bool): bool = all {
+    pendingRefusal.get(r),
+    pendingRefusal' = pendingRefusal.set(r, false),
+    clientGaveUp' = or { clientGaveUp, not(retryable) },
+    rowRegressed' = rowRegressed,
+    belowFloorMutation' = belowFloorMutation,
+    floorRegressed' = floorRegressed,
+    deposedCloseApplied' = deposedCloseApplied,
+  }
+
   // --- 8. actions --------------------------------------------------------------------
 
   /// A replica claims the next generation (the successor). The claim
@@ -293,6 +374,7 @@ module fencedWrites {
     execsMinted < MAX_EXECS,
     txPhase' = txPhase.set(r, TxIdle),
     val g = writeGen
+    val snap = match txPhase.get(r) { | TxIdle => 0 | TxFloorRead(v) => v }
     all {
       // The tenure-stamp oracle: latches on the COMMIT path only.
       staleWriteCommitted' = or {
@@ -302,13 +384,11 @@ module fencedWrites {
       if (activeGen <= g) all {
         // Applies: fresh insert (activeGen == 0 — the priced
         // residual: g may sit below a claims-only floor) or guarded
-        // update of an equal-or-older row. Never a regression.
-        activeGen' = g,
-        activeOwner' = r,
-        activeExec' = execsMinted + 1,
-        execsMinted' = execsMinted + 1,
+        // update of an equal-or-older row. Never a regression — the
+        // upsertApply oracle re-derives that truth live, against the
+        // gen this write actually STAMPS (the plane-1 decision).
+        upsertApply(r, snap, g),
         pendingRefusal' = pendingRefusal,
-        latchesUnchanged,
       } else all {
         // Predicate refused against the newer committed row: zero
         // rows, rollback, surfaced as the same retryable refusal.
@@ -350,16 +430,15 @@ module fencedWrites {
       | TxFloorRead(v) => v <= replicaGen.get(r)
     },
     txPhase' = txPhase.set(r, TxIdle),
-    if (activeGen > 0 and activeOwner == r) all {
-      activeGen' = 0,
-      activeOwner' = "",
-      activeExec' = 0,
-      execsMinted' = execsMinted,
-    } else {
-      rowUnchanged
+    val snap = match txPhase.get(r) { | TxIdle => 0 | TxFloorRead(v) => v }
+    if (activeGen > 0 and activeOwner == r) {
+      closeApply(r, snap)
+    } else all {
+      rowUnchanged,
+      latchesUnchanged,
     },
     pendingRefusal' = pendingRefusal,
-    claimsUnchanged, floorUnchanged, latchesUnchanged,
+    claimsUnchanged, floorUnchanged,
     planesUnchanged,
   }
 
@@ -372,9 +451,10 @@ module fencedWrites {
       | TxFloorRead(f) => f <= replicaGen.get(r)
     },
     txPhase' = txPhase.set(r, TxIdle),
-    resourceFloor' = if (v > resourceFloor) v else resourceFloor,
+    val snap = match txPhase.get(r) { | TxIdle => 0 | TxFloorRead(f) => f }
+    floorWriteApply(r, snap, if (v > resourceFloor) v else resourceFloor),
     pendingRefusal' = pendingRefusal,
-    claimsUnchanged, rowUnchanged, latchesUnchanged,
+    claimsUnchanged, rowUnchanged,
     planesUnchanged,
   }
 
@@ -382,10 +462,9 @@ module fencedWrites {
   /// family — sched.grpc.fence-retryable): it retries; nobody gives
   /// up. The fixed system's only answer arm.
   action answerRetryable(r: str): bool = all {
-    pendingRefusal.get(r),
-    pendingRefusal' = pendingRefusal.set(r, false),
+    answerRefusal(r, true),
     txPhase' = txPhase,
-    claimsUnchanged, rowUnchanged, floorUnchanged, latchesUnchanged,
+    claimsUnchanged, rowUnchanged, floorUnchanged,
     planesUnchanged,
   }
 

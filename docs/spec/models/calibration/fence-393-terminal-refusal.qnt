@@ -30,15 +30,12 @@ module fenceCalib393TerminalRefusal {
     ENABLE_TENURE_LIFECYCLE = false
   ).* from "../fencedWrites"
 
-  /// PRE-FIX: the refusal answered with a terminal code.
+  /// PRE-FIX: the refusal answered with a terminal code. DECISION-ONLY
+  /// perturbation (bughunt-2 bug_358): the answer DECISION flips to
+  /// terminal; the give-up truth comes from the live answerRefusal
+  /// oracle.
   action calibAnswerTerminal(r: str): bool = all {
-    pendingRefusal.get(r),
-    pendingRefusal' = pendingRefusal.set(r, false),
-    clientGaveUp' = true,
-    rowRegressed' = rowRegressed,
-    belowFloorMutation' = belowFloorMutation,
-    floorRegressed' = floorRegressed,
-    deposedCloseApplied' = deposedCloseApplied,
+    answerRefusal(r, false),
     txPhase' = txPhase,
     claimsUnchanged, rowUnchanged, floorUnchanged,
     planesUnchanged,

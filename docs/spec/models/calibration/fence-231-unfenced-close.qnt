@@ -34,21 +34,14 @@ module fenceCalib231UnfencedClose {
 
   /// PRE-FIX: derivation-keyed close — no begin_fenced, no exec
   /// scope: closes WHATEVER row is active for the derivation.
+  /// DECISION-ONLY perturbation (bughunt-2 bug_358): the owner/fence
+  /// guards are SKIPPED; the deposed-foreign-close truth comes from
+  /// the live closeApply oracle (fenceless writers believe
+  /// currentFloor).
   action calibUnfencedDerivationClose(r: str): bool = all {
     replicaGen.get(r) > 0,
     activeGen > 0,
-    activeGen' = 0,
-    activeOwner' = "",
-    activeExec' = 0,
-    execsMinted' = execsMinted,
-    deposedCloseApplied' = or {
-      deposedCloseApplied,
-      deposed(r) and activeOwner != r,
-    },
-    belowFloorMutation' = or { belowFloorMutation, deposed(r) },
-    rowRegressed' = rowRegressed,
-    floorRegressed' = floorRegressed,
-    clientGaveUp' = clientGaveUp,
+    closeApply(r, currentFloor),
     txPhase' = txPhase,
     pendingRefusal' = pendingRefusal,
     claimsUnchanged, floorUnchanged,

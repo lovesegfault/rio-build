@@ -36,7 +36,9 @@ module fenceCalib261UnguardedUpsert {
   ).* from "../fencedWrites"
 
   /// PRE-FIX: the predicate-free DO UPDATE — applies on the stale
-  /// advisory pass, regressing a newer committed row.
+  /// advisory pass, regressing a newer committed row. DECISION-ONLY
+  /// perturbation (bughunt-2 bug_358): the EvalPlanQual re-check is
+  /// SKIPPED; the latch truth comes from the live upsertApply oracle.
   action calibUnguardedUpsertCommit(r: str): bool = all {
     match txPhase.get(r) {
       | TxIdle => false
@@ -44,19 +46,11 @@ module fenceCalib261UnguardedUpsert {
     },
     execsMinted < MAX_EXECS,
     txPhase' = txPhase.set(r, TxIdle),
-    val g = replicaGen.get(r)
-    all {
-      // Applies UNCONDITIONALLY (no EvalPlanQual re-check).
-      activeGen' = g,
-      activeOwner' = r,
-      activeExec' = execsMinted + 1,
-      execsMinted' = execsMinted + 1,
-      rowRegressed' = or { rowRegressed, activeGen > 0 and g < activeGen },
-      belowFloorMutation' = or { belowFloorMutation, deposed(r) },
-      floorRegressed' = floorRegressed,
-      deposedCloseApplied' = deposedCloseApplied,
-      clientGaveUp' = clientGaveUp,
-    },
+    val snap = match txPhase.get(r) { | TxIdle => 0 | TxFloorRead(v) => v }
+    // Applies UNCONDITIONALLY (no EvalPlanQual re-check); still stamps
+    // the writer's own tenure — the defect is the skipped predicate,
+    // not the stamp (that axis is fence-338's).
+    upsertApply(r, snap, replicaGen.get(r)),
     pendingRefusal' = pendingRefusal,
     claimsUnchanged, floorUnchanged,
     planesUnchanged,

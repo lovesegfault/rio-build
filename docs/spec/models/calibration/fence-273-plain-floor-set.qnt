@@ -32,14 +32,12 @@ module fenceCalib273PlainFloorSet {
   ).* from "../fencedWrites"
 
   /// PRE-FIX: the unfenced plain SET — no ratchet, no floor check.
+  /// DECISION-ONLY perturbation (bughunt-2 bug_358): the GREATEST
+  /// ratchet is DROPPED (v passes verbatim); the regression truth
+  /// comes from the live floorWriteApply oracle.
   action calibFloorWritePlainSet(r: str, v: int): bool = all {
     replicaGen.get(r) > 0,
-    floorRegressed' = or { floorRegressed, v < resourceFloor },
-    resourceFloor' = v,
-    belowFloorMutation' = or { belowFloorMutation, deposed(r) },
-    rowRegressed' = rowRegressed,
-    deposedCloseApplied' = deposedCloseApplied,
-    clientGaveUp' = clientGaveUp,
+    floorWriteApply(r, currentFloor, v),
     txPhase' = txPhase,
     pendingRefusal' = pendingRefusal,
     claimsUnchanged, rowUnchanged,

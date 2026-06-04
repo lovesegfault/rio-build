@@ -51,6 +51,7 @@ View-settlement pair (`materializationJobResolveFaults` regime):
 | `quint-fence-calib-231-unfenced-close` | derivation-keyed unfenced close — a deposed sweep closes the successor's row | `openAttemptViewStableUnderDeposedClose` |
 | `quint-fence-calib-273-plain-floor-set` | plain `SET floor = $2` — regression under interleaving / deposed write | `resourceFloorMonotonic` |
 | `quint-fence-calib-393-terminal-refusal` | the refusal answered FAILED_PRECONDITION; the client gives up | `fenceRefusalAlwaysRetryable` |
+| `quint-fence-calib-floor-blind` | the begin_fenced admission compare dropped — a tx the fence refused mutates decision state anyway | `belowFloorTxNeverMutates` |
 | `quint-materialization-calib-133-discarded-outcome` | the fenced/errored resolve still discards the view entry | `viewMatchesDurableUnresolved` |
 | `quint-materialization-calib-276-dag-absent-cancel` | the split cancel leaks the open attempt; the establishment sweep charges it | `chargeFreeCancellation` |
 | `quint-fence-calib-338-atomic-reread` | the mint stamps the fresh lease-atomic read after a mid-tenure bump (the shared apply oracle latches the non-claim stamp) | `writesCarryClaimedTenure` |
@@ -61,6 +62,15 @@ View-settlement pair (`materializationJobResolveFaults` regime):
 Every wired holds/exhaustive check has its falsifiability pair above
 (the constructor's vacuity rule); the baselines (as-built `step`) hold
 on every calibration module.
+
+Latch integrity (bughunt-2 bug_358): the five latches are computed
+LIVE by the oracle-seated apply sub-actions (`upsertApply`,
+`closeApply`, `floorWriteApply`, `answerRefusal`, with the
+`snapshotExceedsGen` oracle) declared in fencedWrites.qnt and named in
+its `quint-policy-latches:` header directive. Calibrations perturb
+DECISIONS only — admission guards, the EvalPlanQual re-check, the
+GREATEST ratchet, the answer code — and never assign a latch; the
+quint-policy lint (P4/P5) enforces both halves mechanically.
 
 ## Priced residuals (deliberate, bounded)
 
