@@ -1823,6 +1823,10 @@ pub const M_081: () = ();
 /// construction and a vacuous `Success{[],[]}` no longer
 /// "re-completes" the node with the `[""]` placeholder.
 ///
+/// NULL = no carrier (every other origin): floating-CA slots then
+/// resolve through `expected_output_paths` exactly as before this
+/// column existed.
+///
 /// Nullable, no backfill, no index. Mixed-version window: an old
 /// scheduler never writes the column (stale-reset jobs degrade to the
 /// pre-082 vacuous shape — today's behavior, not a regression); an
@@ -2113,6 +2117,34 @@ pub const M_092: () = ();
 /// in `rio_migrations::sql::PIN_MATERIALIZED_UPSERT_SQL` (bug_192 —
 /// PD-13's duplicated-SQL pair collapsed to one const).
 pub const M_093: () = ();
+
+/// `migrations/094_establishment_clusters.sql`
+///
+/// Maintained per-node clustering for the hung-node runbook
+/// (bughunt wave, merged_bug_010). `establishment_clusters(window)`
+/// groups establishment charges (`outcome_class = 'executor_crash'`,
+/// `termination_reason = 'unreported'`) by **`drv_attempts
+/// .source_node`** — the authority the establishment sweep PERSISTS
+/// (`actor/housekeeping.rs` establishment arm: the attempt-row value
+/// or the spawn-ack binding fallback; written through
+/// `db/attempts.rs` append). The runbook's previous prose SQL joined
+/// `drv_executions` and grouped on `e.source_node`, whose only
+/// writers are the race-conditional pull mint and a report-only
+/// backfill that never fires for a wedged-but-Ready pod — exactly
+/// the rows this query exists to cluster came back NULL there.
+///
+/// - `window_span` (the spec sketch's `window`; renamed — `WINDOW`
+///   is a reserved word) defaults to `'30 minutes'`, mirroring the
+///   `RioSchedulerAttemptEstablishmentCluster` alert's `[30m]` range
+///   so "the alert fired, run the query" sees the same population.
+/// - `NULL` rows mean NEITHER the attempt row nor the spawn-ack
+///   binding carried a node — not node-attributable; investigate the
+///   scheduler/store, not a node.
+/// - `STABLE` SQL function: one statement, planner-inlinable;
+///   operators call `SELECT * FROM establishment_clusters();` instead
+///   of maintaining hand-rolled SQL (the ops-SQL docs-lint forbids
+///   raw `drv_*` queries in runbooks).
+pub const M_094: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,

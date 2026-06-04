@@ -1330,3 +1330,96 @@ async fn test_gc_exec_rows_spares_referenced_and_live() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// establishment_clusters() — the runbook's per-node clustering (094)
+// ---------------------------------------------------------------------------
+
+/// merged_bug_010: the hung-node runbook's prose SQL joined
+/// `drv_executions` and grouped on `e.source_node` — NULL for exactly
+/// the binding-ack race the establishment charge survives (the attempt
+/// row carries the spawn-ack binding fallback the mint never saw, so
+/// the authority is `drv_attempts.source_node`). The maintained
+/// `establishment_clusters()` function groups on the authority column;
+/// this test seeds that race: executions-side attribution absent,
+/// attempt-side attribution present.
+#[tokio::test]
+async fn test_establishment_clusters_groups_on_attempt_authority() -> anyhow::Result<()> {
+    let (_test_db, db, drv_a) = setup("estab-cluster-a").await?;
+    let drv_b = insert_test_derivation(&db, "estab-cluster-b").await?;
+    let drv_c = insert_test_derivation(&db, "estab-cluster-c").await?;
+    let drv_d = insert_test_derivation(&db, "estab-cluster-d").await?;
+
+    let mk = |drv: Uuid, node: Option<&str>| {
+        let mut r = AttemptRow::new(
+            drv,
+            OutcomeClass::ExecutorCrash,
+            ReportingParty::Scheduler,
+            AttemptKind::Build,
+        );
+        r.source_node = node.map(str::to_owned);
+        r.termination_reason = Some("unreported".into());
+        r
+    };
+    // Two DISTINCT derivations established on wedge-a inside the
+    // window (the hung-node signature) — drv_executions rows absent
+    // throughout, as in the wedged-but-Ready pod case.
+    let a = mk(drv_a, Some("wedge-a"));
+    let b = mk(drv_b, Some("wedge-a"));
+    // A charge with NO attribution anywhere → the NULL bucket.
+    let c = mk(drv_c, None);
+    // An old wedge-a charge — outside the default 30 m window.
+    let d = mk(drv_d, Some("wedge-a"));
+    let d_id = d.attempt_id;
+    append_committed(&db, &[a, b, c, d]).await?;
+    backdate(&db, &[d_id]).await?; // 3 days old
+
+    // Non-establishment rows never count: a worker-reported crash
+    // (termination_reason absent ≠ 'unreported') and a reset row.
+    let mut reported = AttemptRow::new(
+        drv_a,
+        OutcomeClass::ExecutorCrash,
+        ReportingParty::Worker,
+        AttemptKind::Build,
+    );
+    reported.source_node = Some("wedge-a".into());
+    let reset = AttemptRow::new_reset(
+        drv_b,
+        OutcomeClass::ResubmitReset,
+        ReportingParty::Scheduler,
+        1,
+        AttemptKind::Build,
+    );
+    append_committed(&db, &[reported, reset]).await?;
+
+    let rows: Vec<(Option<String>, i64, i64)> = sqlx::query_as(
+        "SELECT source_node, distinct_drvs, establishments FROM establishment_clusters()",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(rows.len(), 2, "wedge-a cluster + NULL bucket: {rows:?}");
+    let wedge = rows
+        .iter()
+        .find(|r| r.0.as_deref() == Some("wedge-a"))
+        .expect("wedge-a cluster present");
+    assert_eq!(
+        (wedge.1, wedge.2),
+        (2, 2),
+        "two distinct drvs, two establishments inside the window"
+    );
+    assert!(rows.iter().any(|r| r.0.is_none()), "NULL bucket present");
+
+    // Widening the window picks the old charge back up (third drv).
+    let widened: Vec<(Option<String>, i64, i64)> = sqlx::query_as(
+        "SELECT source_node, distinct_drvs, establishments \
+         FROM establishment_clusters('4 days')",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    let wedge_w = widened
+        .iter()
+        .find(|r| r.0.as_deref() == Some("wedge-a"))
+        .expect("widened wedge-a cluster");
+    assert_eq!((wedge_w.1, wedge_w.2), (3, 3));
+    Ok(())
+}

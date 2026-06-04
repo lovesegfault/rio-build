@@ -48,29 +48,26 @@ longer pollute the per-node signal.
   #(refs.metric)("rio_scheduler_open_attempts") shows how many attempts are
   still open right now.
 
-+ Run the per-node clustering query (the ledger is the source of truth — the
-  establishment histogram is not labeled by node). On the scheduler
++ Run the per-node clustering function (the ledger is the source of truth —
+  the establishment histogram is not labeled by node). On the scheduler
   PostgreSQL:
 
   ```sql
-  SELECT e.source_node,
-         count(DISTINCT a.derivation_id) AS distinct_drvs,
-         count(*)                        AS establishments,
-         min(a.recorded_at)              AS first_seen,
-         max(a.recorded_at)              AS last_seen
-  FROM drv_attempts a
-  JOIN drv_executions e ON e.exec_id = a.exec_id
-  WHERE a.outcome_class = 'executor_crash'
-    AND a.termination_reason = 'unreported'
-    AND a.recorded_at > now() - interval '30 minutes'
-  GROUP BY e.source_node
-  ORDER BY distinct_drvs DESC;
+  SELECT * FROM establishment_clusters();
   ```
 
-  `source_node` is the controller-authoritative binding persisted by the pull
-  transaction; `NULL` rows are attempts whose binding was never observed
-  (treat a cluster of NULLs as "not node-attributable" — investigate the
-  scheduler/store first, not a node).
+  The function (#(refs.migration)("094_establishment_clusters")) groups on
+  the attempt ledger's own `source_node` — the authority the establishment
+  charge persists (the attempt-row value, or the spawn-ack binding fallback
+  when the mint never observed a binding). Its window defaults to the
+  alert's 30 minutes; widen with `establishment_clusters('3 hours')` when
+  triaging an older burst. `NULL` rows are charges with no node attribution
+  from EITHER source — not node-attributable; investigate the
+  scheduler/store first, not a node. (Do not hand-roll `drv_executions`
+  joins here: that table's `source_node` is written only by the
+  race-conditional pull mint and a report-only backfill that never fires
+  for a wedged-but-Ready pod, so exactly the establishment rows this
+  procedure clusters come back `NULL` there.)
 
 + Two or more *distinct derivations* establishing on *one* node inside the
   window is the hung-node signature. One derivation establishing repeatedly
