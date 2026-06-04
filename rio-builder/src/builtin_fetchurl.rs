@@ -1059,6 +1059,99 @@ struct NetrcEntry {
     password: Option<String>,
 }
 
+/// Shape class of an offending netrc token — the ONLY thing an error
+/// may say about it besides its length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenClass {
+    /// Starts with `"` (the rejected quoted form).
+    Quoted,
+    /// Any other token.
+    Bare,
+}
+
+/// Position-and-shape summary of a netrc token: length and class,
+/// never bytes. This is the only token-derived payload type
+/// [`NetrcParseError`] carries, which is what makes the no-echo
+/// property TOTAL: an arm that wanted to echo would need a `String`
+/// field, and the exhaustive fixture table in tests forces every new
+/// arm through review with its payload type in plain sight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TokenSummary {
+    len: usize,
+    class: TokenClass,
+}
+
+impl From<&str> for TokenSummary {
+    fn from(tok: &str) -> Self {
+        TokenSummary {
+            len: tok.len(),
+            class: if tok.starts_with('"') {
+                TokenClass::Quoted
+            } else {
+                TokenClass::Bare
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for TokenSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let class = match self.class {
+            TokenClass::Quoted => "quoted",
+            TokenClass::Bare => "bare",
+        };
+        write!(f, "{class} token, {} bytes", self.len)
+    }
+}
+
+/// Closed netrc parse-error surface. Every variant's payload is either
+/// a [`TokenSummary`] (length + class, never bytes) or a `&'static
+/// str` naming a CANONICAL keyword (`"login"`, `"password"`, … — the
+/// matched literal, never the input's spelling), so no arm CAN
+/// interpolate input bytes — the no-echo property holds by
+/// construction in every position, keyword and machine-name positions
+/// included.
+///
+/// That REVERSES round-16's documented carve-out ("keyword positions
+/// echo the token, which is what makes a typo diagnosable"): parse
+/// errors flow into build-failure logs whose audience is every tenant
+/// of the pool plus the operator, and a malformed netrc can land a
+/// CREDENTIAL in keyword position (a stray value after a consumed
+/// pair, a quoted password where a keyword belongs). Diagnosis keeps
+/// the position, length, and shape — enough to find the line — and
+/// gives up the bytes.
+// r[impl fetcher.divergence.netrc-strict-parse]
+#[derive(Debug, thiserror::Error)]
+enum NetrcParseError {
+    #[error(
+        "netrc: quoted token in keyword position ({0}) is not supported \
+         (fetcher.divergence.netrc-strict-parse)"
+    )]
+    QuotedKeyword(TokenSummary),
+    #[error(
+        "netrc: quoted value for `{key}` is not supported \
+         (fetcher.divergence.netrc-strict-parse)"
+    )]
+    QuotedValue { key: &'static str },
+    #[error("netrc: `machine` is missing its host name")]
+    MachineMissingName,
+    #[error("netrc: `{key}` is missing its value")]
+    MissingValue { key: &'static str },
+    #[error("netrc: `{key}` before any `machine`/`default` entry")]
+    CredentialBeforeEntry { key: &'static str },
+    #[error(
+        "netrc: `macdef` is not supported — its body ends at a blank line, \
+         which a whitespace tokenizer cannot see \
+         (fetcher.divergence.netrc-strict-parse)"
+    )]
+    Macdef,
+    #[error(
+        "netrc: unrecognized token in keyword position ({0}) \
+         (fetcher.divergence.netrc-strict-parse)"
+    )]
+    Unrecognized(TokenSummary),
+}
+
 /// Strict whitespace-token netrc parser: ONE cursor, and every keyword
 /// consumes its value in the same step (consume-on-key), so no token
 /// is ever scanned twice and a credential VALUE can never be re-read
@@ -1096,7 +1189,7 @@ struct NetrcEntry {
 /// would skip it; that residue is the registered unknown-token
 /// divergence above, not a comment-handling one).
 // r[impl fetcher.divergence.netrc-strict-parse]
-fn parse_netrc(contents: &str) -> anyhow::Result<Vec<NetrcEntry>> {
+fn parse_netrc(contents: &str) -> Result<Vec<NetrcEntry>, NetrcParseError> {
     /// `file2memory`'s load-time comment test (`netrc.c:91-94`):
     /// leading ISBLANK (space/tab ONLY, `curl_ctype.h:45`) passed,
     /// then a `#` first byte drops the line.
@@ -1106,28 +1199,19 @@ fn parse_netrc(contents: &str) -> anyhow::Result<Vec<NetrcEntry>> {
     // Quote rejection applies in EVERY token position, value positions
     // included: the oracle would unquote `login "u"` to `u`, while a
     // whitespace tokenizer would store the quotes verbatim — a silent
-    // credential mangle, not a parse. The two rejecters differ in what
-    // they may ECHO: parse errors flow into build-failure logs (tenant-
-    // and operator-visible via the call site's PermanentForCandidate
-    // context), so a token read at a VALUE position — which may BE a
-    // credential (`password "secret"`) — is never interpolated; the
-    // error names the keyword instead. Keyword/machine-name positions
-    // echo the token, which is what makes a typo diagnosable.
-    fn unquoted_keyword(tok: &str) -> anyhow::Result<&str> {
+    // credential mangle, not a parse. NO position echoes the token
+    // (see [`NetrcParseError`] — the round-16 keyword-position
+    // carve-out is reversed); errors carry a [`TokenSummary`] or a
+    // canonical keyword name only.
+    fn unquoted_keyword(tok: &str) -> Result<&str, NetrcParseError> {
         if tok.starts_with('"') {
-            anyhow::bail!(
-                "netrc: quoted token {tok:?} is not supported \
-                 (fetcher.divergence.netrc-strict-parse)"
-            );
+            return Err(NetrcParseError::QuotedKeyword(TokenSummary::from(tok)));
         }
         Ok(tok)
     }
-    fn unquoted_value<'t>(key: &str, tok: &'t str) -> anyhow::Result<&'t str> {
+    fn unquoted_value<'t>(key: &'static str, tok: &'t str) -> Result<&'t str, NetrcParseError> {
         if tok.starts_with('"') {
-            anyhow::bail!(
-                "netrc: quoted value for `{key}` is not supported \
-                 (fetcher.divergence.netrc-strict-parse)"
-            );
+            return Err(NetrcParseError::QuotedValue { key });
         }
         Ok(tok)
     }
@@ -1144,28 +1228,35 @@ fn parse_netrc(contents: &str) -> anyhow::Result<Vec<NetrcEntry>> {
         let tok = unquoted_keyword(tok)?;
         // Keyword recognition is case-insensitive like the oracle's
         // `curl_strequal`; the values consumed below stay verbatim.
+        // The bound `key` is the CANONICAL literal, never the input
+        // spelling — it is the only keyword text errors may carry.
         match tok.to_ascii_lowercase().as_str() {
             "machine" => {
                 let name = tokens
                     .next()
                     .map(unquoted_keyword)
                     .transpose()?
-                    .context("netrc: `machine` is missing its host name")?;
+                    .ok_or(NetrcParseError::MachineMissingName)?;
                 entries.push(NetrcEntry {
                     machine: Some(name.to_owned()),
                     ..NetrcEntry::default()
                 });
             }
             "default" => entries.push(NetrcEntry::default()),
-            key @ ("login" | "password" | "account") => {
+            lowered @ ("login" | "password" | "account") => {
+                let key: &'static str = match lowered {
+                    "login" => "login",
+                    "password" => "password",
+                    _ => "account",
+                };
                 let value = tokens
                     .next()
                     .map(|t| unquoted_value(key, t))
                     .transpose()?
-                    .with_context(|| format!("netrc: `{key}` is missing its value"))?;
-                let entry = entries.last_mut().with_context(|| {
-                    format!("netrc: `{key}` before any `machine`/`default` entry")
-                })?;
+                    .ok_or(NetrcParseError::MissingValue { key })?;
+                let entry = entries
+                    .last_mut()
+                    .ok_or(NetrcParseError::CredentialBeforeEntry { key })?;
                 match key {
                     "login" => entry.login = Some(value.to_owned()),
                     "password" => entry.password = Some(value.to_owned()),
@@ -1174,15 +1265,8 @@ fn parse_netrc(contents: &str) -> anyhow::Result<Vec<NetrcEntry>> {
                     _ => {}
                 }
             }
-            "macdef" => anyhow::bail!(
-                "netrc: `macdef` is not supported — its body ends at a blank line, \
-                 which a whitespace tokenizer cannot see \
-                 (fetcher.divergence.netrc-strict-parse)"
-            ),
-            _ => anyhow::bail!(
-                "netrc: unrecognized token {tok:?} \
-                 (fetcher.divergence.netrc-strict-parse)"
-            ),
+            "macdef" => return Err(NetrcParseError::Macdef),
+            _ => return Err(NetrcParseError::Unrecognized(TokenSummary::from(tok))),
         }
     }
     Ok(entries)
@@ -1483,7 +1567,7 @@ mod tests {
         for (contents, needle) in [
             (
                 "machine a.example port 8080 login u password p",
-                "unrecognized token \"port\"",
+                "unrecognized token in keyword position (bare token, 4 bytes)",
             ),
             ("macdef init\nlogin u password p", "macdef"),
             (
@@ -1492,7 +1576,7 @@ mod tests {
             ),
             (
                 "\"machine\" a.example login u password p",
-                "quoted token \"\\\"machine\\\"\"",
+                "quoted token in keyword position (quoted token, 9 bytes)",
             ),
             ("machine a.example login", "`login` is missing its value"),
             (
@@ -1562,7 +1646,6 @@ mod tests {
     /// (PermanentForCandidate context, tenant- and operator-visible),
     /// so a value-position token — which may BE a credential — is
     /// never interpolated; the message names the keyword instead.
-    /// Keyword/machine-name positions still echo (typo diagnosis).
     // r[verify fetcher.divergence.netrc-strict-parse]
     #[test]
     fn netrc_quoted_value_error_never_echoes_the_credential() {
@@ -1573,6 +1656,77 @@ mod tests {
             "credential bytes leaked into the parse error: {msg}"
         );
         assert!(msg.contains("quoted value for `password`"), "{msg}");
+    }
+
+    /// TOTAL no-echo: one fixture per [`NetrcParseError`] variant
+    /// (the `variant_name` match is exhaustive — adding an arm fails
+    /// compilation here, forcing a fixture row whose payload type is
+    /// reviewed), each planting a credential-shaped sentinel at the
+    /// position the error reports. No variant may carry input bytes:
+    /// the round-16 keyword-position echo carve-out is REVERSED —
+    /// build-failure logs reach every tenant of the pool, and a
+    /// malformed netrc can land a credential in ANY position.
+    /// Diagnosis keeps position + length + shape, never bytes.
+    // r[verify fetcher.divergence.netrc-strict-parse]
+    #[test]
+    fn netrc_parse_errors_never_echo_input_in_any_position() {
+        fn variant_name(e: &NetrcParseError) -> &'static str {
+            match e {
+                NetrcParseError::QuotedKeyword(_) => "QuotedKeyword",
+                NetrcParseError::QuotedValue { .. } => "QuotedValue",
+                NetrcParseError::MachineMissingName => "MachineMissingName",
+                NetrcParseError::MissingValue { .. } => "MissingValue",
+                NetrcParseError::CredentialBeforeEntry { .. } => "CredentialBeforeEntry",
+                NetrcParseError::Macdef => "Macdef",
+                NetrcParseError::Unrecognized(_) => "Unrecognized",
+            }
+        }
+        const SENTINEL: &str = "sw0rdf1shSENTINEL";
+        let table: &[(&str, String)] = &[
+            ("QuotedKeyword", format!("\"{SENTINEL}\" a.example")),
+            (
+                "QuotedValue",
+                format!("machine a.example password \"{SENTINEL}\""),
+            ),
+            ("MachineMissingName", "machine".to_owned()),
+            (
+                "MissingValue",
+                format!("machine {SENTINEL}.example password"),
+            ),
+            ("CredentialBeforeEntry", format!("password {SENTINEL}")),
+            ("Macdef", format!("macdef {SENTINEL}")),
+            (
+                "Unrecognized",
+                format!("machine a.example login u password p {SENTINEL}"),
+            ),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (expect_variant, contents) in table {
+            let err = parse_netrc(contents).unwrap_err();
+            assert_eq!(
+                variant_name(&err),
+                *expect_variant,
+                "fixture routed to the wrong arm for {contents:?}"
+            );
+            let msg = format!("{err:#} / {err:?}");
+            assert!(
+                !msg.contains(SENTINEL),
+                "{expect_variant}: input bytes leaked (Display or Debug): {msg}"
+            );
+            seen.insert(*expect_variant);
+        }
+        // Every variant the exhaustive match knows about has a row.
+        for v in [
+            "QuotedKeyword",
+            "QuotedValue",
+            "MachineMissingName",
+            "MissingValue",
+            "CredentialBeforeEntry",
+            "Macdef",
+            "Unrecognized",
+        ] {
+            assert!(seen.contains(v), "no fixture exercises {v}");
+        }
     }
 
     /// All-candidates-skipped arm: an s3 origin with no mirrors still
