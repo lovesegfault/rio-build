@@ -185,7 +185,7 @@ impl FetchurlParams {
     /// tenant-controlled (the derivation's `url`). Credential
     /// resolution consumes the provenance — there is no plain URL
     /// list to flatten it away.
-    // r[impl fetcher.mirrors.hashed+2]
+    // r[impl fetcher.mirrors.hashed+3]
     pub fn candidates(&self) -> Vec<Candidate> {
         let mut candidates = Vec::new();
         if !self.hash_algo.is_empty() && !self.hash_b16.is_empty() {
@@ -1420,7 +1420,7 @@ mod tests {
     /// Candidate order AND provenance: mirrors first (tagged Mirror),
     /// origin last (tagged Origin) — the tags are what the credential
     /// scope keys on, so they are pinned alongside the order.
-    // r[verify fetcher.mirrors.hashed+2]
+    // r[verify fetcher.mirrors.hashed+3]
     // r[verify fetcher.fetchurl.netrc-origin-scope]
     #[test]
     fn mirrors_are_tried_before_origin_and_origin_is_last() {
