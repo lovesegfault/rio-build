@@ -5233,6 +5233,143 @@ async fn test_failover_recovery_records_closure_hole_for_dropped_unproduced_term
     Ok(())
 }
 
+/// Round-17 merged_bug_024 (recovery tier): for a TRIGGERED parent the
+/// recovery stamp must record ALL dropped terminal children — produced
+/// (`completed`/`skipped`) included — and a parent restored with the
+/// watched flag is itself a trigger. Pre-fix the stamp recorded only
+/// un-produced dropped children, so a watched parent whose dropped
+/// children were ALL produced recovered with its old witness intact and
+/// a heal re-supplying just that older set re-armed it over a child set
+/// missing the produced-but-dropped children (the all-produced-dropped
+/// live-voucher laundering). Also pins gate-before-stamp disjointness:
+/// the produced-children gate's clear set and the recovery stamp set
+/// share no parent — an un-watched all-produced live-vouched parent is
+/// cleared and NOT stamped, in the same recovery that stamps the
+/// watched one.
+#[tokio::test]
+async fn test_recovery_witness_covers_produced_dropped_children_for_watched_parents() -> TestResult
+{
+    let b2 = Uuid::new_v4(); // full-merge owner — cancelled at failover
+    let b_live = Uuid::new_v4(); // live build co-owning everything
+    let f = RecoveryFixture::run(async |handle, pool| {
+        // W (watched) → {C_prod}; G (gate candidate) → {C_g}.
+        merge_dag(
+            &handle,
+            b2,
+            vec![
+                make_node("mb24-w"),
+                make_node("mb24-cprod"),
+                make_node("mb24-g"),
+                make_node("mb24-cg"),
+            ],
+            vec![
+                make_test_edge("mb24-w", "mb24-cprod"),
+                make_test_edge("mb24-g", "mb24-cg"),
+            ],
+            false,
+        )
+        .await?;
+        // The live build co-owns parents AND children: the produced
+        // children are live-vouched for the gate, and the parents stay
+        // loadable.
+        merge_dag(
+            &handle,
+            b_live,
+            vec![
+                make_node("mb24-w"),
+                make_node("mb24-cprod"),
+                make_node("mb24-g"),
+                make_node("mb24-cg"),
+            ],
+            vec![
+                make_test_edge("mb24-w", "mb24-cprod"),
+                make_test_edge("mb24-g", "mb24-cg"),
+            ],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        // Backdate: both children PRODUCED (their edges drop at the
+        // recovery load); both parents carry restored topdown_pruned;
+        // W additionally carries the watched flag with an OLD witness
+        // row for a child whose derivation row no longer exists (the
+        // orphan-GC'd shape) — staged through the same paired-writer
+        // invariant the production stamp uses (flag ⇔ side rows).
+        sqlx::query(
+            "UPDATE derivations SET status = 'completed' \
+             WHERE drv_hash IN ('mb24-cprod', 'mb24-cg')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "UPDATE derivations SET status = 'substituting', topdown_pruned = true \
+             WHERE drv_hash IN ('mb24-w', 'mb24-g')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("UPDATE derivations SET closure_hole = true WHERE drv_hash = 'mb24-w'")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO derivation_closure_missing (drv_hash, missing_child) \
+             VALUES ('mb24-w', 'mb24-gone-old')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("UPDATE builds SET status = 'cancelled' WHERE build_id = $1")
+            .bind(b2)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // W: watched flag restored, witness EXTENDED with the produced
+    // dropped child — cumulative since last whole.
+    let w = expect_drv(&handle, "mb24-w").await;
+    assert!(w.closure_hole, "watched flag survives recovery");
+    assert_eq!(
+        w.closure_missing_count, 2,
+        "the witness covers the old recorded child AND the produced \
+         dropped child (pre-fix: the old child only)"
+    );
+    assert!(
+        w.topdown_pruned,
+        "the watched parent is vetoed at the gate's candidate \
+         collection — its mark is kept"
+    );
+    // The extension is durable (the additive paired writer appended the
+    // produced child alongside the old row).
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT missing_child FROM derivation_closure_missing \
+         WHERE drv_hash = 'mb24-w' ORDER BY missing_child",
+    )
+    .fetch_all(&f.db.pool)
+    .await?;
+    assert_eq!(
+        rows.iter().map(|(c,)| c.as_str()).collect::<Vec<_>>(),
+        vec!["mb24-cprod", "mb24-gone-old"],
+        "persisted witness rows: old + produced-dropped"
+    );
+
+    // G: gate-cleared and NOT stamped — the gate's clear set and the
+    // stamp set are disjoint (gate-before-stamp ordering pinned).
+    let g = expect_drv(&handle, "mb24-g").await;
+    assert!(
+        !g.topdown_pruned,
+        "un-watched all-produced live-vouched parent is gate-cleared"
+    );
+    assert!(
+        !g.closure_hole,
+        "the gate-cleared parent is NOT stamped by the recovery \
+         witness pass (disjoint sets)"
+    );
+    assert_eq!(g.closure_missing_count, 0);
+    Ok(())
+}
+
 /// Authoritative inline drv_content (content-bound hook fallback) must
 /// survive scheduler failover: the bytes are the only copy of the
 /// derivation anywhere, so the recovered node's dispatch must carry

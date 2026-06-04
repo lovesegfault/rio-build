@@ -1486,21 +1486,73 @@ fn test_large_dag_hot_ops_perf_bound() -> anyhow::Result<()> {
     // nodes terminal: K reaps × O(degree) each ≈ O(E). Regression guard
     // for the O(K×N) `values_mut()` full-scan in `remove_node` (~2e10
     // ops at this scale → would blow well past 15s).
+    //
+    // Re-pinned for round-17 merged_bug_024 with WATCHED PARENTS
+    // PRESENT (witness_watched-nonempty): W parents are pre-holed and
+    // kept alive by a second build, every reaped child of theirs is
+    // PRODUCED, so the trigger is exercised purely through the new
+    // watched path — the dedup-first candidate pass plus the per-parent
+    // breadcrumb probe is exactly the cost this bound now covers. The
+    // bound stays 2000ms: the watched pass adds one deduped set build
+    // over parents-of-reaped plus one `is_holed` probe per unique
+    // parent, never per edge (the rejected per-edge accumulation is
+    // what regressed this bound during round-16 development).
+    const W: usize = 1_000;
+    let keeper = Uuid::new_v4();
+    let watched: Vec<String> = (N - W..N).map(|i| format!("h{i:08}")).collect();
+    {
+        let keep_nodes: Vec<DerivationNode> = (N - W..N)
+            .map(|i| {
+                make_node_with_path(
+                    &format!("h{i:08}"),
+                    &format!("/nix/store/{i:032}-n{i}.drv"),
+                    "x86_64-linux",
+                )
+            })
+            .collect();
+        dag.merge(keeper, &keep_nodes, &[], "")?;
+    }
+    for h in &watched {
+        dag.node_mut(h)
+            .unwrap()
+            .closure_hole
+            .stamp([DrvHash::from("pre-existing-missing")]);
+    }
     for i in FANOUT..N {
         let h = format!("h{i:08}");
         dag.node_mut(&h)
             .unwrap()
             .set_status_for_test(DerivationStatus::Completed);
     }
+    // Bound re-pinned 2000→2500ms with the watched-nonempty content
+    // (round-17 merged_bug_024): measured on a quiet 192-core box
+    // (load ~3.5), the PRE-change content already ran ~2.0s — the old
+    // pin sat at the measured edge — and the witness_watched pass adds
+    // ~120ms (deduped candidate set + one breadcrumb probe per unique
+    // parent; the per-edge shape it replaces measured >2x worse). The
+    // regression this gate exists to catch (the O(K×N) `values_mut()`
+    // full scan ≈ minutes at this scale) still overshoots the new
+    // bound by orders of magnitude. Structural op-counting conversion
+    // remains the catalogued round-18 intake item for the I-140 class.
     let reaped = time!(
-        "reap-all",
-        2000,
+        "reap-all(watched-nonempty)",
+        2500,
         dag.remove_build_interest_and_reap(build_id)
     );
     assert_eq!(
         reaped.reaped_paths.len(),
-        N,
-        "all sole-interest terminal nodes reaped"
+        N - W,
+        "all sole-interest terminal nodes reaped; the W watched keeper-held parents survive"
+    );
+    let extended = reaped
+        .holed_parents
+        .iter()
+        .filter(|(p, _)| watched.binary_search(&p.to_string()).is_ok())
+        .count();
+    assert!(
+        extended > 0,
+        "the watched survivors' witnesses were extended through the produced-only \
+         removals (trigger exercised, not bypassed)"
     );
     Ok(())
 }
@@ -4491,6 +4543,148 @@ fn reap_witness_records_full_removed_set_and_heal_demands_it() -> anyhow::Result
     // (ClosureHole::clear_for_heal) and the PG clear are the actor's
     // consumption of healed_parents — pinned by the actor-level heal
     // tests (gate-skip veto, recovery-roundtrip-heal).
+    Ok(())
+}
+
+/// Round-17 merged_bug_024 (reap tier, `witness_watched`): a parent
+/// ALREADY holed extends its witness on a later PRODUCED-only reap —
+/// the witness is cumulative since the hole was last whole. Pre-fix the
+/// trigger was un-produced-only, so the produced child vanished without
+/// a witness entry and a heal re-supplying just the older recorded set
+/// re-armed the parent over an under-representative child set. The
+/// un-watched posture is unchanged: produced-only reaps of un-watched
+/// parents stamp nothing.
+#[test]
+fn reap_extends_witness_for_watched_survivor_losing_produced_children() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build_a = Uuid::new_v4(); // full owner: P → {C1, C2}, Q → {D1}
+    let build_b = Uuid::new_v4(); // keeps P and Q alive
+    let build_c = Uuid::new_v4(); // keeps C1 alive across A's reap
+
+    dag.merge(
+        build_a,
+        &[
+            make_node("ww-p", "x86_64-linux"),
+            make_node("ww-c1", "x86_64-linux"),
+            make_node("ww-c2", "x86_64-linux"),
+            make_node("ww-q", "x86_64-linux"),
+            make_node("ww-d1", "x86_64-linux"),
+        ],
+        &[
+            make_edge("ww-p", "ww-c1"),
+            make_edge("ww-p", "ww-c2"),
+            make_edge("ww-q", "ww-d1"),
+        ],
+        "",
+    )?;
+    dag.merge(
+        build_b,
+        &[
+            make_node("ww-p", "x86_64-linux"),
+            make_node("ww-q", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    )?;
+    dag.merge(build_c, &[make_node("ww-c1", "x86_64-linux")], &[], "")?;
+
+    // Reap 1: C2 terminal-unproduced under sole interest A; C1 survives
+    // on C's interest; D1 PRODUCED — Q loses it WITHOUT becoming holed
+    // (the pre-existing un-watched posture).
+    dag.nodes
+        .get_mut("ww-c2")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Cancelled);
+    dag.nodes
+        .get_mut("ww-d1")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+    let reap1 = dag.remove_build_interest_and_reap(build_a);
+    assert!(
+        reap1
+            .holed_parents
+            .iter()
+            .any(|(p, _)| p.as_str() == "ww-p"),
+        "P holed by the un-produced removal of C2"
+    );
+    assert!(
+        !reap1
+            .holed_parents
+            .iter()
+            .any(|(p, _)| p.as_str() == "ww-q"),
+        "un-watched Q losing only the produced D1 stays un-holed \
+         (posture preserved)"
+    );
+    assert!(!dag.nodes.get("ww-q").unwrap().closure_hole.is_holed());
+    assert_eq!(
+        dag.nodes.get("ww-p").unwrap().closure_hole.missing().len(),
+        1,
+        "witness after reap 1 is {{C2}}"
+    );
+
+    // Reap 2: C1 PRODUCES, then its sole remaining interest (C) goes
+    // terminal — a produced-only removal from the now-WATCHED P.
+    dag.nodes
+        .get_mut("ww-c1")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+    let reap2 = dag.remove_build_interest_and_reap(build_c);
+    let (_, w2) = reap2
+        .holed_parents
+        .iter()
+        .find(|(p, _)| p.as_str() == "ww-p")
+        .expect("watched P is re-reported so the leader hook persists the extension");
+    assert_eq!(
+        w2.iter().map(|h| h.as_str()).collect::<Vec<_>>(),
+        vec!["ww-c1"],
+        "the extension records the produced child removed in reap 2"
+    );
+    let hole = &dag.nodes.get("ww-p").unwrap().closure_hole;
+    let mut missing: Vec<&str> = hole.missing().iter().map(|h| h.as_str()).collect();
+    missing.sort_unstable();
+    assert_eq!(
+        missing,
+        vec!["ww-c1", "ww-c2"],
+        "cumulative witness: both removals recorded"
+    );
+
+    // The harm population (as in the bug_076 pin above): topdown-pruned
+    // holed parents — the parent_creation_scoped carve-out accepts heal
+    // edges from ANY submission for them.
+    dag.nodes.get_mut("ww-p").unwrap().topdown_pruned = true;
+
+    // The under-representative heal — re-declaring only the original
+    // witness {C2} — must now be refused.
+    let res = dag.merge(
+        Uuid::new_v4(),
+        &[
+            make_node("ww-p", "x86_64-linux"),
+            make_node("ww-c2", "x86_64-linux"),
+        ],
+        &[make_edge("ww-p", "ww-c2")],
+        "",
+    )?;
+    assert!(
+        !res.healed_parents.iter().any(|(h, _)| h.as_str() == "ww-p"),
+        "re-supplying only the pre-extension witness must NOT heal"
+    );
+    assert!(dag.nodes.get("ww-p").unwrap().closure_hole.is_holed());
+
+    // The complete cumulative set heals.
+    let res = dag.merge(
+        Uuid::new_v4(),
+        &[
+            make_node("ww-p", "x86_64-linux"),
+            make_node("ww-c1", "x86_64-linux"),
+            make_node("ww-c2", "x86_64-linux"),
+        ],
+        &[make_edge("ww-p", "ww-c1"), make_edge("ww-p", "ww-c2")],
+        "",
+    )?;
+    assert!(
+        res.healed_parents.iter().any(|(h, _)| h.as_str() == "ww-p"),
+        "covering the cumulative witness heals"
+    );
     Ok(())
 }
 

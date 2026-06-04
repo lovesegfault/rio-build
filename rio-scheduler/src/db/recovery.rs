@@ -323,6 +323,11 @@ impl SchedulerDb {
     /// marked parent to the bounded resubmit-directing fail-fast, so
     /// over-recording errs conservative; failing to record it is what
     /// let a surviving sibling's later completion launder the mark.
+    ///
+    /// Since round-17 merged_bug_024 this query feeds the TRIGGER only;
+    /// the witness CONTENT for triggered parents comes from
+    /// [`Self::load_dropped_terminal_children`] (all five terminal
+    /// statuses, produced included — cumulative witness contract).
     pub(crate) async fn load_parents_with_unproduced_terminal_children(
         &self,
         derivation_ids: &[Uuid],
@@ -343,6 +348,53 @@ impl SchedulerDb {
             "#,
         )
         .bind(derivation_ids)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// All dropped TERMINAL children — every status in
+    /// [`terminal_status_sql!`], produced (`'completed'`/`'skipped'`)
+    /// and un-produced alike — for an already-TRIGGERED parent set
+    /// (round-17 merged_bug_024, recovery tier).
+    ///
+    /// The caller computes the trigger (a parent with ≥1 un-produced
+    /// terminal dropped child, via
+    /// [`Self::load_parents_with_unproduced_terminal_children`], or a
+    /// parent restored with the watched `closure_hole` flag) and then
+    /// stamps THIS set: the witness contract is cumulative since the
+    /// hole was last whole, so for a triggered parent the recovery
+    /// truncation must record every dropped terminal child. Recording
+    /// only the un-produced subset let a watched parent whose dropped
+    /// children were ALL produced recover with its old witness intact —
+    /// a heal re-supplying just that older set then re-armed the parent
+    /// over a child set missing the produced-but-dropped children
+    /// (the all-produced-dropped live-voucher laundering; the recovery
+    /// twin of the reap-tier `witness_watched` extension).
+    ///
+    /// Same conservative posture as the un-produced sibling query:
+    /// within-TTL `'poisoned'` children match here yet keep their
+    /// edges — over-recording is inert (the heal coverage check just
+    /// demands their re-supply, which their loaded edges satisfy).
+    /// No live-build scoping, for the sibling query's documented
+    /// reason: this records a fact about the rows, not a condemnation.
+    pub(crate) async fn load_dropped_terminal_children(
+        &self,
+        parent_ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+        if parent_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // See terminal_status_sql! for why the status set isn't a bind
+        // param.
+        sqlx::query_as(terminal_status_sql!(
+            "
+            SELECT DISTINCT e.parent_id, c.drv_hash
+            FROM derivation_edges e
+            JOIN derivations c ON c.derivation_id = e.child_id
+            WHERE e.parent_id = ANY($1)
+              AND c.status IN "
+        ))
+        .bind(parent_ids)
         .fetch_all(&self.pool)
         .await
     }

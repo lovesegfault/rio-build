@@ -2379,8 +2379,11 @@ impl DerivationDag {
     /// re-evaluation.
     ///
     /// Survivors that lost at least one UN-PRODUCED child (status not
-    /// Completed/Skipped at reap time) additionally get the in-memory
-    /// `closure_hole` breadcrumb set, and are reported back as
+    /// Completed/Skipped at reap time) — and survivors ALREADY carrying
+    /// the breadcrumb that lost ANY child, produced included
+    /// (round-17 merged_bug_024: the witness is cumulative since the
+    /// hole was last whole) — additionally get the in-memory
+    /// `closure_hole` breadcrumb set/extended, and are reported back as
     /// [`ReapOutcome::holed_parents`]: their remaining DAG children no
     /// longer represent their pruned input closure, so the actor's
     /// children-keyed `topdown_pruned` verdicts must not trust the
@@ -2429,8 +2432,10 @@ impl DerivationDag {
         let mut surviving_parents: BTreeSet<DrvHash> = BTreeSet::new();
         // r[impl sched.merge.substitute-topdown+14]
         // Hole trigger: at least one UN-PRODUCED child removed (a
-        // produced-only reap leaves outputs in the store — the
-        // pre-existing posture). Witness CONTENT: the FULL removed set,
+        // produced-only reap of an UN-watched parent leaves outputs in
+        // the store — the pre-existing posture), or the parent is
+        // already watched (`witness_watched` below — any removal
+        // extends a live witness). Witness CONTENT: the FULL removed set,
         // produced and un-produced alike (round-16 bug_076). The heal's
         // coverage check is `missing ⊆ re-declared`; recording only the
         // un-produced subset let ANY submission re-declare just those
@@ -2446,16 +2451,54 @@ impl DerivationDag {
         // designed no-recreation top-up for pruned roots).
         //
         // PERF SHAPE (the I-140 reap-all bound): the trigger set is
-        // computed FIRST from un-produced removals only, and the
-        // full-set capture runs ONLY for triggered parents. A sole-
-        // build completion reap (every child produced — the 150k-node
-        // hot path) takes the empty-trigger fast path and does exactly
-        // the pre-+14 work; the naive per-edge accumulation regressed
+        // computed FIRST — un-produced removals plus the watched
+        // survivors below — and the full-set capture runs ONLY for
+        // triggered parents. A sole-build completion reap (every child
+        // produced, no watched parents — the 150k-node hot path) takes
+        // the empty-trigger fast path and does, beyond one deduped
+        // breadcrumb lookup per unique surviving parent, exactly the
+        // pre-+14 work; the naive per-edge accumulation regressed
         // reap-all past its 2000ms budget.
+        // r[impl sched.merge.substitute-topdown+14]
+        // witness_watched (round-17 merged_bug_024, reap tier): a parent
+        // ALREADY carrying the breadcrumb extends its witness on ANY
+        // child removal — produced children included. The witness
+        // contract is cumulative since the hole was last whole: the
+        // heal's coverage check is `missing ⊆ re-declared`, so a
+        // produced child reaped from a watched parent and left OFF the
+        // witness lets a heal that re-supplies only the older recorded
+        // set re-arm the parent over an under-representative child set
+        // (the reap-tier twin of the recovery-side all-produced
+        // laundering). Un-watched parents losing only produced children
+        // keep the pre-existing posture: outputs are in the store, no
+        // hole exists, nothing to extend.
+        //
+        // Cost shape: dedup-first, single pass — candidate parents are
+        // deduped (unordered HashSet; order is irrelevant pre-trigger)
+        // in the SAME parents-map walk that builds the un-produced
+        // trigger, and the breadcrumb probe runs once per unique
+        // candidate, never per edge. The mirrored watched-parent index
+        // was rejected on desync risk; the per-edge accumulation was
+        // rejected on the measured I-140 regression (see PERF SHAPE
+        // above).
         let mut hole_trigger: BTreeSet<DrvHash> = BTreeSet::new();
+        let mut watched_candidates: HashSet<DrvHash> = HashSet::new();
         for (hash, _, unproduced) in &to_reap {
-            if *unproduced && let Some(ps) = self.parents.get(hash) {
-                hole_trigger.extend(ps.iter().cloned());
+            if let Some(ps) = self.parents.get(hash) {
+                if *unproduced {
+                    hole_trigger.extend(ps.iter().cloned());
+                }
+                watched_candidates.extend(ps.iter().cloned());
+            }
+        }
+        for p in watched_candidates {
+            if !hole_trigger.contains(&p)
+                && self
+                    .nodes
+                    .get(&p)
+                    .is_some_and(|s| s.closure_hole.is_holed())
+            {
+                hole_trigger.insert(p);
             }
         }
         let mut removed_children: std::collections::BTreeMap<DrvHash, Vec<DrvHash>> =

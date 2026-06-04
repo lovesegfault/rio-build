@@ -501,11 +501,11 @@ impl DagActor {
 
         // r[impl sched.merge.substitute-topdown+14]
         // Closure-hole stamp for the edges this load dropped to
-        // UN-PRODUCED terminal children (`poisoned`/`dependency_failed`/
-        // `cancelled`): the recovery-side analogue of the reap, which
-        // breadcrumbs every removal of an un-produced child from a
-        // parent's child set. The edge load above dropped those edges,
-        // so the parent recovers with a silently truncated child set
+        // terminal children: the recovery-side analogue of the reap.
+        // The TRIGGER is computed below (un-produced drop, or restored
+        // watched flag); the un-produced query here feeds the trigger's
+        // first half. The edge load above dropped those edges, so the
+        // parent recovers with a silently truncated child set
         // (NOT necessarily childless — non-terminal siblings keep their
         // edges). The produced-children gate's refusal above is not
         // enough on its own: its evidence never reaches the in-memory
@@ -522,9 +522,46 @@ impl DagActor {
             .db
             .load_parents_with_unproduced_terminal_children(&drv_ids)
             .await?;
+        // r[impl sched.merge.substitute-topdown+14]
+        // TRIGGER (round-17 merged_bug_024, recovery tier): a parent
+        // with ≥1 un-produced terminal dropped child (above), OR a
+        // parent restored with the watched flag — its persisted
+        // breadcrumb means the cumulative witness contract is live, and
+        // the edge load drops its produced terminal children all the
+        // same. CONTENT for triggered parents: ALL dropped terminal
+        // children (all five terminal statuses), not the un-produced
+        // subset — recording only the un-produced children let a
+        // watched parent whose dropped children were ALL produced
+        // recover with its old witness intact, so a heal re-supplying
+        // just that older set re-armed it over a child set missing the
+        // produced-but-dropped children (the all-produced-dropped
+        // live-voucher laundering). Gate-before-stamp ordering: the
+        // produced-children gate above ran FIRST and is disjoint from
+        // this stamp by construction — its candidates are un-watched
+        // (holed rows are vetoed at candidate collection) and
+        // all-produced (an un-produced dropped child fails its
+        // bool_and), so no parent is both gate-cleared and stamped.
+        let mut triggered: std::collections::BTreeSet<Uuid> = std::collections::BTreeSet::new();
+        for (parent_id, _) in &unproduced_dropped {
+            triggered.insert(*parent_id);
+        }
+        for (id, hash) in &id_to_hash {
+            if self
+                .dag
+                .node(hash)
+                .is_some_and(|s| s.closure_hole.is_holed())
+            {
+                triggered.insert(*id);
+            }
+        }
+        let triggered_ids: Vec<Uuid> = triggered.iter().copied().collect();
+        let dropped_terminal = self
+            .db
+            .load_dropped_terminal_children(&triggered_ids)
+            .await?;
         let mut holed_map: std::collections::BTreeMap<String, Vec<String>> =
             std::collections::BTreeMap::new();
-        for (parent_id, child_hash) in unproduced_dropped {
+        for (parent_id, child_hash) in dropped_terminal {
             let Some(hash) = id_to_hash.get(&parent_id) else {
                 continue;
             };
