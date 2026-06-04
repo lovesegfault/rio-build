@@ -607,35 +607,42 @@ mod tests {
     }
 }
 
-/// C2 formal-delta proptest plane 1: the wedge evidence laws over
-/// arbitrary open-attempt views — kinded (build only), attributed
-/// (ledger source_node only), deadline-true (expired = past
-/// deadline+grace, deadline known), first-observation anchored, and
-/// systemic-guarded. Pinned against a mirror specification.
+/// C2 formal-delta proptest plane (bughunt-2 slot 5): the wedge
+/// verdict laws over 2-5-tick TRAJECTORIES, checked against an
+/// independent set-algebra oracle — NOT a mirror of the
+/// implementation (the retired single-tick mirror restated the fold
+/// and would have been wrong together with it). The oracle computes,
+/// from the raw trajectory alone: which (node, drv) anchors are live
+/// in each tick's window (first-observation anchored, eviction- and
+/// drain-aware), and from that the expected verdict populations.
 // r[verify ctrl.nodeclaim.wedge-two-axis+2]
 #[cfg(test)]
 mod proptests {
     use proptest::prelude::*;
-    fn no_reaps() -> std::collections::BTreeSet<String> {
-        std::collections::BTreeSet::new()
-    }
-
     use rio_proto::types::OpenAttempt;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
 
-    const DRVS: [&str; 5] = ["d0", "d1", "d2", "d3", "d4"];
-    const NODES: [&str; 5] = ["", "n0", "n1", "n2", "n3"];
+    const DRVS: [&str; 3] = ["d0", "d1", "d2"];
+    const NODES: [&str; 4] = ["", "n0", "n1", "n2"];
+
+    /// One trajectory tick: the observed view (None = RPC failure),
+    /// plus the backing nodes reaped since the last tick.
+    #[derive(Debug, Clone)]
+    struct Tick {
+        view: Option<Vec<OpenAttempt>>,
+        reaped: BTreeSet<String>,
+    }
 
     fn arb_attempt() -> impl Strategy<Value = OpenAttempt> {
         (
             proptest::sample::select(&DRVS[..]),
             proptest::sample::select(&NODES[..]),
             prop_oneof![
-                Just(rio_proto::types::AttemptKind::Build as i32),
-                Just(rio_proto::types::AttemptKind::Materialization as i32),
-                Just(0i32),
+                3 => Just(rio_proto::types::AttemptKind::Build as i32),
+                1 => Just(rio_proto::types::AttemptKind::Materialization as i32),
+                1 => Just(0i32),
             ],
             prop_oneof![Just(0u64), Just(10u64)],
             prop_oneof![Just(0u64), Just(5u64), Just(100u64)],
@@ -650,108 +657,217 @@ mod proptests {
             })
     }
 
-    /// Mirror spec of one observation pass: which (node, drv) pairs are
-    /// evidence, and what the attributed fleet is.
-    fn mirror(attempts: &[OpenAttempt]) -> (HashMap<String, HashSet<String>>, HashSet<String>) {
-        let mut evidence: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut fleet = HashSet::new();
-        for a in attempts {
-            if a.attempt_kind != rio_proto::types::AttemptKind::Build as i32
-                || a.source_node.is_empty()
-            {
-                continue;
+    fn arb_tick() -> impl Strategy<Value = Tick> {
+        (
+            prop_oneof![
+                4 => proptest::collection::vec(arb_attempt(), 0..=8).prop_map(Some),
+                1 => Just(None),
+            ],
+            proptest::collection::btree_set(
+                proptest::sample::select(&NODES[1..]).prop_map(str::to_owned),
+                0..=2,
+            ),
+        )
+            .prop_map(|(view, reaped)| Tick { view, reaped })
+    }
+
+    /// Independent oracle state: live anchors per (node, drv) and the
+    /// expected marked set, evolved by SET ALGEBRA over the trajectory
+    /// (window arithmetic, first-anchor keep, eviction removal,
+    /// drain-on-systemic), never by calling the implementation.
+    #[derive(Default)]
+    struct Oracle {
+        anchors: BTreeMap<(String, String), f64>,
+        marked: BTreeSet<String>,
+    }
+
+    enum Expect {
+        Skipped,
+        PerNode(Vec<String>),
+        Systemic { affected: usize, of: usize },
+    }
+
+    impl Oracle {
+        fn step(&mut self, tick: &Tick, now: f64) -> Expect {
+            for n in &tick.reaped {
+                self.anchors.retain(|(node, _), _| node != n);
+                self.marked.remove(n);
             }
-            fleet.insert(a.source_node.clone());
-            if a.deadline_secs == 0
-                || a.assigned_at_age_secs <= a.deadline_secs + WEDGE_DEADLINE_GRACE_SECS
-            {
-                continue;
+            let Some(view) = &tick.view else {
+                return Expect::Skipped;
+            };
+            let mut fleet: BTreeSet<String> = BTreeSet::new();
+            for a in view {
+                if a.attempt_kind != rio_proto::types::AttemptKind::Build as i32
+                    || a.source_node.is_empty()
+                {
+                    continue;
+                }
+                fleet.insert(a.source_node.clone());
+                if a.deadline_secs == 0
+                    || a.assigned_at_age_secs <= a.deadline_secs + WEDGE_DEADLINE_GRACE_SECS
+                {
+                    continue;
+                }
+                self.anchors
+                    .entry((a.source_node.clone(), a.intent_id.clone()))
+                    .or_insert(now);
             }
-            evidence
-                .entry(a.source_node.clone())
-                .or_default()
-                .insert(a.intent_id.clone());
+            self.anchors
+                .retain(|_, t| now - *t <= WEDGE_CLUSTER_WINDOW_SECS);
+            let mut per_node: BTreeMap<&str, usize> = BTreeMap::new();
+            for (node, _) in self.anchors.keys() {
+                *per_node.entry(node.as_str()).or_default() += 1;
+            }
+            let wedged: Vec<String> = per_node
+                .iter()
+                .filter(|(_, c)| **c >= WEDGE_CLUSTER_MIN_DISTINCT_DRVS)
+                .map(|(n, _)| (*n).to_owned())
+                .collect();
+            let evidence_nodes: BTreeSet<&str> =
+                self.anchors.keys().map(|(n, _)| n.as_str()).collect();
+            let population = evidence_nodes
+                .iter()
+                .copied()
+                .chain(fleet.iter().map(String::as_str))
+                .collect::<BTreeSet<_>>()
+                .len();
+            let systemic = wedged.len() >= 2
+                && (wedged.len() as f64 / population as f64) > WEDGE_SYSTEMIC_FRACTION;
+            if systemic {
+                let affected = wedged.len();
+                for n in &wedged {
+                    self.anchors.retain(|(node, _), _| node != n);
+                }
+                self.marked.clear();
+                Expect::Systemic {
+                    affected,
+                    of: population,
+                }
+            } else {
+                self.marked = wedged.iter().cloned().collect();
+                Expect::PerNode(wedged)
+            }
         }
-        (evidence, fleet)
     }
 
     proptest! {
-        /// The single-tick verdict law: wedged = nodes whose evidence
-        /// spans ≥ MIN_DISTINCT drvs; the verdict is Systemic (nothing
-        /// marked) iff ≥2 such nodes cover > the systemic fraction of
-        /// the attributed fleet, else exactly the mirror's node set,
-        /// sorted. Materialization / unattributed / deadline-unknown /
-        /// healthy attempts never contribute.
+        /// Trajectory law: over 2-5 ticks of arbitrary views, RPC
+        /// failures and reaps, the tracker's verdicts match the
+        /// set-algebra oracle tick for tick — populations
+        /// commensurable, drain-on-systemic, eviction honored,
+        /// skip-on-None.
         #[test]
-        fn verdict_matches_mirror(attempts in proptest::collection::vec(arb_attempt(), 0..=10)) {
+        fn trajectory_matches_set_algebra_oracle(
+            ticks in proptest::collection::vec(arb_tick(), 2..=5),
+        ) {
             let mut tracker = WedgeTracker::default();
-            let verdict = tracker.update(Some(&attempts), &no_reaps(), 1_000_000.0);
+            let mut oracle = Oracle::default();
+            let t0 = 1_000_000.0;
+            for (i, tick) in ticks.iter().enumerate() {
+                let now = t0 + (i as f64) * 10.0;
+                let verdict = tracker.update(tick.view.as_deref(), &tick.reaped, now);
+                match (oracle.step(tick, now), verdict) {
+                    (Expect::Skipped, WedgeVerdict::NodeWedged(nodes, _)) => {
+                        prop_assert!(nodes.is_empty(), "tick {i}: skip must mark nothing");
+                    }
+                    (Expect::Skipped, v) => {
+                        return Err(TestCaseError::fail(format!("tick {i}: skip produced {v:?}")));
+                    }
+                    (Expect::PerNode(exp), WedgeVerdict::NodeWedged(nodes, _)) => {
+                        prop_assert_eq!(nodes, exp, "tick {}", i);
+                    }
+                    (Expect::Systemic { affected, of }, WedgeVerdict::Systemic { affected: a, of: o, .. }) => {
+                        prop_assert_eq!(a, affected, "tick {}", i);
+                        prop_assert_eq!(o, of, "tick {}", i);
+                        prop_assert!(a <= o, "tick {i}: incommensurable {a}/{o}");
+                    }
+                    (Expect::PerNode(exp), v) => {
+                        return Err(TestCaseError::fail(format!(
+                            "tick {i}: expected per-node {exp:?}, got {v:?}"
+                        )));
+                    }
+                    (Expect::Systemic { affected, of }, v) => {
+                        return Err(TestCaseError::fail(format!(
+                            "tick {i}: expected systemic {affected}/{of}, got {v:?}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
 
-            let (evidence, fleet) = mirror(&attempts);
-            let mut expected: Vec<String> = evidence
-                .iter()
-                .filter(|(_, drvs)| drvs.len() >= WEDGE_CLUSTER_MIN_DISTINCT_DRVS)
-                .map(|(n, _)| n.clone())
-                .collect();
-            expected.sort();
-
-            let systemic = expected.len() >= 2
-                && !fleet.is_empty()
-                && (expected.len() as f64 / fleet.len() as f64) > WEDGE_SYSTEMIC_FRACTION;
+    /// Kani substitute (rio-controller is [[bin]]-ineligible for the
+    /// kani driver — recorded none-sensible-for-kani per the bug_363
+    /// precedent): EXHAUSTIVE single-tick verdict check over the full
+    /// 8-node bitmask universe at the real constants. Every subset of
+    /// nodes carries 2 expired drvs (wedge-qualifying), every disjoint
+    /// subset is healthy fleet — all 3^8 (node ∈ {qualifying, healthy,
+    /// absent}) combinations, affected ≤ of asserted on every systemic
+    /// verdict and the verdict matching the closed-form expectation.
+    #[test]
+    fn wedge_populations_exhaustive_bounded() {
+        let nodes: Vec<String> = (0..8).map(|i| format!("n{i}")).collect();
+        let mut checked = 0u32;
+        // 3^8 assignments: 0 = absent, 1 = healthy-only, 2 = qualifying.
+        for mask in 0..3u32.pow(8) {
+            let mut view: Vec<OpenAttempt> = Vec::new();
+            let mut expect_wedged: Vec<String> = Vec::new();
+            let mut population: BTreeSet<&str> = BTreeSet::new();
+            let mut m = mask;
+            for n in &nodes {
+                let state = m % 3;
+                m /= 3;
+                match state {
+                    0 => {}
+                    1 => {
+                        view.push(OpenAttempt {
+                            intent_id: "h".into(),
+                            source_node: n.clone(),
+                            attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+                            deadline_secs: 100,
+                            assigned_at_age_secs: 10,
+                            ..Default::default()
+                        });
+                        population.insert(n.as_str());
+                    }
+                    _ => {
+                        for d in ["da", "db"] {
+                            view.push(OpenAttempt {
+                                intent_id: d.into(),
+                                source_node: n.clone(),
+                                attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+                                deadline_secs: 100,
+                                assigned_at_age_secs: 100 + WEDGE_DEADLINE_GRACE_SECS + 5,
+                                ..Default::default()
+                            });
+                        }
+                        expect_wedged.push(n.clone());
+                        population.insert(n.as_str());
+                    }
+                }
+            }
+            expect_wedged.sort();
+            let systemic = expect_wedged.len() >= 2
+                && (expect_wedged.len() as f64 / population.len() as f64) > WEDGE_SYSTEMIC_FRACTION;
+            let mut tracker = WedgeTracker::default();
+            let verdict =
+                tracker.update(Some(&view), &std::collections::BTreeSet::new(), 1_000_000.0);
             match verdict {
                 WedgeVerdict::Systemic { affected, of, .. } => {
-                    prop_assert!(systemic, "Systemic verdict outside the guard condition");
-                    prop_assert_eq!(affected, expected.len());
-                    prop_assert_eq!(of, fleet.len());
+                    assert!(systemic, "mask {mask}: unexpected systemic");
+                    assert!(affected <= of, "mask {mask}: {affected}/{of}");
+                    assert_eq!(affected, expect_wedged.len(), "mask {mask}");
+                    assert_eq!(of, population.len(), "mask {mask}");
                 }
                 WedgeVerdict::NodeWedged(nodes, _) => {
-                    prop_assert!(!systemic, "guard condition met but nodes were marked");
-                    prop_assert_eq!(nodes, expected);
+                    assert!(!systemic, "mask {mask}: expected systemic");
+                    assert_eq!(nodes, expect_wedged, "mask {mask}");
                 }
             }
+            checked += 1;
         }
-
-        /// Idempotence (first-observation anchor): re-observing the
-        /// same view at the same instant changes nothing — a stuck
-        /// attempt re-observed every tick neither slides its window
-        /// nor double-counts.
-        #[test]
-        fn reobservation_is_idempotent(attempts in proptest::collection::vec(arb_attempt(), 0..=10)) {
-            let mut t1 = WedgeTracker::default();
-            let v1 = t1.update(Some(&attempts), &no_reaps(), 1_000_000.0);
-            let v2 = t1.update(Some(&attempts), &no_reaps(), 1_000_000.0);
-            let (n1, n2) = match (v1, v2) {
-                (WedgeVerdict::NodeWedged(a, _), WedgeVerdict::NodeWedged(b, _)) => (a, b),
-                (
-                    WedgeVerdict::Systemic { affected: a, of: oa, .. },
-                    WedgeVerdict::Systemic { affected: b, of: ob, .. },
-                ) => {
-                    prop_assert_eq!(a, b);
-                    prop_assert_eq!(oa, ob);
-                    return Ok(());
-                }
-                (a, b) => return Err(TestCaseError::fail(format!("verdict flipped: {a:?} vs {b:?}"))),
-            };
-            prop_assert_eq!(&n1, &n2);
-        }
-
-        /// Window conservation: every piece of evidence ages out — one
-        /// full window plus a tick after the last observation, an empty
-        /// view yields an empty verdict (nothing wedged forever).
-        #[test]
-        fn evidence_ages_out(attempts in proptest::collection::vec(arb_attempt(), 0..=10)) {
-            let mut tracker = WedgeTracker::default();
-            let _ = tracker.update(Some(&attempts), &no_reaps(), 1_000_000.0);
-            let later = 1_000_000.0 + WEDGE_CLUSTER_WINDOW_SECS + 1.0;
-            match tracker.update(Some(&[]), &no_reaps(), later) {
-                WedgeVerdict::NodeWedged(nodes, _) => prop_assert!(nodes.is_empty()),
-                WedgeVerdict::Systemic { .. } => {
-                    return Err(TestCaseError::fail(
-                        proptest::test_runner::Reason::from("empty view cannot be systemic"),
-                    ));
-                }
-            }
-        }
+        assert_eq!(checked, 3u32.pow(8), "full universe covered");
     }
 }
 

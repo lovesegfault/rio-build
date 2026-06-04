@@ -41,6 +41,9 @@ module ggCalibTerminatingPending {
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
     ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
     ENABLE_RETRY_BACKOFF = false
   ).* from "../spawnCoherence"
 
@@ -235,6 +238,8 @@ module ggCalibTerminatingPending {
       seenOpen' = seenOpen,
       exhausted' = exhausted,
       streak' = streak,
+      ownGatedTicks' = ownGatedTicks,
+      jobPostdatesClose' = jobPostdatesClose,
       pendingClose' = pendingClose,
       obsLive' = obsLive,
       inBackoff' = inBackoff,

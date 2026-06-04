@@ -227,6 +227,7 @@ module nodeclaimLifecycle {
     | VCoverMasked
     | VIdleSpellLost
     | VClearEvidenceDropped
+    | VClearLostOnAckFailure
     | VStaleBinding
 
   // ------------------------------------------------------------------
@@ -267,6 +268,13 @@ module nodeclaimLifecycle {
   /// full tick's ack) vs the as-built discard.
   const ENABLE_CLEARBUF_MACHINERY: bool
   const ENABLE_EVIDENCE_BUFFER: bool
+  /// merged_bug_045 (bughunt-2 slot 5): commit-on-Ack. With the latch
+  /// the buffered clears ship BY READ and the buffer empties ONLY when
+  /// the delivering ack lands; off = the as-built mem::take before the
+  /// RPC (an ack failure on exactly the delivering tick loses the
+  /// batch — the retired 007 residual). Ghost-framed: only meaningful
+  /// under ENABLE_CLEARBUF_MACHINERY ∧ ENABLE_EVIDENCE_BUFFER.
+  const ENABLE_ACK_LATCH: bool
   /// C2 area-E axis pair (bug_285): MACHINERY moves the scheduler-side
   /// binding map + latch; SNAPSHOT_PRESENCE selects the FIXED law
   /// (every full-tick ack carries the snapshot — present-and-empty
@@ -374,6 +382,11 @@ module nodeclaimLifecycle {
   /// Falsified as-built (the discard); holds with
   /// ENABLE_EVIDENCE_BUFFER.
   val iceClearDelivered = not(violations.contains(VClearEvidenceDropped))
+  /// merged_bug_045: the buffered clear batch survives the delivering
+  /// tick's ack failure — commit-on-Ack means no moved-out value
+  /// exists between the read and the commit. Falsified with the latch
+  /// off (the mem::take-before-RPC shape); holds with ENABLE_ACK_LATCH.
+  val clearSurvivesAckFailure = not(violations.contains(VClearLostOnAckFailure))
   /// C2/285: after every successful full-tick ack the scheduler's
   /// binding map equals the controller's bound set — present-and-empty
   /// clears (scale-to-zero says so). Falsified as-built (the all-empty
@@ -796,6 +809,11 @@ module nodeclaimLifecycle {
       val bufferedDelivered =
         ENABLE_CLEARBUF_MACHINERY and ENABLE_EVIDENCE_BUFFER
         and ackOk and pendingClear.size() > 0
+      // merged_bug_045: latch OFF + a failed delivering ack = the
+      // buffered batch is lost (mem::take consumed it before the RPC).
+      val vClearLostOnAck =
+        ENABLE_CLEARBUF_MACHINERY and ENABLE_EVIDENCE_BUFFER
+        and not(ENABLE_ACK_LATCH) and ackFails and pendingClear.size() > 0
       // C2/285: the binding snapshot. Fixed law: the full-tick ack is
       // ALWAYS sent (the snapshot is its payload — present-and-empty
       // clears) and the scheduler wholesale-rebuilds. As-built law:
@@ -860,11 +878,14 @@ module nodeclaimLifecycle {
       all {
         claims' = claimsAfter,
         edgeClearDone' = if (ENABLE_EPOCH_MACHINERY) true else edgeClearDone,
-        // Drained whether or not the ack lands (mirrors the code's
-        // mem::take before the RPC; an ack failure loses the batch —
-        // recorded residual, same as fresh same-tick edges).
+        // merged_bug_045: with the latch the buffer empties only when
+        // the delivering ack LANDS (commit-on-Ack — retained on
+        // ackFails for the next tick); latch off = the as-built
+        // mem::take before the RPC (the batch is lost, recorded as
+        // VClearLostOnAckFailure below).
         pendingClear' =
-          if (ENABLE_CLEARBUF_MACHINERY and ENABLE_EVIDENCE_BUFFER) Set()
+          if (ENABLE_CLEARBUF_MACHINERY and ENABLE_EVIDENCE_BUFFER)
+            (if (ENABLE_ACK_LATCH and ackFails) pendingClear else Set())
           else pendingClear,
         schedBinding' = schedBindingAfter,
         placeableArmed' = true,
@@ -906,6 +927,7 @@ module nodeclaimLifecycle {
           .union(if (vMasked) Set(VCoverMasked) else Set())
           .union(if (vGateProd) Set(VGateProducer) else Set())
           .union(if (vIdleLost) Set(VIdleSpellLost) else Set())
+          .union(if (vClearLostOnAck) Set(VClearLostOnAckFailure) else Set())
           .union(if (vStaleBinding) Set(VStaleBinding) else Set()),
       }
   }
@@ -1206,6 +1228,7 @@ module nodeclaimLifecycleBase {
     ENABLE_ACQUIRE_EPOCH = false,
     ENABLE_CLEARBUF_MACHINERY = false,
     ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false
   ).*
@@ -1229,6 +1252,7 @@ module nodeclaimLifecycleFaultRpc {
     ENABLE_ACQUIRE_EPOCH = false,
     ENABLE_CLEARBUF_MACHINERY = false,
     ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false
   ).*
@@ -1282,6 +1306,7 @@ module nodeclaimLifecycleFaultLease {
     ENABLE_ACQUIRE_EPOCH = false,
     ENABLE_CLEARBUF_MACHINERY = false,
     ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false
   ).*
@@ -1304,6 +1329,7 @@ module nodeclaimLifecycleFaultKarpenter {
     ENABLE_ACQUIRE_EPOCH = false,
     ENABLE_CLEARBUF_MACHINERY = false,
     ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false
   ).*
@@ -1327,6 +1353,7 @@ module nodeclaimLifecycleEpochAsBuilt {
     ENABLE_ACQUIRE_EPOCH = false,
     ENABLE_CLEARBUF_MACHINERY = false,
     ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false
   ).*
@@ -1350,6 +1377,7 @@ module nodeclaimLifecycleEpoch {
     ENABLE_ACQUIRE_EPOCH = true,
     ENABLE_CLEARBUF_MACHINERY = false,
     ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false
   ).*
@@ -1372,6 +1400,7 @@ module nodeclaimLifecycleClearBufferAsBuilt {
     ENABLE_ACQUIRE_EPOCH = false,
     ENABLE_CLEARBUF_MACHINERY = true,
     ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false
   ).*
@@ -1394,6 +1423,32 @@ module nodeclaimLifecycleClearBuffer {
     ENABLE_ACQUIRE_EPOCH = false,
     ENABLE_CLEARBUF_MACHINERY = true,
     ENABLE_EVIDENCE_BUFFER = true,
+    ENABLE_ACK_LATCH = true,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false
+  ).*
+}
+
+/// merged_bug_045 FALSIFY half (bughunt-2 slot 5): the as-built
+/// mem::take-before-RPC — the buffer drains into the delivering tick's
+/// ack BEFORE the RPC outcome is known, so an ack failure on exactly
+/// that tick loses the batch (clearSurvivesAckFailure is expected to
+/// be violated). Same shape as the ClearBuffer hold regime, latch off.
+module nodeclaimLifecycleAckLatchAsBuilt {
+  import nodeclaimLifecycle(
+    MAX_FLEET_CORES = 2,
+    CLASS_CAP_A = 1,
+    PER_CELL_TICK_CAP = 1,
+    BOT_THRESHOLD = 2,
+    ENABLE_RPC_FAULT = true,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_KARPENTER_FAULT = false,
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = true,
+    ENABLE_EVIDENCE_BUFFER = true,
+    ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false
   ).*
@@ -1417,6 +1472,7 @@ module nodeclaimLifecycleSnapshotAsBuilt {
     ENABLE_ACQUIRE_EPOCH = false,
     ENABLE_CLEARBUF_MACHINERY = false,
     ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = true,
     ENABLE_SNAPSHOT_PRESENCE = false
   ).*
@@ -1440,6 +1496,7 @@ module nodeclaimLifecycleSnapshot {
     ENABLE_ACQUIRE_EPOCH = false,
     ENABLE_CLEARBUF_MACHINERY = false,
     ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = true,
     ENABLE_SNAPSHOT_PRESENCE = true
   ).*

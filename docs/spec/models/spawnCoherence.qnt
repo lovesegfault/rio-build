@@ -199,6 +199,9 @@ module spawnCoherence {
     | VEstablishedEarly
     | VPoisonTransient
     | VCancelNonCancelled
+    | VCancelPostCloseJob
+    | VPoisonForeignCount
+    | VForeignStreakWipe
     | VYoungLeaderReap
     | VStaleClose
 
@@ -271,6 +274,25 @@ module spawnCoherence {
   /// build_backoff_expired consumes the same fact at pull
   /// admission).
   const ENABLE_RETRY_BACKOFF: bool
+
+  /// merged_bug_117 (bughunt-2 slot 5): a SECOND pool reconciling over
+  /// the same scheduler. Gates the poolBTick action — false in every
+  /// pre-existing regime, so their state graphs are bit-identical
+  /// (the F16 Base identity).
+  const ENABLE_MULTI_POOL: bool
+  /// merged_bug_117 fix axis: exhaustion streaks keyed by (pool,
+  /// intent). Off = the as-built pool-SHARED map (pool B's retain
+  /// wipes pool A's streaks; an intent gated in both pools
+  /// double-steps). Ghost-framed: meaningful only under
+  /// ENABLE_MULTI_POOL ∧ ENABLE_EXHAUST_POISON.
+  const ENABLE_STREAK_POOL_KEY: bool
+  /// bug_113 (bughunt-2 slot 5): the cancel arm's generation conjunct
+  /// — a Job that POSTDATES its intent's cancelled close is
+  /// structurally unselectable (CancelTarget::bind conjunct 3). Off =
+  /// the as-built cause-only law (the respawn-inside-the-window
+  /// teardown, previously a contained residual). Ghost-framed:
+  /// meaningful only under ENABLE_CANCEL_CAUSE.
+  const ENABLE_CANCEL_GENERATION: bool
 
   pure val INTENTS: Set[IntentId] = Set("i1", "i2")
 
@@ -355,6 +377,17 @@ module spawnCoherence {
   /// C2/077: consecutive exhausted-and-wanted ticks (clamped at 3;
   /// constant-zero off-axis).
   var streak: IntentId -> int
+  /// merged_bug_117 ghost: THIS pool's true gated-tick count per
+  /// intent (what the streak SHOULD equal under pool-keying). Written
+  /// only by tick under the exact streak-increment condition;
+  /// constant-zero off the exhaust axis.
+  var ownGatedTicks: IntentId -> int
+  /// bug_113 ghost: the intent's current Job was created AFTER the
+  /// window's close landed (birth-vs-close order of the live pair).
+  /// Set by the spawn pass while a close is in the window; cleared
+  /// when a NEWER close lands or the job leaves. Constant-false
+  /// unless a cancel axis is on (closedCause is constant CCNone).
+  var jobPostdatesClose: IntentId -> bool
   /// C2/135: a synthesized preempted close is in flight for the intent
   /// (decided, not yet landed). Constant-false unless ENABLE_SYNTH_CLOSE.
   var pendingClose: IntentId -> bool
@@ -428,6 +461,23 @@ module spawnCoherence {
   /// cause-blind: a normal completion in the Job-status lag window is
   /// selected); holds with ENABLE_CANCEL_CAUSE.
   val cancelArmDeletesOnlyCancelled = not(violations.contains(VCancelNonCancelled))
+  /// bug_113: the cancel arm never tears down a Job created AFTER its
+  /// close (cancel + fast re-submit respawns the deterministic name).
+  /// Falsified with ENABLE_CANCEL_GENERATION off (the previously
+  /// contained 120-residual respawn trace, promoted to a violation);
+  /// holds with the generation conjunct.
+  val cancelNeverDeletesPostCloseJob = not(violations.contains(VCancelPostCloseJob))
+  /// merged_bug_117: the poison verdict counts the OBSERVING pool's
+  /// own consecutive observations — a foreign pool's tick on the
+  /// shared map can neither advance the count (the double-step) nor
+  /// reach the threshold for it. Falsified as-built under
+  /// ENABLE_MULTI_POOL; holds with ENABLE_STREAK_POOL_KEY.
+  val streakCountsOwnObservations = not(violations.contains(VPoisonForeignCount))
+  /// merged_bug_117: a foreign pool's tick never resets a live streak
+  /// (the as-built retain-wipe livelocked the report — the safety form
+  /// of "persistent exhaustion eventually reports": given no foreign
+  /// wipe, the 3-tick threshold delivers it).
+  val persistentExhaustionEventuallyReports = not(violations.contains(VForeignStreakWipe))
   /// C2/221: a never-pulled Running Job (no executor entry) is never
   /// orphan-reaped while the serving leader is younger than the grace.
   /// Falsified with ENABLE_YOUNG_LEADER_REAP (the as-built gate-less
@@ -547,6 +597,14 @@ module spawnCoherence {
           and postGate.contains(i) and jobsAtList.get(i).phase == JAbsent)
         clampStreak(streak.get(i) + 1)
       else 0)
+    // merged_bug_117 ghost: the same fold over the pool's OWN count —
+    // identical condition, so under pool-keying streak == ownGatedTicks
+    // by construction; a foreign double-step makes them diverge.
+    val ownObsAfter = INTENTS.mapBy(i =>
+      if (ENABLE_EXHAUST_POISON and exhausted.get(i)
+          and postGate.contains(i) and jobsAtList.get(i).phase == JAbsent)
+        clampStreak(ownGatedTicks.get(i) + 1)
+      else 0)
     val poisoned = INTENTS.filter(i =>
       ENABLE_EXHAUST_POISON and exhausted.get(i)
       and postGate.contains(i) and jobsAtList.get(i).phase == JAbsent
@@ -580,6 +638,10 @@ module spawnCoherence {
           not(listExecFails)
           and censusActive(jobsAtList.get(i))
           and closedCause.get(i) == CCCancelled
+          // bug_113 conjunct 3: the Job must PREDATE the close
+          // (CancelTarget::bind's generation check) — a respawned Job
+          // is structurally unselectable.
+          and (not(ENABLE_CANCEL_GENERATION) or not(jobPostdatesClose.get(i)))
           and execr.get(i) != ExecBusy
           and not(reaped.contains(i)))
       else if (ENABLE_CANCEL_ASBUILT)
@@ -683,6 +745,14 @@ module spawnCoherence {
     // C2/120: a cancel of a Job whose close cause is not CANCELLED.
     val vCancelNonC =
       cancelSelected.filter(i => closedCause.get(i) != CCCancelled).size() > 0
+    // bug_113: a cancel of a Job created AFTER its close landed.
+    val vCancelPostClose =
+      cancelSelected.filter(i => jobPostdatesClose.get(i)).size() > 0
+    // merged_bug_117: a poison verdict whose OWN-pool observation
+    // count is below the persistence threshold (a foreign pool's
+    // double-step inflated the shared entry).
+    val vPoisonForeign =
+      poisoned.filter(i => ownObsAfter.get(i) < 3).size() > 0
     // I2 safety form: enabling conditions at tick start imply the delete
     // by tick end (orphan-pending and orphan-running arms).
     val orphanPendingDue = if (schedErr or postGate.size() == 0) Set() else
@@ -761,6 +831,8 @@ module spawnCoherence {
         .union(if (vMatServed) Set(VMatJobServed) else Set())
         .union(if (vPoisonT) Set(VPoisonTransient) else Set())
         .union(if (vCancelNonC) Set(VCancelNonCancelled) else Set())
+        .union(if (vCancelPostClose) Set(VCancelPostCloseJob) else Set())
+        .union(if (vPoisonForeign) Set(VPoisonForeignCount) else Set())
         .union(if (vYoungReap) Set(VYoungLeaderReap) else Set())
 
     all {
@@ -784,6 +856,13 @@ module spawnCoherence {
           censusActive(jobsAtList.get(i)) and execr.get(i) == ExecBusy)
       else seenOpen,
       streak' = streakAfter,
+      ownGatedTicks' = ownObsAfter,
+      // bug_113 birth-order ghost: a spawned Job postdates the close
+      // currently in the window; a surviving Job keeps its bit while
+      // it exists; a departed Job clears it.
+      jobPostdatesClose' = INTENTS.mapBy(i =>
+        if (spawnedSet.contains(i)) closedCause.get(i) != CCNone
+        else (jobPostdatesClose.get(i) and jobsAfter.get(i).phase != JAbsent)),
       closedCause' = closedCause,
       exhausted' = exhausted,
       pendingClose' = pendingClose,
@@ -811,6 +890,8 @@ module spawnCoherence {
     seenOpen' = seenOpen,
     exhausted' = exhausted,
     streak' = streak,
+    ownGatedTicks' = ownGatedTicks,
+    jobPostdatesClose' = jobPostdatesClose,
     pendingClose' = pendingClose,
     inBackoff' = inBackoff,
   }
@@ -958,7 +1039,7 @@ module spawnCoherence {
     closedCause' = closedCause,
     seenOpen' = seenOpen,
     exhausted' = exhausted,
-    streak' = streak,
+    streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
   }
@@ -1013,7 +1094,7 @@ module spawnCoherence {
     closedCause' = closedCause,
     seenOpen' = seenOpen,
     exhausted' = exhausted,
-    streak' = streak,
+    streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
     inBackoff' = inBackoff,
@@ -1032,7 +1113,7 @@ module spawnCoherence {
     closedCause' = closedCause,
     seenOpen' = seenOpen,
     exhausted' = exhausted,
-    streak' = streak,
+    streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
     inBackoff' = inBackoff,
@@ -1065,7 +1146,7 @@ module spawnCoherence {
     closedCause' = closedCause,
     seenOpen' = seenOpen,
     exhausted' = exhausted,
-    streak' = streak,
+    streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
     inBackoff' = inBackoff,
@@ -1085,7 +1166,7 @@ module spawnCoherence {
     closedCause' = closedCause,
     seenOpen' = seenOpen,
     exhausted' = exhausted,
-    streak' = streak,
+    streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
     inBackoff' = inBackoff,
@@ -1132,7 +1213,7 @@ module spawnCoherence {
     closedCause' = closedCause,
     seenOpen' = seenOpen,
     exhausted' = exhausted,
-    streak' = streak,
+    streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
     inBackoff' = inBackoff,
@@ -1151,6 +1232,7 @@ module spawnCoherence {
     renderedFarDl' = renderedFarDl,
     closedCause' = closedCause, seenOpen' = seenOpen,
     streak' = streak, pendingClose' = pendingClose, obsLive' = obsLive,
+    ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
     inBackoff' = inBackoff,
   }
 
@@ -1162,6 +1244,9 @@ module spawnCoherence {
     execr.get(i) != ExecAbsent,
     execr' = execr.set(i, ExecAbsent),
     closedCause' = closedCause.set(i, CCCancelled),
+    // bug_113: this close is NEWER than any existing job — the live
+    // pair's order resets (a later spawn re-sets the bit).
+    jobPostdatesClose' = jobPostdatesClose.set(i, false),
     obsLive' = obsLive.set(i, false),
     queued' = queued, intentFp' = intentFp, job' = job,
     leaderOld' = leaderOld, gate' = gate,
@@ -1169,7 +1254,8 @@ module spawnCoherence {
     prevQueuedSnap' = prevQueuedSnap, matJob' = matJob,
     renderedFarDl' = renderedFarDl,
     seenOpen' = seenOpen, exhausted' = exhausted,
-    streak' = streak, pendingClose' = pendingClose,
+    streak' = streak, ownGatedTicks' = ownGatedTicks,
+    pendingClose' = pendingClose,
     inBackoff' = inBackoff,
   }
 
@@ -1183,6 +1269,7 @@ module spawnCoherence {
     job.get(i).phase == JRunning,
     execr' = execr.set(i, ExecAbsent),
     closedCause' = closedCause.set(i, CCCompleted),
+    jobPostdatesClose' = jobPostdatesClose.set(i, false),
     obsLive' = obsLive.set(i, false),
     queued' = queued, intentFp' = intentFp, job' = job,
     leaderOld' = leaderOld, gate' = gate,
@@ -1190,7 +1277,8 @@ module spawnCoherence {
     prevQueuedSnap' = prevQueuedSnap, matJob' = matJob,
     renderedFarDl' = renderedFarDl,
     seenOpen' = seenOpen, exhausted' = exhausted,
-    streak' = streak, pendingClose' = pendingClose,
+    streak' = streak, ownGatedTicks' = ownGatedTicks,
+    pendingClose' = pendingClose,
     inBackoff' = inBackoff,
   }
 
@@ -1199,13 +1287,15 @@ module spawnCoherence {
     or { ENABLE_CANCEL_ASBUILT, ENABLE_CANCEL_CAUSE },
     closedCause.get(i) != CCNone,
     closedCause' = closedCause.set(i, CCNone),
+    jobPostdatesClose' = jobPostdatesClose.set(i, false),
     queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
     leaderOld' = leaderOld, gate' = gate,
     dispatched' = dispatched, effects' = effects, violations' = violations,
     prevQueuedSnap' = prevQueuedSnap, matJob' = matJob,
     renderedFarDl' = renderedFarDl,
     seenOpen' = seenOpen, exhausted' = exhausted,
-    streak' = streak, pendingClose' = pendingClose, obsLive' = obsLive,
+    streak' = streak, ownGatedTicks' = ownGatedTicks,
+    pendingClose' = pendingClose, obsLive' = obsLive,
     inBackoff' = inBackoff,
   }
 
@@ -1223,7 +1313,7 @@ module spawnCoherence {
     prevQueuedSnap' = prevQueuedSnap, matJob' = matJob,
     renderedFarDl' = renderedFarDl,
     closedCause' = closedCause, seenOpen' = seenOpen,
-    exhausted' = exhausted, streak' = streak,
+    exhausted' = exhausted, streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
     inBackoff' = inBackoff,
   }
 
@@ -1262,7 +1352,7 @@ module spawnCoherence {
     prevQueuedSnap' = prevQueuedSnap, matJob' = matJob,
     renderedFarDl' = renderedFarDl,
     closedCause' = closedCause, seenOpen' = seenOpen,
-    exhausted' = exhausted, streak' = streak,
+    exhausted' = exhausted, streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
     inBackoff' = inBackoff,
   }
 
@@ -1283,7 +1373,7 @@ module spawnCoherence {
     closedCause' = closedCause,
     seenOpen' = seenOpen,
     exhausted' = exhausted,
-    streak' = streak,
+    streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
   }
@@ -1302,7 +1392,7 @@ module spawnCoherence {
     closedCause' = closedCause,
     seenOpen' = seenOpen,
     exhausted' = exhausted,
-    streak' = streak,
+    streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
   }
@@ -1327,15 +1417,57 @@ module spawnCoherence {
     seenOpen' = INTENTS.mapBy(i => false),
     exhausted' = INTENTS.mapBy(i => false),
     streak' = INTENTS.mapBy(i => 0),
+    ownGatedTicks' = INTENTS.mapBy(i => 0),
+    jobPostdatesClose' = INTENTS.mapBy(i => false),
     pendingClose' = INTENTS.mapBy(i => false),
     obsLive' = INTENTS.mapBy(i => false),
     inBackoff' = INTENTS.mapBy(i => false),
+  }
+
+  /// merged_bug_117: a SECOND pool's reconcile tick, abstracted to its
+  /// effect on the exhaustion-streak storage. As-built
+  /// (ENABLE_STREAK_POOL_KEY off): the map is pool-SHARED — B's fold
+  /// retains only ITS gated set (wiping A's streaks) and steps every
+  /// intent gated in B (double-stepping overlap intents). Fixed: B's
+  /// fold lands under B's own (pool, intent) keys — A's storage is
+  /// untouched, a cross-pool wipe is inexpressible. ownGatedTicks (A's
+  /// true observation count) is never B's to advance either way.
+  action poolBTick = {
+    nondet bGated = INTENTS.powerset().oneOf()
+    all {
+      ENABLE_MULTI_POOL,
+      ENABLE_EXHAUST_POISON,
+      streak' =
+        if (ENABLE_STREAK_POOL_KEY) streak
+        else INTENTS.mapBy(i =>
+          if (bGated.contains(i)) clampStreak(streak.get(i) + 1) else 0),
+      // The as-built retain-wipe of a LIVE foreign streak is the
+      // violation (the safety form of "persistent exhaustion
+      // eventually reports": no foreign reset, and the 3-tick
+      // threshold delivers).
+      violations' = violations.union(
+        if (not(ENABLE_STREAK_POOL_KEY)
+            and INTENTS.filter(i =>
+              streak.get(i) > 0 and not(bGated.contains(i))).size() > 0)
+          Set(VForeignStreakWipe)
+        else Set()),
+      ownGatedTicks' = ownGatedTicks,
+      jobPostdatesClose' = jobPostdatesClose,
+      queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
+      leaderOld' = leaderOld, gate' = gate, dispatched' = dispatched,
+      effects' = effects, prevQueuedSnap' = prevQueuedSnap,
+      matJob' = matJob, renderedFarDl' = renderedFarDl,
+      closedCause' = closedCause, seenOpen' = seenOpen,
+      exhausted' = exhausted, pendingClose' = pendingClose,
+      obsLive' = obsLive, inBackoff' = inBackoff,
+    }
   }
 
   action step = {
     nondet i = INTENTS.oneOf()
     any {
       tick,
+      poolBTick,
       intentArrives(i),
       intentLeaves(i),
       intentResolves(i),
@@ -1394,6 +1526,9 @@ module spawnCoherenceBase {
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
     ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
     ENABLE_RETRY_BACKOFF = false
   ).*
 }
@@ -1417,6 +1552,9 @@ module spawnCoherenceFaultRpc {
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
     ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
     ENABLE_RETRY_BACKOFF = false
   ).*
 }
@@ -1441,6 +1579,9 @@ module spawnCoherenceFaultLease {
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
     ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
     ENABLE_RETRY_BACKOFF = false
   ).*
 }
@@ -1465,6 +1606,9 @@ module spawnCoherenceFaultStale {
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
     ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
     ENABLE_RETRY_BACKOFF = false
   ).*
 }
@@ -1489,6 +1633,9 @@ module spawnCoherenceCrdAbsent {
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
     ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
     ENABLE_RETRY_BACKOFF = false
   ).*
 }
@@ -1512,6 +1659,9 @@ module spawnCoherenceFetcher {
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
     ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
     ENABLE_RETRY_BACKOFF = false
   ).*
 }
@@ -1539,6 +1689,9 @@ module spawnCoherenceMatJobs {
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
     ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
     ENABLE_RETRY_BACKOFF = false
   ).*
 }
@@ -1567,6 +1720,9 @@ module spawnCoherenceRenderedDeadline {
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
     ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
     ENABLE_RETRY_BACKOFF = false
   ).*
 }
@@ -1591,6 +1747,9 @@ module spawnCoherenceExhaustAsBuilt {
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
     ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
     ENABLE_RETRY_BACKOFF = false
   ).*
 }
@@ -1616,6 +1775,9 @@ module spawnCoherenceExhaustPersist {
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
     ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
     ENABLE_RETRY_BACKOFF = false
   ).*
 }
@@ -1640,6 +1802,9 @@ module spawnCoherenceCancelAsBuilt {
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
     ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
     ENABLE_RETRY_BACKOFF = false
   ).*
 }
@@ -1664,6 +1829,9 @@ module spawnCoherenceCancelCause {
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
     ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
     ENABLE_RETRY_BACKOFF = false
   ).*
 }
@@ -1692,6 +1860,9 @@ module spawnCoherenceReapYoungLeader {
     ENABLE_YOUNG_LEADER_REAP = true,
     ENABLE_SYNTH_CLOSE = false,
     ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
     ENABLE_RETRY_BACKOFF = false
   ).*
 }
@@ -1717,6 +1888,9 @@ module spawnCoherenceSynthCloseAsBuilt {
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = true,
     ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
     ENABLE_RETRY_BACKOFF = false
   ).*
 }
@@ -1742,6 +1916,9 @@ module spawnCoherenceSynthClosePinned {
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = true,
     ENABLE_EXEC_PINNED = true,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
     ENABLE_RETRY_BACKOFF = false
   ).*
 }
@@ -1766,6 +1943,124 @@ module spawnCoherenceRetryBackoff {
     ENABLE_YOUNG_LEADER_REAP = false,
     ENABLE_SYNTH_CLOSE = false,
     ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
     ENABLE_RETRY_BACKOFF = true
+  ).*
+}
+
+/// merged_bug_117 FALSIFY half (bughunt-2 slot 5): the pool-SHARED
+/// streak map under a second reconciling pool — B's retain wipes A's
+/// live streaks (persistentExhaustionEventuallyReports violated: the
+/// report is livelocked) and an overlap intent double-steps to the
+/// threshold on 2 own observations (streakCountsOwnObservations
+/// violated). Exhaust axes on, no faults, ceiling 1.
+module spawnCoherenceMultiPoolAsBuilt {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = true,
+    ENABLE_EXHAUST_PERSIST = true,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = true,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
+    ENABLE_RETRY_BACKOFF = false
+  ).*
+}
+
+/// merged_bug_117 HOLD half: PoolStreaks pool-keying — B's tick cannot
+/// wipe or advance A's streaks; the poison verdict counts the
+/// observing pool's own 3 observations. canReachPoison keeps the
+/// threshold path non-vacuous under the multi-pool alphabet.
+module spawnCoherenceMultiPool {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = true,
+    ENABLE_EXHAUST_PERSIST = true,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = true,
+    ENABLE_STREAK_POOL_KEY = true,
+    ENABLE_CANCEL_GENERATION = false,
+    ENABLE_RETRY_BACKOFF = false
+  ).*
+}
+
+/// bug_113 FALSIFY half (bughunt-2 slot 5): the cause-only cancel law
+/// — a derivation cancelled and fast re-submitted respawns the
+/// deterministic Job name inside the recently_closed window; the
+/// not-yet-pulled fresh Job is cancel-selected
+/// (cancelNeverDeletesPostCloseJob violated — the previously contained
+/// 120-residual trace, promoted).
+module spawnCoherenceCancelGenAsBuilt {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = true,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
+    ENABLE_RETRY_BACKOFF = false
+  ).*
+}
+
+/// bug_113 HOLD half: CancelTarget::bind's generation conjunct — the
+/// respawned Job postdates its close and is structurally unselectable;
+/// cancelArmDeletesOnlyCancelled is retained alongside.
+module spawnCoherenceCancelGeneration {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = false,
+    ENABLE_EXHAUST_PERSIST = false,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = true,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = true,
+    ENABLE_RETRY_BACKOFF = false
   ).*
 }

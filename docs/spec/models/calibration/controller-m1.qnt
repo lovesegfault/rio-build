@@ -36,6 +36,7 @@ module m1CalibAcquireClearOkOnly {
     ENABLE_ACQUIRE_EPOCH = false,
     ENABLE_CLEARBUF_MACHINERY = false,
     ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false
   ).* from "../nodeclaimLifecycle"
@@ -275,6 +276,7 @@ module m1CalibReapBusyGuardProbe {
     ENABLE_ACQUIRE_EPOCH = false,
     ENABLE_CLEARBUF_MACHINERY = false,
     ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
     ENABLE_SNAPSHOT_PRESENCE = false
   ).* from "../nodeclaimLifecycle"

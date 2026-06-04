@@ -311,6 +311,11 @@ let
       # calibration corpus exposed its pre-fix `calibStep`). null means
       # quint's default (`step`).
       step ? null,
+      # Non-default init action (a calibration module can start from a
+      # MID-TRACE state when the property's prefix is too deep for the
+      # checker's budget from the cold init — the controller-113
+      # respawn-cancel pair). null means quint's default (`init`).
+      init ? null,
       # Pin the TLC worker count to the value the wiring measurement used
       # (closure-evidence Phase-1 review finding MCI-6): an exhaustive
       # check wired from a measured budget must run at the measurement's
@@ -381,6 +386,7 @@ let
           --backend=${backend} \
           --main=${main} \
           ${lib.optionalString (step != null) "--step=${step}"} \
+          ${lib.optionalString (init != null) "--init=${init}"} \
           --invariant=${lib.concatStringsSep "," invariants} \
           ${
             if backend == "tlc" then "--tlc-config=tlc-config.json" else "--max-steps=${toString maxSteps}"
@@ -438,6 +444,11 @@ let
       # that select a non-default transition relation (calibStep and
       # pullStep callers).
       step ? null,
+      # Non-default init action (a calibration module can start from a
+      # MID-TRACE state when the property's prefix is too deep for the
+      # checker's budget from the cold init — the controller-113
+      # respawn-cancel pair). null means quint's default (`init`).
+      init ? null,
       # Apalache server heap (MiB) for the quint->TLA+ conversion. The
       # default matches the historical hardcoded value; only the largest
       # override modules (whose conversion request OOMs a 4 GiB server)
@@ -488,6 +499,7 @@ let
           --backend=tlc \
           --main=${main} \
           ${lib.optionalString (step != null) "--step=${step}"} \
+          ${lib.optionalString (init != null) "--init=${init}"} \
           --invariant=${witness} \
           --tlc-config=tlc-config.json \
           "$src/${spec}.qnt"
@@ -551,6 +563,11 @@ let
       # Same semantics as mkQuintCheck's extraSpecs / step.
       extraSpecs ? [ ],
       step ? null,
+      # Non-default init action (a calibration module can start from a
+      # MID-TRACE state when the property's prefix is too deep for the
+      # checker's budget from the cold init — the controller-113
+      # respawn-cancel pair). null means quint's default (`init`).
+      init ? null,
       # Optional fixed simulator seed (hex string): replays a recorded
       # discovery deterministically; the unseeded sample budget remains
       # the re-find backstop. null leaves the simulator's own seeding —
@@ -584,8 +601,8 @@ let
           --backend=rust \
           --main=${main} \
           ${lib.optionalString (step != null) "--step=${step}"}${
-            lib.optionalString (seed != null) " --seed=${seed}"
-          } \
+            lib.optionalString (init != null) " --init=${init}"
+          }${lib.optionalString (seed != null) " --seed=${seed}"} \
           --invariant=${witness} \
           --max-samples=${toString maxSamples} \
           --max-steps=${toString maxSteps} \
@@ -644,6 +661,11 @@ let
       # Same semantics as mkQuintCheck's extraSpecs / step.
       extraSpecs ? [ ],
       step ? null,
+      # Non-default init action (a calibration module can start from a
+      # MID-TRACE state when the property's prefix is too deep for the
+      # checker's budget from the cold init — the controller-113
+      # respawn-cancel pair). null means quint's default (`init`).
+      init ? null,
     }:
     pkgs.runCommand "quint-${name}"
       {
@@ -670,6 +692,7 @@ let
           --backend=rust \
           --main=${main} \
           ${lib.optionalString (step != null) "--step=${step}"} \
+          ${lib.optionalString (init != null) "--init=${init}"} \
           --invariant='${lib.concatStringsSep " and " invariants}' \
           --max-samples=${toString maxSamples} \
           --max-steps=${toString maxSteps} \
@@ -4996,6 +5019,170 @@ in
       invariants = [ "noReapOfNeverPulledBeforeLeaderAged" ];
     };
 
+    # ── merged_bug_117 + bug_113 axes (bughunt-2 slot 5) ──────────────
+    # merged_bug_117 FALSIFY halves: the pool-SHARED streak map under a
+    # second reconciling pool (poolBTick). Wipe law: B's retain resets
+    # A's live streaks — the poison report is livelocked (rust-sim seed
+    # 0xa108dd26025cd507). Own-count law: an overlap intent
+    # double-steps to the threshold on 2 own observations (rust-sim
+    # seed 0xdf6e64671329a316).
+    # r[verify ctrl.pool.no-eligible-persist+2]
+    quint-spawn-coherence-falsify-multipool-wipe = mkQuintWitnessCheck {
+      name = "spawn-coherence-falsify-multipool-wipe";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceMultiPoolAsBuilt";
+      witness = "persistentExhaustionEventuallyReports";
+    };
+    # r[verify ctrl.pool.no-eligible-persist+2]
+    quint-spawn-coherence-falsify-multipool-own-count = mkQuintWitnessCheck {
+      name = "spawn-coherence-falsify-multipool-own-count";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceMultiPoolAsBuilt";
+      witness = "streakCountsOwnObservations";
+    };
+    # merged_bug_117 HOLD half: PoolStreaks pool-keying — B's tick can
+    # neither wipe nor advance A's streaks; the poison verdict counts
+    # the observing pool's own 3 observations. canReachPoison keeps the
+    # threshold path non-vacuous under the multi-pool alphabet.
+    # r[verify ctrl.pool.no-eligible-persist+2]
+    quint-spawn-coherence-multipool-hold = mkQuintCheck {
+      name = "spawn-coherence-multipool-hold";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceMultiPool";
+      invariants = [
+        "streakCountsOwnObservations"
+        "persistentExhaustionEventuallyReports"
+        "noPoisonWhilePlaceable"
+      ];
+    };
+    quint-spawn-coherence-witness-multipool-poison = mkQuintWitnessCheck {
+      name = "spawn-coherence-witness-multipool-poison";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceMultiPool";
+      witness = "canReachPoison";
+    };
+
+    # bug_113 FALSIFY half: cancel + fast re-submit respawns the
+    # deterministic Job name inside the recently_closed window; the
+    # cause-only law cancel-selects the fresh Job. Live-import calib
+    # with a MID-TRACE init (the cold-init prefix is ~10 ordered steps
+    # — 60k samples x 20 steps found nothing; from calibInit the
+    # violation is 2 ticks, rust-sim seed 0x1819714b2c47fa51).
+    # r[verify ctrl.job.cancel-close-cause+2]
+    quint-controller-calib-113-respawn-cancel = mkQuintWitnessCheck {
+      name = "controller-calib-113-respawn-cancel";
+      spec = "calibration/controller-113-respawn-cancel";
+      main = "controllerCalib113RespawnCancel";
+      extraSpecs = [ "spawnCoherence" ];
+      init = "calibInit";
+      step = "calibStep";
+      witness = "cancelNeverDeletesPostCloseJob";
+    };
+    # bug_113 HOLD half from the SAME mid-trace init: the generation
+    # conjunct makes the respawned Job structurally unselectable
+    # (cancelArmDeletesOnlyCancelled retained alongside).
+    # r[verify ctrl.job.cancel-close-cause+2]
+    quint-controller-calib-113-respawn-cancel-hold = mkQuintCheck {
+      name = "controller-calib-113-respawn-cancel-hold";
+      spec = "calibration/controller-113-respawn-cancel";
+      main = "controllerCalib113RespawnCancelHold";
+      extraSpecs = [ "spawnCoherence" ];
+      init = "calibInit";
+      step = "calibStep";
+      invariants = [
+        "cancelNeverDeletesPostCloseJob"
+        "cancelArmDeletesOnlyCancelled"
+      ];
+    };
+
+    # ── wedgeCluster: the OA2 wedge-clustering verdict after the
+    # bughunt-2 slot-5 rework (merged_bug_009 commensurable populations
+    # + RPC-failure skip, merged_bug_176 sealed single-exit epilogue,
+    # the required eviction argument). The main regime is
+    # TLC-EXHAUSTIVE at these bounds (≤3 nodes × 2 drvs: 206,302,021
+    # states generated / 1,186,107 distinct / 0 on queue, ~5min, no
+    # violation) — the four laws hold over the FULL bounded space, not
+    # a sampled slice. Every law is paired with a falsify twin below
+    # (no vacuous-invariant debt; boundsOK is the standard
+    # bounds-only exemption).
+    # r[verify ctrl.nodeclaim.wedge-two-axis+2]
+    quint-wedge-cluster-main = mkQuintCheck {
+      name = "wedge-cluster-main";
+      spec = "wedgeCluster";
+      main = "wedgeClusterMain";
+      invariants = [
+        "boundsOK"
+        "affectedLeOf"
+        "noPerNodeFromSuppressedEvidence"
+        "reapedImpliesEvicted"
+        "markedIncrementsOnlyOnEdges"
+      ];
+    };
+
+    # Falsify twin (live-import, calibration/): the as-built split
+    # populations — retained-evidence wedged nodes over the THIS-TICK
+    # fleet — emit Systemic{affected: 2, of: 1} within 2 ticks
+    # (merged_bug_009; solo-verified [violation] in ~3s).
+    # r[verify ctrl.nodeclaim.wedge-two-axis+2]
+    quint-wedge-cluster-calib-split-population = mkQuintWitnessCheck {
+      name = "wedge-cluster-calib-split-population";
+      spec = "calibration/wedge-009-split-population";
+      main = "wedgeCalib009SplitPopulation";
+      extraSpecs = [ "wedgeCluster" ];
+      witness = "affectedLeOf";
+    };
+
+    # Falsify twin (live-import, calibration/): the as-built early
+    # return past the Systemic epilogue freezes the marked set against
+    # a verdict whose survivor set is empty (merged_bug_176;
+    # solo-verified [violation] in ~4s).
+    # r[verify ctrl.nodeclaim.wedge-two-axis+2]
+    quint-wedge-cluster-calib-early-return = mkQuintWitnessCheck {
+      name = "wedge-cluster-calib-early-return";
+      spec = "calibration/wedge-176-early-return";
+      main = "wedgeCalib176EarlyReturn";
+      extraSpecs = [ "wedgeCluster" ];
+      witness = "markedIncrementsOnlyOnEdges";
+    };
+    # Same twin, second law: the undrained episode's surviving anchors
+    # later build a per-node verdict a suppression already explained
+    # (solo-verified [violation] in ~7s).
+    # r[verify ctrl.nodeclaim.wedge-two-axis+2]
+    quint-wedge-cluster-calib-suppressed-evidence = mkQuintWitnessCheck {
+      name = "wedge-cluster-calib-suppressed-evidence";
+      spec = "calibration/wedge-176-early-return";
+      main = "wedgeCalib176EarlyReturn";
+      extraSpecs = [ "wedgeCluster" ];
+      witness = "noPerNodeFromSuppressedEvidence";
+    };
+
+    # Falsify twin (in-file): no eviction input — a reaped node's
+    # pre-reap anchors survive the next update and keep feeding the
+    # Dead arm (the REQUIRED-argument rationale; solo-verified
+    # [violation] in ~5s).
+    # r[verify ctrl.nodeclaim.wedge-two-axis+2]
+    quint-wedge-cluster-falsify-no-eviction = mkQuintWitnessCheck {
+      name = "wedge-cluster-falsify-no-eviction";
+      spec = "wedgeCluster";
+      main = "wedgeClusterNoEviction";
+      witness = "reapedImpliesEvicted";
+    };
+
+    # Reachability witnesses on the main regime: both verdict arms
+    # actually fire at these bounds (anti-vacuity for the four laws).
+    quint-wedge-cluster-witness-systemic = mkQuintWitnessCheck {
+      name = "wedge-cluster-witness-systemic";
+      spec = "wedgeCluster";
+      main = "wedgeClusterMain";
+      witness = "systemicReachableW";
+    };
+    quint-wedge-cluster-witness-per-node = mkQuintWitnessCheck {
+      name = "wedge-cluster-witness-per-node";
+      spec = "wedgeCluster";
+      main = "wedgeClusterMain";
+      witness = "perNodeReachableW";
+    };
+
     # C2/135 (area D): a synthesized close consumes only the attempt
     # the controller observed open at decision time — the scheduler
     # refuses an exec-pinned close whose attempt is no longer the open
@@ -5083,6 +5270,7 @@ in
     };
     # r[verify ctrl.nodeclaim.evidence-buffered]
     # r[verify ctrl.nodeclaim.consolidate-only-degraded+3]
+    # r[verify ctrl.nodeclaim.evidence-ack-latch]
     quint-nodeclaim-clear-buffer = mkQuintCheck {
       name = "nodeclaim-clear-buffer";
       spec = "nodeclaimLifecycle";
@@ -5100,7 +5288,23 @@ in
         "coverRespectsMask"
         "degradedCoverPolarity"
         "iceClearDelivered"
+        # merged_bug_045 (bughunt-2 slot 5): commit-on-Ack — the
+        # buffered batch survives the delivering tick's ack failure
+        # (ENABLE_ACK_LATCH = true in this regime since the rework).
+        "clearSurvivesAckFailure"
       ];
+    };
+
+    # merged_bug_045 FALSIFY half: the as-built mem::take before the
+    # RPC loses the batch on exactly the delivering tick's ack failure
+    # (the retired 007 map residual, demonstrated as a model
+    # violation; rust-sim seed 0x603e2a44398a939e).
+    # r[verify ctrl.nodeclaim.evidence-ack-latch]
+    quint-nodeclaim-falsify-ack-latch-asbuilt = mkQuintWitnessCheck {
+      name = "nodeclaim-falsify-ack-latch-asbuilt";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleAckLatchAsBuilt";
+      witness = "clearSurvivesAckFailure";
     };
     quint-nodeclaim-witness-buffered-clear = mkQuintWitnessCheck {
       name = "nodeclaim-witness-buffered-clear";
