@@ -32,6 +32,7 @@
       "expr": "absent(up{job=\"kube-build-scheduler\"} == 1)",
       "for": "5m",
       "severity": "critical",
+      "templated": false,
       "metrics": []
     },
     {
@@ -39,6 +40,7 @@
       "expr": "sum(scheduler_pending_pods{queue=~\"unschedulable|backoff\",job=\"kube-build-scheduler\"}) > 0",
       "for": "5m",
       "severity": "warning",
+      "templated": false,
       "metrics": []
     },
     {
@@ -46,6 +48,7 @@
       "expr": "increase(kube_pod_container_status_restarts_total{container=\"controller\"}[5m]) > 0",
       "for": "0m",
       "severity": "warning",
+      "templated": false,
       "metrics": []
     },
     {
@@ -53,6 +56,7 @@
       "expr": "increase(rio_store_log_chunk_write_failures_total[5m]) > 0",
       "for": "5m",
       "severity": "warning",
+      "templated": false,
       "metrics": [
         "rio_store_log_chunk_write_failures_total"
       ]
@@ -62,6 +66,7 @@
       "expr": "increase(rio_store_log_read_data_loss_total[5m]) > 0",
       "for": "0m",
       "severity": "critical",
+      "templated": false,
       "metrics": [
         "rio_store_log_read_data_loss_total"
       ]
@@ -80,6 +85,7 @@
       "expr": "increase(rio_controller_nodeclaim_intent_dropped_total{reason=\"all_cells_ice_masked\"}[15m]) > 0",
       "for": "15m",
       "severity": "warning",
+      "templated": false,
       "metrics": [
         "rio_controller_nodeclaim_intent_dropped_total"
       ]
@@ -89,6 +95,7 @@
       "expr": "sum by (cell) ( increase(rio_controller_nodeclaim_reaped_total{reason=\"boot-timeout\"}[{{ max 90 (add (mulf 4 (float64 .Values.scheduler.sla.maxLeadTime) | int) 40) }}s]) ) >= 2",
       "for": "5m",
       "severity": "warning",
+      "templated": true,
       "metrics": [
         "rio_controller_nodeclaim_reaped_total"
       ]
@@ -98,6 +105,7 @@
       "expr": "count(sum by (cell) (rate(rio_controller_nodeclaim_reaped_total{reason=~\"ice|vanished\"}[5m])) > 0) >= 3",
       "for": "5m",
       "severity": "warning",
+      "templated": false,
       "metrics": [
         "rio_controller_nodeclaim_reaped_total"
       ]
@@ -107,6 +115,7 @@
       "expr": "increase(rio_controller_nodeclaim_intent_dropped_total{reason=~\"no_hosting_class|no_pool_covers\"}[15m]) > 0",
       "for": "5m",
       "severity": "warning",
+      "templated": false,
       "metrics": [
         "rio_controller_nodeclaim_intent_dropped_total"
       ]
@@ -116,6 +125,7 @@
       "expr": "rio_controller_nodeclaim_inflight_age_max_seconds > clamp(2 * rio_controller_nodeclaim_ice_timeout_seconds, 90, {{ max 90 (mulf 3 (float64 .Values.scheduler.sla.maxLeadTime) | int) }})",
       "for": "30s",
       "severity": "warning",
+      "templated": true,
       "metrics": [
         "rio_controller_nodeclaim_ice_timeout_seconds",
         "rio_controller_nodeclaim_inflight_age_max_seconds"
@@ -126,6 +136,7 @@
       "expr": "rio_controller_nodeclaim_terminating_age_max_seconds > 300",
       "for": "1m",
       "severity": "warning",
+      "templated": false,
       "metrics": [
         "rio_controller_nodeclaim_terminating_age_max_seconds"
       ]
@@ -135,6 +146,7 @@
       "expr": "histogram_quantile(0.99, sum by (le) (rate(rio_scheduler_actor_cmd_seconds_bucket[2m]))) > 1",
       "for": "2m",
       "severity": "warning",
+      "templated": false,
       "metrics": [
         "rio_scheduler_actor_cmd_seconds"
       ]
@@ -144,6 +156,7 @@
       "expr": "sum(increase(rio_scheduler_pull_establishments_total[30m])) >= 2",
       "for": "0m",
       "severity": "warning",
+      "templated": false,
       "metrics": [
         "rio_scheduler_pull_establishments_total"
       ]
@@ -153,6 +166,7 @@
       "expr": "sum(rate(rio_scheduler_evidence_write_fenced_total[5m])) > 0",
       "for": "15m",
       "severity": "critical",
+      "templated": false,
       "metrics": [
         "rio_scheduler_evidence_write_fenced_total"
       ]
@@ -162,6 +176,7 @@
       "expr": "sum(increase(rio_scheduler_materialization_converted_total{origin=\"cache_opportunity\"}[5m])) > 0",
       "for": "15m",
       "severity": "warning",
+      "templated": false,
       "metrics": [
         "rio_scheduler_materialization_converted_total"
       ]
@@ -171,6 +186,7 @@
       "expr": "max(rio_scheduler_materialization_stalled) > 0",
       "for": "15m",
       "severity": "warning",
+      "templated": false,
       "metrics": [
         "rio_scheduler_materialization_stalled"
       ]
@@ -189,6 +205,7 @@
       "expr": "rio_scheduler_sla_hw_cost_stale_seconds > 1800",
       "for": "5m",
       "severity": "warning",
+      "templated": false,
       "metrics": [
         "rio_scheduler_sla_hw_cost_stale_seconds"
       ]
@@ -198,6 +215,7 @@
       "expr": "histogram_quantile(0.5, sum by (le, dim) (rate(rio_scheduler_sla_prediction_ratio_bucket[15m]))) > 2.0 or histogram_quantile(0.5, sum by (le, dim) (rate(rio_scheduler_sla_prediction_ratio_bucket[15m]))) < 0.5",
       "for": "15m",
       "severity": "warning",
+      "templated": false,
       "metrics": [
         "rio_scheduler_sla_prediction_ratio"
       ]
@@ -207,6 +225,7 @@
       "expr": "max by (param) (rio_scheduler_sla_prior_divergence) >= 2.0 or min by (param) (rio_scheduler_sla_prior_divergence) <= 0.5",
       "for": "10m",
       "severity": "warning",
+      "templated": false,
       "metrics": [
         "rio_scheduler_sla_prior_divergence"
       ]
@@ -216,6 +235,7 @@
       "expr": "histogram_quantile(0.99, sum by (le) (rate(rio_store_chunk_upgrade_tx_seconds_bucket[15m]))) > 150",
       "for": "5m",
       "severity": "warning",
+      "templated": false,
       "metrics": [
         "rio_store_chunk_upgrade_tx_seconds"
       ]
@@ -225,6 +245,7 @@
       "expr": "(sum(increase(rio_store_chunk_upgrade_tx_seconds_bucket{le=\"+Inf\"}[15m])) - sum(increase(rio_store_chunk_upgrade_tx_seconds_bucket{le=\"240\"}[15m]))) > 0",
       "for": "0m",
       "severity": "critical",
+      "templated": false,
       "metrics": [
         "rio_store_chunk_upgrade_tx_seconds"
       ]
@@ -234,6 +255,7 @@
       "expr": "increase(rio_store_gc_collect_parse_failures_total[1h]) > 0",
       "for": "0m",
       "severity": "critical",
+      "templated": false,
       "metrics": [
         "rio_store_gc_collect_parse_failures_total"
       ]
@@ -243,6 +265,7 @@
       "expr": "sum(increase(rio_store_gc_collect_cycles_total{outcome=\"ok\"}[25h])) == 0",
       "for": "30m",
       "severity": "warning",
+      "templated": false,
       "metrics": [
         "rio_store_gc_collect_cycles_total"
       ]
@@ -252,6 +275,7 @@
       "expr": "rate(rio_store_putpath_retries_total[1m]) > 10",
       "for": "2m",
       "severity": "warning",
+      "templated": false,
       "metrics": [
         "rio_store_putpath_retries_total"
       ]

@@ -251,10 +251,15 @@ fn visit_rs(dir: &Path, f: &mut impl FnMut(&str)) -> Result<()> {
 /// (merged_bug_001 class — runbooks restated alert exprs by hand and
 /// drifted from the shipped PromQL; the runbook now RENDERS the expr
 /// via `refs.alert-expr`, so a re-key propagates or `docs-data-fresh`
-/// fails). Line-state machine over the template: helm `{{ }}` only
-/// appears in annotations at tip (exprs are plain PromQL — verified),
-/// and rule keys are physical lines, so no YAML parser is needed (the
-/// file is a helm TEMPLATE and not parseable as YAML anyway).
+/// fails). Line-state machine over the template; rule keys are
+/// physical lines, so no YAML parser is needed (the file is a helm
+/// TEMPLATE and not parseable as YAML anyway). merged_bug_014: the
+/// parser is FAIL-CLOSED — an `- alert:` line the strict regex cannot
+/// capture (templated name, trailing tokens) is a hard error, a
+/// duplicate (name, severity) pair is a hard error, and an expr
+/// containing helm `{{ }}` is flagged `templated: true` (rendered
+/// post-helm; alerts.typ captions it) instead of being silently
+/// treated as plain PromQL.
 fn alerts() -> Result<serde_json::Value> {
     let body =
         fs::read_to_string(repo_root().join("infra/helm/rio-build/templates/prometheusrule.yaml"))?;
@@ -265,6 +270,7 @@ fn alerts() -> Result<serde_json::Value> {
 /// access; the fixture lives in the test).
 fn parse_alerts(body: &str) -> Result<serde_json::Value> {
     let alert_re = Regex::new(r"^\s*-\s*alert:\s*(\w+)\s*$")?;
+    let loose_alert_re = Regex::new(r"^\s*-\s*alert:")?;
     let block_expr_re = Regex::new(r"^(\s*)expr:\s*[|>][+-]?\s*$")?;
     let inline_expr_re = Regex::new(r"^\s*expr:\s*(\S.*?)\s*$")?;
     let for_re = Regex::new(r"^\s*for:\s*(\S+)\s*$")?;
@@ -305,6 +311,14 @@ fn parse_alerts(body: &str) -> Result<serde_json::Value> {
                 name: c[1].to_string(),
                 ..Default::default()
             });
+        } else if loose_alert_re.is_match(line) {
+            // Fail closed: an alert line the strict regex cannot
+            // capture would otherwise vanish from the inventory and
+            // every downstream assert (merged_bug_014).
+            anyhow::bail!(
+                "unparseable alert line in prometheusrule.yaml \
+                 (templated name or trailing tokens?): {line:?}"
+            );
         } else if let Some(c) = block_expr_re.captures(line) {
             block_indent = Some(c[1].len());
         } else if let Some(c) = inline_expr_re.captures(line) {
@@ -335,6 +349,19 @@ fn parse_alerts(body: &str) -> Result<serde_json::Value> {
         }
         m.to_string()
     };
+    let mut pairs: Vec<(String, String)> = rules
+        .iter()
+        .map(|r| (r.name.clone(), r.severity.clone()))
+        .collect();
+    pairs.sort();
+    if let Some(w) = pairs.windows(2).find(|w| w[0] == w[1]) {
+        anyhow::bail!(
+            "duplicate alert (name, severity) pair in prometheusrule.yaml: \
+             {} [{}] — same-name arms must differ in severity",
+            w[0].0,
+            w[0].1,
+        );
+    }
     let mut names: Vec<String> = rules.iter().map(|r| r.name.clone()).collect();
     names.sort();
     names.dedup();
@@ -350,6 +377,7 @@ fn parse_alerts(body: &str) -> Result<serde_json::Value> {
                 "expr": r.expr,
                 "for": r.for_,
                 "severity": r.severity,
+                "templated": r.expr.contains("{{"),
                 "metrics": metrics.into_iter().collect::<Vec<_>>(),
             })
         })
@@ -1068,6 +1096,55 @@ spec:
     }
 
     use super::*;
+
+    // merged_bug_014 reds (pre-fix): a templated alert NAME silently
+    // vanished from the inventory (first-wins line regex), and a
+    // duplicated (name, severity) pair flowed through to find-first
+    // consumers. Both are hard errors now; templated EXPRs are
+    // flagged, not silently treated as plain PromQL.
+    #[test]
+    fn unparseable_alert_line_is_a_hard_error() {
+        let yaml = "      rules:\n        - alert: {{ .Values.alertName }}\n";
+        let err = super::parse_alerts(yaml).unwrap_err().to_string();
+        assert!(err.contains("unparseable alert line"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_name_severity_pair_is_a_hard_error() {
+        let yaml = r#"
+      rules:
+        - alert: SameOne
+          expr: rio_a_total > 0
+          labels:
+            severity: warning
+        - alert: SameOne
+          expr: rio_a_total > 5
+          labels:
+            severity: warning
+"#;
+        let err = super::parse_alerts(yaml).unwrap_err().to_string();
+        assert!(err.contains("SameOne") && err.contains("warning"), "{err}");
+    }
+
+    #[test]
+    fn same_name_different_severity_is_legal_and_templated_is_flagged() {
+        let yaml = r#"
+      rules:
+        - alert: TwoArm
+          expr: rio_a_total > 0
+          labels:
+            severity: warning
+        - alert: TwoArm
+          expr: rio_a_total > {{ .Values.critThreshold }}
+          labels:
+            severity: critical
+"#;
+        let v = super::parse_alerts(yaml).unwrap();
+        let rules = v["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["templated"], false);
+        assert_eq!(rules[1]["templated"], true);
+    }
 
     // bug_364 red (pre-fix): "first describe wins" + unsorted read_dir
     // made the divergent-duplicate winner filesystem-order-dependent —

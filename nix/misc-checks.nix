@@ -297,6 +297,10 @@ in
           pkgs.yq-go
           pkgs.jq
           pkgs.gnugrep
+          # promtool (fragment 34): syntax-checks the rendered
+          # PrometheusRule and replays the alert-contract unit tests.
+          # promtool ships in the cli output, not out.
+          pkgs.prometheus.cli
         ];
       }
       ''

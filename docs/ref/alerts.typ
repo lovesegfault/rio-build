@@ -30,7 +30,16 @@ shipped rule never used).
 )
 
 #for r in _rules [
-  == #raw(r.name)
+  // Severity-suffixed heading: alert names may legally carry two
+  // arms (e.g. a warning and a critical threshold); the suffix keeps
+  // the section anchors unique (merged_bug_015).
+  == #raw(r.name) (#raw(r.severity))
+
+  #if r.at("templated", default: false) [
+    _Templated expression — helm renders `{{ }}` values at deploy
+    time; the text below is the template source, not final PromQL
+    (merged_bug_014)._
+  ]
 
   #raw(block: true, lang: "promql", r.expr)
 
