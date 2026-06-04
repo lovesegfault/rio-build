@@ -667,9 +667,11 @@ async fn try_fetch_one(
         .map_err(FetchError::Transient)?;
 
     let mut req = client.get(url);
-    // A malformed netrc parses the same way every time: permanent.
-    if let Some((user, pass)) = netrc_credentials(params.netrc.as_deref(), candidate)
-        .map_err(FetchError::PermanentForCandidate)?
+    // Read-vs-parse permanence is decided at the producing statement
+    // (classify_netrc_error): a malformed netrc is permanent, a
+    // worker-environmental read fault retries.
+    if let Some((user, pass)) =
+        netrc_credentials(params.netrc.as_deref(), candidate).map_err(classify_netrc_error)?
     {
         req = req.basic_auth(user, Some(pass));
     }
@@ -1104,6 +1106,63 @@ impl std::fmt::Display for TokenSummary {
     }
 }
 
+/// netrc failure split at its two producing statements: reading the
+/// file and parsing its contents are different error sources with
+/// different permanence, and folding them into one arm is exactly the
+/// composite blanket amended R1(e) forbids.
+#[derive(Debug, thiserror::Error)]
+enum NetrcError {
+    /// `read_to_string` failed. The PATH is operator config (the
+    /// sandbox netrc location), never tenant input — safe to name.
+    #[error("reading netrc {path}")]
+    Read {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The file read fine and parsed the same way it always will.
+    #[error("parsing netrc")]
+    Parse(#[source] NetrcParseError),
+}
+
+/// Classify a netrc failure AT ITS PRODUCING STATEMENT — replaces the
+/// call-site blanket (`map_err(PermanentForCandidate)` over the whole
+/// `netrc_credentials` composite) that round-15's permanence pass
+/// introduced and the round-17 R1(e) exemplar deliberately left for
+/// this commit:
+///
+/// - [`NetrcError::Parse`]: deterministic — a malformed netrc parses
+///   the same way every time. Permanent for the candidate.
+/// - [`NetrcError::Read`] with a worker-environmental errno
+///   (`ENOSPC`/`EIO`/`EROFS`/`EDQUOT`/`ENOMEM` — the same allowlist as
+///   [`classify_restore_error`], same rationale): the worker's disk or
+///   memory, not the file. Transient.
+/// - [`NetrcError::Read`] otherwise — including the documented
+///   NotFound DELTA from the restore classifier's context: there a
+///   missing path is a dropped-input infra signal; here the operator
+///   configured a netrc path that does not exist in the sandbox, which
+///   is deterministic until the pool spec changes. Permanent for the
+///   candidate.
+// r[impl fetcher.fetchurl.permanence-at-source+3]
+fn classify_netrc_error(e: NetrcError) -> FetchError {
+    match &e {
+        NetrcError::Parse(_) => FetchError::PermanentForCandidate(e.into()),
+        NetrcError::Read { source, .. } => {
+            let worker_environmental = source.raw_os_error().is_some_and(|errno| {
+                matches!(
+                    errno,
+                    libc::ENOSPC | libc::EIO | libc::EROFS | libc::EDQUOT | libc::ENOMEM
+                )
+            });
+            if worker_environmental {
+                FetchError::Transient(e.into())
+            } else {
+                FetchError::PermanentForCandidate(e.into())
+            }
+        }
+    }
+}
+
 /// Closed netrc parse-error surface. Every variant's payload is either
 /// a [`TokenSummary`] (length + class, never bytes) or a `&'static
 /// str` naming a CANONICAL keyword (`"login"`, `"password"`, … — the
@@ -1303,16 +1362,17 @@ fn parse_netrc(contents: &str) -> Result<Vec<NetrcEntry>, NetrcParseError> {
 fn netrc_credentials(
     netrc: Option<&Path>,
     candidate: &Candidate,
-) -> anyhow::Result<Option<(String, String)>> {
+) -> Result<Option<(String, String)>, NetrcError> {
     let Some(path) = netrc else { return Ok(None) };
     let host = reqwest::Url::parse(&candidate.url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned));
     let Some(host) = host else { return Ok(None) };
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("reading netrc {}", path.display()))?;
-    let entries =
-        parse_netrc(&contents).with_context(|| format!("parsing netrc {}", path.display()))?;
+    let contents = std::fs::read_to_string(path).map_err(|source| NetrcError::Read {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let entries = parse_netrc(&contents).map_err(NetrcError::Parse)?;
 
     // Only a complete login+password pair authenticates; incomplete
     // entries are inert (the oracle likewise reports success only once
@@ -1656,6 +1716,57 @@ mod tests {
             "credential bytes leaked into the parse error: {msg}"
         );
         assert!(msg.contains("quoted value for `password`"), "{msg}");
+    }
+
+    /// Read-vs-parse permanence split (the composite blanket is gone):
+    /// a worker-environmental read errno retries, everything else —
+    /// including the documented NotFound delta (a configured netrc
+    /// path missing from the sandbox is deterministic until the pool
+    /// spec changes) and every parse failure — is permanent for the
+    /// candidate.
+    // r[verify fetcher.fetchurl.permanence-at-source+3]
+    #[test]
+    fn netrc_read_errors_classify_by_errno_and_parse_stays_permanent() {
+        let read = |errno: i32| NetrcError::Read {
+            path: "/build/.netrc".into(),
+            source: std::io::Error::from_raw_os_error(errno),
+        };
+        // Worker-environmental allowlist → transient.
+        for errno in [
+            libc::ENOSPC,
+            libc::EIO,
+            libc::EROFS,
+            libc::EDQUOT,
+            libc::ENOMEM,
+        ] {
+            assert!(
+                matches!(classify_netrc_error(read(errno)), FetchError::Transient(_)),
+                "errno {errno} must be transient (worker-environmental)"
+            );
+        }
+        // The NotFound DELTA: configured-but-missing is deterministic.
+        assert!(matches!(
+            classify_netrc_error(read(libc::ENOENT)),
+            FetchError::PermanentForCandidate(_)
+        ));
+        // Permission and other non-allowlist errnos: permanent.
+        assert!(matches!(
+            classify_netrc_error(read(libc::EACCES)),
+            FetchError::PermanentForCandidate(_)
+        ));
+        // Parse failures: deterministic, permanent.
+        let parse = NetrcError::Parse(parse_netrc("machine").unwrap_err());
+        assert!(matches!(
+            classify_netrc_error(parse),
+            FetchError::PermanentForCandidate(_)
+        ));
+        // End to end: a missing configured netrc file errs as Read.
+        let gone = netrc_credentials(
+            Some(Path::new("/nonexistent/netrc-for-this-test")),
+            &origin("https://a.example/x"),
+        )
+        .unwrap_err();
+        assert!(matches!(gone, NetrcError::Read { .. }));
     }
 
     /// TOTAL no-echo: one fixture per [`NetrcParseError`] variant
