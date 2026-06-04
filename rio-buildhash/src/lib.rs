@@ -76,7 +76,7 @@
 //! Watch coverage equals hash coverage, by construction: the settle's
 //! success arm emits a `rerun-if-changed` for every file of the agreed
 //! pass — the same loop iteration that folds a file into the FNV state
-//! carries its name out (see [`DirHash::Hash`]) — so a replayable key
+//! carries its name out (see `DirHash::Hash`) — so a replayable key
 //! always ships with per-file watches over exactly the set it hashed,
 //! alongside the directory watch that covers additions. To be explicit
 //! about what that does NOT fix: deleting a hashed file already re-fires
@@ -102,7 +102,7 @@
 //! the legitimate hash of a smaller set). A content-compared fallthrough
 //! twin is re-hashed once AFTER settling and must still match the
 //! settled value, closing the compare-then-settle window on the twin
-//! side (see [`benign_settle`]). Residual race, by construction
+//! side (see `benign_settle`). Residual race, by construction
 //! unobservable from a build script: the macros re-read the directory
 //! (and any twin) later, inside rustc — a swap landing in *that* window
 //! mislabels one compile. Exposure requires an exit-0 compile against a
@@ -430,7 +430,7 @@ enum FallthroughVerdict {
     /// require three-way agreement — the settled hash must describe the
     /// same tracked state the benign verdict was computed against.
     /// `compared` carries each foreign twin that was content-compared
-    /// (settled-and-equal hashes) so [`benign_settle`] can re-verify it
+    /// (settled-and-equal hashes) so `benign_settle` can re-verify it
     /// against the settled value — the comparison vouched for
     /// twin == snapshot only at COMPARISON time.
     Benign {
@@ -521,7 +521,7 @@ enum FallthroughVerdict {
 /// tracked entry, not the candidate). Both hashes settled and equal =>
 /// benign (identical bytes cannot leak anything the tracked hash does
 /// not cover), with the twin recorded in `Benign::compared` for the
-/// post-settle recheck ([`benign_settle`]); settled and unequal =>
+/// post-settle recheck (`benign_settle`); settled and unequal =>
 /// `Divergent`. Whole-set equality deliberately over-fires when the
 /// divergence is confined to files the tracked dir also contains
 /// (per-query masking means those bytes cannot leak) — precision there
@@ -740,7 +740,7 @@ enum DirHash {
 /// What a settle produced: a replayable key (whose per-file watches over
 /// exactly the hashed set were emitted by the success arm) or an
 /// unreplayable churn key (always-stale sentinel emitted instead). The
-/// distinction exists so [`benign_settle`] runs the post-settle twin
+/// distinction exists so `benign_settle` runs the post-settle twin
 /// recheck only on a genuinely settled value; [`settled_hash`] flattens
 /// it for the migrations tracker.
 #[derive(Debug)]
@@ -771,7 +771,7 @@ fn settled_hash<W: Write>(em: &mut Emitter<'_, W>, dir: &Path, pred: fn(&str) ->
 /// replayable key the comparison never vouched for). The success arm
 /// also emits one `rerun-if-changed` per file of the agreed pass: the
 /// watch set and the hashed set are the same value by construction (one
-/// loop, see [`DirHash::Hash`]), so a replayable key always carries
+/// loop, see `DirHash::Hash`), so a replayable key always carries
 /// per-file watches over exactly what it hashed — deleting a hashed
 /// file is then a MISSING watched path (cargo's always-stale primitive)
 /// independent of dir-mtime semantics, and a name-set-changing dir swap
