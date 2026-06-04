@@ -261,6 +261,23 @@ pub(crate) fn verifiable_identity_matches(
     // positive-evidence bar also stays where re-CREATION happens —
     // the settled-ROW matcher (its joins refresh the row's creation
     // snapshot) and the displacement arbitration.
+    //
+    // SETTLED residents (Completed/Skipped) take this arm too, and
+    // that is a DECLARED residual, not an oversight (round-17
+    // bug_121 re-discovered it; the round-15 RESIDUAL STATES section
+    // of 8db56a2ce declared it): a Skipped bare squat CAN serve its
+    // recorded outputs to a claims-free rejoin without the budgeted
+    // store-evidence arbitration re-running. The proposed gate —
+    // exclude settled-below-PathBoundBytes residents from this arm —
+    // was evaluated and REJECTED: it regresses the substitution
+    // reprobe flow (a Skipped floating-CA node whose outputs were
+    // substituted holds rank UnverifiedClaim with a REALIZED path; a
+    // claims-free re-reference must keep joining it or every
+    // post-substitution rebuild re-arbitrates), pinned by
+    // reprobe_substitute_floating_ca_preserves_realized_path. The
+    // residual's bound: capture requires the squat to have settled
+    // WITHOUT byte evidence, which the gateway's populate pass makes
+    // a non-default flow (TODO below).
     if !existing.drv_content_authoritative
         && node.ca_modular_hash.is_none()
         && node.expected_output_paths.iter().all(|p| p.is_empty())

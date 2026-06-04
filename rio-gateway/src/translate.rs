@@ -264,6 +264,20 @@ pub(crate) fn compute_modular_hash_cached(
 /// and retry-with-backoff; ingress treats a missing hash as no-evidence
 /// (fail-closed for authoritative claims, declaration-only for
 /// store-backed ones).
+///
+// TODO: round-17 bug_121 residual bound — a node this pass FAILS to
+// hash enters the scheduler hash-less, and if it settles (Skipped)
+// without ever acquiring byte evidence it becomes the bare squat the
+// claims-free resident join serves without re-arbitration (the
+// declared 8db56a2ce residual; the gate was rejected as a regression
+// of the substitution reprobe flow — see the rationale at the
+// claims-free arm in scheduler dag/mod.rs). Tightening lives HERE,
+// not there: make the hash-less-but-cached case a hard error for
+// gateway-submitted DAGs (the cache has the bytes; failure to hash
+// cached bytes is a gateway bug, not a tenant condition), so the
+// hash-less settled population shrinks to direct/hostile submitters,
+// who already cannot capture an honest gateway resubmission (the
+// gateway always re-populates hashes).
 // r[impl gw.dag.modulo-hash-all-nodes]
 fn populate_ca_modular_hashes(
     nodes: &mut [types::DerivationNode],
