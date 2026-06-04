@@ -183,7 +183,10 @@ pub(super) async fn resolve_floating_outputs(
     hash_cache: &mut HashMap<String, [u8; 32]>,
 ) -> anyhow::Result<(Option<[u8; 32]>, HashMap<String, String>)> {
     let mut realized: HashMap<String, String> = HashMap::new();
-    let has_floating = drv.outputs().iter().any(|o| o.path().is_empty());
+    // Owner probe (round-17 merged_bug_062): the parsed-drv surface
+    // lives in rio-nix; the open-coded copy is denied by the
+    // floatingness-probe lint.
+    let has_floating = drv.has_unknown_output_paths();
     if !has_floating {
         return Ok((None, realized));
     }

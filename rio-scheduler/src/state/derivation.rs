@@ -1744,7 +1744,17 @@ impl DerivationState {
         // REGISTRATION with the dispatch-time placeholder REWRITE;
         // bug_053 falsified it.)
         let needs_resolve = row.needs_resolve.unwrap_or_else(|| {
-            rio_nix::derivation::should_resolve_from_expected_paths(&row.expected_output_paths)
+            // Round-17 merged_bug_062: the legacy-NULL degrade answers
+            // through the owner helper too — a pre-071 floating/deferred
+            // row that persisted the omitted-[] expected shape derives
+            // unknown from its KIND instead of reading "known" off the
+            // absent slots (the same fail-open the live probes had).
+            rio_nix::derivation::output_paths_unknown_from_claims(
+                &row.expected_output_paths,
+                row.is_fixed_output,
+                row.is_ca,
+                false,
+            )
         });
         let recovered_input_srcs: Vec<String> = parsed_content
             .as_ref()

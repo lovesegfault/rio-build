@@ -188,6 +188,10 @@ pub trait DerivationLike {
     /// Contrast [`has_ca_floating_outputs`](Self::has_ca_floating_outputs)
     /// which is true only for the floating-CA leaf, not for the
     /// deferred-IA nodes above it.
+    /// Public since round-17 merged_bug_062: the gateway's floating
+    /// detection open-coded this exact probe; the floatingness-probe
+    /// xtask lint now denies that form outside this module, so the
+    /// parsed-drv surface is part of the owner API.
     fn has_unknown_output_paths(&self) -> bool {
         self.outputs().iter().any(|o| o.path().is_empty())
     }
@@ -284,6 +288,49 @@ pub fn should_resolve(
 ///   resolve walk visits zero children and is a no-op.
 pub fn should_resolve_from_expected_paths<S: AsRef<str>>(expected_output_paths: &[S]) -> bool {
     expected_output_paths.iter().any(|p| p.as_ref().is_empty())
+}
+
+/// The OWNER of the child-path-knowledge question (round-17
+/// merged_bug_062): "are this node's output paths unknown until
+/// placeholder resolution?", answered from its claimed/expected path
+/// list AND its kind — total over every legal list shape.
+///
+/// The non-empty arm is the classic per-slot emptiness signal
+/// ([`should_resolve_from_expected_paths`]). The EMPTY arm is the fix:
+/// an omitted list (`[]`, a legal ingress shape) carries no slot
+/// signal at all, and the open-coded probes mapped it to "paths
+/// known" — fail-OPEN for exactly the floating-CA/deferred population
+/// whose paths are definitionally unknown (`needs_resolve=false` was
+/// then persisted for parents, which shipped literal placeholders in
+/// env/args and failed deterministically). With the kind in hand the
+/// empty arm answers honestly: a non-FOD that is content-addressed or
+/// already flagged `needs_resolve` has unknown paths; a fixed-output
+/// node's path is statically known regardless of list shape; a plain
+/// input-addressed node with an omitted list has computable paths.
+///
+/// Probes for NON-RESIDENT nodes (no row, no node) must answer
+/// `Some(true)` — unknown — never `None`-degraded-to-false: the
+/// consequence of a spurious `true` is one `maybe_resolve_ca` walk at
+/// dispatch that finds concrete paths and rewrites nothing
+/// (consequence-free); the consequence of a spurious `false` is the
+/// deterministic placeholder failure above. The blanket
+/// `unwrap_or(true)` flip inside [`should_resolve`] was REJECTED in
+/// favor of feeders answering totally: `None` stays reserved for
+/// probes that genuinely cannot answer, and the conservative default
+/// at the consumption site stays visibly false so a silent new
+/// feeder that returns `None` under-approximates loudly in tests
+/// rather than resolving everything.
+pub fn output_paths_unknown_from_claims<S: AsRef<str>>(
+    claims: &[S],
+    is_fixed_output: bool,
+    is_ca: bool,
+    needs_resolve: bool,
+) -> bool {
+    if claims.is_empty() {
+        !is_fixed_output && (is_ca || needs_resolve)
+    } else {
+        should_resolve_from_expected_paths(claims)
+    }
 }
 
 /// A full Nix derivation parsed from a `.drv` file.
@@ -617,6 +664,43 @@ mod tests {
     /// derivations.cc:1125-1155), including the one deliberate
     /// narrowing (fixed-output by type) and its correctness escape
     /// (clause 3).
+    /// Round-17 merged_bug_062: the owner helper's full matrix —
+    /// list shape × kind. The empty-list column is the fix: the
+    /// open-coded probes answered false (paths known) for every kind.
+    #[test]
+    fn output_paths_unknown_matrix() {
+        use super::output_paths_unknown_from_claims as unknown;
+        let empty: &[&str] = &[];
+        // Empty list: kind decides.
+        assert!(
+            !unknown(empty, true, false, false),
+            "FOD: path statically known"
+        );
+        assert!(
+            !unknown(empty, true, true, true),
+            "FOD wins over CA/resolve flags"
+        );
+        assert!(unknown(empty, false, true, false), "floating-CA: unknown");
+        assert!(
+            unknown(empty, false, false, true),
+            "deferred (needs_resolve): unknown"
+        );
+        assert!(
+            !unknown(empty, false, false, false),
+            "plain IA with omitted list: computable, not unknown"
+        );
+        // Non-empty list: per-slot emptiness signal, kind ignored.
+        assert!(
+            unknown(&[""], true, false, false),
+            "empty slot wins even for FOD shape"
+        );
+        assert!(unknown(&["/nix/store/x", ""], false, false, false));
+        assert!(
+            !unknown(&["/nix/store/x"], false, true, true),
+            "all slots concrete: known"
+        );
+    }
+
     #[test]
     fn should_resolve_oracle_truth_table() -> anyhow::Result<()> {
         let dep = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep.drv";

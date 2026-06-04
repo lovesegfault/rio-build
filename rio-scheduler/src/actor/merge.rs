@@ -852,15 +852,32 @@ impl DagActor {
                 .and_then(|s| s.ca.modular_hash)
         };
         // Child output-path knowledge for the byte-derived resolve
-        // flag: a resident child's expected paths carry the same
-        // emptiness signal recovery degrades from
-        // (`should_resolve_from_expected_paths`); a non-resident
-        // child is unknown (None → not-unknown degrade).
+        // flag, answered by the rio-nix OWNER helper (round-17
+        // merged_bug_062): a resident child answers from its claimed
+        // paths AND its kind — the omitted-[] ingress shape no longer
+        // reads as "paths known" for floating/deferred children — and
+        // a NON-RESIDENT child answers Some(true), unknown,
+        // fail-closed: the cost of a spurious true is one
+        // maybe_resolve_ca walk at dispatch that finds concrete paths
+        // and rewrites nothing (consequence-free), while the old
+        // None→unwrap_or(false) degrade persisted needs_resolve=false
+        // for floating-CA parents that then shipped literal
+        // placeholders and failed deterministically.
         let child_unknown = |path: &str| {
-            self.dag
-                .hash_for_path(path)
-                .and_then(|h| self.dag.node(h))
-                .map(|s| s.expected_output_paths.iter().any(|p| p.is_empty()))
+            Some(
+                self.dag
+                    .hash_for_path(path)
+                    .and_then(|h| self.dag.node(h))
+                    .map(|s| {
+                        rio_nix::derivation::output_paths_unknown_from_claims(
+                            &s.expected_output_paths,
+                            s.is_fixed_output,
+                            s.ca.is_ca,
+                            s.ca.needs_resolve,
+                        )
+                    })
+                    .unwrap_or(true),
+            )
         };
         match classify_store_evidence(node, bytes, submission_seed, &resident, &child_unknown) {
             // r[impl sched.dispatch.claims-derived+5]

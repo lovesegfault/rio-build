@@ -257,6 +257,13 @@ in
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-controller/src)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../xtask/src)
+            # floatingness-probe (round-17 merged_bug_062) walks the
+            # owner crate + the remaining consumer crates — without
+            # them in the fileset the lint passes VACUOUSLY under nix
+            # (the trap this header warns about).
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-nix/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-gateway/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-builder/src)
             ../infra/helm/rio-build/templates/scheduler.yaml
             # seccomp-allowlist validates both Localhost profiles —
             # rio-builder.json and rio-fetcher.json. Both must be in

@@ -1394,12 +1394,22 @@ pub(crate) fn validate_inline_drv_content(
 fn normalize_inline_needs_resolve(nodes: &mut [rio_proto::types::DerivationNode]) {
     use rio_nix::derivation::Derivation;
 
+    // Round-17 merged_bug_062: per-node answers come from the rio-nix
+    // OWNER helper — kind decides for the omitted-[] shape (a
+    // floating/deferred child with no expected list is UNKNOWN, where
+    // the open-coded emptiness probe read "known" and normalized
+    // honest needs_resolve echoes to false).
     let unknown_by_path: std::collections::HashMap<String, bool> = nodes
         .iter()
         .map(|n| {
             (
                 n.drv_path.clone(),
-                n.expected_output_paths.iter().any(|p| p.is_empty()),
+                rio_nix::derivation::output_paths_unknown_from_claims(
+                    &n.expected_output_paths,
+                    n.is_fixed_output,
+                    n.is_content_addressed,
+                    n.needs_resolve,
+                ),
             )
         })
         .collect();
@@ -1415,8 +1425,12 @@ fn normalize_inline_needs_resolve(nodes: &mut [rio_proto::types::DerivationNode]
         let Ok(drv) = Derivation::parse(text) else {
             continue;
         };
-        let derived =
-            rio_nix::derivation::should_resolve(&drv, |p| unknown_by_path.get(p).copied());
+        let derived = rio_nix::derivation::should_resolve(&drv, |p| {
+            // A child outside this submission's node set answers
+            // unknown (fail-closed; same consequence-free argument
+            // as the merge feeder) — never the None→false degrade.
+            Some(unknown_by_path.get(p).copied().unwrap_or(true))
+        });
         if node.needs_resolve != derived {
             tracing::debug!(
                 drv_path = %node.drv_path,
