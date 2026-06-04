@@ -2699,6 +2699,17 @@ re-proven over the widened domain, 13/13), the kinded unit table, and
 the failover re-delivery test (the holder now presents its token; the
 tokenless same-identity re-pull is asserted `NotYetReady`).
 
+**Owner counter-signature for the rule-4 amendment: SIGNED 2026-06-04
+(collected at the bughunt-wave close-out — the wave's final owner
+act).** Checked at signing: the resume-token arm is landed and
+kani-proven both directions (evidence-kernel 19/19 at the final
+recount); the colliding-identity calibration falsifies
+`atMostOneClaimWinner`; the failover test pins the token-presenting
+semantics; the wire-delta table is complete (second-lander A4:
+`Aborted=5`, `store_degraded=7`, `resume_exec_id=5`). The amendment's
+behavior change for tokenless senders is accepted as the contract's
+own term.
+
 ### The go/no-go evaluation (T-0e.7)
 
 Every design §6 no-go condition (nine bullets) plus the plan's
