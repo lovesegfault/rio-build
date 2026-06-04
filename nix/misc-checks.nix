@@ -1660,9 +1660,28 @@ in
           echo "FAIL: bare migration number in an ops runbook — use the NNN_slug stem" >&2
           fail=1
         fi
-        if grep -rn -E '\(0[0-9]{2}\)|\bmigrations?-0[0-9]{2}\b' $typSrc $crossSrc \
+        # bug_136: the 0-prefixed shapes silently expired at migration
+        # 100 (a "(103)" shorthand passed unchallenged). Widened to
+        # [0-9]{3} where the form is unambiguous: the migration-NNN
+        # hyphen shape everywhere, the (NNN) paren shape in ops
+        # runbooks (where the corruption class lived). Spec chapters
+        # legitimately parenthesize 3-digit protocol literals
+        # (gateway.typ activity ids), so the paren ban stays 0NN
+        # outside ops — the slug validation below is 3-digit
+        # everywhere and is the load-bearing check; the canary at the
+        # bottom forces a revisit before 4 digits.
+        if grep -rn -E '\bmigrations?-[0-9]{3}\b' $typSrc $crossSrc \
              | grep -vE '/rio-migrations/|misc-checks\.nix'; then
-          echo "FAIL: (0NN)/migration-0NN shorthand — use the NNN_slug stem" >&2
+          echo "FAIL: migration-NNN shorthand — use the NNN_slug stem" >&2
+          fail=1
+        fi
+        if grep -rn -E '\([0-9]{3}\)' $typSrc/ops; then
+          echo "FAIL: (NNN) shorthand in an ops runbook — use the NNN_slug stem" >&2
+          fail=1
+        fi
+        if grep -rn -E '\(0[0-9]{2}\)' $typSrc $crossSrc \
+             | grep -vE '/rio-migrations/|misc-checks\.nix'; then
+          echo "FAIL: (0NN) shorthand — use the NNN_slug stem" >&2
           fail=1
         fi
         while IFS= read -r tok; do
@@ -1670,8 +1689,21 @@ in
             echo "FAIL: migration slug token '$tok' matches no migrations/ filename" >&2
             fail=1
           fi
-        done < <(grep -rohE '\b0[0-9]{2}_[a-z][a-z0-9_]*' $typSrc $crossSrc \
+        done < <(grep -rohE '\b[0-9]{3}_[a-z][a-z0-9_]*' $typSrc $crossSrc \
           | sort -u)
+        # bug_136 canary: these regexes hardcode a 3-digit stem width.
+        # Synthesized from the live inventory so it expires LOUDLY
+        # while there is still headroom (max+6 crossing 1000) instead
+        # of silently un-validating migration 1000_*.
+        maxstem=$(jq -r '.stems | map(split("_")[0] | tonumber) | max' $migrationsJson)
+        if [ "$((maxstem + 6))" -ge 1000 ]; then
+          echo "FAIL: migration numbering is approaching 4 digits" >&2
+          echo "  (max stem $maxstem). Re-widen the docs-lint slug and" >&2
+          echo "  shorthand regexes in nix/misc-checks.nix (bug_136" >&2
+          echo "  canary — they hardcode a 3-digit width) and bump this" >&2
+          echo "  canary's boundary." >&2
+          fail=1
+        fi
         # configuration.typ is 100% derived from rust Config::default()
         # via gen/config.json. Rust source citing it as a spec source is
         # inverted-dataflow (R3-m002, R4-003, R5-019). observability.typ
