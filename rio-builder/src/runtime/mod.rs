@@ -183,6 +183,7 @@ impl BuildSpawnContext {
         &self,
         peak_disk_bytes: Option<u64>,
         circuit_trips_at_spawn: u64,
+        upload_transport: bool,
     ) -> result::CompletionStamp {
         let prev = *self.resources.read().unwrap_or_else(|e| e.into_inner());
         result::CompletionStamp {
@@ -197,14 +198,24 @@ impl BuildSpawnContext {
                 peak_disk_bytes,
                 prev,
             )),
-            // bug_408: degraded = open RIGHT NOW (the build very likely
-            // failed on EIO from the open breaker) OR tripped during
-            // this build (open-then-auto-closed — the 30s auto-close
-            // beats most build durations, so the point-in-time check
-            // alone under-reports). The stamp is advisory data; the
-            // assembly fns apply it only to InfrastructureFailure.
-            store_degraded: self.fuse_circuit.is_open()
-                || self.fuse_circuit.trip_count() > circuit_trips_at_spawn,
+            // Per-lane store evidence (no Default — every lane named).
+            store_evidence: result::StoreEvidenceSet {
+                // bug_408: degraded = open RIGHT NOW (the build very
+                // likely failed on EIO from the open breaker) OR tripped
+                // during this build (open-then-auto-closed — the 30s
+                // auto-close beats most build durations, so the
+                // point-in-time check alone under-reports). The stamp is
+                // advisory data; the assembly fns apply it only to
+                // InfrastructureFailure.
+                fuse_breaker: self.fuse_circuit.is_open()
+                    || self.fuse_circuit.trip_count() > circuit_trips_at_spawn,
+                // bug_286: upload-lane evidence, classified by the
+                // caller from the execution outcome (the assembly fns
+                // additionally fold ExecutionResult/Upload-error
+                // evidence — this seed covers nothing today but keeps
+                // the lane named at the constructor).
+                upload_transport,
+            },
         }
     }
 }
@@ -674,7 +685,11 @@ pub async fn spawn_build_task(
             }
         }
 
-        let stamp = ctx.completion_stamp(peak_disk_bytes, circuit_trips_at_spawn);
+        // bug_286: the upload lane's evidence is folded in by the
+        // assembly fns (ok_completion reads ExecutionResult.
+        // store_unreachable; err_completion classifies
+        // ExecutorError::Upload) — seed false here.
+        let stamp = ctx.completion_stamp(peak_disk_bytes, circuit_trips_at_spawn, false);
         let mut completion = match result {
             Ok(exec_result) => ok_completion(exec_result, stamp),
             Err(e) => err_completion(
@@ -726,8 +741,14 @@ pub async fn spawn_build_task(
                         node_name: panic_node_name,
                         hw_class,
                         final_resources,
-                        store_degraded: panic_circuit.is_open()
-                            || panic_circuit.trip_count() > circuit_trips_at_spawn,
+                        store_evidence: result::StoreEvidenceSet {
+                            fuse_breaker: panic_circuit.is_open()
+                                || panic_circuit.trip_count() > circuit_trips_at_spawn,
+                            // Panic = the build task died before any
+                            // upload outcome existed; no upload-lane
+                            // evidence is observable on this path.
+                            upload_transport: false,
+                        },
                     },
                 ),
             )

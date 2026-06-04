@@ -66,6 +66,28 @@ pub enum UploadError {
     InvalidReference { path: String },
 }
 
+/// bug_286: upload-transport store-unreachability classifier — the
+/// upload lane of `StoreEvidenceSet`.
+///
+/// True iff the retry ladder exhausted on a TRANSPORT-unreachable store:
+/// `UploadExhausted` whose final status is `Unavailable` (connect
+/// refused / LB drained) or `DeadlineExceeded` (store accepting but not
+/// answering). Everything else is explicitly NOT store-degraded
+/// evidence: `UploadExhausted` wrapping `Internal` (NAR serialization —
+/// local disk read, see the enum doc), any other gRPC code (the store
+/// ANSWERED; its verdict is not unreachability), local `Io`, and
+/// `InvalidReference` (builder-side bug).
+pub fn is_store_unreachable(err: &UploadError) -> bool {
+    matches!(
+        err,
+        UploadError::UploadExhausted { source, .. }
+            if matches!(
+                source.code(),
+                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+            )
+    )
+}
+
 /// Scan the overlay upper layer for new store paths.
 ///
 /// Returns basenames of paths under `/nix/store/` in the upper layer

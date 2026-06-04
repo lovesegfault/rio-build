@@ -108,6 +108,8 @@ pub fn scripted_result(
         peak_memory_bytes: o.peak_mem,
         peak_cpu_cores: o.peak_cpu,
         peak_disk_bytes: o.peak_disk,
+        // Scripted builds never exercise the upload lane.
+        store_unreachable: false,
         fixture_resources: Some(ResourceUsage {
             cpu_limit_cores: Some(f64::from(cpu_limit)),
             cpu_seconds_total: Some(o.cpu_seconds),

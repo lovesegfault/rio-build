@@ -25,11 +25,19 @@ use super::inputs::verify_fod_hashes;
 pub(super) struct BuildOutputs {
     /// Proto BuildResult to send to the scheduler in CompletionReport.
     pub(super) proto_result: ProtoBuildResult,
+    /// bug_286: upload-lane store-unreachability evidence
+    /// (`upload::is_store_unreachable` on the upload error). Carried
+    /// BuildOutputs → `ExecutionResult` → `StoreEvidenceSet` so an
+    /// upload-lane store outage stamps `store_degraded` exactly like a
+    /// FUSE-lane one. `false` on every non-upload failure path.
+    pub(super) store_unreachable: bool,
 }
 
 impl BuildOutputs {
     /// Failure-path shorthand: status + error_msg only, all other
-    /// `ProtoBuildResult` fields default.
+    /// `ProtoBuildResult` fields default. Non-upload failures carry no
+    /// upload-lane store evidence (`store_unreachable: false`); the
+    /// upload `Err` arm sets the field from the classifier.
     fn failed(status: BuildResultStatus, error_msg: impl Into<String>) -> Self {
         Self {
             proto_result: ProtoBuildResult {
@@ -37,6 +45,7 @@ impl BuildOutputs {
                 error_msg: error_msg.into(),
                 ..Default::default()
             },
+            store_unreachable: false,
         }
     }
 }
@@ -280,14 +289,24 @@ pub(super) async fn collect_outputs(
                     // (`apply_store_degraded`) only marks infra failures.
                     store_degraded: false,
                 },
+                store_unreachable: false,
             })
         }
         Err(e) => {
             tracing::error!(drv_path = %drv_path, error = %e, "output upload failed");
-            Ok(BuildOutputs::failed(
+            // bug_286: classify the upload-lane evidence BEFORE the error
+            // is stringified away — UploadExhausted{Unavailable|
+            // DeadlineExceeded} is store-degraded evidence; everything
+            // else (NAR-wrapping Internal, store verdicts, local IO) is
+            // not. Status stays InfrastructureFailure either way; the
+            // evidence refines the class, never the verdict.
+            let store_unreachable = crate::upload::is_store_unreachable(&e);
+            let mut out = BuildOutputs::failed(
                 BuildResultStatus::InfrastructureFailure,
                 format!("output upload failed: {e}"),
-            ))
+            );
+            out.store_unreachable = store_unreachable;
+            Ok(out)
         }
     }
 }

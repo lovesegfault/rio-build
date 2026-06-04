@@ -25,20 +25,46 @@ pub(super) struct CompletionStamp {
     /// Cgroup-poll snapshot at completion time. `None` only if the
     /// caller has no `ResourceSnapshotHandle` (panic-catcher fallback).
     pub final_resources: Option<ResourceUsage>,
-    /// bug_408: the FUSE breaker's verdict for THIS build (open at
-    /// completion, or tripped during the build). Advisory — the
+    /// Store-degraded evidence, one field per lane. Advisory — the
     /// assembly fns stamp `BuildResult.store_degraded` from it ONLY
-    /// when the status is `InfrastructureFailure`: the flag is a
+    /// when the status is `InfrastructureFailure`: the evidence is a
     /// classification refinement of an infra failure ("the store was
     /// degraded, wait it out"), never a verdict of its own.
-    pub store_degraded: bool,
+    pub store_evidence: StoreEvidenceSet,
 }
 
-// r[impl builder.outcome.store-degraded]
-/// bug_408: stamp `store_degraded` onto an assembled `ProtoBuildResult`
-/// iff the status is `InfrastructureFailure`. The single chokepoint all
-/// three assembly paths (ok/err/panic) route through, so a status added
-/// later cannot silently carry the flag.
+/// bug_286: per-lane store-degraded evidence.
+///
+/// One boolean per store-coupled failure lane. Deliberately NO
+/// `Default` impl: every construction site must name every lane, so a
+/// future store-coupled lane (e.g. a substitute-fetch path) fails to
+/// compile at each stamp site until its evidence is wired — the lane
+/// set can never silently lag the failure surface.
+pub(super) struct StoreEvidenceSet {
+    /// bug_408 lane: the FUSE breaker open at completion, or its
+    /// monotonic trip count rose during the build (the during-the-build
+    /// half catches open-then-auto-closed).
+    pub fuse_breaker: bool,
+    /// bug_286 lane: the output upload exhausted its retries on a
+    /// transport-unreachable store (`upload::is_store_unreachable` —
+    /// `UploadExhausted` ending in `Unavailable`/`DeadlineExceeded`).
+    pub upload_transport: bool,
+}
+
+impl StoreEvidenceSet {
+    /// Any lane saw store-degraded evidence.
+    pub(super) fn any(&self) -> bool {
+        self.fuse_breaker || self.upload_transport
+    }
+}
+
+// r[impl builder.outcome.store-degraded+1]
+/// bug_408 + bug_286: stamp `store_degraded` onto an assembled
+/// `ProtoBuildResult` iff the status is `InfrastructureFailure`. The
+/// single chokepoint all three assembly paths (ok/err/panic) route
+/// through, so a status added later cannot silently carry the flag.
+/// Takes the COMBINED lane verdict (`StoreEvidenceSet::any`) — lanes
+/// are named at stamp construction, never here.
 fn apply_store_degraded(result: &mut ProtoBuildResult, stamp_degraded: bool) {
     result.store_degraded =
         stamp_degraded && result.status == i32::from(BuildResultStatus::InfrastructureFailure);
@@ -48,9 +74,13 @@ fn apply_store_degraded(result: &mut ProtoBuildResult, stamp_degraded: bool) {
 /// fields flow from the executor (cgroup `memory.peak` + polled `cpu.stat`).
 /// `r.fixture_resources` (test-fixtures only) overrides the cgroup-poll
 /// snapshot so scripted builds can inject `cpu_limit_cores`/`cpu_seconds`.
-pub(super) fn ok_completion(r: ExecutionResult, stamp: CompletionStamp) -> CompletionReport {
+pub(super) fn ok_completion(r: ExecutionResult, mut stamp: CompletionStamp) -> CompletionReport {
+    // bug_286: the upload lane's evidence rides the ExecutionResult
+    // (BuildOutputs -> ExecutionResult -> here); fold it into the stamp
+    // so the chokepoint sees the full lane set.
+    stamp.store_evidence.upload_transport |= r.store_unreachable;
     let mut result = r.result;
-    apply_store_degraded(&mut result, stamp.store_degraded);
+    apply_store_degraded(&mut result, stamp.store_evidence.any());
     CompletionReport {
         drv_path: r.drv_path,
         result: Some(result),
@@ -97,10 +127,16 @@ pub(super) fn err_completion(
     drv_path: String,
     assignment_token: String,
     was_cancelled: bool,
-    stamp: CompletionStamp,
+    mut stamp: CompletionStamp,
     peak_memory_bytes: u64,
     peak_cpu_cores: f64,
 ) -> CompletionReport {
+    // bug_286: an upload error that propagated as ExecutorError (instead
+    // of the collect_outputs mapped arm) carries the same upload-lane
+    // evidence — classify it here so both error shapes converge.
+    if let ExecutorError::Upload(upload_err) = e {
+        stamp.store_evidence.upload_transport |= crate::upload::is_store_unreachable(upload_err);
+    }
     let status = if was_cancelled {
         tracing::info!(drv_path = %drv_path, "build cancelled (cgroup.kill)");
         BuildResultStatus::Cancelled
@@ -120,7 +156,7 @@ pub(super) fn err_completion(
         },
         ..Default::default()
     };
-    apply_store_degraded(&mut result, stamp.store_degraded);
+    apply_store_degraded(&mut result, stamp.store_evidence.any());
     CompletionReport {
         drv_path,
         result: Some(result),
@@ -157,7 +193,7 @@ pub(super) fn panic_completion(
         error_msg: "worker build task panicked".into(),
         ..Default::default()
     };
-    apply_store_degraded(&mut result, stamp.store_degraded);
+    apply_store_degraded(&mut result, stamp.store_evidence.any());
     CompletionReport {
         drv_path,
         result: Some(result),
@@ -271,18 +307,77 @@ mod tests {
             node_name: None,
             hw_class: None,
             final_resources: None,
-            store_degraded: false,
+            store_evidence: StoreEvidenceSet {
+                fuse_breaker: false,
+                upload_transport: false,
+            },
         }
     }
 
     fn degraded_stamp() -> CompletionStamp {
         CompletionStamp {
-            store_degraded: true,
+            store_evidence: StoreEvidenceSet {
+                fuse_breaker: true,
+                upload_transport: false,
+            },
             ..stamp()
         }
     }
 
-    // r[verify builder.outcome.store-degraded]
+    /// bug_286 (R6): `is_store_unreachable` truth table — transport
+    /// unreachability only; store verdicts, NAR-wrapping Internal,
+    /// local IO, and builder bugs are all explicitly NOT evidence.
+    #[test]
+    fn store_unreachable_truth_table() {
+        use crate::upload::{UploadError, is_store_unreachable};
+        let exhausted = |status: tonic::Status| UploadError::UploadExhausted {
+            path: "/nix/store/x".into(),
+            source: status,
+        };
+        let cases = [
+            (exhausted(tonic::Status::unavailable("conn refused")), true),
+            (exhausted(tonic::Status::deadline_exceeded("hang")), true),
+            (
+                exhausted(tonic::Status::internal("NAR serialization")),
+                false,
+            ),
+            (exhausted(tonic::Status::resource_exhausted("quota")), false),
+            (exhausted(tonic::Status::invalid_argument("bad")), false),
+            (UploadError::Io(std::io::Error::other("disk gone")), false),
+            (UploadError::InvalidReference { path: "p".into() }, false),
+        ];
+        for (err, want) in cases {
+            assert_eq!(is_store_unreachable(&err), want, "err={err:?}");
+        }
+    }
+
+    /// bug_286 (R6, stamp rows): the chokepoint treats the two lanes
+    /// identically — upload-transport evidence alone stamps an infra
+    /// failure, and never any other status.
+    #[test]
+    fn upload_lane_stamps_like_fuse_lane() {
+        let upload_stamp = || CompletionStamp {
+            store_evidence: StoreEvidenceSet {
+                fuse_breaker: false,
+                upload_transport: true,
+            },
+            ..stamp()
+        };
+        for (status, want) in [
+            (BuildResultStatus::InfrastructureFailure, true),
+            (BuildResultStatus::TransientFailure, false),
+            (BuildResultStatus::Built, false),
+        ] {
+            let mut result = ProtoBuildResult {
+                status: status.into(),
+                ..Default::default()
+            };
+            apply_store_degraded(&mut result, upload_stamp().store_evidence.any());
+            assert_eq!(result.store_degraded, want, "status={status:?}");
+        }
+    }
+
+    // r[verify builder.outcome.store-degraded+1]
     /// The stamp chokepoint marks `store_degraded` iff the status is
     /// `InfrastructureFailure` AND the breaker verdict was set: a
     /// transient (build-ran) failure with an open breaker stays false
@@ -312,6 +407,29 @@ mod tests {
                 "status={status:?} degraded={degraded}"
             );
         }
+    }
+
+    /// bug_286 (R6, exhausted carry): an `ExecutorError::Upload`
+    /// (`UploadExhausted{Unavailable}`) infra failure with a HEALTHY
+    /// breaker carries the flag through `err_completion`'s classifier.
+    /// RED pre-fix: `assertion failed: report.result.unwrap()
+    /// .store_degraded` — the upload lane produced zero evidence.
+    #[test]
+    fn upload_transport_exhaustion_is_store_degraded() {
+        let status = tonic::Status::unavailable("connect refused");
+        let report = err_completion(
+            &ExecutorError::Upload(crate::upload::UploadError::UploadExhausted {
+                path: "/nix/store/x".into(),
+                source: status,
+            }),
+            "/nix/store/x.drv".into(),
+            "tok".into(),
+            false,
+            stamp(), // fuse lane false
+            0,
+            0.0,
+        );
+        assert!(report.result.unwrap().store_degraded);
     }
 
     /// `err_completion` routes through the chokepoint: a non-permanent

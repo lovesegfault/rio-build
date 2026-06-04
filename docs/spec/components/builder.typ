@@ -347,17 +347,24 @@ fleet-amplification trade-off the heartbeat-era flag had absorbed. The
 successor restores the signal AT CLASSIFICATION instead of as capacity
 state (bug_408): the breaker's verdict rides the completion report.
 
-#r("builder.outcome.store-degraded")[
+#r("builder.outcome.store-degraded+1")[
   A `CompletionReport` whose status is `INFRASTRUCTURE_FAILURE` MUST carry
-  `BuildResult.store_degraded = true` when the FUSE circuit breaker is
-  open at completion time or its monotonic trip count rose during the
-  build, and MUST NOT carry the flag for any other status or for an
-  infra failure with no breaker evidence.
-] The during-the-build half (trip-count delta, not a point-in-time
-`is_open()`) is what catches the open-then-auto-closed window: the 30s
-auto-close beats most build durations, and a one-shot pod's breaker is
-always fresh-closed at spawn. The scheduler routes the flagged class to
-an uncharged backoff requeue (#rref("sched.retry.store-degraded-uncharged")).
+  `BuildResult.store_degraded = true` when any store-evidence lane saw
+  the store degraded — the FUSE-breaker lane (breaker open at completion
+  time or its monotonic trip count rose during the build) or the
+  upload-transport lane (the output upload exhausted its retries with a
+  final status of `UNAVAILABLE` or `DEADLINE_EXCEEDED`) — and MUST NOT
+  carry the flag for any other status or for an infra failure with no
+  lane evidence.
+] The during-the-build half of the FUSE lane (trip-count delta, not a
+point-in-time `is_open()`) is what catches the open-then-auto-closed
+window: the 30s auto-close beats most build durations, and a one-shot
+pod's breaker is always fresh-closed at spawn. The upload-transport lane
+classifies only transport unreachability — an answered upload (any other
+gRPC code, including the NAR-wrapping `INTERNAL`) is the store's verdict
+or a local fault, not unreachability. The scheduler routes the flagged
+class to an uncharged backoff requeue
+(#rref("sched.retry.store-degraded-uncharged")).
 
 - `open`: Open the already-materialized local file (fast path, since `lookup`
   fetched the tree). Falls back to `ensure_cached()` on ENOENT. With

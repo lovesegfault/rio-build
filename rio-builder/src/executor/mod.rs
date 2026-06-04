@@ -332,6 +332,12 @@ pub struct ExecutionResult {
     /// instead of in `cgroup::final_sample()`. `None` = no prjquota
     /// (tmpfs / node without `-o prjquota`).
     pub peak_disk_bytes: Option<u64>,
+    /// bug_286: upload-lane store-unreachability evidence, carried from
+    /// `BuildOutputs` (set by the upload `Err` arm via
+    /// `upload::is_store_unreachable`). Feeds the `upload_transport`
+    /// lane of `StoreEvidenceSet` at completion-stamp time. `false` on
+    /// every path that never reached (or never failed) the upload.
+    pub store_unreachable: bool,
     /// `RIO_BUILDER_SCRIPT` override for `CompletionReport.final_resources`.
     /// `None` on every real build; `Some` only from
     /// `fixture::scripted_result` (feature `test-fixtures`). When set,
@@ -886,7 +892,13 @@ pub async fn execute_build(
 
     // Propagate any daemon/collect error AFTER teardown ran — WITH peaks
     // attached, not via `?`.
-    let (_build_result, BuildOutputs { proto_result }) = match collect_result {
+    let (
+        _build_result,
+        BuildOutputs {
+            proto_result,
+            store_unreachable,
+        },
+    ) = match collect_result {
         Ok(pair) => pair,
         Err(e) => return post_err(e),
     };
@@ -899,6 +911,7 @@ pub async fn execute_build(
             peak_memory_bytes,
             peak_cpu_cores,
             peak_disk_bytes,
+            store_unreachable,
             fixture_resources: None,
         }),
         peak_memory_bytes,
