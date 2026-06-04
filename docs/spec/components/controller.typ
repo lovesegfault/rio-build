@@ -644,12 +644,17 @@ Both Roles split `create` (unrestricted --- RBAC cannot scope `create` by
 `resourceNames`) from `get`/`update` (scoped to the one Lease each component
 owns). All other controller reconcilers remain non-leader-gated.
 
-#r("ctrl.informer.interrupt-sample-conservation")[
+#r("ctrl.informer.interrupt-sample-conservation+2")[
   Every `SpotInterrupted` Event observed by the spot-interrupt watcher MUST
-  be either attributed to a `hw_class` (appending the λ-numerator
-  interrupt sample) or counted as a typed drop on
+  be either APPENDED to the scheduler as the λ-numerator interrupt sample
+  or counted as a typed drop on
   #(refs.metric)("rio_controller_spot_interrupt_dropped_total")`{reason}` with a warning ---
-  a silent skip is not an outcome. Attribution resolves the node's labels
+  a silent skip is not an outcome, and the identity is total over
+  DELIVERY: an attributed sample whose append RPC fails MUST exit
+  through the same counted chokepoint (`reason = append_failed`), so
+  `observed = appended + Σ dropped` holds even while the scheduler is
+  unreachable. An attributed sample is constructible only from the
+  attribution path and consumable only by the counted appender. Attribution resolves the node's labels
   by per-need GET first; when the node is already gone or unreadable (the
   COMMON reclaim case --- the instance is deleted moments after the Event)
   the watcher MUST fall back to the exposure flush's `name → hw_class`

@@ -521,6 +521,12 @@ pub(crate) enum SampleDropReason {
     NoHwClass,
     /// Node GET failed (apiserver error) and no fallback entry.
     GetError,
+    /// Attribution succeeded but the `AppendInterruptSample` RPC
+    /// failed (merged_bug_116): the sample existed and was lost in
+    /// delivery — without this arm the conservation identity
+    /// `observed = appended + Σ dropped{reason}` was false exactly
+    /// when the scheduler was unreachable.
+    AppendFailed,
 }
 
 impl SampleDropReason {
@@ -529,11 +535,12 @@ impl SampleDropReason {
             Self::NodeGone => "node_gone",
             Self::NoHwClass => "no_hw_class",
             Self::GetError => "get_error",
+            Self::AppendFailed => "append_failed",
         }
     }
 }
 
-// r[impl ctrl.informer.interrupt-sample-conservation]
+// r[impl ctrl.informer.interrupt-sample-conservation+2]
 /// bug_363: the one chokepoint for dropped interrupt samples — warn +
 /// counted (`rio_controller_spot_interrupt_dropped_total{reason}`), so
 /// an attribution gap is operator-visible instead of a `debug!` line.
@@ -566,6 +573,57 @@ fn classify_interrupt_resolution(
         // is the best remaining evidence.
         Ok(None) => fallback.ok_or(SampleDropReason::NodeGone),
         Err(()) => fallback.ok_or(SampleDropReason::GetError),
+    }
+}
+
+/// merged_bug_116: an attributed spot-interrupt sample — constructible
+/// ONLY from the classify-Ok path (the field is module-private and the
+/// sole producer is [`attribute_interrupt`]), so every sample that
+/// exists either appends or exits through the counted drop chokepoint.
+pub(crate) struct InterruptSample {
+    hw_class: String,
+    event_uid: Option<String>,
+}
+
+/// The classify-Ok constructor: resolution outcome × fallback →
+/// a deliverable sample or a typed drop.
+fn attribute_interrupt(
+    got: Result<Option<Option<String>>, ()>,
+    fallback: Option<String>,
+    event_uid: Option<String>,
+) -> Result<InterruptSample, SampleDropReason> {
+    classify_interrupt_resolution(got, fallback).map(|hw_class| InterruptSample {
+        hw_class,
+        event_uid,
+    })
+}
+
+// r[impl ctrl.informer.interrupt-sample-conservation+2]
+/// The ONLY interrupt-sample appender (merged_bug_116): a delivery
+/// failure routes through [`record_sample_drop`] with
+/// [`SampleDropReason::AppendFailed`] — NO sample exit exists outside
+/// the counted chokepoint, making the conservation identity
+/// `observed = appended + Σ dropped{reason}` true over delivery too.
+async fn deliver_interrupt_sample(admin: &mut AdminClient, node: &str, sample: InterruptSample) {
+    let InterruptSample {
+        hw_class,
+        event_uid,
+    } = sample;
+    let r = admin_call(admin.append_interrupt_sample(
+        rio_proto::types::AppendInterruptSampleRequest {
+            hw_class: hw_class.clone(),
+            kind: "interrupt".into(),
+            value: 1.0,
+            event_uid,
+        },
+    ))
+    .await;
+    match r {
+        Ok(_) => debug!(%node, %hw_class, "spot-interrupt: sample appended"),
+        Err(e) => {
+            warn!(%node, error = %e, "spot-interrupt: append failed");
+            record_sample_drop(node, SampleDropReason::AppendFailed);
+        }
     }
 }
 
@@ -857,30 +915,14 @@ pub async fn run_spot_interrupt_watcher(
             .expect("fallback map lock")
             .get(&node)
             .map(|(hw, _)| hw.clone());
-        let hw_class = match classify_interrupt_resolution(got, fb) {
-            Ok(hw) => hw,
-            Err(reason) => {
-                record_sample_drop(&node, reason);
-                continue;
-            }
-        };
         // `event_uid` makes the INSERT idempotent: `.applied_objects()`
         // re-yields every still-extant Event on relist (controller
         // restart, apiserver restart, watch reconnect). Without dedup
         // each relist double-counts into λ's numerator → `solve_full`
         // biases away from spot.
-        let r = admin_call(admin.append_interrupt_sample(
-            rio_proto::types::AppendInterruptSampleRequest {
-                hw_class: hw_class.clone(),
-                kind: "interrupt".into(),
-                value: 1.0,
-                event_uid: ev.metadata.uid.clone(),
-            },
-        ))
-        .await;
-        match r {
-            Ok(_) => debug!(%node, %hw_class, "spot-interrupt: sample appended"),
-            Err(e) => warn!(%node, error = %e, "spot-interrupt: append failed"),
+        match attribute_interrupt(got, fb, ev.metadata.uid.clone()) {
+            Ok(sample) => deliver_interrupt_sample(&mut admin, &node, sample).await,
+            Err(reason) => record_sample_drop(&node, reason),
         }
     }
 }
@@ -930,7 +972,7 @@ fn annotation_target(pod: &Pod) -> Option<(String, String, String)> {
 #[cfg(test)]
 mod tests {
 
-    // r[verify ctrl.informer.interrupt-sample-conservation]
+    // r[verify ctrl.informer.interrupt-sample-conservation+2]
     /// bug_363's resolution table: present-node labels are
     /// authoritative; a gone/unreadable node falls back to the flush
     /// map; only a genuinely unattributable event drops — and the drop
@@ -1381,5 +1423,66 @@ mod tests {
         // Pending (no nodeName yet) → skip, costing no GET.
         let p = pod("rb-pending", "rio", None, &[]);
         assert_eq!(annotation_target(&p), None);
+    }
+
+    // r[verify ctrl.informer.interrupt-sample-conservation+2]
+    /// merged_bug_116: a delivery failure exits through the counted
+    /// chokepoint. Recorded red (pre-fix): the append-Err arm only
+    /// warned — observed = appended + Σ dropped was false exactly when
+    /// the scheduler was unreachable.
+    #[tokio::test]
+    async fn append_failure_is_a_counted_drop() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let (mock, addr, _server) = rio_test_support::grpc::spawn_mock_admin()
+            .await
+            .expect("mock admin");
+        let channel = tonic::transport::Endpoint::try_from(format!("http://{addr}"))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect");
+        let mut admin = rio_proto::AdminServiceClient::with_interceptor(
+            channel,
+            rio_auth::hmac::ServiceTokenInterceptor::new(None, "rio-controller"),
+        );
+
+        let dropped = |rec: &DebuggingRecorder, reason: &str| {
+            rec.snapshotter()
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(k, _, _, v)| {
+                    let key = k.key();
+                    (key.name() == "rio_controller_spot_interrupt_dropped_total"
+                        && key
+                            .labels()
+                            .any(|l| l.key() == "reason" && l.value() == reason))
+                    .then_some(v)
+                })
+        };
+
+        let rec = DebuggingRecorder::new();
+        let _g = ::metrics::set_default_local_recorder(&rec);
+
+        // Successful delivery: appended, nothing dropped.
+        let ok = attribute_interrupt(Ok(Some(Some("mid-ebs-x86".into()))), None, None)
+            .expect("attributed");
+        deliver_interrupt_sample(&mut admin, "node-1", ok).await;
+        assert_eq!(mock.interrupt_samples.read().unwrap().len(), 1);
+        assert!(dropped(&rec, "append_failed").is_none());
+
+        // Programmed failure: the sample exits through the chokepoint.
+        mock.fail_next_append
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let lost = attribute_interrupt(Ok(Some(Some("mid-ebs-x86".into()))), None, None)
+            .expect("attributed");
+        deliver_interrupt_sample(&mut admin, "node-1", lost).await;
+        match dropped(&rec, "append_failed") {
+            Some(DebugValue::Counter(n)) => assert_eq!(
+                n, 1,
+                "append failure must be a counted drop (conservation identity)"
+            ),
+            other => panic!("append failure uncounted: no append_failed drop series ({other:?})"),
+        }
     }
 }

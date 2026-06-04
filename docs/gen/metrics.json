@@ -513,7 +513,7 @@
       {
         "name": "rio_controller_spot_interrupt_dropped_total",
         "kind": "counter",
-        "help": "SpotInterrupted Events whose interrupt sample could NOT be attributed to a hw_class (labeled by reason: node_gone | no_hw_class | get_error). Every drop under-counts the spot-reclaim rate λ's numerator — sustained non-zero rate means the SLA solver is biased TOWARD spot exactly while spot is being reclaimed (bug_363; the fallback map covers the common node-already-deleted case, so drops should be rare)."
+        "help": "SpotInterrupted Events whose interrupt sample was NOT appended to the scheduler (labeled by reason: node_gone | no_hw_class | get_error | append_failed). The first three are attribution failures; append_failed is a delivery failure after successful attribution — together they close the conservation identity observed = appended + dropped. Every drop under-counts the spot-reclaim rate λ's numerator — sustained non-zero rate means the SLA solver is biased TOWARD spot exactly while spot is being reclaimed (bug_363/merged_bug_116; the fallback map covers the common node-already-deleted case, so drops should be rare)."
       },
       {
         "name": "rio_controller_wedge_systemic_suppressed_total",
