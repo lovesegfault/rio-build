@@ -94,19 +94,82 @@ fn write(dir: &Path, name: &str, v: &serde_json::Value) -> Result<()> {
 /// into the chart (bug_330: chart descriptions restated HELP by hand
 /// and drifted; one scrape, two renderers).
 pub(crate) fn metrics_help_map() -> Result<BTreeMap<String, String>> {
+    Ok(collect_describes()?
+        .into_iter()
+        .map(|(name, d)| (name, d.help))
+        .collect())
+}
+
+/// One `describe_*!` callsite, with the crate that declared it (for
+/// divergence diagnostics).
+struct Describe {
+    kind: String,
+    help: String,
+    crate_name: String,
+}
+
+/// Scrape every `describe_*!` callsite across the workspace into a
+/// per-metric map. bug_364: duplicates across crates are legal ONLY
+/// when (kind, help) agree exactly — divergent duplicates are a hard
+/// error naming the metric and both crates. Pre-fix, "first describe
+/// wins" + an unsorted `read_dir` walk made the winner (and thus
+/// `docs/gen/metrics.json` and the rendered chart HELP)
+/// filesystem-order-dependent.
+fn collect_describes() -> Result<BTreeMap<String, Describe>> {
     let re = Regex::new(METRICS_RE)?;
-    let mut seen = BTreeMap::<String, String>::new();
-    visit_rio_crates(&mut |_crate, body| {
+    let mut seen = BTreeMap::<String, Describe>::new();
+    let mut err: Option<anyhow::Error> = None;
+    visit_rio_crates(&mut |crate_name, body| {
         for c in re.captures_iter(body) {
-            seen.entry(c[2].to_string()).or_insert_with(|| {
-                unescape_rust_str(&c[3])
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            });
+            let help = unescape_rust_str(&c[3])
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if let Err(e) = merge_describe(&mut seen, &c[2], &c[1], &help, crate_name) {
+                err.get_or_insert(e);
+            }
         }
     })?;
-    Ok(seen)
+    match err {
+        Some(e) => Err(e),
+        None => Ok(seen),
+    }
+}
+
+/// Pure merge step of [`collect_describes`] — unit-tested directly.
+/// Identical duplicates (per-crate nextest spec floors re-describe
+/// shared metrics) are accepted; divergent (kind, help) duplicates
+/// fail naming the metric and the crate pair, order-independently.
+fn merge_describe(
+    seen: &mut BTreeMap<String, Describe>,
+    name: &str,
+    kind: &str,
+    help: &str,
+    crate_name: &str,
+) -> Result<()> {
+    if let Some(prev) = seen.get(name) {
+        if prev.kind != kind || prev.help != help {
+            let mut pair = [prev.crate_name.as_str(), crate_name];
+            pair.sort_unstable();
+            anyhow::bail!(
+                "divergent describe_*! for {name}: {} and {} disagree on \
+                 kind/help — make the callsites byte-identical or rename \
+                 the metric",
+                pair[0],
+                pair[1],
+            );
+        }
+        return Ok(());
+    }
+    seen.insert(
+        name.to_string(),
+        Describe {
+            kind: kind.to_string(),
+            help: help.to_string(),
+            crate_name: crate_name.to_string(),
+        },
+    );
+    Ok(())
 }
 
 /// Scrape `describe_{counter,gauge,histogram}!` callsites into
@@ -116,22 +179,15 @@ pub(crate) fn metrics_help_map() -> Result<BTreeMap<String, String>> {
 /// other way around (the typst migration inverted the pre-existing
 /// "spec → describe" direction).
 fn metrics() -> Result<serde_json::Value> {
-    let re = Regex::new(METRICS_RE)?;
-    // First describe_*! wins per name (some metrics are described in
-    // multiple crates' lib.rs for nextest's per-crate spec floor).
-    let mut seen = BTreeMap::<String, serde_json::Value>::new();
-    visit_rio_crates(&mut |_crate, body| {
-        for c in re.captures_iter(body) {
-            let name = c[2].to_string();
-            seen.entry(name.clone()).or_insert_with(|| {
-                let help = unescape_rust_str(&c[3])
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                json!({"name": name, "kind": &c[1], "help": help})
-            });
-        }
-    })?;
+    // Shared scrape with regen helm-obs; divergent cross-crate
+    // duplicates are a hard error (bug_364), identical ones legal.
+    let seen: BTreeMap<String, serde_json::Value> = collect_describes()?
+        .into_iter()
+        .map(|(name, d)| {
+            let v = json!({"name": name, "kind": d.kind, "help": d.help});
+            (name, v)
+        })
+        .collect();
     // Group by `rio_{component}_` prefix. by_component is what
     // ref/metrics.typ iterates; flat `names` kept for the existing
     // refs.metric membership assert + docs-lint prefix derivation.
@@ -154,8 +210,12 @@ fn metrics() -> Result<serde_json::Value> {
 /// with `(crate_name, file_body)`. The `rio-*` prefix scan is the same
 /// ground-truth filter the workspace `members` glob uses.
 fn visit_rio_crates(f: &mut impl FnMut(&str, &str)) -> Result<()> {
-    for entry in fs::read_dir(repo_root())? {
-        let crate_dir = entry?.path();
+    // Sorted: `read_dir` order is filesystem-dependent; every consumer
+    // of this walk must be a pure function of repo CONTENT (bug_364).
+    let mut entries: Vec<_> = fs::read_dir(repo_root())?.collect::<std::io::Result<_>>()?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let crate_dir = entry.path();
         let Some(crate_name) = crate_dir
             .file_name()
             .and_then(|n| n.to_str())
@@ -174,8 +234,10 @@ fn visit_rio_crates(f: &mut impl FnMut(&str, &str)) -> Result<()> {
 
 /// Recurse `dir`, calling `f` with the body of every `.rs` file.
 fn visit_rs(dir: &Path, f: &mut impl FnMut(&str)) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let p = entry?.path();
+    let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let p = entry.path();
         if p.is_dir() {
             visit_rs(&p, f)?;
         } else if p.extension().is_some_and(|x| x == "rs") {
@@ -1006,6 +1068,36 @@ spec:
     }
 
     use super::*;
+
+    // bug_364 red (pre-fix): "first describe wins" + unsorted read_dir
+    // made the divergent-duplicate winner filesystem-order-dependent —
+    // gen/metrics.json and the rendered chart HELP flipped between
+    // checkouts. Post-fix: divergence is a hard error naming the crate
+    // pair, identically in BOTH insertion orders; identical dups legal.
+    #[test]
+    fn divergent_duplicate_describe_is_a_hard_error_both_orders() {
+        for (first, second) in [("rio-a", "rio-b"), ("rio-b", "rio-a")] {
+            let mut seen = BTreeMap::new();
+            merge_describe(&mut seen, "rio_x_total", "counter", "One.", first).unwrap();
+            let err = merge_describe(&mut seen, "rio_x_total", "counter", "Two.", second)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("rio_x_total"), "{err}");
+            // Crate pair is sorted — the message is order-independent.
+            assert!(err.contains("rio-a") && err.contains("rio-b"), "{err}");
+        }
+    }
+
+    #[test]
+    fn identical_duplicate_describe_is_legal() {
+        let mut seen = BTreeMap::new();
+        merge_describe(&mut seen, "rio_x_total", "counter", "Same.", "rio-a").unwrap();
+        merge_describe(&mut seen, "rio_x_total", "counter", "Same.", "rio-b").unwrap();
+        assert_eq!(seen.len(), 1);
+        // Kind divergence alone also errors.
+        let err = merge_describe(&mut seen, "rio_x_total", "gauge", "Same.", "rio-c").unwrap_err();
+        assert!(err.to_string().contains("rio_x_total"));
+    }
 
     #[test]
     fn unescape_rust_str_handles_all_escapes() {
