@@ -427,14 +427,12 @@ impl SchedulerTransport {
         signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
         instance: &str,
     ) -> anyhow::Result<ExecutorClient> {
-        let endpoint = tonic::transport::Channel::from_shared(format!("http://{scheduler_addr}"))?
-            .connect_timeout(Duration::from_secs(10))
-            .initial_stream_window_size(Some(rio_common::grpc::H2_INITIAL_STREAM_WINDOW))
-            .initial_connection_window_size(Some(rio_common::grpc::H2_INITIAL_CONN_WINDOW))
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .keep_alive_timeout(Duration::from_secs(10))
-            .keep_alive_while_idle(true);
-        let channel = endpoint.connect_lazy();
+        // Sanctioned channel construction: connect timeout, h2 window
+        // tuning, and the hoisted keepalive all come from rio-proto's
+        // chokepoint (h2-keepalive-single-source pins the knobs there —
+        // this used to hand-chain the same values and drifted out of
+        // the single-source set).
+        let channel = rio_proto::client::connect_lazy_channel(scheduler_addr)?;
         let interceptor = rio_auth::hmac::ServiceTokenInterceptor::with_instance(
             signer,
             STORE_SERVICE_CALLER,

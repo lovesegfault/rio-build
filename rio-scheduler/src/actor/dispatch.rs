@@ -1325,7 +1325,8 @@ pub(super) enum ProbeOutcome<R> {
 }
 
 /// Fan probes out `buffer_unordered(min(T, MAX_PROBE_CONCURRENCY))`,
-/// every attempt clamped to the shared [`AttemptBudget`]'s remainder
+/// every attempt clamped to the shared
+/// [`AttemptBudget`](rio_common::transport::AttemptBudget) remainder
 /// (floored at 1 ms by `attempt_bound`; `expired()` short-circuits the
 /// not-yet-started tail straight to `TimedOut`). Total wall-clock is
 /// bounded by the budget regardless of how many probes hang — the
@@ -1347,7 +1348,7 @@ where
     Fut: Future<Output = Result<tonic::Response<R>, tonic::Status>>,
 {
     use futures_util::stream::StreamExt;
-    let concurrency = probes.len().min(super::MAX_PROBE_CONCURRENCY).max(1);
+    let concurrency = probes.len().clamp(1, super::MAX_PROBE_CONCURRENCY);
     futures_util::stream::iter(probes.into_iter().map(|(key, req)| {
         let fut = probe(req);
         async move {

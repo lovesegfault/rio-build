@@ -258,6 +258,16 @@ pub fn connect_store_lazy(addr: &str) -> anyhow::Result<StoreServiceClient<Chann
     Ok(StoreServiceClient::wrap(ch))
 }
 
+/// Build a LAZY channel to `addr` with the full sanctioned tuning
+/// stack: `CONNECT_TIMEOUT`, h2 flow-control windows, and the hoisted
+/// h2 keepalive (the misc-check `h2-keepalive-single-source` pins every
+/// keepalive knob to this module + `rio_common::server` — daemon crates
+/// MUST route long-lived channels through here instead of hand-chaining
+/// `http2_keep_alive_*` on an `Endpoint`).
+pub fn connect_lazy_channel(addr: &str) -> anyhow::Result<Channel> {
+    Ok(with_h2_keepalive(build_endpoint(addr)?).connect_lazy())
+}
+
 #[cfg(test)]
 mod retry_tests {
     use super::*;

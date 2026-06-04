@@ -2814,7 +2814,18 @@ mod tests {
         let (mut client_a, _active_a, server_a, _uri_a) =
             spawn_replica(&db.pool, &chunk_store, "store-a", 256, |s| s).await;
         let (mut client_b, _active_b, server_b, _uri_b) =
-            spawn_replica(&db.pool, &chunk_store, "store-b", 256, |s| s).await;
+            spawn_replica(&db.pool, &chunk_store, "store-b", 256, |s| {
+                // The empty template maps to None AT CONSTRUCTION (the
+                // arm uri_for used to carry): proxy disabled is a
+                // constructor property, not a per-read empty-check.
+                let s = s.with_peer_url_template(String::new());
+                assert!(
+                    s.peer_resolver.is_none(),
+                    "an empty template disables the proxy at construction"
+                );
+                s
+            })
+            .await;
         let exec = seed_assignment(&db.pool, "builder-0").await;
         let tok = token("builder-0", DRV);
 
@@ -3099,8 +3110,11 @@ mod tests {
     }
 
     /// The address-form rule lives in uri_for alone: IPv6 identities
-    /// are bracketed, hostnames and IPv4 pass through bare, and an
-    /// empty template (the fail-closed default) names nobody.
+    /// are bracketed, hostnames and IPv4 pass through bare. (The old
+    /// "empty template names nobody" leg moved to construction:
+    /// `with_peer_url_template("")` builds `peer_resolver: None`, so an
+    /// empty template can no longer reach `uri_for` at all — pinned in
+    /// `disabled_proxy_serves_history_without_proxy_machinery`.)
     #[test]
     fn uri_for_brackets_only_ipv6() {
         let r = PeerResolver::Template("http://{pod}:9002".to_string());
@@ -3118,12 +3132,6 @@ mod tests {
             r.uri_for("rio-store-abc123").as_deref(),
             Some("http://rio-store-abc123:9002"),
             "hostnames stay bare"
-        );
-        let disabled = PeerResolver::Template(String::new());
-        assert_eq!(
-            disabled.uri_for("10.2.3.4"),
-            None,
-            "an empty template names nobody (proxy disabled)"
         );
     }
 }

@@ -191,7 +191,7 @@ pub(super) const FORECAST_DROPPED_WARNED_CAP: usize = 4096;
 
 /// Timeout for the merge-time `FindMissingPaths` only
 /// (`find_missing_with_breaker`). Separate from `grpc_timeout` (30s):
-/// with the store-side 4096-path truncation removed
+/// with the store-side probe-truncation cap removed
 /// (`r[store.substitute.probe-bounded+4]`), `check_available` runs the
 /// FULL uncached set at 128-wide. Envelope: `⌈N_uncached/128⌉ × RTT` —
 /// 153k paths at 30ms ≈ 36s, which the default 30s would clip. 90s

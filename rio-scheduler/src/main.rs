@@ -665,9 +665,10 @@ async fn init_db_pool(
 ///
 /// [`connect_store_lazy`](rio_proto::client::connect_store_lazy)
 /// builds the Endpoint with `connect_lazy()` (re-resolves DNS on
-/// each reconnect) + `http2_keep_alive_interval(30s)` /
-/// `keep_alive_timeout(10s)` / `keep_alive_while_idle(true)`
-/// (detects half-open connections within ~40s). The channel
+/// each reconnect) + the hoisted h2 keepalive consts (30 s interval /
+/// 10 s timeout, while-idle; `rio_common::grpc`, pinned by the
+/// `h2-keepalive-single-source` check — detects half-open connections
+/// within ~40 s). The channel
 /// transparently reconnects to the new pod. The Endpoint
 /// building lives in rio-proto so it can reuse the process-global
 /// the other `connect_*` helpers.

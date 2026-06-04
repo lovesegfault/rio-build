@@ -76,7 +76,7 @@ pub async fn health_reporter_not_serving() -> (
 /// TriggerGC, TailLog, AppendLog acks) survive proxy idle-timeouts and
 /// detect vanished peers in ~40 s instead of the kernel's 2 h TCP
 /// default. The values are the shared
-/// [`rio_common::grpc::H2_KEEPALIVE_INTERVAL`]/`_TIMEOUT` consts —
+/// [`crate::grpc::H2_KEEPALIVE_INTERVAL`]/`_TIMEOUT` consts —
 /// re-used by the client side (`rio-proto::client::with_h2_keepalive`)
 /// so the two directions cannot drift; the `h2-keepalive-single-source`
 /// policy check pins that no daemon hand-chains its own values.

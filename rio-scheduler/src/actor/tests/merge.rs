@@ -2169,7 +2169,7 @@ async fn verify_preexisting_with_poisoned_dep_goes_dependency_failed() -> TestRe
 // substitutable leaf (in the merge transaction).
 // r[verify sched.substitute.eager-probe]
 /// Merge-time substitution covers the WHOLE submission in one
-/// `FindMissingPaths`: with the store-side 4096-path truncation
+/// `FindMissingPaths`: with the store-side probe-truncation cap
 /// removed, 5000 IA leaves whose outputs are all
 /// upstream-substitutable MUST all be routed to materialization jobs
 /// at merge time. Regression guard: pre-change, only the first 4096
