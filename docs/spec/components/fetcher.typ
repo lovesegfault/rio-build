@@ -194,7 +194,7 @@ mis-split truncates passwords. An operator netrc is a handful of
 loudly at first parse beats authenticating with mangled credentials or
 phantom `default` entries.
 
-#r("fetcher.netrc.delivery-unwired")[
+#r("fetcher.netrc.delivery-unwired+1")[
   netrc credentials are NOT yet an operator-reachable capability:
   every production `SandboxOptions` construction MUST pass `netrc:
   None`, and no binary crate's `Config` may expose a netrc key.
@@ -202,8 +202,17 @@ phantom `default` entries.
   secret delivery following the `ca_bundle` pattern (a mounted secret,
   never inline config), an `impl` annotation on the producing knob
   that moves this rule out of the uncovered set and rewrites it as the
-  delivery contract, and the origin-scope, case-fold, and strict-parse
-  rules above exercised against the operator-delivered file.
+  delivery contract, the origin-scope, case-fold, and strict-parse
+  rules above exercised against the operator-delivered file, the
+  comment-skip load parity exercised against a comment-headed
+  operator file, an explicit re-confrontation of the total no-echo
+  error contract (parse errors carry token length and shape, never
+  bytes --- the surface becomes production-reachable at wiring and
+  MUST NOT regain an echoing arm), and a re-confrontation of the
+  read-vs-parse permanence lanes against the chosen secret delivery
+  (a missing mounted secret is a deploy fault and stays in the
+  permanent lane; the worker-environmental read lane starts feeding
+  the real retry ladder).
 ]
 
 This rule is DELIBERATELY left without an implementation annotation:

@@ -496,7 +496,7 @@ travels to tenant-controlled origin URLs
 not yet wired: no production sandbox construction passes a netrc file and no
 `Config` exposes a netrc key, so today this scoping protects no live secret
 --- the capability is gated out until a delivery contract lands
-(#rref("fetcher.netrc.delivery-unwired")).
+(#rref("fetcher.netrc.delivery-unwired+1")).
 
 === Recommended Patterns (by maturity)
 

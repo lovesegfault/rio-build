@@ -9,7 +9,7 @@ rio_test_support::config_schema_frozen!(rio_builder::config::Config);
 /// `Config` re-blesses the frozen snapshot above and then trips THIS
 /// test, whose failure message is the wiring checklist — so the knob
 /// cannot land silently or without the full contract.
-// r[verify fetcher.netrc.delivery-unwired]
+// r[verify fetcher.netrc.delivery-unwired+1]
 #[test]
 fn netrc_stays_unwired() {
     let fixture = include_str!("fixtures/config-schema.json");
@@ -23,7 +23,15 @@ fn netrc_stays_unwired() {
          producing knob, rewriting fetcher.netrc.delivery-unwired as the delivery \
          contract (it is deliberately uncovered today); (4) the origin-scope, \
          case-fold, and strict-parse tests exercised against the operator-delivered \
-         file format. Land all of it in this change, update this tripwire to assert \
-         the new shape — or drop the key."
+         file format; (5) the comment-skip load parity exercised against a \
+         comment-headed operator file (file2memory semantics — ISBLANK then `#`); \
+         (6) re-confront the TOTAL no-echo contract: NetrcParseError carries token \
+         length/shape, never bytes — the error surface becomes production-reachable \
+         at wiring and must not regain an echoing arm; (7) re-confront the \
+         read-vs-parse permanence lanes against the secret delivery: a missing \
+         mounted secret is a deploy fault (permanent lane, the documented NotFound \
+         delta), and the worker-environmental read lane starts feeding the real \
+         retry ladder — confirm the caps. Land all of it in this change, update \
+         this tripwire to assert the new shape — or drop the key."
     );
 }
