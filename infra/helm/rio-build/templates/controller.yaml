@@ -165,11 +165,7 @@ spec:
             # database_url stays env (Secret-sourced; never lands in the
             # ConfigMap-rendered TOML). lease_namespace via downward API
             # so the chart isn't namespace-pinned.
-            - name: RIO_NODECLAIM_POOL__DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: rio-postgres
-                  key: url
+            {{- include "rio.pgEnv" (dict "root" . "authEnv" "RIO_NODECLAIM_POOL__PG_AUTH" "urlEnv" "RIO_NODECLAIM_POOL__DATABASE_URL") | nindent 12 }}
             - name: RIO_NODECLAIM_POOL__LEASE_NAMESPACE
               valueFrom:
                 fieldRef: {fieldPath: metadata.namespace}
@@ -184,7 +180,7 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
-            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "serviceHmac")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "serviceHmac" "rdsCa")) | nindent 12 }}
             # rio_common::config::load reads /etc/rio/controller.toml. The
             # ConfigMap carries [nodeclaim_pool] (lead_time_seed is a
             # nested map — the RIO_ env layer only yields strings, so
@@ -237,7 +233,7 @@ spec:
           resources:
             {{- toYaml $c.resources | nindent 12 }}
       volumes:
-        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "serviceHmac")) | nindent 8 }}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "serviceHmac" "rdsCa")) | nindent 8 }}
         - name: config
           configMap:
             name: rio-controller-config

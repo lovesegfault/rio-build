@@ -217,6 +217,16 @@ spec:
     # silently default-denying the controller's direct PG edge). The
     # enabled guard lives in the helper (bug_171).
     {{ include "rio.pgInClusterEgress" $ | nindent 4 }}
+    {{- if eq .Values.postgres.authMode "iam" }}
+    # RDS IAM auth: rio_common::pg_iam resolves IRSA web-identity
+    # credentials against STS (HTTPS) before each token mint. world:443
+    # mirrors the store-egress AWS-API rule — STS has no stable CIDR,
+    # and an STS VPC endpoint classifies as world too. Gated on iam so
+    # the password-mode controller keeps its tighter no-internet
+    # posture.
+    - toEntities: [world]
+      toPorts: [{ports: [{port: "443", protocol: TCP}]}]
+    {{- end }}
 {{- if .Values.buildScheduler.enabled }}
 ---
 # kube-build-scheduler second kube-scheduler egress: DNS + kube-apiserver

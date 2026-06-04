@@ -76,7 +76,8 @@ prost-types = "0.14"
 # tls-rustls-aws-lc-rs: Aurora PG 15+ has rds.force_ssl=1 by default —
 # connections without TLS are rejected. aws-lc-rs matches the workspace
 # rustls CryptoProvider (see `rustls` dep below and tonic's tls-aws-lc).
-# Connection strings use `?sslmode=require` (encrypt, don't verify cert).
+# EKS connection strings use `?sslmode=verify-full` + the vendored RDS
+# bundle as sslrootcert (k3s/dev URLs carry no ssl params).
 sqlx = { version = "0.9", default-features = false, features = [
   "runtime-tokio",
   "postgres",
