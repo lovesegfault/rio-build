@@ -239,6 +239,14 @@ impl ActorHandle {
         .await
     }
 
+    /// merged_bug_032: stamp the actor's `last_store_rpc_failure` —
+    /// the store-health corroboration leg of the store-degraded gate
+    /// (production writer: a failed dispatch-time store probe).
+    pub async fn debug_mark_store_rpc_failure(&self) -> Result<(), ActorError> {
+        self.debug(|reply| DebugCmd::MarkStoreRpcFailure { reply })
+            .await
+    }
+
     /// Read a derivation's in-memory attempt history (the committed
     /// ledger-suffix mirror). For the 1a acceptance battery.
     pub async fn debug_query_attempt_history(

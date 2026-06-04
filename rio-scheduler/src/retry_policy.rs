@@ -142,6 +142,21 @@ pub(crate) fn admit_worker_abort(
     rio_retry_kernel::admit_worker_abort(&rows, rio_retry_kernel::WORKER_ABORT_FREE_CLOSES)
 }
 
+// r[impl sched.retry.store-degraded-uncharged+2]
+/// Admit one corroborated store-degraded report against the in-memory
+/// attempt history: the kernel counts the trailing run of build-lane
+/// store-degraded pacing rows and admits the uncharged paced requeue
+/// only below [`rio_retry_kernel::STORE_DEGRADED_FREE_RUN`]; at the
+/// bound the report falls through to the CHARGED infra path
+/// (merged_bug_032). Same projection shim shape as [`decide`].
+pub(crate) fn admit_store_degraded(
+    history: &[AttemptRecord],
+) -> rio_retry_kernel::WorkerAbortAdmission {
+    let rows: Vec<rio_retry_kernel::LedgerRow<String>> =
+        history.iter().map(record_to_row).collect();
+    rio_retry_kernel::admit_store_degraded(&rows, rio_retry_kernel::STORE_DEGRADED_FREE_RUN)
+}
+
 /// The materialization lane's windowed counters (the kernel fold over
 /// the in-memory history, projected through the same record→row
 /// conversion `decide()` uses) — THE single budget/one-shot/strictness
@@ -286,7 +301,7 @@ pub(crate) fn classify(event: &ObservedFailure<'_>, floor: FloorOutcomeView) -> 
 }
 
 // r[verify sched.retry.transient-budget+2]
-// r[verify sched.retry.attempts-bounded+3]
+// r[verify sched.retry.attempts-bounded+4]
 // r[verify sched.retry.counters-refine-history+2]
 #[cfg(test)]
 mod tests {
@@ -787,7 +802,7 @@ mod tests {
         rec(class, ReportingParty::Worker, executor, at)
     }
 
-    // r[verify sched.retry.store-degraded-uncharged]
+    // r[verify sched.retry.store-degraded-uncharged+2]
     /// bug_408 fold battery: N store-degraded rows ⇒ Requeue, every
     /// count counter zero, exclusion empty, never Poison; the backoff
     /// deadline follows the curve over the consecutive run

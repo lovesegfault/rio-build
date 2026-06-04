@@ -178,6 +178,14 @@ pub fn describe_metrics() {
         "Orphan-terminal derivations rows deleted by the periodic Tick sweep (I-169.2)"
     );
     describe_counter!(
+        "rio_scheduler_store_degraded_requeues_total",
+        "Worker-flagged store-degraded infrastructure reports by gated disposition \
+         (merged_bug_032): paced = corroborated + inside the kernel free run \
+         (uncharged requeue); uncorroborated = single-node flag charged as plain \
+         infra; run_bound = corroborated but past STORE_DEGRADED_FREE_RUN, charged \
+         fallthrough into the counted infra budget"
+    );
+    describe_counter!(
         "rio_scheduler_attempts_gc_deleted_total",
         "drv_attempts rows deleted by the periodic attempt-ledger retention sweep \
          (sched.db.attempts-gc): suffix-complement rows past the retention horizon plus \

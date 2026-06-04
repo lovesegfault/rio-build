@@ -149,6 +149,12 @@ pub struct DagActorPlumbing {
     /// exercise that fallback in isolation, without closing the pool.
     #[cfg(test)]
     pub fail_next_floor_read: bool,
+    /// merged_bug_003: fail the next infrastructure-failure appending
+    /// transaction (before `begin_fenced`), exercising the
+    /// RecordFailed → CompletionEcho re-delivery path without touching
+    /// PG state.
+    #[cfg(test)]
+    pub fail_next_attempt_append: bool,
     /// Fail the next job-view load inside `recover_from_pg()` — after
     /// the DAG and builds loaded — exercising the merged_bug_246
     /// required-load arm (recovery fails, the term serves degraded
@@ -184,6 +190,8 @@ impl Default for DagActorPlumbing {
             fail_next_recovery_load: false,
             #[cfg(test)]
             fail_next_floor_read: false,
+            #[cfg(test)]
+            fail_next_attempt_append: false,
             #[cfg(test)]
             fail_next_job_view_load: false,
             #[cfg(test)]

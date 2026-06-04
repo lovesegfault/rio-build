@@ -435,6 +435,10 @@ pub enum AdminQuery {
 /// path so tests can set up preconditions directly.
 #[cfg(test)]
 pub enum DebugCmd {
+    /// merged_bug_032: stamp `last_store_rpc_failure = now` — the
+    /// store-health corroboration leg, exactly what a failed
+    /// dispatch-time FindMissingPaths probe records in production.
+    MarkStoreRpcFailure { reply: oneshot::Sender<()> },
     /// Query a derivation's state.
     QueryDerivation {
         drv_hash: String,

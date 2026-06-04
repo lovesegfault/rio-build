@@ -96,6 +96,23 @@ const MAX_ATTEMPT_RECORD_REDELIVERIES: u32 = 3;
 /// of burning the whole re-delivery budget within one event-loop turn.
 const ATTEMPT_RECORD_REDELIVERY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Phase 1b bounded re-enqueue support (merged_bug_003): the
+/// ORIGINAL `ProcessCompletion` payload, captured by value at the
+/// routing match (failure-gated clone — the Built hot path never
+/// clones) so a failed appending transaction re-delivers the
+/// PRISTINE wire report: proto `BuildResult` (status, message,
+/// `store_degraded`, outputs, timestamps), node identity, and
+/// resource telemetry all survive the mailbox roundtrip.
+pub(super) struct CompletionEcho {
+    pub(super) result: rio_proto::types::BuildResult,
+    pub(super) peak_memory_bytes: u64,
+    pub(super) peak_cpu_cores: f64,
+    pub(super) node_name: Option<String>,
+    pub(super) hw_class: Option<String>,
+    pub(super) final_resources: Option<rio_proto::types::ResourceUsage>,
+    pub(super) final_line_count: u64,
+}
+
 /// Number of state events to retain in each build's broadcast ring for
 /// late subscribers.
 ///
@@ -316,6 +333,20 @@ pub struct DagActor {
     /// restart the derivation is still in its pre-report state and the
     /// backstop sweep re-drives it.
     pub(crate) attempt_record_retries: HashMap<DrvHash, u32>,
+
+    /// bughunt-2 slot 3 C2 (merged_bug_032): corroboration evidence for
+    /// worker-supplied `store_degraded` flags — most-recent flagged
+    /// report per CONTROLLER-AUTHORITATIVE node binding (AD2c: the
+    /// worker cannot forge its corroboration identity; reports with no
+    /// binding share the `None` bucket and cannot self-corroborate).
+    /// In-memory only: forgotten on failover, self-healing (the gate
+    /// re-corroborates within one window).
+    pub(crate) store_degraded_sightings: HashMap<Option<String>, Instant>,
+    /// The scheduler-side store-health OR-leg: the last time one of the
+    /// scheduler's OWN store RPCs (the dispatch-time FindMissingPaths
+    /// probes) failed or timed out. Covers the fleet-of-one case where
+    /// two distinct nodes can never be observed.
+    pub(crate) last_store_rpc_failure: Option<Instant>,
     /// Retry policy.
     retry_policy: RetryPolicy,
     /// Establishment report slack for open pull-mode attempts
@@ -666,6 +697,10 @@ pub struct DagActor {
     /// `DagActorPlumbing::fail_next_floor_read`.
     #[cfg(test)]
     fail_next_floor_read: bool,
+    /// Test-only: fail the next infra-failure appending transaction.
+    /// See `DagActorPlumbing::fail_next_attempt_append`.
+    #[cfg(test)]
+    fail_next_attempt_append: bool,
     /// Test-only: fail the next job-view load inside
     /// `recover_from_pg()` (after the DAG and builds loaded) — the
     /// merged_bug_246 required-load arm. See
@@ -775,6 +810,8 @@ impl DagActor {
             authoritative_binding: HashMap::new(),
             acked_spawned: HashMap::new(),
             attempt_record_retries: HashMap::new(),
+            store_degraded_sightings: HashMap::new(),
+            last_store_rpc_failure: None,
             retry_policy: cfg.retry_policy,
             poison_config: cfg.poison,
             establishment_report_slack: cfg.establishment_report_slack,
@@ -866,6 +903,8 @@ impl DagActor {
             #[cfg(test)]
             fail_next_floor_read: plumbing.fail_next_floor_read,
             #[cfg(test)]
+            fail_next_attempt_append: plumbing.fail_next_attempt_append,
+            #[cfg(test)]
             test_counters: TestCounters::default(),
         }
     }
@@ -930,6 +969,14 @@ impl DagActor {
             builds,
             events,
             attempt_record_retries,
+            // Cleared: term-scoped corroboration evidence — a new
+            // tenure re-corroborates within one window (documented
+            // self-healing; merged_bug_032).
+            store_degraded_sightings,
+            // Retained: the scheduler's own observation of store
+            // health, not per-term evidence; a transition does not
+            // change whether the store was failing 30s ago.
+            last_store_rpc_failure: _,
             dispatched_cells,
             authoritative_binding,
             acked_spawned,
@@ -998,6 +1045,8 @@ impl DagActor {
             #[cfg(test)]
                 fail_next_floor_read: _,
             #[cfg(test)]
+                fail_next_attempt_append: _,
+            #[cfg(test)]
                 fail_next_job_view_load: _,
             #[cfg(test)]
                 test_counters: _,
@@ -1011,6 +1060,7 @@ impl DagActor {
         // recovered from PG and re-driven by the backstop, so the
         // counters are meaningless (and would slowly leak) here.
         attempt_record_retries.clear();
+        store_degraded_sightings.clear();
         // `dispatched_cells` is keyed on the previous generation's drv
         // hashes; a stale entry would let a re-spawned pod's first
         // pull clear the wrong cell.
@@ -1077,19 +1127,21 @@ impl DagActor {
     /// is the retry mechanism; past the cap the backstop sweep is the
     /// fallback).
     ///
-    /// The re-delivered command carries only the fields the failure
-    /// paths consume (status, error message, line count) — the
-    /// telemetry fields are success-path-only and are zeroed. The full
-    /// `handle_completion` guard chain re-runs on delivery, so a
-    /// derivation that completed or got cancelled in the meantime drops
-    /// the stale re-delivery exactly like any other stale report.
+    /// The re-delivered command is the ORIGINAL `ProcessCompletion`
+    /// payload, moved verbatim out of the [`CompletionEcho`] — there is
+    /// NO site on this path constructing a `BuildResult`, so no field
+    /// can be dropped by construction (merged_bug_003: the old
+    /// reconstruction zeroed `store_degraded`, node identity, resource
+    /// telemetry, and outputs, silently re-classifying flagged reports
+    /// on re-delivery). The full `handle_completion` guard chain
+    /// re-runs on delivery, so a derivation that completed or got
+    /// cancelled in the meantime drops the stale re-delivery exactly
+    /// like any other stale report.
     pub(super) fn requeue_failure_completion(
         &mut self,
         executor_id: &ExecutorId,
         drv_hash: &DrvHash,
-        status: rio_proto::types::BuildResultStatus,
-        error_msg: &str,
-        final_line_count: u64,
+        echo: CompletionEcho,
     ) {
         let attempt = self
             .attempt_record_retries
@@ -1099,7 +1151,8 @@ impl DagActor {
         let attempt = *attempt;
         if attempt > MAX_ATTEMPT_RECORD_REDELIVERIES {
             error!(
-                drv_hash = %drv_hash, executor_id = %executor_id, ?status, attempt,
+                drv_hash = %drv_hash, executor_id = %executor_id,
+                status = echo.result.status, attempt,
                 "appending transaction kept failing; giving up on re-delivery — the derivation \
                  stays in its pre-report state until the backstop sweep re-drives it"
             );
@@ -1119,7 +1172,8 @@ impl DagActor {
             return;
         };
         warn!(
-            drv_hash = %drv_hash, executor_id = %executor_id, ?status, attempt,
+            drv_hash = %drv_hash, executor_id = %executor_id,
+            status = echo.result.status, attempt,
             max = MAX_ATTEMPT_RECORD_REDELIVERIES,
             "appending transaction failed; re-delivering the completion event"
         );
@@ -1127,17 +1181,13 @@ impl DagActor {
         let cmd = ActorCommand::ProcessCompletion {
             executor_id: executor_id.clone(),
             drv_key: drv_hash.as_str().to_string(),
-            result: rio_proto::types::BuildResult {
-                status: status.into(),
-                error_msg: error_msg.to_string(),
-                ..Default::default()
-            },
-            peak_memory_bytes: 0,
-            peak_cpu_cores: 0.0,
-            node_name: None,
-            hw_class: None,
-            final_resources: None,
-            final_line_count,
+            result: echo.result,
+            peak_memory_bytes: echo.peak_memory_bytes,
+            peak_cpu_cores: echo.peak_cpu_cores,
+            node_name: echo.node_name,
+            hw_class: echo.hw_class,
+            final_resources: echo.final_resources,
+            final_line_count: echo.final_line_count,
         };
         let drv = drv_hash.clone();
         rio_common::task::spawn_monitored("attempt-record-redeliver", async move {

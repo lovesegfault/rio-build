@@ -974,6 +974,11 @@
       "doc": "State recovery on leader acquisition."
     },
     {
+      "path": "actor/report_ctx.rs",
+      "depth": 1,
+      "doc": "Constructor-gated failure report context (bughunt-2 slot 3, C3)."
+    },
+    {
       "path": "actor/snapshot.rs",
       "depth": 1,
       "doc": "Read-only snapshot/inspect handlers on [`DagActor`]. All methods"

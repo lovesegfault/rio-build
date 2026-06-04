@@ -193,11 +193,16 @@ impl DagActor {
                     debug!(?tenant, error = %e,
                         "per-tenant Ready store-check FindMissingPaths failed; \
                          that tenant's answers drop from this pass's fold");
+                    // merged_bug_032: the scheduler's own store RPC
+                    // failed — the store-health OR-leg of the
+                    // store-degraded corroboration gate.
+                    self.last_store_rpc_failure = Some(std::time::Instant::now());
                 }
                 Err(_) => {
                     debug!(?tenant, timeout = ?self.grpc_timeout,
                         "per-tenant Ready store-check timed out; \
                          that tenant's answers drop from this pass's fold");
+                    self.last_store_rpc_failure = Some(std::time::Instant::now());
                 }
             }
         }

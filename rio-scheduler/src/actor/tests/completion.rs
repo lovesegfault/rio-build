@@ -1471,7 +1471,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.retry.store-degraded-uncharged]
+// r[verify sched.retry.store-degraded-uncharged+2]
 /// bug_408: an infra failure carrying the builder's `store_degraded`
 /// flag is UNCHARGED — driven past `max_infra_retries` (10) it never
 /// poisons, never advances `infra_count`, never excludes the node;
@@ -1490,6 +1490,11 @@ async fn test_store_degraded_infra_uncharged_waits_out_the_outage() -> TestResul
     let drv_hash = "store-degraded-drv";
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+
+    // merged_bug_032 re-pin: corroborate via the store-health leg so
+    // the gate admits the class (11 < STORE_DEGRADED_FREE_RUN = 12 —
+    // every original assertion below is intact).
+    handle.debug_mark_store_rpc_failure().await?;
 
     // 11 store-degraded infra failures: one past the infra cap.
     for attempt in 0..11 {
@@ -4325,4 +4330,145 @@ fn failure_report_ctx_literal_construction_is_constructor_gated() {
         "exactly one infra-evidence production site (the classifier's \
          InfrastructureFailure row)"
     );
+    // merged_bug_032: the raw wire bit has exactly ONE read site — the
+    // disposition-gate call at the top of
+    // handle_infrastructure_failure. Everything downstream consumes
+    // the gated disposition.
+    assert_eq!(
+        completion_src.matches("report.store_degraded()").count(),
+        1,
+        "single raw-bit read site (the disposition gate)"
+    );
+}
+
+/// merged_bug_032 (bughunt-2 slot 3 C2, red R3): an UNCORROBORATED
+/// store-degraded flag is worker-supplied evidence — one node's word.
+/// It charges the counted infra budget like any plain infrastructure
+/// failure; no uncharged pacing.
+#[tokio::test]
+async fn test_store_degraded_uncorroborated_is_charged_infra() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let build_id = Uuid::new_v4();
+    let drv_hash = "sd-uncorroborated-drv";
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+
+    // ONE flagged report, no second node, no scheduler-side store
+    // failure: uncorroborated.
+    pull_complete_failure_result(
+        &handle,
+        drv_hash,
+        rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+            error_msg: "FUSE EIO: store unreachable".into(),
+            store_degraded: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let s = expect_drv(&handle, drv_hash).await;
+    assert_eq!(
+        s.retry.infra_count, 1,
+        "uncorroborated flag charges the counted infra budget"
+    );
+    Ok(())
+}
+
+/// merged_bug_032 (bughunt-2 slot 3 C1+C2, red R4): even CORROBORATED
+/// store-degraded reports are bounded — the 13th consecutive flagged
+/// report (kernel free run = 12) falls through CHARGED into the
+/// counted infra budget, so a worker stamping every report cannot mint
+/// unbounded uncharged requeues.
+#[tokio::test]
+async fn test_store_degraded_run_bound_charges_thirteenth_report() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let build_id = Uuid::new_v4();
+    let drv_hash = "sd-run-bound-drv";
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+
+    // Corroborate via the scheduler-side store-health leg.
+    handle.debug_mark_store_rpc_failure().await?;
+
+    for attempt in 0..13 {
+        pull_complete_failure_result(
+            &handle,
+            drv_hash,
+            rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+                error_msg: format!("FUSE EIO: store unreachable (attempt {attempt})"),
+                store_degraded: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+
+    let s = expect_drv(&handle, drv_hash).await;
+    assert_eq!(
+        s.retry.infra_count, 1,
+        "the 13th consecutive report (run bound 12) is charged fallthrough"
+    );
+    assert_ne!(
+        s.status,
+        DerivationStatus::Poisoned,
+        "one charge, far from the cap"
+    );
+    Ok(())
+}
+
+/// merged_bug_003 (bughunt-2 slot 3 C4): a failed appending transaction
+/// re-delivers the ORIGINAL completion payload — the `store_degraded`
+/// flag survives the mailbox roundtrip, so the re-delivered report
+/// classifies exactly like the first delivery (uncharged paced, given
+/// corroboration). RED (recorded, pre-fix): the requeue rebuilt the
+/// result with `..Default::default()`, zeroing the flag (plus node
+/// identity and telemetry) — the re-delivery charged the infra budget
+/// (`left: 1 / right: 0`).
+#[tokio::test]
+async fn test_redelivered_completion_keeps_store_degraded_flag() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, p| {
+        p.fail_next_attempt_append = true;
+    });
+    let build_id = Uuid::new_v4();
+    let drv_hash = "echo-roundtrip-drv";
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+    let _ = &db;
+
+    // Corroborate via the store-health leg (outlives the 1s redelivery
+    // delay by the full 600s window).
+    handle.debug_mark_store_rpc_failure().await?;
+
+    // The plumbing flag fails the FIRST appending transaction →
+    // RecordFailed → bounded re-enqueue of the completion event; the
+    // re-delivery (flag consumed) succeeds.
+    pull_complete_failure_result(
+        &handle,
+        drv_hash,
+        rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+            error_msg: "FUSE EIO: store unreachable".into(),
+            store_degraded: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    // Wait out the 1s ATTEMPT_RECORD_REDELIVERY_DELAY.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    tick(&handle).await?;
+
+    let s = expect_drv(&handle, drv_hash).await;
+    assert_eq!(
+        s.retry.infra_count, 0,
+        "the re-delivered flagged report stays in the uncharged paced class"
+    );
+    assert!(
+        s.retry.backoff_until.is_some(),
+        "paced backoff written by the re-delivered report"
+    );
+    Ok(())
 }

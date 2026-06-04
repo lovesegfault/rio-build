@@ -44,6 +44,28 @@ struct CaCutoffVerified {
 
 pub(super) use super::report_ctx::FailureReportCtx;
 
+/// merged_bug_032: how long a flagged sighting (or a scheduler-side
+/// store RPC failure) counts as corroborating evidence.
+const STORE_DEGRADED_CORROBORATION_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(600);
+
+/// The gated disposition of a worker-supplied `store_degraded` flag —
+/// see `DagActor::store_degraded_disposition`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StoreDegradedDisposition {
+    /// The report did not carry the flag.
+    NotDegraded,
+    /// Flagged, corroborated, inside the kernel free run: uncharged
+    /// paced requeue (the bug_408 class).
+    Paced,
+    /// Flagged but uncorroborated — charged as plain infrastructure.
+    Uncorroborated,
+    /// Flagged and corroborated, but the consecutive uncharged run hit
+    /// `STORE_DEGRADED_FREE_RUN`: charged fallthrough into the counted
+    /// infra budget (merged_bug_032's operator-visible poison path).
+    RunBound,
+}
+
 /// Total status→report-context classifier: the SOLE non-test producer
 /// of [`FailureReportCtx`]. Every failure arm of `handle_completion`'s
 /// routing match calls this instead of constructing the ctx inline, so
@@ -1001,6 +1023,28 @@ impl DagActor {
         // `prost_types::Timestamp`. `ActorCommand::ProcessCompletion`
         // stays proto-typed so `actor/tests/` keeps constructing it
         // unchanged (b03 reconciles post-integration).
+        // merged_bug_003: capture the pristine wire payload for possible
+        // re-delivery BEFORE the domain conversion consumes it.
+        // Failure-gated: the Built/Substituted/AlreadyValid hot path
+        // never clones (status peek mirrors the domain normalization —
+        // unknown discriminants are Unspecified, a failure route).
+        let wire_status = rio_proto::types::BuildResultStatus::try_from(result.status)
+            .unwrap_or(rio_proto::types::BuildResultStatus::Unspecified);
+        let mut echo = (!matches!(
+            wire_status,
+            rio_proto::types::BuildResultStatus::Built
+                | rio_proto::types::BuildResultStatus::Substituted
+                | rio_proto::types::BuildResultStatus::AlreadyValid
+        ))
+        .then(|| super::CompletionEcho {
+            result: result.clone(),
+            peak_memory_bytes,
+            peak_cpu_cores,
+            node_name: node_name.clone(),
+            hw_class: hw_class.clone(),
+            final_resources: final_resources.clone(),
+            final_line_count,
+        });
         let mut result: crate::domain::BuildResult = result.into();
         // Threat model: builders are untrusted. `built_outputs.
         // output_path` reaches PG `realisations` (ca_insert_
@@ -1179,13 +1223,9 @@ impl DagActor {
                         self.attempt_record_retries.remove(drv_hash);
                     }
                     FailureHandling::RecordFailed => {
-                        self.requeue_failure_completion(
-                            executor_id,
-                            drv_hash,
-                            status,
-                            &result.error_msg,
-                            final_line_count,
-                        );
+                        if let Some(echo) = echo.take() {
+                            self.requeue_failure_completion(executor_id, drv_hash, echo);
+                        }
                     }
                 }
             }
@@ -1206,13 +1246,9 @@ impl DagActor {
                         self.attempt_record_retries.remove(drv_hash);
                     }
                     FailureHandling::RecordFailed => {
-                        self.requeue_failure_completion(
-                            executor_id,
-                            drv_hash,
-                            status,
-                            &result.error_msg,
-                            final_line_count,
-                        );
+                        if let Some(echo) = echo.take() {
+                            self.requeue_failure_completion(executor_id, drv_hash, echo);
+                        }
                     }
                 }
             }
@@ -1240,13 +1276,9 @@ impl DagActor {
                         self.attempt_record_retries.remove(drv_hash);
                     }
                     FailureHandling::RecordFailed => {
-                        self.requeue_failure_completion(
-                            executor_id,
-                            drv_hash,
-                            status,
-                            &result.error_msg,
-                            final_line_count,
-                        );
+                        if let Some(echo) = echo.take() {
+                            self.requeue_failure_completion(executor_id, drv_hash, echo);
+                        }
                     }
                 }
             }
@@ -1269,13 +1301,9 @@ impl DagActor {
                         self.attempt_record_retries.remove(drv_hash);
                     }
                     FailureHandling::RecordFailed => {
-                        self.requeue_failure_completion(
-                            executor_id,
-                            drv_hash,
-                            status,
-                            &result.error_msg,
-                            final_line_count,
-                        );
+                        if let Some(echo) = echo.take() {
+                            self.requeue_failure_completion(executor_id, drv_hash, echo);
+                        }
                     }
                 }
             }
@@ -1309,13 +1337,9 @@ impl DagActor {
                         // status so the routing arm re-runs this same
                         // treat-as-infra path (and re-synthesizes the
                         // message).
-                        self.requeue_failure_completion(
-                            executor_id,
-                            drv_hash,
-                            status,
-                            &result.error_msg,
-                            final_line_count,
-                        );
+                        if let Some(echo) = echo.take() {
+                            self.requeue_failure_completion(executor_id, drv_hash, echo);
+                        }
                     }
                 }
             }
@@ -1337,13 +1361,9 @@ impl DagActor {
                         self.attempt_record_retries.remove(drv_hash);
                     }
                     FailureHandling::RecordFailed => {
-                        self.requeue_failure_completion(
-                            executor_id,
-                            drv_hash,
-                            status,
-                            &result.error_msg,
-                            final_line_count,
-                        );
+                        if let Some(echo) = echo.take() {
+                            self.requeue_failure_completion(executor_id, drv_hash, echo);
+                        }
                     }
                 }
             }
@@ -2883,6 +2903,66 @@ impl DagActor {
         FailureHandling::Handled
     }
 
+    /// bughunt-2 slot 3 C2 (merged_bug_032): compute the gated
+    /// disposition of a worker-supplied `store_degraded` flag. Called
+    /// ONCE at the top of `handle_infrastructure_failure`; after that
+    /// line the raw ctx bit is read nowhere else in this file (pinned
+    /// by the policy test) -- floor-skip, event selection, and the
+    /// paced write all consume this disposition.
+    ///
+    /// Corroboration (the flag is WORKER evidence -- one node's word is
+    /// never store evidence): >= 2 distinct CONTROLLER-AUTHORITATIVE
+    /// node bindings flagging within
+    /// [`STORE_DEGRADED_CORROBORATION_WINDOW`], OR the scheduler's own
+    /// store RPCs failing inside the window (the fleet-of-one leg).
+    /// Corroborated reports are then admitted against the kernel run
+    /// bound ([`rio_retry_kernel::STORE_DEGRADED_FREE_RUN`]) -- at the
+    /// bound, charged fallthrough.
+    fn store_degraded_disposition(
+        &mut self,
+        drv_hash: &DrvHash,
+        flagged: bool,
+    ) -> StoreDegradedDisposition {
+        if !flagged {
+            return StoreDegradedDisposition::NotDegraded;
+        }
+        let now = Instant::now();
+        let node = self.pull_attempt_source_node(drv_hash);
+        self.store_degraded_sightings.insert(node, now);
+        self.store_degraded_sightings
+            .retain(|_, t| now.duration_since(*t) <= STORE_DEGRADED_CORROBORATION_WINDOW);
+        let distinct_nodes = self.store_degraded_sightings.len();
+        let store_health_leg = self
+            .last_store_rpc_failure
+            .is_some_and(|t| now.duration_since(t) <= STORE_DEGRADED_CORROBORATION_WINDOW);
+        let disposition = if distinct_nodes < 2 && !store_health_leg {
+            StoreDegradedDisposition::Uncorroborated
+        } else {
+            let admission = self
+                .dag
+                .node(drv_hash)
+                .map(|s| crate::retry_policy::admit_store_degraded(s.attempt_history()))
+                .unwrap_or(rio_retry_kernel::WorkerAbortAdmission::Uncharged);
+            if admission == rio_retry_kernel::WorkerAbortAdmission::ChargedFallthrough {
+                StoreDegradedDisposition::RunBound
+            } else {
+                StoreDegradedDisposition::Paced
+            }
+        };
+        let label = match disposition {
+            StoreDegradedDisposition::Paced => "paced",
+            StoreDegradedDisposition::Uncorroborated => "uncorroborated",
+            StoreDegradedDisposition::RunBound => "run_bound",
+            StoreDegradedDisposition::NotDegraded => unreachable!("flagged"),
+        };
+        metrics::counter!(
+            "rio_scheduler_store_degraded_requeues_total",
+            "disposition" => label
+        )
+        .increment(1);
+        disposition
+    }
+
     /// InfrastructureFailure: worker-local problem, not the build's fault.
     /// Reset to Ready and retry WITHOUT inserting into `failed_builders`.
     ///
@@ -2925,6 +3005,9 @@ impl DagActor {
         // handle_transient_failure).
         let observed_at = Instant::now();
         let error_msg = report.error_msg;
+        // merged_bug_032: the SINGLE raw-bit read site — everything
+        // below consumes the gated disposition, never the wire flag.
+        let degraded = self.store_degraded_disposition(drv_hash, report.store_degraded());
         // Ledger row for this observed attempt (1a): captured before
         // the floor bump / reset clears the exec_id carrier. The class
         // and exemption flags are refined below once the floor outcome
@@ -2955,17 +3038,24 @@ impl DagActor {
         // the breaker fired on store fetches, not on the build's
         // memory — so the floor bump is skipped even if the message
         // happens to contain the OOM marker.
-        let floor_outcome =
-            if !report.store_degraded() && error_msg.contains(rio_proto::CGROUP_OOM_MSG) {
-                self.bump_resource_floor(
-                    drv_hash,
-                    rio_proto::types::TerminationReason::OomKilled,
-                    "cgroup_oom",
-                )
-                .await
-            } else {
-                super::floor::FloorOutcome::default()
-            };
+        // merged_bug_032: only a BELIEVED store attribution (corroborated
+        // — Paced or RunBound) suppresses the sizing signal; an
+        // uncorroborated flag is treated as plain infra INCLUDING the
+        // OOM floor bump.
+        let believed_store = matches!(
+            degraded,
+            StoreDegradedDisposition::Paced | StoreDegradedDisposition::RunBound
+        );
+        let floor_outcome = if !believed_store && error_msg.contains(rio_proto::CGROUP_OOM_MSG) {
+            self.bump_resource_floor(
+                drv_hash,
+                rio_proto::types::TerminationReason::OomKilled,
+                "cgroup_oom",
+            )
+            .await
+        } else {
+            super::floor::FloorOutcome::default()
+        };
 
         if self.dag.node(drv_hash).is_none() {
             return FailureHandling::Handled;
@@ -2992,15 +3082,17 @@ impl DagActor {
         // The exemption predicate (promoted-or-CONCURRENT_PUTPATH) lives
         // in `classify()` — the single append-time classifier — so the
         // row's class is what the fold charges.
-        // r[impl sched.retry.store-degraded-uncharged]
+        // r[impl sched.retry.store-degraded-uncharged+2]
         // bug_408: the flagged report classifies as the dedicated
         // pacing class — the kernel fold advances only the derivation
         // backoff (no count budget, no exclusion, never poison), so
         // the verdict below is a paced Requeue for as long as the
         // outage lasts.
-        let event = if report.store_degraded() {
+        let event = if degraded == StoreDegradedDisposition::Paced {
             crate::retry_policy::ObservedFailure::WorkerStoreDegraded
         } else {
+            // NotDegraded, Uncorroborated, and RunBound all charge the
+            // counted infra budget (merged_bug_032).
             crate::retry_policy::ObservedFailure::WorkerInfra { error_msg }
         };
         let class = crate::retry_policy::classify(
@@ -3028,8 +3120,14 @@ impl DagActor {
         // uncommitted-merge edge (no db row) folds the in-memory
         // attempt history instead and persists nothing (there is no
         // derivations row to update either).
+        #[cfg(test)]
+        let inject_append_failure = std::mem::take(&mut self.fail_next_attempt_append);
         let (decision, recorded_row) = if let Some(row) = attempt_row {
             let result: Result<Option<crate::retry_policy::Decision>, sqlx::Error> = async {
+                #[cfg(test)]
+                if inject_append_failure {
+                    return Err(sqlx::Error::WorkerCrashed);
+                }
                 // r[impl sched.evidence.durability+4]
                 // Claims-floor fence at the appending-transaction start.
                 let mut tx = match self.db.begin_fenced(self.serving_generation()).await? {
@@ -3164,7 +3262,7 @@ impl DagActor {
                           "infrastructure failure: reset_to_ready failed, skipping");
                     return FailureHandling::Handled;
                 }
-                // r[impl sched.retry.store-degraded-uncharged]
+                // r[impl sched.retry.store-degraded-uncharged+2]
                 // bug_408: the flagged class is the ONE infra shape
                 // that does NOT requeue immediately — the fold computed
                 // the pacing deadline from the consecutive run; write
@@ -3172,7 +3270,7 @@ impl DagActor {
                 // above deliberately preserves the actor-managed value,
                 // same convention as the transient site). Epoch→Instant
                 // mirrors `rebuild_retry_view_from_ledger`.
-                if report.store_degraded()
+                if degraded == StoreDegradedDisposition::Paced
                     && let Some(t) = decision.counters.backoff_until
                 {
                     let now_epoch =
