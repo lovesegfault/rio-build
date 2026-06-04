@@ -156,6 +156,7 @@ let
               ../infra/helm/rio-build/templates/prometheusrule.yaml
               ../infra/helm/rio-build/values.yaml # helm_ns()
               ../rio-proto/proto # protos()
+              ../rio-migrations/migrations # migrations()
             ]
             ++
               map (m: lib.fileset.fileFilter (f: f.hasExt "rs") (../. + "/${m}/src"))
@@ -172,6 +173,8 @@ let
         mv work/docs/gen $out
         test "$(jq '.names|length' $out/metrics.json)" -gt 0
         test "$(jq '.names|length' $out/alerts.json)" -gt 0
+        test "$(jq '.rules|length' $out/alerts.json)" -gt 0
+        test "$(jq '.stems|length' $out/migrations.json)" -gt 50
         test "$(jq '.variants|length' $out/errors.json)" -gt 0
         test "$(jq '.members|length' $out/workspace.json)" -gt 0
         test "$(jq 'keys|length' $out/consts.json)" -gt 0

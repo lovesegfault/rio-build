@@ -62,6 +62,7 @@
     #chapter("ref/configuration.typ")[Configuration]
     #chapter("ref/errors.typ")[Error Taxonomy]
     #chapter("ref/metrics.typ")[Metric Reference]
+    #chapter("ref/alerts.typ")[Alert Rules]
     = Ops
     #chapter("ops/capacity-planning.typ")[Capacity Planning]
     #chapter("ops/gc-enablement.typ")[GC Enablement]

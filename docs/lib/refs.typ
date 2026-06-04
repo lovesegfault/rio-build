@@ -12,6 +12,8 @@
 
 #let _metrics = json("/gen/metrics.json").names
 #let _alerts = json("/gen/alerts.json").names
+#let _alert-rules = json("/gen/alerts.json").rules
+#let _migrations = json("/gen/migrations.json").stems
 #let _errors = json("/gen/errors.json")
 #let _ws = json("/gen/workspace.json")
 // _ws.members is [{name, description}]; extract names for membership.
@@ -64,6 +66,23 @@
   alert: name => {
     assert(name in _alerts, message: "unknown alert: " + name)
     raw(name)
+  },
+  // The SHIPPED PromQL for an alert, rendered from gen/alerts.json
+  // (merged_bug_001: the hung-node runbook restated the establishment
+  // alert's expr by hand and cited a metric the rule never used; the
+  // expr is now data — a rule re-key propagates here or fails
+  // docs-data-fresh).
+  alert-expr: name => {
+    let r = _alert-rules.find(r => r.name == name)
+    assert(r != none, message: "unknown alert: " + name)
+    raw(block: true, lang: "promql", r.expr)
+  },
+  // Migration reference by `NNN_slug` stem, validated against the
+  // on-disk chain (merged_bug_122: prose cited bare numbers that the
+  // +2 renumber silently invalidated; the slug is self-checking).
+  migration: slug => {
+    assert(slug in _migrations, message: "unknown migration: " + slug)
+    raw(slug)
   },
   cfg: (comp, key) => {
     assert(comp in _cfg-map, message: "unknown component: " + comp)

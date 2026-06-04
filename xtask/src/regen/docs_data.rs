@@ -77,8 +77,9 @@ pub async fn run() -> Result<()> {
     write(&out, "modules.json", &modules()?)?;
     write(&out, "cli.json", &cli()?)?;
     write(&out, "protos.json", &protos()?)?;
+    write(&out, "migrations.json", &migrations()?)?;
     println!(
-        "wrote docs/gen/{{metrics,alerts,errors,config,workspace,consts,helm-ns,crds,modules,cli,protos}}.json"
+        "wrote docs/gen/{{metrics,alerts,errors,config,workspace,consts,helm-ns,crds,modules,cli,protos,migrations}}.json"
     );
     Ok(())
 }
@@ -164,12 +165,139 @@ fn visit_rs(dir: &Path, f: &mut impl FnMut(&str)) -> Result<()> {
     Ok(())
 }
 
+/// Alert inventory: names PLUS per-rule expr/for/severity/metrics
+/// (merged_bug_001 class — runbooks restated alert exprs by hand and
+/// drifted from the shipped PromQL; the runbook now RENDERS the expr
+/// via `refs.alert-expr`, so a re-key propagates or `docs-data-fresh`
+/// fails). Line-state machine over the template: helm `{{ }}` only
+/// appears in annotations at tip (exprs are plain PromQL — verified),
+/// and rule keys are physical lines, so no YAML parser is needed (the
+/// file is a helm TEMPLATE and not parseable as YAML anyway).
 fn alerts() -> Result<serde_json::Value> {
     let body =
         fs::read_to_string(repo_root().join("infra/helm/rio-build/templates/prometheusrule.yaml"))?;
-    let re = Regex::new(r"(?m)^\s*-\s*alert:\s*(\w+)")?;
-    let names: BTreeSet<_> = re.captures_iter(&body).map(|c| c[1].to_string()).collect();
-    Ok(json!({"names": names.into_iter().collect::<Vec<_>>()}))
+    parse_alerts(&body)
+}
+
+/// Pure parser core of [`alerts`] — unit-tested directly (no repo
+/// access; the fixture lives in the test).
+fn parse_alerts(body: &str) -> Result<serde_json::Value> {
+    let alert_re = Regex::new(r"^\s*-\s*alert:\s*(\w+)\s*$")?;
+    let block_expr_re = Regex::new(r"^(\s*)expr:\s*[|>][+-]?\s*$")?;
+    let inline_expr_re = Regex::new(r"^\s*expr:\s*(\S.*?)\s*$")?;
+    let for_re = Regex::new(r"^\s*for:\s*(\S+)\s*$")?;
+    let severity_re = Regex::new(r"^\s*severity:\s*(\S+)\s*$")?;
+    let metric_re = Regex::new(r"\brio_[a-z0-9_]+")?;
+
+    #[derive(Default)]
+    struct Rule {
+        name: String,
+        expr: String,
+        for_: String,
+        severity: String,
+    }
+    let mut rules: Vec<Rule> = Vec::new();
+    let mut cur: Option<Rule> = None;
+    // Some(key-indent) while inside an `expr: |` block; lines indented
+    // deeper belong to the expr, the first line at <= indent ends it.
+    let mut block_indent: Option<usize> = None;
+    for line in body.lines() {
+        if let Some(indent) = block_indent {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || line.len() - trimmed.len() > indent {
+                if let (Some(r), false) = (cur.as_mut(), trimmed.is_empty()) {
+                    if !r.expr.is_empty() {
+                        r.expr.push(' ');
+                    }
+                    r.expr.push_str(trimmed);
+                }
+                continue;
+            }
+            block_indent = None; // falls through to keyed matches below
+        }
+        if let Some(c) = alert_re.captures(line) {
+            if let Some(r) = cur.take() {
+                rules.push(r);
+            }
+            cur = Some(Rule {
+                name: c[1].to_string(),
+                ..Default::default()
+            });
+        } else if let Some(c) = block_expr_re.captures(line) {
+            block_indent = Some(c[1].len());
+        } else if let Some(c) = inline_expr_re.captures(line) {
+            if let Some(r) = cur.as_mut() {
+                r.expr = c[1].to_string();
+            }
+        } else if let Some(c) = for_re.captures(line) {
+            if let Some(r) = cur.as_mut() {
+                r.for_ = c[1].to_string();
+            }
+        } else if let Some(c) = severity_re.captures(line) {
+            if let Some(r) = cur.as_mut() {
+                r.severity = c[1].to_string();
+            }
+        }
+    }
+    if let Some(r) = cur.take() {
+        rules.push(r);
+    }
+    // Histogram series suffixes resolve to their base metric name (the
+    // describe_histogram! name) — same normalization the obs-surface
+    // lint applies.
+    let strip = |m: &str| -> String {
+        for suf in ["_bucket", "_sum", "_count"] {
+            if let Some(base) = m.strip_suffix(suf) {
+                return base.to_string();
+            }
+        }
+        m.to_string()
+    };
+    let mut names: Vec<String> = rules.iter().map(|r| r.name.clone()).collect();
+    names.sort();
+    names.dedup();
+    let mut rule_objs: Vec<serde_json::Value> = rules
+        .iter()
+        .map(|r| {
+            let metrics: BTreeSet<String> = metric_re
+                .find_iter(&r.expr)
+                .map(|m| strip(m.as_str()))
+                .collect();
+            json!({
+                "name": r.name,
+                "expr": r.expr,
+                "for": r.for_,
+                "severity": r.severity,
+                "metrics": metrics.into_iter().collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    rule_objs.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["name"].as_str().unwrap_or_default())
+    });
+    Ok(json!({"names": names, "rules": rule_objs}))
+}
+
+/// Migration-slug inventory (merged_bug_122 class — prose cited
+/// migration NUMBERS, which the +2 renumber silently invalidated;
+/// references carry the `NNN_slug` stem, validated against this
+/// inventory by `refs.migration` and the docs-lint slug check).
+fn migrations() -> Result<serde_json::Value> {
+    let dir = repo_root().join("rio-migrations/migrations");
+    let mut stems: Vec<String> = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let p = entry?.path();
+        if p.extension().is_some_and(|x| x == "sql") {
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                stems.push(stem.to_string());
+            }
+        }
+    }
+    stems.sort();
+    Ok(json!({"stems": stems}))
 }
 
 /// Strip `^\s*///\s?` from each line of a captured doc-block, join,
@@ -815,6 +943,48 @@ fn first_sentence(desc: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    // Alert-rule scraper (merged_bug_001 mechanism): inline and
+    // `expr: |` block forms, for/severity capture, rio_* token
+    // extraction with histogram-suffix normalization.
+    #[test]
+    fn alerts_scraper_parses_inline_and_block_exprs() {
+        let yaml = r#"
+spec:
+  groups:
+    - name: rio.rules
+      rules:
+        - alert: InlineOne
+          expr: sum(rate(rio_scheduler_foo_total[5m])) > 0
+          for: 2m
+          labels:
+            severity: warning
+        - alert: BlockOne
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (rate(rio_store_bar_seconds_bucket[2m]))) > 1
+          for: 0m
+          labels:
+            severity: critical
+"#;
+        let v = super::parse_alerts(yaml).unwrap();
+        let rules = v["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 2);
+        let inline = &rules[1];
+        assert_eq!(inline["name"], "InlineOne");
+        assert_eq!(inline["expr"], "sum(rate(rio_scheduler_foo_total[5m])) > 0");
+        assert_eq!(inline["for"], "2m");
+        assert_eq!(inline["severity"], "warning");
+        assert_eq!(inline["metrics"][0], "rio_scheduler_foo_total");
+        let block = &rules[0];
+        assert_eq!(block["name"], "BlockOne");
+        assert_eq!(
+            block["expr"],
+            "histogram_quantile(0.99, sum by (le) (rate(rio_store_bar_seconds_bucket[2m]))) > 1"
+        );
+        // _bucket suffix normalizes to the describe_histogram! name.
+        assert_eq!(block["metrics"][0], "rio_store_bar_seconds");
+    }
+
     use super::*;
 
     #[test]

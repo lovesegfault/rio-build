@@ -62,5 +62,7 @@
 #include "ref/errors.typ"
 #pagebreak(weak: true)
 #include "ref/metrics.typ"
+
+#include "ref/alerts.typ"
 #pagebreak(weak: true)
 #bibliography("/lib/bib.yml")

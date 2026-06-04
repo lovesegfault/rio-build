@@ -20,9 +20,12 @@ procedure (OA2 option C's compensating controls, kept as deliverables).
 
 = When the alert fires
 
-The alert is a fleet-wide tripwire: two or more establishment events inside
-30 minutes (#(refs.metric)("rio_scheduler_attempt_requeue_seconds") with
-`cause="establishment"`). Establishments are expected to be rare — a single
+The alert is a fleet-wide tripwire — two or more establishment events
+inside 30 minutes. #(refs.alert)("RioSchedulerAttemptEstablishmentCluster")
+ships exactly this expression (rendered from the chart, not restated):
+
+#(refs.alert-expr)("RioSchedulerAttemptEstablishmentCluster")
+Establishments are expected to be rare — a single
 one usually means one pod crashed without reporting (node OOM, forced
 deletion) and the sweep did its job. A burst is what needs triage: it is
 either a genuinely wedged node (the OA2 signature) or a systemic cause
