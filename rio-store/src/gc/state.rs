@@ -75,7 +75,9 @@ pub(crate) enum CycleCommit {
         cursor_at_stop: Option<Vec<u8>>,
         victims_collected: u64,
         pass_complete: bool,
-        mark_set_size: i64,
+        /// Real-basis observation — only [`super::collect`]'s
+        /// real-basis arm can mint one (bug_226).
+        observation: super::collect::DurableObservation,
     },
     /// A shadow (dry-run) cycle: anchors the backlog estimate at the
     /// would-collect count and records the observation sizes — but
@@ -83,8 +85,11 @@ pub(crate) enum CycleCommit {
     /// cycle; the backstop's cadence question must not be answered by
     /// an observation) and does not touch the cursor.
     Shadow {
-        would_collect: i64,
-        mark_set_size: i64,
+        /// Real-basis observation (bug_226): committing a
+        /// counterfactual (simulated-sweep-excluded) backlog anchor or
+        /// mark size is a type error — the dry-run PREVIEW numbers
+        /// cannot reach this constructor.
+        observation: super::collect::DurableObservation,
     },
 }
 
@@ -134,7 +139,7 @@ impl GcCycleLease {
                 cursor_at_stop,
                 victims_collected,
                 pass_complete,
-                mark_set_size,
+                observation,
             } => {
                 sqlx::query(
                     "UPDATE gc_collect_state SET \
@@ -152,14 +157,11 @@ impl GcCycleLease {
                 .bind(if pass_complete { None } else { cursor_at_stop })
                 .bind(pass_complete)
                 .bind(victims_collected as i64)
-                .bind(mark_set_size)
+                .bind(observation.mark_set_size())
                 .execute(&mut **self.lock.conn())
                 .await?;
             }
-            CycleCommit::Shadow {
-                would_collect,
-                mark_set_size,
-            } => {
+            CycleCommit::Shadow { observation } => {
                 sqlx::query(
                     "UPDATE gc_collect_state SET \
                        cycle_epoch = cycle_epoch + 1, \
@@ -169,8 +171,8 @@ impl GcCycleLease {
                        updated_at = now() \
                      WHERE singleton",
                 )
-                .bind(would_collect)
-                .bind(mark_set_size)
+                .bind(observation.would_collect())
+                .bind(observation.mark_set_size())
                 .execute(&mut **self.lock.conn())
                 .await?;
             }

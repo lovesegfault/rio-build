@@ -383,6 +383,41 @@ pub(crate) enum CollectOutcome {
     ParseFailure,
 }
 
+/// The durable observation of one collect cycle — REAL basis only
+/// (bug_226). Private fields, module-private constructor: the sole
+/// mint site is the real-basis computation inside [`collect_cycle`],
+/// so a counterfactual (simulated-sweep-excluded) mark size or
+/// backlog anchor is unrepresentable in the durable
+/// `gc_collect_state` row by construction — `CycleCommit::{Shadow,
+/// Live}` accept only this type.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DurableObservation {
+    mark_set_size: i64,
+    would_collect: i64,
+}
+
+impl DurableObservation {
+    /// Mint from the exclusion-free computation. NOT pub(crate): only
+    /// collect_cycle's real-basis arm can call this.
+    fn from_real_basis(mark_set_size: i64, would_collect: i64) -> Self {
+        Self {
+            mark_set_size,
+            would_collect,
+        }
+    }
+
+    pub(crate) fn mark_set_size(&self) -> i64 {
+        self.mark_set_size
+    }
+
+    /// Real would-collect count (shadow cycles; always 0 for live
+    /// cycles — the live arm does not re-run the full anti-join count,
+    /// and the Live commit does not consume it).
+    pub(crate) fn would_collect(&self) -> i64 {
+        self.would_collect
+    }
+}
+
 /// What one collect cycle observed (and, for the live arm, did).
 #[derive(Debug, Clone)]
 pub(crate) struct CollectReport {
@@ -424,6 +459,12 @@ pub(crate) struct CollectReport {
     pub(crate) chunks_reaped: u64,
     /// Wall-clock of the cycle (snapshot through report/collect).
     pub(crate) cycle_seconds: f64,
+    /// The real-basis observation the caller commits durably
+    /// ([`super::state::CycleCommit`]). `None` only on a
+    /// parse-failure abort (which is never committed). The PREVIEW
+    /// fields above stay simulated for dry runs (bug_199); this field
+    /// is what may touch `gc_collect_state` (bug_226).
+    pub(crate) durable: Option<DurableObservation>,
 }
 
 /// Test-only failure injection for the per-batch isolation tests: when
@@ -609,6 +650,7 @@ pub(crate) async fn collect_cycle(
             pass_complete: false,
             chunks_reaped: 0,
             cycle_seconds: cycle_started.elapsed().as_secs_f64(),
+            durable: None,
         });
     }
 
@@ -680,6 +722,44 @@ pub(crate) async fn collect_cycle(
         None => (0, 0),
     };
 
+    // --- Durable observation: REAL basis only (bug_226) ---
+    // The durable row (and through it every replica's gauges and the
+    // next cycle's cadence/backlog decisions) records what IS, not the
+    // dry-run counterfactual. With a non-empty simulated sweep the
+    // mark above is exclusion-filtered, so materialize a SECOND,
+    // exclusion-free product on the same REPEATABLE READ snapshot
+    // (2x mark cost, operator dry runs only) and count against it.
+    // With an empty exclusion the product above IS the real basis.
+    let durable = match simulated_swept {
+        Some(swept) if !swept.is_empty() => {
+            let real_expansion =
+                format!("CREATE TEMP TABLE live_chunks_real ON COMMIT DROP AS {expansion_body}");
+            sqlx::query(sqlx::AssertSqlSafe(real_expansion))
+                .execute(&mut *tx)
+                .await?;
+            let real_mark: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM live_chunks_real")
+                .fetch_one(&mut *tx)
+                .await?;
+            let real_would: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM chunks c \
+                  WHERE c.deleted = FALSE \
+                    AND NOT EXISTS (SELECT 1 FROM live_chunks_real lc \
+                                     WHERE lc.blake3_hash = c.blake3_hash) \
+                    AND GREATEST(c.created_at, c.last_referenced_at) < $1::timestamptz",
+            )
+            .bind(&cutoff)
+            .fetch_one(&mut *tx)
+            .await?;
+            DurableObservation::from_real_basis(real_mark, real_would)
+        }
+        // Standalone shadow observation: no exclusion was applied —
+        // the preview numbers ARE the real basis.
+        Some(_) => DurableObservation::from_real_basis(mark_set_size, would_collect),
+        // Live: the mark is exclusion-free by construction; the live
+        // arm never computes a would-collect count.
+        None => DurableObservation::from_real_basis(mark_set_size, 0),
+    };
+
     // Commit ends the cycle's snapshot. In shadow mode the temp table
     // dies here (ON COMMIT DROP) before the connection returns to the
     // pool; in live mode it survives for the batch loop below.
@@ -715,6 +795,7 @@ pub(crate) async fn collect_cycle(
             pass_complete: false,
             chunks_reaped: 0,
             cycle_seconds,
+            durable: Some(durable),
         });
     }
 
@@ -892,6 +973,7 @@ pub(crate) async fn collect_cycle(
         pass_complete,
         chunks_reaped,
         cycle_seconds,
+        durable: Some(durable),
     })
 }
 
@@ -943,7 +1025,7 @@ pub(crate) async fn collect_backstop_once(
                             cursor_at_stop: report.cursor_at_stop.clone(),
                             victims_collected: report.victims_collected,
                             pass_complete: report.pass_complete,
-                            mark_set_size: report.mark_set_size as i64,
+                            observation: report.durable.expect("Ok cycle carries an observation"),
                         })
                         .await?;
                 }
@@ -1150,8 +1232,7 @@ mod tests {
             .expect("lock free");
         lease
             .commit_cycle(super::super::state::CycleCommit::Shadow {
-                would_collect: report.would_collect as i64,
-                mark_set_size: report.mark_set_size as i64,
+                observation: report.durable.expect("Ok cycle carries an observation"),
             })
             .await
             .unwrap();
@@ -1772,6 +1853,61 @@ mod tests {
         assert_eq!(
             excl.would_collect, 1,
             "excluding the manifest exposes its chunk as collectible"
+        );
+    }
+
+    /// bug_226: the DURABLE row must anchor the REAL basis — the
+    /// dry-run preview stays simulated (bug_199), but what lands in
+    /// gc_collect_state (and from there every replica's gauges and
+    /// the next cycle's backlog estimate) is the exclusion-free
+    /// observation. Three referenced chunks, two of their manifests
+    /// simulated-swept: preview mark=1/would=2; durable mark=3/would=0.
+    /// RED (recorded, pre-fix routing of the simulated numbers into
+    /// the commit): durable carried 1/2 — the counterfactual.
+    #[tokio::test]
+    async fn dry_run_commit_anchors_real_basis() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let mut hashes = Vec::new();
+        for (i, name) in [(0xA1u8, "real-a"), (0xA2, "real-b"), (0xA3, "real-c")] {
+            let c = ChunkSeed::new(i)
+                .age_secs(7200)
+                .uploaded()
+                .seed(&db.pool)
+                .await;
+            let h = seed_chunked_manifest(&db.pool, name, "complete", &make_chunk_list(&[c])).await;
+            hashes.push(h);
+        }
+
+        let report = collect_cycle(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            CollectMode::Shadow {
+                simulated_swept: hashes[..2].to_vec(),
+            },
+            None,
+        )
+        .await
+        .expect("excluding shadow cycle");
+
+        // Preview: simulated post-sweep state (bug_199 preserved).
+        assert_eq!(
+            report.mark_set_size, 1,
+            "preview mark is exclusion-filtered"
+        );
+        assert_eq!(
+            report.would_collect, 2,
+            "preview counts the would-be-freed chunks"
+        );
+
+        // Durable: real basis.
+        let durable = report.durable.expect("Ok cycle carries an observation");
+        assert_eq!(durable.mark_set_size(), 3, "durable mark is the REAL mark");
+        assert_eq!(
+            durable.would_collect(),
+            0,
+            "durable backlog anchor is the REAL count"
         );
     }
 
@@ -2657,8 +2793,7 @@ mod tests {
             .expect("lock free");
         lease
             .commit_cycle(super::super::state::CycleCommit::Shadow {
-                would_collect: shadow.would_collect as i64,
-                mark_set_size: shadow.mark_set_size as i64,
+                observation: shadow.durable.expect("Ok cycle carries an observation"),
             })
             .await
             .unwrap();
@@ -2704,7 +2839,7 @@ mod tests {
                 cursor_at_stop: first.cursor_at_stop.clone(),
                 victims_collected: first.victims_collected,
                 pass_complete: first.pass_complete,
-                mark_set_size: first.mark_set_size as i64,
+                observation: first.durable.expect("Ok cycle carries an observation"),
             })
             .await
             .unwrap();
@@ -2763,7 +2898,7 @@ mod tests {
                 cursor_at_stop: None,
                 victims_collected: second.victims_collected,
                 pass_complete: second.pass_complete,
-                mark_set_size: second.mark_set_size as i64,
+                observation: second.durable.expect("Ok cycle carries an observation"),
             })
             .await
             .unwrap();

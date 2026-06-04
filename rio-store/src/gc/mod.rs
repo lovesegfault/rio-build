@@ -354,8 +354,9 @@ pub async fn run_gc(
                     if params.dry_run {
                         lease
                             .commit_cycle(state::CycleCommit::Shadow {
-                                would_collect: report.would_collect as i64,
-                                mark_set_size: report.mark_set_size as i64,
+                                observation: report
+                                    .durable
+                                    .expect("Ok cycle carries an observation"),
                             })
                             .await
                     } else {
@@ -364,7 +365,9 @@ pub async fn run_gc(
                                 cursor_at_stop: report.cursor_at_stop.clone(),
                                 victims_collected: report.victims_collected,
                                 pass_complete: report.pass_complete,
-                                mark_set_size: report.mark_set_size as i64,
+                                observation: report
+                                    .durable
+                                    .expect("Ok cycle carries an observation"),
                             })
                             .await
                     }
