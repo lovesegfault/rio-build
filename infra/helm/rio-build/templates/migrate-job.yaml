@@ -1,0 +1,138 @@
+{{- /*
+Database migration Job: `rio-store migrate` (reuses the store image —
+no dedicated migrate image). A PLAIN Job, deliberately NOT a helm
+hook: the app pods already implement the only convergence contract
+this chart needs — they crash-restart on the startup schema check
+(rio_migrations::assert_current) until migrations land, then come
+clean. A hook would layer a second lifecycle state machine
+(install/upgrade phases, hook weights, before-hook-creation deletion)
+on top of that, and every phase interaction is a place to be wrong:
+post-install vs pre-upgrade asymmetry forces deploy tooling to
+special-case --wait on fresh installs, hook resources apply after
+non-hook resources (gapping the rds-ca ConfigMap the hook pod
+mounts), before-hook-creation deletion can kill a LIVE migration run
+mid-statement, and a fresh `helm install --wait` deadlocks by
+construction (post-install hooks only run after the wait that cannot
+pass without them). One pass, one convergence story. Upgrade ordering
+is NOT load-bearing: migrate-before-roll was a hook nicety — old
+replicas tolerate newer schema (forward-compatible policy,
+deployment.typ), new replicas wait via crash-restart.
+
+NAME: suffixed with a hash of THIS rendered pod template. Job specs
+are immutable, so a re-render that changes anything in the pod spec
+(image tag, RUST_LOG, mounts) must create a NEW Job — a same-name
+upgrade would fail the whole release on spec immutability. The hash
+covers the rendered template rather than the image tag because the
+tag underdetermines the spec: k3s pins tag=dev forever (xtask
+pre-deletes completed rio-migrate Jobs by label before upgrade so a
+re-pushed dev image still migrates — an airgapped kubectl re-apply
+that reuses a tag has the same caveat, delete the old Job first),
+and on EKS a same-tree redeploy with a different --log-level changes
+RUST_LOG in this spec without changing the tag.
+
+helm.sh/resource-policy: keep — REQUIRED with the name suffix. helm 3
+deletes resources present in the previous release manifest but absent
+from the new one, i.e. without keep a still-RUNNING old-named Job
+gets killed mid-migration at upgrade time. With keep, helm never
+deletes old Jobs; ttlSecondsAfterFinished reaps them instead.
+Trade-off: Jobs also survive `helm uninstall` until their TTL —
+accepted. A TTL-reaped Job re-applied later (GitOps sync drift,
+kubectl re-apply) just re-runs: migrations are idempotent under the
+advisory lock. (Repo has no ArgoCD/Flux today; if the rendered chart
+is ever GitOps-applied the TTL+recreate loop is harmless churn, and a
+plain Job is otherwise healthier for GitOps than a hook.)
+
+CREDENTIALS: always the master-password URL from the rio-postgres
+Secret (ESO-templated Aurora URL on EKS, chart-rendered/xtask
+pre-created on k3s) — regardless of postgres.authMode. The Job lives
+for seconds at deploy time, so the 7-day AWS-managed master rotation
+can't strand it (worst case: ESO's 1h refreshInterval lags a rotation
+and ONE deploy fails auth — rerun). Running as the MASTER decouples
+schema DDL and role provisioning (ensure_roles) from app-pod
+credentials. On EKS that URL carries sslmode=verify-full&sslrootcert,
+hence the rdsCa mount; on k3s the bitnami URL has no ssl params and
+the rdsCa family self-guards on externalSecrets.enabled, so the
+render has zero cert references.
+
+FRESH-INSTALL SEQUENCING: none needed — do not add any back. A Job
+pod referencing the not-yet-ESO-synced rio-postgres Secret (or the
+rds-ca ConfigMap volume) sits in Pending/CreateContainerConfigError,
+a kubelet-level retry that does NOT consume backoffLimit (the pod
+never reaches phase Failed). Once the Secret syncs, the pod starts
+and the in-binary connect poll (rio-store/src/main.rs run_migrate)
+rides out PG bring-up (fresh k3s installs apply the bitnami PG
+StatefulSet in the same release).
+*/}}
+{{- $podTpl := include "rio.migratePodTemplate" . -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rio-migrate-{{ $podTpl | sha256sum | trunc 8 }}
+  namespace: {{ .Values.namespaces.system.name }}
+  labels:
+    app.kubernetes.io/name: rio-migrate
+    app.kubernetes.io/part-of: rio-build
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  # Backstop only — PG-not-up is absorbed INSIDE one pod by the
+  # subcommand's 10-minute connect poll, so retries here mean a real
+  # failure (bad SQL, auth). A few retries cover transient pod-level
+  # losses (node drain, OOM) without hiding persistent errors.
+  backoffLimit: 3
+  # Reaps completed Jobs (resource-policy keep means helm never will).
+  # 1h leaves the Job inspectable after a deploy without accreting
+  # one object per release forever.
+  ttlSecondsAfterFinished: 3600
+  template:
+    {{- include "rio.migratePodTemplate" . | nindent 4 }}
+{{- /*
+Pod template as a named include so the Job name can hash EXACTLY what
+is rendered — any drift between the hashed and the rendered spec
+would re-open the same-name/different-spec immutability failure.
+*/}}
+{{- define "rio.migratePodTemplate" -}}
+metadata:
+  labels:
+    app.kubernetes.io/name: rio-migrate
+    app.kubernetes.io/part-of: rio-build
+  annotations:
+    # A drained node mid-migration is the one remaining external kill
+    # vector (run_migrate's SIGTERM handler aborts cleanly; the
+    # advisory lock releases on socket close). Keep Karpenter from
+    # picking this pod's node for consolidation while it runs.
+    karpenter.sh/do-not-disrupt: "true"
+spec:
+  restartPolicy: Never
+  serviceAccountName: rio-migrate
+  # The runner talks to PostgreSQL only — no kube API, no AWS calls
+  # (master-password URL; IAM tokens are an app-pod concern).
+  automountServiceAccountToken: false
+  {{- if .Values.karpenter.enabled }}
+  nodeSelector:
+    rio.build/node-role: general
+  {{- end }}
+  {{- include "rio.podSecurityContext" . | nindent 2 }}
+  containers:
+    - name: migrate
+      image: {{ include "rio.image" (list . .Values.store.image) }}
+      imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+      {{- include "rio.containerSecurityContext" . | nindent 6 }}
+      args: ["migrate"]
+      env:
+        {{- include "rio.rustLogEnv" . | nindent 8 }}
+        {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov")) | nindent 8 }}
+        - name: RIO_DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: rio-postgres
+              key: url
+      volumeMounts:
+        {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "rdsCa")) | nindent 8 }}
+      # Tiny: the process parses SQL and waits on PG.
+      resources:
+        requests: {cpu: 100m, memory: 64Mi}
+        limits: {memory: 256Mi}
+  volumes:
+    {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "rdsCa")) | nindent 4 }}
+{{- end -}}

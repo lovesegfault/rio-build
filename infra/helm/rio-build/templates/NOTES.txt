@@ -6,6 +6,13 @@ Post-install prerequisites that the chart cannot apply itself
 */ -}}
 rio-build installed to namespace {{ .Values.namespaces.system.name }}.
 
+Database migrations run as a plain Job (rio-migrate-*, per-render
+name); app pods crash-restart on the startup schema check until it
+completes, then converge. A first `helm install --wait` on slow PG
+bring-up may exceed helm's default 5m — pass `--timeout 15m`; the
+release converges either way (the timeout is recoverable, not a
+deadlock).
+
 {{- if .Values.mountd.enabled }}
 
 ── castore store via rio-mountd (ADR-022) ─────────────────────────────

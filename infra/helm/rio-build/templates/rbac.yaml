@@ -18,6 +18,7 @@
       (dict "name" "rio-builder"    "ns" .Values.namespaces.builders.name "comp" "worker"     "on" true                       "automount" false)
       (dict "name" "rio-fetcher"    "ns" .Values.namespaces.fetchers.name "comp" "worker"     "on" true                       "automount" false)
       (dict "name" "rio-scheduler"  "ns" $ns                              "comp" "scheduler"  "on" .Values.scheduler.enabled  "automount" true  "annot" .Values.scheduler.serviceAccount.annotations)
+      (dict "name" "rio-migrate"    "ns" $ns                              "comp" "migrate"    "on" true                       "automount" false)
 }}
 {{- if $sa.on }}
 ---

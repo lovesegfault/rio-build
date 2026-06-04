@@ -6353,6 +6353,7 @@ dependencies = [
 name = "rio-migrations"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "hex",
  "rio-test-support",
  "sqlx",

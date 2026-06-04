@@ -21,8 +21,9 @@ spec:
     type: Recreate
   {{- end }}
   {{- if not .Values.componentScaler.store.enabled }}
-  # Stateless at runtime (PG + S3 hold everything). sqlx::migrate! takes
-  # a PG advisory lock, so concurrent replica startup is safe.
+  # Stateless at runtime (PG + S3 hold everything). Replicas don't
+  # migrate (the rio-migrate Job does); startup only verifies the
+  # schema, so concurrent replica startup is safe.
   #
   # OMITTED when componentScaler.store.enabled=true: the ComponentScaler
   # reconciler patches deployments/scale; if helm also rendered
@@ -123,8 +124,9 @@ spec:
             - name: chunks
               mountPath: {{ required "store.chunkBackend.baseDir is required when chunkBackend.kind=filesystem" $cb.baseDir }}
             {{- end }}
-          # tonic-health set_serving() runs AFTER migrations in main.rs —
-          # "PG connected + migrations done" = Ready.
+          # tonic-health set_serving() runs AFTER the schema check in
+          # main.rs — "PG connected + schema current" = Ready. Pods
+          # crash-restart until the rio-migrate Job has run.
           readinessProbe:
             grpc:
               port: 9002

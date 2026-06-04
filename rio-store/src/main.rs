@@ -12,11 +12,16 @@ use rio_store::grpc::{ChunkServiceImpl, StoreAdminServiceImpl, StoreServiceImpl}
 use rio_store::signing::{Signer, TenantSigner};
 use rio_store::substitute::Substituter;
 
-use rio_store::config::{CliArgs, Config, derive_substitute_admission_cap, init_chunk_backend};
+use rio_store::config::{
+    CliArgs, Config, StoreCommand, derive_substitute_admission_cap, init_chunk_backend,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = CliArgs::parse();
+    if let Some(StoreCommand::Migrate) = cli.command {
+        return run_migrate().await;
+    }
     let rio_common::server::Bootstrap::<Config> {
         cfg,
         shutdown,
@@ -36,8 +41,8 @@ async fn main() -> anyhow::Result<()> {
     // (probe → NotFound, which kubelet treats as failure) until the
     // `set_serving::<StoreServiceServer>` call below flips it. K8s
     // readinessProbe (store.yaml `grpc:{service: rio.store.StoreService}`)
-    // hits the named service — readiness fails until migrations complete
-    // means the Service doesn't route to a half-booted pod. NOTE:
+    // hits the named service — readiness fails until the schema check
+    // passes means the Service doesn't route to a half-booted pod. NOTE:
     // tonic-health defaults the EMPTY-string service to SERVING; the
     // store's probe doesn't check "" so that default is harmless here,
     // but DON'T copy this pattern to a binary that probes "" (see
@@ -46,8 +51,9 @@ async fn main() -> anyhow::Result<()> {
     // Ordering: health_reporter() → build services → set_serving() →
     // serve(). The set_serving happens BEFORE serve() blocks, which means
     // the very first health check after listen returns SERVING. That's
-    // correct: by the time we're listening, migrations are done. If
-    // migrations failed, the `?` above already bailed.
+    // correct: by the time we're listening, the schema check passed. If
+    // it failed (migrate Job hasn't run yet), the `?` above already
+    // bailed and the pod restarts until the schema is current.
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
     let chunk_cache = init_chunk_backend(
@@ -323,8 +329,106 @@ async fn main() -> anyhow::Result<()> {
 
 // ── bootstrap helpers (extracted from main) ──────────────────────────
 
-/// Connect to PostgreSQL and run migrations. URL is logged with
-/// password redacted.
+/// `rio-store migrate`: one-shot migration runner. This is the
+/// container entrypoint of the helm `rio-migrate` Job and the
+/// ExecStart of the NixOS `rio-migrate` systemd oneshot — migrations
+/// run out-of-band, BEFORE any app pod/service starts, and always as
+/// the database master — schema DDL never depends on the credentials
+/// or privileges of whatever auth mode the app pods use.
+///
+/// Reads `RIO_DATABASE_URL` directly instead of loading the full
+/// store `Config` — the Job sets exactly this one variable, and the
+/// full config would drag in store-only concerns (chunk backend,
+/// listen addrs) a migration run never touches. Always password-mode:
+/// the runners hand it the master URL.
+///
+/// Connect retry: on fresh k3s installs the bitnami PG StatefulSet
+/// lands in the same helm release as this Job, so PG can trail by
+/// minutes (image pull + initdb). A flat 5s poll for up to 10
+/// minutes rides that out inside ONE Job pod — no CrashLoop backoff
+/// amplification; the Job `backoffLimit` stays a backstop for real
+/// failures (which surface fast: auth errors and bad SQL don't
+/// retry here).
+async fn run_migrate() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    // Same single-provider guard as rio_common::server::bootstrap —
+    // this subcommand skips bootstrap entirely, and a future
+    // transitive dep re-enabling `ring` would otherwise re-create the
+    // rustls dual-provider can't-auto-select panic on the first
+    // verify-full handshake to Aurora. Defense-in-depth; the live
+    // path works today.
+    rio_common::server::install_crypto_provider();
+
+    let _otel_guard = rio_common::observability::init_tracing("store")?;
+    let url = std::env::var("RIO_DATABASE_URL")
+        .context("`rio-store migrate` requires RIO_DATABASE_URL")?;
+    info!(
+        url = %rio_common::config::redact_db_url(&url),
+        "running database migrations"
+    );
+
+    // SIGTERM/SIGINT → cancel (this subcommand skips
+    // rio_common::server::bootstrap and with it the usual signal
+    // wiring). On node drain, kubelet SIGTERMs the Job pod: the
+    // select! below drops the in-flight migrate future — the detached
+    // lock connection closes, PG aborts the running statement
+    // server-side and releases the advisory lock — and main returns
+    // (atexit profraw flush included) instead of dying mid-statement
+    // at SIGKILL. The Job controller reschedules the pod; the re-run
+    // is idempotent under the lock.
+    let shutdown = rio_common::signal::shutdown_signal();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    let pool = loop {
+        match PgPoolOptions::new().max_connections(2).connect(&url).await {
+            Ok(pool) => break pool,
+            Err(e)
+                if rio_common::pg_error::is_transient_bounded(&e)
+                    && std::time::Instant::now() < deadline =>
+            {
+                // Shared classifier, BOUNDED variant: reachability
+                // errors, PG lifecycle FATALs (57P03 during bitnami
+                // initdb burned a backoffLimit pod with an
+                // Io|PoolTimedOut-only filter), resource pressure,
+                // and 3D000 (database not created yet — bitnami init
+                // window). Permanent errors (auth, bad SQL) still
+                // fail fast so the Job log shows them; a bad
+                // sslrootcert path now burns the deadline visibly
+                // (warn every 5s) instead of failing fast — accepted
+                // for the Aurora-resume RST case, see pg_error docs.
+                tracing::warn!(error = %e, "PostgreSQL not ready; retrying in 5s");
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {
+                        anyhow::bail!("shutdown signal during PostgreSQL connect poll");
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                }
+            }
+            Err(e) => return Err(e).context("PostgreSQL connect failed"),
+        }
+    };
+
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {
+            anyhow::bail!(
+                "migration interrupted by shutdown signal; the advisory lock was \
+                 released (lock connection closed) and the rescheduled Job re-runs \
+                 idempotently"
+            );
+        }
+        r = rio_migrations::migrate::run(&pool, rio_migrations::migrator()) => {
+            r.inspect_err(|e| error!(error = %e, "database migrations failed"))?;
+        }
+    }
+    info!("database migrations applied");
+    Ok(())
+}
+
+/// Connect to PostgreSQL and verify the schema is current. URL is
+/// logged with password redacted.
 ///
 // r[impl store.db.pool-idle-timeout]
 /// Aurora Serverless v2 scales `max_connections` with ACU; at
@@ -373,15 +477,13 @@ async fn init_db_pool(
     info!("PostgreSQL connection established");
     tokens.spawn_refresher(pool.clone());
 
-    // r[impl store.db.migrate-try-lock] — try-then-wait advisory
-    // lock; sqlx's default blocking `pg_advisory_lock` deadlocks
-    // against migrations 011/022's CREATE INDEX CONCURRENTLY when
-    // ≥2 replicas start together (I-194). Shared with rio-scheduler
-    // (same DB, same migrations) — see rio_migrations::migrate::run.
-    rio_migrations::migrate::run(&pool, rio_migrations::migrator())
+    // r[impl store.db.schema-current+2] — startup does NOT migrate;
+    // `rio-store migrate` (helm rio-migrate Job / NixOS oneshot)
+    // already did.
+    rio_migrations::migrate::assert_current(&pool)
         .await
-        .inspect_err(|e| error!(error = %e, "database migrations failed"))?;
-    info!("database migrations applied");
+        .inspect_err(|e| error!(error = format!("{e:#}"), "database schema check failed"))?;
+    info!("database schema is current");
 
     Ok(pool)
 }

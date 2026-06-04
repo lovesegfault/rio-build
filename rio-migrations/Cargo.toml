@@ -9,6 +9,8 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+# `migrate::assert_current` error context (schema missing vs stale).
+anyhow = { workspace = true }
 sqlx = { workspace = true, features = ["migrate"] }
 # `migrate::run` poll loop (`tokio::time::sleep`).
 tokio = { workspace = true, features = ["time"] }

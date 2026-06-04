@@ -282,7 +282,7 @@ spec:
           # TCP (NOT named gRPC). Named SchedulerService only goes SERVING
           # when is_leader=true; standby never acquires while leader healthy
           # → named-service startupProbe would crash-loop standby. Generous:
-          # migrations + PG connect + store connect ~60s worst case.
+          # schema check + PG connect + store connect ~60s worst case.
           startupProbe:
             tcpSocket: {port: 9001}
             periodSeconds: 5

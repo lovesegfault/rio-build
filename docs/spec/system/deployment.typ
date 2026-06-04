@@ -28,7 +28,7 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
   [rio-store],
   [Deployment],
   [1],
-  [Stateless at runtime (PG + S3 hold everything). Multi-replica is safe: startup migrations serialize via #rref("store.db.migrate-try-lock").],
+  [Stateless at runtime (PG + S3 hold everything). Multi-replica is safe: replicas never migrate (#rref("store.db.schema-current")); the rio-migrate Job owns migration, serialized via #rref("store.db.migrate-try-lock").],
 
   [rio-controller],
   [Deployment],
@@ -50,7 +50,9 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
 + *rio-gateway* (needs rio-scheduler and rio-store)
 + *Pool CRD* (rio-controller creates and manages builder/fetcher Jobs)
 
-`helm upgrade --wait` blocks until all Deployments report Available — strict ordering isn't enforced, but no component is externally reachable until the release as a whole is Ready. Readiness probes on each component ensure this: store readiness requires PG migrations done, scheduler readiness requires store reachable, gateway readiness requires scheduler reachable.
+Database migrations run in a dedicated `rio-migrate` Job — a PLAIN Job applied alongside every other resource, deliberately not a helm hook — that executes `rio-store migrate` with the master-password URL from the `rio-postgres` Secret, regardless of `postgres.authMode`. App pods never migrate; at startup they verify the schema is current and fail with an error naming the Job otherwise (#rref("store.db.schema-current")), crash-restarting until the Job completes. That crash-restart convergence is the only sequencing contract: migrate-before-roll ordering is not load-bearing (old replicas tolerate the newer, forward-compatible schema; new replicas wait via restart), and the Job's name carries a per-render pod-template hash so a changed spec creates a new Job instead of colliding with Job immutability (`helm.sh/resource-policy: keep` + a 1h TTL handle old Jobs). Because the runner always connects as the master, a fresh cluster can deploy directly with `postgres.authMode=iam` — app pods never need DDL-capable credentials.
+
+`helm upgrade --wait --wait-for-jobs` blocks until all Deployments report Available and the migrate Job completes — strict ordering isn't enforced, but no component is externally reachable until the release as a whole is Ready. Readiness probes on each component ensure this: store readiness requires the schema check to pass, scheduler readiness requires store reachable, gateway readiness requires scheduler reachable. `--wait-for-jobs` matters even when the schema is already current: without it a failed migrate Job is invisible behind green Deployments. Fresh installs work under `--wait` too (the plain Job applies in the same pass as everything else); slow PG bring-up may need `--timeout` above helm's 5m default — a recoverable timeout, not a deadlock.
 
 = Minimum Viable Deployment
 
@@ -177,7 +179,7 @@ For a complete scripted walkthrough against EKS, run `cargo xtask k8s qa --healt
 
 = Upgrades
 
-- *Schema migrations:* Run via `sqlx::migrate!` with sqlx's built-in lock disabled (`set_locking(false)`); rio-store's own PG advisory `pg_try_advisory_lock` serializes concurrent replicas (#rref("store.db.migrate-try-lock")). All migrations are forward-compatible; rollback is supported by deploying the previous binary version (it ignores unknown columns/tables).
+- *Schema migrations:* Run by the `rio-migrate` Job (`rio-store migrate`) via `sqlx::migrate!` with sqlx's built-in lock disabled (`set_locking(false)`); a PG advisory `pg_try_advisory_lock` serializes concurrent runners (#rref("store.db.migrate-try-lock")). App pods only verify (#rref("store.db.schema-current")). All migrations are forward-compatible; rollback is supported by deploying the previous binary version (it ignores unknown columns/tables).
 - *Rolling updates:* Builder Jobs (created by rio-controller) set `terminationGracePeriodSeconds: 7200` --- the builder's SIGTERM handler blocks until its single in-flight build completes, then exits 0. Gateway pods use the Kubernetes default (30s); no extended grace period is configured in the base manifests. Builder pods are one-shot, so a control-plane upgrade naturally rolls the fleet as Jobs complete and new ones spawn with the new image.
 - *Blue/green deployments:* Supported if separate PostgreSQL schemas and S3 key prefixes are used per deployment. The gateway can be switched atomically via NLB target group changes.
 - *Version skew policy:* Gateway and executor binaries can be at most 1 minor version behind the scheduler and store. The scheduler and store must be upgraded first.
