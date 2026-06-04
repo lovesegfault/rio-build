@@ -955,7 +955,7 @@ async fn dedup_upgrade_is_pruned_wins_and_monotone() -> anyhow::Result<()> {
 /// D1/A6 (merged_bug_163): the resolved-jobs retention sweep deletes
 /// ONLY resolved+old+unpinned+interest-free rows — pending jobs, fresh
 /// jobs, pinned jobs, and jobs with live interest all survive.
-// r[verify sched.db.table-retention]
+// r[verify sched.db.table-retention+1]
 #[tokio::test]
 async fn gc_resolved_jobs_sweeps_only_unreferenced_resolved() -> anyhow::Result<()> {
     let (test_db, db, drv_swept) = setup("gc-jobs-swept").await?;

@@ -537,7 +537,7 @@ impl SchedulerDb {
     /// deleted: claimable is the armed action. The NOT-EXISTS-pins
     /// conjunct is the ordering guard the schema deliberately has no FK
     /// for (093 commentary).
-    // r[impl sched.db.table-retention]
+    // r[impl sched.db.table-retention+1]
     pub(crate) async fn gc_resolved_materialization_jobs(
         &self,
         horizon_secs: f64,

@@ -30556,6 +30556,10 @@
           "packageId": "rio-crds"
         },
         {
+          "name": "rio-migrations",
+          "packageId": "rio-migrations"
+        },
+        {
           "name": "rio-proto",
           "packageId": "rio-proto"
         },

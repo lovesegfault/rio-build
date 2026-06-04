@@ -3174,11 +3174,17 @@ backoff. This prevents unbounded request queueing at the gateway layer.
   set classifies Broken (conservative), never Vouched.
 ]
 
-#r("sched.db.table-retention")[
+#r("sched.db.table-retention+1")[
   Every public scheduler-owned table MUST have a declared row lifecycle in
-  `rio-migrations/src/retention.rs` (`RETENTION_REGISTRY`): either a named
-  sweeper that deletes its rows or a written keep-forever rationale. A
-  migration that creates a table without a registry row MUST fail CI.
+  `rio-migrations/src/retention.rs` (`RETENTION_REGISTRY`), as a TYPED
+  policy: a named sweeper (`SweptBy` --- the symbol MUST define in
+  non-test workspace source and a defining file MUST carry the deleting
+  statement), a parent cascade (`CascadeFrom` --- the named migration
+  MUST carry the `REFERENCES parent … ON DELETE CASCADE` clause; RESTRICT
+  does not satisfy), or a written keep-forever rationale (which MAY
+  record an honest retention debt). A migration that creates a table
+  without a registry row MUST fail CI, and a registry row whose claim
+  does not resolve against the code MUST fail CI naming the table.
   Resolved `materialization_jobs` rows MUST be deleted only past the
   forensic horizon and only when no `scheduler_live_pins` row and no
   `materialization_interest` row references the job; `pending` jobs MUST
@@ -3192,7 +3198,15 @@ The registry test (`rio-migrations/tests/retention.rs`) diffs `pg_tables`
 against the registry in both directions, so an undeclared new table and a
 stale registry row are both merge-time failures naming the table — the
 structural close of the class where migration 078 shipped two tables with
-no deletion lifecycle at all (merged_bug_163).
+no deletion lifecycle at all (merged_bug_163). The claim half is
+`xtask lint retention-truth` (the `xtask-lint` flake check): bughunt-2
+found eight registry rows whose prose attribution grepped to nothing or to
+forbidden code — `drv_executions` credited to the store sweep that
+`store.log.sweep-ownership` bans from touching it, `jwt_revoked` credited
+to a TTL sweep never written, `realisation_deps` claiming a CASCADE that
+is declared RESTRICT — and the typed registry makes that whole class a
+named CI failure instead of an unbounded-growth surprise
+(merged_bug_001/142).
 
 #r("sched.db.exec-stamp-on-close")[
   Closing an `assignments` row MUST stamp the closed row's

@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 
 use rio_migrations::retention::RETENTION_REGISTRY;
 
-// r[verify sched.db.table-retention]
+// r[verify sched.db.table-retention+1]
 #[tokio::test]
 async fn every_public_table_has_a_retention_decision() {
     let db = rio_test_support::TestDb::new(&rio_migrations::MIGRATOR).await;

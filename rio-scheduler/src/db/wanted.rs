@@ -210,7 +210,7 @@ impl SchedulerDb {
     /// gc_attempt_ledger orphan-arm class. The per-build purge lives in
     /// [`SchedulerDb::delete_build`]'s fenced one-tx form (fence and
     /// atomicity together — A1 + D1 composed).
-    // r[impl sched.db.table-retention]
+    // r[impl sched.db.table-retention+1]
     pub(crate) async fn gc_dead_build_wanted_outputs(
         &self,
         horizon_secs: f64,

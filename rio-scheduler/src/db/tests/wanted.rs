@@ -377,7 +377,7 @@ async fn wanted_rows_purged_with_build() -> anyhow::Result<()> {
 /// D1/A6 (merged_bug_163): the wanted-outputs retention sweep deletes
 /// rows for long-terminal builds and orphan rows whose build is gone;
 /// live builds' rows and freshly-finished builds' rows survive.
-// r[verify sched.db.table-retention]
+// r[verify sched.db.table-retention+1]
 #[tokio::test]
 async fn gc_dead_wanted_sweeps_terminal_and_orphans() -> anyhow::Result<()> {
     let (test_db, db) = setup().await;
@@ -427,7 +427,7 @@ async fn gc_dead_wanted_sweeps_terminal_and_orphans() -> anyhow::Result<()> {
 /// build row AND its wanted rows in ONE FENCED transaction — the
 /// failed-merge rollback can no longer leak orphans, and a deposed
 /// replica's late rollback is fenced to a no-op.
-// r[verify sched.db.table-retention]
+// r[verify sched.db.table-retention+1]
 #[tokio::test]
 async fn delete_build_purges_wanted_rows_same_fenced_tx() -> anyhow::Result<()> {
     let (test_db, db) = setup().await;

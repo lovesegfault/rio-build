@@ -18,6 +18,9 @@ rio-test-support = { path = "../rio-test-support", default-features = false }
 # the metal-partition predicate, not a doc-comment.
 rio-common.workspace = true
 rio-crds.workspace = true
+# RETENTION_REGISTRY (typed policies) for `lint retention-truth` —
+# the lint consumes the registry as data, no schema/sqlx surface used.
+rio-migrations.workspace = true
 # `sla::FLEET_MEDIAN_MIN_TENANTS` for `k8s sla-gates` seed loop
 # (bug_016: hardcoded `0..3` left the per-dim trust gate unsatisfied).
 rio-scheduler.workspace = true

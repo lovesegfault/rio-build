@@ -244,6 +244,7 @@
       "prod": [
         "rio-common",
         "rio-crds",
+        "rio-migrations",
         "rio-proto",
         "rio-scheduler",
         "rio-test-support"

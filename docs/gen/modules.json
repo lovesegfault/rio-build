@@ -725,7 +725,7 @@
     {
       "path": "retention.rs",
       "depth": 0,
-      "doc": "The table-retention registry (bughunt wave D1, merged_bug_163)."
+      "doc": "The table-retention registry (bughunt wave D1, merged_bug_163;"
     },
     {
       "path": "schema.rs",

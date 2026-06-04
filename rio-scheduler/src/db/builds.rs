@@ -204,7 +204,7 @@ impl SchedulerDb {
     /// — the failed-merge rollback can no longer leave
     /// build_wanted_outputs orphans behind, and a deposed replica's
     /// late rollback cannot destroy a successor's rows.
-    // r[impl sched.db.table-retention]
+    // r[impl sched.db.table-retention+1]
     pub(crate) async fn delete_build(
         &self,
         build_id: Uuid,

@@ -35,6 +35,18 @@ pub enum Lint {
     /// profile edit that flips to a denylist or strands the Nix
     /// sandbox.
     SeccompAllowlist,
+    /// Every `RETENTION_REGISTRY` policy claim resolves against
+    /// reality: `SweptBy` symbols define in non-test workspace source
+    /// AND a defining file carries the deleting statement
+    /// (`DELETE FROM {table}` / a `TRUNCATE` list naming it,
+    /// line-continuation normalized); `CascadeFrom` rows resolve a
+    /// `REFERENCES {parent} … ON DELETE CASCADE` clause in the named
+    /// migration. Catches phantom retention attributions
+    /// (merged_bug_001/142): a registry row crediting a sweeper that
+    /// doesn't exist or doesn't delete the table, or a "CASCADE" that
+    /// is actually RESTRICT — rows growing forever behind a row that
+    /// greps to nothing.
+    RetentionTruth,
 }
 
 impl Lint {
@@ -47,7 +59,12 @@ impl Lint {
     /// subcommand list clap derives from the enum, so a variant added
     /// to the enum but not here fails `cargo test -p xtask`.
     fn all() -> Vec<Lint> {
-        vec![Lint::SchemaLiveness, Lint::HelmSla, Lint::SeccompAllowlist]
+        vec![
+            Lint::SchemaLiveness,
+            Lint::HelmSla,
+            Lint::SeccompAllowlist,
+            Lint::RetentionTruth,
+        ]
     }
 }
 
@@ -57,6 +74,7 @@ pub fn run(lint: &Lint) -> Result<()> {
         Lint::SchemaLiveness => schema_liveness(),
         Lint::HelmSla => helm_sla(),
         Lint::SeccompAllowlist => seccomp_allowlist(),
+        Lint::RetentionTruth => retention_truth(),
     }
 }
 
@@ -550,6 +568,193 @@ fn check_seccomp_profile(
     Ok(())
 }
 
+// r[verify sched.db.table-retention+1]
+/// `RetentionTruth`: every registry policy claim resolves — see the
+/// `Lint` variant doc. KeepForever rows are exempt by construction
+/// (their rationale IS the decision; nothing to resolve).
+fn retention_truth() -> Result<()> {
+    use rio_migrations::retention::{RETENTION_REGISTRY, RetentionPolicy};
+    let root = repo_root();
+    let corpus = retention_corpus(root)?;
+    let mut violations = Vec::new();
+    for (table, policy) in RETENTION_REGISTRY {
+        let res = match policy {
+            RetentionPolicy::SweptBy { symbol, .. } => check_swept_by(table, symbol, &corpus),
+            RetentionPolicy::CascadeFrom {
+                parent, migration, ..
+            } => check_cascade(table, parent, migration, root),
+            RetentionPolicy::KeepForever(_) => Ok(()),
+        };
+        if let Err(e) = res {
+            violations.push(format!("  {table}: {e:#}"));
+        }
+    }
+    ensure!(
+        violations.is_empty(),
+        "retention registry misattributions ({}):
+{}",
+        violations.len(),
+        violations.join(
+            "
+"
+        )
+    );
+    tracing::info!(tables = RETENTION_REGISTRY.len(), "retention-truth ok");
+    Ok(())
+}
+
+/// The non-test corpus for sweeper-symbol resolution: production `.rs`
+/// of the PG-touching crates, `/tests/` directories skipped, each file
+/// cut at its `#[cfg(test)] mod tests` (newline-separated) marker (the canonical
+/// test-module split — the same boundary the source pins use) and
+/// normalized via [`normalize_decl_text`].
+fn retention_corpus(root: &Path) -> Result<Vec<(std::path::PathBuf, String)>> {
+    const CRATES: &[&str] = &[
+        "rio-store",
+        "rio-scheduler",
+        "rio-controller",
+        "rio-gateway",
+        "rio-auth",
+        "rio-builder",
+        "rio-common",
+    ];
+    let mut corpus = Vec::new();
+    for krate in CRATES {
+        let dir = root.join(krate).join("src");
+        if !dir.exists() {
+            continue;
+        }
+        walk_rs(&dir, &mut |path| {
+            if path.components().any(|c| c.as_os_str() == "tests") {
+                return Ok(());
+            }
+            let raw =
+                fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+            let head = raw
+                .split("#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            corpus.push((path.to_owned(), normalize_decl_text(&head)));
+            Ok(())
+        })?;
+    }
+    Ok(corpus)
+}
+
+/// Collapse Rust string-literal line continuations (`\` at EOL) and
+/// all whitespace runs to single spaces, so
+/// `"DELETE FROM \`↵`     drv_log_chunks …"` and multi-line `r#"…"#`
+/// SQL both normalize to greppable single-spaced text.
+fn normalize_decl_text(s: &str) -> String {
+    s.replace("\\\n", "\n")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `"{prefix} {table}"` occurs with a word boundary after the table
+/// name (so `chunks` cannot satisfy a `chunks_archive` statement).
+fn contains_stmt(norm: &str, prefix: &str, table: &str) -> bool {
+    let pat = format!("{prefix} {table}");
+    let mut from = 0;
+    while let Some(i) = norm[from..].find(&pat) {
+        let end = from + i + pat.len();
+        let bounded = norm
+            .as_bytes()
+            .get(end)
+            .is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+        if bounded {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// A `TRUNCATE` statement whose (comma-separated, possibly
+/// `TABLE`-prefixed) list names `table` — `TRUNCATE build_samples,
+/// hw_perf_samples` must satisfy BOTH tables.
+fn truncate_list_names(norm: &str, table: &str) -> bool {
+    let mut from = 0;
+    while let Some(i) = norm[from..].find("TRUNCATE ") {
+        let start = from + i + "TRUNCATE ".len();
+        let window = &norm[start..norm.len().min(start + 200)];
+        let end = window.find(['"', ';', '\'']).unwrap_or(window.len());
+        if window[..end]
+            .split([',', ' '])
+            .any(|tok| tok.trim() == table)
+        {
+            return true;
+        }
+        from = start;
+    }
+    false
+}
+
+/// One `SweptBy` claim: the symbol defines somewhere in the corpus,
+/// and a defining file carries the deleting statement for `table`.
+fn check_swept_by(
+    table: &str,
+    symbol: &str,
+    corpus: &[(std::path::PathBuf, String)],
+) -> Result<()> {
+    let decl_pats = [format!("fn {symbol}("), format!("fn {symbol}<")];
+    let defs: Vec<_> = corpus
+        .iter()
+        .filter(|(_, norm)| decl_pats.iter().any(|p| norm.contains(p.as_str())))
+        .collect();
+    ensure!(
+        !defs.is_empty(),
+        "sweeper symbol `{symbol}` defines nowhere in non-test workspace source"
+    );
+    let hit = defs.iter().any(|(_, norm)| {
+        contains_stmt(norm, "DELETE FROM", table) || truncate_list_names(norm, table)
+    });
+    ensure!(
+        hit,
+        "`{symbol}` defines ({} file(s)) but no defining file deletes `{table}`          (no `DELETE FROM {table}` and no TRUNCATE naming it)",
+        defs.len()
+    );
+    Ok(())
+}
+
+/// The normalized migration text carries `REFERENCES {parent}` (word
+/// boundary or `(`) followed by `ON DELETE CASCADE` within the clause
+/// window. `ON DELETE RESTRICT` does NOT satisfy — the phantom class.
+fn cascade_clause_ok(norm: &str, parent: &str) -> bool {
+    let pat = format!("REFERENCES {parent}");
+    let mut from = 0;
+    while let Some(i) = norm[from..].find(&pat) {
+        let at = from + i;
+        let end = at + pat.len();
+        let bounded = norm
+            .as_bytes()
+            .get(end)
+            .is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+        if bounded {
+            let tail = &norm[at..norm.len().min(at + 220)];
+            if tail.contains("ON DELETE CASCADE") {
+                return true;
+            }
+        }
+        from = end;
+    }
+    false
+}
+
+/// One `CascadeFrom` claim against the named migration file.
+fn check_cascade(table: &str, parent: &str, migration: &str, root: &Path) -> Result<()> {
+    let path = root.join("rio-migrations/migrations").join(migration);
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("CascadeFrom migration for `{table}`: {}", path.display()))?;
+    ensure!(
+        cascade_clause_ok(&normalize_decl_text(&text), parent),
+        "{migration} carries no `REFERENCES {parent} … ON DELETE CASCADE` clause          (missing or RESTRICT — the phantom-cascade class)"
+    );
+    Ok(())
+}
+
 /// Recursive `.rs` walk via `std` (no `walkdir` dep). Follows symlinks
 /// — under the nix flake check, the corpus dirs are staged into a
 /// store-path source tree and may be symlinked.
@@ -573,6 +778,90 @@ fn walk_rs(dir: &Path, f: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The normalizer collapses Rust string-literal line continuations
+    /// and whitespace runs — a table name split across a continuation
+    /// still resolves.
+    #[test]
+    fn normalizer_handles_line_continuations() {
+        let src = "let q = \"DELETE FROM \\\n         drv_log_chunks WHERE exec_id = ANY($1)\";";
+        let norm = normalize_decl_text(src);
+        assert!(
+            contains_stmt(&norm, "DELETE FROM", "drv_log_chunks"),
+            "{norm}"
+        );
+        let raw = "sqlx::query(r#\"\n    DELETE FROM realisations\n    WHERE x = 1\n\"#)";
+        assert!(contains_stmt(
+            &normalize_decl_text(raw),
+            "DELETE FROM",
+            "realisations"
+        ));
+    }
+
+    /// Word boundary: `chunks` must not satisfy `chunks_archive`.
+    #[test]
+    fn stmt_match_is_word_bounded() {
+        let norm = normalize_decl_text("\"DELETE FROM chunks_archive WHERE 1=1\"");
+        assert!(!contains_stmt(&norm, "DELETE FROM", "chunks"));
+        assert!(contains_stmt(&norm, "DELETE FROM", "chunks_archive"));
+    }
+
+    /// `TRUNCATE a, b` satisfies BOTH tables; `TRUNCATE TABLE x` works;
+    /// an absent table does not.
+    #[test]
+    fn truncate_comma_list_resolves_members() {
+        let norm = normalize_decl_text("query(\"TRUNCATE build_samples, hw_perf_samples\")");
+        assert!(truncate_list_names(&norm, "build_samples"));
+        assert!(truncate_list_names(&norm, "hw_perf_samples"));
+        assert!(!truncate_list_names(&norm, "interrupt_samples"));
+        assert!(truncate_list_names(
+            &normalize_decl_text("\"TRUNCATE TABLE jwt_revoked\""),
+            "jwt_revoked"
+        ));
+    }
+
+    /// The planted-phantom battery: a symbol that defines nowhere, a
+    /// symbol whose file does not delete the table, and the good case.
+    #[test]
+    fn swept_by_rejects_phantom_attributions() {
+        let corpus = vec![
+            (
+                std::path::PathBuf::from("fake/sweeper.rs"),
+                normalize_decl_text(
+                    "pub async fn real_sweep() { query(\"DELETE FROM widgets WHERE old\") }",
+                ),
+            ),
+            (
+                std::path::PathBuf::from("fake/other.rs"),
+                normalize_decl_text("pub fn idle_helper() { /* no SQL */ }"),
+            ),
+        ];
+        // Good: symbol defines and its file deletes the table.
+        check_swept_by("widgets", "real_sweep", &corpus).expect("good claim resolves");
+        // Phantom symbol: defines nowhere.
+        let e = check_swept_by("widgets", "ghost_sweep", &corpus).unwrap_err();
+        assert!(e.to_string().contains("defines nowhere"), "{e:#}");
+        // Misattributed: symbol exists, file deletes nothing.
+        let e = check_swept_by("widgets", "idle_helper", &corpus).unwrap_err();
+        assert!(e.to_string().contains("no defining file deletes"), "{e:#}");
+    }
+
+    /// CASCADE resolves; RESTRICT (merged_bug_142's phantom) does not;
+    /// the parent name is word-bounded.
+    #[test]
+    fn cascade_requires_actual_cascade() {
+        let cascade = normalize_decl_text(
+            "ALTER TABLE tenant_keys\n  ADD CONSTRAINT k FOREIGN KEY (tenant_id)\n  \
+             REFERENCES tenants(tenant_id)\n  ON DELETE CASCADE;",
+        );
+        assert!(cascade_clause_ok(&cascade, "tenants"));
+        let restrict = normalize_decl_text(
+            "FOREIGN KEY (drv_hash, output_name) REFERENCES \
+             realisations(drv_hash, output_name) ON DELETE RESTRICT",
+        );
+        assert!(!cascade_clause_ok(&restrict, "realisations"));
+        assert!(!cascade_clause_ok(&cascade, "tenant"));
+    }
 
     /// `Lint::all()` must list every enum variant, or `xtask lint`
     /// (and the `xtask-lint` flake check) silently skip the new lint.
