@@ -328,11 +328,15 @@ struct TransferMeter {
     cap: u64,
     total: u64,
     next_mark: u64,
-    /// Progress sink: `(total_bytes)` at every
-    /// [`PROGRESS_INTERVAL_BYTES`] boundary. Production emits a line on
+    /// Progress sink: `(phase_label, total_bytes)` at every
+    /// [`PROGRESS_INTERVAL_BYTES`] boundary. The label is passed PER
+    /// CALL from `self.what` so [`Self::relabel`] is live on the
+    /// production line (round-17 merged_bug_005: the old sink captured
+    /// the construction-time label by value, so every unpack-phase
+    /// line still printed "download"). Production emits a line on
     /// build stderr (the sandbox pty — what feeds the max-silent
     /// activity watch); tests inject a recorder.
-    emit: Box<dyn FnMut(u64) + Send>,
+    emit: Box<dyn FnMut(&'static str, u64) + Send>,
 }
 
 impl TransferMeter {
@@ -342,7 +346,7 @@ impl TransferMeter {
             cap,
             total: 0,
             next_mark: PROGRESS_INTERVAL_BYTES,
-            emit: Box::new(move |total| {
+            emit: Box::new(|what, total| {
                 eprintln!(
                     "builtin:fetchurl: {what}: {} MiB transferred",
                     total / (1024 * 1024)
@@ -352,7 +356,11 @@ impl TransferMeter {
     }
 
     #[cfg(test)]
-    fn with_emit(what: &'static str, cap: u64, emit: Box<dyn FnMut(u64) + Send>) -> Self {
+    fn with_emit(
+        what: &'static str,
+        cap: u64,
+        emit: Box<dyn FnMut(&'static str, u64) + Send>,
+    ) -> Self {
         Self {
             what,
             cap,
@@ -378,7 +386,7 @@ impl TransferMeter {
     fn charge(&mut self, n: u64) -> Result<(), CapExhausted> {
         self.total = self.total.saturating_add(n);
         while self.total >= self.next_mark {
-            (self.emit)(self.total);
+            (self.emit)(self.what, self.total);
             self.next_mark = self.next_mark.saturating_add(PROGRESS_INTERVAL_BYTES);
         }
         if self.total > self.cap {
@@ -2211,16 +2219,34 @@ mod tests {
         let mut meter = TransferMeter::with_emit(
             "download",
             u64::MAX,
-            Box::new(move |total| m.lock().unwrap().push(total)),
+            Box::new(move |what, total| m.lock().unwrap().push((what, total))),
         );
-        // 40 MiB in 1 MiB chunks: marks when crossing 16 and 32 MiB.
-        for _ in 0..40 {
+        // 40 MiB in 1 MiB chunks: marks when crossing 16 and 32 MiB —
+        // and a relabel mid-stream changes the LABEL on later marks
+        // while the running total continues (round-17 merged_bug_005:
+        // the label is read per-call, so relabel is live on the
+        // production line; the old sink froze the construction-time
+        // label and every unpack-phase line printed "download").
+        for _ in 0..20 {
+            meter.charge(1024 * 1024).expect("under cap");
+        }
+        meter.relabel("unpack");
+        for _ in 0..20 {
             meter.charge(1024 * 1024).expect("under cap");
         }
         let marks = marks.lock().unwrap();
         assert_eq!(marks.len(), 2, "exactly the 16 MiB and 32 MiB marks");
-        assert_eq!(marks[0], 16 * 1024 * 1024);
-        assert_eq!(marks[1], 32 * 1024 * 1024);
+        assert_eq!(
+            marks[0],
+            ("download", 16 * 1024 * 1024),
+            "pre-relabel mark carries the download label"
+        );
+        assert_eq!(
+            marks[1],
+            ("unpack", 32 * 1024 * 1024),
+            "post-relabel mark carries the unpack label on the SAME \
+             running total (single-budget continuity)"
+        );
     }
 
     /// Plain-download budget: a body larger than the per-attempt cap is
