@@ -1949,7 +1949,10 @@ impl DagActor {
     /// Leader-only by construction (`handle_tick` returns early on
     /// standby).
     // r[impl sched.materialize.settlement]
-    pub(super) async fn tick_reevaluate_parked_materialization_jobs(&mut self) {
+    pub(super) async fn tick_reevaluate_parked_materialization_jobs(
+        &mut self,
+        _authority: &super::DagAuthority,
+    ) {
         let now = std::time::Instant::now();
         let parked: Vec<(DrvHash, Uuid)> = self
             .materialization_jobs
@@ -2134,7 +2137,10 @@ impl DagActor {
     /// canceler needs and is closed charge-free on the same tick,
     /// converging the refusal-producing rows). Skips when Unavailable
     /// (ticks → skip; the next recovery hydrates wholesale).
-    pub(super) async fn tick_backstop_materialization_jobs(&mut self) {
+    pub(super) async fn tick_backstop_materialization_jobs(
+        &mut self,
+        _authority: &super::DagAuthority,
+    ) {
         const BACKSTOP_EVERY: u64 = 30;
         if !self.tick_count.is_multiple_of(BACKSTOP_EVERY) {
             return;
@@ -2175,7 +2181,10 @@ impl DagActor {
     /// build-terminal hooks will call the closer directly; in Phase A
     /// this tick backstop and the tests are the only callers.
     // r[impl sched.materialize.settlement]
-    pub(super) async fn tick_cancel_zero_interest_materialization(&mut self) {
+    pub(super) async fn tick_cancel_zero_interest_materialization(
+        &mut self,
+        _authority: &super::DagAuthority,
+    ) {
         use crate::state::BuildStateExt;
         let zero_interest: Vec<DrvHash> = self
             .materialization_jobs

@@ -3200,3 +3200,92 @@ async fn recovered_stale_build_times_out_on_first_tick() -> TestResult {
     );
     Ok(())
 }
+
+/// merged_bug_210 trigger 2 (bughunt-2 wave): a replica whose recovery
+/// FAILED holds an empty, non-authoritative DAG — its housekeeping
+/// ticks must not destroy durable state from "not in the DAG"
+/// inferences. Pre-fix the establishment sweep mapped every durable
+/// open attempt to `Absent → CloseChargeFree` and closed a healthy
+/// predecessor attempt the zombie knows nothing about.
+// r[verify sched.attempt.establishment-window+5]
+#[tokio::test]
+async fn failed_recovery_ticks_never_close_predecessor_attempts() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Predecessor tenure: a live open attempt, durably minted.
+    {
+        let (handle, _task) = setup_actor(db.pool.clone());
+        let _ev = merge_single_node(
+            &handle,
+            Uuid::new_v4(),
+            "rec-zomb",
+            PriorityClass::Scheduled,
+        )
+        .await?;
+        let outcome = handle
+            .query_unchecked(|reply| ActorCommand::PullAssignment {
+                intent_id: "rec-zomb".into(),
+                auth_intent: Some("rec-zomb".into()),
+                kind: rio_evidence_kernel::pull::PullKind::Build,
+                executor_instance: None,
+                resume_exec_id: None,
+                reply,
+            })
+            .await
+            .expect("actor alive");
+        let assignment = match outcome {
+            Ok(PullOutcome::Deliver(a)) => *a,
+            other => panic!("expected Deliver, got {other:?}"),
+        };
+        let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+        sqlx::query(
+            "UPDATE assignments SET assigned_at = now() - interval '100 days' \
+             WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .execute(&db.pool)
+        .await?;
+    }
+
+    // Successor tenure in K8s mode: the DAG load fails — empty,
+    // NON-authoritative state.
+    let generation = Arc::new(AtomicU64::new(2));
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::clone(&generation),
+        Arc::new(AtomicBool::new(true)),
+        false,
+    );
+    let l = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = l;
+        p.holder_id = "pod-zombie".into();
+        p.fail_next_recovery_load = true;
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // The zombie window: housekeeping ticks on the failed-recovery
+    // replica.
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+
+    let status: Vec<String> = sqlx::query_scalar(
+        "SELECT a.status FROM assignments a \
+         JOIN derivations d ON d.derivation_id = a.derivation_id \
+         WHERE d.drv_hash = 'rec-zomb'",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        status,
+        vec!["pending"],
+        "an un-authoritative replica must not close attempts from \
+         not-in-the-(empty)-DAG inferences"
+    );
+    let charges = ledger_rows(&db.pool, "rec-zomb").await;
+    assert!(
+        charges.is_empty(),
+        "an un-authoritative replica charges nothing (got {charges:?})"
+    );
+    Ok(())
+}

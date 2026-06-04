@@ -262,6 +262,33 @@ fn tenure_authority_no_fresh_atomic_reads_in_write_paths() {
     );
 }
 
+/// The `DagAuthority` witness (merged_bug_210) has exactly ONE
+/// production mint: `DagActor::dag_authority`, which reads
+/// `dag_authoritative`. A second construction expression means a
+/// destructive path acquired authority without the bit — review it
+/// against `sched.attempt.establishment-window+5`.
+#[test]
+fn dag_authority_single_mint_site() {
+    let count: usize = ACTOR_SOURCES
+        .iter()
+        .map(|(_, src)| {
+            src.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    // The tuple-struct DECLARATION also contains the
+                    // `DagAuthority(())` token sequence — only value
+                    // constructions count.
+                    !t.starts_with("//") && !t.contains("struct ") && l.contains("DagAuthority(())")
+                })
+                .count()
+        })
+        .sum();
+    assert_eq!(
+        count, 1,
+        "DagAuthority(()) must be constructed exactly once          (DagActor::dag_authority), found {count}"
+    );
+}
+
 /// The `ServingGeneration` stamp has exactly TWO production
 /// constructors: the boot stamp (`DagActor::new`) and the
 /// claim stamp (`handle_leader_acquired`). A third

@@ -1014,7 +1014,7 @@ in
   # activeDeadlineSeconds, and the establishment arm alone (~300s
   # window + rebuild) would blow that group's 1200s budget.
   #
-  # r[verify sched.attempt.establishment-window+4]
+  # r[verify sched.attempt.establishment-window+5]
   #   establishment arm: a pull-mode pod whose builder is SIGKILLed
   #   from the host (no SIGTERM-abort report, plain Error pod, nothing
   #   the controller classifies) stays an open uncharged attempt for

@@ -54,7 +54,7 @@ async fn assignment_statuses(pool: &sqlx::PgPool, drv_hash: &str) -> Vec<String>
     .expect("assignment statuses")
 }
 
-// r[verify sched.attempt.establishment-window+4]
+// r[verify sched.attempt.establishment-window+5]
 /// (a) An open pull-mode attempt past deadline + slack with no terminal
 /// row is established exactly once as executor_crash/unreported,
 /// charged to failure_count, and the drv requeues.
@@ -107,7 +107,7 @@ async fn establishment_charges_and_requeues_after_window() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+4]
+// r[verify sched.attempt.establishment-window+5]
 /// (b) The same attempt with its outputs present in the store is
 /// adopted as completed (store-probe arm) and never charged.
 #[tokio::test]
@@ -150,7 +150,7 @@ async fn establishment_store_probe_adopts_completed_attempt() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+4]
+// r[verify sched.attempt.establishment-window+5]
 /// (c) An attempt inside the window is never established.
 #[tokio::test]
 async fn establishment_never_fires_inside_window() -> TestResult {
@@ -175,7 +175,7 @@ async fn establishment_never_fires_inside_window() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+4]
+// r[verify sched.attempt.establishment-window+5]
 /// (d) The establishment transaction at a below-floor serving
 /// generation writes nothing (the fence applies to establishment too).
 #[tokio::test]
@@ -212,7 +212,7 @@ async fn establishment_below_floor_writes_nothing() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+4]
+// r[verify sched.attempt.establishment-window+5]
 /// (g) The window is anchored to the deadline the attempt was
 /// dispatched with: a sweep-time re-solve that is smaller than the
 /// persisted deadline must NOT shrink the window (no establishment
@@ -394,7 +394,7 @@ async fn cancelled_attempt_is_never_charged_and_close_is_redriven() -> TestResul
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+4]
+// r[verify sched.attempt.establishment-window+5]
 /// merged_bug_232 (bughunt wave, A4): a probe FAILURE is not evidence.
 /// An expired BUILD attempt swept while FindMissingPaths is failing
 /// must DEFER — no executor_crash row, the attempt stays open — and a
@@ -443,7 +443,7 @@ async fn probe_unavailable_defers_build_establishment() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+4]
+// r[verify sched.attempt.establishment-window+5]
 /// merged_bug_232 green pin: the MATERIALIZATION arm still charges on a
 /// failing probe — the kind axis decides before the probe axis (a
 /// mid-walk crash leaves the closure incomplete; outputs-present is
@@ -493,6 +493,127 @@ async fn establishment_mat_arm_charges_with_failing_probe() -> TestResult {
         1,
         "the mat establishment is probe-independent (kind axis decides \
          before the probe axis), got {rows:?}"
+    );
+    Ok(())
+}
+
+/// bug_148 (bughunt-2 wave): the adopt arm must stamp ONLY the
+/// verified wanted subset. A node with two declared outputs where one
+/// build wants just `out` adopts when `out` is present — stamping the
+/// never-probed-or-absent `doc` path as a completed output fabricates
+/// presence evidence (path_tenants upsert + DerivationCompleted event
+/// + downstream input resolution all consume output_paths).
+// r[verify sched.attempt.establishment-window+5]
+#[tokio::test]
+async fn establishment_adopt_stamps_only_verified_wanted_outputs() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let db_pool = _db.pool.clone();
+    let out_path = test_store_path("est-w-out");
+    let doc_path = test_store_path("est-w-doc");
+
+    let mut node = make_node("est-w");
+    node.output_names = vec!["out".into(), "doc".into()];
+    node.expected_output_paths = vec![out_path.clone(), doc_path.clone()];
+    node.wanted_output_names = vec!["out".into()];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    let assignment = pull_deliver(&handle, "est-w").await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    backdate_assignment(&db_pool, exec_id).await?;
+    // Only the WANTED output landed; `doc` is provably absent (the
+    // probe reports it missing).
+    store.seed_with_content(&out_path, b"est-w out");
+
+    tick(&handle).await?;
+
+    let info = expect_drv(&handle, "est-w").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Completed,
+        "all verified wanted outputs present → adopted"
+    );
+    assert_eq!(
+        info.output_paths,
+        vec![out_path.clone()],
+        "the adopt stamps exactly the verified wanted subset — never \
+         the unverified expected_output_paths superset"
+    );
+    assert!(
+        attempt_rows_for(&db_pool, "est-w").await.is_empty(),
+        "the adopt arm never charges"
+    );
+    Ok(())
+}
+
+/// merged_bug_210 trigger 1 (bughunt-2 wave): a terminal-settled node
+/// must close its stale open attempt charge-free, never re-charge.
+/// Shape: the adopt arm completes the node in-memory but its persist
+/// and assignment close both fail (PG blip); the outputs are then
+/// GC'd. The next sweep pass sees an expired open attempt whose node
+/// is Completed with nothing verifiable — charging executor_crash
+/// there seeds the exclusion ledger and the OA2 wedge clustering with
+/// a crash verdict about work that is already done.
+// r[verify sched.attempt.establishment-window+5]
+#[tokio::test]
+async fn establishment_terminal_settled_node_closes_charge_free() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let db_pool = _db.pool.clone();
+    let out_path = test_store_path("est-ts-out");
+
+    let mut node = make_node("est-ts");
+    node.expected_output_paths = vec![out_path.clone()];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    let assignment = pull_deliver(&handle, "est-ts").await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    backdate_assignment(&db_pool, exec_id).await?;
+    store.seed_with_content(&out_path, b"est-ts output");
+
+    // Pass 1: the adopt fires but every fenced PG write is refused (a
+    // foreign claim raises the durable floor above this replica's
+    // serving generation — the same injection as the below-floor
+    // battery): node Completed in-memory, the durable attempt stays
+    // open because the assignment close was fence-refused.
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) \
+         VALUES (999, 'interloper')",
+    )
+    .execute(&db_pool)
+    .await?;
+    tick(&handle).await?;
+    sqlx::query("DELETE FROM leader_generation_claims WHERE generation = 999")
+        .execute(&db_pool)
+        .await?;
+    let info = expect_drv(&handle, "est-ts").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Completed,
+        "pass 1 adopted in-memory despite the failed close"
+    );
+    assert_eq!(
+        assignment_statuses(&db_pool, "est-ts").await,
+        vec!["pending"],
+        "the failed close left the attempt durably open"
+    );
+
+    // The outputs are GC'd between passes (the adopt unpinned them).
+    store.state.paths.write().unwrap().remove(&out_path);
+
+    // Pass 2: the node is terminal-settled — close charge-free.
+    tick(&handle).await?;
+
+    let rows = attempt_rows_for(&db_pool, "est-ts").await;
+    assert!(
+        rows.is_empty(),
+        "a terminal-settled node is never re-charged (got {rows:?})"
+    );
+    assert_eq!(
+        assignment_statuses(&db_pool, "est-ts").await,
+        vec!["completed"],
+        "the stale attempt closes with the settled status's cause"
+    );
+    assert_eq!(
+        expect_drv(&handle, "est-ts").await.retry.failure_count,
+        0,
+        "no crash verdict enters the retry fold of settled work"
     );
     Ok(())
 }

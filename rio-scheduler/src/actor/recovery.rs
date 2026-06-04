@@ -2003,7 +2003,7 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &Option<ExecutorId>,
-        expected_outputs: Vec<String>,
+        verified: rio_evidence_kernel::establish::VerifiedPresent,
     ) {
         info!(drv_hash = %drv_hash, executor_id = ?executor_id,
               "reconcile: orphan completion (outputs found in store)");
@@ -2016,7 +2016,11 @@ impl DagActor {
                       "orphan completion transition failed");
                 return;
             }
-            state.output_paths = expected_outputs;
+            // EXACTLY the kernel-witnessed verified-present wanted
+            // set (bug_148): the witness type is mintable only in the
+            // all-wanted-present probe branch, so an unverified
+            // superset cannot reach this stamp.
+            state.output_paths = verified.into_paths();
             state.assigned_executor = None;
         }
         self.persist_status(drv_hash, DerivationStatus::Completed, None)
@@ -2042,8 +2046,8 @@ impl DagActor {
         // Running at crash, completed during downtime. The
         // normal completion path (handle_success_completion)
         // never fired → no tenant attribution → GC
-        // under-retains. output_paths was just set above
-        // (= expected_outputs, verified present in store).
+        // under-retains. output_paths was just set above (= the
+        // kernel-verified present wanted set).
         self.upsert_path_tenants_for(drv_hash).await;
         // r[impl sched.merge.exec-correlation+8]
         // Same gap as path-tenants above: `handle_success_completion`

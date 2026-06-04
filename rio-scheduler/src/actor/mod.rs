@@ -228,6 +228,28 @@ pub(super) struct StatusBatch {
     pub(super) enqueued_at: std::time::Instant,
 }
 
+/// Zero-sized authority witness: the in-memory DAG reflects PG for
+/// THIS tenure (merged_bug_210). Mintable only through
+/// [`DagActor::dag_authority`] — the one constructor expression reads
+/// `dag_authoritative` (policy-pinned to a single production site).
+/// Every destructive housekeeping tick takes `&DagAuthority`, so a
+/// tick that closes/charges/cancels/GCs from DAG-derived staleness
+/// inferences cannot be CALLED while the DAG is empty-but-not-
+/// authoritative (the pre-recovery window, or a tenure whose recovery
+/// failed): adding a future destructive tick outside the gate is a
+/// compile error, not a review item. Deliberately not `Clone`/`Copy`
+/// and never stored — minted per tick, dropped at tick end.
+pub(crate) struct DagAuthority(());
+
+impl DagActor {
+    /// Mint the tick-scoped DAG-authority witness, or `None` when the
+    /// DAG must not be treated as ground truth (see
+    /// [`DagActor::dag_authoritative`]).
+    pub(super) fn dag_authority(&self) -> Option<DagAuthority> {
+        self.dag_authoritative.then_some(DagAuthority(()))
+    }
+}
+
 pub struct DagActor {
     /// The global derivation DAG.
     dag: DerivationDag,

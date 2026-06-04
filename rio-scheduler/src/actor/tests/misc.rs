@@ -2286,7 +2286,13 @@ async fn test_attempt_ledger_gc_tick_leader_sweeps_standby_noops() -> TestResult
         a.tick_count = 30;
         a
     };
-    leader_actor.tick_gc_attempt_ledger().await;
+    leader_actor
+        .tick_gc_attempt_ledger(
+            &leader_actor
+                .dag_authority()
+                .expect("direct-setup actor is authoritative"),
+        )
+        .await;
     assert_eq!(
         count().await,
         2,

@@ -2899,7 +2899,7 @@ plausible disruption burst --- three consecutive platform terminations with
 nothing else happening to the lane --- while making the loop finite; the
 run resets on any genuine classification, reset, or controller observation.
 
-#r("sched.attempt.establishment-window+4")[
+#r("sched.attempt.establishment-window+5")[
   The establishment sweep MUST visit every open attempt (active assignment ⋈
   execution, no terminal classification) on every sweep, and MUST establish
   an attempt only after its deadline plus the configured
@@ -2910,10 +2910,21 @@ run resets on any genuine classification, reset, or controller observation.
   while the attempt is open. Every expired attempt MUST be dispositioned
   through the single total establishment kernel
   (`establish_expired_attempt`): the store-probe arm adopts the attempt as
-  completed when its outputs are verifiably present; a live-wanted build
+  completed when its outputs are verifiably present, stamping EXACTLY the
+  verified wanted subset the probe witnessed (the kernel's
+  `VerifiedPresent` carrier) and never an unverified expected-paths
+  superset; a node already settled terminal
+  (completed/poisoned/dependency-failed/skipped) MUST close charge-free —
+  no attempt row, no exclusion seed, no establishment metric — the work's
+  verdict already exists and is never re-litigated; a live-wanted build
   attempt otherwise establishes exactly one executor-crash/unreported
   classification (charged per the existing C2 discipline) and requeues the
-  derivation. Establishment MUST never fire inside the window, and the
+  derivation. The node axis MUST be projected through the kernel's total
+  authority-aware projection (`project_node`): while the in-memory DAG is
+  not authoritative (pre-recovery, failed recovery), no destructive
+  housekeeping — establishment, GC, orphan-cancel, timeout-cancel — may
+  run at all, and in particular not-in-the-DAG MUST NOT be read as
+  absent. Establishment MUST never fire inside the window, and the
   establishing transaction MUST apply the same generation-floor fence as
   the pull transaction.
 ]

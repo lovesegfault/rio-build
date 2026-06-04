@@ -114,27 +114,50 @@ impl DagActor {
         // builds (permanent failure) before poison-expire removes DAG
         // nodes.
         let expired_poisons = self.tick_scan_dag();
-        self.tick_check_build_timeouts().await;
-        self.tick_recheck_stuck_completions().await;
-        self.tick_check_orphaned_builds().await;
-        self.tick_process_expired_poisons(expired_poisons).await;
 
-        self.tick_gc_orphan_derivations().await;
-        self.tick_gc_attempt_ledger().await;
-        self.tick_gc_materialization_jobs().await;
-        self.tick_gc_build_wanted_outputs().await;
-        self.tick_sweep_dispatched_cells();
-        self.tick_flush_status_outbox().await;
-        self.tick_sweep_open_pull_attempts().await;
+        // r[impl sched.attempt.establishment-window+5]
+        // The destructive block (merged_bug_210): every tick below
+        // either writes PG or decides from "not in / stale in the
+        // DAG" inferences. All of them take the DagAuthority witness,
+        // minted HERE and only here — an un-authoritative DAG
+        // (pre-recovery, failed recovery) repairs nothing: closing
+        // attempts, cancelling builds, or GC'ing rows from an empty
+        // non-authoritative DAG destroys a healthy predecessor's
+        // state. Observe-only work (estimator refresh, the poison
+        // scan) stays above; the snapshot/gauge tail below is also
+        // skipped — publishing zeros computed from a DAG that is not
+        // ground truth is fabricated telemetry.
+        let Some(authority) = self.dag_authority() else {
+            debug!(
+                "DAG not authoritative (pre-recovery or failed recovery); \
+                 destructive housekeeping skipped this tick"
+            );
+            return;
+        };
+        self.tick_check_build_timeouts(&authority).await;
+        self.tick_recheck_stuck_completions(&authority).await;
+        self.tick_check_orphaned_builds(&authority).await;
+        self.tick_process_expired_poisons(expired_poisons, &authority)
+            .await;
+
+        self.tick_gc_orphan_derivations(&authority).await;
+        self.tick_gc_attempt_ledger(&authority).await;
+        self.tick_gc_materialization_jobs(&authority).await;
+        self.tick_gc_build_wanted_outputs(&authority).await;
+        self.tick_sweep_dispatched_cells(&authority);
+        self.tick_flush_status_outbox(&authority).await;
+        self.tick_sweep_open_pull_attempts(&authority).await;
         // Materialization sweeps: cancel jobs whose derivation has no
         // live interest left, closing open attempts charge-free; then
         // the PD-20 parked-job arm — re-evaluate parked jobs whose
         // nodes have buildable dependency closures (resolve
         // from-source) and publish the stalled gauge from ground truth.
-        self.tick_backstop_materialization_jobs().await;
-        self.tick_cancel_zero_interest_materialization().await;
-        self.tick_reevaluate_parked_materialization_jobs().await;
-        self.tick_retry_pending_carriers().await;
+        self.tick_backstop_materialization_jobs(&authority).await;
+        self.tick_cancel_zero_interest_materialization(&authority)
+            .await;
+        self.tick_reevaluate_parked_materialization_jobs(&authority)
+            .await;
+        self.tick_retry_pending_carriers(&authority).await;
 
         // Advance probe_generation here (1/s) — NOT per
         // `sweep_ready_cached` call — so a Ready node is FMP-probed at
@@ -216,7 +239,7 @@ impl DagActor {
     /// hasn't started dispatching (`validate_transition` rejects Pending →
     /// Failed anyway); terminal builds are already done.
     // r[impl sched.timeout.per-build]
-    async fn tick_check_build_timeouts(&mut self) {
+    async fn tick_check_build_timeouts(&mut self, _authority: &super::DagAuthority) {
         let mut timed_out_builds: Vec<(Uuid, u64)> = Vec::new();
         for (build_id, build) in &self.builds {
             if build.state() == BuildState::Active
@@ -271,7 +294,7 @@ impl DagActor {
     /// (`check_build_completion` early-returns on `is_terminal()`).
     /// Runs BEFORE `tick_check_orphaned_builds` so completion-retry is
     /// attempted before orphan-cancel.
-    async fn tick_recheck_stuck_completions(&mut self) {
+    async fn tick_recheck_stuck_completions(&mut self, _authority: &super::DagAuthority) {
         let candidates: Vec<Uuid> = self
             .builds
             .iter()
@@ -315,7 +338,7 @@ impl DagActor {
     /// (per-tenant config, or rio-gateway advertising
     /// `set-options-map-only`).
     // r[impl sched.backstop.orphan-watcher]
-    async fn tick_check_orphaned_builds(&mut self) {
+    async fn tick_check_orphaned_builds(&mut self, _authority: &super::DagAuthority) {
         let now = Instant::now();
         let mut to_cancel: Vec<Uuid> = Vec::new();
         for (build_id, build) in self.builds.iter_mut() {
@@ -368,7 +391,11 @@ impl DagActor {
     /// still Poisoned, so the next tick's scan retries. Previous order
     /// meant a blip left in-mem gone → scan never finds it again →
     /// PG clear deferred to next scheduler restart).
-    async fn tick_process_expired_poisons(&mut self, expired_poisons: Vec<DrvHash>) {
+    async fn tick_process_expired_poisons(
+        &mut self,
+        expired_poisons: Vec<DrvHash>,
+        _authority: &super::DagAuthority,
+    ) {
         // Surviving parents of the removed children, collected across
         // the loop for the survivor re-evaluation below (the TTL-sweep
         // twin of the admin ClearPoison wake).
@@ -443,7 +470,7 @@ impl DagActor {
     /// (merged_bug_257): re-attempt the stale-reset job creation until
     /// the row applies; drop — counted and warned — once the node is
     /// terminal/gone (the carrier has no consumer left).
-    async fn tick_retry_pending_carriers(&mut self) {
+    async fn tick_retry_pending_carriers(&mut self, _authority: &super::DagAuthority) {
         if self.pending_carriers.is_empty() {
             return;
         }
@@ -486,7 +513,7 @@ impl DagActor {
     /// entries whose DAG node is still in a pre-terminal state where
     /// a pull is plausible. Cheap: `dispatched_cells` is bounded by
     /// acked-but-not-yet-pulled drvs (≪ DAG size).
-    fn tick_sweep_dispatched_cells(&self) {
+    fn tick_sweep_dispatched_cells(&self, _authority: &super::DagAuthority) {
         use DerivationStatus::{Assigned, Ready, Running};
         self.dispatched_cells.retain(|k, _| {
             self.dag
@@ -501,7 +528,7 @@ impl DagActor {
     /// ≤1000. A 1.16M backlog drains in ~4 days; steady-state churn
     /// (terminal nodes per 5min from failed closures) is well under the
     /// batch cap. Best-effort: PG error logs and retries next interval.
-    async fn tick_gc_orphan_derivations(&self) {
+    async fn tick_gc_orphan_derivations(&self, _authority: &super::DagAuthority) {
         const DERIVATIONS_GC_EVERY: u64 = 30;
         const DERIVATIONS_GC_BATCH: i64 = 1000;
         if !self.tick_count.is_multiple_of(DERIVATIONS_GC_EVERY) {
@@ -538,7 +565,7 @@ impl DagActor {
     ///
     /// `pub(super)` for the actor-boundary smoke test, which drives
     /// this directly (the `maybe_refresh_estimator` precedent).
-    pub(super) async fn tick_gc_attempt_ledger(&self) {
+    pub(super) async fn tick_gc_attempt_ledger(&self, _authority: &super::DagAuthority) {
         const ATTEMPTS_GC_EVERY: u64 = 30;
         const ATTEMPTS_GC_BATCH: i64 = 1000;
         if !self.tick_count.is_multiple_of(ATTEMPTS_GC_EVERY) {
@@ -597,7 +624,7 @@ impl DagActor {
     /// D1/A6 (merged_bug_163): reap RESOLVED materialization jobs past the
     /// forensic horizon once unpinned and interest-free. Leader-only via
     /// handle_tick; same cadence/batch class as the attempt-ledger sweep.
-    pub(super) async fn tick_gc_materialization_jobs(&self) {
+    pub(super) async fn tick_gc_materialization_jobs(&self, _authority: &super::DagAuthority) {
         const MAT_JOBS_GC_EVERY: u64 = 30;
         const MAT_JOBS_GC_BATCH: i64 = 1000;
         if !self.tick_count.is_multiple_of(MAT_JOBS_GC_EVERY) {
@@ -632,7 +659,7 @@ impl DagActor {
 
     /// D1/A6 (merged_bug_163): reap build_wanted_outputs rows whose build
     /// is long-terminal (or gone). Leader-only via handle_tick.
-    pub(super) async fn tick_gc_build_wanted_outputs(&self) {
+    pub(super) async fn tick_gc_build_wanted_outputs(&self, _authority: &super::DagAuthority) {
         const WANTED_GC_EVERY: u64 = 30;
         const WANTED_GC_BATCH: i64 = 1000;
         if !self.tick_count.is_multiple_of(WANTED_GC_EVERY) {
@@ -674,14 +701,14 @@ impl DagActor {
     /// it counts). Leader-only via the `handle_tick` early-return; the
     /// establishing transaction additionally carries the same
     /// generation-floor fence as the pull transaction.
-    // r[impl sched.attempt.establishment-window+4]
+    // r[impl sched.attempt.establishment-window+5]
     // r[impl sched.attempt.cancel-close-driven]
     /// Re-drive failed terminal-status persists: FIFO, ONE batch per
     /// tick attempt (a dead PG fails fast once per tick instead of
     /// stalling the actor on N retries), entry dropped on Ok ONLY.
     /// Leader-gated by `handle_tick`; the outbox itself is cleared on
     /// leadership loss in `clear_persisted_state`.
-    async fn tick_flush_status_outbox(&mut self) {
+    async fn tick_flush_status_outbox(&mut self, _authority: &super::DagAuthority) {
         let Some(front) = self.status_outbox.front() else {
             return;
         };
@@ -726,7 +753,7 @@ impl DagActor {
         metrics::gauge!("rio_scheduler_status_outbox_depth").set(self.status_outbox.len() as f64);
     }
 
-    pub(super) async fn tick_sweep_open_pull_attempts(&mut self) {
+    pub(super) async fn tick_sweep_open_pull_attempts(&mut self, _authority: &super::DagAuthority) {
         let opens = match self.db.list_open_pull_attempts().await {
             Ok(rows) => rows,
             Err(e) => {
@@ -856,26 +883,52 @@ impl DagActor {
         let executor = ExecutorId::from(attempt.executor_id.as_str());
 
         // ONE kernel call dispositions the attempt
-        // (sched.attempt.establishment-window+4: every expired attempt
+        // (sched.attempt.establishment-window+5: every expired attempt
         // routes through the total establishment kernel; §4.R2: this is
         // the kernel's single scheduler call site).
         use rio_evidence_kernel::establish::{
-            EstablishmentDisposition, NodeDisposition, ProbeEvidence, establish_expired_attempt,
+            EstablishmentAction, NodeProjection, NodeStatusClass, ProbeEvidence,
+            establish_expired_attempt, project_node,
         };
         let kind = if attempt.attempt_kind == crate::state::AttemptKind::Materialization.as_str() {
             rio_evidence_kernel::pull::PullKind::Materialization
         } else {
             rio_evidence_kernel::pull::PullKind::Build
         };
-        // Node axis: a charge needs a wanting node. Cancelled covers
-        // the failed-persist window (the cancel transitioned in-memory
-        // but the closing persist is still outboxed); Absent covers
-        // post-failover (the new leader rebuilt no interest for the
-        // cancelled node) and cleaned-up builds.
-        let node = match self.dag.node(&drv_hash) {
-            None => NodeDisposition::Absent,
-            Some(s) if s.status() == DerivationStatus::Cancelled => NodeDisposition::Cancelled,
-            Some(_) => NodeDisposition::WantedLive,
+        // Node axis: a charge needs a LIVE wanting node
+        // (merged_bug_210). The status map is a no-wildcard exhaustive
+        // match — a new DerivationStatus must name its cell. Failed is
+        // Live (retriable per is_terminal: the node re-enters
+        // dispatch); the settled terminals close charge-free in the
+        // kernel; Cancelled covers the failed-persist window (the
+        // cancel transitioned in-memory but the closing persist is
+        // still outboxed); not-in-DAG projects to Absent ONLY under
+        // DAG authority (the sweep runs under `repair`'s DagAuthority
+        // witness, but the projection re-checks — defense in depth
+        // against a future caller outside the gate).
+        let status_class = self.dag.node(&drv_hash).map(|s| match s.status() {
+            DerivationStatus::Created
+            | DerivationStatus::Queued
+            | DerivationStatus::Ready
+            | DerivationStatus::Assigned
+            | DerivationStatus::Running
+            | DerivationStatus::Failed => NodeStatusClass::Live,
+            DerivationStatus::Cancelled => NodeStatusClass::Cancelled,
+            DerivationStatus::Completed
+            | DerivationStatus::Poisoned
+            | DerivationStatus::DependencyFailed
+            | DerivationStatus::Skipped => NodeStatusClass::Settled,
+        });
+        let node = match project_node(status_class, self.dag_authoritative) {
+            NodeProjection::Node(node) => node,
+            NodeProjection::NoAuthority => {
+                // Un-authoritative DAG: no node-axis inference, no
+                // destructive establishment. The attempt stays open
+                // for an authoritative pass.
+                debug!(drv_hash = %attempt.drv_hash, exec_id = %attempt.exec_id,
+                       "establishment sweep: DAG not authoritative; attempt left open");
+                return;
+            }
         };
         // Probe axis (merged_bug_232, the §4.R2 split this workstream
         // owns): a failed probe is Unavailable — the kernel DEFERS a
@@ -906,7 +959,7 @@ impl DagActor {
             .map(|v| v.iter().map(String::as_str).collect());
 
         match establish_expired_attempt(kind, node, probe, verifiable_refs.as_deref()) {
-            EstablishmentDisposition::CloseChargeFree => {
+            EstablishmentAction::CloseChargeFree => {
                 // r[impl sched.attempt.cancel-close-driven]
                 // Nobody wants this work any more: close the assignment
                 // row and write NOTHING else — no AttemptRow (no
@@ -915,11 +968,33 @@ impl DagActor {
                 // no push_attempt_record. Fenced + exec_id-scoped (the
                 // FencedTx capability): a deposed leader closes
                 // nothing.
+                // The close CAUSE is truthful per cell: settled work
+                // closes with its settled polarity (a completed node's
+                // stale row reads `completed`, a poisoned/dep-failed
+                // node's reads `failed`); cancelled/absent close as
+                // `cancelled` (work nobody wants). Consumers of
+                // recently_closed select on cause.
+                let close_status = match node {
+                    rio_evidence_kernel::establish::NodeDisposition::TerminalSettled => {
+                        match status_class {
+                            Some(NodeStatusClass::Settled) => {
+                                match self.dag.node(&drv_hash).map(|s| s.status()) {
+                                    Some(
+                                        DerivationStatus::Completed | DerivationStatus::Skipped,
+                                    ) => crate::db::AssignmentCloseStatus::Completed,
+                                    _ => crate::db::AssignmentCloseStatus::Failed,
+                                }
+                            }
+                            _ => crate::db::AssignmentCloseStatus::Cancelled,
+                        }
+                    }
+                    _ => crate::db::AssignmentCloseStatus::Cancelled,
+                };
                 match self
                     .db
                     .close_assignment_fenced(
                         attempt.exec_id,
-                        crate::db::AssignmentCloseStatus::Cancelled,
+                        close_status,
                         self.serving_generation(),
                     )
                     .await
@@ -927,7 +1002,7 @@ impl DagActor {
                     Ok(o) if o.settled() => info!(
                         drv_hash = %attempt.drv_hash, exec_id = %attempt.exec_id,
                         node = ?node,
-                        "establishment sweep: cancelled/absent node; assignment closed charge-free"
+                        "establishment sweep: cancelled/settled/absent node; assignment closed charge-free"
                     ),
                     Ok(_) => {
                         self.note_fenced_evidence_write("establishment charge-free close");
@@ -939,7 +1014,7 @@ impl DagActor {
                 }
                 return;
             }
-            EstablishmentDisposition::ChargeMaterializationInfra => {
+            EstablishmentAction::ChargeMaterializationInfra => {
                 // Substitution-replacement (design §2.4 / findings
                 // BC-2, BC-3): the materialization kind has NO adopt
                 // arm (a mid-walk crash leaves outputs present but the
@@ -952,13 +1027,15 @@ impl DagActor {
                 self.establish_materialization_attempt(attempt).await;
                 return;
             }
-            EstablishmentDisposition::AdoptCompleted => {
+            EstablishmentAction::AdoptCompleted(verified) => {
                 // Store-probe arm: every verifiable wanted output
                 // present → adopt as completed; the attempt is closed
-                // and never charged.
-                if let Some(state) = self.dag.node(&drv_hash) {
-                    let expected = state.expected_output_paths.clone();
-                    self.adopt_orphan_completion(&drv_hash, &Some(executor.clone()), expected)
+                // and never charged. The adopt stamps EXACTLY the
+                // kernel's VerifiedPresent witness (bug_148: the
+                // expected_output_paths superset contained paths the
+                // same probe had just reported absent).
+                if self.dag.node(&drv_hash).is_some() {
+                    self.adopt_orphan_completion(&drv_hash, &Some(executor.clone()), verified)
                         .await;
                 }
                 // r[impl sched.evidence.durability+4]
@@ -987,7 +1064,7 @@ impl DagActor {
                       "establishment sweep: outputs present in store, adopted as completed (no charge)");
                 return;
             }
-            EstablishmentDisposition::Defer => {
+            EstablishmentAction::Defer => {
                 // No probe evidence in either direction: the attempt
                 // stays open for a pass with a working probe. (The
                 // current caller mapping cannot produce this arm —
@@ -996,7 +1073,7 @@ impl DagActor {
                        "establishment sweep: probe evidence unavailable; attempt stays open");
                 return;
             }
-            EstablishmentDisposition::ChargeExecutorCrash => {
+            EstablishmentAction::ChargeExecutorCrash => {
                 // Fall through to the C2 charge arm below.
             }
         }

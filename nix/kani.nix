@@ -407,6 +407,12 @@ in
     #   - check_establishment_unavailable_defers (the C1 fix's pin)
     #   - check_establishment_materialization_never_adopts_or_crash_charges
     #     (the materialization row swept over node × probe).
-    expectedHarnesses = 19;
+    #   - check_terminal_settled_never_charged (merged_bug_210: settled
+    #     work is never re-litigated — CloseChargeFree over every
+    #     kind × probe).
+    #   - check_project_node_authority_total (merged_bug_210: the
+    #     node-axis projection is total and an un-authoritative DAG
+    #     never yields a disposition).
+    expectedHarnesses = 21;
   };
 }

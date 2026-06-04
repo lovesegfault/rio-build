@@ -1735,7 +1735,7 @@ async fn worker_abort_uncharged_closes_are_ledger_bounded() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+4]
+// r[verify sched.attempt.establishment-window+5]
 /// bug_106 (A2.3 MintProfile): the build mint must FLOOR its persisted
 /// deadline at the rendered deadline the pod was actually dispatched
 /// under (`BoundIntent.deadline_secs`, carried as data from the

@@ -1550,7 +1550,7 @@ pub const M_073: () = ();
 /// pull mint writes the solved deadline here; the sweep takes
 /// `max(persisted, re-solved)` so the window can widen (estimate grew,
 /// floor bump) but never shrink while the attempt is open
-/// (`sched.attempt.establishment-window+4`). Nullable: pre-074 rows
+/// (`sched.attempt.establishment-window+5`). Nullable: pre-074 rows
 /// fall back to the sweep-time re-solve, and stream rows never
 /// populate it. Known residual: the Job's `activeDeadlineSeconds` is
 /// rendered slightly before the pull mint, so the persisted value can
