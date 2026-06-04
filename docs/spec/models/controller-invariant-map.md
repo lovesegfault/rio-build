@@ -1765,12 +1765,21 @@ in 56 s on the CI builder — inside the per-check budget with margin.
   `ENABLE_CANCEL_GENERATION` spawnCoherence axis promotes the
   previously-contained respawn trace to a flagged violation
   (`cancelNeverDeletesPostCloseJob`).
-- **007 ack-failure drain loss:** the evidence buffer drains into the
-  healthy tick's Ack BEFORE the RPC; an ack failure on exactly that
-  tick loses the batch (same loss class as fresh same-tick edges,
-  pre-existing). Modeled faithfully (`pendingClear' = Set()` on the
-  drain regardless of `ackFails`); the invariant scopes to
-  non-delivering-tick discards only.
+- **007 ack-failure drain loss — SUPERSEDED 2026-06-04 (bughunt-2
+  slot 5, merged_bug_045):** the original residual read: "the evidence
+  buffer drains into the healthy tick's Ack BEFORE the RPC; an ack
+  failure on exactly that tick loses the batch (same loss class as
+  fresh same-tick edges, pre-existing). Modeled faithfully
+  (`pendingClear' = Set()` on the drain regardless of `ackFails`); the
+  invariant scopes to non-delivering-tick discards only." The loss
+  class is closed by the commit-on-Ack buffer
+  (`ctrl.nodeclaim.evidence-ack-latch`): `drain()` is deleted, the
+  buffer ships by read and clears only in the Ack-Ok arm — Ack-Err AND
+  mid-tick aborts retain it (strictly subsumes re-merge-on-drop: no
+  moved-out value ever exists). The `ENABLE_ACK_LATCH`
+  nodeclaimLifecycle axis re-scopes `clearSurvivesAckFailure` over
+  delivering ticks; the axis-off twin reproduces this residual as a
+  flagged violation.
 - **007/346 acquire-edge suppress:** the qnt models do not compose the
   buffer axis with the lease-fault axis (the suppress-clear on
   re-acquisition is therefore out of model); the Rust pins

@@ -1053,12 +1053,12 @@ async fn bot_tick_makes_exactly_two_lists_no_effects() {
 /// dual-written (R9).
 #[tokio::test(flavor = "multi_thread")]
 async fn report_unfulfillable_always_ships_the_snapshot() {
-    let lab = Lab::new().await;
+    let mut lab = Lab::new().await;
 
     // The scale-to-zero shape: nothing ICE'd, nothing registered, no
     // observations, zero bound pods.
     lab.r
-        .report_unfulfillable(&[], &[], vec![], vec![])
+        .report_unfulfillable(&[], vec![])
         .await
         .expect("ack sent");
 
@@ -1078,8 +1078,6 @@ async fn report_unfulfillable_always_ships_the_snapshot() {
     lab.r
         .report_unfulfillable(
             &[],
-            &[],
-            vec![],
             vec![rio_proto::types::BoundIntent {
                 intent_id: "drv-285".into(),
                 node_name: "node-1".into(),
@@ -1184,5 +1182,63 @@ async fn idle_spell_survives_reload_err_loop() {
         seeded,
         "the idle spell survives the reload-Err loop (the clear is an \
          acquire-EDGE action, not a per-tick action)"
+    );
+}
+
+// r[verify ctrl.nodeclaim.evidence-ack-latch]
+/// merged_bug_045 (commit-on-Ack): buffered kube-only evidence
+/// survives an Ack failure and ships on the next successful Ack.
+/// Recorded red (pre-fix): the buffer was mem::take'n into the wire
+/// shapes BEFORE the RPC — the failed-Ack tick lost the batch, and
+/// tick 2's Ack carried empty registered_cells.
+#[tokio::test(flavor = "multi_thread")]
+async fn evidence_survives_ack_failure_until_committed() {
+    let mut lab = Lab::new().await;
+
+    // Tick 1: n1 fresh-Registered inside the recency window → a
+    // registered-cell ICE-clear enters the buffer; the Ack fails.
+    lab.admin
+        .fail_next_ack
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    lab.tick(
+        600,
+        full_tick_scenario(vec![], vec![nc_json("n1", 0, Some(595))], vec![]),
+    )
+    .await;
+    let acks = lab.ack_calls();
+    assert_eq!(acks.len(), 1, "tick 1 attempted exactly one Ack");
+    assert!(
+        acks[0].registered_cells.contains(&cell().to_string()),
+        "the failed Ack carried the payload to the wire"
+    );
+
+    // Tick 2: nothing new observed (n1 edge already recorded). The
+    // retained buffer MUST re-ship.
+    lab.tick(
+        610,
+        full_tick_scenario(vec![], vec![nc_json("n1", 0, Some(595))], vec![]),
+    )
+    .await;
+    let acks = lab.ack_calls();
+    assert_eq!(acks.len(), 2, "tick 2 acked");
+    assert!(
+        acks[1].registered_cells.contains(&cell().to_string()),
+        "evidence lost on Ack-Err: tick 2 must re-ship the buffered \
+         ICE-clear (registered_cells: {:?})",
+        acks[1].registered_cells
+    );
+
+    // Tick 3: the Ack-Ok committed the buffer — nothing re-ships.
+    lab.tick(
+        620,
+        full_tick_scenario(vec![], vec![nc_json("n1", 0, Some(595))], vec![]),
+    )
+    .await;
+    let acks = lab.ack_calls();
+    assert_eq!(acks.len(), 3);
+    assert!(
+        acks[2].registered_cells.is_empty(),
+        "committed evidence must not re-ship forever: {:?}",
+        acks[2].registered_cells
     );
 }

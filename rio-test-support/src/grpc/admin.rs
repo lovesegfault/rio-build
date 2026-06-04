@@ -43,6 +43,18 @@ pub struct MockAdmin {
     /// suites assert verdict wire content (reason, intent, the
     /// 124(b) `resubmit_cycle` echo) without a live scheduler.
     pub outcome_calls: Arc<RwLock<Vec<types::ReportAttemptOutcomeRequest>>>,
+    /// When set, the next `AckSpawnedIntents` returns UNAVAILABLE
+    /// (consumed). Drives the merged_bug_045 commit-on-Ack reds: the
+    /// failed Ack is still pushed to `ack_calls` (it reached the wire)
+    /// — assert delivery by inspecting which call CARRIED the payload.
+    pub fail_next_ack: Arc<std::sync::atomic::AtomicBool>,
+    /// When set, the next `AppendInterruptSample` returns UNAVAILABLE
+    /// (consumed). Drives the merged_bug_116 counted-drop red.
+    pub fail_next_append: Arc<std::sync::atomic::AtomicBool>,
+    /// Every `AppendInterruptSample` request received (manual method —
+    /// the generated stub would silently default; the node-informer
+    /// suites assert sample content and failure accounting).
+    pub interrupt_samples: Arc<RwLock<Vec<types::AppendInterruptSampleRequest>>>,
 }
 
 impl MockAdmin {
@@ -131,6 +143,12 @@ impl AdminService for MockAdmin {
         request: Request<types::AckSpawnedIntentsRequest>,
     ) -> Result<Response<()>, Status> {
         self.ack_calls.write().unwrap().push(request.into_inner());
+        if self
+            .fail_next_ack
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Status::unavailable("programmed ack failure"));
+        }
         Ok(Response::new(()))
     }
 
@@ -150,6 +168,23 @@ impl AdminService for MockAdmin {
         _: Request<types::ListOpenAttemptsRequest>,
     ) -> Result<Response<types::ListOpenAttemptsResponse>, Status> {
         Ok(Response::new(self.open_attempts.read().unwrap().clone()))
+    }
+
+    async fn append_interrupt_sample(
+        &self,
+        request: Request<types::AppendInterruptSampleRequest>,
+    ) -> Result<Response<()>, Status> {
+        self.interrupt_samples
+            .write()
+            .unwrap()
+            .push(request.into_inner());
+        if self
+            .fail_next_append
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Status::unavailable("programmed append failure"));
+        }
+        Ok(Response::new(()))
     }
 
     // ─── Generated methods: Default::default() stubs ────────────────────

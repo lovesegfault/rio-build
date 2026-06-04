@@ -1233,6 +1233,17 @@ fleet-wide learning.
   updating the map violates this rule.
 ]
 
+#r("ctrl.nodeclaim.evidence-ack-latch")[
+  Kube-only scheduler evidence (registered-cell ICE-clears, observed
+  instance types) MUST be delivered commit-on-Ack: the reconciler ships
+  the accumulated buffer BY READ and clears it ONLY when the
+  `AckSpawnedIntents` RPC returns success. An Ack failure or a
+  mid-tick abort MUST leave the buffer intact for the next tick (no
+  moved-out value may exist between the read and the commit). Duplicate
+  delivery after a successful-but-unobserved Ack is acceptable: ICE
+  clears and observed-type upserts are idempotent scheduler-side.
+]
+
 #r("ctrl.nodeclaim.ice-mark-clear")[
   ICE mark and clear signals sent via `AckSpawnedIntents` MUST be sound:
   `unfulfillable_cells` (marks) are deduplicated to at most one entry per

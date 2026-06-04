@@ -74,7 +74,7 @@ pub use sketch::{CapacityType, Cell, CellSketches, CellState};
 /// of this type must never be dropped — `#[must_use]` turns the old
 /// `let _ =` discard into a deny-warnings error; ticks that cannot
 /// ship it merge it into the reconciler's buffer instead.
-#[must_use = "kube-only evidence is consume-once: merge it into pending_evidence or drain it into an Ack"]
+#[must_use = "kube-only evidence is consume-once: merge it into pending_evidence (shipped from the buffer, cleared only on Ack-Ok)"]
 #[derive(Debug, Default)]
 pub(crate) struct PendingSchedulerEvidence {
     /// Cells whose NodeClaim reached `Registered=True` (the ICE-clear
@@ -100,14 +100,6 @@ impl PendingSchedulerEvidence {
                 self.observed_types.push(o);
             }
         }
-    }
-
-    /// Consume into the wire shapes `report_unfulfillable` takes.
-    pub(crate) fn drain(self) -> (Vec<Cell>, Vec<rio_proto::types::ObservedInstanceType>) {
-        (
-            self.registered_cells.into_iter().collect(),
-            self.observed_types,
-        )
     }
 }
 
@@ -1361,14 +1353,16 @@ impl NodeClaimPoolReconciler {
         // `registered_cells` feeds `report_unfulfillable`'s ICE-clear;
         // `observed_types` feeds the scheduler's `CostTable.cells`
         // (R24B7 instance-type autodiscovery).
-        // Fresh evidence merges INTO the buffer, then the whole buffer
-        // drains into this tick's Ack (merged_bug_007: ⊥-tick and
-        // consolidate-only edges are consume-once and must not be
-        // lost; the merge also fixes the pre-existing ≥5-tick
-        // observed_types loss across consolidate-only stretches).
+        // Fresh evidence merges INTO the buffer; the buffer is shipped
+        // FROM the buffer and cleared only when the Ack lands
+        // (merged_bug_007 + merged_bug_045: ⊥-tick and consolidate-only
+        // edges are consume-once and must not be lost — and neither may
+        // an Ack-Err or a mid-tick abort lose them. No moved-out value
+        // ever exists, which strictly subsumes re-merge-on-drop; the
+        // merge also fixes the pre-existing ≥5-tick observed_types loss
+        // across consolidate-only stretches).
         let fresh = self.kube_only_observations(&live, now, now_sys);
         self.pending_evidence.merge(fresh);
-        let (registered_cells, observed_types) = std::mem::take(&mut self.pending_evidence).drain();
 
         let bound = pod_snapshot.bound_intents();
         // §13d STRIKE-7 (mb_012): the agnostic-fallback admit predicate
@@ -1516,13 +1510,8 @@ impl NodeClaimPoolReconciler {
         // entry per bound builder pod) so the scheduler's
         // `authoritative_binding` map stays current without delta
         // tracking; cardinality is O(active builds).
-        self.report_unfulfillable(
-            &ice_cells,
-            &registered_cells,
-            observed_types,
-            pod_snapshot.bound_intent_protos(),
-        )
-        .await?;
+        self.report_unfulfillable(&ice_cells, pod_snapshot.bound_intent_protos())
+            .await?;
 
         // r42 bug_023: same gauge_universe as `emit_live_gauges` —
         // configured ∪ live cells ∪ one trailing tick of cells
@@ -2104,10 +2093,8 @@ impl NodeClaimPoolReconciler {
     /// RPC failure is warned + dropped (next tick retries; the
     /// scheduler also has its first-heartbeat clear path).
     async fn report_unfulfillable(
-        &self,
+        &mut self,
         ice_cells: &[Cell],
-        registered_cells: &[Cell],
-        observed_types: Vec<rio_proto::types::ObservedInstanceType>,
         bound_intents: Vec<rio_proto::types::BoundIntent>,
     ) -> anyhow::Result<()> {
         // C2/285: NO empty-tick suppression — this reconciler ALWAYS
@@ -2132,6 +2119,19 @@ impl NodeClaimPoolReconciler {
                 .into_iter()
                 .collect()
         };
+        // merged_bug_045 (commit-on-Ack): the buffered evidence ships
+        // BY READ — the buffer is cleared ONLY in the Ack-Ok arm below.
+        // An Ack-Err or a mid-tick `?`-abort earlier in the tick leaves
+        // it intact for the next tick (duplicate delivery is idempotent:
+        // repeated ICE-clears are no-ops and observed-type upserts
+        // dedup server-side).
+        let registered_cells: Vec<Cell> = self
+            .pending_evidence
+            .registered_cells
+            .iter()
+            .cloned()
+            .collect();
+        let observed_types = self.pending_evidence.observed_types.clone();
         let req = AckSpawnedIntentsRequest {
             // The explicit per-tick snapshot (always present from this
             // reconciler; empty = clear). R9: the legacy field 5 is
@@ -2142,12 +2142,24 @@ impl NodeClaimPoolReconciler {
             }),
             spawned: vec![],
             unfulfillable_cells: dedup(ice_cells),
-            registered_cells: dedup(registered_cells),
+            registered_cells: dedup(&registered_cells),
             observed_instance_types: observed_types,
             bound_intents: vec![],
         };
-        if let Err(e) = admin_call(self.admin.clone().ack_spawned_intents(req)).await {
-            warn!(error = %e, "ack_spawned_intents (unfulfillable/registered) failed");
+        // r[impl ctrl.nodeclaim.evidence-ack-latch]
+        match admin_call(self.admin.clone().ack_spawned_intents(req)).await {
+            Ok(_) => {
+                // The ONLY clear: the evidence provably reached the
+                // scheduler.
+                self.pending_evidence = PendingSchedulerEvidence::default();
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "ack_spawned_intents (unfulfillable/registered) failed; \
+                     buffered evidence retained for the next tick"
+                );
+            }
         }
         Ok(())
     }

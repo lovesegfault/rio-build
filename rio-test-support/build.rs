@@ -68,6 +68,9 @@ const MANUAL_METHODS: &[&str] = &[
     "GetSpawnIntents",   // returns the programmed spawn_intents response
     "AckSpawnedIntents", // records the full request to ack_calls
     "ListOpenAttempts",  // returns the programmed open_attempts response
+    // merged_bug_116: call-recording + programmable failure (the
+    // node-informer counted-drop suites).
+    "AppendInterruptSample",
 ];
 
 #[cfg(feature = "full")]

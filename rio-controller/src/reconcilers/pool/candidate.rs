@@ -711,10 +711,12 @@ mod proptests {
     /// admits all). Today the empty `iter().all()` makes it admit ALL.
     #[test]
     fn empty_term_admits_nothing_per_the_kube_contract() {
-        let mut intent = rio_proto::types::SpawnIntent::default();
-        intent.node_affinity = vec![rio_proto::types::NodeSelectorTerm {
-            match_expressions: vec![],
-        }];
+        let mut intent = rio_proto::types::SpawnIntent {
+            node_affinity: vec![rio_proto::types::NodeSelectorTerm {
+                match_expressions: vec![],
+            }],
+            ..Default::default()
+        };
         let ri = RenderInputs::from_intent(&intent);
         let labels: std::collections::BTreeMap<String, String> =
             [("zone".to_string(), "a".to_string())].into();
