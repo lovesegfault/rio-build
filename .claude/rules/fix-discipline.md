@@ -1,15 +1,18 @@
-# Fix discipline — rules distilled from rounds 14–16 fix-genealogy
+# Fix discipline — rules distilled from rounds 14–17 fix-genealogy
 
 When a bug is the outcome of a previous bug fix, the fix for THAT bug must name the
 parent commit and the pattern number (R1–R7) in its commit message. Provenance is
 part of the fix.
 
-Genealogy note: rounds 14-16. Round-16 verdict: rules adopted near-universally,
-failed by precision at the axes amended above; the structural complement is the
-contract-owner pattern (a remedy introducing a contract introduces, same
-commit, the type owning its transitions). If round 17 clusters in the same
-remedies AFTER the owner types land, escalate from "rules imprecise" to
-"abstraction wrong" (F2-class lifecycle redesign becomes the plan).
+Genealogy note: rounds 14-17. Round-17 bet resolution: ADOPTION-INCOMPLETE —
+owner types held where they govern (owner-core 6/40, 4 polish); defects
+clustered at unmigrated siblings (12) and one-seam-beyond edges (10). The
+escalation arm did NOT fire. Three families pre-registered as round-18 F2
+sentinels with CI-defined in-governance triggers: closure-witness (gen ~6,
+closure-witness-producers check), kill-corroboration (gen 5,
+kill-writer-conformance), settled-identity (gen 4, witness-enumeration test).
+A post-conformance recurrence INSIDE any of those governed surfaces activates
+that family's named F2 scope.
 
 ## R1 — Changing what a value can mean requires auditing every reader, in the same change
 A change to the legal states of a shared value, error variant, or counter (new legal
@@ -51,6 +54,14 @@ at producing statements: map_err(Variant) over a composite multi-source call is
 a review reject — it re-creates the default bucket the enum exists to
 eliminate. [merged_068]
 
+R1(e) — EXTERNAL COMPOSITE BOUNDARIES (sharpened). At an external composite
+boundary, classification discriminates on the error's STRUCTURE (variant /
+downcast / errno allowlist) — never on request-side predicates. Catch-all
+Err(_)/Ok(_)/boolean folds at evidence-producing seams are the same
+violation. R1 reader lists for a function whose ERROR meaning changes are
+generated from the function's CALLERS, not variant-name greps. [merged_017,
+merged_056, merged_061, merged_022, bug_105]
+
 R1(f) — CADENCE AND PRODUCER-SET. Wrapping an emitting function in a
 retry/fixpoint loop, or adding a new producer of an existing error/metric
 variant, re-audits terminal-vs-per-attempt semantics of everything emitted
@@ -71,6 +82,15 @@ unless its site list was generated mechanically (rg the TYPE/FIELD, not prose) a
 pasted into the commit message. Newtypes are the strongest form: they turn the missed
 Nth site into a compile error in the next refactor.
 
+R2 — CONFORMANCE (NEW). A commit that introduces or widens a chokepoint/owner
+contract REQUIRES, same commit, a CI-enforced conformance artifact over its
+governed population — a deny-grep of the open-coded form against a registered
+carve-out list, a type seal making bypass unwritable, or a set-equality
+registry assert. The commit-message site list documents; the check enforces.
+[r17: 12 unmigrated siblings, ≥4 mechanically findable at migration time —
+merged_074's audited-but-unmigrated site; bug_030's 4th caller; bug_043's
+same-file writer; 13e8715e4's false residue claim]
+
 R2 — AUTHORITATIVE EVENT. The chokepoint sits at the authoritative event the
 invariant's own quantifier names (delivered/committed/settled), not the
 convenient one. A chokepoint performing a destructive read of shared evidence
@@ -82,6 +102,11 @@ predicate REQUIRES an axis-isolated differential conformance test (identical
 fixtures through both sides, one axis varied per case) in the same commit that
 creates or changes either side; prose cross-reference is a review reject.
 [merged_087]
+
+R2 — CROSS-LANGUAGE TWINS (sharpened). The differential matrix MUST include
+soundness cells staged OUTSIDE the typed fixture path (raw-stored
+out-of-domain rows; hostile add-data incomings). Agreement-only matrices are
+insufficient: shared holes pass them. [bug_091, merged_020]
 
 R2 — NEW WRITE SITES. Adding a write site to a documented collection routes
 through the existing cap/init-owning chokepoint or re-sanctions the documented
@@ -169,7 +194,10 @@ existing verdicts, codification of implicit policies into registries/tables,
 and consequence-arm population shrink — not only "new gates". A permanence
 claim additionally names which premises are system-mutated (reap, recovery,
 displacement, GC, dispatch overwrite) and why each mutation cannot occur or is
-covered. [bug_029, bug_069]
+covered. [bug_029, bug_069] Also a trigger: a new metric/HELP declaring an
+event population — it obligates the producer-set enumeration (one emitting
+arm per declared population member, none silent). [bug_085, bug_064,
+merged_010's canary]
 
 R5 — CONSUMER-DEFINED POPULATIONS. The gate population is defined by the
 CONSUMING contract's accept-set (the parser of record, cross-crate where
@@ -219,6 +247,11 @@ POSIX command-substitution equality); mock producers are format-faithful in the
 pinned dimension; every client-facing COUNT/diagnostic field is asserted equal
 to structural ground truth in at least one fixture; mirrored hand-maintained
 tables get a set-equality chokepoint assert. [merged_004, merged_086, merged_055]
+
+R6 — WITNESS FIDELITY (tightened). Byte-exactness bans command substitution
+anywhere in the compared operands' DATAFLOW (cmp with substitution in operand
+prep is the same violation), and an anti-X pin must attach to the variant/arm
+structurally CAPABLE of X. [bug_006, bug_076]
 
 R6 — PARITY SWEEP. Touching a function/file whose docs or markers claim oracle
 parity obligates a sweep of the WHOLE claimed-parity unit against the pinned
