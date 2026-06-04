@@ -1042,7 +1042,7 @@ impl DagActor {
             peak_cpu_cores,
             node_name: node_name.clone(),
             hw_class: hw_class.clone(),
-            final_resources: final_resources.clone(),
+            final_resources,
             final_line_count,
         });
         let mut result: crate::domain::BuildResult = result.into();
