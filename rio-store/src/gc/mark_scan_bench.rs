@@ -1365,7 +1365,7 @@ async fn run_collect_phase(
             .await
             .expect("begin collect batch tx");
         let scan_started = Instant::now();
-        let candidates: Vec<Vec<u8>> = sqlx::query_scalar(COLLECT_BATCH_SELECT_SQL)
+        let candidates: Vec<Vec<u8>> = sqlx::query_scalar(COLLECT_BATCH_SELECT_SQL.as_str())
             .bind(&cursor)
             .bind(&cutoff)
             .bind(this_limit as i64)
@@ -1380,7 +1380,7 @@ async fn run_collect_phase(
         batches += 1;
         let short = candidates.len() < this_limit as usize;
         let delete_started = Instant::now();
-        let rows: Vec<(Vec<u8>, i64)> = sqlx::query_as(COLLECT_BATCH_UPDATE_SQL)
+        let rows: Vec<(Vec<u8>, i64)> = sqlx::query_as(COLLECT_BATCH_UPDATE_SQL.as_str())
             .bind(&candidates)
             .bind(&cutoff)
             .fetch_all(&mut *tx)
@@ -1625,8 +1625,25 @@ async fn collect_batch_update_rechecks_collect_predicate() {
                 .contains("GREATEST(created_at, last_referenced_at) < $2::timestamptz"),
         "COLLECT_BATCH_UPDATE_SQL must re-check the collect predicate's row-local conjuncts \
          (deleted = FALSE AND GREATEST(created_at, last_referenced_at) < cutoff) in its own \
-         WHERE clause; got: {COLLECT_BATCH_UPDATE_SQL}"
+         WHERE clause; got: {}",
+        COLLECT_BATCH_UPDATE_SQL.as_str()
     );
+    // merged_bug_026 extension: every chunks-mutating statement's
+    // OUTER qual must carry every row-local eligibility conjunct —
+    // the reap DELETE included (its EPQ re-check set).
+    let reap_outer = super::collect::REAP_BATCH_DELETE_SQL
+        .rsplit_once("LIMIT $2)")
+        .expect("reap statement shape")
+        .1;
+    for conjunct in [
+        "chunks.deleted",
+        "chunks.deleted_at < now() - make_interval(secs => $1)",
+    ] {
+        assert!(
+            reap_outer.contains(conjunct),
+            "REAP_BATCH_DELETE_SQL outer qual lost {conjunct:?}: {reap_outer}"
+        );
+    }
 
     let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
     // Two old, unreferenced, past-grace candidates.
@@ -1651,7 +1668,7 @@ async fn collect_batch_update_rechecks_collect_predicate() {
         .await
         .expect("temp live_chunks");
 
-    let candidates: Vec<Vec<u8>> = sqlx::query_scalar(COLLECT_BATCH_SELECT_SQL)
+    let candidates: Vec<Vec<u8>> = sqlx::query_scalar(COLLECT_BATCH_SELECT_SQL.as_str())
         .bind(Vec::<u8>::new())
         .bind(&cutoff)
         .bind(10i64)
@@ -1669,7 +1686,7 @@ async fn collect_batch_update_rechecks_collect_predicate() {
         .await
         .expect("concurrent touch");
 
-    let collected: Vec<(Vec<u8>, i64)> = sqlx::query_as(COLLECT_BATCH_UPDATE_SQL)
+    let collected: Vec<(Vec<u8>, i64)> = sqlx::query_as(COLLECT_BATCH_UPDATE_SQL.as_str())
         .bind(&candidates)
         .bind(&cutoff)
         .fetch_all(&mut *conn)

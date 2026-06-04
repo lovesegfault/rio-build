@@ -41,6 +41,7 @@
 //! retains garbage longer, never collects more.
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
@@ -231,14 +232,20 @@ fn mark_validation_offenders_sql() -> String {
 /// copy.
 // r[impl store.chunk.liveness-derived]
 // r[impl store.chunk.grace-ttl+2]
-pub(crate) const COLLECT_BATCH_SELECT_SQL: &str = "SELECT c.blake3_hash FROM chunks c \
+pub(crate) static COLLECT_BATCH_SELECT_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT c.blake3_hash FROM chunks c \
      WHERE c.blake3_hash > $1 \
-       AND c.deleted = FALSE \
+       AND {not_deleted} \
        AND NOT EXISTS (SELECT 1 FROM live_chunks lc \
                         WHERE lc.blake3_hash = c.blake3_hash AND lc.blake3_hash > $1) \
-       AND GREATEST(c.created_at, c.last_referenced_at) < $2::timestamptz \
+       AND {grace} \
      ORDER BY c.blake3_hash \
-     LIMIT $3";
+     LIMIT $3",
+        not_deleted = render_collect_not_deleted("c."),
+        grace = render_collect_grace("c.")
+    )
+});
 
 /// One collect batch's soft-delete. The UPDATE re-evaluates the collect
 /// predicate's row-local conjuncts — `deleted = FALSE` plus the
@@ -261,10 +268,33 @@ pub(crate) const COLLECT_BATCH_SELECT_SQL: &str = "SELECT c.blake3_hash FROM chu
 /// Shared with `gc::mark_scan_bench` (gate (c) measurement runs and
 /// the structural predicate pin exercise this exact statement).
 // r[impl store.chunk.lock-order+2]
-pub(crate) const COLLECT_BATCH_UPDATE_SQL: &str = "UPDATE chunks SET deleted = TRUE, uploaded_at = NULL, deleted_at = now() \
-     WHERE blake3_hash = ANY($1) AND deleted = FALSE \
-       AND GREATEST(created_at, last_referenced_at) < $2::timestamptz \
-     RETURNING blake3_hash, size";
+pub(crate) static COLLECT_BATCH_UPDATE_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "UPDATE chunks SET deleted = TRUE, uploaded_at = NULL, deleted_at = now() \
+     WHERE blake3_hash = ANY($1) AND {not_deleted} \
+       AND {grace} \
+     RETURNING blake3_hash, size",
+        not_deleted = render_collect_not_deleted(""),
+        grace = render_collect_grace("")
+    )
+});
+
+/// The collect predicate's row-local conjuncts, rendered ONCE and
+/// spliced into BOTH the candidate scan and the soft-delete UPDATE
+/// (merged_bug_026's class fix applied to the collect pair): dropping
+/// a row-local conjunct from either statement now requires deleting
+/// the splice itself, which the predicate-pin battery and the bench's
+/// EXPLAIN plan-shape guard both catch. The rendered text is
+/// byte-identical to the pre-splice literals, so plan shapes are
+/// unaffected.
+fn render_collect_not_deleted(a: &str) -> String {
+    format!("{a}deleted = FALSE")
+}
+/// `GREATEST(created_at, last_referenced_at) < $2` — the grace term;
+/// see [`render_collect_not_deleted`].
+fn render_collect_grace(a: &str) -> String {
+    format!("GREATEST({a}created_at, {a}last_referenced_at) < $2::timestamptz")
+}
 
 /// The simulated-sweep exclusion (bug_199), spliced into the shadow
 /// arm\'s validation (`AND`-form — the validation has a WHERE) and
@@ -285,12 +315,39 @@ const SHADOW_SWEPT_EXCLUSION_WHERE: &str = "WHERE NOT EXISTS \
 /// only after a COMPLETE pass (nothing eligible to collect remained),
 /// batched and capped like the collect loop. `$1` = grace seconds,
 /// `$2` = batch limit.
-const REAP_BATCH_DELETE_SQL: &str = "DELETE FROM chunks WHERE blake3_hash IN ( \
+pub(crate) static REAP_BATCH_DELETE_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "DELETE FROM chunks WHERE blake3_hash IN ( \
        SELECT c.blake3_hash FROM chunks c \
-        WHERE c.deleted AND c.deleted_at < now() - make_interval(secs => $1) \
+        WHERE {inner} \
+        ORDER BY c.blake3_hash LIMIT $2) \
+       AND {outer}",
+        inner = render_reap_row_local_pred("c."),
+        outer = render_reap_row_local_pred("chunks.")
+    )
+});
+
+/// The reap's row-local eligibility conjuncts (merged_bug_026),
+/// rendered ONCE with `{a}` alias substitution into BOTH the
+/// IN-subquery (`c.`) and the OUTER DELETE qual (`chunks.`).
+///
+/// EPQ soundness: under READ COMMITTED, a DELETE blocked on a
+/// concurrent row lock re-evaluates ONLY its own outer WHERE on the
+/// new row version (EvalPlanQual does not re-run the IN-subquery).
+/// `deleted` / `deleted_at` are therefore the load-bearing re-checks —
+/// a tombstone resurrected between the candidate snapshot and the lock
+/// grant (deleted = FALSE, deleted_at NULL) fails the outer qual and
+/// survives. The repeated `NOT EXISTS pending_s3_deletes` conjunct is
+/// symmetry/defense (the drain's resurrect-skip makes it non-load-
+/// bearing, but dropping it from one qual and not the other is exactly
+/// the divergence class this splice forecloses).
+fn render_reap_row_local_pred(a: &str) -> String {
+    format!(
+        "{a}deleted AND {a}deleted_at < now() - make_interval(secs => $1) \
           AND NOT EXISTS (SELECT 1 FROM pending_s3_deletes p \
-                           WHERE p.blake3_hash = c.blake3_hash) \
-        ORDER BY c.blake3_hash LIMIT $2)";
+                           WHERE p.blake3_hash = {a}blake3_hash)"
+    )
+}
 
 /// Which arm of the collector runs (P6: code-staged, no config field).
 ///
@@ -690,7 +747,7 @@ pub(crate) async fn collect_cycle(
         // re-checking soft-delete, outbox enqueue. A failure here
         // leaves prior batches committed (per-batch isolation).
         let mut batch_tx = sqlx::Connection::begin(&mut **conn.conn()).await?;
-        let candidates: Vec<Vec<u8>> = sqlx::query_scalar(COLLECT_BATCH_SELECT_SQL)
+        let candidates: Vec<Vec<u8>> = sqlx::query_scalar(COLLECT_BATCH_SELECT_SQL.as_str())
             .bind(&cursor)
             .bind(&cutoff)
             .bind(this_limit)
@@ -707,7 +764,7 @@ pub(crate) async fn collect_cycle(
         // `= ANY` soft-delete takes its row locks in sorted order
         // (store.chunk.lock-order) and the WHERE re-checks the
         // row-local collect predicate (see COLLECT_BATCH_UPDATE_SQL).
-        let collected: Vec<(Vec<u8>, i64)> = sqlx::query_as(COLLECT_BATCH_UPDATE_SQL)
+        let collected: Vec<(Vec<u8>, i64)> = sqlx::query_as(COLLECT_BATCH_UPDATE_SQL.as_str())
             .bind(&candidates)
             .bind(&cutoff)
             .fetch_all(&mut *batch_tx)
@@ -774,7 +831,7 @@ pub(crate) async fn collect_cycle(
                 break;
             }
             let limit = COLLECT_BATCH_LIMIT.min(remaining) as i64;
-            let reaped = sqlx::query(REAP_BATCH_DELETE_SQL)
+            let reaped = sqlx::query(REAP_BATCH_DELETE_SQL.as_str())
                 .bind(grace_secs)
                 .bind(limit)
                 .execute(&mut **conn.conn())
@@ -2788,5 +2845,128 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending, i64::from(n), "no duplicate enqueues either");
+    }
+
+    /// merged_bug_026 splice pin: the rendered statements are
+    /// byte-identical to the pre-splice literals (plan shapes
+    /// unchanged), and the reap's OUTER DELETE qual carries every
+    /// row-local eligibility conjunct (the EPQ re-check set).
+    #[test]
+    fn reap_and_collect_quals_carry_row_local_conjuncts() {
+        assert_eq!(
+            COLLECT_BATCH_SELECT_SQL.as_str(),
+            "SELECT c.blake3_hash FROM chunks c \
+     WHERE c.blake3_hash > $1 \
+       AND c.deleted = FALSE \
+       AND NOT EXISTS (SELECT 1 FROM live_chunks lc \
+                        WHERE lc.blake3_hash = c.blake3_hash AND lc.blake3_hash > $1) \
+       AND GREATEST(c.created_at, c.last_referenced_at) < $2::timestamptz \
+     ORDER BY c.blake3_hash \
+     LIMIT $3",
+        );
+        assert_eq!(
+            COLLECT_BATCH_UPDATE_SQL.as_str(),
+            "UPDATE chunks SET deleted = TRUE, uploaded_at = NULL, deleted_at = now() \
+     WHERE blake3_hash = ANY($1) AND deleted = FALSE \
+       AND GREATEST(created_at, last_referenced_at) < $2::timestamptz \
+     RETURNING blake3_hash, size",
+        );
+        // The outer DELETE qual (after the IN (...) close paren) must
+        // carry the full row-local predicate, chunks-qualified.
+        let outer = REAP_BATCH_DELETE_SQL
+            .rsplit_once("LIMIT $2)")
+            .expect("reap shape")
+            .1;
+        for conjunct in [
+            "chunks.deleted",
+            "chunks.deleted_at < now() - make_interval(secs => $1)",
+            "p.blake3_hash = chunks.blake3_hash",
+        ] {
+            assert!(
+                outer.contains(conjunct),
+                "reap OUTER qual lost row-local conjunct {conjunct:?}: {outer}"
+            );
+        }
+    }
+
+    // r[verify store.gc.bounded-garbage-retention+3]
+    /// merged_bug_026: a tombstone resurrected AFTER the reap's
+    /// candidate snapshot but BEFORE its row lock is granted must
+    /// survive the EvalPlanQual re-check. Connection A resurrects the
+    /// row in an open transaction (holding the row lock); the reap
+    /// DELETE on connection B blocks on that lock (observed via
+    /// pg_stat_activity); A commits; B's EPQ re-evaluates the OUTER
+    /// qual on the new row version.
+    ///
+    /// RED (pre-fix, recorded): the outer qual was hash-only — the
+    /// resurrected (deleted = FALSE) live row was hard-deleted.
+    #[tokio::test]
+    async fn reap_resurrected_row_survives_epq_recheck() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let grace = super::super::sweep::CHUNK_GRACE_SECS;
+
+        let hash = ChunkSeed::new(0xEC).uploaded().seed(&db.pool).await;
+        sqlx::query(
+            "UPDATE chunks SET deleted = TRUE, \
+             deleted_at = now() - make_interval(secs => $2) \
+             WHERE blake3_hash = $1",
+        )
+        .bind(&hash[..])
+        .bind((grace + 100) as f64)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // A: resurrect in an open tx — row lock held, uncommitted.
+        let mut conn_a = db.pool.acquire().await.unwrap();
+        let mut tx_a = sqlx::Connection::begin(&mut *conn_a).await.unwrap();
+        sqlx::query("UPDATE chunks SET deleted = FALSE, deleted_at = NULL WHERE blake3_hash = $1")
+            .bind(&hash[..])
+            .execute(&mut *tx_a)
+            .await
+            .unwrap();
+
+        // B: the reap DELETE — blocks on A's row lock.
+        let pool_b = db.pool.clone();
+        let reap = tokio::spawn(async move {
+            sqlx::query(REAP_BATCH_DELETE_SQL.as_str())
+                .bind(grace as f64)
+                .bind(10i64)
+                .execute(&pool_b)
+                .await
+                .map(|r| r.rows_affected())
+        });
+
+        // Lock-wait gate: wait until B is provably blocked on a lock.
+        let mut waited = false;
+        for _ in 0..200 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity \
+                 WHERE wait_event_type = 'Lock' AND query LIKE 'DELETE FROM chunks%'",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                waited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(waited, "reap DELETE never blocked on the resurrect lock");
+
+        tx_a.commit().await.unwrap();
+        let reaped = reap.await.unwrap().expect("reap statement");
+        assert_eq!(reaped, 0, "EPQ re-check must veto the resurrected row");
+
+        let alive: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chunks WHERE blake3_hash = $1 AND NOT deleted",
+        )
+        .bind(&hash[..])
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(alive, 1, "resurrected row must survive the reap");
     }
 }
