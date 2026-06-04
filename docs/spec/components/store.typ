@@ -1683,6 +1683,22 @@ PG forever. The empty-buffer gate makes the abort loss-free by
 construction; a non-empty buffer's liveness is owned by the cut path's
 bounded ack send.
 
+#r("store.log.driver-bounded")[
+  Every await the AppendLog driver performs on behalf of the builder
+  (ack delivery, chunk cuts — in-loop, drain, and cleanup) MUST be
+  bounded: in-loop acks wait at most one cut interval before the stream
+  ends as a client disconnect, cleanup and drain acks never wait, and
+  every chunk cut runs under the one-cut-interval watchdog.
+]
+
+The driver is the server's representative of one builder; nothing the
+builder does or fails to do (stop reading acks, vanish mid-cut behind a
+wedged backend) may park the driver — its select loop owns the abort
+check, the heartbeat, and the inbound read, so a parked driver is an
+immortal lease-renewer at worst and a leaked slot at best. The two
+named ack forms and the single named cut form are the only callable
+shapes; an in-file self-scan pins the census.
+
 #r("store.log.tail-reconnect")[
   A `follow`-mode `TailLog` stream ends when the ingest session it is
   attached to closes, which does not imply the execution is finished. A

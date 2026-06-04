@@ -53,7 +53,9 @@ use rio_proto::types::BuildLogBatch;
 
 use super::chunks::LogChunkStore;
 use super::gate::{self, OpenCaps};
-use super::ingest::{AbortReason, AcceptOutcome, IngestConfig, IngestSession, IngestShared};
+use super::ingest::{
+    AbortReason, AcceptOutcome, CutError, IngestConfig, IngestSession, IngestShared,
+};
 use super::sessions::{self, Acquire, HeartbeatOutcome};
 use super::tail::{self, LineCursor};
 use rio_log_kernel::{ChunkVisit, visit_chunk};
@@ -183,17 +185,55 @@ impl PeerResolver {
 
 /// Capacity of the `AppendLog` ack channel. Acks are produced at most
 /// once per chunk cut (≥1/60 s steady-state), so a tiny buffer is
-/// enough. The ack `send` is awaited inside the same `select!` loop as
-/// the inbound read and the heartbeat tick, so a builder that falls 16
-/// acks behind stalls the *whole driver* — ingest, cutting, and the
-/// heartbeat — until it reads one. That is deliberate backpressure on
-/// the ingest side; the cost is that a reader stalled past the lease's
-/// 30 s staleness window lets another replica steal the session (and
-/// this stream then aborts at its next heartbeat). At one ack per cut,
-/// 16 acks of slack is 16 chunk cuts — 16 minutes at the idle-tick
-/// cadence, proportionally less for a log hot enough to cut on the
-/// byte threshold.
+/// enough.
+///
+/// The contract (every ack flows through exactly two named forms; the
+/// in-file self-scan pins it): [`send_ack_bounded`] for in-loop acks —
+/// bounded at one cut interval, an undelivered ack ends the stream as
+/// a client disconnect — and [`ack_try_send`] for post-exit cleanup
+/// and drain acks, which never wait at all. A builder that stops
+/// reading acks but keeps the stream open therefore costs the driver
+/// AT MOST one cut interval before the stream is cut off and the
+/// un-acked tail is left to the reconnect replay (idempotent). The
+/// previous contract awaited `send` raw inside the select loop and
+/// described the resulting whole-driver stall (ingest, cutting, AND
+/// the heartbeat) as "deliberate backpressure" bounded by a lease
+/// steal at its "next heartbeat" — false: the next heartbeat never
+/// came, because the heartbeat arm was parked behind the same send.
 const ACK_QUEUE: usize = 16;
+
+/// Send one in-loop ack, waiting at most `bound` (one cut interval at
+/// the call sites). Returns false — undelivered — on a closed receiver
+/// OR a queue that stayed full for the whole bound; the caller ends
+/// the stream as a client disconnect and the un-acked tail rides the
+/// reconnect replay. One of the exactly two callable ack forms (the
+/// in-file self-scan pins this).
+// r[impl store.log.driver-bounded]
+async fn send_ack_bounded(
+    tx: &mpsc::Sender<Result<AppendLogAck, Status>>,
+    msg: Result<AppendLogAck, Status>,
+    bound: std::time::Duration,
+) -> bool {
+    match tokio::time::timeout(bound, tx.send(msg)).await {
+        Ok(Ok(())) => true,
+        // Receiver gone or full past the bound: either way the builder
+        // is not consuming; never park the driver behind it.
+        Ok(Err(_)) | Err(_) => false,
+    }
+}
+
+/// Fire-and-forget ack form for post-exit cleanup and drain acks: a
+/// full queue or a gone receiver drops the message instead of waiting
+/// even once. The builder that didn't read its queue gets the verdict
+/// from the stream close itself; nothing here is load-bearing for
+/// durability. The other of the two callable ack forms.
+// r[impl store.log.driver-bounded]
+fn ack_try_send(
+    tx: &mpsc::Sender<Result<AppendLogAck, Status>>,
+    msg: Result<AppendLogAck, Status>,
+) {
+    let _ = tx.try_send(msg);
+}
 
 /// The `LogService` implementation. One per replica; cheap to clone
 /// into the tonic server (everything is `Arc`/`PgPool`).
@@ -982,32 +1022,35 @@ impl AppendDriver {
         match exit {
             LoopExit::ClientFinished => {
                 if drain_failed {
-                    let _ = ack_tx
-                        .send(Err(Status::unavailable(
+                    ack_try_send(
+                        &ack_tx,
+                        Err(Status::unavailable(
                             "AppendLog: the final chunk flush failed; \
                              un-acked lines were not stored — reconnect and replay",
-                        )))
-                        .await;
+                        )),
+                    );
                 }
             }
             LoopExit::Abort(status) => {
-                let _ = ack_tx.send(Err(status)).await;
+                ack_try_send(&ack_tx, Err(status));
             }
             LoopExit::LeaseLost => {
-                let _ = ack_tx
-                    .send(Err(Status::aborted(
+                ack_try_send(
+                    &ack_tx,
+                    Err(Status::aborted(
                         "AppendLog: the ingest lease for this execution was taken by \
                          another replica; reconnect and replay from the last ack",
-                    )))
-                    .await;
+                    )),
+                );
             }
             LoopExit::Displaced => {
-                let _ = ack_tx
-                    .send(Err(Status::aborted(
+                ack_try_send(
+                    &ack_tx,
+                    Err(Status::aborted(
                         "AppendLog: a newer ingest session for this execution displaced \
                          this stream; replay from the last ack on the new stream",
-                    )))
-                    .await;
+                    )),
+                );
             }
         }
         info!(%exec_id, %session_id, "AppendLog: ingest session closed");
@@ -1222,26 +1265,16 @@ impl AppendDriver {
     }
 
     /// One cut attempt + the ack + the chunk-count cap.
-    async fn do_cut(&mut self, ack_tx: &mpsc::Sender<Result<AppendLogAck, Status>>) -> CutStep {
-        if self.session.chunk_attempts() >= self.max_chunks_per_exec {
-            metrics::counter!(
-                "rio_store_log_ingest_streams_aborted_total",
-                "reason" => "chunk_cap"
-            )
-            .increment(1);
-            return CutStep::Exit(LoopExit::Abort(Status::resource_exhausted(format!(
-                "AppendLog: execution exceeded the {}-chunk cap",
-                self.max_chunks_per_exec
-            ))));
-        }
-        // The watchdog never awaits monitored work unbounded
-        // (merged_bug_119): a cut whose PUT/INSERT hangs (wedged blob
-        // backend, stuck PG connection) is abandoned at one cut
-        // interval — the driver loop's abort check, heartbeat, and
-        // inbound arms regain liveness, the abandonment is counted
-        // like a failure, and three in a row trip ConsecutiveCutFailures
-        // → UNAVAILABLE → builder failover. The staged run is folded
-        // back by the next cut's restore_in_flight.
+    /// One chunk cut, watchdog-bounded at one cut interval — the ONLY
+    /// callable form of `session.cut` on the driver path (the in-file
+    /// self-scan pins this; the watchdog never awaits monitored work
+    /// unbounded). `None` = abandoned by the watchdog (counted via
+    /// `note_cut_abandoned`; three in a row trip the failover abort).
+    /// The staged run is folded back by the next cut's
+    /// restore_in_flight. Used by BOTH the periodic cut path and the
+    /// final drain — the drain used to call the cut raw, so a wedged
+    /// blob backend could hang stream teardown forever.
+    async fn cut_bounded(&mut self) -> Option<Result<Option<u64>, CutError>> {
         match tokio::time::timeout(
             self.session_cut_interval(),
             self.session.cut(self.chunk_store.as_ref(), &self.pool),
@@ -1255,27 +1288,57 @@ impl AppendDriver {
                     "AppendLog: chunk cut abandoned by the watchdog (hung past one cut interval)"
                 );
                 self.session.note_cut_abandoned();
-                CutStep::Failed
+                None
             }
-            Ok(Ok(None)) => CutStep::Empty,
-            Ok(Ok(Some(durable_through_line))) => {
-                if ack_tx
-                    .send(Ok(AppendLogAck {
+            Ok(result) => Some(result),
+        }
+    }
+
+    async fn do_cut(&mut self, ack_tx: &mpsc::Sender<Result<AppendLogAck, Status>>) -> CutStep {
+        if self.session.chunk_attempts() >= self.max_chunks_per_exec {
+            metrics::counter!(
+                "rio_store_log_ingest_streams_aborted_total",
+                "reason" => "chunk_cap"
+            )
+            .increment(1);
+            return CutStep::Exit(LoopExit::Abort(Status::resource_exhausted(format!(
+                "AppendLog: execution exceeded the {}-chunk cap",
+                self.max_chunks_per_exec
+            ))));
+        }
+        // Watchdog semantics (merged_bug_119) live in cut_bounded: a
+        // hung PUT/INSERT is abandoned at one cut interval, the
+        // driver's abort check, heartbeat, and inbound arms regain
+        // liveness, and three abandonments in a row trip
+        // ConsecutiveCutFailures → UNAVAILABLE → builder failover.
+        match self.cut_bounded().await {
+            None => CutStep::Failed,
+            Some(Ok(None)) => CutStep::Empty,
+            Some(Ok(Some(durable_through_line))) => {
+                let delivered = send_ack_bounded(
+                    ack_tx,
+                    Ok(AppendLogAck {
                         durable_through_line,
-                    }))
-                    .await
-                    .is_err()
-                {
-                    // The builder dropped the response stream. The
-                    // chunk is durable; the builder just doesn't know.
-                    // Treat it as a client disconnect: stop ingesting,
-                    // drain what's left, let the builder's reconnect
-                    // replay the un-acked tail (idempotently).
+                    }),
+                    self.session_cut_interval(),
+                )
+                .await;
+                if !delivered {
+                    // The builder dropped the response stream — or
+                    // stopped reading acks while keeping the stream
+                    // open (the queue stayed full for a whole cut
+                    // interval). The chunk is durable; the builder
+                    // just doesn't know. Treat both as a client
+                    // disconnect: stop ingesting, drain what's left,
+                    // let the reconnect replay the un-acked tail
+                    // (idempotently). The raw `send().await` here used
+                    // to park the WHOLE driver — ingest, cutting, and
+                    // the heartbeat — forever on a full queue.
                     return CutStep::Exit(LoopExit::ClientFinished);
                 }
                 CutStep::Committed
             }
-            Ok(Err(e)) => {
+            Some(Err(e)) => {
                 warn!(
                     exec_id = %self.session.exec_id,
                     error = %e,
@@ -1300,21 +1363,24 @@ impl AppendDriver {
             if self.session.chunk_attempts() >= self.max_chunks_per_exec {
                 return Err(());
             }
-            match self
-                .session
-                .cut(self.chunk_store.as_ref(), &self.pool)
-                .await
-            {
-                Ok(None) => return Ok(()),
-                Ok(Some(durable_through_line)) => {
-                    // Best-effort: the builder may already be gone.
-                    let _ = ack_tx
-                        .send(Ok(AppendLogAck {
+            match self.cut_bounded().await {
+                // Watchdog-abandoned mid-drain: stop. The builder's
+                // retransmit buffer still holds the un-acked tail, and
+                // a wedged backend must not hang stream teardown (the
+                // raw cut here used to await unbounded).
+                None => return Err(()),
+                Some(Ok(None)) => return Ok(()),
+                Some(Ok(Some(durable_through_line))) => {
+                    // Best-effort: the builder may already be gone (or
+                    // not reading); the drain never waits on it.
+                    ack_try_send(
+                        ack_tx,
+                        Ok(AppendLogAck {
                             durable_through_line,
-                        }))
-                        .await;
+                        }),
+                    );
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     warn!(
                         exec_id = %self.session.exec_id,
                         error = %e,
@@ -2113,6 +2179,86 @@ mod tests {
             status.message().contains("no inbound traffic"),
             "got: {status:?}"
         );
+    }
+
+    /// The driver self-scan: every ack flows through the two named
+    /// forms and every cut through the one named form — a raw awaited
+    /// ack send or a raw cut call is unwriteable in this file's
+    /// production half without failing here (the scan stops at the
+    /// test-module boundary). PRE-FIX census (2026-06-04, the recorded
+    /// red): 6 raw ack sends + 2 raw cuts = the 8 park-capable sites
+    /// this scan was born red on.
+    // r[verify store.log.driver-bounded]
+    #[test]
+    fn driver_self_scan_no_raw_ack_sends_or_cuts() {
+        let full: String = include_str!("service.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // Production half only: tests below may drive the session
+        // directly.
+        let boundary = format!("#[cfg({})]modtests", "test");
+        let src = &full[..full.find(&boundary).expect("test module exists")];
+        // The scan's own string literals would self-match; build the
+        // needles at runtime.
+        let raw_send = format!("ack_tx.{}(", "send");
+        let raw_cut = format!("session.{}(", "cut");
+        assert_eq!(
+            src.matches(&raw_send).count(),
+            0,
+            "raw ack send — route through send_ack_bounded/ack_try_send"
+        );
+        assert_eq!(
+            src.matches(&raw_cut).count(),
+            1,
+            "raw session.cut outside cut_bounded — route through cut_bounded"
+        );
+        // And the named forms are actually in use.
+        assert!(src.matches("send_ack_bounded(").count() >= 2);
+        assert!(src.matches("ack_try_send(").count() >= 6);
+        assert!(src.matches("self.cut_bounded()").count() >= 2);
+    }
+
+    /// The ack-park red and its bounded green, side by side on a FULL
+    /// 1-slot queue (paused clock — the hour elapses instantly):
+    /// the raw send (the merged_bug_135 shape at every pre-fix site)
+    /// parks past an HOUR; send_ack_bounded returns undelivered at its
+    /// bound.
+    // r[verify store.log.driver-bounded]
+    #[tokio::test(start_paused = true)]
+    async fn ack_send_park_red_vs_bounded_green() {
+        let (tx, _rx) = mpsc::channel::<Result<AppendLogAck, Status>>(1);
+        tx.try_send(Ok(AppendLogAck {
+            durable_through_line: 0,
+        }))
+        .expect("fill the queue");
+        // RED (kept as the falsify twin of the bounded form): raw send
+        // on a full queue with a live-but-not-reading receiver never
+        // resolves.
+        let raw = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            tx.send(Ok(AppendLogAck {
+                durable_through_line: 1,
+            })),
+        )
+        .await;
+        assert!(
+            raw.is_err(),
+            "raw send resolved on a full queue — the recorded red would be stale"
+        );
+        // GREEN: the bounded form gives up at its bound and reports
+        // undelivered.
+        let t0 = tokio::time::Instant::now();
+        let delivered = send_ack_bounded(
+            &tx,
+            Ok(AppendLogAck {
+                durable_through_line: 1,
+            }),
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        assert!(!delivered);
+        assert_eq!(t0.elapsed(), std::time::Duration::from_secs(60));
     }
 
     /// The 4x relationship the idle bound's doc promises.
