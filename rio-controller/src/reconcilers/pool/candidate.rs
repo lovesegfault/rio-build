@@ -127,16 +127,22 @@ impl RenderInputs {
             return true;
         }
         self.node_affinity.iter().any(|term| {
-            term.match_expressions.iter().all(|r| {
-                let have = labels.get(&r.key);
-                match r.operator.as_str() {
-                    "In" => have.is_some_and(|v| r.values.contains(v)),
-                    "NotIn" => have.is_none_or(|v| !r.values.contains(v)),
-                    "Exists" => have.is_some(),
-                    "DoesNotExist" => have.is_none(),
-                    _ => true,
-                }
-            })
+            // Kubernetes contract (bug_156): a term with empty
+            // matchExpressions matches NO objects — terms are OR'd, so
+            // all-empty-terms admits nothing and only a NIL affinity
+            // (no terms at all, the early return above) admits all.
+            // Mixed lists OR over the non-empty terms.
+            !term.match_expressions.is_empty()
+                && term.match_expressions.iter().all(|r| {
+                    let have = labels.get(&r.key);
+                    match r.operator.as_str() {
+                        "In" => have.is_some_and(|v| r.values.contains(v)),
+                        "NotIn" => have.is_none_or(|v| !r.values.contains(v)),
+                        "Exists" => have.is_some(),
+                        "DoesNotExist" => have.is_none(),
+                        _ => true,
+                    }
+                })
         })
     }
 
@@ -533,29 +539,6 @@ mod proptests {
             )
     }
 
-    /// Mirror spec of `admits_ignoring_exclusion`: selector ⊆ labels ∧
-    /// (no terms ∨ some term's exprs all admit), with the fail-open
-    /// arm for operators the gate cannot evaluate.
-    fn mirror_pre(ri: &RenderInputs, labels: &BTreeMap<String, String>) -> bool {
-        let sel_ok = ri
-            .node_selector
-            .iter()
-            .all(|(k, v)| labels.get(k) == Some(v));
-        let aff_ok = ri.node_affinity.is_empty()
-            || ri.node_affinity.iter().any(|t| {
-                t.match_expressions
-                    .iter()
-                    .all(|r| match r.operator.as_str() {
-                        "In" => labels.get(&r.key).is_some_and(|v| r.values.contains(v)),
-                        "NotIn" => labels.get(&r.key).is_none_or(|v| !r.values.contains(v)),
-                        "Exists" => labels.contains_key(&r.key),
-                        "DoesNotExist" => !labels.contains_key(&r.key),
-                        _ => true,
-                    })
-            });
-        sel_ok && aff_ok
-    }
-
     proptest! {
         /// Law 1 (the single-universe conjunction): full admission is
         /// EXACTLY pre-universe membership minus the exclusion axis —
@@ -569,7 +552,6 @@ mod proptests {
                     ri.admits(&n.name, &n.labels),
                     ri.admits_ignoring_exclusion(&n.labels) && !ri.excluded(&n.name)
                 );
-                prop_assert_eq!(ri.admits_ignoring_exclusion(&n.labels), mirror_pre(&ri, &n.labels));
                 prop_assert_eq!(node_excluded(&intent, &n.name), ri.excluded(&n.name));
             }
         }
@@ -721,5 +703,218 @@ mod proptests {
             s.step_and_prune("pool-a", &gated, late).is_empty(),
             "an expired orphan streak must restart, not resume at 3"
         );
+    }
+
+    /// bug_156 red: a NodeSelectorTerm with empty matchExpressions
+    /// matches NO objects under the Kubernetes contract (terms are
+    /// ORed; an empty term is "matches nothing", only a NIL affinity
+    /// admits all). Today the empty `iter().all()` makes it admit ALL.
+    #[test]
+    fn empty_term_admits_nothing_per_the_kube_contract() {
+        let mut intent = rio_proto::types::SpawnIntent::default();
+        intent.node_affinity = vec![rio_proto::types::NodeSelectorTerm {
+            match_expressions: vec![],
+        }];
+        let ri = RenderInputs::from_intent(&intent);
+        let labels: std::collections::BTreeMap<String, String> =
+            [("zone".to_string(), "a".to_string())].into();
+        assert!(
+            !ri.admits_ignoring_exclusion(&labels),
+            "an all-empty-terms affinity admits nothing (kube semantics); \
+             only NIL affinity admits all"
+        );
+        // Mixed: one empty term + one matching term = OR over the
+        // non-empty term only -> admits.
+        intent
+            .node_affinity
+            .push(rio_proto::types::NodeSelectorTerm {
+                match_expressions: vec![rio_proto::types::NodeSelectorRequirement {
+                    key: "zone".into(),
+                    operator: "In".into(),
+                    values: vec!["a".into()],
+                }],
+            });
+        let ri = RenderInputs::from_intent(&intent);
+        assert!(ri.admits_ignoring_exclusion(&labels));
+        // NIL affinity (no terms at all) admits all - unchanged.
+        let nil = RenderInputs::from_intent(&rio_proto::types::SpawnIntent::default());
+        assert!(nil.admits_ignoring_exclusion(&labels));
+    }
+
+    /// bug_156: the Kubernetes nodeAffinity conformance fixture table —
+    /// expected verdicts TRANSCRIBED from the upstream contract
+    /// (`requiredDuringSchedulingIgnoredDuringExecution` /
+    /// `NodeSelectorTerm`: terms are OR'd; matchExpressions within a
+    /// term are AND'd; an empty/nil term matches no objects; a nil
+    /// affinity matches all; NotIn/DoesNotExist match when the key is
+    /// absent), NOT derived from the implementation (the retired
+    /// `mirror_pre` restated the impl — both wrong together on the
+    /// empty-term row). The one deliberate divergence is an explicit
+    /// EXPECTED-DIVERGENCE row.
+    #[test]
+    fn k8s_nodeaffinity_conformance() {
+        use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm, SpawnIntent};
+        fn term(reqs: &[(&str, &str, &[&str])]) -> NodeSelectorTerm {
+            NodeSelectorTerm {
+                match_expressions: reqs
+                    .iter()
+                    .map(|(k, op, vs)| NodeSelectorRequirement {
+                        key: (*k).into(),
+                        operator: (*op).into(),
+                        values: vs.iter().map(|v| (*v).into()).collect(),
+                    })
+                    .collect(),
+            }
+        }
+        let labels: std::collections::BTreeMap<String, String> = [
+            ("zone".to_string(), "a".to_string()),
+            ("disk".to_string(), "ssd".to_string()),
+        ]
+        .into();
+
+        // (name, terms, expected-admits, kube-divergence?)
+        struct Row {
+            name: &'static str,
+            terms: Vec<NodeSelectorTerm>,
+            admits: bool,
+            expected_divergence: Option<&'static str>,
+        }
+        let rows = vec![
+            Row {
+                name: "nil affinity admits all",
+                terms: vec![],
+                admits: true,
+                expected_divergence: None,
+            },
+            Row {
+                name: "single empty term matches nothing",
+                terms: vec![term(&[])],
+                admits: false,
+                expected_divergence: None,
+            },
+            Row {
+                name: "all-empty terms match nothing",
+                terms: vec![term(&[]), term(&[])],
+                admits: false,
+                expected_divergence: None,
+            },
+            Row {
+                name: "mixed: OR over the non-empty term (matching)",
+                terms: vec![term(&[]), term(&[("zone", "In", &["a"])])],
+                admits: true,
+                expected_divergence: None,
+            },
+            Row {
+                name: "mixed: OR over the non-empty term (non-matching)",
+                terms: vec![term(&[]), term(&[("zone", "In", &["b"])])],
+                admits: false,
+                expected_divergence: None,
+            },
+            Row {
+                name: "In: value present",
+                terms: vec![term(&[("zone", "In", &["a", "b"])])],
+                admits: true,
+                expected_divergence: None,
+            },
+            Row {
+                name: "In: value absent",
+                terms: vec![term(&[("zone", "In", &["b"])])],
+                admits: false,
+                expected_divergence: None,
+            },
+            Row {
+                name: "In: key missing",
+                terms: vec![term(&[("region", "In", &["a"])])],
+                admits: false,
+                expected_divergence: None,
+            },
+            Row {
+                name: "NotIn: value not in set",
+                terms: vec![term(&[("zone", "NotIn", &["b"])])],
+                admits: true,
+                expected_divergence: None,
+            },
+            Row {
+                name: "NotIn: value in set",
+                terms: vec![term(&[("zone", "NotIn", &["a"])])],
+                admits: false,
+                expected_divergence: None,
+            },
+            Row {
+                name: "NotIn: key missing matches",
+                terms: vec![term(&[("region", "NotIn", &["a"])])],
+                admits: true,
+                expected_divergence: None,
+            },
+            Row {
+                name: "Exists: key present",
+                terms: vec![term(&[("disk", "Exists", &[])])],
+                admits: true,
+                expected_divergence: None,
+            },
+            Row {
+                name: "Exists: key missing",
+                terms: vec![term(&[("gpu", "Exists", &[])])],
+                admits: false,
+                expected_divergence: None,
+            },
+            Row {
+                name: "DoesNotExist: key missing",
+                terms: vec![term(&[("gpu", "DoesNotExist", &[])])],
+                admits: true,
+                expected_divergence: None,
+            },
+            Row {
+                name: "DoesNotExist: key present",
+                terms: vec![term(&[("disk", "DoesNotExist", &[])])],
+                admits: false,
+                expected_divergence: None,
+            },
+            Row {
+                name: "AND within a term: both hold",
+                terms: vec![term(&[("zone", "In", &["a"]), ("disk", "In", &["ssd"])])],
+                admits: true,
+                expected_divergence: None,
+            },
+            Row {
+                name: "AND within a term: one fails",
+                terms: vec![term(&[("zone", "In", &["a"]), ("disk", "In", &["hdd"])])],
+                admits: false,
+                expected_divergence: None,
+            },
+            Row {
+                name: "OR across terms: second holds",
+                terms: vec![
+                    term(&[("zone", "In", &["b"])]),
+                    term(&[("disk", "In", &["ssd"])]),
+                ],
+                admits: true,
+                expected_divergence: None,
+            },
+            Row {
+                name: "unknown operator fails open",
+                terms: vec![term(&[("zone", "Gt", &["0"])])],
+                admits: true,
+                expected_divergence: Some(
+                    "kube evaluates Gt/Lt numerically (here: 'a' > '0' would error → not admitted); \
+                     the gate fails OPEN by design — it must never PROVE exhaustion through an \
+                     operator it cannot evaluate (admitting keeps the spawn, the safe direction)",
+                ),
+            },
+        ];
+        for row in rows {
+            let intent = SpawnIntent {
+                node_affinity: row.terms.clone(),
+                ..Default::default()
+            };
+            let ri = RenderInputs::from_intent(&intent);
+            assert_eq!(
+                ri.admits_ignoring_exclusion(&labels),
+                row.admits,
+                "conformance row failed: {} (expected divergence: {:?})",
+                row.name,
+                row.expected_divergence,
+            );
+        }
     }
 }
