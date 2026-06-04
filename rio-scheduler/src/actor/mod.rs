@@ -55,6 +55,7 @@ pub(crate) mod materialize;
 mod merge;
 pub(crate) mod pull;
 mod recovery;
+mod report_ctx;
 mod snapshot;
 
 pub(super) use breaker::CacheCheckBreaker;

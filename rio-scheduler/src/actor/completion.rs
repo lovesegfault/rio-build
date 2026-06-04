@@ -42,36 +42,15 @@ struct CaCutoffVerified {
     output_hash: [u8; 32],
 }
 
-/// Report-carried context for the worker-reported failure handlers
-/// (E1–E4): the fields of the triggering `CompletionReport` the failure
-/// paths consume, borrowed at the `handle_completion` routing match.
-///
-/// `final_line_count` is already in the stamp's `Option` form (the
-/// proto's `0` "not reported" sentinel and out-of-range values become
-/// `None` — same conversion as the success path), so a failure-terminal
-/// path can hand it straight to the `drv_executions` stamp. Reportless
-/// exit paths (disconnect, controller reports, backstop, recovery)
-/// never construct one — they keep stamping `NULL`.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct FailureReportCtx<'a> {
-    /// `CompletionReport.final_line_count`, `None` when not reported.
-    pub(super) final_line_count: Option<i64>,
-    /// Worker-provided error message (may be empty).
-    pub(super) error_msg: &'a str,
-    /// bug_408: `BuildResult.store_degraded` — the builder's FUSE
-    /// breaker attributed this infrastructure failure to a degraded
-    /// store. Routes the report to the uncharged `store_degraded`
-    /// class (`sched.retry.store-degraded-uncharged`). Only the
-    /// InfrastructureFailure dispatch arm sets it; every other path
-    /// leaves it `false`.
-    pub(super) store_degraded: bool,
-}
+pub(super) use super::report_ctx::FailureReportCtx;
 
-/// Total status→report-context classifier: the SOLE producer of
-/// [`FailureReportCtx`] on the completion intake path. Every failure
-/// arm of `handle_completion`'s routing match calls this instead of
-/// constructing the ctx inline, so the status→evidence mapping lives
-/// in exactly one table.
+/// Total status→report-context classifier: the SOLE non-test producer
+/// of [`FailureReportCtx`]. Every failure arm of `handle_completion`'s
+/// routing match calls this instead of constructing the ctx inline, so
+/// the status→evidence mapping lives in exactly one table — and only
+/// the `InfrastructureFailure` row can reach the degraded-carrying
+/// constructor (merged_bug_072 / bug_096: the permanent family used to
+/// forward the raw wire bit).
 ///
 /// `Cancelled` synthesizes its message (the worker sent a status the
 /// scheduler never initiated — the wire message is untrusted noise on
@@ -83,34 +62,17 @@ pub(super) fn failure_ctx_for<'a>(
 ) -> FailureReportCtx<'a> {
     use rio_proto::types::BuildResultStatus as S;
     match status {
-        S::InfrastructureFailure => FailureReportCtx {
-            final_line_count: report_line_count,
-            error_msg: &result.error_msg,
-            store_degraded: result.store_degraded,
-        },
-        S::PermanentFailure
-        | S::CachedFailure
-        | S::DependencyFailed
-        | S::LogLimitExceeded
-        | S::OutputRejected
-        | S::NotDeterministic
-        | S::InputRejected => FailureReportCtx {
-            final_line_count: report_line_count,
-            error_msg: &result.error_msg,
-            store_degraded: result.store_degraded,
-        },
-        S::Cancelled => FailureReportCtx {
-            final_line_count: report_line_count,
-            error_msg: "worker reported Cancelled without scheduler-initiated cancel",
-            store_degraded: false,
-        },
-        // Transient, TimedOut, Unspecified-as-transient, and the
-        // (unreachable here) success statuses: no store evidence.
-        _ => FailureReportCtx {
-            final_line_count: report_line_count,
-            error_msg: &result.error_msg,
-            store_degraded: false,
-        },
+        S::InfrastructureFailure => {
+            FailureReportCtx::infra(report_line_count, &result.error_msg, result.store_degraded)
+        }
+        S::Cancelled => FailureReportCtx::non_infra(
+            report_line_count,
+            "worker reported Cancelled without scheduler-initiated cancel",
+        ),
+        // The permanent family, transient, timeout, unspecified, and
+        // the (unreachable here) success statuses: structurally no
+        // store evidence — `non_infra` has no degraded parameter.
+        _ => FailureReportCtx::non_infra(report_line_count, &result.error_msg),
     }
 }
 
@@ -2994,7 +2956,7 @@ impl DagActor {
         // memory — so the floor bump is skipped even if the message
         // happens to contain the OOM marker.
         let floor_outcome =
-            if !report.store_degraded && error_msg.contains(rio_proto::CGROUP_OOM_MSG) {
+            if !report.store_degraded() && error_msg.contains(rio_proto::CGROUP_OOM_MSG) {
                 self.bump_resource_floor(
                     drv_hash,
                     rio_proto::types::TerminationReason::OomKilled,
@@ -3036,7 +2998,7 @@ impl DagActor {
         // backoff (no count budget, no exclusion, never poison), so
         // the verdict below is a paced Requeue for as long as the
         // outage lasts.
-        let event = if report.store_degraded {
+        let event = if report.store_degraded() {
             crate::retry_policy::ObservedFailure::WorkerStoreDegraded
         } else {
             crate::retry_policy::ObservedFailure::WorkerInfra { error_msg }
@@ -3210,7 +3172,7 @@ impl DagActor {
                 // above deliberately preserves the actor-managed value,
                 // same convention as the transient site). Epoch→Instant
                 // mirrors `rebuild_retry_view_from_ledger`.
-                if report.store_degraded
+                if report.store_degraded()
                     && let Some(t) = decision.counters.backoff_until
                 {
                     let now_epoch =

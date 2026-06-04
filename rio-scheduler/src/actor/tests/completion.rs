@@ -4248,3 +4248,81 @@ async fn test_terminal_build_outcome_not_rewritten_by_late_shared_node_failure()
     );
     Ok(())
 }
+
+/// bughunt-2 slot 3 (merged_bug_072 / bug_096): the status→ctx
+/// classifier's evidence contract — `store_degraded` reaches the
+/// failure handlers ONLY from the InfrastructureFailure arm. Every
+/// other status (including the whole permanent family, which used to
+/// forward the raw wire bit) classifies as no-store-evidence.
+#[test]
+fn failure_ctx_store_evidence_only_on_infra_arm() {
+    use rio_proto::types::BuildResultStatus as S;
+    let flagged = crate::domain::BuildResult {
+        status: S::PermanentFailure,
+        error_msg: "boom".into(),
+        start_time: None,
+        stop_time: None,
+        built_outputs: Vec::new(),
+        store_degraded: true,
+    };
+    for status in [
+        S::TransientFailure,
+        S::InfrastructureFailure,
+        S::PermanentFailure,
+        S::CachedFailure,
+        S::DependencyFailed,
+        S::LogLimitExceeded,
+        S::OutputRejected,
+        S::NotDeterministic,
+        S::InputRejected,
+        S::TimedOut,
+        S::Cancelled,
+        S::Unspecified,
+    ] {
+        let ctx = crate::actor::completion::failure_ctx_for(status, &flagged, Some(7));
+        assert_eq!(
+            ctx.store_degraded(),
+            status == S::InfrastructureFailure,
+            "status {status:?} must carry store evidence iff infra"
+        );
+    }
+}
+
+/// bughunt-2 slot 3 policy pin: `FailureReportCtx` literal construction
+/// is permitted ONLY inside `actor/report_ctx.rs` (the two
+/// constructors), and `failure_ctx_for` is the sole non-test producer
+/// on the intake path — a future arm constructing the ctx inline (or
+/// calling `infra(…, result.store_degraded)` from a permanent arm)
+/// shows up here as a count change, CI-red.
+#[test]
+fn failure_report_ctx_literal_construction_is_constructor_gated() {
+    let completion_src = include_str!("../completion.rs");
+    let report_ctx_src = include_str!("../report_ctx.rs");
+    let literal = "FailureReportCtx {";
+    assert_eq!(
+        completion_src.matches(literal).count(),
+        0,
+        "completion.rs must not construct FailureReportCtx literally — \
+         route through failure_ctx_for"
+    );
+    let body_literals =
+        report_ctx_src.matches("Self {").count() - report_ctx_src.matches(") -> Self {").count();
+    assert_eq!(
+        body_literals, 2,
+        "report_ctx.rs carries exactly the two constructor bodies"
+    );
+    assert_eq!(
+        report_ctx_src.matches(literal).count(),
+        0,
+        "even report_ctx.rs constructs via Self, keeping the literal \
+         grep unambiguous"
+    );
+    // The degraded-carrying constructor is invoked exactly once in
+    // completion.rs: the InfrastructureFailure classifier row.
+    assert_eq!(
+        completion_src.matches("FailureReportCtx::infra(").count(),
+        1,
+        "exactly one infra-evidence production site (the classifier's \
+         InfrastructureFailure row)"
+    );
+}
