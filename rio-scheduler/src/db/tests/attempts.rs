@@ -7,8 +7,8 @@ use rio_test_support::TestDb;
 use uuid::Uuid;
 
 use super::insert_test_derivation;
-use crate::db::SchedulerDb;
 use crate::db::attempts::AttemptRow;
+use crate::db::{AssignmentCloseStatus, SchedulerDb, ServingGeneration};
 use crate::state::{
     AttemptEventKind, AttemptKind, DerivationStatus, DrvHash, ExecutorId, OutcomeClass,
     ReportingParty,
@@ -1387,6 +1387,93 @@ async fn test_gc_exec_rows_waits_for_log_artifacts() -> anyhow::Result<()> {
     assert!(
         !survivors.contains(&exec_h),
         "artifact-free row is collected"
+    );
+    Ok(())
+}
+
+// r[verify sched.db.exec-stamp-on-close]
+/// bug_047: closing an assignment MUST stamp its execution row's
+/// terminal status in the same statement — otherwise the lifecycle row
+/// keeps `status = NULL` forever ("still running" to the completeness
+/// predicate) and `gc_exec_rows`' terminality conjunct never matches:
+/// the row is immortal. Exercises the family through both production
+/// surfaces (the fenced exec_id-scoped closer; the derivation-terminal
+/// close), then proves eventual sweepability end-to-end.
+#[tokio::test]
+async fn test_closing_assignment_stamps_exec_row() -> anyhow::Result<()> {
+    let (_test_db, db, drv_id) = setup("close-stamp-hash").await?;
+
+    // (1) FencedTx::close_assignment via the pool wrapper.
+    let exec_a = Uuid::now_v7();
+    insert_aged_execution(&db.pool, exec_a, None, 60.0).await?;
+    db.insert_assignment(drv_id, &ExecutorId::from("builder-0"), 1, exec_a)
+        .await?;
+    let out = db
+        .close_assignment_fenced(
+            exec_a,
+            AssignmentCloseStatus::Failed,
+            ServingGeneration::stamp_from_claim(1),
+        )
+        .await?;
+    assert!(
+        matches!(out, crate::db::FencedOutcome::Applied(1)),
+        "exactly the one active assignment closes: {out:?}"
+    );
+    let st_a: Option<String> =
+        sqlx::query_scalar("SELECT status FROM drv_executions WHERE exec_id = $1")
+            .bind(exec_a)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        st_a.as_deref(),
+        Some("failed"),
+        "the exec_id-scoped closer stamps the lifecycle row"
+    );
+
+    // (2) The derivation-terminal close (update_derivation_status family).
+    let drv2 = insert_test_derivation(&db, "close-stamp-hash-2").await?;
+    let exec_b = Uuid::now_v7();
+    insert_aged_execution(&db.pool, exec_b, None, 1.0).await?;
+    db.insert_assignment(drv2, &ExecutorId::from("builder-1"), 1, exec_b)
+        .await?;
+    let out = db
+        .update_derivation_status(
+            &DrvHash::new("close-stamp-hash-2"),
+            DerivationStatus::Completed,
+            None,
+            ServingGeneration::stamp_from_claim(1),
+        )
+        .await?;
+    assert!(
+        matches!(out, crate::db::FencedOutcome::Applied(_)),
+        "the fenced status persist applies: {out:?}"
+    );
+    let st_b: Option<String> =
+        sqlx::query_scalar("SELECT status FROM drv_executions WHERE exec_id = $1")
+            .bind(exec_b)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        st_b.as_deref(),
+        Some("succeeded"),
+        "the derivation-terminal close stamps through the same family"
+    );
+
+    // (3) Immortality closed: the aged, closed, unreferenced,
+    // artifact-free row from (1) is now collectable; the fresh row
+    // from (2) survives on the age conjunct.
+    let deleted = db.gc_exec_rows(30.0 * 86_400.0, 1000).await?;
+    assert_eq!(
+        deleted, 1,
+        "a closed execution row becomes sweepable (no immortal rows)"
+    );
+    let survivors: Vec<Uuid> = sqlx::query_scalar("SELECT exec_id FROM drv_executions")
+        .fetch_all(&db.pool)
+        .await?;
+    assert!(!survivors.contains(&exec_a), "aged closed row collected");
+    assert!(
+        survivors.contains(&exec_b),
+        "fresh row survives age conjunct"
     );
     Ok(())
 }

@@ -457,20 +457,21 @@ impl SchedulerDb {
         .execute(tx.conn())
         .await?
         .rows_affected();
-        sqlx::query(
-            "UPDATE assignments a \
-                SET status = $2, completed_at = now() \
-               FROM drv_executions e \
-              WHERE a.exec_id = e.exec_id \
-                AND e.attempt_kind = 'materialization' \
-                AND a.derivation_id = \
-                    (SELECT derivation_id FROM materialization_jobs WHERE job_id = $1) \
-                AND a.status IN ('pending', 'acknowledged')",
-        )
-        .bind(job_id)
-        .bind(super::AssignmentCloseStatus::Cancelled.as_str())
-        .execute(tx.conn())
-        .await?;
+        static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            super::close_assignments_sql(
+                "derivation_id = \
+                     (SELECT derivation_id FROM materialization_jobs WHERE job_id = $1) \
+                 AND exec_id IN (SELECT e.exec_id FROM drv_executions e \
+                                 WHERE e.attempt_kind = 'materialization')",
+                2,
+            )
+        });
+        sqlx::query_scalar::<_, i64>(SQL.as_str())
+            .bind(job_id)
+            .bind(super::AssignmentCloseStatus::Cancelled.as_str())
+            .bind(super::AssignmentCloseStatus::Cancelled.exec_status())
+            .fetch_one(tx.conn())
+            .await?;
         tx.commit().await?;
         Ok(if cancelled > 0 {
             FencedOutcome::Applied(cancelled)

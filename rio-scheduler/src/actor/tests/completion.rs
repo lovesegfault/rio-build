@@ -3320,7 +3320,10 @@ async fn terminal_stamps_drv_executions() -> TestResult {
         .bind(&key)
         .fetch_optional(&db.pool)
         .await?;
-        if matches!(&row, Some((Some(_), _, _))) {
+        // Both columns: the assignment close stamps `status`
+        // synchronously; the line count arrives via the equal-verdict
+        // epilogue commute (sched.db.exec-stamp-on-close).
+        if matches!(&row, Some((Some(_), Some(_), _))) {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -3614,7 +3617,12 @@ async fn failure_terminal_stamps_report_final_line_count() -> TestResult {
         .bind(&key)
         .fetch_optional(&db.pool)
         .await?;
-        if matches!(&row, Some((Some(_), _))) {
+        // Wait for BOTH columns: the assignment-close stamps `status`
+        // synchronously with the poison persist, while the line count
+        // arrives via the fire-and-forget epilogue (which commutes on
+        // the equal verdict — sched.db.exec-stamp-on-close). Breaking
+        // on status alone reads the gap between the two.
+        if matches!(&row, Some((Some(_), Some(_)))) {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;

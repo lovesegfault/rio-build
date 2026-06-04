@@ -515,10 +515,14 @@ impl DagActor {
     /// grows a fourth status string, the match below fails loudly instead
     /// of silently writing a vocabulary the predicate doesn't recognize.
     ///
-    /// `AND status IS NULL` keeps the stamp monotone: a second terminal
-    /// event for the same execution (a completion racing a cancellation)
-    /// cannot overwrite the first verdict — first stamp to LAND wins,
-    /// the loser matches zero rows.
+    /// The qual commutes with the assignment-close stamp
+    /// (`close_assignments_sql` — sched.db.exec-stamp-on-close):
+    /// `status IS NULL` admits the first verdict; `status = $2` admits
+    /// a SAME-verdict epilogue arriving after the closer already
+    /// stamped, so the closer racing ahead cannot cost the row its
+    /// `final_line_count` (filled via COALESCE — first verdict wins on
+    /// every column, late equal-status writes only fill gaps). A
+    /// DIFFERENT verdict still matches zero rows.
     ///
     /// Returns the spawned write's join handle (`None` on the
     /// vocabulary-error arm). [`Self::terminal_log_epilogue`] forwards
@@ -550,10 +554,13 @@ impl DagActor {
         };
         let pool = self.db.pool().clone();
         let handle = rio_common::task::spawn_monitored("drv-execution-terminal", async move {
+            // r[impl sched.db.exec-stamp-on-close]
             if let Err(e) = sqlx::query(
                 "UPDATE drv_executions \
-                 SET status = $2, finished_at = now(), final_line_count = $3 \
-                 WHERE exec_id = $1 AND status IS NULL",
+                 SET status = $2, \
+                     finished_at = COALESCE(finished_at, now()), \
+                     final_line_count = COALESCE(final_line_count, $3) \
+                 WHERE exec_id = $1 AND (status IS NULL OR status = $2)",
             )
             .bind(exec_id)
             .bind(exec_status)

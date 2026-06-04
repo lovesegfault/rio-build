@@ -1,9 +1,11 @@
 //! Per-derivation state + poison tracking — `derivations` table.
 
+use std::sync::LazyLock;
+
 use sqlx::PgConnection;
 
 use super::{
-    AssignmentStatus, FencedBegin, FencedOutcome, PoisonedDerivationRow, SchedulerDb,
+    AssignmentCloseStatus, FencedBegin, FencedOutcome, PoisonedDerivationRow, SchedulerDb,
     ServingGeneration, terminal_status_sql,
 };
 use crate::state::{DerivationStatus, DrvHash, ExecutorId};
@@ -24,19 +26,32 @@ use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 /// FOD-from-store) left the row at `'pending'`, the pruner's
 /// `NOT EXISTS assignments` never matched, and `derivations` leaked
 /// (12,609 stuck rows on terminal derivations observed in production).
-pub(super) fn terminal_assignment_status(drv_status: DerivationStatus) -> Option<AssignmentStatus> {
+pub(super) fn terminal_assignment_status(
+    drv_status: DerivationStatus,
+) -> Option<AssignmentCloseStatus> {
     use DerivationStatus::*;
     // Exhaustive — no `_` arm: a new variant is a compile error here,
     // so the I-209 leak this function guards against can't be silently
     // re-introduced. Belt-and-suspenders runtime check is in
     // `tests::transactions::test_terminal_statuses_match_is_terminal`.
     match drv_status {
-        Completed => Some(AssignmentStatus::Completed),
-        Poisoned | DependencyFailed => Some(AssignmentStatus::Failed),
-        Cancelled | Skipped => Some(AssignmentStatus::Cancelled),
+        Completed => Some(AssignmentCloseStatus::Completed),
+        Poisoned | DependencyFailed => Some(AssignmentCloseStatus::Failed),
+        Cancelled | Skipped => Some(AssignmentCloseStatus::Cancelled),
         Created | Queued | Ready | Assigned | Running | Failed => None,
     }
 }
+
+/// The close+stamp statement for the single-derivation closers (the
+/// terminal-status persist at `update_derivation_status_in_tx` and the
+/// poison close at `persist_poisoned_in_tx` share the selector; binds:
+/// $1 drv_hash, $2 assignment status, $3 execution status).
+static CLOSE_BY_DRV_HASH_SQL: LazyLock<String> = LazyLock::new(|| {
+    super::close_assignments_sql(
+        "derivation_id = (SELECT derivation_id FROM derivations WHERE drv_hash = $1)",
+        2,
+    )
+});
 
 impl SchedulerDb {
     /// Transaction-joining body of [`Self::update_derivation_status`]:
@@ -66,17 +81,13 @@ impl SchedulerDb {
         .execute(&mut *tx)
         .await?;
 
-        if let Some(assign_status) = terminal_assignment_status(status) {
-            sqlx::query!(
-                "UPDATE assignments
-                 SET status = $2, completed_at = now()
-                 WHERE derivation_id = (SELECT derivation_id FROM derivations WHERE drv_hash = $1)
-                   AND status IN ('pending', 'acknowledged')",
-                drv_hash.as_str(),
-                assign_status.as_str(),
-            )
-            .execute(&mut *tx)
-            .await?;
+        if let Some(close) = terminal_assignment_status(status) {
+            sqlx::query_scalar::<_, i64>(CLOSE_BY_DRV_HASH_SQL.as_str())
+                .bind(drv_hash.as_str())
+                .bind(close.as_str())
+                .bind(close.exec_status())
+                .fetch_one(&mut *tx)
+                .await?;
         }
         Ok(())
     }
@@ -137,18 +148,20 @@ impl SchedulerDb {
         .execute(&mut *tx)
         .await?;
 
-        if let Some(assign_status) = terminal_assignment_status(status) {
-            sqlx::query!(
-                "UPDATE assignments
-                 SET status = $2, completed_at = now()
-                 WHERE derivation_id IN
-                       (SELECT derivation_id FROM derivations WHERE drv_hash = ANY($1::text[]))
-                   AND status IN ('pending', 'acknowledged')",
-                drv_hashes as &[&str],
-                assign_status.as_str(),
-            )
-            .execute(&mut *tx)
-            .await?;
+        if let Some(close) = terminal_assignment_status(status) {
+            static SQL: LazyLock<String> = LazyLock::new(|| {
+                super::close_assignments_sql(
+                    "derivation_id IN \
+                     (SELECT derivation_id FROM derivations WHERE drv_hash = ANY($1::text[]))",
+                    2,
+                )
+            });
+            sqlx::query_scalar::<_, i64>(SQL.as_str())
+                .bind(drv_hashes)
+                .bind(close.as_str())
+                .bind(close.exec_status())
+                .fetch_one(&mut *tx)
+                .await?;
         }
         Ok(result.rows_affected())
     }
@@ -195,19 +208,17 @@ impl SchedulerDb {
         .bind(status.as_str())
         .execute(tx.conn())
         .await?;
-        if let Some(assign_status) = terminal_assignment_status(status)
+        if let Some(close) = terminal_assignment_status(status)
             && !latched_exec_ids.is_empty()
         {
-            sqlx::query(
-                "UPDATE assignments \
-                 SET status = $2, completed_at = now() \
-                 WHERE exec_id = ANY($1::uuid[]) \
-                   AND status IN ('pending', 'acknowledged')",
-            )
-            .bind(latched_exec_ids)
-            .bind(assign_status.as_str())
-            .execute(tx.conn())
-            .await?;
+            static SQL: LazyLock<String> =
+                LazyLock::new(|| super::close_assignments_sql("exec_id = ANY($1::uuid[])", 2));
+            sqlx::query_scalar::<_, i64>(SQL.as_str())
+                .bind(latched_exec_ids)
+                .bind(close.as_str())
+                .bind(close.exec_status())
+                .fetch_one(tx.conn())
+                .await?;
         }
         let updated = result.rows_affected();
         tx.commit().await?;
@@ -340,15 +351,12 @@ impl SchedulerDb {
         )
         .execute(&mut *tx)
         .await?;
-        sqlx::query!(
-            "UPDATE assignments
-             SET status = 'failed', completed_at = now()
-             WHERE derivation_id = (SELECT derivation_id FROM derivations WHERE drv_hash = $1)
-               AND status IN ('pending', 'acknowledged')",
-            drv_hash.as_str(),
-        )
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query_scalar::<_, i64>(CLOSE_BY_DRV_HASH_SQL.as_str())
+            .bind(drv_hash.as_str())
+            .bind(AssignmentCloseStatus::Failed.as_str())
+            .bind(AssignmentCloseStatus::Failed.exec_status())
+            .fetch_one(&mut *tx)
+            .await?;
         Ok(())
     }
 
@@ -413,19 +421,26 @@ impl SchedulerDb {
         };
         // Compile-time splice of the terminal-status tuple — see
         // terminal_status_sql! for why it isn't a bind param.
-        let result = sqlx::query(terminal_status_sql!(
-            "UPDATE assignments \
-             SET status = 'failed', completed_at = now() \
-             WHERE status IN ('pending', 'acknowledged') \
-               AND derivation_id IN \
-                 (SELECT derivation_id FROM derivations \
-                  WHERE status IN ",
-            ")"
-        ))
-        .execute(tx.conn())
-        .await?;
+        static SQL: LazyLock<String> = LazyLock::new(|| {
+            super::close_assignments_sql(
+                terminal_status_sql!(
+                    "derivation_id IN \
+                     (SELECT derivation_id FROM derivations \
+                      WHERE status IN ",
+                    ")"
+                ),
+                1,
+            )
+        });
+        let closed: i64 = sqlx::query_scalar(SQL.as_str())
+            .bind(AssignmentCloseStatus::Failed.as_str())
+            .bind(AssignmentCloseStatus::Failed.exec_status())
+            .fetch_one(tx.conn())
+            .await?;
         tx.commit().await?;
-        Ok(FencedOutcome::Applied(result.rows_affected()))
+        Ok(FencedOutcome::Applied(
+            u64::try_from(closed).expect("count(*) is non-negative"),
+        ))
     }
 
     /// Transaction-joining body of [`Self::clear_poison`] — so a reset

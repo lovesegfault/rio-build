@@ -166,6 +166,54 @@ fn every_decision_table_writer_is_fenced_or_allowlisted() {
     );
 }
 
+// r[verify sched.db.exec-stamp-on-close]
+/// bug_047's structural net: every production `UPDATE assignments`
+/// statement renders through `close_assignments_sql` (db/mod.rs),
+/// whose CTE pair stamps the closed rows' `drv_executions` status in
+/// the same statement. An open-coded assignment UPDATE can close a row
+/// WITHOUT the stamp — the immortal-exec-row class (`status` stays
+/// NULL, the terminality conjunct never matches, `gc_exec_rows` never
+/// collects). The cfg(test) fixtures in `assignments.rs` are exempt:
+/// seeding historical row shapes is their documented purpose.
+#[test]
+fn closer_statements_render_through_close_assignments_sql() {
+    const SANCTIONED: &[(&str, &str)] = &[
+        ("mod.rs", "close_assignments_sql"),
+        ("assignments.rs", "update_assignment_status"),
+    ];
+    let mut violations = Vec::new();
+    for (file, src) in SOURCES {
+        let lines: Vec<&str> = src.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
+            // Comments may NAME the statement; only code may render it.
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if !line.to_uppercase().contains("UPDATE ASSIGNMENTS") {
+                continue;
+            }
+            let fn_name = enclosing_fn(&lines, idx)
+                .map(|(n, _)| n)
+                .unwrap_or_default();
+            if SANCTIONED.iter().any(|(f, n)| f == file && *n == fn_name) {
+                continue;
+            }
+            violations.push(format!(
+                "{file}:{}: `UPDATE assignments` in fn `{fn_name}` — production \
+                 closers must render via close_assignments_sql (the close+stamp \
+                 CTE family); an open-coded close skips the drv_executions stamp \
+                 (immortal exec rows, bug_047)",
+                idx + 1
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "open-coded assignment closers:\n{}",
+        violations.join("\n")
+    );
+}
+
 /// The canonical claims-floor SQL exists in exactly the two sanctioned
 /// homes: `db/mod.rs` (the capability) and `db/recovery.rs`
 /// (`max_known_generation`, the pool-seeding read — a READ, not a

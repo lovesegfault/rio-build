@@ -3194,6 +3194,31 @@ stale registry row are both merge-time failures naming the table — the
 structural close of the class where migration 078 shipped two tables with
 no deletion lifecycle at all (merged_bug_163).
 
+#r("sched.db.exec-stamp-on-close")[
+  Closing an `assignments` row MUST stamp the closed row's
+  `drv_executions` lifecycle status in the same SQL statement: every
+  production assignment close renders through `close_assignments_sql`,
+  whose CTE pair updates the assignment rows and stamps each closed
+  row's execution status (guarded `status IS NULL` --- first verdict
+  wins) atomically, with the assignment-close → execution-status
+  mapping at the single site `AssignmentCloseStatus::exec_status`. The
+  terminal-log epilogue MUST commute with the stamp on equal status
+  (late equal-verdict writes fill `finished_at`/`final_line_count`
+  gaps via COALESCE) and MUST match zero rows on a different verdict.
+  An execution row whose assignment closed is therefore eventually
+  sweepable; closing an assignment without stamping its execution row
+  is unwritable through the production surface.
+]
+
+Before this family existed, every closer updated `assignments` alone: the
+execution row kept `status = NULL` ("still running" to the store's
+completeness predicate) forever, `gc_exec_rows`' terminality conjunct never
+matched, and the lifecycle row was immortal (bug_047) --- the retention
+story's second deleter had nothing it was allowed to delete. The CTE shape
+makes the stamp unforgettable rather than remembered-per-callsite;
+`db/tests/fence_coverage.rs` pins the renderer as the only production
+`UPDATE assignments` site.
+
 #r("sched.db.attempts-gc")[
   `drv_attempts` rows MUST be deleted only by the leader's periodic
   Tick-driven sweep, and the suffix every ledger loader returns MUST be

@@ -551,6 +551,63 @@ impl AssignmentCloseStatus {
             Self::Cancelled => "cancelled",
         }
     }
+
+    // r[impl sched.db.exec-stamp-on-close]
+    /// THE assignment-close → `drv_executions.status` mapping — the
+    /// single site where the two deliberately distinct vocabularies
+    /// meet (`completed` vs `succeeded`; see
+    /// `rio_migrations::schema::EXEC_STATUS_SUCCEEDED`). Every closer
+    /// stamps through [`close_assignments_sql`], which binds this.
+    fn exec_status(self) -> &'static str {
+        match self {
+            Self::Completed => rio_migrations::schema::EXEC_STATUS_SUCCEEDED,
+            Self::Failed => rio_migrations::schema::EXEC_STATUS_FAILED,
+            Self::Cancelled => rio_migrations::schema::EXEC_STATUS_CANCELLED,
+        }
+    }
+}
+
+// r[impl sched.db.exec-stamp-on-close]
+/// Render THE production assignment-close statement: one CTE pair that
+/// closes the selected active (`pending`/`acknowledged`) assignments
+/// AND stamps each closed row's `drv_executions` lifecycle status — in
+/// the same statement, same snapshot. Closing an assignment without
+/// stamping its execution row is unwritable through this family
+/// (bug_047: an unstamped row keeps `status = NULL` forever, reads as
+/// "still running" to the store's completeness predicate, never
+/// satisfies `gc_exec_rows`' terminality conjunct, and is immortal).
+///
+/// `selector` filters `assignments` rows (unqualified columns resolve
+/// to `assignments`); `first_free_bind` is the ordinal of the first
+/// unused `$n` placeholder — the renderer appends TWO binds: `$n` =
+/// the assignment status string, `$n+1` = the execution status string
+/// ([`AssignmentCloseStatus::exec_status`], the single mapping site).
+/// The stamp's `status IS NULL` guard keeps first-verdict-wins: a row
+/// already stamped by the terminal-log epilogue is not overwritten
+/// (and the epilogue commutes on equal status — see
+/// `terminal_log_epilogue`). The statement returns the CLOSED row
+/// count (`SELECT count(*) FROM closed`) — fetch it with
+/// `query_scalar::<_, i64>`; `rows_affected()` of a CTE statement is
+/// NOT the close count.
+///
+/// `db/tests/fence_coverage.rs` pins this as the only production
+/// `UPDATE assignments` site; the fence discipline is unchanged (every
+/// caller is itself a `FencedTx` owner or `*_in_tx` body).
+pub(crate) fn close_assignments_sql(selector: &str, first_free_bind: u32) -> String {
+    let sb = first_free_bind;
+    let eb = first_free_bind + 1;
+    format!(
+        "WITH closed AS ( \
+             UPDATE assignments SET status = ${sb}, completed_at = now() \
+             WHERE ({selector}) AND status IN ('pending', 'acknowledged') \
+             RETURNING exec_id), \
+         stamped AS ( \
+             UPDATE drv_executions e \
+             SET status = ${eb}, finished_at = COALESCE(e.finished_at, now()) \
+             WHERE e.exec_id IN (SELECT exec_id FROM closed) \
+               AND e.status IS NULL) \
+         SELECT count(*) FROM closed"
+    )
 }
 
 impl FencedTx {
@@ -593,15 +650,15 @@ impl FencedTx {
         exec_id: Uuid,
         status: AssignmentCloseStatus,
     ) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query(
-            "UPDATE assignments SET status = $2, completed_at = now() \
-             WHERE exec_id = $1 AND status IN ('pending', 'acknowledged')",
-        )
-        .bind(exec_id)
-        .bind(status.as_str())
-        .execute(&mut *self.tx)
-        .await?;
-        Ok(result.rows_affected())
+        static SQL: std::sync::LazyLock<String> =
+            std::sync::LazyLock::new(|| close_assignments_sql("exec_id = $1", 2));
+        let n: i64 = sqlx::query_scalar(SQL.as_str())
+            .bind(exec_id)
+            .bind(status.as_str())
+            .bind(status.exec_status())
+            .fetch_one(&mut *self.tx)
+            .await?;
+        Ok(u64::try_from(n).expect("count(*) is non-negative"))
     }
 }
 
