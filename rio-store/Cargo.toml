@@ -29,6 +29,7 @@ server = [
   "dep:rio-evidence-kernel",
   "dep:rio-proto",
   "dep:rio-log-kernel",
+  "dep:rio-authz-kernel",
   "dep:tokio",
   "dep:async-trait",
   "dep:tonic",
@@ -96,6 +97,9 @@ rio-evidence-kernel = { workspace = true, optional = true }
 # The pure log decision kernels (logs/kernel re-export). `logs` is
 # server-gated, and the lean `schema` feature stays kernel-free.
 rio-log-kernel = { workspace = true, optional = true }
+# The pure transport-authz decision kernel (authz re-export): the
+# credential-class vocabulary, decide(), and boot key-coherence.
+rio-authz-kernel = { workspace = true, optional = true }
 # Optional: only when test-utils feature is on. Also a dev-dep below so
 # rio-store's own `cargo test` (which doesn't enable test-utils) still
 # sees it for the cfg(test) arm of test_helpers.rs.

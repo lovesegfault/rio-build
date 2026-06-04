@@ -12526,6 +12526,21 @@
         "Rio Contributors"
       ]
     },
+    "rio-authz-kernel": {
+      "crateName": "rio-authz-kernel",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "../../rio-authz-kernel"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
     "rio-common": {
       "crateName": "rio-common",
       "version": "0.1.0",
@@ -12957,6 +12972,10 @@
         {
           "name": "rio-auth",
           "packageId": "rio-auth"
+        },
+        {
+          "name": "rio-authz-kernel",
+          "packageId": "rio-authz-kernel"
         },
         {
           "name": "rio-common",

@@ -20875,6 +20875,10 @@
           "packageId": "rio-auth"
         },
         {
+          "name": "rio-authz-kernel",
+          "packageId": "rio-authz-kernel"
+        },
+        {
           "name": "rio-common",
           "packageId": "rio-common"
         },

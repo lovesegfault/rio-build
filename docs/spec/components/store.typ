@@ -1539,13 +1539,16 @@ filter so every consumer inherits it; the `log-no-raw-latest-exec` policy
 check bans new raw `ORDER BY exec_id DESC` reads of `drv_executions` outside
 migrations.
 
-#r("store.log.method-credential")[
+#r("store.log.method-credential+2")[
   Every gRPC method bound on the store's service port MUST carry an explicit
-  credential class (assignment-token, tenant-JWT, service-or-tenant, or
-  open) in one reviewable table, enforced by a transport-layer gate that
-  fails closed on undeclared methods; `TailLog` MUST require a verified
-  tenant token whose tenant owns the requested derivation whenever a JWT
-  pubkey is configured, with no service-token bypass.
+  credential class — keyed (assignment-token, tenant-JWT, or service),
+  public with a recorded rationale, or handler-enforced naming the handler
+  check whose typed witness the data path requires — in one reviewable
+  table, enforced by a transport-layer gate that fails closed on undeclared
+  methods. There is no catch-all open class. `TailLog` and `TenantQuota`
+  MUST require a verified tenant token whenever a JWT pubkey is configured,
+  with no service-token bypass; `TailLog` ownership is checked in the
+  handler against the verified claims.
 ]
 
 Before the table existed, a method's credential demand was implicit in its

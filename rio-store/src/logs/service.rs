@@ -1874,7 +1874,7 @@ mod tests {
         stream.next().await
     }
 
-    // r[verify store.log.method-credential]
+    // r[verify store.log.method-credential+2]
     #[tokio::test]
     async fn taillog_foreign_tenant_rejected() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -1902,7 +1902,7 @@ mod tests {
         }
     }
 
-    // r[verify store.log.method-credential]
+    // r[verify store.log.method-credential+2]
     #[tokio::test]
     async fn taillog_owner_admitted() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -1929,7 +1929,7 @@ mod tests {
     /// the ownership fallback (cross-tenant read: pin a foreign exec,
     /// bind `%` so the prefix predicate matches ANY derivation the
     /// caller's own tenant has).
-    // r[verify store.log.method-credential]
+    // r[verify store.log.method-credential+2]
     #[tokio::test]
     async fn taillog_wildcard_derivation_rejected() {
         let db = TestDb::new(&crate::MIGRATOR).await;

@@ -13,20 +13,35 @@
 //! property of every bound method, and the layer fails CLOSED on any
 //! method that is not declared: adding an RPC without deciding its
 //! credential class is a startup-visible test failure and a
-//! request-time `PERMISSION_DENIED`, not a silent `Open`.
+//! request-time `PERMISSION_DENIED`, not a silent admit.
+//!
+//! The class VOCABULARY and the verdict live in [`rio_authz_kernel`]
+//! (re-exported here): each keyed class declares exactly one verifier
+//! family, the kernel's `decide()` hands each verdict arm a
+//! single-knob projection, and a class arm reading a foreign knob
+//! does not compile. This module owns CLASSIFICATION — mapping the
+//! http request to a [`Presented`] kind *relative to the method's
+//! class* — and the wire mapping of rejections. Classification is
+//! per-family on purpose: real requests carry credential vectors
+//! (the dashboard's nginx injects a service token on TailLog,
+//! gateway PutPath attaches a JWT and a service token), and a
+//! foreign credential must neither widen nor poison a verdict.
 //!
 //! Enforcement is **enforce-when-configured**, mirroring the HMAC
 //! dev-mode posture (`gate.rs`) and the scheduler's JWT layer: a class
-//! is enforced only when the corresponding verifier is configured, so
-//! single-node dev stores and VM scenarios without keys keep working,
-//! and configuring a key flips the gate everywhere at once.
+//! is enforced only when its DECLARED verifier is configured, so
+//! single-node dev stores and VM scenarios without keys keep working.
+//! The dangerous half-keyed states (JWT on, an HMAC key off) are
+//! refused at BOOT by [`validate_key_coherence`] — the layer never
+//! has to reason about them.
 //!
 //! The layer sits AFTER (inner to) the JWT `InterceptorLayer` in the
 //! server stack: the interceptor verifies `x-rio-tenant-token` and
 //! attaches [`TenantClaims`] to request extensions; this layer only
 //! *requires presence* of the verified claims for `TenantJwt` methods.
-//! It never verifies tokens itself — verification stays in exactly one
-//! place per token family.
+//! It never verifies tenant tokens itself — verification stays in
+//! exactly one place per token family. (Service tokens ARE verified
+//! here, sync and I/O-free, because no outer layer owns them.)
 
 use futures_util::future::{Either, Ready, ready};
 use http::{HeaderValue, Request, Response};
@@ -37,37 +52,10 @@ use std::task::{Context, Poll};
 use tonic::body::Body;
 use tower::{Layer, Service};
 
-/// What a caller must present for a method to be dispatched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CredentialClass {
-    /// An `x-rio-assignment-token` header must be present (builder
-    /// ingest). The HMAC *binding* — token matches this exec/builder —
-    /// stays in the stream gate ([`crate::logs::gate`]), which sees the
-    /// first frame; this layer pins presence so a tokenless probe is
-    /// rejected before a stream is ever opened. Enforced when the
-    /// assignment-HMAC verifier is configured.
-    AssignmentToken,
-    /// Verified tenant claims must be attached by the JWT interceptor
-    /// (the header was present AND verified). Enforced when the JWT
-    /// pubkey is configured. Per the owner decision on bug_290 there
-    /// is NO service-token bypass for this class: operator tooling
-    /// reads logs through the gateway path like every other caller.
-    TenantJwt,
-    /// Either verified tenant claims or a VERIFIED
-    /// `x-rio-service-token` (cluster-internal callers). The layer
-    /// verifies the service token itself with the configured store
-    /// verifier — presence is not a credential. When a JWT pubkey is
-    /// configured but no service key is, the service leg admits
-    /// nothing (configure both or use a tenant session); handlers may
-    /// keep their own verification as defense in depth. Enforced when
-    /// the JWT pubkey is configured.
-    ServiceOrTenant,
-    /// No transport-level credential. Either the method is genuinely
-    /// public (health) or its handler enforces a per-message credential
-    /// the transport cannot see (HMAC tokens inside streamed request
-    /// bodies); the per-row comments say which.
-    Open,
-}
+pub use rio_authz_kernel::{
+    CredentialClass, HandlerCheck, KeyCoherence, LayerVerdict, Presented, RejectReason,
+    VerifierConfig, VerifierFamily, consumes, decide, key_coherence,
+};
 
 /// Builder-presented assignment token header — the shared wire const
 /// (the stream gate verifies the HMAC binding; this layer pins
@@ -79,90 +67,173 @@ pub use rio_common::grpc::ASSIGNMENT_TOKEN_HEADER;
 /// `tests::table_covers_all_bound_methods` walks the proto descriptor
 /// set and fails if this table and the bound method set ever diverge
 /// in either direction — a new RPC cannot ship without a row here.
+/// There is no catch-all class: a row is keyed (`AssignmentToken`,
+/// `TenantJwt`, `Service`), `Public` with a recorded rationale, or
+/// `HandlerEnforced` naming the handler check whose typed witness the
+/// data path requires.
 pub const METHOD_CREDENTIALS: &[(&str, CredentialClass)] = &[
     // ── grpc.health.v1.Health — kubelet probes, genuinely public ──
-    ("/grpc.health.v1.Health/Check", CredentialClass::Open),
-    ("/grpc.health.v1.Health/Watch", CredentialClass::Open),
-    ("/grpc.health.v1.Health/List", CredentialClass::Open),
+    (
+        "/grpc.health.v1.Health/Check",
+        CredentialClass::Public {
+            rationale: "kubelet liveness/readiness probe; no caller identity exists",
+        },
+    ),
+    (
+        "/grpc.health.v1.Health/Watch",
+        CredentialClass::Public {
+            rationale: "kubelet liveness/readiness probe; no caller identity exists",
+        },
+    ),
+    (
+        "/grpc.health.v1.Health/List",
+        CredentialClass::Public {
+            rationale: "kubelet liveness/readiness probe; no caller identity exists",
+        },
+    ),
     // ── rio.store.StoreService ──
-    // Builder/fetcher data plane. PutPath* carry the HMAC assignment
-    // token inside the first streamed message (the transport header is
-    // not where the token rides today); GetPath/QueryPathInfo serve the
-    // gateway (JWT) AND builders (token-in-body) — per-handler checks
-    // own these. Declared Open at the transport layer, enforced in the
-    // handlers; rows exist so the fail-closed default cannot regress
-    // them silently.
-    ("/rio.store.StoreService/PutPath", CredentialClass::Open),
+    // Builder/fetcher data plane. PutPath* and AppendHwPerfSample
+    // carry the HMAC assignment token in the `x-rio-assignment-token`
+    // TRANSPORT header, but the handler gate
+    // (`verify_assignment_token`) owns a divergent service-caller
+    // policy the transport layer cannot express: PutPath* admit an
+    // allowlisted `x-rio-service-token` INSTEAD of an assignment
+    // token (the gateway/scheduler upload path), while
+    // AppendHwPerfSample rejects service callers outright. A layer
+    // presence-pin on the assignment header would break the bypass
+    // callers, so these rows are handler-enforced and the data path
+    // demands the gate's typed witness.
+    (
+        "/rio.store.StoreService/PutPath",
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::IngestToken,
+        },
+    ),
     (
         "/rio.store.StoreService/PutPathBatch",
-        CredentialClass::Open,
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::IngestToken,
+        },
     ),
-    ("/rio.store.StoreService/GetPath", CredentialClass::Open),
+    // Read-side path metadata: the sig-visibility gate scopes what a
+    // tenant session can see; builders read through the same methods
+    // with no claims (dual-mode). Gate witnesses ride the data path.
+    (
+        "/rio.store.StoreService/GetPath",
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::SigVisibility,
+        },
+    ),
     (
         "/rio.store.StoreService/QueryPathInfo",
-        CredentialClass::Open,
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::SigVisibility,
+        },
     ),
+    // Builder-internal batch surfaces: NO sig-visibility gate by
+    // design — end-user tenants are rejected outright instead (the
+    // deny-tenants polarity), so the gate-skip cannot be a bypass.
     (
         "/rio.store.StoreService/BatchQueryPathInfo",
-        CredentialClass::Open,
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::EndUserRejected,
+        },
     ),
     (
         "/rio.store.StoreService/BatchGetManifest",
-        CredentialClass::Open,
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::EndUserRejected,
+        },
     ),
+    // The substitution probe: batch sig-visibility gate
+    // (`sig_visibility_gate_batch`'s sole production caller).
     (
         "/rio.store.StoreService/FindMissingPaths",
-        CredentialClass::Open,
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::SigVisibility,
+        },
     ),
     (
         "/rio.store.StoreService/QueryPathFromHashPart",
-        CredentialClass::Open,
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::SigVisibility,
+        },
     ),
     (
         "/rio.store.StoreService/AddSignatures",
-        CredentialClass::Open,
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::SigVisibility,
+        },
     ),
     (
         "/rio.store.StoreService/RegisterRealisation",
-        CredentialClass::Open,
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::ServiceCaller,
+        },
     ),
     (
         "/rio.store.StoreService/QueryRealisation",
-        CredentialClass::Open,
+        CredentialClass::Public {
+            rationale: "content-addressed CA realisation cache lookup served to \
+                        gateway/tenant callers; the returned signatures are themselves \
+                        the trust mechanism (clients verify against trusted keys)",
+        },
     ),
-    ("/rio.store.StoreService/TenantQuota", CredentialClass::Open),
+    // The gateway forwards the SUBMITTING TENANT's JWT for quota
+    // reads — this is a tenant surface, not a service one; handler
+    // ownership (claims.sub vs the named tenant) closes the
+    // cross-tenant read.
+    (
+        "/rio.store.StoreService/TenantQuota",
+        CredentialClass::TenantJwt,
+    ),
     (
         "/rio.store.StoreService/AppendHwPerfSample",
-        CredentialClass::Open,
+        CredentialClass::HandlerEnforced {
+            check: HandlerCheck::IngestToken,
+        },
     ),
     // ── rio.store.ChunkService — chunk reads for in-cluster callers
-    // (S3-presigned is the bulk path); no per-chunk credential today.
-    ("/rio.store.ChunkService/GetChunk", CredentialClass::Open),
+    // (S3-presigned is the bulk path); chunk content-hashes act as
+    // capability tokens (you can only ask for what a manifest told
+    // you about).
+    (
+        "/rio.store.ChunkService/GetChunk",
+        CredentialClass::Public {
+            rationale: "chunk reads are keyed by content hash — possession of the hash \
+                        is the capability (manifest access is what the gated methods \
+                        protect); S3-presigned URLs serve the same bytes",
+        },
+    ),
     // ── rio.store.StoreAdminService — cluster-internal operators and
-    // the controller; service token or a tenant session.
+    // the controller; a VERIFIED service token, nothing else. (The
+    // pre-kernel ServiceOrTenant tenant leg is deleted: every admin
+    // handler demanded a service caller anyway, so the leg admitted
+    // nothing in the green path and was cluster-admin-for-any-tenant
+    // in the half-config state.)
     (
         "/rio.store.StoreAdminService/TriggerGC",
-        CredentialClass::ServiceOrTenant,
+        CredentialClass::Service,
     ),
     (
         "/rio.store.StoreAdminService/VerifyChunks",
-        CredentialClass::ServiceOrTenant,
+        CredentialClass::Service,
     ),
     (
         "/rio.store.StoreAdminService/ListUpstreams",
-        CredentialClass::ServiceOrTenant,
+        CredentialClass::Service,
     ),
     (
         "/rio.store.StoreAdminService/AddUpstream",
-        CredentialClass::ServiceOrTenant,
+        CredentialClass::Service,
     ),
     (
         "/rio.store.StoreAdminService/RemoveUpstream",
-        CredentialClass::ServiceOrTenant,
+        CredentialClass::Service,
     ),
     (
         "/rio.store.StoreAdminService/GetLoad",
-        CredentialClass::ServiceOrTenant,
+        CredentialClass::Service,
     ),
     // ── rio.store.LogService ──
     // AppendLog: untrusted builder pods; token presence pinned here,
@@ -186,17 +257,48 @@ pub fn class_for(path: &str) -> Option<CredentialClass> {
         .map(|(_, c)| *c)
 }
 
+/// Boot key-coherence check: `jwt ⇒ (service ∧ hmac)`, refusal naming
+/// the missing knob(s). Call before serving; see the kernel's
+/// [`key_coherence`] for the predicate and the spec rationale.
+// r[impl store.authz.key-coherence]
+pub fn validate_key_coherence(cfg: VerifierConfig) -> Result<(), String> {
+    match key_coherence(cfg) {
+        KeyCoherence::Coherent => Ok(()),
+        KeyCoherence::MissingServiceKey => Err(
+            "refusing to serve: JWT pubkey is configured but the service HMAC key \
+             (RIO_STORE_SERVICE_HMAC_KEY_FILE / store.serviceHmacKey) is not — \
+             Service-class methods would be silently unenforced while callers \
+             believe the store authenticated (jwt => service && hmac)"
+                .into(),
+        ),
+        KeyCoherence::MissingAssignmentKey => Err(
+            "refusing to serve: JWT pubkey is configured but the assignment HMAC key \
+             (RIO_STORE_LOG_HMAC_KEY_FILE / store.logHmacKey) is not — \
+             AssignmentToken-class methods would be silently unenforced while \
+             callers believe the store authenticated (jwt => service && hmac)"
+                .into(),
+        ),
+        KeyCoherence::MissingBothKeys => Err(
+            "refusing to serve: JWT pubkey is configured but BOTH HMAC keys are \
+             missing (service: RIO_STORE_SERVICE_HMAC_KEY_FILE / store.serviceHmacKey; \
+             assignment: RIO_STORE_LOG_HMAC_KEY_FILE / store.logHmacKey) — every \
+             keyed class except TenantJwt would be silently unenforced \
+             (jwt => service && hmac)"
+                .into(),
+        ),
+    }
+}
+
 /// Tower layer enforcing [`METHOD_CREDENTIALS`].
 #[derive(Clone)]
 pub struct AuthzLayer {
-    /// JWT pubkey configured → `TenantJwt`/`ServiceOrTenant` enforced.
+    /// JWT pubkey configured → `TenantJwt` enforced.
     pub jwt_configured: bool,
     /// Assignment-HMAC verifier configured → `AssignmentToken` enforced.
     pub hmac_configured: bool,
-    /// Verifier for the `ServiceOrTenant` service leg. The layer
-    /// verifies inline (sync, no I/O) — an unverifying layer is not
-    /// constructible without explicitly passing `None`, and `None`
-    /// closes the leg rather than degrading to presence.
+    /// Verifier for the `Service` class. The layer verifies inline
+    /// (sync, no I/O); `Some` is what "service knob configured" means
+    /// — an unverifying-but-enforcing state is not constructible.
     pub service_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
 }
 
@@ -241,8 +343,83 @@ fn grpc_reject(code: tonic::Code, msg: &str) -> Response<Body> {
     resp
 }
 
+/// Wire mapping for kernel rejections.
+fn reject_response(reason: RejectReason) -> Response<Body> {
+    let (code, msg) = match reason {
+        RejectReason::MissingTenantToken => (tonic::Code::Unauthenticated, "tenant token required"),
+        RejectReason::MissingAssignmentToken => {
+            (tonic::Code::Unauthenticated, "assignment token required")
+        }
+        RejectReason::MissingServiceToken => {
+            (tonic::Code::Unauthenticated, "service token required")
+        }
+        RejectReason::ServiceVerificationFailed => (
+            tonic::Code::Unauthenticated,
+            "service token verification failed",
+        ),
+    };
+    grpc_reject(code, msg)
+}
+
 impl<S> AuthzService<S> {
+    /// The three knobs as a kernel view. The service knob IS verifier
+    /// presence — an enforcing-but-unverifying state cannot be built.
+    fn verifier_config(&self) -> VerifierConfig {
+        VerifierConfig {
+            jwt: self.jwt_configured,
+            service: self.service_verifier.is_some(),
+            hmac: self.hmac_configured,
+        }
+    }
+
+    /// Classify the request's credential presentation RELATIVE TO the
+    /// method's declared family (the credential-vector rule): only the
+    /// declared family's material is inspected, so a foreign
+    /// credential — a service token on a TenantJwt method, tenant
+    /// claims on a Service method — is invisible and can neither
+    /// widen nor poison the verdict.
+    fn classify(&self, class: CredentialClass, req: &Request<Body>) -> Presented {
+        match consumes(class) {
+            Some(VerifierFamily::TenantJwt) => {
+                if req.extensions().get::<TenantClaims>().is_some() {
+                    Presented::TenantClaims
+                } else {
+                    Presented::None
+                }
+            }
+            Some(VerifierFamily::Service) => match req.headers().get(SERVICE_TOKEN_HEADER) {
+                // VERIFY, never trust presence — a spoofable header is
+                // not a credential. Sync HMAC verify, no I/O.
+                Some(raw) => {
+                    let ok = raw
+                        .to_str()
+                        .ok()
+                        .zip(self.service_verifier.as_ref())
+                        .is_some_and(|(tok, sv)| {
+                            sv.verify::<rio_auth::hmac::ServiceClaims>(tok).is_ok()
+                        });
+                    if ok {
+                        Presented::ServiceVerified
+                    } else {
+                        Presented::ServiceGarbage
+                    }
+                }
+                None => Presented::None,
+            },
+            Some(VerifierFamily::Assignment) => {
+                if req.headers().contains_key(ASSIGNMENT_TOKEN_HEADER) {
+                    Presented::AssignmentHeader
+                } else {
+                    Presented::None
+                }
+            }
+            // Public / HandlerEnforced consume no transport verifier.
+            None => Presented::None,
+        }
+    }
+
     /// `Some(reject)` if the request must not be dispatched.
+    // r[impl store.authz.declared-verifier]
     fn check(&self, req: &Request<Body>) -> Option<Response<Body>> {
         let path = req.uri().path();
         let Some(class) = class_for(path) else {
@@ -255,59 +432,10 @@ impl<S> AuthzService<S> {
                 "method has no declared credential class",
             ));
         };
-        match class {
-            CredentialClass::Open => None,
-            CredentialClass::AssignmentToken => {
-                if !self.hmac_configured || req.headers().contains_key(ASSIGNMENT_TOKEN_HEADER) {
-                    None
-                } else {
-                    Some(grpc_reject(
-                        tonic::Code::Unauthenticated,
-                        "assignment token required",
-                    ))
-                }
-            }
-            CredentialClass::TenantJwt => {
-                if !self.jwt_configured || req.extensions().get::<TenantClaims>().is_some() {
-                    None
-                } else {
-                    Some(grpc_reject(
-                        tonic::Code::Unauthenticated,
-                        "tenant token required",
-                    ))
-                }
-            }
-            CredentialClass::ServiceOrTenant => {
-                if !self.jwt_configured || req.extensions().get::<TenantClaims>().is_some() {
-                    return None;
-                }
-                // The service leg: VERIFY, never trust presence — a
-                // spoofable header is not a credential. Sync HMAC
-                // verify, no I/O.
-                match req.headers().get(SERVICE_TOKEN_HEADER) {
-                    Some(raw) => {
-                        let ok = raw
-                            .to_str()
-                            .ok()
-                            .zip(self.service_verifier.as_ref())
-                            .is_some_and(|(tok, sv)| {
-                                sv.verify::<rio_auth::hmac::ServiceClaims>(tok).is_ok()
-                            });
-                        if ok {
-                            None
-                        } else {
-                            Some(grpc_reject(
-                                tonic::Code::Unauthenticated,
-                                "service token verification failed",
-                            ))
-                        }
-                    }
-                    None => Some(grpc_reject(
-                        tonic::Code::Unauthenticated,
-                        "service or tenant credential required",
-                    )),
-                }
-            }
+        let presented = self.classify(class, req);
+        match decide(class, self.verifier_config(), presented) {
+            LayerVerdict::Admit => None,
+            LayerVerdict::Reject(reason) => Some(reject_response(reason)),
         }
     }
 }
@@ -395,7 +523,7 @@ mod tests {
         svc.call(r).await.unwrap()
     }
 
-    // r[verify store.log.method-credential]
+    // r[verify store.log.method-credential+2]
     #[tokio::test]
     async fn taillog_tokenless_rejected_when_jwt_configured() {
         let mut s = svc(true, true);
@@ -415,7 +543,9 @@ mod tests {
     /// tokens never produce `TenantClaims` (the JWT interceptor
     /// attaches claims only from a verified tenant JWT), so the worker
     /// credential is STRUCTURALLY incapable of satisfying this gate —
-    /// pinned here rather than assumed.
+    /// pinned here rather than assumed. Post-kernel this is the
+    /// credential-vector rule: a foreign credential is invisible to
+    /// the TenantJwt classifier.
     #[tokio::test]
     async fn taillog_assignment_token_rejected() {
         let mut s = svc(true, true);
@@ -430,8 +560,7 @@ mod tests {
         assert_eq!(
             grpc_status(&resp),
             Some(tonic::Code::Unauthenticated as i32),
-            "a valid-shaped assignment token must not satisfy TailLog's \
-             tenant-JWT credential class"
+            "an assignment token must not satisfy the tenant-JWT class"
         );
     }
 
@@ -477,12 +606,52 @@ mod tests {
         assert_eq!(grpc_status(&resp), None);
     }
 
-    /// Presence is not a credential: a garbage service token must be
-    /// REJECTED at the layer (pre-fix red: the arm passed on
-    /// contains_key alone — a spoofed header bypassed the layer).
-    // r[verify store.log.method-credential]
+    /// THE dead-leg red (bug_237, recorded pre-fix): verified tenant
+    /// claims on an admin method were ADMITTED by the old
+    /// `ServiceOrTenant` tenant leg (observed: grpc-status None vs
+    /// expected Unauthenticated). Every admin handler demands a
+    /// service caller, so the leg admitted nothing in the green path
+    /// — but in the half-config state (JWT on, service key off) the
+    /// handler's dev-mode passthrough made ANY tenant a cluster
+    /// admin. Post-kernel: tenant claims are a foreign credential on
+    /// a `Service` method and never admit.
+    // r[verify store.authz.declared-verifier]
     #[tokio::test]
-    async fn service_or_tenant_garbage_token_rejected() {
+    async fn dead_tenant_leg_rejected_on_admin_methods() {
+        let mut s = svc(true, true);
+        let mut r = req("/rio.store.StoreAdminService/TriggerGC");
+        r.extensions_mut().insert(test_claims());
+        let resp = call(&mut s, r).await;
+        assert_eq!(
+            grpc_status(&resp),
+            Some(tonic::Code::Unauthenticated as i32),
+            "tenant claims must not admit an admin (Service-class) method"
+        );
+    }
+
+    /// 122's layer red (recorded pre-fix): tokenless TenantQuota was
+    /// ADMITTED (the row was `Open`; observed grpc-status None).
+    /// Post-reclassification the row is `TenantJwt`: no verified
+    /// claims, no quota read. (Handler-side ownership — claims.sub vs
+    /// the named tenant — lands with the witness series.)
+    // r[verify store.log.method-credential+2]
+    #[tokio::test]
+    async fn tenantquota_tokenless_rejected_when_jwt_configured() {
+        let mut s = svc(true, true);
+        let resp = call(&mut s, req("/rio.store.StoreService/TenantQuota")).await;
+        assert_eq!(
+            grpc_status(&resp),
+            Some(tonic::Code::Unauthenticated as i32),
+            "tokenless TenantQuota must be rejected when JWT is configured"
+        );
+    }
+
+    /// Presence is not a credential: a garbage service token must be
+    /// REJECTED at the layer (pre-kernel red: the arm passed on
+    /// contains_key alone — a spoofed header bypassed the layer).
+    // r[verify store.log.method-credential+2]
+    #[tokio::test]
+    async fn service_garbage_token_rejected() {
         let mut s = svc(true, true);
         let mut r = req("/rio.store.StoreAdminService/GetLoad");
         r.headers_mut().insert(
@@ -498,7 +667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_or_tenant_valid_token_admitted() {
+    async fn service_valid_token_admitted() {
         let mut s = svc(true, true);
         let tok = rio_auth::hmac::HmacSigner::from_key(SVC_KEY.to_vec()).sign(
             &rio_auth::hmac::ServiceClaims {
@@ -514,11 +683,16 @@ mod tests {
         assert_eq!(grpc_status(&resp), None, "a verified service token passes");
     }
 
+    /// The Service class is keyed on the SERVICE verifier alone: with
+    /// no service key the class is unenforced at the layer (dual-mode
+    /// doctrine) — and the dangerous variant of this state (JWT on,
+    /// service key off) never serves at all: `validate_key_coherence`
+    /// refuses it at boot (see `boot_coherence_*` below). The
+    /// pre-kernel layer keyed this class on the JWT knob instead —
+    /// the foreign-knob read the kernel makes uncompilable.
     #[tokio::test]
-    async fn service_leg_closed_when_verifier_unconfigured() {
-        // jwt configured, NO service verifier: the service leg admits
-        // nothing — presence cannot degrade the gate open.
-        let mut s = svc_with_verifier(true, true, None);
+    async fn service_class_unenforced_without_service_key() {
+        let mut s = svc_with_verifier(false, true, None);
         let mut r = req("/rio.store.StoreAdminService/GetLoad");
         r.headers_mut().insert(
             SERVICE_TOKEN_HEADER,
@@ -527,8 +701,70 @@ mod tests {
         let resp = call(&mut s, r).await;
         assert_eq!(
             grpc_status(&resp),
-            Some(tonic::Code::Unauthenticated as i32)
+            None,
+            "no service key (and no JWT — the coherent variant) = dev mode for the \
+             Service class; the JWT-on variant is refused at boot, not here"
         );
+    }
+
+    /// Boot coherence (bug_237's C2 red, recorded pre-fix: the store
+    /// BOOTED in state (1,0,1) — no coherence check existed):
+    /// jwt ⇒ (service ∧ hmac); each refusal names the missing knob.
+    // r[verify store.authz.key-coherence]
+    #[test]
+    fn boot_coherence_refuses_jwt_without_service_key() {
+        let err = validate_key_coherence(VerifierConfig {
+            jwt: true,
+            service: false,
+            hmac: true,
+        })
+        .unwrap_err();
+        assert!(err.contains("service HMAC key"), "{err}");
+        assert!(err.contains("serviceHmacKey"), "{err}");
+    }
+
+    // r[verify store.authz.key-coherence]
+    #[test]
+    fn boot_coherence_refuses_jwt_without_assignment_key() {
+        let err = validate_key_coherence(VerifierConfig {
+            jwt: true,
+            service: true,
+            hmac: false,
+        })
+        .unwrap_err();
+        assert!(err.contains("assignment HMAC key"), "{err}");
+        assert!(err.contains("logHmacKey"), "{err}");
+    }
+
+    // r[verify store.authz.key-coherence]
+    #[test]
+    fn boot_coherence_refuses_jwt_without_both_keys() {
+        let err = validate_key_coherence(VerifierConfig {
+            jwt: true,
+            service: false,
+            hmac: false,
+        })
+        .unwrap_err();
+        assert!(err.contains("BOTH HMAC keys"), "{err}");
+    }
+
+    /// The five coherent states all boot: dev (0,0,0), helm default
+    /// (0,1,1), full (1,1,1), and the two keys-without-jwt states.
+    // r[verify store.authz.key-coherence]
+    #[test]
+    fn boot_coherence_admits_the_five_coherent_states() {
+        for (jwt, service, hmac) in [
+            (false, false, false),
+            (false, true, true),
+            (true, true, true),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert!(
+                validate_key_coherence(VerifierConfig { jwt, service, hmac }).is_ok(),
+                "({jwt},{service},{hmac}) must boot"
+            );
+        }
     }
 
     #[tokio::test]

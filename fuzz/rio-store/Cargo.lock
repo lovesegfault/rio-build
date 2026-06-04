@@ -3964,6 +3964,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio-authz-kernel"
+version = "0.1.0"
+
+[[package]]
 name = "rio-common"
 version = "0.1.0"
 dependencies = [
@@ -4079,6 +4083,7 @@ dependencies = [
  "moka",
  "reqwest",
  "rio-auth",
+ "rio-authz-kernel",
  "rio-common",
  "rio-evidence-kernel",
  "rio-log-kernel",

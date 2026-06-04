@@ -6552,6 +6552,7 @@ dependencies = [
  "quint-connect",
  "reqwest",
  "rio-auth",
+ "rio-authz-kernel",
  "rio-common",
  "rio-evidence-kernel",
  "rio-log-kernel",

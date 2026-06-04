@@ -414,6 +414,18 @@ async fn main() -> anyhow::Result<()> {
         shutdown.clone(),
     )?;
 
+    // Boot key-coherence: jwt => (service && hmac). The half-keyed
+    // states are refused HERE, naming the missing knob — the authz
+    // layer's per-class dual-mode never has to reason about them
+    // (rio-authz-kernel::key_coherence; bughunt2 bug_237).
+    // r[impl store.authz.key-coherence]
+    rio_store::authz::validate_key_coherence(rio_store::authz::VerifierConfig {
+        jwt: jwt_pubkey.is_some(),
+        service: service_verifier_for_authz.is_some(),
+        hmac: log_hmac_configured,
+    })
+    .map_err(|e| anyhow::anyhow!(e))?;
+
     info!(
         addr = %addr,
         max_msg_size,
@@ -456,7 +468,7 @@ async fn main() -> anyhow::Result<()> {
         // interceptor (it consumes the claims the interceptor
         // attaches). Fails closed on undeclared methods; per-class
         // enforcement is enforce-when-configured. See authz.rs.
-        // r[impl store.log.method-credential]
+        // r[impl store.log.method-credential+2]
         .layer(rio_store::authz::AuthzLayer {
             jwt_configured: jwt_pubkey.is_some(),
             hmac_configured: log_hmac_configured,
