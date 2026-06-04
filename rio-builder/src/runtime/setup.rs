@@ -136,8 +136,6 @@ pub async fn setup(
     //     (/var/rio/fuse-store)     |   (readOnlyRoot only)
     //   cfg.overlay_base_dir        | `overlays` emptyDir
     //     (/var/rio/overlays)       |   (always)
-    //   /nix/var/{nix,log}/**       | `nix-var` emptyDir
-    //                               |   (readOnlyRoot only)
     //   /tmp (tempfile crate)       | `tmp` emptyDir, 64Mi tmpfs
     //                               |   (readOnlyRoot only)
     //   cfg.fuse_cache_dir          | `fuse-cache` emptyDir
@@ -207,7 +205,7 @@ pub async fn setup(
     // (mpsc::error::SendError<T> holds the unsent message) and
     // blocks on watch.changed() until the reconnect loop swaps
     // in a fresh gRPC channel.
-    // r[impl builder.relay.reconnect]
+    // r[impl builder.relay.reconnect+1]
     let (sink_tx, sink_rx) = mpsc::channel::<ExecutorMessage>(256);
 
     // Relay target: Some(grpc_tx) while connected, None during
@@ -263,9 +261,16 @@ pub async fn setup(
     // this is a fence against a DIFFERENT process's stale writes, not a
     // within-process happens-before. The value itself is the signal.
     let latest_generation = Arc::new(AtomicU64::new(0));
-    // Shared with BuildSpawnContext below so the per-build daemon's
-    // `extra-platforms` matches what the heartbeat advertises.
+    // Shared with BuildSpawnContext below so the sandbox's personality
+    // decision and the heartbeat advertise the same system list.
     let systems: std::sync::Arc<[String]> = systems.into();
+    // The host system for the sandbox personality decision comes from the
+    // RESOLVED list — `cfg.systems` was drained by
+    // `resolve_executor_identity` at startup, so reading `cfg.systems`
+    // here would always see an empty vec, silently fall back to
+    // x86_64-linux, and 32-bit guests on non-x86 hosts would never get
+    // PER_LINUX32.
+    let host_system = host_system_of(&systems);
     let heartbeat_handle = spawn_heartbeat(HeartbeatCtx {
         executor_id: executor_id.clone(),
         executor_kind: cfg.executor_kind,
@@ -300,7 +305,7 @@ pub async fn setup(
             rate_lines_per_sec: cfg.log_rate_limit,
             total_bytes: cfg.log_size_limit,
         },
-        daemon_timeout: cfg.daemon_timeout,
+        build_timeout: cfg.build_timeout,
         max_silent_time: cfg.max_silent_time.as_secs(),
         cgroup_parent,
         executor_kind: cfg.executor_kind,
@@ -323,6 +328,21 @@ pub async fn setup(
         // Same Arc as the heartbeat loop (above) — completion reads
         // the snapshot the cgroup poller has been maintaining.
         resources: resource_snapshot,
+        // Native-executor sandbox knobs, resolved once from config. The
+        // host system for the personality decision is the first
+        // advertised system (the native platform by convention), taken
+        // from the resolved list above.
+        sandbox: Arc::new(crate::executor::SandboxEnvConfig {
+            sandbox_shell: cfg.sandbox_shell.clone(),
+            ca_bundle: cfg.ca_bundle.clone(),
+            extra_sandbox_paths: cfg
+                .extra_sandbox_paths
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+            hashed_mirrors: cfg.hashed_mirrors.clone(),
+            host_system,
+        }),
         hw_bench: Arc::new(std::sync::Mutex::new(Some(hw_bench))),
         completion_pending: Arc::clone(&completion_pending),
     };
@@ -358,6 +378,18 @@ pub async fn setup(
         idle_timeout: cfg.idle_timeout,
         _balance_guard,
     }))
+}
+
+/// The host system for the sandbox personality decision: the first
+/// advertised system (the native platform by convention), falling back
+/// to the detected host when the resolved list is empty (it never is
+/// after `resolve_executor_identity`, which defaults to the detected
+/// system).
+///
+/// Takes the *resolved* systems list, never `cfg.systems` — that field
+/// is drained by `resolve_executor_identity` at startup.
+fn host_system_of(systems: &[String]) -> String {
+    systems.first().cloned().unwrap_or_else(detect_system)
 }
 
 /// Resolve executor_id / systems / features from config + environment.
@@ -408,10 +440,11 @@ pub(super) fn resolve_executor_identity(
         systems
     };
     // r[impl sched.dispatch.fod-builtin-any-arch]
-    // Every nix-daemon supports builtin:fetchurl — it's handled
-    // internally, no real process forked. Bootstrap derivations
-    // (busybox, bootstrap-tools) have system="builtin"; without
-    // this, a cold store permanently stalls at the DAG leaves.
+    // builtin:fetchurl is executed by the worker itself (a sandboxed
+    // re-exec of rio-builder), so any worker arch can run it.
+    // Bootstrap derivations (busybox, bootstrap-tools) have
+    // system="builtin"; without this, a cold store permanently
+    // stalls at the DAG leaves.
     // With per-arch fetcher Pools, this is what makes a `builtin`
     // FOD eligible on either arch's fetchers (hard_filter matches
     // on the union; best_executor scores across both).
@@ -462,7 +495,7 @@ pub(super) fn resolve_executor_identity(
 /// I-098: refuse to start when the host arch isn't in `RIO_SYSTEMS`.
 /// A Pool with `systems=[x86_64-linux]` whose pod lands on an
 /// arm64 node would otherwise register as x86_64, accept x86_64 drvs,
-/// and have nix-daemon refuse them at build time. CrashLoopBackOff is
+/// and fail every one at exec time (wrong-arch binaries). CrashLoopBackOff is
 /// the right shape — visible in `kubectl get pods`, doesn't poison drvs.
 ///
 /// r35 bug_039: Fetcher workers DO need arch validation for the
@@ -579,4 +612,23 @@ async fn connect_upstreams(
         anyhow::Ok((store, sched, (store_guard, sched_guard)))
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard for the sandbox personality plumbing: the host
+    /// system must come from the RESOLVED systems list (RIO_SYSTEMS /
+    /// the Pool's `spec.systems`), not from the drained `cfg.systems`,
+    /// and an empty list must fall back to the detected host rather
+    /// than assuming x86_64-linux.
+    #[test]
+    fn host_system_comes_from_the_resolved_systems_list() {
+        assert_eq!(
+            host_system_of(&["aarch64-linux".to_string(), "armv7l-linux".to_string()]),
+            "aarch64-linux"
+        );
+        assert_eq!(host_system_of(&[]), detect_system());
+    }
 }

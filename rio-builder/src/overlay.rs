@@ -6,11 +6,10 @@
 // r[impl builder.overlay.per-build]
 // r[impl builder.overlay.stacked-lower+2]
 //! - Work directory: required by overlayfs (same filesystem as upper)
-//! - Merged: mounted at `{build_dir}/nix/store`. nix-daemon runs with
-//!   `--store local?root={build_dir}` so it reads this as its
-//!   `realStoreDir` directly — no `/nix/store` bind-mount. Outputs
-//!   written by nix-daemon land in `{upper}/nix/store/{hash}-{name}`;
-//!   upload.rs scans that path.
+//! - Merged: mounted at `{build_dir}/nix/store` and bind-mounted writable
+//!   at `/nix/store` inside the build sandbox. Outputs written by the
+//!   build land in `{upper}/nix/store/{hash}-{name}`; upload.rs scans
+//!   that path.
 //!
 //! The overlay is cleaned up (unmounted + directories removed) on drop.
 //! Worker must NOT drop `CAP_SYS_ADMIN` between overlay setup and Nix
@@ -97,15 +96,14 @@ pub(crate) fn mkdir_all(path: &Path) -> Result<(), OverlayError> {
 ///
 /// Directory layout under `{base}/{build_id}/`:
 ///   - `nix/store/`         — overlayfs mountpoint (the merged view)
-///   - `nix/var/nix/db/`    — synthetic SQLite DB
-///   - `etc/nix/`           — nix.conf (`NIX_CONF_DIR` points here)
 ///   - `upper/nix/store/`   — overlayfs upperdir (build outputs land here)
 ///   - `work/`              — overlayfs workdir
 ///
-/// `{base}/{build_id}` is the chroot-store root: nix-daemon runs with
-/// `--store 'local?root={base}/{build_id}'`, so it sees `nix/store` as
-/// its `realStoreDir` and `nix/var/nix/db` as its state dir directly —
-/// no bind-mounting at canonical `/nix/store`.
+/// `{base}/{build_id}/nix/store` (the merged view) is what the request
+/// glue mounts writable at `/nix/store` inside the rio-exec sandbox:
+/// reads of input paths fall through to the FUSE-backed lower layer,
+/// build outputs copy-up into `upper/nix/store/` where the result
+/// pipeline and the upload read them.
 pub struct OverlayMount {
     build_dir: PathBuf,
     upper: PathBuf,
@@ -114,9 +112,8 @@ pub struct OverlayMount {
 }
 
 impl OverlayMount {
-    /// `{base}/{build_id}` — the chroot-store root. Passed to nix-daemon
-    /// as `--store 'local?root={root_dir}'`. Contains `nix/store/`
-    /// (merged), `nix/var/nix/db/` (synth-db), `etc/nix/` (nix.conf).
+    /// `{base}/{build_id}` — the per-build root containing the
+    /// `nix/store/` merged view plus the overlay upper/work dirs.
     pub fn root_dir(&self) -> &Path {
         &self.build_dir
     }
@@ -127,22 +124,9 @@ impl OverlayMount {
         self.upper.join("nix/store")
     }
 
-    /// `{build_dir}/nix/var/nix/db` — synth-db location. Populated by
-    /// synth_db before the daemon starts. nix-daemon with
-    /// `--store local?root={build_dir}` reads its state dir here directly.
-    pub fn upper_synth_db(&self) -> PathBuf {
-        self.build_dir.join("nix/var/nix/db")
-    }
-
-    /// `{build_dir}/etc/nix` — nix.conf location. setup_nix_conf
-    /// populates it from WORKER_NIX_CONF or the rio-nix-conf ConfigMap
-    /// override. spawn.rs sets `NIX_CONF_DIR` to point here.
-    pub fn upper_nix_conf(&self) -> PathBuf {
-        self.build_dir.join("etc/nix")
-    }
-
     /// `{build_dir}/nix/store` — the overlay mountpoint (merged view).
-    /// nix-daemon's `realStoreDir` for this build.
+    /// The request glue mounts this writable at `/nix/store` inside the
+    /// sandbox.
     pub fn merged_dir(&self) -> &Path {
         &self.merged
     }
@@ -203,10 +187,10 @@ impl Drop for OverlayMount {
 ///
 /// The overlay's lower is the FUSE mount only — lazy-fetched build inputs
 /// from rio-store. The host `/nix/store` is NOT in the lowerdir (I-060):
-/// nix-daemon runs in the builder's namespace with `--store
-/// local?root={build_dir}`, so its binary + libs come from the host
-/// store directly. The per-build store contains exactly `{inputs} ∪
-/// {outputs}`; the daemon's runtime closure is structurally separate.
+/// the build sandbox sees only this per-build merged view at
+/// `/nix/store`, which contains exactly `{inputs} ∪ {outputs}`; the
+/// worker's own runtime closure lives in the host store and is
+/// structurally separate.
 ///
 /// # Important
 ///
@@ -228,10 +212,8 @@ pub fn setup_overlay(
     // `{upper}/nix/store/{hash}-{name}` where upload.rs expects them.
     let store_upper = upper.join("nix/store");
     let work = build_dir.join("work");
-    // Merged at `{build_dir}/nix/store` so `--store local?root={build_dir}`
-    // finds it as `realStoreDir` without bind-mounting. Synth-db and
-    // nix.conf siblings (`nix/var/nix/db`, `etc/nix`) are written
-    // directly under `build_dir` for the same reason.
+    // Merged at `{build_dir}/nix/store`; the glue bind-mounts this
+    // merged view writable at `/nix/store` inside the sandbox.
     let merged = build_dir.join("nix/store");
 
     // Any `?` from here (the very first mkdir) until the mount succeeds
@@ -305,17 +287,15 @@ pub fn setup_overlay(
     // refuses redirect_dir=on (`mount -o redirect_dir=on` → EPERM).
     // Without redirect_dir, overlayfs returns EXDEV for any rename(2)
     // of a DIRECTORY whose target parent is a merge-type dir. The
-    // overlay root (= realStoreDir) is always merge-type — its dentry
-    // stack carries both upper-root and lower-root by construction —
-    // so nix-daemon's post-build movePath(chroot/{out} → merged/{out})
-    // EXDEVs for every directory output. nix's moveFile() temp-then-
-    // rename fallback ALSO targets the overlay root → same EXDEV. The
-    // builder image ships a patched nix whose movePath() falls back to
-    // a recursive copy on EXDEV (nix/docker.nix `nixForBuilder`,
-    // nix/patches/nix-movepath-exdev-fallback.patch). Don't pass
-    // redirect_dir here: it's auto-selected (on in init-userns, forced
-    // nofollow in non-init), and an explicit `=on` would EPERM the
-    // mount under hostUsers:false.
+    // overlay root (= the merged store view) is always merge-type — its
+    // dentry stack carries both upper-root and lower-root by
+    // construction. The native executor never rename(2)s outputs across
+    // it (builds write through the merged view and copy-up lands them
+    // in the upper layer), so the historical EXDEV-on-directory-rename
+    // problem the daemon-era movePath patch worked around no longer
+    // applies. Don't pass redirect_dir here: it's auto-selected (on in
+    // init-userns, forced nofollow in non-init), and an explicit `=on`
+    // would EPERM the mount under hostUsers:false.
     let mount_data = format!(
         "lowerdir={},upperdir={},workdir={}",
         lower.display(),
@@ -355,8 +335,8 @@ fn teardown_overlay_inner(merged: &Path, build_dir: &Path) -> Result<(), Overlay
     nix::mount::umount2(merged, MntFlags::MNT_DETACH)
         .map_err(|source| OverlayError::Unmount { source })?;
 
-    // Everything for this build (upper, work, nix/store, nix/var, etc/nix)
-    // lives under build_dir. After umount, remove it whole.
+    // Everything for this build (upper, work, nix/store) lives under
+    // build_dir. After umount, remove it whole.
     if let Err(e) = fs::remove_dir_all(build_dir) {
         tracing::warn!(
             path = %build_dir.display(),
@@ -395,12 +375,10 @@ mod tests {
         let m = OverlayMount::for_test(build_dir.clone());
 
         assert_eq!(m.root_dir(), build_dir.as_path());
-        // chroot-store layout: nix-daemon `--store local?root={build_dir}`
-        // expects realStoreDir at `{build_dir}/nix/store`.
+        // Per-build layout: the merged view the sandbox mounts at
+        // /nix/store and the upper dir outputs copy-up into.
         assert_eq!(m.merged_dir(), build_dir.join("nix/store").as_path());
         assert_eq!(m.upper_store(), build_dir.join("upper/nix/store"));
-        assert_eq!(m.upper_synth_db(), build_dir.join("nix/var/nix/db"));
-        assert_eq!(m.upper_nix_conf(), build_dir.join("etc/nix"));
     }
 
     #[test]
@@ -492,7 +470,7 @@ mod tests {
             eprintln!(
                 "SKIP test_statfs_tmpdir_not_overlayfs: tempdir is on overlayfs \
                  (f_type={fstype:?}). The build sandbox is in the container's \
-                 writable layer — back /nix/var/nix/builds with tmpfs or a \
+                 writable layer — back /var/rio/overlays with tmpfs or a \
                  hostPath to run this test. Preflight rejection is correct \
                  here; the test's premise (\"tempdir is a normal FS\") is not."
             );

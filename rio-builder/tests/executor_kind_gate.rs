@@ -3,12 +3,12 @@
 //! The scheduler's `hard_filter` should never misroute, but a bug or
 //! stale-generation race must not grant a builder internet access. The
 //! gate re-derives `is_fod` from the `.drv` itself and refuses
-//! cross-kind assignments BEFORE overlay setup or daemon spawn.
+//! cross-kind assignments BEFORE overlay setup or build execution.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use rio_builder::executor::{DEFAULT_DAEMON_TIMEOUT, ExecutorEnv, ExecutorError, execute_build};
+use rio_builder::executor::{DEFAULT_BUILD_TIMEOUT, ExecutorEnv, ExecutorError, execute_build};
 use rio_builder::log_stream::LogLimits;
 use rio_proto::StoreServiceClient;
 use rio_proto::types::ExecutorKind;
@@ -16,11 +16,11 @@ use rio_proto::types::WorkAssignment;
 
 /// Minimal non-FOD ATerm: empty hashAlgo/hash in the output tuple →
 /// `Derivation::is_fixed_output()` returns `false`.
-const NON_FOD_DRV: &[u8] = br#"Derive([("out","/nix/store/abc-simple-test","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello > $out"],[("builder","/bin/sh"),("name","simple-test"),("out","/nix/store/abc-simple-test"),("system","x86_64-linux")])"#;
+const NON_FOD_DRV: &[u8] = br#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-simple-test","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello > $out"],[("builder","/bin/sh"),("name","simple-test"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-simple-test"),("system","x86_64-linux")])"#;
 
 /// Minimal FOD ATerm: `sha256` + hash populated → `is_fixed_output()`
 /// returns `true`.
-const FOD_DRV: &[u8] = br#"Derive([("out","/nix/store/abc-fixed","sha256","abcdef0123456789")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/abc-fixed"),("outputHash","abcdef0123456789"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#;
+const FOD_DRV: &[u8] = br#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-fixed","sha256","abcdef0123456789")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-fixed"),("outputHash","abcdef0123456789"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#;
 
 fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
     ExecutorEnv {
@@ -28,7 +28,7 @@ fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
         overlay_base_dir: dir.to_path_buf(),
         executor_id: "test-executor".into(),
         log_limits: LogLimits::UNLIMITED,
-        daemon_timeout: DEFAULT_DAEMON_TIMEOUT,
+        build_timeout: DEFAULT_BUILD_TIMEOUT,
         max_silent_time: 0,
         cgroup_parent: dir.to_path_buf(),
         executor_kind: kind,
@@ -37,6 +37,7 @@ fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
         fuse_cache: None,
         fuse_fetch_timeout: std::time::Duration::from_secs(60),
         cancelled: Arc::new(AtomicBool::new(false)),
+        sandbox: Arc::new(rio_builder::executor::SandboxEnvConfig::default()),
     }
 }
 
@@ -60,7 +61,8 @@ async fn run(kind: ExecutorKind, drv: &[u8], assignment_flag: bool) -> Result<()
     let assignment = make_assignment(drv, assignment_flag);
     // dead_channel: never dials — the gate fires before any gRPC call.
     let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
-    let (log_tx, _rx) = tokio::sync::mpsc::channel(1);
+    let (raw_log_tx, _rx) = tokio::sync::mpsc::channel(1);
+    let log_tx = rio_builder::log_stream::SheddingLogSender::new(raw_log_tx);
     execute_build(&assignment, &env, &mut store, &log_tx, 0)
         .await
         .result
@@ -193,7 +195,8 @@ async fn banner_header_gated_on_first_attempt() {
     let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
 
     // First attempt (`first_line == 0`): header at line 0.
-    let (log_tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let (raw_log_tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let log_tx = rio_builder::log_stream::SheddingLogSender::new(raw_log_tx);
     let outcome = execute_build(&assignment, &env, &mut store, &log_tx, 0).await;
     drop(log_tx);
     assert!(
@@ -230,7 +233,8 @@ async fn banner_header_gated_on_first_attempt() {
     );
 
     // Retry attempt (`first_line > 0`): no header re-sent; offset held.
-    let (log_tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let (raw_log_tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let log_tx = rio_builder::log_stream::SheddingLogSender::new(raw_log_tx);
     let outcome = execute_build(&assignment, &env, &mut store, &log_tx, 3).await;
     drop(log_tx);
     assert!(outcome.result.is_err());
@@ -260,7 +264,8 @@ async fn pre_header_error_carries_caller_offset() {
     let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
 
     for first_line in [0u64, 7u64] {
-        let (log_tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (raw_log_tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let log_tx = rio_builder::log_stream::SheddingLogSender::new(raw_log_tx);
         let outcome = execute_build(&assignment, &env, &mut store, &log_tx, first_line).await;
         drop(log_tx);
         assert!(matches!(

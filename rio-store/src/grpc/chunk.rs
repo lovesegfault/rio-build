@@ -83,18 +83,10 @@ impl ChunkService for ChunkServiceImpl {
         // miss = one S3 GET). The GetPath streaming-task pattern is
         // for large NARs where the stream outlives the handler call;
         // GetChunk's "stream" is one message.
-        let bytes = cache.get_verified(&hash).await.map_err(|e| {
-            use cas::ChunkError;
-            match e {
-                ChunkError::NotFound(_) => {
-                    Status::not_found(format!("chunk {} not found", hex::encode(hash)))
-                }
-                ChunkError::Corrupt { .. } => Status::data_loss(format!(
-                    "chunk {} failed BLAKE3 verification: {e}",
-                    hex::encode(hash)
-                )),
-            }
-        })?;
+        let bytes = cache
+            .get_verified(&hash)
+            .await
+            .map_err(|e| get_chunk_status(&hash, &e))?;
 
         // Single-message "stream". Channel buffer of 1 is enough; 2 is
         // belt-and-suspenders (one for the data, one in case tonic
@@ -110,5 +102,80 @@ impl ChunkService for ChunkServiceImpl {
             .await;
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+/// Map a chunk read failure to the client-facing Status. The auth arm
+/// serves the SINGLE-SOURCED static remediation and logs the full
+/// chain server-side: AWS error chains carry endpoint URLs, request
+/// IDs, and key-shaped identifiers that untrusted callers must not
+/// receive (round-15 scrub rule, 9075dcd8b precedent). The other arms
+/// interpolate only ChunkError Display values that are themselves
+/// hash-and-class shaped (NotFound/Corrupt name the hash; Backend
+/// carries the transient class) — the no-leak pin below feeds a
+/// poisoned auth chain through this mapping and asserts absence.
+fn get_chunk_status(hash: &[u8; 32], e: &cas::ChunkError) -> Status {
+    use cas::ChunkError;
+    match e {
+        ChunkError::NotFound(_) => {
+            Status::not_found(format!("chunk {} not found", hex::encode(hash)))
+        }
+        ChunkError::Corrupt { .. } => Status::data_loss(format!(
+            "chunk {} failed BLAKE3 verification: {e}",
+            hex::encode(hash)
+        )),
+        ChunkError::AuthFailed { .. } => {
+            tracing::error!(hash = %hex::encode(hash), error = %e,
+                   "GetChunk: chunk backend auth failed");
+            crate::grpc::backend_auth_status()
+        }
+        // Transient backend failure (round-16 bug_027): retriable,
+        // says nothing about the chunk's existence.
+        ChunkError::Backend { .. } => Status::unavailable(format!(
+            "chunk {} backend fetch failed; retry: {e}",
+            hex::encode(hash)
+        )),
+    }
+}
+
+/// No-leak pin (round-15 scrub rule, 9075dcd8b precedent): the
+/// client-facing auth Status carries the static remediation ONLY —
+/// nothing from the backend's error chain (endpoint URLs, request
+/// IDs, key-shaped identifiers).
+#[cfg(test)]
+mod scrub_tests {
+    use super::*;
+
+    #[test]
+    fn auth_status_never_echoes_the_backend_chain() {
+        let poisoned = cas::ChunkError::AuthFailed {
+            hash: [7u8; 32],
+            // AWS's published documentation EXAMPLE key
+            // (docs.aws.amazon.com) — deliberately key-shaped so this
+            // test proves real credentials cannot reach client-facing
+            // messages; not a secret.
+            message: "AccessDenied for AKIAIOSFODNN7EXAMPLE at \
+                      https://internal-bucket.s3.amazonaws.com req-id 0xDEADBEEF"
+                .into(),
+        };
+        let status = get_chunk_status(&[7u8; 32], &poisoned);
+        let msg = status.message();
+        for needle in [
+            "AKIAIOSFODNN7EXAMPLE",
+            "internal-bucket",
+            "amazonaws",
+            "0xDEADBEEF",
+        ] {
+            assert!(
+                !msg.contains(needle),
+                "backend chain leaked into the client status: {needle} in {msg:?}"
+            );
+        }
+        assert_eq!(
+            msg,
+            crate::grpc::backend_auth_status().message(),
+            "single source: GetChunk serves the same static text as every reader"
+        );
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     }
 }

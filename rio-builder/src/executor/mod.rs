@@ -1,24 +1,25 @@
 //! Build executor: receives WorkAssignment from scheduler, runs builds.
 //!
 //! Flow:
-//! 1. Set up overlay for the build
-//! 2. Generate synthetic SQLite DB with input closure metadata
-//! 3. Spawn `nix-daemon --stdio` in overlay
-//! 4. Client handshake + wopSetOptions + wopBuildDerivation
-//! 5. Stream logs via LogBatcher -> BuildLogBatch -> scheduler stream
-//! 6. On completion: upload outputs to store via PutPath
+//! 1. Set up overlay for the build (FUSE lazy store lower, local upper)
+//! 2. Resolve the input closure and arm the FUSE JIT allowlist
+//! 3. Translate the derivation into a sandbox request (`glue`)
+//! 4. Run the build in the rio-exec sandbox (`run_native_lifecycle`)
+//! 5. Stream logs via NixLogFilter -> LogBatcher -> scheduler stream
+//! 6. On completion: classify, process outputs, upload to store
 //! 7. Send CompletionReport on scheduler stream
 //! 8. Tear down overlay
 //!
 //! FOD handling: detect fixed-output derivations via `is_fixed_output`
-//! flag on WorkAssignment, skip network namespace isolation.
+//! flag on WorkAssignment; FODs run with networking enabled and
+//! `builtin:fetchurl` re-execs this binary inside the sandbox.
 //!
 //! Phase modules (each owns one step of the flow above):
 //! - `inputs`: drv fetch, input-closure BFS, FOD hash verify
-//! - `sandbox`: synth DB, nix.conf
-//! - `daemon`: nix-daemon spawn + STDERR loop
+//! - `glue`: Derivation → ExecutionRequest + the `@nix` log filter
+//! - `native_result`: exit classification + output pipeline (CA finalization)
 //! - `monitors`: per-build cgroup CPU/OOM watchers + drain
-//! - `outputs`: FOD verify gate, upload, daemon→proto result mapping
+//! - `outputs`: FOD verify gate, upload, proto result mapping
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,24 +32,31 @@ use tracing::instrument;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use rio_nix::derivation::{Derivation, DerivationLike};
 use rio_proto::StoreServiceClient;
-use rio_proto::types::{BuildResult as ProtoBuildResult, ExecutorMessage, WorkAssignment};
+use rio_proto::types::{BuildResult as ProtoBuildResult, WorkAssignment};
 use rio_proto::validated::ValidatedPathInfo;
 
 use crate::log_stream::{LogBatcher, LogLimits};
 use crate::overlay;
 use crate::upload;
 
-mod daemon;
+// Native-executor request glue: Derivation → rio_exec::ExecutionRequest
+// + the `@nix` log filter.
+pub(crate) mod dropped;
+pub(crate) mod glue;
 mod inputs;
 mod monitors;
+mod native_result;
+// Differential-harness driver (vm-differential-standalone). Test-only:
+// composes glue + rio-exec + native_result for one derivation so the VM
+// scenario can diff the result against real Nix. Public so the
+// `differential-driver` bin target can call it; hidden from docs.
+#[doc(hidden)]
+pub mod differential;
 mod outputs;
-mod sandbox;
 
-use daemon::{DaemonBuildOpts, run_daemon_build, spawn_daemon_in_namespace};
 use inputs::{compute_input_closure, fetch_drv_from_store, prefetch_manifests};
 use monitors::{drain_build_cgroup, spawn_cgroup_monitors};
-use outputs::{BuildOutputs, collect_outputs};
-use sandbox::prepare_sandbox;
+use outputs::{BuildOutputs, collect_native_outputs};
 
 /// Max concurrent gRPC calls for input metadata/drv fetches.
 /// Bounds memory (each in-flight QueryPathInfo response is small; each
@@ -71,11 +79,11 @@ pub struct ExecutorEnv {
     pub overlay_base_dir: std::path::PathBuf,
     pub executor_id: String,
     pub log_limits: LogLimits,
-    /// Timeout for the local nix-daemon subprocess build. Used when the
-    /// client didn't specify `BuildOptions.build_timeout`. Intentionally
-    /// long (default 2h) — some builds genuinely take that long; the
-    /// purpose is to bound blast radius of a truly stuck daemon.
-    pub daemon_timeout: Duration,
+    /// Timeout for the sandboxed build process. Used when the client
+    /// didn't specify `BuildOptions.build_timeout`. Intentionally long
+    /// (default 2h) — some builds genuinely take that long; the purpose
+    /// is to bound the blast radius of a truly stuck build.
+    pub build_timeout: Duration,
     /// Silence timeout default (seconds). Used when the assignment's
     /// `BuildOptions.max_silent_time` is 0. 0 = disabled.
     ///
@@ -96,12 +104,13 @@ pub struct ExecutorEnv {
     pub cgroup_parent: std::path::PathBuf,
     /// Builder (airgapped, arbitrary code) or Fetcher (open egress,
     /// FOD-only). The wrong-kind gate in [`execute_build`] checks
-    /// `drv.is_fixed_output()` against this BEFORE daemon spawn —
+    /// `drv.is_fixed_output()` against this BEFORE any sandbox setup —
     /// defense-in-depth against scheduler misroutes (ADR-019).
     pub executor_kind: rio_proto::types::ExecutorKind,
-    /// Advertised target systems (resolved `RIO_SYSTEMS`). Threaded to
-    /// `setup_nix_conf` so the per-build daemon's `extra-platforms`
-    /// stays consistent with what the heartbeat advertises.
+    /// Advertised target systems (resolved `RIO_SYSTEMS`). The glue
+    /// derives the sandbox personality (i686/armv7l 32-bit builds) from
+    /// the drv's `system` against the host system; the heartbeat
+    /// advertises this same list to the scheduler.
     pub systems: Arc<[String]>,
     /// Resolved `hw_class` (controller-stamped pod annotation,
     /// downward-API volume). Read once per assignment by
@@ -119,7 +128,7 @@ pub struct ExecutorEnv {
     /// Handle to the FUSE local cache. The executor calls
     /// `register_inputs` (JIT allowlist, I-043 redesign) and
     /// `prefetch_manifests` (I-110c PG-skip hints) on it after
-    /// `compute_input_closure` and before daemon spawn. `None` in
+    /// `compute_input_closure` and before the sandbox runs. `None` in
     /// tests that don't mount FUSE — both calls are skipped.
     pub fuse_cache: Option<Arc<crate::fuse::cache::Cache>>,
     /// Base per-fetch gRPC timeout for the FUSE cache's `GetPath`
@@ -136,10 +145,56 @@ pub struct ExecutorEnv {
     /// one in `BuildSlot.cancel` and the one `spawn_build_task` reads to
     /// classify the final `Err`.
     pub cancelled: Arc<AtomicBool>,
+    /// Worker-level sandbox configuration shared by every build on this
+    /// pod (shell, CA bundle, operator extra mounts, hashed mirrors).
+    /// Bundled so a new sandbox knob is one field here + one line in
+    /// `runtime::setup` instead of churn at every construction site.
+    pub sandbox: Arc<SandboxEnvConfig>,
 }
 
-/// Default daemon build timeout: 2 hours. See `ExecutorEnv.daemon_timeout`.
-pub const DEFAULT_DAEMON_TIMEOUT: Duration = Duration::from_secs(7200);
+/// Worker-level inputs to the request glue's `SandboxOptions`,
+/// resolved once at startup from [`crate::config::Config`].
+#[derive(Debug, Default)]
+pub struct SandboxEnvConfig {
+    /// Static shell exposed as `/bin/sh` inside the sandbox
+    /// (`Config.sandbox_shell`).
+    pub sandbox_shell: Option<std::path::PathBuf>,
+    /// CA bundle for network (fixed-output) builds (`Config.ca_bundle`).
+    pub ca_bundle: Option<std::path::PathBuf>,
+    /// Operator extra read-only bind mounts (`Config.extra_sandbox_paths`).
+    pub extra_sandbox_paths: Vec<std::path::PathBuf>,
+    /// Hashed-mirror base URLs for `builtin:fetchurl`
+    /// (`Config.hashed_mirrors`).
+    pub hashed_mirrors: Vec<String>,
+    /// The worker's own platform (first entry of the advertised
+    /// `systems` list), for the 32-bit `personality(2)` decision.
+    pub host_system: String,
+}
+
+/// Default build timeout: 2 hours. See `ExecutorEnv.build_timeout`.
+pub const DEFAULT_BUILD_TIMEOUT: Duration = Duration::from_secs(7200);
+
+/// Hard ceiling on how long a sandbox execution may outlive its build
+/// timeout before the worker forcibly reclaims it.
+///
+/// Primary enforcement is rio-exec's `LimitWatchdog`: timeout, silence,
+/// and log-cap kills run in a dedicated task that performs no channel
+/// sends and is fed at raw-read time, so no consumer behavior — this
+/// worker's log loop, scheduler-link backpressure behind it — can
+/// stall a kill. This backstop is the *second* line, against
+/// worker-internal defects (a watchdog bug, a wedged blocking pool):
+/// `build timeout + EXEC_BACKSTOP_SLACK` after spawn, the `execute()`
+/// future is dropped, which fires the executor's process-tree guard —
+/// kill *and* reap, the designed-for cancellation path proven by
+/// `rio-exec/tests/drop_cancel.rs`.
+///
+/// MUST stay below rio-controller's `WORKER_DEADLINE_SLACK_SECS` (90s,
+/// `reconcilers/pool/jobs.rs`): the pod's `activeDeadlineSeconds` is
+/// `build_timeout + 90s`, and the worker has to report `TimedOut`
+/// through the normal completion path before k8s tears the pod down.
+/// The 60s covers sandbox setup plus the bounded post-reap event drain
+/// (`FINAL_DRAIN_TIMEOUT`), with margin.
+const EXEC_BACKSTOP_SLACK: Duration = Duration::from_secs(60);
 
 /// Error type for executor operations.
 ///
@@ -154,16 +209,6 @@ pub enum ExecutorError {
     Overlay(#[from] overlay::OverlayError),
     #[error("overlay setup task panicked: {0}")]
     OverlayTaskPanic(tokio::task::JoinError),
-    #[error("synthetic DB generation failed: {0}")]
-    SynthDb(#[from] sqlx::Error),
-    #[error("failed to write nix.conf: {0}")]
-    NixConf(#[source] std::io::Error),
-    #[error("daemon spawn failed: {0}")]
-    DaemonSpawn(std::io::Error),
-    #[error("daemon handshake failed: {0}")]
-    Handshake(#[from] rio_nix::protocol::handshake::HandshakeError),
-    #[error("daemon setup failed: {0}")]
-    DaemonSetup(String),
     #[error("build failed: {0}")]
     BuildFailed(String),
     /// The assignment's `.drv` content is malformed (UTF-8, ATerm parse,
@@ -178,8 +223,6 @@ pub enum ExecutorError {
     Grpc(#[from] tonic::Status),
     #[error("input metadata fetch failed for {path}: {source}")]
     MetadataFetch { path: String, source: tonic::Status },
-    #[error("wire protocol error: {0}")]
-    Wire(#[from] rio_nix::protocol::wire::WireError),
     #[error("cgroup resource tracking failed: {0}")]
     Cgroup(String),
     /// Pod-level cgroup `memory.events` `oom_kill` incremented during
@@ -199,40 +242,50 @@ pub enum ExecutorError {
         executor_kind: rio_proto::types::ExecutorKind,
     },
     /// Cancel flag observed before the per-build cgroup exists. I-166:
-    /// distinct from the post-cgroup path (cgroup.kill → daemon EOF →
-    /// `Wire(Io(UnexpectedEof))`) so `is_daemon_transient` doesn't retry
-    /// it. `spawn_build_task` maps any `Err` with `cancelled=true` to
-    /// `BuildResultStatus::Cancelled` regardless of variant; this
-    /// variant just makes the pre-cgroup abort explicit in logs.
+    /// distinct from the post-cgroup path (cgroup.kill → the sandboxed
+    /// build is killed and the executor reports the cancellation) so
+    /// `is_infra_transient` doesn't retry it. `spawn_build_task` maps
+    /// any `Err` with `cancelled=true` to `BuildResultStatus::Cancelled`
+    /// regardless of variant; this variant just makes the pre-cgroup
+    /// abort explicit in logs.
     #[error("build cancelled before cgroup creation")]
     Cancelled,
+    /// The request glue rejected the derivation (unsupported builtin,
+    /// malformed structuredAttrs, exportReferencesGraph outside the
+    /// closure, …). Per `GlueError`'s contract these are all input
+    /// problems — deterministic per-derivation, so they map to
+    /// `InputRejected` (see [`ExecutorError::is_permanent`]) instead of
+    /// burning fleet retries.
+    #[error("derivation rejected by the request glue: {0}")]
+    Glue(String),
+    /// The native sandbox failed to set up (host-side skeleton build,
+    /// fork/pipe plumbing, or an in-child setup phase reported over the
+    /// status pipe). The build itself never ran. Worker-local and
+    /// usually transient (FS race, FUSE hiccup while bind-mounting an
+    /// input) — retried locally a bounded number of times before the
+    /// failure escalates to the scheduler.
+    #[error("native sandbox setup failed: {0}")]
+    SandboxSetup(String),
 }
 
 impl ExecutorError {
-    /// Whether this error indicates a transient daemon-side failure
-    /// worth retrying locally before reporting to the scheduler.
+    /// Whether this error indicates a transient worker-local
+    /// infrastructure failure worth retrying locally before reporting
+    /// to the scheduler.
     ///
-    /// Covers the daemon-crashed-mid-handshake cases:
-    /// - `DaemonSpawn`: nix-daemon failed to exec (transient FS/mount race)
-    /// - `Handshake`: daemon died before protocol negotiation completed
-    /// - `Wire(Io(UnexpectedEof))`: daemon crashed mid-conversation
-    ///   (core dump, OOM-kill, SIGABRT) → pipe closed → "early eof"
+    /// Covers `SandboxSetup`: the build never ran, the cause is
+    /// worker-local (mount race, FUSE blip while binding an input), and
+    /// a bounded local retry is far cheaper than a scheduler
+    /// round-trip.
     ///
     /// Does NOT cover `BuildFailed` (real builder failure — retrying
     /// won't help), `Upload`/`Grpc`/`MetadataFetch` (network-side,
     /// scheduler's retry policy handles re-dispatch with backoff), or
-    /// `Overlay`/`SynthDb`/`NixConf` (deterministic setup failures —
-    /// same inputs, same failure).
-    // r[impl builder.retry.daemon-transient]
-    pub fn is_daemon_transient(&self) -> bool {
-        match self {
-            ExecutorError::DaemonSpawn(_) => true,
-            ExecutorError::Handshake(_) => true,
-            ExecutorError::Wire(rio_nix::protocol::wire::WireError::Io(e)) => {
-                e.kind() == std::io::ErrorKind::UnexpectedEof
-            }
-            _ => false,
-        }
+    /// `Overlay` (deterministic setup failure — same inputs, same
+    /// failure).
+    // r[impl builder.retry.infra-transient]
+    pub fn is_infra_transient(&self) -> bool {
+        matches!(self, ExecutorError::SandboxSetup(_))
     }
 
     /// Whether this error is deterministic per-derivation under the
@@ -243,8 +296,8 @@ impl ExecutorError {
     /// each time before the poison threshold trips.
     ///
     /// Everything NOT matched here stays `InfrastructureFailure`: node-
-    /// or network-local conditions (overlay/mount, IO, gRPC, daemon
-    /// crashes, cgroup, OOM) where another pod plausibly succeeds.
+    /// or network-local conditions (overlay/mount, IO, gRPC, sandbox
+    /// setup, cgroup, OOM) where another pod plausibly succeeds.
     pub fn is_permanent(&self) -> bool {
         matches!(
             self,
@@ -259,21 +312,26 @@ impl ExecutorError {
             // .drv content failed UTF-8/ATerm/BasicDerivation parse.
             // The bytes are what they are; every pod parses identically.
             | ExecutorError::InvalidDerivation(_)
+            // The request glue's rejections are all derivation-shaped
+            // input problems (unsupported builtin, bad structuredAttrs,
+            // graph reference outside the closure, …) — identical on
+            // every pod by construction.
+            | ExecutorError::Glue(_)
         )
     }
 }
 
-/// Max local retry attempts for transient daemon failures before
-/// reporting InfrastructureFailure to the scheduler. Bounded so a
-/// persistent crash (bad synth DB, broken nix binary) doesn't spin
+/// Max local retry attempts for transient sandbox-setup failures
+/// before reporting InfrastructureFailure to the scheduler. Bounded so
+/// a persistent failure (broken mount table, dead FUSE) doesn't spin
 /// indefinitely.
-pub const DAEMON_RETRY_MAX: u32 = 3;
+pub const INFRA_RETRY_MAX: u32 = 3;
 
-/// Backoff between daemon retry attempts. Sequence: 500ms, 1s, 2s.
+/// Backoff between local retry attempts. Sequence: 500ms, 1s, 2s.
 /// Total worst-case retry overhead ~3.5s — small vs the scheduler
-/// round-trip (re-dispatch + re-fetch closure + re-generate synth
-/// DB). No jitter: only one daemon per pod, no herd to break.
-pub const DAEMON_RETRY_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
+/// round-trip (re-dispatch + re-fetch closure). No jitter: only one
+/// build per pod, no herd to break.
+pub const INFRA_RETRY_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
     base: Duration::from_millis(500),
     mult: 2.0,
     cap: Duration::from_secs(2),
@@ -290,7 +348,7 @@ pub struct ExecutionResult {
     /// Assignment token from the WorkAssignment.
     pub assignment_token: String,
     /// Peak memory in bytes from the per-build cgroup's `memory.peak`.
-    /// Tree-wide: daemon + builder + every child compiler. 0 = build
+    /// Tree-wide: the sandboxed build and every child compiler. 0 = build
     /// failed before cgroup populated (executor error before spawn).
     pub peak_memory_bytes: u64,
     /// Peak CPU cores-equivalent, polled 1Hz from cgroup `cpu.stat`
@@ -315,7 +373,7 @@ pub struct ExecutionResult {
 
 /// Result of [`execute_build`]: the inner result PLUS the cgroup peak
 /// samples, which survive even when `result` is `Err`. Mirrors
-/// `DaemonOutcome` one level up so `runtime::result::err_completion`
+/// `NativeOutcome` one level up so `runtime::result::err_completion`
 /// can report the actual `memory.peak` for a `CgroupOom`'d build (the
 /// single most actionable sizing signal) instead of hardcoding 0.
 ///
@@ -326,15 +384,15 @@ pub struct ExecutionResult {
 pub struct ExecuteOutcome {
     pub result: Result<ExecutionResult, ExecutorError>,
     /// 0 only for pre-cgroup setup errors (drv parse, WrongKind,
-    /// overlay, daemon-spawn). Populated for `CgroupOom` /
-    /// post-handshake `Wire` / `Upload` / `BuildFailed`.
+    /// overlay, glue, sandbox setup). Populated for `CgroupOom` /
+    /// `Upload` / `BuildFailed`.
     pub peak_memory_bytes: u64,
     pub peak_cpu_cores: f64,
     /// `None` = no prjquota OR pre-cgroup error. Sampled BEFORE
     /// `build_result?` so an OOM'd build also reports it.
     pub peak_disk_bytes: Option<u64>,
     /// Highest line number this attempt's `BuildLogBatch`es reached
-    /// (header + LogBatcher output). The runtime daemon-transient retry
+    /// (header + LogBatcher output). The runtime infra-transient retry
     /// loop feeds it back as the next attempt's `first_line` so output
     /// numbering continues monotonically across attempts; once the loop
     /// breaks it places the banner footer here. `0` only for pre-header
@@ -345,11 +403,11 @@ pub struct ExecuteOutcome {
     /// in `runtime::result::final_footer_result`), computed BEFORE
     /// collect_outputs so a successful build that fails its upload still
     /// reports `ok` here (CompletionReport carries the upload failure).
-    /// `None` when no daemon process ran in THIS attempt — pre-daemon
+    /// `None` when no build process ran in THIS attempt — pre-exec
     /// setup error or `RIO_BUILDER_SCRIPT` fixture short-circuit. The
     /// runtime tracks the most recent `Some(...)` across the retry loop
-    /// so a footer is sent whenever ANY attempt ran a daemon: an
-    /// all-pre-daemon assignment (header only, no output) gets no
+    /// so a footer is sent whenever ANY attempt ran a build: an
+    /// all-pre-exec assignment (header only, no output) gets no
     /// footer — that absence is the documented "build never started"
     /// signal. Sending one footer per attempt produces conflicting
     /// `rio: result` lines for one exec_id (bug_013).
@@ -360,8 +418,8 @@ impl ExecuteOutcome {
     /// Pre-cgroup setup error: cgroup never populated, peaks genuinely 0.
     /// `final_line_count` is the watermark the caller has already pushed
     /// (`first_line` for pre-header errors, `batcher_seed` for
-    /// post-header pre-daemon errors); `footer_result` is `None` —
-    /// no daemon process ran in this attempt.
+    /// post-header pre-exec errors); `footer_result` is `None` —
+    /// no build process ran in this attempt.
     fn pre_cgroup(e: ExecutorError, final_line_count: u64) -> Self {
         Self {
             result: Err(e),
@@ -384,40 +442,42 @@ impl ExecuteOutcome {
             peak_disk_bytes: r.peak_disk_bytes,
             result: Ok(r),
             final_line_count,
-            footer_result: None, // RIO_BUILDER_SCRIPT short-circuit: no daemon ran.
+            footer_result: None, // RIO_BUILDER_SCRIPT short-circuit: no build ran.
         }
     }
 }
 
-/// What `execute_build`'s pre-daemon inner block produced. Exists so
-/// the block's `?` sites stay `?` (pre-cgroup errors → peaks=0) while
-/// the post-daemon section can carry peaks across `Err`.
-enum PreDaemon {
+/// What `execute_build`'s pre-exec inner block (overlay → resolve →
+/// glue → sandbox) produced. Exists so the block's `?` sites stay `?`
+/// (pre-cgroup errors → peaks=0) while the post-build section can
+/// carry peaks across `Err`.
+enum PreExec {
     /// `RIO_BUILDER_SCRIPT` short-circuit (feature `test-fixtures`).
     /// Variant is cfg-gated to its only construction site so the match
     /// stays exhaustive in both feature configurations.
     #[cfg(feature = "test-fixtures")]
     Fixture(ExecutionResult),
-    /// Daemon ran; carry locals needed for the post-daemon section.
+    /// The build ran (natively); carry locals needed for the
+    /// post-build section.
     Ran {
         overlay_mount: overlay::OverlayMount,
-        input_paths: Vec<String>,
-        outcome: DaemonOutcome,
+        outcome: NativeOutcome,
     },
 }
 
 /// Execute a single build assignment.
 ///
 /// This is the main entry point for building a derivation. It handles
-/// the full lifecycle: overlay setup, synthetic DB, daemon invocation,
-/// log streaming, output upload, and cleanup.
+/// the full lifecycle: overlay setup, input resolution, sandbox request
+/// glue, native execution, log streaming, output processing, upload,
+/// and cleanup.
 ///
 /// This is the ROOT span for the worker's contribution to a build trace.
 /// Per observability.typ (trace structure), child spans are:
 /// `fetch_drv_from_store`, `compute_input_closure`,
-/// `generate_db`, `spawn_daemon_in_namespace`, `run_daemon_build`,
-/// `upload_all_outputs`. `drv_path` is the primary identifier (matches
-/// scheduler's `drv_key` span field via the derivation hash substring).
+/// `run_native_lifecycle`, `process_outputs`, `upload_all_outputs`.
+/// `drv_path` is the primary identifier (matches the scheduler's
+/// `drv_key` span field via the derivation hash substring).
 #[instrument(
     skip_all,
     fields(
@@ -430,7 +490,7 @@ pub async fn execute_build(
     assignment: &WorkAssignment,
     env: &ExecutorEnv,
     store_client: &mut StoreServiceClient<Channel>,
-    log_tx: &mpsc::Sender<ExecutorMessage>,
+    log_tx: &crate::log_stream::SheddingLogSender,
     first_line: u64,
 ) -> ExecuteOutcome {
     let drv_path = &assignment.drv_path;
@@ -450,7 +510,7 @@ pub async fn execute_build(
     // 1. Parse the derivation. Scheduler inlines drv_content for
     // missing-output nodes; empty means cache-hit or
     // inline-budget exceeded, so fall back to store fetch.
-    let drv = if assignment.drv_content.is_empty() {
+    let (drv, drv_text) = if assignment.drv_content.is_empty() {
         match fetch_drv_from_store(store_client, drv_path).await {
             Ok(d) => d,
             Err(e) => return ExecuteOutcome::pre_cgroup(e, first_line),
@@ -467,9 +527,11 @@ pub async fn execute_build(
                 ExecutorError::InvalidDerivation(format!("drv content is not valid UTF-8: {e}"))
             })
             .and_then(|t| {
-                Derivation::parse(t).map_err(|e| {
-                    ExecutorError::InvalidDerivation(format!("failed to parse derivation: {e}"))
-                })
+                Derivation::parse(t)
+                    .map(|d| (d, t.to_owned()))
+                    .map_err(|e| {
+                        ExecutorError::InvalidDerivation(format!("failed to parse derivation: {e}"))
+                    })
             });
         match parsed {
             Ok(d) => d,
@@ -496,7 +558,7 @@ pub async fn execute_build(
     }
 
     // r[impl builder.executor.kind-gate]
-    // Wrong-kind gate BEFORE overlay setup or daemon spawn. The
+    // Wrong-kind gate BEFORE overlay setup or sandbox construction. The
     // scheduler's hard_filter should never misroute, but a bug or
     // stale-generation race must not grant a builder internet access
     // even transiently. `is_fod` re-derived from the .drv above
@@ -526,7 +588,7 @@ pub async fn execute_build(
     // r[impl obs.log.worker-header]
     // Banner header — the first thing in the build log, ahead of any
     // build output. Sent directly on `log_tx` (not through `LogBatcher`
-    // — that's created inside `run_daemon_lifecycle`, three call frames
+    // — that's created inside `run_native_lifecycle`, one call frame
     // down); the batcher is seeded with `batcher_seed`
     // (`HEADER_LINE_COUNT` on the first attempt, the prior attempt's
     // `final_line_count` on a retry) so the build's real output numbers
@@ -542,9 +604,9 @@ pub async fn execute_build(
     // going to run. Sent BEFORE overlay setup so a failed mount still
     // leaves a self-describing log (header, no output, no footer).
     //
-    // Sent only on the FIRST daemon-transient retry attempt
+    // Sent only on the FIRST infra-transient retry attempt
     // (`first_line == 0`): the runtime retry loop (runtime/mod.rs)
-    // re-invokes `execute_build` up to DAEMON_RETRY_MAX more times for
+    // re-invokes `execute_build` up to INFRA_RETRY_MAX more times for
     // one assignment; re-emitting the header per attempt would write
     // duplicate "first lines" at line 0 and break the scheduler ring
     // buffer's line-number monotonicity (bug_013).
@@ -567,21 +629,20 @@ pub async fn execute_build(
                 assignment.assigned_mem_bytes,
                 assignment.assigned_disk_bytes,
             ),
-        )
-        .await;
+        );
         crate::banner::HEADER_LINE_COUNT
     } else {
         first_line
     };
 
-    // ── Pre-daemon block: overlay → resolve → sandbox → daemon. ───────
+    // ── Pre-exec block: overlay → resolve → glue → sandbox. ───────────
     // Wrapped so the `?` sites stay `?`: every error here is pre-cgroup
-    // (cgroup created INSIDE `run_daemon_lifecycle` after daemon spawn),
-    // including `run_daemon_lifecycle`'s own outer `Err` (its doc:
-    // "returns Err only for setup failures BEFORE the cgroup kill-guard
-    // is in place"). Converted to `ExecuteOutcome::pre_cgroup` once at
-    // the match below — no per-site churn.
-    let pre: Result<PreDaemon, ExecutorError> =
+    // (the per-build cgroup is created INSIDE `run_native_lifecycle`
+    // before the sandbox forks), including `run_native_lifecycle`'s own
+    // outer `Err` for setup failures before its kill-guard is in place.
+    // Converted to `ExecuteOutcome::pre_cgroup` once at the match below
+    // — no per-site churn.
+    let pre: Result<PreExec, ExecutorError> =
         async {
             // 2. Set up overlay. `setup_overlay` is synchronous (mkdir + stat +
             // overlayfs mount syscall); run on the blocking pool so a slow mount
@@ -596,25 +657,44 @@ pub async fn execute_build(
             .await
             .map_err(ExecutorError::OverlayTaskPanic)??;
 
+            // The native executor has no movePath step: the sandboxed build
+            // writes its outputs directly into the merged store view (the
+            // glue mounts it writable at /nix/store). The merged root is
+            // created root:root 0755 by the overlay mount, which the build
+            // user (uid 1000) cannot create entries in — give it the same
+            // 1775 root:<build-gid> mode Nix gives a chroot store. This is
+            // a metadata-only copy-up onto the upper layer; the FUSE lower
+            // is never touched.
+            make_store_scratch_writable(overlay_mount.merged_dir(), SANDBOX_BUILD_GID).map_err(
+                |e| {
+                    ExecutorError::SandboxSetup(format!(
+                        "preparing writable store scratch {}: {e}",
+                        overlay_mount.merged_dir().display()
+                    ))
+                },
+            )?;
+
             // 3. Resolve inputDrvs → BasicDerivation + full input closure.
             let ResolvedInputs {
                 basic_drv,
                 input_paths,
                 input_sized,
                 input_metadata,
-            } = resolve_inputs(&*store_client, &drv, drv_path).await?;
+                dropped_inputs,
+                graph_drvs,
+            } = resolve_inputs(&*store_client, &drv, drv_path, &drv_text).await?;
 
-            // r[impl builder.cores.cgroup-clamp+2]
-            // Compute once: feeds BOTH nix.conf `cores=` (defense-in-depth)
-            // and wopSetOptions build_cores below. I-196/I-197 rationale at
-            // crate::cgroup::effective_cores.
+            // r[impl builder.cores.cgroup-clamp+3]
+            // Compute once: feeds the assignment-clamped `build_cores`
+            // (exported as NIX_BUILD_CORES in the sandbox env) below.
+            // I-196/I-197 rationale at crate::cgroup::effective_cores.
             let effective_cores = crate::cgroup::effective_cores(&env.cgroup_parent);
 
             // RIO_BUILDER_SCRIPT fixture intercept (sla-sizing VM scenario):
-            // short-circuit the daemon lifecycle and report scripted telemetry
+            // short-circuit the build lifecycle and report scripted telemetry
             // so the explore ladder can be driven without wall-clock minutes
             // per probe. After overlay+input setup so the FUSE/JIT paths still
-            // exercise; before sandbox prep so no nix-daemon spawns.
+            // exercise; before sandbox prep so nothing forks.
             #[cfg(feature = "test-fixtures")]
             if let Some(pname) = drv.env().get("pname")
                 && let Some(o) = crate::fixture::lookup(pname, effective_cores)
@@ -634,29 +714,23 @@ pub async fn execute_build(
                 {
                     tracing::warn!(error = %e, "fixture-path overlay teardown failed");
                 }
-                return Ok(PreDaemon::Fixture(r));
+                return Ok(PreExec::Fixture(r));
             }
 
-            // 4. Populate sandbox: synth DB, nix.conf.
-            prepare_sandbox(
-                &overlay_mount,
-                &drv,
-                drv_path,
-                input_metadata,
-                effective_cores,
-                &env.systems,
-            )
-            .await?;
+            // 4. (native executor) No synthetic store DB and no nix.conf:
+            // the request glue + rio-exec sandbox replace the daemon-era
+            // scaffolding. `input_metadata` flows into the glue (env/refs
+            // planning) and the result pipeline (closure policy checks).
 
             // 4b. Arm JIT FUSE fetch (I-043 redesign): register the input
-            // closure as the FUSE `lookup()` allowlist. The daemon's first
+            // closure as the FUSE `lookup()` allowlist. The sandbox's first
             // overlay→FUSE `lstat` of each input now blocks-and-fetches in
             // FUSE userspace; on fetch failure `lookup()` returns EIO (NEVER
             // ENOENT — overlay would negative-cache it). Names NOT in the
             // allowlist (`.lock`, `.chroot`, output-path probes) get fast
             // ENOENT without contacting the store.
             //
-            // This replaces the pre-daemon `warm_inputs_in_fuse` phase, which
+            // This replaces the daemon-era `warm_inputs_in_fuse` phase, which
             // fetched the WHOLE closure (~800–1500 paths) up-front — defeating
             // lazy fetch for builds that touch a fraction of their closure.
             // The I-165 47-min hang window is gone with it: register +
@@ -689,92 +763,81 @@ pub async fn execute_build(
                 prefetch_manifests(store_client, cache, &input_paths).await;
             }
 
-            // 5. Spawn nix-daemon --stdio --store 'local?root={build_dir}'.
-            //
-            // The daemon reads/writes the chroot store at the per-build dir:
-            //   {build_dir}/nix/store      → overlay merged (FUSE inputs ∪ outputs)
-            //   {build_dir}/nix/var/nix/db → synthetic SQLite DB
-            //   {build_dir}/etc/nix        → WORKER_NIX_CONF (via NIX_CONF_DIR)
-            //
-            // Its OWN binary + libs come from host `/nix/store` (the builder's
-            // namespace) — structurally separate from the per-build store, so a
-            // build whose `$out` collides with the daemon's runtime closure
-            // (I-060) can't shadow it. nix's nested sandbox bind-mounts inputs
-            // from realStoreDir (`{build_dir}/nix/store/...`) to the build's
-            // canonical `/nix/store/...`.
+            // 5. Run the build natively: request glue → rio-exec sandbox →
+            // exit classification → output pipeline. The sandbox's
+            // `/nix/store` is the overlay *merged* view (FUSE-backed inputs
+            // ∪ upper layer); outputs written through it land in the upper
+            // layer where `collect_native_outputs` reads them.
             let opts = resolve_build_opts(assignment, env, effective_cores, batcher_seed);
 
-            let outcome = run_daemon_lifecycle(
-                &overlay_mount,
+            let outcome = run_native_lifecycle(NativeLifecycleArgs {
+                overlay_mount: &overlay_mount,
                 env,
-                &build_id,
+                build_id: &build_id,
                 drv_path,
-                &basic_drv,
+                drv: &drv,
+                basic_drv: &basic_drv,
+                input_paths: &input_paths,
+                input_metadata: &input_metadata,
+                dropped_inputs: &dropped_inputs,
                 opts,
+                is_fod,
                 log_tx,
-            )
+                graph_drvs: std::sync::Arc::clone(&graph_drvs),
+            })
             .await?;
 
-            Ok(PreDaemon::Ran {
+            Ok(PreExec::Ran {
                 overlay_mount,
-                input_paths,
                 outcome,
             })
         }
         .await;
 
-    let (
-        overlay_mount,
-        input_paths,
-        build_result,
-        peak_memory_bytes,
-        peak_cpu_cores,
-        final_line_count,
-    ) = match pre {
-        Err(e) => return ExecuteOutcome::pre_cgroup(e, batcher_seed),
-        #[cfg(feature = "test-fixtures")]
-        Ok(PreDaemon::Fixture(r)) => return ExecuteOutcome::fixture(r, batcher_seed),
-        Ok(PreDaemon::Ran {
-            overlay_mount,
-            input_paths,
-            outcome:
-                DaemonOutcome {
-                    build_result,
-                    peak_memory_bytes,
-                    peak_cpu_cores,
-                    final_line_count,
-                },
-        }) => (
-            overlay_mount,
-            input_paths,
-            build_result,
-            peak_memory_bytes,
-            peak_cpu_cores,
-            final_line_count,
-        ),
-    };
+    let (overlay_mount, build_result, peak_memory_bytes, peak_cpu_cores, final_line_count) =
+        match pre {
+            Err(e) => return ExecuteOutcome::pre_cgroup(e, batcher_seed),
+            #[cfg(feature = "test-fixtures")]
+            Ok(PreExec::Fixture(r)) => return ExecuteOutcome::fixture(r, batcher_seed),
+            Ok(PreExec::Ran {
+                overlay_mount,
+                outcome:
+                    NativeOutcome {
+                        build_result,
+                        peak_memory_bytes,
+                        peak_cpu_cores,
+                        final_line_count,
+                    },
+            }) => (
+                overlay_mount,
+                build_result,
+                peak_memory_bytes,
+                peak_cpu_cores,
+                final_line_count,
+            ),
+        };
 
     // r[impl obs.log.worker-header]
     // Footer result string — computed BEFORE `collect_outputs` consumes
     // `build_result` below so the eventual footer carries the build
     // process's OWN result (`ok` even when upload fails afterward;
-    // `CompletionReport` carries the post-daemon failure). The footer
-    // batch itself is sent by the runtime AFTER the daemon-transient
+    // `CompletionReport` carries the post-build failure). The footer
+    // batch itself is sent by the runtime AFTER the infra-transient
     // retry loop with the most recent attempt's `footer_result` /
     // `final_line_count` — `execute_build` is called once per attempt,
     // and re-emitting the footer per attempt would write conflicting
     // `rio: result` lines for one exec_id (bug_013).
     //
     // Pre-cgroup early returns above (`Err(e)`, `Fixture`) carry
-    // `footer_result: None`: those builds never ran a daemon in THIS
-    // attempt. The runtime tracks the most recent `Some(...)` across
-    // attempts so the footer is sent whenever any attempt produced
-    // output. If NO attempt ran a daemon, the runtime sends no footer:
+    // `footer_result: None`: those builds never ran a build process in
+    // THIS attempt. The runtime tracks the most recent `Some(...)`
+    // across attempts so the footer is sent whenever any attempt
+    // produced output. If NO attempt ran one, the runtime sends no footer:
     // header with no output and no footer is the documented signal
     // that the build never started.
-    let footer_result = footer_result_str(&build_result);
+    let footer_result = footer_result_native(&build_result);
 
-    // ── Post-daemon: peaks now in scope; carry across every Err. ──────
+    // ── Post-build: peaks now in scope; carry across every Err. ───────
     // r[impl builder.cgroup.memory-peak+2]
     // Sample prjquota BEFORE the build_result/collect_outputs
     // early-returns — `dqb_curspace` is current bytes (overlay still
@@ -794,27 +857,42 @@ pub async fn execute_build(
     };
 
     // 10. Collect outputs (borrows &overlay_mount; must precede teardown).
-    // The daemon error is NOT propagated yet — teardown below must run
+    // The build error is NOT propagated yet — teardown below must run
     // on the spawn_blocking pool for both Ok AND Err. A `return
     // post_err(e)` here would drop `overlay_mount` synchronously on this
-    // tokio worker (multi-GB `remove_dir_all`), and `Wire(UnexpectedEof)`
-    // is `is_daemon_transient()` → the retry loop at runtime/mod.rs calls
+    // tokio worker (multi-GB `remove_dir_all`), and `SandboxSetup` is
+    // `is_infra_transient()` → the retry loop at runtime/mod.rs calls
     // back in instead of exiting, so the worker would block across the
     // retry and starve heartbeats.
-    let collect_result = match build_result {
+    let collect_result: Result<BuildOutputs, ExecutorError> = match build_result {
         Err(e) => Err(e),
-        Ok(br) => collect_outputs(
-            &br,
-            store_client,
-            &overlay_mount,
-            &drv,
-            drv_path,
-            is_fod,
-            &input_paths,
-            &assignment.assignment_token,
-        )
-        .await
-        .map(|o| (br, o)),
+        // The build ran and failed: the status was already classified by
+        // the native pipeline (exit classification or output rejection);
+        // nothing to upload.
+        Ok(NativeBuild::Failed {
+            status, error_msg, ..
+        }) => {
+            tracing::warn!(drv_path = %drv_path, ?status, error = %error_msg, "build failed");
+            Ok(outputs::native_failed(status, error_msg))
+        }
+        Ok(NativeBuild::Succeeded {
+            processed,
+            start_time,
+            stop_time,
+        }) => {
+            collect_native_outputs(
+                &processed,
+                store_client,
+                &overlay_mount,
+                &drv,
+                drv_path,
+                is_fod,
+                &assignment.assignment_token,
+                start_time,
+                stop_time,
+            )
+            .await
+        }
     };
 
     // 11. Tear down overlay UNCONDITIONALLY via spawn_blocking — covers
@@ -843,10 +921,10 @@ pub async fn execute_build(
         Ok(Ok(())) => {}
     }
 
-    // Propagate any daemon/collect error AFTER teardown ran — WITH peaks
+    // Propagate any build/collect error AFTER teardown ran — WITH peaks
     // attached, not via `?`.
-    let (_build_result, BuildOutputs { proto_result }) = match collect_result {
-        Ok(pair) => pair,
+    let BuildOutputs { proto_result } = match collect_result {
+        Ok(outputs) => outputs,
         Err(e) => return post_err(e),
     };
 
@@ -870,16 +948,16 @@ pub async fn execute_build(
 
 /// Effective per-build options after applying assignment →
 /// worker-config → cgroup-clamp precedence, plus the `LogBatcher` line
-/// seed for daemon-transient retry continuity. `batcher_seed` is
+/// seed for infra-transient retry continuity. `batcher_seed` is
 /// logging plumbing, not a build option — bundled here so
-/// `run_daemon_lifecycle` stays under `clippy::too_many_arguments`.
+/// `run_native_lifecycle` stays under `clippy::too_many_arguments`.
 struct BuildOpts {
     timeout: Duration,
     max_silent_time: u64,
     build_cores: u64,
     /// Initial `LogBatcher` line counter: `HEADER_LINE_COUNT` on the
-    /// first attempt, the prior attempt's `final_line_count` on a
-    /// daemon-transient retry. See `execute_build`'s `first_line` param.
+    /// first attempt, the prior attempt's `final_line_count` on an
+    /// infra-transient retry. See `execute_build`'s `first_line` param.
     batcher_seed: u64,
 }
 
@@ -887,10 +965,10 @@ struct BuildOpts {
 ///
 /// The scheduler computes `BuildOptions` per-derivation from the
 /// intersecting builds' options (`actor/build.rs` `min_nonzero` for
-/// timeouts, max for cores). `None` → daemon defaults: unbounded
-/// silence, nproc cores. 0 → 0 on the wire = unbounded/all-cores to
-/// the daemon — the scheduler's `min_nonzero` already handles the
-/// 0-means-unset semantics; we pass through verbatim.
+/// timeouts, max for cores). `None` → executor defaults: unbounded
+/// silence, nproc cores. 0 = unbounded/all-cores — the scheduler's
+/// `min_nonzero` already handles the 0-means-unset semantics; we pass
+/// through verbatim.
 ///
 /// `batcher_seed` is passed through verbatim — it's not a build option,
 /// see [`BuildOpts`].
@@ -903,7 +981,7 @@ fn resolve_build_opts(
     let opts = assignment.build_options.as_ref();
     let timeout = opts
         .and_then(|o| (o.build_timeout > 0).then(|| Duration::from_secs(o.build_timeout)))
-        .unwrap_or(env.daemon_timeout);
+        .unwrap_or(env.build_timeout);
     // Assignment's max_silent_time wins if nonzero; else the worker
     // config default. Same 0-means-unset semantics as build_timeout above.
     // Config default exists because Nix ssh-ng clients don't send
@@ -913,8 +991,8 @@ fn resolve_build_opts(
         .map(|o| o.max_silent_time)
         .filter(|&v| v > 0)
         .unwrap_or(env.max_silent_time);
-    // r[impl builder.cores.cgroup-clamp+2]
-    // I-196: NEVER pass build_cores=0 to the daemon. 0 means "use
+    // r[impl builder.cores.cgroup-clamp+3]
+    // I-196: NEVER pass build_cores=0 to the build env. 0 means "use
     // nproc", and nproc inside a pod sees ALL node cores (cgroup CPU
     // quota throttles scheduling, doesn't hide CPUs). On a 16-core
     // node a `tiny` (0.5-core, 1Gi) builder would run `make -j16` →
@@ -922,8 +1000,9 @@ fn resolve_build_opts(
     // (I-197: pools set limits.cpu == requests.cpu so cpu.max is
     // always a real quota), and cap any client-requested value at the
     // same ceiling — a client asking for --cores 64 on a 2-core pod
-    // gets 2. Computed once in the caller (also written to nix.conf in
-    // prepare_sandbox as defense-in-depth).
+    // gets 2. Computed once in the caller; the clamped value reaches
+    // the build solely as NIX_BUILD_CORES in the sandbox env (there is
+    // no per-build nix.conf anymore).
     let effective_cores = u64::from(effective_cores);
     // r[impl sched.sla.cores-reach-nix-build-cores]
     // ADR-023: scheduler-assigned cores are authoritative when set. The
@@ -957,162 +1036,573 @@ fn resolve_build_opts(
     }
 }
 
-/// Result of [`run_daemon_lifecycle`]: the inner build result (NOT yet
-/// `?`-propagated — cgroup teardown must run regardless) plus the
-/// resource samples read from the per-build cgroup before it was dropped.
-struct DaemonOutcome {
-    build_result: Result<rio_nix::protocol::build::BuildResult, ExecutorError>,
+/// Arguments for [`run_native_lifecycle`] — bundled to stay under
+/// `clippy::too_many_arguments` (same convention as [`BuildOpts`]).
+struct NativeLifecycleArgs<'a> {
+    overlay_mount: &'a overlay::OverlayMount,
+    env: &'a ExecutorEnv,
+    build_id: &'a str,
+    drv_path: &'a str,
+    drv: &'a Derivation,
+    basic_drv: &'a rio_nix::derivation::BasicDerivation,
+    input_paths: &'a [String],
+    input_metadata: &'a [ValidatedPathInfo],
+    /// Resolve-time residency gaps (see `ResolvedInputs::dropped_inputs`)
+    /// — consulted by every [`dropped::VerdictArm`].
+    dropped_inputs: &'a dropped::DroppedInputs,
+    opts: BuildOpts,
+    is_fod: bool,
+    log_tx: &'a crate::log_stream::SheddingLogSender,
+    graph_drvs: std::sync::Arc<std::collections::BTreeMap<String, String>>,
+}
+
+/// What the native pipeline produced for one build attempt.
+enum NativeBuild {
+    /// The builder exited 0 and the output pipeline (canonicalise, scan,
+    /// policy checks, floating-CA finalization) accepted every output.
+    Succeeded {
+        processed: native_result::ProcessedOutputs,
+        start_time: u64,
+        stop_time: u64,
+    },
+    /// The build ran (or was prevented from running by an
+    /// already-classified condition) and failed. `status`/`error_msg`
+    /// are final — `collect` only wraps them into the proto result.
+    Failed {
+        status: rio_proto::types::BuildResultStatus,
+        error_msg: String,
+    },
+}
+
+/// Result of [`run_native_lifecycle`]: the inner result is NOT yet
+/// `?`-propagated so the caller can tear down the overlay first, and
+/// the cgroup peaks are already sampled because the cgroup is gone by
+/// the time this returns.
+struct NativeOutcome {
+    build_result: Result<NativeBuild, ExecutorError>,
     peak_memory_bytes: u64,
     peak_cpu_cores: f64,
-    /// Lines accounted for by the [`LogBatcher`] (the seeded banner
-    /// header offset + everything the stderr loop flushed). Read by
-    /// [`execute_build`] to set the footer banner's `first_line_number`
-    /// so it follows the build output instead of colliding. Equal to
-    /// the seeded `opts.batcher_seed` when [`run_daemon_build`]'s
-    /// setup failed before the loop ran (no build output produced).
     final_line_count: u64,
 }
 
-/// Spawn `nix-daemon`, attach it to a per-build cgroup, run the build,
-/// then unconditionally kill + drain the cgroup.
+/// Run one build through the native executor stack:
+/// request glue → `rio_exec::execute` → exit classification → output
+/// pipeline. Owns the per-build cgroup and the log-message bookkeeping
+/// (batcher, `@nix` phase frames, flush ticks) for the duration.
 ///
-/// Returns `Err` only for setup failures BEFORE the cgroup kill-guard is
-/// in place (daemon spawn, cgroup create/add — `kill_on_drop` covers the
-/// daemon for those). Any error from `run_daemon_build` itself is carried
-/// in `DaemonOutcome.build_result` so the caller can propagate it AFTER
-/// the cgroup has been torn down.
-#[instrument(skip_all, fields(drv_path = %drv_path))]
-async fn run_daemon_lifecycle(
-    overlay_mount: &overlay::OverlayMount,
-    env: &ExecutorEnv,
-    build_id: &str,
-    drv_path: &str,
-    basic_drv: &rio_nix::derivation::BasicDerivation,
-    opts: BuildOpts,
-    log_tx: &mpsc::Sender<ExecutorMessage>,
-) -> Result<DaemonOutcome, ExecutorError> {
-    tracing::info!(drv_path = %drv_path, "spawning nix-daemon in mount namespace");
-    let mut daemon = spawn_daemon_in_namespace(overlay_mount).await?;
-    tracing::info!(drv_path = %drv_path, pid = ?daemon.id(), "nix-daemon spawned; starting handshake");
+/// Returns `Err` only for failures BEFORE the cgroup kill-guard is in
+/// place (cgroup create). Everything after — including sandbox setup
+/// failures reported by rio-exec — is carried in
+/// `NativeOutcome.build_result` so the caller tears down the overlay
+/// before propagating.
+// r[impl builder.cores.cgroup-clamp+3]
+// r[impl builder.silence.timeout-kill+3]
+// r[impl builder.stderr.forward-set-phase+2]
+#[instrument(skip_all, fields(drv_path = %args.drv_path))]
+async fn run_native_lifecycle(
+    args: NativeLifecycleArgs<'_>,
+) -> Result<NativeOutcome, ExecutorError> {
+    let NativeLifecycleArgs {
+        overlay_mount,
+        env,
+        build_id,
+        drv_path,
+        drv,
+        basic_drv,
+        input_paths,
+        input_metadata,
+        dropped_inputs,
+        opts,
+        is_fod,
+        log_tx,
+        graph_drvs,
+    } = args;
 
-    // Per-build cgroup. Created AFTER spawn (we need the PID) but
-    // BEFORE run_daemon_build — critical ordering: the daemon must
-    // be in the cgroup BEFORE it forks the builder (step 4 of
-    // run_daemon_build's handshake), otherwise the builder inherits
-    // the PARENT cgroup and we measure only daemon RSS — right back
-    // to the phase2c VmHWM bug. The handshake hasn't started yet
-    // (run_daemon_build does it), so this is safe.
-    //
-    // `?` on both create and add_process: if cgroup setup fails here,
-    // the build fails. cgroup v2 is a hard requirement — we already
-    // validated the parent cgroup at startup, so failure here is
-    // exceptional (stale directory from a crash that we couldn't
-    // rmdir because it has a stuck process, or daemon died between
-    // spawn and now). Both are real errors the operator should see.
-    //
-    // build_id = sanitize_build_id(drv_path). nixbase32 hash chars are
-    // valid cgroup names; sanitize collapses anything outside
-    // [A-Za-z0-9_-] to '_' (drv names can carry `?id=...`, `+`, etc. —
-    // see I-167). Same name as the overlay directory — easy to
-    // correlate in debugging.
+    // ── Per-build cgroup (same name the cancel registry predicts). ──────
     let build_cgroup = crate::cgroup::BuildCgroup::create(&env.cgroup_parent, build_id)
         .map_err(|e| ExecutorError::Cgroup(format!("create sub-cgroup: {e}")))?;
-    let daemon_pid = daemon
-        .id()
-        .ok_or_else(|| ExecutorError::Cgroup("daemon PID unavailable (died at spawn?)".into()))?;
-    build_cgroup
-        .add_process(daemon_pid)
-        .map_err(|e| ExecutorError::Cgroup(format!("add daemon to cgroup: {e}")))?;
-
-    // Kill-guard: any `?` between here and the explicit drop at the
-    // bottom of this function fires this. The explicit kill() + drain
-    // + drop below remain the PRIMARY path (they wait for drain; this
-    // guard doesn't). scopeguard::guard not defer! — we need to hand
-    // it the PathBuf, not borrow build_cgroup.
     let cgroup_kill_path = build_cgroup.path().to_path_buf();
-    let cgroup_kill_guard = scopeguard::guard(cgroup_kill_path, |p| {
-        // Best-effort. No drain — we're in Drop, can't await. The
-        // BuildCgroup's own Drop runs right after this and will EBUSY
-        // if the SIGKILL hasn't landed yet; that's the existing leak
-        // path, just now with the kill attempted.
+    let cgroup_kill_guard = scopeguard::guard(cgroup_kill_path.clone(), |p| {
         let _ = std::fs::write(p.join("cgroup.kill"), "1");
     });
-
     let monitors = spawn_cgroup_monitors(&build_cgroup, &env.cgroup_parent);
 
-    // All daemon I/O is in a helper so we can ALWAYS kill on error.
-    // The cgroup setup above (create/add_process)
-    // is NOT inside this helper — its `?` paths rely on the
-    // kill_on_drop set in spawn_daemon_in_namespace as a safety
-    // net. The explicit kill below remains the primary cleanup
-    // (graceful, bounded wait for reap); kill_on_drop covers early
-    // returns between spawn and here.
-    // Seeded with `opts.batcher_seed`: `execute_build` already sent the
-    // `rio:` banner header on the first attempt, or a prior attempt's
-    // output ended here on a daemon-transient retry. Without this, the
-    // build's line 0 collides with `rio: exec` (or with a prior attempt's
-    // output) and the dashboard's `since_line` resumption desyncs.
+    // ── Host-side directories for the sandbox. ──────────────────────────
+    // Both live under the overlay root so `teardown_overlay`'s
+    // remove_dir_all reclaims them with everything else.
+    let build_dir = overlay_mount.root_dir().join("build");
+    let chroot_dir = overlay_mount.root_dir().join("chroot");
+    for d in [&build_dir, &chroot_dir] {
+        if let Err(e) = std::fs::create_dir_all(d) {
+            return Err(ExecutorError::SandboxSetup(format!(
+                "creating {} failed: {e}",
+                d.display()
+            )));
+        }
+    }
+    // `/build` is the build's cwd, `TMPDIR`/`TEMP*`, and `NIX_BUILD_TOP`.
+    // The directory was just created root:root 0755; hand it to the
+    // sandbox user exactly like CppNix's `chownToBuilder(tmpDir)` (mode
+    // 0700, builder-owned) — without this every build that writes scratch
+    // files outside `$out` (unpackPhase, `mktemp`, configure's conftest)
+    // fails EACCES. The merged store gets the equivalent treatment via
+    // `make_store_scratch_writable` further up.
+    if let Err(e) = make_build_dir_writable(&build_dir, SANDBOX_BUILD_UID, SANDBOX_BUILD_GID) {
+        return Err(ExecutorError::SandboxSetup(format!(
+            "preparing {} for the sandbox user failed: {e}",
+            build_dir.display()
+        )));
+    }
+
+    // ── Request glue. ────────────────────────────────────────────────────
+    let paths = glue::SandboxPaths {
+        build_dir: build_dir.clone(),
+        merged_store: overlay_mount.merged_dir().to_path_buf(),
+    };
+    let sandbox_cfg = &env.sandbox;
+    let glue_opts = glue::SandboxOptions {
+        build_cores: u32::try_from(opts.build_cores).unwrap_or(u32::MAX),
+        // The sandbox identity is fixed (single build per pod); the
+        // numeric values match the design and the rio-exec defaults.
+        uid: SANDBOX_BUILD_UID,
+        gid: SANDBOX_BUILD_GID,
+        sandbox_shell: sandbox_cfg.sandbox_shell.clone(),
+        extra_sandbox_paths: sandbox_cfg.extra_sandbox_paths.clone(),
+        // Operator-scoped impurities for FOD `impureEnvVars`. Not yet a
+        // config surface — the daemon-era nix.conf never carried one
+        // either; revisit when an operator asks.
+        impure_env: std::collections::BTreeMap::new(),
+        ca_bundle: sandbox_cfg.ca_bundle.clone(),
+        extra_devices: if std::path::Path::new("/dev/kvm").exists() {
+            vec![std::path::PathBuf::from("/dev/kvm")]
+        } else {
+            Vec::new()
+        },
+        host_system: sandbox_cfg.host_system.clone(),
+        timeout: Some(opts.timeout),
+        max_silent: (opts.max_silent_time > 0).then(|| Duration::from_secs(opts.max_silent_time)),
+        // Log-volume limits stay with the LogBatcher (bytes) and the
+        // NixLogFilter (lines) so the native path keeps the daemon-era
+        // semantics exactly. rio-exec's raw-byte cap is a backstop set
+        // well above the batcher cap: it can only fire for output the
+        // line pipeline never sees (a newline-free flood), which would
+        // otherwise accumulate in worker memory outside the build
+        // cgroup. 0 (= unlimited) keeps the backstop off too.
+        max_log_bytes: (env.log_limits.total_bytes > 0)
+            .then(|| env.log_limits.total_bytes.saturating_mul(2)),
+        cgroup: Some(cgroup_kill_path.clone()),
+        hashed_mirrors: sandbox_cfg.hashed_mirrors.clone(),
+        builder_binary: std::env::current_exe().ok(),
+        // netrc is NOT yet a config surface (this is the only
+        // production SandboxOptions construction): the strict parser
+        // and its provenance scoping are kept correct under test, but
+        // no operator knob delivers a file here. This hardcoded None,
+        // the deliberately-uncovered spec rule
+        // `fetcher.netrc.delivery-unwired`, and the config-schema
+        // tripwire (`netrc_stays_unwired` in tests/config_schema.rs,
+        // whose failure message is the wiring checklist) are the
+        // recorded gate-out — wiring it later without the delivery
+        // contract fails CI at the exact commit.
+        netrc: None,
+    };
+
+    // The glue is pure CPU (parse + closure walk + serialization — it
+    // holds no filesystem capability, `builder.glue.pure`), but for an
+    // ERG-heavy build that CPU work is real: closureInfo-style graphs
+    // walk thousands of metadata entries and serialize megabytes of
+    // registration text. Run it on the blocking pool like its sibling
+    // stages: tokio's worker count equals the pod's quota-clamped
+    // `available_parallelism()` (see `cgroup::nproc`), so a 1-CPU pod
+    // runs a single-worker runtime and a long compute here would
+    // suspend the heartbeats and every other task on that worker.
+    // The drv-text table rides its Arc (the glue only reads); the
+    // remaining to_vec()s are the closure-path/metadata projections,
+    // already shared shapes elsewhere.
+    let drv_path_owned = drv_path.to_owned();
+    let basic_drv_owned = basic_drv.clone();
+    let input_paths_owned = input_paths.to_vec();
+    let input_metadata_owned = input_metadata.to_vec();
+    let graph_drvs_owned = std::sync::Arc::clone(&graph_drvs);
+    let glue_join = tokio::task::spawn_blocking(move || {
+        glue::derivation_into_request(
+            &drv_path_owned,
+            &basic_drv_owned,
+            &input_paths_owned,
+            &input_metadata_owned,
+            &graph_drvs_owned,
+            &paths,
+            &glue_opts,
+        )
+    })
+    .await;
+
+    let plan = match glue_join {
+        Ok(Ok(plan)) => plan,
+        Ok(Err(e)) => {
+            // Input-shaped rejection: report through the normal result
+            // channel (the caller maps Glue → InputRejected) after the
+            // cgroup has been drained below. Every GlueError is a
+            // permanent property of the inputs — EXCEPT one shape the
+            // glue cannot tell apart from inside: a missing-metadata
+            // rejection for a path the resolve step DROPPED as
+            // not-found (store read lag, GC race). The glue holds no
+            // filesystem capability (`builder.glue.pure`) and
+            // resolution I/O *faults* were classified infra-transient
+            // at the resolve step
+            // (`builder.result.input-materialization-is-infra+6`) —
+            // but a not-found is not a fault, so it slipped past that
+            // classification and re-surfaced here as a
+            // deterministic-looking rejection. The arbitration closes
+            // that laundering channel with the resolve step's own
+            // dropped-set evidence.
+            monitors.stop();
+            drain_build_cgroup(build_cgroup).await;
+            scopeguard::ScopeGuard::into_inner(cgroup_kill_guard);
+            return Ok(NativeOutcome {
+                build_result: Err(arbitrate_glue_rejection(e, dropped_inputs)),
+                peak_memory_bytes: 0,
+                peak_cpu_cores: 0.0,
+                final_line_count: opts.batcher_seed,
+            });
+        }
+        Err(join_err) => {
+            // The glue task panicked — a worker-side bug, never an input
+            // property. Same teardown as the rejection arm; classified as
+            // sandbox setup (infra-transient) so the scheduler retries on
+            // another worker instead of poisoning the derivation.
+            monitors.stop();
+            drain_build_cgroup(build_cgroup).await;
+            scopeguard::ScopeGuard::into_inner(cgroup_kill_guard);
+            return Ok(NativeOutcome {
+                build_result: Err(ExecutorError::SandboxSetup(format!(
+                    "request glue task panicked: {join_err}"
+                ))),
+                peak_memory_bytes: 0,
+                peak_cpu_cores: 0.0,
+                final_line_count: opts.batcher_seed,
+            });
+        }
+    };
+    let prepared = match plan {
+        glue::GluePlan::Sandbox(p) | glue::GluePlan::BuiltinFetchurl(p) => *p,
+    };
+
+    // ── Execute + stream logs. ───────────────────────────────────────────
+    let host = rio_exec::HostLayout {
+        chroot_dir: chroot_dir.clone(),
+    };
     let batcher = LogBatcher::new(
         drv_path.to_owned(),
         env.executor_id.clone(),
         env.log_limits,
         opts.batcher_seed,
     );
-    let (build_result, final_line_count) = run_daemon_build(
-        &mut daemon,
-        drv_path,
-        basic_drv,
-        DaemonBuildOpts {
-            build_timeout: opts.timeout,
-            max_silent_time: opts.max_silent_time,
-            build_cores: opts.build_cores,
-        },
+    let (event_tx, event_rx) = mpsc::channel::<rio_exec::ExecEvent>(256);
+    let log_task = tokio::spawn(native_log_loop(
+        event_rx,
         batcher,
-        log_tx,
+        log_tx.clone(),
+        cgroup_kill_path.clone(),
+    ));
+
+    let start_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // r[impl builder.exec.sandbox+3]
+    // r[impl builder.timeout.no-reassign]
+    // Backstop, second line: primary limit enforcement is rio-exec's
+    // LimitWatchdog, which owns the kill handle in a task that performs
+    // no channel sends — no consumer behavior (this worker's log loop,
+    // scheduler-link backpressure behind it) can delay its kills. This
+    // outer timeout exists for worker-internal defects only: a watchdog
+    // bug, a wedged blocking pool, anything that breaks the executor's
+    // own machinery. On expiry, drop the execute() future: the
+    // executor's process-tree guard kills and reaps the sandbox tree on
+    // drop (the designed-for cancellation path —
+    // rio-exec/tests/drop_cancel.rs), so the worker reclaims the build
+    // instead of waiting for k8s to kill the pod. The result is a build
+    // outcome (TimedOut), never an executor fault.
+    let exec_result = match tokio::time::timeout(
+        opts.timeout.saturating_add(EXEC_BACKSTOP_SLACK),
+        rio_exec::execute(&prepared.request, &host, event_tx),
     )
-    .await;
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            // Reaching this arm means the executor's own watchdog
+            // failed to fire — a worker-internal defect, not consumer
+            // backpressure. Abort the log loop rather than draining
+            // it, then collect the abort before tearing the cgroup
+            // down.
+            log_task.abort();
+            let _ = log_task.await;
+            let (peak_cpu_cores, _oom) = monitors.stop();
+            let peak_memory_bytes = build_cgroup.memory_peak().unwrap_or(0);
+            drain_build_cgroup(build_cgroup).await;
+            scopeguard::ScopeGuard::into_inner(cgroup_kill_guard);
+            return Ok(NativeOutcome {
+                build_result: Ok(NativeBuild::Failed {
+                    status: rio_proto::types::BuildResultStatus::TimedOut,
+                    error_msg: format!(
+                        "build exceeded its timeout ({}s) plus the worker's enforcement \
+                         backstop ({}s); the executor's limit watchdog never fired, which \
+                         indicates a worker-internal fault (the watchdog is isolated from \
+                         log and scheduler-link backpressure by design)",
+                        opts.timeout.as_secs(),
+                        EXEC_BACKSTOP_SLACK.as_secs(),
+                    ),
+                }),
+                peak_memory_bytes,
+                peak_cpu_cores,
+                final_line_count: opts.batcher_seed,
+            });
+        }
+    };
+    let stop_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
-    // Stop both monitors and read their results. The last CPU sample
-    // is up to 1s stale; good enough (peak CPU doesn't change in the
-    // last second of a multi-minute build). The scopeguards inside
-    // `monitors` also abort on drop; this explicit stop is the happy-
-    // path fast stop (guard fires redundantly after, which is a no-op
-    // on an already-aborted handle).
+    let LogLoopResult {
+        final_line_count,
+        log_cap_trip,
+    } = log_task.await.unwrap_or_else(|e| {
+        // A panicked log loop loses the tail of the build log and the
+        // byte-cap signal; the build result itself is unaffected. Make
+        // the loss visible instead of silently zeroing the counters.
+        tracing::warn!(error = %e, "log loop task panicked; build log tail lost");
+        LogLoopResult {
+            final_line_count: opts.batcher_seed,
+            log_cap_trip: None,
+        }
+    });
+
+    // ── Resource samples + cgroup teardown. ──────────────────────────────
     let (peak_cpu_cores, oom_detected) = monitors.stop();
-    let build_result = apply_oom_override(oom_detected, build_result);
-
-    // Read cgroup memory.peak. Kernel-tracked lifetime max of the
-    // WHOLE TREE — daemon + builder + every child. One read, no
-    // polling. This FIXES the phase2c bug: VmHWM on daemon.id()
-    // measured ~10MB (daemon's own RSS) because the builder was a
-    // FORKED child, not exec'd — the builder's memory never showed
-    // in daemon's /proc.
-    //
-    // 0 on None (file missing would mean memory controller not
-    // enabled, but enable_subtree_controllers at startup would have
-    // caught that — this is a belt-and-suspenders default).
     let peak_memory_bytes = build_cgroup.memory_peak().unwrap_or(0);
-
-    // ALWAYS kill the daemon, regardless of success/failure.
-    if let Err(e) = daemon.kill().await {
-        tracing::warn!(error = %e, "daemon.kill() failed (process may already be dead)");
-    }
-    // Reap the zombie (bounded wait).
-    match tokio::time::timeout(Duration::from_secs(2), daemon.wait()).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!(error = %e, "daemon.wait() failed after kill"),
-        Err(_) => tracing::warn!("daemon did not exit within 2s after kill (possible zombie)"),
-    }
-
     drain_build_cgroup(build_cgroup).await;
-
-    // Defuse: explicit kill+drain above already ran; guard is redundant.
     scopeguard::ScopeGuard::into_inner(cgroup_kill_guard);
 
-    // (Final log flush happens inside read_build_stderr_loop — it owns
-    // the batcher by-value.)
+    // ── Classify + process outputs. ──────────────────────────────────────
+    let build_result: Result<NativeBuild, ExecutorError> = match exec_result {
+        Err(rio_exec::ExecError::InvalidRequest(msg)) => {
+            // The glue validates before returning, so this is unreachable
+            // in practice; classify as an input problem if it ever fires.
+            Err(ExecutorError::InvalidDerivation(format!(
+                "execution request rejected: {msg}"
+            )))
+        }
+        // execve ENOENT/ENOTDIR with resolve-time residency gaps on
+        // record: a missing STORE PATH manifests at exec exactly (and
+        // only) as those two errnos — the builder, or the `#!`
+        // interpreter it names, may be (under) a member the resolve
+        // dropped. With gaps present the failure cannot be
+        // distinguished from the gap, so it attributes to
+        // infrastructure (re-dispatch re-resolves the closure) —
+        // bounded by the scheduler's infra retry caps, deliberately
+        // not cap-exempt. ENOENT-only dominance: every OTHER
+        // derivation-caused exec errno (EACCES, ENOEXEC, E2BIG, …)
+        // requires the file to EXIST, which absence cannot produce —
+        // those stay permanent below even with gaps on record.
+        // r[impl builder.result.input-materialization-is-infra+6]
+        // VerdictArm::ExecErrno consults dropped
+        Err(rio_exec::ExecError::Setup(se))
+            if !oom_detected
+                && se.phase == rio_exec::SetupPhase::Exec
+                && matches!(
+                    nix::errno::Errno::from_raw(se.errno),
+                    nix::errno::Errno::ENOENT | nix::errno::Errno::ENOTDIR
+                )
+                && !dropped_inputs.is_empty() =>
+        {
+            let errno = nix::errno::Errno::from_raw(se.errno);
+            let attribution = dropped_inputs
+                .covering_member(basic_drv.builder())
+                .map(|m| format!("the builder path itself sits under the dropped member {m}"))
+                .unwrap_or_else(|| dropped_inputs.summary());
+            Ok(NativeBuild::Failed {
+                status: rio_proto::types::BuildResultStatus::InfrastructureFailure,
+                error_msg: format!(
+                    "cannot execute the builder '{}': {errno} — the build was dispatched \
+                     with {attribution}; re-dispatch re-resolves the closure",
+                    basic_drv.builder(),
+                ),
+            })
+        }
+        // A failed execve of the builder itself (missing builder path,
+        // missing `#!` interpreter, not executable, not a valid binary)
+        // is a property of the derivation, not of this worker — CppNix
+        // and the daemon-era path report it as a permanent build failure
+        // in the build log, not as something to retry. Materialization
+        // faults stay infra-transient: they surface earlier as bind-mount
+        // failures (r[builder.result.input-materialization-is-infra+6]) or
+        // as EIO, never as these errnos at exec time — every input bind
+        // already succeeded by the time the child execs.
+        Err(rio_exec::ExecError::Setup(se))
+            if !oom_detected
+                && se.phase == rio_exec::SetupPhase::Exec
+                && exec_errno_is_derivation_caused(se.errno) =>
+        {
+            let errno = nix::errno::Errno::from_raw(se.errno);
+            Ok(NativeBuild::Failed {
+                status: rio_proto::types::BuildResultStatus::PermanentFailure,
+                error_msg: format!(
+                    "cannot execute the builder '{}': {errno} — the builder (and any `#!` \
+                     interpreter it names) must exist inside the build's input closure and \
+                     be executable",
+                    basic_drv.builder(),
+                ),
+            })
+        }
+        Err(
+            e @ (rio_exec::ExecError::Skeleton(_)
+            | rio_exec::ExecError::Spawn(_)
+            | rio_exec::ExecError::Setup(_)),
+        ) => {
+            if oom_detected {
+                metrics::counter!("rio_builder_cgroup_oom_total").increment(1);
+                Err(ExecutorError::CgroupOom)
+            } else {
+                Err(ExecutorError::SandboxSetup(e.to_string()))
+            }
+        }
+        Ok(outcome) => {
+            // Disk-full probe on the scratch space the build writes to.
+            let disk_full =
+                native_result::disk_full_probe(&[&overlay_mount.upper_store(), &build_dir]);
+            // settle_exit owns the canary-before-override ordering
+            // (round-17 merged_bug_010): the canary consumes the
+            // RELAY-FORWARDED exit; the builder cap override applies
+            // only to classification. Expected ~0; an isolated
+            // increment is the documented natural-137 coincidence —
+            // alert on a sustained RATE, and pull the worker's logs
+            // for the named drv either way.
+            // r[impl builder.exec.kill-canary]
+            let settled =
+                native_result::settle_exit(outcome.exit, log_cap_trip.as_ref(), &outcome.outputs);
+            let exit = settled.classify_as;
+            if settled.canary {
+                metrics::counter!("rio_builder_kill_verdict_outputs_present_total").increment(1);
+                tracing::warn!(
+                    drv_path = %drv_path,
+                    exit = ?outcome.exit,
+                    outputs = outcome.outputs.len(),
+                    "corroborated kill verdict with fully materialized outputs — \
+                     natural-137 coincidence (isolated) or kill-supervision \
+                     regression (sustained rate)"
+                );
+            }
+            let dropped_summary = (!dropped_inputs.is_empty()).then(|| dropped_inputs.summary());
+            match native_result::classify_exit(
+                exit,
+                is_fod,
+                disk_full,
+                oom_detected,
+                log_cap_trip.as_ref(),
+                dropped_summary.as_deref(),
+            ) {
+                native_result::ExitClassification::Failed { status, error_msg } => {
+                    if oom_detected
+                        && status != rio_proto::types::BuildResultStatus::InfrastructureFailure
+                    {
+                        // Keep the daemon-era CgroupOom semantics: an OOM
+                        // plus any failure is the worker being undersized,
+                        // not the derivation being broken.
+                        metrics::counter!("rio_builder_cgroup_oom_total").increment(1);
+                        Err(ExecutorError::CgroupOom)
+                    } else {
+                        Ok(NativeBuild::Failed { status, error_msg })
+                    }
+                }
+                native_result::ExitClassification::Success => {
+                    // Output pipeline does sync filesystem walks + NAR
+                    // streaming; keep it off the async workers.
+                    let to_process: Vec<native_result::OutputToProcess> = prepared
+                        .outputs
+                        .iter()
+                        .map(|po| native_result::OutputToProcess {
+                            name: po.name.clone(),
+                            store_path: po.path.clone(),
+                            // po.basename was computed from the PARSED
+                            // store path at planning time (plan_outputs
+                            // rejects non-store-path declarations), so
+                            // this join can never receive a
+                            // tenant-controlled arbitrary string.
+                            // r[impl builder.exec.declared-path-validated+1]
+                            host_path: overlay_mount.upper_store().join(&po.basename),
+                        })
+                        .collect();
+                    let drv_owned = drv.clone();
+                    let metadata_owned: Vec<ValidatedPathInfo> = input_metadata.to_vec();
+                    let dropped_owned = dropped_inputs.clone();
+                    let processed = tokio::task::spawn_blocking(move || {
+                        native_result::process_outputs(
+                            &drv_owned,
+                            &to_process,
+                            SANDBOX_BUILD_UID,
+                            &metadata_owned,
+                            &dropped_owned,
+                        )
+                    })
+                    .await;
+                    match processed {
+                        Err(join_err) => Err(ExecutorError::SandboxSetup(format!(
+                            "output processing task panicked: {join_err}"
+                        ))),
+                        Ok(Ok(processed)) => Ok(NativeBuild::Succeeded {
+                            processed,
+                            start_time,
+                            stop_time,
+                        }),
+                        Ok(Err(native_result::OutputRejection::DroppedMemberReferenced {
+                            output,
+                            member,
+                        })) => {
+                            // NOT a build fault: the output references a
+                            // member the resolve dropped (read lag / GC
+                            // race) — registering it would record a
+                            // reference the metadata plane cannot see.
+                            // Same re-dispatch channel as the glue arm.
+                            Err(ExecutorError::MetadataFetch {
+                                path: member.clone(),
+                                source: tonic::Status::not_found(format!(
+                                    "output '{output}' references {member}, absent from \
+                                     the store at resolve time; re-dispatch re-resolves \
+                                     the closure"
+                                )),
+                            })
+                        }
+                        Ok(Err(rejection)) => {
+                            // Every rejection (policy violation, FOD with
+                            // references, canonicalisation failure, …)
+                            // reports as OutputRejected — the proto has no
+                            // finer-grained hash-mismatch status; the
+                            // distinction lives in the error message.
+                            Ok(NativeBuild::Failed {
+                                status: rio_proto::types::BuildResultStatus::OutputRejected,
+                                error_msg: rejection.to_string(),
+                            })
+                        }
+                    }
+                }
+            }
+        }
+    };
 
-    Ok(DaemonOutcome {
+    // Cancellation: the cancel path SIGKILLs the cgroup, which surfaces
+    // here as a failed/killed build. Convert to the dedicated error so
+    // the runtime reports `Cancelled` instead of a spurious failure.
+    let build_result = if env.cancelled.load(Ordering::Acquire)
+        && !matches!(build_result, Ok(NativeBuild::Succeeded { .. }))
+    {
+        Err(ExecutorError::Cancelled)
+    } else {
+        build_result
+    };
+
+    Ok(NativeOutcome {
         build_result,
         peak_memory_bytes,
         peak_cpu_cores,
@@ -1120,49 +1610,276 @@ async fn run_daemon_lifecycle(
     })
 }
 
-/// Reclassify a daemon error as `CgroupOom` when `oom_detected` AND
-/// the build already failed; preserve `Ok(Built)` even if OOM fired.
+/// uid/gid the sandboxed builder runs as. Single build per pod, so a
+/// fixed identity is sufficient; the values match the design (and what
+/// nixpkgs' own sandbox tests assume).
+const SANDBOX_BUILD_UID: u32 = 1000;
+const SANDBOX_BUILD_GID: u32 = 100;
+
+/// Make the per-build store scratch (the overlay merged `/nix/store`
+/// view) writable by the sandboxed build user: `1775 root:<gid>`, the
+/// same mode Nix gives a chroot store. Without this the build's
+/// `mkdir $out` fails with `EACCES` — under the daemon the chroot store
+/// was a daemon-owned directory and outputs were `movePath`d into the
+/// merged view by root afterwards; the native executor has the build
+/// write its outputs into the merged view directly.
+fn make_store_scratch_writable(merged_store: &std::path::Path, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // Mode first so the (root-only) chown is the only step that can
+    // fail in unprivileged unit tests.
+    std::fs::set_permissions(merged_store, std::fs::Permissions::from_mode(0o1775))?;
+    std::os::unix::fs::chown(merged_store, None, Some(gid))
+}
+
+/// Hand the per-build scratch directory (the sandbox's `/build`: the
+/// build's cwd, `TMPDIR`, and `NIX_BUILD_TOP`) to the sandbox user —
+/// CppNix's `chownToBuilder(tmpDir)` contract: mode `0700`, owned by the
+/// build uid/gid. The chown half only runs when privileged (production);
+/// unprivileged unit tests and the differential driver already own the
+/// directory they pass in.
+fn make_build_dir_writable(build_dir: &std::path::Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(build_dir, std::fs::Permissions::from_mode(0o700))?;
+    if nix::unistd::geteuid().is_root() {
+        std::os::unix::fs::chown(build_dir, Some(uid), Some(gid))?;
+    }
+    Ok(())
+}
+
+/// Whether an errno from a failed `execve` of the builder is caused by
+/// the derivation itself (bad builder path, bad `#!` interpreter, not
+/// executable, not a valid executable image) rather than by this worker.
+/// Anything else (EIO, ENOMEM, EAGAIN, …) keeps the infra-transient
+/// classification so genuine worker faults still retry / re-dispatch.
+fn exec_errno_is_derivation_caused(errno: i32) -> bool {
+    use nix::errno::Errno;
+    // EPERM is deliberately NOT in this list: a derivation cannot make
+    // execve return EPERM by itself (a non-executable file is EACCES) —
+    // it means a worker-side mount flag or security policy blocked the
+    // exec, which is the operator's fault and should retry elsewhere.
+    matches!(
+        Errno::from_raw(errno),
+        Errno::ENOENT
+            | Errno::ENOTDIR
+            | Errno::EACCES
+            | Errno::ENOEXEC
+            | Errno::ENAMETOOLONG
+            | Errno::ELOOP
+            | Errno::EISDIR
+            | Errno::E2BIG
+            | Errno::EINVAL
+            | Errno::ELIBBAD
+    )
+}
+
+/// Kill the build PRINCIPAL's scope (`<cg>/build`) because a log cap
+/// tripped — never the build root, whose recursive kill would take the
+/// rio-exec relay down with the principal and destroy the forwarded
+/// wait status the verdict corroboration is judged by
+/// (round-17 merged_bug_058; the spec MUST is
+/// `builder.exec.kill-targets-principal`).
 ///
-/// Two paths set `oom_detected`:
-/// - the 1Hz watcher writes `cgroup.kill` → daemon EOF →
-///   `Err(Wire(UnexpectedEof))`. `is_err()` always true.
-/// - `monitors.stop()`'s `final_oom` synchronous read does NOT kill,
-///   so a build whose script tolerated a child OOM (`tool || true`,
-///   `make -k`, retry-runner) returns `Ok(Built)` here. Discarding
-///   that would loop re-dispatch on a build that deterministically
-///   succeeds-with-child-OOM, ratcheting the floor until poisoned.
+/// Ordering argument for why `<cg>/build` exists by the time this can
+/// fire: the cap arms only run on `ExecEvent::Log` lines, and the
+/// sandbox child cannot produce output before the release byte — which
+/// rio-exec writes only AFTER the principal is placed in the build
+/// sub-cgroup. A line that trips the cap therefore proves placement
+/// completed. ENOENT here would mean no tenant instruction ever ran
+/// (nothing to kill); the write stays best-effort like every other
+/// kill path.
 ///
-/// `Err` → `CgroupOom` keeps the runtime from hitting
-/// `is_daemon_transient` (3× local OOM-loop) and from `BuildFailed`
-/// (drv isn't broken). `Ok` → kept; metric still emitted because the
-/// OOM is a real sizing signal.
-// r[impl builder.oom.cgroup-watch+3]
-fn apply_oom_override(
-    oom_detected: bool,
-    build_result: Result<rio_nix::protocol::build::BuildResult, ExecutorError>,
-) -> Result<rio_nix::protocol::build::BuildResult, ExecutorError> {
-    match (oom_detected, &build_result) {
-        (true, Err(_)) => {
-            metrics::counter!("rio_builder_cgroup_oom_total").increment(1);
-            Err(ExecutorError::CgroupOom)
+/// The kill is deliberately UNCLAIMED in rio-exec's kill-claim
+/// machinery: the verdict authority for a cap kill is the builder's
+/// own `log_limit_exceeded` flag (the relay forwards the principal's
+/// true 137, and classification overrides it to `LogLimitExceeded`).
+/// Routing this writer through `KillReason::LogLimit` claims is the
+/// named follow-up tail tracked by the kill-writer-conformance
+/// allowlist's transitional entry.
+// r[impl builder.exec.kill-targets-principal]
+fn principal_cap_kill(cgroup_path: &std::path::Path) {
+    crate::cgroup::kill_principal_scope(cgroup_path);
+}
+
+/// What [`native_log_loop`] reports back to the lifecycle.
+struct LogLoopResult {
+    final_line_count: u64,
+    /// `Some` when a builder-side log cap tripped (which one, with the
+    /// per-attempt figures). The exit override and the cap kill are
+    /// keyed on this — never on rio-exec's own `LogLimitExceeded`
+    /// variant, whose trip is corroborated by the relay.
+    log_cap_trip: Option<crate::log_stream::LogCapTrip>,
+}
+
+/// Submit a batch on the display stream. Returns `false` only when the
+/// sink is closed.
+///
+/// Marker injection is NOT this function's job: the relay-shed
+/// suppression marker is drained and injected inside
+/// [`LogBatcher::flush`], so every assembled batch already carries it —
+/// no delivery site can forget. Settlement isn't either: the batch's
+/// shed lease is consumed/restored inside `try_send_batch` at the
+/// delivery decision, so a shed carrier's count automatically rides
+/// the next delivered batch's marker.
+fn deliver_batch(
+    log_tx: &crate::log_stream::SheddingLogSender,
+    batch: crate::log_stream::AssembledBatch,
+) -> bool {
+    !matches!(
+        log_tx.try_send_batch(batch),
+        crate::log_stream::LogSendOutcome::Closed
+    )
+}
+
+/// Consume the rio-exec event stream: classify each captured line with
+/// the `@nix` filter, batch ordinary lines, forward `setPhase` frames,
+/// and enforce the line/byte caps.
+///
+/// Normative semantics:
+/// - phase frames flush pending log lines first; silence accounting is
+///   not this loop's concern — the max-silent deadline lives in rio-exec
+///   and is reset by ANY builder pty output, including the raw bytes of
+///   `@nix` frames, before this loop ever classifies them (CppNix
+///   behaves the same way: any builder stderr output resets the silence
+///   clock);
+/// - the byte cap (`LogLimits.total_bytes`) and the line cap
+///   (`MAX_BUILD_LOG_LINES`) abort the build by killing the cgroup; the
+///   lifecycle then reports `LogLimitExceeded`.
+///
+/// Delivery is best-effort by construction: every `LogBatch`/`Phase`
+/// goes through the
+/// [`SheddingLogSender`](crate::log_stream::SheddingLogSender) — a full
+/// sink sheds (counted + marked) instead of parking this loop, so the
+/// rio-exec event channel is ALWAYS drained and a stalled scheduler
+/// link can neither freeze the build's output pipeline nor back up
+/// into the executor.
+///
+/// On exit the batcher is CONSUMED through [`LogBatcher::finish`] — the
+/// terminal suppression-window drain and the trailing shed marker
+/// cannot be skipped, because the loop's `final_line_count` only exists
+/// behind that consumption.
+async fn native_log_loop(
+    mut events: mpsc::Receiver<rio_exec::ExecEvent>,
+    mut batcher: LogBatcher,
+    log_tx: crate::log_stream::SheddingLogSender,
+    cgroup_path: std::path::PathBuf,
+) -> LogLoopResult {
+    use crate::log_stream::{AddLineResult, LogSendOutcome};
+
+    // Share the shed tally: from here on, every batch flush() assembles
+    // injects the suppression marker itself.
+    batcher.attach_relay_shed(&log_tx);
+
+    let mut filter = glue::log::NixLogFilter::new();
+    let mut log_cap_trip: Option<crate::log_stream::LogCapTrip> = None;
+    let mut flush_tick = tokio::time::interval(Duration::from_millis(100));
+    flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            ev = events.recv() => {
+                let Some(ev) = ev else { break };
+                let rio_exec::ExecEvent::Log { stream, line, terminated } = ev else {
+                    continue;
+                };
+                if log_cap_trip.is_some() {
+                    // Already aborting; drain the channel so rio-exec's
+                    // reader threads never block on a full channel.
+                    continue;
+                }
+                match filter.handle(stream, &line, terminated) {
+                    glue::log::LineAction::Forward(l) => match batcher.add_line(l) {
+                        AddLineResult::Buffered => {}
+                        AddLineResult::BatchReady(batch) => {
+                            if !deliver_batch(&log_tx, batch) {
+                                break;
+                            }
+                        }
+                        AddLineResult::LimitExceeded { trip } => {
+                            log_cap_trip = Some(trip);
+                            principal_cap_kill(&cgroup_path);
+                        }
+                    },
+                    glue::log::LineAction::Phase(phase) => {
+                        // r[impl builder.stderr.forward-set-phase+2]
+                        if batcher.has_pending() {
+                            let batch = batcher.flush();
+                            if !deliver_batch(&log_tx, batch) {
+                                break;
+                            }
+                        }
+                        let phase = rio_proto::types::BuildPhase {
+                            derivation_path: batcher.drv_path().to_owned(),
+                            phase,
+                        };
+                        if log_tx.try_send_phase(phase) == LogSendOutcome::Closed {
+                            break;
+                        }
+                    }
+                    glue::log::LineAction::Consumed => {}
+                    glue::log::LineAction::CapExceeded(trip) => {
+                        log_cap_trip = Some(trip);
+                        principal_cap_kill(&cgroup_path);
+                    }
+                }
+            }
+            _ = flush_tick.tick() => {
+                if let Some(batch) = batcher.maybe_flush()
+                    && !deliver_batch(&log_tx, batch)
+                {
+                    break;
+                }
+            }
         }
-        (true, Ok(_)) => {
-            metrics::counter!("rio_builder_cgroup_oom_total").increment(1);
-            tracing::warn!(
-                "oom_kill incremented but build succeeded; keeping Ok(Built) \
-                 (script tolerated the OOM-killed child)"
-            );
-            build_result
-        }
-        (false, _) => build_result,
+    }
+
+    // Terminal drain: consume the batcher. finish() unconditionally
+    // drains the final suppression window AND the relay-shed tally —
+    // markers are emitted even when the line buffer is empty (the gap
+    // the old `has_pending()` gate fell through). Delivery of the
+    // terminal batch is still best-effort: a shed here restores the
+    // batch's shed lease to the tally, but the loop is exiting and no
+    // later batch will deliver it — bounded display loss at the very
+    // end of a build, with the truth retained by
+    // rio_builder_log_messages_shed_total; the scheduler ring buffer
+    // accepts forward line-number gaps.
+    let (final_batch, final_line_count) = batcher.finish();
+    if let Some(batch) = final_batch {
+        let _ = log_tx.try_send_batch(batch);
+    }
+
+    LogLoopResult {
+        final_line_count,
+        log_cap_trip,
+    }
+}
+
+/// One-line footer summary for the build pipeline (the `rio: result`
+/// banner line): `ok` or `failed (<reason>)`; `cancelled` is decided
+/// later by `runtime::result::final_footer_result` from the cancel flag.
+fn footer_result_native(build_result: &Result<NativeBuild, ExecutorError>) -> String {
+    use rio_proto::types::BuildResultStatus;
+    match build_result {
+        Ok(NativeBuild::Succeeded { .. }) => "ok".to_string(),
+        Ok(NativeBuild::Failed { status, .. }) => match status {
+            BuildResultStatus::TimedOut => "failed (timed out)".to_string(),
+            BuildResultStatus::LogLimitExceeded => "failed (log limit exceeded)".to_string(),
+            other => format!("failed ({other:?})"),
+        },
+        // Name the executor-error class so the banner-only reader knows
+        // whether the build itself or the worker plumbing failed.
+        Err(ExecutorError::SandboxSetup(_)) => "failed (sandbox setup)".to_string(),
+        Err(ExecutorError::Glue(_)) => "failed (rejected by request glue)".to_string(),
+        Err(ExecutorError::CgroupOom) => "failed (out of memory)".to_string(),
+        Err(ExecutorError::Upload(_)) => "failed (output upload)".to_string(),
+        Err(_) => "failed (executor error)".to_string(),
     }
 }
 
 /// Resolved build inputs: the BasicDerivation (inputDrvs collapsed into
-/// inputSrcs) and the full transitive input closure for the synth DB.
+/// inputSrcs) and the full transitive input closure.
 struct ResolvedInputs {
     /// BasicDerivation with inputDrv outputs resolved into inputSrcs.
-    /// Sent to nix-daemon via wopBuildDerivation.
+    /// The request glue plans the sandbox's input mounts from it.
     basic_drv: rio_nix::derivation::BasicDerivation,
     /// Full transitive input closure (BFS over QueryPathInfo references,
     /// seeded from input_srcs + resolved inputDrv outputs). Used for
@@ -1175,9 +1892,28 @@ struct ResolvedInputs {
     /// Derived from `input_metadata` alongside `input_paths`.
     input_sized: Vec<(String, u64)>,
     /// PathInfo for every closure path, captured during the BFS so the
-    /// synth DB ValidPaths table can be built without a second
-    /// QueryPathInfo pass (I-106).
+    /// glue's closure planning and the output policy checks don't need
+    /// a second QueryPathInfo pass (I-106).
     input_metadata: Vec<ValidatedPathInfo>,
+    /// Closure members whose `BatchQueryPathInfo` came back not-found
+    /// at resolve time (store read lag, GC race) — dropped from the
+    /// JIT allowlist, but RECORDED as typed evidence consulted by
+    /// every verdict-producing arm ([`dropped::VerdictArm`]'s closed
+    /// table) so a residency gap surfaces as a re-dispatch instead of
+    /// laundering into a permanent verdict at any of them.
+    // r[impl builder.result.input-materialization-is-infra+6]
+    dropped_inputs: dropped::DroppedInputs,
+    /// ATerm text for the main `.drv` plus the declaration-demanded
+    /// graph `.drv`s: the request glue's only source of derivation
+    /// bytes (`builder.glue.pure` — the glue holds no filesystem
+    /// capability). Assembled at input resolution; see
+    /// `inputs::fetch_demanded_graph_drvs`. Arc-shared: the glue stage
+    /// runs on the blocking pool and previously deep-cloned the table
+    /// into the closure — for an ERG-heavy build (closureInfo-style,
+    /// thousands of texts) that doubled the table\'s peak memory for
+    /// the duration of the glue run for no reason: the glue only
+    /// reads.
+    graph_drvs: std::sync::Arc<std::collections::BTreeMap<String, String>>,
 }
 
 /// Resolve inputDrvs → BasicDerivation + compute full input closure.
@@ -1185,23 +1921,26 @@ struct ResolvedInputs {
 /// r[impl builder.executor.resolve-input-drvs]
 ///
 /// `drv.to_basic()` only copies static input_srcs (e.g., busybox); it
-/// does NOT resolve inputDrvs to their output paths. nix-daemon's
-/// sandbox only bind-mounts inputSrcs into the chroot, so without this
-/// the builder can't find its input derivations' outputs. Each
+/// does NOT resolve inputDrvs to their output paths. The sandbox only
+/// bind-mounts inputSrcs into the chroot, so without this the builder
+/// can't find its input derivations' outputs. Each
 /// inputDrv's .drv file is already in rio-store (uploaded by the gateway
 /// during SubmitBuild); fetch + parse to get output paths.
 ///
 /// Also computes the full transitive input closure (BFS over
-/// QueryPathInfo references) for the synth DB ValidPaths table. The
-/// scheduler sends a PrefetchHint (approx_input_closure) before the
-/// WorkAssignment so the FUSE cache starts warming; that's a HINT, not
-/// a replacement for this computation — the synth DB needs the FULL
-/// closure.
+/// QueryPathInfo references). The closure feeds the request glue's
+/// planning (sandbox input set, `exportReferencesGraph` expansion), the
+/// output policy checks / reference-scan candidate set, and the FUSE
+/// warm. The scheduler sends a PrefetchHint (approx_input_closure)
+/// before the WorkAssignment so the FUSE cache starts warming; that's a
+/// HINT, not a replacement for this computation — the glue needs the
+/// FULL closure.
 #[instrument(skip_all, fields(drv_path = %drv_path))]
 async fn resolve_inputs(
     store_client: &StoreServiceClient<Channel>,
     drv: &Derivation,
     drv_path: &str,
+    drv_text: &str,
 ) -> Result<ResolvedInputs, ExecutorError> {
     let mut resolved_input_srcs = drv.input_srcs().clone();
     // Collect owned (path, names) pairs up-front so the async closures
@@ -1213,11 +1952,11 @@ async fn resolve_inputs(
         .collect();
     let n_input_drvs = input_drv_specs.len();
     let fetch_drvs_start = std::time::Instant::now();
-    let fetched: Vec<Vec<String>> = stream::iter(input_drv_specs)
+    let fetched: Vec<(String, String, Vec<String>)> = stream::iter(input_drv_specs)
         .map(|(path, names)| {
             let mut client = store_client.clone();
             async move {
-                let input_drv = fetch_drv_from_store(&mut client, &path).await?;
+                let (input_drv, text) = fetch_drv_from_store(&mut client, &path).await?;
                 let matching: Vec<String> = input_drv
                     .outputs()
                     .iter()
@@ -1250,7 +1989,7 @@ async fn resolve_inputs(
                     })
                     .map(|out| out.path().to_string())
                     .collect();
-                Ok::<_, ExecutorError>(matching)
+                Ok::<_, ExecutorError>((path, text, matching))
             }
         })
         .buffer_unordered(MAX_PARALLEL_FETCHES)
@@ -1265,7 +2004,7 @@ async fn resolve_inputs(
     // file has `out.path() == ""` (the path is unknown until the build
     // runs). If the scheduler dispatched us WITHOUT resolving inputDrvs
     // to realized paths (maybe_resolve_ca gate miss, or resolve failed),
-    // we'd pass `""` to nix-daemon's inputSrcs → bind-mount of "" →
+    // we'd pass `""` through inputSrcs → a bind-mount of "" →
     // build fails with a cryptic ENOENT. Dropping empties here makes the
     // failure mode clearer (the build still fails — it's missing an
     // input — but the log shows the actual missing path, not "").
@@ -1275,7 +2014,10 @@ async fn resolve_inputs(
     // steady-state; any warn here means investigate the scheduler's
     // `maybe_resolve_ca` path.
     let mut dropped_empty = 0usize;
-    for paths in fetched {
+    let mut graph_drvs: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for (path, text, paths) in fetched {
+        graph_drvs.insert(path, text);
         for p in paths {
             if p.is_empty() {
                 dropped_empty += 1;
@@ -1303,7 +2045,8 @@ async fn resolve_inputs(
         ExecutorError::InvalidDerivation(format!("failed to build BasicDerivation: {e}"))
     })?;
 
-    // Compute input closure for the synthetic DB (ValidPaths table)
+    // Compute the full input closure for the request glue (sandbox
+    // input set, exportReferencesGraph), the output policy checks,
     // and the FUSE warm. The BFS seeds with resolved_input_srcs so
     // it walks the runtime references of inputDrv OUTPUTS — a .drv
     // file's narinfo references don't include its outputs (those are
@@ -1311,8 +2054,20 @@ async fn resolve_inputs(
     // input_drvs().keys() would miss them. I-043: warm count=8 with
     // the post-BFS merge — autotools-hook (a transitive runtime dep
     // via stdenv-the-output) never reached.
-    let input_metadata =
-        compute_input_closure(store_client, drv, drv_path, &resolved_input_srcs).await?;
+    let inputs::ResolvedClosure {
+        metadata: input_metadata,
+        dropped: dropped_set,
+    } = compute_input_closure(store_client, drv, drv_path, &resolved_input_srcs).await?;
+    let dropped_inputs = dropped::DroppedInputs::from_resolve(dropped_set);
+    if !dropped_inputs.is_empty() {
+        // Evidence, not noise: these are exactly the paths a later
+        // glue ExportRefsMissingMetadata rejection arbitrates against.
+        tracing::info!(
+            dropped = dropped_inputs.len(),
+            "input closure members not in store at resolve time; \
+             recorded for glue-rejection arbitration"
+        );
+    }
     let input_paths: Vec<String> = input_metadata
         .iter()
         .map(|m| m.store_path.to_string())
@@ -1328,12 +2083,84 @@ async fn resolve_inputs(
         .map(|m| (m.store_path.to_string(), m.nar_size))
         .collect();
 
+    // Complete the glue's derivation table: main drv text + exactly
+    // the texts the glue's exportReferencesGraph expansion will read,
+    // derived from the build's own declaration with the same walk the
+    // expansion uses. No declaration ⇒ no graph-purpose fetches —
+    // demand-driven by type (the fetch site cannot see input_paths).
+    let demand = {
+        let index = glue::refs_graph::ClosureIndex::new(&input_metadata, &input_paths);
+        glue::refs_graph::DrvTextDemand::from_declaration(drv, &index)
+    };
+    let graph_drvs =
+        inputs::fetch_demanded_graph_drvs(store_client, drv_path, drv_text, graph_drvs, &demand)
+            .await?;
+
     Ok(ResolvedInputs {
         basic_drv,
         input_paths,
         input_sized,
         input_metadata,
+        dropped_inputs,
+        graph_drvs: std::sync::Arc::new(graph_drvs),
     })
+}
+
+/// Arbitrate a request-glue rejection against the resolve step's
+/// dropped-set evidence: a rejection that hinges on a path the closure
+/// BFS dropped as not-found is a resolve-time RESIDENCY GAP (store
+/// read lag, GC race) wearing a deterministic costume — re-dispatch
+/// re-resolves and plausibly succeeds, so it must be
+/// `MetadataFetch`/InfrastructureFailure, never the permanent
+/// `InputRejected` the same variant earns when the declaration is
+/// genuinely wrong.
+///
+/// Population (every GlueError shape a dropped path can produce — the
+/// glue consults closure state at exactly these three sites):
+/// - `ExportRefsMissingMetadata`: a dropped non-root closure member
+///   reached by the references BFS (canonical path — set membership);
+/// - `ExportRefsDrvOutputMissing`: a dropped output demanded by `.drv`
+///   closure expansion (canonical path — set membership);
+/// - `ExportRefsOutsideClosure`: a dropped ROOT target — the drop
+///   removed it from `input_paths`, so the containment gate misses it;
+///   the error carries the raw declaration target, which CppNix's
+///   `toStorePath()` allows to be a sub-path INSIDE the store path, so
+///   the relation is containment, not equality.
+///
+/// Membership in the dropped set proves the path was part of the
+/// build's declared walk (only frontier members get queried), so the
+/// arbitration cannot misclassify a genuinely-foreign path: had the
+/// store answered, the path would have been inside the closure.
+///
+/// Every other GlueError stays a permanent input property
+/// (`builder.glue.pure` — the glue holds no I/O capability, so no
+/// transient class originates inside it).
+// r[impl builder.result.input-materialization-is-infra+6]
+// VerdictArm::GlueRejection consults dropped
+fn arbitrate_glue_rejection(
+    e: glue::GlueError,
+    dropped_inputs: &dropped::DroppedInputs,
+) -> ExecutorError {
+    let dropped_hit = match &e {
+        glue::GlueError::ExportRefsMissingMetadata { path }
+        | glue::GlueError::ExportRefsDrvOutputMissing { path, .. } => {
+            dropped_inputs.contains(path).then(|| path.clone())
+        }
+        glue::GlueError::ExportRefsOutsideClosure { path } => {
+            dropped_inputs.covering_member(path).map(String::from)
+        }
+        _ => None,
+    };
+    match dropped_hit {
+        Some(path) => ExecutorError::MetadataFetch {
+            path,
+            source: tonic::Status::not_found(
+                "input closure member was not in the store at resolve time \
+                 (read lag or GC race); re-dispatch re-resolves the closure",
+            ),
+        },
+        None => ExecutorError::Glue(e.to_string()),
+    }
 }
 
 /// Convert a derivation path to a safe build ID for directory names.
@@ -1341,16 +2168,13 @@ async fn resolve_inputs(
 /// Public so `spawn_build_task` can predict the cgroup path for the
 /// cancel registry (cgroup_parent/sanitize_build_id(drv_path)) without
 /// execute_build having to report it back. The cgroup is created
-/// DURING execute_build (after daemon spawn, needs PID), so spawn_
+/// DURING execute_build (inside `run_native_lifecycle`), so spawn_
 /// build_task registers the path PREDICTIVELY before spawning and
 /// removes it after. If a cancel arrives before the cgroup exists,
-/// cgroup.kill returns ENOENT — try_cancel_build logs and moves on
-/// (the build will fail anyway since the daemon dies when the cgroup
-/// IS created with a stale kill file — no, cgroup.kill isn't a
-/// persistent file, it's a write-once trigger. ENOENT just means no
-/// kill happened, the build proceeds. Harmless race — a cancel
+/// cgroup.kill returns ENOENT — try_cancel_build logs and moves on:
+/// no kill happens and the build proceeds. Harmless race — a cancel
 /// arriving THAT early is extremely rare and the scheduler will
-/// re-send on the next dispatch cycle if the build keeps running).
+/// re-send on the next dispatch cycle if the build keeps running.
 // r[impl builder.exec.build-id-sanitized]
 pub fn sanitize_build_id(drv_path: &str) -> String {
     // /nix/store/abc...-foo.drv -> abc___-foo_drv
@@ -1358,9 +2182,9 @@ pub fn sanitize_build_id(drv_path: &str) -> String {
     // Derivation names from nixpkgs are NOT constrained to filesystem- or
     // URL-safe characters. fetchpatch against a Gentoo mirror produces e.g.
     // `opensp-1.5.2-c11-using.patch?id=688d9675...drv` (I-167). The build_id
-    // becomes an overlay directory name, a cgroup v2 name, and a component of
-    // the synth_db sqlite:// URI — so anything outside [A-Za-z0-9_-] is
-    // collapsed to `_`. nixbase32 hash chars (0-9 a-z) are already in-set.
+    // becomes an overlay directory name and a cgroup v2 name — so anything
+    // outside [A-Za-z0-9_-] is collapsed to `_`. nixbase32 hash chars
+    // (0-9 a-z) are already in-set.
     drv_path
         .rsplit('/')
         .next()
@@ -1378,20 +2202,21 @@ pub fn sanitize_build_id(drv_path: &str) -> String {
 
 /// Send a worker banner (header or footer) as a `BuildLogBatch`
 /// directly on `log_tx`, bypassing the [`LogBatcher`] (which is
-/// created inside [`run_daemon_lifecycle`] and consumed by the stderr
+/// created inside [`run_native_lifecycle`] and consumed by the log
 /// loop — not in scope at the call sites).
 ///
-/// Best-effort: a closed channel means the scheduler stream is gone,
-/// in which case the build's `CompletionReport` won't reach the
-/// scheduler either — `runtime/` handles that. The banner is
-/// display-only; dropping it is harmless.
+/// Best-effort twice over: a closed sink means the worker is shutting
+/// down, and a *full* sink sheds the banner like any other display
+/// message (counted in the shared shed tally, so the log loop's next
+/// suppression marker covers it). The banner is display-only; the
+/// build's `CompletionReport` keeps its guaranteed path regardless.
 ///
 /// `pub(crate)` because the banner footer is sent from
-/// `runtime::spawn_build_task` (after the daemon-transient retry loop —
+/// `runtime::spawn_build_task` (after the infra-transient retry loop —
 /// once per assignment) rather than from `execute_build` (once per
 /// attempt). See `execute_build`'s `first_line` param doc and bug_013.
-pub(crate) async fn send_banner_batch(
-    log_tx: &mpsc::Sender<ExecutorMessage>,
+pub(crate) fn send_banner_batch(
+    log_tx: &crate::log_stream::SheddingLogSender,
     drv_path: &str,
     executor_id: &str,
     first_line_number: u64,
@@ -1403,60 +2228,105 @@ pub(crate) async fn send_banner_batch(
         first_line_number,
         lines,
     };
-    let msg = ExecutorMessage {
-        msg: Some(rio_proto::types::executor_message::Msg::LogBatch(batch)),
-    };
-    if log_tx.send(msg).await.is_err() {
+    if log_tx.try_send_banner(batch) == crate::log_stream::LogSendOutcome::Closed {
         tracing::debug!(
             drv_path = %drv_path,
-            "banner batch dropped: log channel closed (scheduler stream gone)"
+            "banner batch dropped: log channel closed (worker shutting down)"
         );
-    }
-}
-
-/// Map a [`run_daemon_lifecycle`] result to the banner footer's
-/// `result` string: `ok` or `failed (<reason>)`.
-///
-/// `cancelled` is deliberately NOT in this function's domain. The error
-/// variant cannot decide it: a pre-cgroup cancel
-/// ([`ExecutorError::Cancelled`]) routes through
-/// [`ExecuteOutcome::pre_cgroup`] (`footer_result: None` — no daemon
-/// ran, no footer at all) and never reaches this function, and a
-/// post-cgroup cancel kills the daemon, which surfaces here as
-/// `Wire(Io(UnexpectedEof))` — indistinguishable from a daemon crash.
-/// The runtime's once-per-assignment footer send overrides this string
-/// to `cancelled` from the build's cancel flag
-/// (`runtime::result::final_footer_result`), the same way
-/// `err_completion` decides `BuildResultStatus::Cancelled`.
-///
-/// Display-only: the precise classification (`InfrastructureFailure`
-/// vs `Failed` vs `Cancelled`, retry eligibility, error chain) lives
-/// on `CompletionReport`. The footer just lets a human reading the
-/// log know the build's own outcome without scrolling to the
-/// scheduler's view. `BuildStatus` doesn't carry an exit code (the
-/// daemon protocol only reports a status enum), so `failed (exit N)`
-/// from the design spec maps to the closest available signal: the
-/// status discriminant.
-fn footer_result_str(
-    build_result: &Result<rio_nix::protocol::build::BuildResult, ExecutorError>,
-) -> String {
-    use rio_nix::protocol::build::BuildStatus;
-    match build_result {
-        Ok(br) if br.status.is_success() => "ok".to_string(),
-        Ok(br) => match br.status {
-            BuildStatus::TimedOut => "failed (timed out)".to_string(),
-            BuildStatus::LogLimitExceeded => "failed (log limit exceeded)".to_string(),
-            other => format!("failed ({other:?})"),
-        },
-        // The full error string is on `CompletionReport.error_msg`;
-        // the footer is a one-line summary.
-        Err(_) => "failed (executor error)".to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The glue-rejection arbitration's full population (round-16
+    /// bug_075): each GlueError shape a resolve-time drop can produce
+    /// re-classifies to MetadataFetch (infra → re-dispatch) when its
+    /// path is in the dropped set, and stays a permanent Glue
+    /// rejection otherwise.
+    // r[verify builder.result.input-materialization-is-infra+6]
+    #[test]
+    fn glue_rejection_arbitrated_against_dropped_set() {
+        let dropped = dropped::DroppedInputs::from_resolve(
+            ["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gone".to_string()]
+                .into_iter()
+                .collect(),
+        );
+
+        // Closure-walk miss on a dropped member: residency gap → infra.
+        let e = glue::GlueError::ExportRefsMissingMetadata {
+            path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gone".into(),
+        };
+        match arbitrate_glue_rejection(e, &dropped) {
+            ExecutorError::MetadataFetch { path, source } => {
+                assert_eq!(path, "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gone");
+                assert_eq!(source.code(), tonic::Code::NotFound);
+            }
+            other => panic!("dropped member must re-dispatch, got {other:?}"),
+        }
+
+        // `.drv` output expansion miss on a dropped member: same.
+        let e = glue::GlueError::ExportRefsDrvOutputMissing {
+            drv: "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-x.drv".into(),
+            path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gone".into(),
+        };
+        assert!(
+            matches!(
+                arbitrate_glue_rejection(e, &dropped),
+                ExecutorError::MetadataFetch { .. }
+            ),
+            "dropped expansion target must re-dispatch"
+        );
+
+        // Dropped ROOT target: the containment gate misses it, and the
+        // error carries the raw declaration target — possibly a
+        // sub-path INSIDE the store path (CppNix toStorePath()).
+        let e = glue::GlueError::ExportRefsOutsideClosure {
+            path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gone/share/info".into(),
+        };
+        assert!(
+            matches!(
+                arbitrate_glue_rejection(e, &dropped),
+                ExecutorError::MetadataFetch { .. }
+            ),
+            "dropped root (sub-path target) must re-dispatch"
+        );
+
+        // Same variant, path NOT dropped: genuinely-wrong declaration —
+        // permanent input rejection, exactly as before.
+        let e = glue::GlueError::ExportRefsMissingMetadata {
+            path: "/nix/store/cccccccccccccccccccccccccccccccc-other".into(),
+        };
+        let arbitrated = arbitrate_glue_rejection(e, &dropped);
+        assert!(
+            matches!(&arbitrated, ExecutorError::Glue(_)) && arbitrated.is_permanent(),
+            "non-dropped miss stays a permanent Glue rejection: {arbitrated:?}"
+        );
+
+        // A prefix that is NOT a path-component boundary must not match
+        // (containment is `p` or `p/…`, never string-prefix).
+        let e = glue::GlueError::ExportRefsOutsideClosure {
+            path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gone-extra".into(),
+        };
+        assert!(
+            matches!(
+                arbitrate_glue_rejection(e, &dropped),
+                ExecutorError::Glue(_)
+            ),
+            "sibling store path sharing a string prefix is not contained"
+        );
+
+        // An unrelated GlueError shape never consults the dropped set.
+        let e = glue::GlueError::StructuredAttrsMissingJson;
+        assert!(
+            matches!(
+                arbitrate_glue_rejection(e, &dropped),
+                ExecutorError::Glue(_)
+            ),
+            "non-residency rejections stay permanent"
+        );
+    }
 
     /// Contract pin: rio-scheduler `handle_infrastructure_failure`
     /// matches `error_msg.contains(rio_proto::CGROUP_OOM_MSG)` to
@@ -1474,74 +2344,6 @@ mod tests {
             "ExecutorError::CgroupOom Display ({:?}) must contain rio_proto::CGROUP_OOM_MSG ({:?})",
             ExecutorError::CgroupOom.to_string(),
             rio_proto::CGROUP_OOM_MSG,
-        );
-    }
-
-    /// Pins the footer `result` string domain so `banner::footer_lines`'s
-    /// rustdoc example and `footer_renders_failed`'s fixture can't drift
-    /// from what production actually emits. The domain is `ok` /
-    /// `failed (<reason>)` only — `cancelled` is decided by
-    /// `runtime::result::final_footer_result` from the cancel flag, not
-    /// here (the error variant can't tell a post-cgroup cancel from a
-    /// daemon crash). `BuildStatus` carries no exit code, so the footer
-    /// never produces `failed (exit N)` — the failure reason is the
-    /// status discriminant or a hand-written phrase.
-    ///
-    /// One assertion per `match` arm in `footer_result_str` — keep this
-    /// 1:1 so a reviewer can verify completeness by counting; add a new
-    /// assertion when a new arm is added. The `Err(_)` arm has two
-    /// fixtures (`BuildFailed` and `Wire(UnexpectedEof)`), both
-    /// asserting the catch-all.
-    #[test]
-    fn footer_result_str_domain() {
-        use rio_nix::protocol::build::{BuildResult, BuildStatus};
-
-        let ok_result = |status| -> Result<BuildResult, ExecutorError> {
-            Ok(BuildResult {
-                status,
-                ..Default::default()
-            })
-        };
-
-        // Success → "ok".
-        assert_eq!(footer_result_str(&ok_result(BuildStatus::Built)), "ok");
-
-        // Special-cased human phrases.
-        assert_eq!(
-            footer_result_str(&ok_result(BuildStatus::TimedOut)),
-            "failed (timed out)"
-        );
-        assert_eq!(
-            footer_result_str(&ok_result(BuildStatus::LogLimitExceeded)),
-            "failed (log limit exceeded)"
-        );
-
-        // Catch-all: Debug discriminant. This is what `footer_lines`'s
-        // rustdoc example shows.
-        assert_eq!(
-            footer_result_str(&ok_result(BuildStatus::PermanentFailure)),
-            "failed (PermanentFailure)"
-        );
-
-        // Post-cgroup cancel / daemon crash both surface as
-        // Wire(Io(UnexpectedEof)) — the per-attempt mapper cannot tell
-        // them apart and renders the catch-all. The runtime's
-        // `final_footer_result` overrides this to "cancelled" at the
-        // once-per-assignment send when the cancel flag is set.
-        assert_eq!(
-            footer_result_str(&Err(ExecutorError::Wire(
-                rio_nix::protocol::wire::WireError::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "early eof"
-                ))
-            ))),
-            "failed (executor error)"
-        );
-
-        // Any other executor error → catch-all.
-        assert_eq!(
-            footer_result_str(&Err(ExecutorError::BuildFailed("boom".into()))),
-            "failed (executor error)"
         );
     }
 
@@ -1572,39 +2374,7 @@ mod tests {
     }
 
     #[test]
-    // r[verify builder.retry.daemon-transient]
-    fn test_is_daemon_transient() {
-        use rio_nix::protocol::wire::WireError;
-        use std::io::{Error as IoError, ErrorKind};
-
-        // Retryable: daemon spawn/handshake/early-EOF
-        assert!(ExecutorError::DaemonSpawn(IoError::other("spawn failed")).is_daemon_transient());
-        assert!(
-            ExecutorError::Wire(WireError::Io(IoError::new(
-                ErrorKind::UnexpectedEof,
-                "early eof"
-            )))
-            .is_daemon_transient()
-        );
-
-        // NOT retryable: other wire I/O errors (broken pipe ≠ daemon crash)
-        assert!(
-            !ExecutorError::Wire(WireError::Io(IoError::new(ErrorKind::BrokenPipe, "pipe")))
-                .is_daemon_transient()
-        );
-        // NOT retryable: builder failure, deterministic setup
-        assert!(!ExecutorError::BuildFailed("exit 1".into()).is_daemon_transient());
-        assert!(!ExecutorError::Cgroup("EACCES".into()).is_daemon_transient());
-        assert!(!ExecutorError::NixConf(IoError::other("disk full")).is_daemon_transient());
-        // NOT retryable: cgroup OOM. Retrying on the same undersized
-        // pod just OOM-loops again — must escalate to scheduler for
-        // resource_floor bump (I-196).
-        assert!(!ExecutorError::CgroupOom.is_daemon_transient());
-    }
-
-    #[test]
     fn test_is_permanent() {
-        use std::io::Error as IoError;
         // Permanent: derivation-intrinsic, same on every pod.
         assert!(
             ExecutorError::WrongKind {
@@ -1616,58 +2386,12 @@ mod tests {
         assert!(ExecutorError::InvalidDerivation("not UTF-8".into()).is_permanent());
 
         // NOT permanent: node-/network-local — another pod might succeed.
-        assert!(!ExecutorError::DaemonSpawn(IoError::other("spawn")).is_permanent());
+        assert!(!ExecutorError::SandboxSetup("mount race".into()).is_permanent());
         assert!(!ExecutorError::CgroupOom.is_permanent());
         assert!(!ExecutorError::BuildFailed("exit 1".into()).is_permanent());
         assert!(!ExecutorError::Cgroup("EACCES".into()).is_permanent());
-        assert!(!ExecutorError::NixConf(IoError::other("disk full")).is_permanent());
-        // is_permanent and is_daemon_transient are disjoint.
-        assert!(!ExecutorError::InvalidDerivation("x".into()).is_daemon_transient());
-    }
-
-    // r[verify builder.oom.cgroup-watch+3]
-    /// `apply_oom_override` MUST preserve `Ok(Built)` even when
-    /// `oom_detected` is true (the `final_oom` path does not
-    /// `cgroup.kill`, so a build that tolerated a child OOM reports
-    /// `Built`). Regression: previously the override was unconditional
-    /// and discarded the completed outputs → re-dispatch loop.
-    #[test]
-    fn test_apply_oom_override_preserves_ok_built() {
-        use rio_nix::protocol::build::BuildResult;
-        use rio_nix::protocol::wire::WireError;
-        use std::io::{Error as IoError, ErrorKind};
-
-        // (true, Ok(Built)) → Ok(Built). The bug case.
-        let r = apply_oom_override(true, Ok(BuildResult::success()));
-        assert!(
-            matches!(&r, Ok(br) if br.status == rio_nix::protocol::build::BuildStatus::Built),
-            "Ok(Built) must be preserved when oom_detected, got: {r:?}"
-        );
-
-        // (true, Err(Wire(UnexpectedEof))) → Err(CgroupOom). Watcher path.
-        let r = apply_oom_override(
-            true,
-            Err(ExecutorError::Wire(WireError::Io(IoError::new(
-                ErrorKind::UnexpectedEof,
-                "eof",
-            )))),
-        );
-        assert!(matches!(r, Err(ExecutorError::CgroupOom)), "got: {r:?}");
-
-        // (true, Err(BuildFailed)) → Err(CgroupOom). final_oom reclassify.
-        let r = apply_oom_override(true, Err(ExecutorError::BuildFailed("exit 137".into())));
-        assert!(matches!(r, Err(ExecutorError::CgroupOom)), "got: {r:?}");
-
-        // (false, Ok) → Ok unchanged.
-        let r = apply_oom_override(false, Ok(BuildResult::success()));
-        assert!(r.is_ok());
-
-        // (false, Err) → Err unchanged (NOT reclassified).
-        let r = apply_oom_override(false, Err(ExecutorError::BuildFailed("exit 1".into())));
-        assert!(
-            matches!(r, Err(ExecutorError::BuildFailed(_))),
-            "got: {r:?}"
-        );
+        // is_permanent and is_infra_transient are disjoint.
+        assert!(!ExecutorError::InvalidDerivation("x".into()).is_infra_transient());
     }
 
     fn test_env() -> ExecutorEnv {
@@ -1676,7 +2400,7 @@ mod tests {
             overlay_base_dir: "/tmp".into(),
             executor_id: "t".into(),
             log_limits: crate::log_stream::LogLimits::UNLIMITED,
-            daemon_timeout: DEFAULT_DAEMON_TIMEOUT,
+            build_timeout: DEFAULT_BUILD_TIMEOUT,
             max_silent_time: 0,
             cgroup_parent: "/tmp".into(),
             executor_kind: rio_proto::types::ExecutorKind::Builder,
@@ -1685,6 +2409,7 @@ mod tests {
             fuse_cache: None,
             fuse_fetch_timeout: Duration::from_secs(60),
             cancelled: Arc::new(AtomicBool::new(false)),
+            sandbox: Arc::new(SandboxEnvConfig::default()),
         }
     }
 
@@ -1695,7 +2420,7 @@ mod tests {
     #[test]
     fn resolve_build_opts_assigned_cores_wins() {
         let env = test_env();
-        // Scheduler assigned 4 cores; cgroup ceiling 8 → 4 reaches the daemon.
+        // Scheduler assigned 4 cores; cgroup ceiling 8 → 4 reaches the build env.
         let a = WorkAssignment {
             assigned_cores: Some(4),
             build_options: Some(rio_proto::types::BuildOptions {
@@ -1799,7 +2524,7 @@ mod tests {
         );
 
         // === Resolve ===
-        let resolved = resolve_inputs(&client, &drv, &main_drv_path).await?;
+        let resolved = resolve_inputs(&client, &drv, &main_drv_path, &main_aterm).await?;
 
         // The dep's concrete output path is now in input_srcs.
         assert!(
@@ -1813,13 +2538,55 @@ mod tests {
             resolved.basic_drv.input_srcs().contains(&static_src),
             "static input_srcs must be preserved"
         );
-        // And the closure includes the dep output (synth DB seed set).
+        // And the closure includes the dep output (full input closure).
         assert!(
             resolved.input_paths.contains(&dep_out),
             "input_paths closure must include resolved inputDrv output"
         );
 
         Ok(())
+    }
+
+    /// The execution backstop's deadline arithmetic: the backstop must
+    /// always sit strictly *after* the build's own timeout (so rio-exec's
+    /// in-sandbox enforcement gets first shot) and strictly *inside* the
+    /// pod's k8s deadline slack (so the worker reports TimedOut through
+    /// the normal completion path before k8s kills the pod).
+    ///
+    /// The 90s bound mirrors rio-controller's `WORKER_DEADLINE_SLACK_SECS`
+    /// (reconcilers/pool/jobs.rs) — a cross-crate invariant that cannot be
+    /// expressed as a compile-time check because rio-builder does not
+    /// depend on rio-controller; this test is its documented pin.
+    // r[verify builder.timeout.no-reassign]
+    #[test]
+    fn backstop_deadline_exceeds_build_timeout_and_stays_under_k8s_slack() {
+        // Strictly positive slack: the backstop never races the in-sandbox
+        // enforcement.
+        assert!(EXEC_BACKSTOP_SLACK > Duration::ZERO);
+
+        // Strictly under the controller's pod-deadline slack.
+        const CONTROLLER_WORKER_DEADLINE_SLACK_SECS: u64 = 90;
+        assert!(
+            EXEC_BACKSTOP_SLACK.as_secs() < CONTROLLER_WORKER_DEADLINE_SLACK_SECS,
+            "EXEC_BACKSTOP_SLACK ({}s) must stay under rio-controller's \
+             WORKER_DEADLINE_SLACK_SECS ({CONTROLLER_WORKER_DEADLINE_SLACK_SECS}s), \
+             or the pod dies before the worker can report TimedOut",
+            EXEC_BACKSTOP_SLACK.as_secs(),
+        );
+
+        // Deadline arithmetic for representative timeouts: backstop deadline
+        // is strictly after the build timeout and never panics on overflow.
+        for timeout in [
+            Duration::from_secs(60),
+            DEFAULT_BUILD_TIMEOUT,
+            Duration::from_secs(u64::MAX), // saturates instead of panicking
+        ] {
+            let deadline = timeout.saturating_add(EXEC_BACKSTOP_SLACK);
+            assert!(deadline >= timeout);
+            if timeout < Duration::from_secs(u64::MAX) - EXEC_BACKSTOP_SLACK {
+                assert_eq!(deadline, timeout + EXEC_BACKSTOP_SLACK);
+            }
+        }
     }
 
     /// TimedOut must NOT map to anything the scheduler reassigns. This
@@ -1843,5 +2610,369 @@ mod tests {
         // And it must not be Unspecified (which ALSO reassigns per
         // completion.rs:176-183).
         assert_ne!(mapped, Proto::Unspecified);
+    }
+    /// Native-path retry classification: sandbox setup failures retry
+    /// locally, glue rejections are permanent (deterministic
+    /// per-derivation), and a plain build failure is neither.
+    // r[verify builder.retry.infra-transient]
+    #[test]
+    fn native_error_retry_classification() {
+        assert!(ExecutorError::SandboxSetup("mount race".into()).is_infra_transient());
+        assert!(!ExecutorError::SandboxSetup("mount race".into()).is_permanent());
+        assert!(ExecutorError::Glue("unsupported builtin".into()).is_permanent());
+        assert!(!ExecutorError::Glue("unsupported builtin".into()).is_infra_transient());
+        assert!(!ExecutorError::BuildFailed("exit 1".into()).is_infra_transient());
+        assert!(!ExecutorError::BuildFailed("exit 1".into()).is_permanent());
+    }
+
+    /// The merged store scratch must end up `1775` (and `root:<gid>` when
+    /// running privileged) so the sandboxed uid-1000 build can create its
+    /// output paths in `/nix/store` — vm-ca-cutoff caught the activation
+    /// shipping a root:root 0755 merged root.
+    #[test]
+    fn store_scratch_made_group_writable() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let euid_root = nix::unistd::geteuid().is_root();
+        let res = make_store_scratch_writable(dir.path(), SANDBOX_BUILD_GID);
+        let mode = std::fs::metadata(dir.path())
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o1775, "store scratch must be 1775");
+        if euid_root {
+            res.expect("chown succeeds as root");
+            assert_eq!(
+                std::fs::metadata(dir.path()).expect("stat").gid(),
+                SANDBOX_BUILD_GID
+            );
+        } else {
+            // Unprivileged: the chmod half must have applied (asserted
+            // above); the chown half is allowed to fail.
+            let _ = res;
+        }
+    }
+
+    /// The per-build `/build` scratch must end up `0700` and (when
+    /// privileged) owned by the sandbox uid/gid — CppNix's
+    /// `chownToBuilder(tmpDir)` contract. A root:root 0755 `/build`
+    /// makes every build that writes to `$TMPDIR` fail EACCES.
+    #[test]
+    fn build_dir_made_writable_for_sandbox_user() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().expect("tempdir");
+        make_build_dir_writable(dir.path(), SANDBOX_BUILD_UID, SANDBOX_BUILD_GID)
+            .expect("prepare build dir");
+        let md = std::fs::metadata(dir.path()).expect("stat");
+        assert_eq!(
+            md.permissions().mode() & 0o7777,
+            0o700,
+            "/build must be 0700"
+        );
+        if nix::unistd::geteuid().is_root() {
+            assert_eq!(md.uid(), SANDBOX_BUILD_UID);
+            assert_eq!(md.gid(), SANDBOX_BUILD_GID);
+        }
+    }
+
+    /// Builder execve failures that are the derivation's fault must not
+    /// be classified as transient infrastructure (they would retry
+    /// forever); worker-side faults (EIO, ENOMEM) must stay
+    /// infra-transient so the retry/re-dispatch path still applies.
+    #[test]
+    fn exec_errno_classification() {
+        use nix::errno::Errno;
+        for e in [
+            Errno::ENOENT,
+            Errno::ENOTDIR,
+            Errno::EACCES,
+            Errno::ENOEXEC,
+            Errno::ENAMETOOLONG,
+            Errno::ELOOP,
+            Errno::EISDIR,
+            Errno::E2BIG,
+            Errno::EINVAL,
+            Errno::ELIBBAD,
+        ] {
+            assert!(
+                exec_errno_is_derivation_caused(e as i32),
+                "{e} is derivation-caused"
+            );
+        }
+        // EPERM stays infra by design: only worker-side mount flags or
+        // security policy produce it, never the derivation's own content.
+        for e in [
+            Errno::EIO,
+            Errno::ENOMEM,
+            Errno::EAGAIN,
+            Errno::ETXTBSY,
+            Errno::EPERM,
+        ] {
+            assert!(
+                !exec_errno_is_derivation_caused(e as i32),
+                "{e} stays infra-transient"
+            );
+        }
+    }
+
+    /// `footer_result_native` covers the same domain the daemon-era
+    /// footer did: ok / timed out / log limit / generic failure /
+    /// executor error.
+    #[test]
+    fn footer_result_native_domain() {
+        use rio_proto::types::BuildResultStatus;
+        let failed = |status| NativeBuild::Failed {
+            status,
+            error_msg: String::new(),
+        };
+        assert_eq!(
+            footer_result_native(&Ok(NativeBuild::Succeeded {
+                processed: native_result::ProcessedOutputs {
+                    outputs: Vec::new()
+                },
+                start_time: 0,
+                stop_time: 0,
+            })),
+            "ok"
+        );
+        assert_eq!(
+            footer_result_native(&Ok(failed(BuildResultStatus::TimedOut))),
+            "failed (timed out)"
+        );
+        assert_eq!(
+            footer_result_native(&Ok(failed(BuildResultStatus::LogLimitExceeded))),
+            "failed (log limit exceeded)"
+        );
+        assert!(
+            footer_result_native(&Ok(failed(BuildResultStatus::PermanentFailure)))
+                .starts_with("failed (")
+        );
+        // Executor-error arms name the failure class for the
+        // banner-only reader; anything unrecognized stays generic.
+        assert_eq!(
+            footer_result_native(&Err(ExecutorError::SandboxSetup("x".into()))),
+            "failed (sandbox setup)"
+        );
+        assert_eq!(
+            footer_result_native(&Err(ExecutorError::Glue("nope".into()))),
+            "failed (rejected by request glue)"
+        );
+        assert_eq!(
+            footer_result_native(&Err(ExecutorError::CgroupOom)),
+            "failed (out of memory)"
+        );
+        assert_eq!(
+            footer_result_native(&Err(ExecutorError::Cancelled)),
+            "failed (executor error)"
+        );
+    }
+
+    /// THE merged_bug_019 decoupling pin at the loop level: with the
+    /// sink full and NEVER drained, the log loop keeps consuming the
+    /// rio-exec event stream (shedding batches) instead of parking on
+    /// the first send — pre-FU1 this test times out at the second
+    /// batch boundary.
+    // r[verify builder.relay.log-shed]
+    #[tokio::test]
+    async fn log_loop_drains_exec_events_while_sink_full() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (sink_tx, _sink_rx) = tokio::sync::mpsc::channel(1);
+        let shedder = crate::log_stream::SheddingLogSender::new(sink_tx);
+        let batcher = LogBatcher::new(
+            "/rio/store/aaa-x.drv".into(),
+            "w0".into(),
+            crate::log_stream::LogLimits::UNLIMITED,
+            0,
+        );
+        let (event_tx, event_rx) = mpsc::channel::<rio_exec::ExecEvent>(8);
+        let loop_task = tokio::spawn(native_log_loop(
+            event_rx,
+            batcher,
+            shedder,
+            tmp.path().to_path_buf(),
+        ));
+
+        // 500 lines: ~8 batches, far past the single sink slot. Every
+        // send must complete promptly because the loop always drains.
+        let feed = async {
+            for i in 0..500u32 {
+                event_tx
+                    .send(rio_exec::ExecEvent::Log {
+                        stream: rio_exec::LogStream::Merged,
+                        line: format!("line-{i}").into_bytes(),
+                        terminated: true,
+                    })
+                    .await
+                    .expect("event send");
+            }
+            drop(event_tx);
+        };
+        tokio::time::timeout(Duration::from_secs(10), feed)
+            .await
+            .expect("the loop must keep draining events while the sink is full");
+
+        let result = tokio::time::timeout(Duration::from_secs(10), loop_task)
+            .await
+            .expect("loop must exit after the event stream closes")
+            .expect("loop task");
+        assert!(
+            result.final_line_count >= 500,
+            "every line was numbered (delivered or shed): {}",
+            result.final_line_count
+        );
+        assert!(result.log_cap_trip.is_none());
+    }
+
+    /// Shed accounting end to end: a full sink sheds a batch (counted),
+    /// and the NEXT DELIVERED batch itself carries the single
+    /// suppression marker, with the line numbering exposing the forward
+    /// gap of the shed span.
+    ///
+    /// Restaged by the merged_bug_022 fix: this test previously pinned
+    /// the marker landing one batch LATE (in the flush after the next
+    /// delivery) — the violation of `builder.relay.log-shed`'s "next
+    /// delivered batch MUST carry" clause that 6dff0fd54 shipped
+    /// born-self-inconsistent. With the marker injected inside
+    /// `flush()`, the delivered batch conforms.
+    // r[verify builder.relay.log-shed]
+    #[tokio::test]
+    async fn shed_on_full_counts_and_marks() {
+        use crate::log_stream::AddLineResult;
+
+        let rec = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel(1);
+        let shedder = crate::log_stream::SheddingLogSender::new(sink_tx);
+        let mut batcher = LogBatcher::new(
+            "/rio/store/aaa-x.drv".into(),
+            "w0".into(),
+            crate::log_stream::LogLimits::UNLIMITED,
+            0,
+        );
+        batcher.attach_relay_shed(&shedder);
+
+        let fill_batch = |batcher: &mut LogBatcher| loop {
+            if let AddLineResult::BatchReady(b) = batcher.add_line(b"x".to_vec()) {
+                break b;
+            }
+        };
+
+        // Batch 1 (lines 0-63) occupies the only sink slot.
+        let b1 = fill_batch(&mut batcher);
+        assert!(deliver_batch(&shedder, b1));
+        // Batch 2 (lines 64-127) sheds — the sink is full.
+        let b2 = fill_batch(&mut batcher);
+        assert!(deliver_batch(&shedder, b2), "shed ≠ closed");
+        assert_eq!(
+            rec.get("rio_builder_log_messages_shed_total{kind=log_batch}"),
+            1
+        );
+
+        // Sink drains; batch 3's own flush() injects the marker — the
+        // delivered batch carries it (was: one batch late).
+        let delivered1 = sink_rx.try_recv().expect("batch 1 was delivered");
+        let b3 = fill_batch(&mut batcher);
+        assert!(deliver_batch(&shedder, b3));
+        let delivered3 = sink_rx.try_recv().expect("batch 3 was delivered");
+
+        let as_batch = |msg: &rio_proto::types::ExecutorMessage| match &msg.msg {
+            Some(rio_proto::types::executor_message::Msg::LogBatch(b)) => b.clone(),
+            other => panic!("expected a LogBatch, got {other:?}"),
+        };
+        assert_eq!(as_batch(&delivered1).first_line_number, 0);
+        let d3 = as_batch(&delivered3);
+        assert_eq!(
+            d3.first_line_number, 128,
+            "the shed batch's span (64-127) is a forward line-number gap"
+        );
+        assert_eq!(d3.lines.len(), 65, "64 lines + the suppression marker");
+        let markers: Vec<_> = d3
+            .lines
+            .iter()
+            .filter(|l| l.starts_with(b"[rio: "))
+            .collect();
+        assert_eq!(markers.len(), 1, "single marker, in the delivered batch");
+        assert_eq!(
+            std::str::from_utf8(markers[0]).unwrap(),
+            "[rio: 1 log messages shed (scheduler link backpressure)]"
+        );
+
+        // The tally drained with the delivery: nothing trails.
+        let (tail, _) = batcher.finish();
+        assert!(
+            tail.is_none(),
+            "no marker left behind to ride a later batch"
+        );
+    }
+
+    /// Loop-level wiring for the merged_bug_022 terminal drain: a build
+    /// whose final suppression window still holds drops when the event
+    /// stream closes — with NOTHING buffered — must deliver the marker
+    /// batch. Pre-fix the exit path was gated on `has_pending()` and
+    /// lost it.
+    // r[verify builder.log-limit+4]
+    #[tokio::test]
+    async fn log_loop_delivers_terminal_suppression_marker() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel(64);
+        let shedder = crate::log_stream::SheddingLogSender::new(sink_tx);
+        let batcher = LogBatcher::new(
+            "/rio/store/aaa-x.drv".into(),
+            "w0".into(),
+            crate::log_stream::LogLimits {
+                rate_lines_per_sec: 2,
+                total_bytes: 0,
+            },
+            0,
+        );
+        let (event_tx, event_rx) = mpsc::channel::<rio_exec::ExecEvent>(16);
+        let loop_task = tokio::spawn(native_log_loop(
+            event_rx,
+            batcher,
+            shedder,
+            tmp.path().to_path_buf(),
+        ));
+
+        // 5 lines in one burst: 2 accepted, 3 rate-dropped. Then the
+        // stream closes within the same window.
+        for i in 0..5u32 {
+            event_tx
+                .send(rio_exec::ExecEvent::Log {
+                    stream: rio_exec::LogStream::Merged,
+                    line: format!("line-{i}").into_bytes(),
+                    terminated: true,
+                })
+                .await
+                .expect("event send");
+        }
+        drop(event_tx);
+
+        let result = tokio::time::timeout(Duration::from_secs(10), loop_task)
+            .await
+            .expect("loop exits")
+            .expect("loop task");
+        assert_eq!(
+            result.final_line_count, 3,
+            "2 accepted lines + 1 suppression marker numbered"
+        );
+
+        // Collect everything delivered; the terminal batch must carry
+        // the marker even though the accepted lines and the marker may
+        // arrive in one or two batches depending on tick timing.
+        let mut lines: Vec<Vec<u8>> = Vec::new();
+        while let Ok(msg) = sink_rx.try_recv() {
+            if let Some(rio_proto::types::executor_message::Msg::LogBatch(b)) = msg.msg {
+                lines.extend(b.lines);
+            }
+        }
+        let markers: Vec<_> = lines.iter().filter(|l| l.starts_with(b"[rio: ")).collect();
+        assert_eq!(markers.len(), 1, "terminal suppression marker delivered");
+        assert!(
+            std::str::from_utf8(markers[0])
+                .unwrap()
+                .contains("3 lines suppressed"),
+        );
     }
 }

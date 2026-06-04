@@ -484,6 +484,7 @@ async fn merge_chain(
         .send_unchecked(ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id,
+                ingress_stripped: Default::default(),
                 tenant_id: None,
                 priority_class,
                 nodes,
@@ -1374,7 +1375,9 @@ async fn test_recovery_expired_poison_cleared_not_reloaded() -> TestResult {
 ///
 /// Before the fix, `reset_from_poison` left the node in Created with stub
 /// fields from `from_poisoned_row` (`output_names: []`,
-/// `expected_output_paths: []`). `dag.merge()` on an existing node only
+/// `expected_output_paths: []` — at the time a stub constructor; it now
+/// restores the full creation-time snapshot). `dag.merge()` on an existing
+/// node only
 /// touches `interested_builds` + `traceparent`, and `compute_initial_states`
 /// only iterates `newly_inserted` — so the resubmit's node never progressed
 /// past Created. Build counters stuck at `completed=0, failed=0, total=1`;
@@ -2379,6 +2382,120 @@ async fn test_recovery_keep_going_sticky_failure_survives_clear_poison() -> Test
     Ok(())
 }
 
+// r[verify sched.build.failure-evidence-at-source+1]
+/// Round-16 bug_100 roundtrip: the at-source chokepoint persists the
+/// first-failure PAIR (M_072) through the production writer; after a
+/// leader failover the recovered build's terminal `BuildFailed` event
+/// must carry BOTH halves — pre-fix it shipped the restored
+/// `error_message` with `failed_derivation=""` (only the summary had a
+/// column).
+#[tokio::test]
+async fn test_recovery_restores_failed_derivation_pair() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        // keep_going build, two independent drvs. X fails permanently
+        // through the worker path → handle_derivation_failure →
+        // record_failure_evidence persists the PAIR at source.
+        merge_dag(
+            &handle,
+            build_id,
+            vec![make_node("fdr-x"), make_node("fdr-y")],
+            vec![],
+            true, // keep_going
+        )
+        .await?;
+        // Both X and Y are independently Ready; dispatch order and
+        // worker placement are scheduler's choice. Fail X permanently
+        // and leave Y UNRESOLVED (its worker just never completes) so
+        // the build is still Active at failover — a terminal build
+        // would not be recovered at all.
+        let mut x_failed = false;
+        for i in 0..4 {
+            if x_failed {
+                break;
+            }
+            let wid = format!("fdr-w{i}");
+            let mut wrx = connect_executor(&handle, &wid, "x86_64-linux").await?;
+            let a = recv_assignment(&mut wrx).await;
+            if a.drv_path.contains("fdr-x") {
+                complete_failure(
+                    &handle,
+                    &wid,
+                    "fdr-x",
+                    rio_proto::types::BuildResultStatus::PermanentFailure,
+                    "boom",
+                )
+                .await?;
+                x_failed = true;
+            }
+            // Y assignment: hold it open (no completion) — the
+            // failover resets it to Ready.
+            barrier(&handle).await;
+        }
+        assert!(x_failed, "fixture premise: X permanently failed");
+        // Production writer persisted the pair at source.
+        let (s, fd): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT error_summary, failed_derivation FROM builds WHERE build_id = $1",
+        )
+        .bind(build_id)
+        .fetch_one(&pool)
+        .await?;
+        assert!(s.is_some(), "fixture premise: summary persisted at source");
+        assert_eq!(
+            fd.as_deref(),
+            Some("fdr-x"),
+            "fixture premise: the PAIR persisted at source (M_072)"
+        );
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: subscribe to the state ring, then resolve the
+    // remaining node — the terminal BuildFailed must carry the PAIR.
+    let (tx, rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::WatchBuild {
+            build_id,
+            caller_tenant: None,
+            since_sequence: 0,
+            reply: tx,
+        })
+        .await?;
+    let mut state_rx = rx.await??.0.state;
+
+    // Y was left unresolved across the failover — recovery reset it to
+    // Ready. Finish it now to drive the keep_going build terminal.
+    let mut wrx = connect_executor(&handle, "fdr-w9", "x86_64-linux").await?;
+    let a = recv_assignment(&mut wrx).await;
+    assert!(a.drv_path.contains("fdr-y"), "only Y remains");
+    complete_success(&handle, "fdr-w9", "fdr-y", &test_store_path("fdr-y-out")).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, build_id).await?.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "keep_going build with one permanent failure terminates Failed"
+    );
+
+    // Drain the state ring for the Failed event.
+    let mut failed_evt = None;
+    while let Ok(ev) = state_rx.try_recv() {
+        if let Some(rio_proto::types::build_event::Event::Failed(f)) = ev.event {
+            failed_evt = Some(f);
+        }
+    }
+    let f_evt = failed_evt.expect("BuildFailed event on the state ring");
+    assert!(
+        !f_evt.error_message.is_empty(),
+        "summary half restored across failover"
+    );
+    assert_eq!(
+        f_evt.failed_derivation, "fdr-x",
+        "failed_derivation half must survive failover (pre-M_072 this was \"\")"
+    );
+    Ok(())
+}
+
 // r[verify sched.timeout.per-build]
 /// `build_timeout` is "wall-clock since SUBMISSION" — recovery must
 /// seed `submitted_at` from PG, not reset to `Instant::now()`. Otherwise
@@ -2392,6 +2509,7 @@ async fn test_recovery_restores_build_timeout_baseline() -> TestResult {
             .send_unchecked(ActorCommand::MergeDag {
                 req: MergeDagRequest {
                     build_id,
+                    ingress_stripped: Default::default(),
                     tenant_id: None,
                     priority_class: PriorityClass::Scheduled,
                     nodes: vec![make_node("bto-drv")],
@@ -3630,7 +3748,7 @@ async fn test_recovery_rearms_prefix_state_for_spared_ready_entry() -> TestResul
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// `topdown_pruned` must survive leader failover: a derivations row
 /// persisted with the flag set is restored with the flag set (not
 /// reset to false) so the new leader keeps honoring the "must complete
@@ -3675,7 +3793,7 @@ async fn test_recovery_restores_topdown_pruned_flag() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// Failover regression (the doomed dispatch): a roots-only-pruned root
 /// persisted as `substituting` is recovered CHILDLESS by the new
 /// leader, comes back Ready (no deps in the DAG), and is re-probed
@@ -3782,7 +3900,7 @@ async fn test_failover_childless_pruned_root_fails_fast_not_dispatched_from_sour
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// The fail-fast must CONSUME the `topdown_pruned` marker (clear it in
 /// memory and in PG) when it parks a node: the flag can be stale (a
 /// committed merge whose activation failed, a node stamped while its
@@ -3894,7 +4012,7 @@ async fn test_fail_fast_clears_topdown_pruned_and_resubmission_builds_from_sourc
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// Failover counterpart of the children-became-produced clear: a
 /// restored `topdown_pruned` mark must be DROPPED at recovery when the
 /// node's persisted children are all produced (`completed`/`skipped`)
@@ -4016,7 +4134,7 @@ async fn test_failover_clears_topdown_pruned_when_children_all_produced() -> Tes
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// Live-build scoping of the recovery-time gate: a restored
 /// `topdown_pruned` mark must be KEPT when the parent's produced
 /// children are vouched for only by TERMINAL builds.
@@ -4166,7 +4284,7 @@ async fn test_failover_keeps_topdown_pruned_when_produced_children_belong_to_ter
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// The closure-hole breadcrumb is persisted (`migrations/064`) and must
 /// be restored by `from_recovery_row` — not reset to false the way the
 /// pre-064 code did. Restoring it is what lets the recovery-time gate
@@ -4177,10 +4295,13 @@ async fn test_failover_keeps_topdown_pruned_when_produced_children_belong_to_ter
 /// right after recovery (before any merge) the debug surface must show
 /// the in-memory breadcrumb true — that is `from_recovery_row` carrying
 /// the persisted column into the restored state. The heal half is then
-/// pinned on the persisted column: a post-failover full merge
-/// re-declares the node's edges and the persisted breadcrumb flips
-/// true→false while the still-unvouched mark stays. The heal is TOTAL —
-/// it pushes the PG clear for every edge parent it re-declares, keyed
+/// pinned on the persisted column: a post-failover full merge HEALS
+/// the node (accepted trigger ∧ witness coverage — the defining doc is
+/// `MergeResult::healed_parents`; this staging covers the witness set)
+/// and the persisted breadcrumb flips
+/// true→false while the still-unvouched mark stays. The heal is TOTAL
+/// over the healed set —
+/// it pushes the PG clear for every healed parent, keyed
 /// on the persisted column only, never on the pre-clear in-memory value
 /// (the heal-totality test in merge.rs stages exactly that divergence) —
 /// so the column flip pins the heal + persistence round-trip, not the
@@ -4207,6 +4328,17 @@ async fn test_recovery_restores_closure_hole_and_heal_clears_persisted_breadcrum
         sqlx::query(
             "UPDATE derivations SET status = 'substituting', topdown_pruned = true, \
              closure_hole = true WHERE drv_hash = 'chrec-root'",
+        )
+        .execute(&pool)
+        .await?;
+        // The 069 witness row the transactional writers always pair
+        // with the flag (recovery hydration debug-asserts the pairing).
+        // The missing child is `chrec-dep` — the one the post-failover
+        // covering merge below re-supplies; heal-accepted-edges+1
+        // demands the re-declaration cover exactly this set.
+        sqlx::query(
+            "INSERT INTO derivation_closure_missing (drv_hash, missing_child) \
+             VALUES ('chrec-root', 'chrec-dep')",
         )
         .execute(&pool)
         .await?;
@@ -4243,10 +4375,10 @@ async fn test_recovery_restores_closure_hole_and_heal_clears_persisted_breadcrum
         "fixture premise: the backdated mark + breadcrumb are still persisted after recovery"
     );
 
-    // A post-failover FULL merge re-declares the node's edges: its child
-    // set is representative of its closure again, so the heal drops the
-    // breadcrumb in memory and pushes the PG clear for every edge parent
-    // it re-declares (total — not keyed on the restored in-memory value).
+    // A post-failover FULL merge re-declares the node's edges AND
+    // re-supplies the recorded missing child: coverage met, so the heal
+    // drops the breadcrumb in memory and pushes the PG clear (total —
+    // not keyed on the restored in-memory value).
     merge_dag(
         &handle,
         Uuid::new_v4(),
@@ -4275,7 +4407,7 @@ async fn test_recovery_restores_closure_hole_and_heal_clears_persisted_breadcrum
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// bug_006 regression (the recovery-time veto): a restored
 /// `topdown_pruned` mark whose row also carries the persisted
 /// `closure_hole` breadcrumb must be KEPT at recovery even when every
@@ -4345,6 +4477,15 @@ async fn test_failover_keeps_topdown_pruned_when_closure_hole_recorded() -> Test
         sqlx::query(
             "UPDATE derivations SET status = 'substituting', topdown_pruned = true, \
              closure_hole = true WHERE drv_hash = 'tdvh-root'",
+        )
+        .execute(&pool)
+        .await?;
+        // The 069 witness row the transactional writers always pair
+        // with the flag (the recovery hydration debug-asserts the
+        // pairing).
+        sqlx::query(
+            "INSERT INTO derivation_closure_missing (drv_hash, missing_child) \
+             VALUES ('tdvh-root', 'tdvh-reaped')",
         )
         .execute(&pool)
         .await?;
@@ -4474,6 +4615,89 @@ async fn stage_parent_with_other_builds_cancelled_child(
     Ok(())
 }
 
+// r[verify sched.merge.heal-accepted-edges+1]
+/// Failover-durability of a REFUSED heal: the witness set survives
+/// recovery (hydrated from 069), a post-failover subset re-declaration
+/// is refused, and BOTH halves of the persisted breadcrumb (M_064 flag
+/// + 069 witness rows) remain for the next failover. The laundering
+/// channel must not re-open across leader changes.
+#[tokio::test]
+async fn test_refused_heal_keeps_witness_durable_across_failover() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let f = RecoveryFixture::run(async |handle, pool| {
+        let mut parent = make_node("rhw-root");
+        parent.expected_output_paths = vec![test_store_path("rhw-root-out")];
+        merge_dag(
+            &handle,
+            build_id,
+            vec![parent, make_node("rhw-s")],
+            vec![make_test_edge("rhw-root", "rhw-s")],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        // Old leader reaped an un-produced second child: pruned-parked
+        // root, flag + witness persisted in one transaction.
+        sqlx::query(
+            "UPDATE derivations SET status = 'substituting', topdown_pruned = true, \
+             closure_hole = true WHERE drv_hash = 'rhw-root'",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO derivation_closure_missing (drv_hash, missing_child) \
+             VALUES ('rhw-root', 'rhw-reaped')",
+        )
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+    let pool = f.db.pool.clone();
+
+    // Recovery hydrated the witness set (not the LOST_WITNESS sentinel).
+    let d = expect_drv(&handle, "rhw-root").await;
+    assert!(d.closure_hole, "hole restored at recovery");
+    assert_eq!(d.closure_missing_count, 1, "witness hydrated from 069");
+
+    // Post-failover SUBSET re-declaration (the surviving child only,
+    // through the pruned-root carve-out): accepted trigger, refused
+    // heal.
+    let b2 = Uuid::new_v4();
+    let mut parent = make_node("rhw-root");
+    parent.expected_output_paths = vec![test_store_path("rhw-root-out")];
+    merge_dag(
+        &handle,
+        b2,
+        vec![parent, make_node("rhw-s")],
+        vec![make_test_edge("rhw-root", "rhw-s")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let d = expect_drv(&handle, "rhw-root").await;
+    assert!(
+        d.closure_hole,
+        "subset re-declaration must not heal across a failover"
+    );
+    assert_eq!(d.closure_missing_count, 1, "witness set intact in memory");
+    let (flag,): (bool,) =
+        sqlx::query_as("SELECT closure_hole FROM derivations WHERE drv_hash = 'rhw-root'")
+            .fetch_one(&pool)
+            .await?;
+    assert!(flag, "persisted flag survives the refused heal");
+    let (rows,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM derivation_closure_missing WHERE drv_hash = 'rhw-root'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(rows, 1, "persisted witness rows survive the refused heal");
+    Ok(())
+}
+
 // r[verify sched.recovery.failed-dep-cascade+2]
 /// bug_009, clearing harm: another build's cancelled, never-wanted
 /// child must not condemn a healthy pruning build's recovered parent.
@@ -4590,7 +4814,7 @@ async fn test_failover_pruned_build_completes_via_substitution_despite_other_bui
 }
 
 // r[verify sched.recovery.failed-dep-cascade+2]
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// bug_009, verdict harm: when the recovered parent's wanted set is
 /// genuinely unsatisfiable by substitution, the verdict and error must
 /// come from the node's OWN bounded resubmit-directing fail-fast — not
@@ -4783,7 +5007,7 @@ async fn test_failover_unflagged_parent_with_other_builds_cancelled_child_dispat
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// bug_006 regression (the recovery-time stamp): when recovery drops the
 /// edge to an un-produced terminal child of a restored marked parent, it
 /// must record the closure hole — in memory and best-effort in PG —
@@ -5005,6 +5229,1348 @@ async fn test_failover_recovery_records_closure_hole_for_dropped_unproduced_term
         rio_proto::types::BuildState::Succeeded as i32,
         "the build owning the surviving sibling completes normally; error={:?}",
         sk.error_summary
+    );
+    Ok(())
+}
+
+/// Round-17 merged_bug_024 (recovery tier): for a TRIGGERED parent the
+/// recovery stamp must record ALL dropped terminal children — produced
+/// (`completed`/`skipped`) included — and a parent restored with the
+/// watched flag is itself a trigger. Pre-fix the stamp recorded only
+/// un-produced dropped children, so a watched parent whose dropped
+/// children were ALL produced recovered with its old witness intact and
+/// a heal re-supplying just that older set re-armed it over a child set
+/// missing the produced-but-dropped children (the all-produced-dropped
+/// live-voucher laundering). Also pins gate-before-stamp disjointness:
+/// the produced-children gate's clear set and the recovery stamp set
+/// share no parent — an un-watched all-produced live-vouched parent is
+/// cleared and NOT stamped, in the same recovery that stamps the
+/// watched one.
+#[tokio::test]
+async fn test_recovery_witness_covers_produced_dropped_children_for_watched_parents() -> TestResult
+{
+    let b2 = Uuid::new_v4(); // full-merge owner — cancelled at failover
+    let b_live = Uuid::new_v4(); // live build co-owning everything
+    let f = RecoveryFixture::run(async |handle, pool| {
+        // W (watched) → {C_prod}; G (gate candidate) → {C_g}.
+        merge_dag(
+            &handle,
+            b2,
+            vec![
+                make_node("mb24-w"),
+                make_node("mb24-cprod"),
+                make_node("mb24-g"),
+                make_node("mb24-cg"),
+            ],
+            vec![
+                make_test_edge("mb24-w", "mb24-cprod"),
+                make_test_edge("mb24-g", "mb24-cg"),
+            ],
+            false,
+        )
+        .await?;
+        // The live build co-owns parents AND children: the produced
+        // children are live-vouched for the gate, and the parents stay
+        // loadable.
+        merge_dag(
+            &handle,
+            b_live,
+            vec![
+                make_node("mb24-w"),
+                make_node("mb24-cprod"),
+                make_node("mb24-g"),
+                make_node("mb24-cg"),
+            ],
+            vec![
+                make_test_edge("mb24-w", "mb24-cprod"),
+                make_test_edge("mb24-g", "mb24-cg"),
+            ],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        // Backdate: both children PRODUCED (their edges drop at the
+        // recovery load); both parents carry restored topdown_pruned;
+        // W additionally carries the watched flag with an OLD witness
+        // row for a child whose derivation row no longer exists (the
+        // orphan-GC'd shape) — staged through the same paired-writer
+        // invariant the production stamp uses (flag ⇔ side rows).
+        sqlx::query(
+            "UPDATE derivations SET status = 'completed' \
+             WHERE drv_hash IN ('mb24-cprod', 'mb24-cg')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "UPDATE derivations SET status = 'substituting', topdown_pruned = true \
+             WHERE drv_hash IN ('mb24-w', 'mb24-g')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("UPDATE derivations SET closure_hole = true WHERE drv_hash = 'mb24-w'")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO derivation_closure_missing (drv_hash, missing_child) \
+             VALUES ('mb24-w', 'mb24-gone-old')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("UPDATE builds SET status = 'cancelled' WHERE build_id = $1")
+            .bind(b2)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // W: watched flag restored, witness EXTENDED with the produced
+    // dropped child — cumulative since last whole.
+    let w = expect_drv(&handle, "mb24-w").await;
+    assert!(w.closure_hole, "watched flag survives recovery");
+    assert_eq!(
+        w.closure_missing_count, 2,
+        "the witness covers the old recorded child AND the produced \
+         dropped child (pre-fix: the old child only)"
+    );
+    assert!(
+        w.topdown_pruned,
+        "the watched parent is vetoed at the gate's candidate \
+         collection — its mark is kept"
+    );
+    // The extension is durable (the additive paired writer appended the
+    // produced child alongside the old row).
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT missing_child FROM derivation_closure_missing \
+         WHERE drv_hash = 'mb24-w' ORDER BY missing_child",
+    )
+    .fetch_all(&f.db.pool)
+    .await?;
+    assert_eq!(
+        rows.iter().map(|(c,)| c.as_str()).collect::<Vec<_>>(),
+        vec!["mb24-cprod", "mb24-gone-old"],
+        "persisted witness rows: old + produced-dropped"
+    );
+
+    // G: gate-cleared and NOT stamped — the gate's clear set and the
+    // stamp set are disjoint (gate-before-stamp ordering pinned).
+    let g = expect_drv(&handle, "mb24-g").await;
+    assert!(
+        !g.topdown_pruned,
+        "un-watched all-produced live-vouched parent is gate-cleared"
+    );
+    assert!(
+        !g.closure_hole,
+        "the gate-cleared parent is NOT stamped by the recovery \
+         witness pass (disjoint sets)"
+    );
+    assert_eq!(g.closure_missing_count, 0);
+    Ok(())
+}
+
+/// Authoritative inline drv_content (content-bound hook fallback) must
+/// survive scheduler failover: the bytes are the only copy of the
+/// derivation anywhere, so the recovered node's dispatch must carry
+/// exactly what the gateway submitted.
+// r[verify sched.recovery.inline-drv-durability+3]
+#[tokio::test]
+async fn test_recovery_preserves_authoritative_drv_content() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let aterm: Vec<u8> = br#"Derive([("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hook-ca","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hook-ca")])"#.to_vec();
+    let aterm_seed = aterm.clone();
+    let f = RecoveryFixture::run(async move |handle, _| {
+        let mut node = make_node("hook-durable");
+        node.drv_content = aterm_seed;
+        node.drv_content_authoritative = true;
+        merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: a worker connects and the recovered Ready node is
+    // dispatched — the assignment must carry the original bytes (the
+    // worker has nowhere else to fetch this derivation from).
+    let mut rx = connect_executor(&handle, "durable-w", "x86_64-linux").await?;
+    let assignment = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assignment.drv_content, aterm,
+        "post-failover dispatch must carry the persisted authoritative drv_content"
+    );
+    Ok(())
+}
+
+/// Post-failover completion of a floating-CA hook-fallback build must
+/// still register its realisation: the recovered node's CA modular hash
+/// is recomputed from the persisted authoritative bytes, so the
+/// consumable-result guarantee of the inline fallback survives scheduler
+/// failover.
+// r[verify sched.recovery.inline-drv-ca-hash+3]
+#[tokio::test]
+async fn test_recovery_registers_realisation_for_authoritative_ca_fallback() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let aterm = r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","")])"#;
+    let drv_path = rio_test_support::fixtures::test_drv_path("hook-ca-realise");
+    let expected_hash = rio_nix::derivation::hash_derivation_modulo(
+        &rio_nix::derivation::Derivation::parse(aterm).unwrap(),
+        &drv_path,
+        &|_| None,
+        &mut std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let aterm_seed = aterm.as_bytes().to_vec();
+    let f = RecoveryFixture::run(async move |handle, _| {
+        let mut node = make_node("hook-ca-realise");
+        node.drv_content = aterm_seed;
+        node.drv_content_authoritative = true;
+        node.is_content_addressed = true;
+        node.expected_output_paths = vec![String::new()];
+        node.ca_modular_hash = expected_hash.to_vec();
+        merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: dispatch to a worker and complete with a realized
+    // CA output. The recovered node's modular hash was recomputed from
+    // the persisted bytes, so the completion registers the realisation
+    // under the same key the hook client will look up.
+    let mut rx = connect_executor(&handle, "ca-realise-w", "x86_64-linux").await?;
+    let _assignment = recv_assignment(&mut rx).await;
+    complete_ca(
+        &handle,
+        "ca-realise-w",
+        &drv_path,
+        &[(
+            "out",
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-hook-ca-out",
+            vec![0x42u8; 32],
+        )],
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let (path,): (String,) = sqlx::query_as(
+        "SELECT output_path FROM realisations WHERE drv_hash = $1 AND output_name = 'out'",
+    )
+    .bind(expected_hash.as_slice())
+    .fetch_one(&f.db.pool)
+    .await?;
+    assert_eq!(
+        path, "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-hook-ca-out",
+        "post-failover CA completion must register the realisation under the recomputed key"
+    );
+    Ok(())
+}
+
+/// Deferred-IA failover regression (merged_bug_003): a store-backed
+/// input-addressed derivation whose output path is deferred (floating-CA
+/// input ⇒ empty expected output path) carries a gateway-computed
+/// modular hash precisely so its completion can register the realisation
+/// `wopQueryDerivationOutputMap` serves. Both the hash and the resolve
+/// flag (M_071: persisted by the creation upsert from the merge-time
+/// value, restored verbatim — sched.recovery.deferred-resolve+1) must
+/// survive a leader failover, or the post-failover completion silently
+/// skips the realisation insert and the client can never learn the
+/// deferred output's path.
+// r[verify sched.recovery.deferred-resolve+1]
+// r[verify sched.recovery.inline-drv-ca-hash+3]
+// r[verify sched.persist.ca-modular-hash+2]
+#[tokio::test]
+async fn test_recovery_registers_realisation_for_deferred_ia_node() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let drv_path = rio_test_support::fixtures::test_drv_path("deferred-ia-realise");
+    let modular_hash = [0x5au8; 32];
+    let f = RecoveryFixture::run(async move |handle, _| {
+        // Store-backed deferred-IA node: NOT content-addressed, no inline
+        // bytes, but an unknown output path and a gateway-computed
+        // modular hash (mirrors populate_ca_modular_hashes' deferred-IA
+        // arm in rio-gateway translate).
+        let mut node = make_node("deferred-ia-realise");
+        node.is_content_addressed = false;
+        node.needs_resolve = true;
+        node.expected_output_paths = vec![String::new()];
+        node.ca_modular_hash = modular_hash.to_vec();
+        merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: dispatch and complete with the realized output. The
+    // recovered node must have restored the persisted hash and re-derived
+    // needs_resolve, or the completion gate skips the realisation insert.
+    let mut rx = connect_executor(&handle, "deferred-ia-w", "x86_64-linux").await?;
+    let _assignment = recv_assignment(&mut rx).await;
+    complete_ca(
+        &handle,
+        "deferred-ia-w",
+        &drv_path,
+        &[(
+            "out",
+            "/nix/store/cccccccccccccccccccccccccccccccc-deferred-ia-out",
+            vec![0x24u8; 32],
+        )],
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let (path,): (String,) = sqlx::query_as(
+        "SELECT output_path FROM realisations WHERE drv_hash = $1 AND output_name = 'out'",
+    )
+    .bind(modular_hash.as_slice())
+    .fetch_one(&f.db.pool)
+    .await?;
+    assert_eq!(
+        path, "/nix/store/cccccccccccccccccccccccccccccccc-deferred-ia-out",
+        "post-failover deferred-IA completion must register the realisation under the persisted key"
+    );
+    Ok(())
+}
+
+// r[verify sched.recovery.deferred-resolve+1]
+/// Round-16 bug_053 production-writer roundtrip: a FIXED-OUTPUT node
+/// with a floating input (gateway stamps `needs_resolve=true`; its own
+/// expected paths are CONCRETE) merges → the creation upsert persists
+/// the flag (M_071) → leader failover → the recovered node must carry
+/// `needs_resolve=true` VERBATIM. Pre-fix, recovery re-derived the
+/// flag from expected-path emptiness — all-concrete FOD paths →
+/// `false` — and the persisted `path_bound_bytes` rank then made
+/// dispatch skip the byte re-derivation: the FOD shipped with literal
+/// placeholder strings and poisoned deterministically.
+#[tokio::test]
+async fn test_recovery_restores_fod_needs_resolve_verbatim() -> TestResult {
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        let mut node = make_node("fod-resolve-rt");
+        node.is_fixed_output = true;
+        node.is_content_addressed = true; // FOD: fixed-CA
+        node.needs_resolve = true; // gateway: floating input in env
+        node.expected_output_paths = vec![rio_test_support::fixtures::test_store_path(
+            "fod-resolve-rt-out",
+        )];
+        merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+        barrier(&handle).await;
+        // The creation upsert persisted the merge-time flag.
+        let (col,): (Option<bool>,) =
+            sqlx::query_as("SELECT needs_resolve FROM derivations WHERE drv_hash = $1")
+                .bind("fod-resolve-rt")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(col, Some(true), "creation upsert must persist the flag");
+        Ok(())
+    })
+    .await?;
+
+    let info = expect_drv(&f.handle, "fod-resolve-rt").await;
+    assert!(
+        info.ca.needs_resolve,
+        "recovered FOD must keep needs_resolve=true verbatim (pre-M_071 the \
+         all-concrete expected paths re-derived it to false)"
+    );
+    Ok(())
+}
+
+/// Displacement must survive leader failover: once a conflicting
+/// store-backed definition displaces a terminal authoritative squat, the
+/// persisted row carries the DISPLACING identity — including the
+/// displacing submission's `.drv` path, not the squatter's decoy path —
+/// so recovery rebuilds (and re-dispatches) that definition — not the
+/// squatter's — and without the squatter's stale authoritative bytes.
+// r[verify sched.merge.authoritative-conflict+6]
+// r[verify sched.persist.recreate-refresh+2]
+#[tokio::test]
+async fn test_recovery_rebuilds_displaced_node_with_displacing_identity() -> TestResult {
+    let squatter = Uuid::new_v4();
+    let displacer = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, _| {
+        // Squatter: authoritative single-node build, failed permanently
+        // by an x86_64 worker → node parked Poisoned (terminal failure,
+        // displaceable; a COMPLETED squat is never displaced under
+        // sched.merge.authoritative-conflict+6). It declares a DECOY
+        // .drv path (nothing binds drv_hash to drv_path for a direct
+        // submitter); the recreate-refresh must replace it with the
+        // displacing submission's real path or post-failover dispatch
+        // would tell workers to fetch a .drv that exists in no store.
+        let mut squat = make_node("squat-recover");
+        squat.drv_path = test_drv_path("squat-recover-decoy");
+        squat.drv_content = b"Derive-squat".to_vec();
+        squat.drv_content_authoritative = true;
+        merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+        let mut rx = connect_executor(&handle, "w-x86", "x86_64-linux").await?;
+        let assn = recv_assignment(&mut rx).await;
+        complete_failure(
+            &handle,
+            "w-x86",
+            &assn.drv_path,
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "squat failed permanently",
+        )
+        .await?;
+        wait_for_status(&handle, "squat-recover", DerivationStatus::Poisoned).await;
+
+        // Displacer: conflicting verifiable identity (different system)
+        // displaces the poison-parked squat; its fresh node is still
+        // pending at failover time.
+        merge_dag(
+            &handle,
+            displacer,
+            vec![make_test_node("squat-recover", "aarch64-linux")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: only an aarch64 worker can receive the recovered
+    // node — proof the row (and thus the rebuilt in-memory state) carries
+    // the displacing identity, not the squatter's. The assignment must
+    // not resurrect the squatter's authoritative bytes either.
+    let mut rx = connect_executor(&handle, "w-arm", "aarch64-linux").await?;
+    let assignment = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assignment.drv_path,
+        test_drv_path("squat-recover"),
+        "recovered displaced node dispatches to the displacing system"
+    );
+    assert!(
+        assignment.drv_content.is_empty(),
+        "displaced squat's authoritative bytes must not survive into the displacing definition"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// The displacement interest prune must survive leader failover (bug_001):
+/// recovery rebuilds `interested_builds` purely from `build_derivations`,
+/// so a surviving link would re-point a prior-interested build at the
+/// displacing definition — one it never submitted and that may never
+/// complete — and that build would hang Active. With the durable prune the
+/// joiner settles as soon as its own remaining nodes complete.
+#[tokio::test]
+async fn test_recovery_does_not_repoint_prior_builds_at_displacing_definition() -> TestResult {
+    let squatter = Uuid::new_v4();
+    let joiner = Uuid::new_v4();
+    let displacer = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, _| {
+        // Squatter: in-flight authoritative single-node squat. Connect the
+        // worker while it is the only Ready node so the first assignment
+        // is deterministically the squat.
+        let mut squat = make_node("squat-prune");
+        squat.drv_content = b"Derive-squat".to_vec();
+        squat.drv_content_authoritative = true;
+        squat.expected_output_paths = vec![test_store_path("squat-prune-out")];
+        merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+        let mut rx = connect_executor(&handle, "w-x86", "x86_64-linux").await?;
+        let assn = recv_assignment(&mut rx).await;
+        assert_eq!(assn.drv_path, test_drv_path("squat-prune"));
+
+        // Joiner: keep_going build that joins the in-flight squat with
+        // matching identity and content evidence, plus TWO nodes of its
+        // own — so it stays Active (non-terminal) both when the squat
+        // fails below and when displacement prunes the squat slot, which
+        // is what makes its link prune-eligible and the post-failover
+        // re-point hazard real.
+        let mut squat_join = make_node("squat-prune");
+        squat_join.expected_output_paths = vec![test_store_path("squat-prune-out")];
+        merge_dag(
+            &handle,
+            joiner,
+            vec![squat_join, make_node("fillerC"), make_node("fillerD")],
+            vec![],
+            true,
+        )
+        .await?;
+
+        // Fail the squat permanently: it parks Poisoned (terminal failure
+        // — displaceable; a Completed squat never is). The squatter build
+        // fails; the keep_going joiner records the failure and stays
+        // Active on fillerC + fillerD.
+        complete_failure(
+            &handle,
+            "w-x86",
+            &test_drv_path("squat-prune"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "squat failed permanently",
+        )
+        .await?;
+        wait_for_status(&handle, "squat-prune", DerivationStatus::Poisoned).await;
+
+        // Displacer: conflicting verifiable identity displaces the
+        // poison-parked squat. The joiner's link must be pruned in the
+        // same transaction so the failover below cannot resurrect it.
+        merge_dag(
+            &handle,
+            displacer,
+            vec![make_test_node("squat-prune", "aarch64-linux")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: an x86_64 worker can only receive the joiner's own
+    // nodes (the displaced definition is aarch64-only). Completing them
+    // must SETTLE the joiner — pre-fix the stale build_derivations link
+    // re-pointed the joiner at the displacing definition and it hung
+    // Active forever. (It settles Failed, not Succeeded: the squat
+    // failure it observed pre-failover is durable evidence.)
+    for worker in ["w-x86-2", "w-x86-3"] {
+        let mut rx = connect_executor(&handle, worker, "x86_64-linux").await?;
+        let assn = recv_assignment(&mut rx).await;
+        assert!(
+            assn.drv_path == test_drv_path("fillerC") || assn.drv_path == test_drv_path("fillerD"),
+            "only the joiner's own nodes are dispatchable on x86_64 post-failover, got {}",
+            assn.drv_path
+        );
+        let out = format!(
+            "{}-out",
+            if assn.drv_path == test_drv_path("fillerC") {
+                "fillerC"
+            } else {
+                "fillerD"
+            }
+        );
+        complete_success(&handle, worker, &assn.drv_path, &test_store_path(&out)).await?;
+        barrier(&handle).await;
+    }
+    assert_eq!(
+        query_status(&handle, joiner).await?.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "joiner settles from its own nodes (not re-pointed at the displacing definition); \
+         Failed because the observed squat failure is durable"
+    );
+    assert_eq!(
+        query_status(&handle, displacer).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "displacer still waiting on its aarch64 node"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-edge-scrub+2]
+/// The displaced-edge scrub must survive leader failover: the squatter's
+/// dependency edge (squat → junk) is deleted from `derivation_edges` in
+/// the displacing merge's transaction, so post-failover recovery cannot
+/// re-fail the displacing definition via `load_parents_with_failed_deps`
+/// (the junk's persisted status is a terminal failure). Pre-fix the
+/// surviving edge row marked the recovered displacing node
+/// DependencyFailed and the victim build could never complete.
+#[tokio::test]
+async fn test_recovery_after_displacement_does_not_inherit_squatter_edges() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+    let squat_out = test_store_path("edge-recover-out");
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        // Squatter: authoritative squat with an attacker-attached edge
+        // onto its own junk node.
+        let mut squat = make_node("edge-recover");
+        squat.drv_content = b"Derive-edge-recover".to_vec();
+        squat.drv_content_authoritative = true;
+        squat.expected_output_paths = vec![test_store_path("edge-recover-out")];
+        merge_dag(
+            &handle,
+            squatter,
+            vec![squat, make_node("edge-junk-r")],
+            vec![make_test_edge("edge-recover", "edge-junk-r")],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+
+        // The junk's PERSISTED status is a terminal failure — exactly the
+        // state load_parents_with_failed_deps keys on after failover.
+        sqlx::query("UPDATE derivations SET status = 'poisoned', poisoned_at = now() WHERE drv_hash = 'edge-junk-r'")
+            .execute(&pool)
+            .await?;
+        // Park the squat poison-locked so the victim's identity-matching
+        // submission match-displaces it.
+        assert!(
+            handle
+                .debug_force_poisoned("edge-recover", POISON_RESUBMIT_RETRY_LIMIT)
+                .await?
+        );
+
+        // Victim: identity-matching store-backed submission displaces the
+        // locked squat; its build is still running at failover time.
+        let mut victim_node = make_node("edge-recover");
+        victim_node.expected_output_paths = vec![test_store_path("edge-recover-out")];
+        merge_dag(&handle, victim, vec![victim_node], vec![], false).await?;
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover the displacing node must be dispatchable (not
+    // DependencyFailed from the squatter's edge): an x86_64 worker
+    // receives it, completes it, and the victim build succeeds.
+    let mut rx = connect_executor(&handle, "w-edge-r", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assn.drv_path,
+        test_drv_path("edge-recover"),
+        "recovered displacing node dispatches instead of being re-failed by the squatter's edge"
+    );
+    complete_success(&handle, "w-edge-r", &assn.drv_path, &squat_out).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "victim build completes post-failover without inheriting the squatter's dependency set"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-edge-scrub+2]
+/// The authority-takeover edge scrub must survive leader failover: the
+/// squatter's dependency edge (squat → junk) is deleted from
+/// `derivation_edges` in the takeover merge's transaction, so
+/// post-failover recovery cannot re-fail the taken-over definition via
+/// `load_parents_with_failed_deps` (the junk's persisted status is a
+/// terminal failure). Mirrors the displacement variant above with a
+/// retriable (under-budget) squat taken over through the resubmit-reset.
+#[tokio::test]
+async fn test_recovery_after_takeover_does_not_inherit_squatter_edges() -> TestResult {
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+    let squat_out = test_store_path("tk-recover-out");
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        // Squatter: authoritative squat with an attacker-attached edge
+        // onto its own junk node.
+        let mut squat = make_node("tk-recover");
+        squat.drv_content = b"Derive-tk-recover".to_vec();
+        squat.drv_content_authoritative = true;
+        squat.expected_output_paths = vec![test_store_path("tk-recover-out")];
+        merge_dag(
+            &handle,
+            squatter,
+            vec![squat, make_node("tk-junk-r")],
+            vec![make_test_edge("tk-recover", "tk-junk-r")],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+
+        // The junk's PERSISTED status is a terminal failure — exactly the
+        // state load_parents_with_failed_deps keys on after failover.
+        sqlx::query(
+            "UPDATE derivations SET status = 'poisoned', poisoned_at = now() \
+             WHERE drv_hash = 'tk-junk-r'",
+        )
+        .execute(&pool)
+        .await?;
+        // Park the squat Poisoned UNDER budget so the victim's
+        // identity-matching submission takes it over through the
+        // resubmit-reset (not displacement).
+        assert!(handle.debug_force_poisoned("tk-recover", 1).await?);
+
+        // Victim: identity-matching store-backed resubmission; its build
+        // is still running at failover time.
+        let mut victim_node = make_node("tk-recover");
+        victim_node.expected_output_paths = vec![test_store_path("tk-recover-out")];
+        merge_dag(&handle, victim, vec![victim_node], vec![], false).await?;
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover the taken-over node must be dispatchable (not
+    // DependencyFailed from the squatter's edge).
+    let mut rx = connect_executor(&handle, "w-tk-r", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assn.drv_path,
+        test_drv_path("tk-recover"),
+        "recovered taken-over node dispatches instead of being re-failed by the squatter's edge"
+    );
+    complete_success(&handle, "w-tk-r", &assn.drv_path, &squat_out).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "victim build completes post-failover without inheriting the squatter's dependency set"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// The displacement total adjustment must survive leader failover: the
+/// pruned build's `builds.total_drvs` was decremented in the displacing
+/// merge's transaction, so recovery — which re-seeds totals from that
+/// column — rebuilds the build waiting on exactly its remaining slots and
+/// it can still finish at completed == total.
+#[tokio::test]
+async fn test_displaced_total_adjustment_survives_failover() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let squatter = Uuid::new_v4();
+    let displacer = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, _| {
+        // Squatter build: poison-locked authoritative squat (no result
+        // ever delivered) plus its own filler node.
+        let mut squat = make_node("squat-total");
+        squat.drv_content = b"Derive-squat-total".to_vec();
+        squat.drv_content_authoritative = true;
+        merge_dag(
+            &handle,
+            squatter,
+            vec![squat, make_node("fillerV")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        assert!(
+            handle
+                .debug_force_poisoned("squat-total", POISON_RESUBMIT_RETRY_LIMIT)
+                .await?
+        );
+
+        // Displacer: conflicting verifiable identity displaces the locked
+        // squat; the squatter build's slot is removed (total 2 → 1) in
+        // the same transaction.
+        merge_dag(
+            &handle,
+            displacer,
+            vec![make_test_node("squat-total", "aarch64-linux")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover the recovered build waits on ONE slot, not two.
+    let status = query_status(&handle, squatter).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "prior build recovered Active"
+    );
+    assert_eq!(
+        status.total_derivations, 1,
+        "recovered total re-seeded from the decremented builds.total_drvs"
+    );
+
+    // Completing its own remaining node finishes the build consistently.
+    let mut rx = connect_executor(&handle, "w-total-r", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assn.drv_path,
+        test_drv_path("fillerV"),
+        "only the prior build's own node is dispatchable on x86_64"
+    );
+    complete_success(
+        &handle,
+        "w-total-r",
+        &assn.drv_path,
+        &test_store_path("fillerV-out"),
+    )
+    .await?;
+    barrier(&handle).await;
+    let status = query_status(&handle, squatter).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "prior build completes post-failover with the displaced slot removed"
+    );
+    assert_eq!(
+        (status.total_derivations, status.completed_derivations),
+        (1, 1),
+        "post-failover accounting consistent at terminal"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-failure-evidence]
+/// Wrong-success regression: a keep_going build whose FAILED derivation
+/// is displaced out of its interest must still end Failed after a leader
+/// failover. The displacement prune deletes the build's only failed-node
+/// link, so without the persisted evidence recovery rebuilds the build
+/// with no failure trace and the completion of its remaining derivations
+/// flips it to Succeeded.
+#[tokio::test]
+async fn test_recovery_keep_going_sticky_failure_survives_displacement() -> TestResult {
+    let watcher = Uuid::new_v4();
+    let displacer = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        // keep_going build: an authoritative x86_64 node that fails for
+        // real (PermanentFailure → Poisoned → sticky in-memory failure),
+        // plus its own aarch64 node still pending at failover time.
+        let mut squat = make_node("squat-evi");
+        squat.drv_content = b"Derive-squat-evi".to_vec();
+        squat.drv_content_authoritative = true;
+        merge_dag(
+            &handle,
+            watcher,
+            vec![squat, make_test_node("filler-evi", "aarch64-linux")],
+            vec![],
+            true,
+        )
+        .await?;
+        let mut rx = connect_executor(&handle, "w-evi-r", "x86_64-linux").await?;
+        let assn = recv_assignment(&mut rx).await;
+        assert_eq!(assn.drv_path, test_drv_path("squat-evi"));
+        complete_failure(
+            &handle,
+            "w-evi-r",
+            &test_drv_path("squat-evi"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "builder exploded",
+        )
+        .await?;
+        wait_for_status(&handle, "squat-evi", DerivationStatus::Poisoned).await;
+
+        // Conflicting store-backed submission displaces the poisoned
+        // node, pruning the watcher's only failed-node link — and
+        // persisting its failure evidence in the same transaction.
+        merge_dag(
+            &handle,
+            displacer,
+            vec![make_test_node("squat-evi", "riscv64-linux")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        let (evidence,): (Option<String>,) =
+            sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+                .bind(watcher)
+                .fetch_one(&pool)
+                .await?;
+        assert!(
+            evidence.is_some(),
+            "failure evidence persisted before the failover"
+        );
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover the watcher recovers Active with its sticky failure
+    // seeded from PG; finishing its remaining derivation must end the
+    // build Failed — not the silent wrong-success.
+    let status = query_status(&handle, watcher).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "watcher recovered Active"
+    );
+    let mut rx = connect_executor(&handle, "w-evi-r-arm", "aarch64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assn.drv_path,
+        test_drv_path("filler-evi"),
+        "only the watcher's own remaining node is dispatchable on aarch64"
+    );
+    complete_success(
+        &handle,
+        "w-evi-r-arm",
+        &assn.drv_path,
+        &test_store_path("filler-evi-out"),
+    )
+    .await?;
+    barrier(&handle).await;
+    let status = query_status(&handle, watcher).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "keep_going build ends Failed post-failover (evidence survived the prune)"
+    );
+    assert!(
+        !status.error_summary.is_empty(),
+        "recovered build serves the persisted failure summary"
+    );
+    Ok(())
+}
+
+// r[verify sched.poison.clear-failure-evidence]
+/// Wrong-success regression, poison-clear edition: a keep_going build
+/// whose FAILED derivation has its poison cleared (admin ClearPoison or
+/// the poison-TTL sweep) BEFORE a leader failover must still end Failed.
+/// `clear_poison` resets the row to 'created', so the surviving link
+/// reconstructs nothing — the evidence persisted to
+/// `builds.error_summary` before the clear is the only thing that keeps
+/// the outcome from depending on whether a failover happened.
+///
+/// Post-failover the cleared drv is re-linked into the recovered build's
+/// interest set (the link survives the clear by design — accepted
+/// divergence from the pre-failover pruned state), so BOTH it and the
+/// untouched remaining drv must complete before the terminal check.
+#[rstest::rstest]
+#[case::admin_clear(false)]
+#[case::ttl_expiry(true)]
+#[tokio::test]
+async fn test_recovery_keep_going_sticky_failure_survives_pre_failover_clear_poison(
+    #[case] via_ttl: bool,
+) -> TestResult {
+    let watcher = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        // keep_going build: an x86_64 node that fails for real
+        // (PermanentFailure → Poisoned → sticky in-memory failure), plus
+        // an aarch64 node still pending at failover time.
+        merge_dag(
+            &handle,
+            watcher,
+            vec![
+                make_node("kgpf-clear"),
+                make_test_node("kgpf-fill", "aarch64-linux"),
+            ],
+            vec![],
+            true,
+        )
+        .await?;
+        let mut rx = connect_executor(&handle, "w-kgpf", "x86_64-linux").await?;
+        let assn = recv_assignment(&mut rx).await;
+        assert_eq!(assn.drv_path, test_drv_path("kgpf-clear"));
+        complete_failure(
+            &handle,
+            "w-kgpf",
+            &test_drv_path("kgpf-clear"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "builder exploded",
+        )
+        .await?;
+        wait_for_status(&handle, "kgpf-clear", DerivationStatus::Poisoned).await;
+
+        // Clear the poison BEFORE the failover — admin call or TTL sweep.
+        if via_ttl {
+            tokio::time::sleep(crate::state::POISON_TTL + std::time::Duration::from_millis(50))
+                .await;
+            handle.send_unchecked(ActorCommand::Tick).await?;
+            barrier(&handle).await;
+        } else {
+            let (tx, rx_clear) = oneshot::channel();
+            handle
+                .send_unchecked(ActorCommand::ClearPoison {
+                    drv_hash: "kgpf-clear".into(),
+                    reply: tx,
+                })
+                .await?;
+            assert!(rx_clear.await?, "ClearPoison → cleared=true");
+        }
+
+        // Structural pin: the evidence was persisted before the clear.
+        let (evidence,): (Option<String>,) =
+            sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+                .bind(watcher)
+                .fetch_one(&pool)
+                .await?;
+        assert!(
+            evidence.is_some(),
+            "poison-clear prune must persist failure evidence before the failover"
+        );
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: the watcher recovers Active with its sticky failure
+    // seeded from builds.error_summary; the cleared drv is back in its
+    // interest set as a fresh 'created' node. Complete both it and the
+    // remaining node successfully — the build must still end Failed.
+    let status = query_status(&handle, watcher).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "watcher recovered Active"
+    );
+    let mut rx_x86 = connect_executor(&handle, "w-kgpf-r", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx_x86).await;
+    assert_eq!(
+        assn.drv_path,
+        test_drv_path("kgpf-clear"),
+        "cleared drv re-dispatches post-failover (re-linked at recovery)"
+    );
+    complete_success(
+        &handle,
+        "w-kgpf-r",
+        &assn.drv_path,
+        &test_store_path("kgpf-clear-out"),
+    )
+    .await?;
+    let mut rx_arm = connect_executor(&handle, "w-kgpf-r-arm", "aarch64-linux").await?;
+    let assn = recv_assignment(&mut rx_arm).await;
+    assert_eq!(assn.drv_path, test_drv_path("kgpf-fill"));
+    complete_success(
+        &handle,
+        "w-kgpf-r-arm",
+        &assn.drv_path,
+        &test_store_path("kgpf-fill-out"),
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let status = query_status(&handle, watcher).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "keep_going build ends Failed post-failover (evidence survived the poison clear)"
+    );
+    assert!(
+        !status.error_summary.is_empty(),
+        "recovered build serves the persisted failure summary"
+    );
+    Ok(())
+}
+
+// r[verify sched.build.failure-evidence-at-source+1]
+/// THE wrong-success regression for the resubmit-reset eraser (the
+/// fourth instance of the "failure evidence lost on path X" class —
+/// rounds 12/13 fixed displacement and the poison-clear paths; this
+/// round closes the class at the source instead of patching the path).
+///
+/// A keep_going build's failed derivation is re-submitted by another
+/// build: the same-definition resubmit-reset re-creates the row (status
+/// back to non-failed, poison fields cleared), so nothing about the row
+/// or its links reconstructs the failure at recovery. The build's
+/// outcome must not depend on that — the evidence was made durable at
+/// the moment the failure was observed.
+#[tokio::test]
+async fn test_recovery_keep_going_sticky_failure_survives_resubmit_reset() -> TestResult {
+    let watcher = Uuid::new_v4();
+    let resubmitter = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        // Watcher (keep_going): a node that will fail + a filler on
+        // another arch still pending at failover time.
+        merge_dag(
+            &handle,
+            watcher,
+            vec![
+                make_node("rsr-n"),
+                make_test_node("rsr-fill", "aarch64-linux"),
+            ],
+            vec![],
+            true,
+        )
+        .await?;
+        let mut rx = connect_executor(&handle, "w-rsr", "x86_64-linux").await?;
+        let assn = recv_assignment(&mut rx).await;
+        assert_eq!(assn.drv_path, test_drv_path("rsr-n"));
+        complete_failure(
+            &handle,
+            "w-rsr",
+            &test_drv_path("rsr-n"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "builder exploded",
+        )
+        .await?;
+        wait_for_status(&handle, "rsr-n", DerivationStatus::Poisoned).await;
+
+        // The at-source persist already happened — BEFORE any eraser.
+        let (evidence,): (Option<String>,) =
+            sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+                .bind(watcher)
+                .fetch_one(&pool)
+                .await?;
+        assert!(
+            evidence.is_some(),
+            "first failure must be durable at the source, before any eraser path runs"
+        );
+
+        // Disconnect the worker so the re-created node stays queued.
+        drop(rx);
+
+        // The resubmitter re-submits the SAME definition: the
+        // resubmit-reset re-creates the row — the eraser this test is
+        // about. Post-reset the row carries no failure state at all.
+        merge_dag(
+            &handle,
+            resubmitter,
+            vec![make_node("rsr-n")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        let (status,): (String,) =
+            sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'rsr-n'")
+                .fetch_one(&pool)
+                .await?;
+        assert_ne!(
+            status, "poisoned",
+            "fixture premise: the resubmit-reset erased the row's failure state"
+        );
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: the watcher recovers Active with its sticky failure
+    // seeded from PG. Completing everything must end it Failed — never
+    // the silent wrong-success.
+    assert_eq!(
+        query_status(&handle, watcher).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "watcher recovered Active"
+    );
+    let mut rx = connect_executor(&handle, "w-rsr-r", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assn.drv_path,
+        test_drv_path("rsr-n"),
+        "the re-created node re-dispatches post-failover"
+    );
+    complete_success(
+        &handle,
+        "w-rsr-r",
+        &assn.drv_path,
+        &test_store_path("rsr-n-out"),
+    )
+    .await?;
+    let mut rx_arm = connect_executor(&handle, "w-rsr-r-arm", "aarch64-linux").await?;
+    let assn_arm = recv_assignment(&mut rx_arm).await;
+    assert_eq!(assn_arm.drv_path, test_drv_path("rsr-fill"));
+    complete_success(
+        &handle,
+        "w-rsr-r-arm",
+        &assn_arm.drv_path,
+        &test_store_path("rsr-fill-out"),
+    )
+    .await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        query_status(&handle, watcher).await?.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "keep_going build must end Failed post-failover: the at-source evidence \
+         survived the resubmit-reset eraser (was: silent wrong-success)"
+    );
+    assert!(
+        !query_status(&handle, watcher)
+            .await?
+            .error_summary
+            .is_empty(),
+        "recovered build serves the persisted failure summary"
+    );
+    // The resubmitter is unaffected by the watcher's evidence.
+    assert_eq!(
+        query_status(&handle, resubmitter).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "the resubmitting build succeeds — no evidence inheritance"
+    );
+    Ok(())
+}
+
+// r[verify sched.build.failure-evidence-at-source+1]
+/// Recovery's failed_count fallback reconstruction is itself a fresh
+/// failure observation and must be re-persisted before the new leader
+/// serves traffic — otherwise the reconstructed evidence is exactly as
+/// failover-fragile as the in-memory evidence it replaced.
+///
+/// Staging: the failure IS still reconstructible at recovery (the
+/// poisoned row is linked), but builds.error_summary is NULL (simulating
+/// a lost at-source write — PG blip at observation time). After
+/// recovery, the reconstruction must be durable in PG.
+#[tokio::test]
+async fn test_recovery_fallback_reconstruction_persisted_at_source() -> TestResult {
+    let watcher = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        merge_dag(
+            &handle,
+            watcher,
+            vec![
+                make_node("rfr-n"),
+                make_test_node("rfr-fill", "aarch64-linux"),
+            ],
+            vec![],
+            true,
+        )
+        .await?;
+        let mut rx = connect_executor(&handle, "w-rfr", "x86_64-linux").await?;
+        let assn = recv_assignment(&mut rx).await;
+        assert_eq!(assn.drv_path, test_drv_path("rfr-n"));
+        complete_failure(
+            &handle,
+            "w-rfr",
+            &test_drv_path("rfr-n"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "builder exploded",
+        )
+        .await?;
+        wait_for_status(&handle, "rfr-n", DerivationStatus::Poisoned).await;
+
+        // Simulate a lost at-source write: NULL out the persisted
+        // evidence. The poisoned row + link stay (reconstructible).
+        sqlx::query("UPDATE builds SET error_summary = NULL WHERE build_id = $1")
+            .bind(watcher)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+    let pool = &f.db.pool;
+
+    // Post-failover: the reconstruction ran AND was re-persisted before
+    // the leader serves traffic.
+    assert_eq!(
+        query_status(&handle, watcher).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "watcher recovered Active"
+    );
+    let (evidence,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(watcher)
+            .fetch_one(pool)
+            .await?;
+    assert!(
+        evidence.is_some(),
+        "the failed_count fallback reconstruction must itself be persisted \
+         at the end of recovery (a reconstruction is a fresh observation)"
+    );
+    assert!(
+        evidence.unwrap().contains("failed derivation"),
+        "the persisted evidence is the reconstruction-format summary"
+    );
+    Ok(())
+}
+
+// r[verify sched.persist.ca-modular-hash+2]
+// r[verify sched.merge.authoritative-claim-no-redefine]
+/// End-to-end bug_005 regression: a store-backed floating-CA node parked
+/// retriable, recovered after a leader failover, must still accept a
+/// byte-carrying authoritative resubmission of the SAME derivation — the
+/// node's only content-bound evidence is its CA modular hash, which now
+/// survives failover via the persisted column. Pre-fix the recovered
+/// node had no evidence and the claim was rejected with
+/// AuthoritativeClaimIdentityConflict.
+#[tokio::test]
+async fn test_recovered_store_backed_ca_node_accepts_identical_authoritative_claim() -> TestResult {
+    let ca_hash = [7u8; 32];
+    let producer = Uuid::new_v4();
+    let resubmit = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, _| {
+        // Store-backed floating-CA submission: no expected output paths,
+        // hash evidence only. It fails once on a real worker and parks
+        // Poisoned-under-budget (retriable on resubmit).
+        let mut node = make_node("ca-resub");
+        node.is_content_addressed = true;
+        node.ca_modular_hash = ca_hash.to_vec();
+        merge_dag(&handle, producer, vec![node], vec![], false).await?;
+        let mut rx = connect_executor(&handle, "w-ca-r", "x86_64-linux").await?;
+        let assn = recv_assignment(&mut rx).await;
+        assert_eq!(assn.drv_path, test_drv_path("ca-resub"));
+        complete_failure(
+            &handle,
+            "w-ca-r",
+            &test_drv_path("ca-resub"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "transient build break",
+        )
+        .await?;
+        wait_for_status(&handle, "ca-resub", DerivationStatus::Poisoned).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: the same tenant rebuilds via the hook fallback —
+    // an authoritative claim carrying the byte content and the SAME
+    // modular hash. The recovered store-backed node must present its
+    // persisted evidence and adopt the claim through the resubmit-reset
+    // instead of rejecting it.
+    let mut claim = make_node("ca-resub");
+    claim.is_content_addressed = true;
+    claim.ca_modular_hash = ca_hash.to_vec();
+    claim.drv_content = b"Derive-ca-resub".to_vec();
+    claim.drv_content_authoritative = true;
+    merge_dag(&handle, resubmit, vec![claim], vec![], false)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("identical authoritative resubmission rejected post-failover: {e}")
+        })?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, resubmit).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "resubmitted build is live on the adopted claim"
+    );
+    let info = expect_drv(&handle, "ca-resub").await;
+    assert_ne!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "node reset through the normal resubmit path"
+    );
+    Ok(())
+}
+
+// r[verify sched.recovery.claim-paths-restored]
+// r[verify sched.gc.live-pins+2]
+/// Round-17 merged_bug_099 (M_075): a deferred-IA node's
+/// dispatch-resolved claim paths survive failover — restored verbatim
+/// (including the "" sentinel for unresolved slots) and immediately
+/// visible in the GC root union, so a SURVIVING worker's about-to-upload
+/// real paths stay pinned while the new leader recovers. Pre-M_075 the
+/// claim was in-memory only: the GC pin vanished until a re-dispatch
+/// re-resolved, and a concurrent store sweep could collect the paths.
+#[tokio::test]
+async fn test_recovery_restores_claim_paths_and_gc_pin() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let resolved = test_store_path("claim-restore-out");
+    let resolved_clone = resolved.clone();
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        let mut node = make_node("claim-restore");
+        // Deferred-IA shape: two declared outputs, the first resolved
+        // at dispatch, the second still placeholder-unknown.
+        node.output_names = vec!["out".into(), "dev".into()];
+        node.expected_output_paths = vec![String::new(), String::new()];
+        merge_dag(&handle, build_id, vec![node.clone()], vec![], false).await?;
+        barrier(&handle).await;
+        // Simulate the dispatch-time resolve write-through (the sole
+        // set site persists exactly this shape).
+        sqlx::query(
+            "UPDATE derivations SET claim_output_paths = ARRAY[$2, ''] \
+             WHERE drv_hash = $1",
+        )
+        .bind(&node.drv_hash)
+        .bind(&resolved_clone)
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    let info = expect_drv(&handle, "claim-restore").await;
+    assert_eq!(
+        info.claim_output_paths,
+        vec![resolved.clone(), String::new()],
+        "claim restored VERBATIM incl. the unresolved-slot sentinel"
+    );
+
+    // The GC root union must include the restored resolved path and
+    // filter the sentinel.
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::Admin(AdminQuery::GcRoots { reply: reply_tx }))
+        .await?;
+    let roots = reply_rx.await?;
+    assert!(
+        roots.contains(&resolved),
+        "restored claim path must be in the GC root union (the surviving-worker pin)"
+    );
+    assert!(
+        !roots.iter().any(String::is_empty),
+        "empty sentinel slots are filtered from GC roots"
     );
     Ok(())
 }

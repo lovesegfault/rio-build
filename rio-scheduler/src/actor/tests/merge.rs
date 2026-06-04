@@ -55,6 +55,7 @@ async fn test_shared_node_priority_bumps_on_higher_pri_merge() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id: build_hi,
+            ingress_stripped: Default::default(),
             tenant_id: None,
             priority_class: PriorityClass::Interactive,
             nodes: vec![make_node("shared-x")],
@@ -180,6 +181,7 @@ async fn test_cache_check_circuit_breaker_opens_then_closes() -> TestResult {
         let cmd = ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id: Uuid::new_v4(),
+                ingress_stripped: Default::default(),
                 tenant_id: None,
                 priority_class: PriorityClass::Scheduled,
                 nodes: vec![node],
@@ -279,6 +281,7 @@ async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
         let cmd = ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id,
+                ingress_stripped: Default::default(),
                 tenant_id: None,
                 priority_class: PriorityClass::Scheduled,
                 nodes: vec![node],
@@ -812,7 +815,7 @@ async fn test_substitute_fetch_transient_retry() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// Top-down short-circuit: when the root is substitutable, deps are
 /// pruned from the merge — only the root's NAR is fetched, build
 /// completes immediately.
@@ -894,7 +897,7 @@ async fn test_topdown_root_substitutable_prunes_deps() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// Top-down negative: an `explicitly_requested` NON-root (a client
 /// target folded inside another target's closure by the gateway's
 /// multi-target dedup) whose wanted output is NOT available must block
@@ -973,7 +976,7 @@ async fn test_topdown_explicit_target_unavailable_blocks_prune() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// Top-down positive: when every demanded node — structural roots AND
 /// `explicitly_requested` non-roots — is available upstream, the prune
 /// fires and keeps the whole demand set, not just the roots.
@@ -1070,7 +1073,105 @@ async fn test_topdown_explicit_target_substitutable_kept_in_prune() -> TestResul
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
+// r[verify sched.closure.witness-epoch]
+/// Round-16 bug_045: a pruned merge that merely JOINS a pre-existing
+/// node as a stamped pruned parent must commit `closure_hole = true`
+/// WITH its 069 witness rows (one paired writer), not just the
+/// `topdown_pruned` mark. Pre-fix the flag rode Batch 1's
+/// creation-scoped row bind, so joined parents committed flag-false
+/// with orphan witness rows; on leader failover recovery hydrated them
+/// un-holed and enrolled them as mark-clear candidates — re-arming the
+/// doomed from-source dispatch the born-holed witness suppresses. The
+/// roundtrip half boots a fresh actor on the same PG and asserts the
+/// production-written state recovers holed and un-cleared.
+#[tokio::test]
+async fn test_joined_pruned_parent_commits_paired_hole_and_recovers_holed() -> TestResult {
+    let (db, store, handle, tasks) = setup_with_mock_store().await?;
+    let root_out = test_store_path("jpw-root-out");
+
+    // Build A: jpw-root exists dep-less, NOT substitutable → normal
+    // lane; the node is resident and live when build B arrives.
+    let mut root_a = make_node("jpw-root");
+    root_a.expected_output_paths = vec![root_out.clone()];
+    merge_dag(&handle, Uuid::new_v4(), vec![root_a], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Build B: jpw-root → jpw-dep, with jpw-root's output now
+    // substitutable → the top-down prune keeps {jpw-root}, drops
+    // jpw-dep, and jpw-root — pre-existing, so NOT in Batch 1 — is a
+    // merely-JOINED stamped pruned parent.
+    {
+        let mut subs = store.state.substitutable.write().unwrap();
+        subs.push(root_out.clone());
+    }
+    let mut root_b = make_node("jpw-root");
+    root_b.expected_output_paths = vec![root_out.clone()];
+    let mut dep = make_node("jpw-dep");
+    dep.expected_output_paths = vec![test_store_path("jpw-dep-out")];
+    merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![root_b, dep],
+        vec![make_test_edge("jpw-root", "jpw-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // The merge transaction committed the JOINED parent's mark, flag,
+    // and witness rows TOGETHER (the paired writer; pre-fix this read
+    // (true, false, 1) — flag-less orphan rows).
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'jpw-root'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    let (rows,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM derivation_closure_missing WHERE drv_hash = 'jpw-root'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        pg_pruned && pg_hole && rows == 1,
+        "joined pruned parent must commit mark+flag+witness rows in one tx \
+         (got pruned={pg_pruned}, hole={pg_hole}, rows={rows})"
+    );
+
+    // Let the deferred fetch settle (mark and hole survive completion —
+    // childless ⇒ the produced-children gate has no edges to judge),
+    // then fail the leader over with the node non-terminal: backdate
+    // ONLY the status (the witness state is the production writer's).
+    settle_substituting(&handle, &["jpw-root"]).await;
+    drop(handle);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tasks.1).await;
+    sqlx::query("UPDATE derivations SET status = 'substituting' WHERE drv_hash = 'jpw-root'")
+        .execute(&db.pool)
+        .await?;
+
+    let (handle2, _task2) = setup_actor(db.pool.clone());
+    handle2.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle2).await;
+
+    let d = expect_drv(&handle2, "jpw-root").await;
+    assert!(
+        d.topdown_pruned && d.closure_hole,
+        "the joined pruned parent must recover HOLED (pre-fix it recovered \
+         un-holed and was enrolled as a mark-clear candidate)"
+    );
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'jpw-root'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        pg_pruned && pg_hole,
+        "recovery must not clear the holed parent's mark or flag"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+15]
 /// Top-down + deferred-fetch failure: when the prune commits and the
 /// detached `query_path_info` then fails, the build MUST fail with a
 /// resubmit-directing error — NOT dispatch the root as a build.
@@ -1168,7 +1269,7 @@ async fn test_topdown_pruned_root_substitute_fail_does_not_dispatch_build() -> T
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// The roots-only prune's `topdown_pruned` stamp must survive a leader
 /// failover, so it is persisted: once a pruned merge commits, the kept
 /// (demanded) node's PG row carries `topdown_pruned = true`; a later
@@ -1289,7 +1390,7 @@ async fn test_topdown_pruned_persisted_to_pg_and_cleared_when_children_added() -
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// A kept (demanded) node whose existing DAG children are ALL already
 /// produced (Completed/Skipped) must NOT be stamped `topdown_pruned` —
 /// its dependency closure exists in the store, so a from-source
@@ -1382,7 +1483,7 @@ async fn test_topdown_stamp_skips_kept_node_whose_children_are_already_produced(
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// A kept (demanded) node whose existing DAG children are still UNBUILT
 /// must keep the `topdown_pruned` stamp. Those children can belong to a
 /// different build and be reaped unbuilt later (that build cancelled →
@@ -1470,7 +1571,7 @@ async fn test_topdown_stamp_kept_when_existing_children_unbuilt() -> TestResult 
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// `topdown_pruned` flag persistence bypass: B1 topdown-prunes R; while
 /// R's fetch is in-flight, B2 full-merges R WITH its deps. R is
 /// pre-existing `Substituting` so `dag.merge` doesn't reset it; the
@@ -1565,7 +1666,7 @@ async fn test_topdown_pruned_flag_ignored_after_full_merge_adds_deps() -> TestRe
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// The reap hazard, end to end: B1's prune stamps childless R and parks
 /// its detached fetch; B2 full-merges app→R→dep, which previously
 /// cleared the stamp even though dep was UNBUILT; B2 is cancelled and
@@ -1733,7 +1834,7 @@ async fn test_topdown_pruned_kept_when_merge_adds_unbuilt_children_then_reaped()
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// The reap hazard with the ORDERING REVERSED: the walk verdict arrives
 /// while another build's unbuilt children are still attached, and only
 /// then are those children reaped. B1's prune stamps childless R and
@@ -1906,7 +2007,7 @@ async fn test_topdown_pruned_root_fail_fast_when_children_reaped_after_failed_wa
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// Companion to the test above with the children PRODUCED (not reaped
 /// unbuilt) before the terminal-build reap: the surviving root must NOT
 /// be fail-fasted and the surviving build must not hang.
@@ -2278,7 +2379,7 @@ async fn test_topdown_pruned_survivor_not_fail_fasted_when_cleanup_drains_on_ex_
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// The reap-time fail-fast must defer to a substitution walk that is IN
 /// FLIGHT at cleanup time, even when `substitute_tried` is already set.
 /// The one-shot bit is sticky: after R's first walk failed (suppressed —
@@ -2479,7 +2580,7 @@ async fn test_topdown_pruned_root_not_failed_at_reap_while_respawned_walk_in_fli
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// The MIXED-children reap shape, ordering A (verdict before the reap):
 /// B1's prune stamps R and parks its detached fetch; BC produces a
 /// second child dep2 (cache-hit at merge) and its interest keeps dep2
@@ -2679,7 +2780,7 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// The mixed-children reap shape with the ORDERING REVERSED: B2's
 /// unbuilt dep1 is reaped while R's walk is still in flight (the reap
 /// hook rightly defers to the walk — that skip is pinned by the
@@ -2909,7 +3010,7 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// Negative companion to the two mixed-shape tests above: the reap
 /// removes only PRODUCED children (dep1, completed via a cache hit and
 /// orphaned when B2 goes away) while an UNBUILT child (dep2, kept by
@@ -3100,7 +3201,7 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// The `topdown_pruned` STAMP must treat a closure-holed kept node like
 /// a childless one. Staging: BC full-merges R → D (D's output already
 /// present upstream, so it cache-hits to Completed) and keeps both
@@ -3145,35 +3246,14 @@ async fn test_topdown_stamp_fires_for_closure_holed_node_with_produced_survivors
         n
     };
 
-    // BC: full merge R → D. D's output is already present upstream, so
+    // B2: full merge app → R → {D, E}. B2 CREATES R (so R's full child
+    // set, including the never-built E, is declared by R's creating
+    // submission — under sched.merge.edge-creation-scoped a later join
+    // could not extend it). D's output is already present upstream, so
     // it cache-hits to Completed at merge; R's output is neither
     // present nor substitutable yet, so no prune fires and R carries no
-    // mark. BC keeps R and D alive across B2's reap below.
+    // mark. E (unbuilt) and app are B2's sole interest.
     store.seed_with_content(&d_out, b"d-out");
-    let bc = Uuid::new_v4();
-    let _evc = merge_dag(
-        &handle,
-        bc,
-        vec![mk_r(), mk_d()],
-        vec![make_test_edge("tdsh-r", "tdsh-d")],
-        false,
-    )
-    .await?;
-    barrier(&handle).await;
-    assert!(
-        matches!(
-            expect_drv(&handle, "tdsh-d").await.status,
-            DerivationStatus::Completed | DerivationStatus::Skipped
-        ),
-        "fixture premise: D is produced at BC's merge"
-    );
-    assert!(
-        !expect_drv(&handle, "tdsh-r").await.topdown_pruned,
-        "fixture premise: no prune has fired for R yet"
-    );
-
-    // B2: full merge app → R → {D, E}; E (unbuilt) and app are B2's
-    // sole interest.
     let mut app = make_node("tdsh-app");
     app.expected_output_paths = vec![test_store_path("tdsh-app-out")];
     let b2 = Uuid::new_v4();
@@ -3190,6 +3270,31 @@ async fn test_topdown_stamp_fires_for_closure_holed_node_with_produced_survivors
     )
     .await?;
     barrier(&handle).await;
+
+    // BC: later full merge of R → D only — joins the resident R and D
+    // (duplicate edge is a no-op) and keeps them alive across B2's reap
+    // below.
+    let bc = Uuid::new_v4();
+    let _evc = merge_dag(
+        &handle,
+        bc,
+        vec![mk_r(), mk_d()],
+        vec![make_test_edge("tdsh-r", "tdsh-d")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert!(
+        matches!(
+            expect_drv(&handle, "tdsh-d").await.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "fixture premise: D is produced before the reap"
+    );
+    assert!(
+        !expect_drv(&handle, "tdsh-r").await.topdown_pruned,
+        "fixture premise: no prune has fired for R yet"
+    );
 
     // Cancel B2 and reap its sole-interest nodes: E — never produced —
     // is reaped out from under R (closure hole), app goes with it; D
@@ -3274,7 +3379,7 @@ async fn test_topdown_stamp_fires_for_closure_holed_node_with_produced_survivors
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// The dispatch-time guards must treat a marked closure-holed survivor
 /// like a childless one (bughunter round-20 merged_bug_001). Staging
 /// follows that report's proof: B1's prune (wanting only R's `out`,
@@ -3520,16 +3625,18 @@ async fn test_topdown_pruned_holed_survivor_fails_fast_at_dispatch_not_assigned_
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// Guard companion: a closure hole alone — no `topdown_pruned` mark —
 /// must not defer or fail-fast anything at dispatch time. Same staging
-/// as the stamp test above (BC keeps R + D, B2's cancel reaps the
-/// un-produced E out from under R) but no prune ever fires for R: its
-/// wanted output is neither present nor substitutable, so the probes
-/// leave it Ready and the generic dispatch hands it to a worker from
-/// source — the correct outcome for an unmarked node whose closure no
-/// prune ever dropped. Pins that the must-substitute judgment requires
-/// the mark, not just broken closure evidence.
+/// as the stamp test above (B2 — the build that declares E — CREATES R
+/// with its full child set so the creation-scoped edge gate accepts
+/// R→E; BC then joins R→D to keep R and D alive across B2's reap) but
+/// no prune ever fires for R: its wanted output is neither present nor
+/// substitutable, so the probes leave it Ready and the generic dispatch
+/// hands it to a worker from source — the correct outcome for an
+/// unmarked node whose closure no prune ever dropped. Pins that the
+/// must-substitute judgment requires the mark, not just broken closure
+/// evidence.
 #[tokio::test]
 async fn test_unmarked_closure_holed_node_still_dispatches_from_source() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -3552,30 +3659,14 @@ async fn test_unmarked_closure_holed_node_still_dispatches_from_source() -> Test
         n
     };
 
-    // BC: full merge R → D; D cache-hits to Completed, R stays unbuilt
-    // and unmarked (its output is neither present nor substitutable).
+    // B2: full merge app → R → {D, E}. B2 CREATES R, so R's full child
+    // set — including the never-built E — is declared by R's creating
+    // submission (under sched.merge.edge-creation-scoped a later join
+    // could not extend it). D's output is seeded upstream so it
+    // cache-hits to Completed at merge; R's output is neither present
+    // nor substitutable, so no prune fires and R carries no mark. E
+    // (unbuilt) and app are B2's sole interest.
     store.seed_with_content(&d_out, b"d-out");
-    let bc = Uuid::new_v4();
-    let _evc = merge_dag(
-        &handle,
-        bc,
-        vec![mk_r(), mk_d()],
-        vec![make_test_edge("tdnm-r", "tdnm-d")],
-        false,
-    )
-    .await?;
-    barrier(&handle).await;
-    assert!(
-        matches!(
-            expect_drv(&handle, "tdnm-d").await.status,
-            DerivationStatus::Completed | DerivationStatus::Skipped
-        ),
-        "fixture premise: D is produced at BC's merge"
-    );
-
-    // B2: full merge app → R → {D, E}; E (unbuilt) and app are B2's
-    // sole interest. Cancel + cleanup reaps E un-produced out from
-    // under R (closure hole) while the produced D survives via BC.
     let mut app = make_node("tdnm-app");
     app.expected_output_paths = vec![test_store_path("tdnm-app-out")];
     let b2 = Uuid::new_v4();
@@ -3592,6 +3683,31 @@ async fn test_unmarked_closure_holed_node_still_dispatches_from_source() -> Test
     )
     .await?;
     barrier(&handle).await;
+    assert!(
+        matches!(
+            expect_drv(&handle, "tdnm-d").await.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "fixture premise: D is produced at B2's merge"
+    );
+
+    // BC: later full merge of R → D only — joins the resident R and D
+    // (duplicate edge is a no-op under the creation-scoped gate) and
+    // keeps them alive across B2's reap below.
+    let bc = Uuid::new_v4();
+    let _evc = merge_dag(
+        &handle,
+        bc,
+        vec![mk_r(), mk_d()],
+        vec![make_test_edge("tdnm-r", "tdnm-d")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Cancel B2 and reap its sole-interest nodes: E — never produced —
+    // is reaped out from under R (closure hole) while the produced D
+    // survives via BC.
     let (ctx, crx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::CancelBuild {
@@ -3613,6 +3729,14 @@ async fn test_unmarked_closure_holed_node_still_dispatches_from_source() -> Test
     assert!(
         handle.debug_query_derivation("tdnm-d").await?.is_some(),
         "D must survive the reap (BC still holds interest in it)"
+    );
+    // Fixture premise the rest of this test depends on: the reap really
+    // did stamp the closure-hole breadcrumb on R. Without R having been
+    // CREATED by B2 (full child set accepted), E would never have been
+    // R's child and every assertion below would pass vacuously.
+    assert!(
+        expect_drv(&handle, "tdnm-r").await.closure_hole,
+        "fixture premise: B2's reap must stamp the closure hole on R"
     );
     assert!(
         !expect_drv(&handle, "tdnm-r").await.topdown_pruned,
@@ -3642,7 +3766,190 @@ async fn test_unmarked_closure_holed_node_still_dispatches_from_source() -> Test
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.heal-accepted-edges+1]
+/// End-to-end: a join whose declared edge is GATE-SKIPPED must not heal
+/// the closure hole — in memory or in PG — and the surviving hole must
+/// still do its protective job (a later prune that keeps the node
+/// stamps it `topdown_pruned`, because its produced survivors are a
+/// truncated view of its closure).
+///
+/// Pre-rule, the heal was keyed on the raw request edge list, so this
+/// exact staging laundered the truncation evidence: the joiner's
+/// skipped extension flipped R's closure evidence Broken→Vouched while
+/// R's child set was still truncated, re-arming the doomed from-source
+/// dispatch the breadcrumb exists to prevent.
+#[tokio::test]
+async fn test_gate_skipped_edge_does_not_heal_closure_hole() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let r_out = test_store_path("ghs-r-out");
+    let d_out = test_store_path("ghs-d-out");
+    let mk_r = || {
+        let mut n = make_node("ghs-r");
+        n.expected_output_paths = vec![r_out.clone()];
+        n
+    };
+    let mk_d = || {
+        let mut n = make_node("ghs-d");
+        n.expected_output_paths = vec![d_out.clone()];
+        n
+    };
+    let mk_e = || {
+        let mut n = make_node("ghs-e");
+        n.expected_output_paths = vec![test_store_path("ghs-e-out")];
+        n
+    };
+
+    // B2 CREATES R with its full child set app→R→{D, E}; D cache-hits
+    // (seeded). E and app are B2's sole interest.
+    store.seed_with_content(&d_out, b"d-out");
+    let mut app = make_node("ghs-app");
+    app.expected_output_paths = vec![test_store_path("ghs-app-out")];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(
+        &handle,
+        b2,
+        vec![app, mk_r(), mk_d(), mk_e()],
+        vec![
+            make_test_edge("ghs-app", "ghs-r"),
+            make_test_edge("ghs-r", "ghs-d"),
+            make_test_edge("ghs-r", "ghs-e"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // BC joins R→D to keep R and D alive across B2's reap.
+    let bc = Uuid::new_v4();
+    let _evc = merge_dag(
+        &handle,
+        bc,
+        vec![mk_r(), mk_d()],
+        vec![make_test_edge("ghs-r", "ghs-d")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Cancel B2 → E (sole interest, unbuilt) is reaped out from under R:
+    // closure hole stamped on R, in memory and in PG.
+    let (ctx, crx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: b2,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: ctx,
+        })
+        .await?;
+    assert!(crx.await??, "B2 cancel must be accepted");
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: b2 })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        expect_drv(&handle, "ghs-r").await.closure_hole,
+        "fixture premise: the reap stamped the closure hole on R"
+    );
+    assert!(
+        !expect_drv(&handle, "ghs-r").await.topdown_pruned,
+        "fixture premise: R is unmarked (no prune fired)"
+    );
+
+    // B5 joins resident R (NOT re-creating it, NOT topdown-pruned, so no
+    // carve-out): re-declares R→D (accepted no-op) and tries to extend
+    // R→F (gate-skipped, rejoin-shaped since R is holed). The veto means
+    // R is NOT healed.
+    let mk_f = || {
+        let mut n = make_node("ghs-f");
+        n.expected_output_paths = vec![test_store_path("ghs-f-out")];
+        n
+    };
+    let b5 = Uuid::new_v4();
+    let _ev5 = merge_dag(
+        &handle,
+        b5,
+        vec![mk_r(), mk_d(), mk_f()],
+        vec![
+            make_test_edge("ghs-r", "ghs-d"),
+            make_test_edge("ghs-r", "ghs-f"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // The hole survives the join — in memory AND in PG.
+    assert!(
+        expect_drv(&handle, "ghs-r").await.closure_hole,
+        "a gate-skipped declared edge vetoes the heal: R's truncation \
+         evidence must survive the join in memory"
+    );
+    let (pg_hole,): (bool,) =
+        sqlx::query_as("SELECT closure_hole FROM derivations WHERE drv_hash = 'ghs-r'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        pg_hole,
+        "the persisted breadcrumb must survive the gate-skipped join too \
+         (a failover would otherwise restore the laundered shape)"
+    );
+    let (edge_count,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM derivation_edges e \
+         JOIN derivations p ON p.derivation_id = e.parent_id \
+         JOIN derivations c ON c.derivation_id = e.child_id \
+         WHERE p.drv_hash = 'ghs-r' AND c.drv_hash = 'ghs-f'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        edge_count, 0,
+        "the gate-skipped edge itself must not exist (in PG either)"
+    );
+
+    // The surviving hole still does its job: a prune that keeps R stamps
+    // it (its produced survivor D is a truncated view of R's closure).
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+    let mk_dep3 = || {
+        let mut n = make_node("ghs-dep3");
+        n.expected_output_paths = vec![test_store_path("ghs-dep3-out")];
+        n
+    };
+    let b6 = Uuid::new_v4();
+    let _ev6 = merge_dag(
+        &handle,
+        b6,
+        vec![mk_r(), mk_dep3()],
+        vec![make_test_edge("ghs-r", "ghs-dep3")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, b6).await?.total_derivations,
+        1,
+        "fixture premise: B6 took the roots-only prune path"
+    );
+    assert!(
+        expect_drv(&handle, "ghs-r").await.topdown_pruned,
+        "the un-healed hole must keep gating the stamp: a prune that keeps R \
+         stamps it because its produced survivors do not vouch for its closure"
+    );
+    let (pg_pruned,): (bool,) =
+        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'ghs-r'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(pg_pruned, "the stamp is persisted");
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+15]
 /// The closure-hole VETO on the produced-children clears, and the HEAL
 /// that lifts it. Staging: B1's prune stamps R and parks its detached
 /// fetch on the QPI gate; B3 (a live single-node build) holds the
@@ -3670,7 +3977,9 @@ async fn test_unmarked_closure_holed_node_still_dispatches_from_source() -> Test
 ///
 /// Phase B (the heal): B4 full-merges app2→R→dep2, re-declaring R's
 /// real edge set. The post-reconciliation pass in `handle_merge_dag`
-/// heals the breadcrumb (R's child set is representative again) and,
+/// heals the breadcrumb (accepted trigger ∧ witness coverage — dep2,
+/// the recorded missing child, is re-attached; the defining doc is
+/// `MergeResult::healed_parents`) and,
 /// with dep2 produced, clears the mark in memory and PG — no fail-fast
 /// or resubmit needed once a full merge has re-supplied the closure.
 #[tokio::test]
@@ -3879,31 +4188,93 @@ async fn test_topdown_pruned_kept_after_closure_hole_until_full_remerge_heals() 
     );
 
     // Phase B — the heal. B4 full-merges R with its real edge set
-    // (app2 → R → dep2; app2's output is not substitutable, so no
-    // prune). Re-declaring R's edges makes its child set representative
-    // again: the post-reconciliation pass heals the breadcrumb and,
-    // with dep2 produced, clears the mark in memory and PG.
+    // (app2 → R → {dep1, dep2}). Round-15 heal-accepted-edges+1: the
+    // re-declaration must POSITIVELY COVER the witness set — dep1 is
+    // what the reap removed, so the heal demands dep1 back among R's
+    // children (a dep2-only re-declaration is the subset shape
+    // merged_bug_073 exploited and is now refused; see
+    // test_subset_redeclaration_does_not_heal_closure_hole). With the
+    // full set re-supplied and dep2 produced, the post-reconciliation
+    // pass heals the breadcrumb and clears the mark in memory and PG.
     let mut app2 = make_node("tdch-app2");
     app2.expected_output_paths = vec![test_store_path("tdch-app2-out")];
     let b4 = Uuid::new_v4();
     let _ev4 = merge_dag(
         &handle,
         b4,
-        vec![app2, mk_r(), mk_dep2()],
+        vec![app2, mk_r(), mk_dep1(), mk_dep2()],
         vec![
             make_test_edge("tdch-app2", "tdch-r"),
+            make_test_edge("tdch-r", "tdch-dep1"),
             make_test_edge("tdch-r", "tdch-dep2"),
         ],
         false,
     )
     .await?;
     barrier(&handle).await;
+    // The covering re-declaration heals the HOLE (witness set covered:
+    // dep1 is back among R's children) — but the topdown mark is a
+    // SEPARATE gate keyed on closure_vouched, and the re-supplied dep1
+    // is unbuilt, so the mark must survive. Pre-round-15 this test
+    // asserted the mark cleared here — that pass was the
+    // merged_bug_073 laundering itself (the dep2-only subset made the
+    // truncated child set look Vouched).
     let healed = expect_drv(&handle, "tdch-r").await;
+    assert_eq!(
+        healed.closure_missing_count, 0,
+        "the covering re-declaration heals the hole (witness set covered)"
+    );
     assert!(
-        !healed.topdown_pruned,
-        "a full merge that re-declares R's edges heals the closure hole, and \
-         with its (now representative) children all produced the mark must be \
-         cleared in memory"
+        !healed.closure_hole,
+        "in-memory hole cleared by the witnessed heal"
+    );
+    let (pg_hole_after_heal,): (bool,) =
+        sqlx::query_as("SELECT closure_hole FROM derivations WHERE drv_hash = 'tdch-r'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        !pg_hole_after_heal,
+        "the heal clears the persisted hole too"
+    );
+    assert!(
+        healed.topdown_pruned,
+        "the mark does NOT ride the heal: dep1 was re-supplied unbuilt, so R \
+         is not Vouched and the from-source guard must hold"
+    );
+
+    // Produce the re-supplied child: seed its output and run a second
+    // covering merge — the merge-time cache probe completes dep1, and
+    // the SAME merge's post-reconciliation pass now sees a genuinely
+    // Vouched (all-produced, un-holed) child set and drops the mark in
+    // memory and PG.
+    store.seed_with_content(&test_store_path("tdch-dep1-out"), b"dep1-out");
+    let mut app3 = make_node("tdch-app2");
+    app3.expected_output_paths = vec![test_store_path("tdch-app2-out")];
+    let b5 = Uuid::new_v4();
+    let _ev5 = merge_dag(
+        &handle,
+        b5,
+        vec![app3, mk_r(), mk_dep1(), mk_dep2()],
+        vec![
+            make_test_edge("tdch-app2", "tdch-r"),
+            make_test_edge("tdch-r", "tdch-dep1"),
+            make_test_edge("tdch-r", "tdch-dep2"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert!(
+        matches!(
+            expect_drv(&handle, "tdch-dep1").await.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "fixture premise: dep1 cache-hits on the covering re-merge"
+    );
+    let cleared = expect_drv(&handle, "tdch-r").await;
+    assert!(
+        !cleared.topdown_pruned,
+        "with the witness covered AND every child produced, the mark clears"
     );
     let (pg_marked_after_heal,): (bool,) =
         sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tdch-r'")
@@ -3911,13 +4282,13 @@ async fn test_topdown_pruned_kept_after_closure_hole_until_full_remerge_heals() 
             .await?;
     assert!(
         !pg_marked_after_heal,
-        "the post-reconciliation clear must reach PG as well, so a failover \
+        "the post-completion clear must reach PG as well, so a failover \
          cannot resurrect the mark after the heal"
     );
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// The closure-hole breadcrumb must survive the node's own Completed →
 /// stale-reset round-trip (bughunter round-21 bug_007). Staging: B1's
 /// prune stamps R and parks its detached fetch; BC produces dep2; B2
@@ -4213,7 +4584,7 @@ async fn test_closure_hole_survives_completion_and_stale_completed_reset() -> Te
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// The closure-hole breadcrumb must be carried across the merge-time
 /// resubmit-reset (bughunter round-22 bug_006). Staging: B1's prune
 /// stamps R and parks its detached fetch; BC produces dep2; B2
@@ -4519,7 +4890,7 @@ async fn test_resubmit_reset_carries_closure_hole_and_restamps_topdown_pruned() 
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// The topdown fail-fast must consume the MARK only and retain the
 /// closure-hole breadcrumb, so the directed resubmit it solicits stays
 /// protected (bughunter round-23 bug_006). Staging: B1's prune stamps R
@@ -4820,7 +5191,7 @@ async fn test_fail_fast_keeps_closure_hole_so_directed_resubmit_restamps() -> Te
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// Both poison-removal paths — admin `ClearPoison` and the poison-TTL
 /// sweep — must stamp the closure-hole breadcrumb on surviving parents
 /// when they remove a Poisoned (by definition un-produced) child,
@@ -5104,9 +5475,11 @@ async fn test_poison_clear_paths_stamp_closure_hole_on_surviving_parent(
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// The merge-time heal must clear the PERSISTED closure-hole breadcrumb
-/// for every edge parent it re-declares, even when the in-memory copy
+/// for every parent it HEALS (accepted trigger ∧ witness coverage —
+/// the defining doc is `MergeResult::healed_parents`; this staging
+/// covers the witness set), even when the in-memory copy
 /// of the breadcrumb is GONE (bughunter round-21 merged_bug_001;
 /// staging hardened in round-22 bug_012). Staging: same reap shape as
 /// above (B1's prune stamps R; BC produces dep2; B2 full-merges
@@ -5359,7 +5732,7 @@ async fn test_full_remerge_heals_persisted_closure_hole_after_node_completion() 
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// The lazy clear in `handle_substitute_complete`: when a pruned root's
 /// children are ALL produced by the time its own walk fails, the mark is
 /// moot — cleared in memory AND in PG (best-effort, so a failover cannot
@@ -5440,7 +5813,7 @@ async fn test_topdown_pruned_lazy_clear_when_children_produced_at_walk_failure()
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// The clear decision must be taken AFTER `verify_preexisting_completed`
 /// (phase 6c) has had its say: a merge that re-adds the edge R → C while
 /// C is `Completed` in the DAG but C's recorded output is gone from the
@@ -5546,7 +5919,7 @@ async fn test_topdown_pruned_kept_when_merge_child_is_stale_completed() -> TestR
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// A prune-led merge that fails at the PG-persist step (step 5) must
 /// not leave `topdown_pruned=true` on a pre-existing childless root
 /// shared with an unrelated live build. `cleanup_failed_merge` →
@@ -5613,6 +5986,7 @@ async fn test_topdown_stamp_not_leaked_when_merge_fails_at_persist() -> TestResu
         &handle,
         MergeDagRequest {
             build_id: b2,
+            ingress_stripped: Default::default(),
             tenant_id: None,
             priority_class: PriorityClass::Scheduled,
             nodes: vec![r_b2, s, s_dep],
@@ -5694,7 +6068,7 @@ async fn test_topdown_stamp_not_leaked_when_merge_fails_at_persist() -> TestResu
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// The `topdown_pruned` marker must land only on kept nodes whose
 /// dependency closure the prune actually dropped. A dep-less demanded
 /// leaf (here: one target of a multi-target submission with no
@@ -5774,7 +6148,7 @@ async fn test_topdown_stamp_only_nodes_whose_closure_was_dropped() -> TestResult
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// A pruned merge whose build-activation write fails must reject the
 /// build AND leave nothing of the merge behind in PG — in particular no
 /// `topdown_pruned = true` on a shared pre-existing childless root.
@@ -5859,6 +6233,7 @@ async fn test_topdown_stamp_rolled_back_when_activation_fails() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id: b2,
+            ingress_stripped: Default::default(),
             tenant_id: None,
             priority_class: PriorityClass::Scheduled,
             nodes: vec![r_b2, r_dep, s, s_dep],
@@ -5941,7 +6316,93 @@ async fn test_topdown_stamp_rolled_back_when_activation_fails() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.edge-creation-scoped]
+// r[verify sched.merge.substitute-topdown+15]
+/// Production-order variant of the topdown-pruned dependency top-up: B1's
+/// topdown prune leaves R resident (Substituting, `topdown_pruned`,
+/// no children) and B2's later full merge attaches R→glibc WITHOUT
+/// re-creating R — the creation-scoped edge gate's pruned-root carve-out.
+/// When the substitute then fails, R has children, so the fail-fast does
+/// NOT fire: B2 stays Active and R falls through to Queued.
+#[tokio::test]
+async fn test_topdown_pruned_root_dep_topup_production_order() -> TestResult {
+    let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // B1: R resident alone (its deps were topdown-pruned), mid-fetch.
+    let mut r1 = make_node("tdpp-r");
+    r1.expected_output_paths = vec![test_store_path("tdpp-r-out")];
+    let b1 = Uuid::new_v4();
+    merge_dag(&handle, b1, vec![r1], vec![], false).await?;
+    barrier(&handle).await;
+    handle
+        .debug_force_status("tdpp-r", DerivationStatus::Substituting)
+        .await?;
+    handle.debug_set_topdown_pruned("tdpp-r", true).await?;
+
+    // B2: full merge {app, R, glibc} with app→R, R→glibc. R is resident
+    // (Substituting → not retriable → joined, not re-created); the
+    // R→glibc edge is admitted via the topdown-pruned carve-out.
+    let mut app = make_node("tdpp-app");
+    app.expected_output_paths = vec![test_store_path("tdpp-app-out")];
+    let mut r2 = make_node("tdpp-r");
+    r2.expected_output_paths = vec![test_store_path("tdpp-r-out")];
+    let mut glibc = make_node("tdpp-glibc");
+    glibc.expected_output_paths = vec![test_store_path("tdpp-glibc-out")];
+    let b2 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b2,
+        vec![app, r2, glibc],
+        vec![
+            make_test_edge("tdpp-app", "tdpp-r"),
+            make_test_edge("tdpp-r", "tdpp-glibc"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // B1's deferred fetch fails.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdpp-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // B2 stays Active: R gained children from B2's top-up, so the
+    // "deps were dropped" fail-fast must not fire.
+    let s2 = query_status(&handle, b2).await?;
+    assert_eq!(
+        s2.state,
+        rio_proto::types::BuildState::Active as i32,
+        "topdown-pruned root topped up by a later full merge → no fail-fast"
+    );
+    let post = expect_drv(&handle, "tdpp-r").await;
+    assert_eq!(
+        post.status,
+        DerivationStatus::Queued,
+        "R falls through to Queued behind its (incomplete) new dependency"
+    );
+    // The mark itself is RETAINED while the topped-up children are
+    // still unbuilt: the closure classifier only lets the mark go once
+    // the children are produced (completion-time
+    // `clear_topdown_pruned_for_produced_parents`, or the
+    // post-reconciliation pass once Vouched) — an unbuilt top-up keeps
+    // the guard in place in case those children are reaped unbuilt.
+    // The protections this test cares about are asserted above: no
+    // fail-fast fired (closure evidence is Pending, not Broken), and R
+    // proceeds bottom-up behind its new dependency.
+    assert!(
+        post.topdown_pruned,
+        "mark retained while the topped-up children are unbuilt (cleared only once produced)"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+15]
 /// Top-down negative: root NOT substitutable → fall through to
 /// full bottom-up check. All nodes merged, deps processed normally.
 #[tokio::test]
@@ -6051,7 +6512,7 @@ async fn test_topdown_unresolvable_wanted_set_falls_through() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 // r[verify sched.merge.wanted-outputs+2]
 /// Top-down negative: a PRE-EXISTING root shared with a live build whose
 /// effective wanted set is NOT satisfiable must refuse the prune, even
@@ -6166,7 +6627,7 @@ async fn test_topdown_prune_gated_on_live_effective_wanted_of_preexisting_root()
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// Top-down positive companion: a PRE-EXISTING root whose live
 /// effective wanted set IS satisfiable keeps the prune. Same shape as
 /// the negative test above, but build A wants only `out` too — the
@@ -6250,7 +6711,7 @@ async fn test_topdown_prune_fires_when_preexisting_roots_live_wanted_satisfiable
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 // r[verify sched.merge.wanted-outputs+2]
 /// Top-down negative: the submission's OWN root selector resolving to
 /// no declared output (`drv^bogus`) blocks the prune even when the
@@ -6450,7 +6911,7 @@ async fn test_cache_hit_gates_on_inputdrv_completion() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// Top-down: deps pruned from this build are NOT in the global DAG,
 /// so a later build that needs them triggers its own cache-check.
 ///
@@ -7307,6 +7768,40 @@ async fn test_reprobe_existing_poisoned_unpoisons_on_cache_hit() -> TestResult {
         "build #2 should succeed via re-probe unpoisoning"
     );
 
+    // r[verify sched.retry.revival-total-reset+2]
+    // Round-17 merged_bug_073: the revival reset spans BOTH tiers — the
+    // persisted per-attempt failure history is clean after the flow, so
+    // a leader failover cannot resurrect it. `resubmit_cycles` is the
+    // ONE deliberate exception in THIS flow: build #2 is a user
+    // resubmit, and the I-169 poison-resubmit bound accumulates across
+    // resubmits by design (`clear_poison_batch` increments it; the
+    // in-memory tier carries the same 1 — tiers agree, which is what
+    // the +2 rule demands).
+    let probe = make_node("reprobe-poison");
+    let (retry_count, resubmit_cycles, failed_builders, poison_cleared): (
+        i32,
+        i32,
+        Vec<String>,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT retry_count, resubmit_cycles, failed_builders, poisoned_at IS NULL \
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(&probe.drv_hash)
+    .fetch_one(&_db.pool)
+    .await?;
+    assert_eq!(retry_count, 0, "PG retry_count zeroed at revival");
+    assert_eq!(
+        resubmit_cycles, 1,
+        "the I-169 resubmit bound accumulates across user resubmits — \
+         it is a cycle bound, not per-attempt history"
+    );
+    assert!(
+        failed_builders.is_empty(),
+        "PG failed_builders cleared at revival"
+    );
+    assert!(poison_cleared, "PG poisoned_at cleared at revival");
+
     Ok(())
 }
 
@@ -8011,7 +8506,7 @@ async fn test_stale_skipped_output_reset() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.dedup]
+// r[verify sched.merge.dedup+2]
 /// Re-probe completion fan-out: B1 merges {X} (Ready, no worker). X's
 /// output is then seeded locally. B2 merges {X}: re-probe finds X in
 /// store → X transitions →Completed. B1 must ALSO be notified
@@ -8054,7 +8549,7 @@ async fn test_reprobe_completion_fans_out_to_earlier_build() -> TestResult {
     assert_eq!(
         s1.state,
         rio_proto::types::BuildState::Succeeded as i32,
-        "r[sched.merge.dedup]: re-probe completion of shared X must fan out \
+        "r[sched.merge.dedup+2]: re-probe completion of shared X must fan out \
          to B1 (was: B1 stayed Active, completed_count=0, hung)"
     );
     Ok(())
@@ -8245,6 +8740,102 @@ async fn test_deferred_reprobe_hit_on_poisoned_at_limit_unsticks() -> TestResult
         ),
         "after dep completes, X (Queued) promotes; got {:?}",
         xs2.status
+    );
+    Ok(())
+}
+
+// r[verify sched.retry.revival-total-reset+2]
+/// Round-17 merged_bug_073 — OUTCOME pin for the FAILED origin: after a
+/// Failed node with dirty persisted history is revived (output present,
+/// dep in-flight), PG carries no per-attempt failure history on ANY
+/// route through the merge. Honest scope note: in this flow the
+/// resubmit-reset path (`Failed` is unconditionally
+/// `is_retriable_on_resubmit`) cleanses X before the deferred-re-probe
+/// stanza can, so this test does NOT discriminate the stanza's own gate
+/// — that per-site population is pinned by
+/// `revival_resettable_population_is_exact` plus the stanza calling the
+/// shared predicate (the only gate form left in the code). What this
+/// test pins is the end-to-end invariant the +2 rule states: no
+/// Failed-origin revival flow leaves resurrectable history in PG.
+#[tokio::test]
+async fn test_deferred_reprobe_failed_origin_clears_pg_history() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let mut rx = connect_executor(&handle, "df-w", "x86_64-linux").await?;
+
+    let x_out = test_store_path("df-x-out");
+    let y_out = test_store_path("df-y-out");
+    let mut x = make_node("df-x");
+    x.expected_output_paths = vec![x_out.clone()];
+    let mut y = make_node("df-y");
+    y.expected_output_paths = vec![y_out.clone()];
+
+    // Build 1: X→Y. Y dispatches (leaf). Hold Y running.
+    let b1 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b1,
+        vec![x.clone(), y.clone()],
+        vec![make_test_edge("df-x", "df-y")],
+        false,
+    )
+    .await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert!(assn.drv_path.ends_with("df-y.drv"));
+
+    // Force X to Failed in memory and seed dirty failure history in PG
+    // (what a transient-failure cycle would have persisted).
+    assert!(
+        handle
+            .debug_force_status("df-x", DerivationStatus::Failed)
+            .await?
+    );
+    sqlx::query(
+        "UPDATE derivations SET status = 'failed', retry_count = 2, \
+         failed_builders = ARRAY['df-w'] WHERE drv_hash = $1",
+    )
+    .bind(&x.drv_hash)
+    .execute(&_db.pool)
+    .await?;
+
+    // X's output now locally present; build 2 re-merges → Failed X is in
+    // cached_hits with dep Y in-flight → deferred re-probe stanza.
+    store.seed_with_content(&x_out, b"x");
+    let b2 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b2,
+        vec![x.clone(), y],
+        vec![make_test_edge("df-x", "df-y")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let xs = expect_drv(&handle, "df-x").await;
+    assert_eq!(
+        xs.status,
+        DerivationStatus::Queued,
+        "Failed-origin deferred re-probe resets to Queued"
+    );
+    assert_eq!(xs.retry.count, 0, "in-memory history cleared");
+
+    let (status, retry, builders): (String, i32, Vec<String>) = sqlx::query_as(
+        "SELECT status, retry_count, failed_builders FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(&x.drv_hash)
+    .fetch_one(&_db.pool)
+    .await?;
+    assert_eq!(
+        status, "queued",
+        "the revival flow's own status persist ran (resubmit or stanza route)"
+    );
+    assert_eq!(
+        retry, 0,
+        "PG retry_count cleared for the FAILED origin (the merged_bug_073 gap)"
+    );
+    assert!(
+        builders.is_empty(),
+        "PG failed_builders cleared for the FAILED origin"
     );
     Ok(())
 }
@@ -8779,5 +9370,2955 @@ async fn merge_probe_whole_dag_substituting() -> TestResult {
         .query_path_info_gate_armed
         .store(false, std::sync::atomic::Ordering::SeqCst);
     store.faults.query_path_info_gate.notify_waiters();
+    Ok(())
+}
+
+// ===========================================================================
+// Authoritative-squat displacement: persistence + accounting reconciliation
+// ===========================================================================
+
+/// End-to-end displacement of a terminal authoritative squat
+/// (sched.merge.authoritative-conflict): the displacing submission's
+/// identity is what PG persists, the displaced hash stops counting toward
+/// prior interested builds (they complete instead of hanging Active), and
+/// the displaced fresh node belongs to the displacer only.
+// r[verify sched.merge.authoritative-conflict+6]
+#[tokio::test]
+async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResult {
+    let (db, handle, _task) = setup().await;
+
+    // Build 1 (the squatter): single authoritative node. Connect the
+    // worker while this is the only Ready node so the first assignment is
+    // deterministically the squat.
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("squatA");
+    squat.drv_content = b"Derive-squat".to_vec();
+    squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![test_store_path("squatA-out")];
+    merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+    let mut rx = connect_executor(&handle, "w1", "x86_64-linux").await?;
+    let squat_path = test_drv_path("squatA");
+    let filler_path = test_drv_path("fillerB");
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, squat_path, "squat dispatched first");
+
+    // Build 2 (prior-interested victim of the prune): joins the in-flight
+    // squat with a MATCHING identity (including the shared expected output
+    // path as content evidence) and brings one extra node of its own.
+    // keep_going so the squat's failure below leaves it non-terminal
+    // (the displacement-time link prune only covers non-terminal builds).
+    let joiner = Uuid::new_v4();
+    let mut squat_join = make_node("squatA");
+    squat_join.expected_output_paths = vec![test_store_path("squatA-out")];
+    merge_dag(
+        &handle,
+        joiner,
+        vec![squat_join, make_node("fillerB")],
+        vec![],
+        true,
+    )
+    .await?;
+
+    // Fail the squat permanently — it parks Poisoned (a terminal failure
+    // state, displaceable). build1 fails; the keep_going build2 stays
+    // Active on fillerB. (A squat that COMPLETES is never displaced —
+    // see test_completed_authoritative_node_survives_conflicting_submission.)
+    complete_failure(
+        &handle,
+        "w1",
+        &squat_path,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "squat build failed permanently",
+    )
+    .await?;
+    wait_for_status(&handle, "squatA", DerivationStatus::Poisoned).await;
+    assert_eq!(
+        query_status(&handle, squatter).await?.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "squatter build fails with its poisoned node"
+    );
+    assert_eq!(
+        query_status(&handle, joiner).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "keep_going joiner still waiting on fillerB"
+    );
+    // Settled accounting of the terminal squatter, captured before the
+    // displacement — it must never be rewritten afterwards.
+    let squatter_counts: (i32, i32) =
+        sqlx::query_as("SELECT total_drvs, completed_drvs FROM builds WHERE build_id = $1")
+            .bind(squatter)
+            .fetch_one(&db.pool)
+            .await?;
+
+    // Build 3 (the displacer): conflicting verifiable identity (different
+    // system) for the same drv_hash → displaces the now-terminal squat.
+    let displacer = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        displacer,
+        vec![make_test_node("squatA", "aarch64-linux")],
+        vec![],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // The persisted row now carries the displacing identity and is no
+    // longer terminal — a leader failover would rebuild THIS definition.
+    let (system, status): (String, String) =
+        sqlx::query_as("SELECT system, status FROM derivations WHERE drv_path = $1")
+            .bind(&squat_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        system, "aarch64-linux",
+        "row refreshed to displacer identity"
+    );
+    assert!(
+        matches!(status.as_str(), "created" | "queued" | "ready"),
+        "row no longer claims the squatter's terminal status (got {status})"
+    );
+
+    // r[verify sched.persist.atomic-activation+2]
+    // The displacer's Pending→Active update committed in the same
+    // transaction as the recreate-refresh — there is no window where the
+    // row is refreshed but the displacing build is still pending.
+    let (b_status, started): (String, Option<f64>) = sqlx::query_as(
+        "SELECT status, EXTRACT(EPOCH FROM started_at)::float8 FROM builds WHERE build_id = $1",
+    )
+    .bind(displacer)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(b_status, "active", "displacer build active in PG");
+    assert!(
+        started.is_some(),
+        "started_at set by the in-tx Active update"
+    );
+
+    // The durable half of the interest prune: the still-running joiner's
+    // build_derivations link to the displaced hash is deleted in the same
+    // transaction, the terminal squatter keeps its link as history, and
+    // the displacer's own link is present — so a leader failover cannot
+    // re-point the joiner at the displacing definition.
+    let mut linked: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT bd.build_id FROM build_derivations bd \
+         JOIN derivations d ON d.derivation_id = bd.derivation_id \
+         WHERE d.drv_path = $1",
+    )
+    .bind(&squat_path)
+    .fetch_all(&db.pool)
+    .await?;
+    linked.sort();
+    let mut expected_links = vec![squatter, displacer];
+    expected_links.sort();
+    assert_eq!(
+        linked, expected_links,
+        "joiner's link pruned durably; terminal squatter and displacer keep theirs"
+    );
+    // The terminal squatter's settled accounting is untouched by the
+    // displacement fan-out.
+    let counts_after_displacement: (i32, i32) =
+        sqlx::query_as("SELECT total_drvs, completed_drvs FROM builds WHERE build_id = $1")
+            .bind(squatter)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        counts_after_displacement, squatter_counts,
+        "terminal squatter's persisted counts frozen at its terminal transition"
+    );
+    // r[verify sched.merge.displaced-failure-evidence]
+    // r[verify sched.build.failure-evidence-at-source+1]
+    // The still-running keep_going joiner observed the squat's permanent
+    // failure before the displacement, so its first-failure evidence is
+    // durable (persisted at source) and the displacement prune must keep
+    // it — pruning the link removes the accounting slot, never the
+    // observed-failure record.
+    let (joiner_summary,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(joiner)
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        joiner_summary.is_some(),
+        "joiner's observed-failure evidence survives the displacement prune"
+    );
+
+    // The joiner stays Active after the displacement: the displaced slot
+    // is gone from its accounting (total 2 → 1; the squat's result was a
+    // failure, not delivered output, so no credit is kept) and its
+    // failed_count is recomputed from the live DAG — the displaced node
+    // no longer counts. What DOES persist is the failure evidence
+    // (error_summary, asserted above): displacement prunes accounting,
+    // never observed history.
+    assert_eq!(
+        query_status(&handle, joiner).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "keep_going joiner stays Active on fillerB after the displacement prune"
+    );
+    // Completing fillerB is enough to SETTLE the joiner (no Active hang
+    // on the displaced hash). It settles Failed, not Succeeded: the
+    // squat failure it observed pre-displacement is sticky evidence
+    // even though the failed node itself was displaced out of its
+    // accounting. Executors are one-shot, so a second worker runs
+    // fillerB; the displaced fresh node is aarch64-only and cannot be
+    // what gets dispatched here.
+    let mut rx2 = connect_executor(&handle, "w2", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx2).await;
+    assert_eq!(assn.drv_path, filler_path, "unexpected assignment");
+    complete_success(&handle, "w2", &filler_path, &test_store_path("fillerB-out")).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, joiner).await?.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "joiner settles Failed once its own node completes (sticky observed failure)"
+    );
+    // Frozen terminal accounting: displaced slot gone (total 1), fillerB
+    // completed (1), and the failure COUNT is 0 — the failed node was
+    // displaced out of the live accounting; the build's Failed outcome
+    // rests on the sticky evidence, not the count.
+    let joiner_status = query_status(&handle, joiner).await?;
+    assert_eq!(
+        joiner_status.total_derivations, 1,
+        "displaced slot removed from the joiner's frozen total"
+    );
+    assert_eq!(
+        joiner_status.completed_derivations, 1,
+        "fillerB is the joiner's one completed derivation"
+    );
+    assert_eq!(
+        joiner_status.failed_derivations, 0,
+        "the displaced node's failure is evidence (error_summary), not a live count"
+    );
+    // The displacer owns the fresh node (aarch64 → never dispatched to w1).
+    assert_eq!(
+        query_status(&handle, displacer).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "displacer build is live on the fresh node"
+    );
+    // And the terminal squatter's settled accounting is still untouched
+    // after the displacement + joiner-settlement fan-out.
+    let counts_at_end: (i32, i32) =
+        sqlx::query_as("SELECT total_drvs, completed_drvs FROM builds WHERE build_id = $1")
+            .bind(squatter)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        counts_at_end, squatter_counts,
+        "terminal squatter's counts still frozen after later transitions"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// A successfully completed authoritative node is NEVER displaced: a
+/// later store-backed submission with a conflicting (fabricated)
+/// identity is rejected with FAILED_PRECONDITION, the persisted row
+/// keeps the settled identity and status, and the squatter build's
+/// Succeeded record is untouched (bug_076: an unverified submitter
+/// claim must not erase the record of a successful build).
+#[tokio::test]
+async fn test_completed_authoritative_node_survives_conflicting_submission() -> TestResult {
+    let (db, handle, _task) = setup().await;
+
+    // Build 1: single authoritative node, completed successfully.
+    let owner = Uuid::new_v4();
+    let mut node = make_node("settledA");
+    node.drv_content = b"Derive-settled".to_vec();
+    node.drv_content_authoritative = true;
+    node.expected_output_paths = vec![test_store_path("settledA-out")];
+    merge_dag(&handle, owner, vec![node], vec![], false).await?;
+    let mut rx = connect_executor(&handle, "w1", "x86_64-linux").await?;
+    let drv_path = test_drv_path("settledA");
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, drv_path);
+    complete_success(&handle, "w1", &drv_path, &test_store_path("settledA-out")).await?;
+    wait_for_status(&handle, "settledA", DerivationStatus::Completed).await;
+    assert_eq!(
+        query_status(&handle, owner).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "owner build completes"
+    );
+
+    // Build 2: conflicting AUTHORITATIVE identity (different system,
+    // different bytes) for the same drv_hash → rejected at the merge
+    // gate, never displaces. (A conflicting BARE echo is no longer this
+    // gate's territory: it routes through the store-evidence check,
+    // whose silence/verify/refuse contract has its own pins —
+    // sched.merge.store-evidence-displacement+3.)
+    let attacker = Uuid::new_v4();
+    let mut conflicting = make_test_node("settledA", "aarch64-linux");
+    conflicting.drv_content = b"Derive-forged-conflict".to_vec();
+    conflicting.drv_content_authoritative = true;
+    let result = merge_dag(&handle, attacker, vec![conflicting], vec![], false).await;
+    assert!(
+        result.is_err(),
+        "conflicting submission against a settled node must be rejected"
+    );
+    let err_text = format!("{:#}", result.unwrap_err());
+    assert!(
+        err_text.contains("conflicting authoritative derivation content"),
+        "rejection names the conflict, got: {err_text}"
+    );
+
+    // The persisted row is untouched: settled identity, completed status.
+    let (system, status, content): (String, String, Option<Vec<u8>>) =
+        sqlx::query_as("SELECT system, status, drv_content FROM derivations WHERE drv_path = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(system, "x86_64-linux", "settled identity kept");
+    assert_eq!(status, "completed", "settled status kept");
+    assert_eq!(
+        content.as_deref(),
+        Some(b"Derive-settled".as_slice()),
+        "authoritative bytes kept"
+    );
+
+    // The owner's build record is untouched.
+    assert_eq!(
+        query_status(&handle, owner).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "owner build record survives the conflicting submission"
+    );
+
+    // The attacker's build was rolled back (never inserted).
+    let attacker_row: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM builds WHERE build_id = $1")
+            .bind(attacker)
+            .fetch_optional(&db.pool)
+            .await?;
+    assert!(
+        attacker_row.is_none() || attacker_row.unwrap().0 == "pending",
+        "attacker build never activated"
+    );
+    Ok(())
+}
+
+// r[verify sched.persist.settled-identity-freeze+4]
+/// After a successful build's node is REAPED (terminal cleanup), its
+/// settled PG row is the only record left — the merge gate cannot see
+/// it. A conflicting resubmission for the same hash must be rejected by
+/// the pre-merge settled-identity check with FAILED_PRECONDITION, and
+/// the settled row must be byte-for-byte untouched (bug_076, post-reap
+/// half).
+#[tokio::test]
+async fn test_settled_row_rejects_conflicting_resubmission_after_reap() -> TestResult {
+    let (db, handle, _task) = setup().await;
+
+    // Build 1: complete a node successfully, then reap it.
+    let owner = Uuid::new_v4();
+    let mut node = make_node("settled-reap");
+    node.expected_output_paths = vec![test_store_path("settled-reap-out")];
+    merge_dag(&handle, owner, vec![node], vec![], false).await?;
+    let mut rx = connect_executor(&handle, "w1", "x86_64-linux").await?;
+    let drv_path = test_drv_path("settled-reap");
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, drv_path);
+    complete_success(
+        &handle,
+        "w1",
+        &drv_path,
+        &test_store_path("settled-reap-out"),
+    )
+    .await?;
+    wait_for_status(&handle, "settled-reap", DerivationStatus::Completed).await;
+    // Inject the terminal cleanup (bypass TERMINAL_CLEANUP_DELAY): the
+    // node is reaped from the DAG; the settled row stays in PG.
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: owner })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle
+            .debug_query_derivation("settled-reap")
+            .await?
+            .is_none(),
+        "node reaped from the DAG"
+    );
+
+    // Build 2: conflicting identity (different system) for the reaped
+    // hash → rejected by the settled-identity freeze, not admitted as a
+    // brand-new creation.
+    let attacker = Uuid::new_v4();
+    let result = merge_dag(
+        &handle,
+        attacker,
+        vec![make_test_node("settled-reap", "aarch64-linux")],
+        vec![],
+        false,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "conflicting re-creation of a settled row must be rejected"
+    );
+    let err_text = format!("{:#}", result.unwrap_err());
+    assert!(
+        err_text.contains("settled"),
+        "rejection names the settled record, got: {err_text}"
+    );
+
+    // The settled row is untouched.
+    let (system, status): (String, String) =
+        sqlx::query_as("SELECT system, status FROM derivations WHERE drv_path = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(system, "x86_64-linux", "settled identity kept");
+    assert_eq!(status, "completed", "settled status kept");
+
+    // No build row leaked for the rejected submission (the check runs
+    // before the build row insert).
+    let attacker_row: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM builds WHERE build_id = $1")
+            .bind(attacker)
+            .fetch_optional(&db.pool)
+            .await?;
+    assert!(
+        attacker_row.is_none(),
+        "no build row written for a settled-identity rejection"
+    );
+    Ok(())
+}
+
+// r[verify sched.persist.settled-identity-freeze+4]
+/// A MATCHING-identity resubmission of a reaped hash (same system,
+/// output names, flags, and the same declared expected output path as
+/// content evidence) is a legitimate rebuild — e.g. after the store
+/// garbage-collected the outputs — and must be admitted: the row is
+/// re-created (status back to a live state) and the new build runs.
+#[tokio::test]
+async fn test_settled_row_accepts_matching_resubmission_after_reap() -> TestResult {
+    let (db, handle, _task) = setup().await;
+
+    // Build 1: complete and reap.
+    let owner = Uuid::new_v4();
+    let mut node = make_node("settled-rebuild");
+    node.expected_output_paths = vec![test_store_path("settled-rebuild-out")];
+    merge_dag(&handle, owner, vec![node.clone()], vec![], false).await?;
+    let mut rx = connect_executor(&handle, "w1", "x86_64-linux").await?;
+    let drv_path = test_drv_path("settled-rebuild");
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, drv_path);
+    complete_success(
+        &handle,
+        "w1",
+        &drv_path,
+        &test_store_path("settled-rebuild-out"),
+    )
+    .await?;
+    wait_for_status(&handle, "settled-rebuild", DerivationStatus::Completed).await;
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: owner })
+        .await?;
+    barrier(&handle).await;
+
+    // Build 2: identical identity + the same declared expected output
+    // path (content evidence) → admitted; the node is re-created and
+    // dispatched to a fresh worker.
+    let rebuilder = Uuid::new_v4();
+    merge_dag(&handle, rebuilder, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, rebuilder).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "matching rebuild admitted"
+    );
+    // The row was re-created (no longer settled) by the rebuild.
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM derivations WHERE drv_path = $1")
+        .bind(&drv_path)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_ne!(
+        status, "completed",
+        "row re-created to a live status for the rebuild"
+    );
+    // And the rebuild completes end-to-end.
+    let mut rx2 = connect_executor(&handle, "w2", "x86_64-linux").await?;
+    let assn2 = recv_assignment(&mut rx2).await;
+    assert_eq!(assn2.drv_path, drv_path);
+    complete_success(
+        &handle,
+        "w2",
+        &drv_path,
+        &test_store_path("settled-rebuild-out"),
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, rebuilder).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "legitimate rebuild completes"
+    );
+    Ok(())
+}
+
+/// Displacement must not let the displacing definition inherit the
+/// squat's reactive resource floors (bug_011): a squatter that
+/// deliberately OOM'd/timed out ratchets `floor_*` to ceiling sizes, and
+/// without the reset the victim's definition would be dispatched on the
+/// largest node class with a 24h deadline forever (floors never decay
+/// and survive failover). Asserts BOTH halves: the in-memory fresh node
+/// keeps zeros (the I-208 hydration skips displaced hashes) and the
+/// persisted row's floors are zeroed (`reset_displaced_derivation`,
+/// not the floor-preserving `clear_poison`).
+// r[verify sched.merge.displaced-failure-reset+2]
+#[tokio::test]
+async fn test_displacement_resets_resource_floor() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let (db, handle, _task) = setup().await;
+
+    // The squatter: an authoritative content-bound node.
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("squatF");
+    squat.drv_content = b"Derive-squatF".to_vec();
+    squat.drv_content_authoritative = true;
+    merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Its failures ratcheted the persisted floors (and left poison/retry
+    // history) — simulate the end state directly in PG, and park the
+    // in-memory node terminal and over budget so the next conflicting
+    // store-backed submission displaces it rather than resetting it.
+    sqlx::query(
+        "UPDATE derivations
+         SET floor_mem_bytes = 8589934592, floor_disk_bytes = 34359738368,
+             floor_deadline_secs = 86400, poisoned_at = now(),
+             failed_builders = ARRAY['w1','w2','w3'], retry_count = 3,
+             resubmit_cycles = 7, status = 'poisoned'
+         WHERE drv_hash = $1",
+    )
+    .bind("squatF")
+    .execute(&db.pool)
+    .await?;
+    assert!(
+        handle
+            .debug_force_poisoned("squatF", POISON_RESUBMIT_RETRY_LIMIT)
+            .await?,
+        "squat parked Poisoned over budget"
+    );
+
+    // The victim: a store-backed submission with a conflicting verifiable
+    // identity (different system) → displaces the terminal squat.
+    let victim = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        victim,
+        vec![make_test_node("squatF", "aarch64-linux")],
+        vec![],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // In-memory: the displacing fresh node keeps try_from_node's zero
+    // floors — the pre-existing row's promoted floors are NOT hydrated
+    // onto it.
+    let info = expect_drv(&handle, "squatF").await;
+    assert_eq!(
+        info.sched.resource_floor.mem_bytes, 0,
+        "displacing node must not inherit the squat's mem floor"
+    );
+    assert_eq!(info.sched.resource_floor.disk_bytes, 0);
+    assert_eq!(info.sched.resource_floor.deadline_secs, 0);
+
+    // Persisted row: floors and the rest of the failure history are
+    // zeroed, so a leader failover cannot resurrect the squat's sizing.
+    let (mem, disk, deadline, cycles, retries, poisoned, builders): (
+        i64,
+        i64,
+        i64,
+        i32,
+        i32,
+        bool,
+        Vec<String>,
+    ) = sqlx::query_as(
+        "SELECT floor_mem_bytes, floor_disk_bytes, floor_deadline_secs,
+                resubmit_cycles, retry_count, poisoned_at IS NOT NULL,
+                failed_builders
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind("squatF")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        (mem, disk, deadline),
+        (0, 0, 0),
+        "persisted floors reset on displacement"
+    );
+    assert_eq!(cycles, 0, "poison-resubmit budget starts fresh");
+    assert_eq!(retries, 0);
+    assert!(!poisoned, "poisoned_at cleared");
+    assert!(builders.is_empty(), "failed_builders cleared");
+    Ok(())
+}
+
+/// End-to-end match-displacement (bug_014): a poison-budget-exhausted
+/// authoritative squat must not lock later legitimate store-backed
+/// submissions of the SAME verifiable identity out of the hash for the
+/// rest of its poison TTL. The victim's submission displaces the locked
+/// squat instead of joining it: the victim build does not fail-fast,
+/// the fresh node dispatches and completes, the persisted failure
+/// accounting is reset, and the squatter's still-running build loses
+/// its durable link to the displaced hash.
+// r[verify sched.merge.authoritative-conflict+6]
+#[tokio::test]
+async fn test_matching_identity_displacement_unblocks_victim_build() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let (db, handle, _task) = setup().await;
+    let squat_drv_path = test_drv_path("squatG");
+    let squat_out = test_store_path("squatG-out");
+
+    // The squatter: authoritative content-bound node, then poison-locked
+    // (budget exhausted) — the state in which it can never run again.
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("squatG");
+    squat.drv_content = b"Derive-squatG".to_vec();
+    squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![squat_out.clone()];
+    merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+    barrier(&handle).await;
+    assert!(
+        handle
+            .debug_force_poisoned("squatG", POISON_RESUBMIT_RETRY_LIMIT)
+            .await?,
+        "squat parked Poisoned over budget"
+    );
+
+    // The victim: store-backed submission with the SAME verifiable
+    // identity (shared non-empty expected output path as content
+    // evidence) → match-displaces the locked squat.
+    let victim = Uuid::new_v4();
+    let mut victim_node = make_node("squatG");
+    victim_node.expected_output_paths = vec![squat_out.clone()];
+    merge_dag(&handle, victim, vec![victim_node], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Not captured by the locked squat: the victim build is live, the
+    // node is store-backed again, and its persisted failure accounting
+    // is reset.
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "victim build must not fail-fast on the locked squat"
+    );
+    let info = expect_drv(&handle, "squatG").await;
+    assert_ne!(info.status, DerivationStatus::Poisoned, "fresh node");
+    let (cycles, poisoned): (i32, bool) = sqlx::query_as(
+        "SELECT resubmit_cycles, poisoned_at IS NOT NULL FROM derivations WHERE drv_hash = $1",
+    )
+    .bind("squatG")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(cycles, 0, "displaced row's poison budget reset");
+    assert!(!poisoned, "displaced row's poisoned_at cleared");
+
+    // The squatter's still-running build no longer counts the displaced
+    // hash (durable prune): only the victim keeps a link.
+    let linked: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT bd.build_id FROM build_derivations bd \
+         JOIN derivations d ON d.derivation_id = bd.derivation_id \
+         WHERE d.drv_path = $1",
+    )
+    .bind(&squat_drv_path)
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        linked,
+        vec![victim],
+        "squatter's link pruned, victim's kept"
+    );
+
+    // The displaced fresh node actually dispatches and completes — the
+    // hash is usable again.
+    let mut rx = connect_executor(&handle, "w1", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, squat_drv_path, "displaced node dispatched");
+    complete_success(&handle, "w1", &squat_drv_path, &squat_out).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "victim build completes on the displacing definition"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-failure-reset+2]
+/// An identity-matching store-backed resubmission of a parked (still
+/// retriable) authoritative claim takes the definition over through the
+/// resubmit-reset — an authority takeover, not a displacement. The
+/// takeover must not inherit the squat's failure accounting (bug class:
+/// merged_bug_001 round 12): the recreate-refresh's in-tx
+/// definition-change reset zeroes the row's poison/floor/budget columns
+/// (and RETURNING reports the reset floors, so the I-208 hydration sees
+/// zeros), the in-memory node starts at zero floors with a fresh
+/// poison-resubmit budget, and the cycle-incrementing
+/// `clear_poison_batch` is skipped for it.
+#[tokio::test]
+async fn test_matching_retriable_takeover_resets_row_accounting() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let out = test_store_path("takeoverA-out");
+
+    // The squatter: an authoritative content-bound claim declaring the
+    // same expected output path a store-backed submission of the
+    // derivation declares (the content evidence the takeover presents).
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("takeoverA");
+    squat.drv_content = b"Derive-takeoverA".to_vec();
+    squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![out.clone()];
+    merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Its failures ratcheted the persisted accumulators; park it
+    // Poisoned UNDER budget so it stays retriable on resubmit (the
+    // resubmit-reset path — the displacement arms must not fire).
+    sqlx::query(
+        "UPDATE derivations
+         SET floor_mem_bytes = 8589934592, floor_disk_bytes = 34359738368,
+             floor_deadline_secs = 86400, poisoned_at = now(),
+             failed_builders = ARRAY['w1','w2'], retry_count = 3,
+             resubmit_cycles = 1, status = 'poisoned'
+         WHERE drv_hash = $1",
+    )
+    .bind("takeoverA")
+    .execute(&db.pool)
+    .await?;
+    assert!(
+        handle.debug_force_poisoned("takeoverA", 1).await?,
+        "squat parked Poisoned under budget"
+    );
+
+    // The victim: a store-backed submission with the SAME verifiable
+    // identity (shared non-empty expected output path) → admitted
+    // through the resubmit-reset as an authority takeover.
+    let victim = Uuid::new_v4();
+    let mut victim_node = make_node("takeoverA");
+    victim_node.expected_output_paths = vec![out.clone()];
+    merge_dag(&handle, victim, vec![victim_node], vec![], false).await?;
+    barrier(&handle).await;
+
+    // In-memory: fresh store-backed node, zero floors, fresh budget.
+    let info = expect_drv(&handle, "takeoverA").await;
+    assert_ne!(info.status, DerivationStatus::Poisoned, "squat reset");
+    assert_eq!(
+        info.sched.resource_floor.mem_bytes, 0,
+        "takeover must not inherit the squat's mem floor"
+    );
+    assert_eq!(info.sched.resource_floor.disk_bytes, 0);
+    assert_eq!(info.sched.resource_floor.deadline_secs, 0);
+    assert_eq!(
+        info.retry.resubmit_cycles, 0,
+        "takeover starts with a fresh poison-resubmit budget"
+    );
+
+    // Persisted row: every failure-derived column reset by the merge
+    // transaction, and no clear_poison_batch +1 on top.
+    let (mem, disk, deadline, cycles, retries, poisoned, builders): (
+        i64,
+        i64,
+        i64,
+        i32,
+        i32,
+        bool,
+        Vec<String>,
+    ) = sqlx::query_as(
+        "SELECT floor_mem_bytes, floor_disk_bytes, floor_deadline_secs,
+                resubmit_cycles, retry_count, poisoned_at IS NOT NULL,
+                failed_builders
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind("takeoverA")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!((mem, disk, deadline), (0, 0, 0), "floors reset in-tx");
+    assert_eq!(
+        cycles, 0,
+        "no clear_poison_batch increment for the takeover row"
+    );
+    assert_eq!(retries, 0);
+    assert!(!poisoned, "poisoned_at cleared");
+    assert!(builders.is_empty(), "failed_builders cleared");
+    Ok(())
+}
+
+// r[verify sched.closure.witness-epoch]
+/// Round-16 bug_011 (durable arm): the creation upsert binds
+/// `closure_hole` with OR semantics, so without the merge transaction's
+/// definition-change clear a taken-over or displaced row keeps the dead
+/// epoch's flag and 069 witness rows in PG — and recovery would
+/// resurrect a witness about a definition that no longer exists,
+/// permanently heal-refusing the genuine one. Both definition-change
+/// classes reachable from a node-bearing merge are exercised: an
+/// authority takeover (squat retriable under budget) and a
+/// match-displacement (squat poison-locked at the limit).
+#[tokio::test]
+async fn test_definition_change_clears_persisted_closure_witness() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let (db, handle, _task) = setup().await;
+
+    let stage_hole = async |tag: &str| -> TestResult {
+        sqlx::query("UPDATE derivations SET closure_hole = true WHERE drv_hash = $1")
+            .bind(tag)
+            .execute(&db.pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO derivation_closure_missing (drv_hash, missing_child)
+             VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(tag)
+        .bind(format!("{tag}-junk-child"))
+        .execute(&db.pool)
+        .await?;
+        Ok(())
+    };
+    let witness_state = async |tag: &str| -> anyhow::Result<(bool, i64)> {
+        let flag: bool =
+            sqlx::query_scalar("SELECT closure_hole FROM derivations WHERE drv_hash = $1")
+                .bind(tag)
+                .fetch_one(&db.pool)
+                .await?;
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM derivation_closure_missing WHERE drv_hash = $1",
+        )
+        .bind(tag)
+        .fetch_one(&db.pool)
+        .await?;
+        Ok((flag, rows))
+    };
+
+    // Arm 1: authority takeover (resubmit-reset, squat under budget).
+    let out_c = test_store_path("weTakeC-out");
+    let mut squat = make_node("weTakeC");
+    squat.drv_content = b"Derive-weTakeC".to_vec();
+    squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![out_c.clone()];
+    merge_dag(&handle, Uuid::new_v4(), vec![squat], vec![], false).await?;
+    barrier(&handle).await;
+    stage_hole("weTakeC").await?;
+    assert!(handle.debug_force_poisoned("weTakeC", 1).await?);
+    assert_eq!(witness_state("weTakeC").await?, (true, 1), "staged");
+
+    let mut victim_node = make_node("weTakeC");
+    victim_node.expected_output_paths = vec![out_c.clone()];
+    merge_dag(&handle, Uuid::new_v4(), vec![victim_node], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        witness_state("weTakeC").await?,
+        (false, 0),
+        "takeover must clear the dead epoch's flag AND witness rows in the merge tx"
+    );
+
+    // Arm 2: match-displacement (squat poison-locked at the limit).
+    let out_d = test_store_path("weDispD-out");
+    let mut squat = make_node("weDispD");
+    squat.drv_content = b"Derive-weDispD".to_vec();
+    squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![out_d.clone()];
+    merge_dag(&handle, Uuid::new_v4(), vec![squat], vec![], false).await?;
+    barrier(&handle).await;
+    stage_hole("weDispD").await?;
+    assert!(
+        handle
+            .debug_force_poisoned("weDispD", POISON_RESUBMIT_RETRY_LIMIT)
+            .await?
+    );
+    assert_eq!(witness_state("weDispD").await?, (true, 1), "staged");
+
+    let mut victim_node = make_node("weDispD");
+    victim_node.expected_output_paths = vec![out_d.clone()];
+    merge_dag(&handle, Uuid::new_v4(), vec![victim_node], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        witness_state("weDispD").await?,
+        (false, 0),
+        "displacement must clear the dead epoch's flag AND witness rows in the merge tx"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-edge-scrub+2]
+/// End-to-end displaced-edge scrub: a poison-locked authoritative squat
+/// carries an attacker-attached dependency edge onto a junk node that can
+/// never complete. The victim's identity-matching store-backed submission
+/// match-displaces the squat; the fresh node must NOT inherit the
+/// squatter's dependency set — in memory (the victim build stays live and
+/// its node dispatches) or in PG (the parent-side `derivation_edges` row
+/// is deleted in the merge transaction, while the child-side row of a
+/// node that depends ON the displaced hash is preserved).
+#[tokio::test]
+async fn test_displacement_scrubs_squatter_edges_and_unblocks_victim() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let (db, handle, _task) = setup().await;
+    let squat_path = test_drv_path("edgeSquatA");
+    let squat_out = test_store_path("edgeSquatA-out");
+
+    // Squatter build: dependent → squat → junk. The squat carries
+    // authoritative bytes; the junk is the attacker's never-completing
+    // child; the dependent is a node that legitimately depends on the
+    // squatted hash (its edge must survive the scrub).
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("edgeSquatA");
+    squat.drv_content = b"Derive-edgeSquatA".to_vec();
+    squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![squat_out.clone()];
+    merge_dag(
+        &handle,
+        squatter,
+        vec![squat, make_node("edgeJunkA"), make_node("edgeDependentA")],
+        vec![
+            make_test_edge("edgeSquatA", "edgeJunkA"),
+            make_test_edge("edgeDependentA", "edgeSquatA"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Park the junk in a terminal failure state and the squat
+    // poison-locked (budget exhausted): the shape in which the squat is
+    // match-displaceable and its inherited edge would otherwise seed the
+    // fresh node DependencyFailed.
+    assert!(
+        handle
+            .debug_force_status("edgeJunkA", DerivationStatus::Poisoned)
+            .await?
+    );
+    assert!(
+        handle
+            .debug_force_poisoned("edgeSquatA", POISON_RESUBMIT_RETRY_LIMIT)
+            .await?
+    );
+
+    // Victim: store-backed submission with the SAME verifiable identity
+    // (shared expected output path) → match-displaces the locked squat.
+    let victim = Uuid::new_v4();
+    let mut victim_node = make_node("edgeSquatA");
+    victim_node.expected_output_paths = vec![squat_out.clone()];
+    merge_dag(&handle, victim, vec![victim_node], vec![], false).await?;
+    barrier(&handle).await;
+
+    // The victim build is live (pre-fix the inherited squat→junk edge
+    // seeded its node DependencyFailed and the build failed fast).
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "victim build must not inherit the squatter's dependency set"
+    );
+
+    // PG: the displaced derivation's parent-side edge is gone; the
+    // child-side edge (dependent → displaced hash) is preserved.
+    let (parent_side,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM derivation_edges e
+         JOIN derivations d ON d.derivation_id = e.parent_id
+         WHERE d.drv_path = $1",
+    )
+    .bind(&squat_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(parent_side, 0, "squat→junk edge row deleted in-tx");
+    let (child_side,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM derivation_edges e
+         JOIN derivations d ON d.derivation_id = e.child_id
+         WHERE d.drv_path = $1",
+    )
+    .bind(&squat_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(child_side, 1, "dependent→squat edge row preserved");
+
+    // The fresh node dispatches and completes — the hash is usable again
+    // and the victim build finishes.
+    let mut rx = connect_executor(&handle, "w-edge", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, squat_path, "displaced node dispatched");
+    complete_success(&handle, "w-edge", &squat_path, &squat_out).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "victim build completes on the displacing definition"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.edge-creation-scoped]
+/// End-to-end foreign-edge skip: build B joins build A's resident node X
+/// and tries to attach its own junk child to it. The junk edge must not
+/// reach the in-memory DAG or `derivation_edges`, and X's lifecycle (and
+/// build A's outcome) must be decided by A's declared dependency set
+/// only — the junk node stays B's problem.
+#[tokio::test]
+async fn test_foreign_junk_edge_not_attached_or_persisted() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let x_path = test_drv_path("fje-x");
+    let d_path = test_drv_path("fje-d");
+    let x_out = test_store_path("fje-x-out");
+    let d_out = test_store_path("fje-d-out");
+
+    // Build A: X depends on D (the legitimate definition of X's deps).
+    let build_a = Uuid::new_v4();
+    let mut x = make_node("fje-x");
+    x.expected_output_paths = vec![x_out.clone()];
+    let mut d = make_node("fje-d");
+    d.expected_output_paths = vec![d_out.clone()];
+    merge_dag(
+        &handle,
+        build_a,
+        vec![x, d],
+        vec![make_test_edge("fje-x", "fje-d")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Build B: joins X and attaches a junk child that can never be
+    // dispatched here (kvm-gated) — the cross-tenant interference shape.
+    let build_b = Uuid::new_v4();
+    let mut junk = make_node("fje-junk");
+    junk.required_features = vec!["kvm".into()];
+    merge_dag(
+        &handle,
+        build_b,
+        vec![make_node("fje-x"), junk],
+        vec![make_test_edge("fje-x", "fje-junk")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // PG: X→D persisted by build A; X→junk never persisted.
+    let count_edge = |parent: &'static str, child: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            let (n,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM derivation_edges e
+                 JOIN derivations p ON p.derivation_id = e.parent_id
+                 JOIN derivations c ON c.derivation_id = e.child_id
+                 WHERE p.drv_hash = $1 AND c.drv_hash = $2",
+            )
+            .bind(parent)
+            .bind(child)
+            .fetch_one(&pool)
+            .await
+            .expect("edge count query");
+            n
+        }
+    };
+    assert_eq!(
+        count_edge("fje-x", "fje-d").await,
+        1,
+        "legitimate edge persisted"
+    );
+    assert_eq!(
+        count_edge("fje-x", "fje-junk").await,
+        0,
+        "foreign junk edge must not reach derivation_edges"
+    );
+
+    // X dispatches once D completes — not parked behind the junk node.
+    // (Fresh worker per assignment: the harness pattern for chained
+    // dispatches, mirroring the maybe_resolve_ca tests.)
+    let mut rx = connect_executor(&handle, "w-fje", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assn.drv_path, d_path,
+        "D (the real dependency) dispatches first"
+    );
+    complete_success(&handle, "w-fje", &d_path, &d_out).await?;
+    barrier(&handle).await;
+    let mut rx2 = connect_executor(&handle, "w-fje-2", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx2).await;
+    assert_eq!(
+        assn.drv_path, x_path,
+        "X ready as soon as ITS dependency completed"
+    );
+    complete_success(&handle, "w-fje-2", &x_path, &x_out).await?;
+    barrier(&handle).await;
+
+    // Build A finishes; build B is still waiting on its own junk node.
+    assert_eq!(
+        query_status(&handle, build_a).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "build A unaffected by build B's junk edge attempt"
+    );
+    assert_eq!(
+        query_status(&handle, build_b).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "build B keeps waiting on its own junk node"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-edge-scrub+2]
+/// End-to-end authority-takeover edge scrub: a parked (still retriable)
+/// authoritative squat carries an attacker-attached dependency edge onto
+/// a junk node. The victim's identity-matching store-backed resubmission
+/// takes the definition over through the resubmit-reset; the taken-over
+/// node must NOT inherit the squatter's dependency set — in memory (the
+/// victim build stays live and the node dispatches) or in PG (the
+/// parent-side `derivation_edges` row is deleted in the merge
+/// transaction; the child-side row of a node depending ON the hash is
+/// preserved) — while the squatter build's interest and link carry over
+/// (a takeover, unlike displacement, keeps prior interest).
+#[tokio::test]
+async fn test_takeover_scrubs_squatter_edges_and_unblocks_victim() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let squat_path = test_drv_path("tkSquatA");
+    let squat_out = test_store_path("tkSquatA-out");
+
+    // Squatter build: dependent → squat → junk, squat authoritative.
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("tkSquatA");
+    squat.drv_content = b"Derive-tkSquatA".to_vec();
+    squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![squat_out.clone()];
+    merge_dag(
+        &handle,
+        squatter,
+        vec![squat, make_node("tkJunkA"), make_node("tkDependentA")],
+        vec![
+            make_test_edge("tkSquatA", "tkJunkA"),
+            make_test_edge("tkDependentA", "tkSquatA"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Junk parked terminally failed; squat parked Poisoned UNDER budget
+    // (still retriable on resubmit → the takeover path, not displacement).
+    assert!(
+        handle
+            .debug_force_status("tkJunkA", DerivationStatus::Poisoned)
+            .await?
+    );
+    assert!(handle.debug_force_poisoned("tkSquatA", 1).await?);
+
+    // Victim: identity-matching store-backed resubmission (same declared
+    // output path) → authority takeover.
+    let victim = Uuid::new_v4();
+    let mut victim_node = make_node("tkSquatA");
+    victim_node.expected_output_paths = vec![squat_out.clone()];
+    merge_dag(&handle, victim, vec![victim_node], vec![], false).await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "victim build must not inherit the squatter's dependency set"
+    );
+
+    // PG: parent-side edge gone, child-side edge preserved.
+    let (parent_side,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM derivation_edges e
+         JOIN derivations d ON d.derivation_id = e.parent_id
+         WHERE d.drv_path = $1",
+    )
+    .bind(&squat_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(parent_side, 0, "squat→junk edge row deleted in-tx");
+    let (child_side,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM derivation_edges e
+         JOIN derivations d ON d.derivation_id = e.child_id
+         WHERE d.drv_path = $1",
+    )
+    .bind(&squat_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(child_side, 1, "dependent→squat edge row preserved");
+
+    // Takeover (not displacement): BOTH builds stay linked to the row.
+    let (links,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM build_derivations bd
+         JOIN derivations d ON d.derivation_id = bd.derivation_id
+         WHERE d.drv_path = $1",
+    )
+    .bind(&squat_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        links, 2,
+        "squatter and victim both linked (interest carried)"
+    );
+
+    // The taken-over node dispatches and completes — the victim build
+    // finishes on the new definition.
+    let mut rx = connect_executor(&handle, "w-tk", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, squat_path, "taken-over node dispatched");
+    complete_success(&handle, "w-tk", &squat_path, &squat_out).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "victim build completes on the taken-over definition"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-failure-reset+2]
+/// The reaped-row variant of the authority takeover: the authoritative
+/// squat's in-memory node is long gone (reaped with its terminal build),
+/// but its row — ratcheted floors, consumed budget, stale authoritative
+/// bytes — still exists. A later store-backed submission of the same
+/// drv_hash is a plain fresh insert in memory; the row-level
+/// definition-change detector still fires (prior content present,
+/// incoming content NULL), so the row is reset in the same transaction
+/// and the fresh in-memory node is not hydrated with the squat's floors.
+#[tokio::test]
+async fn test_reaped_authoritative_squat_row_resets_on_fresh_store_backed_merge() -> TestResult {
+    let (db, handle, _task) = setup().await;
+
+    // Pre-seed the authoritative-origin row directly (no in-memory node).
+    sqlx::query(
+        "INSERT INTO derivations
+             (drv_hash, drv_path, system, status, is_fixed_output, is_ca,
+              output_names, expected_output_paths, drv_content,
+              floor_mem_bytes, floor_disk_bytes, floor_deadline_secs,
+              poisoned_at, failed_builders, retry_count, resubmit_cycles)
+         VALUES ($1, $2, 'x86_64-linux', 'cancelled', false, true,
+                 ARRAY['out'], ARRAY[]::text[], $3,
+                 8589934592, 34359738368, 86400,
+                 now(), ARRAY['w1','w2'], 3, 2)",
+    )
+    .bind("reapedA")
+    .bind(test_drv_path("reapedA"))
+    .bind(b"Derive-reapedA".as_slice())
+    .execute(&db.pool)
+    .await?;
+
+    // Fresh store-backed submission for the same hash.
+    let build = Uuid::new_v4();
+    merge_dag(&handle, build, vec![make_node("reapedA")], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Row: reset by the definition-change detector inside the upsert.
+    let (mem, cycles, poisoned, content): (i64, i32, bool, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT floor_mem_bytes, resubmit_cycles, poisoned_at IS NOT NULL, drv_content
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind("reapedA")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(mem, 0, "floor reset on the reaped-row takeover");
+    assert_eq!(cycles, 0, "budget reset");
+    assert!(!poisoned, "poisoned_at cleared");
+    assert_eq!(content, None, "stale authoritative bytes cleared");
+
+    // In-memory: the fresh node keeps zero floors (RETURNING already
+    // carries the reset values, so the I-208 hydration cannot resurrect
+    // the squat's sizing).
+    let info = expect_drv(&handle, "reapedA").await;
+    assert_eq!(
+        info.sched.resource_floor.mem_bytes, 0,
+        "fresh node not hydrated with the reaped squat's floors"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// End-to-end auth-vs-auth displacement: a poison-locked authoritative
+/// squat must not lock a later authoritative (hook-fallback) submission
+/// of byte-different content out of the hash for the rest of its poison
+/// TTL. The victim's submission displaces the locked squat: the victim
+/// build does not fail-fast, the persisted row carries the victim's
+/// bytes with its failure accounting reset in the same transaction, the
+/// squatter's still-running build loses its durable link, and the
+/// dispatched assignment carries the victim's content — which then
+/// completes the victim build.
+#[tokio::test]
+async fn test_authoritative_displacement_unblocks_hook_fallback_victim() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let (db, handle, _task) = setup().await;
+    let squat_drv_path = test_drv_path("squatH");
+    let squat_out = test_store_path("squatH-out");
+
+    // The squatter: an authoritative content-bound claim, then
+    // poison-locked (budget exhausted) — it can never run again.
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("squatH");
+    squat.drv_content = b"Derive-squatH".to_vec();
+    squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![squat_out.clone()];
+    merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+    barrier(&handle).await;
+    assert!(
+        handle
+            .debug_force_poisoned("squatH", POISON_RESUBMIT_RETRY_LIMIT)
+            .await?,
+        "squat parked Poisoned over budget"
+    );
+
+    // The victim: the legitimate hook fallback for the same drv_hash —
+    // authoritative, byte-different content (the squatter's bytes were
+    // never the real derivation).
+    let victim = Uuid::new_v4();
+    let mut victim_node = make_node("squatH");
+    victim_node.drv_content = b"Derive-victimH".to_vec();
+    victim_node.drv_content_authoritative = true;
+    victim_node.expected_output_paths = vec![squat_out.clone()];
+    merge_dag(&handle, victim, vec![victim_node], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Not captured by the locked squat: the victim build is live and the
+    // fresh node carries the victim's definition.
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "victim build must not fail-fast on the locked squat"
+    );
+    let info = expect_drv(&handle, "squatH").await;
+    assert_ne!(info.status, DerivationStatus::Poisoned, "fresh node");
+
+    // Persisted row: the victim's bytes, with the squat's failure
+    // accounting reset inside the merge transaction.
+    let (content, cycles, poisoned): (Option<Vec<u8>>, i32, bool) = sqlx::query_as(
+        "SELECT drv_content, resubmit_cycles, poisoned_at IS NOT NULL
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind("squatH")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        content.as_deref(),
+        Some(b"Derive-victimH".as_slice()),
+        "row refreshed to the victim's authoritative bytes"
+    );
+    assert_eq!(cycles, 0, "displaced row's poison budget reset");
+    assert!(!poisoned, "displaced row's poisoned_at cleared");
+
+    // The squatter's still-running build no longer counts the displaced
+    // hash (durable prune): only the victim keeps a link.
+    let linked: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT bd.build_id FROM build_derivations bd \
+         JOIN derivations d ON d.derivation_id = bd.derivation_id \
+         WHERE d.drv_path = $1",
+    )
+    .bind(&squat_drv_path)
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        linked,
+        vec![victim],
+        "squatter's link pruned, victim's kept"
+    );
+
+    // The displaced fresh node dispatches with the VICTIM's content and
+    // completes — the hash is usable again.
+    let mut rx = connect_executor(&handle, "w-auth", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, squat_drv_path, "displaced node dispatched");
+    assert_eq!(
+        assn.drv_content,
+        b"Derive-victimH".to_vec(),
+        "assignment carries the displacing definition's bytes, not the squat's"
+    );
+    complete_success(&handle, "w-auth", &squat_drv_path, &squat_out).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "victim build completes on the displacing definition"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// When the displaced result had NOT been received by a still-running
+/// prior build, the prune removes the slot from the build's absolute
+/// totals — in the same transaction durably (`builds.total_drvs`) and in
+/// memory — so the build can still finish with `completed == total`
+/// instead of being stuck forever at N-1 of N.
+#[tokio::test]
+async fn test_displacement_decrements_running_build_total_for_unreceived_result() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let (db, handle, _task) = setup().await;
+
+    // The squatter's own build carries the squat plus one node of its
+    // own. The squat is authoritative and parks poison-locked without
+    // ever delivering a result to the build.
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("squatT");
+    squat.drv_content = b"Derive-squatT".to_vec();
+    squat.drv_content_authoritative = true;
+    merge_dag(
+        &handle,
+        squatter,
+        vec![squat, make_node("fillerT")],
+        vec![],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, squatter).await?.total_derivations,
+        2,
+        "two slots before displacement"
+    );
+    assert!(
+        handle
+            .debug_force_poisoned("squatT", POISON_RESUBMIT_RETRY_LIMIT)
+            .await?,
+        "squat parked Poisoned over budget"
+    );
+
+    // The displacer: conflicting verifiable identity (different system)
+    // displaces the locked squat.
+    let displacer = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        displacer,
+        vec![make_test_node("squatT", "aarch64-linux")],
+        vec![],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Durable half: builds.total_drvs dropped with the prune, inside the
+    // displacing merge's transaction.
+    let (total_drvs,): (i32,) = sqlx::query_as("SELECT total_drvs FROM builds WHERE build_id = $1")
+        .bind(squatter)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        total_drvs, 1,
+        "persisted total decremented for the unreceived displaced result"
+    );
+    // In-memory half: the served total shrank with the slot.
+    let status = query_status(&handle, squatter).await?;
+    assert_eq!(status.total_derivations, 1, "served total decremented");
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "prior build stays live on its own remaining node"
+    );
+
+    // The prior build finishes consistently: its remaining node is the
+    // only x86_64 work (the displaced fresh node is aarch64-only), and
+    // completing it ends the build at completed == total == 1.
+    let mut rx = connect_executor(&handle, "w-total", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, test_drv_path("fillerT"));
+    complete_success(
+        &handle,
+        "w-total",
+        &test_drv_path("fillerT"),
+        &test_store_path("fillerT-out"),
+    )
+    .await?;
+    barrier(&handle).await;
+    let status = query_status(&handle, squatter).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "prior build completes after the displaced slot is removed"
+    );
+    assert_eq!(status.total_derivations, 1);
+    assert_eq!(status.completed_derivations, 1);
+    let counts: (i32, i32) =
+        sqlx::query_as("SELECT total_drvs, completed_drvs FROM builds WHERE build_id = $1")
+            .bind(squatter)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(counts, (1, 1), "persisted counts agree at terminal");
+    Ok(())
+}
+
+// r[verify sched.build.terminal-status-settled+2]
+/// A build that already finished keeps serving its settled progress after
+/// one of its nodes is displaced: QueryBuildStatus short-circuits on the
+/// terminal state and serves the frozen counts instead of recomputing
+/// them from the mutated DAG (which no longer carries the build's
+/// interest on the fresh node).
+#[tokio::test]
+async fn test_terminal_build_status_settled_after_displacement() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let squat_path = test_drv_path("squatU");
+
+    // The squatter build completes normally: 1/1, Succeeded, counts
+    // persisted and frozen at the terminal transition.
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("squatU");
+    squat.drv_content = b"Derive-squatU".to_vec();
+    squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![test_store_path("squatU-out")];
+    merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+    let mut rx = connect_executor(&handle, "w-settled", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, squat_path);
+    complete_success(
+        &handle,
+        "w-settled",
+        &squat_path,
+        &test_store_path("squatU-out"),
+    )
+    .await?;
+    wait_for_status(&handle, "squatU", DerivationStatus::Completed).await;
+    let before = query_status(&handle, squatter).await?;
+    assert_eq!(before.state, rio_proto::types::BuildState::Succeeded as i32);
+    assert_eq!(
+        (before.total_derivations, before.completed_derivations),
+        (1, 1)
+    );
+
+    // Force the node into a terminal FAILURE state (cfg-test injection —
+    // a Completed node is never displaceable under
+    // sched.merge.authoritative-conflict+6, so the displacement below
+    // needs a poison-parked target; the finished build's settled
+    // accounting must be indifferent to either mutation).
+    assert!(
+        handle
+            .debug_force_status("squatU", DerivationStatus::Poisoned)
+            .await?,
+        "node still resident for the poison flip"
+    );
+
+    // A conflicting store-backed submission displaces the poison-parked
+    // node while the finished build is still resident in its cleanup
+    // window.
+    let displacer = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        displacer,
+        vec![make_test_node("squatU", "aarch64-linux")],
+        vec![],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // The finished build's served progress is settled history — not a
+    // live recompute over a DAG that no longer counts the node for it.
+    let after = query_status(&handle, squatter).await?;
+    assert_eq!(
+        after.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "terminal state unchanged"
+    );
+    assert_eq!(
+        (after.total_derivations, after.completed_derivations),
+        (1, 1),
+        "served counts stay settled after the displacement"
+    );
+    assert_eq!(after.failed_derivations, 0);
+    assert_eq!(after.running_derivations, 0);
+    // Persisted counts were already frozen by the terminal guard.
+    let counts: (i32, i32) =
+        sqlx::query_as("SELECT total_drvs, completed_drvs FROM builds WHERE build_id = $1")
+            .bind(squatter)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(counts, (1, 1), "persisted counts untouched");
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-failure-evidence]
+// r[verify sched.build.failure-evidence-at-source+1]
+/// Two independent layers keep a displaced failure's evidence durable:
+/// the at-source persist (fires the moment the failure is observed) and
+/// the in-transaction backstop (rides the displacing merge's link
+/// prune). This test pins BOTH: the evidence is durable before the
+/// displacement (at-source), and — after artificially erasing it to
+/// simulate a lost at-source write — the displacement transaction
+/// independently re-persists it (backstop). The build's live outcome is
+/// unchanged either way: it still ends Failed once its remaining
+/// derivations resolve.
+#[tokio::test]
+async fn test_displacement_persists_prior_build_failure_evidence() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let squat_path = test_drv_path("squatW");
+
+    // keep_going build: an authoritative x86_64 node that will fail, plus
+    // its own aarch64 node so the build keeps running afterwards.
+    let watcher = Uuid::new_v4();
+    let mut squat = make_node("squatW");
+    squat.drv_content = b"Derive-squatW".to_vec();
+    squat.drv_content_authoritative = true;
+    merge_dag(
+        &handle,
+        watcher,
+        vec![squat, make_test_node("fillerW", "aarch64-linux")],
+        vec![],
+        true,
+    )
+    .await?;
+
+    // The squat fails permanently on a real worker → the watcher records
+    // its sticky first failure and (keep_going) stays Active.
+    let mut rx = connect_executor(&handle, "w-evi", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assn.drv_path, squat_path,
+        "squat dispatched to the x86 worker"
+    );
+    complete_failure(
+        &handle,
+        "w-evi",
+        &squat_path,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "builder exploded",
+    )
+    .await?;
+    wait_for_status(&handle, "squatW", DerivationStatus::Poisoned).await;
+    assert_eq!(
+        query_status(&handle, watcher).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "keep_going build stays live after the failure"
+    );
+    // Layer 1 — at-source: the evidence is ALREADY durable, in the same
+    // actor turn the failure was observed, before any eraser runs.
+    let (pre,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(watcher)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        pre.as_deref(),
+        Some("derivation squatW failed"),
+        "at-source layer: evidence persisted the moment the failure was observed"
+    );
+
+    // Simulate a lost at-source write (PG blip at observation time +
+    // no successful retry yet) so the backstop below is verified
+    // INDEPENDENTLY of the at-source layer. Note: in-memory state still
+    // believes the evidence is durable (write-suppression flag), which
+    // is exactly the situation the in-tx backstop exists for.
+    sqlx::query("UPDATE builds SET error_summary = NULL WHERE build_id = $1")
+        .bind(watcher)
+        .execute(&db.pool)
+        .await?;
+
+    // Layer 2 — the in-tx backstop: a conflicting store-backed
+    // submission displaces the poisoned squat; the watcher's link (its
+    // only failed-node link) is pruned, and the same transaction
+    // re-persists the failure evidence even though the at-source copy
+    // was lost.
+    let displacer = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        displacer,
+        vec![make_test_node("squatW", "riscv64-linux")],
+        vec![],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    let (evidence,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(watcher)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        evidence.as_deref(),
+        Some("derivation squatW failed"),
+        "backstop layer: first-failure evidence re-persisted in the \
+         displacing merge's transaction, independent of the at-source layer"
+    );
+
+    // Live outcome unchanged: completing the watcher's remaining node
+    // ends the build Failed (sticky failure), not Succeeded.
+    let mut rx2 = connect_executor(&handle, "w-evi-arm", "aarch64-linux").await?;
+    let assn = recv_assignment(&mut rx2).await;
+    assert_eq!(assn.drv_path, test_drv_path("fillerW"));
+    complete_success(
+        &handle,
+        "w-evi-arm",
+        &test_drv_path("fillerW"),
+        &test_store_path("fillerW-out"),
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, watcher).await?.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "keep_going build still ends Failed after the displacement"
+    );
+    Ok(())
+}
+
+// r[verify sched.build.failure-evidence-at-source+1]
+/// The in-tx evidence backstop covers BOTH non-displacement destructive
+/// removals: the same-definition resubmit-reset and the authority
+/// takeover. Staging simulates a lost at-source write (NULL out the
+/// persisted evidence after the failure), then lets the resubmitting
+/// merge run — its transaction must independently re-persist the prior
+/// build's evidence while resetting the row, the resubmitter must not
+/// inherit any false evidence, and the prior build stays Active.
+#[rstest::rstest]
+#[case::same_definition(false)]
+#[case::authority_takeover(true)]
+#[tokio::test]
+async fn test_resubmit_reset_persists_prior_build_failure_evidence(
+    #[case] takeover: bool,
+) -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let tag = if takeover { "rrpA" } else { "rrpB" };
+    let out = test_store_path(&format!("{tag}-out"));
+
+    // The prior build (keep_going): the node that will fail + a filler
+    // on another arch so the build stays Active throughout.
+    let watcher = Uuid::new_v4();
+    let mut node = make_node(tag);
+    node.expected_output_paths = vec![out.clone()];
+    if takeover {
+        // Authoritative content-bound claim → the store-backed
+        // resubmission below takes the authority-takeover arm.
+        node.drv_content = format!("Derive-{tag}").into_bytes();
+        node.drv_content_authoritative = true;
+    }
+    merge_dag(
+        &handle,
+        watcher,
+        vec![
+            node,
+            make_test_node(&format!("{tag}-fill"), "aarch64-linux"),
+        ],
+        vec![],
+        true,
+    )
+    .await?;
+
+    // Real failure on a worker → at-source evidence + Poisoned (under
+    // budget → retriable on resubmit).
+    let mut rx = connect_executor(&handle, "w-rrp", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, test_drv_path(tag));
+    complete_failure(
+        &handle,
+        "w-rrp",
+        &test_drv_path(tag),
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "builder exploded",
+    )
+    .await?;
+    wait_for_status(&handle, tag, DerivationStatus::Poisoned).await;
+    drop(rx);
+
+    // Simulate a lost at-source write so the in-tx backstop is verified
+    // independently.
+    sqlx::query("UPDATE builds SET error_summary = NULL WHERE build_id = $1")
+        .bind(watcher)
+        .execute(&db.pool)
+        .await?;
+
+    // The resubmitter: store-backed submission of the same definition
+    // (same expected output path = the verifiable identity). For the
+    // takeover case the prior node was authoritative, so this is an
+    // authority takeover; for the plain case it is a same-definition
+    // resubmit-reset. Both reset the row's failure state in the same
+    // transaction that must re-persist the watcher's evidence.
+    let resubmitter = Uuid::new_v4();
+    let mut renode = make_node(tag);
+    renode.expected_output_paths = vec![out.clone()];
+    merge_dag(&handle, resubmitter, vec![renode], vec![], false).await?;
+    barrier(&handle).await;
+
+    // The eraser ran: the row no longer carries the failure state.
+    let (status, poisoned): (String, bool) = sqlx::query_as(
+        "SELECT status, poisoned_at IS NOT NULL FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(tag)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_ne!(
+        status, "poisoned",
+        "fixture premise: the reset erased the row's status"
+    );
+    assert!(!poisoned, "fixture premise: the reset cleared poisoned_at");
+
+    // The backstop fired: the watcher's evidence was re-persisted INSIDE
+    // the resetting merge's transaction.
+    let (evidence,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(watcher)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        evidence.as_deref(),
+        Some(format!("derivation {tag} failed").as_str()),
+        "in-tx backstop re-persisted the prior build's evidence on the \
+         resubmit-reset/takeover path"
+    );
+
+    // The resubmitter has no false evidence and the watcher stays Active.
+    let (resub_evidence,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(resubmitter)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        resub_evidence, None,
+        "the resubmitting build must not inherit the prior build's evidence"
+    );
+    assert_eq!(
+        query_status(&handle, watcher).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "the prior keep_going build stays Active (its filler is still pending)"
+    );
+    Ok(())
+}
+
+// ===========================================================================
+// Merge-time store-evidence displacement (sched.merge.store-evidence-displacement+3)
+// ===========================================================================
+
+/// Stage a settled content-bound squat at `drv_hash` and reap it: build,
+/// complete, terminal-cleanup. Afterwards only the PG row remains.
+async fn settle_and_reap_squat(
+    handle: &ActorHandle,
+    worker: &str,
+    drv_hash: &str,
+) -> anyhow::Result<Uuid> {
+    let squatter = Uuid::new_v4();
+    let squat = rio_proto::types::DerivationNode {
+        drv_path: drv_hash.to_owned(),
+        drv_hash: drv_hash.to_owned(),
+        pname: "squat".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        expected_output_paths: vec![test_store_path("squat-out")],
+        drv_content: b"Derive-squat-bytes".to_vec(),
+        drv_content_authoritative: true,
+        ..Default::default()
+    };
+    merge_dag(handle, squatter, vec![squat], vec![], false).await?;
+    let mut rx = connect_executor(handle, worker, "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, drv_hash);
+    complete_success(handle, worker, drv_hash, &test_store_path("squat-out")).await?;
+    wait_for_status(handle, drv_hash, DerivationStatus::Completed).await;
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: squatter })
+        .await?;
+    barrier(handle).await;
+    assert!(
+        handle.debug_query_derivation(drv_hash).await?.is_none(),
+        "squat reaped from the DAG; only the settled row remains"
+    );
+    Ok(squatter)
+}
+
+// r[verify sched.merge.store-evidence-displacement+3]
+// r[verify sched.persist.settled-identity-freeze+4]
+/// THE bug_076 self-service kill test, row-only form: an authoritative
+/// squat settles at the victim's text-CA `drv_path` and is reaped; the
+/// victim uploads its genuine `.drv` to the store and resubmits
+/// store-backed. The merge-time store-evidence check verifies the claim
+/// against the store's bytes, displaces the settled squat through the
+/// upsert carve-out, and the victim's build dispatches — no operator
+/// involved. The squatter's own build keeps its settled (succeeded)
+/// accounting.
+#[tokio::test]
+async fn test_store_evidence_displaces_settled_squat() -> TestResult {
+    let (db, store, handle, _task) = setup_with_mock_store().await?;
+    let (victim_node, aterm, _out) = mint_text_ca_leaf("evi-displace");
+    let drv_path = victim_node.drv_path.clone();
+
+    let squatter = settle_and_reap_squat(&handle, "w1", &drv_path).await?;
+
+    // The victim's genuine .drv is in the store (text-CA-bound bytes).
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+
+    // Store-backed resubmission of the genuine identity.
+    let victim = Uuid::new_v4();
+    merge_dag(&handle, victim, vec![victim_node.clone()], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Admitted and active — not FAILED_PRECONDITION.
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "verified claim admitted"
+    );
+    // The row was rewritten to the verified identity in the same merge:
+    // fresh lifecycle, victim's declared outputs, store-verified rank.
+    let (status, expected, rank): (String, Vec<String>, String) = sqlx::query_as(
+        "SELECT status, expected_output_paths, evidence_rank \
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(&drv_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_ne!(status, "completed", "settled squat record erased");
+    assert_eq!(
+        expected, victim_node.expected_output_paths,
+        "row carries the victim's verified outputs"
+    );
+    assert_eq!(rank, "path_bound_bytes", "store-verified rank persisted");
+
+    // The victim's build dispatches on the fresh node.
+    let mut rx2 = connect_executor(&handle, "w2", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx2).await;
+    assert_eq!(assn.drv_path, drv_path, "victim's definition dispatched");
+
+    // The squatter's BUILD row keeps its settled accounting — the
+    // displacement erases the derivation record, not build history.
+    let (squat_build_status,): (String,) =
+        sqlx::query_as("SELECT status FROM builds WHERE build_id = $1")
+            .bind(squatter)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(squat_build_status, "succeeded");
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement+3]
+/// Resident form: the settled authoritative squat is still in the DAG
+/// (not yet reaped). The store-evidence check raises the verified
+/// claimant to path-bound standing and the displacement primitive — not
+/// a parallel path — erases the squat (ContentBoundClaim < the raised
+/// PathBoundBytes).
+#[tokio::test]
+async fn test_store_evidence_displaces_settled_resident_squat() -> TestResult {
+    let (db, store, handle, _task) = setup_with_mock_store().await?;
+    let (victim_node, aterm, _out) = mint_text_ca_leaf("evi-resident");
+    let drv_path = victim_node.drv_path.clone();
+
+    // Squat settles but stays resident.
+    let squatter = Uuid::new_v4();
+    let squat = rio_proto::types::DerivationNode {
+        drv_path: drv_path.clone(),
+        drv_hash: drv_path.clone(),
+        pname: "squat".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        expected_output_paths: vec![test_store_path("resident-squat-out")],
+        drv_content: b"Derive-resident-squat".to_vec(),
+        drv_content_authoritative: true,
+        ..Default::default()
+    };
+    merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+    let mut rx = connect_executor(&handle, "w1", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, drv_path);
+    complete_success(
+        &handle,
+        "w1",
+        &drv_path,
+        &test_store_path("resident-squat-out"),
+    )
+    .await?;
+    wait_for_status(&handle, &drv_path, DerivationStatus::Completed).await;
+
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+
+    let victim = Uuid::new_v4();
+    merge_dag(&handle, victim, vec![victim_node.clone()], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "verified claim displaces the resident settled squat"
+    );
+    // The fresh in-memory node carries the victim's identity.
+    let d = handle
+        .debug_query_derivation(&drv_path)
+        .await?
+        .expect("displacing node resident");
+    assert_ne!(
+        d.status,
+        DerivationStatus::Completed,
+        "squat's settled status gone — fresh lifecycle"
+    );
+    let (rank,): (String,) =
+        sqlx::query_as("SELECT evidence_rank FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(rank, "path_bound_bytes");
+
+    // Victim dispatches.
+    let mut rx2 = connect_executor(&handle, "w2", "x86_64-linux").await?;
+    let assn2 = recv_assignment(&mut rx2).await;
+    assert_eq!(assn2.drv_path, drv_path);
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement+3]
+/// THE bug_072 kill (resident settled bare x bare squat cell; depth-3
+/// fix-child of 9d83580f6 <- 1c8cc6877 <- f0a8ffcc9): a bare squat at
+/// the victim's drv_path settles as a CACHE HIT (forged expected
+/// outputs pre-seeded in the store; never dispatched, so it stays
+/// UnverifiedClaim) and remains DAG-resident. Pre-fix, the genuine
+/// owner's conflicting store-backed submission was silently JOINED
+/// through the gate's store-backed exemption — handed the squat's
+/// forged outputs as a DerivationCached result. Post-fix: Step 0.6
+/// scans bare settled victims, the store proves the genuine claim,
+/// and the displacement primitive erases the squat.
+#[tokio::test]
+async fn test_store_evidence_displaces_settled_bare_squat() -> TestResult {
+    let (db, store, handle, _task) = setup_with_mock_store().await?;
+    let (victim_node, aterm, _out) = mint_text_ca_leaf("evi-bare-squat");
+    let drv_path = victim_node.drv_path.clone();
+
+    // Bare squat: same hash key, FORGED output path (pre-seeded so the
+    // cache check settles it without any build), conflicting with the
+    // genuine identity (the genuine .drv derives a different out path).
+    let forged_out = test_store_path("bare-squat-forged-out");
+    store.seed_with_content(&forged_out, b"forged");
+    let squat = rio_proto::types::DerivationNode {
+        drv_path: drv_path.clone(),
+        drv_hash: drv_path.clone(),
+        pname: "bare-squat".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        expected_output_paths: vec![forged_out.clone()],
+        ..Default::default()
+    };
+    let squatter = Uuid::new_v4();
+    merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, squatter).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "squat settles as a cache hit (never dispatched: UnverifiedClaim)"
+    );
+    let resident = handle
+        .debug_query_derivation(&drv_path)
+        .await?
+        .expect("squat resident");
+    assert!(
+        matches!(
+            resident.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "squat is settled and resident"
+    );
+    let (squat_rank,): (String,) =
+        sqlx::query_as("SELECT evidence_rank FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        squat_rank, "unverified_claim",
+        "cache-hit squat never gained byte-bound standing"
+    );
+
+    // Genuine owner: uploads the real .drv and resubmits store-backed.
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+    let victim = Uuid::new_v4();
+    merge_dag(&handle, victim, vec![victim_node.clone()], vec![], false).await?;
+    barrier(&handle).await;
+
+    // NOT a silent join onto the forged outputs: the squat is
+    // displaced and the genuine build proceeds on a fresh node.
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "genuine claim displaces the bare squat instead of joining it"
+    );
+    let d = handle
+        .debug_query_derivation(&drv_path)
+        .await?
+        .expect("displacing node resident");
+    assert_ne!(
+        d.status,
+        DerivationStatus::Completed,
+        "fresh lifecycle — not the squat's settled state"
+    );
+    assert_ne!(
+        d.output_paths,
+        vec![forged_out.clone()],
+        "the genuine node does not carry the forged output claim"
+    );
+    let (rank, pname): (String, String) =
+        sqlx::query_as("SELECT evidence_rank, pname FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(rank, "path_bound_bytes", "store-verified standing");
+    assert_ne!(pname, "bare-squat", "squat row identity displaced");
+    Ok(())
+}
+
+// r[verify sched.persist.settled-identity-freeze+4]
+/// THE merged_bug_038 kill on the HYDRATED row path: Step 0.5 loads
+/// the settled row from PG (load_settled_identity_rows — the
+/// post-reap / post-failover surface) and the M_070 bases admit the
+/// re-presentation. The row is planted via SQL in the exact shape the
+/// strip writers leave behind (live NULL + preserved set + every
+/// expected path empty + byte-anchored rank — pinned against the real
+/// writers by the c1 strip tests), so this covers the full
+/// row -> loader -> matcher -> Step 0.5 counter chain that the unit
+/// matcher tests exercise only with constructed rows. Pre-fix BOTH
+/// cells terminated in SettledIdentityConflict (zero classical
+/// evidence against a byte-anchored row).
+#[tokio::test]
+async fn test_hydrated_stripped_row_rejoins_via_m070_bases() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (db, handle, _task) = setup().await;
+
+    let preserved = [0xCC_u8; 32];
+    let plant = |tag: &str| {
+        let pool = db.pool.clone();
+        let tag = tag.to_owned();
+        async move {
+            let drv_path = rio_test_support::fixtures::test_drv_path(&tag);
+            sqlx::query(
+                "INSERT INTO derivations \
+                 (drv_hash, drv_path, pname, system, status, output_names, \
+                  expected_output_paths, is_ca, ca_modular_hash, \
+                  ca_modular_hash_stripped, evidence_rank) \
+                 VALUES ($1, $2, $3, 'x86_64-linux', 'completed', \
+                         ARRAY['out'], ARRAY[''], TRUE, NULL, $4, \
+                         'path_bound_bytes')",
+            )
+            .bind(&tag)
+            .bind(&drv_path)
+            .bind(&tag)
+            .bind(preserved.as_slice())
+            .execute(&pool)
+            .await
+            .map(|_| ())
+        }
+    };
+
+    // Cell 1: byte-equal re-presentation (the gateway recomputes the
+    // same declared value) -> PreservedClaim.
+    plant("hyd-pc").await?;
+    let mut represent = make_node("hyd-pc");
+    represent.is_content_addressed = true;
+    represent.expected_output_paths = vec![String::new()];
+    represent.ca_modular_hash = preserved.to_vec();
+    let b1 = Uuid::new_v4();
+    merge_dag(&handle, b1, vec![represent], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, b1).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "byte-equal preserved claim rejoins the hydrated row"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_merge_stripped_rejoin_total{basis=preserved_claim}"),
+        1,
+        "rejoin counted on the preserved_claim basis"
+    );
+
+    // Cell 2: hash-less re-presentation (the gateway DEGRADED — no
+    // declared value) -> DualAnchor on the byte-anchored rank.
+    plant("hyd-da").await?;
+    let mut bare = make_node("hyd-da");
+    bare.is_content_addressed = true;
+    bare.expected_output_paths = vec![String::new()];
+    let b2 = Uuid::new_v4();
+    merge_dag(&handle, b2, vec![bare], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, b2).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "hash-less re-presentation rejoins via the dual anchor"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_merge_stripped_rejoin_total{basis=dual_anchor}"),
+        1,
+        "rejoin counted on the dual_anchor basis"
+    );
+
+    // The rejoined re-creations REFRESH the rows (fresh lifecycle) —
+    // and the preserved claim is CARRIED FORWARD by the upsert
+    // (test_preserved_stripped_hash_supersede_carry_and_move pins the
+    // conflict arm), so a second strip-shaped lifecycle stays
+    // matchable too.
+    let (status, carried): (String, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT status, ca_modular_hash_stripped FROM derivations WHERE drv_hash = 'hyd-da'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_ne!(status, "completed", "fresh lifecycle after rejoin");
+    assert_eq!(
+        carried.as_deref(),
+        Some(preserved.as_slice()),
+        "preserved claim carried forward through the re-creation"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement+3]
+/// A claim the store's own bytes CONTRADICT is rejected outright — the
+/// fetched `.drv` is text-CA-bound to the declared path, so the
+/// contradiction is content-bound truth, not transport noise. The
+/// settled record stays.
+#[tokio::test]
+async fn test_store_evidence_mismatch_rejects_submission() -> TestResult {
+    let (db, store, handle, _task) = setup_with_mock_store().await?;
+    let (victim_node, aterm, _out) = mint_text_ca_leaf("evi-mismatch");
+    let drv_path = victim_node.drv_path.clone();
+
+    settle_and_reap_squat(&handle, "w1", &drv_path).await?;
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+
+    // Forge the claims: declared outputs that the store bytes do NOT
+    // derive.
+    let mut forged = victim_node;
+    forged.expected_output_paths = vec![test_store_path("forged-out")];
+
+    let attacker = Uuid::new_v4();
+    let result = merge_dag(&handle, attacker, vec![forged], vec![], false).await;
+    let err = format!(
+        "{:#}",
+        result.expect_err("contradicted claim must be rejected")
+    );
+    assert!(
+        err.contains("contradicts"),
+        "rejection names the store contradiction, got: {err}"
+    );
+
+    // Settled row untouched.
+    let (status, system): (String, String) =
+        sqlx::query_as("SELECT status, system FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(status, "completed");
+    assert_eq!(system, "x86_64-linux");
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement+3]
+/// Store silence is not evidence — and it is not a CONFLICT either:
+/// with nothing seeded at the declared path, the merge surfaces
+/// UNAVAILABLE ("retry when the store recovers"), never hardening a
+/// transient store condition into the conflict's permanent
+/// FAILED_PRECONDITION (bug_055's inversion, merge form / Step 0.5).
+/// Nothing is displaced.
+#[tokio::test]
+async fn test_store_silence_surfaces_unavailable_row_form() -> TestResult {
+    let (db, _store, handle, _task) = setup_with_mock_store().await?;
+    let (victim_node, _aterm, _out) = mint_text_ca_leaf("evi-unavail");
+    let drv_path = victim_node.drv_path.clone();
+
+    settle_and_reap_squat(&handle, "w1", &drv_path).await?;
+    // Nothing seeded: the fetch finds no path.
+
+    let claimant = Uuid::new_v4();
+    let result = merge_dag(&handle, claimant, vec![victim_node], vec![], false).await;
+    let err = format!("{:#}", result.expect_err("silence cannot verify the claim"));
+    assert!(
+        err.contains("retry when the store recovers"),
+        "silence surfaces the transient UNAVAILABLE contract, got: {err}"
+    );
+    assert!(
+        !err.contains("re-creating it would erase"),
+        "silence must NOT be reported as the permanent settled conflict, got: {err}"
+    );
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = $1")
+        .bind(&drv_path)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(status, "completed", "settled row untouched");
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement+3]
+/// The Step 0.6 (resident squat) form of the silence contract: the
+/// settled authoritative squat is still in the DAG, the bare claimant's
+/// evidence fetch finds nothing — UNAVAILABLE again, by the SAME shared
+/// verdict consequence, so the two steps cannot drift.
+#[tokio::test]
+async fn test_store_silence_surfaces_unavailable_resident_form() -> TestResult {
+    let (_db, _store, handle, _task) = setup_with_mock_store().await?;
+    let (victim_node, _aterm, _out) = mint_text_ca_leaf("evi-unavail-res");
+    let drv_path = victim_node.drv_path.clone();
+
+    // Squat settles but stays resident (no reap).
+    let squatter = Uuid::new_v4();
+    let squat = rio_proto::types::DerivationNode {
+        drv_path: drv_path.clone(),
+        drv_hash: drv_path.clone(),
+        pname: "squat".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        expected_output_paths: vec![test_store_path("unavail-res-out")],
+        drv_content: b"Derive-unavail-res-squat".to_vec(),
+        drv_content_authoritative: true,
+        ..Default::default()
+    };
+    merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+    let mut rx = connect_executor(&handle, "w1", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, drv_path);
+    complete_success(
+        &handle,
+        "w1",
+        &drv_path,
+        &test_store_path("unavail-res-out"),
+    )
+    .await?;
+    wait_for_status(&handle, &drv_path, DerivationStatus::Completed).await;
+    // Nothing seeded: the evidence fetch finds no path.
+
+    let claimant = Uuid::new_v4();
+    let result = merge_dag(&handle, claimant, vec![victim_node], vec![], false).await;
+    let err = format!("{:#}", result.expect_err("silence cannot verify the claim"));
+    assert!(
+        err.contains("retry when the store recovers"),
+        "resident form surfaces the same UNAVAILABLE contract, got: {err}"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement+3]
+/// R4 row-rank gate: a settled row whose persisted lineage is
+/// byte-anchored (`path_bound_bytes`) is NOT displaceable by the
+/// store-evidence path even when the store would verify the claim — the
+/// rank gate refuses before any fetch, rank-uniform with the
+/// displacement primitive's settled rule.
+#[tokio::test]
+async fn test_settled_row_rank_gate_refuses_path_bound_rows() -> TestResult {
+    let (db, store, handle, _task) = setup_with_mock_store().await?;
+    let (victim_node, aterm, _out) = mint_text_ca_leaf("evi-rankgate");
+    let drv_path = victim_node.drv_path.clone();
+
+    settle_and_reap_squat(&handle, "w1", &drv_path).await?;
+    // Backdate the settled row's lineage to byte-anchored.
+    sqlx::query("UPDATE derivations SET evidence_rank = 'path_bound_bytes' WHERE drv_hash = $1")
+        .bind(&drv_path)
+        .execute(&db.pool)
+        .await?;
+    // Even a verifiable store object must not help.
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+
+    let claimant = Uuid::new_v4();
+    let result = merge_dag(&handle, claimant, vec![victim_node], vec![], false).await;
+    let err = format!(
+        "{:#}",
+        result.expect_err("byte-anchored settled row is immovable")
+    );
+    assert!(
+        err.contains("settled"),
+        "freeze rejection stands, got: {err}"
+    );
+    let (status, rank): (String, String) =
+        sqlx::query_as("SELECT status, evidence_rank FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(status, "completed");
+    assert_eq!(rank, "path_bound_bytes");
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement+3]
+/// The per-merge fetch budget is structural: nine settled conflicts in
+/// one submission exceed the budget of eight, so at least one conflict
+/// keeps its fail-closed rejection and the whole merge fails; the same
+/// staging with eight conflicts verifies every one and is admitted.
+#[tokio::test]
+async fn test_store_evidence_budget_caps_fetches() -> TestResult {
+    let (db, store, handle, _task) = setup_with_mock_store().await?;
+
+    let mut nodes = Vec::new();
+    for i in 0..9 {
+        let (node, aterm, _out) = mint_text_ca_leaf(&format!("evi-budget-{i}"));
+        // Stage the settled conflicting row directly (row-only form):
+        // a content-bound squat lineage with a conflicting identity.
+        sqlx::query(
+            "INSERT INTO derivations \
+             (drv_hash, drv_path, pname, system, status, output_names, \
+              expected_output_paths, drv_content, evidence_rank) \
+             VALUES ($1, $1, 'squat', 'aarch64-linux', 'completed', \
+                     ARRAY['out'], ARRAY[$2], $3, 'content_bound_claim')",
+        )
+        .bind(&node.drv_path)
+        .bind(test_store_path(&format!("squat-{i}-out")))
+        .bind(b"Derive-squat".as_slice())
+        .execute(&db.pool)
+        .await?;
+        store.seed_with_content(&node.drv_path, aterm.as_bytes());
+        nodes.push(node);
+    }
+
+    // Nine conflicts: the ninth lands over budget → the merge fails
+    // atomically (nothing displaced) with the load-shaped
+    // RESOURCE_EXHAUSTED contract — actionable splitting guidance,
+    // never the conflict's permanent FAILED_PRECONDITION.
+    let result = merge_dag(&handle, Uuid::new_v4(), nodes.clone(), vec![], false).await;
+    let err = format!(
+        "{:#}",
+        result.expect_err("nine settled conflicts exceed the fetch budget of eight")
+    );
+    assert!(
+        err.contains("split the submission"),
+        "budget exhaustion carries the splitting guidance, got: {err}"
+    );
+    assert!(
+        !err.contains("re-creating it would erase"),
+        "budget exhaustion must NOT be reported as the permanent settled \
+         conflict, got: {err}"
+    );
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM derivations WHERE status = 'completed' AND pname = 'squat'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(count, 9, "over-budget merge displaced nothing");
+
+    // Eight conflicts: all within budget, all verified, admitted.
+    let eight: Vec<_> = nodes.into_iter().take(8).collect();
+    let ok_build = Uuid::new_v4();
+    merge_dag(&handle, ok_build, eight, vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, ok_build).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "eight verified conflicts admitted within budget"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement+3]
+/// A MATCHING-identity store-backed resubmission joins the settled node
+/// without ever consulting the store: the store is seeded with bytes
+/// that would CONTRADICT the claim, and the join still succeeds — the
+/// match short-circuits before the evidence machinery (resolved-vs-full
+/// modular-hash equality is decided by `verifiable_identity_matches`,
+/// not by a fetch).
+#[tokio::test]
+async fn test_matching_identity_join_never_consults_store() -> TestResult {
+    let (_db, store, handle, _task) = setup_with_mock_store().await?;
+
+    // A normal authoritative node settles and stays resident.
+    let owner = Uuid::new_v4();
+    let mut node = make_node("evi-match-join");
+    node.expected_output_paths = vec![test_store_path("evi-match-out")];
+    node.drv_content = b"Derive-evi-match".to_vec();
+    node.drv_content_authoritative = true;
+    merge_dag(&handle, owner, vec![node.clone()], vec![], false).await?;
+    let mut rx = connect_executor(&handle, "w1", "x86_64-linux").await?;
+    let drv_path = test_drv_path("evi-match-join");
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, drv_path);
+    complete_success(&handle, "w1", &drv_path, &test_store_path("evi-match-out")).await?;
+    wait_for_status(&handle, "evi-match-join", DerivationStatus::Completed).await;
+
+    // Poison the well: bytes at the declared path that contradict
+    // everything. A fetch would yield Contradicts and fail the merge.
+    store.seed_with_content(
+        &drv_path,
+        b"Derive([(\"out\",\"\",\"\",\"\")],[],[],\"mips64-linux\",\"/bin/false\",[],[])",
+    );
+
+    // Matching store-backed resubmission (same identity + content
+    // evidence via the shared expected path) joins as a cache hit.
+    let mut matching = make_node("evi-match-join");
+    matching.expected_output_paths = vec![test_store_path("evi-match-out")];
+    let joiner = Uuid::new_v4();
+    merge_dag(&handle, joiner, vec![matching], vec![], false).await?;
+    barrier(&handle).await;
+    let st = query_status(&handle, joiner).await?;
+    assert!(
+        st.state == rio_proto::types::BuildState::Active as i32
+            || st.state == rio_proto::types::BuildState::Succeeded as i32,
+        "matching resubmission joins without a store fetch (state {})",
+        st.state
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement+3]
+/// THE 4x4 arbitration matrix, pinned cell by cell (x bare/non-bare):
+/// no `!=` catch-all survives — every (row rank, incoming rank) pair is
+/// an explicit decision, byte-anchored rows are immovable, the
+/// reverse-squat guard holds, and a bare echo gets the store fetch
+/// exactly where a displaceable row meets an unproven claim. The
+/// arbitration takes the PERSISTED rank string (the victim-side decode
+/// is internal and fail-closed); the undecodable-row arm is pinned
+/// separately below.
+#[test]
+fn test_settled_arbitration_matrix_4x4() {
+    use crate::actor::settled::{SettledArbitration, arbitrate_settled_row};
+    use crate::state::DefinitionEvidence as E;
+    let ranks = [
+        E::UnverifiedClaim,
+        E::ContentBoundClaim,
+        E::PathBoundBytes,
+        E::VerifiedBuilt,
+    ];
+    for row in ranks {
+        for incoming in ranks {
+            for bare in [false, true] {
+                let got = arbitrate_settled_row(row.as_str(), incoming, bare);
+                let want: SettledArbitration = match (row, incoming) {
+                    // Byte-anchored rows refuse every claim class.
+                    (E::VerifiedBuilt | E::PathBoundBytes, _) => {
+                        SettledArbitration::Refuse(String::new())
+                    }
+                    // Displaceable rows yield to strictly byte-bound
+                    // evidence with no fetch.
+                    (
+                        E::ContentBoundClaim | E::UnverifiedClaim,
+                        E::PathBoundBytes | E::VerifiedBuilt,
+                    ) => SettledArbitration::DisplaceByRank,
+                    // A bare echo against a displaceable row earns the
+                    // budgeted store fetch.
+                    (E::ContentBoundClaim | E::UnverifiedClaim, E::UnverifiedClaim) if bare => {
+                        SettledArbitration::NeedsStoreEvidence
+                    }
+                    // Everything else refuses — including the
+                    // reverse-squat guard: ContentBoundClaim rank alone
+                    // never displaces a store-backed row.
+                    (
+                        E::ContentBoundClaim | E::UnverifiedClaim,
+                        E::ContentBoundClaim | E::UnverifiedClaim,
+                    ) => SettledArbitration::Refuse(String::new()),
+                };
+                match (&got, &want) {
+                    (SettledArbitration::Refuse(msg), SettledArbitration::Refuse(_)) => {
+                        assert!(
+                            !msg.is_empty(),
+                            "({row:?},{incoming:?},bare={bare}): refusal must carry \
+                             generated remediation"
+                        );
+                    }
+                    _ => assert_eq!(
+                        got, want,
+                        "arbitration cell ({row:?},{incoming:?},bare={bare})"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+// r[verify sched.persist.settled-identity-freeze+4]
+/// Round-16 bug_073: an UNDECODABLE persisted rank on the settled
+/// VICTIM side must take the immutable Refuse arm — never the
+/// parse_lossy unverified_claim floor, which is conservative only for
+/// a displacer and made the row maximally displaceable here (a future
+/// rank-widening migration read by older code would have silently
+/// demoted byte-anchored rows to DisplaceByRank/NeedsStoreEvidence).
+/// Pinned across every incoming rank x bare shape.
+#[test]
+fn test_settled_arbitration_refuses_undecodable_row_rank() {
+    use crate::actor::settled::{SettledArbitration, arbitrate_settled_row};
+    use crate::state::DefinitionEvidence as E;
+    for incoming in [
+        E::UnverifiedClaim,
+        E::ContentBoundClaim,
+        E::PathBoundBytes,
+        E::VerifiedBuilt,
+    ] {
+        for bare in [false, true] {
+            match arbitrate_settled_row("rank-from-the-future", incoming, bare) {
+                SettledArbitration::Refuse(msg) => assert!(
+                    msg.contains("could not be decoded"),
+                    "remediation must name the decode failure; got {msg:?}"
+                ),
+                other => panic!(
+                    "undecodable row rank must refuse (incoming={incoming:?}, \
+                     bare={bare}); got {other:?}"
+                ),
+            }
+        }
+    }
+}
+
+// r[verify sched.merge.store-evidence-displacement+3]
+/// merged_bug_043 kill test, rank form: a settled BARE-ECHO row
+/// (`unverified_claim` — e.g. a forged store-backed squat that settled
+/// before anyone noticed) is displaced by the victim's ordinary
+/// ingress-byte-bound resubmission with ZERO store fetches — the store
+/// is poisoned with contradicting bytes to prove no fetch happens. The
+/// previous categorical refusal of this rank contradicted the
+/// remediation its own rejection emitted.
+#[tokio::test]
+async fn test_unverified_claim_row_displaced_by_ingress_bytes() -> TestResult {
+    let (db, store, handle, _task) = setup_with_mock_store().await?;
+    let (bare_node, aterm, _out) = mint_text_ca_leaf("evi-uc-kill");
+    let drv_path = bare_node.drv_path.clone();
+
+    // Settled bare-echo squat row with a CONFLICTING identity.
+    sqlx::query(
+        "INSERT INTO derivations \
+         (drv_hash, drv_path, pname, system, status, output_names, \
+          expected_output_paths, evidence_rank) \
+         VALUES ($1, $1, 'squat', 'aarch64-linux', 'completed', \
+                 ARRAY['out'], ARRAY[$2], 'unverified_claim')",
+    )
+    .bind(&drv_path)
+    .bind(test_store_path("uc-kill-squat-out"))
+    .execute(&db.pool)
+    .await?;
+    // Poison the store: a fetch would CONTRADICT and fail the merge,
+    // so success proves displacement was decided by rank alone.
+    store.seed_with_content(
+        &drv_path,
+        b"Derive([(\"out\",\"\",\"\",\"\")],[],[],\"mips64-linux\",\"/bin/false\",[],[])",
+    );
+
+    // The victim resubmits with ingress-byte-bound inline content
+    // (non-authoritative bytes => PathBoundBytes shape).
+    let mut victim = bare_node;
+    victim.drv_content = aterm.into_bytes();
+    victim.drv_content_authoritative = false;
+
+    let build = Uuid::new_v4();
+    merge_dag(&handle, build, vec![victim], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, build).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "byte-bound resubmission displaces the bare-echo squat row"
+    );
+    let (pname, rank): (String, String) =
+        sqlx::query_as("SELECT pname, evidence_rank FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(pname, "evi-uc-kill", "squat row erased, victim's row live");
+    assert_eq!(rank, "path_bound_bytes");
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement+3]
+/// merged_bug_043 kill test, store-proof form: the victim's
+/// resubmission is BARE (no inline bytes), but its claim verifies
+/// against the store's text-CA `.drv` — a bare store-verified
+/// resubmission displaces the settled bare-echo squat row.
+#[tokio::test]
+async fn test_unverified_claim_row_displaced_by_store_verified_bare() -> TestResult {
+    let (db, store, handle, _task) = setup_with_mock_store().await?;
+    let (bare_node, aterm, _out) = mint_text_ca_leaf("evi-uc-store");
+    let drv_path = bare_node.drv_path.clone();
+
+    sqlx::query(
+        "INSERT INTO derivations \
+         (drv_hash, drv_path, pname, system, status, output_names, \
+          expected_output_paths, evidence_rank) \
+         VALUES ($1, $1, 'squat', 'aarch64-linux', 'completed', \
+                 ARRAY['out'], ARRAY[$2], 'unverified_claim')",
+    )
+    .bind(&drv_path)
+    .bind(test_store_path("uc-store-squat-out"))
+    .execute(&db.pool)
+    .await?;
+    // The genuine .drv is in the store.
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+
+    let build = Uuid::new_v4();
+    merge_dag(&handle, build, vec![bare_node], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, build).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "store-verified bare resubmission displaces the bare-echo squat"
+    );
+    let (pname,): (String,) = sqlx::query_as("SELECT pname FROM derivations WHERE drv_hash = $1")
+        .bind(&drv_path)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(pname, "evi-uc-store");
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement+3]
+/// Reverse-squat integrity pin: an AUTHORITATIVE inline claim
+/// (ContentBoundClaim — the hook-fallback shape a forger can mint at
+/// will) can NEVER displace a settled store-backed (`unverified_claim`)
+/// row by rank alone — its bytes are bound to themselves, not to the
+/// declared path. The refusal's generated remediation names the
+/// verifiable paths.
+#[tokio::test]
+async fn test_reverse_squat_authoritative_cannot_displace_bare_row() -> TestResult {
+    let (db, _store, handle, _task) = setup_with_mock_store().await?;
+    let (node, _aterm, _out) = mint_text_ca_leaf("evi-reverse");
+    let drv_path = node.drv_path.clone();
+
+    sqlx::query(
+        "INSERT INTO derivations \
+         (drv_hash, drv_path, pname, system, status, output_names, \
+          expected_output_paths, evidence_rank) \
+         VALUES ($1, $1, 'genuine', 'aarch64-linux', 'completed', \
+                 ARRAY['out'], ARRAY[$2], 'unverified_claim')",
+    )
+    .bind(&drv_path)
+    .bind(test_store_path("reverse-genuine-out"))
+    .execute(&db.pool)
+    .await?;
+
+    let mut forger = node;
+    forger.drv_content = b"Derive-forged-authoritative".to_vec();
+    forger.drv_content_authoritative = true;
+
+    let result = merge_dag(&handle, Uuid::new_v4(), vec![forger], vec![], false).await;
+    let err = format!(
+        "{:#}",
+        result.expect_err("authoritative rank alone must not displace")
+    );
+    assert!(
+        err.contains("rank alone"),
+        "refusal names the reverse-squat guard, got: {err}"
+    );
+    let (pname, status): (String, String) =
+        sqlx::query_as("SELECT pname, status FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!((pname.as_str(), status.as_str()), ("genuine", "completed"));
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement+3]
+/// THE merged_bug_020 kill (strip consequence parity, end to end): the
+/// bare claimant's declared `ca_modular_hash` cannot be recomputed
+/// (its only input is a FLOATING drv absent from every seed) but the
+/// store bytes verify everything else. Pre-+2 this arm REFUSED with
+/// "resubmit WITHOUT the declared ca_modular_hash" — remediation the
+/// gateway makes unfollowable (populate_ca_modular_hashes stamps the
+/// hash unconditionally), so the squat was permanently undisplaceable
+/// through the advertised path. Post-+2: ONE verdict, ONE consequence
+/// — the submission AS PRODUCED displaces directly; the declaration is
+/// stripped with M_070 preservation, exactly like the dispatch
+/// consumer.
+#[tokio::test]
+async fn test_stripped_verification_displaces_directly() -> TestResult {
+    let (db, store, handle, _task) = setup_with_mock_store().await?;
+    let (floating, floating_aterm, _pub) = mint_floating_ca_leaf("evi-strip-input");
+    let (claimant, aterm) = mint_deferred_ia_node(
+        "evi-strip",
+        &floating.drv_path,
+        &[(floating.drv_path.as_str(), floating_aterm.as_str())],
+    );
+    let declared: [u8; 32] = claimant
+        .ca_modular_hash
+        .as_slice()
+        .try_into()
+        .expect("fixture declares a 32-byte hash");
+    let drv_path = claimant.drv_path.clone();
+
+    sqlx::query(
+        "INSERT INTO derivations \
+         (drv_hash, drv_path, pname, system, status, output_names, \
+          expected_output_paths, drv_content, evidence_rank) \
+         VALUES ($1, $1, 'squat', 'aarch64-linux', 'completed', \
+                 ARRAY['out'], ARRAY[$2], $3, 'content_bound_claim')",
+    )
+    .bind(&drv_path)
+    .bind(test_store_path("strip-squat-out"))
+    .bind(b"Derive-strip-squat".as_slice())
+    .execute(&db.pool)
+    .await?;
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+
+    // The submission AS THE GATEWAY PRODUCES IT (declared hash and
+    // all) displaces — no refusal, no client-side strip required.
+    let build = Uuid::new_v4();
+    merge_dag(&handle, build, vec![claimant], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, build).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "stripped verification approves the displacement directly"
+    );
+
+    // The squat is erased; the created node carries the strip with
+    // M_070 preservation and byte-anchored rank — dispatch-strip
+    // parity at the merge consumer.
+    let (pname, rank, live, preserved): (String, String, Option<Vec<u8>>, Option<Vec<u8>>) =
+        sqlx::query_as(
+            "SELECT pname, evidence_rank, ca_modular_hash, ca_modular_hash_stripped \
+             FROM derivations WHERE drv_hash = $1",
+        )
+        .bind(&drv_path)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(pname, "evi-strip", "squat displaced by the claimant");
+    assert_eq!(rank, "path_bound_bytes", "verified standing persisted");
+    assert_eq!(live, None, "unverifiable declaration not persisted live");
+    assert_eq!(
+        preserved.as_deref(),
+        Some(declared.as_slice()),
+        "declared value preserved out-of-band (M_070)"
+    );
+    let d = handle
+        .debug_query_derivation(&drv_path)
+        .await?
+        .expect("created node resident");
+    assert_eq!(d.ca.modular_hash, None, "in-memory live hash shed");
+    assert_eq!(
+        d.ca.modular_hash_stripped,
+        Some(declared),
+        "in-memory preserved claim recorded"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+15]
+// r[verify sched.merge.heal-accepted-edges+1]
+/// THE childless kill (round-15 C6c3, merged_bug_073 aggravator): a
+/// pruned root is born holed with the children its prune dropped, so a
+/// single junk child completing can no longer flip its closure
+/// evidence to Vouched and clear the mark — pre-C6c3 that channel
+/// dispatched the root from source into a guaranteed ENOENT.
+// r[verify sched.evidence.positive-witness]
+#[tokio::test]
+async fn test_pruned_root_junk_child_completion_does_not_vouch() -> TestResult {
+    let root_out = test_store_path("bhk-root-out");
+    let dep_out = test_store_path("bhk-dep-out");
+    let junk_out = test_store_path("bhk-junk-out");
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    {
+        let mut sub = store.state.substitutable.write().unwrap();
+        sub.push(root_out.clone());
+        sub.push(dep_out.clone());
+    }
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _actor_task) = setup_actor_with_store(db.pool.clone(), Some(store_client));
+
+    // The prune fires: root→dep, both substitutable; root is kept,
+    // born holed with witness {bhk-dep}.
+    let b1 = Uuid::new_v4();
+    let mut root = make_node("bhk-root");
+    root.expected_output_paths = vec![root_out.clone()];
+    let mut dep = make_node("bhk-dep");
+    dep.expected_output_paths = vec![dep_out.clone()];
+    merge_dag(
+        &handle,
+        b1,
+        vec![root, dep],
+        vec![make_test_edge("bhk-root", "bhk-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    let d = expect_drv(&handle, "bhk-root").await;
+    assert!(d.topdown_pruned, "fixture premise: the prune fired");
+    assert!(d.closure_hole, "born holed: the prune dropped the closure");
+    assert_eq!(
+        d.closure_missing_count, 1,
+        "witness records the dropped dep"
+    );
+    let (pg_hole,): (bool,) =
+        sqlx::query_as("SELECT closure_hole FROM derivations WHERE drv_hash = 'bhk-root'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(pg_hole, "born-holed flag rides the merge transaction");
+    let (rows,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM derivation_closure_missing WHERE drv_hash = 'bhk-root'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(rows, 1, "witness rows ride the same transaction");
+
+    // A second build attaches ONE junk child through the pruned-root
+    // carve-out and that child completes via the store-hit lane.
+    store.seed_with_content(&junk_out, b"junk");
+    let b2 = Uuid::new_v4();
+    let mut junk = make_node("bhk-junk");
+    junk.expected_output_paths = vec![junk_out.clone()];
+    merge_dag(
+        &handle,
+        b2,
+        vec![make_node("bhk-root"), junk],
+        vec![make_test_edge("bhk-root", "bhk-junk")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert!(
+        matches!(
+            expect_drv(&handle, "bhk-junk").await.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "fixture premise: the junk child is produced"
+    );
+    let d = expect_drv(&handle, "bhk-root").await;
+    assert!(
+        d.closure_hole && d.closure_missing_count == 1,
+        "the junk child does not cover the witness: still holed"
+    );
+    assert!(
+        d.topdown_pruned,
+        "one produced junk child must NOT vouch a born-holed pruned root \
+         (the pre-C6c3 junk-Vouched channel)"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+15]
+/// The legitimate full top-up of a born-holed pruned root heals the
+/// hole AT MERGE (witness covered by the re-supplied closure) — no
+/// fail-fast bounce, no resubmit detour.
+#[tokio::test]
+async fn test_pruned_root_full_topup_heals_born_hole() -> TestResult {
+    let root_out = test_store_path("bht-root-out");
+    let dep_out = test_store_path("bht-dep-out");
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    {
+        let mut sub = store.state.substitutable.write().unwrap();
+        sub.push(root_out.clone());
+        sub.push(dep_out.clone());
+    }
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _actor_task) = setup_actor_with_store(db.pool.clone(), Some(store_client));
+
+    // Park the detached fetch on the QPI gate so the pruned root stays
+    // Substituting (the mock store would otherwise complete it
+    // instantly and moot the heal).
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let b1 = Uuid::new_v4();
+    let mut root = make_node("bht-root");
+    root.expected_output_paths = vec![root_out.clone()];
+    let mut dep = make_node("bht-dep");
+    dep.expected_output_paths = vec![dep_out.clone()];
+    merge_dag(
+        &handle,
+        b1,
+        vec![root.clone(), dep.clone()],
+        vec![make_test_edge("bht-root", "bht-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "bht-root").await.closure_missing_count,
+        1,
+        "fixture premise: born holed"
+    );
+
+    // A non-prunable full re-merge (dep's output now missing upstream →
+    // the all-or-nothing prune cannot fire) re-supplies the dropped
+    // child: coverage met, hole healed at merge.
+    {
+        let mut sub = store.state.substitutable.write().unwrap();
+        sub.retain(|p| p != &dep_out && p != &root_out);
+    }
+    let b2 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b2,
+        vec![root, dep],
+        vec![make_test_edge("bht-root", "bht-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    let d = expect_drv(&handle, "bht-root").await;
+    assert!(
+        !d.closure_hole && d.closure_missing_count == 0,
+        "the covering top-up heals the born hole at merge"
+    );
+    let (pg_hole,): (bool,) =
+        sqlx::query_as("SELECT closure_hole FROM derivations WHERE drv_hash = 'bht-root'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(!pg_hole, "the heal reaches PG");
+    let (rows,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM derivation_closure_missing WHERE drv_hash = 'bht-root'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(rows, 0, "witness rows deleted with the heal");
     Ok(())
 }

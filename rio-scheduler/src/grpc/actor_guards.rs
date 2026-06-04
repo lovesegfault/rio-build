@@ -67,7 +67,31 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
         // signature, not two.
         ActorError::ChannelSend => Status::unavailable(ACTOR_UNAVAILABLE_MSG),
         ActorError::Database(e) => Status::internal(format!("database error: {e}")),
-        ActorError::Dag(e) => Status::internal(format!("DAG merge failed: {e}")),
+        // DAG-merge failures are internal invariants (cycle detection,
+        // malformed paths — both also pre-screened at ingress) EXCEPT the
+        // authoritative-content protections, which are client-actionable
+        // conflicts with state another submission established
+        // (sched.merge.authoritative-conflict,
+        // sched.merge.authoritative-claim-no-redefine): they map to
+        // FAILED_PRECONDITION rather than INTERNAL. The precondition can
+        // clear later — via a later submission, the conflicting node
+        // reaching a displaceable state, or operator action — but HOW it
+        // clears differs per variant; notably an authoritative claim
+        // onto a parked store-backed node is never cleared by retrying
+        // the same claim (an authoritative claim never displaces a
+        // store-backed definition). Each DagError variant's doc and its
+        // #[error] remediation text are the single source of truth for
+        // the per-variant clearing semantics.
+        ActorError::Dag(e) => match &e {
+            crate::dag::DagError::AuthoritativeContentMismatch { .. }
+            | crate::dag::DagError::ConflictingInFlightContent { .. }
+            | crate::dag::DagError::AuthoritativeClaimIdentityConflict { .. } => {
+                Status::failed_precondition(format!("DAG merge failed: {e}"))
+            }
+            crate::dag::DagError::CycleDetected | crate::dag::DagError::InvalidDrvPath { .. } => {
+                Status::internal(format!("DAG merge failed: {e}"))
+            }
+        },
         ActorError::MissingDbId { .. } => Status::internal(err.to_string()),
         // UNAVAILABLE — gateway/client sees this as a retriable error.
         // They should back off and retry; the breaker auto-closes in 30s
@@ -79,5 +103,31 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
         // Same string as `ensure_leader` above so operators grep for
         // one signature.
         ActorError::NotLeader => Status::unavailable("not leader (standby replica)"),
+        // r[impl sched.persist.settled-identity-freeze+4]
+        // Client-actionable conflict with a settled (successfully built)
+        // derivation record — same FAILED_PRECONDITION class as the
+        // merge gate's authoritative-content conflicts; the variant's
+        // #[error] text carries the remediation (store-backed
+        // resubmission is now self-service via the store-evidence
+        // check).
+        ActorError::SettledIdentityConflict { .. } => Status::failed_precondition(err.to_string()),
+        // r[impl sched.merge.store-evidence-displacement+3]
+        // Wire codes DERIVED per variant: silence is transient
+        // (UNAVAILABLE — retried), budget exhaustion is load-shaped
+        // (RESOURCE_EXHAUSTED — actionable), and only a true identity
+        // conflict carries the permanent FAILED_PRECONDITION.
+        ActorError::SettledConflictEvidenceUnavailable { .. } => {
+            Status::unavailable(err.to_string())
+        }
+        ActorError::SettledConflictEvidenceBudget { .. } => {
+            Status::resource_exhausted(err.to_string())
+        }
+        // r[impl sched.merge.store-evidence-displacement+3]
+        // The store's own text-CA-bound bytes disprove the submission's
+        // claimed identity. FAILED_PRECONDITION, not INVALID_ARGUMENT:
+        // the request is well-formed; it conflicts with durable state
+        // (the store object), and retrying the identical claim can
+        // never succeed.
+        ActorError::StoreEvidenceContradicts { .. } => Status::failed_precondition(err.to_string()),
     }
 }

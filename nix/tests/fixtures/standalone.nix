@@ -170,9 +170,9 @@ let
         extraServiceEnv = controlHmacEnv // otelEnv;
         inherit
           extraSchedulerConfig
+          extraSchedulerEnv
           extraStoreConfig
           extraPackages
-          extraSchedulerEnv
           ;
         # Metrics ports open for cross-VM scraping (scheduling fanout
         # scenario asserts worker metrics from control).

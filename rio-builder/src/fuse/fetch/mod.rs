@@ -120,9 +120,10 @@ const WAIT_SLOP: Duration = Duration::from_secs(30);
 /// floor needs ≈127 s; the previous flat 60 s timeout aborted the fetch
 /// mid-stream → daemon ENOENT → PermanentFailure poison.
 ///
-/// Tune DOWN if `rio_builder_input_materialization_failures_total` is
-/// sustained nonzero (means real throughput is below this floor —
-/// cross-AZ builders, S3 throttle).
+/// Tune DOWN if builds keep failing while materializing inputs (fetch
+/// durations pinned at the timeout, ENOENT-on-input infrastructure
+/// failures) — that means real store→builder throughput is below this
+/// floor (cross-AZ builders, S3 throttle).
 pub const JIT_MIN_THROUGHPUT_BPS: u64 = 15 * 1024 * 1024;
 
 /// Per-path JIT fetch timeout: `max(base, nar_size / MIN_THROUGHPUT)`.
@@ -552,9 +553,9 @@ fn fetch_extract_insert(
     // dot check passes it (47 chars, no leading dot); without this check we'd
     // gRPC the store, get InvalidArgument → EIO → circuit.record(false). Five
     // such lookups (a single configure run touches glibc's references several
-    // times) trip the breaker → ALL FUSE reads ENOENT → nix-daemon's OWN
-    // dynamic loader can't find libunistring.so.5 → daemon dies → unexpected
-    // EOF → MiscFailure → poison. Scheduler then marks the builder
+    // times) trip the breaker → ALL FUSE reads ENOENT → the sandboxed
+    // build's dynamic loader can't find its libraries → the build fails
+    // → poison. Scheduler then marks the builder
     // store-degraded and pulls it from the assignment pool. ENOENT here flows
     // through ensure_cached:166's existing record(true) — store wasn't asked,
     // but the path is unambiguously absent, which IS a healthy answer.
@@ -673,7 +674,7 @@ fn stream_nar_to_spool(
                 &mut store_client,
                 store_path,
                 fetch_timeout,
-                rio_common::limits::MAX_NAR_SIZE,
+                rio_common::limits::NarSizeCap::general(),
                 // Hint consumed above. Only send on attempt 0; on retries
                 // it's None — same staleness rationale as the take above.
                 if attempt == 0 { hint.clone() } else { None },
@@ -753,7 +754,7 @@ fn stream_nar_to_spool(
                     }
                     None => {
                         // I-189: error! (not warn!) — terminal failure
-                        // that surfaces as EIO to nix-daemon. The
+                        // that surfaces as EIO to the sandboxed build. The
                         // underlying gRPC status (h2 BrokenPipe,
                         // ResourceExhausted, …) on this line is the
                         // root cause; ops.rs's "JIT fetch failed → EIO"

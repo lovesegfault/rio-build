@@ -1629,7 +1629,7 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.timeout.promote-on-exceed+2]
+// r[verify sched.timeout.promote-on-exceed+3]
 /// I-200 regression: cold-start (no `[sla]` → `est_deadline_secs=None`,
 /// `floor.deadline_secs=0`) means `bump_floor_or_count` returns
 /// `{promoted:false, counted:false}` (base=0 → next=0 → unchanged).
@@ -1666,7 +1666,7 @@ async fn cold_start_timeout_consumes_budget_then_cancels() -> TestResult {
             "cs-w",
             &drv_path,
             rio_proto::types::BuildResultStatus::TimedOut,
-            "build exceeded daemon_timeout_secs",
+            "build exceeded build_timeout_secs",
         )
         .await?;
         let s = expect_drv(&handle, drv_hash).await;
@@ -1698,7 +1698,7 @@ async fn cold_start_timeout_consumes_budget_then_cancels() -> TestResult {
         "cs-w",
         &drv_path,
         rio_proto::types::BuildResultStatus::TimedOut,
-        "build exceeded daemon_timeout_secs",
+        "build exceeded build_timeout_secs",
     )
     .await?;
     let s = expect_drv(&handle, drv_hash).await;
@@ -2124,7 +2124,7 @@ async fn test_disconnect_no_promote_oom_report_promotes(
     Ok(())
 }
 
-// r[verify sched.termination.deadline-exceeded+2]
+// r[verify sched.termination.deadline-exceeded+3]
 /// Non-promoting report (`Error`/`Completed`/`EvictedOther`) MUST NOT
 /// consume the `recently_disconnected` entry. Before the
 /// `reason_label` gate was hoisted above `remove()`, an `Error` report
@@ -2413,7 +2413,7 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.termination.deadline-exceeded+2]
+// r[verify sched.termination.deadline-exceeded+3]
 /// `activeDeadlineSeconds` backstop fired (worker too wedged to report
 /// `TimedOut` itself). Controller reports `DeadlineExceeded` by JOB
 /// name; scheduler prefix-matches the disconnected pod, promotes
@@ -2854,10 +2854,10 @@ async fn test_force_drain_increments_cancel_signals_total_metric() -> TestResult
     Ok(())
 }
 
-// r[verify sched.backstop.timeout+3]
+// r[verify sched.backstop.timeout+4]
 /// Backstop timeout: a derivation Running far longer than expected
 /// gets CancelSignal + reset_to_ready on Tick. The cfg(test) floor
-/// is 0s (BACKSTOP_DAEMON_TIMEOUT_SECS=0, BACKSTOP_SLACK_SECS=0) so
+/// is 0s (BACKSTOP_BUILD_TIMEOUT_SECS=0, BACKSTOP_SLACK_SECS=0) so
 /// any positive `running_since` elapsed triggers the backstop.
 ///
 /// Uses DebugBackdateRunning to force Running status with a stale
@@ -2943,7 +2943,7 @@ async fn test_backstop_timeout_cancels_and_reassigns() -> TestResult {
 }
 
 // r[verify sched.sla.hw-ref-seconds]
-// r[verify sched.backstop.timeout+3]
+// r[verify sched.backstop.timeout+4]
 /// `est_duration` is reference-seconds (sla `t_min`); `elapsed` is
 /// wall-clock. The backstop must denormalize via `min_factor()` so a
 /// long build on slow hardware (`hw_factor < 1/3`) is not cancelled
@@ -3040,6 +3040,7 @@ async fn test_per_build_timeout_fails_build_on_tick() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id,
+            ingress_stripped: Default::default(),
             tenant_id: None,
             priority_class: PriorityClass::Scheduled,
             nodes: vec![make_node("pbt-drv")],
@@ -5046,7 +5047,7 @@ async fn test_heartbeat_cross_executor_spoof_rejected() -> TestResult {
 /// `timeout_count` UNCONDITIONALLY, so a deterministically-wedging drv
 /// poisons after `max_timeout_retries` backstop reports instead of
 /// climbing ~9 free ladder rungs. Default `max_timeout_retries=4`.
-// r[verify sched.timeout.promote-on-exceed+2]
+// r[verify sched.timeout.promote-on-exceed+3]
 #[tokio::test]
 async fn test_deadline_exceeded_unconditional_timeout_count() -> TestResult {
     use rio_proto::types::TerminationReason;
@@ -5102,7 +5103,7 @@ async fn test_deadline_exceeded_unconditional_timeout_count() -> TestResult {
 /// poison threshold, distinct-workers mode) is poisoned by
 /// `reassign_derivations`' poison check on the 3rd backstop instead
 /// of looping forever with `failure_count=0`.
-// r[verify sched.backstop.timeout+3]
+// r[verify sched.backstop.timeout+4]
 #[tokio::test]
 async fn test_backstop_timeout_bounds_retry_loop() -> TestResult {
     let (_db, handle, _task) = setup().await;

@@ -25,7 +25,7 @@
       node((4, 1), [PostgreSQL], name: <pg>, shape: fletcher.shapes.cylinder),
       node(
         (3, 1.5),
-        [nix sandbox\ #text(size: 0.85em)[(purity, NOT security)]],
+        [rio-exec sandbox\ #text(size: 0.85em)[(purity, NOT security)]],
         name: <sb>,
         stroke: (dash: "dashed"),
       ),
@@ -61,6 +61,33 @@
     )
   },
 )
+
+=== Component Trust
+
+The control plane --- gateway, scheduler, store, and controller --- is
+trusted. Workers (builders and fetchers) are not: they execute arbitrary
+tenant-supplied build instructions in the same pod as the code that
+prepares requests and parses outputs, so a sufficiently determined tenant
+must be assumed capable of compromising the worker process itself.
+
+#r("sec.trust.workers-untrusted")[
+  Workers (builders and fetchers) MUST be treated as untrusted. Any
+  validation a worker performs --- request-glue shape checks, output
+  policy enforcement, hash verification before upload --- is
+  defense-in-depth only. Authoritative enforcement of what may be
+  registered MUST live in the trusted plane: the gateway/scheduler for
+  submission-shape validation, and rio-store at registration time for
+  the content it accepts.
+]
+
+- *Threat*: A compromised worker uploads content that does not match what
+  the derivation legitimately produces, or claims paths it was never asked
+  to build.
+- *Mitigations*: Upload authorization is HMAC-scoped to the exact output
+  paths the scheduler assigned; the store's content-address gates
+  re-derive paths from uploaded bytes rather than trusting the claim.
+  Worker-side checks remain useful for failing fast, never as the
+  authority.
 
 === Boundary 1: Nix Client → Gateway (SSH)
 
@@ -111,16 +138,23 @@
   certificate to rotate or expire.
 ]
 
-#r("common.hmac.claims")[
+#r("common.hmac.claims+1")[
   The scheduler signs *assignment tokens* (HMAC-SHA256) when dispatching work.
   Token format is
   `base64url(json(AssignmentClaims)).base64url(hmac_sha256(key, claims_json))`.
-  `AssignmentClaims` has exactly five fields: `executor_id` (string, audit only
+  `AssignmentClaims` carries seven fields: `executor_id` (string, audit only
   --- the store doesn't know which executor is calling), `drv_hash` (string,
   ties token to a specific build), `expected_outputs` (list of store paths, the
   authorization check), `is_ca` (bool, skips the membership check for
   floating-CA derivations whose output paths are computed post-build),
-  `expiry_unix` (u64 Unix seconds, replay prevention).
+  `is_fixed_output` (bool, marks a fixed-output assignment: the store requires
+  the upload to carry a `fixed:` content-address descriptor and verifies the
+  uploaded bytes and the claimed path against it --- descriptor-less uploads
+  under such a token are rejected), `tenant` (optional string, the attributed
+  tenant for audit and per-tenant isolation; absent on legacy tokens), and
+  `expiry_unix` (u64 Unix seconds, replay prevention). Optional fields use
+  serde defaults so tokens minted without them still verify; the store fleet
+  must carry a new field's reader before a scheduler that emits it.
   - Executors present the assignment token in the `x-rio-assignment-token` gRPC
     metadata header when calling `PutPath` on the store. The store verifies the
     token signature, checks `now < expiry_unix`, and rejects with
@@ -141,6 +175,7 @@
     assigned). For deployments requiring strict tenant read isolation, a future
     enhancement could add tenant-scoped read tokens.
 ]
+
 
 #r("sec.executor.identity-token+2")[
   The scheduler signs *executor-identity tokens* (`ExecutorClaims { intent_id,
@@ -202,7 +237,7 @@
   self-guarded on `.Values.jwt.enabled`.
 ]
 
-=== Boundary 3: Executor → Nix Sandbox
+=== Boundary 3: Executor → rio-exec Sandbox
 
 - *Auth*: None (sandbox is a purity mechanism, NOT a security boundary)
 - *Threat*: Malicious derivation escaping sandbox and accessing executor
@@ -339,7 +374,7 @@ allowance before onboarding untrusted tenants.
     [Recommended],
 
     [*Executor isolation*],
-    [Per-build @overlayfs, Nix sandbox, NetworkPolicy],
+    [Per-build @overlayfs, rio-exec sandbox, NetworkPolicy],
     [Designed],
 
     [*Metadata service blocking*],
@@ -387,17 +422,22 @@ tracey rule or phase deferral.
     [On `PutPath`, the store recomputes SHA-256 over the NAR bytes and rejects
       on mismatch.],
 
-    [`restrict-eval`],
+    [Eval-time path access (daemon-era `restrict-eval`)],
     [Executor],
-    [Implemented],
-    [The executor's `nix.conf` sets `restrict-eval = true`, preventing
-      derivations from accessing paths outside the Nix store during evaluation.],
+    [Structural],
+    [rio-build never evaluates Nix expressions server-side --- derivations
+      arrive pre-evaluated from the client --- so there is no evaluator whose
+      path access could need restricting; the daemon-era `restrict-eval`
+      `nix.conf` knob has no remaining surface.],
 
     [Sandbox enforcement],
     [Executor],
     [Implemented],
-    [`sandbox = true` in `nix.conf` ensures all builds run inside the Nix
-      sandbox (user/mount/PID/network namespaces).],
+    [Every build runs inside the rio-exec sandbox (mount/PID/IPC/UTS/cgroup
+      namespaces, plus a network namespace for everything except fixed-output builds),
+      constructed unconditionally by the executor itself with no unsandboxed
+      fallback (#rref("builder.exec.sandbox+3")); the daemon-era
+      `sandbox = true` `nix.conf` knob is gone along with the daemon.],
 
     [@dag size limit],
     [Gateway + Scheduler],
@@ -419,11 +459,28 @@ tracey rule or phase deferral.
       global `MAX_NAR_SIZE` limit.],
 
     [Output path match],
-    [Store],
+    [Gateway + Scheduler + Store],
     [Implemented],
-    [HMAC assignment tokens: store verifies `x-rio-assignment-token` metadata
-      on PutPath, checks `store_path ∈ claims.expected_outputs`. Gateway
-      bypasses via `x-rio-service-token` (`r[sec.authz.service-token]`).],
+    [Gateway: declared output paths are bound to the derivation at
+      submission --- input-addressed paths must equal the recomputed
+      derivation-hash paths, and declared-hash (fixed-output) outputs must
+      equal the path derived from their declared hash. Scheduler: every
+      inline derivation (authoritative or not) is bound to its declared
+      identity at `SubmitBuild` ingress --- text content-address of the
+      bytes equals the declared `.drv` path, declared paths/flags equal
+      values recomputed from the bytes
+      (#rref("sched.merge.ingress-inline-drv-binding")); store-backed
+      nodes' claims are derived at dispatch from the store's
+      text-CA-verified `.drv` bytes --- never signed from submitter
+      echoes (#rref("sched.dispatch.claims-derived")), and settled
+      conflicts are arbitrated against those bytes
+      (#rref("sched.merge.store-evidence-displacement+3")). Store:
+      HMAC assignment tokens gate registration ---
+      `x-rio-assignment-token` metadata on PutPath, `store_path ∈
+      claims.expected_outputs` --- and content-addressed or fixed-output
+      uploads are re-verified against their descriptor and claimed path.
+      Gateway bypasses via `x-rio-service-token`
+      (`r[sec.authz.service-token]`).],
   ),
 )
 
@@ -432,7 +489,14 @@ tracey rule or phase deferral.
 rio-build requires several secrets: SSH host keys, signing keys, database
 credentials, and HMAC signing keys (assignment tokens + service tokens). There
 are no application-level TLS certificates --- transport encryption is at the
-Cilium overlay layer.
+Cilium overlay layer. Operator fetch credentials (the worker netrc) are
+provenance-scoped inside the fetcher: the catch-all `default` entry never
+travels to tenant-controlled origin URLs
+(#rref("fetcher.fetchurl.netrc-origin-scope")). Note that netrc delivery is
+not yet wired: no production sandbox construction passes a netrc file and no
+`Config` exposes a netrc key, so today this scoping protects no live secret
+--- the capability is gated out until a delivery contract lands
+(#rref("fetcher.netrc.delivery-unwired+1")).
 
 === Recommended Patterns (by maturity)
 
@@ -644,7 +708,7 @@ heartbeat) plus one reconciler tick (\~10s).
 
 == Known Limitations
 
-+ *The Nix sandbox is NOT a security boundary.* It prevents builds from
++ *The rio-exec sandbox is NOT a security boundary.* It prevents builds from
   accessing undeclared inputs (purity) but does not prevent a determined
   attacker from escaping. For multi-tenant deployments, the security boundary
   is the executor pod + node isolation.
@@ -667,7 +731,7 @@ heartbeat) plus one reconciler tick (\~10s).
 
 + *`CAP_SYS_ADMIN` is held throughout build execution.* The executor cannot
   drop `CAP_SYS_ADMIN` between overlay setup and build completion because the
-  Nix sandbox itself requires mount namespace manipulation. A sandbox escape
+  rio-exec sandbox itself requires mount namespace manipulation. A sandbox escape
   gives the attacker `CAP_SYS_ADMIN` capabilities within the user namespace
   (see mitigation in \#2). Additional mitigations: RuntimeDefault or Localhost
   seccomp (`r[builder.seccomp.localhost-profile]`), dedicated node pools, and
@@ -690,9 +754,9 @@ heartbeat) plus one reconciler tick (\~10s).
 <sec-rationale-privileged>
 
 Workers require Linux kernel capabilities for two operations: overlayfs mounts
-(per-build isolation) and Nix build sandboxing (user/mount/PID namespaces,
-chroot). Kubernetes pod security must grant these capabilities without opening
-unnecessary attack surface.
+(per-build isolation) and rio-exec build sandboxing (mount/PID/IPC/UTS/cgroup
+namespaces, `pivot_root`). Kubernetes pod security must grant these
+capabilities without opening unnecessary attack surface.
 
 Worker pods request `CAP_SYS_ADMIN` + `CAP_SYS_CHROOT` via the container
 security context. Critically, `privileged: true` is NOT used --- it disables

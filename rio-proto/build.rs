@@ -50,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "GetSpawnIntentsResponse",
         "UpstreamInfo",
         "ListUpstreamsResponse",
+        "InvalidatePathResponse",
         "DebugExecutorState",
         "DebugListExecutorsResponse",
         "ListSlaOverridesResponse",

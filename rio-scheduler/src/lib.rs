@@ -158,6 +158,135 @@ pub fn describe_metrics() {
         "Total build duration"
     );
     describe_counter!(
+        "rio_scheduler_merge_foreign_edge_skipped_total",
+        "Submitted dependency edges skipped at merge because their parent is a resident \
+         node not (re)created by the submission (sched.merge.edge-creation-scoped) and \
+         not carrying the closure_hole breadcrumb (rejoin-shaped skips are counted \
+         separately). Sustained nonzero rate → hostile direct submitter or gateway \
+         DAG-construction bug."
+    );
+    describe_counter!(
+        "rio_scheduler_merge_rejoin_edge_skipped_total",
+        "Submitted dependency edges skipped at merge whose parent is a resident \
+         closure-holed node not (re)created by the submission — the legitimate \
+         full-closure rejoin signature after a reap truncated the parent's children \
+         (sched.merge.heal-accepted-edges+1). The parent's hole stays set until a \
+         submission re-creates the node and re-supplies every recorded missing \
+         child."
+    );
+    describe_counter!(
+        "rio_scheduler_closure_heal_refused_total",
+        "Closure-hole heals refused at merge: the parent's full declared edge \
+         set was accepted, but the re-declaration does not cover the recorded \
+         witness set (sched.merge.heal-accepted-edges+1) — subset re-declaration \
+         after a reap (expected), junk top-up, or a lost-witness sentinel. The \
+         hole and its fail-fast routing survive."
+    );
+    describe_counter!(
+        "rio_scheduler_merge_store_evidence_total",
+        "Merge-time store-evidence checks for settled identity conflicts \
+         (sched.merge.store-evidence-displacement+3), labeled by result: \
+         displaced (claim fully verified — by ingress-byte-bound rank or \
+         against the store's text-CA .drv bytes — and the settled squat \
+         erased), stripped (verified EXCEPT an unverifiable declared \
+         modular hash: declaration stripped with M_070 preservation and \
+         the displacement approved on the verified bytes — dispatch-strip \
+         parity; pre-+2 this population surfaced as unavailable, so \
+         dashboards keyed on result=unavailable see it move), mismatch \
+         (the store derivation contradicts the claim; submission rejected \
+         FAILED_PRECONDITION), unavailable (store silent — fetch failed, \
+         path absent, or bytes unverifiable — surfaced UNAVAILABLE; or \
+         permanently unprovable as submitted — refused with generated \
+         remediation), over_budget (per-merge fetch budget exhausted; \
+         merge fails RESOURCE_EXHAUSTED, nothing displaced)"
+    );
+    describe_counter!(
+        "rio_scheduler_merge_stripped_rejoin_total",
+        "Settled rows REJOINED by a re-creating submission via the M_070 \
+         match bases the pre-strip-preservation matcher refused \
+         (sched.persist.settled-identity-freeze+4), labeled by basis: \
+         preserved_claim (byte-equal preserved stripped claim), \
+         stripped_hash_match (byte-anchored row x inline-bound \
+         incoming — both sides text-CA-bound to the declared path), or \
+         dual_anchor (byte-anchored row x identity-SILENT bare \
+         incoming: no declared hash, no non-empty path — a bare \
+         submission ADDING either matches nothing, round-17 \
+         merged_bug_020). Each increment is a rebuild that pre-fix \
+         terminated in a deterministic FAILED_PRECONDITION \
+         (merged_bug_038) — the wipe-deploy success signal."
+    );
+    describe_counter!(
+        "rio_scheduler_dispatch_claims_source_total",
+        "Dispatch-time assignment-claims derivations by byte-bound source \
+         (sched.dispatch.claims-derived): inline (ingress-bound inline content), \
+         authoritative (hook-fallback content), store (store .drv fetched, \
+         text-CA-verified, and the recorded claims proven against it — or a \
+         prior verification's persisted path_bound_bytes rank)"
+    );
+    describe_counter!(
+        "rio_scheduler_dispatch_claims_forgery_total",
+        "Store-backed nodes whose recorded claims CONTRADICT the store's \
+         text-CA-verified .drv bytes at dispatch (or whose verified bytes are \
+         content-bound garbage): no token signed, node poisoned \
+         (sched.dispatch.claims-derived). Nonzero → hostile direct submitter."
+    );
+    describe_counter!(
+        "rio_scheduler_dispatch_claims_unavailable_total",
+        "Dispatch-time claims derivations deferred on STORE SILENCE only \
+         (fetch failure, absent .drv, transport-grade byte noise): assignment \
+         rolled back with backoff and retried when the store recovers, \
+         bounded by the claims-unavailable budget. Structurally permanent \
+         shapes never land here — they poison with remediation \
+         (..._claims_unverifiable_total) and unverifiable declared hashes \
+         strip and proceed (..._claims_stripped_total) \
+         (sched.dispatch.claims-derived+5)"
+    );
+    describe_counter!(
+        "rio_scheduler_dispatch_claims_unseeded_total",
+        "Dispatch-time claims derivations deferred on POST-READ-THROUGH \
+         unseeded inputs (sched.dispatch.claims-derived+5, bug_029): a \
+         direct input's identity was found in neither the resident DAG \
+         nor the persisted rows. Bounded by the node's own budget \
+         (max_infra_retries); exhaustion poisons with the generated \
+         remediation. Pre-+3 this population instant-poisoned through \
+         ..._claims_unverifiable_total — a deploy failover (which erases \
+         every completed input's residency at once) poisoned honest \
+         in-flight builds; expect transient nonzero here right after a \
+         scheduler failover, converging as read-throughs hit."
+    );
+    describe_counter!(
+        "rio_scheduler_claims_row_readthrough_total",
+        "Persisted-row read-throughs for unseeded claim inputs at the \
+         check_store_evidence chokepoint (sched.dispatch.claims-derived+5), \
+         labeled by result: seeded (rows re-seeded the verification — the \
+         reap/failover recovery path working as designed), partial (rows \
+         seeded SOME missing inputs but not all; still unseeded \
+         post-read-through), miss (NO seedable rows at all; the verdict \
+         stands post-read-through), error (PG lookup failed; deferred as \
+         transient store silence, never a permanence verdict)."
+    );
+    describe_counter!(
+        "rio_scheduler_dispatch_claims_stripped_total",
+        "Bare store-backed nodes whose declared modular hash could not be \
+         recomputed against the store's text-CA-verified bytes and was \
+         STRIPPED at dispatch (an unverifiable claim is no claim — exact \
+         ingress-strip parity): the node proceeds on the verified bytes at \
+         path_bound_bytes with the hash cleared in memory and PG \
+         (sched.dispatch.claims-derived+5). The expected nonzero source is \
+         warm gateway CA-chain / deferred-IA submissions."
+    );
+    describe_counter!(
+        "rio_scheduler_dispatch_claims_unverifiable_total",
+        "Bare store-backed nodes whose claims verification is STRUCTURALLY \
+         impossible for CONTENT-BOUND reasons (today exactly: unparseable \
+         declared drv_path): poisoned at dispatch with generated \
+         remediation instead of livelocking through backoff \
+         (sched.dispatch.claims-derived+5). Missing input identity is NO \
+         LONGER in this population — it defers through \
+         ..._claims_unseeded_total with a bounded budget; dashboards keyed \
+         here see the unseeded population move."
+    );
+    describe_counter!(
         "rio_scheduler_cache_hits_total",
         "Derivations served from cache (labeled by source: scheduler/reprobe/existing/dispatch)"
     );
@@ -299,6 +428,19 @@ pub fn describe_metrics() {
         "rio_scheduler_malformed_built_output_total",
         "Worker-supplied BuiltOutput.output_path that failed StorePath::parse \
          (dropped at handle_completion boundary); alert if rate > 0"
+    );
+    describe_counter!(
+        "rio_scheduler_completion_path_binding_total",
+        "Completion-admission slot binding (sched.completion.\
+         output-membership+1, round-17 bug_100), labeled by result: \
+         bound (reported path equals the scheduler-held claim for that \
+         slot), mismatch_dropped (worker-reported path contradicted the \
+         claim — forged or confused report, dropped before any \
+         trusted-plane consumer), accepted_floating_ca (CA output, path \
+         unknowable pre-build — explicit accept cell), \
+         accepted_unresolved_slot (deferred-IA claim did not survive; \
+         expected ~0 once claim persistence (M_075) lands — that \
+         stream's done-signal)."
     );
     describe_counter!(
         "rio_scheduler_undeclared_built_output_total",
@@ -583,6 +725,19 @@ pub fn describe_metrics() {
          Each increment is one build that did NOT run because a CA dep's \
          output matched the content index. Direct measure of CA cutoff \
          efficacy."
+    );
+    describe_counter!(
+        "rio_scheduler_ca_bookkeeping_skipped_total",
+        "Completion-time CA bookkeeping steps skipped because the node has \
+         no modular hash (sched.ca.absent-hash-surfaced) — the population \
+         the ingress strip legalizes. Labeled by consumer: \
+         realisation_insert (the build's realisation NOT registered — \
+         clients cannot resolve outputs by derivation), cutoff_compare / \
+         cutoff_skipped_copy (early-cutoff lost), realisation_deps (build \
+         trace not recorded). Nonzero realisation_insert is the bug_048 \
+         signature; the staged re-establisher (follow-up F2, \
+         reestablish_stripped_modular_hash) drives this \
+         to zero."
     );
     describe_counter!(
         "rio_scheduler_ca_cutoff_seconds_saved",

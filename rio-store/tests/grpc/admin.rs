@@ -234,3 +234,55 @@ async fn trigger_gc_without_service_token_rejected() -> TestResult {
     server.abort();
     Ok(())
 }
+
+/// `InvalidatePath` is operator-remediation surface (deletes cache-hit
+/// metadata): allowlist is `["rio-cli"]`. No token → reject; allow-
+/// listed caller with a token → accepted and the metadata is gone.
+// r[verify store.admin.service-gate]
+#[tokio::test]
+async fn invalidate_path_service_gate_and_happy_path() -> TestResult {
+    use rio_proto::types::InvalidatePathRequest;
+    use rio_test_support::fixtures::test_store_path;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let path = test_store_path("gate-invalidate");
+    let hash = rio_store::test_helpers::StoreSeed::path("gate-invalidate")
+        .seed(&db.pool)
+        .await;
+    let (mut admin, server) = spawn_admin_gated(db.pool.clone()).await?;
+
+    // No header → reject; the row must survive.
+    let err = admin
+        .invalidate_path(InvalidatePathRequest {
+            store_path: path.clone(),
+            keep_realisations: false,
+        })
+        .await
+        .expect_err("no service token → reject");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM narinfo WHERE store_path_hash = $1")
+        .bind(&hash)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(n, 1, "rejected call must not delete narinfo");
+
+    // Allowlisted caller (rio-cli) → accepted, metadata deleted.
+    let mut req = tonic::Request::new(InvalidatePathRequest {
+        store_path: path,
+        keep_realisations: false,
+    });
+    req.metadata_mut().insert(
+        rio_proto::SERVICE_TOKEN_HEADER,
+        sign_service("rio-cli").parse().unwrap(),
+    );
+    let resp = admin.invalidate_path(req).await?.into_inner();
+    assert!(resp.found);
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM narinfo WHERE store_path_hash = $1")
+        .bind(&hash)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(n, 0, "allowlisted call deletes the narinfo row");
+
+    server.abort();
+    Ok(())
+}

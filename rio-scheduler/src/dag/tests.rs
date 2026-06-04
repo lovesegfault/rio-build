@@ -103,6 +103,13 @@ fn test_merge_unions_wanted_outputs_on_existing_node() -> anyhow::Result<()> {
     let mut a = make_node("hashWA", "x86_64-linux");
     a.wanted_output_names = vec!["out".into()];
     dag.merge(Uuid::new_v4(), &[a.clone()], &[], "")?;
+    // The resident parent must be edge-admissible under the
+    // creation-scoped edge rule (sched.merge.edge-creation-scoped) for
+    // the joining submission's hashWA→hashWB edge to land at all (a
+    // foreign-parent edge would be skipped, no cycle would form, and
+    // the merge would succeed) — same staging as
+    // test_cycle_via_new_edge_between_existing_nodes.
+    dag.nodes.get_mut("hashWA").unwrap().topdown_pruned = true;
     let mut b = make_node("hashWB", "x86_64-linux");
     b.wanted_output_names = vec![];
     a.wanted_output_names = vec!["dev".into()];
@@ -902,6 +909,11 @@ fn test_cycle_via_new_edge_between_existing_nodes() -> anyhow::Result<()> {
 
     // Now merge the SAME nodes (no new inserts) with a B->A edge.
     // This creates a cycle via a new edge between two existing nodes.
+    // B is resident and not re-created, so the creation-scoped edge gate
+    // would skip the new edge; mark it topdown-pruned (the carve-out that
+    // legitimately admits dependency top-ups onto a resident parent) so
+    // the dfs-from-pre-existing-parent cycle coverage stays exercised.
+    dag.nodes.get_mut("hashB").unwrap().topdown_pruned = true;
     let build2 = Uuid::new_v4();
     let cycle_edge = vec![make_edge("hashB", "hashA")];
     let result = dag.merge(build2, &nodes, &cycle_edge, "");
@@ -946,19 +958,22 @@ fn test_cycle_rollback_preserves_prior_interest() -> anyhow::Result<()> {
         "B1 interest in A should be set after successful merge"
     );
 
-    // Step 2: merge B1 again with nodes {A, C} and cycle A->C->A — fails.
+    // Step 2: merge B1 again with nodes {A, C, D} and a C->D->C cycle
+    // among the NEWLY-inserted nodes (A is resident and not re-created,
+    // so the creation-scoped edge gate would skip edges parented on it).
     // Regression guard: rollback must not clear B1 from A even though
     // B1 was already interested in A from step 1.
-    let nodes_ac = vec![
+    let nodes_acd = vec![
         make_node("hashA", "x86_64-linux"),
         make_node("hashC", "x86_64-linux"),
+        make_node("hashD", "x86_64-linux"),
     ];
-    let cycle_edges = vec![make_edge("hashA", "hashC"), make_edge("hashC", "hashA")];
-    let result = dag.merge(b1, &nodes_ac, &cycle_edges, "");
+    let cycle_edges = vec![make_edge("hashC", "hashD"), make_edge("hashD", "hashC")];
+    let result = dag.merge(b1, &nodes_acd, &cycle_edges, "");
     assert!(result.is_err(), "cycle should be rejected");
 
     // Step 3: A should STILL have B1 interest (was present before the
-    // failed merge). C should be gone entirely (was newly inserted).
+    // failed merge). C and D should be gone entirely (newly inserted).
     assert!(
         dag.nodes
             .get("hashA")
@@ -970,6 +985,10 @@ fn test_cycle_rollback_preserves_prior_interest() -> anyhow::Result<()> {
     assert!(
         !dag.nodes.contains_key("hashC"),
         "newly-inserted C should be rolled back"
+    );
+    assert!(
+        !dag.nodes.contains_key("hashD"),
+        "newly-inserted D should be rolled back"
     );
     Ok(())
 }
@@ -1143,12 +1162,17 @@ fn test_path_to_hash_consistency() -> anyhow::Result<()> {
     assert_eq!(dag.hash_for_path("/nix/store/nonexistent.drv"), None);
 
     // Cycle rollback: newly-inserted node's path entry must be removed.
+    // hashA is resident and not re-created, so its half of the cycle is
+    // only admissible through the topdown-pruned carve-out
+    // (sched.merge.edge-creation-scoped).
+    dag.nodes.get_mut("hashA").unwrap().topdown_pruned = true;
     let cycle_nodes = vec![
         make_node("hashA", "x86_64-linux"),
         make_node("hashC", "x86_64-linux"),
     ];
     let cycle_edges = vec![make_edge("hashA", "hashC"), make_edge("hashC", "hashA")];
     dag.merge(b1, &cycle_nodes, &cycle_edges, "").unwrap_err();
+    dag.nodes.get_mut("hashA").unwrap().topdown_pruned = false;
     assert_eq!(
         dag.hash_for_path(&p_c),
         None,
@@ -1462,21 +1486,73 @@ fn test_large_dag_hot_ops_perf_bound() -> anyhow::Result<()> {
     // nodes terminal: K reaps × O(degree) each ≈ O(E). Regression guard
     // for the O(K×N) `values_mut()` full-scan in `remove_node` (~2e10
     // ops at this scale → would blow well past 15s).
+    //
+    // Re-pinned for round-17 merged_bug_024 with WATCHED PARENTS
+    // PRESENT (witness_watched-nonempty): W parents are pre-holed and
+    // kept alive by a second build, every reaped child of theirs is
+    // PRODUCED, so the trigger is exercised purely through the new
+    // watched path — the dedup-first candidate pass plus the per-parent
+    // breadcrumb probe is exactly the cost this bound now covers. The
+    // bound stays 2000ms: the watched pass adds one deduped set build
+    // over parents-of-reaped plus one `is_holed` probe per unique
+    // parent, never per edge (the rejected per-edge accumulation is
+    // what regressed this bound during round-16 development).
+    const W: usize = 1_000;
+    let keeper = Uuid::new_v4();
+    let watched: Vec<String> = (N - W..N).map(|i| format!("h{i:08}")).collect();
+    {
+        let keep_nodes: Vec<DerivationNode> = (N - W..N)
+            .map(|i| {
+                make_node_with_path(
+                    &format!("h{i:08}"),
+                    &format!("/nix/store/{i:032}-n{i}.drv"),
+                    "x86_64-linux",
+                )
+            })
+            .collect();
+        dag.merge(keeper, &keep_nodes, &[], "")?;
+    }
+    for h in &watched {
+        dag.node_mut(h)
+            .unwrap()
+            .closure_hole
+            .stamp([DrvHash::from("pre-existing-missing")]);
+    }
     for i in FANOUT..N {
         let h = format!("h{i:08}");
         dag.node_mut(&h)
             .unwrap()
             .set_status_for_test(DerivationStatus::Completed);
     }
+    // Bound re-pinned 2000→2500ms with the watched-nonempty content
+    // (round-17 merged_bug_024): measured on a quiet 192-core box
+    // (load ~3.5), the PRE-change content already ran ~2.0s — the old
+    // pin sat at the measured edge — and the witness_watched pass adds
+    // ~120ms (deduped candidate set + one breadcrumb probe per unique
+    // parent; the per-edge shape it replaces measured >2x worse). The
+    // regression this gate exists to catch (the O(K×N) `values_mut()`
+    // full scan ≈ minutes at this scale) still overshoots the new
+    // bound by orders of magnitude. Structural op-counting conversion
+    // remains the catalogued round-18 intake item for the I-140 class.
     let reaped = time!(
-        "reap-all",
-        2000,
+        "reap-all(watched-nonempty)",
+        2500,
         dag.remove_build_interest_and_reap(build_id)
     );
     assert_eq!(
         reaped.reaped_paths.len(),
-        N,
-        "all sole-interest terminal nodes reaped"
+        N - W,
+        "all sole-interest terminal nodes reaped; the W watched keeper-held parents survive"
+    );
+    let extended = reaped
+        .holed_parents
+        .iter()
+        .filter(|(p, _)| watched.binary_search(&p.to_string()).is_ok())
+        .count();
+    assert!(
+        extended > 0,
+        "the watched survivors' witnesses were extended through the produced-only \
+         removals (trigger exercised, not bypassed)"
     );
     Ok(())
 }
@@ -2107,7 +2183,7 @@ fn cascade_rejected_parent_promoted_not_stuck() {
     );
 }
 
-// r[verify sched.merge.dedup]
+// r[verify sched.merge.dedup+2]
 /// H2 regression (P0399): merge a new node X depending on
 /// pre-existing Skipped Y. compute_initial_states must return X as
 /// Ready, not Queued.
@@ -2531,4 +2607,3207 @@ fn test_remove_node_scrubs_only_neighbors() -> anyhow::Result<()> {
     assert_eq!(dag.children["c"], HashSet::from(["d".into()]));
     assert_eq!(dag.parents["c"], HashSet::from(["a".into()]));
     Ok(())
+}
+
+// ── sched.merge.authoritative-conflict ──────────────────────────────────
+
+/// Helper: a content-bound (floating-CA-shaped) node carrying
+/// authoritative inline derivation content, the shape produced by the
+/// gateway's content-bound hook fallback.
+fn authoritative_node(tag: &str, content: &[u8]) -> DerivationNode {
+    let mut n = make_node(tag, "x86_64-linux");
+    n.drv_content = content.to_vec();
+    n.drv_content_authoritative = true;
+    n.is_content_addressed = true;
+    n.expected_output_paths = vec![String::new()];
+    // The realisation key ingress binds to the bytes; the merge gate uses
+    // it as the floating-CA content evidence.
+    n.ca_modular_hash = Some([0xAB; 32]);
+    n
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+#[test]
+fn authoritative_collision_requires_byte_equality() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+    let b3 = Uuid::new_v4();
+
+    dag.merge(b1, &[authoritative_node("auth", b"Derive-A")], &[], "")?;
+
+    // Different authoritative bytes for the same drv_hash → rejected,
+    // existing node untouched, no interest recorded for the rejecter.
+    let err = dag
+        .merge(b2, &[authoritative_node("auth", b"Derive-B")], &[], "")
+        .unwrap_err();
+    assert!(matches!(err, DagError::AuthoritativeContentMismatch { .. }));
+    let node = dag.node("auth").unwrap();
+    assert_eq!(node.drv_content, b"Derive-A");
+    assert!(!node.interested_builds.contains(&b2));
+
+    // Byte-identical resubmission (the legitimate hook producer) joins.
+    let res = dag.merge(b3, &[authoritative_node("auth", b"Derive-A")], &[], "")?;
+    assert!(res.newly_inserted.is_empty());
+    assert!(dag.node("auth").unwrap().interested_builds.contains(&b3));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+#[test]
+fn conflicting_identity_against_inflight_authoritative_rejected() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    dag.merge(b1, &[authoritative_node("squat", b"Derive-A")], &[], "")?;
+
+    // Store-backed submission with a conflicting verifiable identity
+    // (different system) while the squatting node is in flight → rejected.
+    let mut victim = make_node("squat", "aarch64-linux");
+    victim.is_content_addressed = true;
+    let err = dag.merge(b2, &[victim], &[], "").unwrap_err();
+    assert!(matches!(err, DagError::ConflictingInFlightContent { .. }));
+    assert!(!dag.node("squat").unwrap().interested_builds.contains(&b2));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// Displacement of a conflicting authoritative squat is scoped to
+/// terminal FAILURE states: the verifiable store-backed definition wins
+/// against a parked failure, but never against a settled success (see
+/// `conflicting_identity_rejected_on_settled_authoritative_node`).
+#[rstest]
+#[case::poisoned(DerivationStatus::Poisoned)]
+#[case::cancelled(DerivationStatus::Cancelled)]
+#[case::dependency_failed(DerivationStatus::DependencyFailed)]
+fn conflicting_identity_displaces_terminal_authoritative_node(
+    #[case] parked: DerivationStatus,
+) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    dag.merge(b1, &[authoritative_node("squat2", b"Derive-A")], &[], "")?;
+    dag.nodes
+        .get_mut("squat2")
+        .unwrap()
+        .set_status_for_test(parked);
+
+    // Once the squatting node is parked in a terminal failure state, the
+    // verifiable definition displaces it: fresh node, no inherited
+    // interest, no rejection.
+    let mut victim = make_node("squat2", "aarch64-linux");
+    victim.is_content_addressed = true;
+    let res = dag.merge(b2, &[victim], &[], "")?;
+    assert!(res.newly_inserted.contains("squat2"));
+    // Displacement is surfaced to the actor via `displaced` (for poison /
+    // accounting reconciliation), never via `reset_on_resubmit`.
+    assert!(res.displaced.iter().any(|h| h.as_str() == "squat2"));
+    assert!(res.reset_on_resubmit.is_empty());
+    let node = dag.node("squat2").unwrap();
+    assert_eq!(node.system, "aarch64-linux");
+    assert!(node.drv_content.is_empty());
+    assert!(!node.drv_content_authoritative);
+    assert!(node.interested_builds.contains(&b2));
+    assert!(!node.interested_builds.contains(&b1));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// A conflicting store-backed submission against a SETTLED
+/// (Completed/Skipped) authoritative node is rejected, never displaces:
+/// the settled record — its identity, inline bytes, and interest
+/// accounting — survives intact. Displacing it would let an unverified
+/// submitter claim erase the record of a successful build (bug_076).
+#[rstest]
+#[case::completed(DerivationStatus::Completed)]
+#[case::skipped(DerivationStatus::Skipped)]
+fn conflicting_identity_rejected_on_settled_authoritative_node(
+    #[case] settled: DerivationStatus,
+) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    dag.merge(b1, &[authoritative_node("settled", b"Derive-A")], &[], "")?;
+    dag.nodes
+        .get_mut("settled")
+        .unwrap()
+        .set_status_for_test(settled);
+
+    let mut conflicting = make_node("settled", "aarch64-linux");
+    conflicting.is_content_addressed = true;
+    let err = dag.merge(b2, &[conflicting], &[], "").unwrap_err();
+    assert!(matches!(err, DagError::ConflictingInFlightContent { .. }));
+
+    // The settled node is byte-for-byte what it was before the attempt.
+    let node = dag.node("settled").unwrap();
+    assert_eq!(node.status(), settled, "settled status untouched");
+    assert_eq!(node.system, "x86_64-linux");
+    assert_eq!(node.drv_content, b"Derive-A");
+    assert!(node.drv_content_authoritative);
+    assert!(node.interested_builds.contains(&b1));
+    assert!(!node.interested_builds.contains(&b2));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+#[test]
+fn matching_identity_joins_authoritative_node() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    dag.merge(b1, &[authoritative_node("join", b"Derive-A")], &[], "")?;
+
+    // Same verifiable identity WITH content evidence (the matching CA
+    // modular hash a store-backed submission of the same resolved
+    // derivation computes) → joins as before; bytes untouched.
+    let mut same = make_node("join", "x86_64-linux");
+    same.is_content_addressed = true;
+    same.ca_modular_hash = Some([0xAB; 32]);
+    let res = dag.merge(b2, &[same], &[], "")?;
+    assert!(res.newly_inserted.is_empty());
+    let node = dag.node("join").unwrap();
+    assert!(node.interested_builds.contains(&b2));
+    assert_eq!(node.drv_content, b"Derive-A");
+    assert!(node.drv_content_authoritative);
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+#[test]
+fn authoritative_bytes_ignored_when_existing_node_is_store_backed() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    // Store-backed node first…
+    dag.merge(b1, &[make_node("store-backed", "x86_64-linux")], &[], "")?;
+    // …then an authoritative submission for the same drv_hash: joins,
+    // bytes ignored (the store remains the source of truth).
+    let res = dag.merge(
+        b2,
+        &[authoritative_node("store-backed", b"Derive-X")],
+        &[],
+        "",
+    )?;
+    assert!(res.newly_inserted.is_empty());
+    let node = dag.node("store-backed").unwrap();
+    assert!(node.interested_builds.contains(&b2));
+    assert!(node.drv_content.is_empty());
+    assert!(!node.drv_content_authoritative);
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-claim-no-redefine]
+/// The inverse direction of the gate: an authoritative claim landing on
+/// a STORE-BACKED node that is eligible for the resubmit-reset must not
+/// be able to redefine it. With a conflicting verifiable identity
+/// (different system here) the claim is rejected and the parked
+/// store-backed node is left exactly as it was — still store-backed,
+/// same status, no interest recorded for the rejecter.
+#[rstest]
+#[case::failed(DerivationStatus::Failed)]
+#[case::cancelled(DerivationStatus::Cancelled)]
+#[case::dependency_failed(DerivationStatus::DependencyFailed)]
+#[case::poisoned_under_budget(DerivationStatus::Poisoned)]
+fn authoritative_claim_rejected_on_retriable_store_backed_node(
+    #[case] prior: DerivationStatus,
+) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    // Store-backed (verifiable) definition first, then parked retriable.
+    let mut store_backed = make_node("claim-park", "aarch64-linux");
+    store_backed.is_content_addressed = true;
+    dag.merge(b1, &[store_backed], &[], "")?;
+    dag.nodes
+        .get_mut("claim-park")
+        .unwrap()
+        .set_status_for_test(prior);
+    let prior_cycles = dag.node("claim-park").unwrap().retry.resubmit_cycles;
+
+    // Authoritative claim with a conflicting identity (x86_64 vs the
+    // parked aarch64 definition) → rejected, nothing adopted.
+    let err = dag
+        .merge(
+            b2,
+            &[authoritative_node("claim-park", b"Derive-EVIL")],
+            &[],
+            "",
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DagError::AuthoritativeClaimIdentityConflict { .. }
+    ));
+    let node = dag.node("claim-park").unwrap();
+    assert_eq!(node.status(), prior, "parked status untouched");
+    assert_eq!(node.system, "aarch64-linux");
+    assert!(node.drv_content.is_empty(), "no bytes adopted");
+    assert!(!node.drv_content_authoritative, "still store-backed");
+    assert_eq!(node.retry.resubmit_cycles, prior_cycles);
+    assert!(node.interested_builds.contains(&b1));
+    assert!(!node.interested_builds.contains(&b2));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-claim-no-redefine]
+/// An authoritative claim whose verifiable identity MATCHES the parked
+/// store-backed node (same public attributes plus content-bound
+/// evidence) is the legitimate hook-fallback retry: it is admitted
+/// through the normal resubmit-reset — bytes adopted, prior interest
+/// carried, resubmit cycle accumulated — and never via displacement.
+/// Covers both evidence forms: a byte-equal CA modular hash and a
+/// shared non-empty fixed-output expected path.
+#[test]
+fn authoritative_claim_with_matching_identity_resets_store_backed_node() -> anyhow::Result<()> {
+    // Floating-CA evidence: matching modular hash.
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+    let mut store_backed = make_node("claim-ca", "x86_64-linux");
+    store_backed.is_content_addressed = true;
+    store_backed.expected_output_paths = vec![String::new()];
+    store_backed.ca_modular_hash = Some([0xAB; 32]);
+    dag.merge(b1, &[store_backed], &[], "")?;
+    dag.nodes
+        .get_mut("claim-ca")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Failed);
+    let prior_cycles = dag.node("claim-ca").unwrap().retry.resubmit_cycles;
+
+    let res = dag.merge(b2, &[authoritative_node("claim-ca", b"Derive-A")], &[], "")?;
+    assert!(res.newly_inserted.contains("claim-ca"));
+    assert!(
+        res.reset_on_resubmit
+            .iter()
+            .any(|h| h.as_str() == "claim-ca"),
+        "admitted through the resubmit-reset"
+    );
+    assert!(
+        res.displaced.is_empty(),
+        "never displaces a store-backed node"
+    );
+    let node = dag.node("claim-ca").unwrap();
+    assert_eq!(node.drv_content, b"Derive-A", "claim bytes adopted");
+    assert!(node.drv_content_authoritative);
+    assert!(
+        node.interested_builds.contains(&b1),
+        "prior interest carried"
+    );
+    assert!(node.interested_builds.contains(&b2));
+    assert_eq!(node.retry.resubmit_cycles, prior_cycles + 1);
+
+    // Fixed-output evidence: shared non-empty expected path.
+    let mut dag = DerivationDag::new();
+    let b3 = Uuid::new_v4();
+    let b4 = Uuid::new_v4();
+    let fod_path = "/nix/store/ffffffffffffffffffffffffffffffff-fod-out";
+    let mut fod_store_backed = make_node("claim-fod", "x86_64-linux");
+    fod_store_backed.is_fixed_output = true;
+    fod_store_backed.is_content_addressed = true;
+    fod_store_backed.expected_output_paths = vec![fod_path.to_string()];
+    dag.merge(b3, &[fod_store_backed], &[], "")?;
+    dag.nodes
+        .get_mut("claim-fod")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Cancelled);
+
+    let mut fod_claim = authoritative_node("claim-fod", b"Derive-FOD");
+    fod_claim.is_fixed_output = true;
+    fod_claim.expected_output_paths = vec![fod_path.to_string()];
+    fod_claim.ca_modular_hash = None;
+    let res = dag.merge(b4, &[fod_claim], &[], "")?;
+    assert!(
+        res.reset_on_resubmit
+            .iter()
+            .any(|h| h.as_str() == "claim-fod")
+    );
+    let node = dag.node("claim-fod").unwrap();
+    assert_eq!(node.drv_content, b"Derive-FOD");
+    assert!(node.drv_content_authoritative);
+    assert!(node.interested_builds.contains(&b3));
+    assert!(node.interested_builds.contains(&b4));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-claim-no-redefine]
+/// Degenerate-evidence parity with the store-backed→authoritative arm:
+/// a parked retriable store-backed floating-CA node that carries NO
+/// content-bound evidence (no modular hash) cannot be claimed by an
+/// authoritative submission — no evidence is a conflict, not a match.
+#[test]
+fn authoritative_claim_without_evidence_is_rejected() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    // Same public attributes as the claimant (system, CA flag, output
+    // set) but no modular hash on the parked node → no evidence.
+    let mut store_backed = make_node("claim-noev", "x86_64-linux");
+    store_backed.is_content_addressed = true;
+    store_backed.expected_output_paths = vec![String::new()];
+    dag.merge(b1, &[store_backed], &[], "")?;
+    dag.nodes
+        .get_mut("claim-noev")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Failed);
+
+    let err = dag
+        .merge(
+            b2,
+            &[authoritative_node("claim-noev", b"Derive-A")],
+            &[],
+            "",
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DagError::AuthoritativeClaimIdentityConflict { .. }
+    ));
+    let node = dag.node("claim-noev").unwrap();
+    assert!(!node.drv_content_authoritative);
+    assert!(node.drv_content.is_empty());
+    assert!(!node.interested_builds.contains(&b2));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// Match-displacement of a poison-locked squat: an identity-MATCHING
+/// store-backed submission must DISPLACE (not join) an authoritative
+/// node that sits in a terminal failure state no longer retriable on
+/// resubmit (poison budget exhausted) — otherwise the locked claim
+/// would capture every later legitimate submission of the derivation
+/// for the rest of its poison TTL. FOD-shaped here: path agreement is
+/// the content evidence, exactly the join-evidence the squat used.
+#[test]
+fn fod_matching_identity_displaces_poisoned_over_budget_squat() -> anyhow::Result<()> {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+    let fod_path = "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-fod-out";
+
+    let mut squat = authoritative_node("locked-fod", b"Derive-FOD");
+    squat.is_fixed_output = true;
+    squat.expected_output_paths = vec![fod_path.to_string()];
+    squat.ca_modular_hash = None;
+    dag.merge(squatter, &[squat], &[], "")?;
+    {
+        let n = dag.nodes.get_mut("locked-fod").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = POISON_RESUBMIT_RETRY_LIMIT;
+    }
+
+    // Same verifiable identity (shared non-empty expected path).
+    let mut store_backed = make_node("locked-fod", "x86_64-linux");
+    store_backed.is_fixed_output = true;
+    store_backed.is_content_addressed = true;
+    store_backed.expected_output_paths = vec![fod_path.to_string()];
+    let res = dag.merge(victim, &[store_backed], &[], "")?;
+
+    assert!(res.newly_inserted.contains("locked-fod"));
+    assert!(
+        res.displaced.iter().any(|h| h.as_str() == "locked-fod"),
+        "match-displacement, not a join"
+    );
+    assert!(
+        res.reset_on_resubmit.is_empty(),
+        "not the resubmit-reset path"
+    );
+    let n = dag.node("locked-fod").unwrap();
+    assert!(n.drv_content.is_empty());
+    assert!(!n.drv_content_authoritative);
+    assert_eq!(
+        n.interested_builds,
+        HashSet::from([victim]),
+        "no inherited interest"
+    );
+    assert_eq!(n.retry.resubmit_cycles, 0, "fresh poison budget");
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// Match-displacement is scoped to LOCKED terminal failures only: a
+/// successfully finished authoritative node (Completed or Skipped)
+/// keeps the join semantics for an identity-matching store-backed
+/// submission, so cache-hit dedup of an already-built derivation is
+/// not lost.
+#[rstest]
+#[case::completed(DerivationStatus::Completed)]
+#[case::skipped(DerivationStatus::Skipped)]
+fn matching_identity_joins_completed_authoritative_node(
+    #[case] terminal_ok: DerivationStatus,
+) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    dag.merge(b1, &[authoritative_node("done-auth", b"Derive-A")], &[], "")?;
+    dag.nodes
+        .get_mut("done-auth")
+        .unwrap()
+        .set_status_for_test(terminal_ok);
+
+    let mut same = make_node("done-auth", "x86_64-linux");
+    same.is_content_addressed = true;
+    same.ca_modular_hash = Some([0xAB; 32]);
+    let res = dag.merge(b2, &[same], &[], "")?;
+    assert!(res.newly_inserted.is_empty(), "joins, not displaced");
+    assert!(res.displaced.is_empty());
+    let node = dag.node("done-auth").unwrap();
+    assert_eq!(node.status(), terminal_ok, "terminal-success state kept");
+    assert_eq!(node.drv_content, b"Derive-A");
+    assert!(node.drv_content_authoritative);
+    assert!(node.interested_builds.contains(&b2));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+// r[verify sched.merge.displaced-failure-reset+2]
+/// An UNDER-budget poisoned squat is still retriable on resubmit, so an
+/// identity-matching store-backed submission takes the normal
+/// resubmit-reset (interest carried, the squat's bytes replaced by the
+/// store-backed definition) — the match-displacement arm must not
+/// pre-empt it. Because the removed node was authoritative and the
+/// re-creating submission is store-backed, this is an authority
+/// takeover: the fresh node is a different definition, so it starts
+/// with a fresh poison-resubmit budget and is surfaced in
+/// `authority_takeovers` (so the actor skips the cycle-incrementing
+/// `clear_poison_batch` for it).
+#[test]
+fn matching_identity_resets_poisoned_under_budget_squat() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let resubmitter = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("under-budget", b"Derive-A")],
+        &[],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("under-budget").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = 1; // under POISON_RESUBMIT_RETRY_LIMIT
+    }
+
+    let mut same = make_node("under-budget", "x86_64-linux");
+    same.is_content_addressed = true;
+    same.ca_modular_hash = Some([0xAB; 32]);
+    let res = dag.merge(resubmitter, &[same], &[], "")?;
+
+    assert!(res.newly_inserted.contains("under-budget"));
+    assert!(
+        res.reset_on_resubmit
+            .iter()
+            .any(|h| h.as_str() == "under-budget"),
+        "resubmit-reset, not displacement"
+    );
+    assert!(res.displaced.is_empty());
+    assert!(
+        res.authority_takeovers
+            .iter()
+            .any(|h| h.as_str() == "under-budget"),
+        "authoritative→store-backed flip surfaced as an authority takeover"
+    );
+    let n = dag.node("under-budget").unwrap();
+    assert!(n.interested_builds.contains(&squatter), "interest carried");
+    assert!(n.interested_builds.contains(&resubmitter));
+    assert_eq!(
+        n.retry.resubmit_cycles, 0,
+        "definition change: the squat's consumed poison budget does not carry over"
+    );
+    assert!(n.drv_content.is_empty(), "store-backed definition adopted");
+    assert!(!n.drv_content_authoritative);
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-failure-reset+2]
+/// Contrast pin for the authority-takeover carve-out: SAME-definition
+/// resubmits keep accumulating the poison-resubmit budget and are never
+/// reported as authority takeovers — a store-backed node resubmitted
+/// store-backed, and an authoritative node resubmitted with
+/// byte-identical content, both increment `resubmit_cycles` exactly as
+/// before.
+#[test]
+fn store_backed_resubmit_is_not_an_authority_takeover() -> anyhow::Result<()> {
+    // Store-backed → store-backed.
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+    dag.merge(b1, &[make_node("same-store", "x86_64-linux")], &[], "")?;
+    {
+        let n = dag.nodes.get_mut("same-store").unwrap();
+        n.set_status_for_test(DerivationStatus::Failed);
+        n.retry.resubmit_cycles = 1;
+    }
+    let res = dag.merge(b2, &[make_node("same-store", "x86_64-linux")], &[], "")?;
+    assert!(
+        res.reset_on_resubmit
+            .iter()
+            .any(|h| h.as_str() == "same-store")
+    );
+    assert!(
+        res.authority_takeovers.is_empty(),
+        "store→store resubmit is not a takeover"
+    );
+    assert_eq!(
+        dag.node("same-store").unwrap().retry.resubmit_cycles,
+        2,
+        "same-definition resubmit keeps accumulating the budget"
+    );
+
+    // Authoritative → byte-identical authoritative.
+    let mut dag = DerivationDag::new();
+    let b3 = Uuid::new_v4();
+    let b4 = Uuid::new_v4();
+    dag.merge(b3, &[authoritative_node("same-auth", b"Derive-A")], &[], "")?;
+    {
+        let n = dag.nodes.get_mut("same-auth").unwrap();
+        n.set_status_for_test(DerivationStatus::Failed);
+        n.retry.resubmit_cycles = 1;
+    }
+    let res = dag.merge(b4, &[authoritative_node("same-auth", b"Derive-A")], &[], "")?;
+    assert!(
+        res.reset_on_resubmit
+            .iter()
+            .any(|h| h.as_str() == "same-auth")
+    );
+    assert!(
+        res.authority_takeovers.is_empty(),
+        "byte-identical authoritative retry is not a takeover"
+    );
+    assert_eq!(dag.node("same-auth").unwrap().retry.resubmit_cycles, 2);
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// A merge that match-displaces a poison-locked squat but fails on a
+/// LATER node in the same submission must restore the squat exactly —
+/// the match-displacement rides the same rollback container as the
+/// conflict-displacement.
+#[test]
+fn rollback_restores_a_match_displaced_poisoned_squat() -> anyhow::Result<()> {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("locked-rb", b"Derive-A")],
+        &[],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("locked-rb").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = POISON_RESUBMIT_RETRY_LIMIT;
+    }
+
+    let mut displacing = make_node("locked-rb", "x86_64-linux");
+    displacing.is_content_addressed = true;
+    displacing.ca_modular_hash = Some([0xAB; 32]);
+    let result = dag.merge(
+        victim,
+        &[
+            displacing,
+            make_node_with_path("bad", "not-a-store-path", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    );
+    assert!(matches!(result, Err(DagError::InvalidDrvPath { .. })));
+
+    let n = dag.node("locked-rb").expect("squat restored");
+    assert_eq!(n.status(), DerivationStatus::Poisoned);
+    assert_eq!(n.drv_content, b"Derive-A");
+    assert!(n.drv_content_authoritative);
+    assert_eq!(n.retry.resubmit_cycles, POISON_RESUBMIT_RETRY_LIMIT);
+    assert_eq!(n.interested_builds, HashSet::from([squatter]));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// The gate is evaluated BEFORE the resubmit-reset, so an authoritative
+/// node that is merely `Failed` (non-terminal — the retry machinery
+/// still owns it) cannot be silently redefined by different
+/// authoritative bytes — while the legitimate byte-identical retry still
+/// flows through the resubmit-reset (interest carry + cycle increment).
+/// Terminal failure states are covered by
+/// `authoritative_redefinition_displaces_parked_terminal_failure`.
+#[test]
+fn authoritative_redefinition_rejected_while_failed() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+    let b3 = Uuid::new_v4();
+
+    dag.merge(b1, &[authoritative_node("retriable", b"Derive-A")], &[], "")?;
+    dag.nodes
+        .get_mut("retriable")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Failed);
+
+    // Different authoritative bytes → rejected while Failed; node
+    // untouched.
+    let err = dag
+        .merge(b2, &[authoritative_node("retriable", b"Derive-B")], &[], "")
+        .unwrap_err();
+    assert!(matches!(err, DagError::AuthoritativeContentMismatch { .. }));
+    let node = dag.node("retriable").unwrap();
+    assert_eq!(node.drv_content, b"Derive-A");
+    assert_eq!(node.status(), DerivationStatus::Failed);
+    assert!(!node.interested_builds.contains(&b2));
+
+    // Byte-identical retry (the legitimate hook producer) is admitted and
+    // takes the resubmit-reset path: fresh node, prior interest carried,
+    // poison-cycle accumulator incremented.
+    let prior_cycles = dag.node("retriable").unwrap().retry.resubmit_cycles;
+    let res = dag.merge(b3, &[authoritative_node("retriable", b"Derive-A")], &[], "")?;
+    assert!(res.newly_inserted.contains("retriable"));
+    assert!(
+        res.reset_on_resubmit
+            .iter()
+            .any(|h| h.as_str() == "retriable")
+    );
+    assert!(res.displaced.is_empty());
+    let node = dag.node("retriable").unwrap();
+    assert!(node.interested_builds.contains(&b1));
+    assert!(node.interested_builds.contains(&b3));
+    assert_eq!(node.retry.resubmit_cycles, prior_cycles + 1);
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// A byte-different authoritative submission DISPLACES an authoritative
+/// claim parked in a terminal failure state (Poisoned at any budget,
+/// Cancelled, DependencyFailed): the hook-fallback population submits
+/// authoritatively and has no store-backed form, so without this arm a
+/// failed pre-squat would lock those victims out of the hash for the
+/// rest of its poison TTL. The fresh node carries the new bytes, only
+/// the new submitter's interest, and a fresh poison budget; it is
+/// surfaced via `displaced` (not `reset_on_resubmit`) so all the
+/// displacement bookkeeping applies.
+#[rstest]
+#[case::poisoned_over_budget(DerivationStatus::Poisoned, true)]
+#[case::poisoned_under_budget(DerivationStatus::Poisoned, false)]
+#[case::cancelled(DerivationStatus::Cancelled, false)]
+#[case::dependency_failed(DerivationStatus::DependencyFailed, false)]
+fn authoritative_redefinition_displaces_parked_terminal_failure(
+    #[case] prior: DerivationStatus,
+    #[case] over_budget: bool,
+) -> anyhow::Result<()> {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("auth-displace", b"Derive-squat")],
+        &[],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("auth-displace").unwrap();
+        n.set_status_for_test(prior);
+        if over_budget {
+            n.retry.resubmit_cycles = POISON_RESUBMIT_RETRY_LIMIT;
+        }
+    }
+
+    let res = dag.merge(
+        victim,
+        &[authoritative_node("auth-displace", b"Derive-victim")],
+        &[],
+        "",
+    )?;
+    assert!(res.newly_inserted.contains("auth-displace"));
+    assert!(
+        res.displaced.iter().any(|h| h.as_str() == "auth-displace"),
+        "terminal-failure squat displaced, not joined or reset"
+    );
+    assert!(
+        res.reset_on_resubmit.is_empty(),
+        "not the resubmit-reset path"
+    );
+    let n = dag.node("auth-displace").unwrap();
+    assert_eq!(n.drv_content, b"Derive-victim", "redefinition's bytes win");
+    assert!(n.drv_content_authoritative);
+    assert_eq!(
+        n.interested_builds,
+        HashSet::from([victim]),
+        "no inherited interest"
+    );
+    assert_eq!(n.retry.resubmit_cycles, 0, "fresh poison budget");
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// A successfully finished authoritative definition (Completed or
+/// Skipped) is never redefined: byte-different authoritative content is
+/// still rejected, so an attacker cannot rewrite an already-built
+/// derivation out from under the builds that produced or consumed it.
+#[rstest]
+#[case::completed(DerivationStatus::Completed)]
+#[case::skipped(DerivationStatus::Skipped)]
+fn authoritative_redefinition_still_rejected_after_success(
+    #[case] terminal_ok: DerivationStatus,
+) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    dag.merge(b1, &[authoritative_node("auth-done", b"Derive-A")], &[], "")?;
+    dag.nodes
+        .get_mut("auth-done")
+        .unwrap()
+        .set_status_for_test(terminal_ok);
+
+    let err = dag
+        .merge(b2, &[authoritative_node("auth-done", b"Derive-B")], &[], "")
+        .unwrap_err();
+    assert!(matches!(err, DagError::AuthoritativeContentMismatch { .. }));
+    let node = dag.node("auth-done").unwrap();
+    assert_eq!(node.status(), terminal_ok, "built definition untouched");
+    assert_eq!(node.drv_content, b"Derive-A");
+    assert!(!node.interested_builds.contains(&b2));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// A merge that auth-displaces a poison-locked squat but fails on a
+/// LATER node in the same submission must restore the squat exactly —
+/// the auth-vs-auth displacement rides the same rollback container as
+/// the store-backed displacement arms.
+#[test]
+fn rollback_restores_an_auth_displaced_locked_squat() -> anyhow::Result<()> {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("auth-rb", b"Derive-A")],
+        &[],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("auth-rb").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = POISON_RESUBMIT_RETRY_LIMIT;
+    }
+
+    let result = dag.merge(
+        victim,
+        &[
+            authoritative_node("auth-rb", b"Derive-B"),
+            make_node_with_path("bad", "not-a-store-path", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    );
+    assert!(matches!(result, Err(DagError::InvalidDrvPath { .. })));
+
+    let n = dag.node("auth-rb").expect("squat restored");
+    assert_eq!(n.status(), DerivationStatus::Poisoned);
+    assert_eq!(n.drv_content, b"Derive-A");
+    assert!(n.drv_content_authoritative);
+    assert_eq!(n.retry.resubmit_cycles, POISON_RESUBMIT_RETRY_LIMIT);
+    assert_eq!(n.interested_builds, HashSet::from([squatter]));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// A poison-budget-exhausted authoritative squat is terminal and gets
+/// displaced by the conflicting verifiable (store-backed) definition —
+/// fresh node without inherited interest or failure history, surfaced in
+/// `MergeResult::displaced` (and NOT in `reset_on_resubmit`).
+#[test]
+fn conflicting_identity_displaces_poisoned_over_budget_squat() -> anyhow::Result<()> {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("squat3", b"Derive-A")],
+        &[],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("squat3").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = POISON_RESUBMIT_RETRY_LIMIT;
+    }
+
+    let mut node = make_node("squat3", "aarch64-linux");
+    node.is_content_addressed = true;
+    let res = dag.merge(victim, &[node], &[], "")?;
+
+    assert!(res.newly_inserted.contains("squat3"));
+    assert!(res.displaced.iter().any(|h| h.as_str() == "squat3"));
+    assert!(res.reset_on_resubmit.is_empty());
+    let n = dag.node("squat3").unwrap();
+    assert_eq!(n.system, "aarch64-linux");
+    assert!(n.drv_content.is_empty());
+    assert!(!n.drv_content_authoritative);
+    assert_eq!(n.interested_builds, HashSet::from([victim]));
+    assert_eq!(n.retry.resubmit_cycles, 0);
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// Cancelled is terminal: a conflicting store-backed definition takes the
+/// displacement path (fresh node, no inherited interest), NOT the
+/// interest-carrying resubmit-reset.
+#[test]
+fn conflicting_identity_displaces_cancelled_authoritative_node_without_interest()
+-> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("squat4", b"Derive-A")],
+        &[],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("squat4")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Cancelled);
+
+    let mut node = make_node("squat4", "aarch64-linux");
+    node.is_content_addressed = true;
+    let res = dag.merge(victim, &[node], &[], "")?;
+
+    assert!(res.newly_inserted.contains("squat4"));
+    assert!(res.displaced.iter().any(|h| h.as_str() == "squat4"));
+    assert!(res.reset_on_resubmit.is_empty());
+    let n = dag.node("squat4").unwrap();
+    assert!(!n.interested_builds.contains(&squatter));
+    assert!(n.interested_builds.contains(&victim));
+    assert!(!n.drv_content_authoritative);
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// Failed is NOT terminal (the retry machinery still owns it): a
+/// conflicting store-backed submission is rejected, not displaced.
+#[test]
+fn conflicting_identity_rejected_while_failed() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("squat5", b"Derive-A")],
+        &[],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("squat5")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Failed);
+
+    let mut node = make_node("squat5", "aarch64-linux");
+    node.is_content_addressed = true;
+    let err = dag.merge(victim, &[node], &[], "").unwrap_err();
+    assert!(matches!(err, DagError::ConflictingInFlightContent { .. }));
+    let n = dag.node("squat5").unwrap();
+    assert_eq!(n.status(), DerivationStatus::Failed);
+    assert_eq!(n.drv_content, b"Derive-A");
+    assert!(n.drv_content_authoritative);
+    assert!(!n.interested_builds.contains(&victim));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// A merge that displaces a poisoned-over-budget squat but fails on a
+/// LATER node in the same submission must restore the squat exactly
+/// (status, bytes, interest, poison accumulator) — displacement rides the
+/// same rollback container as the resubmit-reset.
+#[test]
+fn rollback_restores_a_displaced_poisoned_squat() -> anyhow::Result<()> {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("squat6", b"Derive-A")],
+        &[],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("squat6").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = POISON_RESUBMIT_RETRY_LIMIT;
+    }
+
+    let mut displacing = make_node("squat6", "aarch64-linux");
+    displacing.is_content_addressed = true;
+    let result = dag.merge(
+        victim,
+        &[
+            displacing,
+            make_node_with_path("bad", "not-a-store-path", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    );
+    assert!(matches!(result, Err(DagError::InvalidDrvPath { .. })));
+
+    let n = dag.node("squat6").expect("squat restored");
+    assert_eq!(n.status(), DerivationStatus::Poisoned);
+    assert_eq!(n.drv_content, b"Derive-A");
+    assert!(n.drv_content_authoritative);
+    assert_eq!(n.system, "x86_64-linux");
+    assert_eq!(n.retry.resubmit_cycles, POISON_RESUBMIT_RETRY_LIMIT);
+    assert_eq!(n.interested_builds, HashSet::from([squatter]));
+    Ok(())
+}
+
+// ── sched.merge.displaced-edge-scrub ────────────────────────────────────
+
+// r[verify sched.merge.displaced-edge-scrub+2]
+/// Displacement scrubs the squatter's dependency (children) edges: the
+/// displacing fresh node's initial state is computed against ITS OWN
+/// declared dependency set (none here), not the squatter's — whether the
+/// squatter-attached child is terminally failed (which would otherwise
+/// seed the fresh node `DependencyFailed`) or merely incomplete (which
+/// would park it `Queued` forever).
+#[rstest]
+#[case::terminal_failed_child(DerivationStatus::Poisoned)]
+#[case::incomplete_child(DerivationStatus::Queued)]
+fn displacement_scrubs_inherited_dependency_edges(
+    #[case] junk_status: DerivationStatus,
+) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    // Squatter: authoritative squat plus its own junk node, with an
+    // attacker-attached dependency edge squat → junk.
+    dag.merge(
+        squatter,
+        &[
+            authoritative_node("edge-squat", b"Derive-squat"),
+            make_node("edge-junk", "x86_64-linux"),
+        ],
+        &[make_edge("edge-squat", "edge-junk")],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("edge-junk")
+        .unwrap()
+        .set_status_for_test(junk_status);
+    dag.nodes
+        .get_mut("edge-squat")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::DependencyFailed);
+
+    // Victim: conflicting store-backed identity (different system)
+    // displaces the parked terminal squat.
+    let mut victim_node = make_node("edge-squat", "aarch64-linux");
+    victim_node.is_content_addressed = true;
+    let res = dag.merge(victim, &[victim_node], &[], "")?;
+    assert!(res.displaced.iter().any(|h| h.as_str() == "edge-squat"));
+
+    // The fresh node's dependency set is exactly the displacing
+    // submission's (none): the squatter's edge is gone in BOTH directions.
+    assert!(
+        dag.get_children("edge-squat").is_empty(),
+        "squatter's squat→junk edge scrubbed"
+    );
+    assert!(
+        !dag.get_parents("edge-junk")
+            .iter()
+            .any(|h| h.as_str() == "edge-squat"),
+        "junk child no longer lists the displaced hash as a dependent"
+    );
+    // And the initial-state seed reflects that: Ready, not
+    // DependencyFailed (terminal junk) or Queued (incomplete junk).
+    let states: HashMap<_, _> = dag
+        .compute_initial_states(&res.newly_inserted)
+        .into_iter()
+        .collect();
+    assert_eq!(
+        states["edge-squat"],
+        DerivationStatus::Ready,
+        "displacing node seeds from its own (empty) dependency set"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-edge-scrub+2]
+/// The scrub is children-direction only: nodes that DEPEND ON the
+/// displaced hash keep their edges (they want its output, whichever
+/// definition produces it), while the displaced node's own dependency
+/// edges are dropped.
+#[test]
+fn displacement_preserves_dependent_edges() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    // dependent → squat → junk
+    dag.merge(
+        squatter,
+        &[
+            make_node("edge-dependent", "x86_64-linux"),
+            authoritative_node("edge-squat-p", b"Derive-squat"),
+            make_node("edge-junk-p", "x86_64-linux"),
+        ],
+        &[
+            make_edge("edge-dependent", "edge-squat-p"),
+            make_edge("edge-squat-p", "edge-junk-p"),
+        ],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("edge-squat-p")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::DependencyFailed);
+
+    let mut victim_node = make_node("edge-squat-p", "aarch64-linux");
+    victim_node.is_content_addressed = true;
+    let res = dag.merge(victim, &[victim_node], &[], "")?;
+    assert!(res.displaced.iter().any(|h| h.as_str() == "edge-squat-p"));
+
+    // Children direction scrubbed…
+    assert!(
+        dag.get_children("edge-squat-p").is_empty(),
+        "squat→junk scrubbed"
+    );
+    assert!(
+        !dag.get_parents("edge-junk-p")
+            .iter()
+            .any(|h| h.as_str() == "edge-squat-p")
+    );
+    // …parents direction preserved.
+    assert!(
+        dag.get_children("edge-dependent")
+            .iter()
+            .any(|h| h.as_str() == "edge-squat-p"),
+        "dependent→squat edge preserved"
+    );
+    assert!(
+        dag.get_parents("edge-squat-p")
+            .iter()
+            .any(|h| h.as_str() == "edge-dependent"),
+        "displaced hash still lists its dependent"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-edge-scrub+2]
+/// A merge that displaces a squat (scrubbing its dependency edges) but
+/// fails on a LATER node in the same submission must restore the squat
+/// WITH its scrubbed edges — the pre-merge DAG exactly.
+#[test]
+fn rollback_restores_displaced_dependency_edges() -> anyhow::Result<()> {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[
+            authoritative_node("edge-squat-rb", b"Derive-squat"),
+            make_node("edge-junk-rb", "x86_64-linux"),
+        ],
+        &[make_edge("edge-squat-rb", "edge-junk-rb")],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("edge-squat-rb").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = POISON_RESUBMIT_RETRY_LIMIT;
+    }
+
+    let mut displacing = make_node("edge-squat-rb", "aarch64-linux");
+    displacing.is_content_addressed = true;
+    let result = dag.merge(
+        victim,
+        &[
+            displacing,
+            make_node_with_path("bad", "not-a-store-path", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    );
+    assert!(matches!(result, Err(DagError::InvalidDrvPath { .. })));
+
+    // The squat is restored together with its dependency edge.
+    let n = dag.node("edge-squat-rb").expect("squat restored");
+    assert_eq!(n.status(), DerivationStatus::Poisoned);
+    assert!(n.drv_content_authoritative);
+    assert!(
+        dag.get_children("edge-squat-rb")
+            .iter()
+            .any(|h| h.as_str() == "edge-junk-rb"),
+        "scrubbed squat→junk edge restored on rollback"
+    );
+    assert!(
+        dag.get_parents("edge-junk-rb")
+            .iter()
+            .any(|h| h.as_str() == "edge-squat-rb"),
+        "reverse direction restored too"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-edge-scrub+2]
+/// The authority takeover through the resubmit-reset (identity-matching
+/// store-backed resubmission of a parked, still-retriable authoritative
+/// claim) is a definition change: the squat's dependency (children)
+/// edges must not carry onto the taken-over node — whether the
+/// squatter-attached child is terminally failed (would seed
+/// `DependencyFailed`) or merely incomplete (would park it `Queued`).
+/// The dependent (parents) direction is preserved.
+#[rstest]
+#[case::terminal_failed_child(DerivationStatus::Poisoned)]
+#[case::incomplete_child(DerivationStatus::Queued)]
+fn authority_takeover_scrubs_inherited_dependency_edges(
+    #[case] junk_status: DerivationStatus,
+) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    // Squatter: dependent → squat → junk, squat carries authoritative
+    // bytes and parks retriable (Poisoned under budget).
+    dag.merge(
+        squatter,
+        &[
+            authoritative_node("ats-squat", b"Derive-ats"),
+            make_node("ats-junk", "x86_64-linux"),
+            make_node("ats-dependent", "x86_64-linux"),
+        ],
+        &[
+            make_edge("ats-squat", "ats-junk"),
+            make_edge("ats-dependent", "ats-squat"),
+        ],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("ats-junk")
+        .unwrap()
+        .set_status_for_test(junk_status);
+    {
+        let n = dag.nodes.get_mut("ats-squat").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = 1; // under POISON_RESUBMIT_RETRY_LIMIT
+    }
+
+    // Victim: identity-matching store-backed resubmission → authority
+    // takeover via the resubmit-reset (NOT displacement).
+    let mut takeover = make_node("ats-squat", "x86_64-linux");
+    takeover.is_content_addressed = true;
+    takeover.ca_modular_hash = Some([0xAB; 32]);
+    let res = dag.merge(victim, &[takeover], &[], "")?;
+
+    assert!(
+        res.reset_on_resubmit
+            .iter()
+            .any(|h| h.as_str() == "ats-squat"),
+        "takeover goes through the resubmit-reset"
+    );
+    assert!(
+        res.authority_takeovers
+            .iter()
+            .any(|h| h.as_str() == "ats-squat")
+    );
+    assert!(res.displaced.is_empty(), "not a displacement");
+
+    // Children direction scrubbed…
+    assert!(
+        dag.get_children("ats-squat").is_empty(),
+        "squat→junk edge must not carry onto the taken-over definition"
+    );
+    assert!(
+        !dag.get_parents("ats-junk")
+            .iter()
+            .any(|h| h.as_str() == "ats-squat"),
+        "junk no longer lists the taken-over hash as a dependent"
+    );
+    // …parents direction preserved, interest carried.
+    assert!(
+        dag.get_children("ats-dependent")
+            .iter()
+            .any(|h| h.as_str() == "ats-squat"),
+        "dependent→squat edge preserved"
+    );
+    assert!(
+        dag.get_parents("ats-squat")
+            .iter()
+            .any(|h| h.as_str() == "ats-dependent")
+    );
+    let n = dag.node("ats-squat").unwrap();
+    assert!(n.interested_builds.contains(&squatter), "interest carried");
+    assert!(n.interested_builds.contains(&victim));
+
+    // Initial state seeds from the takeover's own (empty) dependency set.
+    let states: HashMap<_, _> = dag
+        .compute_initial_states(&res.newly_inserted)
+        .into_iter()
+        .collect();
+    assert_eq!(
+        states["ats-squat"],
+        DerivationStatus::Ready,
+        "taken-over node seeds Ready, not from the squatter's junk child"
+    );
+    Ok(())
+}
+
+// r[verify sched.closure.witness-epoch]
+/// Round-16 bug_011: an authority takeover must NOT inherit the squat's
+/// closure-hole witness. The witness records children removed from the
+/// SQUAT's declared closure; the genuine definition's real inputDrvs can
+/// never contain those (possibly attacker-chosen) hashes, so a carried
+/// witness would heal-refuse every honest re-declaration and route the
+/// node to the bounded fail-fast permanently. A same-definition
+/// resubmit (no authority flip) keeps carrying the witness — the epoch
+/// continues.
+#[test]
+fn closure_witness_dies_at_takeover_and_rides_same_definition_resubmit() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+
+    // Arm 1: authority takeover drops the witness.
+    dag.merge(
+        Uuid::new_v4(),
+        &[authoritative_node("we-squat", b"Derive-we")],
+        &[],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("we-squat").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = 1; // under budget → resubmit-reset path
+        n.closure_hole.stamp([DrvHash::from("we-squat-junk-child")]);
+        assert!(n.closure_hole.is_holed());
+    }
+    let mut takeover = make_node("we-squat", "x86_64-linux");
+    takeover.is_content_addressed = true;
+    takeover.ca_modular_hash = Some([0xAB; 32]);
+    let res = dag.merge(Uuid::new_v4(), &[takeover], &[], "")?;
+    assert!(
+        res.authority_takeovers
+            .iter()
+            .any(|h| h.as_str() == "we-squat"),
+        "staging must produce an authority takeover"
+    );
+    assert!(
+        !dag.node("we-squat").unwrap().closure_hole.is_holed(),
+        "the taken-over definition must not inherit the squat's witness"
+    );
+
+    // Arm 2: same-definition resubmit carries the witness verbatim.
+    dag.merge(
+        Uuid::new_v4(),
+        &[make_node("we-bare", "x86_64-linux")],
+        &[],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("we-bare").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = 1;
+        n.closure_hole.stamp([DrvHash::from("we-bare-lost-child")]);
+    }
+    let res = dag.merge(
+        Uuid::new_v4(),
+        &[make_node("we-bare", "x86_64-linux")],
+        &[],
+        "",
+    )?;
+    assert!(
+        res.reset_on_resubmit
+            .iter()
+            .any(|h| h.as_str() == "we-bare"),
+        "staging must go through the resubmit-reset"
+    );
+    assert!(
+        res.authority_takeovers.is_empty(),
+        "same-definition resubmit is not a takeover"
+    );
+    let carried = &dag.node("we-bare").unwrap().closure_hole;
+    assert!(
+        carried.is_holed()
+            && carried
+                .missing()
+                .iter()
+                .any(|h| h.as_str() == "we-bare-lost-child"),
+        "a same-definition resubmit must carry the witness verbatim"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-edge-scrub+2]
+/// A merge that takes over a parked authoritative claim (scrubbing its
+/// dependency edges) but fails on a LATER node in the same submission
+/// must restore the squat verbatim — status, authoritative flag,
+/// resubmit budget, and its children edges in both directions.
+#[test]
+fn rollback_restores_takeover_scrubbed_edges() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[
+            authoritative_node("ats-rb-squat", b"Derive-ats-rb"),
+            make_node("ats-rb-junk", "x86_64-linux"),
+        ],
+        &[make_edge("ats-rb-squat", "ats-rb-junk")],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("ats-rb-squat").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = 1;
+    }
+
+    // Identity-matching store-backed takeover plus an invalid second
+    // node: the merge fails AFTER the takeover scrub ran.
+    let mut takeover = make_node("ats-rb-squat", "x86_64-linux");
+    takeover.is_content_addressed = true;
+    takeover.ca_modular_hash = Some([0xAB; 32]);
+    let result = dag.merge(
+        victim,
+        &[
+            takeover,
+            make_node_with_path("bad", "not-a-store-path", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    );
+    assert!(matches!(result, Err(DagError::InvalidDrvPath { .. })));
+
+    let n = dag.node("ats-rb-squat").expect("squat restored");
+    assert_eq!(n.status(), DerivationStatus::Poisoned);
+    assert!(n.drv_content_authoritative, "authoritative claim restored");
+    assert_eq!(n.retry.resubmit_cycles, 1, "consumed budget restored");
+    assert!(
+        dag.get_children("ats-rb-squat")
+            .iter()
+            .any(|h| h.as_str() == "ats-rb-junk"),
+        "scrubbed squat→junk edge restored on rollback"
+    );
+    assert!(
+        dag.get_parents("ats-rb-junk")
+            .iter()
+            .any(|h| h.as_str() == "ats-rb-squat"),
+        "reverse direction restored too"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-edge-scrub+2]
+/// Contrast pin: a SAME-definition resubmit (store-backed → store-backed)
+/// keeps the node's dependency edges — the scrub is scoped to definition
+/// changes only.
+#[test]
+fn same_definition_resubmit_keeps_dependency_edges() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    dag.merge(
+        b1,
+        &[
+            make_node("sdr-x", "x86_64-linux"),
+            make_node("sdr-dep", "x86_64-linux"),
+        ],
+        &[make_edge("sdr-x", "sdr-dep")],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("sdr-x")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Failed);
+
+    let res = dag.merge(b2, &[make_node("sdr-x", "x86_64-linux")], &[], "")?;
+    assert!(
+        res.reset_on_resubmit.iter().any(|h| h.as_str() == "sdr-x"),
+        "same-definition resubmit-reset"
+    );
+    assert!(res.authority_takeovers.is_empty());
+    assert!(
+        dag.get_children("sdr-x")
+            .iter()
+            .any(|h| h.as_str() == "sdr-dep"),
+        "same-definition reset keeps its dependency edges"
+    );
+    // Parked behind its (incomplete) dependency, exactly as before.
+    let states: HashMap<_, _> = dag
+        .compute_initial_states(&res.newly_inserted)
+        .into_iter()
+        .collect();
+    assert_eq!(states["sdr-x"], DerivationStatus::Queued);
+    Ok(())
+}
+
+// ── sched.merge.edge-creation-scoped ────────────────────────────────────
+
+// r[verify sched.merge.edge-creation-scoped]
+/// A submission that merely JOINS a resident node may not extend its
+/// dependency set: the foreign edge is skipped (recorded, not inserted,
+/// not part of `new_edges`) and the resident node's readiness is decided
+/// by its own dependency set, not the joiner's junk child.
+#[test]
+fn test_foreign_parent_edge_skipped_on_resident_join() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    // b1 creates X (no dependencies).
+    dag.merge(b1, &[make_node("fps-x", "x86_64-linux")], &[], "")?;
+
+    // b2 joins X and tries to attach its own junk child Y to it.
+    let res = dag.merge(
+        b2,
+        &[
+            make_node("fps-x", "x86_64-linux"),
+            make_node("fps-y", "x86_64-linux"),
+        ],
+        &[make_edge("fps-x", "fps-y")],
+        "",
+    )?;
+
+    assert!(res.new_edges.is_empty(), "foreign edge must not be added");
+    assert_eq!(
+        res.foreign_parent_edges_skipped.len(),
+        1,
+        "skip recorded for observability"
+    );
+    assert_eq!(res.foreign_parent_edges_skipped[0].0.as_str(), "fps-x");
+    assert_eq!(res.foreign_parent_edges_skipped[0].1.as_str(), "fps-y");
+    // r[verify sched.merge.heal-accepted-edges+1]
+    assert!(
+        !res.healed_parents
+            .iter()
+            .any(|(h, _)| h.as_str() == "fps-x"),
+        "a parent with a gate-skipped declared edge must not be healed"
+    );
+    assert!(
+        res.newly_inserted.contains("fps-y"),
+        "the junk node itself is admitted (it is b2's own node)"
+    );
+    assert!(
+        res.interest_added.iter().any(|h| h.as_str() == "fps-x"),
+        "b2 still joins X"
+    );
+    assert!(
+        dag.get_children("fps-x").is_empty(),
+        "X's dependency set is unchanged"
+    );
+
+    // Even with the junk child terminally failed, X is unaffected — the
+    // edge never existed.
+    dag.nodes
+        .get_mut("fps-y")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Poisoned);
+    assert!(
+        !dag.any_dep_terminally_failed("fps-x"),
+        "X must not be poisoned-by-association with the skipped junk child"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.edge-creation-scoped]
+/// The topdown-pruned carve-out: a resident pruned root deliberately had
+/// its dependency edges dropped by its creating submission, so a later
+/// full merge MAY top them up without re-creating the root.
+#[test]
+fn test_topdown_pruned_resident_parent_accepts_dep_topup() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    // b1 creates R alone (the topdown prune dropped its deps).
+    dag.merge(b1, &[make_node("tdp-r", "x86_64-linux")], &[], "")?;
+    dag.nodes.get_mut("tdp-r").unwrap().topdown_pruned = true;
+
+    // b2 full-merges {app, R, glibc} with app→R and R→glibc, without
+    // re-creating R (it is resident and live).
+    let res = dag.merge(
+        b2,
+        &[
+            make_node("tdp-app", "x86_64-linux"),
+            make_node("tdp-r", "x86_64-linux"),
+            make_node("tdp-glibc", "x86_64-linux"),
+        ],
+        &[
+            make_edge("tdp-app", "tdp-r"),
+            make_edge("tdp-r", "tdp-glibc"),
+        ],
+        "",
+    )?;
+
+    assert!(
+        res.foreign_parent_edges_skipped.is_empty(),
+        "pruned-root top-up must not be treated as a foreign edge"
+    );
+    assert_eq!(res.new_edges.len(), 2, "both edges accepted");
+    // r[verify sched.merge.heal-accepted-edges+1]
+    assert!(
+        res.healed_parents
+            .iter()
+            .any(|(h, _)| h.as_str() == "tdp-r")
+            && res
+                .healed_parents
+                .iter()
+                .any(|(h, _)| h.as_str() == "tdp-app"),
+        "every parent whose declared edges were all accepted is healed \
+         (topdown carve-out and newly-inserted alike)"
+    );
+    assert!(
+        dag.get_children("tdp-r")
+            .iter()
+            .any(|h| h.as_str() == "tdp-glibc"),
+        "R gained its dependency"
+    );
+    assert!(
+        dag.get_children("tdp-app")
+            .iter()
+            .any(|h| h.as_str() == "tdp-r"),
+        "app→R accepted (parent newly inserted)"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.edge-creation-scoped]
+/// A displacing submission (re)creates the displaced hash, so its own
+/// dependency edges for that hash are attached — displacement is a
+/// re-creation, not a join.
+#[test]
+fn test_displacing_submission_attaches_own_edges() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    // Authoritative squat parked in a terminal failure state.
+    dag.merge(
+        squatter,
+        &[authoritative_node("ecs-h", b"Derive-squat")],
+        &[],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("ecs-h")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::DependencyFailed);
+
+    // Victim: conflicting store-backed identity displaces the squat and
+    // declares its own dependency H→D2 in the same submission.
+    let mut displacing = make_node("ecs-h", "aarch64-linux");
+    displacing.is_content_addressed = true;
+    let res = dag.merge(
+        victim,
+        &[displacing, make_node("ecs-d2", "aarch64-linux")],
+        &[make_edge("ecs-h", "ecs-d2")],
+        "",
+    )?;
+
+    assert!(res.displaced.iter().any(|h| h.as_str() == "ecs-h"));
+    assert!(
+        res.foreign_parent_edges_skipped.is_empty(),
+        "displacement is a re-creation: its own edges are not foreign"
+    );
+    // r[verify sched.merge.heal-accepted-edges+1]
+    assert!(
+        res.healed_parents
+            .iter()
+            .any(|(h, _)| h.as_str() == "ecs-h"),
+        "a displacing re-creation whose edges were all accepted is healed"
+    );
+    assert!(
+        res.new_edges
+            .iter()
+            .any(|(p, c)| p.as_str() == "ecs-h" && c.as_str() == "ecs-d2"),
+        "displacing submission's own edge attached"
+    );
+    assert!(
+        dag.get_children("ecs-h")
+            .iter()
+            .any(|h| h.as_str() == "ecs-d2"),
+        "fresh node's dependency set is the displacing submission's"
+    );
+    Ok(())
+}
+
+// ── sched.merge.heal-accepted-edges+1 ─────────────────────────────────────
+
+// r[verify sched.merge.heal-accepted-edges+1]
+/// A joining submission with one accepted re-declaration AND one
+/// gate-skipped extension is NOT healed: the partial acceptance means its
+/// declared set is not what the DAG holds, so reap-truncation evidence
+/// must not be cleared on its strength.
+#[test]
+fn test_healed_parents_excludes_gate_skipped_parent() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    // b1 creates X→D (X's true dependency set).
+    dag.merge(
+        b1,
+        &[
+            make_node("hgs-x", "x86_64-linux"),
+            make_node("hgs-d", "x86_64-linux"),
+        ],
+        &[make_edge("hgs-x", "hgs-d")],
+        "",
+    )?;
+
+    // b2 joins X, re-declares X→D (accepted no-op) and tries to extend
+    // X→J (gate-skipped). One veto → X is not healed.
+    let res = dag.merge(
+        b2,
+        &[
+            make_node("hgs-x", "x86_64-linux"),
+            make_node("hgs-d", "x86_64-linux"),
+            make_node("hgs-j", "x86_64-linux"),
+        ],
+        &[make_edge("hgs-x", "hgs-d"), make_edge("hgs-x", "hgs-j")],
+        "",
+    )?;
+
+    assert_eq!(
+        res.foreign_parent_edges_skipped.len(),
+        1,
+        "the extension edge is gate-skipped"
+    );
+    assert!(
+        !res.healed_parents
+            .iter()
+            .any(|(h, _)| h.as_str() == "hgs-x"),
+        "one gate-skipped declared edge vetoes the parent's heal even \
+         though another declared edge was accepted"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.heal-accepted-edges+1]
+/// A joining submission whose declared edges are ALL exact
+/// re-declarations of existing edges IS healed HERE because the parent
+/// is un-holed — coverage is trivially satisfied over the empty witness
+/// set (the defining doc is `MergeResult::healed_parents`). For a HOLED
+/// parent the same shape would NOT heal unless the re-declaration also
+/// covered every recorded missing child: acceptance alone is only the
+/// trigger, not the heal.
+#[test]
+fn test_healed_parents_includes_already_present_redeclaration() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    dag.merge(
+        b1,
+        &[
+            make_node("hrd-x", "x86_64-linux"),
+            make_node("hrd-d", "x86_64-linux"),
+        ],
+        &[make_edge("hrd-x", "hrd-d")],
+        "",
+    )?;
+
+    // b2 joins and re-declares the full existing edge set, extending
+    // nothing.
+    let res = dag.merge(
+        b2,
+        &[
+            make_node("hrd-x", "x86_64-linux"),
+            make_node("hrd-d", "x86_64-linux"),
+        ],
+        &[make_edge("hrd-x", "hrd-d")],
+        "",
+    )?;
+
+    assert!(res.new_edges.is_empty(), "re-declaration adds nothing");
+    assert!(res.foreign_parent_edges_skipped.is_empty());
+    assert!(
+        res.healed_parents
+            .iter()
+            .any(|(h, _)| h.as_str() == "hrd-x"),
+        "a parent whose every declared edge is an accepted re-declaration is healed"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.heal-accepted-edges+1]
+/// THE merged_bug_073 kill test: a holed parent whose full merge
+/// re-declares only the SURVIVING children (an exact, fully-accepted
+/// subset of what the DAG already holds) must NOT heal — acceptance of
+/// every declared edge is the laundering channel when the declared set
+/// silently omits what the reap removed. Coverage demands the missing
+/// child back.
+// r[verify sched.evidence.positive-witness]
+#[test]
+fn test_subset_redeclaration_does_not_heal_closure_hole() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    // b1 creates X→{S, M}; a truncation removes M and stamps the witness.
+    dag.merge(
+        b1,
+        &[
+            make_node("shx-x", "x86_64-linux"),
+            make_node("shx-s", "x86_64-linux"),
+            make_node("shx-m", "x86_64-linux"),
+        ],
+        &[make_edge("shx-x", "shx-s"), make_edge("shx-x", "shx-m")],
+        "",
+    )?;
+    dag.remove_node(&"shx-m".into());
+    dag.nodes
+        .get_mut("shx-x")
+        .unwrap()
+        .closure_hole
+        .stamp(["shx-m".into()]);
+
+    // b2 re-creates X re-declaring ONLY the survivor: every declared
+    // edge is accepted (exact re-declaration), the trigger fires —
+    // and the heal must still be refused.
+    let res = dag.merge(
+        b2,
+        &[
+            make_node("shx-x", "x86_64-linux"),
+            make_node("shx-s", "x86_64-linux"),
+        ],
+        &[make_edge("shx-x", "shx-s")],
+        "",
+    )?;
+    assert!(
+        res.foreign_parent_edges_skipped.is_empty() && res.rejoin_parent_edges_skipped.is_empty(),
+        "fixture premise: the subset re-declaration is fully accepted"
+    );
+    assert!(
+        res.accepted_edge_parents
+            .iter()
+            .any(|h| h.as_str() == "shx-x"),
+        "fixture premise: X is in the accepted trigger set"
+    );
+    assert!(
+        !res.healed_parents
+            .iter()
+            .any(|(h, _)| h.as_str() == "shx-x"),
+        "a fully-accepted SUBSET re-declaration must not heal: shx-m is \
+         missing and was not re-supplied"
+    );
+    assert!(
+        res.heal_refused_parents
+            .iter()
+            .any(|h| h.as_str() == "shx-x"),
+        "the refusal is surfaced, not silent"
+    );
+    assert!(
+        dag.nodes.get("shx-x").unwrap().closure_hole.is_holed(),
+        "the witness set survives the refused heal"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+15]
+/// Round-16 bug_076: the reap stamps the FULL removed child set on the
+/// witness — produced and un-produced alike. Pre-fix only the
+/// un-produced child landed there, so re-declaring just that
+/// (publicly reconstructible) hash covered the witness, healed the
+/// hole, and — once it produced — the parent was judged Vouched over a
+/// child set silently missing the produced-but-reaped input. The heal
+/// must now demand the complete removed set.
+#[test]
+fn reap_witness_records_full_removed_set_and_heal_demands_it() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build_a = Uuid::new_v4();
+    let build_b = Uuid::new_v4();
+
+    // Build A: P → {C1, C2}. Build B holds interest in P only, so P
+    // survives A's reap.
+    dag.merge(
+        build_a,
+        &[
+            make_node("frw-p", "x86_64-linux"),
+            make_node("frw-c1", "x86_64-linux"),
+            make_node("frw-c2", "x86_64-linux"),
+        ],
+        &[make_edge("frw-p", "frw-c1"), make_edge("frw-p", "frw-c2")],
+        "",
+    )?;
+    dag.merge(build_b, &[make_node("frw-p", "x86_64-linux")], &[], "")?;
+
+    // C1 PRODUCED, C2 terminal-unproduced; A goes terminal and reaps
+    // both children out from under P.
+    dag.nodes
+        .get_mut("frw-c1")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+    dag.nodes
+        .get_mut("frw-c2")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Cancelled);
+    let reap = dag.remove_build_interest_and_reap(build_a);
+
+    let (holed, witness) = reap
+        .holed_parents
+        .iter()
+        .find(|(p, _)| p.as_str() == "frw-p")
+        .expect("P is holed (an un-produced child was removed)");
+    assert_eq!(holed.as_str(), "frw-p");
+    let mut w: Vec<&str> = witness.iter().map(|h| h.as_str()).collect();
+    w.sort_unstable();
+    assert_eq!(
+        w,
+        vec!["frw-c1", "frw-c2"],
+        "the witness records the FULL removed set — the produced C1 too \
+         (pre-fix: only the un-produced C2)"
+    );
+    let hole = &dag.nodes.get("frw-p").unwrap().closure_hole;
+    assert!(hole.is_holed());
+    assert_eq!(hole.missing().len(), 2, "in-memory witness matches");
+
+    // bug_076's harm population: topdown-pruned holed parents — the
+    // parent_creation_scoped carve-out accepts heal edges from ANY
+    // submission for them (the designed no-recreation top-up).
+    dag.nodes.get_mut("frw-p").unwrap().topdown_pruned = true;
+
+    // Under-representative heal attempt: re-declare ONLY the
+    // un-produced child. Pre-fix the witness held just C2, so this
+    // covered the whole witness and healed; now it must be refused.
+    let res = dag.merge(
+        Uuid::new_v4(),
+        &[
+            make_node("frw-p", "x86_64-linux"),
+            make_node("frw-c2", "x86_64-linux"),
+        ],
+        &[make_edge("frw-p", "frw-c2")],
+        "",
+    )?;
+    assert!(
+        !res.healed_parents
+            .iter()
+            .any(|(h, _)| h.as_str() == "frw-p"),
+        "re-declaring only the un-produced subset must NOT heal"
+    );
+    assert!(
+        res.heal_refused_parents
+            .iter()
+            .any(|h| h.as_str() == "frw-p"),
+        "the refusal is surfaced"
+    );
+    assert!(dag.nodes.get("frw-p").unwrap().closure_hole.is_holed());
+
+    // Full re-declaration covers the witness: healed.
+    let res = dag.merge(
+        Uuid::new_v4(),
+        &[
+            make_node("frw-p", "x86_64-linux"),
+            make_node("frw-c1", "x86_64-linux"),
+            make_node("frw-c2", "x86_64-linux"),
+        ],
+        &[make_edge("frw-p", "frw-c1"), make_edge("frw-p", "frw-c2")],
+        "",
+    )?;
+    assert!(
+        res.healed_parents
+            .iter()
+            .any(|(h, _)| h.as_str() == "frw-p"),
+        "the complete removed set heals"
+    );
+    assert!(
+        !res.heal_refused_parents
+            .iter()
+            .any(|h| h.as_str() == "frw-p"),
+        "no refusal alongside the heal"
+    );
+    // Tier note: dag.merge REPORTS the heal; the in-memory drop
+    // (ClosureHole::clear_for_heal) and the PG clear are the actor's
+    // consumption of healed_parents — pinned by the actor-level heal
+    // tests (gate-skip veto, recovery-roundtrip-heal).
+    Ok(())
+}
+
+/// Round-17 merged_bug_024 (reap tier, `witness_watched`): a parent
+/// ALREADY holed extends its witness on a later PRODUCED-only reap —
+/// the witness is cumulative since the hole was last whole. Pre-fix the
+/// trigger was un-produced-only, so the produced child vanished without
+/// a witness entry and a heal re-supplying just the older recorded set
+/// re-armed the parent over an under-representative child set. The
+/// un-watched posture is unchanged: produced-only reaps of un-watched
+/// parents stamp nothing.
+#[test]
+fn reap_extends_witness_for_watched_survivor_losing_produced_children() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build_a = Uuid::new_v4(); // full owner: P → {C1, C2}, Q → {D1}
+    let build_b = Uuid::new_v4(); // keeps P and Q alive
+    let build_c = Uuid::new_v4(); // keeps C1 alive across A's reap
+
+    dag.merge(
+        build_a,
+        &[
+            make_node("ww-p", "x86_64-linux"),
+            make_node("ww-c1", "x86_64-linux"),
+            make_node("ww-c2", "x86_64-linux"),
+            make_node("ww-q", "x86_64-linux"),
+            make_node("ww-d1", "x86_64-linux"),
+        ],
+        &[
+            make_edge("ww-p", "ww-c1"),
+            make_edge("ww-p", "ww-c2"),
+            make_edge("ww-q", "ww-d1"),
+        ],
+        "",
+    )?;
+    dag.merge(
+        build_b,
+        &[
+            make_node("ww-p", "x86_64-linux"),
+            make_node("ww-q", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    )?;
+    dag.merge(build_c, &[make_node("ww-c1", "x86_64-linux")], &[], "")?;
+
+    // Reap 1: C2 terminal-unproduced under sole interest A; C1 survives
+    // on C's interest; D1 PRODUCED — Q loses it WITHOUT becoming holed
+    // (the pre-existing un-watched posture).
+    dag.nodes
+        .get_mut("ww-c2")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Cancelled);
+    dag.nodes
+        .get_mut("ww-d1")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+    let reap1 = dag.remove_build_interest_and_reap(build_a);
+    assert!(
+        reap1
+            .holed_parents
+            .iter()
+            .any(|(p, _)| p.as_str() == "ww-p"),
+        "P holed by the un-produced removal of C2"
+    );
+    assert!(
+        !reap1
+            .holed_parents
+            .iter()
+            .any(|(p, _)| p.as_str() == "ww-q"),
+        "un-watched Q losing only the produced D1 stays un-holed \
+         (posture preserved)"
+    );
+    assert!(!dag.nodes.get("ww-q").unwrap().closure_hole.is_holed());
+    assert_eq!(
+        dag.nodes.get("ww-p").unwrap().closure_hole.missing().len(),
+        1,
+        "witness after reap 1 is {{C2}}"
+    );
+
+    // Reap 2: C1 PRODUCES, then its sole remaining interest (C) goes
+    // terminal — a produced-only removal from the now-WATCHED P.
+    dag.nodes
+        .get_mut("ww-c1")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+    let reap2 = dag.remove_build_interest_and_reap(build_c);
+    let (_, w2) = reap2
+        .holed_parents
+        .iter()
+        .find(|(p, _)| p.as_str() == "ww-p")
+        .expect("watched P is re-reported so the leader hook persists the extension");
+    assert_eq!(
+        w2.iter().map(|h| h.as_str()).collect::<Vec<_>>(),
+        vec!["ww-c1"],
+        "the extension records the produced child removed in reap 2"
+    );
+    let hole = &dag.nodes.get("ww-p").unwrap().closure_hole;
+    let mut missing: Vec<&str> = hole.missing().iter().map(|h| h.as_str()).collect();
+    missing.sort_unstable();
+    assert_eq!(
+        missing,
+        vec!["ww-c1", "ww-c2"],
+        "cumulative witness: both removals recorded"
+    );
+
+    // The harm population (as in the bug_076 pin above): topdown-pruned
+    // holed parents — the parent_creation_scoped carve-out accepts heal
+    // edges from ANY submission for them.
+    dag.nodes.get_mut("ww-p").unwrap().topdown_pruned = true;
+
+    // The under-representative heal — re-declaring only the original
+    // witness {C2} — must now be refused.
+    let res = dag.merge(
+        Uuid::new_v4(),
+        &[
+            make_node("ww-p", "x86_64-linux"),
+            make_node("ww-c2", "x86_64-linux"),
+        ],
+        &[make_edge("ww-p", "ww-c2")],
+        "",
+    )?;
+    assert!(
+        !res.healed_parents.iter().any(|(h, _)| h.as_str() == "ww-p"),
+        "re-supplying only the pre-extension witness must NOT heal"
+    );
+    assert!(dag.nodes.get("ww-p").unwrap().closure_hole.is_holed());
+
+    // The complete cumulative set heals.
+    let res = dag.merge(
+        Uuid::new_v4(),
+        &[
+            make_node("ww-p", "x86_64-linux"),
+            make_node("ww-c1", "x86_64-linux"),
+            make_node("ww-c2", "x86_64-linux"),
+        ],
+        &[make_edge("ww-p", "ww-c1"), make_edge("ww-p", "ww-c2")],
+        "",
+    )?;
+    assert!(
+        res.healed_parents.iter().any(|(h, _)| h.as_str() == "ww-p"),
+        "covering the cumulative witness heals"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.heal-accepted-edges+1]
+/// Junk top-up refused: re-supplying SOMETHING is not re-supplying the
+/// MISSING thing. A re-creation that attaches a brand-new child while
+/// still omitting the reaped one keeps the hole.
+// r[verify sched.evidence.positive-witness]
+#[test]
+fn test_junk_topup_does_not_heal_closure_hole() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+    dag.merge(
+        b1,
+        &[
+            make_node("jtx-x", "x86_64-linux"),
+            make_node("jtx-m", "x86_64-linux"),
+        ],
+        &[make_edge("jtx-x", "jtx-m")],
+        "",
+    )?;
+    dag.remove_node(&"jtx-m".into());
+    {
+        let x = dag.nodes.get_mut("jtx-x").unwrap();
+        x.closure_hole.stamp(["jtx-m".into()]);
+        // Pruned root: the carve-out is what ADMITS the top-up edge at
+        // all (a plain resident join's extensions are gate-skipped and
+        // vetoed before coverage is even consulted).
+        x.topdown_pruned = true;
+    }
+
+    let res = dag.merge(
+        b2,
+        &[
+            make_node("jtx-x", "x86_64-linux"),
+            make_node("jtx-j", "x86_64-linux"),
+        ],
+        &[make_edge("jtx-x", "jtx-j")],
+        "",
+    )?;
+    assert!(
+        !res.healed_parents
+            .iter()
+            .any(|(h, _)| h.as_str() == "jtx-x"),
+        "a new child that is not the missing child does not cover the witness"
+    );
+    assert!(
+        res.heal_refused_parents
+            .iter()
+            .any(|h| h.as_str() == "jtx-x"),
+        "junk top-up is a refused heal"
+    );
+    assert!(dag.nodes.get("jtx-x").unwrap().closure_hole.is_holed());
+    Ok(())
+}
+
+// r[verify sched.merge.heal-accepted-edges+1]
+/// Coverage matrix: full re-supply heals (witness consumed); partial
+/// re-supply of a multi-child witness is refused.
+#[test]
+fn test_heal_coverage_full_vs_partial() -> anyhow::Result<()> {
+    for (resupply_both, expect_heal) in [(true, true), (false, false)] {
+        let mut dag = DerivationDag::new();
+        let b1 = Uuid::new_v4();
+        let b2 = Uuid::new_v4();
+        dag.merge(
+            b1,
+            &[
+                make_node("cvx-x", "x86_64-linux"),
+                make_node("cvx-m1", "x86_64-linux"),
+                make_node("cvx-m2", "x86_64-linux"),
+            ],
+            &[make_edge("cvx-x", "cvx-m1"), make_edge("cvx-x", "cvx-m2")],
+            "",
+        )?;
+        dag.remove_node(&"cvx-m1".into());
+        dag.remove_node(&"cvx-m2".into());
+        {
+            let x = dag.nodes.get_mut("cvx-x").unwrap();
+            x.closure_hole.stamp(["cvx-m1".into(), "cvx-m2".into()]);
+            x.topdown_pruned = true;
+        }
+
+        let mut nodes = vec![
+            make_node("cvx-x", "x86_64-linux"),
+            make_node("cvx-m1", "x86_64-linux"),
+        ];
+        let mut edges = vec![make_edge("cvx-x", "cvx-m1")];
+        if resupply_both {
+            nodes.push(make_node("cvx-m2", "x86_64-linux"));
+            edges.push(make_edge("cvx-x", "cvx-m2"));
+        }
+        let res = dag.merge(b2, &nodes, &edges, "")?;
+        assert_eq!(
+            res.healed_parents
+                .iter()
+                .any(|(h, _)| h.as_str() == "cvx-x"),
+            expect_heal,
+            "full coverage heals; partial coverage is refused (both={resupply_both})"
+        );
+        assert_eq!(
+            res.heal_refused_parents
+                .iter()
+                .any(|h| h.as_str() == "cvx-x"),
+            !expect_heal,
+        );
+    }
+    Ok(())
+}
+
+// r[verify sched.merge.heal-accepted-edges+1]
+/// The recovery LOST_WITNESS sentinel is uncoverable by construction:
+/// no re-supply can name it, so the heal stays refused until operator
+/// intervention re-creates the truncation record.
+#[test]
+fn test_lost_witness_sentinel_never_heals() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+    dag.merge(
+        b1,
+        &[
+            make_node("lwx-x", "x86_64-linux"),
+            make_node("lwx-d", "x86_64-linux"),
+        ],
+        &[make_edge("lwx-x", "lwx-d")],
+        "",
+    )?;
+    // Recovery found the flag set but the side rows gone.
+    dag.nodes.get_mut("lwx-x").unwrap().closure_hole =
+        crate::state::ClosureHole::from_recovery_flag(true);
+
+    let res = dag.merge(
+        b2,
+        &[
+            make_node("lwx-x", "x86_64-linux"),
+            make_node("lwx-d", "x86_64-linux"),
+        ],
+        &[make_edge("lwx-x", "lwx-d")],
+        "",
+    )?;
+    assert!(
+        !res.healed_parents
+            .iter()
+            .any(|(h, _)| h.as_str() == "lwx-x"),
+        "the sentinel cannot be covered — fail-closed"
+    );
+    assert!(
+        res.heal_refused_parents
+            .iter()
+            .any(|h| h.as_str() == "lwx-x")
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.heal-accepted-edges+1]
+/// Scale shape: a 10k-child witness set is covered by a full re-supply
+/// in one merge — the subset check is witness-set-sized (≤ the parent's
+/// direct out-degree), never closure-sized.
+#[test]
+fn test_heal_coverage_scales_to_wide_witness() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+    let n = 10_000;
+    let child = |i: usize| format!("wsx-c{i}");
+    let mut nodes = vec![make_node("wsx-x", "x86_64-linux")];
+    let mut edges = Vec::with_capacity(n);
+    for i in 0..n {
+        nodes.push(make_node(&child(i), "x86_64-linux"));
+        edges.push(make_edge("wsx-x", &child(i)));
+    }
+    dag.merge(b1, &nodes, &edges, "")?;
+    for i in 0..n {
+        dag.remove_node(&child(i).into());
+    }
+    {
+        let x = dag.nodes.get_mut("wsx-x").unwrap();
+        x.closure_hole
+            .stamp((0..n).map(|i| crate::dag::DrvHash::from(child(i))));
+        // Pruned root, so the re-supply edges are admitted (see the
+        // junk-topup test).
+        x.topdown_pruned = true;
+    }
+
+    let res = dag.merge(b2, &nodes, &edges, "")?;
+    assert!(
+        res.healed_parents
+            .iter()
+            .any(|(h, _)| h.as_str() == "wsx-x"),
+        "full 10k re-supply covers the witness"
+    );
+    assert!(
+        dag.nodes.get("wsx-x").unwrap().closure_hole.is_holed(),
+        "merge only computes the heal; the hole must stay stamped until \
+         the actor clears it with the witness — see the actor-side heal \
+         test"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.heal-accepted-edges+1]
+/// All three creation-scope admission arms produce healed parents: a
+/// newly-inserted parent, a topdown-pruned resident parent taking its
+/// dependency top-up, and a resubmit-reset re-creation.
+#[test]
+fn test_healed_parents_creation_scoped_parents_included() -> anyhow::Result<()> {
+    // Arm 1: newly-inserted parent.
+    {
+        let mut dag = DerivationDag::new();
+        let res = dag.merge(
+            Uuid::new_v4(),
+            &[
+                make_node("hcs-new", "x86_64-linux"),
+                make_node("hcs-dep", "x86_64-linux"),
+            ],
+            &[make_edge("hcs-new", "hcs-dep")],
+            "",
+        )?;
+        assert!(
+            res.healed_parents
+                .iter()
+                .any(|(h, _)| h.as_str() == "hcs-new"),
+            "newly-inserted parent with accepted edges is healed"
+        );
+    }
+
+    // Arm 2: topdown-pruned resident parent accepting its top-up.
+    {
+        let mut dag = DerivationDag::new();
+        dag.merge(
+            Uuid::new_v4(),
+            &[make_node("hcs-r", "x86_64-linux")],
+            &[],
+            "",
+        )?;
+        dag.nodes.get_mut("hcs-r").unwrap().topdown_pruned = true;
+        // Simulate the truncation breadcrumb the top-up is healing —
+        // the missing child is the one the top-up RE-SUPPLIES
+        // (heal-accepted-edges+1 coverage; a top-up of anything else
+        // is refused, see test_junk_topup_does_not_heal_closure_hole).
+        dag.nodes
+            .get_mut("hcs-r")
+            .unwrap()
+            .closure_hole
+            .stamp(["hcs-glibc".into()]);
+        let res = dag.merge(
+            Uuid::new_v4(),
+            &[
+                make_node("hcs-r", "x86_64-linux"),
+                make_node("hcs-glibc", "x86_64-linux"),
+            ],
+            &[make_edge("hcs-r", "hcs-glibc")],
+            "",
+        )?;
+        assert!(
+            res.healed_parents
+                .iter()
+                .any(|(h, _)| h.as_str() == "hcs-r"),
+            "topdown-pruned resident parent taking its top-up is healed"
+        );
+        assert!(
+            dag.nodes.get("hcs-r").unwrap().closure_hole.is_holed(),
+            "merge() only COMPUTES healed_parents; the closure_hole \
+             mutation itself is actor-side"
+        );
+    }
+
+    // Arm 3: resubmit-reset re-creation of a retriable node.
+    {
+        let mut dag = DerivationDag::new();
+        let b1 = Uuid::new_v4();
+        dag.merge(
+            b1,
+            &[
+                make_node("hcs-f", "x86_64-linux"),
+                make_node("hcs-d2", "x86_64-linux"),
+            ],
+            &[make_edge("hcs-f", "hcs-d2")],
+            "",
+        )?;
+        dag.nodes
+            .get_mut("hcs-f")
+            .unwrap()
+            .set_status_for_test(DerivationStatus::Failed);
+        // Resubmit re-creates the failed node with the same edges.
+        let res = dag.merge(
+            Uuid::new_v4(),
+            &[
+                make_node("hcs-f", "x86_64-linux"),
+                make_node("hcs-d2", "x86_64-linux"),
+            ],
+            &[make_edge("hcs-f", "hcs-d2")],
+            "",
+        )?;
+        assert!(
+            res.reset_on_resubmit.iter().any(|h| h.as_str() == "hcs-f"),
+            "fixture premise: the resubmit reset fired"
+        );
+        assert!(
+            res.healed_parents
+                .iter()
+                .any(|(h, _)| h.as_str() == "hcs-f"),
+            "a resubmit-reset re-creation with accepted edges is healed"
+        );
+    }
+    Ok(())
+}
+
+// r[verify sched.merge.heal-accepted-edges+1]
+/// An edge whose child endpoint does not resolve vetoes its parent's
+/// heal: the parent's declared set could not be fully attached, so its
+/// child set is not representative of its closure.
+#[test]
+fn test_healed_parents_unresolvable_child_endpoint_vetoes_parent() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+
+    // One submission declaring P→missing (the child node is not part of
+    // the submission and not resident — e.g. a non-gRPC driver bug).
+    let res = dag.merge(
+        Uuid::new_v4(),
+        &[make_node("huc-p", "x86_64-linux")],
+        &[make_edge("huc-p", "huc-missing")],
+        "",
+    )?;
+
+    assert!(res.new_edges.is_empty(), "unresolvable edge is skipped");
+    assert!(
+        !res.healed_parents
+            .iter()
+            .any(|(h, _)| h.as_str() == "huc-p"),
+        "an unresolvable child endpoint vetoes the parent's heal"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.heal-accepted-edges+1]
+/// Gate-skips are classified by the parent's closure_hole breadcrumb:
+/// holed parent → rejoin signature (separate vec/metric, debug-level);
+/// un-holed parent → hostile/bug signature (existing vec/metric, warn).
+/// Both shapes veto the heal.
+#[test]
+fn test_foreign_skip_classified_by_parent_hole() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+
+    // Two resident nodes created without children; one carries the
+    // truncation breadcrumb.
+    dag.merge(
+        b1,
+        &[
+            make_node("cls-holed", "x86_64-linux"),
+            make_node("cls-clean", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("cls-holed")
+        .unwrap()
+        .closure_hole
+        .stamp(["cls-reaped-child".into()]);
+
+    // A later join tries to attach a child to each.
+    let res = dag.merge(
+        Uuid::new_v4(),
+        &[
+            make_node("cls-holed", "x86_64-linux"),
+            make_node("cls-clean", "x86_64-linux"),
+            make_node("cls-dep", "x86_64-linux"),
+        ],
+        &[
+            make_edge("cls-holed", "cls-dep"),
+            make_edge("cls-clean", "cls-dep"),
+        ],
+        "",
+    )?;
+
+    assert_eq!(
+        res.rejoin_parent_edges_skipped.len(),
+        1,
+        "the holed parent's skip is classified as a rejoin"
+    );
+    assert_eq!(res.rejoin_parent_edges_skipped[0].0.as_str(), "cls-holed");
+    assert_eq!(
+        res.foreign_parent_edges_skipped.len(),
+        1,
+        "the clean parent's skip is classified as hostile/bug"
+    );
+    assert_eq!(res.foreign_parent_edges_skipped[0].0.as_str(), "cls-clean");
+    assert!(
+        !res.healed_parents
+            .iter()
+            .any(|(h, _)| h.as_str() == "cls-holed")
+            && !res
+                .healed_parents
+                .iter()
+                .any(|(h, _)| h.as_str() == "cls-clean"),
+        "both skip shapes veto the heal"
+    );
+    assert!(
+        dag.nodes.get("cls-holed").unwrap().closure_hole.is_holed(),
+        "the rejoin-shaped skip does not clear the hole (only a \
+         re-creation can)"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// Floating-CA squat scenario: public attributes (system, output names,
+/// flags) are copyable from the victim's public derivation and floating-CA
+/// expected paths are empty by construction, so a store-backed submission
+/// with NO content evidence (no CA modular hash, or a different one) must
+/// NOT silently join an in-flight authoritative node.
+#[test]
+fn floating_ca_squat_without_evidence_conflicts_in_flight() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("squat-ev", b"Derive-A")],
+        &[],
+        "",
+    )?;
+
+    // Same public attributes, no modular hash at all → no evidence.
+    let mut no_hash = make_node("squat-ev", "x86_64-linux");
+    no_hash.is_content_addressed = true;
+    let err = dag.merge(victim, &[no_hash], &[], "").unwrap_err();
+    assert!(matches!(err, DagError::ConflictingInFlightContent { .. }));
+
+    // Same public attributes, DIFFERENT modular hash → still no evidence.
+    let mut wrong_hash = make_node("squat-ev", "x86_64-linux");
+    wrong_hash.is_content_addressed = true;
+    wrong_hash.ca_modular_hash = Some([0xCD; 32]);
+    let err = dag.merge(victim, &[wrong_hash], &[], "").unwrap_err();
+    assert!(matches!(err, DagError::ConflictingInFlightContent { .. }));
+
+    let node = dag.node("squat-ev").unwrap();
+    assert!(node.drv_content_authoritative, "squat untouched");
+    assert!(!node.interested_builds.contains(&victim));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// Once the no-evidence conflict target sits in a terminal FAILURE
+/// state, the store-backed definition displaces it instead of being
+/// rejected — same displacement semantics as any other
+/// verifiable-identity conflict. (A settled Completed/Skipped target is
+/// rejected instead — see
+/// `conflicting_identity_rejected_on_settled_authoritative_node`.)
+#[test]
+fn floating_ca_squat_without_evidence_displaced_when_terminal() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("squat-ev2", b"Derive-A")],
+        &[],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("squat-ev2")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Poisoned);
+
+    let mut no_hash = make_node("squat-ev2", "x86_64-linux");
+    no_hash.is_content_addressed = true;
+    let res = dag.merge(victim, &[no_hash], &[], "")?;
+    assert!(res.newly_inserted.contains("squat-ev2"));
+    assert!(res.displaced.iter().any(|h| h.as_str() == "squat-ev2"));
+    let node = dag.node("squat-ev2").unwrap();
+    assert!(node.drv_content.is_empty());
+    assert!(!node.drv_content_authoritative);
+    assert!(node.interested_builds.contains(&victim));
+    assert!(!node.interested_builds.contains(&squatter));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// Fixed-output derivations carry their content commitment in the expected
+/// output path (derived from the declared hash and bound to the bytes at
+/// ingress), so agreement on a non-empty path is sufficient evidence — no
+/// modular hash required.
+#[test]
+fn fod_path_agreement_is_sufficient_evidence() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+    let fod_path = "/nix/store/ffffffffffffffffffffffffffffffff-fod-out";
+
+    let mut fod_auth = authoritative_node("fod-join", b"Derive-FOD");
+    fod_auth.is_fixed_output = true;
+    fod_auth.expected_output_paths = vec![fod_path.to_string()];
+    fod_auth.ca_modular_hash = None;
+    dag.merge(b1, &[fod_auth], &[], "")?;
+
+    let mut store_backed = make_node("fod-join", "x86_64-linux");
+    store_backed.is_fixed_output = true;
+    store_backed.is_content_addressed = true;
+    store_backed.expected_output_paths = vec![fod_path.to_string()];
+    let res = dag.merge(b2, &[store_backed], &[], "")?;
+    assert!(res.newly_inserted.is_empty(), "joins, not displaced");
+    let node = dag.node("fod-join").unwrap();
+    assert!(node.interested_builds.contains(&b2));
+    assert_eq!(node.drv_content, b"Derive-FOD", "bytes untouched");
+    assert!(node.drv_content_authoritative);
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+6]
+/// The conflict gate must keep holding for a node REBUILT FROM PG after a
+/// leader failover (bug_007): `from_poisoned_row` restores the
+/// authoritative bytes/flag/identity, so a recovered poisoned squat is
+/// judged exactly like the live node was — byte-different authoritative
+/// content displaces the terminal-failure claim through the explicit
+/// displacement path (never a silent adoption that carries the squat's
+/// interest), the byte-identical resubmit is admitted, and a conflicting
+/// store-backed definition is displaced rather than silently joined onto
+/// attacker content.
+#[test]
+fn recovered_poisoned_squat_keeps_authoritative_gate() -> anyhow::Result<()> {
+    fn recovered_squat(tag: &str) -> crate::state::DerivationState {
+        let base = crate::db::RecoveryDerivationRow {
+            drv_content: Some(b"Derive-A".to_vec()),
+            is_ca: true,
+            expected_output_paths: vec![String::new()],
+            status: "poisoned".into(),
+            ..crate::db::RecoveryDerivationRow::test_default(tag, "x86_64-linux")
+        };
+        crate::state::DerivationState::from_poisoned_row(crate::db::PoisonedDerivationRow {
+            base,
+            elapsed_secs: 60.0,
+        })
+        .expect("recovered poisoned row is valid")
+    }
+
+    // (a) Post-failover authoritative submission with DIFFERENT bytes:
+    // the recovered squat is parked in a terminal failure state, so the
+    // redefinition DISPLACES it — exactly like it would have pre-failover
+    // — rather than being silently adopted through the resubmit-reset
+    // (which would carry the squat's interest onto the new bytes and
+    // consume its budget). Pre-fix the recovered stub carried
+    // drv_content_authoritative=false and the gate did not hold at all.
+    let mut dag = DerivationDag::new();
+    dag.insert_recovered_node(recovered_squat("rec-squat"));
+    let redefiner = Uuid::new_v4();
+    let res = dag.merge(
+        redefiner,
+        &[authoritative_node("rec-squat", b"Derive-B")],
+        &[],
+        "",
+    )?;
+    assert!(
+        res.displaced.iter().any(|h| h.as_str() == "rec-squat"),
+        "explicit displacement, not a silent adoption"
+    );
+    assert!(res.reset_on_resubmit.is_empty());
+    let node = dag.node("rec-squat").unwrap();
+    assert!(node.drv_content_authoritative);
+    assert_eq!(node.drv_content, b"Derive-B", "redefinition's bytes win");
+    assert_ne!(node.status(), DerivationStatus::Poisoned, "fresh node");
+    assert_eq!(node.retry.resubmit_cycles, 0, "fresh poison budget");
+    assert_eq!(node.interested_builds, HashSet::from([redefiner]));
+
+    // (b) Byte-identical authoritative resubmit (the legitimate hook
+    // producer retrying after failover) is admitted through the normal
+    // resubmit-reset, keeps the bytes, and carries the new interest.
+    let mut dag = DerivationDag::new();
+    dag.insert_recovered_node(recovered_squat("rec-retry"));
+    let producer = Uuid::new_v4();
+    let res = dag.merge(
+        producer,
+        &[authoritative_node("rec-retry", b"Derive-A")],
+        &[],
+        "",
+    )?;
+    assert!(res.reset_on_resubmit.contains(&"rec-retry".into()));
+    let node = dag.node("rec-retry").unwrap();
+    assert!(node.drv_content_authoritative);
+    assert_eq!(node.drv_content, b"Derive-A");
+    assert_ne!(node.status(), DerivationStatus::Poisoned);
+    assert!(node.interested_builds.contains(&producer));
+
+    // (c) A conflicting store-backed definition displaces the recovered
+    // (terminal) squat instead of joining it — same as pre-failover.
+    let mut dag = DerivationDag::new();
+    dag.insert_recovered_node(recovered_squat("rec-displace"));
+    let victim = Uuid::new_v4();
+    let mut displacing = make_node("rec-displace", "aarch64-linux");
+    displacing.is_content_addressed = true;
+    let res = dag.merge(victim, &[displacing], &[], "")?;
+    assert!(res.displaced.contains(&"rec-displace".into()));
+    let node = dag.node("rec-displace").unwrap();
+    assert!(!node.drv_content_authoritative);
+    assert_eq!(node.system, "aarch64-linux");
+    assert_eq!(node.interested_builds, HashSet::from([victim]));
+    Ok(())
+}
+
+// r[verify sched.merge.evidence-ranked-displacement]
+/// THE displacement primitive's verdict matrix: every cell of
+/// (victim anchoring × victim status × victim rank × displacer rank)
+/// that the contract distinguishes, asserted directly against
+/// `displace()` so the decision order (store-anchored → in-flight →
+/// settled-rank → displaced) and the rank rule cannot drift from the
+/// spec. Includes the deliberate strict-inequality cell: a settled
+/// `ContentBoundClaim` squat IS displaced by a `PathBoundBytes`
+/// displacer (its bytes were text-CA-bound at ingress — no store
+/// fetch needed), while `VerifiedBuilt` is unreachable by any
+/// displacer.
+#[rstest]
+// Store-anchored victims: categorical refusal, regardless of status or ranks.
+#[case::store_anchored_running(
+    false,
+    DerivationStatus::Running,
+    DefinitionEvidence::UnverifiedClaim,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::RefusedStoreAnchored
+)]
+#[case::store_anchored_poisoned(
+    false,
+    DerivationStatus::Poisoned,
+    DefinitionEvidence::UnverifiedClaim,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::RefusedStoreAnchored
+)]
+// SETTLED bare victims are rank-arbitrated, not categorically exempt
+// (sched.merge.store-evidence-displacement+3 rank-uniform; bug_072):
+// byte-anchored settled bare nodes refuse by rank...
+#[case::settled_bare_outranking(
+    false,
+    DerivationStatus::Completed,
+    DefinitionEvidence::VerifiedBuilt,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::RefusedSettledOutranked
+)]
+// ...while a cache-hit squat (Skipped, never dispatched, so stuck at
+// unverified_claim) is displaced by store-verified standing — THE
+// bug_072 cell.
+#[case::settled_bare_cache_squat_displaced(
+    false,
+    DerivationStatus::Skipped,
+    DefinitionEvidence::UnverifiedClaim,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::Displaced
+)]
+// In-flight victims: live and Failed (non-terminal) keep first-writer-wins.
+#[case::live_running(
+    true,
+    DerivationStatus::Running,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::RefusedInFlight
+)]
+#[case::live_failed(
+    true,
+    DerivationStatus::Failed,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::RefusedInFlight
+)]
+#[case::live_ready(
+    true,
+    DerivationStatus::Ready,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::VerifiedBuilt,
+    DisplaceVerdict::RefusedInFlight
+)]
+// Terminal-failure victims: displaced REGARDLESS of rank (anti-squat).
+#[case::failure_poisoned_low_displacer(
+    true,
+    DerivationStatus::Poisoned,
+    DefinitionEvidence::VerifiedBuilt,
+    DefinitionEvidence::UnverifiedClaim,
+    DisplaceVerdict::Displaced
+)]
+#[case::failure_cancelled(
+    true,
+    DerivationStatus::Cancelled,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::UnverifiedClaim,
+    DisplaceVerdict::Displaced
+)]
+#[case::failure_dep_failed(
+    true,
+    DerivationStatus::DependencyFailed,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::UnverifiedClaim,
+    DisplaceVerdict::Displaced
+)]
+// Settled victims: strict-inequality rank rule.
+#[case::settled_echo_refused(
+    true,
+    DerivationStatus::Completed,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::UnverifiedClaim,
+    DisplaceVerdict::RefusedSettledOutranked
+)]
+#[case::settled_equal_refused(
+    true,
+    DerivationStatus::Completed,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::ContentBoundClaim,
+    DisplaceVerdict::RefusedSettledOutranked
+)]
+#[case::settled_strictly_outranked_displaced(
+    true,
+    DerivationStatus::Completed,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::Displaced
+)]
+#[case::settled_skipped_strictly_outranked(
+    true,
+    DerivationStatus::Skipped,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::Displaced
+)]
+#[case::settled_verified_built_unreachable(
+    true,
+    DerivationStatus::Completed,
+    DefinitionEvidence::VerifiedBuilt,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::RefusedSettledOutranked
+)]
+#[case::settled_path_bound_vs_path_bound(
+    true,
+    DerivationStatus::Completed,
+    DefinitionEvidence::PathBoundBytes,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::RefusedSettledOutranked
+)]
+fn displace_verdict_matrix(
+    #[case] victim_authoritative: bool,
+    #[case] victim_status: DerivationStatus,
+    #[case] victim_rank: DefinitionEvidence,
+    #[case] displacer_rank: DefinitionEvidence,
+    #[case] expected: DisplaceVerdict,
+) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let owner = Uuid::new_v4();
+    let node = if victim_authoritative {
+        authoritative_node("verdict", b"Derive-squat")
+    } else {
+        make_node("verdict", "x86_64-linux")
+    };
+    dag.merge(owner, &[node], &[], "")?;
+    {
+        let n = dag.nodes.get_mut("verdict").unwrap();
+        n.set_status_for_test(victim_status);
+        n.evidence = victim_rank;
+    }
+
+    let mut removed_retriable = Vec::new();
+    let mut displaced_scrubbed_edges = Vec::new();
+    let mut displaced = Vec::new();
+    let verdict = dag.displace(
+        &"verdict".into(),
+        displacer_rank,
+        &mut DisplacementBookkeeping {
+            removed_retriable: &mut removed_retriable,
+            displaced_scrubbed_edges: &mut displaced_scrubbed_edges,
+            displaced: &mut displaced,
+        },
+    );
+    assert_eq!(verdict, expected);
+
+    if expected == DisplaceVerdict::Displaced {
+        assert!(dag.node("verdict").is_none(), "victim removed");
+        assert_eq!(removed_retriable.len(), 1, "prior state rides rollback");
+        assert_eq!(removed_retriable[0].0.as_str(), "verdict");
+        assert_eq!(removed_retriable[0].1.status(), victim_status);
+        assert_eq!(displaced, vec![DrvHash::from("verdict")]);
+    } else {
+        let n = dag.node("verdict").expect("refusal leaves the victim");
+        assert_eq!(n.status(), victim_status, "victim untouched");
+        assert_eq!(n.evidence, victim_rank, "victim rank untouched");
+        assert!(removed_retriable.is_empty());
+        assert!(displaced.is_empty());
+        assert!(displaced_scrubbed_edges.is_empty());
+    }
+    Ok(())
+}
+
+// r[verify sched.merge.evidence-ranked-displacement]
+/// The deliberate strict-inequality cell END TO END through the merge
+/// gate: an ingress-byte-bound store-backed submission (non-empty
+/// non-authoritative `drv_content` → `PathBoundBytes` at ingress)
+/// whose identity conflicts with a SETTLED content-bound squat
+/// displaces it — no store fetch, no operator — while the bare echo
+/// form of the same submission stays rejected. Pins the R7 sentence
+/// of the spec rule.
+#[test]
+fn settled_squat_displaced_by_ingress_byte_bound_submission() -> anyhow::Result<()> {
+    // Bare store-backed echo first: rejected (must-not-regress half).
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+    dag.merge(
+        squatter,
+        &[authoritative_node("squat", b"Derive-squat")],
+        &[],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("squat")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+    let mut echo = make_node("squat", "aarch64-linux");
+    echo.is_content_addressed = true;
+    let err = dag.merge(victim, &[echo.clone()], &[], "").unwrap_err();
+    assert!(
+        matches!(err, DagError::ConflictingInFlightContent { .. }),
+        "bare echo (UnverifiedClaim) cannot erase a settled record: {err}"
+    );
+    assert!(dag.node("squat").is_some(), "squat survives the echo");
+
+    // Same submission shape, but ingress-byte-bound: the inline bytes
+    // were text-CA-validated at SubmitBuild admission
+    // (sched.merge.ingress-inline-drv-binding), so the node ranks
+    // PathBoundBytes and strictly outranks the settled
+    // ContentBoundClaim squat.
+    let mut byte_bound = echo;
+    byte_bound.drv_content = b"Derive-genuine".to_vec();
+    byte_bound.drv_content_authoritative = false;
+    let res = dag.merge(victim, &[byte_bound], &[], "")?;
+    assert!(
+        res.displaced.contains(&"squat".into()),
+        "ingress-byte-bound submission displaces the settled squat"
+    );
+    let node = dag.node("squat").unwrap();
+    assert!(!node.drv_content_authoritative);
+    assert_eq!(node.system, "aarch64-linux", "displacer's identity wins");
+    assert_eq!(node.evidence, DefinitionEvidence::PathBoundBytes);
+    assert_eq!(node.interested_builds, HashSet::from([victim]));
+    Ok(())
+}
+
+// r[verify sched.merge.evidence-ranked-displacement]
+/// merge_with_evidence's store-evidence set raises a bare store-backed
+/// displacer to PathBoundBytes standing — the c3 enrichment's contract
+/// with the gate — while the same submission without the set entry
+/// stays rejected (the empty-set delegation of merge() is
+/// behavior-identical to HEAD).
+#[test]
+fn store_evidence_set_raises_displacer_standing() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+    dag.merge(
+        squatter,
+        &[authoritative_node("sev", b"Derive-squat")],
+        &[],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("sev")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+
+    let mut echo = make_node("sev", "aarch64-linux");
+    echo.is_content_addressed = true;
+    // Forged echo: the submitter claims needs_resolve — the evidence
+    // map's byte-derived value (false) must win on the created node.
+    echo.needs_resolve = true;
+
+    // Without evidence: rejected.
+    let err = dag
+        .merge_with_evidence(victim, &[echo.clone()], &[], "", &HashMap::new())
+        .unwrap_err();
+    assert!(matches!(err, DagError::ConflictingInFlightContent { .. }));
+
+    // With the hash in the store-evidence set: displaced.
+    let evidence: HashMap<DrvHash, StoreEvidenceGrant> = HashMap::from([(
+        "sev".into(),
+        StoreEvidenceGrant {
+            needs_resolve: false,
+            stripped_declared_hash: None,
+        },
+    )]);
+    let res = dag.merge_with_evidence(victim, &[echo], &[], "", &evidence)?;
+    assert!(res.displaced.contains(&"sev".into()));
+    assert_eq!(
+        dag.node("sev").unwrap().evidence,
+        DefinitionEvidence::PathBoundBytes,
+        "store-evidence-backed creation ranks PathBoundBytes"
+    );
+    // r[verify sched.dispatch.claims-derived+5]
+    assert!(
+        !dag.node("sev").unwrap().ca.needs_resolve,
+        "store-evidence-created node carries the BYTE-DERIVED resolve \
+         flag from the map, not the submitter's forged echo"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement+3]
+/// A grant carrying a strip applies it at node creation: the created
+/// node sheds the submitter's unverifiable declared hash (live None)
+/// and preserves the declared value out-of-band (M_070) — exact
+/// dispatch-strip parity at the merge consumer.
+#[test]
+fn store_evidence_grant_strip_applies_at_creation() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+    dag.merge(
+        squatter,
+        &[authoritative_node("sevs", b"Derive-squat2")],
+        &[],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("sevs")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+
+    let mut echo = make_node("sevs", "aarch64-linux");
+    echo.is_content_addressed = true;
+    // The submitter's declared (unverifiable) hash — the verification
+    // stripped it; the grant carries the strip.
+    echo.ca_modular_hash = Some([0xCC; 32]);
+
+    let evidence: HashMap<DrvHash, StoreEvidenceGrant> = HashMap::from([(
+        "sevs".into(),
+        StoreEvidenceGrant {
+            needs_resolve: true,
+            stripped_declared_hash: Some([0xCC; 32]),
+        },
+    )]);
+    let res = dag.merge_with_evidence(victim, &[echo], &[], "", &evidence)?;
+    assert!(res.displaced.contains(&"sevs".into()));
+    let created = dag.node("sevs").unwrap();
+    assert_eq!(
+        created.evidence,
+        DefinitionEvidence::PathBoundBytes,
+        "stripped-verified creation still ranks PathBoundBytes"
+    );
+    assert_eq!(
+        created.ca.modular_hash, None,
+        "the unverifiable declared hash is shed (an unverifiable claim is no claim)"
+    );
+    assert_eq!(
+        created.ca.modular_hash_stripped,
+        Some([0xCC; 32]),
+        "the declared value is preserved out-of-band (M_070)"
+    );
+    assert!(created.ca.needs_resolve, "byte-derived resolve recorded");
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement+3]
+/// bug_072 gate half, fail-closed cell: a settled BARE node and a
+/// conflicting bare incoming WITHOUT a store-evidence grant must
+/// REFUSE — never silently join (pre-fix this cell fell through the
+/// store-backed exemption and the genuine owner was served the
+/// squat's outputs as a cache hit). With a grant, the displacement
+/// primitive erases the squat. Identity-matching resubmissions —
+/// including the M_070 dual-anchor shape (stripped resident: live
+/// hash None, paths empty, byte-anchored rank) — keep the join.
+#[test]
+fn settled_bare_conflict_refuses_without_grant_and_displaces_with() -> anyhow::Result<()> {
+    // Cell 1: conflict without grant -> refuse (fail closed).
+    let mut dag = DerivationDag::new();
+    let mut squat = make_node("bare-cell", "x86_64-linux");
+    squat.expected_output_paths = vec!["/nix/store/forged-out".into()];
+    dag.merge(Uuid::new_v4(), &[squat.clone()], &[], "")?;
+    dag.nodes
+        .get_mut("bare-cell")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Skipped);
+
+    let mut genuine = make_node("bare-cell", "x86_64-linux");
+    genuine.expected_output_paths = vec!["/nix/store/genuine-out".into()];
+    let err = dag
+        .merge_with_evidence(Uuid::new_v4(), &[genuine.clone()], &[], "", &HashMap::new())
+        .unwrap_err();
+    assert!(
+        matches!(err, DagError::ConflictingInFlightContent { .. }),
+        "ungranted settled bare x bare conflict refuses, never joins: {err:?}"
+    );
+    assert_eq!(
+        dag.node("bare-cell").unwrap().expected_output_paths,
+        vec!["/nix/store/forged-out".to_string()],
+        "refusal leaves the settled node untouched"
+    );
+
+    // Cell 2: same conflict WITH the grant -> displaced.
+    let evidence: HashMap<DrvHash, StoreEvidenceGrant> = HashMap::from([(
+        "bare-cell".into(),
+        StoreEvidenceGrant {
+            needs_resolve: false,
+            stripped_declared_hash: None,
+        },
+    )]);
+    let res = dag.merge_with_evidence(Uuid::new_v4(), &[genuine], &[], "", &evidence)?;
+    assert!(res.displaced.contains(&"bare-cell".into()));
+    assert_eq!(
+        dag.node("bare-cell").unwrap().expected_output_paths,
+        vec!["/nix/store/genuine-out".to_string()],
+        "granted claim displaces the squat"
+    );
+    Ok(())
+}
+
+// r[verify sched.persist.settled-identity-freeze+4]
+/// Resident-matcher M_070 bases: an honest rebuild against a STRIPPED
+/// settled bare resident (live hash None, every path empty — zero
+/// classical evidence) must JOIN, not refuse: preserved-claim when the
+/// declaration is re-presented byte-equal, dual-anchor when the node
+/// is byte-anchored and the incoming is hash-free. Authoritative
+/// incomings get NO dual-anchor (their bytes are self-bound — no
+/// second anchor; the claim-no-redefine population).
+#[test]
+fn stripped_settled_bare_resident_rejoins_instead_of_refusing() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let mut stripped = make_node("strip-res", "x86_64-linux");
+    stripped.is_content_addressed = true;
+    stripped.expected_output_paths = vec![String::new()];
+    dag.merge(Uuid::new_v4(), &[stripped.clone()], &[], "")?;
+    {
+        let n = dag.nodes.get_mut("strip-res").unwrap();
+        n.set_status_for_test(DerivationStatus::Completed);
+        // Dispatch-strip end state: rank raised on verified bytes,
+        // live hash shed, claim preserved (M_070).
+        n.evidence = DefinitionEvidence::PathBoundBytes;
+        n.ca.modular_hash = None;
+        n.ca.modular_hash_stripped = Some([0xCC; 32]);
+    }
+
+    // Byte-equal re-presentation: preserved-claim basis.
+    let mut represent = stripped.clone();
+    represent.ca_modular_hash = Some([0xCC; 32]);
+    let res = dag.merge_with_evidence(Uuid::new_v4(), &[represent], &[], "", &HashMap::new())?;
+    assert!(
+        res.displaced.is_empty() && res.newly_inserted.is_empty(),
+        "byte-equal preserved claim JOINS the settled resident"
+    );
+
+    // Hash-free resubmission: dual-anchor basis (byte-anchored node).
+    let res = dag.merge_with_evidence(
+        Uuid::new_v4(),
+        &[stripped.clone()],
+        &[],
+        "",
+        &HashMap::new(),
+    )?;
+    assert!(
+        res.displaced.is_empty() && res.newly_inserted.is_empty(),
+        "hash-free resubmission of a byte-anchored node JOINS"
+    );
+
+    // Authoritative incoming with no evidence: NOT granted dual-anchor
+    // — falls into the claim-no-redefine population (settled node is
+    // not retriable, so the no-redefine arm does not fire either; the
+    // claim joins-and-is-ignored per the store-backed exemption for
+    // authoritative-incoming x bare-existing... it must NOT adopt).
+    let mut auth = stripped.clone();
+    auth.drv_content = b"Derive-claim".to_vec();
+    auth.drv_content_authoritative = true;
+    let _ = dag.merge_with_evidence(Uuid::new_v4(), &[auth], &[], "", &HashMap::new());
+    assert!(
+        dag.node("strip-res").unwrap().drv_content.is_empty(),
+        "an evidence-free authoritative claim never adopts its bytes \
+         into a byte-anchored settled node"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.identity-hash-veto]
+/// Resident-matcher twin: a present-but-differing modular hash vetoes
+/// `verifiable_identity_matches` even when the (public, copyable)
+/// expected output paths agree byte-for-byte. Pre-fix the differing
+/// hash was treated as merely "no hash evidence" and path agreement
+/// carried the match — letting a provably different definition join or
+/// displace as identical.
+#[test]
+fn differing_modular_hash_vetoes_identity_match_despite_path_agreement() {
+    let mint_existing = |hash: Option<[u8; 32]>| {
+        let row = crate::db::RecoveryDerivationRow {
+            is_ca: true,
+            expected_output_paths: vec!["/nix/store/agreed-out".into()],
+            ca_modular_hash: hash.map(|h| h.to_vec()),
+            ..crate::db::RecoveryDerivationRow::test_default("hv", "x86_64-linux")
+        };
+        crate::state::DerivationState::from_recovery_row(row, DerivationStatus::Ready)
+            .expect("state mints")
+    };
+    let mint_incoming = |hash: Option<[u8; 32]>| {
+        let mut n = make_node("hv", "x86_64-linux");
+        n.is_content_addressed = true;
+        n.expected_output_paths = vec!["/nix/store/agreed-out".into()];
+        n.ca_modular_hash = hash;
+        n
+    };
+
+    let existing = mint_existing(Some([0xAA; 32]));
+    assert!(
+        !crate::dag::verifiable_identity_matches(&existing, &mint_incoming(Some([0xBB; 32]))),
+        "present-but-differing hashes are a definition conflict; path \
+         agreement must not override"
+    );
+    assert!(
+        crate::dag::verifiable_identity_matches(&existing, &mint_incoming(Some([0xAA; 32]))),
+        "byte-equal hashes still match"
+    );
+    assert!(
+        crate::dag::verifiable_identity_matches(&existing, &mint_incoming(None)),
+        "an absent incoming hash falls back to path evidence"
+    );
+    let no_hash_existing = mint_existing(None);
+    assert!(
+        crate::dag::verifiable_identity_matches(
+            &no_hash_existing,
+            &mint_incoming(Some([0xBB; 32]))
+        ),
+        "an absent existing hash falls back to path evidence"
+    );
 }

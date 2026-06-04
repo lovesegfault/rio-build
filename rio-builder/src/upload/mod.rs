@@ -1,11 +1,12 @@
 //! Output upload to rio-store after build completion.
 //!
-//! Scans the overlay upper layer for new store paths, serializes each as
-//! a NAR, computes SHA-256, and uploads via `StoreService.PutPath` gRPC
-//! with retry on failure.
+//! Takes the outputs the native result pipeline recorded (paths,
+//! reference sets, content addresses), serializes each as a NAR from the
+//! overlay upper layer, computes SHA-256, and uploads via
+//! `StoreService.PutPath` gRPC with retry on failure.
 //!
 //! Submodules:
-//! - `common`: streaming-tee sink, ref-scan, trailer-mode `PathInfo`,
+//! - `common`: streaming-tee sink, trailer-mode `PathInfo`,
 //!   assignment-token header — mechanics shared by single + batch.
 //! - `single`: per-output `PutPath` with retry + I-125b concurrent-put
 //!   adoption.
@@ -14,13 +15,12 @@
 
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
-use std::sync::Arc;
 
 use futures_util::stream::{self, StreamExt};
 use tonic::transport::Channel;
 use tracing::instrument;
 
-use rio_nix::refscan::CandidateSet;
+use rio_nix::store_path::StorePath;
 use rio_proto::StoreServiceClient;
 use rio_proto::types::FindMissingPathsRequest;
 use rio_proto::validated::ValidatedPathInfo;
@@ -30,7 +30,7 @@ pub(crate) mod common;
 mod single;
 
 use batch::upload_outputs_batch;
-use common::{MAX_PARALLEL_UPLOADS, MAX_UPLOAD_RETRIES, UPLOAD_BACKOFF, prepare_output};
+use common::{MAX_PARALLEL_UPLOADS, MAX_UPLOAD_RETRIES, PreparedOutput, UPLOAD_BACKOFF};
 use single::upload_output;
 
 // Re-exports for the test module's `use super::*` (private mechanics
@@ -57,12 +57,13 @@ pub enum UploadError {
     UploadExhausted { path: String, source: tonic::Status },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    /// Ref-scan returned a path that fails `StorePath::parse`. The
-    /// candidate set is built from validated input-closure paths, so
-    /// this indicates a bug in `CandidateSet::resolve` (or a mismatched
-    /// store-prefix). Surfaced as an error — silently dropping the ref
-    /// would publish a path with a broken reference graph.
-    #[error("ref-scan returned unparseable store path {path:?}")]
+    /// A reference recorded by the result pipeline fails
+    /// `StorePath::parse`. The pipeline resolves references against
+    /// validated input-closure and output paths, so this indicates a bug
+    /// upstream (or a mismatched store-prefix). Surfaced as an error —
+    /// silently dropping the ref would publish a path with a broken
+    /// reference graph.
+    #[error("unparseable store path in recorded references: {path:?}")]
     InvalidReference { path: String },
 }
 
@@ -112,7 +113,36 @@ pub fn scan_new_outputs(upper_store: &Path) -> std::io::Result<Vec<String>> {
     Ok(outputs)
 }
 
-/// Upload all new outputs from the overlay upper layer.
+/// One build output to upload, exactly as the native result pipeline
+/// recorded it (`ProcessedOutputs`): the realized store path plus the
+/// reference set and content-address descriptor the pipeline computed.
+///
+/// The upload registers EXACTLY this. It does not rediscover outputs by
+/// scanning the overlay upper layer (a stray store path a build leaves
+/// behind is never uploaded) and it does not re-scan references (the
+/// pipeline's post-`unsafeDiscardReferences`, post-CA-remapping set is
+/// what gets registered — diverging from it here would re-introduce the
+/// references CppNix drops).
+#[derive(Debug, Clone)]
+pub struct OutputToUpload {
+    /// Full `/nix/store/...` path (final, post-CA-finalization).
+    pub store_path: String,
+    /// Where the output's bytes live on the worker host (the overlay
+    /// upper layer entry; for finalized floating-CA outputs, the
+    /// renamed-in-place final basename — see `native_result::ca`). The
+    /// NAR dump streams from here.
+    pub host_path: std::path::PathBuf,
+    /// Sorted full-store-path references to register, post
+    /// `unsafeDiscardReferences`. A self-referencing output lists its
+    /// own final path here.
+    pub references: Vec<String>,
+    /// `fixed:[r:]<algo>:<hash>` descriptor for content-addressed
+    /// outputs — floating-CA finalization or a fixed-output derivation's
+    /// declared hash; `None` for input-addressed outputs.
+    pub content_address: Option<String>,
+}
+
+/// Upload the given build outputs from the overlay upper layer.
 ///
 /// Pipeline:
 /// 1. **Idempotency pre-check** (`r[builder.upload.idempotent-precheck]`):
@@ -132,12 +162,10 @@ pub fn scan_new_outputs(upper_store: &Path) -> std::io::Result<Vec<String>> {
 #[instrument(skip_all)]
 pub async fn upload_all_outputs(
     store_client: &StoreServiceClient<Channel>,
-    upper_store: &Path,
     assignment_token: &str,
     deriver: &str,
-    ref_candidates: &[String],
+    outputs: &[OutputToUpload],
 ) -> Result<Vec<ValidatedPathInfo>, UploadError> {
-    let outputs = scan_new_outputs(upper_store)?;
     if outputs.is_empty() {
         return Ok(Vec::new());
     }
@@ -147,9 +175,9 @@ pub async fn upload_all_outputs(
     //
     // Batch-check all outputs against the store BEFORE reading any bytes
     // from disk. Outputs with a `'complete'` manifest are skipped: the
-    // pre-scan disk read, NAR stream, SHA-256, and gRPC stream setup
-    // are all wasted work when r[store.put.idempotent] would no-op
-    // server-side anyway.
+    // disk read, NAR stream, SHA-256, and gRPC stream setup are all
+    // wasted work when r[store.put.idempotent] would no-op server-side
+    // anyway.
     //
     // Best-effort: on FindMissingPaths error, log + treat ALL as missing.
     // r[store.put.idempotent] catches the duplicates server-side — zero
@@ -162,30 +190,61 @@ pub async fn upload_all_outputs(
     // trusted → store must reconstruct NAR to verify, so the "win" is
     // net positive only if ChunkCache hit rate is high (>80%). P0263
     // scoped down to the zero-proto-change path; deferred remainder.
-    let store_paths: Vec<String> = outputs.iter().map(|b| format!("/nix/store/{b}")).collect();
+    let basename_of = |store_path: &str| -> String {
+        store_path
+            .strip_prefix("/nix/store/")
+            .unwrap_or(store_path)
+            .to_string()
+    };
+    let basenames: Vec<String> = outputs.iter().map(|o| basename_of(&o.store_path)).collect();
+    let store_paths: Vec<String> = outputs.iter().map(|o| o.store_path.clone()).collect();
     let (to_upload, mut skipped_results) =
-        partition_by_presence(store_client, &outputs, store_paths).await;
+        partition_by_presence(store_client, &basenames, store_paths).await;
     // ---------------------------------------------------------------------
 
-    // Build the candidate set ONCE. Same input closure applies to every
-    // output of a derivation; Arc so buffer_unordered's per-task clone
-    // is a pointer copy, not a full HashMap clone.
-    let candidates = Arc::new(CandidateSet::from_paths(ref_candidates));
-
-    // Prep ALL outputs (parse + ref-scan) BEFORE any byte hits the wire.
-    // A prep failure on output k returns Err here; the batch producer is
-    // prep-free, so partial server commit (`r[store.atomic.multi-output]`)
-    // is unrepresentable. Serial — scan_references is spawn_blocking
-    // disk-read; matches MAX_BATCH_OUTPUTS=16 small-N shape. Retries
-    // (batch and per-output) do NOT re-scan.
+    // Prep ALL outputs (path parse + the pipeline-recorded reference
+    // sets) BEFORE any byte hits the wire. A prep failure on output k
+    // returns Err here; the batch producer is prep-free, so partial
+    // server commit (`r[store.atomic.multi-output]`) is unrepresentable.
     //
-    // TODO(P0433): trailer-refs protocol extension — move refs into the
-    // PutPath trailer so the scan happens inline with the upload tee
-    // (avoiding this extra disk pass). Gated on measuring pre-scan cost
-    // at scale (see worker.md § pre-scan cost). Deferred P0181 remainder.
+    // References are NOT re-scanned at upload time: the result pipeline
+    // already dumped and scanned every output, applied
+    // `unsafeDiscardReferences`, and remapped floating-CA self/sibling
+    // references to their final paths — that recorded set is what gets
+    // registered, exactly as Nix registers it.
+    // r[impl builder.upload.references-scanned+2]
+    let by_basename: std::collections::HashMap<String, &OutputToUpload> = outputs
+        .iter()
+        .map(|o| (basename_of(&o.store_path), o))
+        .collect();
     let mut prepared = Vec::with_capacity(to_upload.len());
     for b in &to_upload {
-        prepared.push(prepare_output(upper_store, b, &candidates).await?);
+        let o = by_basename
+            .get(b.as_str())
+            .expect("to_upload is a subset of the outputs passed in");
+        let parsed = StorePath::parse(&o.store_path).map_err(|e| UploadError::UploadExhausted {
+            path: o.store_path.clone(),
+            source: tonic::Status::invalid_argument(format!(
+                "output store path {:?} is malformed: {e}",
+                o.store_path
+            )),
+        })?;
+        // The pipeline resolved these against the input closure and the
+        // sibling outputs; re-check the parse so a bug upstream cannot
+        // publish a path with a broken reference graph.
+        for r in &o.references {
+            let _ = StorePath::parse(r)
+                .map_err(|_| UploadError::InvalidReference { path: r.clone() })?;
+        }
+        metrics::histogram!("rio_builder_upload_references_count")
+            .record(o.references.len() as f64);
+        prepared.push(PreparedOutput {
+            store_path: o.store_path.clone(),
+            host_path: o.host_path.clone(),
+            parsed,
+            references: o.references.clone(),
+            content_address: o.content_address.clone(),
+        });
     }
 
     // Branch: ≥2 outputs TO UPLOAD → atomic batch; ≤1 → independent
@@ -193,7 +252,24 @@ pub async fn upload_all_outputs(
     // post-idempotency-pre-check set — if 3 outputs exist but 2 are already
     // in the store, only 1 needs upload and PutPath is sufficient. See
     // store.atomic.multi-output in the store spec.
-    if prepared.len() >= 2 {
+    // Capacity pre-check (round-17 bug_111): a prepared set wider than the
+    // batch capacity cannot succeed server-side (the server answers
+    // FailedPrecondition per output_index >= MAX_BATCH_OUTPUTS), so take
+    // the documented independent-PutPath fallback BEFORE streaming any
+    // NAR, not after N streamed NARs x retries. With MAX_BATCH_OUTPUTS
+    // protocol-aligned (= MAX_OUTPUT_NAMES, compile-asserted in batch.rs)
+    // this is unreachable from a parsed derivation; it guards internal
+    // callers handing a hand-built slice.
+    let batch_capacity_ok = prepared.len() <= rio_common::limits::MAX_BATCH_OUTPUTS;
+    if !batch_capacity_ok {
+        tracing::warn!(
+            to_upload = prepared.len(),
+            max = rio_common::limits::MAX_BATCH_OUTPUTS,
+            "output set exceeds batch capacity; using independent PutPath \
+             — partial registration possible"
+        );
+    }
+    if prepared.len() >= 2 && batch_capacity_ok {
         tracing::info!(
             to_upload = prepared.len(),
             skipped = skipped_results.len(),
@@ -212,18 +288,23 @@ pub async fn upload_all_outputs(
             if attempt > 0 {
                 tokio::time::sleep(UPLOAD_BACKOFF.duration(attempt - 1)).await;
             }
-            match upload_outputs_batch(
-                store_client,
-                upper_store,
-                &prepared,
-                assignment_token,
-                deriver,
-            )
-            .await
-            {
+            match upload_outputs_batch(store_client, &prepared, assignment_token, deriver).await {
                 Ok(mut results) => {
                     results.append(&mut skipped_results);
                     return Ok(results);
+                }
+                Err(UploadError::UploadExhausted { source, path })
+                    if source.code() == tonic::Code::InvalidArgument =>
+                {
+                    // R1(e) (round-17 bug_111 rider): a request the server
+                    // DETERMINISTICALLY rejects cannot become acceptable by
+                    // resending the same bytes — classify permanent at the
+                    // producing statement instead of burning
+                    // MAX_UPLOAD_RETRIES x N re-streamed NARs. Capacity
+                    // overruns are NOT this arm (the server signals those
+                    // as FailedPrecondition, below); this is malformed
+                    // requests only.
+                    return Err(UploadError::UploadExhausted { source, path });
                 }
                 Err(UploadError::UploadExhausted { source, .. })
                     if source.code() == tonic::Code::FailedPrecondition =>
@@ -261,7 +342,6 @@ pub async fn upload_all_outputs(
         "uploading build outputs (independent PutPath)"
     );
 
-    let upper_store = upper_store.to_path_buf();
     // Clone the token into each task (it's a String in each async
     // block; MAX_PARALLEL_UPLOADS=4 copies of ~150 bytes — trivial).
     let token = assignment_token.to_string();
@@ -269,10 +349,9 @@ pub async fn upload_all_outputs(
     let results: Vec<Result<ValidatedPathInfo, UploadError>> = stream::iter(prepared)
         .map(|p| {
             let mut client = store_client.clone();
-            let upper_store = upper_store.clone();
             let token = token.clone();
             let deriver = deriver.clone();
-            async move { upload_output(&mut client, &upper_store, p, &token, &deriver).await }
+            async move { upload_output(&mut client, p, &token, &deriver).await }
         })
         .buffer_unordered(MAX_PARALLEL_UPLOADS)
         .collect()
@@ -416,19 +495,30 @@ mod tests {
 
     use rio_test_support::fixtures::seed_store_output as make_output_file;
 
-    /// Empty candidate set — for tests that don't care about ref scanning.
-    fn no_candidates() -> Arc<CandidateSet> {
-        Arc::new(CandidateSet::from_paths(std::iter::empty::<&str>()))
+    /// Build the `OutputToUpload` an `upload_all_outputs` caller (the
+    /// result pipeline) would pass: full store path, on-disk location,
+    /// and recorded refs.
+    fn out_for(store_dir: &Path, basename: &str, references: &[String]) -> OutputToUpload {
+        OutputToUpload {
+            store_path: format!("/nix/store/{basename}"),
+            host_path: store_dir.join(basename),
+            references: references.to_vec(),
+            content_address: None,
+        }
     }
 
-    /// Prep helper for tests calling `upload_output` directly: runs the
-    /// real `prepare_output` chokepoint (parse + scan_references).
-    async fn prep_one(
-        store_dir: &Path,
-        basename: &str,
-        candidates: &Arc<CandidateSet>,
-    ) -> Result<common::PreparedOutput, UploadError> {
-        prepare_output(store_dir, basename, candidates).await
+    /// Prep helper for tests calling `upload_output` directly: builds the
+    /// `PreparedOutput` exactly as `upload_all_outputs` does, with the
+    /// caller-provided (pipeline-recorded) references.
+    fn prep_one(store_dir: &Path, basename: &str, references: &[String]) -> common::PreparedOutput {
+        let store_path = format!("/nix/store/{basename}");
+        common::PreparedOutput {
+            store_path: store_path.clone(),
+            host_path: store_dir.join(basename),
+            parsed: StorePath::parse(&store_path).expect("test basename is a valid store path"),
+            references: references.to_vec(),
+            content_address: None,
+        }
     }
 
     #[tokio::test]
@@ -437,8 +527,8 @@ mod tests {
         let basename = test_store_basename("hello");
         let (_tmp, store_dir) = make_output_file(&basename, b"hello world")?;
 
-        let p = prep_one(&store_dir, &basename, &no_candidates()).await?;
-        let result = upload_output(&mut client, &store_dir, p, "", "")
+        let p = prep_one(&store_dir, &basename, &[]);
+        let result = upload_output(&mut client, p, "", "")
             .await
             .expect("upload should succeed");
 
@@ -466,8 +556,8 @@ mod tests {
         let basename = test_store_basename("retry");
         let (_tmp, store_dir) = make_output_file(&basename, b"retry me")?;
 
-        let p = prep_one(&store_dir, &basename, &no_candidates()).await?;
-        let result = upload_output(&mut client, &store_dir, p, "", "")
+        let p = prep_one(&store_dir, &basename, &[]);
+        let result = upload_output(&mut client, p, "", "")
             .await
             .expect("upload should succeed on 3rd attempt");
 
@@ -490,8 +580,8 @@ mod tests {
         let basename = test_store_basename("exhaust");
         let (_tmp, store_dir) = make_output_file(&basename, b"never uploads")?;
 
-        let p = prep_one(&store_dir, &basename, &no_candidates()).await?;
-        let err = upload_output(&mut client, &store_dir, p, "", "")
+        let p = prep_one(&store_dir, &basename, &[]);
+        let err = upload_output(&mut client, p, "", "")
             .await
             .expect_err("upload should exhaust retries");
 
@@ -530,8 +620,8 @@ mod tests {
             nar.clone(),
         );
 
-        let p = prep_one(&store_dir, &basename, &no_candidates()).await?;
-        let result = upload_output(&mut client, &store_dir, p, "", "")
+        let p = prep_one(&store_dir, &basename, &[]);
+        let result = upload_output(&mut client, p, "", "")
             .await
             .expect("should adopt concurrent uploader's result");
 
@@ -566,8 +656,8 @@ mod tests {
         let basename = test_store_basename("clears");
         let (_tmp, store_dir) = make_output_file(&basename, b"clears eventually")?;
 
-        let p = prep_one(&store_dir, &basename, &no_candidates()).await?;
-        let result = upload_output(&mut client, &store_dir, p, "", "")
+        let p = prep_one(&store_dir, &basename, &[]);
+        let result = upload_output(&mut client, p, "", "")
             .await
             .expect("should retry upload after poll window");
 
@@ -623,9 +713,18 @@ mod tests {
         fs::write(store_dir.join(&b2), b"two")?;
         fs::write(store_dir.join(&b3), b"three")?;
 
-        let results = upload_all_outputs(&client, &store_dir, "", "", &[])
-            .await
-            .expect("all uploads succeed");
+        let results = upload_all_outputs(
+            &client,
+            "",
+            "",
+            &[
+                out_for(&store_dir, &b1, &[]),
+                out_for(&store_dir, &b2, &[]),
+                out_for(&store_dir, &b3, &[]),
+            ],
+        )
+        .await
+        .expect("all uploads succeed");
 
         assert_eq!(results.len(), 3);
         // Result order is NOT guaranteed (buffer_unordered). Collect to set.
@@ -638,10 +737,9 @@ mod tests {
         Ok(())
     }
 
-    /// ENOENT during streaming dump → UploadExhausted (wraps the NAR error).
-    /// The ENOENT is caught in `prepare_output` (pre-scan reads from disk
-    /// first), BEFORE any gRPC stream opens. The error surfaces as
-    /// UploadExhausted with a NAR-serialization message.
+    /// ENOENT during the streaming dump → UploadExhausted (wraps the NAR
+    /// error): the output file vanished between the result pipeline and
+    /// the upload. Same ENOENT on every retry, so the budget exhausts.
     #[tokio::test(start_paused = true)]
     async fn test_upload_output_nar_serialize_error() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
@@ -652,12 +750,12 @@ mod tests {
         // Use a VALID basename (32-char hash) so we get past the path
         // validation and into the dump that actually ENOENTs.
         let basename = test_store_basename("nonexistent");
-        let err = prep_one(&store_dir, &basename, &no_candidates())
+        let (_store, mut client, _h) = spawn_mock_store_with_client().await?;
+        let err = upload_output(&mut client, prep_one(&store_dir, &basename, &[]), "", "")
             .await
-            .expect_err("should fail NAR serialization in prep");
+            .expect_err("should fail NAR serialization in the dump");
 
-        // NAR error happens in the pre-scan pass (before the retry loop) —
-        // same ENOENT every time → UploadExhausted. Error message still
+        // Same ENOENT every retry → UploadExhausted. Error message still
         // names path + cause.
         assert!(
             matches!(err, UploadError::UploadExhausted { .. }),
@@ -711,8 +809,8 @@ mod tests {
         let basename = test_store_basename("tee-hash");
         let (_tmp, store_dir) = make_output_file(&basename, b"tee upload test data")?;
 
-        let p = prep_one(&store_dir, &basename, &no_candidates()).await?;
-        let result = upload_output(&mut client, &store_dir, p, "", "").await?;
+        let p = prep_one(&store_dir, &basename, &[]);
+        let result = upload_output(&mut client, p, "", "").await?;
 
         // The hash returned by upload_output == the hash MockStore recorded
         // == SHA-256 of dump_path(). Three-way consistency.
@@ -737,18 +835,19 @@ mod tests {
 
     /// Two distinct valid nixbase32 hashes for building test candidate paths.
     /// Must differ from TEST_HASH (aaaa...) used by test_store_basename, so
-    /// the CandidateSet's hash→path map doesn't collide.
+    /// the recorded reference paths stay distinct.
     const DEP_HASH_A: &str = "7rjj5xmrxb3n63wlk6mzlwxzxbvg7r3a";
     const DEP_HASH_B: &str = "v5sv61sszx301i0x6xysaqzla09nksnd";
 
-    /// r[verify builder.upload.references-scanned]
+    /// r[verify builder.upload.references-scanned+2]
     /// r[verify builder.upload.deriver-populated]
     ///
-    /// End-to-end: output file embeds a store-path string → pre-scan finds
-    /// it → PathInfo.references arrives at MockStore non-empty. Also checks
+    /// End-to-end: the references recorded by the result pipeline are
+    /// delivered unchanged → PathInfo.references arrives at MockStore
+    /// exactly as provided (no rescan, no additions). Also checks
     /// PathInfo.deriver is populated (was String::new() before this fix).
     #[tokio::test]
-    async fn test_upload_output_scans_references() -> anyhow::Result<()> {
+    async fn test_upload_output_sends_recorded_references() -> anyhow::Result<()> {
         let (store, mut client, _h) = spawn_mock_store_with_client().await?;
         let basename = test_store_basename("scanned");
         let deriver = test_drv_path("scanned");
@@ -757,25 +856,24 @@ mod tests {
         // path, the way a real RPATH or shebang would). dep-B is NOT in the
         // output — verifies we don't over-report.
         let dep_a = format!("/nix/store/{DEP_HASH_A}-glibc-2.38");
-        let dep_b = format!("/nix/store/{DEP_HASH_B}-unused");
+        let _dep_b = format!("/nix/store/{DEP_HASH_B}-unused");
         let self_path = format!("/nix/store/{basename}");
         let contents = format!("RPATH={dep_a}/lib\nself={self_path}\n");
         let (_tmp, store_dir) = make_output_file(&basename, contents.as_bytes())?;
 
-        // Candidate set: both deps + the output itself (self-references are
-        // legal — binaries embed their own store path in rpaths).
-        let candidates = Arc::new(CandidateSet::from_paths([&dep_a, &dep_b, &self_path]));
+        // References as the result pipeline recorded them: dep-A + the
+        // output's own path (self-references are legal — binaries embed
+        // their own store path in rpaths). dep-B is NOT recorded.
+        let p = prep_one(&store_dir, &basename, &[dep_a.clone(), self_path.clone()]);
+        let result = upload_output(&mut client, p, "", &deriver).await?;
 
-        let p = prep_one(&store_dir, &basename, &candidates).await?;
-        let result = upload_output(&mut client, &store_dir, p, "", &deriver).await?;
-
-        // Result carries the scanned refs. Sorted: /nix/store/7rjj...
-        // < /nix/store/aaaa... (self). dep-B absent.
+        // Result carries exactly the provided refs — no rescan, no
+        // additions, dep-B absent.
         let refs: Vec<String> = result.references.iter().map(|r| r.to_string()).collect();
         assert_eq!(
             refs,
             vec![dep_a.clone(), self_path.clone()],
-            "scanned refs: dep-A + self, sorted, no dep-B"
+            "provided refs: dep-A + self, no dep-B"
         );
 
         // MockStore recorded the PathInfo WITH references + deriver. This is
@@ -803,13 +901,13 @@ mod tests {
         let deriver = test_drv_path("noref");
         let (_tmp, store_dir) = make_output_file(&basename, b"plain text, no store paths here")?;
 
-        let dep = format!("/nix/store/{DEP_HASH_A}-dep");
-        let candidates = Arc::new(CandidateSet::from_paths([&dep]));
+        let p = prep_one(&store_dir, &basename, &[]);
+        let result = upload_output(&mut client, p, "", &deriver).await?;
 
-        let p = prep_one(&store_dir, &basename, &candidates).await?;
-        let result = upload_output(&mut client, &store_dir, p, "", &deriver).await?;
-
-        assert!(result.references.is_empty(), "no refs in output contents");
+        assert!(
+            result.references.is_empty(),
+            "no refs recorded for this output"
+        );
         let puts = store.calls.put_calls.read().unwrap();
         assert!(puts[0].references.is_empty());
         assert_eq!(
@@ -833,8 +931,8 @@ mod tests {
         fs::create_dir_all(&store_dir)?;
 
         // Two outputs: one mentions dep-A, the other mentions dep-B.
-        // Use distinct hashes for the outputs so CandidateSet doesn't
-        // collapse them (test_store_basename uses a single TEST_HASH).
+        // Use distinct hashes for the outputs so their self-reference
+        // paths stay distinct (test_store_basename uses a single TEST_HASH).
         let out1 = format!("{DEP_HASH_A}-out1");
         let out2 = format!("{DEP_HASH_B}-out2");
         let dep_a = format!("/nix/store/{DEP_HASH_A}-out1"); // out1 self-ref
@@ -845,10 +943,12 @@ mod tests {
         let deriver = test_drv_path("multi");
         let results = upload_all_outputs(
             &client,
-            &store_dir,
             "",
             &deriver,
-            &[dep_a.clone(), dep_b.clone()],
+            &[
+                out_for(&store_dir, &out1, std::slice::from_ref(&dep_a)),
+                out_for(&store_dir, &out2, std::slice::from_ref(&dep_b)),
+            ],
         )
         .await?;
 
@@ -961,7 +1061,8 @@ mod tests {
             "precondition: seeded vs disk NARs must differ, else this test proves nothing"
         );
 
-        let results = upload_all_outputs(&client, &store_dir, "", "", &[]).await?;
+        let results =
+            upload_all_outputs(&client, "", "", &[out_for(&store_dir, &basename, &[])]).await?;
 
         // Zero PutPath calls — the skip fired.
         assert_eq!(
@@ -998,7 +1099,16 @@ mod tests {
         fs::write(store_dir.join(&b_present), b"disk present")?;
         fs::write(store_dir.join(&b_missing), b"disk missing")?;
 
-        let results = upload_all_outputs(&client, &store_dir, "", "", &[]).await?;
+        let results = upload_all_outputs(
+            &client,
+            "",
+            "",
+            &[
+                out_for(&store_dir, &b_present, &[]),
+                out_for(&store_dir, &b_missing, &[]),
+            ],
+        )
+        .await?;
 
         // Exactly one PutPath: the missing output.
         let puts = store.calls.put_calls.read().unwrap();
@@ -1044,7 +1154,8 @@ mod tests {
         fs::create_dir_all(&store_dir)?;
         fs::write(store_dir.join(&basename), b"disk fallback")?;
 
-        let results = upload_all_outputs(&client, &store_dir, "", "", &[]).await?;
+        let results =
+            upload_all_outputs(&client, "", "", &[out_for(&store_dir, &basename, &[])]).await?;
 
         // FindMissingPaths failed → fell back to upload → PutPath called.
         // (MockStore's put_path doesn't implement the idempotent no-op;
@@ -1078,11 +1189,7 @@ mod tests {
         // MockStore doesn't expose call-count for find_missing_paths.
         // Just assert empty result + zero PutPath. The is_empty() guard
         // is simple enough that existence-in-code is the real assurance.
-        let tmp = tempfile::tempdir()?;
-        // upper_store doesn't exist — scan_new_outputs returns empty.
-
-        let results =
-            upload_all_outputs(&client, &tmp.path().join("nonexistent"), "", "", &[]).await?;
+        let results = upload_all_outputs(&client, "", "", &[]).await?;
         assert!(results.is_empty());
         assert_eq!(store.calls.put_calls.read().unwrap().len(), 0);
         Ok(())
@@ -1092,14 +1199,16 @@ mod tests {
     // Batch atomicity / retry / liveness regressions
     // -----------------------------------------------------------------------
 
-    // r[verify builder.upload.batch+2]
-    // r[verify store.atomic.multi-output]
-    /// bug_392: prep failure on output k must NOT leave outputs 0..k-1
-    /// committed server-side. Two outputs on disk; output 1's basename
-    /// has no file (scan_references ENOENTs). Pre-fix: producer streamed
-    /// output 0 fully, then errored → MockStore committed `{0}` →
-    /// put_calls.len() == 1. Post-fix: prep loop fails BEFORE any gRPC
-    /// → put_calls.len() == 0.
+    // r[verify builder.upload.batch+3]
+    // r[verify store.atomic.multi-output+1]
+    /// bug_392 (adapted): prep failure on output k must NOT leave outputs
+    /// 0..k-1 committed server-side. Prep no longer reads disk (references
+    /// come precomputed from the result pipeline), so the prep-detectable
+    /// failure here is a reference that fails `StorePath::parse` — the
+    /// prep loop fails BEFORE any gRPC → put_calls.len() == 0. (A file
+    /// that disappears between the result pipeline and the dump is
+    /// covered by the store-side batch atomicity, not by this worker-side
+    /// guarantee.)
     #[tokio::test(start_paused = true)]
     async fn test_batch_prep_failure_no_partial_commit() -> anyhow::Result<()> {
         let (store, client, _h) = spawn_mock_store_with_client().await?;
@@ -1108,33 +1217,22 @@ mod tests {
         fs::create_dir_all(&store_dir)?;
 
         let b_ok = format!("{DEP_HASH_A}-ok");
-        let b_bad = format!("{DEP_HASH_B}-unreadable");
+        let b_bad = format!("{DEP_HASH_B}-bad-ref");
         fs::write(store_dir.join(&b_ok), b"ok contents")?;
-        // b_bad: directory with mode 0 → scan_new_outputs lists it (the
-        // dirent is visible), but dump_path_streaming → read_dir() fails
-        // EACCES inside scan_references.
-        let bad_dir = store_dir.join(&b_bad);
-        fs::create_dir(&bad_dir)?;
-        fs::set_permissions(
-            &bad_dir,
-            std::os::unix::fs::PermissionsExt::from_mode(0o000),
-        )?;
-        // Restore permissions on drop so tempdir cleanup succeeds.
-        struct Restore(std::path::PathBuf);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                let _ = fs::set_permissions(
-                    &self.0,
-                    std::os::unix::fs::PermissionsExt::from_mode(0o755),
-                );
-            }
-        }
-        let _restore = Restore(bad_dir);
+        fs::write(store_dir.join(&b_bad), b"bad ref contents")?;
 
-        let err = upload_all_outputs(&client, &store_dir, "", "", &[])
-            .await
-            .expect_err("prep must fail on the unreadable output");
-        assert!(matches!(err, UploadError::UploadExhausted { .. }));
+        let err = upload_all_outputs(
+            &client,
+            "",
+            "",
+            &[
+                out_for(&store_dir, &b_ok, &[]),
+                out_for(&store_dir, &b_bad, &["not-a-store-path".to_string()]),
+            ],
+        )
+        .await
+        .expect_err("prep must fail on the unparseable reference");
+        assert!(matches!(err, UploadError::InvalidReference { .. }));
 
         assert_eq!(
             store.calls.put_calls.read().unwrap().len(),
@@ -1161,9 +1259,14 @@ mod tests {
         fs::write(store_dir.join(&b1), b"one")?;
         fs::write(store_dir.join(&b2), b"two")?;
 
-        let results = upload_all_outputs(&client, &store_dir, "", "", &[])
-            .await
-            .expect("batch upload should succeed on 3rd attempt");
+        let results = upload_all_outputs(
+            &client,
+            "",
+            "",
+            &[out_for(&store_dir, &b1, &[]), out_for(&store_dir, &b2, &[])],
+        )
+        .await
+        .expect("batch upload should succeed on 3rd attempt");
 
         assert_eq!(results.len(), 2);
         assert_eq!(
@@ -1175,6 +1278,86 @@ mod tests {
             store.faults.fail_next_puts.load(Ordering::SeqCst),
             0,
             "all injected failures consumed"
+        );
+        Ok(())
+    }
+
+    // r[verify builder.upload.batch+3]
+    /// Round-17 bug_111 R1(e) rider: a deterministic `InvalidArgument`
+    /// from the batch RPC is permanent at the producing statement —
+    /// exactly ONE attempt, no fallback. Detector shape: the injection
+    /// knob is set to 2, so a buggy retry loop would consume the second
+    /// injection (or even succeed on attempt 3); the surviving count
+    /// proves exactly one attempt fired.
+    #[tokio::test(start_paused = true)]
+    async fn test_batch_invalid_argument_not_retried() -> anyhow::Result<()> {
+        let (store, client) = spawn_mock_store_inproc().await?;
+        store.faults.invalid_next_puts.store(2, Ordering::SeqCst);
+
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
+        let (b1, b2) = (format!("{DEP_HASH_A}-one"), format!("{DEP_HASH_B}-two"));
+        fs::write(store_dir.join(&b1), b"one")?;
+        fs::write(store_dir.join(&b2), b"two")?;
+
+        let err = upload_all_outputs(
+            &client,
+            "",
+            "",
+            &[out_for(&store_dir, &b1, &[]), out_for(&store_dir, &b2, &[])],
+        )
+        .await
+        .expect_err("deterministic rejection must fail the upload");
+        assert!(
+            matches!(
+                &err,
+                UploadError::UploadExhausted { source, .. }
+                    if source.code() == tonic::Code::InvalidArgument
+            ),
+            "permanent classification carries the original status: {err:?}"
+        );
+        assert_eq!(
+            store.faults.invalid_next_puts.load(Ordering::SeqCst),
+            1,
+            "exactly one batch attempt — no retry burned the second injection"
+        );
+        assert_eq!(
+            store.calls.put_calls.read().unwrap().len(),
+            0,
+            "nothing committed and no per-output fallback attempted"
+        );
+        Ok(())
+    }
+
+    /// Round-17 bug_111 R1(e) rider, single-output flavor: `InvalidArgument`
+    /// on independent PutPath is permanent after exactly one attempt.
+    #[tokio::test(start_paused = true)]
+    async fn test_single_invalid_argument_not_retried() -> anyhow::Result<()> {
+        let (store, client) = spawn_mock_store_inproc().await?;
+        store.faults.invalid_next_puts.store(2, Ordering::SeqCst);
+
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
+        let b1 = format!("{DEP_HASH_A}-solo");
+        fs::write(store_dir.join(&b1), b"solo")?;
+
+        let err = upload_all_outputs(&client, "", "", &[out_for(&store_dir, &b1, &[])])
+            .await
+            .expect_err("deterministic rejection must fail the upload");
+        assert!(
+            matches!(
+                &err,
+                UploadError::UploadExhausted { source, .. }
+                    if source.code() == tonic::Code::InvalidArgument
+            ),
+            "permanent classification carries the original status: {err:?}"
+        );
+        assert_eq!(
+            store.faults.invalid_next_puts.load(Ordering::SeqCst),
+            1,
+            "exactly one PutPath attempt"
         );
         Ok(())
     }
@@ -1192,12 +1375,21 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let store_dir = tmp.path().join("nix/store");
         fs::create_dir_all(&store_dir)?;
-        fs::write(store_dir.join(format!("{DEP_HASH_A}-a")), b"a")?;
-        fs::write(store_dir.join(format!("{DEP_HASH_B}-b")), b"b")?;
+        let (b_a, b_b) = (format!("{DEP_HASH_A}-a"), format!("{DEP_HASH_B}-b"));
+        fs::write(store_dir.join(&b_a), b"a")?;
+        fs::write(store_dir.join(&b_b), b"b")?;
 
-        let err = upload_all_outputs(&client, &store_dir, "", "", &[])
-            .await
-            .expect_err("batch should exhaust retries");
+        let err = upload_all_outputs(
+            &client,
+            "",
+            "",
+            &[
+                out_for(&store_dir, &b_a, &[]),
+                out_for(&store_dir, &b_b, &[]),
+            ],
+        )
+        .await
+        .expect_err("batch should exhaust retries");
         assert!(matches!(err, UploadError::UploadExhausted { .. }));
         assert_eq!(store.calls.put_calls.read().unwrap().len(), 0);
         Ok(())
@@ -1250,5 +1442,30 @@ mod tests {
             common::DUMP_JOIN_SLACK,
             "post-rx-drop join must NOT re-wait the gRPC budget"
         );
+    }
+    /// The content-address descriptor reaches both the PutPath metadata
+    /// (what the store records as the narinfo `CA:` field) and the
+    /// returned `ValidatedPathInfo`.
+    #[test]
+    fn content_address_threads_into_path_info() {
+        let store_path = format!("/nix/store/{}", test_store_basename("ca-out"));
+        let parsed = rio_nix::store_path::StorePath::parse(&store_path).unwrap();
+        let ca = "fixed:r:sha256:1abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc";
+
+        let info = common::trailer_mode_path_info(&store_path, "drv", &[], Some(ca));
+        assert_eq!(info.content_address, ca);
+        let info_none = common::trailer_mode_path_info(&store_path, "drv", &[], None);
+        assert!(info_none.content_address.is_empty());
+
+        let validated = common::uploaded_info(
+            parsed,
+            [0u8; 32],
+            1,
+            Vec::new(),
+            "drv",
+            Some(ca.to_string()),
+        )
+        .unwrap();
+        assert_eq!(validated.content_address.as_deref(), Some(ca));
     }
 }

@@ -667,7 +667,7 @@ impl DagActor {
     ) -> bool {
         use rio_proto::types::TerminationReason as R;
 
-        // r[impl sched.termination.deadline-exceeded+2]
+        // r[impl sched.termination.deadline-exceeded+3]
         // DeadlineExceeded is reported by JOB name (the Job controller
         // deletes the Pod when activeDeadlineSeconds fires, so the
         // controller never sees a terminated container). Prefix-match
@@ -773,9 +773,9 @@ impl DagActor {
     }
 
     /// `activeDeadlineSeconds` backstop fired — worker was too wedged
-    /// to fire its own `daemon_timeout`. Bump `resource_floor.
+    /// to fire its own `build_timeout`. Bump `resource_floor.
     /// deadline_secs` (D4) and increment `timeout_count`
-    /// UNCONDITIONALLY (`r[sched.timeout.promote-on-exceed+2]`, same
+    /// UNCONDITIONALLY (`r[sched.timeout.promote-on-exceed+3]`, same
     /// I-200 semantics as `handle_timeout_failure`): every timeout
     /// consumes budget regardless of promotion, so
     /// `max_timeout_retries` bounds TOTAL attempts. NOT gated on

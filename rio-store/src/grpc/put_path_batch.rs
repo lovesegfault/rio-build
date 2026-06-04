@@ -21,7 +21,7 @@
 //! to `'complete'` together. On batch failure the staged chunks orphan
 //! (refcount-zero after `PlaceholderGuard` drop-reap, GC-eligible).
 //! Bound: ≤1 NAR-size of orphaned blob per failed output.
-// r[impl store.atomic.multi-output]
+// r[impl store.atomic.multi-output+1]
 
 use std::collections::BTreeMap;
 
@@ -36,6 +36,7 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use crate::metadata::{self};
 
+use super::put_path::common::admit_denial_status;
 use super::put_path::common::{NarPersist, PlaceholderGuard};
 use super::put_path::{
     PlaceholderClaim, apply_trailer, validate_put_metadata, verify_ca_store_path, verify_nar,
@@ -109,6 +110,7 @@ impl StoreServiceImpl {
         // explicit cleanup loop. Separate from `outputs` so it can be
         // pushed while a phase-2/3 loop holds `&mut outputs`.
         let mut placeholder_guards: Vec<PlaceholderGuard> = Vec::new();
+        let mut drv_cache_candidates: Vec<(String, Vec<u8>)> = Vec::new();
         // Count of outputs for which `claim_placeholder` already fired
         // `{result="exists"}` (AlreadyComplete arm). The error metric
         // unit is per-store-path; on bail! we increment by the number
@@ -142,8 +144,21 @@ impl StoreServiceImpl {
             if let Err(e) = verify_nar(computed, accum.nar_data.len() as u64, info, &ctx) {
                 bail!(e);
             }
-            // r[impl sec.authz.ca-path-derived+2]
-            if let Err(e) = verify_ca_store_path(info, auth.hmac_claims.as_ref(), &ctx) {
+            // r[impl store.put.drv-text-ca+3]
+            // The admission witness: class cap re-check + the .drv
+            // text-CA binding + the single preimage extraction. The
+            // batch's staging primitive only accepts the witness.
+            let mut admitted = match crate::ingest::AdmittedNar::admit(
+                info,
+                std::mem::take(&mut accum.nar_data),
+            ) {
+                Ok(a) => a,
+                Err(d) => bail!(admit_denial_status(d, &ctx)),
+            };
+            // r[impl sec.authz.ca-path-derived+9]
+            if let Err(e) =
+                verify_ca_store_path(info, admitted.bytes(), auth.hmac_claims.as_ref(), &ctx)
+            {
                 bail!(e);
             }
 
@@ -160,6 +175,16 @@ impl StoreServiceImpl {
                 Ok(PlaceholderClaim::AlreadyComplete) => {
                     accum.already_complete = true;
                     n_exists_emitted += 1;
+                    // store.ingest.drv-modulo-cache+2: a re-upload of a
+                    // complete .drv re-fires population — the natural
+                    // retry signal for rows whose original population
+                    // skipped on then-missing inputs. Bytes are in hand;
+                    // push them into the same post-commit fixpoint.
+                    // The witness extracted (and text-CA-bound) the
+                    // preimage at admission — no re-parse.
+                    if let Some(bytes) = admitted.take_drv_preimage() {
+                        drv_cache_candidates.push((info.store_path.as_str().to_string(), bytes));
+                    }
                     continue;
                 }
                 Ok(PlaceholderClaim::Owned(c)) => c,
@@ -175,10 +200,29 @@ impl StoreServiceImpl {
             placeholder_guards
                 .push(self.spawn_placeholder_guard(accum.store_path_hash.clone(), claim));
             accum.claim = Some(claim);
+            // r[impl store.put.ia-deriver-proof+4]
+            // Owned-arm only, AFTER the AlreadyComplete short-circuit
+            // (idempotency precedence — see PutPath): descriptor-less IA
+            // outputs must prove deriver membership against the store's
+            // own bytes before any new registration proceeds. A bail
+            // here drops `placeholder_guards`, whose Drop reaps the
+            // just-claimed placeholder.
+            if let Err(e) = self
+                .verify_ia_registration_proof(info, auth.hmac_claims.as_ref(), &ctx)
+                .await
+            {
+                bail!(e);
+            }
 
             info.store_path_hash = accum.store_path_hash.clone();
-            let nar_data = std::mem::take(&mut accum.nar_data);
-            match self.stage_nar_for_batch(info, claim, nar_data).await {
+            // Take the witness's .drv preimage BEFORE staging consumes
+            // it (store.ingest.drv-modulo-cache+2); populated only
+            // after the batch commit succeeds. Extracted once and
+            // text-CA-bound at admission.
+            if let Some(bytes) = admitted.take_drv_preimage() {
+                drv_cache_candidates.push((info.store_path.as_str().to_string(), bytes));
+            }
+            match self.stage_nar_for_batch(info, claim, admitted).await {
                 Ok(p) => accum.staged = Some(p),
                 Err(e) => bail!(e),
             }
@@ -197,6 +241,47 @@ impl StoreServiceImpl {
 
         for g in placeholder_guards {
             g.defuse();
+        }
+        // r[impl store.ingest.drv-modulo-cache+2]
+        // Best-effort modulo-cache population for the batch's .drv
+        // outputs, after the one-transaction commit made them durable —
+        // run to FIXPOINT so in-batch ordering is irrelevant: a consumer
+        // uploaded before its inputs in the same batch populates on a
+        // later pass once they do (bug_102 sibling of the ordering
+        // class; pattern R2 — the per-upload single pass was an
+        // enumeration of "sites that populate" that silently excluded
+        // reverse-topological batches).
+        let mut pending = drv_cache_candidates;
+        loop {
+            let mut next = Vec::with_capacity(pending.len());
+            let mut progressed = false;
+            for (drv_path, bytes) in pending {
+                use crate::metadata::drv_modulo::PopulateOutcome;
+                match crate::metadata::drv_modulo::populate_on_ingest(&self.pool, &drv_path, &bytes)
+                    .await
+                {
+                    PopulateOutcome::Populated => progressed = true,
+                    PopulateOutcome::MissingInput => next.push((drv_path, bytes)),
+                    // Both terminal-skip classes drop out of the
+                    // fixpoint identically; the split exists for the
+                    // heal memo decision (round-17 merged_bug_056).
+                    PopulateOutcome::SkippedDeterministic | PopulateOutcome::SkippedTransient => {}
+                }
+            }
+            if !progressed || next.is_empty() {
+                // Fixpoint exhausted: record the TERMINAL
+                // skipped_missing_input event ONCE per still-missing
+                // .drv (bug_085 -- per-attempt emission inside
+                // populate_on_ingest inflated the counter
+                // quadratically in reverse-topological batches; the
+                // metric means ".drv left unpopulated by this
+                // ingestion", an event per .drv, not per pass).
+                for (drv_path, _) in &next {
+                    crate::metadata::drv_modulo::record_missing_input(drv_path);
+                }
+                break;
+            }
+            pending = next;
         }
         Ok(Response::new(PutPathBatchResponse { created }))
     }
@@ -237,9 +322,24 @@ impl StoreServiceImpl {
             let idx = msg.output_index;
             // Bound output count. Checked on every message because the
             // highest index can arrive at any point in the stream.
+            //
+            // FailedPrecondition (not InvalidArgument), matching the
+            // cumulative-charge sibling below: both are CAPACITY
+            // overruns of the batch path, and the builder's documented
+            // response to capacity is the independent-PutPath fallback
+            // (atomicity registered-weakened for that population) — not
+            // a request-defect classification, which the client now
+            // treats as permanent without retry (round-17 bug_111: the
+            // old InvalidArgument here was retried 8x with all NARs
+            // re-streamed each attempt). With MAX_BATCH_OUTPUTS aligned
+            // to the protocol's MAX_OUTPUT_NAMES this arm is
+            // unreachable from a parseable derivation; it guards
+            // hand-rolled clients.
+            // r[impl store.atomic.multi-output+1]
             if idx as usize >= MAX_BATCH_OUTPUTS {
-                return Err(Status::invalid_argument(format!(
-                    "output_index {idx} exceeds MAX_BATCH_OUTPUTS ({MAX_BATCH_OUTPUTS})"
+                return Err(Status::failed_precondition(format!(
+                    "PutPathBatch: output_index {idx} exceeds MAX_BATCH_OUTPUTS \
+                     ({MAX_BATCH_OUTPUTS}); fall back to per-output PutPath"
                 )));
             }
             let inner = msg
@@ -288,8 +388,23 @@ impl StoreServiceImpl {
                              MAX_NAR_SIZE {MAX_NAR_SIZE}; fall back to per-output PutPath"
                         )));
                     }
+                    // Path-class byte cap (16 MiB for .drv texts); the
+                    // chunk-before-metadata guard above means info is
+                    // always present here.
+                    let nar_cap = rio_common::limits::nar_size_cap(
+                        accum
+                            .info
+                            .as_ref()
+                            .is_some_and(|i| i.store_path.is_derivation()),
+                    );
                     let permit = self
-                        .accumulate_chunk(&mut accum.nar_data, &mut accum.hasher, &chunk, &ctx)
+                        .accumulate_chunk(
+                            &mut accum.nar_data,
+                            &mut accum.hasher,
+                            &chunk,
+                            nar_cap,
+                            &ctx,
+                        )
                         .await?;
                     held_permits.push(permit);
                 }

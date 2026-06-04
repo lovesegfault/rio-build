@@ -1,6 +1,9 @@
 //! Per-derivation state + poison tracking — `derivations` table.
 
-use super::{AssignmentStatus, PoisonedDerivationRow, SchedulerDb, terminal_status_sql};
+use super::{
+    AssignmentStatus, InputFormRow, PoisonedDerivationRow, SchedulerDb, SettledIdentityRow,
+    terminal_status_sql,
+};
 use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 
 /// Map a terminal `DerivationStatus` to the `assignments.status` value
@@ -129,6 +132,32 @@ impl SchedulerDb {
 
         tx.commit().await?;
         Ok(result.rows_affected())
+    }
+
+    // r[impl sched.recovery.claim-paths-restored]
+    /// M_075 write-through (round-17 merged_bug_099): persist the
+    /// dispatch-resolved claim paths at their sole in-memory set site
+    /// so the GC pin and the completion path-binding survive leader
+    /// failover. The vec is the EXACT in-memory claim (index-aligned
+    /// with output_names; unresolved slots keep the "" sentinel — see
+    /// M_075's doc-const for the cross-audit slot semantics). Plain
+    /// runtime query — no `.sqlx/` impact. The DB write deliberately
+    /// lives OUTSIDE the state type: `merge_resolved_claim_paths` stays a
+    /// pure field write and the actor owns durability ordering.
+    pub async fn persist_claim_output_paths(
+        &self,
+        drv_hash: &DrvHash,
+        claim: &[String],
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE derivations SET claim_output_paths = $2, updated_at = now() \
+             WHERE drv_hash = $1",
+        )
+        .bind(drv_hash.as_str())
+        .bind(claim)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
     }
 
     /// Increment the retry count for a derivation.
@@ -278,6 +307,15 @@ impl SchedulerDb {
     /// override and TTL expiry are full resets (unlike
     /// [`Self::clear_poison_batch`], which preserves+increments
     /// `resubmit_cycles` for the resubmit-bound).
+    ///
+    /// Deliberately FLOOR-PRESERVING: the reactive resource floors
+    /// (`floor_mem_bytes`/`floor_disk_bytes`/`floor_deadline_secs`) are
+    /// same-definition sizing memory (M_044) and survive an admin/TTL
+    /// poison clear. A *definition change* (displacement, or a
+    /// store-backed re-creation taking over an authoritative claim) is
+    /// handled by the recreate-refresh upsert's in-tx definition-change
+    /// reset (plus [`Self::reset_displaced_derivation`] as
+    /// belt-and-suspenders), which also zeroes the floors.
     pub async fn clear_poison(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "UPDATE derivations
@@ -286,6 +324,35 @@ impl SchedulerDb {
              WHERE drv_hash = $1",
             drv_hash.as_str(),
         )
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+    }
+
+    // r[impl sched.retry.revival-total-reset+2]
+    /// Persisted-tier half of a REVIVAL reset (round-17 merged_bug_073):
+    /// zeroes exactly the failure-history columns the recovery hydration
+    /// reads back into `RetryState` (`retry_count`, `failed_builders`,
+    /// `resubmit_cycles`, `poisoned_at`) WITHOUT touching `status` —
+    /// every revival site owns its own status flow (cache-hit persists
+    /// `Completed`, the deferred re-probe persists `Queued`, the
+    /// substitutable lane persists on `SubstituteComplete`), and a
+    /// status write here would race those. Distinct from
+    /// [`Self::clear_poison`] (admin/TTL full reset, status='created')
+    /// and [`Self::clear_poison_batch`] (resubmit: increments
+    /// `resubmit_cycles` instead of zeroing — the bound accumulates).
+    /// Like [`Self::clear_poison`], floors are deliberately preserved
+    /// (same-definition sizing memory survives revival).
+    /// Plain runtime query (no `query!`) per the runtime-bound-SQL
+    /// convention for new statements — `.sqlx/` is unaffected.
+    pub async fn clear_revival_history(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE derivations
+             SET poisoned_at = NULL, failed_builders = '{}', retry_count = 0,
+                 resubmit_cycles = 0, updated_at = now()
+             WHERE drv_hash = $1",
+        )
+        .bind(drv_hash.as_str())
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -309,6 +376,12 @@ impl SchedulerDb {
     /// `resubmit_cycles` (admin/TTL → full reset); this one increments
     /// it (resubmit → bound accumulates).
     ///
+    /// Scope: SAME-definition resubmit-resets only. Authority takeovers
+    /// (`MergeResult::authority_takeovers`) are excluded by the caller —
+    /// their rows already got the full definition-change reset inside the
+    /// recreate-refresh upsert, and incrementing `resubmit_cycles` here
+    /// would diverge from the fresh in-memory budget.
+    ///
     /// [`clear_poison`]: Self::clear_poison
     /// [`update_derivation_status_batch`]: Self::update_derivation_status_batch
     pub async fn clear_poison_batch(&self, drv_hashes: &[DrvHash]) -> Result<u64, sqlx::Error> {
@@ -327,6 +400,39 @@ impl SchedulerDb {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    // r[impl sched.merge.displaced-failure-reset+2]
+    /// Full failure-history reset for a DISPLACED derivation row
+    /// (`sched.merge.authoritative-conflict`): the displacing submission
+    /// is a different derivation definition, so nothing learned from the
+    /// displaced definition's failures may carry over. One statement so
+    /// there is no partial state where poison is cleared but the floors
+    /// survive: NULL `poisoned_at`, empty `failed_builders`, zero
+    /// `retry_count`/`resubmit_cycles`, status='created', AND zero the
+    /// reactive resource floors (`floor_*`) that
+    /// [`Self::clear_poison`]/[`Self::clear_poison_batch`] deliberately
+    /// preserve for same-definition resets.
+    ///
+    /// Since the definition-change reset moved into
+    /// `batch_upsert_derivations`' ON CONFLICT (riding the merge
+    /// transaction), this post-commit per-hash call is redundant
+    /// belt-and-suspenders for displaced rows whose persisted content had
+    /// drifted from the displaced in-memory definition; the in-tx reset
+    /// is the primary enforcement.
+    pub async fn reset_displaced_derivation(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            "UPDATE derivations
+             SET poisoned_at = NULL, failed_builders = '{}', retry_count = 0,
+                 resubmit_cycles = 0, status = 'created',
+                 floor_mem_bytes = 0, floor_disk_bytes = 0,
+                 floor_deadline_secs = 0, updated_at = now()
+             WHERE drv_hash = $1",
+            drv_hash.as_str(),
+        )
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
     }
 
     // r[impl sched.db.derivations-gc+2]
@@ -371,7 +477,7 @@ impl SchedulerDb {
         // terminal_status_sql! for why it isn't a bind param.
         let result = sqlx::query(terminal_status_sql!(
             "WITH victims AS (
-                 SELECT d.derivation_id FROM derivations d
+                 SELECT d.derivation_id, d.drv_hash FROM derivations d
                  WHERE d.status IN ",
             "
                    AND NOT EXISTS (SELECT 1 FROM build_derivations bd
@@ -385,6 +491,11 @@ impl SchedulerDb {
                  DELETE FROM derivation_edges e
                  WHERE e.parent_id IN (SELECT derivation_id FROM victims)
                     OR e.child_id  IN (SELECT derivation_id FROM victims)
+                 RETURNING 1
+             ),
+             del_closure_missing AS (
+                 DELETE FROM derivation_closure_missing m
+                 WHERE m.drv_hash IN (SELECT drv_hash FROM victims)
                  RETURNING 1
              )
              DELETE FROM derivations d USING victims v
@@ -408,18 +519,34 @@ impl SchedulerDb {
     /// Succeeded on recovery. After `persist_poisoned` landed, new rows
     /// can never be in this state.
     ///
-    /// Returns minimal fields — poisoned rows aren't dispatched, just
-    /// TTL-tracked + resubmit-bound checked. `failed_builders` matters
-    /// for display; `resubmit_cycles` for `is_retriable_on_resubmit`;
-    /// `elapsed_secs` is `now() - poisoned_at` computed PG-side so
-    /// the caller can convert `Instant::now() - Duration::from_secs(elapsed)`.
+    /// Returns the full creation-time snapshot (the same column set as
+    /// `load_nonterminal_derivations`): the merge gate
+    /// (`sched.merge.authoritative-conflict`) keys on the recovered
+    /// node's authoritative content and verifiable identity, so a
+    /// poisoned row recovered as an empty stub would silently disable
+    /// the gate after failover. Poisoned executions are already
+    /// finalized by `persist_poisoned`, so `exec_id` /
+    /// `assigned_builder_id` are selected as NULL. `elapsed_secs` is
+    /// `now() - poisoned_at` computed PG-side so the caller can convert
+    /// `Instant::now() - Duration::from_secs(elapsed)`.
     pub(crate) async fn load_poisoned_derivations(
         &self,
     ) -> Result<Vec<PoisonedDerivationRow>, sqlx::Error> {
         sqlx::query_as(
             r#"
-            SELECT derivation_id, drv_hash, drv_path, pname, system,
-                   failed_builders, is_fixed_output, resubmit_cycles,
+            SELECT derivation_id, drv_hash, drv_path, pname, system, status,
+                   required_features,
+                   NULL::text AS assigned_builder_id,
+                   retry_count, resubmit_cycles,
+                   expected_output_paths, claim_output_paths, output_names, wanted_output_names,
+                   is_fixed_output,
+                   is_ca, topdown_pruned, closure_hole,
+                   failed_builders,
+                   floor_mem_bytes, floor_disk_bytes, floor_deadline_secs,
+                   drv_content, ca_modular_hash, ca_modular_hash_stripped,
+                   evidence_rank,
+                   needs_resolve,
+                   NULL::uuid AS exec_id,
                    COALESCE(
                        EXTRACT(EPOCH FROM (now() - poisoned_at))::float8,
                        0.0
@@ -430,5 +557,160 @@ impl SchedulerDb {
         )
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// Load the identity columns of SETTLED (`completed`/`skipped`)
+    /// derivation rows for the given hashes.
+    ///
+    /// r[impl sched.persist.settled-identity-freeze+4]
+    /// A settled row is the durable record of a successful build whose
+    /// DAG node may already have been reaped (terminal cleanup); the
+    /// merge gate cannot protect it (no resident node), so the
+    /// pre-merge settled-identity check loads these rows and rejects
+    /// conflicting re-creations before any DAG or DB mutation happens.
+    /// Indexed by the `derivations.drv_hash` unique constraint — one
+    /// batched lookup per merge that contains non-resident hashes.
+    pub(crate) async fn load_settled_identity_rows(
+        &self,
+        hashes: &[String],
+    ) -> Result<Vec<SettledIdentityRow>, sqlx::Error> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as(
+            r#"
+            SELECT drv_hash, drv_path, system, output_names,
+                   expected_output_paths, is_fixed_output, is_ca,
+                   ca_modular_hash, evidence_rank, ca_modular_hash_stripped
+            FROM derivations
+            WHERE drv_hash = ANY($1) AND status IN ('completed', 'skipped')
+            "#,
+        )
+        .bind(hashes)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    // r[impl sched.dispatch.claims-derived+5]
+    /// Load the input-form columns of derivation rows by drv PATH —
+    /// the unseeded-input read-through (bug_029). The rows are
+    /// CONTENT-DERIVED state that survives reap and failover (the two
+    /// residency erasers), which is what qualifies them to re-seed a
+    /// verification that resident state alone could not. Only rows
+    /// with a recorded hash are returned (a NULL hash contributes
+    /// nothing); the not-floating seed predicate stays with
+    /// `InputFormSeed::from_persisted_rows` (single owner). One
+    /// batched lookup per check, sized by the derivation's direct
+    /// input count.
+    pub(crate) async fn load_input_form_rows(
+        &self,
+        drv_paths: &[String],
+    ) -> Result<Vec<InputFormRow>, sqlx::Error> {
+        if drv_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        // r[impl sched.evidence.seed-rank-floor]
+        // The rank floor is DERIVED from
+        // `DefinitionEvidence::seeds_input_form` (one predicate, two
+        // tiers): a row whose recorded hash is a submitter echo
+        // (unverified_claim / content_bound_claim) never reaches the
+        // seed constructor, so a planted row cannot convert an
+        // attacker-chosen digest into a trusted input seed
+        // (round-17 bug_077). The constructor re-checks the returned
+        // rank — SQL narrowing here is an optimization; the predicate
+        // owns the decision.
+        let seeding: Vec<&'static str> = crate::state::DefinitionEvidence::seeding_rank_strs();
+        sqlx::query_as(
+            r#"
+            SELECT drv_path, ca_modular_hash, is_fixed_output, is_ca,
+                   evidence_rank
+            FROM derivations
+            WHERE drv_path = ANY($1)
+              AND ca_modular_hash IS NOT NULL
+              AND evidence_rank = ANY($2)
+            "#,
+        )
+        .bind(drv_paths)
+        .bind(&seeding)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    // r[impl sched.derivation.evidence-rank]
+    /// Persist a definition-evidence rank UPGRADE outside the
+    /// creation-scoped upsert: the settle chokepoint
+    /// (`PathBoundBytes` → `VerifiedBuilt` in
+    /// `DerivationState::transition`) and the dispatch-time claims
+    /// derivation (`UnverifiedClaim` → `PathBoundBytes`). Runtime
+    /// query (NOT `sqlx::query!`): keeps `M_067` out of the offline
+    /// `.sqlx` cache so the migration and its writers land in one
+    /// commit. Best-effort at every call site — a lost write degrades
+    /// to the persisted ingress rank at recovery, which never weakens
+    /// a victim (no displacer outranks `path_bound_bytes`).
+    /// `needs_resolve`: `Some` from the dispatch claims derivation —
+    /// the byte-derived flag computed alongside the raised rank (M_071,
+    /// round-16 bug_053) — persisted in the SAME statement so a
+    /// failover between rank and flag cannot leave a `path_bound_bytes`
+    /// row whose recovered flag re-derives from the lossy expected-path
+    /// degrade. `None` from the settle chokepoint (no re-derivation
+    /// happens there): COALESCE leaves the column untouched.
+    pub(crate) async fn persist_evidence_rank(
+        &self,
+        drv_hash: &str,
+        rank: crate::state::DefinitionEvidence,
+        needs_resolve: Option<bool>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE derivations SET evidence_rank = $2, \
+             needs_resolve = COALESCE($3, needs_resolve), \
+             updated_at = now() WHERE drv_hash = $1",
+        )
+        .bind(drv_hash)
+        .bind(rank.as_str())
+        .bind(needs_resolve)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Persist a stripped-claim verification: the rank rises on the
+    /// verified bytes AND the unverifiable declared modular hash is
+    /// MOVED to the segregated preservation column in the same
+    /// statement (`sched.dispatch.claims-derived+5` — an unverifiable
+    /// claim is NO claim and never stays in the live evidence column;
+    /// exact ingress-strip parity, `ingress-inline-drv-binding+1`).
+    /// M_070: round-15 destroyed the value here, which left
+    /// floating-CA / deferred-IA settled rows with zero matchable
+    /// identity evidence and bricked every resubmission
+    /// (merged_bug_038); preserving it keeps the settled-row matcher's
+    /// preserved-claim basis available without laundering the
+    /// unverified value into evidence. One statement so a failover
+    /// between the writes cannot leave the raised rank with the
+    /// unverified hash still attached (or the moved value lost):
+    /// PostgreSQL evaluates both SET expressions against the OLD row,
+    /// and COALESCE keeps an earlier preserved claim when the live
+    /// column is already NULL (re-strip idempotence).
+    /// `needs_resolve` rides the same statement as the plain raise
+    /// writer above (M_071) — the strip arm derives it from the same
+    /// verified bytes.
+    pub(crate) async fn persist_evidence_rank_and_strip_modular_hash(
+        &self,
+        drv_hash: &str,
+        rank: crate::state::DefinitionEvidence,
+        needs_resolve: Option<bool>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE derivations SET evidence_rank = $2, \
+             needs_resolve = COALESCE($3, needs_resolve), \
+             ca_modular_hash_stripped = COALESCE(ca_modular_hash, ca_modular_hash_stripped), \
+             ca_modular_hash = NULL, \
+             updated_at = now() WHERE drv_hash = $1",
+        )
+        .bind(drv_hash)
+        .bind(rank.as_str())
+        .bind(needs_resolve)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }

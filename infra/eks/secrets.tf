@@ -145,12 +145,61 @@ resource "aws_iam_policy" "rio_bootstrap" {
         Effect = "Allow"
         Action = [
           "secretsmanager:CreateSecret",
-          "secretsmanager:PutSecretValue",
           "secretsmanager:DescribeSecret",
         ]
-        # Scope to rio/* only. The bootstrap script only writes rio/hmac,
-        # rio/signing-key, rio/signing-key-pub.
+        # Scope to rio/* only. The bootstrap script probes and creates
+        # rio/hmac, rio/service-hmac, rio/signing-key{,-pub}, and
+        # rio/gateway-host-key. Create-only is the concurrency CAS:
+        # CreateSecret on an existing secret fails
+        # ResourceExistsException and can never overwrite — which is
+        # exactly why this statement does NOT carry PutSecretValue
+        # (see the dedicated statement below).
         Resource = "arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:rio/*"
+      },
+      {
+        Effect = "Allow"
+        # GetSecretValue: the signing-key block's steady-state
+        # pair-consistency probe and the pub re-derive/heal paths
+        # read rio/signing-key{,-pub} on every run (the derivation
+        # itself happens in rio-cli; the shell never decodes key
+        # bytes). Without this grant the re-derive branch
+        # AccessDenied-aborts fail-closed — visible, but the pair
+        # never converges. Apply terraform BEFORE helm install.
+        # Kept in lockstep with the script by the
+        # bootstrap-iam-parity check (nix/misc-checks.nix), which
+        # pins every (action, resource) pair against the script's
+        # per-verb target set.
+        #
+        # Read access is confined to the signing-key pair — the only
+        # secrets the script ever READS. A compromised bootstrap pod
+        # cannot read rio/hmac, rio/service-hmac, or the gateway host
+        # key. `rio/signing-key*` covers both names plus Secrets
+        # Manager's random ARN suffix.
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = "arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:rio/signing-key*"
+      },
+      {
+        Effect = "Allow"
+        # PutSecretValue: the ONLY secret the script ever OVERWRITES
+        # is the derived public half (the heal and stale-pub paths).
+        # Confined so a compromised bootstrap pod cannot stage
+        # attacker-known versions of rio/hmac, rio/service-hmac,
+        # rio/signing-key, or the gateway host key for ESO to sync
+        # into the cluster (round-17 merged_bug_013 — the write-side
+        # twin of the round-16 GetSecretValue confinement; an
+        # overwritten HMAC would let the attacker mint valid tokens,
+        # strictly stronger than the read that commit closed).
+        #
+        # RESIDUAL (enumerated, accepted): this pod CAN overwrite the
+        # pub half (pub poisoning). Bounded three ways: the poisoned
+        # pub diverges from the private half, so every signature
+        # verified against it FAILS — a loud denial, never a silent
+        # trust grant; the next Job run's pair-consistency probe
+        # detects and heals the divergence; and the attacker cannot
+        # make the poison self-consistent without the private half,
+        # which this role cannot read.
+        Action   = ["secretsmanager:PutSecretValue"]
+        Resource = "arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:rio/signing-key-pub*"
       }
     ]
   })

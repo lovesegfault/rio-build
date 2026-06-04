@@ -14,7 +14,8 @@ use rio_proto::types::FindMissingPathsRequest;
 
 use crate::dag::ClosureEvidence;
 use crate::state::{
-    DerivationStatus, DrvHash, ExecutorId, effective_wanted, verifiable_wanted_paths, wanted_subset,
+    BuildStateExt, DerivationStatus, DrvHash, ExecutorId, effective_wanted,
+    verifiable_wanted_paths, wanted_subset,
 };
 
 use super::DagActor;
@@ -103,6 +104,76 @@ fn check_freeze(
         (false, _) => *since = None,
         _ => {} // frozen but not yet 60s — keep counting
     }
+}
+
+/// Outcome of [`DagActor::build_assignment_proto`].
+pub(super) enum AssignmentProtoOutcome {
+    /// Assignment constructed; send it.
+    Ready(Box<rio_proto::types::WorkAssignment>),
+    /// DAG node vanished (TOCTOU vs. concurrent cancel) — caller
+    /// defers with the legacy NO-rollback semantics.
+    NodeGone,
+    /// The store could not vouch for a bare store-backed node's claims
+    /// (`sched.dispatch.claims-derived`): transient — caller rolls the
+    /// assignment back and sets the dispatch backoff.
+    Unavailable(&'static str),
+    /// The store's verified bytes disprove the recorded claims, or are
+    /// content-bound garbage that can never parse: permanent — caller
+    /// rolls back and poisons.
+    Forged(String),
+    /// Claims verification is STRUCTURALLY impossible for this node
+    /// (`StoreEvidenceOutcome::StructurallyUnverifiable`): permanent
+    /// for retries — caller rolls back and poisons with the carried
+    /// remediation (generated from the typed reason, fix-discipline
+    /// R6) instead of livelocking through backoff.
+    PermanentlyUnverifiable(String),
+    /// Direct input identities are missing AFTER the persisted-row
+    /// read-through (`sched.dispatch.claims-derived+5`, bug_029):
+    /// NOT instant permanence — the missing identity is a fact about
+    /// CURRENT state (a deeper submission, an upload, or a mid-merge
+    /// row can supply it at any time), so the caller rolls back and
+    /// charges the node's own bounded unseeded-inputs budget; only
+    /// exhaustion poisons, with the carried post-read-through
+    /// remediation. Pre-fix this population routed through
+    /// PermanentlyUnverifiable: a deploy failover (which erases every
+    /// completed input's residency at once) instantly poisoned honest
+    /// in-flight builds through the claims gate.
+    UnseededInputs(String),
+}
+
+/// Closed outcome of [`DagActor::fetch_drv_content_from_store`]
+/// (round-17 bug_030). Permanence is typed at the fetch site so the
+/// consumers (the store-evidence chokepoint in merge.rs and the
+/// dispatch-time CA resolve) cannot fold a deterministic content-bound
+/// denial into transient store silence — the fold is what burned the
+/// claims-unavailable budget and poisoned blaming store health for a
+/// fact no retry can change.
+pub(super) enum DrvFetch {
+    /// NAR fetched and unwrapped to the raw ATerm bytes.
+    Bytes(Vec<u8>),
+    /// The store could not vouch either way: unconfigured client,
+    /// transport failure, timeout, absent path, or a NAR that is not
+    /// a single regular file. TRANSIENT — the store may answer
+    /// differently later.
+    Silence,
+    /// The transfer was DENIED before any chunk flowed: the path's
+    /// declared NAR size exceeds the derivation-text class cap
+    /// ([`rio_common::limits::MAX_DRV_NAR_BYTES`]). CONTENT-BOUND and
+    /// deterministic — the named path's contents cannot shrink on
+    /// retry. Reachable for paths that bypassed store admission (the
+    /// substitution ingest route, round-17 merged_063) or whose
+    /// PathInfo declares a hostile size.
+    Denied {
+        /// Declared NAR size that tripped the cap.
+        got: u64,
+        /// The class cap it exceeded.
+        limit: u64,
+    },
+}
+
+/// `DrvHash` → owned `String` (the domain node synth wants `String`).
+fn state_drv_hash_string(h: &DrvHash) -> String {
+    h.as_str().to_string()
 }
 
 impl DagActor {
@@ -321,7 +392,7 @@ impl DagActor {
             return true;
         }
 
-        // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.merge.substitute-topdown+15]
         // Fail-open carve-out: a topdown-pruned node whose closure
         // evidence is Broken — childless or closure-holed, see
         // `must_substitute` — must never be handed to a worker: its dep
@@ -754,7 +825,7 @@ impl DagActor {
                 // through to build via `substitute_tried`.
                 to_spawn.push((drv_hash, paths));
             } else if self.must_substitute(&drv_hash) {
-                // r[impl sched.merge.substitute-topdown+10]
+                // r[impl sched.merge.substitute-topdown+15]
                 // Truly missing (a wanted output is missing upstream and
                 // not substitutable): every other node is left Ready and
                 // dispatches from source. A topdown-pruned root whose
@@ -903,10 +974,19 @@ impl DagActor {
             // DependencyFailed) and may get one more dispatch attempt
             // — acceptable, since substitutability is evidence the
             // world changed (Hydra/another tenant built it).
-            if matches!(
-                from,
-                DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
-            ) {
+            //
+            // Round-17 merged_bug_073: the gate is the shared revival
+            // population (`is_revival_resettable`), not a per-site
+            // subset — WIDENED from {Poisoned, DependencyFailed} to
+            // include Failed, whose →Substituting arm the FSM has
+            // always allowed; the old gate silently kept a
+            // Failed-origin substitution's stale history. Observable
+            // delta is confined to post-substitution-failure retry
+            // budgets (one more dispatch attempt possible — the same
+            // acceptability argument above). The PG tier resets below,
+            // outside the node borrow.
+            let revive = from.is_revival_resettable();
+            if revive {
                 state.retry.clear();
             }
             // r[impl sched.merge.wanted-outputs+2]
@@ -962,16 +1042,20 @@ impl DagActor {
             };
             let drv_path = state.drv_path().to_string();
             let interested = state.interested_builds.clone();
-            // Best-effort PG clear so recovery doesn't resurrect the
-            // poison. After last use of `state` so the &mut self.dag
-            // borrow ends before &self.db.
-            if matches!(
-                from,
-                DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
-            ) && let Err(e) = self.db.clear_poison(&drv_hash).await
-            {
+            // Best-effort PG tier of the revival reset (the SAME
+            // population as the in-memory clear above — round-17
+            // merged_bug_073) so recovery doesn't resurrect the moot
+            // history. After last use of `state` so the &mut self.dag
+            // borrow ends before &self.db. `clear_revival_history`
+            // leaves `status` alone: PG keeps the origin status until
+            // SubstituteComplete persists the outcome, and a failover
+            // in the window recovers the origin with CLEAN history —
+            // the I-094 re-probe lane re-discovers substitutability.
+            // (The old `clear_poison` call's status='created' flip
+            // bought nothing: both flows converge on re-probe.)
+            if revive && let Err(e) = self.db.clear_revival_history(&drv_hash).await {
                 warn!(%drv_hash, error = %e,
-                      "failed to clear poison in PG after re-probe substitutable hit");
+                      "failed to clear revival history in PG after re-probe substitutable hit");
             }
             let output_paths = paths.clone();
             let store = store.clone();
@@ -1196,7 +1280,7 @@ impl DagActor {
             }
             return;
         }
-        // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.merge.substitute-topdown+15]
         // Topdown-pruned root: the dep subgraph was dropped from this
         // submission, so a build dispatch cannot succeed (worker
         // ENOENTs on inputDrvs). Fail every interested build with a
@@ -1439,7 +1523,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.merge.substitute-topdown+10]
+    // r[impl sched.merge.substitute-topdown+15]
     /// Topdown-pruned fail-fast: the node's dep subgraph was dropped
     /// from its submission, so a from-source build dispatch cannot
     /// succeed (the worker ENOENTs on inputDrvs that were never
@@ -1740,7 +1824,7 @@ impl DagActor {
                         .await;
                     return true;
                 }
-                // r[impl sched.merge.substitute-topdown+10]
+                // r[impl sched.merge.substitute-topdown+15]
                 // Truly missing → the caller dispatches from source. A
                 // topdown-pruned root with broken closure evidence
                 // (childless or closure-holed) must not be (its dep
@@ -1908,13 +1992,20 @@ impl DagActor {
             }
         }
         for (build_id, n) in cached_per_build {
-            if let Some(b) = self.builds.get_mut(&build_id) {
+            // r[impl sched.build.terminal-status-settled+2]
+            // Dispatch-time store hits can fan out to resident terminal
+            // builds that retained interest on the shared node; their
+            // served accounting and progress are frozen at the terminal
+            // transition (the wrapper below also skips the Progress).
+            if let Some(b) = self.builds.get_mut(&build_id)
+                && !b.state().is_terminal()
+            {
                 b.cached_count += n;
             }
             // I-140: one build_summary scan shared, not two.
             let summary = self.dag.build_summary(build_id);
             self.update_build_counts_with(build_id, &summary).await;
-            self.events.emit_progress_with(build_id, &summary);
+            self.emit_progress_with(build_id, &summary);
             self.check_build_completion(build_id).await;
         }
     }
@@ -2081,15 +2172,194 @@ impl DagActor {
         // the HINT fails, the build still works (on-demand FUSE).
         self.send_prefetch_hint(executor_id, drv_hash);
 
-        // Resolve CA inputs + construct the WorkAssignment proto.
-        // None means the DAG node disappeared between the Ready
-        // check and here (TOCTOU vs. concurrent cancel) — treat as
-        // assignment failure so the caller defers.
-        let Some(assignment) = self
+        // Derive claims + resolve CA inputs + construct the proto.
+        let assignment = match self
             .build_assignment_proto(drv_hash, executor_id, generation)
             .await
-        else {
-            return false;
+        {
+            AssignmentProtoOutcome::Ready(a) => *a,
+            // Node disappeared between the Ready check and here
+            // (TOCTOU vs. concurrent cancel) — legacy no-rollback
+            // semantics: caller defers.
+            AssignmentProtoOutcome::NodeGone => return false,
+            // r[impl sched.dispatch.claims-derived+5]
+            // The store could not vouch for a bare store-backed node's
+            // claims — STORE SILENCE only; the cause population is the
+            // `SilenceReason` enum (merge.rs), nothing else routes
+            // here. The other outcomes route per the
+            // build_assignment_proto match (the defining site):
+            // content-bound structural reasons take the
+            // PermanentlyUnverifiable poison arm; UNSEEDED INPUTS take
+            // the bounded UnseededInputs deferral arm — NOT poison
+            // (claims-derived+5; round-17 merged_bug_090 site 1
+            // re-trued the pre-+3 "unseedable inputs poison" sentence
+            // that contradicted that arm). Transient,
+            // store-trust posture:
+            // roll the assignment back AND set the dispatch backoff
+            // ourselves — `rollback_assignment` resets to Ready
+            // without one, and a store outage would otherwise hot-loop
+            // assign → fetch-fail → rollback on every dispatch pass.
+            AssignmentProtoOutcome::Unavailable(reason) => {
+                metrics::counter!("rio_scheduler_dispatch_claims_unavailable_total").increment(1);
+                self.rollback_assignment(drv_hash, executor_id).await;
+                // r[impl sched.dispatch.claims-derived+5]
+                // Store silence is a transient verdict (post-+3 the
+                // unseeded-inputs arm below defers too, on its own
+                // budget), and it
+                // is bounded by its OWN budget (charge(); cap = the
+                // existing max_infra_retries — no new knob): a
+                // persistently silent store on a deterministic input
+                // must converge to a visible poison, not retry
+                // forever. The charge deliberately does NOT touch
+                // retry.count — silence is not a build failure, and
+                // borrowing that counter polluted the transient build
+                // budget (merged_bug_010). Failover forgives: the
+                // counter is in-memory, a fresh leader re-probes.
+                let cap = self.retry_policy.max_infra_retries;
+                let decision = match self.dag.node_mut(drv_hash) {
+                    Some(state) => state
+                        .retry
+                        .charge(crate::state::FailureClass::ClaimsUnavailable, cap),
+                    None => return false,
+                };
+                match decision {
+                    crate::state::ChargeDecision::Backoff(attempt) => {
+                        warn!(
+                            drv_hash = %drv_hash,
+                            executor_id = %executor_id,
+                            reason,
+                            attempt,
+                            cap,
+                            "claims derivation unavailable; assignment rolled back with backoff"
+                        );
+                        if let Some(state) = self.dag.node_mut(drv_hash) {
+                            let backoff = self.retry_policy.backoff_duration(attempt);
+                            state.retry.backoff_until = Some(std::time::Instant::now() + backoff);
+                        }
+                    }
+                    crate::state::ChargeDecision::Exhausted => {
+                        warn!(
+                            drv_hash = %drv_hash,
+                            executor_id = %executor_id,
+                            reason,
+                            cap,
+                            "claims derivation unavailable budget exhausted; poisoning"
+                        );
+                        let msg = format!(
+                            "the store could not vouch for this derivation's claims \
+                             after {cap} dispatch attempts (last reason: {reason}); \
+                             verify the .drv is uploaded and the store is healthy, \
+                             then clear the poison or resubmit"
+                        );
+                        self.poison_and_cascade(drv_hash, &msg).await;
+                        for build_id in self.get_interested_builds(drv_hash) {
+                            self.record_failure_evidence(build_id, drv_hash).await;
+                        }
+                    }
+                }
+                return false;
+            }
+            // Claims forgery (the verified bytes contradict the
+            // recorded claims) or content-bound unparseable bytes:
+            // PERMANENT. No token is ever signed; the node is poisoned
+            // through the terminal-failure machinery and every
+            // interested build records the failure evidence at source.
+            AssignmentProtoOutcome::Forged(detail) => {
+                metrics::counter!("rio_scheduler_dispatch_claims_forgery_total").increment(1);
+                warn!(
+                    drv_hash = %drv_hash,
+                    executor_id = %executor_id,
+                    detail = %detail,
+                    "dispatch claims forged; poisoning the derivation"
+                );
+                self.rollback_assignment(drv_hash, executor_id).await;
+                let msg = format!("dispatch claims derivation failed permanently: {detail}");
+                self.poison_and_cascade(drv_hash, &msg).await;
+                for build_id in self.get_interested_builds(drv_hash) {
+                    self.record_failure_evidence(build_id, drv_hash).await;
+                }
+                return false;
+            }
+            // r[impl sched.dispatch.claims-derived+5]
+            // Structurally unverifiable: PERMANENT for retries of this
+            // submission shape — surface a visible poison carrying the
+            // generated remediation instead of livelocking through
+            // backoff (pre-fix: deterministic re-verification forever).
+            AssignmentProtoOutcome::PermanentlyUnverifiable(remediation) => {
+                metrics::counter!("rio_scheduler_dispatch_claims_unverifiable_total").increment(1);
+                warn!(
+                    drv_hash = %drv_hash,
+                    executor_id = %executor_id,
+                    remediation = %remediation,
+                    "dispatch claims structurally unverifiable; poisoning with remediation"
+                );
+                self.rollback_assignment(drv_hash, executor_id).await;
+                let msg = format!(
+                    "dispatch claims verification is structurally impossible: {remediation}"
+                );
+                self.poison_and_cascade(drv_hash, &msg).await;
+                for build_id in self.get_interested_builds(drv_hash) {
+                    self.record_failure_evidence(build_id, drv_hash).await;
+                }
+                return false;
+            }
+            // r[impl sched.dispatch.claims-derived+5]
+            // Post-read-through unseeded inputs (bug_029): bounded
+            // backoff on the node's OWN budget, exactly the
+            // claims-unavailable shape — because the blocking fact is
+            // mutable state (residency erased by reap/failover; rows
+            // that may land mid-merge), not content. Pre-fix this
+            // population instant-poisoned: a deploy failover erased
+            // every completed input's residency at once and the
+            // claims gate poisoned every in-flight dependent honest
+            // build it touched. Exhaustion converges to the SAME
+            // visible poison, but only after the budget proves the
+            // identity is genuinely not arriving.
+            AssignmentProtoOutcome::UnseededInputs(remediation) => {
+                metrics::counter!("rio_scheduler_dispatch_claims_unseeded_total").increment(1);
+                self.rollback_assignment(drv_hash, executor_id).await;
+                let cap = self.retry_policy.max_infra_retries;
+                let decision = match self.dag.node_mut(drv_hash) {
+                    Some(state) => state
+                        .retry
+                        .charge(crate::state::FailureClass::UnseededInputs, cap),
+                    None => return false,
+                };
+                match decision {
+                    crate::state::ChargeDecision::Backoff(attempt) => {
+                        warn!(
+                            drv_hash = %drv_hash,
+                            executor_id = %executor_id,
+                            attempt,
+                            cap,
+                            "claims inputs unseeded after row read-through; \
+                             assignment rolled back with backoff"
+                        );
+                        if let Some(state) = self.dag.node_mut(drv_hash) {
+                            let backoff = self.retry_policy.backoff_duration(attempt);
+                            state.retry.backoff_until = Some(std::time::Instant::now() + backoff);
+                        }
+                    }
+                    crate::state::ChargeDecision::Exhausted => {
+                        warn!(
+                            drv_hash = %drv_hash,
+                            executor_id = %executor_id,
+                            cap,
+                            "unseeded-inputs budget exhausted; poisoning with remediation"
+                        );
+                        let msg = format!(
+                            "dispatch claims verification could not seed the \
+                             derivation's input identities after {cap} attempts: \
+                             {remediation}"
+                        );
+                        self.poison_and_cascade(drv_hash, &msg).await;
+                        for build_id in self.get_interested_builds(drv_hash) {
+                            self.record_failure_evidence(build_id, drv_hash).await;
+                        }
+                    }
+                }
+                return false;
+            }
         };
 
         if !self.try_send_assignment(drv_hash, executor_id, assignment) {
@@ -2146,7 +2416,7 @@ impl DagActor {
     /// PG `assignments` row, in-mem `worker.running_build`, GC
     /// `scheduler_live_pins`. All best-effort (log+continue). Inverse
     /// is [`rollback_assignment`](Self::rollback_assignment).
-    // r[impl sched.gc.live-pins]
+    // r[impl sched.gc.live-pins+2]
     async fn record_assignment(
         &mut self,
         drv_hash: &DrvHash,
@@ -2320,13 +2590,11 @@ impl DagActor {
     }
 
     /// Construct the [`WorkAssignment`] proto for `drv_hash` →
-    /// `executor_id`: CA-input resolve, HMAC token sign, build-options
-    /// lookup. Side-effect: stashes `pending_realisation_deps` on the
-    /// node so `handle_success_completion` can write the realisation FK
-    /// rows post-build.
-    ///
-    /// Returns `None` if the DAG node is gone (TOCTOU vs. concurrent
-    /// cancel) — caller treats that as assignment failure.
+    /// `executor_id`: claims derivation, CA-input resolve, HMAC token
+    /// sign, build-options lookup. Side-effect: stashes
+    /// `pending_realisation_deps` on the node so
+    /// `handle_success_completion` can write the realisation FK rows
+    /// post-build.
     ///
     /// [`WorkAssignment`]: rio_proto::types::WorkAssignment
     async fn build_assignment_proto(
@@ -2334,7 +2602,275 @@ impl DagActor {
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
         generation: u64,
-    ) -> Option<rio_proto::types::WorkAssignment> {
+    ) -> AssignmentProtoOutcome {
+        // === Claims derivation (sched.dispatch.claims-derived+5) ======
+        // r[impl sched.dispatch.claims-derived+5]
+        // Decide the byte-bound source of every value the token will
+        // sign and the worker will obey, BEFORE any of it is used.
+        // Unsigned dev mode mints no claims — nothing to derive (the
+        // store accepts unsigned only when its own verifier is off).
+        //
+        // Ingress-byte-bound nodes (inline / authoritative): commits
+        // 13/16 bound the recorded values to the bytes at SubmitBuild —
+        // sign recorded. Store-backed nodes already at
+        // `path_bound_bytes` (a prior dispatch derived them, or the
+        // merge-time store-evidence check verified them; recovery
+        // restores the persisted rank): sign recorded. EVERY other
+        // store-backed node: fetch the .drv the declared path names,
+        // re-derive its text content-address in the actor, and run the
+        // parsed derivation against the RECORDED claims through the
+        // same identity validator SubmitBuild ingress applies — the
+        // resolve-need is then derived from those verified bytes,
+        // never from the submitter's `needs_resolve` echo.
+        //
+        // Computed cost bound: this gate performs exactly ONE store
+        // GetPath per FIRST dispatch of a bare store-backed node — the
+        // node's own `.drv`, never a closure walk (input digests come
+        // from the InputFormSeed over resident DAG children, zero
+        // fetches). A verified or stripped node is raised to
+        // `path_bound_bytes`, so re-dispatch skips the fetch entirely.
+        // Contrast with the store-side deriver-proof read-through,
+        // which is the O(closure) surface and carries its own budget.
+        let verified_bytes: Option<Vec<u8>> = if self.hmac_signer.is_some() {
+            let verdict = {
+                let Some(state) = self.dag.node(drv_hash) else {
+                    return AssignmentProtoOutcome::NodeGone;
+                };
+                if !state.drv_content.is_empty() {
+                    let source = if state.drv_content_authoritative {
+                        "authoritative"
+                    } else {
+                        "inline"
+                    };
+                    metrics::counter!(
+                        "rio_scheduler_dispatch_claims_source_total",
+                        "source" => source
+                    )
+                    .increment(1);
+                    None
+                } else if state.evidence >= crate::state::DefinitionEvidence::PathBoundBytes {
+                    metrics::counter!(
+                        "rio_scheduler_dispatch_claims_source_total",
+                        "source" => "store"
+                    )
+                    .increment(1);
+                    None
+                } else {
+                    // Bare store-backed below path-bound standing:
+                    // synthesize the RECORDED claims (pre-resolve:
+                    // deferred/floating slots still carry their
+                    // ingress-shape empty paths) and verify against the
+                    // store's own bytes. Sibling hash seeds come from
+                    // the DAG children — for a dispatched node its
+                    // dependencies are resident and Completed.
+                    let node = crate::domain::DerivationNode {
+                        drv_hash: state_drv_hash_string(drv_hash),
+                        drv_path: state.drv_path().to_string(),
+                        pname: String::new(),
+                        system: state.system.clone(),
+                        output_names: state.output_names.clone(),
+                        expected_output_paths: state.expected_output_paths.clone(),
+                        is_fixed_output: state.is_fixed_output,
+                        is_content_addressed: state.ca.is_ca,
+                        ca_modular_hash: state.ca.modular_hash,
+                        // The synth is a verification INPUT; preserved
+                        // stripped claims are not part of the claimed
+                        // identity being verified.
+                        ca_modular_hash_stripped: None,
+                        drv_content: Vec::new(),
+                        drv_content_authoritative: false,
+                        required_features: Vec::new(),
+                        wanted_output_names: Vec::new(),
+                        explicitly_requested: false,
+                        needs_resolve: false,
+                        version: None,
+                        enable_parallel_building: None,
+                        enable_parallel_checking: None,
+                        prefer_local_build: None,
+                    };
+                    // Input-form seeds only: the constructor owns the
+                    // not-floating predicate (sched.merge.input-form-seed)
+                    // — a Completed floating child's recorded hash is
+                    // the masked published form and would steer the
+                    // verification onto wrong derived paths (wrongful
+                    // Forged for honest parents, wrongful Verified for
+                    // crafted ones). Excluded children make the input
+                    // unseedable instead, which is the fail-closed
+                    // direction.
+                    //
+                    // TODO: round-15 C3c7 (slipped to follow-up) — these
+                    // seeds are rank-blind: a non-floating child whose
+                    // recorded hash is still a submitter echo
+                    // (UnverifiedClaim) seeds the parent's verification
+                    // with an unverified value (merged_bug_039's
+                    // value-trust half). The fix is a
+                    // min_rank=PathBoundBytes floor here plus a store
+                    // read-through for sub-floor/unseedable children —
+                    // but the M_068-backed digests (`prove_drv_modulo`)
+                    // have NO read RPC on StoreService today, and a
+                    // floor without the fallback livelocks honest bare
+                    // closures (cache-hit children never re-verify).
+                    // Minting that read surface is trusted-plane design
+                    // (auth posture for a scheduler-privileged read,
+                    // walk-budget-over-wire), deferred wholesale per the
+                    // round-15 plan §4.3.1 slip clause. Residual until
+                    // then: a forged child echo steers THIS node's
+                    // verification toward Contradicts/Unverifiable —
+                    // bounded backoff + noisy rejection, never a forged
+                    // Verified for a path the store's bytes don't derive
+                    // (the parent's own bytes are still text-CA-bound).
+                    let seed = super::merge::InputFormSeed::from_dag_children(&self.dag, drv_hash);
+                    Some(self.check_store_evidence(&node, &seed).await)
+                }
+            };
+            match verdict {
+                None => None,
+                Some(super::merge::StoreEvidenceOutcome::Verified(def)) => {
+                    metrics::counter!(
+                        "rio_scheduler_dispatch_claims_source_total",
+                        "source" => "store"
+                    )
+                    .increment(1);
+                    // The recorded claims are now PROVEN byte-derived:
+                    // raise the node's standing so re-dispatch skips
+                    // the re-fetch. Best-effort persist — a lost write
+                    // degrades to re-derivation after failover.
+                    // r[impl sched.dispatch.claims-derived+5]
+                    // The resolve flag is recorded HERE, in the same
+                    // node_mut block as the rank raise, from the
+                    // byte-derived fact the classification site
+                    // computed — every later read (maybe_resolve_ca)
+                    // consults recorded state only, so a forged echo
+                    // cannot steer post-verification dispatch.
+                    if let Some(state) = self.dag.node_mut(drv_hash) {
+                        state.evidence = crate::state::DefinitionEvidence::PathBoundBytes;
+                        state.ca.needs_resolve = def.needs_resolve;
+                        // Verified edge: consecutive-silence budget resets.
+                        state.retry.reset_claims_unavailable();
+                    }
+                    if let Err(e) = self
+                        .db
+                        .persist_evidence_rank(
+                            drv_hash.as_str(),
+                            crate::state::DefinitionEvidence::PathBoundBytes,
+                            // M_071: the byte-derived resolve flag rides
+                            // the raise — one statement, so the
+                            // persisted rank can never outlive a lossy
+                            // re-derivation of the flag (bug_053).
+                            Some(def.needs_resolve),
+                        )
+                        .await
+                    {
+                        debug!(drv_hash = %drv_hash, error = %e,
+                               "evidence-rank persist failed (best-effort)");
+                    }
+                    Some(def.bytes)
+                }
+                Some(super::merge::StoreEvidenceOutcome::Contradicts(detail)) => {
+                    return AssignmentProtoOutcome::Forged(detail);
+                }
+                Some(super::merge::StoreEvidenceOutcome::UnparseableVerified) => {
+                    return AssignmentProtoOutcome::Forged(
+                        "the store's text-CA-bound bytes at the declared path do not \
+                         parse as a derivation (content-bound: refetching reproduces \
+                         them)"
+                            .into(),
+                    );
+                }
+                // r[impl sched.dispatch.claims-derived+5]
+                // Three-way permanence contract (the merged_bug_019
+                // deploy-blocker fix; fix-discipline R1 — consequences
+                // derived from the variant's typed permanence):
+                //
+                // TRANSIENT silence → backoff. The ONLY arm allowed to
+                // retry, and it is bounded by its own budget.
+                Some(super::merge::StoreEvidenceOutcome::StoreSilence(reason)) => {
+                    return AssignmentProtoOutcome::Unavailable(reason.as_str());
+                }
+                // PERMANENT structural impossibility → visible poison
+                // with remediation generated from the typed reason.
+                // Backoff cannot resolve it: pre-fix this arm
+                // livelocked (deterministic re-verification, identical
+                // result, forever). Restricted BY TYPE to content-bound
+                // reasons (claims-derived+5): missing input identity
+                // is the UnseededInputs arm below.
+                Some(super::merge::StoreEvidenceOutcome::StructurallyUnverifiable(reason)) => {
+                    return AssignmentProtoOutcome::PermanentlyUnverifiable(reason.remediation());
+                }
+                // r[impl sched.dispatch.claims-derived+5]
+                // Post-read-through unseeded inputs → BOUNDED BACKOFF
+                // (the bug_029 kill): the chokepoint already consulted
+                // the persisted rows, but residency/rows are state
+                // that can still change under this node (deeper
+                // submission, upload, mid-merge row). The caller
+                // charges the dedicated budget; exhaustion poisons
+                // with this remediation.
+                Some(super::merge::StoreEvidenceOutcome::UnseededInputs { missing, .. }) => {
+                    return AssignmentProtoOutcome::UnseededInputs(
+                        super::merge::unseeded_remediation(&missing),
+                    );
+                }
+                // Strip-resolvable: the bytes ARE the store's text-CA
+                // object and the identity verifies EXCEPT the declared
+                // modular hash, which can never be recomputed (floating
+                // store-backed input). Exact ingress-STRIP parity
+                // (ingress-inline-drv-binding+1): an unverifiable claim
+                // is NO claim — clear it (memory + row), raise the node
+                // to path_bound_bytes on the verified bytes, and
+                // proceed. Pre-fix this arm livelocked 100% of bare
+                // CA-chain / deferred-IA dispatches under signing.
+                Some(super::merge::StoreEvidenceOutcome::VerifiedExceptDeclaredHash(def)) => {
+                    metrics::counter!(
+                        "rio_scheduler_dispatch_claims_source_total",
+                        "source" => "store"
+                    )
+                    .increment(1);
+                    metrics::counter!("rio_scheduler_dispatch_claims_stripped_total").increment(1);
+                    info!(
+                        drv_hash = %drv_hash,
+                        "declared modular hash unverifiable against store bytes; \
+                         stripped (an unverifiable claim is no claim) and \
+                         proceeding on the verified bytes"
+                    );
+                    if let Some(state) = self.dag.node_mut(drv_hash) {
+                        // MOVE, never destroy (M_070): the preserved
+                        // claim is what lets a settled row formed from
+                        // this node match a byte-equal resubmission
+                        // after reap (merged_bug_038). take() keeps an
+                        // earlier preserved value when the live hash is
+                        // already None (re-strip idempotence).
+                        if let Some(stripped) = state.ca.modular_hash.take() {
+                            state.ca.modular_hash_stripped = Some(stripped);
+                        }
+                        state.evidence = crate::state::DefinitionEvidence::PathBoundBytes;
+                        // r[impl sched.dispatch.claims-derived+5]
+                        // Same record-at-raise as the Verified arm:
+                        // the strip raises rank on these bytes, so the
+                        // byte-derived resolve flag rides the raise.
+                        state.ca.needs_resolve = def.needs_resolve;
+                        // Verified-modulo-strip edge: budget resets too.
+                        state.retry.reset_claims_unavailable();
+                    }
+                    if let Err(e) = self
+                        .db
+                        .persist_evidence_rank_and_strip_modular_hash(
+                            drv_hash.as_str(),
+                            crate::state::DefinitionEvidence::PathBoundBytes,
+                            // M_071: same one-statement pairing as the
+                            // plain raise arm above.
+                            Some(def.needs_resolve),
+                        )
+                        .await
+                    {
+                        debug!(drv_hash = %drv_hash, error = %e,
+                               "stripped-evidence persist failed (best-effort)");
+                    }
+                    Some(def.bytes)
+                }
+            }
+        } else {
+            None
+        };
         // CA input resolution: rewrite placeholder paths in
         // env/args/builder to realized output paths before
         // dispatch. Fires when gateway set needs_resolve (ADR-018
@@ -2353,8 +2889,11 @@ impl DagActor {
         // can be stashed via node_mut() below before the main
         // WorkAssignment construction takes its own & borrow.
         let (drv_content_to_send, resolve_lookups, resolved_output_paths) = {
-            let state = self.dag.node(drv_hash)?;
-            self.maybe_resolve_ca(drv_hash, state).await
+            let Some(state) = self.dag.node(drv_hash) else {
+                return AssignmentProtoOutcome::NodeGone;
+            };
+            self.maybe_resolve_ca(drv_hash, state, verified_bytes.as_deref())
+                .await
         };
 
         // Stash lookups for handle_success_completion's
@@ -2363,25 +2902,57 @@ impl DagActor {
         // Empty vec → no-op; non-empty only for CA-on-CA chains
         // that actually resolved.
         //
-        // Deferred-IA: also overwrite expected_output_paths with the
-        // post-resolve computed paths (index-aligned with output_names)
-        // so the HMAC `expected_outputs` claim below carries the real
-        // path, not `""`. Floating-CA leaves resolved_output_paths
-        // empty → no overwrite (its HMAC path is `is_ca` instead).
+        // Deferred-IA: record the post-resolve computed paths
+        // (index-aligned with output_names) in the CLAIM field so the
+        // HMAC `expected_outputs` claim below carries the real path,
+        // not `""`. NEVER written to `expected_output_paths` — the
+        // round-16 bug_094 fix: that field's ingress shape (empty slot
+        // = path unknown until resolution) is the contract of the
+        // byte-derived resolve probe (`child_unknown`, merge.rs) and
+        // the recovery degrade; the old per-slot overwrite destroyed
+        // the emptiness signal, so a bare store-backed FOD parent
+        // dispatching after its deferred-IA child recorded a STICKY
+        // `needs_resolve=false` at its PathBoundBytes raise and then
+        // failed deterministically on the un-rewritten placeholder.
+        // Floating-CA leaves resolved_output_paths empty → claim falls
+        // back to expected (its HMAC path is `is_ca` instead).
+        let mut persist_claim: Option<Vec<String>> = None;
         if (!resolve_lookups.is_empty() || !resolved_output_paths.is_empty())
             && let Some(state) = self.dag.node_mut(drv_hash)
         {
             state.ca.pending_realisation_deps = resolve_lookups;
-            for (name, path) in resolved_output_paths {
-                if let Some(i) = state.output_names.iter().position(|n| n == &name)
-                    && let Some(slot) = state.expected_output_paths.get_mut(i)
-                {
-                    *slot = path;
-                }
+            if !resolved_output_paths.is_empty() {
+                // Owner method (round-17 bug_033): arity-total over the
+                // omitted-[] ingress shape — the resize-then-merge lives
+                // in ONE place so a resolved path can never be silently
+                // dropped against a short expected list again.
+                let claim = state
+                    .merge_resolved_claim_paths(resolved_output_paths)
+                    .to_vec();
+                persist_claim = Some(claim);
             }
         }
+        // M_075 write-through (round-17 merged_bug_099): the claim vec
+        // persists at its sole set site so a leader failover keeps the
+        // surviving worker's GC pin and completion path-binding. The
+        // exact in-memory vec is written — resolved slots carry real
+        // paths, still-unresolved slots keep the "" sentinel (the
+        // completion gate's accepted_unresolved_slot cell distinguishes
+        // them; a floating-CA node never reaches this set site, so its
+        // column stays NULL and the fallback-to-expected behaviour is
+        // untouched). Best-effort: on write failure the pre-M_075
+        // behaviour (re-resolve at next dispatch) is the fallback.
+        if let Some(claim) = persist_claim
+            && let Err(e) = self.db.persist_claim_output_paths(drv_hash, &claim).await
+        {
+            warn!(%drv_hash, error = %e,
+                  "failed to persist dispatch-resolved claim paths \
+                   (GC pin and binding fall back to re-resolve after failover)");
+        }
 
-        let state = self.dag.node(drv_hash)?;
+        let Some(state) = self.dag.node(drv_hash) else {
+            return AssignmentProtoOutcome::NodeGone;
+        };
         let build_opts = self.build_options_for_derivation(drv_hash);
 
         // Assignment token: HMAC-signed if configured, else
@@ -2390,15 +2961,16 @@ impl DagActor {
         // from a compromised worker). Unsigned tokens are
         // accepted by a store with hmac_verifier=None (dev).
         //
-        // Expiry: 2× build_timeout (or 2× daemon_timeout
-        // default if timeout=0). A worker legitimately
+        // Expiry: 2× the effective build timeout (the
+        // assignment's BuildOptions.build_timeout, or the
+        // worker's default when unset). A worker legitimately
         // uploading after completion is well within that
         // window. Prevents replay from a leaked token later.
         let assignment_token = if let Some(signer) = &self.hmac_signer {
             let timeout_secs = if build_opts.build_timeout > 0 {
                 build_opts.build_timeout
             } else {
-                // Match rio-builder's DEFAULT_DAEMON_TIMEOUT.
+                // Match rio-builder's DEFAULT_BUILD_TIMEOUT.
                 // Can't reference the const cross-crate, so
                 // duplicate the value. 7200s = 2h.
                 7200
@@ -2419,7 +2991,7 @@ impl DagActor {
             signer.sign(&rio_auth::hmac::AssignmentClaims {
                 executor_id: executor_id.to_string(),
                 drv_hash: drv_hash.to_string(),
-                expected_outputs: state.expected_output_paths.clone(),
+                expected_outputs: state.claim_output_paths().to_vec(),
                 // Floating-CA: output path is computed post-build
                 // from the NAR hash, so expected_output_paths is
                 // [""] here. Store skips the path-in-claims check
@@ -2428,6 +3000,15 @@ impl DagActor {
                 // Fixed-output CA (FOD) has a known path → treat
                 // as IA for the membership check.
                 is_ca: state.ca.is_ca && !state.is_fixed_output,
+                // Signed FOD marker (persisted on the node, so recovered
+                // assignments still carry it): the store rejects
+                // descriptor-less uploads under a FOD-flagged token, so
+                // a worker cannot skip the content⇔path verification by
+                // simply omitting its `fixed:` descriptor
+                // (sec.authz.ca-path-derived). Always signed — the
+                // store-side rejection is a core guarantee, not an
+                // opt-in.
+                is_fixed_output: state.is_fixed_output,
                 expiry_unix,
                 // Tenant attribution for hw_perf_samples.submitting_tenant (M_054).
                 // Phase 2 of the bug_011 two-phase rollout (Phase 1 = fb096e50f);
@@ -2441,7 +3022,7 @@ impl DagActor {
             format!("{executor_id}-{drv_hash}-{generation}")
         };
 
-        Some(rio_proto::types::WorkAssignment {
+        AssignmentProtoOutcome::Ready(Box::new(rio_proto::types::WorkAssignment {
             drv_path: state.drv_path().to_string(),
             // Forward what the gateway inlined (or empty → worker
             // fetches from store). Gateway only inlines for nodes
@@ -2480,7 +3061,7 @@ impl DagActor {
             // proto-build — the actor is single-threaded so that can't
             // happen, but the field is non-Option in the proto.
             exec_id: state.exec_id.map(|u| u.to_string()).unwrap_or_default(),
-        })
+        }))
     }
 
     /// Send a PrefetchHint for the chosen worker to warm its FUSE
@@ -2591,19 +3172,33 @@ impl DagActor {
         &self,
         drv_hash: &DrvHash,
         state: &crate::state::DerivationState,
+        verified_bytes: Option<&[u8]>,
     ) -> (
         Vec<u8>,
         Vec<crate::ca::RealisationLookup>,
         Vec<(String, String)>,
     ) {
-        // Gate: ADR-018 Appendix B `shouldResolve`. Gateway computes
-        // `needs_resolve = has_ca_floating_outputs() || any inputDrv
-        // is floating-CA` at translate time. Covers both floating-CA
-        // self AND ia.deferred (IA with CA inputs — the CA input's
-        // placeholder is embedded in this drv's env/args and needs
-        // rewriting to the realized path).
-        if !state.ca.needs_resolve {
-            return (state.drv_content.clone(), Vec::new(), Vec::new());
+        // Gate: the RECORDED resolve flag, single-source
+        // (sched.dispatch.claims-derived+5). Every writer derived it
+        // from bytes through the shared oracle predicate
+        // (`rio_nix::derivation::should_resolve`): the gateway's
+        // post-BFS pass for ingress-bound nodes (normalized again at
+        // SubmitBuild from the validated inline bytes), the claims
+        // derivation's record-at-raise for store-backed nodes, the
+        // merge-time store-evidence stamp for evidence-created nodes,
+        // and recovery's expected-paths degrade. The submitter's echo
+        // is structurally out of reach here — the local re-derivation
+        // this read used to do (a clause-dropping copy of the
+        // predicate, merged_bug_035) is gone.
+        let needs_resolve = state.ca.needs_resolve;
+        if !needs_resolve {
+            return (
+                verified_bytes
+                    .map(|b| b.to_vec())
+                    .unwrap_or_else(|| state.drv_content.clone()),
+                Vec::new(),
+                Vec::new(),
+            );
         }
 
         // Build the input lists: walk DAG children, split into CA
@@ -2624,11 +3219,19 @@ impl DagActor {
         let ca_inputs = self.collect_ca_inputs(drv_hash);
         let ia_inputs = self.collect_ia_inputs(drv_hash);
         if ca_inputs.is_empty() && ia_inputs.is_empty() {
-            return (state.drv_content.clone(), Vec::new(), Vec::new());
+            return (
+                verified_bytes
+                    .map(|b| b.to_vec())
+                    .unwrap_or_else(|| state.drv_content.clone()),
+                Vec::new(),
+                Vec::new(),
+            );
         }
 
         // No drv_content → recovered derivation (scheduler restart,
-        // DAG reloaded from PG, drv_content not persisted). The store
+        // DAG reloaded from PG; only authoritative hook-fallback
+        // content is persisted — M_062 — everything else is
+        // refetched). The store
         // has the ATerm — fetch it. Workers do the same when the
         // inline is empty (build_types.proto:231: "Empty = fallback;
         // worker fetches via GetPath"). ~10-50ms round-trip, once
@@ -2643,16 +3246,25 @@ impl DagActor {
         // `resolve_ca_inputs` can parse `inputDrvs` and serialize
         // the resolved `BasicDerivation` form.
         //
-        // The same lossy-on-recovery pattern still applies to
-        // `ca_modular_hash` (see `collect_ca_inputs`'s skip-on-None)
-        // and `pending_realisation_deps` (best-effort cache,
-        // reconstituted here on each resolve).
+        // The lossy-on-recovery pattern still applies to
+        // `pending_realisation_deps` (best-effort cache, reconstituted
+        // here on each resolve); `ca_modular_hash` and `needs_resolve`
+        // are no longer lossy — recovery restores BOTH from their
+        // persisted columns (sched.persist.ca-modular-hash,
+        // sched.recovery.deferred-resolve+1 / M_071 verbatim restore).
         //
         // r[impl sched.ca.resolve+3]
-        let drv_content = if state.drv_content.is_empty() {
-            match self.fetch_drv_content_from_store(drv_hash, state).await {
-                Some(bytes) => bytes,
-                None => {
+        let drv_content = if let Some(bytes) = verified_bytes {
+            // Claims derivation already fetched + text-CA-verified the
+            // bytes — resolve over THOSE, no second fetch.
+            bytes.to_vec()
+        } else if state.drv_content.is_empty() {
+            match self
+                .fetch_drv_content_from_store(drv_hash.as_str(), state.drv_path())
+                .await
+            {
+                DrvFetch::Bytes(bytes) => bytes,
+                DrvFetch::Silence => {
                     // Store unreachable or .drv not found — dispatch
                     // unresolved (worker fails on placeholder,
                     // self-heals via retry after a fresh SubmitBuild
@@ -2662,6 +3274,22 @@ impl DagActor {
                         drv_hash = %drv_hash,
                         "recovered CA-on-CA dispatch: drv_content empty + store fetch failed; \
                          dispatching unresolved (worker will fail on placeholder)"
+                    );
+                    return (state.drv_content.clone(), Vec::new(), Vec::new());
+                }
+                DrvFetch::Denied { got, limit } => {
+                    // Same unresolved degrade — the worker's own fetch
+                    // applies the same class cap and will fail the
+                    // build with its content-bound InvalidDerivation
+                    // classification — but the log must be truthful:
+                    // this is a deterministic denial, NOT a store
+                    // outage (round-17 bug_030's fold, kept out).
+                    warn!(
+                        drv_hash = %drv_hash,
+                        got,
+                        limit,
+                        "recovered CA-on-CA dispatch: .drv NAR exceeds the derivation-text \
+                         class cap (content-bound, not store health); dispatching unresolved"
                     );
                     return (state.drv_content.clone(), Vec::new(), Vec::new());
                 }
@@ -2724,25 +3352,37 @@ impl DagActor {
     /// when `WorkAssignment.drv_content` is empty
     /// ([`rio-builder/src/executor/inputs.rs::fetch_drv_from_store`]).
     ///
-    /// Returns `None` on any failure: store unconfigured
-    /// (`store_client = None`, test mode), `GetPath` error, timeout,
-    /// not-found, or NAR unwrap failure. Callers treat `None` as
-    /// "degrade to the pre-P0408 behavior" — dispatch unresolved,
-    /// worker fails on placeholder, retry-with-backoff self-heals.
+    /// The outcome is CLOSED ([`DrvFetch`]) so the two consumers — the
+    /// merge/dispatch store-evidence chokepoint and the dispatch-time
+    /// CA resolve — derive their consequence from the variant's typed
+    /// permanence instead of collapsing every failure into one shape:
+    /// transient failures (store unconfigured, transport, timeout,
+    /// not-found, NAR shape) are [`DrvFetch::Silence`]; the
+    /// over-class-cap denial is [`DrvFetch::Denied`], content-bound
+    /// and deterministic (round-17 bug_030).
     ///
-    /// Hard 2s timeout + 1 MiB NAR cap: a `.drv` is ~1-50 KB ASCII.
-    /// A larger-than-1-MiB blob means something is badly wrong (the
-    /// path isn't a `.drv`, or the store returned a closure NAR).
-    /// Either way, bail — resolve can't parse a non-ATerm.
-    async fn fetch_drv_content_from_store(
+    /// Hard 2s idle timeout + the shared derivation-text NAR cap
+    /// ([`rio_common::limits::MAX_DRV_NAR_BYTES`], 16 MiB): legitimate
+    /// `.drv`s reach ~10 MiB at nixpkgs scale (huge env blocks,
+    /// `exportReferencesGraph` users — the cap's own sizing note), and
+    /// every other derivation-text fetch site (store admission,
+    /// gateway BFS, worker glue fetch) admits up to that bound. A
+    /// private lower cap here deterministically failed every
+    /// (1,16] MiB `.drv`'s claims verification as "store silence"
+    /// (round-17 bug_030). The class cap still bounds mis-resolution:
+    /// a closure NAR behind a mis-resolved path is rejected by the
+    /// collector's leading `Info.nar_size` pre-check, byte-free.
+    ///
+    /// Shared by the dispatch-time CA resolve (this module) and the
+    /// merge-time store-evidence check
+    /// (`sched.merge.store-evidence-displacement+3`) — hence the
+    /// path-taking signature: the merge-side caller verifies
+    /// non-resident settled rows, which have no `DerivationState`.
+    pub(super) async fn fetch_drv_content_from_store(
         &self,
-        drv_hash: &DrvHash,
-        state: &crate::state::DerivationState,
-    ) -> Option<Vec<u8>> {
-        /// `.drv` NAR cap. ~1-50 KB typical; 1 MiB is ~20× any
-        /// real-world `.drv`. Avoids pulling a multi-GB closure if
-        /// the store path was mis-resolved.
-        const MAX_DRV_NAR_SIZE: u64 = 1024 * 1024;
+        drv_hash: &str,
+        drv_path: &str,
+    ) -> DrvFetch {
         /// Per-chunk idle bound for `GetPath` (initial RPC + each
         /// stream.message() — I-211, not whole-call). ~10-50 ms
         /// typical; 2 s covers a slow store without blocking
@@ -2750,14 +3390,16 @@ impl DagActor {
         /// dispatch (same as store-unconfigured).
         const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-        let mut client = self.store_client.as_ref()?.clone();
-        let drv_path = state.drv_path().to_string();
+        let Some(client) = self.store_client.as_ref() else {
+            return DrvFetch::Silence;
+        };
+        let mut client = client.clone();
 
         let result = rio_proto::client::get_path_nar(
             &mut client,
-            &drv_path,
+            drv_path,
             FETCH_TIMEOUT,
-            MAX_DRV_NAR_SIZE,
+            rio_common::limits::NarSizeCap::derivation(),
             None,
             &[],
         )
@@ -2771,7 +3413,25 @@ impl DagActor {
                     drv_path = %drv_path,
                     "recovered CA resolve: .drv not found in store"
                 );
-                return None;
+                return DrvFetch::Silence;
+            }
+            // Content-bound denial: the path's DECLARED NAR size
+            // exceeds the derivation-text class cap, reported by the
+            // collector's leading `Info.nar_size` pre-check before any
+            // chunk flows. Deterministic — a retry cannot shrink the
+            // named path's contents — so this must NOT be folded into
+            // store silence (round-17 bug_030: that fold burned the
+            // claims-unavailable budget and poisoned blaming store
+            // health for a content-bound fact).
+            Err(rio_proto::client::NarCollectError::SizeExceeded { got, limit }) => {
+                debug!(
+                    drv_hash = %drv_hash,
+                    drv_path = %drv_path,
+                    got,
+                    limit,
+                    "drv fetch denied: NAR exceeds the derivation-text class cap"
+                );
+                return DrvFetch::Denied { got, limit };
             }
             Err(e) => {
                 debug!(
@@ -2780,21 +3440,23 @@ impl DagActor {
                     error = %e,
                     "recovered CA resolve: GetPath failed"
                 );
-                return None;
+                return DrvFetch::Silence;
             }
         };
 
         // NAR unwrap: .drv is a single regular file. Anything else
-        // (directory, symlink, corrupt NAR) → None.
+        // (directory, symlink, corrupt NAR) → silence: the store may
+        // answer differently later (the genuine text-CA object
+        // replacing a corrupt one).
         match rio_nix::nar::extract_single_file(&nar) {
-            Ok(bytes) => Some(bytes),
+            Ok(bytes) => DrvFetch::Bytes(bytes),
             Err(e) => {
                 debug!(
                     drv_hash = %drv_hash,
                     error = %e,
                     "recovered CA resolve: NAR unwrap failed (not a single regular file)"
                 );
-                None
+                DrvFetch::Silence
             }
         }
     }

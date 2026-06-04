@@ -6,6 +6,7 @@ DERIVATION_EVENT_KIND_QUEUED = 0;
 DERIVATION_EVENT_KIND_STARTED = 1;
 DERIVATION_EVENT_KIND_SUBSTITUTING = 5;
 DerivationEventKind kind = 2;
+bool drv_content_authoritative = 20;
 bool explicitly_requested = 19;
 bool is_content_addressed = 11;
 bool is_fixed_output = 7;

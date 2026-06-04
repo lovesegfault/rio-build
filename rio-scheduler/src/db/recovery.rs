@@ -29,7 +29,8 @@ impl SchedulerDb {
             r#"
             SELECT build_id, tenant_id, status, priority_class,
                    keep_going, options_json,
-                   total_drvs, completed_drvs, cached_drvs,
+                   total_drvs, completed_drvs, cached_drvs, error_summary,
+                   failed_derivation,
                    EXTRACT(EPOCH FROM (now() - submitted_at))::float8
                        AS submitted_age_secs
             FROM builds
@@ -81,11 +82,14 @@ impl SchedulerDb {
                    d.required_features,
                    d.assigned_builder_id,
                    d.retry_count, d.resubmit_cycles,
-                   d.expected_output_paths, d.output_names,
+                   d.expected_output_paths, d.claim_output_paths, d.output_names,
                    d.wanted_output_names, d.is_fixed_output,
                    d.is_ca, d.topdown_pruned, d.closure_hole,
                    d.failed_builders,
                    d.floor_mem_bytes, d.floor_disk_bytes, d.floor_deadline_secs,
+                   d.drv_content, d.ca_modular_hash, d.ca_modular_hash_stripped,
+                   d.evidence_rank,
+                   d.needs_resolve,
                    a.exec_id
             FROM derivations d
             LEFT JOIN assignments a ON a.derivation_id = d.derivation_id
@@ -319,16 +323,24 @@ impl SchedulerDb {
     /// marked parent to the bounded resubmit-directing fail-fast, so
     /// over-recording errs conservative; failing to record it is what
     /// let a surviving sibling's later completion launder the mark.
+    ///
+    /// Since round-17 merged_bug_024 this query feeds the TRIGGER only;
+    /// the witness CONTENT for triggered parents comes from
+    /// [`Self::load_dropped_terminal_children`] (all five terminal
+    /// statuses, produced included — cumulative witness contract).
     pub(crate) async fn load_parents_with_unproduced_terminal_children(
         &self,
         derivation_ids: &[Uuid],
-    ) -> Result<Vec<Uuid>, sqlx::Error> {
+    ) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
         if derivation_ids.is_empty() {
             return Ok(Vec::new());
         }
-        sqlx::query_scalar(
+        // (parent_id, child drv_hash) pairs — the recovery edge-drop
+        // stamp records WHICH child went missing (069 witness set),
+        // not just that one did.
+        sqlx::query_as(
             r#"
-            SELECT DISTINCT e.parent_id
+            SELECT DISTINCT e.parent_id, c.drv_hash
             FROM derivation_edges e
             JOIN derivations c ON c.derivation_id = e.child_id
             WHERE e.parent_id = ANY($1)
@@ -336,6 +348,73 @@ impl SchedulerDb {
             "#,
         )
         .bind(derivation_ids)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// All dropped TERMINAL children — every status in
+    /// [`terminal_status_sql!`], produced (`'completed'`/`'skipped'`)
+    /// and un-produced alike — for an already-TRIGGERED parent set
+    /// (round-17 merged_bug_024, recovery tier).
+    ///
+    /// The caller computes the trigger (a parent with ≥1 un-produced
+    /// terminal dropped child, via
+    /// [`Self::load_parents_with_unproduced_terminal_children`], or a
+    /// parent restored with the watched `closure_hole` flag) and then
+    /// stamps THIS set: the witness contract is cumulative since the
+    /// hole was last whole, so for a triggered parent the recovery
+    /// truncation must record every dropped terminal child. Recording
+    /// only the un-produced subset let a watched parent whose dropped
+    /// children were ALL produced recover with its old witness intact —
+    /// a heal re-supplying just that older set then re-armed the parent
+    /// over a child set missing the produced-but-dropped children
+    /// (the all-produced-dropped live-voucher laundering; the recovery
+    /// twin of the reap-tier `witness_watched` extension).
+    ///
+    /// Same conservative posture as the un-produced sibling query:
+    /// within-TTL `'poisoned'` children match here yet keep their
+    /// edges — over-recording is inert (the heal coverage check just
+    /// demands their re-supply, which their loaded edges satisfy).
+    /// No live-build scoping, for the sibling query's documented
+    /// reason: this records a fact about the rows, not a condemnation.
+    pub(crate) async fn load_dropped_terminal_children(
+        &self,
+        parent_ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+        if parent_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // See terminal_status_sql! for why the status set isn't a bind
+        // param.
+        sqlx::query_as(terminal_status_sql!(
+            "
+            SELECT DISTINCT e.parent_id, c.drv_hash
+            FROM derivation_edges e
+            JOIN derivations c ON c.derivation_id = e.child_id
+            WHERE e.parent_id = ANY($1)
+              AND c.status IN "
+        ))
+        .bind(parent_ids)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Load the 069 closure-hole witness rows for a set of holed
+    /// parents (recovery hydration).
+    pub(crate) async fn load_closure_missing(
+        &self,
+        drv_hashes: &[String],
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        if drv_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as(
+            r#"
+            SELECT drv_hash, missing_child FROM derivation_closure_missing
+            WHERE drv_hash = ANY($1)
+            "#,
+        )
+        .bind(drv_hashes)
         .fetch_all(&self.pool)
         .await
     }

@@ -14,6 +14,12 @@ pub(crate) mod actor_guards;
 mod executor_service;
 mod scheduler_service;
 
+// The merge-time store-evidence check (actor/merge.rs) runs fetched
+// `.drv` bytes through the SAME identity validator SubmitBuild ingress
+// applies to inline content, so the two rules cannot drift
+// (sched.merge.store-evidence-displacement+3).
+pub(crate) use scheduler_service::validate_inline_drv_content;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 

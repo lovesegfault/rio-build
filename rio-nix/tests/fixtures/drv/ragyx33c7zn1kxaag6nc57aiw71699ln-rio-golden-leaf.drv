@@ -1,0 +1,1 @@
+Derive([("out","/nix/store/5ghg28b7yskhnsn9fxm00ha34n93z0il-rio-golden-leaf","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo leaf > $out"],[("builder","/bin/sh"),("name","rio-golden-leaf"),("out","/nix/store/5ghg28b7yskhnsn9fxm00ha34n93z0il-rio-golden-leaf"),("system","x86_64-linux")])

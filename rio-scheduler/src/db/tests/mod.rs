@@ -38,6 +38,7 @@ pub(super) async fn insert_test_derivation(
 ) -> anyhow::Result<Uuid> {
     let mut tx = db.pool.begin().await?;
     let row = DerivationRow {
+        needs_resolve: false,
         drv_hash: drv_hash.into(),
         drv_path: rio_test_support::fixtures::test_drv_path(drv_hash),
         pname: Some("test-pkg".into()),
@@ -51,8 +52,12 @@ pub(super) async fn insert_test_derivation(
         wanted_output_names: vec![],
         topdown_pruned: false,
         closure_hole: false,
+        drv_content: None,
+        ca_modular_hash: None,
+        ca_modular_hash_stripped: None,
+        evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
     };
-    let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
+    let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[row], &[]).await?;
     tx.commit().await?;
     Ok(ids.get(drv_hash).expect("just inserted").0)
 }

@@ -167,9 +167,11 @@ pub struct ResolvedDerivation {
     /// path was computed post-resolve via
     /// [`BasicDerivation::fill_deferred_outputs`]. Empty for
     /// floating-CA-self (its outputs stay `""` — nix-daemon computes
-    /// scratch paths) and for concrete IA. Dispatch overwrites
-    /// `state.expected_output_paths` from this so the HMAC
-    /// `expected_outputs` claim carries the real path, not `""`.
+    /// scratch paths) and for concrete IA. Dispatch records these as
+    /// the node's CLAIM paths (`DerivationState::merge_resolved_claim_paths`)
+    /// so the HMAC `expected_outputs` claim carries the real path, not
+    /// `""` — never written to `expected_output_paths`, whose ingress
+    /// shape is the resolve probes' contract (round-16 bug_094).
     pub output_paths: Vec<(String, String)>,
 }
 
@@ -1027,7 +1029,7 @@ mod tests {
     /// `resolve_ca_inputs`, the parent's own `$out` MUST be a real
     /// store path in BOTH `outputs[0].path` and `env["out"]`, and
     /// `ResolvedDerivation.output_paths` must surface it for the
-    /// dispatch-side `expected_output_paths` overwrite.
+    /// dispatch-side claim recording (`merge_resolved_claim_paths`).
     ///
     /// Regression: pre-fix, `resolve_ca_inputs` only did phase 1
     /// (input collapse + placeholder rewrite); the resolved ATerm
@@ -1080,7 +1082,7 @@ mod tests {
             Some(out_path),
             "env[\"out\"] must match outputs[0].path"
         );
-        // Surfaced for dispatch's expected_output_paths overwrite.
+        // Surfaced for dispatch's claim recording.
         assert_eq!(
             resolved.output_paths,
             vec![("out".to_string(), out_path.to_string())]
@@ -1099,8 +1101,8 @@ mod tests {
     /// Floating-CA-self with a CA input: `("out","","sha256","")`.
     /// `fill_deferred_outputs` must leave it alone — nix-daemon
     /// computes the scratch path internally from `hash_algo`.
-    /// `output_paths` stays empty so dispatch doesn't clobber
-    /// `expected_output_paths` with a wrong value.
+    /// `output_paths` stays empty so dispatch records no claim
+    /// override (the HMAC path for floating-CA is `is_ca`).
     #[tokio::test]
     async fn resolve_floating_ca_self_leaves_out_empty() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -1700,4 +1702,65 @@ mod tests {
     //   fixture exists yet. Adjacent golden-fixture work: P0311-T62
     //   (downstream_placeholder golden — landed above as
     //   placeholder_golden_matches_nix_upstream).
+}
+
+#[cfg(test)]
+mod typed_rewrite_pin {
+    use rio_nix::derivation::Derivation;
+
+    /// The placeholder rewrite re-parses the rewritten ATerm under the
+    /// TYPED parse boundary, which validates declared output paths.
+    /// This pin converts the re-parse-safety argument into structure:
+    /// downstream placeholders contain `/` (`/<hash>/<output>` shape),
+    /// which is invalid in a store-path NAME, so a placeholder can
+    /// never appear inside an output-path field of a parseable ATerm —
+    /// the rewrite therefore cannot alter output-path bytes, and the
+    /// resolved derivation's declared paths are byte-identical to the
+    /// source's.
+    #[test]
+    fn placeholder_rewrite_never_touches_output_paths() {
+        let placeholder = super::downstream_placeholder(
+            &rio_nix::store_path::StorePath::parse(
+                "/nix/store/vfhik20db6k5ff75sf3dbf6i3jymbnir-dep.drv",
+            )
+            .unwrap(),
+            "out",
+        );
+        assert!(
+            placeholder.starts_with('/') && !placeholder.starts_with("/nix/store/"),
+            "downstream placeholders are absolute but never store paths (and '/' cannot \
+             appear inside a store-path name, so one can never be embedded in a declared \
+             output path either): {placeholder}"
+        );
+
+        // A drv whose ENV carries the placeholder but whose declared
+        // output path is a real store path: rewrite, re-parse, compare.
+        let out_p = "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-app";
+        let aterm = format!(
+            r#"Derive([("out","{out_p}","","")],[],[],"x86_64-linux","/bin/sh",["-c","cp {placeholder} $out"],[("dep","{placeholder}"),("out","{out_p}")])"#
+        );
+        let parsed = Derivation::parse(&aterm).expect("source parses");
+        let realized = "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-dep-out";
+        let rewritten = aterm.replace(&placeholder, realized);
+        let reparsed = Derivation::parse(&rewritten).expect("rewritten ATerm re-parses");
+
+        assert_eq!(
+            parsed.outputs()[0].path(),
+            reparsed.outputs()[0].path(),
+            "output-path bytes are untouched by the placeholder rewrite"
+        );
+        assert_eq!(
+            reparsed.env().get("dep").map(String::as_str),
+            Some(realized)
+        );
+        // And a hostile ATerm that DID embed a placeholder as an output
+        // path could never have parsed in the first place.
+        let hostile = format!(
+            r#"Derive([("out","{placeholder}","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#
+        );
+        assert!(
+            Derivation::parse(&hostile).is_err(),
+            "a placeholder is not a valid declared output path"
+        );
+    }
 }

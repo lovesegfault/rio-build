@@ -13,7 +13,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::state::{DerivationStatus, DrvHash, ExecutorId};
+use crate::state::{BuildStateExt, DerivationStatus, DrvHash, ExecutorId};
 
 use super::{BUILD_EVENT_BUFFER_SIZE, DagActor, LOG_EVENT_BUFFER_SIZE};
 
@@ -237,6 +237,11 @@ impl BuildEventBus {
     /// Emit a `BuildProgress` from a precomputed summary, marking the
     /// debounce timestamp. Bypasses [`progress_debounced`] — the caller
     /// paid for the O(dag_nodes) scan, so emit unconditionally.
+    ///
+    /// Callers outside [`DagActor`] methods must go through
+    /// [`DagActor::emit_progress_with`], which adds the terminal-build
+    /// freeze (`sched.build.terminal-status-settled`); this bus-level
+    /// emitter cannot see `self.builds` and emits whatever it is handed.
     pub(super) fn emit_progress_with(
         &mut self,
         build_id: Uuid,
@@ -316,6 +321,17 @@ impl DagActor {
     /// dumb — no stateful reconstruction from the DerivationEvent
     /// stream.
     pub(super) fn emit_progress(&mut self, build_id: Uuid) {
+        // r[impl sched.build.terminal-status-settled+2]
+        // A terminal build's served progress is settled at its terminal
+        // transition: shared-node fan-outs (release_downstream,
+        // dispatch-time cache hits, displacement re-checks) can still
+        // reach a resident terminal build during the cleanup window, and
+        // a post-`BuildCompleted` Progress recomputed from the mutating
+        // DAG would be sequenced, persisted, and replayed after the
+        // terminal event with shrunk totals.
+        if self.build_progress_frozen(build_id) {
+            return;
+        }
         // I-140: debounce. Progress is dashboard-only; `build_summary`
         // is O(dag_nodes). At 153k nodes that's ~60ms (debug) / ~15ms
         // (release) per call. Calling per-assign + per-complete +
@@ -330,6 +346,33 @@ impl DagActor {
         }
         let summary = self.dag.build_summary(build_id);
         self.events.emit_progress_with(build_id, &summary);
+    }
+
+    /// Whether `BuildProgress` emission for this build is frozen because
+    /// the build already reached a terminal state
+    /// (`sched.build.terminal-status-settled`). Terminal builds stay
+    /// resident — and in shared nodes' `interested_builds` — for the
+    /// cleanup window, so aggregate-progress emitters must skip them.
+    pub(super) fn build_progress_frozen(&self, build_id: Uuid) -> bool {
+        self.builds
+            .get(&build_id)
+            .is_some_and(|b| b.state().is_terminal())
+    }
+
+    /// [`BuildEventBus::emit_progress_with`] behind the terminal-build
+    /// freeze: the caller paid for the `build_summary` scan, but a
+    /// resident terminal build's progress must not be re-emitted from
+    /// the still-mutating DAG.
+    // r[impl sched.build.terminal-status-settled+2]
+    pub(super) fn emit_progress_with(
+        &mut self,
+        build_id: Uuid,
+        summary: &crate::dag::BuildSummary,
+    ) {
+        if self.build_progress_frozen(build_id) {
+            return;
+        }
+        self.events.emit_progress_with(build_id, summary);
     }
 
     pub(super) fn get_interested_builds(&self, drv_hash: &DrvHash) -> Vec<Uuid> {

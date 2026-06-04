@@ -93,8 +93,8 @@ externalSecrets:
   auroraEndpoint: ""
 
 # Helm pre-install/pre-upgrade hook Job. Idempotent — describe-secret guards.
-# Generates rio/hmac (openssl rand 32) and rio/signing-key (nix-store
-# --generate-binary-cache-key) in Secrets Manager IF THEY DON'T EXIST.
+# Generates rio/hmac (openssl rand 32) and rio/signing-key (rio-cli
+# keygen) in Secrets Manager IF THEY DON'T EXIST.
 # Regenerating would invalidate in-flight assignment tokens / all narinfo
 # signatures. The public signing key goes to rio/signing-key-pub so operators
 # can read it without touching the private half.
@@ -103,8 +103,16 @@ bootstrap:
   # Nix-built image (awscli2 + openssl + nix). See nix/docker.nix.
   image: rio-bootstrap
   serviceAccount:
-    # IRSA: secretsmanager:CreateSecret, PutSecretValue, DescribeSecret on rio/*
+    # IRSA role annotation; the grant set lives ONLY in
+    # infra/eks/secrets.tf (aws_iam_policy.rio_bootstrap).
     annotations: {}
+  # Extra container env for the bootstrap Job. Production leaves this
+  # empty (IRSA injects credentials via the EKS pod identity webhook;
+  # endpoints resolve normally). The prod-parity VM fixture points
+  # AWS_ENDPOINT_URL at an in-VM Secrets Manager mock plus dummy
+  # creds so the Job exercises the real awscli2 against genuine
+  # not-found/create wire semantics (k3s-prod-parity.nix).
+  extraEnv: []
 
 podDisruptionBudget:
   enabled: true
@@ -115,16 +123,6 @@ networkPolicy:
   # AWS-specific; varies by VPC. Unset → no S3 egress rule in
   # store-egress (store uses local filesystem backend only).
   storeS3Cidr: ""
-
-# nix.conf knobs for the rio-nix-conf ConfigMap (mounted into worker
-# pods at /etc/rio/nix-conf/nix.conf; see rio-builder/src/executor/
-# sandbox.rs for the compiled-in fallback).
-nixConf:
-  # Content-addressed mirror(s) for builtin:fetchurl. When a flat-hash
-  # FOD's origin URL is dead, nix-daemon tries {mirror}/{algo}/{hex}
-  # first. Only fires for outputHashMode = "flat" — recursive (NAR-hash)
-  # FODs skip it. Space-separated list; "" disables the lookup.
-  hashedMirrors: "http://tarballs.nixos.org/"
 
 # Prometheus-operator scrape wiring. Renders ServiceMonitor + PodMonitor +
 # PrometheusRule (templates/{servicemonitor,prometheusrule}.yaml). Requires
@@ -1190,6 +1188,12 @@ poolDefaults:
   enabled: false
   features: []
   image: rio-builder
+  # Content-addressed mirrors for the native builtin:fetchurl
+  # (Pool spec.hashedMirrors → RIO_HASHED_MIRRORS; tried as
+  # {mirror}/{algo}/{base16} before the origin URL, flat-hash FODs
+  # only). Default mirrors the long-standing tarballs.nixos.org convention.
+  hashedMirrors:
+    - "http://tarballs.nixos.org/"
   # 50Gi. Reconciler adds this verbatim to every BUILDER pod's
   # ephemeral-storage request/limit AND the fuse-cache emptyDir
   # sizeLimit. Single-sourced through controller.toml

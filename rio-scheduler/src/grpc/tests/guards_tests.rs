@@ -25,7 +25,11 @@ fn _actor_error_exhaustive(e: &ActorError) {
         | ActorError::MissingDbId { .. }
         | ActorError::StoreUnavailable
         | ActorError::PermissionDenied { .. }
-        | ActorError::NotLeader => {}
+        | ActorError::NotLeader
+        | ActorError::SettledIdentityConflict { .. }
+        | ActorError::SettledConflictEvidenceUnavailable { .. }
+        | ActorError::SettledConflictEvidenceBudget { .. }
+        | ActorError::StoreEvidenceContradicts { .. } => {}
     }
 }
 
@@ -75,6 +79,45 @@ fn test_actor_error_to_status_all_arms() {
             "permission denied",
         ),
         (ActorError::NotLeader, Code::Unavailable, "not leader"),
+        (
+            // r[verify sched.persist.settled-identity-freeze+4]
+            ActorError::SettledIdentityConflict {
+                drv_path: "/nix/store/x".into(),
+                remediation: "resubmit store-backed".into(),
+            },
+            Code::FailedPrecondition,
+            "settled",
+        ),
+        (
+            // r[verify sched.merge.store-evidence-displacement+3]
+            // Wire codes derived per variant: silence is transient and
+            // must surface UNAVAILABLE (bug_055's inversion, merge
+            // form) ...
+            ActorError::SettledConflictEvidenceUnavailable {
+                drv_path: "/nix/store/x".into(),
+                reason: "fetch_failed",
+            },
+            Code::Unavailable,
+            "retry when the store recovers",
+        ),
+        (
+            // r[verify sched.merge.store-evidence-displacement+3]
+            // ... and budget exhaustion is load-shaped, never the
+            // conflict's permanent FAILED_PRECONDITION.
+            ActorError::SettledConflictEvidenceBudget {
+                drv_path: "/nix/store/x".into(),
+            },
+            Code::ResourceExhausted,
+            "split the submission",
+        ),
+        (
+            // r[verify sched.merge.store-evidence-displacement+3]
+            ActorError::StoreEvidenceContradicts {
+                drv_path: "/nix/store/x".into(),
+            },
+            Code::FailedPrecondition,
+            "contradicts",
+        ),
     ];
     // Count derived from the enum (strum::EnumCount), not a hardcoded
     // literal. The `_actor_error_exhaustive` pin only catches a missing

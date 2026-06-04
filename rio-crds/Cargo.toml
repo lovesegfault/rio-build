@@ -40,3 +40,9 @@ serde_json = { workspace = true }
 # Write-only for crdgen (and the crd_serializes test).
 serde-saphyr = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+# The mirror accept-set differential only: asserts the structural
+# predicate equals the regex derivation of HASHED_MIRROR_URL_PATTERN.
+# Dev-only — consumers of this crate never pull regex.
+regex = { workspace = true }

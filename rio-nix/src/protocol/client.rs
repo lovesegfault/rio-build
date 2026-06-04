@@ -333,8 +333,9 @@ pub async fn client_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 ///
 /// Read side is left to the caller: loop on [`read_stderr_message`] until
 /// [`StderrMessage::Last`], then call [`read_build_result`](super::build::read_build_result).
-/// rio-builder's `run_daemon_build` does this with cancel-safe batching and a
-/// silence deadline layered on top of the protocol read.
+/// (rio-builder's daemon-era executor used to drive this with cancel-safe
+/// batching and a silence deadline layered on top; rio no longer spawns
+/// nix-daemon, so today's callers are tests/tooling driving an external daemon.)
 pub async fn client_send_build_derivation<W: AsyncWrite + Unpin>(
     writer: &mut W,
     drv_path: &str,
@@ -361,7 +362,15 @@ mod tests {
 
     fn test_drv() -> BasicDerivation {
         BasicDerivation::new(
-            vec![DerivationOutput::new("out", "/nix/store/abc-hello", "", "").unwrap()],
+            vec![
+                DerivationOutput::new(
+                    "out",
+                    "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-hello",
+                    "",
+                    "",
+                )
+                .unwrap(),
+            ],
             std::collections::BTreeSet::new(),
             "x86_64-linux".into(),
             "/bin/sh".into(),
@@ -371,11 +380,11 @@ mod tests {
         .unwrap()
     }
 
-    /// Roundtrip the decomposed wopBuildDerivation client primitives the
-    /// way rio-builder's `run_daemon_build` drives them:
-    /// `client_send_build_derivation` → `read_stderr_message`* →
-    /// `read_build_result`.
-    // r[verify builder.daemon.stdio-client]
+    /// Roundtrip the decomposed wopBuildDerivation client primitives
+    /// (`client_send_build_derivation` → `read_stderr_message`* →
+    /// `read_build_result`) --- the gateway's golden protocol tests use
+    /// this client side against real daemons; nothing in production
+    /// drives it anymore.
     #[tokio::test]
     async fn client_build_derivation_roundtrip() -> anyhow::Result<()> {
         let (client_stream, server_stream) = tokio::io::duplex(8192);

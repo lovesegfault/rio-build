@@ -123,11 +123,23 @@ See #cross-link("/spec/system/security.typ")[Security: Secrets Management] for r
 - Authorized SSH keys (gateway)
 - @nar signing key (store)
 - Database credentials (scheduler, store)
-- HMAC signing key for assignment tokens (scheduler, store) --- set via `RIO_HMAC_KEY_PATH` on both. The scheduler signs Claims{executor_id, drv_hash, expected_outputs, is_ca, expiry_unix} at dispatch; the store verifies on `PutPath`. Same key file both sides (shared secret). Generate: `openssl rand -out /path/to/key 32`.
+- HMAC signing key for assignment tokens (scheduler, store) --- set via `RIO_HMAC_KEY_PATH` on both. The scheduler signs Claims{executor_id, drv_hash, expected_outputs, is_ca, is_fixed_output, tenant, expiry_unix} at dispatch (the optional fields use serde defaults); the store verifies on `PutPath`. Same key file both sides (shared secret). Generate: `openssl rand -out /path/to/key 32`.
 
 #info[
+  *Signing-key bootstrap (pair-consistency probe):* the bootstrap Job's signing-key block delegates ALL key-byte work to `rio-cli` (the `rio_common::signing_keyfmt` codec — see #rref("store.signing.entry-codec")); the shell never decodes key material. On every upgrade the Job log must show either `[bootstrap] signing-key pair consistent` or a heal line (the pub half re-derived from the live private half — never a rotation). The probe reads both secrets, so the IRSA role needs `secretsmanager:GetSecretValue` — apply terraform (the grant) BEFORE `helm install`, or the probe AccessDenied-aborts fail-closed (visible in the Job log; the pair never silently diverges). The `bootstrap-iam-parity` check pins every (action, resource) pair in both directions — the granting statement's resource must equal the pattern derived from the script's own per-verb target set.
+
   *SSH key mounting:* On EKS deploys (`xtask k8s -p eks up`), the bootstrap Job generates `rio/gateway-host-key` in AWS Secrets Manager and ESO syncs it to the `rio-gateway-host-key` Secret; deploy sets `gateway.ssh.hostKeySecret` to that name so all replicas present the same host key across restarts. On other deployments, the chart default leaves `hostKeySecret` empty — the gateway then generates an ephemeral key per pod (fine for dev; breaks `known_hosts` on reschedule and across replicas). `gateway.ssh.authorizedKeysSecret` defaults to `rio-gateway-ssh` — create that Secret before deploy or the gateway pod blocks on the missing mount.
 ]
+
+#r("infra.bootstrap.secret-state-probe")[
+  Every Secrets Manager existence decision in the bootstrap Job MUST route through the fail-closed `secret_state` probe, which MUST distinguish all four provider states: present (live), missing (the API said `ResourceNotFoundException`), scheduled-for-deletion (`DeletedDate` set --- abort naming both `restore-secret` and `--force-delete-without-recovery`), and transient/unknown (abort, refusing to guess).
+]
+A secret in its 7--30 day deletion recovery window keeps answering `describe-secret` while refusing every read and write: classifying it `present` wedges the Job for the whole window (every retry dies at the first `get-secret-value`/`put-secret-value`), and classifying a throttle `missing` would regenerate a live key. The probe instead aborts printing the only two operator exits, so a delete-only rotation converges in minutes (operator finalizes or restores) instead of stalling for up to 30 days. The `bootstrap-probe-conformance` check pins `secret_state` as the script's sole `describe-secret` call site; `bootstrap-idempotent` scenarios J--M pin the deletion arm per secret class and the fail-closed routing of the create-only guards.
+
+#r("infra.bootstrap.pair-probe-byte-exact")[
+  The pair-consistency probe MUST compare the stored public entry byte-exactly against the derived entry plus exactly the one transport newline `--output text` appends, with no command substitution anywhere in the compared operands' dataflow; any other byte difference --- including trailing-newline corruption of the stored value itself --- MUST trigger the heal.
+]
+POSIX `$(...)` strips _all_ trailing newlines, not just the transport framing: a normalization built on it erases the only byte distinguishing a `name:b64\n`-corrupted stored pub (the legacy shell re-derive's artifact class) from the canonical entry, so the probe logs `pair consistent` forever over the very corruption the heal exists to converge. `bootstrap-idempotent` scenario N plants that corruption directly in provider state and pins detect-heal-settle.
 
 = Verification
 

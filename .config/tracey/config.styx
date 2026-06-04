@@ -50,6 +50,7 @@ specs (
           rio-scheduler/src/**/*.rs
           rio-store/src/**/*.rs
           rio-builder/src/**/*.rs
+          rio-exec/src/**/*.rs
           rio-controller/src/**/*.rs
           rio-crds/src/**/*.rs
           rio-lease/src/**/*.rs
@@ -80,6 +81,7 @@ specs (
           rio-store/tests/**/*.rs
           rio-scheduler/tests/**/*.rs
           rio-builder/tests/**/*.rs
+          rio-exec/tests/**/*.rs
           rio-controller/tests/**/*.rs
           rio-migrations/tests/**/*.rs
           xtask/tests/**/*.rs

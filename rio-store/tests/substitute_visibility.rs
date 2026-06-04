@@ -155,7 +155,7 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
     let path = test_store_path("subvis-p");
     let (nar, nar_hash) = make_nar(b"subvis-payload");
     let fp = rio_nix::narinfo::fingerprint(&path, &nar_hash, nar.len() as u64, &[]);
-    let signer_k1 = Signer::from_seed("key-K1", &seed_k1);
+    let signer_k1 = Signer::from_seed("key-K1", &seed_k1).unwrap();
     let sig_k1 = signer_k1.sign(&fp);
 
     let path_hash = sha256(&path);
@@ -437,7 +437,7 @@ async fn sig_visibility_gate_cluster_key_timing_window() -> TestResult {
 
     // ── Cluster key (what rio signs freshly-built paths with) ──────────
     let cluster_seed = [0x55u8; 32];
-    let cluster_signer = Signer::from_seed("rio-cluster", &cluster_seed);
+    let cluster_signer = Signer::from_seed("rio-cluster", &cluster_seed).unwrap();
     let cluster_trusted_entry = cluster_signer.trusted_key_entry();
 
     // ── Unrelated upstream key (tenant trusts this, NOT cluster) ───────
@@ -585,11 +585,11 @@ async fn sig_visibility_gate_tenant_key_timing_window() -> TestResult {
     .bind(&tenant_seed[..])
     .execute(&db.pool)
     .await?;
-    let tenant_signer = Signer::from_seed("tenant-own-1", &tenant_seed);
+    let tenant_signer = Signer::from_seed("tenant-own-1", &tenant_seed).unwrap();
 
     // Cluster signer DIFFERENT from tenant key (proves it's the
     // tenant_keys union doing the work, not cluster).
-    let cluster = Signer::from_seed("rio-cluster", &[0xCCu8; 32]);
+    let cluster = Signer::from_seed("rio-cluster", &[0xCCu8; 32]).unwrap();
     let sub = Arc::new(Substituter::new(db.pool.clone(), None));
     let ts = TenantSigner::new(cluster, db.pool.clone());
     let store_svc = StoreServiceImpl::new(db.pool.clone())

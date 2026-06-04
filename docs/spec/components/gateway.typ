@@ -693,6 +693,33 @@ which the inline `BasicDerivation` lacks — so in the single-node fallback
 pre-verification behavior: empty `builtOutputs`, scheduler outcome passed
 through.
 
+#r("gw.build.scheduler-rejection-permanent")[
+  When `SubmitBuild` fails with `INVALID_ARGUMENT` or `FAILED_PRECONDITION`,
+  the gateway MUST report the failure to the client as a permanent rejection
+  (`BuildResult` status `InputRejected`), never as `TransientFailure`; all
+  other submission failures (timeout, `UNAVAILABLE`, transport errors) remain
+  transient. The gateway MUST NOT mint fallback nodes it knows the scheduler
+  will reject: `build_fallback_node` refuses non-content-bound derivations.
+]
+
+A scheduler `INVALID_ARGUMENT` / `FAILED_PRECONDITION` means the scheduler
+validated the submission's content and refused it --- resubmitting the
+identical request can never succeed, so reporting it as transient sends
+clients (and CI retry wrappers) into a retry loop against a deterministic
+rejection. The producer half closes the one known way the gateway itself
+could manufacture such a rejection: an inline fallback node for a
+non-content-bound derivation, which the scheduler's authoritative-content
+validation always refuses. The contract's load-bearing inverse is pinned
+scheduler-side
+(#rref("sched.merge.store-evidence-displacement+3")): conditions that are
+NOT deterministic content refusals --- store silence while resolving a
+settled conflict, or store-evidence fetch-budget exhaustion --- carry
+`UNAVAILABLE` / `RESOURCE_EXHAUSTED` precisely so they flow through this
+classifier's transient arm untouched; the gateway needs no knowledge of
+those variants, and widening the permanent set here without a
+scheduler-side code pin would re-create the inversion this pairing
+exists to prevent.
+
 === BuildResult Wire Format
 
 All fields below are present for 1.35+ except `cpu_user`/`cpu_system`, which
@@ -889,9 +916,23 @@ rio-build currently advertises an empty feature set.
   [9], [S → C], [Nix version string (e.g. `"rio-gateway 0.1.0"`)], [string],
   [10],
   [S → C],
-  [Trusted status: 0 = unknown, 1 = trusted, 2 = not-trusted],
+  [Trusted status: 0 = unknown, 1 = trusted, 2 = not-trusted. rio always
+    sends 2 (#rref("gw.handshake.untrusted"))],
   [u64],
 )
+
+#r("gw.handshake.untrusted")[
+  The gateway MUST report not-trusted (`2`) in the handshake trusted-status
+  field and MUST NOT report trusted.
+]
+rio is multi-tenant and has no CppNix trusted-user concept: reporting
+trusted would invite inline input-addressed `wopBuildDerivation`
+submissions whose declared output paths cannot be validated (the
+path-squatting shape #rref("gw.reject.output-path-mismatch+2") exists to
+prevent), while not-trusted steers stock `build-remote` (Nix ≥ 2.16,
+Lix) onto the copy-the-`.drv`-closure + `wopBuildPathsWithResults` flow
+that the gateway fully supports and gates. Beyond `build-remote`'s flow
+selection, clients only display the flag (`nix store info`).
 
 #r("gw.handshake.initial-stderr-last")[
   *Phase 4: Initial STDERR_LAST*
@@ -944,14 +985,17 @@ the handshake before the client will send any opcodes.
 
 = DAG Reconstruction
 
-#r("gw.dag.reconstruct+3")[
+#r("gw.dag.reconstruct+4")[
   When the gateway receives `wopBuildDerivation`, `wopBuildPaths`, or
   `wopBuildPathsWithResults`, it reconstructs the full derivation DAG to send
   to the scheduler via `SubmitBuild`. `wopBuildDerivation` (build-hook path)
   attempts the same full-DAG walk: it resolves the `.drv` from the session
   cache or the store and runs `reconstruct_dag`; only if resolution fails does
-  it fall back to a single-node DAG built from the inline `BasicDerivation`
-  (see #rref("gw.hook.single-node-dag")). Alongside the node/edge walk, the
+  it fall back to a single-node DAG built from the inline `BasicDerivation`,
+  and only when every statically-declared output of that derivation is
+  content-bound (fixed-output / floating-CA) --- an unresolvable inline
+  *input-addressed* derivation is rejected rather than trusted
+  (see #rref("gw.hook.single-node-dag+2")). Alongside the node/edge walk, the
   gateway computes each node's `wanted_output_names` --- the union of every
   consumer's `inputDrvs` output-name references for it plus the root request's
   output selection, empty meaning every declared output --- which feeds the
@@ -987,19 +1031,38 @@ the handshake before the client will send any opcodes.
   `RIO_MAX_TRANSITIVE_INPUTS`) to prevent DoS via pathological derivation
   graphs. The gateway sends the *full DAG* to the scheduler; cache-hit
   determination (which nodes have outputs already in the store) happens in the
-  scheduler, not here.
-+ *Validation (`validate_dag`):* Malformed `.drv` files and missing `.drv`
+  scheduler, not here --- the one exception is the bounded tenant-scoped
+  realization probe that decides unverifiable-hash-algo offenders
+  (#rref("gw.reject.unsupported-hash-algo+4")).
++ *Validation:* Malformed `.drv` files and missing `.drv`
   files (referenced by `inputDrvs` but not in the store) are rejected via
   `BuildResult::failure` delivered through `STDERR_LAST` --- the session stays
   open, subsequent opcodes are accepted. (Previously `STDERR_ERROR` terminal;
   changed in remediation-07 to avoid the ERROR→LAST desync when called from
   `wopBuildPaths`/`wopBuildPathsWithResults`, which wrap the error.)
-  `validate_dag` also enforces two early rejections before the gRPC round-trip:
-  (a) `nodes.len() > MAX_DAG_NODES` (scheduler enforces this too, but
-  gateway-side early reject saves the submission), and (b) any derivation with
-  `__noChroot=1` in its env (sandbox escape --- this check is ONLY at the
-  gateway; the scheduler does not re-check). `validate_dag` is invoked from all
-  three build handlers (`wopBuildDerivation`, `wopBuildPaths`,
+  `validate_dag` enforces the cheap submission gates before the gRPC
+  round-trip:
+  - `nodes.len() > MAX_DAG_NODES` (scheduler enforces this too, but
+    gateway-side early reject saves the submission);
+  - any derivation with `__noChroot=1` in its env (sandbox escape --- this
+    check is ONLY at the gateway; the scheduler does not re-check;
+    #rref("gw.reject.nochroot+2"));
+  - any output declaring an `outputHash`/`outputHashAlgo` the builder cannot
+    verify or finalize, unless every declared output of that derivation is
+    already realized for the submitting tenant or substitutable from its
+    upstreams --- a single bounded tenant-scoped `FindMissingPaths` probe
+    decides, fail-closed (#rref("gw.reject.unsupported-hash-algo+4"));
+  - any floating-CA-shaped output (`outputHashAlgo` set, `outputHash` empty)
+    that nevertheless declares an output path — a shape CppNix refuses to
+    parse (#rref("gw.reject.floating-ca-declared-path"));
+  - declared-hash (fixed-output) outputs whose declared path does not derive
+    from the declared hash, including CppNix's single-`out` shape rule
+    (#rref("gw.reject.output-path-mismatch+2")).
+  The expensive input-addressed output-path binding over the full closure
+  runs later in the pipeline --- after the per-tenant rate-limit and quota
+  gates, on the blocking pool --- but still before `SubmitBuild`
+  (#rref("gw.reject.output-path-mismatch+2")). `validate_dag` is invoked from
+  all three build handlers (`wopBuildDerivation`, `wopBuildPaths`,
   `wopBuildPathsWithResults`).
 + *The reconstructed DAG is sent to the scheduler via `SubmitBuild`.* The
   gateway holds the SSH connection open and converts the `BuildEvent` response
@@ -1013,9 +1076,34 @@ one submission), so the scheduler's top-down prune
 (#rref("sched.merge.substitute-topdown")) retains and verifies a requested
 target even when another target's closure swallows it as a non-root.
 
-#r("gw.reject.nochroot")[
+#r("gw.dag.modulo-hash-all-nodes")[
+  After DAG reconstruction, the gateway MUST populate `ca_modular_hash`
+  (the `hashDerivationModulo` SHA-256) on every submitted node whose full
+  derivation is in the BFS cache --- content-addressed, deferred
+  input-addressed, and plain input-addressed nodes alike. Hash-computation
+  failure for a node degrades that node only (empty hash, warning logged);
+  it MUST NOT fail the submission.
+]
+Plain IA nodes previously carried no hash ("dead bytes on the wire"),
+which made every declared IA output path unverifiable at scheduler
+ingress: verifying `path == input_addressed_output_paths(bytes)` requires
+the modulo hashes of the node's inputs, and those inputs' own nodes are
+the only place the scheduler can get them without store access. With
+every node carrying its hash, the scheduler can seed the derivation-hash
+cache from sibling nodes and bind declared IA paths to inline bytes
+(#rref("sched.merge.ingress-inline-drv-binding")), and the follow-up
+store-evidence displacement can compare a store-fetched `.drv` against
+the persisted hash. The per-node degrade keeps the prior availability
+semantics: a node whose closure the gateway could not fully parse
+submits without evidence, and the scheduler's fail-closed rules decide
+what that node may then claim.
+
+#r("gw.reject.nochroot+2")[
   The gateway MUST reject any derivation (at SubmitBuild time) whose env
-  contains `__noChroot = "1"`. This is a sandbox-escape request that rio-build
+  contains `__noChroot = "1"` --- and, fail-closed, any derivation whose
+  `__noChroot` is present but not a JSON boolean or whose `__json` blob does
+  not parse: a sandbox-shape attribute the gateway cannot type is rejected,
+  never guessed at. This is a sandbox-escape request that rio-build
   does not honor. Rejection happens at two points with different frame
   semantics: (1) `validate_dag` rejects via `BuildResult::failure` →
   `STDERR_LAST` (opcodes 36/46 wrap the error; session stays open); (2)
@@ -1024,6 +1112,136 @@ target even when another target's closure swallows it as a non-root.
   the `__noChroot` env (DerivationNode doesn't carry it), so this check is
   gateway-only.
 ]
+
+The fail-closed clause is oracle parity, not extra strictness: CppNix's
+`getBoolAttr("__noChroot")` routes through `getBoolean`, which THROWS on a
+non-boolean — there is no coercion of `1` or `"true"`, and an unparseable
+structured-attrs blob fails the build before options are read. The pre-fix
+gateway read the attribute through a lenient accessor where a wrong-typed
+value (or a malformed blob) degraded to "absent" — i.e. exactly the
+derivations whose sandbox intent could not be read were the ones waved
+through.
+
+#r("gw.reject.unsupported-hash-algo+4")[
+  The gateway MUST reject at submission any derivation output declaring an
+  `outputHash` and/or `outputHashAlgo` that the builder cannot verify
+  (fixed-output) or finalize (floating-CA) --- the supported set is `sha1`,
+  `sha256`, `sha512`, each optionally `r:`-prefixed, mirroring
+  #rref("builder.fod.verify-hash+2") and the floating-CA finalization rules
+  --- unless every declared output path of that derivation is already
+  present and visible to the submitting tenant, or substitutable from that
+  tenant's configured upstreams, verified by a single bounded
+  `FindMissingPaths` probe at submission time that carries the session
+  tenant token (anonymous only in dual-mode sessions, matching the
+  scheduler's anonymous merge-time probe in that mode). The exemption is
+  fail-closed: a floating-CA output with an unsupported algorithm (no
+  declared path), an empty or unparseable declared path, an offender set
+  larger than the probe cap, an indeterminate probe answer, a probe error,
+  or a probe timeout all reject the submission. The rejection applies both
+  in `validate_dag` over cached full derivations (`BuildResult::failure` →
+  `STDERR_LAST`) and inline on `wopBuildDerivation`'s `BasicDerivation`
+  (`STDERR_ERROR`); the probe-backed exemption applies only where a
+  resolvable `.drv` binds the claim — on the inline single-node fallback
+  (full `.drv` unresolvable) the gateway MUST reject an unverifiable-algo
+  offender even when its declared outputs are already realized, with
+  remediation naming both options (copy the outputs directly, or upload
+  the `.drv` first so the cached-DAG exemption applies).
+]
+Both code paths are fail-closed on the worker side too, but only after the
+build has burned a pod; rejecting at submission lands the error on the
+submitting client immediately. The exemption exists because a derivation
+whose declared outputs are all present (and visible to the submitting
+tenant) or substitutable from its upstreams never dispatches --- the
+scheduler cache-cuts it or completes it through the substitute lane --- so
+rejecting the whole submission for a legacy (e.g. `md5`) fixed-output
+derivation that already exists for that tenant would block otherwise-valid
+DAGs that merely reference it. The exemption mirrors the scheduler's
+no-dispatch predicate (tenant-scoped cache-cut OR substitute lane),
+evaluated with the same tenant identity the submission itself will carry,
+and never lets a node that would actually build escape the gate. Residual
+divergences, accepted deliberately: a garbage-collection race between the
+probe and dispatch makes the node dispatch and fail at the worker's
+fail-closed FOD gate (a node-level failure instead of a submission
+rejection); a substitute fetch that fails after a positive upstream probe
+ends the same way; and dual-mode sessions probe anonymously, which matches
+the scheduler's anonymous merge-time probe in that mode. The exemption
+deliberately does not extend to the inline single-node fallback: with no
+resolvable `.drv` nothing binds the claimed `drv_path`, output names, or
+declared paths to real derivation text, so forwarding the claim would mint
+an unvalidated node under a client-chosen `drv_path` — the squat shape the
+scheduler's merge protections (`sched.merge.authoritative-conflict`) exist
+to prevent — and the rejection's remediation (upload the `.drv`, or copy
+the already-realized outputs directly) restores the exemption on the
+cached-DAG path.
+
+#r("gw.reject.floating-ca-declared-path+1")[
+  A floating content-addressed output (`outputHashAlgo` set, `outputHash`
+  empty) declaring a non-empty output path MUST be rejected, and the
+  enforcement point is the typed parse boundary
+  (#rref("nix.drv.output-typed")): the shape fails `Derivation` /
+  `BasicDerivation` construction with CppNix's own wording
+  ("content-addressing derivation output should not specify output path"),
+  so neither the session derivation cache nor the inline
+  `wopBuildDerivation` payload can ever contain it. The gateway MUST
+  surface the parse failure as a rejection — `STDERR_ERROR` then close for
+  the mid-payload inline case — rather than masking it.
+]
+No legitimate client can produce this shape, so the rule rejects only
+crafted submissions; proper floating-CA outputs (empty declared path) are
+unaffected. Accepting it would have exempted the declared path from both
+the input-addressed and the declared-hash output-path bindings.
+
+The binding gates dispatch on the typed output model: shape rules
+(malformed paths, floating-with-path, fixed-without-path, mixed sets) are
+enforced once at the parse boundary (#rref("nix.drv.output-typed"),
+#rref("nix.drv.type-classify+1")), and the gateway's validators retain only
+the SEMANTIC half — deriving paths from derivation or declared-hash
+contents and comparing. Re-introducing a divergent shape classification in
+the gateway would require re-adding data the types no longer carry.
+
+#r("gw.reject.output-path-mismatch+2")[
+  The gateway MUST NOT trust declared output paths. For input-addressed
+  outputs it MUST re-derive the paths from the derivation contents
+  (`hashDerivationModulo` + output-path derivation, CppNix parity) over the
+  submitted closure and reject any mismatch before `SubmitBuild`; a non-empty
+  declared output path that does not parse as a store path MUST be rejected
+  (empty paths — deferred shapes — are skipped); the check MUST be
+  fail-closed when derivation is impossible (incomplete `inputDrvs` closure,
+  mixed content-bound and static-path shapes), and submissions MUST NOT be
+  rejected on derivation-chain depth (only the documented size caps apply).
+  For declared-hash (fixed-output) outputs it MUST require the declared path
+  to equal the path derived from the declared hash (`makeFixedOutputPath`)
+  and enforce CppNix's fixed-output shape rule (exactly one output, named
+  `out`). On `wopBuildDerivation`'s single-node fallback (full `.drv`
+  unresolvable) the gateway MUST reject inline derivations with ANY
+  input-addressed output — declared, malformed, or deferred (empty) — and
+  MUST apply the same declared-hash binding to inline fixed-output
+  declarations.
+]
+Workers are untrusted (#rref("sec.trust.workers-untrusted")), so this is the
+authoritative half of output-path enforcement; the builder-side checks are
+defense in depth and the store additionally verifies content-addressed
+uploads at registration time. Malformed declared paths cannot alias a store
+object, but they CAN reach the worker glue and the result pipeline as
+tenant-controlled strings where store paths are expected — rejecting them at
+the trusted plane is what keeps every downstream `Path::join` over a declared
+path total. Content-bound outputs (fixed-output / floating-CA) have no static
+derivation-derived path; their binding is the declared-hash rule above and
+the store-side content verification, and a floating-CA output that
+nevertheless declares a path is rejected outright
+(#rref("gw.reject.floating-ca-declared-path")) rather than exempted.
+
+#r("gw.dag.drv-cache-text-ca")[
+  The gateway MUST NOT use cached derivation content whose text
+  content-address does not match the store path it was uploaded under: when
+  intercepting `.drv` uploads for the session derivation cache, content
+  whose recomputed text-CA store path differs from the claimed path MUST NOT
+  be cached under that path (the upload itself is rejected by the store's
+  text-CA verification).
+]
+This keeps the copy of a derivation that the gateway validates identical to
+the copy workers fetch from the store --- a tenant must not be able to make
+the two diverge.
 
 #r("gw.reject.build-mode")[
   The gateway MUST reject `wopBuildDerivation` / `wopBuildPaths` /
@@ -1746,26 +1964,39 @@ relies on the grace period rather than querying gateways for active temp roots.
 
 = Build Hook Protocol Path
 
-#r("gw.hook.single-node-dag")[
+#r("gw.hook.single-node-dag+2")[
   When a Nix client uses `--builders` (build hook mode) instead of `--store
-  ssh-ng://` (remote store mode), the interaction pattern changes
-  significantly:
+  ssh-ng://` (remote store mode), the local daemon drives DAG traversal and
+  delegates derivations one at a time. Because the gateway reports
+  not-trusted (#rref("gw.handshake.untrusted")), `build-remote` (Nix ≥ 2.16,
+  Lix) copies the `.drv` closure and drives `wopBuildPathsWithResults` for
+  input-addressed derivations; the inline `wopBuildDerivation` single-node
+  fallback remains available only for derivations whose statically-declared
+  outputs are all content-bound (fixed-output / floating-CA) --- an inline
+  input-addressed derivation whose full `.drv` cannot be resolved is
+  rejected with remediation guidance.
 ]
 
 *How it works:* The local `nix-daemon` drives DAG traversal and delegates
-individual derivations to rio-build one at a time via `wopBuildDerivation`.
-Each hook invocation is an independent SSH session that submits a single
-derivation without the full DAG context.
+individual derivations to rio-build one at a time. Each hook invocation is
+an independent SSH session.
 
-*What the gateway does:*
-- Receives `wopAddToStoreNar` for the derivation's inputs, then
-  `wopBuildDerivation` for the target derivation
-- *Attempts full-DAG reconstruction* (#rref("gw.dag.reconstruct")) by resolving
-  the `.drv` from the session cache or store and walking `inputDrvs`. If the
-  `.drv` cannot be resolved, falls back to a *single-node "DAG"* built from the
-  inline `BasicDerivation` (no edges, no DAG context). DAG-reconstruction
-  errors (transitive-input cap exceeded, child-`.drv` resolve failure mid-BFS)
-  are surfaced to the client --- degrading to single-node would dispatch an
+*What the gateway does (two sub-flows, selected by the client from the
+untrusted handshake):*
+- *Input-addressed derivations (Nix ≥ 2.16 / Lix):* `build-remote` copies
+  the realized inputs *and the `.drv` closure* (`wopAddToStoreNar` /
+  `wopAddMultipleToStore`), then drives `wopBuildPathsWithResults`. The
+  gateway runs the normal full-DAG reconstruction
+  (#rref("gw.dag.reconstruct+4")) and every submission gate, including the
+  output-path binding (#rref("gw.reject.output-path-mismatch+2")).
+- *Content-bound derivations (any client):* the inline `wopBuildDerivation`
+  single-node fallback still applies when the full `.drv` is unavailable ---
+  the output paths are governed by the content-hash rules, not by trust in
+  the declared paths. The serialized derivation is carried inline in the
+  submission (#rref("gw.hook.inline-drv-content")) because the `.drv`
+  exists in no store for the worker to fetch. DAG-reconstruction errors
+  (transitive-input cap exceeded, child-`.drv` resolve failure mid-BFS) are
+  surfaced to the client --- degrading to single-node would dispatch an
   input-addressed root with missing inputs.
 - Submits to the scheduler via `SubmitBuild` as usual
 - On a successful outcome with the resolved `.drv` available, verifies the
@@ -1773,6 +2004,53 @@ derivation without the full DAG context.
   (#rref("gw.opcode.build-results-honest")) before writing the `BuildResult`;
   a missing or unrealized output is reported as a failure result, not an
   empty-`outPath` success
+
+#r("gw.hook.inline-drv-content+4")[
+  When the gateway accepts a content-bound derivation through the inline
+  `wopBuildDerivation` single-node fallback (the full `.drv` cannot be
+  resolved from the session cache or the store), it MUST embed the
+  serialized derivation in the submitted node's `drv_content` so the worker
+  can execute it without the `.drv` existing in any store, and it MUST
+  reject submissions whose serialized derivation exceeds the fallback
+  inline cap (1 MiB, `MAX_FALLBACK_INLINE_DRV_BYTES`) with remediation
+  guidance (upload the `.drv` first via `nix copy --derivation`, or use
+  `--store ssh-ng://`). It MUST mark the node as carrying the authoritative
+  copy (`drv_content_authoritative`) so the scheduler persists those bytes
+  for recovery (#rref("sched.recovery.inline-drv-durability")). The inlined
+  bytes are never written to the store or
+  the session derivation cache: re-serialized content does not text-hash to
+  the client's claimed `.drv` path, so persisting it would poison later
+  full-DAG builds of the same derivation.
+]
+
+The fallback inline cap is the same constant the scheduler enforces per
+node at `SubmitBuild` ingress (`MAX_DRV_CONTENT_BYTES` in
+#src("rio-common/src/limits.rs")), so a fallback submission the gateway
+accepts is never size-rejected downstream.
+
+#r("gw.hook.fallback-built-outputs")[
+  When a content-bound (fixed-output or floating-CA) inline fallback build
+  succeeds, the gateway MUST return `builtOutputs` for the derivation's
+  outputs keyed by the modular hash of the inline derivation --- CppNix
+  `staticOutputHashes` over the received `BasicDerivation`, i.e.
+  `hashDerivationModulo` with empty `inputDrvs` --- with floating-CA
+  outputs carrying the realized path from the realisations table, and it
+  MUST carry that hash on the submitted node (`ca_modular_hash`) so the
+  scheduler registers the realisation at completion.
+]
+Build-remote registers exactly that realisation locally and the client's
+resolved-derivation goal looks it up under the same key (the derivation
+delegated to the hook for CA builds is already resolved, so the
+inputDrvs-less hash is the canonical one). Without this the hook client
+receives an empty `builtOutputs`, cannot locate the CA output path, and
+fails after an otherwise successful build; repeat submissions of the same
+resolved derivation now also benefit from merge-time realisation cache
+hits.
+
+Pre-2.16 hook clients that send inline input-addressed derivations without
+uploading the `.drv` receive the rejection described in
+#rref("gw.reject.output-path-mismatch+2"); the documented client floor for
+hook-mode input-addressed builds is Nix 2.16 or Lix.
 
 *Scheduling optimizations lost in build hook mode:*
 - *No critical-path analysis* --- the scheduler sees each derivation in
@@ -1782,13 +2060,27 @@ derivation without the full DAG context.
 - *No CA early cutoff* --- without the full DAG, the scheduler cannot propagate
   cutoffs to downstream nodes
 
-#r("gw.hook.ifd-detection+2")[
-  *IFD detection:* When a `wopBuildDerivation` call arrives without a preceding
-  `wopBuildPathsWithResults` on the same session, the gateway sets
-  `SubmitBuildRequest.priority_class = "interactive"` (otherwise `"ci"`). There
-  is no dedicated `is_ifd_hint` proto field --- the hint is encoded entirely in
-  the `priority_class` string and the gateway, not the scheduler, makes the
-  assignment.
+Interactive priority is *not* lost: the hook-shaped first
+`wopBuildPathsWithResults` of a session is classified `"interactive"` exactly
+like the inline `wopBuildDerivation` flow (#rref("gw.hook.ifd-detection+3")),
+so steering ≥ 2.16 clients onto the `.drv`-upload flow does not silently
+demote their hook builds to `"ci"`.
+
+#r("gw.hook.ifd-detection+3")[
+  *IFD / hook detection:* The gateway sets
+  `SubmitBuildRequest.priority_class = "interactive"` for exactly two request
+  shapes, and `"ci"` for everything else: (1) a `wopBuildDerivation` call that
+  arrives without a preceding `wopBuildPathsWithResults` on the same session
+  (an IFD or inline hook delegation); (2) the FIRST
+  `wopBuildPathsWithResults` of a session whose only target is a single
+  `DerivedPath::Built` with the all-outputs spec (`<drv>!*`) --- the shape
+  stock `build-remote` (Nix ≥ 2.16, Lix) emits when delegating one
+  derivation in build-hook mode against an untrusted remote. Named-output
+  targets, multi-target batches, `wopBuildPaths` (opcode 9), and any
+  subsequent `wopBuildPathsWithResults` on the session remain `"ci"`. There
+  is no dedicated `is_ifd_hint` proto field --- the hint is encoded entirely
+  in the `priority_class` string and the gateway, not the scheduler, makes
+  the assignment.
 ]
 
 #tip(title: [Recommendation])[

@@ -533,6 +533,7 @@ pub(crate) async fn merge_single_node(
         .send_unchecked(ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id,
+                ingress_stripped: Default::default(),
                 tenant_id: None,
                 priority_class,
                 nodes: vec![make_node(tag)],
@@ -564,6 +565,7 @@ pub(crate) async fn merge_dag(
         .send_unchecked(ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id,
+                ingress_stripped: Default::default(),
                 tenant_id: None,
                 priority_class: PriorityClass::Scheduled,
                 nodes,
@@ -1299,4 +1301,234 @@ async fn test_actor_is_alive_detection() {
         !handle.is_alive(),
         "is_alive should report false after actor task dies"
     );
+}
+
+/// Mint a leaf input-addressed derivation whose declared identity is
+/// derived from real ATerm bytes, and whose `drv_path`/`drv_hash` is the
+/// text content-address of those bytes — exactly what a genuine
+/// store-uploaded `.drv` looks like. Returns the BARE store-backed proto
+/// node (no inline content) plus the canonical ATerm for seeding the
+/// mock store.
+pub(crate) fn mint_text_ca_leaf(tag: &str) -> (rio_proto::types::DerivationNode, String, String) {
+    use rio_nix::derivation::{Derivation, input_addressed_output_paths};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+
+    let build_aterm = |out_path: &str| -> String {
+        format!(
+            r#"Derive([("out","{out_path}","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","{tag}"),("out","{out_path}")])"#
+        )
+    };
+    let masked = build_aterm("");
+    let masked_drv = Derivation::parse(&masked).expect("masked template parses");
+    let name_only_path = format!("/nix/store/{}-{tag}.drv", "a".repeat(32));
+    let resolve_none = |_: &str| -> Option<&Derivation> { None };
+    let paths = input_addressed_output_paths(
+        &masked_drv,
+        &name_only_path,
+        &resolve_none,
+        &mut HashMap::new(),
+    )
+    .expect("derive leaf IA paths");
+    let out_path = paths["out"].as_str().to_owned();
+    let aterm = build_aterm(&out_path);
+    let drv = Derivation::parse(&aterm).expect("final ATerm parses");
+    assert_eq!(drv.to_aterm(), aterm, "fixture must be canonical");
+
+    let content_hash =
+        NixHash::new(HashAlgo::SHA256, Sha256::digest(aterm.as_bytes()).to_vec()).unwrap();
+    let drv_path = StorePath::make_text(&format!("{tag}.drv"), &content_hash, &[])
+        .unwrap()
+        .as_str()
+        .to_owned();
+
+    let node = rio_proto::types::DerivationNode {
+        drv_path: drv_path.clone(),
+        drv_hash: drv_path,
+        pname: tag.to_owned(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_content_addressed: false,
+        expected_output_paths: vec![out_path.clone()],
+        ..Default::default()
+    };
+    (node, aterm, out_path)
+}
+
+/// [`mint_text_ca_leaf`] with `pad` bytes of `x` in an extra env
+/// entry, for the (1,16] MiB derivation-text population (round-17
+/// bug_030): real `.drv`s reach ~10 MiB at nixpkgs scale, and any
+/// over-1-MiB `.drv` necessarily arrives BARE store-backed (the
+/// inline path caps at `MAX_DRV_CONTENT_BYTES` = 1 MiB), so this is
+/// exactly the population whose claims verification depends on the
+/// store fetch using the shared class cap. Same canonicality
+/// invariants as the unpadded mint.
+pub(crate) fn mint_text_ca_leaf_padded(
+    tag: &str,
+    pad: usize,
+) -> (rio_proto::types::DerivationNode, String, String) {
+    use rio_nix::derivation::{Derivation, input_addressed_output_paths};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+
+    let padding = "x".repeat(pad);
+    let build_aterm = |out_path: &str| -> String {
+        format!(
+            r#"Derive([("out","{out_path}","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","{tag}"),("out","{out_path}"),("pad","{padding}")])"#
+        )
+    };
+    let masked = build_aterm("");
+    let masked_drv = Derivation::parse(&masked).expect("masked padded template parses");
+    let name_only_path = format!("/nix/store/{}-{tag}.drv", "a".repeat(32));
+    let resolve_none = |_: &str| -> Option<&Derivation> { None };
+    let paths = input_addressed_output_paths(
+        &masked_drv,
+        &name_only_path,
+        &resolve_none,
+        &mut HashMap::new(),
+    )
+    .expect("derive padded leaf IA paths");
+    let out_path = paths["out"].as_str().to_owned();
+    let aterm = build_aterm(&out_path);
+    let drv = Derivation::parse(&aterm).expect("final padded ATerm parses");
+    assert_eq!(drv.to_aterm(), aterm, "padded fixture must be canonical");
+
+    let content_hash =
+        NixHash::new(HashAlgo::SHA256, Sha256::digest(aterm.as_bytes()).to_vec()).unwrap();
+    let drv_path = StorePath::make_text(&format!("{tag}.drv"), &content_hash, &[])
+        .unwrap()
+        .as_str()
+        .to_owned();
+
+    let node = rio_proto::types::DerivationNode {
+        drv_path: drv_path.clone(),
+        drv_hash: drv_path,
+        pname: tag.to_owned(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_content_addressed: false,
+        expected_output_paths: vec![out_path.clone()],
+        ..Default::default()
+    };
+    (node, aterm, out_path)
+}
+
+/// Mint a canonical floating-CA LEAF derivation as a bare store-backed
+/// submission node (gateway warm shape: declared 32-byte modular hash,
+/// no inline content). Returns `(node, aterm, published_hash)` where
+/// `published_hash` is the MASKED-subject form `hashDerivationModulo`
+/// publishes for a floating drv — deliberately NOT an input-position
+/// digest (`sched.merge.input-form-seed`).
+pub(crate) fn mint_floating_ca_leaf(
+    tag: &str,
+) -> (rio_proto::types::DerivationNode, String, [u8; 32]) {
+    use rio_nix::derivation::{Derivation, hash_derivation_modulo};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+
+    let aterm = format!(
+        r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","{tag}"),("out","")])"#
+    );
+    let drv = Derivation::parse(&aterm).expect("floating leaf parses");
+    assert_eq!(drv.to_aterm(), aterm, "fixture must be canonical");
+
+    let content_hash =
+        NixHash::new(HashAlgo::SHA256, Sha256::digest(aterm.as_bytes()).to_vec()).unwrap();
+    let drv_path = StorePath::make_text(&format!("{tag}.drv"), &content_hash, &[])
+        .unwrap()
+        .as_str()
+        .to_owned();
+
+    let resolve_none = |_: &str| -> Option<&Derivation> { None };
+    let published = hash_derivation_modulo(&drv, &drv_path, &resolve_none, &mut HashMap::new())
+        .expect("floating leaf modulo hash");
+
+    let node = rio_proto::types::DerivationNode {
+        drv_path: drv_path.clone(),
+        drv_hash: drv_path,
+        pname: tag.to_owned(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_content_addressed: true,
+        expected_output_paths: vec![String::new()],
+        ca_modular_hash: published.to_vec(),
+        ..Default::default()
+    };
+    (node, aterm, published)
+}
+
+/// Mint a canonical DEFERRED-IA derivation over one CA input as a bare
+/// store-backed submission node (gateway warm shape: declared modular
+/// hash, `needs_resolve`, no inline content, `is_content_addressed =
+/// false` — deferred-IA nodes carry the hash with the IA flag). The
+/// declared hash is computed through the real input-form recursion
+/// (`hash_derivation_modulo`, mask=false for non-floating subjects), so
+/// it equals what an honest gateway publishes.
+pub(crate) fn mint_deferred_ia_node(
+    tag: &str,
+    input_drv_path: &str,
+    transitive_inputs: &[(&str, &str)],
+) -> (rio_proto::types::DerivationNode, String) {
+    use rio_nix::derivation::{Derivation, hash_derivation_modulo};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+
+    let aterm = format!(
+        r#"Derive([("out","","","")],[("{input_drv_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","{tag}"),("out","")])"#
+    );
+    let drv = Derivation::parse(&aterm).expect("deferred-IA fixture parses");
+    assert_eq!(drv.to_aterm(), aterm, "fixture must be canonical");
+
+    let content_hash =
+        NixHash::new(HashAlgo::SHA256, Sha256::digest(aterm.as_bytes()).to_vec()).unwrap();
+    let drv_path = StorePath::make_text(
+        &format!("{tag}.drv"),
+        &content_hash,
+        &[StorePath::parse(input_drv_path).unwrap()],
+    )
+    .unwrap()
+    .as_str()
+    .to_owned();
+
+    // The modulo walk recurses through the WHOLE transitive input set;
+    // the caller supplies every (path, aterm) pair the recursion visits.
+    let parsed: Vec<(String, Derivation)> = transitive_inputs
+        .iter()
+        .map(|(p, a)| {
+            (
+                (*p).to_owned(),
+                Derivation::parse(a).expect("input fixture parses"),
+            )
+        })
+        .collect();
+    let resolver =
+        |p: &str| -> Option<&Derivation> { parsed.iter().find(|(ip, _)| ip == p).map(|(_, d)| d) };
+    let declared = hash_derivation_modulo(&drv, &drv_path, &resolver, &mut HashMap::new())
+        .expect("deferred-IA modulo hash");
+
+    let node = rio_proto::types::DerivationNode {
+        drv_path: drv_path.clone(),
+        drv_hash: drv_path,
+        pname: tag.to_owned(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_content_addressed: false,
+        expected_output_paths: vec![String::new()],
+        ca_modular_hash: declared.to_vec(),
+        needs_resolve: true,
+        ..Default::default()
+    };
+    (node, aterm)
 }

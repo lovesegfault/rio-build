@@ -6,6 +6,18 @@
 //! the real implementation.
 //!
 //! Ported from rio-build/tests/golden_conformance.rs. Uses MockStore (gRPC)
+//!
+//! Typed-parse-boundary note: the rejected output shapes (malformed
+//! declared paths, floating-with-path, fixed-without-path, mixed sets,
+//! hash-without-algo) need no live-daemon coverage because real clients
+//! cannot emit them — CppNix's writer re-derives CAFixed paths and
+//! type()-checks every derivation before serializing
+//! (`derivations.cc`), so the bytes never leave an honest daemon. The
+//! oracle-wording unit matrices in rio-nix are the parity evidence;
+//! these conformance tests pin the ACCEPTED shapes' wire behavior, and
+//! every new parse failure follows the STDERR_ERROR-then-close desync
+//! rule (asserted in the wire_opcodes suite).
+
 //! instead of the monolith's local MemoryStore.
 // r[verify gw.wire.all-ints-u64]
 // r[verify gw.wire.string-encoding]

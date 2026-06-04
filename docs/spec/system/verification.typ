@@ -182,7 +182,7 @@ needs russh fixture.
   (#src("nix/tests/scenarios/security/standalone.nix")) cover HMAC
   assignment/service tokens, executor-kind spoofing, tenant resolution, JWT
   dual-mode fallback, per-tenant rate limiting, store-quota enforcement, and
-  the `__noChroot` gateway pre-check (#rref("gw.reject.nochroot")).
+  the `__noChroot` gateway pre-check (#rref("gw.reject.nochroot+2")).
 ]
 
 = Chaos Testing

@@ -241,9 +241,104 @@ impl SchedulerDb {
         Ok(())
     }
 
+    /// Persist a still-running build's sticky first-failure summary
+    /// without touching its status — `COALESCE` keeps an already-persisted
+    /// summary, so the first write wins (mirroring the in-memory
+    /// `get_or_insert_with`). Three writer tiers share this statement:
+    /// the at-source chokepoint (`record_failure_evidence`,
+    /// `sched.build.failure-evidence-at-source+1`) persists in the same
+    /// actor turn the failure is observed — the PRIMARY durability
+    /// mechanism; the displacement / resubmit-reset path calls this
+    /// inside the merge transaction
+    /// (`sched.merge.displaced-failure-evidence`) and the poison-clear
+    /// prune paths call it through the pool-level wrapper
+    /// (`sched.poison.clear-failure-evidence`) — both BACKSTOPS for the
+    /// case where the at-source write failed and no retry has succeeded
+    /// yet. Idempotence (COALESCE) is what lets all three coexist
+    /// without coordination. Plain runtime query — no `.sqlx/` impact.
+    // r[impl sched.merge.displaced-failure-evidence]
+    // r[impl sched.build.failure-evidence-at-source+1]
+    /// M_072 (round-16 bug_100): the evidence is a PAIR —
+    /// `(error_summary, failed_derivation)` — written in ONE statement
+    /// with first-write-wins on BOTH columns, mirroring the paired
+    /// in-memory `get_or_insert_with` at the chokepoint. A `None` hash
+    /// binds NULL and COALESCE makes it a no-op: a backstop writer
+    /// that only knows a reconstructed summary can never blank an
+    /// earlier at-source pair.
+    pub(crate) async fn persist_build_error_summary_tx(
+        conn: &mut sqlx::PgConnection,
+        build_id: Uuid,
+        error_summary: &str,
+        failed_derivation: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE builds SET error_summary = COALESCE(error_summary, $2), \
+             failed_derivation = COALESCE(failed_derivation, $3) \
+             WHERE build_id = $1",
+        )
+        .bind(build_id)
+        .bind(error_summary)
+        .bind(failed_derivation)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
+    /// Pool-level wrapper around [`Self::persist_build_error_summary_tx`]
+    /// for callers with no surrounding transaction: the at-source
+    /// chokepoint and its tick-retry sweep
+    /// (`sched.build.failure-evidence-at-source+1`), and the poison-clear
+    /// prune paths (`AdminService.ClearPoison` and the poison-TTL sweep,
+    /// `sched.poison.clear-failure-evidence`) where `clear_poison` is a
+    /// single pool UPDATE and evidence-first ordering plus the
+    /// idempotent COALESCE write is what makes the sticky failure
+    /// durable across a failover.
+    // r[impl sched.poison.clear-failure-evidence]
+    // r[impl sched.build.failure-evidence-at-source+1]
+    pub(crate) async fn persist_build_error_summary(
+        &self,
+        build_id: Uuid,
+        error_summary: &str,
+        failed_derivation: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        Self::persist_build_error_summary_tx(&mut conn, build_id, error_summary, failed_derivation)
+            .await
+    }
+
     /// Update a build's status.
     pub async fn update_build_status(
         &self,
+        build_id: Uuid,
+        status: BuildState,
+        error_summary: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        Self::update_build_status_tx(&mut conn, build_id, status, error_summary).await
+    }
+
+    /// Executor-scoped variant of [`Self::update_build_status`], used by the
+    /// merge path so the owning build's Pending→Active update commits in
+    /// the same transaction as the (re)created derivation rows, links, and
+    /// edges — `sched.persist.atomic-activation`: "the build was accepted"
+    /// and "its rows are durable" are one commit point. Plain runtime
+    /// queries (no `query!`) so `.sqlx/` is unaffected.
+    ///
+    /// The terminal arm's `error_summary` write is the FOURTH writer
+    /// tier of the M_072 failure-evidence pair (round-17 bug_043): it
+    /// COALESCEs exactly like [`Self::persist_build_error_summary_tx`],
+    /// so a terminal transition can never displace or blank the sticky
+    /// at-source pair — a Cancel after a derivation failure keeps the
+    /// failure evidence, and a timeout's reconstructed reason loses to
+    /// an earlier at-source summary on every ordering. It deliberately
+    /// writes only the summary half: a status transition carries no
+    /// derivation hash, and a NULL second half is the documented
+    /// backstop shape (never an empty-string tombstone). The
+    /// `paired-writer-seal` check denies any plain-bind write of either
+    /// pair column outside this file's two COALESCE statements.
+    // r[impl sched.persist.atomic-activation+2]
+    pub(crate) async fn update_build_status_tx(
+        conn: &mut sqlx::PgConnection,
         build_id: Uuid,
         status: BuildState,
         error_summary: Option<&str>,
@@ -258,22 +353,23 @@ impl SchedulerDb {
             sqlx::query("UPDATE builds SET status = $2 WHERE build_id = $1")
                 .bind(build_id)
                 .bind(status.as_str())
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await?;
         } else if now_col == "started_at" {
             sqlx::query("UPDATE builds SET status = $2, started_at = now() WHERE build_id = $1")
                 .bind(build_id)
                 .bind(status.as_str())
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await?;
         } else {
             sqlx::query(
-                "UPDATE builds SET status = $2, finished_at = now(), error_summary = $3 WHERE build_id = $1",
+                "UPDATE builds SET status = $2, finished_at = now(), \
+                 error_summary = COALESCE(error_summary, $3) WHERE build_id = $1",
             )
             .bind(build_id)
             .bind(status.as_str())
             .bind(error_summary)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
         }
 

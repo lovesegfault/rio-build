@@ -3,18 +3,18 @@
 //! Translates the per-session derivation cache into `SubmitBuildRequest`
 //! messages for the scheduler, walking `inputDrvs` recursively to build
 //! the full derivation graph.
-// r[impl gw.dag.reconstruct+3]
+// r[impl gw.dag.reconstruct+4]
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rio_common::tenant::NormalizedName;
-use rio_nix::derivation::{Derivation, DerivationLike};
+use rio_nix::derivation::{Derivation, DerivationLike, SizingHint};
 use rio_nix::protocol::derived_path::OutputSpec;
 use rio_nix::store_path::StorePath;
 use rio_proto::StoreServiceClient;
 use rio_proto::types;
 use tonic::transport::Channel;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Per-node inline threshold. Most .drv files are 1-10 KB; 64 KB is
 /// a generous cap. Anything larger is probably a generated derivation
@@ -161,11 +161,11 @@ pub async fn reconstruct_dag(
     // worker-fail-on-placeholder + retry).
     populate_ca_modular_hashes(&mut nodes, drv_cache);
 
-    // Populate needs_resolve for the ia.deferred case: an IA (or
-    // fixed-CA) derivation whose inputDrvs include a floating-CA
-    // child has that child's placeholder path embedded in its
-    // env/args — it needs resolve even though it's not floating-CA
-    // itself. AFTER BFS so every child is in drv_cache.
+    // Stamp needs_resolve from the shared oracle predicate
+    // (rio_nix::derivation::should_resolve) — covers floating-CA
+    // self, deferred-IA, and the ia.deferred/FOD-with-floating-input
+    // propagation in one place. AFTER BFS so every child is in
+    // drv_cache.
     populate_needs_resolve(&mut nodes, drv_cache);
 
     // Populate wanted_output_names: the union of every consumer's
@@ -236,31 +236,56 @@ pub(crate) fn compute_modular_hash_cached(
     }
 }
 
-/// Fill `ca_modular_hash` on each CA node via `hash_derivation_modulo`.
+/// Fill `ca_modular_hash` on EVERY node with a cached full derivation
+/// via `hash_derivation_modulo`.
 ///
-/// The scheduler's CA-on-CA resolve queries `realisations` keyed on
-/// `(modular_hash, output_name)`. The modular hash needs the full
-/// transitive closure of parsed derivations (what BFS put in
-/// `drv_cache`). Memoised via one shared `hash_cache` — for N CA
-/// nodes sharing a common CA input, the common sub-hash is computed
-/// once.
+/// Three consumers, three node populations:
+///   - CA nodes: the scheduler's CA-on-CA resolve queries `realisations`
+///     keyed on `(modular_hash, output_name)`;
+///   - deferred-IA nodes (empty output path): the scheduler writes a
+///     realisation on completion keyed by this hash so the gateway's
+///     `wopQueryDerivationOutputMap` can answer the client;
+///   - plain IA nodes with statically-known paths: the hash is the
+///     identity evidence the scheduler's ingress inline-content binding
+///     and Follow-up store-evidence displacement consume — it lets the
+///     scheduler verify a declared IA output path against inline bytes
+///     by seeding `input_addressed_output_paths`' hash cache with the
+///     children's hashes, no store access needed. (Previously these
+///     nodes carried no hash — "dead bytes on the wire" — which made
+///     every IA declared path unverifiable at ingress.)
+///
+/// The modular hash needs the full transitive closure of parsed
+/// derivations (what BFS put in `drv_cache`). Memoised via one shared
+/// `hash_cache` — for N nodes sharing a common input, the common
+/// sub-hash is computed once.
 ///
 /// Best-effort: hash failure → warn, leave empty. Scheduler's
 /// `collect_ca_inputs` skips empty; resolve degrades to worker-fail
-/// + retry-with-backoff.
+/// and retry-with-backoff; ingress treats a missing hash as no-evidence
+/// (fail-closed for authoritative claims, declaration-only for
+/// store-backed ones).
+///
+// TODO: round-17 bug_121 residual bound — a node this pass FAILS to
+// hash enters the scheduler hash-less, and if it settles (Skipped)
+// without ever acquiring byte evidence it becomes the bare squat the
+// claims-free resident join serves without re-arbitration (the
+// declared 8db56a2ce residual; the gate was rejected as a regression
+// of the substitution reprobe flow — see the rationale at the
+// claims-free arm in scheduler dag/mod.rs). Tightening lives HERE,
+// not there: make the hash-less-but-cached case a hard error for
+// gateway-submitted DAGs (the cache has the bytes; failure to hash
+// cached bytes is a gateway bug, not a tenant condition), so the
+// hash-less settled population shrinks to direct/hostile submitters,
+// who already cannot capture an honest gateway resubmission (the
+// gateway always re-populates hashes).
+// r[impl gw.dag.modulo-hash-all-nodes]
 fn populate_ca_modular_hashes(
     nodes: &mut [types::DerivationNode],
     drv_cache: &HashMap<StorePath, Derivation>,
 ) {
     let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
-    // IA nodes with statically-known paths: ca_modular_hash stays
-    // empty — dead bytes on the wire. Deferred-IA (empty output
-    // path) DOES need it: the scheduler writes a realisation on
-    // completion keyed by this hash so the gateway's
-    // wopQueryDerivationOutputMap can answer the client.
     let hashes: Vec<(usize, Vec<u8>)> =
         iter_cached_drvs(nodes, drv_cache, "populate_ca_modular_hashes")
-            .filter(|(_, node, drv)| node.is_content_addressed || drv.has_unknown_output_paths())
             .filter_map(|(idx, node, drv)| {
                 compute_modular_hash_cached(drv, &node.drv_path, drv_cache, &mut hash_cache)
                     .map(|h| (idx, h.to_vec()))
@@ -271,45 +296,36 @@ fn populate_ca_modular_hashes(
     }
 }
 
-/// Set `needs_resolve` for nodes with unresolved-path inputs (`ia.deferred`).
+/// Stamp `needs_resolve` from the shared oracle predicate
+/// [`rio_nix::derivation::should_resolve`] — the single owner of the
+/// clause set (oracle citation, the deliberate fixed-CA narrowing, and
+/// the ADR-018 Appendix B ia.deferred propagation rationale all live on
+/// the predicate; this pass only feeds it the BFS closure).
 ///
-/// ADR-018 Appendix B: Nix's `shouldResolve` returns true for IA
-/// derivations when they're "deferred" — i.e., they have an input whose
-/// output path is a placeholder at eval time. The parent's env/args
-/// reference that placeholder, so dispatch-time resolve must rewrite it
-/// to the realized path.
-///
-/// [`build_node`] already set `needs_resolve = has_ca_floating_outputs()`
-/// (self-floating always resolves). This pass ORs in the
-/// any-child-has-unknown-output-path case — that covers BOTH floating-CA
-/// children AND deferred-IA children. CppNix's `derivationStrict`
-/// propagates the deferred kind upward (every IA whose input has an
-/// unknown path becomes `DerivationOutput::Deferred{}` with empty path
-/// itself), so every node in a deferred chain has empty output paths and
-/// this propagates transitively in a single pass; no fixpoint needed.
-/// Concrete-IA and FOD children have non-empty paths so are unaffected.
-///
-/// AFTER BFS so every child drv is in `drv_cache`. Missing children
-/// (BFS inconsistency) → skip; the node keeps its self-computed value.
-/// Same degrade as `populate_ca_modular_hashes`.
+/// One post-BFS pass (every child drv is in `drv_cache` by then): each
+/// cached node's flag is COMPUTED — not OR-merged with [`build_node`]'s
+/// seed — so the gateway cannot drift from the predicate by re-deriving
+/// a clause locally (the round-15 merged_035 lesson). A node missing
+/// from the cache (BFS inconsistency) keeps the seed; a CHILD missing
+/// from the cache degrades to not-unknown inside the predicate — the
+/// same degrade as `populate_ca_modular_hashes`.
 fn populate_needs_resolve(
     nodes: &mut [types::DerivationNode],
     drv_cache: &HashMap<StorePath, Derivation>,
 ) {
-    let deferred: Vec<usize> = iter_cached_drvs(nodes, drv_cache, "populate_needs_resolve")
-        .filter(|(_, node, _)| !node.needs_resolve)
-        .filter(|(_, _, drv)| {
-            drv.input_drvs().keys().any(|child_path| {
+    let computed: Vec<(usize, bool)> = iter_cached_drvs(nodes, drv_cache, "populate_needs_resolve")
+        .map(|(idx, _, drv)| {
+            let flag = rio_nix::derivation::should_resolve(drv, |child_path| {
                 StorePath::parse(child_path)
                     .ok()
                     .and_then(|sp| drv_cache.get(&sp))
-                    .is_some_and(|child| child.has_unknown_output_paths())
-            })
+                    .map(|child| child.has_unknown_output_paths())
+            });
+            (idx, flag)
         })
-        .map(|(idx, _, _)| idx)
         .collect();
-    for idx in deferred {
-        nodes[idx].needs_resolve = true;
+    for (idx, flag) in computed {
+        nodes[idx].needs_resolve = flag;
     }
 }
 
@@ -349,7 +365,7 @@ fn populate_needs_resolve(
 /// Only the scheduler's cache-hit / substitutability classification
 /// reads this; `output_names` / `expected_output_paths` keep the full
 /// declared set (assignment-token allowlist, GC pins, client report).
-// r[impl gw.dag.reconstruct+3]
+// r[impl gw.dag.reconstruct+4]
 fn populate_wanted_outputs(
     nodes: &mut [types::DerivationNode],
     drv_cache: &HashMap<StorePath, Derivation>,
@@ -407,13 +423,40 @@ fn populate_wanted_outputs(
     }
 }
 
-/// Validate a DAG before SubmitBuild. Returns `Err(reason)` if the
-/// DAG should be rejected — caller sends STDERR_ERROR with the
-/// reason. Returns `Ok(())` if valid.
+/// Validate a DAG before SubmitBuild — the CHEAP checks only. Returns
+/// `Err(reason)` if the DAG should be rejected — caller sends
+/// STDERR_ERROR with the reason. Returns `Ok(offenders)` if valid,
+/// where `offenders` lists derivations that declare an
+/// `outputHash`/`outputHashAlgo` the builder cannot verify or finalize:
+/// those are NOT rejected here — the caller must pass them to
+/// [`reject_unrealized_fod_offenders`], which exempts them only when
+/// every declared output is already present and visible to the
+/// submitting tenant, or substitutable from that tenant's configured
+/// upstreams (one bounded tenant-scoped probe; rejects otherwise,
+/// fail-closed).
 ///
 /// Checks:
 /// - `__noChroot=1` in any node's env → reject (sandbox escape)
 /// - `nodes.len() > MAX_DAG_NODES` → reject (early, before gRPC)
+/// - floating-CA-shaped outputs declaring an output path → reject
+///   (CppNix cannot produce that shape; applies to unverifiable-algo
+///   offenders too)
+/// - declared-hash (fixed-output) outputs with a verifiable algo:
+///   declared path must derive from the declared hash
+/// - outputs with an unverifiable algo → classified as offenders and
+///   returned (the FOD hash gate and floating-CA finalization are
+///   fail-closed worker-side; a build of such a node could only ever
+///   fail after burning a pod — but a node whose outputs already exist
+///   never dispatches, so the realization probe decides)
+///
+/// The expensive declared-output-path binding (one
+/// `hashDerivationModulo`-shaped pass over every cached derivation)
+/// deliberately does NOT live here: it runs later in the pipeline via
+/// [`validate_output_path_bindings`], on the blocking pool, behind the
+/// rate-limit and quota gates — see the pipeline order in
+/// `handler/build.rs`. Keeping this function cheap means a
+/// rate-limited or over-quota client cannot make the gateway burn CPU
+/// hashing its closure first.
 ///
 /// The scheduler ALSO enforces MAX_DAG_NODES (grpc/mod.rs:298);
 /// this is an early reject to save the gRPC round-trip for obvious
@@ -422,7 +465,7 @@ fn populate_wanted_outputs(
 pub fn validate_dag(
     nodes: &[types::DerivationNode],
     drv_cache: &HashMap<StorePath, Derivation>,
-) -> Result<(), String> {
+) -> Result<Vec<UnverifiableFodOffender>, String> {
     // MAX_DAG_NODES: early reject. Scheduler enforces too but
     // this saves a 100MB+ gRPC message for obvious over-size.
     if nodes.len() > rio_common::limits::MAX_DAG_NODES {
@@ -433,7 +476,7 @@ pub fn validate_dag(
         ));
     }
 
-    // r[impl gw.reject.nochroot]
+    // r[impl gw.reject.nochroot+2]
     // __noChroot check: iterate nodes, look up each drv in the
     // cache (it was populated during BFS), check env. Nodes
     // without a cached drv (BasicDerivation fallback) are
@@ -450,28 +493,462 @@ pub fn validate_dag(
     // user Nix for bootstrap derivations; NEVER allowed in a
     // multi-tenant build farm. A malicious .drv could use this
     // to exfiltrate secrets from the worker.
-    if let Some((_, node, _)) = iter_cached_drvs(nodes, drv_cache, "validate_dag")
-        .find(|(_, _, drv)| StructuredEnv::new(drv.env()).bool("__noChroot") == Some(true))
-    {
+    for (_, node, drv) in iter_cached_drvs(nodes, drv_cache, "validate_dag") {
+        match StructuredEnv::new(drv.env()).bool_attr("__noChroot") {
+            Ok(Some(true)) => {
+                return Err(format!(
+                    "derivation {} requests __noChroot (sandbox escape) — not permitted",
+                    node.drv_path
+                ));
+            }
+            Ok(_) => {}
+            // Fail-closed: a sandbox-shape attribute the gateway cannot
+            // type (wrong-typed __noChroot, unparseable __json) is
+            // rejected — never guessed at. Oracle parity: getBoolAttr →
+            // getBoolean THROWS on non-bools; "absent" is the only safe
+            // default, and an unreadable blob is not "absent".
+            Err(e) => {
+                return Err(format!(
+                    "derivation {}: __noChroot is unreadable ({e}) — \
+                     wrong-typed sandbox attributes are not permitted",
+                    node.drv_path
+                ));
+            }
+        }
+    }
+
+    // r[impl gw.reject.unsupported-hash-algo+4]
+    // Outputs whose declared hash algorithm the builder cannot verify
+    // are CLASSIFIED here and decided by the realization probe
+    // (`reject_unrealized_fod_offenders`). For fixed-output derivations
+    // the builder's `verify_fod_hashes` is fail-closed (it is the sole
+    // worker-side content check between an egress-open fetcher and the
+    // signed cache); for floating-CA outputs (hash_algo set, hash
+    // empty) `FloatingCaSpec::from_outputs` is equally fail-closed
+    // (`CaUnsupportedAlgo`) — but only after the build has run to
+    // completion on a builder pod. A node that would BUILD with such an
+    // algo can therefore only ever fail and is rejected; a node whose
+    // declared outputs are already realized in the store never
+    // dispatches (the scheduler cache-cuts it), so rejecting the whole
+    // submission for it would block otherwise-valid DAGs that merely
+    // reference a legacy (e.g. md5) FOD that already exists. Offender
+    // nodes skip the declared-hash binding below (the algo cannot be
+    // parsed), but the floating-CA shape rule still applies to them.
+    // Input-addressed outputs (no hash, no algo) are untouched.
+    //
+    // r[impl gw.reject.output-path-mismatch+2]
+    // Declared-hash (fixed-output) outputs: bind the declared path to
+    // the declared hash and enforce CppNix's single-'out' shape rule.
+    // Without this a junk outputHash would exempt an arbitrary declared
+    // path from every submission-time trusted-plane binding (the
+    // builder-side check is defense in depth; the store independently
+    // re-verifies FOD uploads and rejects descriptor-less ones under a
+    // scheduler-signed fixed-output assignment — but only at upload
+    // time, after a pod has already run).
+    // (The floating-CA-with-declared-path shape — formerly checked here
+    // for offenders too — is unrepresentable past the typed parse
+    // boundary, so a path-declaring floating output cannot exist in the
+    // drv cache to slip through via an unparseable algo.)
+    let mut offenders = Vec::new();
+    for (_, node, drv) in iter_cached_drvs(nodes, drv_cache, "validate_dag") {
+        use rio_nix::derivation::OutputKind;
+        let unverifiable = |o: &rio_nix::derivation::DerivationOutput| {
+            matches!(
+                o.kind(),
+                OutputKind::Fixed { hash_algo, .. } | OutputKind::Floating { hash_algo }
+                    if !fod_algo_verifiable(hash_algo)
+            )
+        };
+        if let Some(out) = drv.outputs().iter().find(|o| unverifiable(o)) {
+            offenders.push(UnverifiableFodOffender {
+                drv_path: node.drv_path.clone(),
+                output_name: out.name().to_string(),
+                algo: out.hash_algo().to_string(),
+                declared_paths: drv.outputs().iter().map(|o| o.path().to_string()).collect(),
+            });
+            continue;
+        }
+        validate_declared_hash_outputs(&node.drv_path, drv.outputs())?;
+    }
+
+    Ok(offenders)
+}
+
+/// A derivation that declares an `outputHash`/`outputHashAlgo` the
+/// builder cannot verify or finalize, classified by [`validate_dag`]
+/// (or built directly from an inline `BasicDerivation`). The
+/// submission-time decision for these nodes is made by
+/// [`reject_unrealized_fod_offenders`]: exempt iff every declared
+/// output path is already realized for the submitting tenant or
+/// substitutable from its upstreams.
+#[derive(Debug, Clone)]
+pub struct UnverifiableFodOffender {
+    pub drv_path: String,
+    pub output_name: String,
+    pub algo: String,
+    /// Every declared output path of the derivation (not just the
+    /// offending output's): exemption requires the WHOLE node to be a
+    /// guaranteed cache-hit, mirroring the scheduler's skip-dispatch
+    /// predicate (all expected outputs present).
+    pub declared_paths: Vec<String>,
+}
+
+/// Cap on the total number of store paths the unverifiable-algo
+/// realization probe will check in one submission. A DAG referencing
+/// more legacy-algo derivations than this is rejected fail-closed —
+/// the probe must stay one bounded RPC, not a vector for amplifying
+/// store load.
+pub(crate) const MAX_FOD_EXEMPTION_PROBE_PATHS: usize = 1024;
+
+/// Decide the unverifiable-algo offenders collected by
+/// [`validate_dag`]: exempt a node iff every one of its declared
+/// output paths either is already present and visible to the
+/// submitting tenant (the scheduler cache-cuts it) or is
+/// substitutable from the tenant's configured upstreams (the
+/// scheduler's substitute lane completes it without dispatching);
+/// reject otherwise. This mirrors exactly the scheduler's no-dispatch
+/// predicate, evaluated with the same tenant identity.
+///
+/// Fail-closed by construction: any offender with an empty or
+/// unparseable declared path (floating-CA with an unsupported algo has
+/// no path at all), an offender set larger than
+/// [`MAX_FOD_EXEMPTION_PROBE_PATHS`], an indeterminate probe answer
+/// (upstream 429/5xx/deadline), a store error, or a probe timeout all
+/// reject the submission — the gate never exempts a node it cannot
+/// prove will skip dispatch. The probe is a single bounded
+/// `FindMissingPaths` carrying the session tenant token (anonymous
+/// only in dual-mode, matching the scheduler's anonymous merge probe
+/// in that mode), so the answer is the same one the scheduler will
+/// act on at merge time.
+///
+/// The exemption can go stale between this probe and dispatch (GC
+/// races, or a substitute fetch that fails after a positive upstream
+/// probe): the node then dispatches and fails at the worker's
+/// fail-closed FOD gate — a node-level failure instead of a
+/// submission rejection, never an unverified build.
+// r[impl gw.reject.unsupported-hash-algo+4]
+pub(crate) async fn reject_unrealized_fod_offenders(
+    offenders: &[UnverifiableFodOffender],
+    store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
+) -> Result<(), String> {
+    if offenders.is_empty() {
+        return Ok(());
+    }
+
+    let remediation = "re-pin the derivation to a supported outputHashAlgo (supported: sha1, \
+                       sha256, sha512, optionally 'r:'-prefixed) or copy its output into the \
+                       store first";
+
+    let mut probe_paths: Vec<String> = Vec::new();
+    for offender in offenders {
+        if offender.declared_paths.is_empty()
+            || offender
+                .declared_paths
+                .iter()
+                .any(|p| p.is_empty() || StorePath::parse(p).is_err())
+        {
+            return Err(format!(
+                "derivation {} output '{}' declares unsupported outputHashAlgo '{}' and its \
+                 declared output paths cannot be checked for prior realization — {remediation}",
+                offender.drv_path, offender.output_name, offender.algo
+            ));
+        }
+        probe_paths.extend(offender.declared_paths.iter().cloned());
+    }
+
+    if probe_paths.len() > MAX_FOD_EXEMPTION_PROBE_PATHS {
         return Err(format!(
-            "derivation {} requests __noChroot (sandbox escape) — not permitted",
-            node.drv_path
+            "{} derivations declare unsupported outputHashAlgo values ({} output paths > {} \
+             probe cap) — {remediation}",
+            offenders.len(),
+            probe_paths.len(),
+            MAX_FOD_EXEMPTION_PROBE_PATHS
         ));
+    }
+
+    // The probe carries the session tenant token (gw.jwt.propagate):
+    // the exemption must be decided with the same tenant-scoped answer
+    // the scheduler's merge-time cache-cut and substitute lane will
+    // act on. In dual-mode (no JWT) nothing is attached and the store
+    // answers anonymously — matching the scheduler's anonymous merge
+    // probe in that mode.
+    let probe_req = crate::handler::with_jwt(
+        types::FindMissingPathsRequest {
+            store_paths: probe_paths,
+        },
+        jwt_token,
+    )
+    .map_err(|e| {
+        format!(
+            "cannot verify prior realization of derivations declaring unsupported \
+             outputHashAlgo values (probe construction failed: {e}) — {remediation}"
+        )
+    })?;
+    let (missing, substitutable): (HashSet<String>, HashSet<String>) = match tokio::time::timeout(
+        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+        store_client.find_missing_paths(probe_req),
+    )
+    .await
+    {
+        Ok(Ok(r)) => {
+            let r = r.into_inner();
+            (
+                r.missing_paths.into_iter().collect(),
+                // indeterminate_paths are deliberately NOT collected as
+                // exemptable: neither confirmed-present nor confirmed-
+                // substitutable answers fail closed.
+                r.substitutable_paths.into_iter().collect(),
+            )
+        }
+        Ok(Err(e)) => {
+            return Err(format!(
+                "cannot verify prior realization of derivations declaring unsupported \
+                 outputHashAlgo values (store error: {e}) — {remediation}"
+            ));
+        }
+        Err(_) => {
+            return Err(format!(
+                "cannot verify prior realization of derivations declaring unsupported \
+                 outputHashAlgo values (store probe timed out) — {remediation}"
+            ));
+        }
+    };
+
+    for offender in offenders {
+        // Exempt iff every declared output is present-and-visible to
+        // the submitting tenant OR substitutable from its upstreams —
+        // i.e. the node will cache-cut or substitute, never dispatch.
+        // Plain-missing and indeterminate paths reject (fail-closed).
+        if let Some(missing_path) = offender
+            .declared_paths
+            .iter()
+            .find(|p| missing.contains(*p) && !substitutable.contains(*p))
+        {
+            return Err(format!(
+                "derivation {} output '{}' declares unsupported outputHashAlgo '{}' and its \
+                 declared output {} is not already realized in the store for this tenant (nor \
+                 substitutable from its configured upstreams) — the build could only fail \
+                 after burning a pod; {remediation}",
+                offender.drv_path, offender.output_name, offender.algo, missing_path
+            ));
+        }
+        info!(
+            drv_path = %offender.drv_path,
+            algo = %offender.algo,
+            "exempting unverifiable-outputHashAlgo derivation: all declared outputs already \
+             realized or substitutable (node will cache-cut or substitute, never dispatch)"
+        );
     }
 
     Ok(())
 }
 
-/// `__structuredAttrs`-aware env lookup, mirroring Nix's
-/// `ParsedDerivation::get{String,Bool,Strings}Attr`.
+/// Trusted-plane binding of declared output paths to the paths the
+/// derivation itself derives to. Returns `Err(reason)` when any cached
+/// derivation declares an input-addressed output path that does not
+/// match the derived one — the caller rejects the submission before
+/// `SubmitBuild` exactly like a [`validate_dag`] rejection.
 ///
-/// When a derivation sets `__structuredAttrs = true`, Nix's
-/// `derivationStrict` serializes user attrs into `env["__json"]` ONLY —
-/// they do NOT appear as separate env keys. Direct `env.get("foo")`
-/// returns None, so the ADR-023 sizing hints (and pre-existing
-/// `requiredSystemFeatures` / `__noChroot`) were always None for
-/// structuredAttrs drvs. JSON is checked first, then raw env, matching
-/// upstream semantics.
+/// Workers are untrusted, so this is the trusted-plane enforcement
+/// (the builder-side fixed-output binding is defense in depth):
+/// without it, any tenant could declare another derivation's
+/// not-yet-built input-addressed output path on a crafted .drv and
+/// have arbitrary content built, signed and served at that path.
+/// Mirrors CppNix, which recomputes IA output paths from the
+/// derivation (hashDerivationModulo + makeOutputPath) and never
+/// trusts the declared ones.
+///
+/// Scope: every input-addressed output with a NON-EMPTY declared path
+/// is validated — paths that match the derivation are accepted, paths
+/// that do not parse as store paths are rejected outright. (A malformed
+/// declared path cannot alias a store object, but it CAN reach the
+/// worker glue and the result pipeline as a tenant-controlled string
+/// where a store path is expected; workers are untrusted
+/// (`sec.trust.workers-untrusted`), so the trusted plane must not
+/// forward it.) Empty declared paths (deferred IA) have nothing to
+/// validate. Fixed-output outputs are bound to their declared hash by
+/// the declared-hash gate in [`validate_dag`], and floating-CA outputs
+/// have no static path to check. Nodes without a cached full derivation
+/// (BasicDerivation fallback) are skipped like the cheap checks;
+/// closure-incomplete derivations are rejected fail-closed — an
+/// attacker must not be able to dodge the check by withholding an
+/// input drv.
+///
+/// Cost: roughly two full ATerm serializations + SHA-256 per cached
+/// derivation (CppNix pays the same at instantiation). The pipeline
+/// therefore runs this AFTER the rate-limit and quota gates and on the
+/// blocking pool (`spawn_blocking`) — see
+/// `handler::build::enforce_output_path_bindings` — so a single
+/// adversarial closure cannot stall the session reactor or bypass the
+/// per-tenant limiter.
+// r[impl gw.reject.output-path-mismatch+2]
+pub(crate) fn validate_output_path_bindings(
+    nodes: &[types::DerivationNode],
+    drv_cache: &HashMap<StorePath, Derivation>,
+) -> Result<(), String> {
+    let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
+    let resolve = |p: &str| StorePath::parse(p).ok().and_then(|sp| drv_cache.get(&sp));
+    for (_, node, drv) in iter_cached_drvs(nodes, drv_cache, "validate_output_path_bindings") {
+        // Drv-level dispatch on the typed classifier: content-bound
+        // derivations (fixed / floating) are governed by the content-
+        // hash rules, deferred IA has nothing to bind yet, and only
+        // CONCRETE input-addressed sets are derivation-hash-bound.
+        // Mixed shapes are unrepresentable past the parse boundary
+        // ("can't mix derivation output types"), so there is no
+        // fall-through to half-validate; classify failure on a value
+        // predating the gate is impossible, but stays fail-closed.
+        use rio_nix::derivation::{DerivationType, OutputKind};
+        match drv.derivation_type() {
+            Ok(DerivationType::Fixed | DerivationType::Floating) => continue,
+            Ok(DerivationType::InputAddressed { deferred: true }) => continue,
+            Ok(DerivationType::InputAddressed { deferred: false }) => {}
+            Err(e) => {
+                return Err(format!(
+                    "cannot classify outputs of {} (rejecting rather than trusting the \
+                     declared paths): {e}",
+                    node.drv_path
+                ));
+            }
+        }
+        let derived = rio_nix::derivation::input_addressed_output_paths(
+            drv,
+            &node.drv_path,
+            &resolve,
+            &mut hash_cache,
+        )
+        .map_err(|e| {
+            format!(
+                "cannot derive output paths for {} (rejecting rather than trusting the \
+                 declared ones): {e}",
+                node.drv_path
+            )
+        })?;
+        for output in drv.outputs() {
+            // Concrete-IA sets: every output carries a typed declared
+            // path (malformed ones are unrepresentable).
+            let OutputKind::InputAddressed(declared) = output.kind() else {
+                unreachable!("uniform concrete-IA set classified above");
+            };
+            match derived.get(output.name()) {
+                Some(expected) if expected.as_str() == declared.as_str() => {}
+                Some(expected) => {
+                    return Err(format!(
+                        "derivation {} declares output '{}' at {} but the derivation \
+                         derives to {} — declared output paths must match the derivation",
+                        node.drv_path,
+                        output.name(),
+                        declared.as_str(),
+                        expected.as_str(),
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "derivation {} output '{}' has no derivable output path",
+                        node.drv_path,
+                        output.name(),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Trusted-plane binding of declared-hash (fixed-output) output paths to
+/// their declared hash. Mirrors rio-builder's
+/// `validate_fixed_output_declarations` (the worker-side check is
+/// defense in depth — workers are untrusted) and CppNix: a CAFixed
+/// output's path is never trusted; every consumer recomputes
+/// `makeFixedOutputPath`.
+///
+/// SHAPE rules live at the typed parse boundary now: a fixed output
+/// without a path, a floating output with one, a malformed declared
+/// path, a multi-fixed / mixed / misnamed output set — all
+/// unrepresentable past `Derivation::parse` / `BasicDerivation::new`
+/// (`nix.drv.output-typed`, `nix.drv.type-classify`). What remains
+/// here is pure SEMANTIC binding: decode the declared hash
+/// (base16/nixbase32/base64) and require the declared path to equal
+/// `StorePath::make_fixed_output` over it — otherwise a junk
+/// outputHash would exempt an arbitrary (well-formed) declared path
+/// from validation.
+///
+/// Keep the accepted algo set in sync with [`fod_algo_verifiable`]
+/// (the algo gate runs first, so unsupported algos already carry their
+/// own error message).
+pub(crate) fn validate_declared_hash_outputs(
+    drv_path: &str,
+    outputs: &[rio_nix::derivation::DerivationOutput],
+) -> Result<(), String> {
+    use rio_nix::derivation::OutputKind;
+    use rio_nix::hash::{HashAlgo, NixHash};
+
+    let Some((name, declared_path, raw_algo, raw_hash)) =
+        outputs.iter().find_map(|o| match o.kind() {
+            OutputKind::Fixed {
+                path,
+                hash_algo,
+                hash,
+            } => Some((o.name(), path.as_str(), hash_algo, hash)),
+            _ => None,
+        })
+    else {
+        return Ok(());
+    };
+
+    let drv_sp = StorePath::parse(drv_path)
+        .map_err(|e| format!("derivation path {drv_path} is not a valid store path: {e}"))?;
+    let drv_name = drv_sp
+        .name()
+        .strip_suffix(".drv")
+        .unwrap_or_else(|| drv_sp.name());
+
+    // Shared FodAlgo constructor — case-exact algo, one case-sensitive
+    // `r:` strip. Before this, the declared-hash gate folded case (lax
+    // FromStr) while `fod_algo_verifiable` below was exact — the
+    // merged_bug_048 disagreement shape INSIDE one component.
+    // r[impl nix.hash.algos+2]
+    let parsed = rio_nix::hash::OutputHashAlgo::parse(raw_algo).map_err(|_| {
+        format!(
+            "derivation {drv_path} output '{name}' declares unsupported outputHashAlgo '{raw_algo}'"
+        )
+    })?;
+    let (recursive, algo): (bool, HashAlgo) = (parsed.recursive, parsed.algo);
+    // Length-discriminated decode (base16 / nixbase32 / base64) — CppNix
+    // accepts all three encodings for outputHash, so the gate must too.
+    // r[impl nix.hash.fod-decode+1]
+    let hash = NixHash::parse_nonsri_unprefixed(algo, raw_hash).map_err(|e| {
+        format!(
+            "derivation {drv_path} output '{name}': outputHash is not a valid base16, \
+             nixbase32, or base64 {algo} hash: {e}"
+        )
+    })?;
+    let expected = StorePath::make_fixed_output(drv_name, &hash, recursive, &[]).map_err(|e| {
+        format!("derivation {drv_path} output '{name}': cannot derive fixed-output path: {e}")
+    })?;
+    if expected.as_str() != declared_path {
+        return Err(format!(
+            "derivation {drv_path} declares fixed output '{name}' at {declared_path} but the \
+             declared hash derives to {} — declared output paths must match the derivation",
+            expected.as_str()
+        ));
+    }
+    Ok(())
+}
+
+/// True iff `algo` (`"sha256"`, `"r:sha512"`, …) is an outputHashAlgo
+/// the builder can verify/finalize. Delegates to the system-wide
+/// FodAlgo constructor — the SAME parse rio-builder's verify pipeline
+/// and floating-CA finalizer run — so this screen cannot drift from
+/// what the worker enforces (it used to be a hand-mirrored set with a
+/// "must stay in sync" comment; merged_bug_048 was the sibling
+/// declared-hash gate disagreeing with it on case).
+// r[impl nix.hash.algos+2]
+pub(crate) fn fod_algo_verifiable(algo: &str) -> bool {
+    rio_nix::hash::OutputHashAlgo::parse(algo).is_ok()
+}
+
 /// Clamp for tenant-controlled string attrs (`pname`/`version`/`name`)
 /// that become cache keys / PG columns. 256 chars: longest real nixpkgs
 /// pname is ~90; this leaves headroom for monorepos with path-style
@@ -486,31 +963,40 @@ const MAX_ATTR_LEN: usize = 256;
 /// and 64 is well past any legitimate `requiredSystemFeatures` set.
 const MAX_LIST_LEN: usize = 64;
 
-pub(crate) struct StructuredEnv<'a> {
-    env: &'a std::collections::BTreeMap<String, String>,
-    json: Option<serde_json::Value>,
-}
+/// The shared `__structuredAttrs`-aware lookup lives in
+/// [`rio_nix::derivation::StructuredEnv`] (it is also used by
+/// rio-builder's native-executor glue — one parser, no JSON-vs-env
+/// precedence drift). The gateway-specific ADR-023 clamping policy
+/// stays HERE, as an extension trait over the shared type: the clamps
+/// exist because these attrs feed gateway-owned cache keys / PG columns
+/// / wire messages, which is this crate's threat model, not rio-nix's.
+pub(crate) use rio_nix::derivation::StructuredEnv;
 
-impl<'a> StructuredEnv<'a> {
-    pub(crate) fn new(env: &'a std::collections::BTreeMap<String, String>) -> Self {
-        let json = env.get("__json").and_then(|s| serde_json::from_str(s).ok());
-        Self { env, json }
-    }
-
-    fn string(&self, key: &str) -> Option<String> {
-        self.json
-            .as_ref()
-            .and_then(|j| j.get(key)?.as_str().map(String::from))
-            .or_else(|| self.env.get(key).cloned())
-    }
-
-    /// [`Self::string`] with a `MAX_ATTR_LEN`-char clamp. ADR-023
+/// Gateway-side clamped accessors over [`StructuredEnv`].
+pub(crate) trait ClampedAttrs {
+    /// String attr with a `MAX_ATTR_LEN`-char clamp. ADR-023
     /// §Threat-model: `pname`/`version` are tenant-controlled and feed
     /// the per-tenant `SlaEstimator` cache key + `build_samples.pname`
     /// PG column; a 1 MiB pname is otherwise carried verbatim through
     /// proto → DerivationNode → ModelKey → cache key → PG.
-    fn string_clamped(&self, key: &str) -> Option<String> {
-        self.string(key).map(|mut s| {
+    fn string_clamped(&self, hint: SizingHint) -> Option<String>;
+
+    /// String-list attr with a `MAX_LIST_LEN`-element / `MAX_ATTR_LEN`-
+    /// char clamp. ADR-023 §Threat-model: `requiredSystemFeatures` is
+    /// tenant-controlled and feeds the `derivations.required_features`
+    /// PG `text[]` column, `SpawnIntent.required_features` on the wire,
+    /// and the scheduler's in-memory `DerivationState`. Same threat as
+    /// [`ClampedAttrs::string_clamped`] but for a list. See also
+    /// `executor_service.rs`'s `MAX_HEARTBEAT_FEATURES` (the
+    /// post-translate scheduler-side bound) and `snapshot.rs`'s LRU
+    /// debounce-key clamp — both are second-line defenses behind this
+    /// gateway-side bound at the trust boundary.
+    fn strings_clamped(&self, hint: SizingHint) -> Option<Vec<String>>;
+}
+
+impl ClampedAttrs for StructuredEnv<'_> {
+    fn string_clamped(&self, hint: SizingHint) -> Option<String> {
+        self.lenient_string(hint).map(|mut s| {
             if s.chars().count() > MAX_ATTR_LEN {
                 s = s.chars().take(MAX_ATTR_LEN).collect();
             }
@@ -518,44 +1004,8 @@ impl<'a> StructuredEnv<'a> {
         })
     }
 
-    pub(crate) fn bool(&self, key: &str) -> Option<bool> {
-        self.json
-            .as_ref()
-            .and_then(|j| j.get(key)?.as_bool())
-            .or_else(|| self.env.get(key).map(|v| v == "1" || v == "true"))
-    }
-
-    fn strings(&self, key: &str) -> Option<Vec<String>> {
-        self.json
-            .as_ref()
-            .and_then(|j| {
-                Some(
-                    j.get(key)?
-                        .as_array()?
-                        .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect(),
-                )
-            })
-            .or_else(|| {
-                self.env
-                    .get(key)
-                    .map(|s| s.split_whitespace().map(String::from).collect())
-            })
-    }
-
-    /// [`Self::strings`] with a `MAX_LIST_LEN`-element / `MAX_ATTR_LEN`-
-    /// char clamp. ADR-023 §Threat-model: `requiredSystemFeatures` is
-    /// tenant-controlled and feeds the `derivations.required_features`
-    /// PG `text[]` column, `SpawnIntent.required_features` on the wire,
-    /// and the scheduler's in-memory `DerivationState`. Same threat as
-    /// [`Self::string_clamped`] but for a list. See also
-    /// `executor_service.rs`'s `MAX_HEARTBEAT_FEATURES` (the
-    /// post-translate scheduler-side bound) and `snapshot.rs`'s LRU
-    /// debounce-key clamp — both are second-line defenses behind this
-    /// gateway-side bound at the trust boundary.
-    fn strings_clamped(&self, key: &str) -> Option<Vec<String>> {
-        self.strings(key).map(|mut v| {
+    fn strings_clamped(&self, hint: SizingHint) -> Option<Vec<String>> {
+        self.lenient_strings(hint).map(|mut v| {
             v.truncate(MAX_LIST_LEN);
             for s in &mut v {
                 if s.chars().count() > MAX_ATTR_LEN {
@@ -598,8 +1048,13 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
     let env = StructuredEnv::new(drv.env());
     types::DerivationNode {
         drv_path: drv_path.to_string(),
-        // Input-addressed derivations use the store path as the drv_hash.
-        // This ensures every node has a unique, non-empty key in the DAG.
+        // The DAG key is the declared .drv store path for EVERY node
+        // shape (IA, floating-CA, FOD, hook fallback) — SubmitBuild
+        // ingress rejects drv_hash != drv_path
+        // (sched.merge.ingress-identity-binding), so this assignment is
+        // load-bearing, not an IA-specific convention. CA content
+        // identity travels separately in ca_modular_hash and keys
+        // realisations, never the DAG.
         drv_hash: drv_path.to_string(),
         // pname → name fallback: stdenv's mkDerivation sets both;
         // raw derivation{} calls typically only set name. Without
@@ -610,20 +1065,20 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
         // rows), but some history beats none. Clamped at MAX_ATTR_LEN
         // (§Threat-model: tenant-controlled, becomes a cache key).
         pname: env
-            .string_clamped("pname")
-            .or_else(|| env.string_clamped("name"))
+            .string_clamped(SizingHint::Pname)
+            .or_else(|| env.string_clamped(SizingHint::Name))
             .unwrap_or_default(),
         // ADR-023 sizing attrs. Nix bool env values are "1"/"" (older
         // stdenv) or "true"/"false" (newer). Absent stays None — for
         // enableParallelBuilding in particular, absent ≠ false (nixpkgs
         // is migrating to default-true; None means "unknown, explore").
-        version: env.string_clamped("version"),
-        enable_parallel_building: env.bool("enableParallelBuilding"),
-        enable_parallel_checking: env.bool("enableParallelChecking"),
-        prefer_local_build: env.bool("preferLocalBuild"),
+        version: env.string_clamped(SizingHint::Version),
+        enable_parallel_building: env.lenient_bool(SizingHint::EnableParallelBuilding),
+        enable_parallel_checking: env.lenient_bool(SizingHint::EnableParallelChecking),
+        prefer_local_build: env.lenient_bool(SizingHint::PreferLocalBuild),
         system: drv.platform().to_string(),
         required_features: env
-            .strings_clamped("requiredSystemFeatures")
+            .strings_clamped(SizingHint::RequiredSystemFeatures)
             .unwrap_or_default(),
         output_names,
         is_fixed_output: drv.is_fixed_output(),
@@ -642,6 +1097,7 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
         // fallback's caller flags its single node directly.
         explicitly_requested: false,
         drv_content: Vec::new(),
+        drv_content_authoritative: false,
         is_content_addressed: drv.is_content_addressed(),
         // Empty here — populate_ca_modular_hashes() fills AFTER the
         // full BFS so hash_derivation_modulo has the complete
@@ -649,12 +1105,110 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
         // inline would be a partial-closure recurse (InputNotFound
         // for inputs the BFS hasn't visited yet).
         ca_modular_hash: Vec::new(),
-        // ADR-018 Appendix B: floating-CA self always resolves.
-        // populate_needs_resolve() ORs in the ia.deferred case
-        // (IA-with-floating-CA-input) AFTER BFS — needs the
-        // drv_cache to look up children's addressing mode.
+        // Seed only — populate_needs_resolve() recomputes every cached
+        // node from the shared oracle predicate
+        // (rio_nix::derivation::should_resolve) AFTER BFS, when the
+        // drv_cache can answer child lookups. The seed survives only
+        // for nodes the BFS failed to cache (inconsistency degrade);
+        // self-floating is the safe over-approximation there (a
+        // spurious resolve over zero known children is a no-op).
         needs_resolve: drv.has_ca_floating_outputs(),
     }
+}
+
+/// Cap on the serialized size of an inline `BasicDerivation` carried in
+/// the content-bound single-node fallback ([`build_fallback_node`]).
+/// 16× the per-node inline-optimization cap and well under the 4 MiB
+/// tonic default message limit; a derivation bigger than this almost
+/// certainly has a pathological env, and the size-unbounded path
+/// (upload the `.drv`, let the worker fetch it from the store) is
+/// always available.
+///
+/// This is an alias of the shared SubmitBuild ingress bound
+/// ([`rio_common::limits::MAX_DRV_CONTENT_BYTES`]): the scheduler
+/// validates the same constant, so a fallback submission the gateway
+/// accepts is never size-rejected downstream.
+pub(crate) const MAX_FALLBACK_INLINE_DRV_BYTES: usize = rio_common::limits::MAX_DRV_CONTENT_BYTES;
+
+/// Build the submission node for the content-bound single-node
+/// fallback: like [`build_node`], but the serialized derivation is
+/// embedded in `drv_content` so the worker can execute it even though
+/// the `.drv` exists in no store (the client never uploaded it and the
+/// gateway deliberately does not write it — re-serialized content
+/// would not text-hash to the client's claimed `.drv` path, so caching
+/// or uploading it would poison later full-DAG builds).
+///
+/// Rejects derivations whose serialized form exceeds
+/// [`MAX_FALLBACK_INLINE_DRV_BYTES`] with remediation guidance — that
+/// path cannot work any other way (the worker has nowhere to fetch the
+/// derivation from), so failing fast at submission is the only honest
+/// answer.
+// r[impl gw.hook.inline-drv-content+4]
+pub fn build_fallback_node(
+    drv_path: &str,
+    basic: &rio_nix::derivation::BasicDerivation,
+) -> Result<types::DerivationNode, String> {
+    // Producer contract: the single-node fallback exists ONLY for
+    // content-bound derivations (fixed-output / floating-CA), whose
+    // output paths are governed by content-hash rules. The scheduler
+    // unconditionally rejects authoritative inline content with
+    // input-addressed outputs (nothing binds declared IA paths to
+    // derivation text), so minting such a node here would manufacture a
+    // guaranteed scheduler rejection — one that, before this guard, was
+    // misreported to the client as a transient failure. The handler's
+    // inline IA gate rejects these earlier with client remediation
+    // (gw.reject.output-path-mismatch+2); this guard makes the
+    // producer's contract self-enforcing.
+    // r[impl gw.build.scheduler-rejection-permanent]
+    if !basic.is_content_addressed() {
+        return Err(format!(
+            "cannot build '{drv_path}': the full derivation is not in the store and inline \
+             input-addressed derivations cannot be validated — upload the .drv first with \
+             `nix copy --derivation` or use --store ssh-ng:// so the worker can fetch it \
+             from the store"
+        ));
+    }
+    let aterm = basic.to_aterm();
+    if aterm.len() > MAX_FALLBACK_INLINE_DRV_BYTES {
+        return Err(format!(
+            "cannot build '{drv_path}': the full derivation is not in the store and its inline \
+             form is {} bytes (> {} byte cap for the single-node fallback) — upload the .drv \
+             first with `nix copy --derivation` or use --store ssh-ng:// so the worker can \
+             fetch it from the store",
+            aterm.len(),
+            MAX_FALLBACK_INLINE_DRV_BYTES
+        ));
+    }
+    let mut node = build_node(drv_path, basic);
+    node.drv_content = aterm.into_bytes();
+    // The inline bytes are the only copy of this derivation anywhere —
+    // mark them authoritative so the scheduler persists them with the
+    // derivation row and a post-failover dispatch still carries them.
+    node.drv_content_authoritative = true;
+    // r[impl gw.hook.fallback-built-outputs]
+    // A content-addressed fallback node must carry the modular hash of
+    // the inline derivation (CppNix `staticOutputHashes` over the
+    // received BasicDerivation = hashDerivationModulo with empty
+    // inputDrvs) so the scheduler registers the realisation under the
+    // exact id the client will register and look up, and merge-time
+    // cache hits apply to resubmissions. The producer guard above means
+    // every node reaching this point is content-addressed. Degrade like
+    // populate_ca_modular_hashes: never reject on hash failure.
+    let lifted = rio_nix::derivation::Derivation::from_basic(basic);
+    match rio_nix::derivation::hash_derivation_modulo(
+        &lifted,
+        drv_path,
+        &|_| None,
+        &mut HashMap::new(),
+    ) {
+        Ok(hash) => node.ca_modular_hash = hash.to_vec(),
+        Err(e) => warn!(
+            drv_path = %drv_path,
+            error = %e,
+            "failed to hash inline fallback derivation; builtOutputs enrichment degraded"
+        ),
+    }
+    Ok(node)
 }
 
 /// Inline .drv content into nodes whose outputs are missing from the
@@ -880,7 +1434,12 @@ mod tests {
     use rstest::rstest;
 
     fn make_basic_drv(env: BTreeMap<String, String>) -> anyhow::Result<BasicDerivation> {
-        let output = DerivationOutput::new("out", "/nix/store/test-out", "", "")?;
+        let output = DerivationOutput::new(
+            "out",
+            "/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-out",
+            "",
+            "",
+        )?;
         Ok(BasicDerivation::new(
             vec![output],
             BTreeSet::new(),
@@ -893,7 +1452,14 @@ mod tests {
 
     /// Same as make_basic_drv but with a configurable single output.
     fn make_basic_drv_with_output(hash_algo: &str, hash: &str) -> anyhow::Result<BasicDerivation> {
-        let output = DerivationOutput::new("out", "/nix/store/test-out", hash_algo, hash)?;
+        // Floating-CA outputs (algo set, hash empty) must not declare a
+        // path — the typed constructor enforces the oracle's shape rule.
+        let path = if !hash_algo.is_empty() && hash.is_empty() {
+            ""
+        } else {
+            "/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-out"
+        };
+        let output = DerivationOutput::new("out", path, hash_algo, hash)?;
         Ok(BasicDerivation::new(
             vec![output],
             BTreeSet::new(),
@@ -931,13 +1497,19 @@ mod tests {
     ) -> anyhow::Result<()> {
         // BasicDerivation path (single-node fallback).
         let basic = make_basic_drv_with_output(basic_algo, hash)?;
-        let node = build_node("/nix/store/test.drv", &basic);
+        let node = build_node("/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi.drv", &basic);
         assert_eq!(node.is_content_addressed, want_ca, "basic: is_ca");
         assert_eq!(node.is_fixed_output, want_fod, "basic: strict is_fod");
 
-        // Full Derivation path (via ATerm parse).
+        // Full Derivation path (via ATerm parse). Floating shapes carry
+        // an empty declared path (typed-boundary parity with the helper).
+        let out_path = if !aterm_algo.is_empty() && hash.is_empty() {
+            ""
+        } else {
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-out"
+        };
         let aterm = format!(
-            r#"Derive([("out","/nix/store/aaa-out","{aterm_algo}","{hash}")],[],[],"x86_64-linux","/bin/sh",[],[])"#
+            r#"Derive([("out","{out_path}","{aterm_algo}","{hash}")],[],[],"x86_64-linux","/bin/sh",[],[])"#
         );
         let node = build_node(&test_drv_path("ca-test"), &Derivation::parse(&aterm)?);
         assert_eq!(node.is_content_addressed, want_ca, "full: is_ca");
@@ -967,7 +1539,7 @@ mod tests {
         env.insert("requiredSystemFeatures".into(), "kvm big-parallel".into());
         let drv = make_basic_drv(env)?;
 
-        let node = build_node("/nix/store/test.drv", &drv);
+        let node = build_node("/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi.drv", &drv);
         assert_eq!(
             node.required_features,
             vec!["kvm".to_string(), "big-parallel".to_string()],
@@ -1004,12 +1576,12 @@ mod tests {
         // no __noChroot → Ok.
         let nodes = vec![
             types::DerivationNode {
-                drv_path: "/nix/store/aaa-test.drv".into(),
+                drv_path: "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-test.drv".into(),
                 drv_hash: "aaa".into(),
                 ..Default::default()
             },
             types::DerivationNode {
-                drv_path: "/nix/store/bbb-test.drv".into(),
+                drv_path: "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-test.drv".into(),
                 drv_hash: "bbb".into(),
                 ..Default::default()
             },
@@ -1018,19 +1590,1128 @@ mod tests {
         assert!(validate_dag(&nodes, &empty_cache).is_ok());
     }
 
-    // __noChroot rejection is hard to unit-test here because it
-    // needs a Derivation in drv_cache with __noChroot=1 in env,
-    // and constructing a full Derivation (not BasicDerivation)
-    // requires ATerm parsing or a complex builder. Coverage comes
-    // from the golden tests at tests/wire_opcodes/build.rs (seed
-    // NOCHROOT_DRV_ATERM into the mock store so resolve_derivation
-    // populates drv_cache, then drive opcodes 36 + 46 and assert
-    // the failure BuildResult carries the "sandbox escape" message).
+    // The __noChroot=1 happy-path rejection is wire-tested at
+    // tests/wire_opcodes/build.rs (seed NOCHROOT_DRV_ATERM into the
+    // mock store so resolve_derivation populates drv_cache, then drive
+    // opcodes 36 + 46 and assert the failure BuildResult carries the
+    // "sandbox escape" message). The typed matrix below covers the
+    // fail-closed arms via hand-built ATerms.
+
+    /// Helper: a cached single-node DAG whose drv carries `extra_env`.
+    fn nochroot_fixture(
+        extra_env: &str,
+    ) -> (Vec<types::DerivationNode>, HashMap<StorePath, Derivation>) {
+        let drv_path = "/nix/store/nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn-nochroot-probe.drv";
+        let aterm = format!(
+            r#"Derive([("out","/nix/store/gsqizyqxzjbdjyb1jav5zjndvsadgs15-out","","")],[],[],"x86_64-linux","/bin/sh",[],[("out","/nix/store/gsqizyqxzjbdjyb1jav5zjndvsadgs15-out"){extra_env}])"#
+        );
+        let drv = Derivation::parse(&aterm).expect("test ATerm parses");
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: drv_path.into(),
+            ..Default::default()
+        };
+        let mut cache = HashMap::new();
+        cache.insert(sp(drv_path), drv);
+        (vec![node], cache)
+    }
+
+    /// Wrong-typed `__noChroot` is rejected fail-closed (oracle
+    /// `getBoolean` throws — `1` and `"true"` are NOT booleans);
+    /// `false`/absent stay accepted; `true` keeps the sandbox-escape
+    /// rejection.
+    // r[verify gw.reject.nochroot+2]
+    #[test]
+    fn validate_dag_rejects_wrong_typed_nochroot() {
+        // JSON number 1: the classic "truthy but not a boolean".
+        let (nodes, cache) = nochroot_fixture(r#",("__json","{\"__noChroot\":1}")"#);
+        let err = validate_dag(&nodes, &cache).unwrap_err();
+        assert!(err.contains("__noChroot is unreadable"), "{err}");
+
+        // JSON string "true": also not a boolean.
+        let (nodes, cache) = nochroot_fixture(r#",("__json","{\"__noChroot\":\"true\"}")"#);
+        let err = validate_dag(&nodes, &cache).unwrap_err();
+        assert!(err.contains("__noChroot is unreadable"), "{err}");
+
+        // JSON false: a real boolean, sandbox stays on → accepted.
+        let (nodes, cache) = nochroot_fixture(r#",("__json","{\"__noChroot\":false}")"#);
+        assert!(validate_dag(&nodes, &cache).is_ok());
+
+        // JSON true: the original sandbox-escape rejection.
+        let (nodes, cache) = nochroot_fixture(r#",("__json","{\"__noChroot\":true}")"#);
+        let err = validate_dag(&nodes, &cache).unwrap_err();
+        assert!(err.contains("sandbox escape"), "{err}");
+
+        // Flat env "1" (the non-structured spelling): still rejected.
+        let (nodes, cache) = nochroot_fixture(r#",("__noChroot","1")"#);
+        let err = validate_dag(&nodes, &cache).unwrap_err();
+        assert!(err.contains("sandbox escape"), "{err}");
+    }
+
+    /// An unparseable `__json` blob on a cached drv is rejected — the
+    /// gateway cannot read the derivation's sandbox intent, so it does
+    /// not guess (pre-fix: the lenient reader degraded the whole blob
+    /// to "no structured attrs" and waved the derivation through).
+    // r[verify gw.reject.nochroot+2]
+    #[test]
+    fn validate_dag_rejects_unparseable_json_blob() {
+        let (nodes, cache) = nochroot_fixture(r#",("__json","{not json")"#);
+        let err = validate_dag(&nodes, &cache).unwrap_err();
+        assert!(err.contains("__noChroot is unreadable"), "{err}");
+    }
+
+    /// A consistent input-addressed derivation (declared paths == the
+    /// paths it derives to) passes; declaring somebody else's
+    /// well-formed path is rejected; malformed declared paths are out
+    /// of scope for this gate (they cannot alias a real store object).
+    // r[verify gw.reject.output-path-mismatch+2]
+    #[test]
+    fn validate_dag_binds_ia_declared_paths_to_the_derivation() {
+        let drv_path = "/nix/store/cccccccccccccccccccccccccccccccc-mine.drv";
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: "ccc".into(),
+            ..Default::default()
+        };
+        let key = StorePath::parse(drv_path).unwrap();
+
+        let aterm_with = |out_path: &str| -> Derivation {
+            let aterm = format!(
+                r#"Derive([("out","{out_path}","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","{out_path}")])"#
+            );
+            Derivation::parse(&aterm).expect("test ATerm parses")
+        };
+
+        // Compute the honest path for THIS derivation (declared paths are
+        // masked during the computation, so any placeholder works here).
+        let probe = aterm_with("/nix/store/dddddddddddddddddddddddddddddddd-mine");
+        let mut hash_cache = HashMap::new();
+        let resolve = |_: &str| -> Option<&Derivation> { None };
+        let honest = rio_nix::derivation::input_addressed_output_paths(
+            &probe,
+            drv_path,
+            &resolve,
+            &mut hash_cache,
+        )
+        .expect("derive")["out"]
+            .as_str()
+            .to_owned();
+
+        // Consistent declaration → accepted.
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), aterm_with(&honest));
+        assert!(
+            validate_output_path_bindings(std::slice::from_ref(&node), &cache).is_ok(),
+            "consistent IA declaration must pass"
+        );
+
+        // Declaring somebody else's (well-formed) path → rejected.
+        let victim = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), aterm_with(victim));
+        let err = validate_output_path_bindings(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(
+            err.contains("must match the derivation"),
+            "squatted path must be rejected: {err}"
+        );
+        assert!(err.contains(victim), "error names the declared path: {err}");
+
+        // Malformed declared path (not a store path): formerly this
+        // gate's fail-closed arm, now unrepresentable — the typed parse
+        // boundary rejects it before the drv cache is ever populated,
+        // so a tenant-controlled non-store-path string has no route to
+        // untrusted workers.
+        let aterm = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",[],[("name","mine"),("out","/nix/store/zzz-output")])"#;
+        assert!(
+            Derivation::parse(aterm).is_err(),
+            "malformed declared path must fail at the parse boundary"
+        );
+
+        // Deferred IA (EMPTY declared path) stays out of scope — nothing
+        // to validate until resolution computes the path.
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), aterm_with(""));
+        assert!(
+            validate_output_path_bindings(std::slice::from_ref(&node), &cache).is_ok(),
+            "deferred (empty) declared paths have nothing to validate"
+        );
+    }
+
+    /// Both former carve-outs of the declared-hash gate (malformed
+    /// declared path, empty "deferred FOD" path) are unrepresentable
+    /// at the typed boundary — the gate's input type cannot carry them.
+    // r[verify gw.reject.output-path-mismatch+2]
+    #[test]
+    fn declared_hash_gate_rejects_malformed_declared_path() {
+        let hex_hash = "5a".repeat(32);
+
+        // Non-empty, unparseable declared path → constructor rejection.
+        assert!(matches!(
+            rio_nix::derivation::DerivationOutput::new(
+                "out",
+                "/nix/store/zzz-evil",
+                "sha256",
+                hex_hash.as_str()
+            ),
+            Err(rio_nix::derivation::DerivationError::InvalidOutputPath(_))
+        ));
+
+        // Empty declared path on a hash-declaring output → constructor
+        // rejection (oracle validatePath analog); the gate has no
+        // deferred carve-out left to maintain.
+        assert!(matches!(
+            rio_nix::derivation::DerivationOutput::new("out", "", "sha256", hex_hash.as_str()),
+            Err(rio_nix::derivation::DerivationError::FixedOutputNoPath(_))
+        ));
+    }
+
+    /// A crafted derivation pairing a floating-CA output with a squatted
+    /// well-formed static path must not dodge the gate via the
+    /// content-bound fast path; genuinely all-content-bound derivations
+    /// (all-floating-CA, single-output FOD) keep their fast path.
+    // r[verify gw.reject.output-path-mismatch+2]
+    #[test]
+    fn validate_dag_rejects_squatted_path_next_to_floating_ca() {
+        let drv_path = "/nix/store/cccccccccccccccccccccccccccccccc-camix.drv";
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: "ccc".into(),
+            ..Default::default()
+        };
+        let key = StorePath::parse(drv_path).unwrap();
+        let victim = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
+
+        // Mixed floating-CA + squatted static path: unrepresentable —
+        // the drv-level classifier rejects the mix at parse (oracle
+        // wording), so the squat-next-to-CA shape never reaches the
+        // binding gate at all.
+        let err = Derivation::parse(&format!(
+            r#"Derive([("ca","","r:sha256",""),("evil","{victim}","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("ca",""),("evil","{victim}")])"#
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("can't mix derivation output types"),
+            "mixed CA + static shape dies at the parse boundary: {err}"
+        );
+
+        // All-floating-CA → still accepted (content-bound fast path).
+        let all_ca = Derivation::parse(
+            r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","")])"#,
+        )
+        .expect("test ATerm parses");
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), all_ca);
+        assert!(
+            validate_output_path_bindings(std::slice::from_ref(&node), &cache).is_ok(),
+            "all-floating-CA derivations keep the fast path"
+        );
+
+        // Single-output FOD → unchanged, accepted.
+        let fod = Derivation::parse(
+            r#"Derive([("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src","sha256","abababababababababababababababababababababababababababababababab")],[],[],"x86_64-linux","/bin/sh",[],[("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src")])"#,
+        )
+        .expect("test ATerm parses");
+        let mut cache = HashMap::new();
+        cache.insert(key, fod);
+        assert!(
+            validate_output_path_bindings(std::slice::from_ref(&node), &cache).is_ok(),
+            "fixed-output derivations are unchanged"
+        );
+    }
+
+    /// A crafted derivation pairing a deferred (empty-path) output with a
+    /// squatted well-formed one must not dodge the path gate via any
+    /// drv-level skip.
+    // r[verify gw.reject.output-path-mismatch+2]
+    #[test]
+    fn validate_dag_rejects_squatted_path_next_to_deferred_output() {
+        let drv_path = "/nix/store/cccccccccccccccccccccccccccccccc-mixed.drv";
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: "ccc".into(),
+            ..Default::default()
+        };
+        let key = StorePath::parse(drv_path).unwrap();
+
+        let _ = key;
+        let _ = node;
+        // Concrete-IA next to deferred-IA is a type MIX in the oracle's
+        // decide() (InputAddressed{deferred:false} vs {deferred:true}),
+        // so the squat-next-to-deferred shape is now unrepresentable at
+        // the parse boundary — strictly earlier than the binding gate
+        // that used to catch it.
+        let victim = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
+        let aterm = format!(
+            r#"Derive([("evil","{victim}","",""),("out","","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("evil","{victim}"),("out","")])"#
+        );
+        let err = Derivation::parse(&aterm).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("can't mix derivation output types"),
+            "mixed deferred+squatted shape dies at the parse boundary: {err}"
+        );
+    }
+
+    /// Build a linear input-addressed chain of `n` cached derivations
+    /// whose declared output paths are the HONEST derived ones
+    /// (constructed bottom-up, since each parent's derivation hash
+    /// depends on its child's final form). Returns root-first nodes and
+    /// the populated cache.
+    /// `squat`: optionally make node `at` declare the output path of the
+    /// (deeper, already-built) node `steal_from` instead of its honest
+    /// one — every OTHER node stays consistent relative to the tampered
+    /// node, so the tampered node is the only mismatch.
+    fn ia_chain_with(
+        n: usize,
+        squat: Option<(usize, usize)>,
+    ) -> (Vec<types::DerivationNode>, HashMap<StorePath, Derivation>) {
+        let drv_path = |i: usize| format!("/nix/store/{i:0>32}-chain-{i}.drv");
+        let mut cache: HashMap<StorePath, Derivation> = HashMap::new();
+        let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
+        for i in (0..n).rev() {
+            let inputs = if i + 1 < n {
+                format!(r#"[("{}",["out"])]"#, drv_path(i + 1))
+            } else {
+                "[]".to_owned()
+            };
+            // Probe with a placeholder declared path (declared paths are
+            // masked out of the computation), derive the honest path,
+            // then store the final form.
+            let probe = Derivation::parse(&format!(
+                r#"Derive([("out","","","")],{inputs},[],"x86_64-linux","/bin/sh",["-c","echo"],[("out","")])"#
+            ))
+            .expect("probe ATerm parses");
+            let honest = {
+                let resolve = |p: &str| StorePath::parse(p).ok().and_then(|sp| cache.get(&sp));
+                rio_nix::derivation::input_addressed_output_paths(
+                    &probe,
+                    &drv_path(i),
+                    &resolve,
+                    &mut hash_cache,
+                )
+                .expect("derive honest path")["out"]
+                    .as_str()
+                    .to_owned()
+            };
+            let declared = match squat {
+                Some((at, steal_from)) if at == i => {
+                    let victim_key = StorePath::parse(&drv_path(steal_from)).unwrap();
+                    cache[&victim_key].outputs()[0].path().to_owned()
+                }
+                _ => honest,
+            };
+            let final_drv = Derivation::parse(&format!(
+                r#"Derive([("out","{declared}","","")],{inputs},[],"x86_64-linux","/bin/sh",["-c","echo"],[("out","{declared}")])"#
+            ))
+            .expect("final ATerm parses");
+            cache.insert(StorePath::parse(&drv_path(i)).unwrap(), final_drv);
+        }
+        let nodes = (0..n)
+            .map(|i| types::DerivationNode {
+                drv_path: drv_path(i),
+                drv_hash: format!("{i}"),
+                ..Default::default()
+            })
+            .collect();
+        (nodes, cache)
+    }
+
+    fn honest_ia_chain(n: usize) -> (Vec<types::DerivationNode>, HashMap<StorePath, Derivation>) {
+        ia_chain_with(n, None)
+    }
+
+    /// A 600-deep honest chain passes the binding gate with a cold
+    /// per-submission hash cache — depth is never a rejection cause.
+    /// (Regression test for the former 512-level recursion cap, which
+    /// turned deep-but-legitimate DAGs into whole-submission
+    /// rejections.)
+    // r[verify gw.reject.output-path-mismatch+2]
+    #[test]
+    fn validate_output_path_bindings_accepts_deep_ia_chain() {
+        let (nodes, cache) = honest_ia_chain(600);
+        assert!(
+            validate_output_path_bindings(&nodes, &cache).is_ok(),
+            "a deep honest chain must not be rejected"
+        );
+    }
+
+    /// The same 600-deep chain with one node's declared path swapped to
+    /// another derivation's path is still rejected — removing the depth
+    /// cap must not weaken the gate at depth.
+    #[test]
+    fn validate_output_path_bindings_still_rejects_squat_in_deep_chain() {
+        // Node 300 declares node 400's output path; every other node is
+        // consistent relative to the tampered node (the realistic
+        // attacker shape), so node 300 is the single mismatch.
+        let (nodes, cache) = ia_chain_with(600, Some((300, 400)));
+        let err = validate_output_path_bindings(&nodes, &cache).unwrap_err();
+        assert!(
+            err.contains(&nodes[300].drv_path) && err.contains("must match the derivation"),
+            "squat at depth must be rejected naming the drv: {err}"
+        );
+    }
+
+    /// Structural pin for the pipeline split: `validate_dag` performs
+    /// only the cheap checks and no longer runs the output-path binding
+    /// pass — a squatted IA path passes `validate_dag` but is caught by
+    /// `validate_output_path_bindings`. This is NOT a bypass: the
+    /// handler pipeline always runs the binding gate before
+    /// `SubmitBuild` (behind rate-limit/quota, on the blocking pool) —
+    /// see the wopBuildDerivation / wopBuildPathsWithResults squatting
+    /// wire tests in `tests/wire_opcodes/build.rs`, which assert the
+    /// rejection end-to-end.
+    #[test]
+    fn validate_dag_no_longer_runs_the_binding_pass() {
+        let drv_path = "/nix/store/cccccccccccccccccccccccccccccccc-split.drv";
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: "ccc".into(),
+            ..Default::default()
+        };
+        let key = StorePath::parse(drv_path).unwrap();
+        let victim = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
+        let aterm = format!(
+            r#"Derive([("out","{victim}","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","{victim}")])"#
+        );
+        let mut cache = HashMap::new();
+        cache.insert(key, Derivation::parse(&aterm).expect("test ATerm parses"));
+
+        assert!(
+            validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
+            "validate_dag holds only the cheap checks"
+        );
+        assert!(
+            validate_output_path_bindings(std::slice::from_ref(&node), &cache).is_err(),
+            "the binding gate still rejects the squat"
+        );
+    }
+
+    /// Any output declaring a hash algorithm the builder cannot handle
+    /// is rejected at submission: a FOD with an md5 hash and a
+    /// A floating-CA-shaped output (algo set, hash EMPTY) that also
+    /// declares a non-empty output path is rejected: CppNix refuses to
+    /// parse that shape, and accepting it would exempt the declared
+    /// path from every output-path binding. Proper floating-CA (empty
+    /// path) stays accepted; the rule applies to any declared path
+    /// string, parseable or not, and to mixed multi-output shapes.
+    // r[verify gw.reject.floating-ca-declared-path+1]
+    #[test]
+    fn validate_dag_rejects_floating_ca_with_declared_path() {
+        // The shape is now UNREPRESENTABLE: the typed parse boundary
+        // rejects a floating-CA output declaring a path with the
+        // oracle's wording (derivations.cc:339-340), so validate_dag
+        // can never see one. These pins witness the boundary at the
+        // gateway's own input channel (the session drv cache is
+        // populated via Derivation::parse).
+        let parse_with_outputs = |outs: &[(&str, &str, &str, &str)]| {
+            let rendered: Vec<String> = outs
+                .iter()
+                .map(|(n, p, a, h)| format!(r#"("{n}","{p}","{a}","{h}")"#))
+                .collect();
+            let env: Vec<String> = outs
+                .iter()
+                .map(|(n, p, _, _)| format!(r#"("{n}","{p}")"#))
+                .collect();
+            Derivation::parse(&format!(
+                r#"Derive([{}],[],[],"x86_64-linux","/bin/sh",[],[{}])"#,
+                rendered.join(","),
+                env.join(",")
+            ))
+        };
+        let victim = "/nix/store/cccccccccccccccccccccccccccccccc-victim";
+
+        // (a) single floating-CA output declaring a path → unparseable,
+        // with the oracle's message.
+        let err = parse_with_outputs(&[("out", victim, "r:sha256", "")]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("content-addressing derivation output should not specify output path"),
+            "oracle wording: {err}"
+        );
+
+        // (b) proper floating-CA (empty path) parses and passes the gate.
+        let drv_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-src.drv";
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: "bbb".into(),
+            ..Default::default()
+        };
+        let key = StorePath::parse(drv_path).unwrap();
+        let mut cache = HashMap::new();
+        cache.insert(
+            key.clone(),
+            parse_with_outputs(&[("out", "", "r:sha256", "")]).expect("legal floating shape"),
+        );
+        assert!(validate_dag(std::slice::from_ref(&node), &cache).is_ok());
+
+        // (c) mixed multi-output: the offending output rejects the whole
+        // parse even with an innocent sibling.
+        assert!(
+            parse_with_outputs(&[("out", victim, "r:sha256", ""), ("doc", "", "", "")]).is_err()
+        );
+
+        // (d) the declared "path" need not parse as a store path — the
+        // SHAPE is the violation, checked before path syntax.
+        let err = parse_with_outputs(&[("out", "not-a-store-path", "sha256", "")]).unwrap_err();
+        assert!(
+            err.to_string().contains("should not specify output path"),
+            "{err}"
+        );
+
+        // (e) the squat-binding protection survives over representable
+        // shapes: an IA output declaring the victim's path is rejected by
+        // the binding gate (declared != derived), not silently accepted.
+        let mut cache = HashMap::new();
+        cache.insert(
+            key,
+            parse_with_outputs(&[("out", victim, "", "")]).expect("legal IA shape"),
+        );
+        let err = validate_output_path_bindings(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(
+            err.contains("must match the derivation"),
+            "IA squat must still be rejected by the binding gate: {err}"
+        );
+    }
+
+    /// Unverifiable outputHashAlgo values are CLASSIFIED (returned as
+    /// offenders for the realization probe), not rejected outright:
+    /// fixed-output md5 and floating-CA md5/blake3 alike. Verifiable
+    /// algorithms (sha256, r:sha512) pass in both shapes with no
+    /// offenders, and input-addressed outputs (no hash, no algo) are
+    /// never classified.
+    // r[verify gw.reject.unsupported-hash-algo+4]
+    #[test]
+    fn validate_dag_rejects_unverifiable_fod_algo() {
+        let fod_drv_at = |algo: &str, hash: &str, path: &str| -> Derivation {
+            let aterm = format!(
+                r#"Derive([("out","{path}","{algo}","{hash}")],[],[],"x86_64-linux","/bin/sh",[],[("out","{path}")])"#
+            );
+            Derivation::parse(&aterm).expect("test ATerm parses")
+        };
+        let fod_drv = |algo: &str, hash: &str| {
+            fod_drv_at(
+                algo,
+                hash,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src",
+            )
+        };
+        let drv_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-src.drv";
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: "bbb".into(),
+            ..Default::default()
+        };
+        let key = StorePath::parse(drv_path).unwrap();
+
+        // md5 FOD → classified as an offender (NOT an immediate Err),
+        // carrying the algo, the offending output and every declared
+        // path; the declared-hash binding is skipped for it (a junk
+        // declared path does not produce the "must match" error).
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), fod_drv("md5", &"de".repeat(16)));
+        let offenders = validate_dag(std::slice::from_ref(&node), &cache).unwrap();
+        assert_eq!(offenders.len(), 1);
+        assert_eq!(offenders[0].drv_path, drv_path);
+        assert_eq!(offenders[0].output_name, "out");
+        assert_eq!(offenders[0].algo, "md5");
+        assert_eq!(
+            offenders[0].declared_paths,
+            vec!["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src".to_string()]
+        );
+
+        // sha256 and r:sha512 → accepted with NO offenders, with
+        // hash-consistent declared paths and correctly-sized digests
+        // (the declared-hash binding gate requires both).
+        for (algo, digest_len) in [("sha256", 32usize), ("r:sha512", 64)] {
+            let digest = vec![0xabu8; digest_len];
+            let nix_hash = rio_nix::hash::NixHash::new(
+                rio_nix::hash::OutputHashAlgo::parse(algo).unwrap().algo,
+                digest.clone(),
+            )
+            .unwrap();
+            let honest =
+                StorePath::make_fixed_output("src", &nix_hash, algo.starts_with("r:"), &[])
+                    .unwrap();
+            let mut cache = HashMap::new();
+            cache.insert(
+                key.clone(),
+                fod_drv_at(algo, &hex::encode(&digest), honest.as_str()),
+            );
+            assert!(
+                validate_dag(std::slice::from_ref(&node), &cache)
+                    .unwrap()
+                    .is_empty(),
+                "{algo} must be accepted with no offenders"
+            );
+        }
+
+        // Floating-CA (algo set, hash EMPTY, path EMPTY — the only shape
+        // CppNix can produce) with a supported algo → accepted, no
+        // offenders.
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), fod_drv_at("r:sha256", "", ""));
+        assert!(
+            validate_dag(std::slice::from_ref(&node), &cache)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Floating-CA with an algo the builder's CA finalization cannot
+        // produce (md5, blake3) → classified; its declared path is empty,
+        // which the realization probe rejects (floating-CA is never
+        // exempt — see reject_unrealized_fod_offenders tests).
+        for algo in ["md5", "blake3"] {
+            let mut cache = HashMap::new();
+            cache.insert(key.clone(), fod_drv_at(algo, "", ""));
+            let offenders = validate_dag(std::slice::from_ref(&node), &cache).unwrap();
+            assert_eq!(offenders.len(), 1, "{algo}: classified, not rejected");
+            assert_eq!(offenders[0].algo, algo);
+            assert_eq!(offenders[0].declared_paths, vec![String::new()]);
+        }
+
+        // An offender that ALSO violates the floating-CA shape rule
+        // (algo set, hash empty, path declared) never reaches the gate:
+        // the typed parse boundary rejects the shape outright, so the
+        // realization exemption cannot apply to it by construction.
+        let aterm = r#"Derive([("out","/nix/store/cccccccccccccccccccccccccccccccc-squat","md5","")],[],[],"x86_64-linux","/bin/sh",[],[("out","/nix/store/cccccccccccccccccccccccccccccccc-squat")])"#;
+        let err = Derivation::parse(aterm).unwrap_err();
+        assert!(
+            err.to_string().contains("should not specify output path"),
+            "{err}"
+        );
+
+        // Input-addressed output (no hash, no algo) → never checked by
+        // the ALGO gate. The IA path gate does apply, so give the
+        // fixture its honest derived path (any placeholder works for
+        // the computation — declared paths are masked out of it).
+        let ia_with = |out_path: &str| -> Derivation {
+            let aterm = format!(
+                r#"Derive([("out","{out_path}","","")],[],[],"x86_64-linux","/bin/sh",[],[("out","{out_path}")])"#
+            );
+            Derivation::parse(&aterm).expect("test ATerm parses")
+        };
+        let mut hash_cache = HashMap::new();
+        let resolve_none = |_: &str| -> Option<&Derivation> { None };
+        let honest = rio_nix::derivation::input_addressed_output_paths(
+            &ia_with("/nix/store/dddddddddddddddddddddddddddddddd-src"),
+            drv_path,
+            &resolve_none,
+            &mut hash_cache,
+        )
+        .expect("derive")["out"]
+            .as_str()
+            .to_owned();
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), ia_with(&honest));
+        assert!(
+            validate_dag(std::slice::from_ref(&node), &cache)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The content-bound single-node fallback carries the serialized
+    /// derivation; oversized derivations are rejected with remediation.
+    // r[verify gw.hook.inline-drv-content+4]
+    #[test]
+    fn build_fallback_node_inlines_the_basic_derivation() {
+        use rio_nix::derivation::BasicDerivation;
+
+        let drv_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-fetch.drv";
+        // A FOD-shaped BasicDerivation with one input source.
+        let basic = BasicDerivation::new(
+            vec![
+                rio_nix::derivation::DerivationOutput::new(
+                    "out",
+                    "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fetch",
+                    "r:sha256",
+                    "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                )
+                .unwrap(),
+            ],
+            ["/nix/store/cccccccccccccccccccccccccccccccc-src".to_string()]
+                .into_iter()
+                .collect(),
+            "x86_64-linux".into(),
+            "/bin/sh".into(),
+            vec!["-c".into(), "echo hi".into()],
+            [(
+                "out".to_string(),
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fetch".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .expect("test BasicDerivation constructs");
+
+        let node = build_fallback_node(drv_path, &basic).expect("under the cap");
+        assert_eq!(node.drv_path, drv_path);
+        assert!(node.is_fixed_output, "FOD detection preserved");
+        assert!(
+            node.drv_content_authoritative,
+            "fallback nodes carry the only copy of the derivation — must be marked authoritative"
+        );
+        assert!(
+            !build_node(drv_path, &basic).drv_content_authoritative,
+            "ordinary nodes are not authoritative (worker fetches the .drv from the store)"
+        );
+        // r[verify gw.hook.fallback-built-outputs]
+        // Content-addressed fallback nodes carry the modular hash of the
+        // inline derivation (staticOutputHashes parity: the lifted
+        // inputDrvs-less derivation), so the scheduler registers the
+        // realisation under the id the client will look up.
+        let lifted = rio_nix::derivation::Derivation::from_basic(&basic);
+        let expected_hash = rio_nix::derivation::hash_derivation_modulo(
+            &lifted,
+            drv_path,
+            &|_| None,
+            &mut HashMap::new(),
+        )
+        .expect("no-input derivation always hashes");
+        assert_eq!(
+            node.ca_modular_hash,
+            expected_hash.to_vec(),
+            "FOD fallback node carries the modular hash of the inline derivation"
+        );
+
+        // A non-content-bound (input-addressed / deferred-IA) inline
+        // derivation is REFUSED by the producer: the scheduler
+        // unconditionally rejects authoritative inline IA content, so
+        // minting the node would only manufacture a guaranteed rejection
+        // misreported as transient. The handler's inline IA gate rejects
+        // these earlier; this is the producer's own contract.
+        // r[verify gw.build.scheduler-rejection-permanent]
+        let ia_basic = BasicDerivation::new(
+            vec![rio_nix::derivation::DerivationOutput::new("out", "", "", "").unwrap()],
+            Default::default(),
+            "x86_64-linux".into(),
+            "/bin/sh".into(),
+            vec!["-c".into(), "echo hi".into()],
+            [("out".to_string(), String::new())].into_iter().collect(),
+        )
+        .expect("IA-shaped BasicDerivation constructs");
+        let ia_err = build_fallback_node(
+            "/nix/store/cccccccccccccccccccccccccccccccc-plain.drv",
+            &ia_basic,
+        )
+        .expect_err("non-content-bound fallback nodes are refused");
+        assert!(
+            ia_err.contains("input-addressed") && ia_err.contains("upload the .drv"),
+            "refusal names the cause and the remediation: {ia_err}"
+        );
+        assert_eq!(
+            node.drv_content,
+            basic.to_aterm().into_bytes(),
+            "drv_content is exactly the serialized BasicDerivation"
+        );
+        // The inlined bytes are a parseable derivation (what the worker
+        // will do with them).
+        let reparsed = Derivation::parse(std::str::from_utf8(&node.drv_content).unwrap()).unwrap();
+        assert_eq!(reparsed.platform(), "x86_64-linux");
+        assert_eq!(reparsed.input_srcs().len(), 1, "input sources preserved");
+
+        // Over the cap → Err with actionable remediation.
+        let huge_env = "x".repeat(MAX_FALLBACK_INLINE_DRV_BYTES + 1);
+        let huge = BasicDerivation::new(
+            vec![
+                rio_nix::derivation::DerivationOutput::new(
+                    "out",
+                    "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fetch",
+                    "r:sha256",
+                    "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                )
+                .unwrap(),
+            ],
+            Default::default(),
+            "x86_64-linux".into(),
+            "/bin/sh".into(),
+            vec![],
+            [("big".to_string(), huge_env)].into_iter().collect(),
+        )
+        .expect("constructs");
+        let err = build_fallback_node(drv_path, &huge).unwrap_err();
+        assert!(err.contains("nix copy --derivation"), "{err}");
+        assert!(err.contains("byte cap"), "{err}");
+    }
+
+    /// The realization probe: offenders are exempt iff every declared
+    /// output is already present; everything uncertain rejects.
+    // r[verify gw.reject.unsupported-hash-algo+4]
+    #[tokio::test]
+    async fn reject_unrealized_fod_offenders_decides_by_realization() -> anyhow::Result<()> {
+        use rio_test_support::grpc::spawn_mock_store_with_client;
+
+        let offender = |paths: &[&str]| UnverifiableFodOffender {
+            drv_path: "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-legacy.drv".into(),
+            output_name: "out".into(),
+            algo: "md5".into(),
+            declared_paths: paths.iter().map(|s| s.to_string()).collect(),
+        };
+        let realized = "/nix/store/cccccccccccccccccccccccccccccccc-legacy-out";
+        let missing = "/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-legacy-out";
+
+        let (store, mut store_client, _handle) = spawn_mock_store_with_client().await?;
+        store.seed(
+            rio_proto::validated::ValidatedPathInfo {
+                store_path: StorePath::parse(realized)?,
+                nar_hash: [0u8; 32],
+                nar_size: 1,
+                store_path_hash: vec![],
+                deriver: None,
+                references: vec![],
+                signatures: vec![],
+                content_address: None,
+                registration_time: 0,
+                ultimate: false,
+            },
+            vec![0u8; 1],
+        );
+
+        // No offenders → Ok without any store RPC.
+        reject_unrealized_fod_offenders(&[], &mut store_client, None)
+            .await
+            .expect("empty offender set is a no-op");
+        assert_eq!(
+            store
+                .calls
+                .find_missing_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no probe RPC for an empty offender set"
+        );
+
+        // All declared outputs realized → exempt.
+        reject_unrealized_fod_offenders(&[offender(&[realized])], &mut store_client, None)
+            .await
+            .expect("realized offender is exempt");
+
+        // Any declared output missing → rejected, naming the algo and
+        // the remediation.
+        let err = reject_unrealized_fod_offenders(&[offender(&[missing])], &mut store_client, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("outputHashAlgo 'md5'"), "{err}");
+        assert!(
+            err.contains("sha256"),
+            "remediation names the supported set: {err}"
+        );
+
+        // Two offenders, one realized one not → rejected, naming the
+        // unrealized one.
+        let err = reject_unrealized_fod_offenders(
+            &[offender(&[realized]), offender(&[missing])],
+            &mut store_client,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains(missing), "{err}");
+
+        // Empty declared path (floating-CA with unsupported algo) →
+        // rejected WITHOUT a probe RPC.
+        let before = store
+            .calls
+            .find_missing_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let err = reject_unrealized_fod_offenders(&[offender(&[""])], &mut store_client, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("cannot be checked"), "{err}");
+        assert_eq!(
+            store
+                .calls
+                .find_missing_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "no probe RPC when a declared path is empty/unparseable"
+        );
+
+        // Oversized offender set → rejected without a probe RPC.
+        let many: Vec<UnverifiableFodOffender> = (0..(MAX_FOD_EXEMPTION_PROBE_PATHS + 1))
+            .map(|_| offender(&[realized]))
+            .collect();
+        let err = reject_unrealized_fod_offenders(&many, &mut store_client, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("probe cap"), "{err}");
+
+        // Declared output missing but substitutable from the tenant's
+        // upstreams → exempt (the scheduler's substitute lane completes
+        // it without dispatching).
+        let substitutable_path = "/nix/store/ssssssssssssssssssssssssssssssss-legacy-out";
+        store
+            .state
+            .substitutable
+            .write()
+            .unwrap()
+            .push(substitutable_path.to_string());
+        reject_unrealized_fod_offenders(
+            &[offender(&[substitutable_path])],
+            &mut store_client,
+            None,
+        )
+        .await
+        .expect("substitutable offender is exempt");
+
+        // Missing and INDETERMINATE (upstream probe failed) → fail-closed
+        // rejection, even though it is also seeded substitutable.
+        let indeterminate_path = "/nix/store/iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii-legacy-out";
+        store
+            .state
+            .substitutable
+            .write()
+            .unwrap()
+            .push(indeterminate_path.to_string());
+        store
+            .state
+            .indeterminate
+            .write()
+            .unwrap()
+            .push(indeterminate_path.to_string());
+        let err = reject_unrealized_fod_offenders(
+            &[offender(&[indeterminate_path])],
+            &mut store_client,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("not already realized"), "{err}");
+
+        // The probe carries the session tenant token when one exists,
+        // and stays anonymous (None) in dual-mode.
+        reject_unrealized_fod_offenders(
+            &[offender(&[realized])],
+            &mut store_client,
+            Some("tok-fod-probe"),
+        )
+        .await
+        .expect("realized offender exempt with a token too");
+        {
+            let meta = store.calls.find_missing_metadata.read().unwrap();
+            assert_eq!(
+                meta.last().unwrap().as_deref(),
+                Some("tok-fod-probe"),
+                "tenant token forwarded on the probe"
+            );
+            assert!(
+                meta.iter().rev().nth(1).unwrap().is_none(),
+                "dual-mode probes stay anonymous"
+            );
+        }
+
+        // Store error → fail-closed rejection.
+        store
+            .faults
+            .fail_find_missing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err =
+            reject_unrealized_fod_offenders(&[offender(&[realized])], &mut store_client, None)
+                .await
+                .unwrap_err();
+        assert!(err.contains("store error"), "{err}");
+
+        Ok(())
+    }
+
+    /// merged_bug_048 pins: case variants are NOT verifiable — the
+    /// screen now delegates to the shared constructor, so these pins
+    /// hold for every other gate by construction (the oracle's
+    /// `parseHashAlgo`, hash.cc:468-490, rejects the same spellings).
+    // r[verify nix.hash.algos+2]
+    #[test]
+    fn fod_algo_verifiable_table() {
+        for ok in ["sha1", "sha256", "sha512", "r:sha1", "r:sha256", "r:sha512"] {
+            assert!(fod_algo_verifiable(ok), "{ok} must be verifiable");
+        }
+        for bad in [
+            "md5",
+            "r:md5",
+            "blake3",
+            "sha3-256",
+            "",
+            "SHA256",
+            "Sha256",
+            "sHa512",
+            "SHA1",
+            "r:SHA256",
+            "R:sha256",
+            "r:r:sha256",
+            "git:sha256",
+            "text:sha256",
+            " sha256",
+            "sha256 ",
+        ] {
+            assert!(!fod_algo_verifiable(bad), "{bad:?} must not be verifiable");
+        }
+    }
+
+    /// Declared-hash (fixed-output) outputs are bound to their declared
+    /// hash at submission: the declared path must equal
+    /// `make_fixed_output(declared hash)`. A junk hash can no longer
+    /// exempt an arbitrary (victim) path from validation.
+    // r[verify gw.reject.output-path-mismatch+2]
+    #[test]
+    fn validate_dag_binds_declared_hash_outputs() {
+        let drv_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-fetch.drv";
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: "bbb".into(),
+            ..Default::default()
+        };
+        let key = StorePath::parse(drv_path).unwrap();
+        let fod_at = |algo: &str, hash: &str, path: &str| -> Derivation {
+            let aterm = format!(
+                r#"Derive([("out","{path}","{algo}","{hash}")],[],[],"x86_64-linux","/bin/sh",[],[("out","{path}")])"#
+            );
+            Derivation::parse(&aterm).expect("test ATerm parses")
+        };
+        let digest = vec![0x5au8; 32];
+        let nix_hash =
+            rio_nix::hash::NixHash::new("sha256".parse().unwrap(), digest.clone()).unwrap();
+        let hex_hash = hex::encode(&digest);
+
+        // Honest flat-sha256 and r:sha256 declarations → accepted, in
+        // every encoding CppNix accepts (base16 / nixbase32 / base64).
+        // r[verify nix.hash.fod-decode+1]
+        use base64::Engine;
+        let encodings = [
+            hex_hash.clone(),
+            rio_nix::store_path::nixbase32::encode(&digest),
+            base64::engine::general_purpose::STANDARD.encode(&digest),
+        ];
+        for recursive in [false, true] {
+            let algo = if recursive { "r:sha256" } else { "sha256" };
+            let honest = StorePath::make_fixed_output("fetch", &nix_hash, recursive, &[]).unwrap();
+            for declared in &encodings {
+                let mut cache = HashMap::new();
+                cache.insert(key.clone(), fod_at(algo, declared, honest.as_str()));
+                assert!(
+                    validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
+                    "honest {algo} declaration with hash {declared:?} must pass"
+                );
+            }
+        }
+
+        // Junk hash + somebody else's well-formed path → rejected,
+        // naming the declared and derived paths.
+        let victim = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), fod_at("sha256", &hex_hash, victim));
+        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(
+            err.contains("must match the derivation") && err.contains(victim),
+            "squatted FOD path must be rejected naming the path: {err}"
+        );
+
+        // Non-hex hash with a parseable path → rejected fail-closed.
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), fod_at("sha256", "nothex!", victim));
+        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(err.contains("base16"), "{err}");
+
+        // Wrong-length digest (sha512 algo, 32-byte hash) → rejected: the
+        // length matches none of sha512's three encodings.
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), fod_at("sha512", &hex_hash, victim));
+        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(
+            err.contains("outputHash") && err.contains("base16"),
+            "{err}"
+        );
+
+        // Empty declared path on a hash-declaring output: formerly this
+        // gate's "deferred FOD" carve-out, now unrepresentable — the
+        // typed boundary rejects it at parse (oracle validatePath
+        // analog), so the gate has no carve-out to maintain.
+        let err = Derivation::parse(&format!(
+            r#"Derive([("out","","sha256","{hex_hash}")],[],[],"x86_64-linux","/bin/sh",[],[("out","")])"#
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("bad path ''"), "{err}");
+
+        // merged_bug_048 pin: a case-variant algo is UNVERIFIABLE — it
+        // routes to the offender flow (decided by realized-outputs
+        // exemption: no build can ever run for it), with the raw
+        // spelling preserved for diagnostics. Both gateway gates now
+        // agree by construction: the verifiability screen and the
+        // declared-hash binding parse with the same constructor —
+        // previously the binding's lax FromStr folded "SHA256" while
+        // the screen was exact, a latent disagreement shadowed only by
+        // the screen running first.
+        // r[verify nix.hash.algos+2]
+        let honest = StorePath::make_fixed_output("fetch", &nix_hash, false, &[]).unwrap();
+        for bad_algo in ["SHA256", "Sha256", "r:SHA256", "R:sha256"] {
+            let mut cache = HashMap::new();
+            cache.insert(key.clone(), fod_at(bad_algo, &hex_hash, honest.as_str()));
+            let offenders = validate_dag(std::slice::from_ref(&node), &cache)
+                .expect("classified as offender, not an immediate Err");
+            assert_eq!(offenders.len(), 1, "{bad_algo:?} must be an offender");
+            assert_eq!(offenders[0].algo, bad_algo, "raw spelling preserved");
+        }
+    }
+
+    /// CppNix's shape rule for fixed-output derivations, enforced at
+    /// submission: exactly one output, named "out"; hash-declaring and
+    /// plain outputs cannot be mixed.
+    #[test]
+    fn validate_dag_rejects_mixed_declared_hash_shapes() {
+        let drv_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-fetch.drv";
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: "bbb".into(),
+            ..Default::default()
+        };
+        let key = StorePath::parse(drv_path).unwrap();
+        let hex_hash = "5a".repeat(32);
+        let victim = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
+
+        let _ = (key, node);
+        // All three shapes are now unrepresentable at the parse
+        // boundary (drv-level classification, oracle type() parity) —
+        // the submission gate has nothing left to check because the
+        // session drv cache can never contain them.
+
+        // Declared-hash output + IA sibling → mixing, oracle wording.
+        let err = Derivation::parse(&format!(
+            r#"Derive([("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fetch","sha256","{hex_hash}"),("doc","{victim}","","")],[],[],"x86_64-linux","/bin/sh",[],[("out",""),("doc","")])"#
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("can't mix derivation output types"),
+            "{err}"
+        );
+
+        // Two declared-hash outputs → only one fixed output allowed.
+        let p_out = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fetch";
+        let p_src = "/nix/store/dddddddddddddddddddddddddddddddd-src";
+        let err = Derivation::parse(&format!(
+            r#"Derive([("out","{p_out}","sha256","{hex_hash}"),("src","{p_src}","sha256","{hex_hash}")],[],[],"x86_64-linux","/bin/sh",[],[("out","{p_out}"),("src","{p_src}")])"#
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only one fixed output is allowed for now"),
+            "{err}"
+        );
+
+        // Single declared-hash output not named "out".
+        let err = Derivation::parse(&format!(
+            r#"Derive([("src","{p_src}","sha256","{hex_hash}")],[],[],"x86_64-linux","/bin/sh",[],[("src","{p_src}")])"#
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("single fixed output must be named \"out\""),
+            "{err}"
+        );
+    }
 
     #[test]
     fn test_single_node_no_features() -> anyhow::Result<()> {
         let drv = make_basic_drv(BTreeMap::new())?;
-        let node = build_node("/nix/store/test.drv", &drv);
+        let node = build_node("/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi.drv", &drv);
         assert!(node.required_features.is_empty());
         Ok(())
     }
@@ -1045,14 +2726,14 @@ mod tests {
         env.insert("pname".into(), "hello".into());
         env.insert("name".into(), "hello-2.12".into());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.pname, "hello", "pname preferred over name");
 
         // name fallback when pname absent (raw derivation{} case).
         let mut env = BTreeMap::new();
         env.insert("name".into(), "rawbuild-1.0".into());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(
             node.pname, "rawbuild-1.0",
             "name fallback — less stable (includes version) but beats empty"
@@ -1060,7 +2741,7 @@ mod tests {
 
         // neither → empty (no build_samples key possible).
         let drv = make_basic_drv(BTreeMap::new())?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.pname, "");
 
         Ok(())
@@ -1078,7 +2759,7 @@ mod tests {
         env.insert("enableParallelBuilding".into(), "1".into());
         env.insert("preferLocalBuild".into(), "true".into());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.version.as_deref(), Some("2.12"));
         assert_eq!(node.enable_parallel_building, Some(true));
         assert_eq!(node.enable_parallel_checking, None, "absent stays None");
@@ -1092,7 +2773,7 @@ mod tests {
         env.insert("enableParallelChecking".into(), "1".into());
         env.insert("preferLocalBuild".into(), "false".into());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.enable_parallel_building, Some(false));
         assert_eq!(node.enable_parallel_checking, Some(true));
         assert_eq!(node.prefer_local_build, Some(false));
@@ -1108,7 +2789,7 @@ mod tests {
         env.insert("pname".into(), long.clone());
         env.insert("version".into(), long.clone());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.pname.chars().count(), MAX_ATTR_LEN);
         assert_eq!(
             node.version.as_deref().map(|s| s.chars().count()),
@@ -1118,7 +2799,7 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("name".into(), long.clone());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.pname.chars().count(), MAX_ATTR_LEN);
         // Multi-byte: clamp is by chars not bytes (don't split a code
         // point). 300×'é' (2 bytes each) → 256 chars = 512 bytes.
@@ -1126,14 +2807,17 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("pname".into(), mb);
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.pname.chars().count(), MAX_ATTR_LEN);
         assert_eq!(node.pname.len(), MAX_ATTR_LEN * 2, "bytes ≠ chars");
         // Under-threshold is unchanged (no spurious reallocation/copy).
         let mut env = BTreeMap::new();
         env.insert("pname".into(), "hello".into());
         let drv = make_basic_drv(env)?;
-        assert_eq!(build_node("/nix/store/x.drv", &drv).pname, "hello");
+        assert_eq!(
+            build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv).pname,
+            "hello"
+        );
         Ok(())
     }
 
@@ -1156,7 +2840,7 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("requiredSystemFeatures".into(), many);
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.required_features.len(), MAX_LIST_LEN);
         assert_eq!(node.required_features[0], "f0", "head preserved");
         assert_eq!(
@@ -1170,7 +2854,7 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("requiredSystemFeatures".into(), long);
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.required_features.len(), 1);
         assert_eq!(node.required_features[0].chars().count(), MAX_ATTR_LEN);
 
@@ -1187,7 +2871,7 @@ mod tests {
             serde_json::json!({ "requiredSystemFeatures": json_features }).to_string(),
         );
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.required_features.len(), MAX_LIST_LEN);
         for f in &node.required_features {
             assert_eq!(f.chars().count(), MAX_ATTR_LEN);
@@ -1197,7 +2881,7 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("requiredSystemFeatures".into(), "kvm big-parallel".into());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.required_features, vec!["kvm", "big-parallel"]);
         Ok(())
     }
@@ -1226,7 +2910,7 @@ mod tests {
             .to_string(),
         );
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.pname, "foo", "pname from __json, not name fallback");
         assert_eq!(node.version.as_deref(), Some("1.0"));
         assert_eq!(
@@ -1242,7 +2926,7 @@ mod tests {
         env.insert("__json".into(), "{not json".into());
         env.insert("version".into(), "2.0".into());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.version.as_deref(), Some("2.0"));
         Ok(())
     }
@@ -1257,7 +2941,7 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("pname".into(), "hello".into());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.version, None);
         assert_eq!(
             node.enable_parallel_building, None,
@@ -1328,7 +3012,8 @@ mod tests {
     #[tokio::test]
     async fn test_reconstruct_dag_single_node_no_inputs() {
         let root_path = sp(&test_drv_path("root"));
-        let root_drv = make_test_derivation("/nix/store/aaa-root-out", &[]);
+        let root_drv =
+            make_test_derivation("/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-root-out", &[]);
 
         let mut store = unreachable_store();
         let mut cache = HashMap::new();
@@ -1349,10 +3034,11 @@ mod tests {
         let child_path = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-child.drv");
 
         let root_drv = make_test_derivation(
-            "/nix/store/aaa-root-out",
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-root-out",
             &[(child_path.as_str(), &["out"])],
         );
-        let child_drv = make_test_derivation("/nix/store/bbb-child-out", &[]);
+        let child_drv =
+            make_test_derivation("/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-child-out", &[]);
 
         let mut store = unreachable_store();
         // Pre-populate cache so resolve_derivation finds the child without gRPC.
@@ -1375,6 +3061,81 @@ mod tests {
         assert!(paths.contains(&child_path.to_string()));
     }
 
+    /// Plain IA nodes (statically-known output paths) now carry the
+    /// modular hash too — they are no longer "dead bytes on the wire":
+    /// the scheduler's ingress inline-content binding seeds
+    /// `input_addressed_output_paths`' hash cache from sibling nodes'
+    /// hashes to verify declared IA paths without store access.
+    // r[verify gw.dag.modulo-hash-all-nodes]
+    #[tokio::test]
+    async fn populate_modular_hashes_covers_plain_ia_nodes() {
+        let root_path = sp(&test_drv_path("ia-root"));
+        let child_path = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-ia-child.drv");
+
+        // Plain IA: non-empty declared output paths, no hash algo.
+        let child_aterm = format!(
+            r#"Derive([("out","/nix/store/{}-ia-child","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo c"],[("out","/nix/store/{}-ia-child")])"#,
+            "c".repeat(32),
+            "c".repeat(32),
+        );
+        let child_drv = Derivation::parse(&child_aterm).expect("child ATerm");
+        let root_aterm = format!(
+            r#"Derive([("out","/nix/store/{}-ia-root","","")],[("{}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo r"],[("out","/nix/store/{}-ia-root")])"#,
+            "d".repeat(32),
+            child_path.as_str(),
+            "d".repeat(32),
+        );
+        let root_drv = Derivation::parse(&root_aterm).expect("root ATerm");
+
+        let mut store = unreachable_store();
+        let mut cache = HashMap::new();
+        // Production parity: the root .drv is in the session drv_cache
+        // (the client uploaded it before requesting the build).
+        cache.insert(root_path.clone(), root_drv.clone());
+        cache.insert(child_path.clone(), child_drv.clone());
+
+        let (nodes, _edges) = reconstruct_dag(&root_path, &root_drv, None, &mut store, &mut cache)
+            .await
+            .expect("reconstruct should succeed");
+
+        assert_eq!(nodes.len(), 2);
+        for node in &nodes {
+            assert!(
+                !node.is_content_addressed,
+                "fixture nodes are plain IA: {}",
+                node.drv_path
+            );
+            assert!(
+                !node.ca_modular_hash.is_empty(),
+                "plain IA node {} must carry the modular hash",
+                node.drv_path
+            );
+            assert_eq!(node.ca_modular_hash.len(), 32);
+        }
+
+        // The child's populated hash equals a direct hash_derivation_modulo
+        // computation — i.e. it IS the value a consumer can seed a hash
+        // cache with.
+        let child_node = nodes
+            .iter()
+            .find(|n| n.drv_path == child_path.as_str())
+            .expect("child node present");
+        let mut direct_cache = HashMap::new();
+        let no_resolve = |_: &str| -> Option<&Derivation> { None };
+        let direct = rio_nix::derivation::hash_derivation_modulo(
+            &child_drv,
+            child_path.as_str(),
+            &no_resolve,
+            &mut direct_cache,
+        )
+        .expect("leaf IA hash");
+        assert_eq!(
+            child_node.ca_modular_hash,
+            direct.to_vec(),
+            "populated hash equals the direct computation"
+        );
+    }
+
     #[tokio::test]
     async fn test_reconstruct_dag_unresolvable_inputdrv_fails() {
         // inputDrv not in cache AND store unreachable -> hard failure.
@@ -1383,8 +3144,10 @@ mod tests {
         let root_path = sp(&test_drv_path("root"));
         let missing_child = "/nix/store/cccccccccccccccccccccccccccccccc-missing.drv";
 
-        let root_drv =
-            make_test_derivation("/nix/store/aaa-root-out", &[(missing_child, &["out"])]);
+        let root_drv = make_test_derivation(
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-root-out",
+            &[(missing_child, &["out"])],
+        );
 
         let mut store = unreachable_store();
         let mut cache = HashMap::new(); // child NOT in cache
@@ -1414,7 +3177,10 @@ mod tests {
         let root_path = sp(&test_drv_path("root"));
         let bogus_child = "/not/a/store/path";
 
-        let root_drv = make_test_derivation("/nix/store/aaa-root-out", &[(bogus_child, &["out"])]);
+        let root_drv = make_test_derivation(
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-root-out",
+            &[(bogus_child, &["out"])],
+        );
 
         let mut store = unreachable_store();
         let mut cache = HashMap::new();
@@ -1440,9 +3206,15 @@ mod tests {
         let b_path = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv");
         let c_path = sp("/nix/store/cccccccccccccccccccccccccccccccc-c.drv");
 
-        let a_drv = make_test_derivation("/nix/store/aaa-out", &[(b_path.as_str(), &["out"])]);
-        let b_drv = make_test_derivation("/nix/store/bbb-out", &[(c_path.as_str(), &["out"])]);
-        let c_drv = make_test_derivation("/nix/store/ccc-out", &[]);
+        let a_drv = make_test_derivation(
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-out",
+            &[(b_path.as_str(), &["out"])],
+        );
+        let b_drv = make_test_derivation(
+            "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-out",
+            &[(c_path.as_str(), &["out"])],
+        );
+        let c_drv = make_test_derivation("/nix/store/h215ws5mqjq1pnqd7j0incvdyqk96lhp-out", &[]);
 
         let mut store = unreachable_store();
         let mut cache = HashMap::new();
@@ -1478,7 +3250,10 @@ mod tests {
             .map(|p| (p.as_str(), &["out"][..]))
             .collect();
         let root_path = sp(&test_drv_path("wide"));
-        let root_drv = make_test_derivation("/nix/store/aaa-wide-out", &child_refs);
+        let root_drv = make_test_derivation(
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-wide-out",
+            &child_refs,
+        );
 
         let mut store = unreachable_store();
         let mut cache = HashMap::new();
@@ -1645,7 +3420,7 @@ mod tests {
     #[tokio::test]
     async fn test_filter_and_inline_drv_store_error_skips_safely() {
         let drv_path = sp(&test_drv_path("x"));
-        let drv = make_test_derivation("/nix/store/aaa-out", &[]);
+        let drv = make_test_derivation("/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-out", &[]);
 
         let mut cache = HashMap::new();
         cache.insert(drv_path.clone(), drv.clone());
@@ -1783,6 +3558,64 @@ mod tests {
         Ok(())
     }
 
+    /// The warm store-backed-floating shape is MANUFACTURED by the
+    /// per-node inline cap (round-15 C3c6, bug_048 lineage): a
+    /// floating-CA derivation whose canonical ATerm exceeds
+    /// `MAX_INLINE_DRV_BYTES` (64 KiB) is never inlined, so every
+    /// submission containing it ships the child STORE-BACKED while
+    /// its (inlined) consumers carry a declared `ca_modular_hash`
+    /// computed from the gateway's full session cache. At scheduler
+    /// ingress that declaration is unverifiable — the floating
+    /// input's bytes are not in the submission — and is STRIPPED
+    /// (`sched.merge.ingress-inline-drv-binding+1`). Arithmetic: ONE
+    /// >64 KiB floating .drv forces the shape on every warm
+    /// submission that consumes it, independent of the 16 MiB total
+    /// budget; this is honest gateway traffic, which is why the
+    /// scheduler strips instead of rejecting.
+    #[tokio::test]
+    async fn test_inline_cap_manufactures_store_backed_floating_shape() -> anyhow::Result<()> {
+        use rio_test_support::grpc::spawn_mock_store_with_client;
+
+        let (_store, mut store_client, _h) = spawn_mock_store_with_client().await?;
+
+        // Floating-CA child: empty output path, >64 KiB ATerm.
+        let pad_val = "x".repeat(MAX_INLINE_DRV_BYTES + 1024);
+        let big_floating_aterm = format!(
+            r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",[],[("PAD","{pad_val}"),("out","")])"#
+        );
+        let big_floating = Derivation::parse(&big_floating_aterm)?;
+        let child_path = sp(&format!("/nix/store/{:0>32}-bigfloat.drv", 7));
+
+        // Small inline-able consumer of the floating child.
+        let consumer = make_test_derivation(
+            "/nix/store/x265isadxs1xhsd5larxdal956cxmsk1-out",
+            &[(child_path.as_str(), &["out"])],
+        );
+        let consumer_path = sp(&format!("/nix/store/{:0>32}-consumer.drv", 8));
+
+        let mut cache = HashMap::new();
+        cache.insert(child_path.clone(), big_floating.clone());
+        cache.insert(consumer_path.clone(), consumer.clone());
+        let mut nodes = vec![
+            build_node(child_path.as_str(), &big_floating),
+            build_node(consumer_path.as_str(), &consumer),
+        ];
+
+        filter_and_inline_drv(&mut nodes, &cache, &mut store_client).await;
+
+        assert!(
+            nodes[0].drv_content.is_empty(),
+            "floating child above the per-node cap stays STORE-BACKED"
+        );
+        assert!(
+            !nodes[1].drv_content.is_empty(),
+            "small consumer inlines — together with the store-backed \
+             floating child this is exactly the shape the scheduler's \
+             ingress strip exists for"
+        );
+        Ok(())
+    }
+
     /// Once the budget gate rejects ANY node, the fast-path arms and
     /// every subsequent node (including tiny ones that would fit in
     /// the headroom) skips `to_aterm()`.
@@ -1885,8 +3718,14 @@ mod tests {
 
         // Only a + c in the cache; b is the miss (BFS-inconsistency).
         let mut drv_cache = HashMap::new();
-        drv_cache.insert(a, make_test_derivation("/nix/store/aaa-out", &[]));
-        drv_cache.insert(c, make_test_derivation("/nix/store/ccc-out", &[]));
+        drv_cache.insert(
+            a,
+            make_test_derivation("/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-out", &[]),
+        );
+        drv_cache.insert(
+            c,
+            make_test_derivation("/nix/store/h215ws5mqjq1pnqd7j0incvdyqk96lhp-out", &[]),
+        );
 
         let hits: Vec<usize> = iter_cached_drvs(&nodes, &drv_cache, "test")
             .map(|(i, _, _)| i)
@@ -1899,7 +3738,7 @@ mod tests {
     #[test]
     fn modular_hash_wrapper_none_on_resolver_miss() {
         let drv = make_test_derivation(
-            "/nix/store/oooooooooooooooooooooooooooooooo-out",
+            "/nix/store/gsqizyqxzjbdjyb1jav5zjndvsadgs15-out",
             &[(
                 "/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-missing.drv",
                 &["out"],
@@ -1920,10 +3759,16 @@ mod tests {
     }
 
     // r[verify sched.ca.detect]
-    /// `populate_needs_resolve`: IA parent depending on a floating-CA
-    /// child gets `needs_resolve = true` (the ia.deferred case from
-    /// ADR-018 Appendix B). IA-on-IA stays false. Floating-CA self
-    /// stays true (set earlier by `build_node`, unchanged here).
+    /// `populate_needs_resolve` clause survival through the shared
+    /// oracle predicate: IA parent depending on a floating-CA child
+    /// gets `needs_resolve = true` (ia.deferred, ADR-018 Appendix B);
+    /// IA-on-IA stays false; a FOD with a floating input resolves
+    /// (the narrowing's correctness escape). KNOWINGLY-FLIPPED PIN
+    /// (round-15 C3c3, oracle derivations.cc:1125-1155 clause 1): a
+    /// floating-CA leaf with NO input drvs is now `false` — "no input
+    /// drvs means nothing to resolve"; the resolve walk over zero
+    /// children was a proven no-op and realisation registration is
+    /// gated by `is_ca`, not this flag.
     #[test]
     fn populate_needs_resolve_ia_deferred() {
         let ca_child_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ca.drv");
@@ -1937,17 +3782,19 @@ mod tests {
         let ca_child = Derivation::parse(ca_child_aterm).unwrap();
 
         // IA child: all-empty output tuple.
-        let ia_child = make_test_derivation("/nix/store/ia-out", &[]);
+        let ia_child = make_test_derivation("/nix/store/x265isadxs1xhsd5larxdal956cxmsk1-out", &[]);
 
         // IA parent depending on the floating-CA child.
         let ia_parent = make_test_derivation(
-            "/nix/store/parent-out",
+            "/nix/store/pj8izfqdpab526ki2jvdgjfmvjs5zs9x-out",
             &[(ca_child_path.as_str(), &["out"])],
         );
 
         // IA parent depending only on the IA child (pure IA-on-IA).
-        let ia_pure =
-            make_test_derivation("/nix/store/pure-out", &[(ia_child_path.as_str(), &["out"])]);
+        let ia_pure = make_test_derivation(
+            "/nix/store/9js5mjfd9addln5rwamdijq5mj4x9j7d-out",
+            &[(ia_child_path.as_str(), &["out"])],
+        );
 
         let mut drv_cache = HashMap::new();
         drv_cache.insert(ca_child_path.clone(), ca_child.clone());
@@ -1968,7 +3815,10 @@ mod tests {
 
         populate_needs_resolve(&mut nodes, &drv_cache);
 
-        assert!(nodes[0].needs_resolve, "floating-CA unchanged");
+        assert!(
+            !nodes[0].needs_resolve,
+            "floating-CA leaf with no input drvs → false (oracle clause 1)"
+        );
         assert!(!nodes[1].needs_resolve, "IA leaf → still false");
         assert!(
             nodes[2].needs_resolve,
@@ -1977,6 +3827,26 @@ mod tests {
         assert!(
             !nodes[3].needs_resolve,
             "IA with only-IA inputs → still false"
+        );
+
+        // Clause survival: a FOD whose input is the floating-CA child
+        // must resolve (its env embeds the child's placeholder) — the
+        // population the deleted local OR-pass used to catch and the
+        // shared predicate's clause 3 now owns.
+        let fod_path = sp("/nix/store/gggggggggggggggggggggggggggggggg-fod.drv");
+        let fod_aterm = format!(
+            r#"Derive([("out","/nix/store/x265isadxs1xhsd5larxdal956cxmsk1-fodout","sha256","0123abcd")],[("{}",["out"])],[],"x86_64-linux","/bin/sh",[],[])"#,
+            ca_child_path.as_str()
+        );
+        let fod = Derivation::parse(&fod_aterm).unwrap();
+        let mut fod_cache = drv_cache.clone();
+        fod_cache.insert(fod_path.clone(), fod.clone());
+        let mut fod_nodes = vec![build_node(fod_path.as_str(), &fod)];
+        assert!(!fod_nodes[0].needs_resolve, "FOD seed → false pre-pass");
+        populate_needs_resolve(&mut fod_nodes, &fod_cache);
+        assert!(
+            fod_nodes[0].needs_resolve,
+            "FOD with floating-CA input → needs_resolve=true"
         );
     }
 
@@ -2011,9 +3881,11 @@ mod tests {
         let ia_gp = make_deferred_derivation(&[(ia_mid_path.as_str(), &["out"])]);
         // Concrete-IA child (non-empty out_path) and a parent on it —
         // proves concrete-IA-on-concrete-IA still stays false.
-        let ia_conc = make_test_derivation("/nix/store/ia-out", &[]);
-        let ia_pure =
-            make_test_derivation("/nix/store/pure-out", &[(ia_conc_path.as_str(), &["out"])]);
+        let ia_conc = make_test_derivation("/nix/store/x265isadxs1xhsd5larxdal956cxmsk1-out", &[]);
+        let ia_pure = make_test_derivation(
+            "/nix/store/9js5mjfd9addln5rwamdijq5mj4x9j7d-out",
+            &[(ia_conc_path.as_str(), &["out"])],
+        );
 
         let mut drv_cache = HashMap::new();
         for (p, d) in [
@@ -2041,7 +3913,14 @@ mod tests {
 
         populate_needs_resolve(&mut nodes, &drv_cache);
 
-        assert!(nodes[0].needs_resolve, "floating-CA leaf unchanged");
+        // KNOWINGLY-FLIPPED PIN (round-15 C3c3): no-input floating
+        // leaf → false under the shared oracle predicate's clause 1
+        // (derivations.cc:1125-1155 "no input drvs means nothing to
+        // resolve"); see populate_needs_resolve_ia_deferred.
+        assert!(
+            !nodes[0].needs_resolve,
+            "floating-CA leaf with no inputs → false (oracle clause 1)"
+        );
         assert!(
             nodes[1].needs_resolve,
             "IA-mid (child = floating-CA) → true"
@@ -2089,7 +3968,7 @@ mod tests {
         Derivation::parse(&aterm).expect("test ATerm should parse")
     }
 
-    // r[verify gw.dag.reconstruct+3]
+    // r[verify gw.dag.reconstruct+4]
     /// A node consumed by one parent that names only `{out}` of its three
     /// declared outputs gets `wanted_output_names == ["out"]`. The `^*`
     /// root keeps the empty (= all declared outputs wanted) sentinel.
@@ -2108,7 +3987,7 @@ mod tests {
             &[],
         );
         let parent = make_test_derivation(
-            "/nix/store/ppp-parent-out",
+            "/nix/store/mjc59j05djg72j3gf2pp7487bwwg7cgr-parent-out",
             &[(child_path.as_str(), &["out"])],
         );
 
@@ -2163,10 +4042,16 @@ mod tests {
             &[],
         );
         // A consumes child^out, B consumes child^dev.
-        let a = make_test_derivation("/nix/store/aaa-out", &[(child_path.as_str(), &["out"])]);
-        let b = make_test_derivation("/nix/store/bbb-out", &[(child_path.as_str(), &["dev"])]);
+        let a = make_test_derivation(
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-out",
+            &[(child_path.as_str(), &["out"])],
+        );
+        let b = make_test_derivation(
+            "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-out",
+            &[(child_path.as_str(), &["dev"])],
+        );
         let root = make_test_derivation(
-            "/nix/store/rrr-out",
+            "/nix/store/zjsm32y5pjmp8y5v8a5gdls3m0az5lx1-out",
             &[(a_path.as_str(), &["out"]), (b_path.as_str(), &["out"])],
         );
 
@@ -2264,9 +4149,10 @@ mod tests {
         let parent_path = sp("/nix/store/pppppppppppppppppppppppppppppppp-parent.drv");
         let child_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc.drv");
 
-        let child = make_test_derivation("/nix/store/aaa-glibc-out", &[]);
+        let child =
+            make_test_derivation("/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-glibc-out", &[]);
         let parent = make_test_derivation(
-            "/nix/store/ppp-parent-out",
+            "/nix/store/mjc59j05djg72j3gf2pp7487bwwg7cgr-parent-out",
             &[(child_path.as_str(), &["out"])],
         );
 
@@ -2311,7 +4197,7 @@ mod tests {
             &[],
         );
         let root = make_test_derivation(
-            "/nix/store/aaa-root-out",
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-root-out",
             &[(child_path.as_str(), &["dev"])],
         );
 

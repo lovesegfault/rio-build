@@ -1,7 +1,75 @@
 set -euo pipefail
 : "${AWS_REGION:?}" "${CHUNK_BUCKET:?}"
 
-if aws secretsmanager describe-secret --secret-id rio/hmac >/dev/null 2>&1; then
+tmp=$(mktemp -d)
+
+# r[impl infra.bootstrap.secret-state-probe] (scannable anchor in
+# nix/docker.nix at the bootstrapScript export — .sh is outside
+# tracey's extension set; this line is documentary.)
+#
+# Fail-closed state probe for EVERY Secrets Manager existence
+# decision in this Job (bootstrap-probe-conformance pins this as the
+# script's sole describe-secret call site). The signing key is the
+# secret where a wrong "missing" verdict is DESTRUCTIVE — the
+# recovery path mints a fresh keypair, and rotating the live key
+# invalidates every narinfo `Sig:` made under the old one — but the
+# same discrimination protects every guard. Four provider states:
+#   present  — the secret exists and is live (DeletedDate unset)
+#   missing  — the API SAID ResourceNotFoundException
+#   (abort)  — scheduled for deletion: the default `delete-secret`
+#              only SCHEDULES; describe-secret keeps succeeding (with
+#              DeletedDate) for the whole 7-30 day recovery window
+#              while get/put/create all fail InvalidRequestException.
+#              "present" here wedges every Job retry until the window
+#              elapses (round-17 bug_097); "missing" would try to
+#              create and wedge identically. Neither converges — the
+#              operator holds the only two exits, so abort NAMES them.
+#   (abort)  — anything else: a throttle, an IAM hiccup, a network
+#              blip (all also exit nonzero). Refuse to guess.
+secret_state() {
+  _ss_id=$1
+  if _ss_deleted=$(aws secretsmanager describe-secret --secret-id "$_ss_id" \
+      --query DeletedDate --output text 2>"$tmp/_ss.err"); then
+    if [ "$_ss_deleted" = None ]; then
+      echo present
+    else
+      # The remediation verbs ride as printf ARGUMENTS (not literal
+      # `aws secretsmanager <verb>` text) so bootstrap-iam-parity's
+      # executed-verb extraction never reads remediation prose as a
+      # grant requirement — the operator runs these under their own
+      # credentials; the Job role must NOT hold delete/restore.
+      printf '[bootstrap] %s is scheduled for deletion (DeletedDate %s); Secrets Manager refuses reads and writes until the recovery window ends. Pick one:\n  aws secretsmanager %s --secret-id %s   # cancel the deletion, keep the value\n  aws secretsmanager %s --secret-id %s --force-delete-without-recovery   # finalize now; the next Job run regenerates\n' \
+        "$_ss_id" "$_ss_deleted" restore-secret "$_ss_id" delete-secret "$_ss_id" >&2
+      return 1
+    fi
+  else
+    # Pure-POSIX exception discrimination: the production image's
+    # PATH is awscli2/openssl/openssh/rio-cli/coreutils/diffutils —
+    # no grep (round-17 composition bug: a grep here passed the
+    # harness, whose PATH was tool-richer than the image, and died
+    # 'command not found' in the real pod). Substring match via
+    # case is a shell builtin and needs nothing from PATH. Command
+    # substitution is fine HERE — this is error-text classification,
+    # not the byte-compared pub operands the R6 ban covers.
+    _ss_err=$(cat "$tmp/_ss.err")
+    case "$_ss_err" in
+      *ResourceNotFoundException*)
+        echo missing
+        ;;
+      *)
+        printf '[bootstrap] describe-secret %s failed without ResourceNotFoundException; refusing to guess:\n%s\n' \
+          "$_ss_id" "$_ss_err" >&2
+        return 1
+        ;;
+    esac
+  fi
+}
+
+# Assignment-then-test form everywhere: `state=$(secret_state id)` at
+# top level propagates the probe's abort through `set -e`; an
+# `if secret_state ...` guard would swallow it.
+hmac_state=$(secret_state rio/hmac)
+if [ "$hmac_state" = present ]; then
   echo "[bootstrap] rio/hmac already exists, skipping"
 else
   echo "[bootstrap] generating rio/hmac"
@@ -12,7 +80,8 @@ else
     --secret-binary fileb:///tmp/hmac
 fi
 
-if aws secretsmanager describe-secret --secret-id rio/service-hmac >/dev/null 2>&1; then
+service_hmac_state=$(secret_state rio/service-hmac)
+if [ "$service_hmac_state" = present ]; then
   echo "[bootstrap] rio/service-hmac already exists, skipping"
 else
   echo "[bootstrap] generating rio/service-hmac"
@@ -24,50 +93,101 @@ else
     --secret-binary fileb:///tmp/service-hmac
 fi
 
-# Guard on BOTH halves. With one guard and two creates, a Job
-# retry after dying between the two creates (or a rotation by
-# deleting only the private half) left a permanently mismatched
-# pair while the Job reported success — every client signature
-# check then fails. Guarding both + create||put converges from
-# any partial state.
-if aws secretsmanager describe-secret --secret-id rio/signing-key >/dev/null 2>&1 \
-  && aws secretsmanager describe-secret --secret-id rio/signing-key-pub >/dev/null 2>&1; then
-  echo "[bootstrap] rio/signing-key{,-pub} already exist, skipping"
+# Probe BOTH halves and dispatch on the pair state. With one guard
+# and two creates, a Job retry after dying between the two creates
+# left a permanently mismatched pair while the Job reported success —
+# every client signature check then fails. A rotation by deleting
+# only one half converges THROUGH the probe's scheduled-for-deletion
+# abort: the operator finalizes (or restores) per the printed
+# remediation and the next run regenerates or re-derives.
+#
+# ALL key-byte work is delegated to rio-cli (the signing_keyfmt
+# codec): the shell never decodes, slices, or re-encodes key
+# material. The previous re-derive (`base64 -d | tail -c 32 |
+# base64 -w0`) assumed the 64-byte expanded payload; for a 32-byte
+# seed-only entry — a format the store's own Signer::parse accepts —
+# it published the PRIVATE SEED verbatim onto rio/signing-key-pub
+# and into this Job's log (round-16 bug_023, critical).
+sec_state=$(secret_state rio/signing-key)
+pub_state=$(secret_state rio/signing-key-pub)
+if [ "$sec_state" = present ]; then
+  # Private half is live: NEVER regenerate. Converge the pub half to
+  # the seed-derived public entry. derive-pub reads the secret on
+  # stdin (never argv) and refuses corrupt or internally inconsistent
+  # entries with nothing published — operator intervention beats
+  # minting or advertising a key that doesn't match the data.
+  aws secretsmanager get-secret-value --secret-id rio/signing-key \
+    --query SecretString --output text > "$tmp/sec.entry"
+  rio-cli keygen derive-pub < "$tmp/sec.entry" > "$tmp/pub.derived"
+  if [ "$pub_state" = present ]; then
+    # Pair-consistency probe: every upgrade's Job log must show
+    # either "pair consistent" or a heal. cmp (byte-exact), with NO
+    # command substitution anywhere in the compared operands'
+    # dataflow: $(...) strips ALL trailing newlines, so a stored pub
+    # corrupted to 'name:b64\n' — the exact round-16 merged_bug_004
+    # class this heal exists to converge — would normalize to the
+    # canonical bytes and log 'pair consistent' forever (round-17
+    # bug_006). Instead the RAW stored bytes are compared against
+    # derived + exactly the ONE newline `--output text` appends:
+    # canonical stored value 'entry' arrives as 'entry\n' (match);
+    # corrupted 'entry\n' arrives as 'entry\n\n' (heal fires).
+    aws secretsmanager get-secret-value --secret-id rio/signing-key-pub \
+      --query SecretString --output text > "$tmp/pub.stored.raw"
+    { cat "$tmp/pub.derived"; echo; } > "$tmp/pub.derived.nl"
+    if cmp -s "$tmp/pub.stored.raw" "$tmp/pub.derived.nl"; then
+      echo "[bootstrap] signing-key pair consistent"
+    else
+      echo "[bootstrap] rio/signing-key-pub does not match the private half; healing"
+      aws secretsmanager put-secret-value --secret-id rio/signing-key-pub \
+        --secret-string "file://$tmp/pub.derived"
+      echo "[bootstrap] public key (add to nix.conf trusted-public-keys):"
+      cat "$tmp/pub.derived"; echo
+    fi
+  else
+    echo "[bootstrap] rio/signing-key-pub missing; re-deriving from rio/signing-key"
+    aws secretsmanager create-secret --name rio/signing-key-pub \
+      --secret-string "file://$tmp/pub.derived" 2>/dev/null \
+      || aws secretsmanager put-secret-value --secret-id rio/signing-key-pub \
+        --secret-string "file://$tmp/pub.derived"
+    echo "[bootstrap] public key (add to nix.conf trusted-public-keys):"
+    cat "$tmp/pub.derived"; echo
+  fi
 else
   echo "[bootstrap] generating rio/signing-key"
-  tmp=$(mktemp -d)
   # Key name includes the bucket so narinfo `Sig:` lines identify
-  # which cluster signed them. Format: name:base64-seed.
-  # --store dummy://: nix-store opens LocalStore on startup
-  # (mkdir /nix/store/.links) → EROFS under readOnlyRootFilesystem.
-  # The dummy backend skips all filesystem store init.
-  nix-store --store dummy:// \
-    --generate-binary-cache-key "rio-$CHUNK_BUCKET" \
-    "$tmp/key.sec" "$tmp/key.pub"
-  # Pub FIRST, create||put: a half-done prior run or a delete-
-  # private-only rotation converges instead of leaving a stale
-  # pub. If we die after pub-create, retry's guard fails (private
-  # missing) → regenerate both → pub overwritten via put.
-  # Public half stored separately so operators can `get-secret-
-  # value` it for their nix.conf trusted-public-keys without
-  # access to the private half.
+  # which cluster signed them. rio-cli keygen emits the same
+  # name:base64(seed++pubkey) / name:base64(pubkey) pair that
+  # `nix-store --generate-binary-cache-key` did, without needing the
+  # Nix closure in the bootstrap image.
+  rio-cli keygen new "rio-$CHUNK_BUCKET" "$tmp/key.sec" "$tmp/key.pub"
+  # PRIVATE half FIRST, create-only: this create IS the concurrency
+  # guard. Two overlapping Jobs racing this branch both call
+  # create-secret; the loser gets ResourceExistsException → set -e
+  # aborts having written NOTHING (the pub write is sequenced after
+  # the private CAS), and its retry converges through the re-derive/
+  # heal branch above. The previous order (pub overwrite first) let
+  # the loser clobber the winner's pub with a key that was about to
+  # be discarded (round-16 merged_bug_015).
+  aws secretsmanager create-secret --name rio/signing-key \
+    --secret-string "file://$tmp/key.sec"
+  # Pub second, create||put: any pre-existing pub here is stale by
+  # definition (its private half did not exist) and must be
+  # overwritten. Stored separately so operators can get-secret-value
+  # it for nix.conf trusted-public-keys without access to the
+  # private half.
   aws secretsmanager create-secret --name rio/signing-key-pub \
     --secret-string "file://$tmp/key.pub" 2>/dev/null \
     || aws secretsmanager put-secret-value --secret-id rio/signing-key-pub \
       --secret-string "file://$tmp/key.pub"
-  aws secretsmanager create-secret --name rio/signing-key \
-    --secret-string "file://$tmp/key.sec" 2>/dev/null \
-    || aws secretsmanager put-secret-value --secret-id rio/signing-key \
-      --secret-string "file://$tmp/key.sec"
   echo "[bootstrap] public key (add to nix.conf trusted-public-keys):"
-  cat "$tmp/key.pub"
+  cat "$tmp/key.pub"; echo
 fi
 
-if aws secretsmanager describe-secret --secret-id rio/gateway-host-key >/dev/null 2>&1; then
+host_key_state=$(secret_state rio/gateway-host-key)
+if [ "$host_key_state" = present ]; then
   echo "[bootstrap] rio/gateway-host-key already exists, skipping"
 else
   echo "[bootstrap] generating rio/gateway-host-key"
-  tmp=$(mktemp -d)
   # OpenSSH-format ed25519 private key. -N "" (no passphrase),
   # -C "" (no comment — the comment field in a host key is unused
   # and would otherwise leak the build-time hostname). -f writes

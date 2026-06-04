@@ -37,15 +37,43 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
     assert!(has_ts, "poisoned_at must be set in the same statement");
     assert!(worker.is_none(), "assigned_builder_id must be NULLed");
 
+    // bug_007: give the row an authoritative creation-time snapshot so the
+    // load below proves the recovery SELECT returns the full column set
+    // (the merge gate keys on the recovered node's content + identity).
+    sqlx::query(
+        "UPDATE derivations SET drv_content=$2, output_names=$3, \
+         expected_output_paths=$4, is_ca=true, required_features=$5 \
+         WHERE drv_hash=$1",
+    )
+    .bind(drv_hash.as_str())
+    .bind(b"Derive(A)".as_slice())
+    .bind(vec!["out".to_string()])
+    .bind(vec![String::new()])
+    .bind(vec!["big-parallel".to_string()])
+    .execute(&test_db.pool)
+    .await?;
+
     let rows = db.load_poisoned_derivations().await?;
     assert_eq!(rows.len(), 1, "persist_poisoned should make row loadable");
-    assert_eq!(rows[0].drv_hash, drv_hash.as_str());
-    assert_ne!(rows[0].derivation_id, Uuid::nil());
+    assert_eq!(rows[0].base.drv_hash, drv_hash.as_str());
+    assert_ne!(rows[0].base.derivation_id, Uuid::nil());
     assert!(
         rows[0].elapsed_secs >= 0.0 && rows[0].elapsed_secs < 5.0,
         "elapsed should be ~0s, got {}",
         rows[0].elapsed_secs
     );
+    // Full creation-time snapshot comes back, not a minimal stub.
+    assert_eq!(
+        rows[0].base.drv_content.as_deref(),
+        Some(b"Derive(A)".as_slice())
+    );
+    assert!(rows[0].base.is_ca);
+    assert_eq!(rows[0].base.output_names, vec!["out"]);
+    assert_eq!(rows[0].base.expected_output_paths, vec![String::new()]);
+    assert_eq!(rows[0].base.required_features, vec!["big-parallel"]);
+    // Poisoned executions are finalized — no live assignment surfaces.
+    assert!(rows[0].base.exec_id.is_none());
+    assert!(rows[0].base.assigned_builder_id.is_none());
 
     // clear_poison → no longer loadable; status reset to 'created'.
     db.clear_poison(&drv_hash).await?;
@@ -116,6 +144,80 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
 
     // Empty input: no-op, no PG round-trip.
     assert_eq!(db.clear_poison_batch(&[]).await?, 0);
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-failure-reset+2]
+/// Column-set contrast between the two scalar resets: `clear_poison`
+/// (admin/TTL/same-definition) PRESERVES the reactive resource floors —
+/// sticky sizing memory for the same definition — while
+/// `reset_displaced_derivation` (displacement: a DIFFERENT definition
+/// takes over the row) zeroes the floors along with the rest of the
+/// failure history, in one statement.
+#[tokio::test]
+async fn test_displaced_reset_zeroes_floors_clear_poison_preserves_them() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    let drv_hash: DrvHash = "displaced-floor-hash".into();
+    insert_test_derivation(&db, drv_hash.as_str()).await?;
+
+    // Failure history + floors as left behind by a poisoned definition.
+    let poison_with_floors = "UPDATE derivations
+         SET poisoned_at = now(), failed_builders = ARRAY['w1','w2'],
+             retry_count = 3, resubmit_cycles = 7, status = 'poisoned',
+             floor_mem_bytes = 8589934592, floor_disk_bytes = 34359738368,
+             floor_deadline_secs = 86400
+         WHERE drv_hash = $1";
+    sqlx::query(poison_with_floors)
+        .bind(drv_hash.as_str())
+        .execute(&test_db.pool)
+        .await?;
+
+    // Admin/TTL clear: poison + counters reset, floors PRESERVED.
+    db.clear_poison(&drv_hash).await?;
+    let row: (String, bool, Vec<String>, i32, i32, i64, i64, i64) = sqlx::query_as(
+        "SELECT status, poisoned_at IS NOT NULL, failed_builders,
+                retry_count, resubmit_cycles,
+                floor_mem_bytes, floor_disk_bytes, floor_deadline_secs
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(drv_hash.as_str())
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert_eq!(row.0, "created");
+    assert!(!row.1, "poisoned_at cleared");
+    assert!(row.2.is_empty(), "failed_builders cleared");
+    assert_eq!((row.3, row.4), (0, 0), "counters zeroed");
+    assert_eq!(
+        (row.5, row.6, row.7),
+        (8589934592, 34359738368, 86400),
+        "clear_poison keeps the same-definition sizing floors"
+    );
+
+    // Re-poison, then take the displacement reset: floors go too.
+    sqlx::query(poison_with_floors)
+        .bind(drv_hash.as_str())
+        .execute(&test_db.pool)
+        .await?;
+    db.reset_displaced_derivation(&drv_hash).await?;
+    let row: (String, bool, Vec<String>, i32, i32, i64, i64, i64) = sqlx::query_as(
+        "SELECT status, poisoned_at IS NOT NULL, failed_builders,
+                retry_count, resubmit_cycles,
+                floor_mem_bytes, floor_disk_bytes, floor_deadline_secs
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(drv_hash.as_str())
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert_eq!(row.0, "created");
+    assert!(!row.1, "poisoned_at cleared");
+    assert!(row.2.is_empty(), "failed_builders cleared");
+    assert_eq!((row.3, row.4), (0, 0), "counters zeroed");
+    assert_eq!(
+        (row.5, row.6, row.7),
+        (0, 0, 0),
+        "displacement reset zeroes the floors as well"
+    );
     Ok(())
 }
 
@@ -209,6 +311,19 @@ async fn test_gc_orphan_terminal_derivations() -> anyhow::Result<()> {
     .execute(&test_db.pool)
     .await?;
 
+    // (f) 069 witness rows: one keyed by a victim's drv_hash (must be
+    // deleted by the del_closure_missing CTE — keyed by drv_hash, no
+    // FK, otherwise permanent orphans, the bug_102 class) and one
+    // keyed by a kept row (must survive).
+    sqlx::query(
+        "INSERT INTO derivation_closure_missing (drv_hash, missing_child)
+         VALUES ($1, 'gc-witness-child'), ($2, 'gc-witness-child')",
+    )
+    .bind(format!("gc-orphan-{}", TERMINAL_STATUSES[0]))
+    .bind("gc-linked")
+    .execute(&test_db.pool)
+    .await?;
+
     // Sweep with generous limit.
     let deleted = db.gc_orphan_terminal_derivations(1000).await?;
     assert_eq!(
@@ -251,6 +366,18 @@ async fn test_gc_orphan_terminal_derivations() -> anyhow::Result<()> {
         remaining_edges,
         vec![(linked_id, live_id)],
         "edges referencing victims deleted; non-victim edge kept"
+    );
+
+    // (f) Victim-keyed 069 witness rows deleted in the same statement;
+    // kept-row witness survives.
+    let witness: Vec<String> =
+        sqlx::query_scalar("SELECT drv_hash FROM derivation_closure_missing")
+            .fetch_all(&test_db.pool)
+            .await?;
+    assert_eq!(
+        witness,
+        vec!["gc-linked".to_string()],
+        "del_closure_missing CTE removes victims' witness rows only"
     );
 
     // Second sweep: nothing left to delete.
@@ -345,5 +472,102 @@ async fn test_sweep_stale_assignments_repairs_torn_terminal() -> anyhow::Result<
     );
     // Idempotent.
     assert_eq!(db.sweep_stale_assignments().await?, 0);
+    Ok(())
+}
+
+// r[verify sched.evidence.seed-rank-floor]
+/// Hostile-planted-row e2e (round-17 bug_077): the unseeded-input
+/// read-through query returns ONLY byte-anchored rows. A bare
+/// store-backed submission (rank `unverified_claim`) and an
+/// authoritative inline squat (rank `content_bound_claim`) both
+/// carry recorded 32-byte hashes — submitter echoes — and neither may
+/// reach the seed constructor; `path_bound_bytes` and
+/// `verified_built` rows do. The floor list is DERIVED from
+/// `DefinitionEvidence::seeds_input_form` (asserted directly here so
+/// a predicate widening is visible in this test's diff, not just in
+/// the query's behavior).
+#[tokio::test]
+async fn input_form_read_through_floors_sub_anchor_ranks() -> anyhow::Result<()> {
+    use crate::state::DefinitionEvidence as E;
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    // The derived floor is exactly the byte-anchored pair.
+    assert_eq!(
+        E::seeding_rank_strs(),
+        vec!["path_bound_bytes", "verified_built"]
+    );
+
+    let hostile_digest = [0x41u8; 32];
+    let mut paths = Vec::new();
+    for (i, rank) in E::ALL.iter().copied().enumerate() {
+        let h = format!("seedfloor-{i}");
+        insert_test_derivation(&db, &h).await?;
+        // Plant the recorded hash + rank exactly as a hostile bare
+        // submission row would carry them (raw SQL: the production
+        // writers refuse to construct this shape above the floor
+        // without byte binding — the planted row IS the attack).
+        sqlx::query(
+            "UPDATE derivations SET ca_modular_hash = $2, evidence_rank = $3 \
+             WHERE drv_hash = $1",
+        )
+        .bind(&h)
+        .bind(hostile_digest.as_slice())
+        .bind(rank.as_str())
+        .execute(&db.pool)
+        .await?;
+        paths.push(rio_test_support::fixtures::test_drv_path(&h));
+    }
+
+    let rows = db.load_input_form_rows(&paths).await?;
+    let returned: std::collections::HashSet<&str> =
+        rows.iter().map(|r| r.evidence_rank.as_str()).collect();
+    assert_eq!(
+        returned,
+        ["path_bound_bytes", "verified_built"].into_iter().collect(),
+        "sub-floor ranks must not be returned by the seed query"
+    );
+    assert_eq!(rows.len(), 2);
+    Ok(())
+}
+
+// r[verify sched.retry.revival-total-reset+2]
+/// merged_bug_073: `clear_revival_history` zeroes exactly the persisted
+/// failure-history columns (the ones recovery hydrates back into
+/// `RetryState`) and leaves `status` to the caller's own flow — unlike
+/// `clear_poison`, a revival never flips the row to 'created'.
+#[tokio::test]
+async fn test_clear_revival_history_resets_columns_not_status() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    let drv_hash: DrvHash = "revival-hist-hash".into();
+    let _ = insert_test_derivation(&db, drv_hash.as_str()).await?;
+
+    sqlx::query(
+        "UPDATE derivations SET status = 'failed', retry_count = 3, \
+         resubmit_cycles = 2, failed_builders = ARRAY['w1','w2'], \
+         poisoned_at = now() WHERE drv_hash = $1",
+    )
+    .bind(drv_hash.as_str())
+    .execute(&test_db.pool)
+    .await?;
+
+    db.clear_revival_history(&drv_hash).await?;
+
+    let (status, retry, cycles, builders, poison_null): (String, i32, i32, Vec<String>, bool) =
+        sqlx::query_as(
+            "SELECT status, retry_count, resubmit_cycles, failed_builders, \
+             poisoned_at IS NULL FROM derivations WHERE drv_hash = $1",
+        )
+        .bind(drv_hash.as_str())
+        .fetch_one(&test_db.pool)
+        .await?;
+    assert_eq!(
+        status, "failed",
+        "status untouched — the caller owns its flow"
+    );
+    assert_eq!(retry, 0);
+    assert_eq!(cycles, 0);
+    assert!(builders.is_empty());
+    assert!(poison_null);
     Ok(())
 }

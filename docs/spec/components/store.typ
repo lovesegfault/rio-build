@@ -61,6 +61,13 @@ The inline/chunked decision is made at `PutPath` time based on @nar size; see th
 - Stored in PostgreSQL (shared with scheduler for query efficiency, separate
   schema)
 
+*Startup ordering note:* rio-store requires PostgreSQL at startup and exits
+if it cannot connect; under Kubernetes this surfaces as a few crash-loop
+restarts while the database becomes reachable (observed in the k3s VM
+fixtures), after which the deployment converges without intervention. A
+startup connect-retry with backoff would remove the restart noise --- tracked
+as a follow-up, not a correctness issue.
+
 = Hash Domain Separation
 
 #r("store.hash.domain-sep")[
@@ -306,21 +313,59 @@ the `pending_s3_deletes` table.
   via a service token --- see #rref("sec.authz.service-token").
 ]
 
-#r("sec.authz.ca-path-derived+2")[
-  For floating-CA derivations (`AssignmentClaims.is_ca = true`),
-  `expected_outputs` is unknown at dispatch time. Instead of skipping
-  authorization, the store recomputes the CA store path *server-side* from the
-  SHA-256 it computed over the buffered NAR (via
-  `StorePath::make_fixed_output(name, nar_hash, recursive=true, refs)`) and
-  rejects with `PERMISSION_DENIED` if it does not match the uploaded
-  `store_path`. The server-side CA-path recompute MUST run BEFORE the
-  `'uploading'` placeholder is claimed (#rref("store.put.wal-manifest") step
-  1), so a worker holding an `is_ca` token cannot squat placeholders for paths
-  it has not content-proven (it would otherwise drip-feed chunks while
-  heartbeating an arbitrary path's placeholder fresh, forcing legitimate
-  uploaders into `Aborted`). A worker holding an `is_ca=true` token therefore
-  cannot upload to (or squat the placeholder for) any path other than the
-  content-derived path of the NAR it actually sent.
+#r("sec.authz.ca-path-derived+9")[
+  Workers are untrusted: builder-side hash checks are defense-in-depth, and
+  the store is the authority on whether a claimed path is derivable from the
+  uploaded bytes. The store MUST verify every worker upload that makes a
+  content-address claim, with the required outcome fixed PER UPLOAD CLASS,
+  the class derived from trusted-plane token bits plus the descriptor ---
+  never from worker-controlled shape alone:
+
+  - *Floating-CA* (`AssignmentClaims.is_ca = true`): `expected_outputs` is
+    unknown at dispatch time. Instead of skipping authorization, the store
+    MUST recompute the CA store path *server-side* from the buffered NAR
+    using the ingestion method declared by the upload's `fixed:`
+    content-address descriptor --- recursive (NAR) or flat (a single
+    non-executable regular file), sha1/sha256/sha512, hash-modulo when a
+    self-reference is declared (via
+    `StorePath::make_fixed_output_with_self`). When the descriptor's
+    declared hash disagrees with the plain recompute, the store MUST retry
+    exactly once with the hash taken modulo the claimed path's own hash part
+    (the discarded-self-reference shape structured-attrs
+    `unsafeDiscardReferences` produces) --- and that modulo retry MUST be
+    confined to this floating-CA class, where it is self-certifying because
+    the claimed path derives FROM the modulo hash. Acceptance always
+    requires the descriptor to equal the store's own recompute and the
+    claimed path to re-derive from it; uploads without a descriptor are
+    verified as recursive SHA-256. Mismatch ⇒ `PERMISSION_DENIED`.
+  - *Fixed-output* (`is_ca = false`, token flagged `is_fixed_output`): the
+    builder records the derivation's declared hash as a `fixed:` descriptor;
+    the same server-side recompute, descriptor cross-check, and path
+    re-derivation MUST run in addition to the `expected_outputs` membership
+    check --- and the discarded-self modulo retry MUST NOT apply. A
+    declared-hash path derives from the declared hash itself, so accepting a
+    modulo match would register spliced content whose plain hash differs
+    from the declared hash (bytes embedding the claimed path's own hash
+    part, chosen so the modulo --- not the content --- equals it). The store
+    MUST reject a descriptor-less upload under a fixed-output-flagged token
+    with `PERMISSION_DENIED`: the verification trigger is the
+    scheduler-signed bit, never the worker's own claim, so a worker cannot
+    opt out of content verification by omitting its descriptor.
+  - *Input-addressed* (`is_ca = false`, not fixed-output-flagged): authorized
+    by `expected_outputs` membership (plus
+    #rref("store.put.ia-deriver-proof+4")); a voluntarily attached `fixed:`
+    descriptor is verified with the same no-modulo-retry semantics as the
+    fixed-output class, a non-`fixed:` descriptor on any worker upload is
+    rejected, and daemon-era descriptor-less uploads remain membership-only.
+
+  The server-side CA-path recompute MUST run BEFORE the `'uploading'`
+  placeholder is claimed (#rref("store.put.wal-manifest") step 1), so a
+  worker holding an `is_ca` token cannot squat placeholders for paths it has
+  not content-proven (it would otherwise drip-feed chunks while heartbeating
+  an arbitrary path's placeholder fresh, forcing legitimate uploaders into
+  `Aborted`). A worker holding an `is_ca=true` token therefore cannot upload
+  to (or squat the placeholder for) any path other than the content-derived
+  path of the NAR it actually sent.
 ]
 
 #r("sec.authz.service-token")[
@@ -378,6 +423,159 @@ whose refcount drops to 0 become eligible for S3 deletion via
   16-minute upload over 50Mbps would be reaped at the 15-minute mark.
 ]
 
+#r("store.put.drv-text-ca+3")[
+  Every NAR ingest route whose claimed path is a `.drv` --- `PutPath`,
+  `PutPathBatch` (including service-token relays), and SUBSTITUTION --- MUST
+  pass the residency admission witness (`ingest::AdmittedNar`): the claimed
+  path must equal `make_text(name, sha256(file bytes), declared references)`,
+  and mismatches are rejected. The witness is the ONLY constructor of
+  persistable bytes --- every persistence primitive (`persist_nar`,
+  `stage_chunked`/`put_chunked`, batch staging) accepts the witness type, not
+  raw bytes --- so a future ingest route that skips the binding is a compile
+  error, and the `store-ingest-conformance` check denies the raw persistence
+  and extraction forms outside the sealed layer. A registered `.drv` path is
+  therefore always the unique preimage of its bytes, so the derivation the
+  gateway validates at submission is byte-identical to the one a worker later
+  fetches from the store, and the modulo cache is populated only from
+  path-bound bytes on every route. This is a REGISTERED FAIL-CLOSED
+  DIVERGENCE from CppNix: the oracle's `registerValidPath` parses and
+  invariant-checks every `.drv`-named path but ACCEPTS source-CA byte-copies
+  (`local-store.cc:680-716` --- `readInvalidDerivation` + `checkInvariants`,
+  with the path's own CA left as declared); rio rejects any `.drv`-named path
+  that is not the text-CA of its bytes, including such oracle-legal source
+  copies.
+]
+The gateway's session derivation cache enforces the same invariant on its
+side (`gw.dag.drv-cache-text-ca`); `store.put.idempotent` is unchanged ---
+an already-complete `.drv` path no-ops, which is harmless because the
+registered copy is content-bound to the path. The divergence is deliberate
+identity hygiene, not an accident to re-report: the modulo cache
+(#rref("store.ingest.drv-modulo-cache+2")), the gateway derivation cache,
+and the deriver-proof claims chain all assume "registered `.drv` path ⇒
+unique text-CA preimage of its bytes"; an oracle-style source-CA `.drv`
+copy would let a path named `*.drv` carry bytes whose text-CA is a
+DIFFERENT path, breaking that assumption. The shapes are reachable in
+CppNix only via store surgery (`nix store add` of an existing `.drv` file)
+plus `builtins.storePath` --- no build pipeline emits them --- and the
+differential corpus deliberately carries NO entry for this (the corpus
+asserts parity; this is a registered divergence pinned by the unit and
+service-relay tests instead).
+
+#r("store.ingest.drv-modulo-cache+2")[
+  When a `.drv` upload finalizes, the store MUST best-effort populate a
+  persistent modulo cache from its OWN copy of the bytes: the
+  `hashDerivationModulo` value, the statically derived
+  `{output name → store path}` map for static input-addressed derivers,
+  and a deferred flag for derivers whose own output paths are not
+  statically derivable (floating-CA self or deferred-IA). Input hashes
+  MUST be resolved only from existing cache rows at ingestion time;
+  population MUST never fail the upload (missing inputs and unparseable
+  bytes skip with a counter), and cached values are immutable
+  content-derived facts (idempotent insert, no overwrite). Population
+  MUST be order-independent: a batch's `.drv` candidates run to
+  FIXPOINT (passes repeat until none makes progress), so
+  reverse-topological in-batch ordering populates every row; a re-upload
+  of an ALREADY-COMPLETE `.drv` re-fires population for that path; and
+  the heal is probe-first --- a present row makes it a no-op.
+]
+This is rio's persistent form of CppNix's `drvHashes` /
+`pathDerivationModulo` (`derivations.cc:856-874`) feeding
+`Store::queryPartialDerivationOutputMap` (`store-api.cc:396-410`): the
+authority for "which output paths does this deriver own" is the store's
+own text-CA-bound bytes (#rref("store.put.drv-text-ca+3") makes a `.drv`
+path the unique preimage of its bytes), never a client's claim. Rows the
+ingestion pass still skips — a consumer whose inputs have not arrived in
+ANY completed upload yet — are completed read-through at proof time by
+the IA deriver-proof gate, which computes from the store's own backend
+under its work budget and warms the cache. Resolvers in the hash walk
+are synchronous by design; all I/O happens before the walk (cache-row
+seeding at ingestion; arena pre-fetch at proof time).
+
+#r("store.put.ia-deriver-proof+4")[
+  A descriptor-less upload under signed assignment claims that are
+  neither content-addressed nor fixed-output (plain input-addressed)
+  MUST additionally prove deriver membership against the store's OWN
+  bytes: the deriver `.drv` named by the claims (`claims.drv_hash`,
+  ingress-bound to its store path) must be store-resident, and the
+  claimed path must be among the input-addressed output paths the store
+  derives from its own copy via the modulo cache. On a cache miss the
+  store MUST complete the chain itself with a budgeted, MONOTONE
+  read-through walk over its own resident bytes: every operation
+  (cache probe, `.drv` fetch, chunk reassembly) charges a typed
+  two-dimensional budget (work units AND retained arena bytes, the
+  byte ledger charged before each retention); cold walks are admitted
+  under a fixed permit pool (the cached-row probe runs before
+  admission, so warm traffic never queues) bounding the process
+  aggregate of retained arenas; EVERY exit --- typed verdicts, budget
+  exhaustion of either dimension, AND infrastructure-error
+  propagation --- first persists every row whose input closure
+  completed, through one persist chokepoint whose count equals the
+  rows made durable, so retries resume from durable progress rather
+  than re-deriving (or forever re-failing) the same prefix; budget
+  exhaustion is `RESOURCE_EXHAUSTED` (retriable, with the persisted-row
+  count named), never an authorization verdict. The walk applies the
+  oracle's fixed-output base case (`hashDerivationModulo`,
+  derivations.cc:864-874): a fixed-output node is a LEAF --- its modulo
+  hash derives from its own declaration, and the walk MUST NOT probe,
+  descend into, or require residency of anything below it.
+  Residency is judged on the store's own manifests regardless of
+  storage form (inline or chunked) and regardless of ingestion order.
+  Closure verdicts are typed and fail-closed (`PERMISSION_DENIED`
+  naming the reason: a non-resident `.drv`, unusable resident bytes, or
+  cyclic input metadata); infrastructure failures are `INTERNAL` (or
+  the retriable transport class for transient chunk-backend failures)
+  and MUST NOT surface as any closure verdict. Derivers whose own output paths are not
+  statically derivable (deferred) are membership-only. The scheduler's
+  service token MUST NOT bypass PutPath or PutPathBatch (probe rights
+  only); the gate applies to both upload RPCs per output. Idempotency
+  takes precedence: the proof runs ONLY for uploads that own a fresh
+  `'uploading'` placeholder --- an already-complete path returns
+  `created: false` without consulting the proof (re-upload of complete
+  content is governed by #rref("store.put.idempotent"), and demanding a
+  registration proof for a no-op re-registration would reject honest
+  re-uploads whose deriver was registered through a claimsless route)
+  --- and a proof failure MUST release the just-claimed placeholder
+  before propagating, so a denied upload leaves no `'uploading'` squat.
+]
+The honest scope (deliberately narrow): the guarantee is that claimed
+paths are genuinely attributable to the NAMED deriver per
+store-resident bytes --- which kills forged cross-deriver membership (a
+compromised worker, or forged store-backed claims, cannot register
+content at a path the named deriver's bytes do not derive). Named
+residuals: a fully compromised SCHEDULER can still name the victim's
+own deriver in claims it signs --- equivalent in power to dispatching
+the victim's real derivation to a hostile worker, and input-addressed
+content is inherently builder-trusted; and deferred-IA derivers are
+membership-only at the store (their dispatch-time claims are
+realisation-derived or unsigned, so the residual exposure is
+compromised-scheduler-only; store-side resolution against realisations
+is buildable later without schema change). Oracle parity:
+`Store::queryPartialDerivationOutputMap` (`store-api.cc:396-410`) and
+the local store's own-copy posture (`local-store.cc:848`). The
+`expected_outputs` membership check stays as the first line
+(`sec.authz.ca-path-derived` is unchanged --- adjacent rule, different
+upload classes); this rule is the second, byte-bound line behind it. GC-stale rows are harmless: every column is a
+content-derived immutable fact about bytes that were at that text-CA
+path, and a re-upload of the path carries identical bytes by
+construction. Cyclic input metadata fails the walk closed --- population
+is skipped and the proof stays unverifiable; no PutPath-level cycle
+rejection is introduced (`store.gc.sweep-cycle-reclaim` keeps owning
+cycle reclamation). The work budget is two-dimensional: operation UNITS
+(`PROOF_WALK_WORK_MAX`, blind to payload size) and retained arena BYTES
+(`PROOF_WALK_ARENA_BYTES_MAX`, charged before each retention) --- the
+unit ledger alone would admit padded-`.drv` byte floods that retain
+GiBs while "within budget" (round-16 bug_079); exhaustion of either
+dimension is the same typed `RESOURCE_EXHAUSTED` monotone exit, and the
+#(refs.metric)("rio_store_ia_proof_arena_bytes") histogram makes byte-pressure approach
+visible. Cold walks are ADMITTED: a cache miss acquires one of
+`PROOF_WALK_CONCURRENCY = 4` shared permits — probe-before-admit keeps
+warm traffic permit-free — bounding the process aggregate of retained
+arenas at permits × byte cap = 1 GiB; best-effort heals share the same
+pool, skip (rather than queue) when saturated, and a per-path negative
+memo (`HEAL_NEGATIVE_MEMO_TTL` = 10 min) collapses
+AlreadyComplete-re-upload heal stampedes to one attempt per window
+(round-16 bug_080).
+
 #r("store.put.idempotent")[
   *Idempotency:* If `PutPath` is called for a store path that already has a
   `'complete'` manifest, the call returns success immediately without
@@ -396,11 +594,17 @@ whose refcount drops to 0 become eligible for S3 deletion via
   (I-168).
 ]
 
-#r("store.atomic.multi-output")[
+#r("store.atomic.multi-output+1")[
   Multi-output derivation registration MUST be atomic at the DB level: all
   output rows commit in one transaction, or none do. Blob-store writes are NOT
   rolled back (orphaned blobs are refcount-zero and GC-eligible on the next
-  sweep). The bound is ≤1 NAR-size per failure.
+  sweep). The bound is ≤1 NAR-size per failure. Batch CAPACITY overruns ---
+  `output_index ≥ MAX_BATCH_OUTPUTS` or cumulative charged bytes exceeding
+  one `MAX_NAR_SIZE` --- are signalled as `FailedPrecondition` (never
+  `InvalidArgument`), routing the builder to the documented
+  independent-PutPath fallback whose atomicity weakening is registered in
+  #rref("builder.upload.batch"); request DEFECTS keep `InvalidArgument` and
+  are never retried.
 ]
 
 #r("store.put.nar-bytes-budget+3")[
@@ -536,22 +740,32 @@ whose refcount drops to 0 become eligible for S3 deletion via
 
 = Request Coalescing (Singleflight)
 
-#r("store.singleflight")[
+#r("store.singleflight+2")[
   When multiple concurrent requests need the same chunk from S3 (common during
   cold starts or thundering herd scenarios), rio-store coalesces them into a
-  single in-flight fetch using a singleflight pattern:
+  single in-flight fetch using a singleflight pattern, with these
+  obligations:
 
-  - A `DashMap<[u8; 32], Shared<BoxFuture<'static, Option<Bytes>>>>` tracks
-    in-flight S3 GETs (the fetch is spawned as a tokio task and its
-    `JoinHandle` is mapped to `Option<Bytes>` before `.shared()`, since
-    `JoinError` is not `Clone`)
-  - First request for chunk X spawns the fetch task and inserts the shared
-    future
-  - Subsequent requests for chunk X `.await` the existing shared future instead
-    of issuing duplicate S3 GETs
-  - On completion (success or failure), the entry is removed from the map
-  - Failed fetches (including task panics) resolve to `None`, and removal from
-    the map means the next request retries cleanly
+  - The fetch is spawned as a detached task (it survives caller
+    cancellation) and its result crosses the shared boundary as a
+    `Clone`-able TYPED carrier: the backend's authoritative not-found,
+    a transient backend error / task panic, and an authentication
+    refusal are three distinct outcomes --- never conflated, never
+    flattened to a string that erases the auth root. Auth refusals
+    surface as `FAILED_PRECONDITION` with remediation at every reader
+    (the read-side twin of the write path's auth fail-fast); transient
+    errors as retriable `UNAVAILABLE`; not-found as the data-loss-class
+    verdict its consumers stamp.
+  - Subsequent requests for an in-flight chunk await the existing
+    shared future instead of issuing duplicate S3 GETs.
+  - The PRODUCER (the spawned task) removes the in-flight entry as its
+    terminal act --- cleanup MUST NOT depend on any awaiter surviving
+    to do it. A completed fetch's memoized verdict is therefore never
+    discoverable in the map: a caller that did not overlap the fetch
+    performs a fresh one (a stale not-found must not mask a chunk
+    uploaded since; a stale error must not outlive backend recovery).
+    Sole exception: a producer PANIC cannot run its own removal --- the
+    first awaiter that observes the join error sweeps the entry.
 ]
 
 This is critical for cold start thundering herd: when many builds start
@@ -577,6 +791,27 @@ unique chunks.
     `rio-nix/src/narinfo.rs`.
   - Multi-tenant: each tenant can have their own signing key for their paths
 ]
+
+#r("store.signing.entry-codec")[
+  The signing-key secret-entry byte contract (`name:base64`; 32-byte
+  seed-only or 64-byte expanded `seed ++ pubkey` payload; RFC 4648
+  standard alphabet; canonical encodings carry no trailing newline)
+  MUST be owned by a single codec (`rio_common::signing_keyfmt`).
+  Every secret-to-public derivation MUST go through the codec's
+  seed-derived mapping --- no consumer may slice payload byte windows
+  --- and an expanded entry whose trailing 32 bytes do not equal the
+  seed-derived public key MUST be refused, never published or loaded.
+]
+
+The bootstrap Job's shell previously re-implemented the derivation as
+`base64 -d | tail -c 32 | base64 -w0`: for a 32-byte seed-only entry
+(accepted by the store's own `Signer::parse`) that published the
+private seed verbatim onto the lower-privileged `rio/signing-key-pub`
+secret and into the Job log (round-16 bug_023, critical). The codec is
+the population chokepoint: producer (`rio-cli keygen`), consumer
+(`Signer::parse` delegation), and the bootstrap re-derive
+(`rio-cli keygen derive-pub`) compile against one format enum, so the
+populations cannot drift again.
 
 #r("store.signing.empty-refs-warn")[
   When signing a non-CA path with zero references, the store MUST emit a
@@ -657,13 +892,25 @@ unique chunks.
   psql can't poison the response.
 ]
 
-#r("store.realisation.gc-sweep")[
-  GC sweep MUST `DELETE FROM realisations WHERE output_path = $swept_path` in
-  the same transaction as the `narinfo` DELETE. The `realisations` table has NO
-  foreign key to `narinfo` (migration 002) so CASCADE does not cover it;
+#r("store.realisation.gc-sweep+2")[
+  GC sweep MUST, in the same transaction as the `narinfo` DELETE and in this
+  order, (1) `DELETE FROM realisation_deps` rows touching the swept path's
+  realisations in EITHER FK role (forward `(drv_hash, output_name)` and
+  reverse `(dep_drv_hash, dep_output_name)`), then (2) `DELETE FROM
+  realisations WHERE output_path = $swept_path`. The `realisations` table has
+  NO foreign key to `narinfo` (migration 002) so CASCADE does not cover it;
   without explicit cleanup, stale rows would point to swept paths and
   `QueryRealisation` would claim a CA cache hit for an output no longer in the
-  store. The `realisations_output_idx` index makes the per-path DELETE fast.
+  store. The edge deletion MUST precede it because both `realisation_deps`
+  FKs are `ON DELETE RESTRICT` (migration 015): with no edge statement, a
+  swept path whose realisation participated in any dependency edge aborted
+  the whole sweep transaction --- and since the aged chain stayed
+  unreachable, every subsequent GC run re-aborted on the same chain, a
+  permanent GC wedge (round-16 bug_069). Migration 015's surface-loudly
+  intent still governs every non-sweep, non-invalidation deleter: the
+  RESTRICT fires for any writer that has not declared an edge policy in the
+  per-path registry. `realisations_output_idx` makes the per-path DELETEs
+  fast; the reverse edge role rides `realisation_deps_reverse_idx`.
 ]
 
 CA `Realisation` objects carry their own ed25519 signatures over the tuple
@@ -805,16 +1052,23 @@ content-addressed output mappings independently of narinfo signatures.
   and the 5-minute stale-reclaim.
 ]
 
-#r("store.substitute.untrusted-upstream+3")[
+#r("store.substitute.untrusted-upstream+4")[
   `tenant_upstreams` rows (URL and `trusted_keys`) are tenant-supplied via
   `AddUpstream`, and the substituter is process-global, so one tenant's hostile
-  upstream MUST NOT be able to OOM or stall rio-store for all tenants. Every
+  upstream MUST NOT be able to OOM or stall rio-store for all tenants --- nor
+  mint resident rows that violate the store's own admission bounds. Every
   upstream-supplied body is size-capped: narinfo bodies at `MAX_NARINFO_BYTES`
   (1 MiB --- sized for `MAX_REFERENCES` basenames), `/nix-cache-info` bodies at
-  `MAX_CACHE_INFO_BYTES` (4 KiB), and decompressed NARs at `MAX_NAR_SIZE` (4
-  GiB) --- the decompressed cap is applied AFTER the decoder so a zstd bomb is
-  bounded regardless of what `NarSize` claimed. The actual decompressed length
-  MUST equal the narinfo's declared `NarSize` (rejected as integrity failure on
+  `MAX_CACHE_INFO_BYTES` (4 KiB), and NARs at the path's CLASS cap
+  (`nar_size_cap(is_derivation)`: `MAX_DRV_NAR_BYTES`, 16 MiB, for `.drv`
+  paths; `MAX_NAR_SIZE`, 4 GiB, otherwise) applied to BOTH the declared
+  `NarSize` (refused before download) and the decompressed byte count AFTER
+  the decoder, so a zstd bomb is bounded regardless of what `NarSize` claimed
+  and a substituted `.drv` can never exceed the bound `PutPath` enforces ---
+  an over-cap resident `.drv` would be permanently unfetchable by every
+  capped consumer (gateway derivation cache, worker glue) and would void the
+  proof-walk arena's sizing assumption. The actual decompressed length MUST
+  equal the narinfo's declared `NarSize` (rejected as integrity failure on
   mismatch); signatures are computed only after this check so stored
   `(nar_size, signatures)` are always mutually consistent. narinfo
   `References:` count MUST NOT exceed `MAX_REFERENCES`. The
@@ -823,14 +1077,14 @@ content-addressed output mappings independently of narinfo signatures.
   a tokio worker.
 ]
 
-#r("store.substitute.compression")[
+#r("store.substitute.compression+1")[
   `fetch_nar` MUST decode every `Compression:` value reference Nix's
   `libutil/compression.cc` accepts: `none`/empty, `xz`, `zstd`, `bzip2`, `br`,
   `gzip`. cache.nixos.org never recompresses; pre-2016 paths still serve
   `bzip2`. An unrecognised value is treated as a per-upstream fetch failure
   (`Ok(None)` after exhausting upstreams), not a hard error, so a single
   oddly-configured tenant upstream cannot fail the originating RPC. The
-  `MAX_NAR_SIZE` decompressed-side cap from
+  class-capped decompressed-side bound from
   #rref("store.substitute.untrusted-upstream") applies uniformly across all
   decoders.
 ]
@@ -1098,8 +1352,51 @@ leaked chunks not covered by manifest-based cleanup.
   ls}`; #rref("store.substitute.upstream") consumes the resulting rows.
 ]
 
+#r("store.admin.invalidate-total")[
+  `StoreAdminService.InvalidatePath` MUST delete every per-path metadata row
+  the store keeps for the target path --- a declared SUPERSET of the GC
+  sweep's deletion set: the sweep's tables (narinfo + CASCADE, realisations,
+  realisation_deps, path_tenants, chunk-refcount decrements) PLUS the rows the
+  sweep deliberately preserves (`drv_modulo_cache`, keyed by the same
+  `sha256(store_path)` digest). `found` MUST be true when any row existed,
+  including an orphan-only `drv_modulo_cache` row, and the call MUST stay
+  idempotent.
+]
+
+Operator invalidation is the remediation for wrong-content incidents; a
+surviving modulo-cache row would keep proving IA outputs of a `.drv` whose
+narinfo the operator just removed, so "invalidate" must mean *every* table.
+The sweep, by contrast, preserves `drv_modulo_cache` by design
+(#rref("store.put.ia-deriver-proof+4") --- proofs survive deriver GC). The
+per-table policy split is the registry's job
+(#rref("store.db.per-path-registry+2")).
+
 = PostgreSQL Schema
 <store-schema>
+
+#r("store.db.per-path-registry+2")[
+  Every store table keyed by a store path (directly or via its
+  `sha256(store_path)` digest) MUST be enumerated in the per-path lifecycle
+  registry (`metadata/per_path.rs`) with an explicit GC-sweep policy AND an
+  explicit operator-invalidation policy (`Delete` with the statement,
+  `Cascade` naming the parent, or `Survive` with the rationale --- there is
+  deliberately NO rely-on-the-FK-to-abort sweep policy since round-16
+  bug_069: a no-op policy over a `RESTRICT` FK is a standing GC wedge, not a
+  guard). Both deletion paths MUST iterate the registry in its pinned
+  order (`RESTRICT`-FK junction rows first, the `CASCADE` root last),
+  and a schema-conformance test MUST fail when a path-keyed table exists
+  without a registry entry or a registry entry without a table.
+]
+
+bug_102 was the third per-path table to silently join neither deletion path
+--- the lifecycle decision used to live as hand enumeration at each deletion
+site, so a table authored before a rule existed (or after the last sweep of
+the sites) defaulted to "leak". The registry inverts the default: a migration
+adding per-path table N+1 fails CI until a variant --- and therefore both
+policy decisions --- exists. The opposite regression is pinned too: GC
+survival of `drv_modulo_cache` is a typed `Survive` declaration backed by
+`sweep_preserves_drv_modulo_rows`, so the wrong-direction "fix" (sweeping
+proof rows) cannot merge either.
 
 #r("store.db.migrate-try-lock")[
   Startup migrations MUST serialize across replicas via a non-blocking

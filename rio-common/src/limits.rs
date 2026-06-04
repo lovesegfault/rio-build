@@ -98,10 +98,33 @@ pub fn is_hw_class_name(s: &str) -> bool {
 
 /// Maximum number of outputs in a single PutPathBatch request.
 ///
-/// Nix multi-output derivations typically have 2-5 outputs (out, dev, lib,
-/// doc, man). 16 gives generous headroom without allowing a client to open
-/// an unbounded number of per-output accumulation buffers on the server.
-pub const MAX_BATCH_OUTPUTS: usize = 16;
+/// Aligned with `rio_nix::protocol::derived_path::MAX_OUTPUT_NAMES` (= 256;
+/// equality is compile-asserted in `rio-builder/src/upload/batch.rs`, the
+/// consumer that sees both crates — rio-common and rio-nix do not depend on
+/// each other). Every derivation the protocol can EXPRESS now fits in one
+/// atomic batch, so the "wide-output derivation deterministically fails the
+/// batch path" population (round-17 bug_111: 8 retries x 16 streamed NARs,
+/// then InfrastructureFailure) is empty by construction.
+///
+/// R4 re-audit for the 16 -> 256 raise (round-17 bug_111, option (b)):
+/// - MEMORY (count-independent): peak accumulation is bounded by the
+///   per-batch cumulative charge cap (one `MAX_NAR_SIZE` = 4 GiB, enforced
+///   in `put_path_batch` with a FailedPrecondition fallback signal) and the
+///   process-global 32 GiB NAR-byte semaphore
+///   (`r[store.put.nar-bytes-budget+3]`). The raise widens only per-output
+///   bookkeeping: 256 x (`OutputAccum` + ValidatedPathInfo) ~ 1 MiB worst.
+/// - MESSAGE SIZE (count-independent): requests stream 256 KiB chunks; the
+///   unary response carries one `created` entry per output, 256 x ~150 B
+///   ~ 38 KiB, vs the 256 MiB `DEFAULT_MAX_MESSAGE_SIZE` tonic cap.
+/// - TIME: `batch_stream_timeout` derives the deadline from the byte budget
+///   (which bounds what can actually flow), with a fixed per-output
+///   allowance — NOT count-linear (the old `300s x N` formula would be a
+///   21-hour hang ceiling at 256).
+/// - POPULATION: pinned-nixpkgs static maximum is 13 outputs
+///   (nomad-autoscaler's plugin list); >16 arises only from programmatic
+///   outputs lists (genList/dataset splits) and out-of-tree derivations,
+///   legal up to the protocol's 256.
+pub const MAX_BATCH_OUTPUTS: usize = 256;
 
 /// Maximum number of DAG nodes in a single SubmitBuild request.
 ///
@@ -120,6 +143,105 @@ pub const MAX_DAG_NODES: usize = 1_048_576;
 /// bounding the O(edges) merge loop against a fully-connected
 /// pathological submission (1M nodes = 10^12 edges).
 pub const MAX_DAG_EDGES: usize = 5_242_880;
+
+/// Maximum size of a single `DerivationNode.drv_content` payload accepted
+/// at SubmitBuild ingress, and equally the gateway's cap on the serialized
+/// inline derivation for the content-bound single-node hook fallback.
+///
+/// Two producers fill `drv_content`:
+/// - the inline-`.drv` *optimization* (`filter_and_inline_drv`), which
+///   inlines cache-resident derivations of ≤64 KiB each under a 16 MiB
+///   per-submission total budget, and
+/// - the content-bound *hook fallback* (`build_fallback_node`), which may
+///   carry a single derivation up to this constant because the `.drv`
+///   exists in no store for the worker to fetch.
+///
+/// The scheduler validates the same bound defensively at SubmitBuild
+/// ingress (workers and direct submitters are untrusted). Because the
+/// gateway's fallback cap *is* this constant, anything the gateway
+/// accepts is never size-rejected downstream — keep both sides pointed
+/// at this single definition so the producer and consumer bounds cannot
+/// drift apart again.
+pub const MAX_DRV_CONTENT_BYTES: usize = 1024 * 1024;
+
+/// Maximum NAR size for a `.drv` (derivation text) transfer: enforced
+/// at the store's PutPath admission — chunk accumulation and the
+/// trailer's declared `nar_size` — so an oversized "derivation" blob
+/// never gets buffered, hashed, or stored; and passed as the collect
+/// cap at every derivation-text fetch site (worker glue-table fetches,
+/// gateway BFS `.drv` resolution), where the leading `Info.nar_size`
+/// pre-check turns it into an immediate, byte-free rejection.
+///
+/// Sizing (no-knobs: const with rationale, not config): derivations
+/// are ATerm text. The largest legitimate `.drv`s observed at
+/// nixpkgs-scale are ~10 MiB (huge env blocks, `exportReferencesGraph`
+/// users), so 16 MiB gives ~60% headroom and equals the gateway's
+/// long-standing write-side `DRV_NAR_BUFFER_LIMIT`, which now aliases
+/// this const. The general [`MAX_NAR_SIZE`] (4 GiB) is 256x too
+/// generous for this class: combined with 16-way worker and 32-way
+/// gateway fan-out it let one tenant-controlled `.drv` name stream
+/// tens of GiB into trusted-plane buffers (round-16 bug_095).
+pub const MAX_DRV_NAR_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The NAR transfer cap for a path CLASS, as a sealed type: derivation
+/// texts get [`MAX_DRV_NAR_BYTES`], everything else [`MAX_NAR_SIZE`].
+///
+/// The field is PRIVATE and the only constructors are the two class
+/// constructors — there is no `From<u64>` and no arithmetic: a fetch
+/// site cannot mint a private or divergent bound, by construction
+/// (round-17 bug_030: the round-16 cap consolidation missed the
+/// scheduler's dispatch fetch precisely because the bound was an
+/// untyped `u64` any site could shadow with a local const; the typed
+/// seal turns the next missed sibling into a compile error). The NAR
+/// fetch primitives (`get_path_nar` / `get_path_nar_to_file` in
+/// rio-proto) take this type — never a raw `u64` — and the
+/// `drv-cap-conformance` CI check pins both that signature and the
+/// constructor call-site registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NarSizeCap(u64);
+
+impl NarSizeCap {
+    /// The derivation-text class cap ([`MAX_DRV_NAR_BYTES`], 16 MiB).
+    /// For every fetch whose target is a `.drv` (claims verification,
+    /// CA resolve, glue-table fetches, BFS `.drv` resolution).
+    pub const fn derivation() -> Self {
+        Self(MAX_DRV_NAR_BYTES)
+    }
+
+    /// The general path-class cap ([`MAX_NAR_SIZE`], 4 GiB). For
+    /// fetches of arbitrary store paths (FUSE input materialization,
+    /// client downloads).
+    pub const fn general() -> Self {
+        Self(MAX_NAR_SIZE)
+    }
+
+    /// The class cap for a path, derived from whether it is a
+    /// derivation. Single source for the split so the store's
+    /// admission bound and the worker/gateway collection bounds cannot
+    /// drift apart.
+    pub const fn for_path_class(is_derivation: bool) -> Self {
+        if is_derivation {
+            Self::derivation()
+        } else {
+            Self::general()
+        }
+    }
+
+    /// The cap in bytes — for comparisons and error text only. This
+    /// is deliberately a one-way door: bytes come OUT of a class cap;
+    /// a cap never comes from bytes.
+    pub const fn bytes(self) -> u64 {
+        self.0
+    }
+}
+
+/// The NAR byte cap appropriate for a path class. Prefer
+/// [`NarSizeCap::for_path_class`]; this remains for arithmetic-only
+/// consumers (store admission accumulation) and returns the same
+/// sealed value's byte count.
+pub const fn nar_size_cap(is_derivation: bool) -> u64 {
+    NarSizeCap::for_path_class(is_derivation).bytes()
+}
 
 /// Worker heartbeat interval. The worker sends a HeartbeatRequest to the
 /// scheduler at this cadence; the scheduler's staleness check uses the

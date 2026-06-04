@@ -577,8 +577,8 @@ impl AdminService for AdminServiceImpl {
         let derivations = rows
             .into_iter()
             .map(|r| PoisonedDerivation {
-                drv_path: r.drv_path,
-                failed_executors: r.failed_builders,
+                drv_path: r.base.drv_path,
+                failed_executors: r.base.failed_builders,
                 poisoned_secs_ago: r.elapsed_secs.max(0.0) as u64,
             })
             .collect();

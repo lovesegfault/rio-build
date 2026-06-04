@@ -80,7 +80,11 @@ pub(crate) fn max_transitive_inputs() -> usize {
 /// reconstruction (one extra round-trip, correctness unchanged).
 /// 16 MiB covers observed outliers (`options.json.drv` ≈ 9.7MB) with
 /// headroom; typical `.drv` NARs are <10KB.
-pub(crate) const DRV_NAR_BUFFER_LIMIT: u64 = 16 * 1024 * 1024;
+///
+/// Aliases the workspace-wide derivation-text bound so the write-side
+/// buffering decision and the store's admission cap / fetch-side
+/// collect caps cannot drift apart (single source: rio-common).
+pub(crate) const DRV_NAR_BUFFER_LIMIT: u64 = rio_common::limits::MAX_DRV_NAR_BYTES;
 
 /// Max in-flight `GetPath` calls during BFS .drv resolution. The store's
 /// `inline_blob` reads are tiny (.drv NARs are KB-range) so the bound is
@@ -127,6 +131,27 @@ fn parse_fetched_drv(
     })
 }
 
+/// Canonical text content-address of a `.drv` upload: CppNix mints
+/// every derivation path as `makeTextPath(name, sha256(text),
+/// inputSrcs ∪ inputDrvs)`, so recompute exactly that from the uploaded
+/// bytes and the parsed derivation's own input sets.
+fn drv_text_ca_path(
+    path: &StorePath,
+    nar_data: &[u8],
+    drv: &Derivation,
+) -> anyhow::Result<StorePath> {
+    use std::io::Write as _;
+    let bytes = rio_nix::nar::extract_single_file(nar_data)?;
+    let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
+    w.write_all(&bytes)?;
+    let hash = w.finish();
+    let mut refs: Vec<StorePath> = Vec::new();
+    for r in drv.input_srcs().iter().chain(drv.input_drvs().keys()) {
+        refs.push(StorePath::parse(r)?);
+    }
+    Ok(StorePath::make_text(path.name(), &hash, &refs)?)
+}
+
 /// Best-effort: if `path` is a `.drv`, parse the ATerm from NAR data and
 /// cache it. Logs and continues on parse error or cap hit — the upload
 /// itself still proceeds.
@@ -140,6 +165,33 @@ pub(crate) fn try_cache_drv(
     }
     match Derivation::parse_from_nar(nar_data) {
         Ok(drv) => {
+            // r[impl gw.dag.drv-cache-text-ca]
+            // Bind the cache key to the bytes: only cache content whose
+            // canonical text content-address equals the claimed path —
+            // the same invariant the store enforces at ingestion
+            // (store.put.drv-text-ca+3). The session cache is what
+            // validate_dag judges and what expected_outputs are derived
+            // from, while a worker may later fetch the store's copy of
+            // the same path; if the cache could hold content that is not
+            // the unique preimage of its key, those two could diverge.
+            // On mismatch the store rejects the upload anyway — skipping
+            // the cache here just keeps the gateway's view consistent
+            // (warn, no client-visible behaviour change at this layer).
+            match drv_text_ca_path(path, nar_data, &drv) {
+                Ok(expected) if expected == *path => {}
+                Ok(expected) => {
+                    warn!(
+                        claimed = %path,
+                        derived = %expected,
+                        "claimed .drv path is not the text CA of its bytes; not caching"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    warn!(path = %path, error = %e, "cannot derive .drv text CA; not caching");
+                    return;
+                }
+            }
             if insert_drv_bounded(drv_cache, path.clone(), drv) {
                 debug!(path = %path, "cached parsed derivation");
             } else {
@@ -181,7 +233,15 @@ pub(crate) async fn resolve_derivation(
 
     let drv = parse_fetched_drv(
         drv_path,
-        grpc_get_path(store_client, None, drv_path.as_str()).await?,
+        // Derivation-text fetch: the .drv class cap, not the general
+        // NAR bound (round-16 bug_095).
+        grpc_get_path(
+            store_client,
+            None,
+            drv_path.as_str(),
+            rio_common::limits::NarSizeCap::derivation(),
+        )
+        .await?,
     )?;
 
     // Bound drv_cache. resolve_derivation is called from BFS in
@@ -259,8 +319,19 @@ pub(crate) async fn resolve_derivations_batch(
         .map(|sp| {
             let mut client = store_client.clone();
             async move {
-                let drv =
-                    parse_fetched_drv(&sp, grpc_get_path(&mut client, None, sp.as_str()).await?)?;
+                // Derivation-text class cap: with BFS_FETCH_CONCURRENCY-way
+                // fan-out, the general 4 GiB bound let one hostile DAG
+                // buffer tens of GiB here (round-16 bug_095).
+                let drv = parse_fetched_drv(
+                    &sp,
+                    grpc_get_path(
+                        &mut client,
+                        None,
+                        sp.as_str(),
+                        rio_common::limits::NarSizeCap::derivation(),
+                    )
+                    .await?,
+                )?;
                 Ok::<_, anyhow::Error>((sp, drv))
             }
         })
@@ -297,6 +368,53 @@ mod tests {
             StorePath::parse(&path).unwrap(),
             Derivation::parse(&aterm).unwrap(),
         )
+    }
+
+    /// Build a `.drv` NAR plus its CANONICAL text-CA store path (the
+    /// path nix's `writeDerivation` would mint for these bytes).
+    fn canonical_drv(tag: &str) -> (StorePath, Vec<u8>) {
+        use std::io::Write as _;
+        let aterm = format!(
+            r#"Derive([("out","/nix/store/{}-{tag}-out","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#,
+            "b".repeat(32)
+        );
+        let node = rio_nix::nar::NarNode::Regular {
+            executable: false,
+            contents: aterm.clone().into_bytes(),
+        };
+        let mut nar = Vec::new();
+        rio_nix::nar::serialize(&mut nar, &node).unwrap();
+        let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
+        w.write_all(aterm.as_bytes()).unwrap();
+        let hash = w.finish();
+        let path = StorePath::make_text(&format!("{tag}.drv"), &hash, &[]).unwrap();
+        (path, nar)
+    }
+
+    // r[verify gw.dag.drv-cache-text-ca]
+    /// The session cache only binds a claimed `.drv` path to content
+    /// whose canonical text CA equals it; anything else is not cached.
+    #[test]
+    fn try_cache_drv_requires_canonical_text_ca_path() {
+        let mut cache: HashMap<StorePath, Derivation> = HashMap::new();
+
+        // Canonical path → cached.
+        let (path, nar) = canonical_drv("honest");
+        try_cache_drv(&path, &nar, &mut cache);
+        assert!(cache.contains_key(&path), "canonical .drv must be cached");
+
+        // Same bytes claimed under a fabricated path → not cached.
+        let (fab_path, _) = parse_drv("fabricated");
+        try_cache_drv(&fab_path, &nar, &mut cache);
+        assert!(
+            !cache.contains_key(&fab_path),
+            "non-canonical claimed path must not be cached"
+        );
+
+        // Non-.drv paths are ignored entirely (unchanged behaviour).
+        let plain = StorePath::parse(&format!("/nix/store/{}-plain", "c".repeat(32))).unwrap();
+        try_cache_drv(&plain, &nar, &mut cache);
+        assert!(!cache.contains_key(&plain));
     }
 
     /// Pre-fetch gate must account for existing `drv_cache` occupancy,
@@ -345,5 +463,34 @@ mod tests {
             "gate must reject BEFORE any GetPath — pre-fix this was non-empty \
              (fetch happened, then insert_drv_bounded errored)"
         );
+    }
+
+    /// round-16 bug_095 (gateway twin): the BFS `.drv` resolution
+    /// fetches under MAX_DRV_NAR_BYTES, not the general 4 GiB bound —
+    /// a "derivation" declaring an oversized NAR is rejected at the
+    /// Info pre-check (byte-free; the mock serves a tiny actual NAR
+    /// behind the forged declared size).
+    #[tokio::test]
+    async fn bfs_drv_fetch_rejects_over_class_cap() {
+        use rio_test_support::fixtures::make_path_info_for_nar;
+        use rio_test_support::grpc::spawn_mock_store_with_client;
+
+        let (store, store_client, _h) = spawn_mock_store_with_client().await.unwrap();
+
+        let (path, nar) = canonical_drv("huge");
+        let mut info = make_path_info_for_nar(path.as_str(), &nar);
+        info.nar_size = rio_common::limits::MAX_DRV_NAR_BYTES + 1; // forged
+        store.seed(info, nar);
+
+        let mut drv_cache = HashMap::new();
+        let err = resolve_derivations_batch(vec![path], &store_client, &mut drv_cache)
+            .await
+            .expect_err("over-cap declared .drv must fail BFS resolution");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("exceeds maximum size"),
+            "SizeExceeded surfaces from the collect cap: {msg}"
+        );
+        assert!(drv_cache.is_empty(), "nothing cached on rejection");
     }
 }

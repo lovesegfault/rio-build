@@ -354,6 +354,7 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
     // claims must include them.
     let expected_out = test_store_path("hmac-expected-out");
     let mut node = make_node("hmac-drv");
+    node.drv_content = b"Derive-hmac-test".to_vec(); // ingress-byte-bound (see claims-derived suite)
     node.expected_output_paths = vec![expected_out.clone()];
     merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
@@ -378,6 +379,10 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
         claims.expected_outputs.contains(&expected_out),
         "claims should include expected_output_paths: {:?}",
         claims.expected_outputs
+    );
+    assert!(
+        !claims.is_fixed_output,
+        "a non-FOD assignment must sign is_fixed_output = false"
     );
     // Expiry is in the future (timeout_secs × 2 from now).
     let now = std::time::SystemTime::now()
@@ -429,9 +434,16 @@ async fn test_hmac_assignment_carries_tenant() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id: Uuid::new_v4(),
+            ingress_stripped: Default::default(),
             tenant_id: Some(tenant),
             priority_class: PriorityClass::Scheduled,
-            nodes: vec![make_node("phase2-drv")],
+            nodes: vec![{
+                // Ingress-byte-bound: token-mechanics pin (see the
+                // sched.dispatch.claims-derived suite for store-backed).
+                let mut n = make_node("phase2-drv");
+                n.drv_content = b"Derive-hmac-test".to_vec();
+                n
+            }],
             edges: vec![],
             options: BuildOptions::default(),
             keep_going: false,
@@ -459,6 +471,63 @@ async fn test_hmac_assignment_carries_tenant() -> TestResult {
     Ok(())
 }
 
+/// bug_001 (round 6): the scheduler always signs `is_fixed_output`
+/// from the persisted node flag so the store can refuse
+/// descriptor-less uploads for content-bound (fixed-output)
+/// assignments. Writer-side pin — the serde shape lives in `rio-auth`
+/// (`assignment_claims_fixed_output_round_trip`), the store-side
+/// enforcement in `rio-store` (`hmac_fod_descriptorless_rejected`).
+#[tokio::test]
+async fn test_hmac_assignment_marks_fixed_output() -> TestResult {
+    use rio_auth::hmac::{HmacSigner, HmacVerifier};
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let test_key = b"test-fod-claims-key-32-bytes!!!!".to_vec();
+
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, p| {
+        p.hmac_signer = Some(Arc::new(HmacSigner::from_key(test_key.clone())));
+    });
+
+    // FOD nodes dispatch to Fetcher-kind executors.
+    let mut worker_rx = connect_executor_kind(
+        &handle,
+        "fod-w",
+        "x86_64-linux",
+        rio_proto::types::ExecutorKind::Fetcher,
+    )
+    .await?;
+
+    let expected_out = test_store_path("fod-expected-out");
+    let mut node = make_node("fod-claims-drv");
+    // Ingress-byte-bound: token-mechanics pin (see the
+    // sched.dispatch.claims-derived suite for store-backed).
+    node.drv_content = b"Derive-hmac-test".to_vec();
+    node.is_fixed_output = true;
+    node.expected_output_paths = vec![expected_out.clone()];
+    merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    let assignment = recv_assignment(&mut worker_rx).await;
+    let claims = HmacVerifier::from_key(test_key)
+        .verify::<rio_auth::hmac::AssignmentClaims>(&assignment.assignment_token)
+        .expect("token verifies");
+
+    assert!(
+        claims.is_fixed_output,
+        "FOD assignment must sign is_fixed_output = true"
+    );
+    assert!(
+        !claims.is_ca,
+        "FOD has a known output path — is_ca must stay false"
+    );
+    assert_eq!(
+        claims.expected_outputs,
+        vec![expected_out],
+        "the declared FOD path is membership-bound as usual"
+    );
+
+    Ok(())
+}
+
 /// MAX_HMAC_TIMEOUT_SECS clamp: even if build_timeout is u64::MAX,
 /// the token's expiry stays bounded (≤ ~14 days from now: 7d × 2).
 #[tokio::test]
@@ -479,9 +548,16 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
         &handle,
         MergeDagRequest {
             build_id: Uuid::new_v4(),
+            ingress_stripped: Default::default(),
             tenant_id: None,
             priority_class: PriorityClass::Scheduled,
-            nodes: vec![make_node("clamp-drv")],
+            nodes: vec![{
+                // Ingress-byte-bound: token-mechanics pin (see the
+                // sched.dispatch.claims-derived suite for store-backed).
+                let mut n = make_node("clamp-drv");
+                n.drv_content = b"Derive-hmac-test".to_vec();
+                n
+            }],
             edges: vec![],
             options: BuildOptions {
                 build_timeout: u64::MAX,
@@ -574,7 +650,7 @@ async fn test_gc_roots_dedupes() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.gc.live-pins]
+// r[verify sched.gc.live-pins+2]
 /// Floating-CA derivations carry `expected_output_paths == [""]`
 /// pre-completion (translate.rs convention). GcRoots must filter these
 /// — a `""` in the roots list makes the store's `validate_store_path`
@@ -627,6 +703,7 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
         .send_unchecked(ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id,
+                ingress_stripped: Default::default(),
                 tenant_id: None,
                 priority_class: PriorityClass::Scheduled,
                 nodes: vec![make_node("orphan-drv")],
@@ -2389,4 +2466,1916 @@ async fn build_options_merge_zero_cores_is_all() {
     mk2(8);
     let opts = actor.build_options_for_derivation(&DrvHash::from("h2"));
     assert_eq!(opts.build_cores, 8, "all-positive → max");
+}
+
+// ===========================================================================
+// Dispatch claims derivation (sched.dispatch.claims-derived)
+// ===========================================================================
+
+/// Signer + mock store for the claims-derivation suite. Backoff base is
+/// zeroed so the unavailable→retry path can be driven with Ticks.
+async fn setup_claims_fixture(
+    test_key: &[u8],
+) -> anyhow::Result<(
+    TestDb,
+    rio_test_support::grpc::MockStore,
+    ActorHandle,
+    (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>),
+)> {
+    use rio_auth::hmac::HmacSigner;
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let key = test_key.to_vec();
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |c, p| {
+            c.retry_policy.backoff_base_secs = 0.0;
+            p.hmac_signer = Some(Arc::new(HmacSigner::from_key(key)));
+        });
+    Ok((db, store, handle, (store_task, actor_task)))
+}
+
+/// Drain the worker stream until an Assignment arrives (skipping
+/// Prefetch hints), or `None` after `wait_ms` of silence.
+async fn try_recv_assignment(
+    rx: &mut tokio::sync::mpsc::Receiver<rio_proto::types::SchedulerMessage>,
+    wait_ms: u64,
+) -> Option<rio_proto::types::WorkAssignment> {
+    loop {
+        match tokio::time::timeout(Duration::from_millis(wait_ms), rx.recv()).await {
+            Err(_) => return None,
+            Ok(None) => return None,
+            Ok(Some(msg)) => match msg.msg {
+                Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => return Some(a),
+                Some(rio_proto::types::scheduler_message::Msg::Prefetch(_)) => continue,
+                _ => continue,
+            },
+        }
+    }
+}
+
+// r[verify sched.dispatch.claims-derived+5]
+/// Happy path: a bare store-backed node whose `.drv` is in the store
+/// gets its claims PROVEN against the store bytes — the token verifies
+/// with the derived (== recorded, now byte-bound) values, the verified
+/// bytes are forwarded to the worker, and the node's standing is
+/// persisted as `path_bound_bytes` so re-dispatch skips the re-fetch.
+#[tokio::test]
+async fn test_dispatch_claims_derived_from_store_bytes() -> TestResult {
+    use rio_auth::hmac::HmacVerifier;
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    let (node, aterm, out_path) = mint_text_ca_leaf("claims-happy");
+    let drv_path = node.drv_path.clone();
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+
+    let mut worker_rx = connect_executor(&handle, "claims-w", "x86_64-linux").await?;
+    merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    let assignment = recv_assignment(&mut worker_rx).await;
+    assert_eq!(assignment.drv_path, drv_path);
+    assert_eq!(
+        assignment.drv_content,
+        aterm.as_bytes(),
+        "the store-verified bytes are forwarded as the build instructions"
+    );
+    let claims = HmacVerifier::from_key(test_key)
+        .verify::<rio_auth::hmac::AssignmentClaims>(&assignment.assignment_token)
+        .expect("token verifies");
+    assert_eq!(
+        claims.expected_outputs,
+        vec![out_path],
+        "signed expected_outputs are the byte-derived paths"
+    );
+    assert!(!claims.is_ca && !claims.is_fixed_output);
+
+    let (rank,): (String,) =
+        sqlx::query_as("SELECT evidence_rank FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(rank, "path_bound_bytes", "verification persisted");
+    Ok(())
+}
+
+/// Round-17 bug_030 population cell: a (1,16] MiB `.drv` — too big to
+/// arrive inline (`MAX_DRV_CONTENT_BYTES` = 1 MiB caps that path), so
+/// necessarily a BARE store-backed node — must pass claims
+/// verification through the store fetch. Pre-fix, the dispatch-side
+/// fetch carried a private 1 MiB cap while store admission, gateway
+/// BFS, and the worker fetch all admit 16 MiB
+/// (`rio_common::limits::MAX_DRV_NAR_BYTES`): this exact node was
+/// admitted everywhere else, then deterministically failed the fetch
+/// → `StoreSilence` → transient backoff → poison blaming store
+/// health. The cell pins the shared-cap behavior end to end: bytes
+/// verified, forwarded, and the byte-bound rank persisted.
+// r[verify sched.dispatch.claims-derived+5]
+#[tokio::test]
+async fn test_dispatch_claims_verifies_multi_mib_drv() -> TestResult {
+    use rio_auth::hmac::HmacVerifier;
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    // 2 MiB of env padding: comfortably inside the 16 MiB class cap,
+    // comfortably outside the old private 1 MiB one.
+    let (node, aterm, out_path) = mint_text_ca_leaf_padded("claims-2mib", 2 * 1024 * 1024);
+    assert!(
+        aterm.len() > rio_common::limits::MAX_DRV_CONTENT_BYTES,
+        "fixture must exceed the inline cap (else the cell tests nothing)"
+    );
+    assert!(
+        (aterm.len() as u64) < rio_common::limits::MAX_DRV_NAR_BYTES,
+        "fixture must remain inside the derivation-text class cap"
+    );
+    let drv_path = node.drv_path.clone();
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+
+    let mut worker_rx = connect_executor(&handle, "claims-2mib-w", "x86_64-linux").await?;
+    merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    let assignment = recv_assignment(&mut worker_rx).await;
+    assert_eq!(assignment.drv_path, drv_path);
+    assert_eq!(
+        assignment.drv_content,
+        aterm.as_bytes(),
+        "the multi-MiB store-verified bytes are forwarded as the build instructions"
+    );
+    let claims = HmacVerifier::from_key(test_key)
+        .verify::<rio_auth::hmac::AssignmentClaims>(&assignment.assignment_token)
+        .expect("token verifies");
+    assert_eq!(claims.expected_outputs, vec![out_path]);
+
+    let (rank,): (String,) =
+        sqlx::query_as("SELECT evidence_rank FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        rank, "path_bound_bytes",
+        "multi-MiB .drv reaches byte-bound rank — not StoreSilence backoff"
+    );
+    Ok(())
+}
+
+/// Round-17 bug_030 over-cap cell: a bare store-backed node whose
+/// declared path carries a NAR LARGER than the derivation-text class
+/// cap is a CONTENT-BOUND verdict — instant visible poison with the
+/// generated remediation — never store silence. The mock store
+/// declares a hostile 17 MiB `Info.nar_size` over a tiny actual NAR:
+/// the collector's leading pre-check denies byte-free, and the typed
+/// [`DrvFetch::Denied`] maps to
+/// `StructuralReason::OversizedDrvNar` → poison. Pre-typing, this
+/// fold burned the claims-unavailable budget as transient
+/// "store silence" and poisoned blaming store health only at budget
+/// exhaustion — the bounded `wait_for_status(Poisoned)` here is the
+/// discriminator (the silence path parks in backoff far past it).
+/// Reachability: paths that bypassed store admission (substitution
+/// ingest, round-17 merged_063) or hostile PathInfo declarations.
+// r[verify sched.dispatch.claims-derived+5]
+#[tokio::test]
+async fn test_dispatch_claims_over_cap_drv_poisons_content_bound() -> TestResult {
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (_db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    let (node, aterm, _out) = mint_text_ca_leaf("claims-overcap");
+    let drv_path = node.drv_path.clone();
+
+    // Forge the declared size over the class cap; keep the real NAR
+    // tiny — the denial must be byte-free off the declaration.
+    let (nar, nar_hash) = rio_test_support::fixtures::make_nar(aterm.as_bytes());
+    let mut info = rio_test_support::fixtures::make_path_info(&drv_path, &nar, nar_hash);
+    info.nar_size = rio_common::limits::MAX_DRV_NAR_BYTES + 1024 * 1024;
+    store.seed(info, nar);
+
+    let mut worker_rx = connect_executor(&handle, "overcap-w", "x86_64-linux").await?;
+    merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    assert!(
+        try_recv_assignment(&mut worker_rx, 300).await.is_none(),
+        "no assignment may be signed over an over-cap derivation text"
+    );
+    wait_for_status(&handle, &drv_path, DerivationStatus::Poisoned).await;
+    Ok(())
+}
+
+/// Round-16 bug_094: a deferred-IA node's dispatch-time resolution
+/// must record its computed REAL paths as the claim
+/// (`merge_resolved_claim_paths`) — the HMAC `expected_outputs` site reads
+/// `claim_output_paths()` — while `expected_output_paths` keeps its
+/// INGRESS shape (the empty slot). Pre-fix, dispatch overwrote the
+/// expected slots, which destroyed the emptiness signal the
+/// byte-derived resolve probe (`child_unknown`, merge.rs) reads off
+/// resident children: a bare store-backed FOD parent dispatching after
+/// this child built recorded a sticky `needs_resolve=false` at its
+/// PathBoundBytes raise and then failed deterministically on the
+/// un-rewritten placeholder until poison. (Unsigned fixture: the claim
+/// values are asserted via the debug surface, which exposes exactly
+/// what the HMAC site signs — `claim_output_paths()`; the signed-token
+/// mechanics are pinned by the claims suite above.)
+#[tokio::test]
+async fn test_deferred_ia_resolve_claims_real_path_and_preserves_ingress_shape() -> TestResult {
+    use crate::ca::resolve::downstream_placeholder;
+    use rio_nix::store_path::StorePath;
+    let (db, _store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Child: floating-CA leaf with a known modular hash.
+    let child_modular: [u8; 32] = [0x11; 32];
+    let mut child = make_node("dia-child");
+    child.is_content_addressed = true;
+    child.needs_resolve = true;
+    child.ca_modular_hash = child_modular.to_vec();
+    let child_drv_path = child.drv_path.clone();
+
+    // Parent: deferred-IA — IA drv whose own output path is unknown
+    // until its floating input resolves. Ingress shape: ONE empty
+    // expected slot. Minted store-shaped: canonical ATerm with the
+    // deferred output ("out","","","") and the child placeholder in
+    // env, drv_path = the bytes' text content-address (the dispatch
+    // claims gate re-derives and compares it), bare submission (the
+    // gate fetches the seeded store bytes).
+    let placeholder = downstream_placeholder(&StorePath::parse(&child_drv_path).unwrap(), "out");
+    let parent_aterm = format!(
+        r#"Derive([("out","","","")],[("{child_drv_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","build"],[("DEP","{placeholder}"),("name","dia-parent"),("out",""),("system","x86_64-linux")])"#
+    );
+    {
+        use rio_nix::derivation::Derivation;
+        let drv = Derivation::parse(&parent_aterm).expect("fixture parses");
+        assert_eq!(drv.to_aterm(), parent_aterm, "fixture must be canonical");
+    }
+    let parent_path = {
+        use rio_nix::hash::{HashAlgo, NixHash};
+        use sha2::{Digest, Sha256};
+        let h = NixHash::new(
+            HashAlgo::SHA256,
+            Sha256::digest(parent_aterm.as_bytes()).to_vec(),
+        )
+        .unwrap();
+        StorePath::make_text(
+            "dia-parent.drv",
+            &h,
+            &[StorePath::parse(&child_drv_path).unwrap()],
+        )
+        .unwrap()
+        .as_str()
+        .to_owned()
+    };
+    let parent = rio_proto::types::DerivationNode {
+        drv_path: parent_path.clone(),
+        drv_hash: parent_path.clone(),
+        pname: "dia-parent".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_content_addressed: false,
+        needs_resolve: true,
+        expected_output_paths: vec![String::new()],
+        ..Default::default()
+    };
+    _store.seed_with_content(&parent_path, parent_aterm.as_bytes());
+
+    let mut worker_rx = connect_executor(&handle, "dia-w", "x86_64-linux").await?;
+    merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![child, parent],
+        vec![rio_proto::types::DerivationEdge {
+            parent_drv_path: parent_path.clone(),
+            child_drv_path: child_drv_path.clone(),
+        }],
+        false,
+    )
+    .await?;
+
+    // Child dispatches first (leaf). Seed its realisation AFTER the
+    // merge (so it does not cache-hit), then complete it — the parent
+    // becomes Ready and resolves at dispatch.
+    let a1 = recv_assignment(&mut worker_rx).await;
+    assert!(a1.drv_path.contains("dia-child"), "child dispatches first");
+    let realized = test_store_path("dia-child-realized-out");
+    sqlx::query(
+        "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
+         VALUES ($1, 'out', $2, $3)",
+    )
+    .bind(child_modular.as_slice())
+    .bind(&realized)
+    .bind([0x33u8; 32].as_slice())
+    .execute(&db.pool)
+    .await?;
+    complete_success(&handle, "dia-w", "dia-child", &realized).await?;
+
+    // The first executor drains after its completion (one-shot worker
+    // semantics) — connect a fresh one for the parent, like the
+    // recovered CA-on-CA dispatch test.
+    let mut worker_rx2 = connect_executor(&handle, "dia-w2", "x86_64-linux").await?;
+    let assignment = recv_assignment(&mut worker_rx2).await;
+    assert_eq!(assignment.drv_path, parent_path);
+    // Resolution actually happened: the forwarded bytes carry the
+    // realized input path, not the placeholder.
+    let sent = String::from_utf8(assignment.drv_content.clone())?;
+    assert!(
+        sent.contains(&realized) && !sent.contains(&placeholder),
+        "parent must dispatch with the placeholder rewritten"
+    );
+
+    let info = expect_drv(&handle, &parent_path).await;
+    // The claim carries the RESOLVED real path, not the ingress "".
+    assert_eq!(info.claim_output_paths.len(), 1);
+    let claimed = &info.claim_output_paths[0];
+    assert!(
+        claimed.starts_with("/nix/store/") && claimed.ends_with("-dia-parent"),
+        "the claim field must carry the resolved deferred-IA path; got {claimed:?}"
+    );
+    // The node's expected paths keep the INGRESS shape — the resolve
+    // probe contract (pre-fix this read [claimed] and the emptiness
+    // signal was gone).
+    assert_eq!(
+        info.expected_output_paths,
+        vec![String::new()],
+        "expected_output_paths must keep its ingress shape across dispatch"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.path-shape-totality]
+/// Round-17 bug_033: same deferred-IA flow, but the submission OMITS
+/// `expected_output_paths` entirely (the legal `[]` shape). The old
+/// open-coded merge cloned the empty list and `get_mut(i)` returned
+/// `None` for every slot — the resolved real path silently vanished,
+/// the HMAC `expected_outputs` claim was empty, and the worker's
+/// upload failed authorization against a deny-all allowlist. The
+/// arity-total owner method resizes to `output_names.len()` first, so
+/// the resolved path lands at its name's index through the omitted
+/// shape; the ingress list itself stays `[]` (reshaping REJECTED —
+/// padded expected lists are identity-bearing in the
+/// authoritative-conflict matcher).
+#[tokio::test]
+async fn test_deferred_ia_resolve_total_over_omitted_expected_paths() -> TestResult {
+    use crate::ca::resolve::downstream_placeholder;
+    use rio_nix::store_path::StorePath;
+    let (db, _store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let child_modular: [u8; 32] = [0x21; 32];
+    let mut child = make_node("dot-child");
+    child.is_content_addressed = true;
+    child.needs_resolve = true;
+    child.ca_modular_hash = child_modular.to_vec();
+    let child_drv_path = child.drv_path.clone();
+
+    let placeholder = downstream_placeholder(&StorePath::parse(&child_drv_path).unwrap(), "out");
+    let parent_aterm = format!(
+        r#"Derive([("out","","","")],[("{child_drv_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","build"],[("DEP","{placeholder}"),("name","dot-parent"),("out",""),("system","x86_64-linux")])"#
+    );
+    {
+        use rio_nix::derivation::Derivation;
+        let drv = Derivation::parse(&parent_aterm).expect("fixture parses");
+        assert_eq!(drv.to_aterm(), parent_aterm, "fixture must be canonical");
+    }
+    let parent_path = {
+        use rio_nix::hash::{HashAlgo, NixHash};
+        use sha2::{Digest, Sha256};
+        let h = NixHash::new(
+            HashAlgo::SHA256,
+            Sha256::digest(parent_aterm.as_bytes()).to_vec(),
+        )
+        .unwrap();
+        StorePath::make_text(
+            "dot-parent.drv",
+            &h,
+            &[StorePath::parse(&child_drv_path).unwrap()],
+        )
+        .unwrap()
+        .as_str()
+        .to_owned()
+    };
+    let parent = rio_proto::types::DerivationNode {
+        drv_path: parent_path.clone(),
+        drv_hash: parent_path.clone(),
+        pname: "dot-parent".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_content_addressed: false,
+        needs_resolve: true,
+        // THE shape under test: omitted entirely.
+        expected_output_paths: vec![],
+        ..Default::default()
+    };
+    _store.seed_with_content(&parent_path, parent_aterm.as_bytes());
+
+    let mut worker_rx = connect_executor(&handle, "dot-w", "x86_64-linux").await?;
+    merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![child, parent],
+        vec![rio_proto::types::DerivationEdge {
+            parent_drv_path: parent_path.clone(),
+            child_drv_path: child_drv_path.clone(),
+        }],
+        false,
+    )
+    .await?;
+
+    let a1 = recv_assignment(&mut worker_rx).await;
+    assert!(a1.drv_path.contains("dot-child"), "child dispatches first");
+    let realized = test_store_path("dot-child-realized-out");
+    sqlx::query(
+        "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
+         VALUES ($1, 'out', $2, $3)",
+    )
+    .bind(child_modular.as_slice())
+    .bind(&realized)
+    .bind([0x44u8; 32].as_slice())
+    .execute(&db.pool)
+    .await?;
+    complete_success(&handle, "dot-w", "dot-child", &realized).await?;
+
+    let mut worker_rx2 = connect_executor(&handle, "dot-w2", "x86_64-linux").await?;
+    let assignment = recv_assignment(&mut worker_rx2).await;
+    assert_eq!(assignment.drv_path, parent_path);
+
+    let info = expect_drv(&handle, &parent_path).await;
+    // The claim is arity-total: exactly one slot, carrying the
+    // resolved real path — through the OMITTED ingress shape (the old
+    // merge produced an empty claim here and the path vanished).
+    assert_eq!(
+        info.claim_output_paths.len(),
+        1,
+        "claim must be resized to the declared arity through the [] shape"
+    );
+    let claimed = &info.claim_output_paths[0];
+    assert!(
+        claimed.starts_with("/nix/store/") && claimed.ends_with("-dot-parent"),
+        "the resolved path must land at its name's index; got {claimed:?}"
+    );
+    // M_075 write-through happened with the same arity-total vec.
+    let persisted: Option<Vec<String>> =
+        sqlx::query_scalar("SELECT claim_output_paths FROM derivations WHERE drv_hash = $1")
+            .bind(&parent_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        persisted.as_deref(),
+        Some(info.claim_output_paths.as_slice()),
+        "persisted claim must equal the in-memory arity-total claim"
+    );
+    // Ingress shape untouched: still the omitted [].
+    assert_eq!(
+        info.expected_output_paths,
+        Vec::<String>::new(),
+        "expected_output_paths must keep the omitted ingress shape"
+    );
+    Ok(())
+}
+
+// r[verify sched.ca.absent-hash-surfaced]
+/// THE ingress-stripped node, followed end-to-end PAST ingress for the
+/// first time (round-15 C3c6, bug_048 part 2). Shape provenance: a
+/// warm gateway submission whose floating input is already realized
+/// and store-backed — the consumer's declared modular hash is
+/// unverifiable at ingress and STRIPPED
+/// (`sched.merge.ingress-inline-drv-binding+1`); this test submits the
+/// post-strip shape directly (inline floating node, empty
+/// ca_modular_hash). It dispatches (inline = ingress-byte-bound, no
+/// claims fetch), completes — and the completion-time CA bookkeeping
+/// SKIPS, surfaced by the counter: NO realisation row is written.
+///
+/// WHEN STAGED FOLLOW-UP F2 LANDS (the verifying re-establisher /
+/// ModularHashState): this test's final assertions FLIP — the
+/// realisation row EXISTS and the skip counter stays zero. Do not
+/// weaken either assertion before then; they are the visible record
+/// of the accepted gap.
+#[tokio::test]
+async fn test_stripped_node_completes_without_realisation_and_surfaces() -> TestResult {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _g = metrics::set_default_local_recorder(&rec);
+
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (db, _store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    let (mut node, aterm, _hash) = mint_floating_ca_leaf("strip-e2e");
+    let drv_path = node.drv_path.clone();
+    // The post-strip shape: inline bytes, floating, NO declared hash.
+    node.drv_content = aterm.into_bytes();
+    node.ca_modular_hash = Vec::new();
+
+    let mut worker_rx = connect_executor(&handle, "strip-w", "x86_64-linux").await?;
+    let _events = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    let assignment = recv_assignment(&mut worker_rx).await;
+    assert_eq!(
+        assignment.drv_path, drv_path,
+        "stripped inline node dispatches"
+    );
+
+    let out_path = "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-strip-e2e-out";
+    complete_success(&handle, "strip-w", &drv_path, out_path).await?;
+    barrier(&handle).await;
+
+    let probe = handle.debug_query_derivation(&drv_path).await?.unwrap();
+    assert_eq!(probe.status, DerivationStatus::Completed);
+    assert!(
+        probe.ca.modular_hash.is_none(),
+        "still stripped at completion"
+    );
+
+    // F2 FLIP POINT 1: becomes count == 1 when the re-establisher lands.
+    let (n_rows,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM realisations WHERE output_path = $1")
+            .bind(out_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(n_rows, 0, "no realisation row for the stripped node");
+
+    // F2 FLIP POINT 2: becomes 0 when the re-establisher lands.
+    let skipped: u64 = snap
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(ck, ..)| {
+            ck.key().name() == "rio_scheduler_ca_bookkeeping_skipped_total"
+                && ck
+                    .key()
+                    .labels()
+                    .any(|l| l.key() == "consumer" && l.value() == "realisation_insert")
+        })
+        .map(|(.., v)| match v {
+            DebugValue::Counter(c) => c,
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(skipped, 1, "the realisation-insert skip is surfaced");
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived+5]
+/// Forged `needs_resolve` echo cannot steer post-verification
+/// dispatch: a bare store-backed deferred-IA node submitted with
+/// `needs_resolve = false` (the forged echo — its bytes derive TRUE:
+/// deferred type with an input) ends up with the BYTE-DERIVED flag
+/// recorded at the rank raise; the resolve gate reads only that
+/// recorded state.
+#[tokio::test]
+async fn test_dispatch_records_byte_derived_resolve_not_echo() -> TestResult {
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (_db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    let (leaf, leaf_aterm, _out) = mint_text_ca_leaf("rne-leaf");
+    let leaf_path = leaf.drv_path.clone();
+    let (mut mid, mid_aterm) =
+        mint_deferred_ia_node("rne-mid", &leaf_path, &[(&leaf_path, &leaf_aterm)]);
+    let mid_path = mid.drv_path.clone();
+    // FORGE the echo: bytes say resolve (deferred + input), the
+    // submitter says don't.
+    mid.needs_resolve = false;
+    store.seed_with_content(&mid_path, mid_aterm.as_bytes());
+
+    let mut worker_rx = connect_executor(&handle, "rne-w", "x86_64-linux").await?;
+    // Submit the mid ALONE (no DAG edges): it is a root, dispatches
+    // immediately, and the claims derivation verifies its bytes.
+    let _events = merge_dag(&handle, Uuid::new_v4(), vec![mid], vec![], false).await?;
+
+    let assignment = recv_assignment(&mut worker_rx).await;
+    assert_eq!(assignment.drv_path, mid_path);
+
+    let probe = handle.debug_query_derivation(&mid_path).await?.unwrap();
+    assert!(
+        probe.ca.needs_resolve,
+        "recorded resolve flag is the byte-derived TRUE, not the \
+         forged echo FALSE: {probe:?}"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived+5]
+/// THE forged-claims kill test (merged_bug_053 variants 2/3 + the
+/// needs_resolve bypass): a submitter echoes forged expected outputs
+/// and a forged resolve flag for a store-backed node. The store bytes
+/// disprove the claim — NO token is signed, no WorkAssignment reaches
+/// the worker, the node is poisoned, and the interested build fails
+/// with its evidence persisted at source.
+#[tokio::test]
+async fn test_dispatch_claims_forgery_poisons_without_signing() -> TestResult {
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    let (mut node, aterm, _out) = mint_text_ca_leaf("claims-forged");
+    let drv_path = node.drv_path.clone();
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+    // The forgery: claim a different output path, and a resolve flag
+    // that would (pre-derivation) have steered signing onto the echo.
+    node.expected_output_paths = vec![test_store_path("forged-target")];
+    node.needs_resolve = true;
+
+    let mut worker_rx = connect_executor(&handle, "forge-w", "x86_64-linux").await?;
+    let build_id = Uuid::new_v4();
+    let _events = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    assert!(
+        try_recv_assignment(&mut worker_rx, 300).await.is_none(),
+        "no WorkAssignment may be sent for forged claims"
+    );
+    wait_for_status(&handle, &drv_path, DerivationStatus::Poisoned).await;
+    // Failure evidence at source: the interested build's error_summary
+    // is durable while the failure propagates.
+    let (summary,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(build_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        summary.is_some(),
+        "failure evidence persisted at source for the forged dispatch"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived+5]
+/// Store unavailability is transient: the assignment rolls back with
+/// backoff (no token, node NOT poisoned), and once the `.drv` appears
+/// the next dispatch derives the claims and assigns normally.
+#[tokio::test]
+async fn test_dispatch_claims_unavailable_backs_off_then_succeeds() -> TestResult {
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (_db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    let (node, aterm, _out) = mint_text_ca_leaf("claims-unavail");
+    let drv_path = node.drv_path.clone();
+    // NOT seeded yet.
+
+    let mut worker_rx = connect_executor(&handle, "unavail-w", "x86_64-linux").await?;
+    merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    assert!(
+        try_recv_assignment(&mut worker_rx, 300).await.is_none(),
+        "no assignment while the store cannot vouch"
+    );
+    let info = handle
+        .debug_query_derivation(&drv_path)
+        .await?
+        .expect("node resident");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Ready,
+        "unavailable is transient: rolled back to Ready, not poisoned"
+    );
+
+    // The store recovers. A fresh worker registration triggers the
+    // next dispatch pass (the harness's established trigger — Tick
+    // alone only dispatches when the dirty flag is set); the deferred
+    // node's claims now derive and either worker may receive it.
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+    let mut worker_rx2 = connect_executor(&handle, "unavail-w2", "x86_64-linux").await?;
+    for _ in 0..50 {
+        handle.send_unchecked(ActorCommand::Tick).await?;
+        barrier(&handle).await;
+        let got = match try_recv_assignment(&mut worker_rx, 50).await {
+            Some(a) => Some(a),
+            None => try_recv_assignment(&mut worker_rx2, 50).await,
+        };
+        if let Some(a) = got {
+            assert_eq!(a.drv_path, drv_path);
+            // merged_bug_010 pin: silence deferrals charge their OWN
+            // budget, never the transient build budget — and the
+            // Verified edge resets the silence counter.
+            let info = handle
+                .debug_query_derivation(&drv_path)
+                .await?
+                .expect("resident");
+            assert_eq!(
+                info.retry.count, 0,
+                "transient build budget must not be consumed by store silence"
+            );
+            assert_eq!(
+                info.retry.claims_unavailable_count, 0,
+                "Verified edge resets the consecutive-silence budget"
+            );
+            return Ok(());
+        }
+    }
+    panic!("assignment never arrived after the store recovered");
+}
+
+// r[verify sched.dispatch.claims-derived+5]
+/// Bytes that do not re-derive the declared text content-address are
+/// transport-grade noise, not evidence in either direction: the
+/// assignment is held (rolled back, NOT poisoned) — never signed.
+#[tokio::test]
+async fn test_dispatch_claims_text_ca_mismatch_never_signs() -> TestResult {
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (_db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    let (node, _aterm, _out) = mint_text_ca_leaf("claims-mismatch");
+    let drv_path = node.drv_path.clone();
+    // A DIFFERENT (parseable, canonical) derivation's bytes at the
+    // path: text-CA re-derivation cannot match.
+    let (_other, other_aterm, _o) = mint_text_ca_leaf("claims-other");
+    store.seed_with_content(&drv_path, other_aterm.as_bytes());
+
+    let mut worker_rx = connect_executor(&handle, "mismatch-w", "x86_64-linux").await?;
+    merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    assert!(
+        try_recv_assignment(&mut worker_rx, 300).await.is_none(),
+        "unverifiable bytes must never be signed against"
+    );
+    let info = handle
+        .debug_query_derivation(&drv_path)
+        .await?
+        .expect("node resident");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Ready,
+        "transient, not poisoned"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived+5]
+/// Text-CA-VERIFIED garbage is permanent: the bytes are content-bound
+/// to the declared path (zero-reference text-CA matches) and can never
+/// parse — refetching reproduces them, so the node is poisoned instead
+/// of hot-looping through backoff.
+#[tokio::test]
+async fn test_dispatch_unparseable_verified_bytes_poison() -> TestResult {
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (_db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    let garbage = b"this is not a derivation";
+    let h = NixHash::new(HashAlgo::SHA256, Sha256::digest(garbage).to_vec()).unwrap();
+    let garbage_path = StorePath::make_text("garbage.drv", &h, &[])
+        .unwrap()
+        .as_str()
+        .to_owned();
+    store.seed_with_content(&garbage_path, garbage);
+
+    let (mut node, _aterm, _out) = mint_text_ca_leaf("claims-garbage");
+    node.drv_path = garbage_path.clone();
+    node.drv_hash = garbage_path.clone();
+
+    let mut worker_rx = connect_executor(&handle, "garbage-w", "x86_64-linux").await?;
+    merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    assert!(
+        try_recv_assignment(&mut worker_rx, 300).await.is_none(),
+        "no assignment for content-bound garbage"
+    );
+    wait_for_status(&handle, &garbage_path, DerivationStatus::Poisoned).await;
+    Ok(())
+}
+
+// r[verify sched.merge.input-form-seed]
+/// The seed constructors own the not-floating predicate: a floating-CA
+/// node's declared (published, masked) hash never enters the seed map;
+/// IA and FOD nodes' hashes do.
+#[test]
+fn input_form_seed_constructor_excludes_floating_published_hashes() {
+    let mk = |path: &str, is_ca: bool, fod: bool| crate::domain::DerivationNode {
+        drv_hash: path.to_owned(),
+        drv_path: path.to_owned(),
+        pname: String::new(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        expected_output_paths: vec![String::new()],
+        is_fixed_output: fod,
+        is_content_addressed: is_ca,
+        ca_modular_hash: Some([7u8; 32]),
+        ca_modular_hash_stripped: None,
+        drv_content: Vec::new(),
+        drv_content_authoritative: false,
+        required_features: Vec::new(),
+        wanted_output_names: Vec::new(),
+        explicitly_requested: false,
+        needs_resolve: false,
+        version: None,
+        enable_parallel_building: None,
+        enable_parallel_checking: None,
+        prefer_local_build: None,
+    };
+    let nodes = vec![
+        mk("/nix/store/ia.drv", false, false),
+        mk("/nix/store/fod.drv", true, true),
+        mk("/nix/store/floating.drv", true, false),
+    ];
+    let seed = crate::actor::merge::InputFormSeed::from_submission_nodes(&nodes);
+    assert!(
+        seed.get("/nix/store/ia.drv").is_some(),
+        "IA hash is an input-form digest"
+    );
+    assert!(
+        seed.get("/nix/store/fod.drv").is_some(),
+        "FOD hash is an input-form digest (mask never applies)"
+    );
+    assert!(
+        seed.get("/nix/store/floating.drv").is_none(),
+        "a floating node's published hash is the masked form and must \
+         never seed input position"
+    );
+}
+
+// r[verify sched.merge.input-form-seed]
+/// merged_bug_003 e2e (the dispatch-time 4th site, fix-child of
+/// e2c2dbfc2 / pattern R2): a bare IA parent whose Completed
+/// floating-CA child carries its published (masked) hash must NOT have
+/// that hash seeded into the dispatch-time claims verification. Pre-fix
+/// the raw children loop seeded it, the validator derived the parent's
+/// IA paths from a masked digest, the honest declared paths "differed",
+/// and the node was wrongfully poisoned as FORGED (a hostile-submitter
+/// verdict against an honest victim). Post-fix the child is excluded
+/// and the input is UNSEEDED — under the claims-derived+5 permanence
+/// contract that defers on the bounded unseeded budget (the floating
+/// child's row is not seedable either: the not-floating predicate is
+/// uniform across seed sources) and converges to the budget-exhausted
+/// poison carrying the post-read-through remediation, NOT a forgery:
+/// the failure class is the discriminator.
+#[tokio::test]
+async fn test_dispatch_floating_child_masked_hash_not_treated_as_forged() -> TestResult {
+    use rio_nix::derivation::{Derivation, input_addressed_output_paths};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (_db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    // Floating child, resident + Completed, carrying its PUBLISHED
+    // (masked) modular hash — the gateway warm shape.
+    let (child_node, child_aterm, _published) = mint_floating_ca_leaf("ifs-child");
+    let child_path = child_node.drv_path.clone();
+    let child_drv = Derivation::parse(&child_aterm).expect("child parses");
+    merge_dag(&handle, Uuid::new_v4(), vec![child_node], vec![], false).await?;
+    assert!(
+        handle
+            .debug_force_status(&child_path, DerivationStatus::Completed)
+            .await?,
+        "child forced Completed"
+    );
+
+    // Honest IA parent over the floating child: declared output paths
+    // derived through the real input-form recursion (the resolver
+    // computes the child's UNMASKED input digest internally).
+    let build_parent = |out: &str| {
+        format!(
+            r#"Derive([("out","{out}","","")],[("{child_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","ifs-parent"),("out","{out}")])"#
+        )
+    };
+    let masked_parent = Derivation::parse(&build_parent("")).expect("masked parent parses");
+    let name_only = format!("/nix/store/{}-ifs-parent.drv", "a".repeat(32));
+    let resolver = |p: &str| -> Option<&Derivation> { (p == child_path).then_some(&child_drv) };
+    let paths =
+        input_addressed_output_paths(&masked_parent, &name_only, &resolver, &mut HashMap::new())
+            .expect("derive honest parent paths");
+    let parent_out = paths["out"].as_str().to_owned();
+    let parent_aterm = build_parent(&parent_out);
+    let parent_drv = Derivation::parse(&parent_aterm).expect("parent parses");
+    assert_eq!(parent_drv.to_aterm(), parent_aterm, "parent canonical");
+    let content_hash = NixHash::new(
+        HashAlgo::SHA256,
+        Sha256::digest(parent_aterm.as_bytes()).to_vec(),
+    )
+    .unwrap();
+    let parent_drv_path = StorePath::make_text(
+        "ifs-parent.drv",
+        &content_hash,
+        &[StorePath::parse(&child_path).unwrap()],
+    )
+    .unwrap()
+    .as_str()
+    .to_owned();
+    store.seed_with_content(&parent_drv_path, parent_aterm.as_bytes());
+
+    let parent_node = rio_proto::types::DerivationNode {
+        drv_path: parent_drv_path.clone(),
+        drv_hash: parent_drv_path.clone(),
+        pname: "ifs-parent".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_content_addressed: false,
+        expected_output_paths: vec![parent_out],
+        ..Default::default()
+    };
+    let edge = rio_proto::types::DerivationEdge {
+        parent_drv_path: parent_drv_path.clone(),
+        child_drv_path: child_path.clone(),
+    };
+
+    let mut worker_rx = connect_executor(&handle, "ifs-w", "x86_64-linux").await?;
+    let mut events = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![parent_node],
+        vec![edge],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    assert!(
+        try_recv_assignment(&mut worker_rx, 300).await.is_none(),
+        "the masked child hash must not be signed against"
+    );
+    // Post-claims-derived+5 the unseeded parent DEFERS on its bounded
+    // budget (cap = max_infra_retries) before the visible poison;
+    // each heartbeat chains a Tick that drives another dispatch pass.
+    let mut poisoned = false;
+    for _ in 0..300 {
+        send_heartbeat(&handle, "ifs-w", "x86_64-linux").await?;
+        barrier(&handle).await;
+        if let Ok(Some(d)) = handle.debug_query_derivation(&parent_drv_path).await
+            && d.status == DerivationStatus::Poisoned
+        {
+            poisoned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(poisoned, "unseeded budget must converge to visible poison");
+    // The DISCRIMINATOR: the failure must be the unseeded-input class
+    // naming the excluded child — NEVER the forgery class a seeded
+    // masked digest produced pre-fix.
+    let mut failed_msg = None;
+    while let Ok(ev) = events.try_recv() {
+        if let Some(rio_proto::types::build_event::Event::Derivation(d)) = ev.event
+            && d.kind == rio_proto::types::DerivationEventKind::Failed as i32
+        {
+            failed_msg = Some(d.error_message);
+        }
+    }
+    let failed_msg = failed_msg.expect("failure event visible");
+    assert!(
+        failed_msg.contains("covered by neither the submission, the resident DAG"),
+        "unseeded-input class (post-read-through), not forgery; got: {failed_msg}"
+    );
+    assert!(
+        failed_msg.contains(&child_path),
+        "remediation names the EXCLUDED floating child (proves the seed \
+         filter held — across the resident AND row sources); got: {failed_msg}"
+    );
+    assert!(
+        !failed_msg.contains("failed permanently"),
+        "must not be the forgery/contradiction class"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived+5]
+/// THE merged_bug_019 strip kill (deploy-blocker; fix-child of
+/// e2c2dbfc2 × 31d281c4d, pattern R1): a bare floating-CA node whose
+/// declared modular hash cannot be recomputed (floating store-backed
+/// input missing from every seed) used to bounce Unavailable→backoff
+/// FOREVER — deterministic re-verification, identical verdict, no exit.
+/// Post-fix the declaration is STRIPPED (ingress-strip parity: an
+/// unverifiable claim is no claim), the node proceeds on the verified
+/// bytes, and both the cleared hash and the raised rank are persisted.
+#[tokio::test]
+async fn test_dispatch_strips_unverifiable_declared_hash_and_assigns() -> TestResult {
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    // Floating parent over a floating input that exists NOWHERE (not
+    // submitted, not resident, not in the store): the declared hash is
+    // structurally unrecomputable, but the parent's own bytes verify.
+    let (child, _child_aterm, _h) = mint_floating_ca_leaf("strip-child");
+    let child_path = child.drv_path.clone();
+    let fparent_aterm = format!(
+        r#"Derive([("out","","r:sha256","")],[("{child_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","strip-parent"),("out","")])"#
+    );
+    let fhash = NixHash::new(
+        HashAlgo::SHA256,
+        Sha256::digest(fparent_aterm.as_bytes()).to_vec(),
+    )
+    .unwrap();
+    let fparent_path = StorePath::make_text(
+        "strip-parent.drv",
+        &fhash,
+        &[StorePath::parse(&child_path).unwrap()],
+    )
+    .unwrap()
+    .as_str()
+    .to_owned();
+    store.seed_with_content(&fparent_path, fparent_aterm.as_bytes());
+
+    let node = rio_proto::types::DerivationNode {
+        drv_path: fparent_path.clone(),
+        drv_hash: fparent_path.clone(),
+        pname: "strip-parent".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_content_addressed: true,
+        expected_output_paths: vec![String::new()],
+        ca_modular_hash: vec![0xCC; 32], // junk claim, unrecomputable
+        ..Default::default()
+    };
+
+    let mut worker_rx = connect_executor(&handle, "strip-w", "x86_64-linux").await?;
+    let _events = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    // Pre-fix: no assignment, ever (infinite backoff). Post-fix: the
+    // verified bytes are forwarded.
+    let assignment = recv_assignment(&mut worker_rx).await;
+    assert_eq!(assignment.drv_path, fparent_path);
+    assert_eq!(
+        assignment.drv_content,
+        fparent_aterm.as_bytes(),
+        "the store-verified bytes are forwarded"
+    );
+
+    // The strip is durable AND in-memory: claim cleared, rank raised.
+    let info = handle
+        .debug_query_derivation(&fparent_path)
+        .await?
+        .expect("node resident");
+    assert!(
+        info.ca.modular_hash.is_none(),
+        "in-memory declared hash cleared (an unverifiable claim is no claim)"
+    );
+    // M_070 (merged_bug_038): the strip MOVES the claim — preserved in
+    // the segregated field, never destroyed — so the settled row this
+    // node becomes can still match a byte-equal resubmission.
+    assert_eq!(
+        info.ca.modular_hash_stripped,
+        Some([0xCC; 32]),
+        "in-memory stripped claim preserved out-of-band"
+    );
+    let (rank, hash, stripped): (String, Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT evidence_rank, ca_modular_hash, ca_modular_hash_stripped \
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(&fparent_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        rank, "path_bound_bytes",
+        "rank raised on the verified bytes"
+    );
+    assert!(hash.is_none(), "persisted declared hash cleared");
+    assert_eq!(
+        stripped.as_deref(),
+        Some([0xCC; 32].as_slice()),
+        "persisted stripped claim moved to the preservation column"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived+5]
+/// THE bug_029 kill, failover trigger (depth 2, e47c330a0 <-
+/// e2c2dbfc2 <- 1c8cc6877, pattern R5 population-axis): a bare
+/// static-IA parent whose completed input child is erased from
+/// residency by a LEADER FAILOVER (recovery rehydrates non-terminal
+/// rows only). Pre-fix the dispatch claims gate typed the missing
+/// input as STRUCTURAL permanence and instant-poisoned the parent —
+/// every in-flight build with completed inputs died on the first
+/// post-failover dispatch. Post-fix: the chokepoint's persisted-row
+/// read-through re-seeds the verification from the child's row (the
+/// content-derived state both residency erasers leave intact) and
+/// the parent dispatches with proven claims.
+#[tokio::test]
+async fn test_failover_unseeded_input_reseeds_from_rows_and_dispatches() -> TestResult {
+    use rio_auth::hmac::HmacSigner;
+    use rio_nix::derivation::{Derivation, hash_derivation_modulo, input_addressed_output_paths};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+
+    // Child: seedable form (is_ca=false), gateway-shaped declared
+    // modulo hash (populate_ca_modular_hashes stamps every hash it
+    // can compute) — the value the creation upsert persists and the
+    // read-through later recovers.
+    let (mut child, child_aterm, child_out) = mint_text_ca_leaf("rt-child");
+    let child_path = child.drv_path.clone();
+    let child_drv = Derivation::parse(&child_aterm).unwrap();
+    let child_hash = hash_derivation_modulo(
+        &child_drv,
+        &child_path,
+        &|_| None,
+        &mut std::collections::HashMap::new(),
+    )
+    .unwrap();
+    child.ca_modular_hash = child_hash.to_vec();
+
+    // Parent: bare static-IA over the child (concrete declared output
+    // path derived through the child's modulo hash — the shape whose
+    // verification NEEDS the input seed).
+    let build_parent = |out: &str| {
+        format!(
+            r#"Derive([("out","{out}","","")],[("{child_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","rt-parent"),("out","{out}")])"#
+        )
+    };
+    let masked = Derivation::parse(&build_parent("")).unwrap();
+    let name_only = format!("/nix/store/{}-rt-parent.drv", "a".repeat(32));
+    let resolver = |p: &str| -> Option<&Derivation> { (p == child_path).then_some(&child_drv) };
+    let paths = input_addressed_output_paths(
+        &masked,
+        &name_only,
+        &resolver,
+        &mut std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let parent_aterm = build_parent(paths["out"].as_str());
+    let phash = NixHash::new(
+        HashAlgo::SHA256,
+        Sha256::digest(parent_aterm.as_bytes()).to_vec(),
+    )
+    .unwrap();
+    let parent_path = StorePath::make_text(
+        "rt-parent.drv",
+        &phash,
+        &[StorePath::parse(&child_path).unwrap()],
+    )
+    .unwrap()
+    .as_str()
+    .to_owned();
+    let parent = rio_proto::types::DerivationNode {
+        drv_path: parent_path.clone(),
+        drv_hash: parent_path.clone(),
+        pname: "rt-parent".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        expected_output_paths: vec![paths["out"].as_str().to_owned()],
+        ..Default::default()
+    };
+    store.seed_with_content(&child_path, child_aterm.as_bytes());
+    store.seed_with_content(&parent_path, parent_aterm.as_bytes());
+
+    let key = test_key.clone();
+    let edge = rio_proto::types::DerivationEdge {
+        parent_drv_path: parent_path.clone(),
+        child_drv_path: child_path.clone(),
+    };
+
+    // Phase 1: child completes under the first leader, then the
+    // leader dies (handle dropped, task joined).
+    {
+        let (handle, task) =
+            setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |c, p| {
+                c.retry_policy.backoff_base_secs = 0.0;
+                p.hmac_signer = Some(Arc::new(HmacSigner::from_key(key.clone())));
+            });
+        let mut rx = connect_executor(&handle, "rt-w1", "x86_64-linux").await?;
+        merge_dag(
+            &handle,
+            Uuid::new_v4(),
+            vec![child.clone(), parent.clone()],
+            vec![edge.clone()],
+            false,
+        )
+        .await?;
+        let assn = recv_assignment(&mut rx).await;
+        assert_eq!(assn.drv_path, child_path, "child dispatches first");
+        complete_success(&handle, "rt-w1", &child_path, &child_out).await?;
+        wait_for_status(&handle, &child_path, DerivationStatus::Completed).await;
+        drop(rx);
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Phase 2: fresh leader. The completed child is ROW-ONLY
+    // (recovery loads non-terminal rows); the parent is resident and
+    // becomes Ready. Pre-fix its first dispatch instant-poisoned.
+    // Recorder installed for the exit-class witness (bug_064): this
+    // path must land in result="seeded", never partial/miss.
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _mguard = metrics::set_default_local_recorder(&recorder);
+    let (handle, _task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |c, p| {
+            c.retry_policy.backoff_base_secs = 0.0;
+            p.hmac_signer = Some(Arc::new(HmacSigner::from_key(test_key.clone())));
+        });
+    handle
+        .send_unchecked(crate::actor::ActorCommand::LeaderAcquired)
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation(&child_path).await?.is_none(),
+        "precondition: completed child is NOT resident after failover"
+    );
+
+    let mut rx2 = connect_executor(&handle, "rt-w2", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx2).await;
+    assert_eq!(
+        assn.drv_path, parent_path,
+        "post-failover parent DISPATCHES (read-through re-seeded the \
+         verification from the child's persisted row)"
+    );
+    assert_eq!(
+        assn.drv_content,
+        parent_aterm.as_bytes(),
+        "claims proven against the store bytes, which are forwarded"
+    );
+    let d = handle
+        .debug_query_derivation(&parent_path)
+        .await?
+        .expect("parent resident");
+    assert_ne!(d.status, DerivationStatus::Poisoned, "no instant poison");
+    let (rank,): (String,) =
+        sqlx::query_as("SELECT evidence_rank FROM derivations WHERE drv_hash = $1")
+            .bind(&parent_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(rank, "path_bound_bytes", "verified standing persisted");
+    // Exit-class witness (bug_064): full re-seed = result="seeded".
+    let m = "rio_scheduler_claims_row_readthrough_total";
+    assert_eq!(
+        recorder.get(&format!("{m}{{result=seeded}}")),
+        1,
+        "rows re-seeded everything -> seeded; keys: {:?}",
+        recorder.all_keys()
+    );
+    assert_eq!(recorder.get(&format!("{m}{{result=partial}}")), 0);
+    assert_eq!(recorder.get(&format!("{m}{{result=miss}}")), 0);
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived+5]
+/// Read-through MISS arm: the missing input has NO seedable row (the
+/// child never declared a hash, so its row's ca_modular_hash is
+/// NULL). The verdict stands post-read-through — but the consequence
+/// is BOUNDED BACKOFF on the dedicated budget, never the pre-fix
+/// instant poison: the identity can still arrive (deeper submission,
+/// upload, mid-merge row). Backoff base is set high so exactly one
+/// charge lands in the test window.
+#[tokio::test]
+async fn test_unseeded_input_without_row_backs_off_not_poisons() -> TestResult {
+    use rio_auth::hmac::HmacSigner;
+    use rio_nix::derivation::{Derivation, input_addressed_output_paths};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+
+    // Hash-LESS child: its row will carry ca_modular_hash NULL — the
+    // read-through finds nothing seedable.
+    let (child, child_aterm, child_out) = mint_text_ca_leaf("nort-child");
+    let child_path = child.drv_path.clone();
+    let child_drv = Derivation::parse(&child_aterm).unwrap();
+    let build_parent = |out: &str| {
+        format!(
+            r#"Derive([("out","{out}","","")],[("{child_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","nort-parent"),("out","{out}")])"#
+        )
+    };
+    let masked = Derivation::parse(&build_parent("")).unwrap();
+    let name_only = format!("/nix/store/{}-nort-parent.drv", "a".repeat(32));
+    let resolver = |p: &str| -> Option<&Derivation> { (p == child_path).then_some(&child_drv) };
+    let paths = input_addressed_output_paths(
+        &masked,
+        &name_only,
+        &resolver,
+        &mut std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let parent_aterm = build_parent(paths["out"].as_str());
+    let phash = NixHash::new(
+        HashAlgo::SHA256,
+        Sha256::digest(parent_aterm.as_bytes()).to_vec(),
+    )
+    .unwrap();
+    let parent_path = StorePath::make_text(
+        "nort-parent.drv",
+        &phash,
+        &[StorePath::parse(&child_path).unwrap()],
+    )
+    .unwrap()
+    .as_str()
+    .to_owned();
+    let parent = rio_proto::types::DerivationNode {
+        drv_path: parent_path.clone(),
+        drv_hash: parent_path.clone(),
+        pname: "nort-parent".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        expected_output_paths: vec![paths["out"].as_str().to_owned()],
+        ..Default::default()
+    };
+    store.seed_with_content(&child_path, child_aterm.as_bytes());
+    store.seed_with_content(&parent_path, parent_aterm.as_bytes());
+    let edge = rio_proto::types::DerivationEdge {
+        parent_drv_path: parent_path.clone(),
+        child_drv_path: child_path.clone(),
+    };
+
+    // Phase 1: child completes; leader dies.
+    {
+        let key = test_key.clone();
+        let (handle, task) =
+            setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |c, p| {
+                c.retry_policy.backoff_base_secs = 0.0;
+                p.hmac_signer = Some(Arc::new(HmacSigner::from_key(key)));
+            });
+        let mut rx = connect_executor(&handle, "nort-w1", "x86_64-linux").await?;
+        merge_dag(
+            &handle,
+            Uuid::new_v4(),
+            vec![child.clone(), parent.clone()],
+            vec![edge.clone()],
+            false,
+        )
+        .await?;
+        let assn = recv_assignment(&mut rx).await;
+        assert_eq!(assn.drv_path, child_path);
+        complete_success(&handle, "nort-w1", &child_path, &child_out).await?;
+        wait_for_status(&handle, &child_path, DerivationStatus::Completed).await;
+        drop(rx);
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Phase 2: long backoff base — exactly one deferral lands.
+    // Recorder installed for the exit-class witness (bug_064): a
+    // hash-less child means NO seedable rows -> result="miss",
+    // never "partial" (that arm is reserved for rows that seeded
+    // SOME of the missing inputs).
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _mguard = metrics::set_default_local_recorder(&recorder);
+    let (handle, _task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |c, p| {
+            c.retry_policy.backoff_base_secs = 600.0;
+            p.hmac_signer = Some(Arc::new(HmacSigner::from_key(test_key.clone())));
+        });
+    handle
+        .send_unchecked(crate::actor::ActorCommand::LeaderAcquired)
+        .await?;
+    barrier(&handle).await;
+
+    let mut rx2 = connect_executor(&handle, "nort-w2", "x86_64-linux").await?;
+    // No assignment arrives (the deferral rolled it back)...
+    let got = try_recv_assignment(&mut rx2, 1500).await;
+    assert!(
+        got.is_none(),
+        "unseedable parent must not be assigned: {got:?}"
+    );
+    // ...and the node is DEFERRED on the dedicated budget — not
+    // poisoned (pre-fix: instant Poisoned with structural
+    // remediation).
+    let d = handle
+        .debug_query_derivation(&parent_path)
+        .await?
+        .expect("parent resident");
+    assert_ne!(
+        d.status,
+        DerivationStatus::Poisoned,
+        "post-read-through unseeded inputs defer; they never instant-poison"
+    );
+    assert_eq!(
+        d.retry.unseeded_inputs_count, 1,
+        "exactly one charge against the dedicated unseeded budget"
+    );
+    // Exit-class witness (bug_064): no seedable rows = result="miss".
+    let m = "rio_scheduler_claims_row_readthrough_total";
+    assert_eq!(
+        recorder.get(&format!("{m}{{result=miss}}")),
+        1,
+        "no seedable rows -> miss; keys: {:?}",
+        recorder.all_keys()
+    );
+    assert_eq!(
+        recorder.get(&format!("{m}{{result=partial}}")),
+        0,
+        "partial is reserved for rows seeding SOME missing inputs"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived+5]
+/// The verified 100%-livelock population end-to-end: a depth-3
+/// deferred-IA chain (floating leaf ← deferred mid ← deferred root),
+/// all bare store-backed with gateway-shaped declared hashes, under
+/// signing. Pre-fix: the leaf dispatches (its hash recomputes — no
+/// inputs) but mid and root livelock forever. Post-fix: the whole
+/// chain dispatches and completes.
+#[tokio::test]
+async fn test_deferred_ia_chain_depth3_dispatches_under_signing() -> TestResult {
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    // IA leaf: completes without CA-realisation machinery; the
+    // deferred shape ABOVE it is what livelocked (the strip arm).
+    let (leaf, leaf_aterm, leaf_out) = mint_text_ca_leaf("dia-leaf");
+    let leaf_path = leaf.drv_path.clone();
+    let (mid, mid_aterm) =
+        mint_deferred_ia_node("dia-mid", &leaf_path, &[(&leaf_path, &leaf_aterm)]);
+    let mid_path = mid.drv_path.clone();
+    let (root, root_aterm) = mint_deferred_ia_node(
+        "dia-root",
+        &mid_path,
+        &[(&mid_path, &mid_aterm), (&leaf_path, &leaf_aterm)],
+    );
+    let root_path = root.drv_path.clone();
+    store.seed_with_content(&leaf_path, leaf_aterm.as_bytes());
+    store.seed_with_content(&mid_path, mid_aterm.as_bytes());
+    store.seed_with_content(&root_path, root_aterm.as_bytes());
+
+    let edges = vec![
+        rio_proto::types::DerivationEdge {
+            parent_drv_path: root_path.clone(),
+            child_drv_path: mid_path.clone(),
+        },
+        rio_proto::types::DerivationEdge {
+            parent_drv_path: mid_path.clone(),
+            child_drv_path: leaf_path.clone(),
+        },
+    ];
+    let mut worker_rx = connect_executor(&handle, "dia-w", "x86_64-linux").await?;
+    // Keep the event receiver alive: the orphan-watcher cancels
+    // watcher-less builds at the first housekeeping tick (grace 0 in
+    // tests), and this test pumps Ticks.
+    let _events = merge_dag(&handle, Uuid::new_v4(), vec![leaf, mid, root], edges, false).await?;
+
+    // Leaf: dispatches even pre-fix (no inputs, hash recomputes).
+    let a1 = recv_assignment(&mut worker_rx).await;
+    assert_eq!(a1.drv_path, leaf_path);
+    barrier(&handle).await;
+    let probe = handle.debug_query_derivation(&mid_path).await?.unwrap();
+    assert_eq!(
+        probe.status,
+        DerivationStatus::Queued,
+        "mid must be Queued while leaf builds; got {:?}",
+        probe.status
+    );
+    complete_success(&handle, "dia-w", &leaf_path, &leaf_out).await?;
+
+    // Mid: THE pre-fix livelock. Post-fix: stripped + assigned. A
+    // fresh worker registration is the harness's established
+    // post-completion dispatch trigger (Tick only dispatches when the
+    // dirty flag is set).
+    let mut worker_rx2 = connect_executor(&handle, "dia-w2", "x86_64-linux").await?;
+    let mut a2 = None;
+    for _ in 0..50 {
+        handle.send_unchecked(ActorCommand::Tick).await?;
+        barrier(&handle).await;
+        if let Some(a) = try_recv_assignment(&mut worker_rx, 50).await {
+            a2 = Some(a);
+            break;
+        }
+        if let Some(a) = try_recv_assignment(&mut worker_rx2, 50).await {
+            a2 = Some(a);
+            break;
+        }
+    }
+    if a2.is_none() {
+        let leaf_info = handle.debug_query_derivation(&leaf_path).await?;
+        let info = handle.debug_query_derivation(&mid_path).await?;
+        panic!("mid never dispatched; leaf: {leaf_info:?}\nmid: {info:?}");
+    }
+    let a2 = a2.expect("mid must dispatch after the strip (pre-fix: livelocked forever)");
+    assert_eq!(a2.drv_path, mid_path);
+    let a2_executor = handle
+        .debug_query_derivation(&mid_path)
+        .await?
+        .unwrap()
+        .assigned_executor
+        .expect("mid assigned");
+    let (mid_rank, mid_hash): (String, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT evidence_rank, ca_modular_hash FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(&mid_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(mid_rank, "path_bound_bytes");
+    assert!(mid_hash.is_none(), "mid's unverifiable claim stripped");
+    let mid_out = format!("/nix/store/{}-dia-mid-out", "c".repeat(32));
+    let mid_executor = a2_executor;
+    complete_success(&handle, &mid_executor, &mid_path, &mid_out).await?;
+
+    // Root: same strip path one level up.
+    let mut worker_rx3 = connect_executor(&handle, "dia-w3", "x86_64-linux").await?;
+    let mut a3 = None;
+    for _ in 0..50 {
+        handle.send_unchecked(ActorCommand::Tick).await?;
+        barrier(&handle).await;
+        for rx in [&mut worker_rx, &mut worker_rx2, &mut worker_rx3] {
+            if let Some(a) = try_recv_assignment(rx, 40).await {
+                a3 = Some(a);
+                break;
+            }
+        }
+        if a3.is_some() {
+            break;
+        }
+    }
+    let a3 = a3.expect("root must dispatch (pre-fix: livelocked forever)");
+    assert_eq!(a3.drv_path, root_path);
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived+5]
+/// Unseeded-input EXHAUSTION converges to a visible poison: an IA
+/// node whose direct input is neither submitted, nor resident, nor
+/// seedable from any persisted row (the floating child here was
+/// never even created — no row exists) defers on the bounded
+/// unseeded-inputs budget and, once the cap is spent, poisons with
+/// the POST-READ-THROUGH remediation. Three eras of this test: the
+/// original arm livelocked through backoff forever; the +2 fix
+/// instant-poisoned (which bug_029 showed also poisoned honest
+/// post-failover builds); +3 defers on a budget and still ends in
+/// the same visible poison for the genuinely-hopeless population —
+/// no silent livelock returns. (Unsigned mode mints no claims and
+/// still dispatches from source.)
+#[tokio::test]
+async fn test_dispatch_unseeded_exhaustion_poisons_with_remediation() -> TestResult {
+    use rio_nix::derivation::{Derivation, input_addressed_output_paths};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+
+    use rio_auth::hmac::HmacSigner;
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    // cap=1 so exhaustion lands within two dispatch passes (the
+    // merge-inline pass charges attempt 0; the next tick-driven pass
+    // exhausts) — production cap (max_infra_retries=10) would need
+    // ~10 one-second ticks, which is wall-clock the unit suite
+    // shouldn't spend. The budget ARITHMETIC is pinned by the charge
+    // unit test; this pins the routing (deferral -> exhaustion ->
+    // visible poison with the post-read-through remediation).
+    let key = test_key.clone();
+    let (handle, _actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |c, p| {
+            c.retry_policy.backoff_base_secs = 0.0;
+            c.retry_policy.max_infra_retries = 1;
+            p.hmac_signer = Some(Arc::new(HmacSigner::from_key(key)));
+        });
+
+    let (child, child_aterm, _h) = mint_floating_ca_leaf("unseed-child");
+    let child_path = child.drv_path.clone();
+    let child_drv = Derivation::parse(&child_aterm).unwrap();
+    let build_parent = |out: &str| {
+        format!(
+            r#"Derive([("out","{out}","","")],[("{child_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","unseed-parent"),("out","{out}")])"#
+        )
+    };
+    let masked = Derivation::parse(&build_parent("")).unwrap();
+    let name_only = format!("/nix/store/{}-unseed-parent.drv", "a".repeat(32));
+    let resolver = |p: &str| -> Option<&Derivation> { (p == child_path).then_some(&child_drv) };
+    let paths =
+        input_addressed_output_paths(&masked, &name_only, &resolver, &mut HashMap::new()).unwrap();
+    let parent_aterm = build_parent(paths["out"].as_str());
+    let phash = NixHash::new(
+        HashAlgo::SHA256,
+        Sha256::digest(parent_aterm.as_bytes()).to_vec(),
+    )
+    .unwrap();
+    let parent_path = StorePath::make_text(
+        "unseed-parent.drv",
+        &phash,
+        &[StorePath::parse(&child_path).unwrap()],
+    )
+    .unwrap()
+    .as_str()
+    .to_owned();
+    store.seed_with_content(&parent_path, parent_aterm.as_bytes());
+
+    let node = rio_proto::types::DerivationNode {
+        drv_path: parent_path.clone(),
+        drv_hash: parent_path.clone(),
+        pname: "unseed-parent".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        expected_output_paths: vec![paths["out"].as_str().to_owned()],
+        ..Default::default()
+    };
+
+    let mut worker_rx = connect_executor(&handle, "unseed-w", "x86_64-linux").await?;
+    let build_id = Uuid::new_v4();
+    let mut events = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    assert!(
+        try_recv_assignment(&mut worker_rx, 300).await.is_none(),
+        "no token may be signed for an unverifiable node"
+    );
+    // backoff 0 + cap 1: the merge-inline dispatch pass charged
+    // attempt 0; each heartbeat (which chains a Tick) drives another
+    // dispatch pass — the second pass exhausts and poisons.
+    let mut poisoned = false;
+    for _ in 0..50 {
+        send_heartbeat(&handle, "unseed-w", "x86_64-linux").await?;
+        barrier(&handle).await;
+        if let Ok(Some(d)) = handle.debug_query_derivation(&parent_path).await
+            && d.status == DerivationStatus::Poisoned
+        {
+            poisoned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        poisoned,
+        "exhausted unseeded budget must converge to a visible poison"
+    );
+
+    // The remediation is CLIENT-VISIBLE: the DerivationFailed event's
+    // error_message carries the generated POST-read-through text
+    // (visible poison, not a silent backoff).
+    let mut failed_msg = None;
+    while let Ok(ev) = events.try_recv() {
+        if let Some(rio_proto::types::build_event::Event::Derivation(d)) = ev.event
+            && d.kind == rio_proto::types::DerivationEventKind::Failed as i32
+        {
+            failed_msg = Some(d.error_message);
+        }
+    }
+    let failed_msg = failed_msg.expect("a DerivationFailed event reaches the watcher");
+    assert!(
+        failed_msg.contains("covered by neither the submission, the resident DAG"),
+        "remediation is the post-read-through text (the rows WERE \
+         consulted before permanence); got: {failed_msg}"
+    );
+    assert!(
+        failed_msg.contains(&child_path),
+        "remediation names the unseeded input"
+    );
+    assert!(
+        failed_msg.contains("could not seed"),
+        "poison message names the exhausted budget; got: {failed_msg}"
+    );
+
+    // Failure evidence is durably recorded at source.
+    let (summary,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(build_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        summary.is_some(),
+        "failure evidence recorded at source for the interested build"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived+5]
+/// Computed-bound scale pin (counts OPS, not wall-clock): dispatching
+/// 128 independent bare store-backed nodes performs EXACTLY one store
+/// GetPath per node — no closure walks, no refetches after the rank
+/// raise. The claims gate's cost is O(nodes), in contrast to the
+/// store-side deriver-proof read-through (O(closure), own budget).
+/// One pre-connected worker per node so the merge-time dispatch pass
+/// assigns the whole set in one wave (the harness has no idle-worker
+/// heartbeat loop).
+#[tokio::test]
+async fn test_claims_gate_scale_one_getpath_per_node() -> TestResult {
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (_db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    const N: usize = 128;
+    let mut nodes = Vec::with_capacity(N);
+    for i in 0..N {
+        let (node, aterm, _out) = mint_text_ca_leaf(&format!("scale{i:03}"));
+        store.seed_with_content(&node.drv_path, aterm.as_bytes());
+        nodes.push(node);
+    }
+
+    let mut receivers = Vec::with_capacity(N);
+    for i in 0..N {
+        receivers.push(connect_executor(&handle, &format!("scale-w{i:03}"), "x86_64-linux").await?);
+    }
+    let _events = merge_dag(&handle, Uuid::new_v4(), nodes, vec![], false).await?;
+    barrier(&handle).await;
+
+    // Every node dispatches exactly once across the worker fleet.
+    let mut assigned: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for _ in 0..20 {
+        for rx in receivers.iter_mut() {
+            while let Some(a) = try_recv_assignment(rx, 20).await {
+                assigned.insert(a.drv_path);
+            }
+        }
+        if assigned.len() == N {
+            break;
+        }
+        handle.send_unchecked(ActorCommand::Tick).await?;
+        barrier(&handle).await;
+    }
+    assert_eq!(assigned.len(), N, "all {N} nodes dispatch");
+
+    let fetches = store
+        .calls
+        .get_path_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        fetches as usize, N,
+        "exactly ONE GetPath per node first-dispatch — no closure walks, \
+         no refetch after the path_bound_bytes raise"
+    );
+    Ok(())
+}
+
+/// charge() unit semantics: per-class cap, attempt indices, reset.
+#[test]
+fn retry_charge_claims_budget_boundaries() {
+    use crate::state::{ChargeDecision, FailureClass, RetryState};
+    let mut r = RetryState::default();
+    assert_eq!(
+        r.charge(FailureClass::ClaimsUnavailable, 2),
+        ChargeDecision::Backoff(0)
+    );
+    assert_eq!(
+        r.charge(FailureClass::ClaimsUnavailable, 2),
+        ChargeDecision::Backoff(1)
+    );
+    assert_eq!(
+        r.charge(FailureClass::ClaimsUnavailable, 2),
+        ChargeDecision::Exhausted,
+        "cap reached -> terminal, never another retry"
+    );
+    assert_eq!(
+        r.charge(FailureClass::ClaimsUnavailable, 2),
+        ChargeDecision::Exhausted,
+        "exhaustion is sticky until a success edge"
+    );
+    // The other budgets are untouched by the claims charge.
+    assert_eq!(r.count, 0);
+    assert_eq!(r.infra_count, 0);
+    r.reset_claims_unavailable();
+    assert_eq!(
+        r.charge(FailureClass::ClaimsUnavailable, 2),
+        ChargeDecision::Backoff(0),
+        "success edge resets to consecutive-failure semantics"
+    );
+}
+
+// r[verify sched.dispatch.claims-derived+5]
+/// merged_bug_010 + merged_bug_019 residual: persistent store silence
+/// on a deterministic input converges to a VISIBLE poison at its own
+/// cap — and consumes neither the transient build budget nor the
+/// completion-side infra budget.
+#[tokio::test]
+async fn test_dispatch_claims_silence_poisons_at_cap() -> TestResult {
+    use rio_auth::hmac::HmacSigner;
+    let db = TestDb::new(&MIGRATOR).await;
+    let (_store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (handle, _actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |c, p| {
+            c.retry_policy.backoff_base_secs = 0.0;
+            c.retry_policy.max_infra_retries = 3;
+            p.hmac_signer = Some(Arc::new(HmacSigner::from_key(key)));
+        });
+
+    let (node, _aterm, _out) = mint_text_ca_leaf("silence-cap");
+    let drv_path = node.drv_path.clone();
+    // NEVER seeded: the store stays silent forever.
+
+    let mut worker_rx = connect_executor(&handle, "cap-w0", "x86_64-linux").await?;
+    let mut events = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    barrier(&handle).await;
+    assert!(try_recv_assignment(&mut worker_rx, 200).await.is_none());
+
+    // Pump dispatch attempts (fresh registration = the harness
+    // trigger) until the budget converges to poison.
+    for i in 1..=10 {
+        let st = handle
+            .debug_query_derivation(&drv_path)
+            .await?
+            .expect("resident")
+            .status;
+        if st == DerivationStatus::Poisoned {
+            break;
+        }
+        let _rx = connect_executor(&handle, &format!("cap-w{i}"), "x86_64-linux").await?;
+        barrier(&handle).await;
+    }
+    wait_for_status(&handle, &drv_path, DerivationStatus::Poisoned).await;
+
+    let info = handle
+        .debug_query_derivation(&drv_path)
+        .await?
+        .expect("resident");
+    assert_eq!(
+        info.retry.claims_unavailable_count, 3,
+        "poisoned exactly at the cap"
+    );
+    assert_eq!(info.retry.count, 0, "transient build budget untouched");
+    assert_eq!(
+        info.retry.infra_count, 0,
+        "completion-side infra budget untouched"
+    );
+
+    let mut failed_msg = None;
+    while let Ok(ev) = events.try_recv() {
+        if let Some(rio_proto::types::build_event::Event::Derivation(d)) = ev.event
+            && d.kind == rio_proto::types::DerivationEventKind::Failed as i32
+        {
+            failed_msg = Some(d.error_message);
+        }
+    }
+    let failed_msg = failed_msg.expect("visible failure event");
+    assert!(
+        failed_msg.contains("could not vouch") && failed_msg.contains("3 dispatch attempts"),
+        "remediation names the cap; got: {failed_msg}"
+    );
+    Ok(())
+}
+
+// r[verify sched.evidence.seed-rank-floor]
+/// Constructor tier of the seed rank floor (round-17 bug_077): even if
+/// a future query change returns sub-floor or rank-garbage rows, the
+/// seed constructor refuses them — one predicate, two tiers. The
+/// hostile digest below is exactly what a planted bare row carries.
+#[test]
+fn persisted_row_seed_floors_sub_anchor_and_garbage_ranks() {
+    use crate::actor::merge::InputFormSeed;
+    use crate::db::InputFormRow;
+    let digest = vec![0x41u8; 32];
+    let row = |path: &str, rank: &str| InputFormRow {
+        drv_path: path.to_string(),
+        ca_modular_hash: Some(digest.clone()),
+        is_fixed_output: false,
+        is_ca: false,
+        evidence_rank: rank.to_string(),
+    };
+    let rows = vec![
+        row(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-echo.drv",
+            "unverified_claim",
+        ),
+        row(
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-squat.drv",
+            "content_bound_claim",
+        ),
+        row(
+            "/nix/store/cccccccccccccccccccccccccccccccc-bound.drv",
+            "path_bound_bytes",
+        ),
+        row(
+            "/nix/store/dddddddddddddddddddddddddddddddd-built.drv",
+            "verified_built",
+        ),
+        // Fail-closed decode: rank garbage never floors INTO seeding.
+        row(
+            "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-junk.drv",
+            "totally_bogus_rank",
+        ),
+    ];
+    let seed = InputFormSeed::from_persisted_rows(&rows);
+    assert!(
+        seed.get("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-echo.drv")
+            .is_none()
+    );
+    assert!(
+        seed.get("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-squat.drv")
+            .is_none()
+    );
+    assert!(
+        seed.get("/nix/store/cccccccccccccccccccccccccccccccc-bound.drv")
+            .is_some()
+    );
+    assert!(
+        seed.get("/nix/store/dddddddddddddddddddddddddddddddd-built.drv")
+            .is_some()
+    );
+    assert!(
+        seed.get("/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-junk.drv")
+            .is_none()
+    );
+}
+
+/// Round-17 bug_064: the read-through exit classes are three distinct
+/// populations, derived from one pure function so an emit site cannot
+/// pick a label the HELP text doesn't define. `partial` ≠ `miss`:
+/// "rows seeded SOME missing inputs" and "no seedable rows at all"
+/// steer an operator to different causes (a specific child lost its
+/// hash vs. rows gone entirely).
+#[test]
+fn readthrough_result_labels_cover_the_three_populations() {
+    use crate::actor::merge::readthrough_result;
+    assert_eq!(readthrough_result(true, false), "miss");
+    assert_eq!(
+        readthrough_result(true, true),
+        "miss",
+        "empty seed dominates"
+    );
+    assert_eq!(readthrough_result(false, false), "partial");
+    assert_eq!(readthrough_result(false, true), "seeded");
 }

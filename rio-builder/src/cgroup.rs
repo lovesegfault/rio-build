@@ -1,12 +1,13 @@
 //! Per-build cgroup v2 resource tracking.
 //!
-//! Solves the whole-tree measurement problem: `read_vmhwm_bytes(daemon.id())`
-//! measured nix-daemon's RSS (~10MB) because nix-daemon FORKS the
+//! Solves the whole-tree measurement problem: the daemon-era
+//! `read_vmhwm_bytes(daemon.id())` measured only nix-daemon's RSS (~10MB)
+//! because nix-daemon forked the
 //! builder and waitpid()s — the builder's memory never appeared in
 // r[impl builder.cgroup.sibling-layout]
 // r[impl builder.cgroup.memory-peak+2]
 //! daemon's `/proc`. cgroup `memory.peak` captures the WHOLE TREE
-//! (daemon + builder + every compiler sub-process), which is what the
+//! (the build child and every compiler sub-process), which is what the
 //! resource_floor memory-bump actually needs.
 //!
 //! Bonus: `cpu.stat usage_usec` gives us cumulative tree-wide CPU
@@ -32,10 +33,20 @@
 //! /sys/fs/cgroup/<worker-slice>/          ← delegated_root() finds this
 //!   cgroup.subtree_control                ← enable_subtree_controllers writes +memory +cpu
 //!   <drv-hash>/                           ← BuildCgroup::create makes this per build
-//!     cgroup.procs                        ← add_process writes daemon PID here
+//!     cgroup.procs                        ← rio-exec attaches its relay process here
 //!     memory.peak                         ← kernel-tracked tree peak, read at build end
 //!     cpu.stat                            ← usage_usec, polled 1Hz for peak-cores
+//!     build/                              ← rio-exec's principal kill scope: the
+//!       cgroup.procs                        sandboxed build's root PID lives HERE
 //! ```
+//!
+//! The `build/` level is rio-exec's: limit kills target it (and a
+//! pidfd) so the relay — the carrier of the build's exit status — is
+//! never signaled by a racing deadline. No controllers are delegated
+//! into it (`<drv-hash>/cgroup.subtree_control` stays empty), so
+//! `memory.peak`/`cpu.stat` at `<drv-hash>/` keep aggregating the
+//! whole tree hierarchically and the no-internal-process rule is not
+//! violated by the relay living at `<drv-hash>/` directly.
 //!
 //! The `<drv-hash>` subdirectory name: derivation hashes are
 //! nixbase32-encoded (alphabet `[0-9a-df-np-sv-z]`) so they're valid
@@ -54,8 +65,8 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// RAII per-build cgroup. `Drop` removes the directory.
 ///
 /// `rmdir` fails (`EBUSY`) if processes are still in the cgroup. The
-/// executor calls `daemon.kill().await` + `daemon.wait().await` BEFORE
-/// dropping this, so the tree should be empty. If rmdir still fails
+/// executor kills and reaps the build child BEFORE dropping this, so
+/// the tree should be empty. If rmdir still fails
 /// (zombie grandchild we don't know about), we log and leak — the
 /// kernel cleans up when the processes eventually die. Leaked
 /// cgroups are empty directories under `/sys/fs/cgroup`; harmless,
@@ -92,7 +103,12 @@ impl BuildCgroup {
         // investigates. Don't try to be clever with SIGKILL-ing
         // unknown PIDs.
         if path.exists() {
-            // Best-effort; mkdir below surfaces the real error.
+            // Best-effort; mkdir below surfaces the real error. The
+            // executor's `build` sub-cgroup (rio-exec places the build
+            // principal in `<cg>/build`) must go first — rmdir refuses
+            // non-empty directories, and cgroupfs children are
+            // directories.
+            let _ = fs::remove_dir(path.join("build"));
             let _ = fs::remove_dir(&path);
         }
 
@@ -105,15 +121,16 @@ impl BuildCgroup {
     ///
     /// Write `{pid}\n` to `cgroup.procs`. The kernel moves the
     /// process atomically. Fails (`EINVAL`) if the PID doesn't exist
-    /// — which means the daemon died between spawn and this call.
-    /// Executor treats that as a build failure anyway (no daemon =
-    /// no build), so bubbling this error is correct.
+    /// — which means the process died between spawn and this call.
+    /// The executor treats that as a build failure anyway, so bubbling
+    /// this error is correct.
     ///
-    /// **Ordering matters:** call this AFTER `spawn_daemon` returns
-    /// but BEFORE `run_daemon_build` — so the daemon is in the cgroup
-    /// BEFORE it forks the builder. If we added it after the fork,
-    /// the builder would be in the parent cgroup and we'd measure
-    /// only daemon RSS (back to the phase2c bug).
+    /// **Ordering matters:** attach the process BEFORE it forks the
+    /// real work — otherwise the descendants land in the parent cgroup
+    /// and only the supervisor's RSS is measured (the phase2c bug).
+    /// The native path attaches via rio-exec (the `ExecutionRequest`
+    /// cgroup field); this helper remains for callers that manage the
+    /// attach themselves.
     pub fn add_process(&self, pid: u32) -> io::Result<()> {
         // OpenOptions write (not append): cgroup.procs is a
         // pseudo-file; each write() syscall moves one PID. append
@@ -149,7 +166,7 @@ impl BuildCgroup {
     ///
     /// Path to this cgroup. Exposed so the CPU polling task can
     /// clone it (the task outlives the borrowed `&BuildCgroup`
-    /// across the `run_daemon_build` await).
+    /// across the build-execution await).
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -160,15 +177,15 @@ impl BuildCgroup {
     /// pseudo-file: write "1" → kernel sends SIGKILL to every PID
     /// in `cgroup.procs` recursively.
     ///
-    /// This is the Cancel mechanism. The daemon + builder + every
-    /// child dies immediately (SIGKILL can't be caught). nix-daemon
-    /// has no chance to do its normal cleanup (which is FINE — we're
+    /// This is the Cancel mechanism. The build child + every
+    /// descendant dies immediately (SIGKILL can't be caught). The
+    /// build has no chance to do its own cleanup (which is FINE — we're
     /// abandoning this build entirely, the overlayfs Drop handles
-    /// mount cleanup, and a crashed daemon's sandbox doesn't need
+    /// mount cleanup, and a killed build's sandbox doesn't need
     /// orderly teardown).
     ///
-    /// After this, `run_daemon_build` sees stdout EOF → returns
-    /// Err(DaemonDied or similar). The executor's error path sends
+    /// After this, the executor observes the child's exit and returns
+    /// the kill-induced failure. The executor's error path sends
     /// CompletionReport; the caller (spawn_build_task) checks the
     /// cancel flag to decide between InfrastructureFailure and
     /// Cancelled status.
@@ -176,9 +193,41 @@ impl BuildCgroup {
     /// `io::Result`: can fail if the cgroup was already removed
     /// (race with Drop) or the kernel is too old for cgroup.kill
     /// (Linux 5.14+). The caller logs and the build lingers —
-    /// worst case is the 2h daemon_timeout still applies.
+    /// worst case is the 2h build_timeout still applies.
     pub fn kill(&self) -> io::Result<()> {
         fs::write(self.path.join("cgroup.kill"), "1")
+    }
+}
+
+/// Kill a build's PRINCIPAL scope (`<cg>/build`) for an enforcement
+/// verdict (log cap, OOM-loop breaker), falling back to the build root
+/// only when the principal sub-cgroup does not exist yet.
+///
+/// The two-phase contract mirrors rio-exec's own kill targets
+/// (`builder.exec.kill-targets-principal`): post-placement, killing
+/// `<cg>` recursively would take the relay down with the principal and
+/// destroy the forwarded wait status the verdict corroboration is
+/// judged by (round-17 merged_bug_058). Pre-placement (ENOENT on the
+/// sub-cgroup), no tenant instruction has run and no forwarded status
+/// exists to protect — the root kill is the legacy whole-tree
+/// semantics rio-exec itself uses for that phase.
+///
+/// Both writes are deliberately UNCLAIMED in rio-exec's kill-claim
+/// machinery: the verdict authority for these kills is the caller's
+/// own flag (`log_limit_exceeded` / `oom_detected`), not the wait
+/// status. Routing them through typed claims is the named follow-up
+/// tail (`KillReason::LogLimit`) tracked by kill-writer-conformance's
+/// transitional entries.
+// r[impl builder.exec.kill-targets-principal]
+pub(crate) fn kill_principal_scope(cg_root: &Path) {
+    let principal = cg_root.join(rio_exec::BUILD_SUBCGROUP).join("cgroup.kill");
+    match fs::write(&principal, "1") {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Pre-placement: the sub-cgroup is not created yet.
+            let _ = fs::write(cg_root.join("cgroup.kill"), "1");
+        }
+        Err(_) => {}
     }
 }
 
@@ -201,7 +250,12 @@ impl Drop for BuildCgroup {
         // Best-effort. EBUSY if processes remain; we log and leak.
         // The leaked cgroup is an empty (or nearly-empty) pseudo-
         // directory under /sys/fs/cgroup — harmless but untidy.
-        // Pod restart clears the whole subtree.
+        // Pod restart clears the whole subtree. The executor's `build`
+        // sub-cgroup goes first: rmdir refuses non-empty directories,
+        // so leaving it would turn every parent removal into a
+        // guaranteed leak. ENOENT is fine (no-cgroup runs, or the
+        // execution aborted before the sub-cgroup was created).
+        let _ = fs::remove_dir(self.path.join("build"));
         if let Err(e) = fs::remove_dir(&self.path) {
             metrics::counter!("rio_builder_cgroup_leak_total").increment(1);
             tracing::warn!(
@@ -233,7 +287,7 @@ impl Drop for BuildCgroup {
 ///   builds/                       ← DelegateSubgroup; /proc/self/cgroup points here
 ///     cgroup.procs                ← worker PID
 ///   <drv-hash>/                   ← BuildCgroup::create per build (SIBLING of builds/)
-///     cgroup.procs                ← nix-daemon PID
+///     cgroup.procs                ← the sandboxed build's root PID
 ///     memory.peak, cpu.stat       ← resource tracking
 /// ```
 ///
@@ -507,7 +561,7 @@ fn parse_own_cgroup(content: &str) -> io::Result<PathBuf> {
 /// `pub(crate)`: the executor's CPU poll task reads `cpu.stat`
 /// directly by path (cloned from `BuildCgroup::path()`) and calls
 /// this to parse. It can't hold `&BuildCgroup` across the
-/// `run_daemon_build` await; exposing the parser is the simplest fix.
+/// build-execution await; exposing the parser is the simplest fix.
 pub(crate) fn parse_cpu_stat_usage_usec(content: &str) -> Option<u64> {
     content
         .lines()
@@ -522,11 +576,28 @@ fn read_single_u64(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// Host logical-CPU count. `available_parallelism()` is std (no
-/// `num_cpus` dep) and reads `/proc` directly — NOT cgroup-aware on
-/// Linux, so it returns the node's full core count even under a
-/// `cpu.max` quota. That's exactly what we want as the "no quota"
-/// fallback for [`parse_cpu_max`]; the quota clamp is applied on top.
+/// Effective CPU count for this process.
+///
+/// `available_parallelism()` IS cgroup-aware on Linux (std clamps the
+/// affinity count to the cgroup v1/v2 CPU quota, rounded *down*, min 1
+/// — `library/std/src/sys/thread/unix.rs`, `cgroups::quota()`), so
+/// inside a pod this returns the **quota-limited** core count, not the
+/// node's. Two consequences this module and the executor rely on:
+///
+/// * In [`parse_cpu_max`]'s `"max"` arm and its parse-failure fallback,
+///   the value returned here is already the pod-appropriate `-jN`: with
+///   no quota of its own the pod sees its affinity/ancestor-quota limit,
+///   and on a malformed `cpu.max` the std-side clamp still applies. (The
+///   quota arm never calls this — it computes `ceil(quota/period)`
+///   itself, which intentionally rounds *up* where std rounds down.)
+///
+/// * tokio sizes its default worker pool from this same value, so a
+///   1-CPU pod runs a **single-worker** async runtime. Any blocking call
+///   on that worker suspends every other task — limit watchdogs,
+///   heartbeats, cancellation. This is why every FUSE/merged-store
+///   filesystem operation in the executor must go through
+///   `spawn_blocking` or stay async (see the request-glue call in
+///   `executor::run_native_lifecycle`).
 fn nproc() -> u32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u32)
@@ -543,10 +614,11 @@ fn nproc() -> u32 {
 /// Returns `ceil(quota/period)` clamped to ≥1. Ceiling because a
 /// fractional limit (0.5 cores) still means ONE concurrent job is
 /// the right `-jN` — `make -j0` is meaningless and `-j` ≥2 just
-/// thrashes the throttle. `"max"` → host nproc.
+/// thrashes the throttle. `"max"` → [`nproc`] (the effective,
+/// quota-clamped count — see its doc).
 ///
 /// On parse failure (malformed file — shouldn't happen on a v2
-/// mount), falls back to host nproc rather than erroring: `cpu.max`
+/// mount), falls back to [`nproc`] rather than erroring: `cpu.max`
 /// is advisory for `-jN`, not a hard gate, and the cgroup throttle
 /// still applies regardless of what we pass to make.
 pub(crate) fn parse_cpu_max(content: &str) -> u32 {
@@ -568,7 +640,7 @@ pub(crate) fn parse_cpu_max(content: &str) -> u32 {
 ///
 /// Same input format as [`parse_cpu_max`] but returns the un-ceilinged
 /// f64 ratio for ADR-023 SLA telemetry (`ResourceUsage.cpu_limit_cores`).
-/// `"max"` → `None` (caller substitutes host nproc); the integer
+/// `"max"` → `None` (caller substitutes the effective nproc); the integer
 /// [`parse_cpu_max`] keeps its nproc-fallback for the `-jN` clamp path
 /// where a definite whole number is required.
 pub(crate) fn parse_cpu_max_cores(content: &str) -> Option<f64> {
@@ -603,22 +675,22 @@ pub(crate) fn parse_io_pressure_some_avg10(content: &str) -> Option<f64> {
         .ok()
 }
 
-// r[impl builder.cores.cgroup-clamp+2]
+// r[impl builder.cores.cgroup-clamp+3]
 /// Effective core count for `build_cores` (`nix --cores`, → `make -jN`).
 ///
 /// Reads `cpu.max` from the delegated-root cgroup (`parent`). In a k8s
 /// pod that's `/sys/fs/cgroup/cpu.max` — the pod's CPU limit. cgroup
 /// CPU quota does NOT reduce visible cores (sched_getaffinity / nproc
 /// see all node cores), so without this clamp `build_cores=0` →
-/// nix-daemon uses nproc → `make -j16` on a 0.5-core pod → 16×cc1 each
+/// the build env reports nproc → `make -j16` on a 0.5-core pod → 16×cc1 each
 /// at ~100MB → cgroup OOM-loop (cc1 killed, make respawns, never
 /// converges). I-196: python3-minimal stuck 15min on a `tiny` builder.
 ///
 /// I-197: builder/fetcher pools set `limits.cpu == requests.cpu`
 /// (hard, no burst — `672d1bf8`), so `cpu.max` is always a real quota
 /// in production. The `"max"` → nproc fallback only fires in VM tests
-/// / bare-metal dev. Also written to nix.conf `cores =` as
-/// defense-in-depth (see `executor::setup_nix_conf`).
+/// / bare-metal dev. Also exported as `NIX_BUILD_CORES` in the sandbox
+/// environment as defense-in-depth.
 pub fn effective_cores(parent: &Path) -> u32 {
     match fs::read_to_string(parent.join("cpu.max")) {
         Ok(s) => parse_cpu_max(&s),
@@ -778,7 +850,7 @@ fn sample_disk(overlay_base: &Path) -> (u64, u64) {
 ///
 /// `root` is the PARENT cgroup (what `delegated_root()` returns) —
 /// this captures the whole worker's tree: rio-builder process + all
-/// per-build sub-cgroups + all nix-daemon subprocesses.
+/// per-build sub-cgroups + every build subprocess.
 ///
 /// CPU fraction: delta `cpu.stat usage_usec` / interval µs. 1.0 = one
 /// core fully utilized; >1.0 on multi-core. Directly comparable to
@@ -811,7 +883,7 @@ pub async fn utilization_reporter_loop_with_shutdown(
 
     // cpu.max is static for the pod's lifetime (k8s sets it once from
     // resources.limits.cpu). Read once. None = "max" (unbounded) → report
-    // host nproc as the effective limit so the SLA model has a denominator.
+    // the effective (quota-clamped) nproc so the SLA model has a denominator.
     let cpu_limit_cores = fs::read_to_string(root.join("cpu.max"))
         .ok()
         .and_then(|s| parse_cpu_max_cores(&s))
@@ -1051,7 +1123,7 @@ mod tests {
         // parsing and filesystem path are sane on the host.
         //
         // Skip under the nix sandbox: /proc/self/cgroup shows the
-        // HOST's path (e.g. system.slice/nix-daemon.service) but the
+        // HOST's path (e.g. system.slice/rio-builder.service) but the
         // sandbox's /sys/fs/cgroup mount doesn't expose it. The
         // VM-test k3s scenarios exercise this for real.
         if !std::path::Path::new(CGROUP_ROOT)
@@ -1126,9 +1198,9 @@ mod tests {
         assert_eq!(read_single_u64(&dir.path().join("nope")), None);
     }
 
-    // r[verify builder.cores.cgroup-clamp+2]
+    // r[verify builder.cores.cgroup-clamp+3]
     /// I-196: cpu.max → effective whole-core count for `make -jN`.
-    /// Ceiling division, min 1, "max" → host nproc.
+    /// Ceiling division, min 1, "max" → effective nproc.
     #[test]
     fn parse_cpu_max_quota_to_cores() {
         // 0.5 cores: 50ms/100ms. -j1 (ceil, never 0).

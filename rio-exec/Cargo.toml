@@ -1,0 +1,42 @@
+[package]
+name = "rio-exec"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Build-system-agnostic Linux sandbox executor (namespaces, bind mounts, seccomp)"
+
+# The executor half of the native-build-execution split: callers
+# (rio-builder's Nix glue today, a REAPI glue later) describe a process
+# plus its filesystem view, isolation, and limits as an
+# `ExecutionRequest`; this crate materializes the sandbox and runs it.
+#
+# ARCHITECTURAL RULE: this crate must not depend on rio-nix, rio-proto,
+# or any other rio crate (workspace-hack excepted), and nothing in it may
+# reference a store path, a derivation, or a Nix convention. The sandbox
+# user identity is a mandatory request field (SandboxIdentity), so the
+# Nix names live in rio-builder's glue, not here. That is what keeps the
+# sandbox reusable for non-Nix build systems. Enforced by
+# checks.x86_64-linux.rio-exec-boundary (token grep over this crate).
+
+[dependencies]
+# Syscall wrappers for the sandbox sequence (unshare, mount, pivot_root,
+# setuid, personality, pty). `term` + `personality` on top of the
+# workspace feature set.
+nix = { workspace = true, features = ["term", "personality"] }
+# Raw constants/syscalls where `nix` has no wrapper (seccomp(2), the
+# BPF sock_filter program, capget/capset).
+libc = { workspace = true }
+# Async entry point: the parent side of execute() (pty read loop,
+# timeouts) runs on the caller's tokio runtime.
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+# Skeleton-builder tests materialize chroot trees in throwaway
+# directories.
+tempfile = { workspace = true }

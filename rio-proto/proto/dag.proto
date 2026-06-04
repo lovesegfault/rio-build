@@ -17,7 +17,11 @@ import "types.proto"; // DerivationEvent.failure_status → BuildResultStatus
 // A node in the derivation DAG submitted by the gateway.
 message DerivationNode {
   string drv_path = 1;                      // Store path of the .drv file
-  string drv_hash = 2;                      // Input-addressed: store path; CA: modular hash
+  // Scheduler DAG key. The gateway sets this to the declared .drv store
+  // path for every node shape, and SubmitBuild ingress rejects nodes
+  // where the two differ — CA content identity is carried separately in
+  // ca_modular_hash (field 12), which keys realisations, not the DAG.
+  string drv_hash = 2;
   string pname = 3;                         // Package name (for duration estimation)
   string system = 4;                        // e.g. "x86_64-linux"
   repeated string required_features = 5;    // requiredSystemFeatures
@@ -29,12 +33,13 @@ message DerivationNode {
   // between the gateway's FindMissingPaths and the scheduler's queue.
   repeated string expected_output_paths = 8;
   // ATerm-serialized .drv content. Empty = scheduler/executor fetches
-  // from store (the inline-content fallback). Populated by the
-  // gateway via filter_and_inline_drv ONLY for nodes whose outputs
-  // are missing from the store (= will actually dispatch). Cache-hit
-  // nodes stay empty — no point inflating SubmitBuild for derivations
-  // that won't build. Per-node ≤64KB (gateway enforces); scheduler
-  // validates ≤256KB defensively. 16MB total budget across the DAG.
+  // from store (the inline-content fallback). Two gateway producers:
+  // filter_and_inline_drv inlines cache-resident derivations whose
+  // outputs are missing from the store (≤64 KiB each, 16 MiB total
+  // budget — cache-hit nodes stay empty), and the content-bound hook
+  // fallback (build_fallback_node) carries a single derivation up to
+  // 1 MiB (rio-common MAX_DRV_CONTENT_BYTES). The scheduler validates
+  // the same shared bound defensively at SubmitBuild ingress.
   bytes drv_content = 9;
   reserved 10;  // was input_srcs_nar_size (closure-size proxy; ADR-023 supersedes)
 
@@ -43,14 +48,28 @@ message DerivationNode {
   // this to gate the hash-compare branch in completion.rs.
   bool is_content_addressed = 11;
 
-  // For CA derivations: the modular derivation hash (hashDerivationModulo
-  // SHA-256). This is the `drv_hash` half of the realisations table
-  // composite PK — the same value Nix sends as the `sha256:<hex>` prefix
-  // of wopRegisterDrvOutput's `id` field. Populated by the gateway after
+  // The modular derivation hash (hashDerivationModulo SHA-256). This is
+  // the `drv_hash` half of the realisations table composite PK — the
+  // same value Nix sends as the `sha256:<hex>` prefix of
+  // wopRegisterDrvOutput's `id` field. Populated by the gateway after
   // DAG BFS from the same drv_cache that resolves inputDrvs (so the full
-  // transitive closure is available). Empty (zero-length) for IA
-  // derivations AND for the single-node BasicDerivation fallback (no
-  // transitive closure to compute over).
+  // transitive closure is available) for EVERY node with a cached full
+  // derivation: content-addressed nodes (realisation key for CA-on-CA
+  // resolve), deferred input-addressed nodes (realisation row keyed by
+  // this hash is how the scheduler answers wopQueryDerivationOutputMap
+  // for them), AND plain input-addressed nodes with statically-known
+  // output paths (identity evidence — the scheduler's ingress
+  // inline-content binding seeds input_addressed_output_paths' hash
+  // cache with children's hashes to verify declared IA paths without
+  // store access). May be empty when the gateway's best-effort hash
+  // computation failed (consumers degrade per their own rules). For
+  // the single-node BasicDerivation fallback, build_fallback_node
+  // populates it when the inline derivation is content-addressed
+  // (CppNix staticOutputHashes: hashDerivationModulo over the lifted
+  // derivation, which has no inputDrvs); the scheduler's
+  // authoritative-content validation requires it to match the inline
+  // drv_content whenever a floating-CA output is present (FOD-only
+  // fallbacks may leave it empty, but a present value must still match).
   bytes ca_modular_hash = 12;
 
   // ADR-018 Appendix B `shouldResolve`: true if this derivation needs
@@ -105,6 +124,16 @@ message DerivationNode {
   // are not structural roots. False (the proto3 default) means "only
   // demanded as a dependency", which is the pre-addition behaviour.
   bool explicitly_requested = 19;
+
+  // Set by the gateway when the inline drv_content is the ONLY copy of
+  // the derivation anywhere (content-bound hook fallback: the .drv was
+  // never uploaded and the gateway never writes its re-serialization to
+  // any store). The scheduler MUST persist these bytes with the
+  // derivation row so a post-failover dispatch still carries them —
+  // otherwise the build can only fail after recovery. False for the
+  // inline-.drv optimization (the worker can always fetch those from
+  // the store).
+  bool drv_content_authoritative = 20;
 }
 
 // A dependency edge in the derivation DAG.
@@ -147,8 +176,9 @@ enum DerivationEventKind {
 // Dashboard DAG (GetBuildGraph — AdminService)
 // ───────────────────────────────────────────────────────────────────────────
 
-// Dashboard DAG — deliberately THIN (~200B/node). DerivationNode is ≤64KB
-// (drv_content inline). 2000 nodes × 64KB = 128MB > max_encoding_message_size.
+// Dashboard DAG — deliberately THIN (~200B/node). DerivationNode carries
+// inline drv_content (typically ≤64KB, up to 1 MiB for hook-fallback
+// nodes). 2000 nodes × 64KB = 128MB > max_encoding_message_size.
 // GraphNode carries a handful of strings — just what the dashboard needs to render a
 // node box with a status color.
 message GraphNode {

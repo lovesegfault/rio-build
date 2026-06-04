@@ -485,7 +485,7 @@ impl ProbeShape {
         // `solve_intent_for` floors `SpawnIntent.deadline_secs` at the
         // probe value; the controller takes it verbatim as
         // `activeDeadlineSeconds` and derives the worker's
-        // `daemon_timeout = deadline − 90s`. At the old 60s floor both
+        // `build_timeout = deadline − 90s`. At the old 60s floor both
         // timers tied (the worker `.max(60)` clamp masked the negative
         // slack) so K8s SIGKILL raced `CompletionReport{TimedOut}`.
         // 180s leaves the 90s slack + ~30s cold-start + a meaningful

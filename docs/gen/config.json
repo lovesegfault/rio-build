@@ -602,10 +602,10 @@
         "description": "HMAC-signed `ExecutorClaims{intent_id, kind, expiry}` from the controller's `RIO_EXECUTOR_TOKEN` env var (passed through from `SpawnIntent.executor_token`)."
       },
       {
-        "key": "daemon_timeout_secs",
+        "key": "build_timeout_secs",
         "type": "uint64",
         "default": "7200",
-        "description": "Timeout (seconds) for the local nix-daemon subprocess build when the client didn't specify BuildOptions.build_timeout."
+        "description": "Timeout (seconds) for the sandboxed build when the client didn't specify BuildOptions.build_timeout."
       },
       {
         "key": "max_silent_time_secs",
@@ -618,6 +618,30 @@
         "type": "uint64",
         "default": "120",
         "description": "I-116 idle timeout: exit if no assignment arrives for this long."
+      },
+      {
+        "key": "hashed_mirrors",
+        "type": "list<string>",
+        "default": "[]",
+        "description": "Hashed-mirror base URLs that the native `builtin:fetchurl` tries before the origin URL, as `<mirror>/<algo>/<base16-hash>`."
+      },
+      {
+        "key": "extra_sandbox_paths",
+        "type": "list<string>",
+        "default": "[]",
+        "description": "Extra host paths bind-mounted read-only into every build sandbox (same path inside and outside)."
+      },
+      {
+        "key": "sandbox_shell",
+        "type": "string",
+        "default": "",
+        "description": "Host path of a static POSIX shell exposed as `/bin/sh` inside every build sandbox. nixpkgs builds assume `/bin/sh` exists (the daemon-era sandbox provided busybox baked into the Nix binary; the native executor must be told where one lives in the worker image)."
+      },
+      {
+        "key": "ca_bundle",
+        "type": "string",
+        "default": "/etc/ssl/certs/ca-certificates.crt",
+        "description": "Host path of the CA bundle exposed read-only at `/etc/ssl/certs/ca-certificates.crt` for network (fixed-output) builds."
       }
     ],
     "controller": [

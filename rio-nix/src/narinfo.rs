@@ -184,18 +184,33 @@ impl NarInfo {
     /// the first matching trusted key, or `None` if no signature
     /// verifies.
     ///
-    /// The fingerprint reconstruction uses `self.nar_hash` verbatim
-    /// (already `sha256:nixbase32` from the `NarHash:` line) and
-    /// prepends the store dir (derived from `self.store_path`) to
-    /// each reference basename — the narinfo text format stores
-    /// basenames but the fingerprint signs full paths.
+    /// The fingerprint reconstruction CANONICALIZES `self.nar_hash`:
+    /// the `NarHash:` line is parsed in any oracle encoding
+    /// ([`crate::hash::NixHash::parse_any_prefixed`], the same parser
+    /// the oracle's narinfo reader uses — `nar-info.cc:23-29`) and
+    /// re-encoded as `sha256:<nixbase32>`, because the signed
+    /// fingerprint ALWAYS uses the canonical Nix32 spelling
+    /// regardless of how the narinfo spelled the hash
+    /// (`ValidPathInfo::fingerprint`, `path-info.cc:43-50`:
+    /// `narHash.to_string(HashFormat::Nix32, true)`). Echoing the
+    /// narinfo's own spelling would mis-verify honest upstreams that
+    /// serve base16 or base64. Reference basenames are re-prefixed
+    /// with the store dir (derived from `self.store_path`) — the
+    /// narinfo text format stores basenames but the fingerprint
+    /// signs full paths.
+    ///
+    /// Non-sha256 `NarHash` algorithms return `None` — registered
+    /// divergence `nix.divergence.narinfo-sha256-only`: the oracle
+    /// PARSES any algorithm but asserts sha256 on every narinfo it
+    /// writes (`nar-info.cc:117`), and rio's NarHash pipeline is
+    /// `[u8; 32]` SHA-256 throughout.
     ///
     /// Malformed inputs (bad base64, wrong key length, unparseable
-    /// sig) are treated as non-matching, not errors: an attacker
-    /// who can inject a malformed `Sig:` line shouldn't be able to
-    /// make verification crash — they just don't verify.
+    /// sig, undecodable `NarHash`) are treated as non-matching, not
+    /// errors: an attacker who can inject a malformed line shouldn't
+    /// be able to make verification crash — they just don't verify.
     // r[impl store.signing.fingerprint]
-    // r[impl nix.narinfo.verify-sig]
+    // r[impl nix.narinfo.verify-sig+1]
     pub fn verify_sig(&self, trusted_keys: &[String]) -> Option<String> {
         use base64::Engine as _;
         use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
@@ -216,11 +231,20 @@ impl NarInfo {
             return None;
         }
 
+        // Canonicalize the NarHash for the fingerprint (see the doc
+        // comment): parse in any oracle encoding, reject non-sha256,
+        // re-encode as `sha256:<nixbase32>`.
+        let nar_hash = crate::hash::NixHash::parse_any_prefixed(&self.nar_hash).ok()?;
+        // r[impl nix.divergence.narinfo-sha256-only]
+        if nar_hash.algo() != crate::hash::HashAlgo::SHA256 {
+            return None;
+        }
+        let canonical_nar_hash = nar_hash.to_colon();
+
         // Reconstruct the fingerprint from narinfo fields. Can't call
-        // the free `fingerprint()` — that wants raw [u8; 32] hash
-        // bytes, but `self.nar_hash` is the already-encoded
-        // `sha256:nixbase32` string. Rebuilding from the string is
-        // correct (and what a Nix client does).
+        // the free `fingerprint()` directly — that wants raw [u8; 32]
+        // hash bytes — but the canonical re-encode above produces the
+        // same `sha256:<nixbase32>` spelling it would.
         //
         // Store dir: everything up to and including the last '/' of
         // store_path. E.g. "/nix/store/abc-foo" → "/nix/store/".
@@ -236,7 +260,7 @@ impl NarInfo {
         let fp = format!(
             "1;{};{};{};{}",
             self.store_path,
-            self.nar_hash,
+            canonical_nar_hash,
             self.nar_size,
             full_refs.join(","),
         );
@@ -769,6 +793,90 @@ FileSize: 54321
             ni.verify_sig(&[trusted]).as_deref(),
             Some("test-key-1"),
             "duplicate refs must not invalidate the signature"
+        );
+    }
+
+    // r[verify nix.narinfo.verify-sig+1]
+    /// The signed fingerprint always covers the CANONICAL
+    /// `sha256:<nixbase32>` spelling (`path-info.cc:43-50`); a narinfo
+    /// that spells `NarHash:` in base16 or base64 (oracle-legal —
+    /// `nar-info.cc:23-29` parses via `parseAnyPrefixed`) must verify
+    /// against the same signature, and an undecodable spelling must
+    /// be non-matching, never a panic.
+    #[test]
+    fn verify_sig_canonicalizes_nar_hash_spelling() {
+        use base64::Engine as _;
+        let (ni, trusted) = signed_narinfo("test-key-1", [7u8; 32]);
+        // Fixture digest is all-zero 32 bytes, signed over the
+        // canonical nixbase32 spelling (52 '0' chars).
+        let raw = [0u8; 32];
+
+        // base16 spelling: 64 hex chars.
+        let mut base16 = ni.clone();
+        base16.nar_hash = format!("sha256:{}", hex::encode(raw));
+        assert_eq!(
+            base16.verify_sig(std::slice::from_ref(&trusted)).as_deref(),
+            Some("test-key-1"),
+            "base16-spelled NarHash must verify against the canonical-fingerprint sig"
+        );
+
+        // base64 spelling: 44 chars.
+        let mut base64s = ni.clone();
+        base64s.nar_hash = format!(
+            "sha256:{}",
+            base64::engine::general_purpose::STANDARD.encode(raw)
+        );
+        assert_eq!(
+            base64s
+                .verify_sig(std::slice::from_ref(&trusted))
+                .as_deref(),
+            Some("test-key-1"),
+            "base64-spelled NarHash must verify against the canonical-fingerprint sig"
+        );
+
+        // Undecodable spelling: non-matching, not a panic.
+        let mut junk = ni.clone();
+        junk.nar_hash = "sha256:zzz".into();
+        assert_eq!(junk.verify_sig(std::slice::from_ref(&trusted)), None);
+    }
+
+    // r[verify nix.divergence.narinfo-sha256-only]
+    /// Non-sha256 NarHash algorithms are rejected at verification:
+    /// the oracle asserts sha256 on every narinfo it writes
+    /// (`nar-info.cc:117`), and rio's pipeline is [u8; 32] sha256
+    /// throughout. A correctly-signed sha512 narinfo must NOT verify.
+    #[test]
+    fn verify_sig_rejects_non_sha256_nar_hash() {
+        use base64::Engine as _;
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let pk = sk.verifying_key();
+
+        let store_path = "/nix/store/00000000000000000000000000000000-hello";
+        let nar_hash = format!("sha512:{}", hex::encode([0u8; 64]));
+        // Sign over the LITERAL spelling — even a sig the upstream
+        // computed over its own sha512 fingerprint must not verify.
+        let fp = format!("1;{store_path};{nar_hash};1234;");
+        let sig = sk.sign(fp.as_bytes());
+        let ni = NarInfo {
+            store_path: store_path.into(),
+            url: "nar/x.nar.zst".into(),
+            compression: "zstd".into(),
+            nar_hash,
+            nar_size: 1234,
+            references: vec![],
+            deriver: None,
+            sigs: vec![format!("k:{}", b64.encode(sig.to_bytes()))],
+            ca: None,
+            file_hash: None,
+            file_size: None,
+        };
+        let trusted = format!("k:{}", b64.encode(pk.to_bytes()));
+        assert_eq!(
+            ni.verify_sig(&[trusted]),
+            None,
+            "sha512 NarHash is the registered sha256-only divergence"
         );
     }
 

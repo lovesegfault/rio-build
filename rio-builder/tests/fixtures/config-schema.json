@@ -139,8 +139,8 @@
         "type": "string",
         "default": ""
       },
-      "daemon_timeout_secs": {
-        "description": "Timeout (seconds) for the local nix-daemon subprocess build when\nthe client didn't specify BuildOptions.build_timeout. Intentionally\nlong (2h default) — some builds genuinely take that long; this is\na bound on blast radius of a truly stuck daemon, not an expected\nbuild time.",
+      "build_timeout_secs": {
+        "description": "Timeout (seconds) for the sandboxed build when the client didn't\nspecify BuildOptions.build_timeout. Intentionally long (2h\ndefault) — some builds genuinely take that long; this is a bound\non blast radius of a truly stuck build, not an expected build\ntime.",
         "type": "integer",
         "format": "uint64",
         "minimum": 0,
@@ -159,6 +159,38 @@
         "format": "uint64",
         "minimum": 0,
         "default": 120
+      },
+      "hashed_mirrors": {
+        "description": "Hashed-mirror base URLs that the native `builtin:fetchurl`\ntries before the origin URL, as `<mirror>/<algo>/<base16-hash>`.\nSuccessor of the daemon-era nix.conf `hashed-mirrors` setting\n(spec rule `fetcher.mirrors.hashed`); there is no nix.conf\nanywhere in the worker anymore.\nEnv: `RIO_HASHED_MIRRORS=http://a/,http://b/` (comma-sep).\nDefault: empty (origin URLs only).",
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": []
+      },
+      "extra_sandbox_paths": {
+        "description": "Extra host paths bind-mounted read-only into every build\nsandbox (same path inside and outside). Successor of the\ndaemon-era nix.conf `extra-sandbox-paths` setting. Operators use\nthis for site-local impurities (e.g. a corporate CA directory).\nEnv: `RIO_EXTRA_SANDBOX_PATHS=/a,/b` (comma-sep). Default: empty.",
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": []
+      },
+      "sandbox_shell": {
+        "description": "Host path of a static POSIX shell exposed as `/bin/sh` inside\nevery build sandbox. nixpkgs builds assume `/bin/sh` exists (the\ndaemon-era sandbox provided busybox baked into the Nix binary;\nthe native executor must be told where one lives in the worker\nimage). Empty disables the mount — only viable for corpora whose\nbuilders never invoke `/bin/sh`. Env: `RIO_SANDBOX_SHELL`.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "ca_bundle": {
+        "description": "Host path of the CA bundle exposed read-only at\n`/etc/ssl/certs/ca-certificates.crt` for network (fixed-output)\nbuilds. The mount is optional-if-missing, so the default points\nat the conventional location in the worker image. Env:\n`RIO_CA_BUNDLE`.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": "/etc/ssl/certs/ca-certificates.crt"
       }
     },
     "$defs": {
@@ -222,8 +254,12 @@
     "hw_bench_needed": false,
     "intent_id": "",
     "executor_token": "",
-    "daemon_timeout_secs": 7200,
+    "build_timeout_secs": 7200,
     "max_silent_time_secs": 0,
-    "idle_secs": 120
+    "idle_secs": 120,
+    "hashed_mirrors": [],
+    "extra_sandbox_paths": [],
+    "sandbox_shell": null,
+    "ca_bundle": "/etc/ssl/certs/ca-certificates.crt"
   }
 }

@@ -41,7 +41,10 @@ use tracing::warn;
 
 mod chunked;
 mod cluster_key_history;
+pub(crate) mod drv_modulo;
 mod inline;
+pub(crate) mod invalidate;
+pub(crate) mod per_path;
 mod queries;
 pub(crate) mod tenant_keys;
 pub(crate) mod upstreams;
@@ -724,6 +727,7 @@ mod tests {
             MetadataError::PlaceholderMissing { store_path } => MetadataError::PlaceholderMissing {
                 store_path: store_path.clone(),
             },
+            MetadataError::BackendAuth(s) => MetadataError::BackendAuth(s.clone()),
             MetadataError::InvariantViolation(s) => MetadataError::InvariantViolation(s.clone()),
             MetadataError::CorruptManifest { store_path, .. } => MetadataError::CorruptManifest {
                 store_path: store_path.clone(),
@@ -736,6 +740,8 @@ mod tests {
                 },
             ),
             MetadataError::ResourceExhausted(s) => MetadataError::ResourceExhausted(s.clone()),
+            MetadataError::ChunkBackend(s) => MetadataError::ChunkBackend(s.clone()),
+            MetadataError::DataLoss(s) => MetadataError::DataLoss(s.clone()),
             MetadataError::Other(_) => MetadataError::Other(sqlx::Error::RowNotFound),
             MetadataError::RealisationConflict {
                 drv_hash,

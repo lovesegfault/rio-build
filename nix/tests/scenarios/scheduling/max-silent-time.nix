@@ -65,21 +65,23 @@ scope: with scope; ''
 
       # SOME worker must have logged the silence warn. journalctl grep
       # is the end-to-end proof that RIO (not the local nix-daemon)
-      # fired. If this is 0 but elapsed is in-range, the nix-daemon
-      # enforced it instead — rio-side backstop didn't fire (impl bug).
-      # Sum across all workers: I-200 retries may land on different
-      # workers each attempt.
+      # fired. If this is 0 but elapsed is in-range, something else
+      # killed the build — the rio-side silence arm didn't fire
+      # (impl bug). Sum across all workers: I-200 retries may land on
+      # different workers each attempt. The phrase is the
+      # classification message the native executor emits for
+      # ExitOutcome::Silent (native_result::classify_exit).
       warn_total = sum(
           int(w.succeed(
               "journalctl -u rio-builder --no-pager | "
-              "grep -c 'silent for maxSilentTime' || true"
+              "grep -c 'no output for longer than max-silent-time' || true"
           ).strip() or "0")
           for w in all_workers
       )
       assert warn_total >= 1, (
-          f"no worker logged 'silent for maxSilentTime'. The local "
-          f"nix-daemon may have enforced maxSilentTime before the "
-          f"rio-side backstop fired.\nBuild output:\n{out}"
+          f"no worker logged 'no output for longer than "
+          f"max-silent-time'. Something other than the rio-side "
+          f"silence arm killed the build.\nBuild output:\n{out}"
       )
 
       print(f"max-silent-time PASS: {attempts} attempts, {per_attempt:.1f}s/attempt (drv sleep was 60s)")

@@ -161,14 +161,14 @@ pub struct Config {
     /// intent it was spawned for. Empty in dev mode → header omitted.
     /// See `r[sec.executor.identity-token]`.
     pub executor_token: String,
-    /// Timeout (seconds) for the local nix-daemon subprocess build when
-    /// the client didn't specify BuildOptions.build_timeout. Intentionally
-    /// long (2h default) — some builds genuinely take that long; this is
-    /// a bound on blast radius of a truly stuck daemon, not an expected
-    /// build time.
-    #[serde(rename = "daemon_timeout_secs", with = "rio_common::config::secs")]
+    /// Timeout (seconds) for the sandboxed build when the client didn't
+    /// specify BuildOptions.build_timeout. Intentionally long (2h
+    /// default) — some builds genuinely take that long; this is a bound
+    /// on blast radius of a truly stuck build, not an expected build
+    /// time.
+    #[serde(rename = "build_timeout_secs", with = "rio_common::config::secs")]
     #[schemars(with = "u64")]
-    pub daemon_timeout: std::time::Duration,
+    pub build_timeout: std::time::Duration,
     /// Silence timeout (seconds): kill the build if no output for N seconds.
     /// 0 = disabled. Used when the assignment's BuildOptions.max_silent_time
     /// is 0/unset. Env: `RIO_MAX_SILENT_TIME_SECS`.
@@ -196,8 +196,57 @@ pub struct Config {
     #[serde(rename = "idle_secs", with = "rio_common::config::secs")]
     #[schemars(with = "u64")]
     pub idle_timeout: std::time::Duration,
+    /// Hashed-mirror base URLs that the native `builtin:fetchurl`
+    /// tries before the origin URL, as `<mirror>/<algo>/<base16-hash>`.
+    /// Successor of the daemon-era nix.conf `hashed-mirrors` setting
+    /// (spec rule `fetcher.mirrors.hashed`); there is no nix.conf
+    /// anywhere in the worker anymore.
+    /// Env: `RIO_HASHED_MIRRORS=http://a/,http://b/` (comma-sep).
+    /// Default: empty (origin URLs only).
+    #[serde(deserialize_with = "rio_common::config::comma_vec")]
+    #[schemars(with = "Vec<String>")]
+    pub hashed_mirrors: Vec<String>,
+    /// Extra host paths bind-mounted read-only into every build
+    /// sandbox (same path inside and outside). Successor of the
+    /// daemon-era nix.conf `extra-sandbox-paths` setting. Operators use
+    /// this for site-local impurities (e.g. a corporate CA directory).
+    /// Env: `RIO_EXTRA_SANDBOX_PATHS=/a,/b` (comma-sep). Default: empty.
+    #[serde(deserialize_with = "rio_common::config::comma_vec")]
+    #[schemars(with = "Vec<String>")]
+    pub extra_sandbox_paths: Vec<String>,
+    // r[impl builder.sandbox.shell]
+    /// Host path of a static POSIX shell exposed as `/bin/sh` inside
+    /// every build sandbox. nixpkgs builds assume `/bin/sh` exists (the
+    /// daemon-era sandbox provided busybox baked into the Nix binary;
+    /// the native executor must be told where one lives in the worker
+    /// image). Empty disables the mount — only viable for corpora whose
+    /// builders never invoke `/bin/sh`. Env: `RIO_SANDBOX_SHELL`.
+    #[serde(default)]
+    pub sandbox_shell: Option<std::path::PathBuf>,
+    /// Host path of the CA bundle exposed read-only at
+    /// `/etc/ssl/certs/ca-certificates.crt` for network (fixed-output)
+    /// builds. The mount is optional-if-missing, so the default points
+    /// at the conventional location in the worker image. Env:
+    /// `RIO_CA_BUNDLE`.
+    #[serde(default = "default_ca_bundle")]
+    pub ca_bundle: Option<std::path::PathBuf>,
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to fetchers which have direct egress. Squid proxy deleted.
+}
+
+/// Default *host* CA bundle location in the worker image (Debian/NixOS
+/// convention). The sandbox mount is `optional`, so a missing file
+/// simply omits the mount instead of failing the build.
+///
+/// Distinct from the *in-sandbox* mount target,
+/// [`crate::builtin_fetchurl::SANDBOX_CA_BUNDLE`]: this is where the
+/// bundle is read from on the host; that constant is where readers
+/// inside the sandbox find it. The two coincide textually only because
+/// the conventional Linux location is used on both sides.
+fn default_ca_bundle() -> Option<std::path::PathBuf> {
+    Some(std::path::PathBuf::from(
+        "/etc/ssl/certs/ca-certificates.crt",
+    ))
 }
 
 impl Default for Config {
@@ -230,9 +279,13 @@ impl Default for Config {
             hw_bench_needed: false,
             intent_id: String::new(),
             executor_token: String::new(),
-            daemon_timeout: crate::executor::DEFAULT_DAEMON_TIMEOUT,
+            build_timeout: crate::executor::DEFAULT_BUILD_TIMEOUT,
             max_silent_time: std::time::Duration::ZERO,
             idle_timeout: std::time::Duration::from_secs(120),
+            hashed_mirrors: Vec::new(),
+            extra_sandbox_paths: Vec::new(),
+            sandbox_shell: None,
+            ca_bundle: default_ca_bundle(),
         }
     }
 }
@@ -331,10 +384,10 @@ pub struct CliArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     log_size_limit: Option<u64>,
 
-    /// Daemon build timeout seconds (default: 7200)
+    /// Build timeout seconds (default: 7200)
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    daemon_timeout_secs: Option<u64>,
+    build_timeout_secs: Option<u64>,
 }
 
 /// Detect the system architecture (e.g. "x86_64-linux").

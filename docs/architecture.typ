@@ -107,7 +107,7 @@
       #text(size: 0.75em)[
         @fuse `/nix/store` + SSD cache \
         @overlayfs + synth SQLite DB \
-        nix sandbox
+        rio-exec sandbox
       ]
     ],
     node(
@@ -350,7 +350,7 @@ and #cross-link("/spec/components/store.typ")[rio-store] for the chunked CAS.
         comment: [`WorkAssignment` (via `BuildExecution`)#pin("rs-assign")],
       )
       _seq("Builder", "Store", comment: [`GetPath` (FUSE fetch)])
-      _seq("Builder", "Builder", comment: [nix sandbox build])
+      _seq("Builder", "Builder", comment: [rio-exec sandbox build])
       _seq("Builder", "Sched", comment: [`BuildLogBatch`])
       _seq("Sched", "GW", comment: [`BuildEvent` (logs)])
       _seq("GW", "Client", comment: [`STDERR_NEXT`])
@@ -530,8 +530,15 @@ and #cross-link("/spec/components/store.typ")[rio-store] for the chunked CAS.
   `wopBuildPathsWithResults`. The gateway annotates the `SubmitBuildRequest`
   with `priority_class = "interactive"` when the session has not yet seen a
   `wopBuildPathsWithResults` call (see `rio-gateway/src/handler/build.rs`).
-  There is no dedicated `is_ifd_hint` field; priority classification is
-  conveyed entirely through `priority_class`.
+  Input-addressed build-hook delegations from Nix ≥ 2.16 / Lix arrive
+  instead as the session's first `wopBuildPathsWithResults` with a single
+  all-outputs target (`<drv>!*`, after the client copies the `.drv`
+  closure to the untrusted gateway); content-bound (fixed-output /
+  floating-CA) hook delegations keep the inline `wopBuildDerivation`
+  shape, with the serialized derivation carried inline in `drv_content`
+  (see #rref("gw.hook.single-node-dag")). Both delegation shapes are
+  classified `"interactive"`. There is no dedicated `is_ifd_hint` field;
+  priority classification is conveyed entirely through `priority_class`.
 ]
 
 = Rationale

@@ -228,7 +228,7 @@ impl DagActor {
                 ) => Some((exec_id, executor_id)),
                 _ => None,
             };
-            // r[impl sched.merge.substitute-topdown+10]
+            // r[impl sched.merge.substitute-topdown+15]
             // The recovery-time consult of the persisted closure-hole
             // breadcrumb (`migrations/064`): a holed flagged parent is
             // never enrolled as a clear candidate, however produced its
@@ -240,7 +240,7 @@ impl DagActor {
             // (a holed node is never Vouched). The kept mark routes the
             // node to the dispatch-time carve-out / resubmit-directing
             // fail-fast instead.
-            if state.topdown_pruned && !state.closure_hole {
+            if state.topdown_pruned && !state.closure_hole.is_holed() {
                 flagged.push(derivation_id);
             }
             id_to_hash.insert(derivation_id, hash.clone());
@@ -290,7 +290,7 @@ impl DagActor {
         }
         let ttl_secs = crate::state::POISON_TTL.as_secs_f64();
         for row in poisoned_rows {
-            let derivation_id = row.derivation_id;
+            let derivation_id = row.base.derivation_id;
             // Expired-at-load: clear in PG, don't insert. Avoids the
             // from_poisoned_row Instant-arithmetic trap on fresh
             // nodes — checked_sub(30h) on a node booted 1h ago returns
@@ -310,9 +310,9 @@ impl DagActor {
             // the same actor turn. Not worth the re-load complexity
             // for a 24h-outage + crash-window intersection.
             if row.elapsed_secs > ttl_secs {
-                info!(drv_hash = %row.drv_hash, elapsed_secs = row.elapsed_secs,
+                info!(drv_hash = %row.base.drv_hash, elapsed_secs = row.elapsed_secs,
                       "poison already past TTL at recovery — clearing");
-                let hash: crate::state::DrvHash = row.drv_hash.into();
+                let hash: crate::state::DrvHash = row.base.drv_hash.into();
                 if let Err(e) = self.db.clear_poison(&hash).await {
                     warn!(drv_hash = %hash, error = %e,
                           "clear_poison for expired-at-load failed; next recovery will retry");
@@ -333,6 +333,45 @@ impl DagActor {
             // stays empty → check_build_completion sees 0/0 → Succeeded.
             id_to_hash.insert(derivation_id, hash);
             self.dag.insert_recovered_node(state);
+        }
+
+        // --- Hydrate the 069 closure-hole witness sets ---
+        // Both row loops restored the persisted FLAG (a holed row gets
+        // the fail-closed sentinel until hydrated). The transactional
+        // writers guarantee flag ⇔ side-rows; the debug_assert checks
+        // exactly that, and a release-mode inconsistency leaves the
+        // sentinel — uncoverable by any re-supply, so the heal stays
+        // refused (fail-closed).
+        let holed_hashes: Vec<String> = self
+            .dag
+            .iter_nodes()
+            .filter(|(_, st)| st.closure_hole.is_holed())
+            .map(|(h, _)| h.to_string())
+            .collect();
+        if !holed_hashes.is_empty() {
+            let witness_rows = self.db.load_closure_missing(&holed_hashes).await?;
+            let mut by_parent: std::collections::BTreeMap<String, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for (parent, child) in witness_rows {
+                by_parent.entry(parent).or_default().push(child);
+            }
+            for hash in &holed_hashes {
+                let rows = by_parent.remove(hash.as_str()).unwrap_or_default();
+                debug_assert!(
+                    !rows.is_empty(),
+                    "holed row {hash} has no 069 witness rows — the \
+                     transactional writers cannot produce this"
+                );
+                if let Some(state) = self.dag.node_mut(hash)
+                    && !rows.is_empty()
+                {
+                    state.closure_hole.hydrate(rows.into_iter().map(Into::into));
+                }
+            }
+            info!(
+                count = holed_hashes.len(),
+                "hydrated closure-hole witness sets"
+            );
         }
 
         // --- Load edges + add to DAG ---
@@ -385,7 +424,7 @@ impl DagActor {
         }
         info!(count = edge_rows.len(), "loaded edges");
 
-        // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.merge.substitute-topdown+15]
         // Produced-children gate on restored `topdown_pruned` marks:
         // drop the mark from any flagged row whose persisted children
         // are ALL produced (`completed`/`skipped`) and vouched for by
@@ -460,13 +499,13 @@ impl DagActor {
             }
         }
 
-        // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.merge.substitute-topdown+15]
         // Closure-hole stamp for the edges this load dropped to
-        // UN-PRODUCED terminal children (`poisoned`/`dependency_failed`/
-        // `cancelled`): the recovery-side analogue of the reap, which
-        // breadcrumbs every removal of an un-produced child from a
-        // parent's child set. The edge load above dropped those edges,
-        // so the parent recovers with a silently truncated child set
+        // terminal children: the recovery-side analogue of the reap.
+        // The TRIGGER is computed below (un-produced drop, or restored
+        // watched flag); the un-produced query here feeds the trigger's
+        // first half. The edge load above dropped those edges, so the
+        // parent recovers with a silently truncated child set
         // (NOT necessarily childless — non-terminal siblings keep their
         // edges). The produced-children gate's refusal above is not
         // enough on its own: its evidence never reaches the in-memory
@@ -483,16 +522,58 @@ impl DagActor {
             .db
             .load_parents_with_unproduced_terminal_children(&drv_ids)
             .await?;
-        let mut holed: Vec<String> = Vec::new();
-        for parent_id in unproduced_dropped {
+        // r[impl sched.merge.substitute-topdown+15]
+        // TRIGGER (round-17 merged_bug_024, recovery tier): a parent
+        // with ≥1 un-produced terminal dropped child (above), OR a
+        // parent restored with the watched flag — its persisted
+        // breadcrumb means the cumulative witness contract is live, and
+        // the edge load drops its produced terminal children all the
+        // same. CONTENT for triggered parents: ALL dropped terminal
+        // children (all five terminal statuses), not the un-produced
+        // subset — recording only the un-produced children let a
+        // watched parent whose dropped children were ALL produced
+        // recover with its old witness intact, so a heal re-supplying
+        // just that older set re-armed it over a child set missing the
+        // produced-but-dropped children (the all-produced-dropped
+        // live-voucher laundering). Gate-before-stamp ordering: the
+        // produced-children gate above ran FIRST and is disjoint from
+        // this stamp by construction — its candidates are un-watched
+        // (holed rows are vetoed at candidate collection) and
+        // all-produced (an un-produced dropped child fails its
+        // bool_and), so no parent is both gate-cleared and stamped.
+        let mut triggered: std::collections::BTreeSet<Uuid> = std::collections::BTreeSet::new();
+        for (parent_id, _) in &unproduced_dropped {
+            triggered.insert(*parent_id);
+        }
+        for (id, hash) in &id_to_hash {
+            if self
+                .dag
+                .node(hash)
+                .is_some_and(|s| s.closure_hole.is_holed())
+            {
+                triggered.insert(*id);
+            }
+        }
+        let triggered_ids: Vec<Uuid> = triggered.iter().copied().collect();
+        let dropped_terminal = self
+            .db
+            .load_dropped_terminal_children(&triggered_ids)
+            .await?;
+        let mut holed_map: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (parent_id, child_hash) in dropped_terminal {
             let Some(hash) = id_to_hash.get(&parent_id) else {
                 continue;
             };
             if let Some(state) = self.dag.node_mut(hash) {
-                state.closure_hole = true;
-                holed.push(hash.to_string());
+                state.closure_hole.stamp([child_hash.clone().into()]);
+                holed_map
+                    .entry(hash.to_string())
+                    .or_default()
+                    .push(child_hash);
             }
         }
+        let holed: Vec<(String, Vec<String>)> = holed_map.into_iter().collect();
         if !holed.is_empty() {
             info!(
                 count = holed.len(),
@@ -506,7 +587,7 @@ impl DagActor {
             // the next failover re-derives the hole from the same
             // persisted children — or misses it if those rows are GC'd
             // first, the already-accepted best-effort window.
-            if let Err(e) = self.db.set_closure_hole_by_hashes(&holed).await {
+            if let Err(e) = self.db.set_closure_holes(&holed).await {
                 warn!(count = holed.len(), error = %e,
                       "failed to persist closure holes at recovery (best-effort; \
                        in-memory breadcrumb covers this tenure)");
@@ -668,6 +749,25 @@ impl DagActor {
             info.total_count = row.total_drvs as u32;
             info.recovered_completed = row.completed_drvs as u32;
             info.cached_count = row.cached_drvs as u32;
+            // r[impl sched.merge.displaced-failure-evidence]
+            // r[impl sched.build.failure-evidence-at-source+1]
+            // Sticky first-failure evidence persisted while the build was
+            // running (at-source chokepoint, or one of the eraser-path
+            // backstops). Seeding it here keeps a keep_going build's
+            // outcome failover-independent even when the failed
+            // derivation is no longer linked to it; the
+            // failed_count-based reconstruction in
+            // finalize_recovered_builds stays as the fallback for builds
+            // whose failed nodes are still linked. PG-seeded evidence is
+            // durable by definition — mark it so the tick sweep does not
+            // re-write it; a reconstructed summary (set later, with the
+            // durable flag still false) IS re-persisted by the
+            // end-of-recovery sweep.
+            info.error_summary = row.error_summary;
+            // M_072 (bug_100): the pair restores TOGETHER — the
+            // terminal BuildFailed event reads both halves.
+            info.failed_derivation = row.failed_derivation;
+            info.failure_evidence_durable = info.error_summary.is_some();
             // Seed submitted_at from PG so r[sched.timeout.per-build]
             // and rio_scheduler_build_duration_seconds survive failover
             // (otherwise each failover grants a fresh full
@@ -973,18 +1073,29 @@ impl DagActor {
             // r[sched.recovery.poisoned-failed-count]). Without this,
             // a later ClearPoison/TTL removes the node →
             // failed_count=0 → keep_going build spuriously Succeeds.
-            // error_summary is the sticky; failed_count is not.
+            // error_summary is the sticky; failed_count is not. The
+            // reconstruction leaves `failure_evidence_durable` false —
+            // it is a fresh observation, re-persisted by the sweep
+            // below before the new leader serves traffic.
             if let Some(b) = self.builds.get_mut(&build_id)
                 && b.failed_count > 0
-                && b.error_summary.is_none()
             {
-                b.error_summary = Some(format!(
-                    "recovered with {} failed derivation(s)",
-                    b.failed_count
-                ));
+                // Chokepoint form (round-17 bug_043): first-failure wins —
+                // a row-hydrated at-source summary is never displaced by
+                // the failed_count reconstruction.
+                let n = b.failed_count;
+                b.error_summary
+                    .get_or_insert_with(|| format!("recovered with {n} failed derivation(s)"));
             }
             self.check_build_completion(build_id).await;
         }
+
+        // r[impl sched.build.failure-evidence-at-source+1]
+        // A failed_count-based reconstruction above is a fresh failure
+        // observation: persist it durably NOW, before the new leader
+        // serves any traffic, so a second failover (or an eraser path
+        // running before the first housekeeping tick) cannot lose it.
+        self.persist_pending_failure_evidence().await;
     }
 
     /// Handle `LeaderAcquired`: run recovery, then set the

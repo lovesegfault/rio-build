@@ -23,6 +23,19 @@
 //! seed (the actual secret) + 32 bytes of public key. Nix stores both
 //! together; we only need the seed for signing, but we accept the full
 //! 64-byte format for compatibility.
+//!
+//! Parsing delegates to `rio_common::signing_keyfmt` — the single
+//! owner of the entry byte contract, shared with the producer
+//! (`rio-cli keygen`) and the bootstrap re-derive path so the accepted
+//! population cannot drift between crates (round-16 bug_023: the
+//! bootstrap shell guessed this population and published a 32-byte
+//! seed verbatim as the "public" half). One DELIBERATE tightening
+//! rides the delegation: a 64-byte entry whose trailing 32 bytes do
+//! not equal the seed-derived public key is now refused at load
+//! ([`SignerError::InconsistentEntry`]) instead of silently signing
+//! with the seed — an internally inconsistent key file means the
+//! published pub may match no signature, and failing at startup beats
+//! discovering that one narinfo at a time.
 
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
@@ -43,18 +56,27 @@ use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, Verifying
 /// 4. Invalid curve point — 32 bytes but not a valid ed25519 point
 ///    (rare; ed25519-dalek rejects low-order points)
 pub(crate) fn parse_trusted_key_entry(entry: &str) -> Result<(&str, VerifyingKey), &'static str> {
-    let (name, pk_b64) = entry
-        .split_once(':')
-        .ok_or("missing ':' separator (expected name:base64(pubkey))")?;
-    let pk_bytes = base64::engine::general_purpose::STANDARD
-        .decode(pk_b64)
-        .map_err(|_| "pubkey is not valid base64")?;
-    let pk: [u8; 32] = pk_bytes
-        .try_into()
-        .map_err(|_| "pubkey is not 32 bytes (ed25519 public key length)")?;
-    VerifyingKey::from_bytes(&pk)
-        .map(|vk| (name, vk))
-        .map_err(|_| "pubkey is not a valid ed25519 point")
+    use rio_common::signing_keyfmt::{KeyFmtError, PublicEntry};
+    let pe = PublicEntry::parse(entry).map_err(|e| match e {
+        KeyFmtError::MissingSeparator => "missing ':' separator (expected name:base64(pubkey))",
+        KeyFmtError::EmptyName
+        | KeyFmtError::NameContainsColon
+        | KeyFmtError::NameForbiddenChar(_) => {
+            "key name is empty or contains whitespace/control bytes"
+        }
+        KeyFmtError::Base64(_) => "pubkey is not valid base64",
+        KeyFmtError::PubKeyLength(_) | KeyFmtError::KeyLength(_) => {
+            "pubkey is not 32 bytes (ed25519 public key length)"
+        }
+        KeyFmtError::InvalidCurvePoint | KeyFmtError::StaleTail => {
+            "pubkey is not a valid ed25519 point"
+        }
+    })?;
+    let vk = VerifyingKey::from_bytes(pe.pubkey()).expect("codec validated the curve point");
+    // The name slice of the original entry — same bytes the codec
+    // validated (split_once exists because the parse succeeded).
+    let name = entry.split_once(':').expect("codec parsed this entry").0;
+    Ok((name, vk))
 }
 
 // r[impl store.substitute.tenant-sig-visibility+2]
@@ -152,13 +174,35 @@ pub enum SignerError {
     #[error("key name is empty")]
     EmptyName,
 
+    /// Name carries whitespace or a control byte — it would fragment
+    /// the whitespace-tokenized `trusted-public-keys` entry this key's
+    /// public half is published as, or corrupt `Sig:` line framing.
+    /// Refused at load (the codec refuses it at every constructor).
+    #[error("key name {0:?} contains whitespace or a control byte")]
+    InvalidName(String),
+
+    /// Sanitized decode failure (position/shape only). The raw
+    /// `base64::DecodeError` echoes the offending BYTE VALUE in its
+    /// `Display` — for a secret-key file that is a byte of key
+    /// material, and `SignerError` lands in startup logs. Type-level
+    /// sanitization: this variant has nowhere to put a payload byte.
     #[error("base64 decode failed: {0}")]
-    Base64(#[from] base64::DecodeError),
+    Base64(rio_common::signing_keyfmt::Base64ErrorKind),
 
     /// Nix's format is 64 bytes (seed + pubkey). We also accept just the
     /// 32-byte seed. Anything else is malformed.
     #[error("secret key must be 32 or 64 bytes, got {0}")]
     KeyLength(usize),
+
+    /// 64-byte entry whose trailing 32 bytes are not the seed-derived
+    /// public key (corrupt or hand-assembled file). Refused at load:
+    /// signing with the seed while the redundant pub half disagrees
+    /// would produce signatures the published key never verifies.
+    #[error(
+        "secret key entry is internally inconsistent (expanded tail does not match the \
+         seed-derived public key); refusing to load a corrupt signing key"
+    )]
+    InconsistentEntry,
 
     /// DB lookup of a tenant's signing key failed. Stringified
     /// `MetadataError` — `metadata` is `pub(crate)`, so we can't put
@@ -191,39 +235,28 @@ impl Signer {
 
     /// Parse a key string (`name:base64`). Extracted from `load` so
     /// tests can construct a Signer without touching the filesystem.
+    ///
+    /// Delegates to the shared codec
+    /// (`rio_common::signing_keyfmt::SecretEntry::parse`) so the
+    /// accepted population (32-byte seed-only / 64-byte expanded with
+    /// a CONSISTENT tail) is compile-shared with the producer and the
+    /// bootstrap derive path. See the module doc for the deliberate
+    /// stale-tail tightening.
     pub fn parse(content: &str) -> Result<Self, SignerError> {
-        // split_once: exactly one ':'. A key name CAN contain dashes
-        // and dots (e.g., `cache.example.org-1`) but not colons — the
-        // colon is THE separator.
-        let (name, b64) = content
-            .split_once(':')
-            .ok_or_else(|| SignerError::Format(content.matches(':').count() + 1))?;
-
-        if name.is_empty() {
-            return Err(SignerError::EmptyName);
-        }
-
-        // STANDARD (not URL_SAFE): Nix's nix-base64.cc uses the RFC
-        // 4648 standard alphabet with '+' and '/', not '-' and '_'.
-        // Getting this wrong means every real key file fails to load
-        // with "invalid byte" on the first '+' or '/'.
-        let key_bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
-
-        // Nix stores seed + pubkey (64 bytes). We only need the seed.
-        // Accept both formats: 64 bytes (take first 32) or 32 bytes
-        // (use as-is). ed25519-dalek derives the pubkey from the seed
-        // anyway, so the stored pubkey is redundant for us.
-        let seed: [u8; 32] = match key_bytes.len() {
-            64 => key_bytes[..32]
-                .try_into()
-                .expect("slice of len-64 at [..32] is 32 bytes"),
-            32 => key_bytes.as_slice().try_into().expect("checked len == 32"),
-            other => return Err(SignerError::KeyLength(other)),
-        };
-
+        use rio_common::signing_keyfmt::{KeyFmtError, SecretEntry};
+        let entry = SecretEntry::parse(content).map_err(|e| match e {
+            KeyFmtError::MissingSeparator => SignerError::Format(content.matches(':').count() + 1),
+            KeyFmtError::EmptyName | KeyFmtError::NameContainsColon => SignerError::EmptyName,
+            KeyFmtError::NameForbiddenChar(n) => SignerError::InvalidName(n),
+            KeyFmtError::Base64(b) => SignerError::Base64(b),
+            KeyFmtError::KeyLength(n) | KeyFmtError::PubKeyLength(n) => SignerError::KeyLength(n),
+            KeyFmtError::StaleTail | KeyFmtError::InvalidCurvePoint => {
+                SignerError::InconsistentEntry
+            }
+        })?;
         Ok(Self {
-            key_name: name.to_string(),
-            key: SigningKey::from_bytes(&seed),
+            key_name: entry.name().to_string(),
+            key: SigningKey::from_bytes(entry.seed()),
         })
     }
 
@@ -232,13 +265,31 @@ impl Signer {
     /// seed as bytes — [`load`](Self::load)/[`parse`](Self::parse) handle
     /// the file format (`name:base64`).
     ///
-    /// Infallible: a 32-byte seed is always a valid ed25519 key (every
-    /// 256-bit string is a valid scalar for ed25519).
-    pub fn from_seed(key_name: impl Into<String>, seed: &[u8; 32]) -> Self {
-        Self {
-            key_name: key_name.into(),
+    /// The seed is infallible (every 256-bit string is a valid ed25519
+    /// scalar), but the NAME is validated through the codec's framing
+    /// rules — this is the fourth name intake (file-parse, public-parse
+    /// and keygen go through the codec's constructors; DB rows enter
+    /// here), and an unvalidated DB name (manual SQL) would otherwise
+    /// flow into [`Self::trusted_key_entry`] and publish a fragmented
+    /// `trusted-public-keys` entry.
+    pub fn from_seed(key_name: impl Into<String>, seed: &[u8; 32]) -> Result<Self, SignerError> {
+        use rio_common::signing_keyfmt::KeyFmtError;
+        let key_name = key_name.into();
+        // Reuse the codec's name rules via the seed-entry constructor
+        // (cheap: no encode/decode happens).
+        rio_common::signing_keyfmt::SecretEntry::from_seed(&key_name, seed).map_err(
+            |e| match e {
+                KeyFmtError::EmptyName | KeyFmtError::NameContainsColon => SignerError::EmptyName,
+                KeyFmtError::NameForbiddenChar(n) => SignerError::InvalidName(n),
+                // from_seed only validates the name; other variants are
+                // unreachable from this constructor.
+                other => SignerError::InvalidName(format!("{other}")),
+            },
+        )?;
+        Ok(Self {
+            key_name,
             key: SigningKey::from_bytes(seed),
-        }
+        })
     }
 
     /// Sign a fingerprint, returning a Nix-format signature string.
@@ -272,9 +323,17 @@ impl Signer {
     /// `path_tenants` not yet populated by the scheduler) must verify
     /// against the cluster key, not only the tenant's upstream keys.
     pub fn trusted_key_entry(&self) -> String {
-        let pk = self.key.verifying_key();
-        let pk_b64 = base64::engine::general_purpose::STANDARD.encode(pk.to_bytes());
-        format!("{}:{}", self.key_name, pk_b64)
+        // Through the codec's encode-side twin: the same canonical
+        // encoding (standard alphabet, padded, no trailing newline)
+        // every other public entry carries. Cannot fail: the name was
+        // codec-validated at construction (parse or from_seed) and a
+        // derived verifying key is always a valid curve point.
+        rio_common::signing_keyfmt::PublicEntry::from_parts(
+            &self.key_name,
+            &self.key.verifying_key().to_bytes(),
+        )
+        .expect("name validated at construction; derived key is always a valid point")
+        .encode()
     }
 }
 
@@ -525,31 +584,47 @@ mod tests {
 
     #[test]
     fn parse_64_byte_nix_format() {
-        // Nix's format: seed (32) + pubkey (32) = 64 bytes.
-        // We should take the first 32 (seed) and ignore the pubkey.
+        // Nix's format: seed (32) + pubkey (32) = 64 bytes, with the
+        // tail equal to the seed-derived public key (the only form any
+        // honest producer emits — `rio-cli keygen`, `nix-store
+        // --generate-binary-cache-key`).
         let seed = [0x11u8; 32];
-        // The pubkey bytes can be anything — we derive our own.
-        let fake_pubkey = [0xFFu8; 32];
+        let pubkey = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
         let mut combined = Vec::from(seed);
-        combined.extend_from_slice(&fake_pubkey);
+        combined.extend_from_slice(&pubkey);
 
         let b64 = base64::engine::general_purpose::STANDARD.encode(&combined);
         let signer = Signer::parse(&format!("my-key:{b64}")).unwrap();
         assert_eq!(signer.key_name(), "my-key");
 
-        // Verify the seed was extracted correctly by signing something
-        // and checking it verifies against the CORRECT derived pubkey
-        // (not the fake one we stored).
-        let expected_pubkey = SigningKey::from_bytes(&seed).verifying_key();
         let sig_str = signer.sign("test");
         let (_, sig_b64) = sig_str.split_once(':').unwrap();
         let sig_bytes = base64::engine::general_purpose::STANDARD
             .decode(sig_b64)
             .unwrap();
         let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().unwrap();
-        expected_pubkey
+        SigningKey::from_bytes(&seed)
+            .verifying_key()
             .verify(b"test", &Signature::from_bytes(&sig_arr))
-            .expect("should verify against pubkey derived from seed, not stored fake");
+            .expect("signature verifies against the seed-derived public key");
+    }
+
+    /// RESTAGED (round-16 bug_023 stale-tail arm): the previous form of
+    /// `parse_64_byte_nix_format` pinned the LAX behavior — a 64-byte
+    /// entry with an arbitrary fake tail parsed fine and signed with
+    /// the seed, which is exactly the internally-inconsistent state
+    /// whose tail the bootstrap re-derive used to publish. That entry
+    /// is now a typed load-time refusal.
+    #[test]
+    fn parse_rejects_inconsistent_expanded_tail() {
+        let seed = [0x11u8; 32];
+        let mut combined = Vec::from(seed);
+        combined.extend_from_slice(&[0xFFu8; 32]); // NOT derive(seed)
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&combined);
+        let Err(err) = Signer::parse(&format!("my-key:{b64}")) else {
+            panic!("inconsistent expanded tail must be refused");
+        };
+        assert!(matches!(err, SignerError::InconsistentEntry), "got {err:?}");
     }
 
     #[test]
@@ -703,7 +778,7 @@ mod tests {
         let tid = seed_tenant_key(&db.pool, "ts-with-key", "tenant-foo-1", &TENANT_SEED).await;
 
         let ts = TenantSigner::new(
-            Signer::from_seed("cluster-1", &CLUSTER_SEED),
+            Signer::from_seed("cluster-1", &CLUSTER_SEED).unwrap(),
             db.pool.clone(),
         );
         let fp = "1;/nix/store/x;sha256:y;42;";
@@ -743,7 +818,7 @@ mod tests {
         let tid = crate::test_helpers::seed_tenant(&db.pool, "ts-no-key").await;
 
         let ts = TenantSigner::new(
-            Signer::from_seed("cluster-1", &CLUSTER_SEED),
+            Signer::from_seed("cluster-1", &CLUSTER_SEED).unwrap(),
             db.pool.clone(),
         );
         let fp = "1;/nix/store/x;sha256:y;42;";
@@ -778,7 +853,7 @@ mod tests {
         seed_tenant_key(&db.pool, "ts-decoy", "decoy-1", &TENANT_SEED).await;
 
         let ts = TenantSigner::new(
-            Signer::from_seed("cluster-1", &CLUSTER_SEED),
+            Signer::from_seed("cluster-1", &CLUSTER_SEED).unwrap(),
             db.pool.clone(),
         );
         let (signer, was_tenant) = ts.resolve_once(None).await.unwrap();
@@ -803,7 +878,7 @@ mod tests {
         let tid = seed_tenant_key(&db.pool, "ro-with-key", "tenant-ro-1", &TENANT_SEED).await;
 
         let ts = TenantSigner::new(
-            Signer::from_seed("cluster-1", &CLUSTER_SEED),
+            Signer::from_seed("cluster-1", &CLUSTER_SEED).unwrap(),
             db.pool.clone(),
         );
         let (signer, was_tenant) = ts.resolve_once(Some(tid)).await.unwrap();
@@ -845,7 +920,7 @@ mod tests {
         let tid = crate::test_helpers::seed_tenant(&db.pool, "ro-no-key").await;
 
         let ts = TenantSigner::new(
-            Signer::from_seed("cluster-1", &CLUSTER_SEED),
+            Signer::from_seed("cluster-1", &CLUSTER_SEED).unwrap(),
             db.pool.clone(),
         );
 
@@ -875,7 +950,7 @@ mod tests {
     #[test]
     fn any_sig_trusted_accepts_matching() {
         let seed = [0x11u8; 32];
-        let signer = Signer::from_seed("key-a", &seed);
+        let signer = Signer::from_seed("key-a", &seed).unwrap();
         let fp = "1;/nix/store/x;sha256:y;1;";
         let sig = signer.sign(fp);
         let trusted = signer.trusted_key_entry();
@@ -894,8 +969,8 @@ mod tests {
     #[test]
     fn any_sig_trusted_tries_all_keys_with_same_name() {
         let fp = "1;/nix/store/x;sha256:y;1;";
-        let k1 = Signer::from_seed("rio-prod", &[0x11u8; 32]);
-        let k2 = Signer::from_seed("rio-prod", &[0x22u8; 32]);
+        let k1 = Signer::from_seed("rio-prod", &[0x11u8; 32]).unwrap();
+        let k2 = Signer::from_seed("rio-prod", &[0x22u8; 32]).unwrap();
         // Sig is from k2; trust set lists k1 FIRST (sig_visibility_gate
         // pushes current before priors).
         let sig = k2.sign(fp);
@@ -910,11 +985,13 @@ mod tests {
 
     #[test]
     fn any_sig_trusted_rejects_untrusted() {
-        let signer = Signer::from_seed("key-a", &[0x11u8; 32]);
+        let signer = Signer::from_seed("key-a", &[0x11u8; 32]).unwrap();
         let fp = "1;/nix/store/x;sha256:y;1;";
         let sig = signer.sign(fp);
         // Different key in trust set — key-b, not key-a.
-        let trusted = Signer::from_seed("key-b", &[0x22u8; 32]).trusted_key_entry();
+        let trusted = Signer::from_seed("key-b", &[0x22u8; 32])
+            .unwrap()
+            .trusted_key_entry();
 
         assert_eq!(any_sig_trusted(&[sig], &[trusted], fp), None);
     }
@@ -922,7 +999,7 @@ mod tests {
     #[test]
     fn any_sig_trusted_rejects_tampered_fingerprint() {
         let seed = [0x11u8; 32];
-        let signer = Signer::from_seed("key-a", &seed);
+        let signer = Signer::from_seed("key-a", &seed).unwrap();
         let sig = signer.sign("1;/nix/store/REAL;sha256:y;1;");
         let trusted = signer.trusted_key_entry();
 
@@ -939,12 +1016,16 @@ mod tests {
         // trusted_keys has key-a and key-b. Expect match on key-a.
         let seed_a = [0x11u8; 32];
         let fp = "1;/nix/store/x;sha256:y;1;";
-        let sig_a = Signer::from_seed("key-a", &seed_a).sign(fp);
-        let sig_c = Signer::from_seed("key-c", &[0x33u8; 32]).sign(fp);
+        let sig_a = Signer::from_seed("key-a", &seed_a).unwrap().sign(fp);
+        let sig_c = Signer::from_seed("key-c", &[0x33u8; 32]).unwrap().sign(fp);
 
         let trusted = vec![
-            Signer::from_seed("key-a", &seed_a).trusted_key_entry(),
-            Signer::from_seed("key-b", &[0x22u8; 32]).trusted_key_entry(),
+            Signer::from_seed("key-a", &seed_a)
+                .unwrap()
+                .trusted_key_entry(),
+            Signer::from_seed("key-b", &[0x22u8; 32])
+                .unwrap()
+                .trusted_key_entry(),
         ];
 
         assert_eq!(
@@ -965,7 +1046,7 @@ mod tests {
     fn any_sig_trusted_skips_malformed() {
         let seed = [0x11u8; 32];
         let fp = "1;/nix/store/x;sha256:y;1;";
-        let good = Signer::from_seed("good", &seed);
+        let good = Signer::from_seed("good", &seed).unwrap();
         let good_sig = good.sign(fp);
         let good_key = good.trusted_key_entry();
 
@@ -1006,7 +1087,9 @@ mod tests {
         );
 
         // Roundtrip: what trusted_key_entry() emits, this parses.
-        let entry = Signer::from_seed("roundtrip", &[0x55u8; 32]).trusted_key_entry();
+        let entry = Signer::from_seed("roundtrip", &[0x55u8; 32])
+            .unwrap()
+            .trusted_key_entry();
         let (name, _vk) = parse_trusted_key_entry(&entry).expect("roundtrip parses");
         assert_eq!(name, "roundtrip");
     }

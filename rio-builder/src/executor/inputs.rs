@@ -1,5 +1,5 @@
 //! Input fetching: .drv from store, metadata, input closure, FOD hash verification.
-// r[impl builder.fod.verify-hash]
+// r[impl builder.fod.verify-hash+2]
 
 use std::path::Path;
 
@@ -12,9 +12,12 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use super::ExecutorError;
 
-/// Hash algorithm for FOD output verification. Maps from Nix's
-/// `outputHashAlgo` string (sha1, sha256, sha512; recursive variants
-/// prefixed "r:").
+/// Hash algorithm for FOD output verification — the digest-dispatch
+/// twin of `rio_nix::hash::HashAlgo`. Constructed only FROM a parsed
+/// declaration (`OutputHashAlgo::parse`, the system-wide FodAlgo
+/// constructor), never from a raw string, so this module cannot
+/// develop its own opinion about spellings or prefixes.
+// r[impl nix.hash.algos+2]
 #[derive(Debug, Clone, Copy)]
 enum FodHashAlgo {
     Sha1,
@@ -22,18 +25,25 @@ enum FodHashAlgo {
     Sha512,
 }
 
+impl From<rio_nix::hash::HashAlgo> for FodHashAlgo {
+    fn from(algo: rio_nix::hash::HashAlgo) -> Self {
+        match algo {
+            rio_nix::hash::HashAlgo::SHA1 => Self::Sha1,
+            rio_nix::hash::HashAlgo::SHA256 => Self::Sha256,
+            rio_nix::hash::HashAlgo::SHA512 => Self::Sha512,
+        }
+    }
+}
+
 impl FodHashAlgo {
-    /// Parse from Nix's outputHashAlgo. Strips the "r:" recursive
-    /// prefix (the prefix determines hash MODE not ALGO).
-    ///
-    /// Returns None for unknown algos — caller should log+skip rather
-    /// than false-reject a valid output whose algo we don't support.
-    fn from_nix_str(s: &str) -> Option<Self> {
-        match s.strip_prefix("r:").unwrap_or(s) {
-            "sha1" => Some(Self::Sha1),
-            "sha256" => Some(Self::Sha256),
-            "sha512" => Some(Self::Sha512),
-            _ => None,
+    /// The corresponding `rio_nix::hash::HashAlgo` — used to decode the
+    /// DECLARED hash with the shared length-discriminated parser, while
+    /// this enum drives the local hash COMPUTATION.
+    fn as_nix_hash_algo(self) -> rio_nix::hash::HashAlgo {
+        match self {
+            Self::Sha1 => rio_nix::hash::HashAlgo::SHA1,
+            Self::Sha256 => rio_nix::hash::HashAlgo::SHA256,
+            Self::Sha512 => rio_nix::hash::HashAlgo::SHA512,
         }
     }
 }
@@ -98,15 +108,24 @@ fn compute_local_flat_hash(path: &Path, algo: FodHashAlgo) -> anyhow::Result<Vec
     }
 }
 
-/// Verify FOD output hashes match the declared outputHash (defense-in-depth;
-/// nix-daemon also verifies, but we re-check BEFORE upload).
+/// Verify FOD output hashes match the declared outputHash.
+///
+/// This is the **sole** verifier and the integrity boundary that makes
+/// the fetcher's open egress safe (`fetcher.upload.hash-verify-before`):
+/// nothing downstream re-checks the content, so it is fail-closed — an
+/// output whose declared `outputHashAlgo` we cannot verify is rejected,
+/// never skipped.
 ///
 /// Dispatches on outputHashAlgo (sha1/sha256/sha512) and computes the
 /// hash LOCALLY before upload — a bad output is rejected before it
 /// enters the store.
 ///
 /// For `r:<algo>` (recursive): hash the NAR serialization of the output
-/// path. For `<algo>` (flat): hash the file contents directly.
+/// path. For `<algo>` (flat): hash the file contents directly — and,
+/// like CppNix, require the output to be exactly one non-executable
+/// regular file (an executable and a non-executable file with the same
+/// bytes would collide on one store path, so the shape is part of the
+/// contract, not just the bytes).
 ///
 /// `upper_store` is `{overlay_upper}/nix/store` — callers pass
 /// `OverlayMount::upper_store()`.
@@ -116,38 +135,107 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
     use anyhow::{Context, bail};
 
     for output in drv.outputs() {
-        // Only FOD outputs have a declared hash
-        if output.hash().is_empty() {
-            continue;
-        }
-
-        let expected = hex::decode(output.hash())
-            .with_context(|| format!("FOD outputHash is not valid hex: {}", output.hash()))?;
-
-        // Dispatch on outputHashAlgo. Unknown algo →
-        // skip (log warn, don't false-reject). nix-daemon's own
-        // verification still runs; we're just defense-in-depth.
-        let Some(algo) = FodHashAlgo::from_nix_str(output.hash_algo()) else {
-            tracing::warn!(
-                output = output.name(),
-                hash_algo = output.hash_algo(),
-                "FOD output uses unsupported hash algo — skipping worker-side verification \
-                 (nix-daemon still verifies)"
-            );
+        // Only fixed outputs carry a declared hash (typed dispatch).
+        let rio_nix::derivation::OutputKind::Fixed {
+            path: typed_path, ..
+        } = output.kind()
+        else {
             continue;
         };
 
-        let is_recursive = output.hash_algo().starts_with("r:");
+        // Dispatch on outputHashAlgo via the shared constructor —
+        // unknown algo (or spelling, or prefix) → reject. This gate is
+        // the only content verification between an egress-open fetcher
+        // and the signed cache; an algorithm we cannot verify (md5, or
+        // garbage in a hand-written .drv) must fail the build rather
+        // than ship unverified content. The gateway pre-screens with
+        // the SAME constructor at submission (`fod_algo_verifiable`) so
+        // the failure normally lands on the client instead of burning a
+        // fetcher pod; a rejection here means that gate was bypassed —
+        // or the derivation was admitted under the gateway's
+        // realized-outputs exemption and its outputs were lost (e.g.
+        // GC'd) between the submission-time probe and dispatch, in
+        // which case failing the build is exactly the intended
+        // fail-closed behavior.
+        // r[impl nix.hash.algos+2]
+        let Ok(parsed) = rio_nix::hash::OutputHashAlgo::parse(output.hash_algo()) else {
+            bail!(
+                "FOD output '{}' declares unsupported hash algorithm '{}' \
+                 (supported: sha1, sha256, sha512, each optionally prefixed 'r:'); \
+                 refusing to upload unverified fetched content",
+                output.name(),
+                output.hash_algo(),
+            );
+        };
+        let algo = FodHashAlgo::from(parsed.algo);
 
-        let store_basename = rio_nix::store_path::basename(output.path())
-            .with_context(|| format!("invalid output path: {}", output.path()))?;
-        let fs_path = upper_store.join(store_basename);
+        // Decode the declared hash with the shared length-discriminated
+        // parser (base16 / nixbase32 / base64) — the same function every
+        // other component uses, so a declaration accepted at submission
+        // can never fail to decode here.
+        // r[impl nix.hash.fod-decode+1]
+        let expected =
+            rio_nix::hash::NixHash::parse_nonsri_unprefixed(algo.as_nix_hash_algo(), output.hash())
+                .with_context(|| {
+                    format!(
+                        "FOD outputHash {:?} is not a valid base16, nixbase32, or base64 hash",
+                        output.hash()
+                    )
+                })?
+                .digest()
+                .to_vec();
+
+        let is_recursive = parsed.recursive;
+
+        // The basename comes from the TYPED declared path — no free
+        // string re-derivation over a declared output path remains.
+        let fs_path = upper_store.join(typed_path.basename());
 
         let computed = if is_recursive {
             // Compute NAR hash locally (before upload) so a bad
             // output is rejected without entering the store.
             compute_local_nar_hash(&fs_path, algo)?
         } else {
+            // CppNix rejects a flat fixed-output that is not exactly one
+            // non-executable regular file even when the bytes hash
+            // correctly (`derivation-builder.cc`, CAFixed/flat branch):
+            // an executable and a non-executable file with identical
+            // bytes would otherwise collide on the same store path. The
+            // floating-CA pipeline already enforces the same rule
+            // (`CaFlatNotSingleFile` in `native_result/ca.rs`); mirror
+            // it here. lstat so a symlink is reported as a symlink
+            // instead of being followed to its target's bytes.
+            let md = std::fs::symlink_metadata(&fs_path)
+                .with_context(|| format!("failed to stat FOD output {}", fs_path.display()))?;
+            if md.file_type().is_symlink() || !md.is_file() {
+                bail!(
+                    "FOD flat output '{}' must be a single regular file \
+                     (outputHashMode=flat), but {} is a {}",
+                    output.name(),
+                    output.path(),
+                    if md.file_type().is_symlink() {
+                        "symlink"
+                    } else {
+                        "non-regular file"
+                    },
+                );
+            }
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = md.permissions().mode();
+                if mode & 0o111 != 0 {
+                    bail!(
+                        "FOD flat output '{}' must be a non-executable regular \
+                         file (outputHashMode=flat), but {} has mode {:o}; an \
+                         executable and a non-executable file with the same \
+                         bytes would collide on one store path, so CppNix \
+                         rejects this shape",
+                        output.name(),
+                        output.path(),
+                        mode & 0o7777,
+                    );
+                }
+            }
             // Flat hash — stream file contents through a digest
             // sink. Same O(1)-memory contract as the recursive
             // branch above (see compute_local_flat_hash doc).
@@ -233,24 +321,140 @@ pub(super) async fn prefetch_manifests(
 pub(super) async fn fetch_drv_from_store(
     store_client: &mut StoreServiceClient<Channel>,
     drv_path: &str,
-) -> Result<Derivation, ExecutorError> {
+) -> Result<(Derivation, String), ExecutorError> {
     // .drv files are small (KB range), but wrap in stream timeout: this is
     // the first gRPC call after setup_overlay, so a stalled store would hang
     // the build with an overlay mount held indefinitely.
+    //
+    // Returns the parsed derivation AND its ATerm text: the text feeds
+    // the request glue's graph-derivation table (the glue itself holds
+    // no filesystem capability — every input byte arrives as a
+    // parameter resolved here, at the resolve step).
+    let text = fetch_drv_text(store_client, drv_path).await?;
+    let drv = Derivation::parse(&text)
+        .map_err(|e| ExecutorError::InvalidDerivation(format!("failed to parse .drv: {e}")))?;
+    Ok((drv, text))
+}
+
+/// Assemble the request glue's graph-derivation table: the main
+/// derivation's text plus the texts the glue's `exportReferencesGraph`
+/// expansion will actually read — exactly the [`DrvTextDemand`]
+/// derived from the build's own declaration. The full input closure is
+/// deliberately NOT a parameter: a resolver that cannot see
+/// `input_paths` cannot regress into fetching by closure membership.
+///
+/// Scale arithmetic (the I-110 multiplication this replaces): a
+/// nixpkgs-scale closure carries on the order of 2,000 transitive
+/// `.drv`s, and the previous closure-membership prefetch fetched every
+/// one of them not retained from the input-drv loop — per build,
+/// whether or not anything would read them, across hundreds of
+/// ephemeral builders. Demand is empty for every build with no
+/// `exportReferencesGraph` declaration, which is nearly all of them;
+/// `rio_builder_graph_drv_fetch_total` counts the demanded fetches and
+/// is the post-wipe resurgence alarm (expected ~0 fleet-wide).
+///
+/// Texts are fetched RAW (no parse): the previous eager
+/// `Derivation::parse` discarded its result — the glue lazily
+/// re-parses at consumption with its own consumption-scoped error
+/// (`ExportRefsDrvUnreadable`).
+///
+/// Failures: store stream faults and missing demanded paths are
+/// worker-local input-materialization faults (`MetadataFetch` →
+/// `InfrastructureFailure` → scheduler re-dispatch). Extract/UTF-8
+/// failures are permanent (`InvalidDerivation`) — justified by
+/// consumption: every demanded byte WILL be read by the glue, and a
+/// `.drv` that is not UTF-8 ATerm can never become readable by
+/// retrying elsewhere.
+// r[impl builder.result.input-materialization-is-infra+6]
+// r[impl builder.glue.pure]
+// r[impl builder.glue.drv-table-demand]
+pub(super) async fn fetch_demanded_graph_drvs(
+    store_client: &StoreServiceClient<Channel>,
+    main_drv_path: &str,
+    main_drv_text: &str,
+    mut table: std::collections::BTreeMap<String, String>,
+    demand: &super::glue::refs_graph::DrvTextDemand,
+) -> Result<std::collections::BTreeMap<String, String>, ExecutorError> {
+    use futures_util::stream::{StreamExt as _, TryStreamExt as _};
+
+    table.insert(main_drv_path.to_owned(), main_drv_text.to_owned());
+
+    let demanded: Vec<String> = demand
+        .iter()
+        .filter(|p| !table.contains_key(*p))
+        .map(str::to_owned)
+        .collect();
+    if demanded.is_empty() {
+        return Ok(table);
+    }
+    metrics::counter!("rio_builder_graph_drv_fetch_total").increment(demanded.len() as u64);
+    // info, not debug: this is the journal-observable half of
+    // `rio_builder_graph_drv_fetch_total` (expected ~0 fleet-wide; the
+    // VM suite asserts the line is ABSENT across a whole scenario, ERG
+    // builds included). Reaching here at all is rare even for ERG
+    // builds: Nix's drvPath context makes a declared graph's `.drv`s
+    // direct inputDrvs, whose texts the input-drv loop already
+    // retained — this fetch only fires for graphs whose closure
+    // reaches a `.drv` that is NOT an input drv (e.g. an output
+    // embedding a derivation path).
+    tracing::info!(
+        n_demanded = demanded.len(),
+        "fetching declaration-demanded graph .drv texts for the request glue"
+    );
+    let fetched: Vec<(String, String)> = futures_util::stream::iter(demanded)
+        .map(|path| {
+            let mut client = store_client.clone();
+            async move {
+                let text = fetch_drv_text(&mut client, &path).await?;
+                Ok::<_, ExecutorError>((path, text))
+            }
+        })
+        .buffer_unordered(super::MAX_PARALLEL_FETCHES)
+        .try_collect()
+        .await?;
+    table.extend(fetched);
+    Ok(table)
+}
+
+/// Fetch a `.drv`'s ATerm text from the store WITHOUT parsing it (the
+/// demanded-graph table wants bytes; the glue parses at consumption).
+/// Same classification as [`fetch_drv_from_store`]: stream faults and
+/// missing paths are `MetadataFetch` (infra); extract/UTF-8 failures
+/// are permanent — and so is exceeding `MAX_DRV_NAR_BYTES`: a
+/// "derivation" bigger than the class cap is hostile or corrupt input
+/// that no re-dispatch will shrink. The cap also bounds buffering:
+/// with [`super::MAX_PARALLEL_FETCHES`]-way concurrency the previous
+/// general-NAR bound (4 GiB) let one build buffer tens of GiB of
+/// tenant-controlled bytes (round-16 bug_095); the collector's leading
+/// `Info.nar_size` pre-check rejects an oversized declaration before
+/// pulling a single chunk.
+async fn fetch_drv_text(
+    store_client: &mut StoreServiceClient<Channel>,
+    drv_path: &str,
+) -> Result<String, ExecutorError> {
     let result = rio_proto::client::get_path_nar(
         store_client,
         drv_path,
         rio_common::grpc::GRPC_STREAM_TIMEOUT,
-        rio_common::limits::MAX_NAR_SIZE,
+        rio_common::limits::NarSizeCap::derivation(),
         None,
         &[],
     )
     .await
-    .map_err(|e| ExecutorError::MetadataFetch {
-        path: drv_path.to_string(),
-        source: match e {
-            rio_proto::client::NarCollectError::Stream(s) => s,
-            other => tonic::Status::internal(other.to_string()),
+    .map_err(|e| match e {
+        rio_proto::client::NarCollectError::SizeExceeded { got, limit } => {
+            ExecutorError::InvalidDerivation(format!(
+                ".drv NAR for {drv_path} is {got} bytes, exceeding the \
+                 {limit}-byte derivation-text cap"
+            ))
+        }
+        rio_proto::client::NarCollectError::Stream(s) => ExecutorError::MetadataFetch {
+            path: drv_path.to_string(),
+            source: s,
+        },
+        other => ExecutorError::MetadataFetch {
+            path: drv_path.to_string(),
+            source: tonic::Status::internal(other.to_string()),
         },
     })?;
 
@@ -261,8 +465,11 @@ pub(super) async fn fetch_drv_from_store(
         });
     };
 
-    Derivation::parse_from_nar(&nar_data).map_err(|e| {
-        ExecutorError::InvalidDerivation(format!("failed to parse .drv from NAR: {e}"))
+    let bytes = rio_nix::nar::extract_single_file(&nar_data).map_err(|e| {
+        ExecutorError::InvalidDerivation(format!("failed to extract .drv from NAR: {e}"))
+    })?;
+    String::from_utf8(bytes).map_err(|e| {
+        ExecutorError::InvalidDerivation(format!(".drv content is not valid UTF-8: {e}"))
     })
 }
 
@@ -299,16 +506,18 @@ pub(super) async fn compute_input_closure(
     drv: &Derivation,
     drv_path: &str,
     resolved_input_srcs: &std::collections::BTreeSet<String>,
-) -> Result<Vec<ValidatedPathInfo>, ExecutorError> {
+) -> Result<ResolvedClosure, ExecutorError> {
     use std::collections::HashSet;
 
-    // I-106: keep the full PathInfo from each BFS query so callers
-    // (synth_db generation in prepare_sandbox) don't have to re-query
-    // the same ~800 paths. Under ephemeral-builder load that second
-    // pass was a ~800 × N-builders QueryPathInfo burst that exhausted
-    // the store's PG pool.
+    // I-106: keep the full PathInfo from each BFS query so downstream
+    // consumers (the request glue's closure planning, FUSE prefetch
+    // sizing, output policy checks) don't have to re-query the same
+    // ~800 paths. Under ephemeral-builder load that second pass was a
+    // ~800 × N-builders QueryPathInfo burst that exhausted the store's
+    // PG pool.
     let mut closure: HashSet<String> = HashSet::new();
     let mut metadata: Vec<ValidatedPathInfo> = Vec::new();
+    let mut dropped: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut frontier: Vec<String> = Vec::new();
 
     // Seed: the .drv itself, input_drv paths (so nix-daemon can read them),
@@ -363,7 +572,17 @@ pub(super) async fn compute_input_closure(
                 // A path skipped here is NOT in the JIT allowlist, so
                 // FUSE returns ENOENT (not lazy-fetch — the builder
                 // carries no tenant context to substitute on miss).
+                //
+                // The drop is RECORDED, not silent: a store read lag or
+                // GC race here surfaces later as a deterministic-looking
+                // glue rejection (exportReferencesGraph demands the
+                // path's metadata), and the executor's arbitration must
+                // be able to tell "the store didn't have it at resolve
+                // time" (infra — re-dispatch re-resolves) from "the
+                // declaration is wrong" (input-rejected).
+                // r[impl builder.result.input-materialization-is-infra+6]
                 tracing::debug!(path = %path, "input not in store; dropped from JIT allowlist");
+                dropped.insert(path);
                 continue;
             };
             for r in &info.references {
@@ -376,7 +595,19 @@ pub(super) async fn compute_input_closure(
         }
     }
 
-    Ok(metadata)
+    Ok(ResolvedClosure { metadata, dropped })
+}
+
+/// What the closure BFS resolved — the metadata it found plus the
+/// EVIDENCE of what it could not: members whose `BatchQueryPathInfo`
+/// came back not-found at resolve time. The dropped set travels to the
+/// glue-rejection arbitration so a resolve-time residency gap (store
+/// read lag, GC race) is classified as infrastructure instead of
+/// laundering into a permanent input rejection.
+#[derive(Debug)]
+pub(super) struct ResolvedClosure {
+    pub(super) metadata: Vec<ValidatedPathInfo>,
+    pub(super) dropped: std::collections::BTreeSet<String>,
 }
 
 /// Fetch one BFS layer's metadata via `BatchQueryPathInfo` (one RPC
@@ -407,7 +638,7 @@ async fn query_layer(
     }
 }
 
-// r[verify builder.fod.verify-hash]
+// r[verify builder.fod.verify-hash+2]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,16 +749,19 @@ mod tests {
         #[case] declare_correct: bool,
     ) -> anyhow::Result<()> {
         let content = format!("fod test content for {algo}").into_bytes();
-        let (_tmp, store_dir) = seed_output(basename, &content)?;
+        // Declared output paths must parse as store paths (typed
+        // boundary), so the on-disk name carries a valid hash prefix.
+        let store_name = format!("gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-{basename}");
+        let (_tmp, store_dir) = seed_output(&store_name, &content)?;
 
         let declared = if declare_correct {
-            correct_fod_hash(&store_dir, basename, &content, algo)?
+            correct_fod_hash(&store_dir, &store_name, &content, algo)?
         } else {
             // Wrong hash: all-zero digest of the correct width.
-            let width = correct_fod_hash(&store_dir, basename, &content, algo)?.len();
+            let width = correct_fod_hash(&store_dir, &store_name, &content, algo)?.len();
             "0".repeat(width)
         };
-        let drv = make_fod_drv(&format!("/nix/store/{basename}"), algo, &declared);
+        let drv = make_fod_drv(&format!("/nix/store/{store_name}"), algo, &declared);
 
         let result = verify_fod_hashes(&drv, &store_dir);
         assert_eq!(
@@ -557,30 +791,100 @@ mod tests {
         // 16 MiB of pseudo-random-ish bytes (not all-zero — we want a
         // digest that changes if a chunk is dropped or reordered).
         let content: Vec<u8> = (0..16 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
-        let (_tmp, store_dir) = seed_output("test-flat-large", &content)?;
+        let (_tmp, store_dir) =
+            seed_output("gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-large", &content)?;
         let expected = hex::encode(sha2::Sha256::digest(&content));
-        let drv = make_fod_drv("/nix/store/test-flat-large", "sha256", &expected);
+        let drv = make_fod_drv(
+            "/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-large",
+            "sha256",
+            &expected,
+        );
         verify_fod_hashes(&drv, &store_dir)
     }
 
-    /// Unknown algo (e.g., md5 — Nix doesn't support it, but be defensive):
-    /// skip verification (log warn) rather than false-reject.
+    /// CppNix rejects a flat FOD output that is not a single
+    /// NON-EXECUTABLE regular file even when the bytes hash correctly:
+    /// executability is part of the contract because two files with
+    /// identical bytes but different modes would collide on one store
+    /// path.
     #[test]
-    fn test_verify_fod_unknown_algo_skipped() -> anyhow::Result<()> {
-        let (_tmp, store_dir) = seed_output("test-md5-fod", b"content")?;
-        // 32-char hex that's NOT the md5 of "content" — would fail
-        // if we actually tried to verify. Skip means it passes.
+    fn test_verify_fod_flat_executable_rejected() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let content = b"#!/bin/sh\necho fetched\n";
+        let (_tmp, store_dir) = seed_output("gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-exec", content)?;
+        std::fs::set_permissions(
+            store_dir.join("gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-exec"),
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+        // The declared hash is CORRECT for the bytes — only the shape is wrong.
+        let declared = correct_fod_hash(
+            &store_dir,
+            "gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-exec",
+            content,
+            "sha256",
+        )?;
         let drv = make_fod_drv(
-            "/nix/store/test-md5-fod",
+            "/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-exec",
+            "sha256",
+            &declared,
+        );
+        let err = verify_fod_hashes(&drv, &store_dir)
+            .expect_err("executable flat FOD must be rejected like CppNix");
+        assert!(
+            err.to_string().contains("non-executable"),
+            "error should explain the shape rule: {err}"
+        );
+        Ok(())
+    }
+
+    /// A symlink pointing at content whose bytes match the declared flat
+    /// hash is still rejected: the output must BE a regular file, not
+    /// point at one (CppNix lstats the output).
+    #[test]
+    fn test_verify_fod_flat_symlink_rejected() -> anyhow::Result<()> {
+        let content = b"symlink target bytes";
+        let (_tmp, store_dir) = seed_output("test-flat-target", content)?;
+        std::os::unix::fs::symlink(
+            store_dir.join("test-flat-target"),
+            store_dir.join("gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-link"),
+        )?;
+        let declared = correct_fod_hash(
+            &store_dir,
+            "gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-link",
+            content,
+            "sha256",
+        )?;
+        let drv = make_fod_drv(
+            "/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-link",
+            "sha256",
+            &declared,
+        );
+        let err = verify_fod_hashes(&drv, &store_dir)
+            .expect_err("symlinked flat FOD must be rejected like CppNix");
+        assert!(
+            err.to_string().contains("regular file"),
+            "error should mention the regular-file requirement: {err}"
+        );
+        Ok(())
+    }
+
+    /// Unknown algo (e.g., md5): fail-closed. This function is the sole
+    /// content verifier for fetched outputs; an algorithm it cannot
+    /// verify must reject the build, not skip the check.
+    #[test]
+    fn test_verify_fod_unknown_algo_rejected() -> anyhow::Result<()> {
+        let (_tmp, store_dir) = seed_output("test-md5-fod", b"content")?;
+        let drv = make_fod_drv(
+            "/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-md5-fod",
             "md5",
             "deadbeefdeadbeefdeadbeefdeadbeef",
         );
 
-        // Skipped — should NOT error. nix-daemon's own verify catches
-        // the actual mismatch; we just don't double-check unknowns.
+        let err = verify_fod_hashes(&drv, &store_dir)
+            .expect_err("unknown algo must be rejected, not skipped");
         assert!(
-            verify_fod_hashes(&drv, &store_dir).is_ok(),
-            "unknown algo should be skipped (warn + Ok), not false-rejected"
+            err.to_string().contains("unsupported hash algorithm 'md5'"),
+            "error must name the algorithm: {err}"
         );
         Ok(())
     }
@@ -588,7 +892,11 @@ mod tests {
     #[test]
     fn test_verify_fod_non_fod_skipped() -> anyhow::Result<()> {
         // Non-FOD (no hash) should be skipped without error
-        let drv = make_fod_drv("/nix/store/test-non-fod", "", "");
+        let drv = make_fod_drv(
+            "/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-non-fod",
+            "",
+            "",
+        );
         let tmp = tempfile::tempdir()?;
         assert!(verify_fod_hashes(&drv, tmp.path()).is_ok());
         Ok(())
@@ -648,8 +956,9 @@ mod tests {
     }
 
     /// Project closure metadata to a path set for membership assertions.
-    fn paths_of(closure: Vec<ValidatedPathInfo>) -> std::collections::HashSet<String> {
+    fn paths_of(closure: ResolvedClosure) -> std::collections::HashSet<String> {
         closure
+            .metadata
             .into_iter()
             .map(|m| m.store_path.to_string())
             .collect()
@@ -658,8 +967,9 @@ mod tests {
     /// I-106: compute_input_closure now returns the full ValidatedPathInfo
     /// captured during BFS, eliminating the second QueryPathInfo pass that
     /// fetch_input_metadata used to do. This test verifies the metadata
-    /// fields are populated (not just path), proving the synth_db
-    /// generation can use this directly.
+    /// fields are populated (not just path), proving downstream consumers
+    /// (glue closure planning, FUSE prefetch sizing, policy checks) can
+    /// use this directly.
     #[tokio::test]
     async fn test_compute_input_closure_returns_full_metadata() -> anyhow::Result<()> {
         let (store, client) = spawn_and_connect().await?;
@@ -671,13 +981,15 @@ mod tests {
         let closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv)).await?;
 
         let lib = closure
+            .metadata
             .iter()
             .find(|m| m.store_path.as_str() == p_a)
             .expect("p_a in closure");
         assert!(
             lib.nar_size > 0,
-            "nar_size populated (synth_db needs this) — proves we kept the \
-             full PathInfo, not just the path string"
+            "nar_size populated (FUSE prefetch sizing and closure-size \
+             policy checks need this) — proves we kept the full PathInfo, \
+             not just the path string"
         );
         Ok(())
     }
@@ -755,6 +1067,16 @@ mod tests {
             .await
             .expect("missing ref is non-fatal");
 
+        // The drop is EVIDENCE, not silence: the dropped set is what the
+        // glue-rejection arbitration consults to tell a resolve-time
+        // residency gap from a genuinely-wrong declaration.
+        // r[verify builder.result.input-materialization-is-infra+6]
+        assert_eq!(
+            closure.dropped.iter().collect::<Vec<_>>(),
+            vec![&p_missing],
+            "the not-found member must be recorded in the dropped set"
+        );
+
         let set = paths_of(closure);
         assert_eq!(set.len(), 2, "closure should be {{drv, A}} without B");
         assert!(set.contains(&p_drv));
@@ -776,7 +1098,7 @@ mod tests {
         let drv = drv_with_srcs(&[p_a, p_b]);
         let closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv)).await?;
 
-        assert_eq!(closure.len(), 4); // drv, A, B, C (once)
+        assert_eq!(closure.metadata.len(), 4); // drv, A, B, C (once)
         Ok(())
     }
 
@@ -796,7 +1118,7 @@ mod tests {
 
         let drv = drv_with_srcs(std::slice::from_ref(&p_a));
         let closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv)).await?;
-        assert_eq!(closure.len(), 4);
+        assert_eq!(closure.metadata.len(), 4);
 
         let batch_calls = store.calls.batch_qpi_calls.load(Ordering::SeqCst);
         assert!(
@@ -937,7 +1259,7 @@ mod tests {
     /// sensitivity proof: same output bytes, direct-only candidate set →
     /// transitive ref is missed. That's the exact shape of the original bug.
     ///
-    // r[verify builder.upload.references-scanned]
+    // r[verify builder.upload.references-scanned+2]
     #[tokio::test]
     async fn test_candidate_set_is_transitive_not_direct() -> anyhow::Result<()> {
         use rio_nix::refscan::{CandidateSet, RefScanSink};
@@ -1034,7 +1356,7 @@ mod tests {
         let drv_path = tp("test.drv");
         store.seed(make_path_info(&drv_path, &nar, hash), nar);
 
-        let drv = fetch_drv_from_store(&mut client, &drv_path)
+        let (drv, _text) = fetch_drv_from_store(&mut client, &drv_path)
             .await
             .expect("fetch + parse should succeed");
 
@@ -1061,6 +1383,221 @@ mod tests {
         Ok(())
     }
 
+    /// No double-fetch by construction: a table that already covers
+    /// every demanded `.drv` (retained from the input-drv loop + the
+    /// main text) makes the demand fetch a pure merge — proven by
+    /// running it against a store where any fetch would 404.
+    // r[verify builder.glue.pure]
+    #[tokio::test]
+    async fn demanded_texts_already_retained_pure_merge() -> anyhow::Result<()> {
+        use crate::executor::glue::refs_graph::DrvTextDemand;
+        let (_store, client) = spawn_and_connect().await?; // EMPTY store
+        let main_drv = tp("main.drv");
+        let dep_drv = tp("dep.drv");
+        let mut table = std::collections::BTreeMap::new();
+        table.insert(dep_drv.clone(), "Derive-dep".to_owned());
+
+        // Both demanded texts are retained → pure merge, zero RPCs
+        // (any fetch against the empty store would fail).
+        let demand = DrvTextDemand::from_paths_for_tests([main_drv.clone(), dep_drv.clone()]);
+        let table =
+            fetch_demanded_graph_drvs(&client, &main_drv, "Derive-main", table, &demand).await?;
+        assert_eq!(
+            table.get(&main_drv).map(String::as_str),
+            Some("Derive-main")
+        );
+        assert_eq!(table.get(&dep_drv).map(String::as_str), Some("Derive-dep"));
+        assert_eq!(table.len(), 2);
+        Ok(())
+    }
+
+    /// round-16 bug_095: a "derivation" whose declared NAR size
+    /// exceeds MAX_DRV_NAR_BYTES is rejected as PERMANENT
+    /// `InvalidDerivation` (hostile/corrupt input — re-dispatch cannot
+    /// shrink it), not infra `MetadataFetch`; and the collector's
+    /// Info-message pre-check means the rejection is byte-free (the
+    /// mock serves the forged declared size with a tiny actual NAR —
+    /// no oversized body is ever streamed or buffered).
+    #[tokio::test]
+    async fn oversized_drv_text_is_permanent_invalid_derivation() -> anyhow::Result<()> {
+        use rio_common::limits::MAX_DRV_NAR_BYTES;
+        let (store, mut client) = spawn_and_connect().await?;
+        let big_drv = tp("huge.drv");
+        let (nar, hash) = make_nar(b"Derive-tiny-but-lying");
+        let mut info = make_path_info(&big_drv, &nar, hash);
+        info.nar_size = MAX_DRV_NAR_BYTES + 1; // forged declared size
+        store.seed(info, nar);
+
+        let err = fetch_drv_text(&mut client, &big_drv)
+            .await
+            .expect_err("over-cap declared .drv NAR must be rejected");
+        match &err {
+            ExecutorError::InvalidDerivation(msg) => {
+                assert!(
+                    msg.contains(&MAX_DRV_NAR_BYTES.to_string()),
+                    "rejection names the derivation-text cap: {msg}"
+                );
+            }
+            other => panic!("expected permanent InvalidDerivation, got {other:?}"),
+        }
+
+        // Control: an honest small .drv on the same store still fetches.
+        let ok_drv = tp("ok.drv");
+        let (nar2, hash2) = make_nar(b"Derive-honest");
+        store.seed(make_path_info(&ok_drv, &nar2, hash2), nar2);
+        let text = fetch_drv_text(&mut client, &ok_drv).await?;
+        assert_eq!(text, "Derive-honest");
+        Ok(())
+    }
+
+    /// THE bug_081 kill shot: with no exportReferencesGraph
+    /// declaration the demand is empty, so input resolution fetches
+    /// NOTHING — proven against an EMPTY store where any fetch 404s.
+    /// The replaced closure-membership prefetch deterministically
+    /// errored here (it fetched every closure `.drv` whether or not
+    /// anything would read it).
+    // r[verify builder.glue.drv-table-demand]
+    #[tokio::test]
+    async fn no_declaration_fetches_nothing_at_depth_3() -> anyhow::Result<()> {
+        use crate::executor::glue::refs_graph::DrvTextDemand;
+        let (_store, client) = spawn_and_connect().await?; // EMPTY store
+        let main_drv = tp("main.drv");
+        // A 3-deep closure of .drvs, none retained, none in the store.
+        // Old code: 3 fetches → 3 NotFound failures. New code cannot
+        // fetch them BY TYPE: they are not in the demand.
+        let demand = DrvTextDemand::from_paths_for_tests([]);
+        let table = fetch_demanded_graph_drvs(
+            &client,
+            &main_drv,
+            "Derive-main",
+            std::collections::BTreeMap::new(),
+            &demand,
+        )
+        .await?;
+        assert_eq!(table.len(), 1, "only the main drv text");
+        Ok(())
+    }
+
+    /// An undemanded sibling `.drv` is never fetched: only the
+    /// demanded path is in the store; success proves the sibling
+    /// (whose fetch would 404 → MetadataFetch error) was never
+    /// requested.
+    // r[verify builder.glue.drv-table-demand]
+    #[tokio::test]
+    async fn undemanded_sibling_never_fetched() -> anyhow::Result<()> {
+        use crate::executor::glue::refs_graph::DrvTextDemand;
+        let (store, client) = spawn_and_connect().await?;
+        let main_drv = tp("main.drv");
+        let demanded = tp("demanded.drv");
+        let aterm = r#"Derive([("out","/nix/store/llllllllllllllllllllllllllllllll-r","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
+        let (nar, hash) = make_nar(aterm.as_bytes());
+        store.seed(make_path_info(&demanded, &nar, hash), nar);
+        // The sibling exists in the build's closure conceptually, but
+        // is NOT seeded — a fetch of it would fail the resolve.
+
+        let demand = DrvTextDemand::from_paths_for_tests([demanded.clone()]);
+        let table = fetch_demanded_graph_drvs(
+            &client,
+            &main_drv,
+            "Derive-main",
+            std::collections::BTreeMap::new(),
+            &demand,
+        )
+        .await?;
+        assert_eq!(table.get(&demanded).map(String::as_str), Some(aterm));
+        assert_eq!(table.len(), 2, "main + demanded only");
+        Ok(())
+    }
+
+    /// 2,000-drv closure, all demanded texts retained: zero RPCs
+    /// (empty store), instant. The scale IS the verification — the
+    /// I-110 shape was per-build whole-closure refetch.
+    // r[verify builder.glue.drv-table-demand]
+    #[tokio::test]
+    async fn two_thousand_drv_demand_retained_zero_rpcs() -> anyhow::Result<()> {
+        use crate::executor::glue::refs_graph::DrvTextDemand;
+        let (_store, client) = spawn_and_connect().await?; // EMPTY store
+        let main_drv = tp("main.drv");
+        let mut table = std::collections::BTreeMap::new();
+        let mut demanded = Vec::new();
+        for i in 0..2000 {
+            let p = tp(&format!("dep-{i}.drv"));
+            table.insert(p.clone(), format!("Derive-{i}"));
+            demanded.push(p);
+        }
+        let demand = DrvTextDemand::from_paths_for_tests(demanded);
+        let table =
+            fetch_demanded_graph_drvs(&client, &main_drv, "Derive-main", table, &demand).await?;
+        assert_eq!(table.len(), 2001);
+        Ok(())
+    }
+
+    /// A demanded `.drv` the table does not cover is fetched RAW; a
+    /// store failure there is a MetadataFetch infrastructure fault
+    /// (the resolve-step classification — never a glue rejection),
+    /// and a demanded path whose bytes are not UTF-8 ATerm is
+    /// permanent (consumption-backed: the glue WILL read these bytes,
+    /// and they can never become readable by retrying elsewhere).
+    // r[verify builder.result.input-materialization-is-infra+6]
+    // r[verify builder.glue.drv-table-demand]
+    #[tokio::test]
+    async fn demanded_fetch_and_error_classification() -> anyhow::Result<()> {
+        use crate::executor::glue::refs_graph::DrvTextDemand;
+        let (store, client) = spawn_and_connect().await?;
+        let main_drv = tp("main.drv");
+        let demanded = tp("residual.drv");
+        let aterm = r#"Derive([("out","/nix/store/llllllllllllllllllllllllllllllll-r","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
+        let (nar, hash) = make_nar(aterm.as_bytes());
+        store.seed(make_path_info(&demanded, &nar, hash), nar);
+
+        // Demanded + present: fetched into the table, raw text.
+        let table = fetch_demanded_graph_drvs(
+            &client,
+            &main_drv,
+            "Derive-main",
+            std::collections::BTreeMap::new(),
+            &DrvTextDemand::from_paths_for_tests([demanded.clone()]),
+        )
+        .await?;
+        assert_eq!(table.get(&demanded).map(String::as_str), Some(aterm));
+
+        // Demanded + missing: MetadataFetch (infra), not InvalidDerivation.
+        let missing = tp("missing.drv");
+        let err = fetch_demanded_graph_drvs(
+            &client,
+            &main_drv,
+            "Derive-main",
+            std::collections::BTreeMap::new(),
+            &DrvTextDemand::from_paths_for_tests([missing.clone()]),
+        )
+        .await
+        .expect_err("missing demanded .drv must fail the resolve step");
+        assert!(
+            matches!(err, ExecutorError::MetadataFetch { ref path, .. } if *path == missing),
+            "got: {err}"
+        );
+
+        // Demanded + non-UTF-8 bytes: permanent (InvalidDerivation).
+        let invalid = tp("invalid.drv");
+        let (bad_nar, bad_hash) = make_nar(&[0xff, 0xfe, 0x00, 0x80]);
+        store.seed(make_path_info(&invalid, &bad_nar, bad_hash), bad_nar);
+        let err = fetch_demanded_graph_drvs(
+            &client,
+            &main_drv,
+            "Derive-main",
+            std::collections::BTreeMap::new(),
+            &DrvTextDemand::from_paths_for_tests([invalid.clone()]),
+        )
+        .await
+        .expect_err("non-UTF-8 demanded .drv is a permanent input fault");
+        assert!(
+            matches!(err, ExecutorError::InvalidDerivation(_)),
+            "got: {err}"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_fetch_drv_from_store_bad_nar() -> anyhow::Result<()> {
         let (store, mut client) = spawn_and_connect().await?;
@@ -1075,7 +1612,7 @@ mod tests {
 
         assert!(matches!(err, ExecutorError::InvalidDerivation(_)));
         assert!(
-            err.to_string().contains("failed to parse .drv from NAR"),
+            err.to_string().contains("failed to extract .drv from NAR"),
             "got: {err}"
         );
         Ok(())

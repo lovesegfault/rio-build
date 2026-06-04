@@ -17,6 +17,10 @@
       "description": "Kubernetes operator for rio-build: Pool, ComponentScaler CRDs"
     },
     {
+      "name": "rio-exec",
+      "description": "Build-system-agnostic Linux sandbox executor (namespaces, bind mounts, seccomp)"
+    },
+    {
       "name": "rio-gateway",
       "description": "SSH gateway and Nix protocol frontend for rio-build"
     },
@@ -72,6 +76,7 @@
     "rio-builder": {
       "prod": [
         "rio-common",
+        "rio-exec",
         "rio-nix",
         "rio-proto"
       ],
@@ -112,6 +117,11 @@
       ]
     },
     "rio-crds": {
+      "prod": [],
+      "optional": [],
+      "dev": []
+    },
+    "rio-exec": {
       "prod": [],
       "optional": [],
       "dev": []

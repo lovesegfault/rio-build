@@ -82,7 +82,7 @@
       "name": "Cancelled",
       "crate": "rio-builder",
       "msg": "build cancelled before cgroup creation",
-      "doc": "Cancel flag observed before the per-build cgroup exists. I-166: distinct from the post-cgroup path (cgroup.kill → daemon EOF → `Wire(Io(UnexpectedEof))`) so `is_daemon_transient` doesn't retry it. `spawn_build_task` maps any `Err` with `cancelled=true` to `BuildResultStatus::Cancelled` regardless of variant; this variant just makes the pre-cgroup abort explicit in logs."
+      "doc": "Cancel flag observed before the per-build cgroup exists. I-166: distinct from the post-cgroup path (cgroup.kill → the sandboxed build is killed and the executor reports the cancellation) so `is_infra_transient` doesn't retry it. `spawn_build_task` maps any `Err` with `cancelled=true` to `BuildResultStatus::Cancelled` regardless of variant; this variant just makes the pre-cgroup abort explicit in logs."
     },
     {
       "enum": "ExecutorError",
@@ -100,30 +100,16 @@
     },
     {
       "enum": "ExecutorError",
-      "name": "DaemonSetup",
+      "name": "Glue",
       "crate": "rio-builder",
-      "msg": "daemon setup failed: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "DaemonSpawn",
-      "crate": "rio-builder",
-      "msg": "daemon spawn failed: {0}",
-      "doc": ""
+      "msg": "derivation rejected by the request glue: {0}",
+      "doc": "The request glue rejected the derivation (unsupported builtin, malformed structuredAttrs, exportReferencesGraph outside the closure, …). Per `GlueError`'s contract these are all input problems — deterministic per-derivation, so they map to `InputRejected` (see [`ExecutorError::is_permanent`]) instead of burning fleet retries."
     },
     {
       "enum": "ExecutorError",
       "name": "Grpc",
       "crate": "rio-builder",
       "msg": "gRPC error: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "Handshake",
-      "crate": "rio-builder",
-      "msg": "daemon handshake failed: {0}",
       "doc": ""
     },
     {
@@ -142,13 +128,6 @@
     },
     {
       "enum": "ExecutorError",
-      "name": "NixConf",
-      "crate": "rio-builder",
-      "msg": "failed to write nix.conf: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
       "name": "Overlay",
       "crate": "rio-builder",
       "msg": "overlay setup failed: {0}",
@@ -163,10 +142,10 @@
     },
     {
       "enum": "ExecutorError",
-      "name": "SynthDb",
+      "name": "SandboxSetup",
       "crate": "rio-builder",
-      "msg": "synthetic DB generation failed: {0}",
-      "doc": ""
+      "msg": "native sandbox setup failed: {0}",
+      "doc": "The native sandbox failed to set up (host-side skeleton build, fork/pipe plumbing, or an in-child setup phase reported over the status pipe). The build itself never ran. Worker-local and usually transient (FS race, FUSE hiccup while bind-mounting an input) — retried locally a bounded number of times before the failure escalates to the scheduler."
     },
     {
       "enum": "ExecutorError",
@@ -177,16 +156,72 @@
     },
     {
       "enum": "ExecutorError",
-      "name": "Wire",
-      "crate": "rio-builder",
-      "msg": "wire protocol error: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
       "name": "WrongKind",
       "crate": "rio-builder",
       "msg": "wrong executor kind: derivation is_fod={is_fod} but this executor is {executor_kind:?}",
+      "doc": ""
+    },
+    {
+      "enum": "NetrcError",
+      "name": "Parse",
+      "crate": "rio-builder",
+      "msg": "parsing netrc",
+      "doc": "The file read fine and parsed the same way it always will."
+    },
+    {
+      "enum": "NetrcError",
+      "name": "Read",
+      "crate": "rio-builder",
+      "msg": "reading netrc {path}",
+      "doc": "`read_to_string` failed. The PATH is operator config (the sandbox netrc location), never tenant input — safe to name."
+    },
+    {
+      "enum": "NetrcParseError",
+      "name": "CredentialBeforeEntry",
+      "crate": "rio-builder",
+      "msg": "netrc: `{key}` before any `machine`/`default` entry",
+      "doc": ""
+    },
+    {
+      "enum": "NetrcParseError",
+      "name": "Macdef",
+      "crate": "rio-builder",
+      "msg": "netrc: `macdef` is not supported — its body ends at a blank line, which a whitespace tokenizer cannot see (fetcher.divergence.netrc-strict-parse)",
+      "doc": ""
+    },
+    {
+      "enum": "NetrcParseError",
+      "name": "MachineMissingName",
+      "crate": "rio-builder",
+      "msg": "netrc: `machine` is missing its host name",
+      "doc": ""
+    },
+    {
+      "enum": "NetrcParseError",
+      "name": "MissingValue",
+      "crate": "rio-builder",
+      "msg": "netrc: `{key}` is missing its value",
+      "doc": ""
+    },
+    {
+      "enum": "NetrcParseError",
+      "name": "QuotedKeyword",
+      "crate": "rio-builder",
+      "msg": "netrc: quoted token in keyword position ({0}) is not supported (fetcher.divergence.netrc-strict-parse)",
+      "doc": ""
+    },
+    {
+      "enum": "NetrcParseError",
+      "name": "QuotedValue",
+      "crate": "rio-builder",
+      "msg": "netrc: quoted value for `{key}` is not supported (fetcher.divergence.netrc-strict-parse)",
+      "doc": ""
+    },
+    {
+      "enum": "NetrcParseError",
+      "name": "Unrecognized",
+      "crate": "rio-builder",
+      "msg": "netrc: unrecognized token in keyword position ({0}) (fetcher.divergence.netrc-strict-parse)",
       "doc": ""
     },
     {
@@ -242,8 +277,8 @@
       "enum": "UploadError",
       "name": "InvalidReference",
       "crate": "rio-builder",
-      "msg": "ref-scan returned unparseable store path {path:?}",
-      "doc": "Ref-scan returned a path that fails `StorePath::parse`. The candidate set is built from validated input-closure paths, so this indicates a bug in `CandidateSet::resolve` (or a mismatched store-prefix). Surfaced as an error — silently dropping the ref would publish a path with a broken reference graph."
+      "msg": "unparseable store path in recorded references: {path:?}",
+      "doc": "A reference recorded by the result pipeline fails `StorePath::parse`. The pipeline resolves references against validated input-closure and output paths, so this indicates a bug upstream (or a mismatched store-prefix). Surfaced as an error — silently dropping the ref would publish a path with a broken reference graph."
     },
     {
       "enum": "UploadError",
@@ -258,6 +293,69 @@
       "crate": "rio-builder",
       "msg": "upload failed after {MAX_UPLOAD_RETRIES} retries for {path}: {source}",
       "doc": ""
+    },
+    {
+      "enum": "KeyFmtError",
+      "name": "Base64",
+      "crate": "rio-common",
+      "msg": "key payload is not valid base64: {0}",
+      "doc": "The part after `:` is not valid standard-alphabet base64."
+    },
+    {
+      "enum": "KeyFmtError",
+      "name": "EmptyName",
+      "crate": "rio-common",
+      "msg": "key name must not be empty",
+      "doc": "Empty key name."
+    },
+    {
+      "enum": "KeyFmtError",
+      "name": "InvalidCurvePoint",
+      "crate": "rio-common",
+      "msg": "public key bytes are not a valid ed25519 curve point",
+      "doc": "Public-entry payload is 32 bytes but not a valid ed25519 point."
+    },
+    {
+      "enum": "KeyFmtError",
+      "name": "KeyLength",
+      "crate": "rio-common",
+      "msg": "secret key must be {SEED_LEN} or {EXPANDED_LEN} bytes, got {0}",
+      "doc": "Decoded payload is neither 32 (seed) nor 64 (expanded) bytes."
+    },
+    {
+      "enum": "KeyFmtError",
+      "name": "MissingSeparator",
+      "crate": "rio-common",
+      "msg": "missing ':' separator (expected name:base64)",
+      "doc": "Entry has no `:` separator."
+    },
+    {
+      "enum": "KeyFmtError",
+      "name": "NameContainsColon",
+      "crate": "rio-common",
+      "msg": "key name must not contain ':' (it separates name from key material)",
+      "doc": "Key name contains `:` (would corrupt the `name:base64` framing)."
+    },
+    {
+      "enum": "KeyFmtError",
+      "name": "NameForbiddenChar",
+      "crate": "rio-common",
+      "msg": "key name {0:?} contains whitespace or a control byte (it would fragment the whitespace-tokenized trusted-public-keys entry or corrupt Sig: line framing)",
+      "doc": "Key name contains a byte that fragments or corrupts the entry in its consuming contexts. The published entry lands in Nix's `trusted-public-keys` — \"a whitespace-separated list of public keys\" (`globals.hh:239-266`) tokenized on `\" \\t\\n\\r\"` (`strings.hh:28`) — and in line-framed `Sig:` narinfo fields, so a space-bearing name silently splits into two garbage tokens and a control byte corrupts line framing. Rejected at every constructor; the name is echoed (escaped) because key names are public identifiers, not key material."
+    },
+    {
+      "enum": "KeyFmtError",
+      "name": "PubKeyLength",
+      "crate": "rio-common",
+      "msg": "public key must be {SEED_LEN} bytes, got {0}",
+      "doc": "Public-entry payload decoded but is not 32 bytes."
+    },
+    {
+      "enum": "KeyFmtError",
+      "name": "StaleTail",
+      "crate": "rio-common",
+      "msg": "expanded secret entry is internally inconsistent: trailing {SEED_LEN} bytes do not equal the seed-derived public key (refusing to derive from a corrupt entry)",
+      "doc": "Expanded entry whose trailing 32 bytes are NOT the seed-derived public key. The entry is internally inconsistent (corrupt or hand-assembled); refusing beats publishing a verification key that matches no signature."
     },
     {
       "enum": "NameError",
@@ -293,6 +391,34 @@
       "crate": "rio-controller",
       "msg": "kubernetes API error: {0}",
       "doc": "K8s API error (connection, permission, not-found)."
+    },
+    {
+      "enum": "ExecError",
+      "name": "InvalidRequest",
+      "crate": "rio-exec",
+      "msg": "invalid request: {0}",
+      "doc": "The request failed [`ExecutionRequest::validate`]. The message names the rule that was violated and the offending path or field."
+    },
+    {
+      "enum": "ExecError",
+      "name": "Setup",
+      "crate": "rio-exec",
+      "msg": "sandbox setup failed while {}: {} (errno {}, entry {})",
+      "doc": "The forked process reported a sandbox-setup failure before reaching `execve`. Carries the failing phase, the errno, and (for indexed phases such as bind mounts) which entry failed."
+    },
+    {
+      "enum": "ExecError",
+      "name": "Skeleton",
+      "crate": "rio-exec",
+      "msg": "failed to build the sandbox skeleton: {0}",
+      "doc": "Building the host-side chroot skeleton failed (directory creation, the synthesized `/etc` files, inline files, or the per-bind source stat)."
+    },
+    {
+      "enum": "ExecError",
+      "name": "Spawn",
+      "crate": "rio-exec",
+      "msg": "failed to spawn the sandbox: {0}",
+      "doc": "Creating the supervision plumbing failed: pipes, the pty, the fork itself, the cgroup attach, or the go signal."
     },
     {
       "enum": "GatewayError",
@@ -373,6 +499,13 @@
     },
     {
       "enum": "GatewayError",
+      "name": "SchedulerRejected",
+      "crate": "rio-gateway",
+      "msg": "scheduler rejected the submission: {0}",
+      "doc": "The scheduler VALIDATED the submission and refused it (`INVALID_ARGUMENT` / `FAILED_PRECONDITION`). Unlike [`GatewayError::Scheduler`] this is not infrastructure trouble: retrying the identical submission can never succeed, so callers that convert errors into `BuildResult`s must report `InputRejected`, never `TransientFailure`."
+    },
+    {
+      "enum": "GatewayError",
       "name": "Store",
       "crate": "rio-gateway",
       "msg": "store gRPC: {0}",
@@ -443,6 +576,41 @@
     },
     {
       "enum": "DerivationError",
+      "name": "FixedOutputNoPath",
+      "crate": "rio-nix",
+      "msg": "bad path '' in derivation (fixed output '{0}' must specify its output path)",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
+      "name": "FloatingCaDeclaredPath",
+      "crate": "rio-nix",
+      "msg": "content-addressing derivation output should not specify output path (output '{0}')",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
+      "name": "HashWithoutAlgo",
+      "crate": "rio-nix",
+      "msg": "derivation output '{0}' specifies a hash without outputHashAlgo (the reference parser silently drops such hashes on unparse, breaking byte-faithful round-trips)",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
+      "name": "IllTypedOutputs",
+      "crate": "rio-nix",
+      "msg": "ill-typed derivation outputs: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
+      "name": "ImpureUnsupported",
+      "crate": "rio-nix",
+      "msg": "experimental Nix feature 'impure-derivations' is disabled (output '{0}')",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
       "name": "InputNotFound",
       "crate": "rio-nix",
       "msg": "input derivation not found: {0}",
@@ -485,9 +653,16 @@
     },
     {
       "enum": "DerivationError",
-      "name": "RecursionLimitExceeded",
+      "name": "NonDeferredFill",
       "crate": "rio-nix",
-      "msg": "derivation graph too deep at '{0}' (max {MAX_HASH_RECURSION_DEPTH} levels)",
+      "msg": "internal: fill_deferred refused non-deferred output '{0}' (deferred-filter/fill drift — report this)",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
+      "name": "NotInputAddressed",
+      "crate": "rio-nix",
+      "msg": "derivation '{0}' is not plain input-addressed (fixed-output and floating-CA outputs derive their paths from content, not from the derivation hash)",
       "doc": ""
     },
     {
@@ -496,6 +671,48 @@
       "crate": "rio-nix",
       "msg": "unexpected end of input",
       "doc": ""
+    },
+    {
+      "enum": "DerivationTypeError",
+      "name": "DuplicateOutputName",
+      "crate": "rio-nix",
+      "msg": "duplicate derivation output '{0}'",
+      "doc": "Two outputs share a name. The oracle's eval refuses to construct this set (primops.cc:1529, wording verbatim); its parsers would first-wins-collapse it (module doc, divergence 4) — rio rejects fail-closed so name-keyed views stay total."
+    },
+    {
+      "enum": "DerivationTypeError",
+      "name": "FixedNotNamedOut",
+      "crate": "rio-nix",
+      "msg": "single fixed output must be named \"out\"",
+      "doc": "The single fixed output is not named \"out\"."
+    },
+    {
+      "enum": "DerivationTypeError",
+      "name": "FloatingAlgoMismatch",
+      "crate": "rio-nix",
+      "msg": "all floating outputs must use the same hash algorithm",
+      "doc": "Floating outputs disagree on the hash algorithm (compared after stripping the `r:` method prefix — method is not part of the oracle's `hashAlgo`)."
+    },
+    {
+      "enum": "DerivationTypeError",
+      "name": "Mixed",
+      "crate": "rio-nix",
+      "msg": "can't mix derivation output types",
+      "doc": "Outputs of different kinds in one derivation (including concrete-IA mixed with deferred-IA — distinct types in the oracle's `decide`)."
+    },
+    {
+      "enum": "DerivationTypeError",
+      "name": "MultipleFixed",
+      "crate": "rio-nix",
+      "msg": "only one fixed output is allowed for now",
+      "doc": "More than one fixed output."
+    },
+    {
+      "enum": "DerivationTypeError",
+      "name": "NoOutputs",
+      "crate": "rio-nix",
+      "msg": "must have at least one output",
+      "doc": "Empty output set."
     },
     {
       "enum": "DerivedPathError",
@@ -589,6 +806,13 @@
       "doc": ""
     },
     {
+      "enum": "HashError",
+      "name": "WrongEncodedLength",
+      "crate": "rio-nix",
+      "msg": "hash {hash:?} has wrong length {len} for hash algorithm '{algo}': expected {b16} (base16), {b32} (nixbase32), or {b64} (base64) characters",
+      "doc": ""
+    },
+    {
       "enum": "NarError",
       "name": "ContentTooLarge",
       "crate": "rio-nix",
@@ -649,6 +873,13 @@
       "name": "NotSingleFile",
       "crate": "rio-nix",
       "msg": "not a single-file NAR",
+      "doc": ""
+    },
+    {
+      "enum": "NarError",
+      "name": "RestorePathTooLong",
+      "crate": "rio-nix",
+      "msg": "restored path would be {len} bytes (max {MAX_RESTORE_PATH_LEN}, the kernel's PATH_MAX - 1)",
       "doc": ""
     },
     {
@@ -722,6 +953,20 @@
       "doc": ""
     },
     {
+      "enum": "RewriteError",
+      "name": "EmptyFrom",
+      "crate": "rio-nix",
+      "msg": "rewrite pair {index}: from is empty",
+      "doc": ""
+    },
+    {
+      "enum": "RewriteError",
+      "name": "LengthMismatch",
+      "crate": "rio-nix",
+      "msg": "rewrite pair {index}: from is {from} bytes but to is {to} bytes (must be equal)",
+      "doc": ""
+    },
+    {
       "enum": "StorePathError",
       "name": "EmptyName",
       "crate": "rio-nix",
@@ -732,7 +977,7 @@
       "enum": "StorePathError",
       "name": "FixedOutputRefsNotAllowed",
       "crate": "rio-nix",
-      "msg": "fixed-output path with references requires recursive SHA-256 (got {algo}, recursive={recursive})",
+      "msg": "fixed-output path with references or self-reference requires recursive SHA-256 (got {algo}, recursive={recursive})",
       "doc": ""
     },
     {
@@ -804,6 +1049,41 @@
       "crate": "rio-nix",
       "msg": "path is too short to contain a hash",
       "doc": ""
+    },
+    {
+      "enum": "StructuredAttrError",
+      "name": "MalformedJson",
+      "crate": "rio-nix",
+      "msg": "structured attrs (__json) do not parse: {error}",
+      "doc": "`__json` is present but does not parse — the derivation claims structured attrs and the claim is unreadable. Fail-closed consumers MUST NOT degrade this to \"attr absent\" (the pre-fix readers did, which let an unparseable blob neutralize every behavioral attribute at once)."
+    },
+    {
+      "enum": "StructuredAttrError",
+      "name": "WrongType",
+      "crate": "rio-nix",
+      "msg": "while parsing attribute \"{key}\": {source}",
+      "doc": "The attribute exists in the parsed blob with the wrong type. Mirrors the oracle's `e.addTrace(... \"while parsing attribute \\\"%s\\\"\")` framing around its `get*` throw."
+    },
+    {
+      "enum": "TypedError",
+      "name": "NotStringOrArray",
+      "crate": "rio-nix",
+      "msg": "value is not an array or a string: {dump}",
+      "doc": "Oracle `flatten` (derivation-options.cc:106-114)."
+    },
+    {
+      "enum": "TypedError",
+      "name": "NotUnsigned",
+      "crate": "rio-nix",
+      "msg": "Expected JSON value to be an unsigned integral number but it is of type '{got}': {dump}",
+      "doc": "Oracle `getUnsigned` (json-utils.cc:62-73) — kept distinct because its message names the refined numeric storage class. Raised here only for non-numbers (see [`unsigned_lossy`])."
+    },
+    {
+      "enum": "TypedError",
+      "name": "WrongType",
+      "crate": "rio-nix",
+      "msg": "Expected JSON value to be of type '{want}' but it is of type '{got}': {dump}",
+      "doc": "Oracle `ensureType` (json-utils.cc:35-45)."
     },
     {
       "enum": "WireError",
@@ -949,8 +1229,8 @@
       "enum": "ActorError",
       "name": "MissingDbId",
       "crate": "rio-scheduler",
-      "msg": "edge references unpersisted derivation (db_id missing): {drv_path}",
-      "doc": "Invariant violation: an edge references a derivation that was never persisted to PG. Merge assigns db_ids to every node before processing edges; if `DerivationDag::db_id_for_path` returns None for an endpoint, the node was never in the submission (malformed request) or the id_map build loop has a bug."
+      "msg": "merge persistence references an unpersisted derivation (db_id missing): {drv_path}",
+      "doc": "Invariant violation: merge persistence needed a derivation's `db_id` and none exists. Two producers: the build→derivation link loop (a node this submission merely joins should have had its `db_id` committed by the merge that created it) and edge endpoint resolution (id_map for rows this merge wrote, the live DAG for everything else). Either way the node was never part of a committed submission (malformed request) or the resolution logic has a bug."
     },
     {
       "enum": "ActorError",
@@ -968,10 +1248,59 @@
     },
     {
       "enum": "ActorError",
+      "name": "SettledConflictEvidenceBudget",
+      "crate": "rio-scheduler",
+      "msg": "the per-merge store-evidence budget was exhausted before the settled conflict for {drv_path} could be verified; split the submission into smaller batches or retry after earlier conflicts resolve",
+      "doc": "`r[sched.merge.store-evidence-displacement+3]`: the per-merge store-evidence fetch budget was exhausted before this settled conflict could be verified. Maps to RESOURCE_EXHAUSTED with actionable guidance (split the submission); partial displacements from earlier conflicts in the SAME submission are not persisted — the merge is atomic (`sched.persist.atomic-activation`)."
+    },
+    {
+      "enum": "ActorError",
+      "name": "SettledConflictEvidenceUnavailable",
+      "crate": "rio-scheduler",
+      "msg": "store evidence unavailable ({reason}) while resolving a settled identity conflict for {drv_path}; retry when the store recovers",
+      "doc": "`r[sched.merge.store-evidence-displacement+3]`: a settled-conflict resolution needed store evidence and the store stayed SILENT (fetch failure, absent path, transport-grade noise). TRANSIENT: maps to UNAVAILABLE so clients retry when the store recovers — silence must never harden into the permanent FAILED_PRECONDITION the conflict itself would carry."
+    },
+    {
+      "enum": "ActorError",
+      "name": "SettledIdentityConflict",
+      "crate": "rio-scheduler",
+      "msg": "derivation {drv_path} has a settled (successfully built) record with a different identity; re-creating it would erase that record. {remediation}",
+      "doc": "`r[sched.persist.settled-identity-freeze+4]`: a submission tried to (re)create a derivation whose persisted row is SETTLED (completed/skipped — the durable record of a successful build, possibly already reaped from the DAG) under a conflicting identity. Maps to FAILED_PRECONDITION (client-actionable conflict). The `remediation` is GENERATED from the arbitration verdict's refuse arm (`sched.merge.store-evidence-displacement+3`, fix-discipline R6) — a refused class structurally cannot emit a remediation its verdict does not support."
+    },
+    {
+      "enum": "ActorError",
+      "name": "StoreEvidenceContradicts",
+      "crate": "rio-scheduler",
+      "msg": "the store derivation at {drv_path} contradicts this submission's claimed identity; the declared outputs/flags do not derive from the .drv bytes the store holds at that path",
+      "doc": "`r[sched.merge.store-evidence-displacement+3]`: the merge-time store-evidence check fetched the `.drv` the submission's declared `drv_path` names, verified its text content-address, and the parsed derivation CONTRADICTS the submission's claimed identity — the store, not the prior record, disproves the claim. Maps to FAILED_PRECONDITION: the submitter's declared identity does not belong to the derivation at that path, so no retry of the same claim can succeed (fix the submission, or the `.drv` upload it references)."
+    },
+    {
+      "enum": "ActorError",
       "name": "StoreUnavailable",
       "crate": "rio-scheduler",
       "msg": "store service unavailable (cache-check circuit breaker open)",
       "doc": "Store service is unreachable (cache-check circuit breaker is open). Maps to gRPC UNAVAILABLE. Rejecting SubmitBuild here is the user decision from phase2c planning: if the store is down, builds can't dispatch anyway (workers PutPath/GetPath also fail), so fail fast with a clear error instead of queueing builds that will all stall."
+    },
+    {
+      "enum": "DagError",
+      "name": "AuthoritativeClaimIdentityConflict",
+      "crate": "rio-scheduler",
+      "msg": "authoritative inline content for {drv_path} conflicts with the existing store-backed derivation definition (no matching content-bound identity evidence); if this is your own derivation, re-upload the .drv and resubmit store-backed, ask an operator to clear the parked definition, or wait for its retention window to expire",
+      "doc": "The inverse direction of [`Self::ConflictingInFlightContent`]: a submission claiming authoritative inline content landed on an existing STORE-BACKED node that is eligible for the resubmit-reset, and its verifiable identity does not match the existing node's. Admitting it would let the claim redefine a parked (failed / cancelled / poison-reset) store-backed definition through the reset, carrying the prior builds' interest onto bytes only the claimant can see. An identity-matching claim is admitted through the normal resubmit-reset instead, and an authoritative claim never displaces a store-backed node. Maps to `FAILED_PRECONDITION` (client-actionable conflict, not an internal invariant breach)."
+    },
+    {
+      "enum": "DagError",
+      "name": "AuthoritativeContentMismatch",
+      "crate": "rio-scheduler",
+      "msg": "conflicting authoritative derivation content for {drv_path}: a node with different inline content already exists",
+      "doc": "A submission claimed authoritative inline derivation content for a node that already holds DIFFERENT authoritative content. Those bytes are the only copy of their derivation anywhere, so silently joining would let the second submitter redefine what the first one's build runs and what recovery rebuilds. Returned while the existing claim is live or `Failed` (still owned by the retry machinery — `RefusedInFlight`), or settled with a definition- evidence rank ≥ the displacer's (`RefusedSettledOutranked`; authoritative displacers carry `content_bound_claim`, so a settled authoritative claim is never redefined by another authoritative claim) — once it parks in a terminal failure state the byte-different submission displaces it instead of being rejected. Maps to `FAILED_PRECONDITION` (client-actionable conflict, not an internal invariant breach)."
+    },
+    {
+      "enum": "DagError",
+      "name": "ConflictingInFlightContent",
+      "crate": "rio-scheduler",
+      "msg": "derivation {drv_path} carries authoritative inline content that conflicts with this submission's declared identity; if the existing record is a squat on your derivation's path, upload your .drv to the store and resubmit store-backed — the scheduler verifies the store derivation and displaces the squat",
+      "doc": "A store-backed (non-authoritative) submission's verifiable identity (system, output names, fixed-output flag, content-addressed flag, declared expected output paths, plus content-bound evidence — a shared fixed-output path or a matching CA modular hash) conflicts with a node that carries authoritative inline content and is either still in flight or settled without being strictly outranked. Joining would attribute that node's results to a derivation that either provably differs or cannot be shown to be the same; erasing a settled (Completed/Skipped) record takes STRICTLY higher definition evidence than the settled node's rank (`sched.merge.evidence-ranked-displacement`) — a bare store-backed echo (`unverified_claim`) never qualifies, while an ingress-byte-bound submission (`path_bound_bytes`) displaces a content-bound squat. Maps to `FAILED_PRECONDITION`; once the conflicting node sits in a terminal FAILURE state the verifiable definition displaces it regardless of rank. (An identity-MATCHING store-backed submission never sees this error: it joins the node, or displaces it without error when the node is poison-locked — terminal failure, no longer retriable on resubmit.) A legitimate bare-resubmission claimant hitting this against a settled squat is self-service: upload the genuine `.drv` to the store and resubmit — the merge-time store-evidence check (`sched.merge.store-evidence-displacement+3`) verifies the claim against the store's text-CA-bound bytes and raises it past the squat's rank."
     },
     {
       "enum": "DagError",
@@ -1094,17 +1423,31 @@
     },
     {
       "enum": "ChunkError",
+      "name": "AuthFailed",
+      "crate": "rio-store",
+      "msg": "chunk {} backend fetch auth-failed (check S3 credentials/IAM permissions): {message}",
+      "doc": "The backend REFUSED the fetch with an authentication/authorization failure (IRSA/IAM/KMS misconfiguration — [`BackendAuthError`] was the root). Deterministic until an operator fixes the role: FAILED_PRECONDITION class at every reader, never silent-retried — the read-side twin of the write path's auth fail-fast (round-17 merged_bug_061; the incident class grpc/mod.rs cites: 12 derivations × 146 retry cycles in 6 minutes). [`BackendAuthError`]: crate::backend::BackendAuthError"
+    },
+    {
+      "enum": "ChunkError",
+      "name": "Backend",
+      "crate": "rio-store",
+      "msg": "chunk {} backend fetch failed (transient): {message}",
+      "doc": "The backend ERRORED (S3 5xx/timeout/connect failure) or the fetch task panicked — nothing is known about the object's existence. Transient: retry. MUST NOT be read as data loss (the round-16 bug_027 conflation: this used to surface as `NotFound`)."
+    },
+    {
+      "enum": "ChunkError",
       "name": "Corrupt",
       "crate": "rio-store",
       "msg": "chunk {} failed BLAKE3 verification (corrupt; expected {}, got {})",
-      "doc": "BLAKE3 of the fetched bytes doesn't match the requested hash. S3 bitrot, memory corruption, or a backend bug. The corrupt bytes are NOT cached (we verify before insert)."
+      "doc": "BLAKE3 of the AUTHORITATIVE (backend) bytes doesn't match the requested hash: S3 bitrot or a backend bug — truthfully terminal (DATA_LOSS) at every reader. Process-local LRU corruption is NOT a producer: a corrupt cache hit invalidates and falls through to the backend in-request (round-17 bug_105), so this variant only ever describes the authoritative copy. The corrupt bytes are NOT cached (we verify before insert)."
     },
     {
       "enum": "ChunkError",
       "name": "NotFound",
       "crate": "rio-store",
       "msg": "chunk {} not found in backend (data loss if manifest claims it exists)",
-      "doc": "Backend returned None — chunk not in S3. If the manifest says this hash exists, this is data loss. Caller should propagate as a hard error (not retry — retrying NotFound is pointless)."
+      "doc": "Backend AUTHORITATIVELY returned None — the object is not in S3. If the manifest says this hash exists, this is data loss. Caller should propagate as a hard error (not retry — retrying NotFound is pointless)."
     },
     {
       "enum": "ManifestError",
@@ -1136,6 +1479,20 @@
     },
     {
       "enum": "MetadataError",
+      "name": "BackendAuth",
+      "crate": "rio-store",
+      "msg": "chunk backend authentication failed (check S3 credentials/IAM permissions): {0}",
+      "doc": "The chunk backend REFUSED a metadata-layer read with an auth failure (IRSA/IAM/KMS misconfiguration). Deterministic until an operator fixes the role: maps to `failed_precondition` so the caller fail-fasts with the remediation instead of retrying as `unavailable` forever (round-17 merged_bug_061 — the read-side twin of the write path's BackendAuthError fail-fast)."
+    },
+    {
+      "enum": "MetadataError",
+      "name": "ChunkBackend",
+      "crate": "rio-store",
+      "msg": "chunk backend unavailable: {0}",
+      "doc": "The chunk BACKEND failed transiently (S3 5xx/timeout/connect) while serving a metadata-layer read (e.g. proof-walk `.drv` reassembly). Nothing is known about the data's existence — retriable. Maps to `unavailable`. Split from data-integrity verdicts in round-16 bug_027: this variant MUST NOT be read as corruption or data loss."
+    },
+    {
+      "enum": "MetadataError",
       "name": "Conflict",
       "crate": "rio-store",
       "msg": "conflict: {0}",
@@ -1154,6 +1511,13 @@
       "crate": "rio-store",
       "msg": "corrupt manifest_data for {store_path}: {source}",
       "doc": "A `manifest_data.chunk_list` blob failed to deserialize. Written by us, read by us — if it doesn't round-trip, either the write was torn or the format version is wrong. NOT retriable. Maps to `data_loss`."
+    },
+    {
+      "enum": "MetadataError",
+      "name": "DataLoss",
+      "crate": "rio-store",
+      "msg": "data loss: {0}",
+      "doc": "Stored data is verifiably lost or corrupt: a manifest references a chunk the backend authoritatively lacks, or fetched bytes fail content verification. NOT retriable. Maps to `data_loss`."
     },
     {
       "enum": "MetadataError",
@@ -1223,7 +1587,7 @@
       "name": "Base64",
       "crate": "rio-store",
       "msg": "base64 decode failed: {0}",
-      "doc": ""
+      "doc": "Sanitized decode failure (position/shape only). The raw `base64::DecodeError` echoes the offending BYTE VALUE in its `Display` — for a secret-key file that is a byte of key material, and `SignerError` lands in startup logs. Type-level sanitization: this variant has nowhere to put a payload byte."
     },
     {
       "enum": "SignerError",
@@ -1238,6 +1602,20 @@
       "crate": "rio-store",
       "msg": "key file format: expected 'name:base64', got {0} ':'-separated parts",
       "doc": ""
+    },
+    {
+      "enum": "SignerError",
+      "name": "InconsistentEntry",
+      "crate": "rio-store",
+      "msg": "secret key entry is internally inconsistent (expanded tail does not match the seed-derived public key); refusing to load a corrupt signing key",
+      "doc": "64-byte entry whose trailing 32 bytes are not the seed-derived public key (corrupt or hand-assembled file). Refused at load: signing with the seed while the redundant pub half disagrees would produce signatures the published key never verifies."
+    },
+    {
+      "enum": "SignerError",
+      "name": "InvalidName",
+      "crate": "rio-store",
+      "msg": "key name {0:?} contains whitespace or a control byte",
+      "doc": "Name carries whitespace or a control byte — it would fragment the whitespace-tokenized `trusted-public-keys` entry this key's public half is published as, or corrupt `Sig:` line framing. Refused at load (the codec refuses it at every constructor)."
     },
     {
       "enum": "SignerError",
@@ -1266,6 +1644,13 @@
       "crate": "rio-store",
       "msg": "(transparent — delegates to inner error)",
       "doc": "Per-replica admission gate timed out (or closed). Transient — `Err` so moka does NOT cache it; the next caller after the burst clears retries cleanly."
+    },
+    {
+      "enum": "SubstituteError",
+      "name": "AdmissionRefused",
+      "crate": "rio-store",
+      "msg": "NAR refused at admission: {0}",
+      "doc": "The NAR failed residency admission (`ingest::AdmittedNar`): for `.drv` paths, the bytes are not the text-CA preimage of the claimed path (or not a single-file NAR). Upstream signing keys are tenant-supplied — a verified sig is NOT a trust boundary — so without this gate a hostile upstream could park non-preimage bytes at a victim `.drv` path and seed forged `drv_modulo_cache` rows consumed as trusted evidence by the IA deriver-proof gate (round-17 merged_bug_063)."
     },
     {
       "enum": "SubstituteError",
@@ -1341,6 +1726,21 @@
       "doc": "Error type for executor operations. No `#[from] anyhow::Error` — every variant has a typed source. A catch-all `#[from] anyhow::Error` would mean any `?` on an anyhow::Result anywhere in execute_build silently becomes the wrong variant. Typed sources make the compiler catch misattribution at the `?` site."
     },
     {
+      "name": "FetchError",
+      "crate": "rio-builder",
+      "doc": "Closed permanence classification for one fetch attempt. Every failure source inside [`try_fetch_one`] must choose a class at the point where the error is produced — there is deliberately no `From<anyhow::Error>` impl and no default bucket, so a future failure source cannot silently inherit retryability (the downcast-marker shape this replaces let exactly that happen: any error NOT carrying the marker was retryable by omission). The retry loop matches exhaustively."
+    },
+    {
+      "name": "NetrcError",
+      "crate": "rio-builder",
+      "doc": "netrc failure split at its two producing statements: reading the file and parsing its contents are different error sources with different permanence, and folding them into one arm is exactly the composite blanket amended R1(e) forbids."
+    },
+    {
+      "name": "NetrcParseError",
+      "crate": "rio-builder",
+      "doc": ""
+    },
+    {
       "name": "OverlayError",
       "crate": "rio-builder",
       "doc": "Errors from overlay setup and teardown. Distinct from `anyhow::Error` so `ExecutorError::Overlay(#[from])` only catches overlay failures — a bare `?` on an unrelated `anyhow::Result` elsewhere in `execute_build` no longer silently becomes an \"overlay setup failed\" message."
@@ -1351,6 +1751,11 @@
       "doc": "Errors from upload operations. NAR serialization happens inside the retry loop (each retry is a fresh disk read), so NAR errors surface as `UploadExhausted` wrapping a `tonic::Status::internal(\"NAR serialization failed...\")`."
     },
     {
+      "name": "KeyFmtError",
+      "crate": "rio-common",
+      "doc": "Errors from parsing/encoding signing-key entries. Deliberately carries NO key material (no payload bytes, no decoded windows) — these errors land in bootstrap Job logs."
+    },
+    {
       "name": "NameError",
       "crate": "rio-common",
       "doc": "Construction-time rejection. The `Display` impl's message is what callers map to `Status::invalid_argument`."
@@ -1359,6 +1764,11 @@
       "name": "Error",
       "crate": "rio-controller",
       "doc": "Top-level reconcile error. kube's `Controller::run` takes an `error_policy` fn that receives this and decides requeue timing. `Box` on the finalizer variant: `finalizer::Error<Self>` is recursive (it wraps our Error for ApplyFailed/CleanupFailed). Unboxed it's an infinite-size type. Box breaks the cycle with a pointer indirection."
+    },
+    {
+      "name": "ExecError",
+      "crate": "rio-exec",
+      "doc": "Errors produced by the executor. Every variant is an *infrastructure* failure from the caller's point of view — a request that could not be validated or a sandbox that could not be constructed or supervised. A process that runs and exits non-zero (or is killed by a limit) is **not** an error; that is an [`ExitOutcome`] in a successful [`ExecutionOutcome`]."
     },
     {
       "name": "GatewayError",
@@ -1374,6 +1784,11 @@
       "name": "DerivationError",
       "crate": "rio-nix",
       "doc": "Errors from parsing or hashing ATerm derivations."
+    },
+    {
+      "name": "DerivationTypeError",
+      "crate": "rio-nix",
+      "doc": "Ill-typed output sets, with the oracle's verbatim wording."
     },
     {
       "name": "DerivedPathError",
@@ -1401,9 +1816,24 @@
       "doc": "Errors from narinfo parsing."
     },
     {
+      "name": "RewriteError",
+      "crate": "rio-nix",
+      "doc": "Error constructing a [`RewritingSink`] or [`HashModuloSink`]."
+    },
+    {
       "name": "StorePathError",
       "crate": "rio-nix",
       "doc": ""
+    },
+    {
+      "name": "StructuredAttrError",
+      "crate": "rio-nix",
+      "doc": "A typed structured-attrs read failed."
+    },
+    {
+      "name": "TypedError",
+      "crate": "rio-nix",
+      "doc": "A typed read failed: the value exists but is not the expected type."
     },
     {
       "name": "WireError",
@@ -1448,7 +1878,7 @@
     {
       "name": "ChunkError",
       "crate": "rio-store",
-      "doc": "Error from `ChunkCache::get_verified`."
+      "doc": "Error from `ChunkCache::get_verified`. Three variants, three wire codes (round-16 bug_027; pattern R1 — an error variant whose producers span transient and permanent causes is split, with the code DERIVED from the variant): `NotFound`/`Corrupt` are data-integrity verdicts (`DATA_LOSS`-class, retrying is pointless); `Backend` is transient infrastructure (`UNAVAILABLE`-class, retry)."
     },
     {
       "name": "ManifestError",

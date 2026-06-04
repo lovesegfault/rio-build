@@ -1,9 +1,9 @@
 //! DAG merge handling: SubmitBuild → merge client DAG into global DAG.
-// r[impl sched.merge.dedup]
+// r[impl sched.merge.dedup+2]
 // r[impl sched.merge.shared-priority-max]
 // r[impl sched.merge.toctou-serial]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use tracing::{debug, error, info, instrument, warn};
@@ -17,6 +17,7 @@ use crate::state::{
     union_wanted_saturating, verifiable_wanted_paths,
 };
 
+use super::settled::{SettledArbitration, arbitrate_settled_row, settled_row_identity_matches};
 use super::{ActorError, DagActor, MergeDagRequest};
 
 /// Cross-phase carrier from [`DagActor::validate_and_ingest`] to
@@ -32,6 +33,14 @@ use super::{ActorError, DagActor, MergeDagRequest};
 /// `node_index` is NOT carried (it borrows from `nodes`, which would
 /// make this self-referential) — `reconcile_merged_state` rebuilds it
 /// in one pass over `nodes`.
+/// INVARIANT (sched.merge.heal-accepted-edges+1): no field of this struct
+/// may derive from the raw request edge list. Everything downstream of
+/// the merge — the closure-hole heal, the `topdown_pruned`
+/// clear-candidate seeding, the PG edge persist, metrics — must read
+/// `merge_result` (computed by the same loop that enforces edge
+/// admission). `validate_and_ingest` drops the request edges immediately
+/// after `dag.merge` returns precisely so that re-deriving state from
+/// them is a compile error, not a code-review catch.
 pub(super) struct MergeIngest {
     pub build_id: Uuid,
     /// Post-topdown-prune node set (may be smaller than the request's).
@@ -39,12 +48,6 @@ pub(super) struct MergeIngest {
     /// Only `edges.len()` survives past step 5 (for the total-time log);
     /// the edges themselves are consumed by `dag.merge` + persist.
     pub edges_len: usize,
-    /// Deduped parent hashes of the post-prune submission `edges`,
-    /// resolved while the edges were still alive in
-    /// `validate_and_ingest`. Candidate set for the caller's
-    /// post-reconciliation `topdown_pruned` clear pass — empty for a
-    /// pruned merge (its edges were dropped with the closure).
-    pub edge_parent_hashes: Vec<DrvHash>,
     pub merge_result: crate::dag::MergeResult,
     pub event_rx: super::BuildEventReceivers,
     /// Pre-existing not-done nodes that were re-probed in step 4.
@@ -74,11 +77,925 @@ pub(super) struct MergeReconcile {
     /// that a re-probe transitioned →Completed. Caller fans out
     /// `update_build_counts` + `check_build_completion` so a
     /// shared-node completion doesn't leave the earlier build hung
-    /// Active. r[sched.merge.dedup]
+    /// Active. r[sched.merge.dedup+2]
     pub other_builds: HashSet<Uuid>,
 }
 
+/// Prior-interest snapshot for one displaced hash, computed by
+/// [`DagActor::displaced_prior_interest`] and consumed by both the
+/// in-memory prune (reconcile) and the durable link prune + total
+/// adjustment (persist transaction).
+#[derive(Default)]
+struct DisplacedPriorInterest {
+    /// Still-running prior builds (≠ the displacer) interested in the
+    /// displaced node.
+    prior_builds: Vec<Uuid>,
+    /// Whether the displaced node had already delivered its result
+    /// (`Completed`/`Skipped`). True → those builds keep the credit
+    /// (slot + completed count both stay); false → the slot is removed
+    /// from their absolute totals (in memory and in `builds.total_drvs`).
+    prior_completed: bool,
+}
+
+/// Per-merge budget for store-evidence `.drv` fetches
+/// (`sched.merge.store-evidence-displacement+3`): settled-conflict
+/// resolution is a remediation path, not a bulk operation, and an
+/// unbounded fetch loop would let a submission filled with manufactured
+/// conflicts stall the single-threaded actor on store round-trips.
+/// Exhaustion fails the merge with `RESOURCE_EXHAUSTED` (counted
+/// `over_budget`) and actionable guidance — split the submission —
+/// rather than hardening a load condition into the conflict's permanent
+/// `FAILED_PRECONDITION`. The failure is atomic: Steps 0.5/0.6 run
+/// before any state is written, so displacements approved earlier in
+/// the same submission are discarded with it
+/// (`sched.persist.atomic-activation` — persisting partial
+/// displacements is rejected by design).
+const MERGE_STORE_EVIDENCE_BUDGET: u32 = 8;
+
+/// Input-form modular-hash seeds for store-evidence verification.
+///
+/// r[impl sched.merge.input-form-seed]
+/// The not-floating predicate (`is_fixed_output || !is_ca`) lives INSIDE
+/// this type's two constructors — the only ways to build a seed map —
+/// so a future call site cannot forget it: a floating-CA node's
+/// published hash is the masked-subject form (oracle parity:
+/// `hashDerivationModulo` masks its own outputs) and can never stand in
+/// for its input-position digest. Seeding one re-creates the
+/// masked-form false-rejection/false-verification class fixed at
+/// ingress (`ingress-inline-drv-binding+1`) and at the three merge-time
+/// sites (e2c2dbfc2) — whose hand-sweep missed the dispatch-time
+/// fourth site, which is exactly why the predicate now has a single
+/// owner (fix-discipline R2: chokepoints over call-site discipline).
+///
+/// Consumers read through [`Self::get`]; `check_store_evidence` accepts
+/// only this type, never a raw map.
+// TODO: F1 (round-15 C3c8 follow-up) — the seed still carries bare
+// `[u8; 32]` digests; InputFormDigest/PublishedDigest newtypes through
+// `hash_derivation_modulo` would make a published-form digest entering
+// any seed a compile error (PublishedDigest gets no From into seeds),
+// retiring the not-floating call-site predicate this type centralizes.
+pub(super) struct InputFormSeed(HashMap<String, [u8; 32]>);
+
+impl InputFormSeed {
+    /// Seed from a submission's nodes (merge Steps 0.5/0.6): every
+    /// non-floating node's declared 32-byte modular hash, keyed by its
+    /// declared `drv_path`.
+    pub(super) fn from_submission_nodes(nodes: &[crate::domain::DerivationNode]) -> Self {
+        Self(
+            nodes
+                .iter()
+                .filter(|n| n.is_fixed_output || !n.is_content_addressed)
+                .filter_map(|n| n.ca_modular_hash.map(|h| (n.drv_path.clone(), h)))
+                .collect(),
+        )
+    }
+
+    /// Seed from a dispatched node's resident DAG children (the
+    /// dispatch-time claims derivation): a child's recorded modular
+    /// hash qualifies only when the child is not floating-CA — for a
+    /// dispatched parent its children are resident and Completed, but
+    /// a Completed floating child's recorded hash is still the masked
+    /// published form, not an input digest.
+    pub(super) fn from_dag_children(dag: &crate::dag::DerivationDag, drv_hash: &DrvHash) -> Self {
+        let mut map = HashMap::new();
+        for child in dag.get_children(drv_hash) {
+            if let Some(cs) = dag.node(&child)
+                && (cs.is_fixed_output || !cs.ca.is_ca)
+                && let Some(h) = cs.ca.modular_hash
+            {
+                map.insert(cs.drv_path().to_string(), h);
+            }
+        }
+        Self(map)
+    }
+
+    /// Seed from PERSISTED derivation rows (the unseeded-input
+    /// read-through, `sched.dispatch.claims-derived+5`): a row's
+    /// recorded modular hash qualifies under the same not-floating
+    /// predicate as the other constructors AND the byte-anchored rank
+    /// floor (`sched.evidence.seed-rank-floor`) — the row is
+    /// content-derived state that survives reap and failover, which is
+    /// exactly why the read-through consults it before any permanence
+    /// verdict; the floor is what keeps a submitter-echoed row from
+    /// impersonating that content derivation. Rows with a NULL hash, a
+    /// non-32-byte blob, or an undecodable rank contribute nothing
+    /// (absent ≠ evidence).
+    pub(super) fn from_persisted_rows(rows: &[crate::db::InputFormRow]) -> Self {
+        Self(
+            rows.iter()
+                .filter(|r| r.is_fixed_output || !r.is_ca)
+                // r[impl sched.evidence.seed-rank-floor]
+                // Constructor tier of the seed rank floor (round-17
+                // bug_077): only byte-anchored rows seed, decided by
+                // the same predicate the SQL tier derives its list
+                // from. Fail-closed decode — an undecodable persisted
+                // rank contributes nothing (absent != evidence), it
+                // never floors into a seeding rank.
+                .filter(|r| {
+                    r.evidence_rank
+                        .parse::<crate::state::DefinitionEvidence>()
+                        .is_ok_and(|rank| rank.seeds_input_form())
+                })
+                .filter_map(|r| {
+                    let h: [u8; 32] = r.ca_modular_hash.as_deref()?.try_into().ok()?;
+                    Some((r.drv_path.clone(), h))
+                })
+                .collect(),
+        )
+    }
+
+    /// Look up the input-form digest recorded for `drv_path`.
+    pub(super) fn get(&self, drv_path: &str) -> Option<[u8; 32]> {
+        self.0.get(drv_path).copied()
+    }
+
+    /// Whether the seed map is empty (read-through fast-path: an empty
+    /// row seed cannot change a classification).
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Why the store stayed SILENT on a verification: nothing here is
+/// evidence in either direction, and every reason is TRANSIENT — the
+/// store may answer differently later (object uploaded, transport
+/// recovers, the genuine text-CA object replacing a hostile or corrupt
+/// answer that failed the self-consistency checks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SilenceReason {
+    /// Fetch failed or the path is absent from the store.
+    Fetch,
+    /// Bytes are not UTF-8 and not provably the path's text-CA object.
+    NotUtf8,
+    /// Bytes do not parse as a derivation and are not provably the
+    /// path's text-CA object.
+    Parse,
+    /// Bytes parse but do not re-serialize canonically — the store
+    /// holds SOME derivation there, but it cannot vouch identity.
+    NonCanonical,
+    /// A reference path inside the derivation does not parse.
+    RefPath,
+    /// Digest construction failed (defensive; unreachable for SHA-256).
+    Digest,
+    /// The bytes do not re-derive the declared path as their text
+    /// content-address — transport-grade noise, not the store's object.
+    TextCa,
+    /// The unseeded-input persisted-row read-through could not run
+    /// (PG error). The verification was NOT completed in either
+    /// direction — permanence may not be concluded from a failed
+    /// lookup (`claims-derived+5`); retry when the database recovers.
+    RowReadThrough,
+}
+
+impl SilenceReason {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::NotUtf8 => "not-utf8",
+            Self::Parse => "parse",
+            Self::NonCanonical => "non-canonical",
+            Self::RefPath => "ref-path",
+            Self::Digest => "digest",
+            Self::TextCa => "text-ca",
+            Self::RowReadThrough => "row-read-through",
+        }
+    }
+}
+
+/// Why a verification is STRUCTURALLY impossible: PERMANENT because the
+/// reason is CONTENT-BOUND — it depends only on the submission's own
+/// declared data or the immutable contents of the store path that data
+/// names, never on scheduler-mutated residency. Round-16 bug_029 (the
+/// claims-derived+3 delta) restricted this enum BY TYPE to exactly
+/// that: the former `UnseedableInput` variant's verdict depended on
+/// what happened to be RESIDENT (reap and failover both erase residency
+/// without touching content), so a guaranteed deploy failover could
+/// poison honest in-flight builds through the claims gate. Missing
+/// input identity is now [`StoreEvidenceOutcome::UnseededInputs`] —
+/// read-through then bounded backoff, never instant permanence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum StructuralReason {
+    /// The node's own declared `drv_path` does not parse as a store
+    /// path. Content-bound: no later state change can make it parse.
+    UnparseableDrvPath,
+    /// The store path the declaration names carries a NAR larger than
+    /// the derivation-text class cap
+    /// ([`rio_common::limits::MAX_DRV_NAR_BYTES`]) — the transfer is
+    /// denied byte-free off the declared `Info.nar_size`. Content-bound:
+    /// the named path's contents cannot shrink on retry, and a
+    /// "derivation" over the class bound is inadmissible everywhere
+    /// (store admission, gateway BFS, worker fetch all apply the same
+    /// cap). Round-17 bug_030: pre-typing this fold into store silence
+    /// burned the claims-unavailable budget and poisoned blaming store
+    /// health.
+    OversizedDrvNar {
+        /// Declared NAR size that tripped the cap.
+        got: u64,
+        /// The class cap it exceeded.
+        limit: u64,
+    },
+}
+
+impl StructuralReason {
+    /// Client-facing remediation, GENERATED from the typed reason
+    /// (fix-discipline R6: prose coupled to mechanism — an arm cannot
+    /// promise a remedy its verdict does not support).
+    pub(super) fn remediation(&self) -> String {
+        match self {
+            Self::UnparseableDrvPath => "the declared drv_path does not parse as a store \
+                 path; resubmit with a valid .drv store path"
+                .to_string(),
+            Self::OversizedDrvNar { got, limit } => format!(
+                "the .drv at the declared drv_path is {got} bytes of NAR, exceeding the \
+                 {limit}-byte derivation-text cap; a derivation this large is not \
+                 admissible — restructure it (move large data out of the derivation, \
+                 e.g. into a fetched source or a builder script) and resubmit"
+            ),
+        }
+    }
+}
+
+/// Remediation for a verification still blocked on missing input
+/// identity AFTER the persisted-row read-through (R6: generated from
+/// the post-read-through fact set — the rows were consulted, so the
+/// text can honestly say the identities are nowhere).
+pub(super) fn unseeded_remediation(missing: &[String]) -> String {
+    format!(
+        "the derivation's direct input(s) {} are covered by neither the \
+         submission, the resident DAG, nor any persisted derivation row, \
+         so their identities cannot be verified from here: upload the \
+         input derivation(s) to the store (or submit the deeper closure) \
+         and resubmit",
+        missing.join(", ")
+    )
+}
+
+/// A definition the store's text-CA-bound bytes verified, together
+/// with every fact the trusted plane derives FROM those bytes at the
+/// classification site (fix-discipline R1: facts ride the verified
+/// value; consumers cannot fall back to a submitter echo because the
+/// echo is not in scope where this is consumed).
+#[derive(Debug)]
+pub(super) struct VerifiedDefinition {
+    /// The verified canonical ATerm bytes.
+    pub(super) bytes: Vec<u8>,
+    /// Dispatch-resolve requirement derived from the bytes via the
+    /// shared oracle predicate (`rio_nix::derivation::should_resolve`)
+    /// over the resident DAG's child knowledge — never the submitter's
+    /// `needs_resolve` echo (sched.dispatch.claims-derived+5).
+    pub(super) needs_resolve: bool,
+    /// `Some(declared)` iff the classification stripped an
+    /// unverifiable declared modular hash
+    /// (`VerifiedExceptDeclaredHash`): consumers that raise rank on
+    /// these bytes apply the strip in the same motion — clear the
+    /// live hash, preserve the declared value (M_070) — so the strip
+    /// verdict has ONE consequence everywhere
+    /// (`sched.merge.store-evidence-displacement+3`). `None` on full
+    /// verification.
+    pub(super) stripped_declared_hash: Option<[u8; 32]>,
+}
+
+/// Outcome of [`DagActor::check_store_evidence`]. Permanence is typed
+/// at the classification site (fix-discipline R1): consumers derive
+/// their consequence from the variant's documented permanence instead
+/// of guessing from a string reason — routing a PERMANENT arm into
+/// backoff (the merged_bug_019 livelock) now requires writing it
+/// against the variant's own rustdoc.
+pub(super) enum StoreEvidenceOutcome {
+    /// The store's text-CA-bound bytes derive exactly the submission's
+    /// claimed identity — the claim is genuine. TERMINAL-POSITIVE.
+    /// Carries the verified definition so callers (the dispatch claims
+    /// derivation) can forward the bytes and record the byte-derived
+    /// facts without a second fetch.
+    Verified(VerifiedDefinition),
+    /// The bytes are sound (text-CA-bound to the declared path) but the
+    /// derivation they parse as CONTRADICTS the claim — PERMANENT, a
+    /// retry of the same claim can never succeed.
+    Contradicts(String),
+    /// The store could not vouch either way. TRANSIENT: retry when the
+    /// store recovers. Store silence is never evidence.
+    StoreSilence(SilenceReason),
+    /// Verification is impossible for CONTENT-BOUND reasons (the
+    /// submission's own declared data, or the immutable contents of
+    /// the store path it names — see [`StructuralReason`]).
+    /// PERMANENT: backoff cannot resolve it; consumers must surface
+    /// it (visible poison with remediation at dispatch, refusal with
+    /// remediation at merge). Instant permanence is restricted to
+    /// this variant BY TYPE (claims-derived+5).
+    StructurallyUnverifiable(StructuralReason),
+    /// Declared-IA derivability is blocked because direct input(s)
+    /// are covered by neither the seeds nor the resident DAG. NOT
+    /// permanent by itself: residency is SCHEDULER-MUTATED state
+    /// (reap and failover erase it without touching content), so this
+    /// verdict must pass the persisted-row read-through (the
+    /// chokepoint [`DagActor::check_store_evidence`] performs it and
+    /// re-classifies; a post-read-through emission means the rows
+    /// were consulted too) and then BOUNDED BACKOFF at dispatch
+    /// before any permanent consequence (`claims-derived+5`,
+    /// bug_029). At merge the submitter is present: refusal with the
+    /// post-read-through remediation is synchronous self-service.
+    /// Carries ALL missing input paths (batched read-through, honest
+    /// remediation) and the fetched bytes (the re-classify reuses
+    /// them — one budgeted store fetch per check, never two).
+    UnseededInputs {
+        missing: Vec<String>,
+        bytes: Vec<u8>,
+    },
+    /// The bytes ARE the store's text-CA object for the declared path
+    /// and the claimed identity verifies EXCEPT that the declared
+    /// modular hash cannot be recomputed (a floating store-backed
+    /// input is missing from the seeds — the ingress strip shape,
+    /// `ingress-inline-drv-binding+1`). Carries the verified bytes.
+    /// PERMANENT-as-claimed, RESOLVABLE-by-strip: the declared hash
+    /// can never be verified, but the submission minus that claim is
+    /// fully verified — an unverifiable claim is NO claim, so the
+    /// dispatch consumer strips it and proceeds; treating this as
+    /// silence livelocks (merged_bug_019). Carries the verified
+    /// definition: the strip arm raises rank on these bytes, so the
+    /// byte-derived facts ride along exactly as on `Verified`.
+    VerifiedExceptDeclaredHash(VerifiedDefinition),
+    /// The bytes are PROVABLY the store's text-CA object for the
+    /// declared path (zero-reference text-CA re-derivation matched) and
+    /// they do not parse as a derivation. Content-bound and PERMANENT:
+    /// refetching reproduces the same garbage.
+    UnparseableVerified,
+}
+
+/// Classify fetched store bytes against a submission node's claimed
+/// identity. Pure (no I/O): the actor's [`DagActor::check_store_evidence`]
+/// supplies the fetched bytes and a resident-DAG input lookup; tests
+/// drive the full outcome matrix directly.
+///
+/// The verification never trusts store transport: the bytes must
+/// re-derive the declared path as their text content-address before
+/// anything is believed, and only then is the parsed derivation
+/// compared against the claimed identity by the SAME validator
+/// SubmitBuild ingress applies to inline content
+/// (`validate_inline_drv_content` — reusing it is what keeps the
+/// merge-time and ingress-time identity rules from drifting).
+///
+/// Outcome classification is deterministic, not message-matched:
+/// availability problems pre-check into [`StoreEvidenceOutcome::StoreSilence`],
+/// shape problems into [`StoreEvidenceOutcome::StructurallyUnverifiable`];
+/// once those pass, any validator failure IS an identity contradiction.
+pub(super) fn classify_store_evidence(
+    node: &crate::domain::DerivationNode,
+    bytes: Vec<u8>,
+    submission_seed: &InputFormSeed,
+    resident_input_form: &dyn Fn(&str) -> Option<[u8; 32]>,
+    child_has_unknown_output_paths: &dyn Fn(&str) -> Option<bool>,
+) -> StoreEvidenceOutcome {
+    use rio_nix::derivation::Derivation;
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+
+    let zero_ref_text_ca_matches = |bytes: &[u8]| -> bool {
+        let Ok(sp) = StorePath::parse(&node.drv_path) else {
+            return false;
+        };
+        let Ok(h) = NixHash::new(HashAlgo::SHA256, Sha256::digest(bytes).to_vec()) else {
+            return false;
+        };
+        matches!(StorePath::make_text(sp.name(), &h, &[]), Ok(p) if p.as_str() == node.drv_path)
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        // Binary garbage can still be the genuine (reference-free)
+        // text-CA object at this path — then it is PERMANENTLY not
+        // a derivation, not a transport blip.
+        if zero_ref_text_ca_matches(&bytes) {
+            return StoreEvidenceOutcome::UnparseableVerified;
+        }
+        return StoreEvidenceOutcome::StoreSilence(SilenceReason::NotUtf8);
+    };
+    let Ok(drv) = Derivation::parse(text) else {
+        if zero_ref_text_ca_matches(&bytes) {
+            return StoreEvidenceOutcome::UnparseableVerified;
+        }
+        return StoreEvidenceOutcome::StoreSilence(SilenceReason::Parse);
+    };
+    // Canonicality: the validator requires bytes == to_aterm(parse).
+    // A store object that parses but re-serializes differently
+    // cannot vouch identity (and is not a contradiction — the store
+    // holds SOME derivation there, just not canonically encoded).
+    if drv.to_aterm().as_bytes() != bytes.as_slice() {
+        return StoreEvidenceOutcome::StoreSilence(SilenceReason::NonCanonical);
+    }
+    // Text-CA self-consistency of the store object, verified HERE
+    // before any identity comparison: make_text(name, sha256(bytes),
+    // refs) must reproduce the declared path. The store enforces
+    // this at .drv ingestion (store.put.drv-text-ca+3); re-deriving it
+    // means a confused or hostile store answer cannot smuggle
+    // unrelated bytes into the comparison.
+    let Ok(drv_sp) = StorePath::parse(&node.drv_path) else {
+        return StoreEvidenceOutcome::StructurallyUnverifiable(
+            StructuralReason::UnparseableDrvPath,
+        );
+    };
+    let mut refs: Vec<StorePath> = Vec::new();
+    for r in drv.input_srcs().iter().chain(drv.input_drvs().keys()) {
+        match StorePath::parse(r) {
+            Ok(p) => refs.push(p),
+            Err(_) => return StoreEvidenceOutcome::StoreSilence(SilenceReason::RefPath),
+        }
+    }
+    let content_hash =
+        match NixHash::new(HashAlgo::SHA256, Sha256::digest(bytes.as_slice()).to_vec()) {
+            Ok(h) => h,
+            Err(_) => return StoreEvidenceOutcome::StoreSilence(SilenceReason::Digest),
+        };
+    match StorePath::make_text(drv_sp.name(), &content_hash, &refs) {
+        Ok(p) if p.as_str() == node.drv_path => {}
+        _ => return StoreEvidenceOutcome::StoreSilence(SilenceReason::TextCa),
+    }
+    // Declared-IA derivability pre-check: the validator derives
+    // input-addressed output paths with a sibling-seeded hash
+    // cache. Seed every direct input from the submission's declared
+    // hashes or the resident DAG; an input neither covers makes the
+    // verification STRUCTURALLY impossible for this submission (a
+    // deeper upload/submission is needed), never a contradiction.
+    let needs_ia = drv
+        .outputs()
+        .iter()
+        .any(|o| matches!(o.kind(), rio_nix::derivation::OutputKind::InputAddressed(_)));
+    // Seed-collection population = the validator's step-6 accept-set
+    // (round-17 bug_052): step 6 recomputes a declared modular hash for
+    // ANY node carrying one — not only declared-IA — so a deferred-IA /
+    // CA-chain node's declared hash is provable from exactly the same
+    // sibling seeds. Gating collection on needs_ia silently withheld
+    // the seeds, and the validator stripped a PROVABLE declaration as
+    // "unverifiable" (or worse, could not refuse a contradicted one:
+    // with seeds present a recompute MISMATCH is a typed refusal —
+    // the Q7-accepted Contradicts widening, fail-closed, never a
+    // forged verification).
+    let declared_hash_present = node.ca_modular_hash.is_some();
+    let mut input_seed: Vec<rio_proto::types::DerivationNode> = Vec::new();
+    if needs_ia || declared_hash_present {
+        // Collect ALL unseedable inputs (claims-derived+5): the
+        // read-through is batched — one PG roundtrip covers every
+        // missing input — and the remediation names the full set
+        // instead of leaking them one resubmit at a time.
+        let mut missing: Vec<String> = Vec::new();
+        for input in drv.input_drvs().keys() {
+            let hash = submission_seed
+                .get(input.as_str())
+                .or_else(|| resident_input_form(input.as_str()));
+            match hash {
+                Some(h) => input_seed.push(rio_proto::types::DerivationNode {
+                    drv_path: input.clone(),
+                    ca_modular_hash: h.to_vec(),
+                    ..Default::default()
+                }),
+                None => missing.push(input.clone()),
+            }
+        }
+        // UnseededInputs EMISSION stays IA-gated: for declared-IA the
+        // verification is STRUCTURALLY impossible without every input
+        // (output paths cannot derive), so the typed verdict routes to
+        // the read-through + bounded backoff. For a declared-hash-only
+        // node, missing seeds are the ingress-strip population — the
+        // validator strips the unrecomputable claim and the rest
+        // verifies (VerifiedExceptDeclaredHash), which is the
+        // e47c330a0 bare-CA-chain unbrick this gate must not re-brick.
+        if needs_ia && !missing.is_empty() {
+            return StoreEvidenceOutcome::UnseededInputs { missing, bytes };
+        }
+    }
+
+    // Identity comparison: the submission's claims, with the
+    // store's bytes attached, through the ingress inline validator.
+    // Every remaining failure mode is a contradiction between the
+    // claimed identity and what the verified bytes derive.
+    let mut synth = rio_proto::types::DerivationNode {
+        drv_hash: node.drv_hash.clone(),
+        drv_path: node.drv_path.clone(),
+        system: node.system.clone(),
+        output_names: node.output_names.clone(),
+        expected_output_paths: node.expected_output_paths.clone(),
+        is_fixed_output: node.is_fixed_output,
+        is_content_addressed: node.is_content_addressed,
+        ca_modular_hash: node.ca_modular_hash.map(|h| h.to_vec()).unwrap_or_default(),
+        drv_content: bytes,
+        drv_content_authoritative: false,
+        ..Default::default()
+    };
+    // The validator treats a node's own declared hash as
+    // self-certification and removes it; siblings carry the seeds.
+    let claimed_modular_hash = !synth.ca_modular_hash.is_empty();
+    // r[impl sched.dispatch.claims-derived+5]
+    // Byte-derived dispatch facts, computed HERE — the single site
+    // that holds the verified parse — so the consumers that raise
+    // rank on these bytes record the derived flag in the same motion
+    // and the submitter's `needs_resolve` echo is structurally out of
+    // reach. Child knowledge comes from the resident DAG; an unknown
+    // child degrades to not-unknown (the predicate's documented
+    // fail-direction: a missed resolve fails the build visibly, a
+    // spurious one is a no-op walk).
+    let needs_resolve =
+        rio_nix::derivation::should_resolve(&drv, |p| child_has_unknown_output_paths(p));
+    let mut slice = vec![std::mem::take(&mut synth)];
+    slice.extend(input_seed);
+    match crate::grpc::validate_inline_drv_content(&mut slice) {
+        // Ingress strip semantics (ingress-inline-drv-binding+1):
+        // when a declared modular hash cannot be RECOMPUTED (a
+        // floating store-backed input is missing from the seeds)
+        // the validator strips the declaration and accepts. The
+        // submission MINUS the declared-hash claim is fully verified
+        // against the store's text-CA bytes; the declared hash itself
+        // can never be. The variant carries both facts — consumers
+        // decide (dispatch strips-and-proceeds; merge treats the
+        // declared hash as unprovable).
+        Ok(strips) if claimed_modular_hash && !strips.is_empty() => {
+            StoreEvidenceOutcome::VerifiedExceptDeclaredHash(VerifiedDefinition {
+                bytes: std::mem::take(&mut slice[0].drv_content),
+                needs_resolve,
+                // The declared value the validator stripped — carried
+                // so the consuming raise applies clear+preserve in one
+                // motion (M_070).
+                stripped_declared_hash: node.ca_modular_hash,
+            })
+        }
+        Ok(_) => {
+            // `synth.drv_content` was moved into the slice; the
+            // verified bytes are returned from there.
+            StoreEvidenceOutcome::Verified(VerifiedDefinition {
+                bytes: std::mem::take(&mut slice[0].drv_content),
+                needs_resolve,
+                stripped_declared_hash: None,
+            })
+        }
+        Err(status) => StoreEvidenceOutcome::Contradicts(status.message().to_string()),
+    }
+}
+
+/// Post-fetch consequence of a settled-conflict store-evidence
+/// verdict — the SINGLE arbiter for merge Steps 0.5 (settled rows) and
+/// 0.6 (resident settled squats), so the two steps cannot drift on
+/// what a verdict means. Wire-code consequences are DERIVED from the
+/// verdict's typed permanence (`store-evidence-displacement+3`):
+/// silence is the transient verdict and surfaces UNAVAILABLE;
+/// permanent unprovability carries generated remediation back to the
+/// refusing caller — including post-read-through unseeded inputs,
+/// which at MERGE refuse synchronously (the submitter is present;
+/// the dispatch consumer of the same variant backs off instead,
+/// `claims-derived+5`).
+enum EvidenceVerdict {
+    /// The claim verified: the hash joined the approved set.
+    Approved,
+    /// The claim is permanently unprovable as submitted (carries the
+    /// generated remediation). Step 0.5 refuses with it; Step 0.6
+    /// leaves the merge gate's own refusal in place.
+    Unprovable(String),
+}
+
+fn settle_evidence_verdict(
+    build_id: Uuid,
+    node: &crate::domain::DerivationNode,
+    outcome: StoreEvidenceOutcome,
+    store_evidence: &mut std::collections::HashMap<
+        crate::state::DrvHash,
+        crate::dag::StoreEvidenceGrant,
+    >,
+) -> Result<EvidenceVerdict, ActorError> {
+    match outcome {
+        StoreEvidenceOutcome::Verified(def) => {
+            metrics::counter!(
+                "rio_scheduler_merge_store_evidence_total",
+                "result" => "displaced"
+            )
+            .increment(1);
+            // The grant carries the byte-derived facts: the DAG stamps
+            // them on the node it creates for this hash, so a
+            // store-evidence-created node never carries the
+            // submitter's echo (sched.dispatch.claims-derived+5).
+            store_evidence.insert(
+                node.drv_hash.as_str().into(),
+                crate::dag::StoreEvidenceGrant {
+                    needs_resolve: def.needs_resolve,
+                    stripped_declared_hash: None,
+                },
+            );
+            Ok(EvidenceVerdict::Approved)
+        }
+        StoreEvidenceOutcome::Contradicts(detail) => {
+            metrics::counter!(
+                "rio_scheduler_merge_store_evidence_total",
+                "result" => "mismatch"
+            )
+            .increment(1);
+            warn!(
+                build_id = %build_id,
+                drv_hash = %node.drv_hash,
+                drv_path = %node.drv_path,
+                detail = %detail,
+                "store derivation contradicts the submission's claimed identity"
+            );
+            Err(ActorError::StoreEvidenceContradicts {
+                drv_path: node.drv_path.clone(),
+            })
+        }
+        // r[impl sched.merge.store-evidence-displacement+3]
+        // TRANSIENT: silence must never harden into the conflict's
+        // permanent FAILED_PRECONDITION — surface UNAVAILABLE so the
+        // client retries when the store recovers (bug_055's inversion,
+        // merge form).
+        StoreEvidenceOutcome::StoreSilence(reason) => {
+            metrics::counter!(
+                "rio_scheduler_merge_store_evidence_total",
+                "result" => "unavailable"
+            )
+            .increment(1);
+            debug!(
+                build_id = %build_id,
+                drv_hash = %node.drv_hash,
+                reason = reason.as_str(),
+                "store silent while resolving a settled conflict"
+            );
+            Err(ActorError::SettledConflictEvidenceUnavailable {
+                drv_path: node.drv_path.clone(),
+                reason: reason.as_str(),
+            })
+        }
+        // PERMANENT unprovability: remediation generated from the
+        // typed reason (R6).
+        StoreEvidenceOutcome::StructurallyUnverifiable(reason) => {
+            metrics::counter!(
+                "rio_scheduler_merge_store_evidence_total",
+                "result" => "unavailable"
+            )
+            .increment(1);
+            Ok(EvidenceVerdict::Unprovable(reason.remediation()))
+        }
+        // r[impl sched.dispatch.claims-derived+5]
+        // POST-READ-THROUGH unseeded inputs: the chokepoint already
+        // consulted the persisted rows (check_store_evidence
+        // re-classifies with the row seed before this variant can
+        // reach a consumer), so at MERGE — where the submitter is
+        // synchronously present — refusal with the post-read-through
+        // remediation is honest self-service: the input identities
+        // are genuinely nowhere (not submitted, not resident, no
+        // seedable row), and the gateway always submits full
+        // closures, so this arm's production population is direct
+        // submitters of partial closures. Dispatch (no submitter
+        // present) routes the same variant to bounded backoff
+        // instead.
+        StoreEvidenceOutcome::UnseededInputs { missing, .. } => {
+            metrics::counter!(
+                "rio_scheduler_merge_store_evidence_total",
+                "result" => "unavailable"
+            )
+            .increment(1);
+            info!(
+                build_id = %build_id,
+                drv_hash = %node.drv_hash,
+                missing = missing.len(),
+                "settled-conflict claim unverifiable: unseeded inputs \
+                 after the persisted-row read-through"
+            );
+            Ok(EvidenceVerdict::Unprovable(unseeded_remediation(&missing)))
+        }
+        // r[impl sched.merge.store-evidence-displacement+3]
+        // STRIP CONSEQUENCE PARITY (merged_bug_020 + merged_bug_038's
+        // refusal half): the identity verified EXCEPT an unverifiable
+        // declared hash — the SAME verdict the dispatch consumer
+        // strips-and-proceeds on. The previous arm here refused with
+        // "resubmit WITHOUT the declared ca_modular_hash", remediation
+        // the production producer made unfollowable (the gateway
+        // stamps the hash on every submission it can compute one for —
+        // populate_ca_modular_hashes, rio-gateway/src/translate.rs —
+        // and the verdict is deterministic for CA-chain/deferred-IA
+        // nodes because InputFormSeed excludes floating inputs by
+        // construction): a settled squat on such a node was
+        // permanently undisplaceable through the advertised
+        // self-service path. Now: one verdict, one consequence —
+        // approve the displacement on the verified bytes, with the
+        // strip riding the grant (clear live, preserve M_070).
+        StoreEvidenceOutcome::VerifiedExceptDeclaredHash(def) => {
+            metrics::counter!(
+                "rio_scheduler_merge_store_evidence_total",
+                "result" => "stripped"
+            )
+            .increment(1);
+            info!(
+                build_id = %build_id,
+                drv_hash = %node.drv_hash,
+                "store evidence verified modulo the declared hash; \
+                 stripping (an unverifiable claim is no claim) and \
+                 approving the displacement — dispatch-strip parity"
+            );
+            store_evidence.insert(
+                node.drv_hash.as_str().into(),
+                crate::dag::StoreEvidenceGrant {
+                    needs_resolve: def.needs_resolve,
+                    stripped_declared_hash: def.stripped_declared_hash,
+                },
+            );
+            Ok(EvidenceVerdict::Approved)
+        }
+        StoreEvidenceOutcome::UnparseableVerified => {
+            metrics::counter!(
+                "rio_scheduler_merge_store_evidence_total",
+                "result" => "unavailable"
+            )
+            .increment(1);
+            Ok(EvidenceVerdict::Unprovable(
+                "the bytes at the declared path are content-bound (the \
+                 store provably holds them) but do not parse as a \
+                 derivation; the declared drv_path does not name a .drv — \
+                 fix the submission"
+                    .to_string(),
+            ))
+        }
+    }
+}
+
+/// Exit-class label for the unseeded-input row read-through
+/// (`rio_scheduler_claims_row_readthrough_total{result=...}`).
+///
+/// One arm per population (round-17 bug_064 — the HELP text is the
+/// contract; `partial` and `miss` are DIFFERENT failure populations
+/// for an operator chasing post-failover convergence):
+/// - `miss`: NO seedable rows at all (every missing input's row is
+///   absent, hash-less, or below the seed-rank floor).
+/// - `partial`: rows seeded SOME missing inputs, but the verdict is
+///   still unseeded post-read-through.
+/// - `seeded`: rows re-seeded the verification entirely.
+///
+/// The error arm (`result="error"`) is emitted at the PG-failure
+/// site directly — it has no seed/verdict cell to derive from.
+pub(super) fn readthrough_result(seed_empty: bool, fully_seeded: bool) -> &'static str {
+    match (seed_empty, fully_seeded) {
+        (true, _) => "miss",
+        (false, false) => "partial",
+        (false, true) => "seeded",
+    }
+}
+
 impl DagActor {
+    // r[impl sched.merge.store-evidence-displacement+3]
+    /// Verify a bare store-backed submission node against the store's
+    /// OWN copy of the `.drv` its declared `drv_path` names: fetch,
+    /// then classify through [`classify_store_evidence`].
+    pub(super) async fn check_store_evidence(
+        &self,
+        node: &crate::domain::DerivationNode,
+        submission_seed: &InputFormSeed,
+    ) -> StoreEvidenceOutcome {
+        let bytes = match self
+            .fetch_drv_content_from_store(node.drv_hash.as_str(), &node.drv_path)
+            .await
+        {
+            super::dispatch::DrvFetch::Bytes(bytes) => bytes,
+            super::dispatch::DrvFetch::Silence => {
+                return StoreEvidenceOutcome::StoreSilence(SilenceReason::Fetch);
+            }
+            // Content-bound denial (round-17 bug_030): the declared
+            // path's NAR exceeds the derivation-text class cap —
+            // deterministic, byte-free, and no retry can shrink it.
+            // Typed as structural permanence so dispatch poisons with
+            // the generated remediation instead of burning the
+            // claims-unavailable budget, and merge refuses with the
+            // same text instead of returning UNAVAILABLE forever.
+            super::dispatch::DrvFetch::Denied { got, limit } => {
+                return StoreEvidenceOutcome::StructurallyUnverifiable(
+                    StructuralReason::OversizedDrvNar { got, limit },
+                );
+            }
+        };
+        let resident = |path: &str| {
+            self.dag
+                .hash_for_path(path)
+                .and_then(|h| self.dag.node(h))
+                // Same input-form discipline as the submission seed
+                // (sched.merge.input-form-seed): a resident floating
+                // node's stored hash is the masked published form,
+                // never an input digest.
+                .filter(|s| s.is_fixed_output || !s.ca.is_ca)
+                .and_then(|s| s.ca.modular_hash)
+        };
+        // Child output-path knowledge for the byte-derived resolve
+        // flag, answered by the rio-nix OWNER helper (round-17
+        // merged_bug_062): a resident child answers from its claimed
+        // paths AND its kind — the omitted-[] ingress shape no longer
+        // reads as "paths known" for floating/deferred children — and
+        // a NON-RESIDENT child answers Some(true), unknown,
+        // fail-closed: the cost of a spurious true is one
+        // maybe_resolve_ca walk at dispatch that finds concrete paths
+        // and rewrites nothing (consequence-free), while the old
+        // None→unwrap_or(false) degrade persisted needs_resolve=false
+        // for floating-CA parents that then shipped literal
+        // placeholders and failed deterministically.
+        let child_unknown = |path: &str| {
+            Some(
+                self.dag
+                    .hash_for_path(path)
+                    .and_then(|h| self.dag.node(h))
+                    .map(|s| {
+                        rio_nix::derivation::output_paths_unknown_from_claims(
+                            &s.expected_output_paths,
+                            s.is_fixed_output,
+                            s.ca.is_ca,
+                            s.ca.needs_resolve,
+                        )
+                    })
+                    .unwrap_or(true),
+            )
+        };
+        match classify_store_evidence(node, bytes, submission_seed, &resident, &child_unknown) {
+            // r[impl sched.dispatch.claims-derived+5]
+            // Persisted-row read-through (bug_029): residency is
+            // scheduler-mutated state — reap and failover both erase a
+            // completed input's node without touching content — but
+            // the input's ROW retains the recorded modular hash. One
+            // batched PG roundtrip re-seeds the classification before
+            // any consumer may conclude permanence; performed at THIS
+            // chokepoint so merge and dispatch get it uniformly (R2).
+            // The fetched bytes ride the variant: re-classify reuses
+            // them, never a second budgeted store fetch.
+            StoreEvidenceOutcome::UnseededInputs { missing, bytes } => {
+                let rows = match self.db.load_input_form_rows(&missing).await {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        // The read-through did NOT run: emitting
+                        // UnseededInputs here would let merge refuse
+                        // permanently while claiming the rows were
+                        // consulted. PG unavailability is transient —
+                        // route it like every other silence.
+                        warn!(
+                            drv_hash = %node.drv_hash,
+                            error = %e,
+                            "unseeded-input row read-through failed; \
+                             deferring as transient"
+                        );
+                        metrics::counter!(
+                            "rio_scheduler_claims_row_readthrough_total",
+                            "result" => "error"
+                        )
+                        .increment(1);
+                        return StoreEvidenceOutcome::StoreSilence(SilenceReason::RowReadThrough);
+                    }
+                };
+                let row_seed = InputFormSeed::from_persisted_rows(&rows);
+                if row_seed.is_empty() {
+                    // No seedable rows: the verdict stands,
+                    // post-read-through.
+                    metrics::counter!(
+                        "rio_scheduler_claims_row_readthrough_total",
+                        "result" => readthrough_result(true, false)
+                    )
+                    .increment(1);
+                    return StoreEvidenceOutcome::UnseededInputs {
+                        missing,
+                        bytes: Vec::new(),
+                    };
+                }
+                let resident_or_row = |path: &str| resident(path).or_else(|| row_seed.get(path));
+                match classify_store_evidence(
+                    node,
+                    bytes,
+                    submission_seed,
+                    &resident_or_row,
+                    &child_unknown,
+                ) {
+                    StoreEvidenceOutcome::UnseededInputs { missing, .. } => {
+                        // Rows seeded SOME inputs but not all — still
+                        // post-read-through unseeded; drop the bytes
+                        // (no consumer re-classifies past here).
+                        // result="partial", not "miss": operators
+                        // watching post-failover convergence need to
+                        // distinguish "no persisted rows at all" from
+                        // "partial recovery" (round-17 bug_064 — the
+                        // arms are different failure populations).
+                        metrics::counter!(
+                            "rio_scheduler_claims_row_readthrough_total",
+                            "result" => readthrough_result(false, false)
+                        )
+                        .increment(1);
+                        StoreEvidenceOutcome::UnseededInputs {
+                            missing,
+                            bytes: Vec::new(),
+                        }
+                    }
+                    reseeded => {
+                        metrics::counter!(
+                            "rio_scheduler_claims_row_readthrough_total",
+                            "result" => readthrough_result(false, true)
+                        )
+                        .increment(1);
+                        info!(
+                            drv_hash = %node.drv_hash,
+                            rows = rows.len(),
+                            "unseeded inputs re-seeded from persisted rows \
+                             (read-through hit)"
+                        );
+                        reseeded
+                    }
+                }
+            }
+            other => other,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // MergeDag
     // -----------------------------------------------------------------------
@@ -123,7 +1040,7 @@ impl DagActor {
         // (total, completed, cached) to PG so list_builds is O(LIMIT).
         self.update_build_counts(build_id).await;
 
-        // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.merge.substitute-topdown+15]
         // Post-reconciliation `topdown_pruned` clear pass. A node may
         // only lose the mark once its children (in the post-merge DAG)
         // are all already produced — its closure is then in the store,
@@ -154,19 +1071,29 @@ impl DagActor {
         // drops it (with the lazy clear in `handle_substitute_complete`
         // as the walk-failure backstop).
         //
-        // Closure-hole healing comes FIRST: a full merge that
-        // re-declares a node's edges re-supplies its inputDrvs, so its
-        // child set is representative of its closure again — drop the
-        // `closure_hole` breadcrumb for every edge parent of this
-        // submission before judging the clear. A pruned merge has
-        // no edges (`edge_parent_hashes` is empty), so it never heals a
-        // hole. Candidates that are NOT edge parents of this submission
-        // (e.g. pre-existing DAG parents of a cache hit) keep their
-        // breadcrumb and are skipped below: the classifier judges their
-        // reap-truncated child set Broken, never Vouched.
+        // r[impl sched.merge.heal-accepted-edges+1]
+        // Closure-hole healing comes FIRST: drop the `closure_hole`
+        // breadcrumb for every HEALED parent before judging the clear.
+        // `merge_result.healed_parents` = accepted trigger ∧ positive
+        // re-supply coverage (every recorded missing child among the
+        // post-insert children) — see its defining field doc on
+        // `MergeResult`; acceptance alone does NOT imply re-supply (a
+        // subset re-declaration of the surviving children satisfies
+        // the trigger without covering the truncation). This is
+        // deliberately NOT the raw request edge list: a parent with
+        // even one gate-skipped or unresolvable
+        // declared edge keeps its breadcrumb, so reap-truncation
+        // evidence can never be laundered into Vouched closure evidence
+        // by a join the gate refused (the Broken→Vouched flip that
+        // re-arms the doomed from-source dispatch is unconstructible).
+        // A pruned merge has no edges (`healed_parents` is empty), so it
+        // never heals a hole. Candidates that are NOT healed parents of
+        // this submission (e.g. pre-existing DAG parents of a cache hit)
+        // keep their breadcrumb and are skipped below: the classifier
+        // judges their reap-truncated child set Broken, never Vouched.
         //
         // The persisted breadcrumb (`migrations/064`) is cleared here
-        // too, best-effort, for EVERY edge parent of this submission:
+        // too, best-effort, for every healed parent:
         // the upsert above never clears the column (OR-on-conflict,
         // merge binds false), and the heal must also fire when the
         // `topdown_pruned` mark stays (unbuilt children), so it cannot
@@ -180,15 +1107,32 @@ impl DagActor {
         // earlier heal's best-effort write may simply have failed. The
         // helper's `AND closure_hole` WHERE keeps the statement a
         // no-op for rows that never carried the hole.
-        for hash in &ingest.edge_parent_hashes {
+        for (hash, witness) in &ingest.merge_result.healed_parents {
             if let Some(s) = self.dag.node_mut(hash) {
-                s.closure_hole = false;
+                // The witness proves the merge's positive-coverage
+                // check ran for THIS parent (missing ⊆ post-insert
+                // children) — sched.evidence.positive-witness.
+                s.closure_hole.clear_for_heal(witness);
             }
         }
+        if !ingest.merge_result.heal_refused_parents.is_empty() {
+            // Accepted trigger but the re-declared set does not cover
+            // the witness set: the hole survives, fail-fast routing
+            // intact. Expected for subset re-declarations after a reap;
+            // hostile junk top-ups land here too.
+            metrics::counter!("rio_scheduler_closure_heal_refused_total")
+                .increment(ingest.merge_result.heal_refused_parents.len() as u64);
+            tracing::debug!(
+                build_id = %build_id,
+                refused = ingest.merge_result.heal_refused_parents.len(),
+                "closure-hole heal refused: re-supply does not cover the witness set"
+            );
+        }
         let heal_parents: Vec<String> = ingest
-            .edge_parent_hashes
+            .merge_result
+            .healed_parents
             .iter()
-            .map(|h| h.to_string())
+            .map(|(h, _)| h.to_string())
             .collect();
         if !heal_parents.is_empty()
             && let Err(e) = self.db.clear_closure_hole_by_hashes(&heal_parents).await
@@ -196,8 +1140,17 @@ impl DagActor {
             warn!(build_id = %build_id, count = heal_parents.len(), error = %e,
                   "failed to clear persisted closure_hole after merge heal (continuing)");
         }
-        let mut clear_candidates: HashSet<DrvHash> =
-            ingest.edge_parent_hashes.iter().cloned().collect();
+        // Seeded from the accepted TRIGGER set (not the coverage-gated
+        // heal set): the topdown clear is independently gated on
+        // closure_vouched below, and a holed parent is never Vouched —
+        // so the wider seed keeps today's reach without re-opening the
+        // laundering channel.
+        let mut clear_candidates: HashSet<DrvHash> = ingest
+            .merge_result
+            .accepted_edge_parents
+            .iter()
+            .cloned()
+            .collect();
         for child in ingest.cached_hits.keys() {
             clear_candidates.extend(self.dag.get_parents(child));
         }
@@ -223,7 +1176,7 @@ impl DagActor {
             }
         }
 
-        // r[impl sched.merge.dedup]
+        // r[impl sched.merge.dedup+2]
         // Re-probe completed a node that other builds were waiting on:
         // fan out the count-update + completion-check to them. Mirrors
         // complete_ready_from_store / release_downstream.
@@ -334,12 +1287,25 @@ impl DagActor {
             traceparent,
             jti,
             jwt_token,
+            ingress_stripped,
         } = req;
         // Arch#13: proto→domain at the actor boundary. `MergeDagRequest`
         // keeps proto-typed `nodes`/`edges` so `actor/tests/` and
         // `rio-test-support` (b03 territory) can keep constructing it
         // unchanged; everything downstream of this line is wire-agnostic.
-        let nodes = crate::domain::nodes_from_proto(nodes);
+        let mut nodes = crate::domain::nodes_from_proto(nodes);
+        // M_070: re-attach the ingress strip's preserved claims at the
+        // boundary (the wire field was cleared in place — an
+        // unverifiable claim must never travel as a live hash; the
+        // preserved value rides the domain node into the creation
+        // snapshot and the DAG state).
+        if !ingress_stripped.is_empty() {
+            for n in &mut nodes {
+                if let Some(h) = ingress_stripped.get(n.drv_hash.as_str()) {
+                    n.ca_modular_hash_stripped = Some(*h);
+                }
+            }
+        }
         let edges = crate::domain::edges_from_proto(edges);
         let mut t_phase = Instant::now();
         macro_rules! phase {
@@ -353,7 +1319,7 @@ impl DagActor {
         }
 
         // === Step 0: Top-down demand-set substitution check =========
-        // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.merge.substitute-topdown+15]
         // Before merging the full DAG, check if the DEMANDED
         // derivations' outputs are already available. The demand set is
         // the structural roots ∪ every node the gateway marked
@@ -413,16 +1379,271 @@ impl DagActor {
                     .iter()
                     .map(|n| (n.drv_path.as_str(), n.drv_hash.as_str()))
                     .collect();
-                let parents: HashSet<String> = edges
-                    .iter()
-                    .filter_map(|e| path_to_hash.get(e.parent_drv_path.as_str()))
-                    .map(|h| (*h).to_string())
-                    .collect();
+                // Parent → the children whose edges this prune DROPS:
+                // the born-holed witness set (round-15 C6c3). The
+                // original edge list is only in scope here, so this is
+                // the one place the witness can be recorded — a pruned
+                // root is born holed and stays Broken until a full
+                // top-up positively covers exactly this set
+                // (sched.merge.heal-accepted-edges+1). Children whose
+                // path does not resolve in the submission never were
+                // attachable; skipping them cannot under-record the
+                // closure the prune dropped.
+                let mut parents: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                for e in &edges {
+                    let (Some(p), Some(c)) = (
+                        path_to_hash.get(e.parent_drv_path.as_str()),
+                        path_to_hash.get(e.child_drv_path.as_str()),
+                    ) else {
+                        continue;
+                    };
+                    parents
+                        .entry((*p).to_string())
+                        .or_default()
+                        .push((*c).to_string());
+                }
                 (demanded, Vec::new(), true, parents)
             }
-            None => (nodes, edges, false, HashSet::new()),
+            None => (nodes, edges, false, BTreeMap::new()),
         };
         phase!("0-topdown-roots");
+
+        // === Step 0.5: Settled-row identity freeze ===================
+        // r[impl sched.persist.settled-identity-freeze+4]
+        // A derivation row whose status is completed/skipped is the
+        // durable record of a successful build. Once its DAG node is
+        // reaped (terminal cleanup) the merge gate
+        // (sched.merge.authoritative-conflict) can no longer protect it
+        // — a fresh submission for the same hash looks like a brand-new
+        // creation and would flow straight into the creation-scoped
+        // upsert, rewriting settled history. This check loads the
+        // settled rows for every submitted hash that is NOT resident in
+        // the DAG and rejects conflicting (or evidence-less) identity
+        // re-creations BEFORE any state is written: no build row, no
+        // DAG mutation, nothing to roll back. Resident nodes are the
+        // merge gate's job; the in-flight window between this check and
+        // the upsert is covered by the upsert's own settled-row WHERE
+        // guard (defense in depth).
+        //
+        // r[impl sched.merge.store-evidence-displacement+3]
+        // The rejection is no longer unconditional: a conflicting
+        // re-creation of a row whose lineage is CONTENT-BOUND (the
+        // row-level mirror of the displacement primitive's verdicts)
+        // may prove its claim — by ingress-byte-bound rank alone, or
+        // by the budgeted store-evidence check that fetches the `.drv`
+        // the declared path names and verifies the claim against the
+        // store's own text-CA-bound bytes. Approved hashes bypass the
+        // upsert's settled WHERE guard ($-array) and get their stale
+        // parent-side edges scrubbed in the same transaction.
+        let mut store_evidence: std::collections::HashMap<
+            crate::state::DrvHash,
+            crate::dag::StoreEvidenceGrant,
+        > = std::collections::HashMap::new();
+        let mut settled_evidence_displaced: Vec<String> = Vec::new();
+        let mut evidence_budget: u32 = MERGE_STORE_EVIDENCE_BUDGET;
+        // Input-form seeds only — the not-floating predicate lives in
+        // the InputFormSeed constructors (sched.merge.input-form-seed);
+        // floating inputs that matter resolve to Unverifiable in
+        // check_store_evidence.
+        let submission_seed = InputFormSeed::from_submission_nodes(&nodes);
+        let non_resident: Vec<String> = nodes
+            .iter()
+            .filter(|n| self.dag.node(&n.drv_hash).is_none())
+            .map(|n| n.drv_hash.clone())
+            .collect();
+        if !non_resident.is_empty() {
+            let settled = self.db.load_settled_identity_rows(&non_resident).await?;
+            if !settled.is_empty() {
+                let by_hash: HashMap<&str, &crate::domain::DerivationNode> =
+                    nodes.iter().map(|n| (n.drv_hash.as_str(), n)).collect();
+                for row in &settled {
+                    let Some(node) = by_hash.get(row.drv_hash.as_str()) else {
+                        continue;
+                    };
+                    if let Some(basis) = settled_row_identity_matches(row, node) {
+                        // Identity proven — the re-creation JOINS the
+                        // settled history. Rejoins on the M_070 bases
+                        // are the would-have-bricked population
+                        // (pre-fix: deterministic FAILED_PRECONDITION
+                        // on every stripped floating-CA rebuild) —
+                        // counted as the deploy's success signal.
+                        if basis.is_stripped_rejoin() {
+                            metrics::counter!(
+                                "rio_scheduler_merge_stripped_rejoin_total",
+                                "basis" => basis.as_str()
+                            )
+                            .increment(1);
+                            info!(
+                                build_id = %build_id,
+                                drv_hash = %row.drv_hash,
+                                basis = basis.as_str(),
+                                witness = basis.positive_witness(),
+                                "settled row rejoined via an M_070 byte-bound basis \
+                                 (would have refused before M_070)"
+                            );
+                        }
+                        continue;
+                    }
+                    // Conflict. The row-level mirror of displace() is
+                    // decided by the exhaustive 4x4 arbitration — every
+                    // (row rank, incoming rank) cell is an explicit
+                    // decision, and a refusal carries remediation
+                    // GENERATED from its arm, so the error can never
+                    // promise a path the verdict does not support.
+                    let incoming_rank = crate::state::DefinitionEvidence::from_node_shape(node);
+                    let incoming_is_bare =
+                        node.drv_content.is_empty() && !node.drv_content_authoritative;
+                    // The victim-side rank decode happens INSIDE the
+                    // arbitration (fail-closed; round-16 bug_073) —
+                    // this call site never sees a floored rank.
+                    match arbitrate_settled_row(&row.evidence_rank, incoming_rank, incoming_is_bare)
+                    {
+                        SettledArbitration::DisplaceByRank => {
+                            // Ingress-byte-bound submission: its bytes
+                            // were text-CA-bound to the declared path at
+                            // SubmitBuild admission — strictly higher
+                            // evidence, no store fetch needed.
+                            metrics::counter!(
+                                "rio_scheduler_merge_store_evidence_total",
+                                "result" => "displaced"
+                            )
+                            .increment(1);
+                            settled_evidence_displaced.push(row.drv_hash.clone());
+                            continue;
+                        }
+                        SettledArbitration::NeedsStoreEvidence => {
+                            // Bare store-backed echo: fetch the proof.
+                            if evidence_budget == 0 {
+                                metrics::counter!(
+                                    "rio_scheduler_merge_store_evidence_total",
+                                    "result" => "over_budget"
+                                )
+                                .increment(1);
+                                // RESOURCE_EXHAUSTED, not a silent
+                                // refusal: budget exhaustion is a load
+                                // condition, and hardening it into the
+                                // conflict's permanent
+                                // FAILED_PRECONDITION is the bug_055
+                                // inversion. Nothing has been persisted
+                                // (Steps 0.5/0.6 run before Step 1), so
+                                // the merge stays atomic
+                                // (sched.persist.atomic-activation) —
+                                // earlier approved displacements in this
+                                // submission are discarded with it.
+                                return Err(ActorError::SettledConflictEvidenceBudget {
+                                    drv_path: node.drv_path.clone(),
+                                });
+                            }
+                            evidence_budget -= 1;
+                            let outcome = self.check_store_evidence(node, &submission_seed).await;
+                            match settle_evidence_verdict(
+                                build_id,
+                                node,
+                                outcome,
+                                &mut store_evidence,
+                            )? {
+                                EvidenceVerdict::Approved => {
+                                    settled_evidence_displaced.push(row.drv_hash.clone());
+                                    continue;
+                                }
+                                EvidenceVerdict::Unprovable(remediation) => {
+                                    warn!(
+                                        build_id = %build_id,
+                                        drv_hash = %row.drv_hash,
+                                        drv_path = %row.drv_path,
+                                        "rejecting re-creation of a settled derivation row: \
+                                         claim unprovable as submitted"
+                                    );
+                                    return Err(ActorError::SettledIdentityConflict {
+                                        drv_path: node.drv_path.clone(),
+                                        remediation,
+                                    });
+                                }
+                            }
+                        }
+                        SettledArbitration::Refuse(remediation) => {
+                            warn!(
+                                build_id = %build_id,
+                                drv_hash = %row.drv_hash,
+                                drv_path = %row.drv_path,
+                                "rejecting re-creation of a settled derivation row \
+                                 with conflicting identity"
+                            );
+                            return Err(ActorError::SettledIdentityConflict {
+                                drv_path: node.drv_path.clone(),
+                                remediation,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        phase!("0.5-settled-identity-freeze");
+
+        // === Step 0.6: Resident settled-squat store evidence ==========
+        // r[impl sched.merge.store-evidence-displacement+3]
+        // The DAG-resident form of the same remediation: a bare
+        // store-backed echo whose identity conflicts with a SETTLED
+        // resident node — authoritative (would be rejected by the
+        // merge gate, RefusedSettledOutranked) or BARE (would
+        // previously have silently JOINED through the gate's
+        // store-backed exemption and been served the squat's outputs
+        // as a cache hit, bug_072) — gets the budgeted store check.
+        // When the store can prove the claim, raise the submission's
+        // standing so displace() — which still owns the decision —
+        // sees PathBoundBytes against the squat's ContentBoundClaim /
+        // UnverifiedClaim. Rank-uniform with the row gate above
+        // (store-evidence-displacement+3): no settled victim form
+        // below the byte-anchored ranks is exempt; victims already at
+        // path_bound_bytes / verified_built are unreachable here and
+        // refuse through the gate.
+        for node in &nodes {
+            if node.drv_content_authoritative || !node.drv_content.is_empty() {
+                continue;
+            }
+            // (Step 0.6 — resident settled-squat scan; see header above.)
+            let Some(existing) = self.dag.node(&node.drv_hash) else {
+                continue;
+            };
+            if !matches!(
+                existing.status(),
+                crate::state::DerivationStatus::Completed | crate::state::DerivationStatus::Skipped
+            ) || existing.evidence >= crate::state::DefinitionEvidence::PathBoundBytes
+                || crate::dag::verifiable_identity_matches(existing, node)
+            {
+                continue;
+            }
+            if evidence_budget == 0 {
+                metrics::counter!(
+                    "rio_scheduler_merge_store_evidence_total",
+                    "result" => "over_budget"
+                )
+                .increment(1);
+                // Same consequence as Step 0.5: this scan only reaches
+                // nodes whose alternative is the merge gate's permanent
+                // FAILED_PRECONDITION, so letting exhaustion fall
+                // through would harden a load condition into a
+                // permanent rejection (bug_055's inversion). Atomic:
+                // nothing is persisted before Step 1.
+                return Err(ActorError::SettledConflictEvidenceBudget {
+                    drv_path: node.drv_path.clone(),
+                });
+            }
+            evidence_budget -= 1;
+            let outcome = self.check_store_evidence(node, &submission_seed).await;
+            match settle_evidence_verdict(build_id, node, outcome, &mut store_evidence)? {
+                EvidenceVerdict::Approved => {}
+                EvidenceVerdict::Unprovable(_) => {
+                    // The merge gate's own refusal stands for resident
+                    // squats — it carries the conflict's
+                    // FAILED_PRECONDITION and its message already names
+                    // the store-backed resubmission path; the generated
+                    // remediation here would describe a fetch the gate
+                    // never demanded.
+                }
+            }
+        }
+        phase!("0.6-store-evidence");
 
         // === Step 1: DB build row ==================================
         // If this fails, nothing is in memory; caller gets a clean error.
@@ -443,7 +1664,19 @@ impl DagActor {
         // DB build row exists, which we best-effort delete. This ordering
         // prevents the leak where a cyclic submission left permanent entries
         // in build_events/build_sequences/builds with no cleanup scheduled.
-        let merge_result = match self.dag.merge(build_id, &nodes, &edges, &traceparent) {
+        let edges_len = edges.len();
+        // Production entry into the merge gate: hashes in the
+        // store-evidence set were verified by Step 0.5/0.6 against the
+        // store's own text-CA `.drv` bytes
+        // (sched.merge.store-evidence-displacement+3); the gate's
+        // displacement primitive still owns every decision.
+        let merge_result = match self.dag.merge_with_evidence(
+            build_id,
+            &nodes,
+            &edges,
+            &traceparent,
+            &store_evidence,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 // Best-effort: clean up the orphan build row.
@@ -454,6 +1687,48 @@ impl DagActor {
                 return Err(ActorError::Dag(e));
             }
         };
+        // r[impl sched.merge.heal-accepted-edges+1]
+        // The raw request edge list is dead from here on: every consumer
+        // of "what this submission's edges did" must read `merge_result`
+        // (computed by the same loop that enforces edge admission), so an
+        // edge the gate skipped can never influence post-merge state.
+        // Deriving anything from the declared list after this point is a
+        // compile error by construction.
+        drop(edges);
+        // r[impl sched.merge.edge-creation-scoped]
+        // Surface creation-scope edge skips, split by signature.
+        // Hostile/bug shape: parent is a resident node with no
+        // closure_hole — a submission tried to extend the dependency set
+        // of a node it did not (re)create. Legitimate full-closure joins
+        // only re-declare existing edges (silent no-ops), so a sustained
+        // nonzero rate is either a hostile direct submitter or a gateway
+        // DAG-construction bug.
+        if !merge_result.foreign_parent_edges_skipped.is_empty() {
+            let count = merge_result.foreign_parent_edges_skipped.len() as u64;
+            metrics::counter!("rio_scheduler_merge_foreign_edge_skipped_total").increment(count);
+            warn!(
+                build_id = %build_id,
+                count,
+                "skipped foreign-parent dependency edges at merge \
+                 (parents are resident nodes this submission did not (re)create)"
+            );
+        }
+        // Rejoin shape: parent is a resident node CARRYING the
+        // closure_hole breadcrumb — the expected signature of a
+        // full-closure rejoin after a reap truncated the parent's
+        // children. Not hostile; counted separately (debug-level) and
+        // the parent's hole deliberately stays set until a submission
+        // re-creates the node (sched.merge.heal-accepted-edges+1).
+        if !merge_result.rejoin_parent_edges_skipped.is_empty() {
+            let count = merge_result.rejoin_parent_edges_skipped.len() as u64;
+            metrics::counter!("rio_scheduler_merge_rejoin_edge_skipped_total").increment(count);
+            debug!(
+                build_id = %build_id,
+                count,
+                "skipped rejoin dependency edges at merge \
+                 (closure-holed parents not (re)created by this submission keep their hole)"
+            );
+        }
         let newly_inserted = &merge_result.newly_inserted;
         phase!("2-dag-merge-inmem");
 
@@ -537,18 +1812,21 @@ impl DagActor {
         phase!("4-check-cached-outputs");
 
         // === Step 5: PG persist + → Active ============================
-        // All remaining error-returning PG writes. On any error, roll
-        // back the merge AND the map inserts AND delete the DB build row
-        // so in-memory and DB state stay consistent. After this returns
-        // Ok the build is committed (Active); later DB writes are
+        // The single error-returning PG write: one transaction carrying
+        // the (re)created derivation rows, build links, edges, and the
+        // build's Pending→Active update (sched.persist.atomic-activation).
+        // On any error, roll back the merge AND the map inserts AND
+        // delete the DB build row so in-memory and DB state stay
+        // consistent — nothing of the merge was committed. After this
+        // returns Ok the build is committed (Active); later DB writes are
         // log-and-continue.
         if let Err(e) = self
             .persist_and_activate(
                 build_id,
                 &nodes,
-                &edges,
                 &merge_result,
                 &pruned_closure_parents,
+                &settled_evidence_displaced,
             )
             .await
         {
@@ -558,7 +1836,7 @@ impl DagActor {
         phase!("5-persist-and-activate");
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
-        // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.merge.substitute-topdown+15]
         // Stamp topdown_pruned on the kept (demanded) nodes only now
         // that the merge is committed (steps 4–5 can no longer fail).
         // The stamp is a cross-build-visible mutation of possibly
@@ -593,35 +1871,28 @@ impl DagActor {
         // trade. Mirrors the row-level bind in persist_merge_to_db.
         if topdown_fired {
             for n in &nodes {
-                if pruned_closure_parents.contains(n.drv_hash.as_str())
+                if let Some(dropped) = pruned_closure_parents.get(n.drv_hash.as_str())
                     && !self.closure_vouched(&n.drv_hash)
                     && let Some(s) = self.dag.node_mut(&n.drv_hash)
                 {
                     s.topdown_pruned = true;
+                    // Born holed (round-15 C6c3): the prune dropped
+                    // this node's declared closure, so its child set
+                    // under-represents it FROM BIRTH. Recording the
+                    // dropped children closes the childless
+                    // junk-Vouched channel — one junk child completing
+                    // can no longer flip closure evidence to Vouched,
+                    // because the witness set demands the real closure
+                    // back (the vouch-gated mark clear structurally
+                    // cannot fire while holed).
+                    s.closure_hole
+                        .stamp(dropped.iter().cloned().map(Into::into));
                 }
             }
         }
-        // Parents of this submission's (post-prune) edges, deduped and
-        // resolved while `edges` is still alive — only `edges_len`
-        // otherwise survives into MergeIngest. These are the candidate
-        // set for the caller's post-reconciliation `topdown_pruned`
-        // clear pass. The clear DECISION is deliberately NOT taken
-        // here: `verify_preexisting_completed` (reconcile phase 6c) has
-        // not run yet, so a stale pre-existing Completed child that 6c
-        // is about to demote would launder a clear computed against the
-        // pre-verification view. A pruned merge has no edges, so this
-        // is empty there.
-        let edge_parent_hashes: Vec<DrvHash> = edges
-            .iter()
-            .filter_map(|e| self.dag.hash_for_path(&e.parent_drv_path).cloned())
-            .collect::<HashSet<DrvHash>>()
-            .into_iter()
-            .collect();
-
         Ok(MergeIngest {
             build_id,
-            edges_len: edges.len(),
-            edge_parent_hashes,
+            edges_len,
             nodes,
             merge_result,
             event_rx,
@@ -659,20 +1930,25 @@ impl DagActor {
     /// succeeds. (The topdown fail-fast still clears the marker it
     /// consumes, as defense-in-depth for stale-flag shapes that do not
     /// involve this path at all.)
+    ///
+    /// Best-effort accounting resets (poison clears, displaced-row resets)
+    /// run strictly AFTER that commit, so a rejected submission can never
+    /// clear accounting for a re-creation that was rolled back
+    /// (sched.persist.atomic-activation).
     async fn persist_and_activate(
         &mut self,
         build_id: Uuid,
         nodes: &[crate::domain::DerivationNode],
-        edges: &[crate::domain::DerivationEdge],
         merge_result: &crate::dag::MergeResult,
-        topdown_pruned_parents: &HashSet<String>,
+        topdown_pruned_parents: &BTreeMap<String, Vec<String>>,
+        settled_evidence_displaced: &[String],
     ) -> Result<(), ActorError> {
         self.persist_merge_to_db(
             build_id,
             nodes,
-            edges,
-            &merge_result.newly_inserted,
+            merge_result,
             topdown_pruned_parents,
+            settled_evidence_displaced,
         )
         .await
         .inspect_err(
@@ -682,25 +1958,69 @@ impl DagActor {
         // I-169: PG-side poison clear for nodes that were reset by the
         // resubmit-retry path (Poisoned/Cancelled/Failed/DependencyFailed
         // → fresh state in `dag.merge`). `batch_upsert_derivations`' ON
-        // CONFLICT does NOT touch poisoned_at/failed_builders/retry_count,
-        // so without this PG keeps stale poison fields. The status itself
+        // CONFLICT does NOT touch poisoned_at/failed_builders/retry_count
+        // for same-definition re-creations, so without this PG keeps
+        // stale poison fields. The status itself
         // is overwritten by `update_derivation_status_batch` below
         // (→ ready/queued), so recovery's `WHERE status='poisoned'` won't
         // resurrect it; this is about keeping failed_builders/poisoned_at
         // consistent for the NEXT poison cycle. resubmit_cycles is
         // INCREMENTED in PG here so the bound survives leader failover.
-        // Best-effort.
+        // Best-effort, and strictly post-commit
+        // (sched.persist.atomic-activation): a merge that failed above
+        // never reaches these.
+        //
+        // Authority takeovers (an authoritative claim replaced by a
+        // store-backed re-creation through the resubmit-reset) are
+        // EXCLUDED: the recreate-refresh's definition-change reset
+        // already zeroed their accumulators inside the merge transaction
+        // (sched.merge.displaced-failure-reset), and their in-memory
+        // budget starts fresh — running the cycle-incrementing batch on
+        // them would diverge PG from memory.
         // r[impl sched.db.clear-poison-batch]
-        if let Err(e) = self
-            .db
-            .clear_poison_batch(&merge_result.reset_on_resubmit)
-            .await
-        {
+        let same_definition_resets: Vec<DrvHash> = merge_result
+            .reset_on_resubmit
+            .iter()
+            .filter(|h| {
+                !merge_result
+                    .authority_takeovers
+                    .iter()
+                    .any(|t| t.as_str() == h.as_str())
+            })
+            .cloned()
+            .collect();
+        if let Err(e) = self.db.clear_poison_batch(&same_definition_resets).await {
             warn!(
-                count = merge_result.reset_on_resubmit.len(),
+                count = same_definition_resets.len(),
                 error = %e,
                 "failed to clear poison in PG for resubmit-reset nodes"
             );
+        }
+
+        // r[impl sched.merge.displaced-failure-reset+2]
+        // Displaced authoritative squats (sched.merge.authoritative-conflict)
+        // get the FULL failure-history reset (zeroed `resubmit_cycles`
+        // AND reactive resource floors), not `clear_poison_batch`: the
+        // fresh node is the verifiable definition taking over the hash,
+        // not a retry of the squat, so it must not inherit the squat's
+        // failure history, consume its poison-resubmit budget, or be
+        // dispatched at the ceiling sizes the squat's deliberate failures
+        // ratcheted the floors up to (the same-definition resets above
+        // stay floor-preserving by design). PRIMARY enforcement is the
+        // definition-change reset inside the recreate-refresh upsert,
+        // which committed with the merge transaction; this per-hash
+        // post-commit loop is redundant belt-and-suspenders kept for the
+        // rare case where the row's persisted content did not reflect the
+        // displaced in-memory definition. Best-effort like the batch
+        // above.
+        for drv_hash in &merge_result.displaced {
+            if let Err(e) = self.db.reset_displaced_derivation(drv_hash).await {
+                warn!(
+                    drv_hash = %drv_hash,
+                    error = %e,
+                    "failed to reset failure accounting for displaced node"
+                );
+            }
         }
 
         // The PG half of Pending→Active already committed inside the
@@ -749,6 +2069,58 @@ impl DagActor {
         // live in MergeIngest (self-referential). Cheap: one iter pass.
         let node_index: HashMap<&str, &crate::domain::DerivationNode> =
             nodes.iter().map(|n| (n.drv_hash.as_str(), n)).collect();
+
+        // Displacement accounting (sched.merge.authoritative-conflict):
+        // a displaced node is a different derivation definition — a
+        // conflicting-identity squat, a poison-locked claim evicted by an
+        // identity-matching store-backed submission, or a terminal-failure
+        // claim replaced by byte-different authoritative content — and the
+        // spec forbids carrying the squat's interest onto the fresh node
+        // — but every removal path must either carry or prune interest,
+        // otherwise a prior-interested build keeps counting a hash that
+        // no longer exists for it and can hang Active forever. Prune the
+        // displaced hash from those builds' accounting and re-check their
+        // completion via the same `other_builds` fan-out used for
+        // shared-node re-probes. The pruned slot's absolute accounting
+        // follows the prior result: if the displaced node had already
+        // delivered (Completed/Skipped), the build keeps the credit —
+        // `recovered_completed` absorbs it because the fresh node carries
+        // no prior interest, so `build_summary` no longer counts it — and
+        // the total stays; otherwise the build no longer waits on the
+        // slot at all, so `total_count` shrinks with it (the durable
+        // `builds.total_drvs` decrement rides the persist transaction via
+        // delete_displaced_build_links). Scope: still-running prior
+        // builds only — a build already terminal at displacement time has
+        // settled accounting that must not be rewritten (its persisted
+        // counts are frozen by update_build_counts_with's terminal guard,
+        // and it keeps its build_derivations link as history). The
+        // durable half of this prune — deleting the same builds'
+        // build_derivations links — already committed inside
+        // persist_merge_to_db's transaction; accepted residual: if the
+        // leader dies after that commit but before this in-memory fan-out
+        // runs, a prior single-derivation build can be recovered as
+        // Active with zero remaining links and only completes via its
+        // per-build timeout.
+        // both sides are driven by displaced_prior_interest so they
+        // cannot diverge. Runs after the point of no return (the build
+        // is already committed), so a later rollback can no longer occur.
+        // r[impl sched.merge.authoritative-conflict+6]
+        let mut displaced_prune_builds: HashSet<Uuid> = HashSet::new();
+        for hash in &merge_result.displaced {
+            let interest = self.displaced_prior_interest(merge_result, hash, ingest.build_id);
+            for prior_build in interest.prior_builds {
+                if let Some(b) = self.builds.get_mut(&prior_build)
+                    && b.derivation_hashes.remove(hash)
+                {
+                    if interest.prior_completed {
+                        b.recovered_completed += 1;
+                    } else {
+                        b.total_count = b.total_count.saturating_sub(1);
+                    }
+                    displaced_prune_builds.insert(prior_build);
+                }
+            }
+        }
 
         let mut t_phase = Instant::now();
         macro_rules! phase {
@@ -933,6 +2305,9 @@ impl DagActor {
         phase!("6h-preexisting-nodes-loop");
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
+        let mut other_builds = other_builds;
+        other_builds.extend(displaced_prune_builds);
+
         MergeReconcile {
             cached_count,
             first_dep_failed,
@@ -982,7 +2357,7 @@ impl DagActor {
         // B2's re-probe — completed_count stays 0, dispatch_ready
         // silently drops the now-Completed entry,
         // check_build_completion(B1) never fires → B1 hangs Active.
-        // r[sched.merge.dedup]: "all interested builds are notified".
+        // r[sched.merge.dedup+2]: "all interested builds are notified".
         let mut reprobe_completed: Vec<DrvHash> = Vec::new();
         // I-139: collect for batched Completed-status + path_tenants
         // updates after the loop instead of N sequential round-trips.
@@ -1046,12 +2421,9 @@ impl DagActor {
                     state.never_forgive_paths.clear();
                     // I-099/I-094: re-probe hit on a previously-failed node
                     // — failure history is moot now we have the output.
-                    if matches!(
-                        from,
-                        DerivationStatus::Poisoned
-                            | DerivationStatus::DependencyFailed
-                            | DerivationStatus::Failed
-                    ) {
+                    // Shared revival population (round-17 merged_bug_073);
+                    // the PG tier resets below with the SAME gate.
+                    if from.is_revival_resettable() {
                         state.retry.clear();
                     }
                     from
@@ -1061,17 +2433,23 @@ impl DagActor {
                 metrics::counter!("rio_scheduler_cache_hits_total", "source" => source)
                     .increment(1);
 
-                // I-094: PG-side poison clear (status='created', NULLs
-                // poisoned_at/retry_count/failed_builders) so recovery
-                // doesn't resurrect the poison. Best-effort like the
-                // status update below.
-                if matches!(
-                    from_status,
-                    DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
-                ) && let Err(e) = self.db.clear_poison(drv_hash).await
+                // I-094: PG-side revival reset (NULLs poisoned_at and
+                // zeroes retry_count/failed_builders/resubmit_cycles)
+                // so recovery doesn't resurrect the moot history —
+                // SAME population as the in-memory clear (round-17
+                // merged_bug_073: the old {Poisoned, DependencyFailed}
+                // clear_poison gate skipped Failed-origin hits, so a
+                // failover restored their full failure history). The
+                // Completed status batch below owns the status write;
+                // a failover between the two recovers the origin
+                // status with clean history and the re-probe lane
+                // converges it again. Best-effort like the status
+                // update below.
+                if from_status.is_revival_resettable()
+                    && let Err(e) = self.db.clear_revival_history(drv_hash).await
                 {
                     warn!(drv_hash = %drv_hash, error = %e,
-                      "failed to clear poison in PG after re-probe cache hit");
+                      "failed to clear revival history in PG after re-probe cache hit");
                 }
                 completed_batch.push(drv_hash.clone());
 
@@ -1136,12 +2514,10 @@ impl DagActor {
                 continue;
             };
             let from = state.status();
-            if !matches!(
-                from,
-                DerivationStatus::Poisoned
-                    | DerivationStatus::Failed
-                    | DerivationStatus::DependencyFailed
-            ) {
+            // Shared revival population (round-17 merged_bug_073) —
+            // the same predicate gates the in-memory clear AND the PG
+            // history reset below.
+            if !from.is_revival_resettable() {
                 continue;
             }
             if let Err(e) = state.transition(DerivationStatus::Queued) {
@@ -1153,13 +2529,14 @@ impl DagActor {
             info!(drv_hash = %h, ?from,
                   "deferred re-probe: pre-existing failed node's output present \
                    but inputDrv in-flight; reset to Queued (failure history moot)");
-            if matches!(
-                from,
-                DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
-            ) && let Err(e) = self.db.clear_poison(h).await
-            {
+            // PG tier, same gate (the old {Poisoned, DependencyFailed}
+            // clear_poison left a Failed-origin node's persisted
+            // history to resurrect at failover). The Queued persist
+            // below owns the status write — clear_poison's
+            // status='created' flip was redundant with it.
+            if let Err(e) = self.db.clear_revival_history(h).await {
                 warn!(drv_hash = %h, error = %e,
-                      "failed to clear poison in PG after deferred re-probe reset");
+                      "failed to clear revival history in PG after deferred re-probe reset");
             }
             if let Err(e) = self
                 .db
@@ -1849,7 +3226,7 @@ impl DagActor {
         self.dag.closure_evidence(drv_hash) == ClosureEvidence::Vouched
     }
 
-    // r[impl sched.merge.substitute-topdown+10]
+    // r[impl sched.merge.substitute-topdown+15]
     /// True when `drv_hash` carries the `topdown_pruned` mark AND its
     /// closure evidence is [`ClosureEvidence::Broken`] (childless or
     /// closure-holed): its dependency closure was dropped from the
@@ -1870,6 +3247,57 @@ impl DagActor {
             && self.dag.closure_evidence(drv_hash) == ClosureEvidence::Broken
     }
 
+    /// Prior interested builds of a destructively-removed node
+    /// (displacement, same-definition resubmit-reset, or authority
+    /// takeover): every build captured on the removed node's prior state
+    /// EXCEPT the removing build and builds already terminal at removal
+    /// time — a terminal build's completion accounting and its
+    /// build_derivations links are settled history
+    /// (sched.merge.authoritative-conflict). Also reports whether the
+    /// removed node had already delivered its result
+    /// (`Completed`/`Skipped`) to those builds, which decides between
+    /// keeping the credit and shrinking the total. One helper feeds
+    /// the durable link DELETE + total adjustment inside the persist
+    /// transaction (displacement only), the in-memory prune/fan-out in
+    /// reconcile_merged_state (displacement only), AND the
+    /// failure-evidence backstops for all three removal kinds (Batches
+    /// 2b and 2b'), so the prune sets, the credit-vs-total decision,
+    /// and the evidence scope are congruent by construction (the actor
+    /// is single-threaded, so build states cannot change between the
+    /// call sites within one merge).
+    fn displaced_prior_interest(
+        &self,
+        merge_result: &crate::dag::MergeResult,
+        hash: &DrvHash,
+        displacer: Uuid,
+    ) -> DisplacedPriorInterest {
+        let Some((_, prior)) = merge_result
+            .removed_retriable
+            .iter()
+            .find(|(h, _)| h == hash)
+        else {
+            return DisplacedPriorInterest::default();
+        };
+        let prior_builds: Vec<Uuid> = prior
+            .interested_builds
+            .iter()
+            .filter(|b| **b != displacer)
+            .filter(|b| {
+                self.builds
+                    .get(b)
+                    .is_some_and(|info| !info.state().is_terminal())
+            })
+            .copied()
+            .collect();
+        DisplacedPriorInterest {
+            prior_builds,
+            prior_completed: matches!(
+                prior.status(),
+                DerivationStatus::Completed | DerivationStatus::Skipped
+            ),
+        }
+    }
+
     /// Persist nodes and edges to the DB after a successful DAG merge,
     /// and flip the build to Active as the transaction's last statement.
     /// Extracted from handle_merge_dag so failures can be caught and
@@ -1883,31 +3311,48 @@ impl DagActor {
     /// Inside the same transaction so a rejected merge can never
     /// leak the marker into PG, and a committed one can never lose it
     /// to a failover that races the in-memory stamp.
+    ///
+    /// Derivation rows are written ONLY for nodes this merge (re)created
+    /// (`newly_inserted`); submissions that merely join a live node never
+    /// rewrite or clear its persisted recovery columns — see
+    /// `sched.persist.creation-scoped`.
+    ///
+    /// The build's Pending→Active update rides the same transaction
+    /// (`sched.persist.atomic-activation`): a merge that fails at any
+    /// point leaves every pre-existing derivation row (including
+    /// displaced / resubmit-reset nodes' recreate-refresh) untouched and
+    /// the build row still `pending`, so cleanup_failed_merge's
+    /// memory-rollback + Pending-row delete fully undoes it.
     async fn persist_merge_to_db(
         &mut self,
         build_id: Uuid,
         nodes: &[crate::domain::DerivationNode],
-        edges: &[crate::domain::DerivationEdge],
-        newly_inserted: &HashSet<DrvHash>,
-        topdown_pruned_parents: &HashSet<String>,
+        merge_result: &crate::dag::MergeResult,
+        topdown_pruned_parents: &BTreeMap<String, Vec<String>>,
+        settled_evidence_displaced: &[String],
     ) -> Result<(), ActorError> {
-        // Build input rows for batch upsert.
+        let newly_inserted = &merge_result.newly_inserted;
+        // r[impl sched.persist.creation-scoped]
+        // Build input rows for batch upsert — creation-scoped: only the
+        // nodes this merge inserted (fresh or reset-recreated). The SQL
+        // upsert itself stays last-write-wins, but because the only
+        // writers are creations, a live node's persisted identity and
+        // authoritative inline content (sched.recovery.inline-drv-
+        // durability) cannot be overwritten or cleared by a later
+        // submission that merely joins it.
         let node_rows: Vec<_> = nodes
             .iter()
+            .filter(|node| newly_inserted.contains(node.drv_hash.as_str()))
             .map(|node| {
-                let status = if newly_inserted.contains(node.drv_hash.as_str()) {
-                    DerivationStatus::Created
-                } else if let Some(state) = self.dag.node(&node.drv_hash) {
-                    state.status()
-                } else {
-                    DerivationStatus::Created
-                };
                 crate::db::DerivationRow {
                     drv_hash: node.drv_hash.clone(),
                     drv_path: node.drv_path.clone(),
                     pname: (!node.pname.is_empty()).then(|| node.pname.clone()),
                     system: node.system.clone(),
-                    status,
+                    // Newly-inserted nodes always start at Created; later
+                    // status changes are persisted by their own
+                    // update_derivation_status call sites.
+                    status: DerivationStatus::Created,
                     required_features: node.required_features.clone(),
                     // Phase 3b recovery columns: persist what we
                     // need to fully reconstruct DerivationState on
@@ -1939,68 +3384,427 @@ impl DagActor {
                     // gate in validate_and_ingest. OR-on-conflict
                     // upsert: a later non-pruned merge of the same drv
                     // (false here) never clears it.
-                    topdown_pruned: topdown_pruned_parents.contains(node.drv_hash.as_str())
+                    topdown_pruned: topdown_pruned_parents.contains_key(node.drv_hash.as_str())
                         && !self.closure_vouched(&node.drv_hash),
-                    // Always false: a merge never creates a closure hole
-                    // (holes are stamped in PG via
-                    // `set_closure_hole_by_hashes` by the leader's reap
-                    // hook, the recovery-time stamp in
-                    // `load_dag_from_rows`, and the poison-clear paths —
-                    // admin ClearPoison and the poison-TTL sweep), and
-                    // binding the in-memory value here would turn the
-                    // upsert into a second stamping site. The
-                    // OR-on-conflict SET keeps any existing persisted
-                    // hole; the merge-side clears are the explicit heal
-                    // in `handle_merge_dag` and the both-bits batched
-                    // mark clear it runs for Vouched parents.
+                    // ALWAYS false at the row bind: the merge's one
+                    // flag-true writer is `set_closure_holes_tx` in
+                    // Batch 1b, which pairs the flag with its 069
+                    // witness rows in this same transaction for EVERY
+                    // stamped pruned parent — newly created and merely
+                    // joined alike (round-16 bug_045: the bind-here /
+                    // rows-there split left joined parents
+                    // flag-false with orphan witness rows, and
+                    // failover recovered them un-holed). Non-pruned
+                    // merges never create holes (those are stamped via
+                    // `set_closure_holes` by the reap hook, the
+                    // recovery-time stamp, and the poison-clear paths),
+                    // and the OR-on-conflict SET keeps any existing
+                    // persisted hole. The merge-side clears are the
+                    // witnessed heal in `handle_merge_dag`, the
+                    // both-bits batched mark clear for Vouched parents,
+                    // and the definition-change clear (Batch 1a,
+                    // sched.closure.witness-epoch).
                     closure_hole: false,
+                    // r[impl sched.recovery.inline-drv-durability+3]
+                    // Persist the authoritative inline derivation
+                    // (content-bound hook fallback: these bytes are
+                    // the only copy anywhere) so post-failover
+                    // dispatch still carries it. Plain inline-
+                    // optimization content stays NULL — workers can
+                    // always fetch those .drvs from the store.
+                    drv_content: node
+                        .drv_content_authoritative
+                        .then(|| node.drv_content.clone()),
+                    // r[impl sched.persist.ca-modular-hash+2]
+                    // Content-bound identity evidence and realisation
+                    // key: persisting it keeps the merge gate's
+                    // evidence and post-failover realisation
+                    // registration working for store-backed CA rows
+                    // (whose bytes are never persisted) and for
+                    // deferred-IA rows (is_ca=false, but the gateway
+                    // populates the hash because their output paths
+                    // resolve only at dispatch time). Read from the
+                    // in-memory node the merge just created — NOT the
+                    // submission echo — so a store-evidence GRANT that
+                    // stripped the declaration
+                    // (sched.merge.store-evidence-displacement+3)
+                    // persists the post-strip truth: the submitter's
+                    // unverifiable declared hash must never re-enter
+                    // the row through the persist path after the DAG
+                    // shed it.
+                    ca_modular_hash: self
+                        .dag
+                        .node(node.drv_hash.as_str())
+                        .map(|s| s.ca.modular_hash)
+                        .unwrap_or(node.ca_modular_hash),
+                    // r[impl sched.derivation.evidence-rank]
+                    // Read from the in-memory node the merge just
+                    // created — NOT recomputed from shape — so a
+                    // store-evidence-raised creation
+                    // (sched.merge.evidence-ranked-displacement
+                    // PathBoundBytes standing) persists the same rank
+                    // the DAG carries. The shape fallback is defensive
+                    // only: the node was inserted by this merge, so the
+                    // lookup cannot miss.
+                    evidence_rank: self
+                        .dag
+                        .node(node.drv_hash.as_str())
+                        .map(|s| s.evidence)
+                        .unwrap_or_else(|| crate::state::DefinitionEvidence::from_node_shape(node)),
+                    // M_070: the preserved claim — set by the ingress
+                    // strip (riding the domain node) or by a stripping
+                    // store-evidence grant (recorded on the DAG node) —
+                    // rides the creation snapshot. Same DAG-first read
+                    // as the live hash above so both halves of the
+                    // strip persist together.
+                    ca_modular_hash_stripped: self
+                        .dag
+                        .node(node.drv_hash.as_str())
+                        .map(|s| s.ca.modular_hash_stripped)
+                        .unwrap_or(node.ca_modular_hash_stripped),
+                    // M_071 (round-16 bug_053): same DAG-first read as
+                    // the rank above — a store-evidence-verified
+                    // creation persists the BYTE-DERIVED resolve flag
+                    // the grant stamped, not the submitter's echo, so
+                    // recovery restores exactly what dispatch would
+                    // have computed.
+                    needs_resolve: self
+                        .dag
+                        .node(node.drv_hash.as_str())
+                        .map(|s| s.ca.needs_resolve)
+                        .unwrap_or(node.needs_resolve),
                 }
             })
-            .collect();
-
-        // drv_path → drv_hash lookup for edge resolution below. Edges
-        // carry paths (proto wire format); id_map keys by hash.
-        let path_to_hash: HashMap<&str, &str> = node_rows
-            .iter()
-            .map(|r| (r.drv_path.as_str(), r.drv_hash.as_str()))
             .collect();
 
         // Transaction: 3 batched roundtrips instead of 2N+E serial.
         let mut tx = self.db.pool().begin().await?;
 
-        // Batch 1: upsert all derivations, get back drv_hash -> db_id map.
-        let id_map = crate::db::SchedulerDb::batch_upsert_derivations(&mut tx, &node_rows).await?;
+        // The full definition-change set — DAG-level displacements,
+        // authority takeovers, and row-only store-evidence
+        // displacements. ONE enumeration feeding BOTH the upsert
+        // carve-out and Batch 1a's closure-witness clear (R2: the two
+        // consumers cannot drift on the population). The carve-out
+        // needs the whole union, not just the row-only arm: a
+        // displaced or taken-over hash's row may be SETTLED
+        // (completed/skipped) with an identity that conflicts with the
+        // approved displacing definition on the freeze-guard axes —
+        // pre-+3 the guard's missing path/hash axes happened to admit
+        // the path-only-conflict shapes by accident, masking that the
+        // resident-displacement arm was never carved out (the
+        // settled-identity-freeze+4 axis alignment exposed it: every
+        // legitimately arbitrated definition change must be admitted
+        // EXPLICITLY, by this list, never by an axis gap).
+        let definition_changed: Vec<String> = merge_result
+            .displaced
+            .iter()
+            .chain(merge_result.authority_takeovers.iter())
+            .map(|h| h.to_string())
+            .chain(settled_evidence_displaced.iter().cloned())
+            .collect();
 
-        // Batch 2: link all nodes to this build.
-        let db_ids: Vec<Uuid> = id_map.values().map(|(id, _)| *id).collect();
+        // Batch 1: upsert the newly-created derivations, get back
+        // drv_hash -> db_id map.
+        let id_map = crate::db::SchedulerDb::batch_upsert_derivations(
+            &mut tx,
+            &node_rows,
+            &definition_changed,
+        )
+        .await?;
+
+        // Batch 1a: definition-change clear of the closure witness
+        // (r[impl sched.closure.witness-epoch]). Displaced nodes,
+        // authority takeovers, and row-only store-evidence
+        // displacements replace the definition the witness testified
+        // about; the in-memory side already dropped or rebuilt the
+        // hole (fresh node / `ClosureHole::carry_across`), but Batch
+        // 1's upsert binds `closure_hole` with OR semantics, so the
+        // dead epoch's flag and 069 witness rows would survive in PG
+        // and rehydrate on failover (round-16 bug_011's durable arm).
+        // Clearing here — after the upsert, BEFORE the born-holed
+        // stamp (Batch 1b) — means a re-creation that is itself a
+        // pruned stamping parent ends the transaction with its OWN
+        // epoch's witness, never a union of eras.
+        if !definition_changed.is_empty() {
+            crate::db::SchedulerDb::clear_closure_holes_tx(&mut tx, &definition_changed).await?;
+        }
+
+        // Batch 1b: persist the topdown_pruned stamp for kept nodes this
+        // merge merely JOINED. Batch 1 is creation-scoped
+        // (sched.persist.creation-scoped), so a pruned merge that keeps a
+        // pre-existing node never reaches its row above; without this
+        // statement the demand-set guard would be memory-only for exactly
+        // those nodes and disappear on leader failover
+        // (sched.merge.substitute-topdown). Same gate as the row bind:
+        // parents of the ORIGINAL submission's edges, minus nodes whose
+        // existing children the closure classifier vouches for.
+        let joined_stamped: Vec<String> = topdown_pruned_parents
+            .keys()
+            .filter(|h| !newly_inserted.contains(h.as_str()))
+            .filter(|h| !self.closure_vouched(h.as_str()))
+            .cloned()
+            .collect();
+        if !joined_stamped.is_empty() {
+            crate::db::SchedulerDb::stamp_topdown_pruned_tx(&mut tx, &joined_stamped).await?;
+        }
+        // r[impl sched.merge.substitute-topdown+15]
+        // Born-holed flag + witness rows (069) for EVERY stamped pruned
+        // parent — joined and newly-inserted alike — through the ONE
+        // paired writer, in the SAME transaction as the row bind and
+        // the mark stamp. The flag ⇔ side-rows invariant is positional:
+        // before round-16 bug_045 the flag rode Batch 1's
+        // creation-scoped bind while the rows were inserted here for
+        // BOTH populations, so a merely-JOINED pruned parent committed
+        // flag-false with orphan witness rows — recovery hydrated it
+        // un-holed, enrolled it as a mark-clear candidate, and re-armed
+        // the doomed from-source dispatch the born-holed witness exists
+        // to suppress. The paired writer makes the populations
+        // congruent by construction. (Runs after Batch 1a's
+        // definition-change clear, so a re-creation that is itself a
+        // stamping parent keeps its OWN epoch's witness.)
+        let stamped_witness: Vec<(String, Vec<String>)> = topdown_pruned_parents
+            .iter()
+            .filter(|(h, _)| !self.closure_vouched(h.as_str()))
+            .map(|(h, cs)| (h.clone(), cs.clone()))
+            .collect();
+        if !stamped_witness.is_empty() {
+            crate::db::SchedulerDb::set_closure_holes_tx(&mut tx, &stamped_witness).await?;
+        }
+
+        // Batch 2: link ALL submitted nodes to this build — newly-created
+        // ones via this tx's id_map, pre-existing live nodes via the
+        // db_id their creating merge committed (their rows are not
+        // re-upserted, see above).
+        let mut db_ids: Vec<Uuid> = id_map.values().map(|(id, _)| *id).collect();
+        for node in nodes {
+            if newly_inserted.contains(node.drv_hash.as_str()) {
+                continue;
+            }
+            let db_id = self
+                .dag
+                .node(&node.drv_hash)
+                .and_then(|s| s.db_id)
+                .or_else(|| self.dag.db_id_for_path(&node.drv_path))
+                .ok_or_else(|| ActorError::MissingDbId {
+                    drv_path: node.drv_path.clone(),
+                })?;
+            db_ids.push(db_id);
+        }
         crate::db::SchedulerDb::batch_insert_build_derivations(&mut tx, build_id, &db_ids).await?;
 
-        // Batch 3: insert edges. Resolve drv_path -> db_id via:
-        //   1. this tx's id_map (covers newly-inserted + re-upserted
-        //      nodes from this batch — ON CONFLICT RETURNING gives
-        //      back existing ids for the latter),
-        //   2. fall back to self.dag (covers cross-batch edges to
-        //      nodes merged by a PRIOR SubmitBuild that aren't in
-        //      this request's `nodes` list at all — rare but legal
-        //      when gateway deduplicates against live DAG).
-        // Does NOT read self.dag.node().db_id for nodes in THIS
-        // batch — that field isn't set until after commit() below.
-        let resolve = |drv_path: &str| -> Option<Uuid> {
-            path_to_hash
-                .get(drv_path)
-                .and_then(|h| id_map.get(*h).map(|(id, _)| *id))
-                .or_else(|| self.dag.db_id_for_path(drv_path))
-        };
-        let edge_rows: Result<Vec<(Uuid, Uuid)>, ActorError> = edges
+        // Batch 2b: durable half of the displacement interest prune
+        // (sched.merge.authoritative-conflict). The in-memory prune in
+        // reconcile_merged_state stops still-running prior builds from
+        // counting the displaced hash; deleting their build_derivations
+        // links in the SAME transaction as the recreate-refresh makes the
+        // prune survive leader failover — recovery rebuilds interest
+        // purely from this table, so a surviving link would silently
+        // re-point those builds at the displacing definition. When the
+        // pruned result had NOT been received yet (the displaced node was
+        // not Completed/Skipped), the same statement also decrements the
+        // pruned builds' `builds.total_drvs`, mirroring the in-memory
+        // `total_count` decrement — recovery re-seeds totals from that
+        // column, so leaving it would resurrect a permanently
+        // unreachable slot (Succeeded builds stuck at N-1/N). Received
+        // results keep both the link-derived credit (recovered_completed
+        // in memory) and the persisted total. Scope: non-terminal prior
+        // builds only (terminal builds keep links and counts as settled
+        // history), never the displacer. Per-hash loop is fine —
+        // displacement is a rare, adversarial-only path.
+        // r[impl sched.merge.authoritative-conflict+6]
+        let mut evidence_persisted: HashSet<Uuid> = HashSet::new();
+        for hash in &merge_result.displaced {
+            let Some((displaced_id, _)) = id_map.get(hash.as_str()) else {
+                // displaced ⊆ newly_inserted, so the upsert returned an id
+                // for it; tolerate drift defensively rather than abort.
+                warn!(drv_hash = %hash,
+                      "displaced hash missing from upsert id_map; skipping durable link prune");
+                continue;
+            };
+            let interest = self.displaced_prior_interest(merge_result, hash, build_id);
+            if interest.prior_builds.is_empty() {
+                continue;
+            }
+            let pruned = crate::db::SchedulerDb::delete_displaced_build_links(
+                &mut tx,
+                *displaced_id,
+                &interest.prior_builds,
+                !interest.prior_completed,
+            )
+            .await?;
+            debug!(drv_hash = %hash, pruned, "pruned displaced node from prior builds' links");
+
+            // r[impl sched.merge.displaced-failure-evidence]
+            // DEFENSE-IN-DEPTH BACKSTOP: since the at-source persist
+            // (sched.build.failure-evidence-at-source+1) landed, a
+            // still-running keep_going build's first failure is normally
+            // already durable in builds.error_summary by the time a
+            // displacement prunes its link — this in-tx persist only
+            // matters when the at-source write failed (PG blip at
+            // observation time) and no retry has succeeded since. It
+            // stays because it rides an existing transaction (free
+            // atomicity), keeps the displacement path's evidence
+            // contract self-contained, and the COALESCE write is a no-op
+            // when the evidence is already durable. Builds with no
+            // observed failure (e.g. the displaced node had Completed
+            // for them) are left untouched — joining a later-displaced
+            // node is not a failure.
+            for prior_build in &interest.prior_builds {
+                if !evidence_persisted.insert(*prior_build) {
+                    continue;
+                }
+                let Some(summary) = self
+                    .builds
+                    .get(prior_build)
+                    .and_then(|b| b.error_summary.as_deref())
+                else {
+                    continue;
+                };
+                let failed = self
+                    .builds
+                    .get(prior_build)
+                    .and_then(|b| b.failed_derivation.as_deref());
+                crate::db::SchedulerDb::persist_build_error_summary_tx(
+                    &mut tx,
+                    *prior_build,
+                    summary,
+                    failed,
+                )
+                .await?;
+            }
+        }
+
+        // Batch 2b': the same failure-evidence backstop for the
+        // NON-displacement destructive removals — same-definition
+        // resubmit-resets and authority takeovers (removed_retriable
+        // minus displaced). Unlike displacement these do not prune prior
+        // interest (the carried interested_builds ride the re-created
+        // node), but the recreate-refresh upsert in Batch 1 just reset
+        // the row's failure state (status, poison fields), so a
+        // still-running keep_going build whose only reconstructible
+        // failure evidence was that row would lose it at failover. The
+        // at-source persist (sched.build.failure-evidence-at-source+1)
+        // normally already covered it; this in-tx write is the same
+        // defense-in-depth backstop as the displacement loop above —
+        // flag-agnostic, idempotent (COALESCE), and fail-closed (a
+        // persist error fails the merge, which cleanup_failed_merge
+        // rolls back).
+        // r[impl sched.build.failure-evidence-at-source+1]
+        let displaced_set: HashSet<&str> =
+            merge_result.displaced.iter().map(|h| h.as_str()).collect();
+        for (hash, _prior) in &merge_result.removed_retriable {
+            if displaced_set.contains(hash.as_str()) {
+                continue; // handled by Batch 2b above
+            }
+            let interest = self.displaced_prior_interest(merge_result, hash, build_id);
+            for prior_build in &interest.prior_builds {
+                if !evidence_persisted.insert(*prior_build) {
+                    continue;
+                }
+                let Some(summary) = self
+                    .builds
+                    .get(prior_build)
+                    .and_then(|b| b.error_summary.as_deref())
+                else {
+                    continue;
+                };
+                let failed = self
+                    .builds
+                    .get(prior_build)
+                    .and_then(|b| b.failed_derivation.as_deref());
+                crate::db::SchedulerDb::persist_build_error_summary_tx(
+                    &mut tx,
+                    *prior_build,
+                    summary,
+                    failed,
+                )
+                .await?;
+            }
+        }
+
+        // Batch 2c: durable half of the displaced-edge scrub
+        // (sched.merge.displaced-edge-scrub). dag.merge() already dropped
+        // the displaced and taken-over nodes' in-memory children edges;
+        // deleting the persisted parent-side rows in the SAME transaction
+        // — and strictly BEFORE batch_insert_edges re-inserts the
+        // replacing submission's own edges for the same parent id — keeps
+        // a leader failover from rebuilding the squatter's dependency set
+        // onto the replacing definition. Authority takeovers (an
+        // authoritative squat replaced by a store-backed re-creation
+        // through the resubmit-reset) are the same definition-change
+        // boundary, so their hashes are chained in. Child-side rows
+        // (other nodes depending on the removed hash) are preserved,
+        // mirroring the in-memory parents-direction preservation.
+        // r[impl sched.merge.displaced-edge-scrub+2]
+        //
+        // Row-only store-evidence displacements
+        // (sched.merge.store-evidence-displacement+3) chain in for the same
+        // reason: the displaced SETTLED row had no DAG node (reaped), so
+        // the gate never scrubbed anything in memory, but its persisted
+        // parent-side dependency edges still describe the OLD lineage —
+        // the evidence-approved upsert just rewrote the row to the new
+        // definition, which must not inherit them on recovery. Their ids
+        // resolve via id_map because the $-array carve-out admitted those
+        // rows through RETURNING.
+        let edge_scrub_ids: Vec<Uuid> = merge_result
+            .displaced
             .iter()
-            .map(|e| {
+            .chain(merge_result.authority_takeovers.iter())
+            .map(|h| h.as_str())
+            .chain(settled_evidence_displaced.iter().map(String::as_str))
+            .filter_map(|h| id_map.get(h).map(|(id, _)| *id))
+            .collect();
+        if !edge_scrub_ids.is_empty() {
+            let scrubbed =
+                crate::db::SchedulerDb::delete_displaced_parent_edges(&mut tx, &edge_scrub_ids)
+                    .await?;
+            debug!(
+                count = scrubbed,
+                "scrubbed displaced/taken-over nodes' persisted dependency edges"
+            );
+        }
+
+        // Batch 3: insert edges.
+        // r[impl sched.merge.edge-creation-scoped]
+        // The rows come from `merge_result.new_edges` — exactly the edges
+        // the in-memory merge accepted — NOT from the raw request edge
+        // list, so an edge the creation-scoped gate skipped (foreign
+        // resident parent) can never reach `derivation_edges` and
+        // recovery cannot resurrect it; PG and memory cannot diverge.
+        // Re-declared duplicates of existing edges are absent from
+        // `new_edges` too: their rows were persisted by the merge that
+        // created them (ON CONFLICT DO NOTHING would make re-inserting
+        // them harmless, just pointless). Resolve drv_hash -> db_id via:
+        //   1. this tx's id_map — exactly the rows this merge wrote,
+        //      i.e. (re)created nodes (sched.persist.creation-scoped);
+        //      ON CONFLICT RETURNING hands back the existing id when a
+        //      re-created node's row already existed,
+        //   2. fall back to self.dag for everything this merge did NOT
+        //      (re)create: live nodes this submission merely joins —
+        //      their db_id was committed by their creating merge.
+        // A node (re)created by THIS merge is never resolved via
+        // self.dag — its db_id isn't set until after commit() below.
+        let resolve = |drv_hash: &str| -> Option<Uuid> {
+            id_map
+                .get(drv_hash)
+                .map(|(id, _)| *id)
+                .or_else(|| self.dag.node(drv_hash).and_then(|s| s.db_id))
+        };
+        let edge_rows: Result<Vec<(Uuid, Uuid)>, ActorError> = merge_result
+            .new_edges
+            .iter()
+            .map(|(parent_hash, child_hash)| {
+                let missing = |hash: &str| ActorError::MissingDbId {
+                    drv_path: self
+                        .dag
+                        .node(hash)
+                        .map(|s| s.drv_path().to_string())
+                        .unwrap_or_else(|| hash.to_string()),
+                };
                 let parent =
-                    resolve(&e.parent_drv_path).ok_or_else(|| ActorError::MissingDbId {
-                        drv_path: e.parent_drv_path.clone(),
-                    })?;
-                let child = resolve(&e.child_drv_path).ok_or_else(|| ActorError::MissingDbId {
-                    drv_path: e.child_drv_path.clone(),
-                })?;
+                    resolve(parent_hash.as_str()).ok_or_else(|| missing(parent_hash.as_str()))?;
+                let child =
+                    resolve(child_hash.as_str()).ok_or_else(|| missing(child_hash.as_str()))?;
                 Ok((parent, child))
             })
             .collect();
@@ -2018,9 +3822,14 @@ impl DagActor {
         // failure here aborts the whole merge (derivation upserts incl.
         // the topdown_pruned stamps, links, edges) instead of leaving
         // committed side effects behind for a build the caller is about
-        // to reject and roll back in memory. The in-memory BuildInfo
-        // transition happens in `persist_and_activate` only after this
-        // commit succeeds.
+        // to reject and roll back in memory. Recovery therefore sees
+        // either nothing (plus a pending build row that orphan handling
+        // covers) or the fully-committed Active build — never a
+        // half-committed recreate-refresh or definition-change
+        // accumulator reset for a build that was never activated. The
+        // in-memory BuildInfo transition happens in `persist_and_activate`
+        // only after this commit succeeds.
+        // r[impl sched.persist.atomic-activation+2]
         crate::db::SchedulerDb::activate_build_tx(&mut tx, build_id).await?;
 
         // r[verify sched.db.tx-commit-before-mutate]
@@ -2081,10 +3890,28 @@ impl DagActor {
         // since then wrote both in-mem and DB), so overwriting would
         // downgrade. Per-dimension `.max()` only RAISES so a stale DB
         // row never demotes a higher in-memory floor.
+        //
+        // r[impl sched.merge.displaced-failure-reset+2]
+        // DISPLACED hashes are excluded: the row's floors were ratcheted
+        // by the displaced definition's failures, and the displacing
+        // submission is a different definition, so its fresh node keeps
+        // try_from_node's zeros regardless of what the row carried.
+        // Authority-takeover rows need no exclusion of their own: the
+        // definition-change reset inside the upsert already zeroed their
+        // floors, so the RETURNING values hydrated here are zeros by
+        // construction. The explicit displaced exclusion is kept as
+        // defense-in-depth for a row whose persisted content drifted from
+        // the displaced in-memory definition (where the in-tx reset's
+        // row-level predicate could miss).
         for (hash, (db_id, floor)) in &id_map {
             if let Some(state) = self.dag.node_mut(hash) {
                 state.db_id = Some(*db_id);
-                if newly_inserted.contains(hash.as_str()) {
+                if newly_inserted.contains(hash.as_str())
+                    && !merge_result
+                        .displaced
+                        .iter()
+                        .any(|d| d.as_str() == hash.as_str())
+                {
                     let f = &mut state.sched.resource_floor;
                     f.mem_bytes = f.mem_bytes.max(floor.mem_bytes);
                     f.disk_bytes = f.disk_bytes.max(floor.disk_bytes);
@@ -2096,9 +3923,13 @@ impl DagActor {
     }
 
     /// Undo all in-memory state from a failed handle_merge_dag AFTER the
-    /// merge succeeded but DB persistence or transition_build failed.
-    /// Rolls back the DAG merge, removes map entries, and best-effort
-    /// deletes the orphan DB build row.
+    /// in-memory merge succeeded but persistence (the single
+    /// derivations + links + edges + Pending→Active transaction, or the
+    /// store cache-check before it) failed. Nothing was committed
+    /// (sched.persist.atomic-activation), so rolling back the DAG merge,
+    /// removing map entries, and best-effort deleting the orphan
+    /// still-`pending` DB build row restores the pre-submission state
+    /// exactly.
     ///
     /// Takes `merge_result` by value: `removed_retriable` carries owned
     /// `DerivationState`s that `rollback_merge` re-inserts into the DAG.
@@ -2116,6 +3947,7 @@ impl DagActor {
             &merge_result.contributions_recorded,
             build_id,
             merge_result.removed_retriable,
+            merge_result.displaced_scrubbed_edges,
         );
         self.events.remove(build_id);
         self.builds.remove(&build_id);
@@ -2562,7 +4394,7 @@ impl DagActor {
         Ok(Some(resp))
     }
 
-    // r[impl sched.merge.substitute-topdown+10]
+    // r[impl sched.merge.substitute-topdown+15]
     /// Top-down demand-set substitution pre-check (step 0 of
     /// `handle_merge_dag`).
     ///
@@ -2817,5 +4649,359 @@ impl DagActor {
         // does the fetch detached under SUBSTITUTE_FETCH_TIMEOUT.
         // Prune benefit preserved; actor never blocks on QPI.
         Some(demanded.into_iter().cloned().collect())
+    }
+}
+
+#[cfg(test)]
+mod evidence_matrix_tests {
+    use super::*;
+    use crate::actor::tests::helpers::{mint_floating_ca_leaf, mint_text_ca_leaf};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+
+    fn dn(proto: rio_proto::types::DerivationNode) -> crate::domain::DerivationNode {
+        proto.into()
+    }
+
+    fn classify(node: &crate::domain::DerivationNode, bytes: &[u8]) -> StoreEvidenceOutcome {
+        let seed = InputFormSeed::from_submission_nodes(&[]);
+        classify_store_evidence(node, bytes.to_vec(), &seed, &|_| None, &|_| None)
+    }
+
+    /// Table-driven outcome matrix for `classify_store_evidence`: every
+    /// variant of the typed verdict is reachable and lands exactly
+    /// where its permanence rustdoc says. Consequence-neutrality of
+    /// the C2c1 split is proven by the whole suite staying green.
+    #[test]
+    fn store_evidence_outcome_matrix() {
+        use StoreEvidenceOutcome as O;
+
+        // Verified: the store's canonical bytes at their text-CA path
+        // derive the claimed identity.
+        let (leaf, leaf_aterm, _out) = mint_text_ca_leaf("semx-ok");
+        let verified = dn(leaf.clone());
+        match classify(&verified, leaf_aterm.as_bytes()) {
+            O::Verified(def) => {
+                // r[verify sched.dispatch.claims-derived+5]
+                // Byte-derived resolve fact rides the verdict: an
+                // inputless leaf is `false` by the oracle predicate's
+                // empty-inputs clause EVEN IF a child lookup would
+                // claim unknown paths (clause-1 precedence) — the
+                // submitter's echo is not consulted anywhere here.
+                assert!(!def.needs_resolve, "inputless leaf: no resolve");
+            }
+            other => panic!("expected Verified, got {}", outcome_name(&other)),
+        }
+        let child_says_unknown: &dyn Fn(&str) -> Option<bool> = &|_| Some(true);
+        match classify_store_evidence(
+            &verified,
+            leaf_aterm.as_bytes().to_vec(),
+            &InputFormSeed::from_submission_nodes(&[]),
+            &|_| None,
+            child_says_unknown,
+        ) {
+            O::Verified(def) => assert!(
+                !def.needs_resolve,
+                "empty-inputs clause precedes the child lookup"
+            ),
+            other => panic!("expected Verified, got {}", outcome_name(&other)),
+        }
+
+        // Contradicts: same bytes, tampered claimed system.
+        let mut tampered = dn(leaf.clone());
+        tampered.system = "aarch64-linux".into();
+        assert!(matches!(
+            classify(&tampered, leaf_aterm.as_bytes()),
+            O::Contradicts(_)
+        ));
+
+        // StoreSilence(NotUtf8): binary garbage that is NOT the path's
+        // text-CA object.
+        assert!(matches!(
+            classify(&verified, &[0xFF, 0xFE, 0x00]),
+            O::StoreSilence(SilenceReason::NotUtf8)
+        ));
+
+        // StoreSilence(Parse): UTF-8 that is not a derivation and not
+        // the path's text-CA object.
+        assert!(matches!(
+            classify(&verified, b"definitely not a derivation"),
+            O::StoreSilence(SilenceReason::Parse)
+        ));
+
+        // UnparseableVerified: garbage bytes at their OWN zero-ref
+        // text-CA path — content-bound, permanent.
+        let garbage = b"content-bound garbage";
+        let gh = NixHash::new(HashAlgo::SHA256, Sha256::digest(garbage).to_vec()).unwrap();
+        let gpath = StorePath::make_text("semx-garbage.drv", &gh, &[])
+            .unwrap()
+            .as_str()
+            .to_owned();
+        let mut gnode = dn(leaf.clone());
+        gnode.drv_path = gpath.clone();
+        gnode.drv_hash = gpath;
+        assert!(matches!(classify(&gnode, garbage), O::UnparseableVerified));
+
+        // StoreSilence(TextCa): canonical derivation bytes at a WRONG
+        // (valid) store path.
+        let (other, other_aterm, _o) = mint_text_ca_leaf("semx-other");
+        let mut wrong_path = dn(other);
+        wrong_path.drv_path = verified.drv_path.clone();
+        wrong_path.drv_hash = verified.drv_hash.clone();
+        assert!(matches!(
+            classify(&wrong_path, other_aterm.as_bytes()),
+            O::StoreSilence(SilenceReason::TextCa)
+        ));
+
+        // StructurallyUnverifiable(UnparseableDrvPath): the node's own
+        // declared path is not a store path.
+        let mut bad_path = dn(leaf.clone());
+        bad_path.drv_path = "not-a-store-path".into();
+        bad_path.drv_hash = "not-a-store-path".into();
+        assert!(matches!(
+            classify(&bad_path, leaf_aterm.as_bytes()),
+            O::StructurallyUnverifiable(StructuralReason::UnparseableDrvPath)
+        ));
+
+        // UnseededInputs: an IA parent whose direct input is covered
+        // by neither seeds nor the DAG (the pure classifier never
+        // consults rows — the chokepoint owns the read-through).
+        let (child, child_aterm, _h) = mint_floating_ca_leaf("semx-child");
+        let child_path = child.drv_path.clone();
+        let child_drv = rio_nix::derivation::Derivation::parse(&child_aterm).unwrap();
+        let build_parent = |out: &str| {
+            format!(
+                r#"Derive([("out","{out}","","")],[("{child_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","semx-parent"),("out","{out}")])"#
+            )
+        };
+        let masked = rio_nix::derivation::Derivation::parse(&build_parent("")).unwrap();
+        let name_only = format!("/nix/store/{}-semx-parent.drv", "a".repeat(32));
+        let resolver = |p: &str| -> Option<&rio_nix::derivation::Derivation> {
+            (p == child_path).then_some(&child_drv)
+        };
+        let paths = rio_nix::derivation::input_addressed_output_paths(
+            &masked,
+            &name_only,
+            &resolver,
+            &mut std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let parent_aterm = build_parent(paths["out"].as_str());
+        let phash = NixHash::new(
+            HashAlgo::SHA256,
+            Sha256::digest(parent_aterm.as_bytes()).to_vec(),
+        )
+        .unwrap();
+        let parent_path = StorePath::make_text(
+            "semx-parent.drv",
+            &phash,
+            &[StorePath::parse(&child_path).unwrap()],
+        )
+        .unwrap()
+        .as_str()
+        .to_owned();
+        let parent_node = dn(rio_proto::types::DerivationNode {
+            drv_path: parent_path.clone(),
+            drv_hash: parent_path,
+            system: "x86_64-linux".into(),
+            output_names: vec!["out".into()],
+            expected_output_paths: vec![paths["out"].as_str().to_owned()],
+            ..Default::default()
+        });
+        match classify(&parent_node, parent_aterm.as_bytes()) {
+            // r[verify sched.dispatch.claims-derived+5]
+            // Missing input identity is the typed UnseededInputs
+            // outcome — NOT StructurallyUnverifiable (instant
+            // permanence is restricted to content-bound reasons): the
+            // chokepoint read-through and the dispatch backoff key on
+            // this variant. ALL missing inputs are collected, and the
+            // fetched bytes ride along for the re-classify.
+            StoreEvidenceOutcome::UnseededInputs { missing, bytes } => {
+                assert_eq!(missing, vec![child_path.clone()]);
+                assert_eq!(
+                    bytes,
+                    parent_aterm.as_bytes(),
+                    "bytes ride the variant so the read-through retry \
+                     never re-fetches"
+                );
+            }
+            other => panic!("expected UnseededInputs, got {}", outcome_name(&other)),
+        }
+
+        // VerifiedExceptDeclaredHash: a floating parent over an
+        // unresolvable floating input, with a DECLARED modular hash —
+        // the validator strips the unrecomputable claim and the rest
+        // verifies; the verified bytes ride along.
+        let build_fparent = |_unused: &str| {
+            format!(
+                r#"Derive([("out","","r:sha256","")],[("{child_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","semx-fparent"),("out","")])"#
+            )
+        };
+        let fparent_aterm = build_fparent("");
+        let fhash = NixHash::new(
+            HashAlgo::SHA256,
+            Sha256::digest(fparent_aterm.as_bytes()).to_vec(),
+        )
+        .unwrap();
+        let fparent_path = StorePath::make_text(
+            "semx-fparent.drv",
+            &fhash,
+            &[StorePath::parse(&child_path).unwrap()],
+        )
+        .unwrap()
+        .as_str()
+        .to_owned();
+        let fparent_node = dn(rio_proto::types::DerivationNode {
+            drv_path: fparent_path.clone(),
+            drv_hash: fparent_path,
+            system: "x86_64-linux".into(),
+            output_names: vec!["out".into()],
+            expected_output_paths: vec![String::new()],
+            is_content_addressed: true,
+            ca_modular_hash: vec![0xCC; 32],
+            ..Default::default()
+        });
+        match classify(&fparent_node, fparent_aterm.as_bytes()) {
+            StoreEvidenceOutcome::VerifiedExceptDeclaredHash(def) => {
+                assert_eq!(
+                    def.bytes,
+                    fparent_aterm.as_bytes(),
+                    "verified bytes ride along"
+                );
+                // r[verify sched.dispatch.claims-derived+5]
+                // Floating parent WITH an input: the type clause
+                // derives `true` from the bytes — recorded by the
+                // strip arm exactly like the Verified arm.
+                assert!(def.needs_resolve, "floating-with-input resolves");
+                // r[verify sched.merge.store-evidence-displacement+3]
+                // The stripped declared value rides the verdict so the
+                // consuming raise can clear+preserve in one motion.
+                assert_eq!(
+                    def.stripped_declared_hash,
+                    Some([0xCC; 32]),
+                    "stripped declared hash carried for M_070 preservation"
+                );
+            }
+            other => panic!(
+                "expected VerifiedExceptDeclaredHash, got {}",
+                outcome_name(&other)
+            ),
+        }
+    }
+
+    fn outcome_name(o: &StoreEvidenceOutcome) -> &'static str {
+        match o {
+            StoreEvidenceOutcome::Verified(_) => "Verified",
+            StoreEvidenceOutcome::Contradicts(_) => "Contradicts",
+            StoreEvidenceOutcome::StoreSilence(_) => "StoreSilence",
+            StoreEvidenceOutcome::StructurallyUnverifiable(_) => "StructurallyUnverifiable",
+            StoreEvidenceOutcome::UnseededInputs { .. } => "UnseededInputs",
+            StoreEvidenceOutcome::VerifiedExceptDeclaredHash(_) => "VerifiedExceptDeclaredHash",
+            StoreEvidenceOutcome::UnparseableVerified => "UnparseableVerified",
+        }
+    }
+
+    // r[verify sched.dispatch.claims-derived+5]
+    /// Round-17 bug_052: seed collection follows the validator's
+    /// step-6 accept-set — a deferred-IA (CA-chain) node carries a
+    /// declared modular hash but NO input-addressed output, and its
+    /// declaration is provable from exactly the sibling seeds the old
+    /// `needs_ia` gate withheld. Three cells:
+    ///   seeds present + honest declaration → Verified (no strip);
+    ///   seeds present + corrupted declaration → Contradicts (the
+    ///     Q7-accepted fail-closed widening — previously silently
+    ///     stripped);
+    ///   seeds absent → VerifiedExceptDeclaredHash (the ingress-strip
+    ///     population, byte-for-byte the e47c330a0 unbrick — must not
+    ///     re-brick).
+    #[test]
+    fn deferred_ia_declared_hash_seeds_follow_step6_accept_set() {
+        use crate::actor::tests::helpers::mint_deferred_ia_node;
+        use StoreEvidenceOutcome as O;
+
+        let (leaf, leaf_aterm, _out) = mint_text_ca_leaf("c2seed-leaf");
+        let leaf_path = leaf.drv_path.clone();
+        let (parent, parent_aterm) =
+            mint_deferred_ia_node("c2seed-parent", &leaf_path, &[(&leaf_path, &leaf_aterm)]);
+        assert!(
+            !parent.ca_modular_hash.is_empty()
+                && !parent.expected_output_paths.iter().any(|p| !p.is_empty()),
+            "fixture: declared hash, no concrete IA output"
+        );
+
+        // The leaf's input-position digest, exactly as the walk wants it.
+        let leaf_drv = rio_nix::derivation::Derivation::parse(&leaf_aterm).unwrap();
+        let resolve_none = |_: &str| -> Option<&rio_nix::derivation::Derivation> { None };
+        let leaf_digest = rio_nix::derivation::hash_derivation_modulo(
+            &leaf_drv,
+            &leaf_path,
+            &resolve_none,
+            &mut std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let mut leaf_seed_node = dn(leaf.clone());
+        leaf_seed_node.ca_modular_hash = Some(leaf_digest);
+        let seed = InputFormSeed::from_submission_nodes(std::slice::from_ref(&leaf_seed_node));
+        assert!(!seed.is_empty(), "non-floating leaf must seed");
+
+        // Cell 1: honest declaration + seeds → Verified, no strip.
+        let honest = dn(parent.clone());
+        match classify_store_evidence(
+            &honest,
+            parent_aterm.as_bytes().to_vec(),
+            &seed,
+            &|_| None,
+            &|_| None,
+        ) {
+            O::Verified(def) => {
+                assert!(def.stripped_declared_hash.is_none(), "no strip with seeds");
+            }
+            other => panic!("expected Verified, got {}", outcome_name(&other)),
+        }
+
+        // Cell 2: corrupted declaration + seeds → Contradicts (typed
+        // refusal, never a forged verification, never a silent strip).
+        let mut forged = dn(parent.clone());
+        let mut h = forged.ca_modular_hash.unwrap();
+        h[0] ^= 0xFF;
+        forged.ca_modular_hash = Some(h);
+        match classify_store_evidence(
+            &forged,
+            parent_aterm.as_bytes().to_vec(),
+            &seed,
+            &|_| None,
+            &|_| None,
+        ) {
+            O::Contradicts(msg) => {
+                assert!(
+                    msg.contains("ca_modular_hash"),
+                    "refusal names the contradicted claim; got: {msg}"
+                );
+            }
+            other => panic!("expected Contradicts, got {}", outcome_name(&other)),
+        }
+
+        // Cell 3: seeds absent → the strip population, unchanged.
+        let empty = InputFormSeed::from_submission_nodes(&[]);
+        match classify_store_evidence(
+            &dn(parent.clone()),
+            parent_aterm.as_bytes().to_vec(),
+            &empty,
+            &|_| None,
+            &|_| None,
+        ) {
+            O::VerifiedExceptDeclaredHash(def) => {
+                assert_eq!(
+                    def.stripped_declared_hash,
+                    Some(<[u8; 32]>::try_from(parent.ca_modular_hash.as_slice()).unwrap()),
+                    "the strip preserves the declared value (M_070)"
+                );
+            }
+            other => panic!(
+                "expected VerifiedExceptDeclaredHash, got {}",
+                outcome_name(&other)
+            ),
+        }
     }
 }

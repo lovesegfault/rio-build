@@ -2,23 +2,81 @@
 // r[verify gw.opcode.build-paths-with-results]
 // r[verify gw.opcode.build-derivation+2]
 // r[verify gw.wire.derived-path]
-// r[verify gw.dag.reconstruct+3]
-// r[verify gw.hook.single-node-dag]
-// r[verify gw.hook.ifd-detection+2]
+// r[verify gw.dag.reconstruct+4]
+// r[verify gw.hook.single-node-dag+2]
+// r[verify gw.reject.output-path-mismatch+2]
+// r[verify gw.reject.unsupported-hash-algo+4]
+// r[verify gw.hook.ifd-detection+3]
+// r[verify gw.hook.inline-drv-content+4]
 // r[verify gw.stderr.activity+2]
 
 use super::*;
 
-/// Minimal valid ATerm derivation text. One output ("out"), no inputs,
-/// trivial builder. Used by every test that needs reconstruct_dag to
-/// resolve a .drv. Tests choose their own store path; this is just the
-/// body.
-const TEST_DRV_ATERM: &str = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
+/// Minimal single-output IA ATerm body, parameterized by declared output
+/// path and builder command. Flow-level tests get SELF-CONSISTENT fixtures
+/// from [`seed_flow_drv`] (declared path == derived path), because the
+/// gateway's IA binding gate (gw.reject.output-path-mismatch+2) rejects
+/// anything else and the build-result store verification
+/// (gw.opcode.build-results-honest) asks the store about every parseable
+/// declared path.
+fn ia_aterm_body(out_path: &str, cmd: &str) -> String {
+    format!(
+        r#"Derive([("out","{out_path}","","")],[],[],"x86_64-linux","/bin/sh",["-c","{cmd}"],[("out","{out_path}")])"#
+    )
+}
 
-/// ATerm derivation with __noChroot=1 in env. Triggers validate_dag rejection.
-/// Seeded into the store so resolve_derivation populates drv_cache; the inline
-/// BasicDerivation sent on the wire stays CLEAN so the :466 inline check passes.
-const NOCHROOT_DRV_ATERM: &str = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("__noChroot","1"),("out","/nix/store/zzz-output")])"#;
+/// Compute the self-consistent ATerm + derived output path for `drv_path`:
+/// the declared output path equals what `input_addressed_output_paths`
+/// derives — i.e. what `nix-instantiate` would have produced.
+fn consistent_ia_fixture(drv_path: &str, cmd: &str) -> (String, String) {
+    let probe =
+        rio_nix::derivation::Derivation::parse(&ia_aterm_body("", cmd)).expect("probe parses");
+    let mut cache = std::collections::HashMap::new();
+    let derived = rio_nix::derivation::input_addressed_output_paths(
+        &probe,
+        drv_path,
+        &|_: &str| None,
+        &mut cache,
+    )
+    .expect("single-output IA derivation derives");
+    let out = derived["out"].as_str().to_owned();
+    (ia_aterm_body(&out, cmd), out)
+}
+
+/// Seed a self-consistent `.drv` at `drv_path` AND mark its derived output
+/// present in the mock store; returns the derived output path. This is the
+/// standard fixture for flow-level tests: the IA binding gate accepts it
+/// and the post-build store verification finds the output, so the test
+/// outcome is governed purely by the mocked scheduler outcome.
+fn seed_flow_drv(h: &GatewaySession, drv_path: &str) -> String {
+    seed_flow_drv_cmd(h, drv_path, "echo hi")
+}
+
+/// [`seed_flow_drv`] with a distinct builder command (so two seeded `.drv`s
+/// can have different contents).
+fn seed_flow_drv_cmd(h: &GatewaySession, drv_path: &str, cmd: &str) -> String {
+    let (aterm, out) = consistent_ia_fixture(drv_path, cmd);
+    h.store.seed_with_content(drv_path, aterm.as_bytes());
+    h.store.seed_with_content(&out, b"flow-test output");
+    out
+}
+
+/// Seed a self-consistent `.drv` whose output is NOT in the store — the
+/// fixture for failure/cancellation-path tests, where the build never
+/// produced anything and the result must reflect the scheduler outcome
+/// (a present output would legitimately be reported as built).
+fn seed_unbuilt_drv(h: &GatewaySession, drv_path: &str) -> String {
+    let (aterm, out) = consistent_ia_fixture(drv_path, "echo hi");
+    h.store.seed_with_content(drv_path, aterm.as_bytes());
+    out
+}
+
+/// ATerm derivation with __noChroot=1 in env. Triggers validate_dag rejection
+/// (which fires before the output-path binding gate, so the deferred output
+/// shape never reaches it). Seeded into the store so resolve_derivation
+/// populates drv_cache; the inline BasicDerivation sent on the wire stays
+/// CLEAN so the :466 inline check passes.
+const NOCHROOT_DRV_ATERM: &str = r#"Derive([("out","","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("__noChroot","1"),("out","")])"#;
 
 // ===========================================================================
 // Build opcode tests
@@ -32,8 +90,7 @@ async fn test_build_paths_success() -> anyhow::Result<()> {
 
     // Seed a .drv in store so translate::reconstruct_dag can resolve it.
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     wire_send!(&mut h.stream;
         u64: 9,                                  // wopBuildPaths
@@ -62,8 +119,7 @@ async fn test_build_paths_scheduler_error_returns_stderr_error() -> anyhow::Resu
         .set_submit_outcome(SubmitOutcome::Error(tonic::Code::Unavailable));
 
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     wire_send!(&mut h.stream;
         u64: 9,                                  // wopBuildPaths
@@ -108,15 +164,14 @@ async fn test_build_paths_eof_triggers_reconnect_not_error() -> anyhow::Result<(
             sequence: 2,
             timestamp: None,
             event: Some(build_event::Event::Completed(types::BuildCompleted {
-                output_paths: vec!["/nix/store/zzz-out".into()],
+                output_paths: vec!["/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-out".into()],
             })),
         }]),
         ..Default::default()
     });
 
     let drv_path = "/nix/store/00000000000000000000000000000000-early-close.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     wire_send!(&mut h.stream;
         u64: 9,                                  // wopBuildPaths
@@ -160,8 +215,7 @@ async fn test_build_paths_with_results_keyed_format() -> anyhow::Result<()> {
     h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     let derived_path = format!("{drv_path}!out");
     wire_send!(&mut h.stream;
@@ -221,6 +275,11 @@ async fn test_build_derivation_basic_format() -> anyhow::Result<()> {
     h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+    // Seed the full .drv: the inline single-node fallback rejects ALL
+    // input-addressed shapes (gw.reject.output-path-mismatch+2), so the
+    // wire-format properties this test pins are exercised on the
+    // resolve-success (full-DAG) path.
+    seed_flow_drv(&h, drv_path);
 
     wire_send!(&mut h.stream;
         u64: 36,                                 // wopBuildDerivation
@@ -228,7 +287,7 @@ async fn test_build_derivation_basic_format() -> anyhow::Result<()> {
         // BasicDerivation: outputs
         u64: 1,                                  // 1 output
         string: "out",                           // name
-        string: "/nix/store/zzz-output",         // path
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",         // path
         string: "",                              // hash_algo (input-addressed)
         string: "",                              // hash
         // input_srcs
@@ -242,7 +301,7 @@ async fn test_build_derivation_basic_format() -> anyhow::Result<()> {
         // env pairs (count + flat key/value strings; no string_pairs kind)
         u64: 1,
         string: "out",
-        string: "/nix/store/zzz-output",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
         // build_mode
         u64: 0,
     );
@@ -388,7 +447,7 @@ async fn drain_build_result_tail(stream: &mut tokio::io::DuplexStream) -> anyhow
 }
 
 // r[verify gw.stderr.error-before-return+2]
-// r[verify gw.reject.nochroot]
+// r[verify gw.reject.nochroot+2]
 /// wopBuildDerivation (36): DAG-validation failure (cached drv has __noChroot)
 /// sends STDERR_LAST + failure BuildResult, NOT STDERR_ERROR.
 ///
@@ -416,7 +475,7 @@ async fn test_build_derivation_dag_reject_clean_stderr_last() -> anyhow::Result<
         string: drv_path,
         u64: 1,                                  // 1 output
         string: "out",
-        string: "/nix/store/zzz-output",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
         string: "",                              // hash_algo
         string: "",                              // hash
         strings: wire::NO_STRINGS,               // input_srcs
@@ -425,7 +484,7 @@ async fn test_build_derivation_dag_reject_clean_stderr_last() -> anyhow::Result<
         strings: &["-c", "echo hi"],
         u64: 1,                                  // 1 env pair (NOT __noChroot)
         string: "out",
-        string: "/nix/store/zzz-output",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
         u64: 0,                                  // build_mode
     );
 
@@ -471,7 +530,7 @@ async fn test_build_derivation_dag_reject_clean_stderr_last() -> anyhow::Result<
 }
 
 // r[verify gw.stderr.error-before-return+2]
-// r[verify gw.reject.nochroot]
+// r[verify gw.reject.nochroot+2]
 /// wopBuildPathsWithResults (46): DAG-validation failure sends STDERR_LAST +
 /// per-path failure results, NOT STDERR_ERROR. Sibling of the opcode-36 test
 /// above, covering the second bug site at build.rs:799-806.
@@ -526,7 +585,7 @@ async fn test_build_paths_with_results_dag_reject_clean_stderr_last() -> anyhow:
     Ok(())
 }
 
-// r[verify gw.reject.nochroot]
+// r[verify gw.reject.nochroot+2]
 /// wopBuildDerivation (36): __noChroot=1 in the INLINE BasicDerivation's
 /// env is rejected at the handler's early check (build.rs:592-613), before
 /// resolve_derivation / validate_dag ever run.
@@ -563,7 +622,7 @@ async fn test_build_derivation_inline_nochroot_rejected() -> anyhow::Result<()> 
         // BasicDerivation:
         u64: 1,                                  // 1 output
         string: "out",
-        string: "/nix/store/zzz-output",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
         string: "",                              // hash_algo (input-addressed)
         string: "",                              // hash
         strings: wire::NO_STRINGS,               // input_srcs
@@ -597,6 +656,1423 @@ async fn test_build_derivation_inline_nochroot_rejected() -> anyhow::Result<()> 
         h.scheduler.submit_calls.read().unwrap().len(),
         0,
         "inline __noChroot rejection happens BEFORE SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.reject.nochroot+2]
+/// wopBuildDerivation (36): a WRONG-TYPED `__noChroot` in the inline
+/// BasicDerivation's `__json` (number, not boolean) is rejected
+/// fail-closed — the gateway does not guess at sandbox attributes it
+/// cannot type (oracle getBoolean throws on non-bools). Pre-fix, the
+/// lenient reader degraded the wrong-typed value to "absent" and waved
+/// the derivation through to the scheduler.
+#[tokio::test]
+async fn build_derivation_rejects_wrong_typed_nochroot() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    let drv_path = "/nix/store/00000000000000000000000000000004-inline-typed.drv";
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        // BasicDerivation:
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
+        string: "",                              // hash_algo (input-addressed)
+        string: "",                              // hash
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo evil"],
+        u64: 1,                                  // 1 env pair: __json with a numeric __noChroot
+        string: "__json",
+        string: r#"{"__noChroot":1}"#,
+        u64: 0,                                  // build_mode
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("__noChroot"),
+        "error names the attribute: {:?}",
+        err.message
+    );
+    assert!(
+        err.message.contains("not permitted"),
+        "error is a rejection: {:?}",
+        err.message
+    );
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "wrong-typed __noChroot rejection happens BEFORE SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): an inline input-addressed derivation whose
+/// full .drv is NOT in the store is rejected fail-closed when it declares
+/// a real (parseable) store path — with only the inline BasicDerivation
+/// there is nothing binding that declared path to the derivation, which
+/// is exactly the path-squatting shape the validate_dag gate closes for
+/// cached derivations. Mirrors CppNix's daemon, which refuses
+/// buildDerivation for input-addressed derivations from untrusted
+/// clients.
+#[tokio::test]
+async fn test_build_derivation_inline_ia_unresolvable_rejected() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    // Store is EMPTY — resolve_derivation fails, single-node fallback.
+    let drv_path = "/nix/store/00000000000000000000000000000004-inline-ia.drv";
+    let squatted = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: squatted,                        // parseable, not ours to claim
+        string: "",                              // hash_algo (input-addressed)
+        string: "",                              // hash
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: squatted,
+        u64: 0,                                  // build_mode
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("input-addressed"),
+        "error should say why inline IA is refused: {:?}",
+        err.message
+    );
+    assert!(
+        err.message.contains("upload the .drv") || err.message.contains("not in the store"),
+        "error should tell the client what to do: {:?}",
+        err.message
+    );
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "inline IA rejection happens BEFORE SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): the inline single-node fallback rejects ALL
+/// input-addressed shapes, including DEFERRED IA (empty hash_algo + empty
+/// declared path). Pre-fix, the gate keyed on "declares a PARSEABLE path",
+/// so a deferred-IA inline fallback slipped past it and was submitted —
+/// only for the scheduler to unconditionally reject it (and the rejection
+/// to be misreported as a transient failure). The gateway and scheduler
+/// must agree: no IA shape is acceptable without a resolvable .drv.
+// r[verify gw.reject.output-path-mismatch+2]
+#[tokio::test]
+async fn test_build_derivation_inline_deferred_ia_unresolvable_rejected() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    // Store is EMPTY — resolve_derivation fails, single-node fallback.
+    let drv_path = "/nix/store/00000000000000000000000000000044-inline-deferred-ia.drv";
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "",                              // declared path EMPTY (deferred IA)
+        string: "",                              // hash_algo (input-addressed)
+        string: "",                              // hash
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: "",
+        u64: 0,                                  // build_mode
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("input-addressed"),
+        "error should say why inline IA is refused: {:?}",
+        err.message
+    );
+    assert!(
+        err.message.contains("deferred") || err.message.contains("no declared path"),
+        "error should name the deferred variant: {:?}",
+        err.message
+    );
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "deferred-IA inline rejection happens BEFORE SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): the single-node fallback stays available for
+/// content-bound derivations — an inline FIXED-OUTPUT derivation with no
+/// uploaded .drv is accepted and submitted (its output path is governed by
+/// the content-hash rules, not by trust in the declared path).
+#[tokio::test]
+async fn test_build_derivation_inline_fod_unresolvable_accepted() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    // No .drv uploaded — resolve_derivation fails, single-node fallback.
+    let drv_path = "/nix/store/00000000000000000000000000000005-inline-fod.drv";
+
+    // The declared path must be the one the declared hash derives to —
+    // the gateway now binds fixed-output declarations exactly like the
+    // builder does, so the fixture computes the honest path instead of
+    // making one up.
+    let digest = hex::decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")?;
+    let nix_hash = rio_nix::hash::NixHash::new("sha256".parse().unwrap(), digest)?;
+    let honest_path =
+        rio_nix::store_path::StorePath::make_fixed_output("inline-fod", &nix_hash, false, &[])?
+            .as_str()
+            .to_owned();
+    // The produced output must be present in the store for the post-build
+    // result verification (gw.opcode.build-results-honest); the .drv stays
+    // absent so the single-node fallback path is still what's exercised.
+    h.store.seed_with_content(&honest_path, b"fod-out");
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: &honest_path,
+        string: "sha256",                        // hash_algo → fixed-output
+        string: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: &honest_path,
+        u64: 0,                                  // build_mode
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(
+        status, 0,
+        "inline FOD must still build (Built=0), got {status}"
+    );
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    assert!(
+        error_msg.is_empty(),
+        "no error for the content-bound fallback"
+    );
+    drain_build_result_tail(&mut h.stream).await?;
+
+    {
+        let submits = h.scheduler.submit_calls.read().unwrap();
+        assert_eq!(
+            submits.len(),
+            1,
+            "the content-bound inline fallback is submitted"
+        );
+        // r[verify gw.hook.inline-drv-content+4]
+        // The submitted node carries the serialized derivation (the .drv
+        // exists in no store for the worker to fetch) and it parses back
+        // to the same fixed-output derivation.
+        let node = &submits[0].nodes[0];
+        assert!(
+            !node.drv_content.is_empty(),
+            "inline fallback must carry drv_content"
+        );
+        // Pins the boundary of the realization-exemption carve-out: an
+        // ordinary (verifiable-algo) content-bound fallback stays
+        // authoritative so the scheduler persists it for recovery.
+        assert!(
+            node.drv_content_authoritative,
+            "non-exempted content-bound fallback must stay authoritative"
+        );
+        let reparsed =
+            rio_nix::derivation::Derivation::parse(std::str::from_utf8(&node.drv_content).unwrap())
+                .expect("inlined drv_content parses");
+        assert!(node.is_fixed_output, "FOD flag preserved");
+        assert_eq!(
+            reparsed.outputs()[0].path(),
+            honest_path,
+            "inlined derivation declares the same output path"
+        );
+    }
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): a scheduler INVALID_ARGUMENT on SubmitBuild is
+/// reported to the client as a PERMANENT rejection (InputRejected), never
+/// TransientFailure — the scheduler validated the submission and refused
+/// it, so retrying the identical request can never succeed. UNAVAILABLE
+/// (infrastructure trouble) stays transient.
+// r[verify gw.build.scheduler-rejection-permanent]
+#[tokio::test]
+async fn test_build_derivation_scheduler_invalid_argument_reported_input_rejected()
+-> anyhow::Result<()> {
+    // Helper: drive a content-bound (FOD) inline fallback — which passes
+    // every gateway gate — into a scheduler whose submit outcome is `code`,
+    // and return the BuildResult status the client reads back.
+    async fn submit_with_scheduler_code(code: tonic::Code, tag: &str) -> anyhow::Result<u64> {
+        let mut h = GatewaySession::new_with_handshake().await?;
+        h.scheduler.set_submit_outcome(SubmitOutcome::Error(code));
+
+        let drv_path = format!("/nix/store/00000000000000000000000000000055-sched-rej-{tag}.drv");
+        let digest =
+            hex::decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")?;
+        let nix_hash = rio_nix::hash::NixHash::new("sha256".parse().unwrap(), digest)?;
+        let honest_path = rio_nix::store_path::StorePath::make_fixed_output(
+            &format!("sched-rej-{tag}"),
+            &nix_hash,
+            false,
+            &[],
+        )?
+        .as_str()
+        .to_owned();
+
+        wire_send!(&mut h.stream;
+            u64: 36,                                 // wopBuildDerivation
+            string: &drv_path,
+            u64: 1,                                  // 1 output
+            string: "out",
+            string: &honest_path,
+            string: "sha256",                        // hash_algo → fixed-output
+            string: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            strings: wire::NO_STRINGS,               // input_srcs
+            string: "x86_64-linux",
+            string: "/bin/sh",
+            strings: &["-c", "echo hi"],
+            u64: 1,                                  // 1 env pair
+            string: "out",
+            string: &honest_path,
+            u64: 0,                                  // build_mode
+        );
+
+        drain_stderr_until_last(&mut h.stream).await?;
+        let status = wire::read_u64(&mut h.stream).await?;
+        let _error_msg = wire::read_string(&mut h.stream).await?;
+        drain_build_result_tail(&mut h.stream).await?;
+        h.finish().await;
+        Ok(status)
+    }
+
+    // Scheduler validated and refused → InputRejected (4), permanent.
+    let rejected = submit_with_scheduler_code(tonic::Code::InvalidArgument, "inv").await?;
+    assert_eq!(
+        rejected, 4,
+        "scheduler INVALID_ARGUMENT must surface as InputRejected (4), got {rejected}"
+    );
+
+    // FAILED_PRECONDITION (merge-gate conflict) → also permanent.
+    let precondition = submit_with_scheduler_code(tonic::Code::FailedPrecondition, "pre").await?;
+    assert_eq!(
+        precondition, 4,
+        "scheduler FAILED_PRECONDITION must surface as InputRejected (4), got {precondition}"
+    );
+
+    // Infrastructure trouble → TransientFailure (6), retryable.
+    let transient = submit_with_scheduler_code(tonic::Code::Unavailable, "unav").await?;
+    assert_eq!(
+        transient, 6,
+        "scheduler UNAVAILABLE must stay TransientFailure (6), got {transient}"
+    );
+
+    Ok(())
+}
+
+/// wopBuildDerivation (36): an inline floating-CA derivation (algo set,
+/// hash and path empty) with no uploaded .drv is accepted, and the
+/// submitted node carries parseable drv_content with needs_resolve set.
+/// r[verify gw.hook.inline-drv-content+4]
+#[tokio::test]
+async fn test_build_derivation_inline_floating_ca_unresolvable_inlines_content()
+-> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    // No .drv uploaded — resolve_derivation fails, single-node fallback.
+    let drv_path = "/nix/store/0000000000000000000000000000000g-inline-ca.drv";
+
+    // Post-build verification (gw.opcode.build-results-honest) resolves the
+    // floating-CA output through the realisations table and then requires
+    // the realised path to be present in the store — model the scheduler
+    // having built and registered it. The realisation key is the modular
+    // hash over the inline derivation (same construction as the
+    // fallback-returns-built-outputs test below).
+    let aterm = r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","")])"#;
+    let drv = rio_nix::derivation::Derivation::parse(aterm)?;
+    let hash = rio_nix::derivation::hash_derivation_modulo(
+        &drv,
+        drv_path,
+        &|_| None,
+        &mut std::collections::HashMap::new(),
+    )?;
+    let realised_out = "/nix/store/66666666666666666666666666666666-inline-ca-out";
+    h.store.state.realisations.write().unwrap().insert(
+        (hash.to_vec(), "out".into()),
+        rio_proto::types::Realisation {
+            drv_hash: hash.to_vec(),
+            output_name: "out".into(),
+            output_path: realised_out.into(),
+            output_hash: vec![0u8; 32],
+            signatures: vec![],
+        },
+    );
+    h.store.seed_with_content(realised_out, b"inline-ca-out");
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "",                              // floating-CA: no static path
+        string: "r:sha256",
+        string: "",                              // no hash either
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: "",
+        u64: 0,                                  // build_mode
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(
+        status, 0,
+        "inline floating-CA must build (Built=0), got {status}"
+    );
+    let _error_msg = wire::read_string(&mut h.stream).await?;
+    drain_build_result_tail(&mut h.stream).await?;
+
+    {
+        let submits = h.scheduler.submit_calls.read().unwrap();
+        assert_eq!(submits.len(), 1);
+        let node = &submits[0].nodes[0];
+        assert!(!node.drv_content.is_empty(), "drv_content inlined");
+        assert!(node.needs_resolve, "floating-CA node needs resolution");
+        // r[verify gw.hook.fallback-built-outputs]
+        assert!(
+            !node.ca_modular_hash.is_empty(),
+            "content-bound fallback nodes carry the modular hash for realisation keying"
+        );
+        rio_nix::derivation::Derivation::parse(std::str::from_utf8(&node.drv_content).unwrap())
+            .expect("inlined drv_content parses");
+    }
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): a floating-CA derivation built via the
+/// content-bound single-node fallback (the .drv exists in no store)
+/// returns consumable builtOutputs — keyed by the modular hash of the
+/// inline derivation, with the realized path from the realisations
+/// table — instead of an empty list the hook client cannot use.
+/// r[verify gw.hook.fallback-built-outputs]
+#[tokio::test]
+async fn test_build_derivation_inline_floating_ca_fallback_returns_built_outputs()
+-> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    // No .drv uploaded — resolve_derivation fails, fallback path. The
+    // realisation key is the modular hash over the *inline* derivation
+    // (equal to hashing the same ATerm: it has no inputDrvs).
+    let drv_path = "/nix/store/0000000000000000000000000000000h-fallback-ca.drv";
+    let aterm = r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","true"],[("out","")])"#;
+    let drv = rio_nix::derivation::Derivation::parse(aterm)?;
+    let hash = rio_nix::derivation::hash_derivation_modulo(
+        &drv,
+        drv_path,
+        &|_| None,
+        &mut std::collections::HashMap::new(),
+    )?;
+    let realised_out = "/nix/store/77777777777777777777777777777777-fallback-ca-out";
+    h.store.state.realisations.write().unwrap().insert(
+        (hash.to_vec(), "out".into()),
+        rio_proto::types::Realisation {
+            drv_hash: hash.to_vec(),
+            output_name: "out".into(),
+            output_path: realised_out.into(),
+            output_hash: vec![0u8; 32],
+            signatures: vec![],
+        },
+    );
+    // The realised output must also be PRESENT in the store — the gateway
+    // verifies it via FindMissingPaths before reporting success.
+    h.store.seed_with_content(realised_out, b"fallback-ca-out");
+
+    wire_send!(&mut h.stream;
+        u64: 36,
+        string: drv_path,
+        u64: 1,                             // 1 output
+        string: "out", string: "",          // floating-CA: path empty
+        string: "r:sha256", string: "",     // hash_algo set, hash empty
+        strings: wire::NO_STRINGS,          // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "true"],
+        u64: 1, string: "out", string: "",  // env
+        u64: 0,                             // build_mode
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(status, 0, "Built");
+    let _err = wire::read_string(&mut h.stream).await?;
+    let _tb = wire::read_u64(&mut h.stream).await?;
+    let _nd = wire::read_bool(&mut h.stream).await?;
+    let _st = wire::read_u64(&mut h.stream).await?;
+    let _sp = wire::read_u64(&mut h.stream).await?;
+    if wire::read_u64(&mut h.stream).await? == 1 {
+        let _ = wire::read_u64(&mut h.stream).await?;
+    }
+    if wire::read_u64(&mut h.stream).await? == 1 {
+        let _ = wire::read_u64(&mut h.stream).await?;
+    }
+    let outs = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(outs, 1, "fallback builtOutputs populated (was 0 pre-fix)");
+    let drv_output_id = wire::read_string(&mut h.stream).await?;
+    assert_eq!(drv_output_id, format!("sha256:{}!out", hex::encode(hash)));
+    let realisation_json = wire::read_string(&mut h.stream).await?;
+    assert!(
+        realisation_json.contains("77777777777777777777777777777777-fallback-ca-out"),
+        "outPath should be the realised path, got: {realisation_json}"
+    );
+
+    {
+        let submits = h.scheduler.submit_calls.read().unwrap();
+        assert_eq!(submits.len(), 1);
+        let node = &submits[0].nodes[0];
+        assert_eq!(
+            node.ca_modular_hash,
+            hash.to_vec(),
+            "the node carried the same hash the realisation is keyed by"
+        );
+    }
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): an inline content-bound derivation whose
+/// serialized form exceeds the 1 MiB fallback cap is rejected with
+/// remediation, before SubmitBuild. r[verify gw.hook.inline-drv-content+4]
+#[tokio::test]
+async fn test_build_derivation_inline_fallback_oversized_rejected() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    // Store is EMPTY — single-node fallback path.
+    let drv_path = "/nix/store/0000000000000000000000000000000f-inline-huge.drv";
+    let huge_env = "x".repeat(1024 * 1024 + 1);
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "",                              // floating-CA
+        string: "r:sha256",
+        string: "",
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "big",
+        string: &huge_env,
+        u64: 0,                                  // build_mode
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("nix copy --derivation"),
+        "remediation present: {:?}",
+        err.message
+    );
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "oversized fallback rejection happens BEFORE SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): an inline content-bound derivation whose
+/// serialized form sits between the old scheduler ingress bound
+/// (256 KiB) and the shared 1 MiB fallback cap is accepted and the
+/// submitted node carries the full drv_content — the producer cap and
+/// the SubmitBuild ingress bound are the same shared constant, so the
+/// (256 KiB, 1 MiB] window cannot be rejected downstream.
+/// r[verify gw.hook.inline-drv-content+4]
+#[tokio::test]
+async fn test_build_derivation_inline_fallback_midsize_accepted() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    // No .drv uploaded — single-node fallback path.
+    let drv_path = "/nix/store/0000000000000000000000000000000m-inline-mid.drv";
+    // ~320 KiB env value: above the old 256 KiB scheduler bound, well
+    // under the 1 MiB fallback cap.
+    let mid_env = "x".repeat(320 * 1024);
+
+    // Post-build verification (gw.opcode.build-results-honest) needs the
+    // floating-CA output realised and the realised path present in the
+    // store; the realisation key is the modular hash over the inline
+    // derivation exactly as the gateway computes it.
+    let aterm = format!(
+        r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("big","{mid_env}")])"#
+    );
+    let drv = rio_nix::derivation::Derivation::parse(&aterm)?;
+    let hash = rio_nix::derivation::hash_derivation_modulo(
+        &drv,
+        drv_path,
+        &|_| None,
+        &mut std::collections::HashMap::new(),
+    )?;
+    let realised_out = "/nix/store/55555555555555555555555555555555-inline-mid-out";
+    h.store.state.realisations.write().unwrap().insert(
+        (hash.to_vec(), "out".into()),
+        rio_proto::types::Realisation {
+            drv_hash: hash.to_vec(),
+            output_name: "out".into(),
+            output_path: realised_out.into(),
+            output_hash: vec![0u8; 32],
+            signatures: vec![],
+        },
+    );
+    h.store.seed_with_content(realised_out, b"inline-mid-out");
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "",                              // floating-CA
+        string: "r:sha256",
+        string: "",
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "big",
+        string: &mid_env,
+        u64: 0,                                  // build_mode
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(
+        status, 0,
+        "mid-size inline fallback must build (Built=0), got {status}"
+    );
+    let _error_msg = wire::read_string(&mut h.stream).await?;
+    drain_build_result_tail(&mut h.stream).await?;
+
+    {
+        let submits = h.scheduler.submit_calls.read().unwrap();
+        assert_eq!(submits.len(), 1, "mid-size fallback is submitted");
+        let node = &submits[0].nodes[0];
+        assert!(
+            node.drv_content.len() > 256 * 1024,
+            "the full drv_content ({} bytes) is carried past the old 256 KiB bound",
+            node.drv_content.len()
+        );
+        assert!(
+            node.drv_content.len() <= rio_common::limits::MAX_DRV_CONTENT_BYTES,
+            "still within the shared cap"
+        );
+    }
+
+    h.finish().await;
+    Ok(())
+}
+
+/// ATerm whose declared output path is a well-formed store path that the
+/// derivation does NOT derive to — the canonical path-squatting shape the
+/// output-path binding gate rejects. Seeded into the mock store so
+/// `resolve_derivation` populates `drv_cache` and the full-DAG pipeline
+/// (not the inline fallback) handles it.
+const SQUATTED_IA_DRV_ATERM: &str = r#"Derive([("out","/nix/store/ffffffffffffffffffffffffffffffff-victim","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/ffffffffffffffffffffffffffffffff-victim")])"#;
+
+/// wopBuildDerivation (36): a cached derivation declaring a squatted
+/// (well-formed, non-derived) input-addressed output path is rejected by
+/// the output-path binding gate AFTER the rate/quota gates, still before
+/// SubmitBuild, and delivered as STDERR_LAST + failure BuildResult (same
+/// shape as a validate_dag rejection). Sending the opcode a second time
+/// proves the session drv_cache survived the spawn_blocking round-trip
+/// (`mem::take`/restore): the .drv is served from the cache, so the mock
+/// store's GetPath count does not grow.
+#[tokio::test]
+async fn test_build_derivation_squatted_path_rejected_and_cache_restored() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    let drv_path = "/nix/store/00000000000000000000000000000006-squat.drv";
+    h.store
+        .seed_with_content(drv_path, SQUATTED_IA_DRV_ATERM.as_bytes());
+
+    for round in 1..=2u32 {
+        wire_send!(&mut h.stream;
+            u64: 36,                                 // wopBuildDerivation
+            string: drv_path,
+            u64: 1,                                  // 1 output
+            string: "out",
+            string: "/nix/store/ffffffffffffffffffffffffffffffff-victim",
+            string: "",                              // hash_algo (input-addressed)
+            string: "",                              // hash
+            strings: wire::NO_STRINGS,               // input_srcs
+            string: "x86_64-linux",
+            string: "/bin/sh",
+            strings: &["-c", "echo hi"],
+            u64: 1,                                  // 1 env pair
+            string: "out",
+            string: "/nix/store/ffffffffffffffffffffffffffffffff-victim",
+            u64: 0,                                  // build_mode
+        );
+        drain_stderr_until_last(&mut h.stream).await?;
+        let status = wire::read_u64(&mut h.stream).await?;
+        assert_ne!(status, 0, "round {round}: must be a failure code");
+        let error_msg = wire::read_string(&mut h.stream).await?;
+        assert!(
+            error_msg.contains("must match the derivation"),
+            "round {round}: errorMsg should name the binding violation: {error_msg:?}"
+        );
+        drain_build_result_tail(&mut h.stream).await?;
+    }
+
+    // The squat never reaches the scheduler.
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "binding rejection happens BEFORE SubmitBuild"
+    );
+
+    // drv_cache restored after spawn_blocking: the second round resolved
+    // the .drv from the session cache, not the store.
+    assert_eq!(
+        h.store
+            .calls
+            .get_path_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the .drv must be fetched exactly once — the session cache survives the binding gate"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// ATerm with a floating-CA-shaped output (`outputHashAlgo` set, empty
+/// `outputHash`) that nevertheless declares an output path — a shape
+/// CppNix refuses to parse and the gateway rejects at submission
+/// (`gw.reject.floating-ca-declared-path`).
+/// wopBuildDerivation (36): an inline BasicDerivation whose floating-CA-
+/// shaped output declares a non-empty path fails AT THE WIRE PARSE — the
+/// typed boundary classifies the output triple during
+/// `read_basic_derivation`, so the malformed value never exists in the
+/// gateway. The handler answers STDERR_ERROR (mid-payload failure, so
+/// the connection closes; protocol-wire.md desync rule) carrying the
+/// oracle's wording, and SubmitBuild is never reached.
+// r[verify gw.reject.floating-ca-declared-path+1]
+#[tokio::test]
+async fn test_build_derivation_floating_ca_declared_path_rejected() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    // The store seed is irrelevant — the rejection happens while READING
+    // the payload, before any resolve. Keep the store empty to prove it.
+    let drv_path = "/nix/store/00000000000000000000000000000007-fca.drv";
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "/nix/store/ffffffffffffffffffffffffffffffff-victim",
+        string: "r:sha256",                      // hash_algo (floating-CA shape)
+        string: "",                              // hash (empty)
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: "/nix/store/ffffffffffffffffffffffffffffffff-victim",
+        u64: 0,                                  // build_mode
+    );
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message
+            .contains("content-addressing derivation output should not specify output path"),
+        "errorMsg should carry the oracle's shape wording: {:?}",
+        err.message
+    );
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "the shape rejection happens BEFORE SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36) after the .drv was uploaded in-session
+/// (wopAddToStoreNar): the resolve-success shape — what a hook client that
+/// does upload its derivations gets — goes through the full-DAG pipeline,
+/// passes the binding gates and is submitted. Positive-path guard against
+/// over-rejection of the build-hook flow.
+#[tokio::test]
+async fn test_build_derivation_after_drv_upload_submitted() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/00000000000000000000000000000009-uploaded.drv";
+    let (uploaded_aterm, uploaded_out) = consistent_ia_fixture(drv_path, "echo hi");
+    // The output must be present for the post-build store verification.
+    h.store.seed_with_content(&uploaded_out, b"uploaded output");
+    let (nar, hash) = make_nar(uploaded_aterm.as_bytes());
+
+    // Upload the .drv exactly like `nix copy --derivation` does.
+    wire_send!(&mut h.stream;
+        u64: 39,                           // wopAddToStoreNar
+        string: drv_path,
+        string: "",                        // deriver
+        string: &hex::encode(hash),
+        strings: wire::NO_STRINGS,         // references
+        u64: 0,                            // registration_time
+        u64: nar.len() as u64,             // nar_size
+        bool: false,                       // ultimate
+        strings: wire::NO_STRINGS,         // sigs
+        string: "",                        // ca
+        bool: false, bool: true,           // repair, dont_check_sigs
+        framed: &nar,
+    );
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    // Now build it: the gateway resolves the full derivation (store →
+    // drv_cache), reconstructs the DAG and submits.
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
+        string: "",                              // hash_algo (input-addressed)
+        string: "",                              // hash
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
+        u64: 0,                                  // build_mode
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(
+        status, 0,
+        "uploaded-drv build must succeed (Built=0), got {status}"
+    );
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    assert!(error_msg.is_empty(), "no error expected: {error_msg:?}");
+    drain_build_result_tail(&mut h.stream).await?;
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        1,
+        "the resolved full-DAG path must be submitted"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36), behavior deltas (b)+(c) of the typed parse
+/// boundary: a CACHED .drv whose text is newly unparseable (here a
+/// floating-CA output declaring a path) fails resolve like any
+/// truncated ATerm — and when the client's INLINE BasicDerivation is
+/// well-formed and content-bound, the adversary-chooses-branch
+/// fall-through lands on the authoritative single-node fallback, which
+/// SUBMITS. The fallback is content-bound and scheduler-ingress-bound,
+/// so this is a fall-through to a GATED path, not a bypass.
+#[tokio::test]
+async fn test_build_derivation_unparseable_cached_drv_falls_back_to_inline() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    // Seed the .drv with a floating-with-path body: parseable before the
+    // typed boundary, rejected at parse now.
+    let drv_path = "/nix/store/0000000000000000000000000000000d-newly-bad.drv";
+    let bad_aterm = r#"Derive([("out","/nix/store/ffffffffffffffffffffffffffffffff-victim","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/ffffffffffffffffffffffffffffffff-victim")])"#;
+    h.store.seed_with_content(drv_path, bad_aterm.as_bytes());
+
+    // Well-formed content-bound inline: honest FOD declaration.
+    let digest = hex::decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")?;
+    let nix_hash = rio_nix::hash::NixHash::new("sha256".parse().unwrap(), digest)?;
+    let honest_path =
+        rio_nix::store_path::StorePath::make_fixed_output("newly-bad", &nix_hash, false, &[])?
+            .as_str()
+            .to_owned();
+    h.store.seed_with_content(&honest_path, b"fod-out");
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: &honest_path,
+        string: "sha256",                        // fixed-output shape
+        string: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: &honest_path,
+        u64: 0,                                  // build_mode
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(status, 0, "content-bound fallback must build, got {status}");
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    assert!(error_msg.is_empty(), "no error expected: {error_msg:?}");
+    drain_build_result_tail(&mut h.stream).await?;
+
+    {
+        let submits = h.scheduler.submit_calls.read().unwrap();
+        assert_eq!(
+            submits.len(),
+            1,
+            "the unparseable cached drv must fall through to the \
+             authoritative content-bound fallback, not a rejection"
+        );
+        let node = &submits[0].nodes[0];
+        assert!(
+            !node.drv_content.is_empty() && node.drv_content_authoritative,
+            "fallback node is content-bound"
+        );
+    }
+
+    h.finish().await;
+    Ok(())
+}
+
+/// The IA-inline variant of the fall-through above: the cached .drv is
+/// newly unparseable, and the inline BasicDerivation is INPUT-ADDRESSED
+/// — the existing inline-IA refusal still fires (STDERR_LAST + failure
+/// result, no submit). The unparseable cache entry buys the adversary
+/// nothing.
+#[tokio::test]
+async fn test_build_derivation_unparseable_cached_drv_ia_inline_still_rejected()
+-> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    let drv_path = "/nix/store/0000000000000000000000000000000f-newly-bad-ia.drv";
+    let bad_aterm = r#"Derive([("out","/nix/store/ffffffffffffffffffffffffffffffff-victim","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/ffffffffffffffffffffffffffffffff-victim")])"#;
+    h.store.seed_with_content(drv_path, bad_aterm.as_bytes());
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
+        string: "",                              // input-addressed
+        string: "",
+        strings: wire::NO_STRINGS,
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,
+        string: "out",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
+        u64: 0,                                  // build_mode
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("input-addressed"),
+        "rejection names the IA refusal: {:?}",
+        err.message
+    );
+    assert!(
+        err.message
+            .contains("content-addressing derivation output should not specify output path"),
+        "remediation context names WHY the cached .drv failed to parse: {:?}",
+        err.message
+    );
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "no submit for the IA inline"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): an inline BasicDerivation declaring an
+/// outputHashAlgo the builder cannot verify (md5) is rejected at the
+/// gateway's inline check, before resolve/SubmitBuild — same rule the
+/// cached-DAG algo gate enforces — when the declared output is NOT already
+/// realized in the store. r[verify gw.reject.unsupported-hash-algo+4]
+#[tokio::test]
+async fn test_build_derivation_inline_bad_hash_algo_rejected() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    // Store is EMPTY — the inline check must fire on its own.
+    let drv_path = "/nix/store/0000000000000000000000000000000a-inline-md5.drv";
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "/nix/store/ffffffffffffffffffffffffffffffff-fetched",
+        string: "md5",                           // unsupported algo
+        string: "deadbeefdeadbeefdeadbeefdeadbeef",
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: "/nix/store/ffffffffffffffffffffffffffffffff-fetched",
+        u64: 0,                                  // build_mode
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("md5") && err.message.contains("sha256"),
+        "error should name the bad algo and the supported set: {:?}",
+        err.message
+    );
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "unsupported-algo rejection happens BEFORE SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): the same inline md5 FOD is REJECTED even when
+/// its declared output path is already realized in the store, as long as
+/// the full .drv is unresolvable — with no derivation text to bind the
+/// claim, forwarding it would mint an unvalidated node under a
+/// client-claimed drv_path. The rejection names both remediations and is
+/// distinguishable from the unrealized rejection (which talks about
+/// re-pinning the algo). r[verify gw.reject.unsupported-hash-algo+4]
+#[tokio::test]
+async fn test_build_derivation_inline_bad_hash_algo_realized_rejected_without_drv()
+-> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    let drv_path = "/nix/store/0000000000000000000000000000000b-inline-md5-realized.drv";
+    let out_path = "/nix/store/ffffffffffffffffffffffffffffffff-fetched";
+    // The declared output is already in the store — only the .drv is absent.
+    h.store.seed_with_content(out_path, b"already realized");
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: out_path,
+        string: "md5",                           // unsupported algo
+        string: "deadbeefdeadbeefdeadbeefdeadbeef",
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: out_path,
+        u64: 0,                                  // build_mode
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("already") && err.message.contains("nix copy --derivation"),
+        "rejection must say the outputs are already available and how to upload the .drv: {:?}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("re-pin"),
+        "must be the realized-but-unbindable rejection, not the unrealized one: {:?}",
+        err.message
+    );
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "the unbindable inline claim must never reach SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): the same realized md5 FOD IS submitted once the
+/// full .drv is resolvable (uploaded beforehand, exactly the rejection's
+/// remediation): the cached-DAG path classifies the offender, the
+/// realization probe exempts it, and the node is store-backed.
+/// r[verify gw.reject.unsupported-hash-algo+4]
+#[tokio::test]
+async fn test_build_derivation_md5_fod_realized_with_drv_cached_submitted() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/0000000000000000000000000000000b-inline-md5-realized.drv";
+    let out_path = "/nix/store/ffffffffffffffffffffffffffffffff-fetched";
+    // Both the .drv (the remediation step) and the declared output exist.
+    h.store
+        .seed_with_content(drv_path, MD5_FOD_DRV_ATERM.as_bytes());
+    h.store.seed_with_content(out_path, b"already realized");
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: out_path,
+        string: "md5",                           // unsupported algo
+        string: "deadbeefdeadbeefdeadbeefdeadbeef",
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: out_path,
+        u64: 0,                                  // build_mode
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(
+        status, 0,
+        "realized md5 FOD with a resolvable .drv must be accepted (Built=0), got {status}"
+    );
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    assert!(error_msg.is_empty(), "no error: {error_msg:?}");
+    drain_build_result_tail(&mut h.stream).await?;
+
+    {
+        let submits = h.scheduler.submit_calls.read().unwrap();
+        assert_eq!(
+            submits.len(),
+            1,
+            "the realized offender is exempted on the cached-DAG path and submitted"
+        );
+        // The node is store-backed: the .drv is fetchable, so no
+        // authoritative inline copy is claimed.
+        let node = &submits[0].nodes[0];
+        assert!(
+            !node.drv_content_authoritative,
+            "store-backed node must not claim the authoritative copy"
+        );
+        assert!(node.is_fixed_output, "FOD flag preserved");
+        assert_eq!(
+            node.expected_output_paths,
+            vec![out_path.to_string()],
+            "declared output path comes from the real .drv"
+        );
+    }
+
+    h.finish().await;
+    Ok(())
+}
+
+/// ATerm for a legacy md5 fixed-output derivation (cached-DAG path).
+const MD5_FOD_DRV_ATERM: &str = r#"Derive([("out","/nix/store/ffffffffffffffffffffffffffffffff-fetched","md5","deadbeefdeadbeefdeadbeefdeadbeef")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/ffffffffffffffffffffffffffffffff-fetched")])"#;
+
+/// wopBuildPaths (9): a cached legacy md5 FOD whose declared output is
+/// already realized in the store is submitted (the scheduler cache-cuts
+/// it) instead of rejecting the whole submission.
+/// r[verify gw.reject.unsupported-hash-algo+4]
+#[tokio::test]
+async fn test_build_paths_md5_fod_realized_submitted() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/0000000000000000000000000000000c-legacy-md5.drv";
+    h.store
+        .seed_with_content(drv_path, MD5_FOD_DRV_ATERM.as_bytes());
+    // The declared output already exists.
+    h.store.seed_with_content(
+        "/nix/store/ffffffffffffffffffffffffffffffff-fetched",
+        b"already realized",
+    );
+
+    wire_send!(&mut h.stream;
+        u64: 9,                                  // wopBuildPaths
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1, "BuildPaths returns u64(1) on success");
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        1,
+        "realized legacy-algo FOD must not block the submission"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildPaths (9): the unverifiable-algo exemption probe carries the
+/// session JWT — the answer must be the tenant-scoped one the scheduler
+/// will act on, not an anonymous one.
+/// r[verify gw.reject.unsupported-hash-algo+4]
+/// r[verify gw.jwt.propagate]
+#[tokio::test]
+async fn test_build_paths_md5_fod_probe_carries_session_jwt() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_jwt_handshake("tok-fod-exemption").await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/0000000000000000000000000000000d-legacy-md5-jwt.drv";
+    h.store
+        .seed_with_content(drv_path, MD5_FOD_DRV_ATERM.as_bytes());
+    h.store.seed_with_content(
+        "/nix/store/ffffffffffffffffffffffffffffffff-fetched",
+        b"already realized",
+    );
+
+    wire_send!(&mut h.stream;
+        u64: 9,                                  // wopBuildPaths
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1, "BuildPaths returns u64(1) on success");
+    assert_eq!(h.scheduler.submit_calls.read().unwrap().len(), 1);
+    {
+        let meta = h.store.calls.find_missing_metadata.read().unwrap();
+        assert!(
+            meta.iter()
+                .any(|m| m.as_deref() == Some("tok-fod-exemption")),
+            "the exemption probe must carry the session tenant token, got {meta:?}"
+        );
+    }
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildPaths (9): a cached legacy md5 FOD whose declared output is
+/// absent locally but substitutable from the tenant's upstreams is
+/// exempted and submitted — the scheduler's substitute lane completes it
+/// without dispatching, so rejecting it would over-reject a flow that
+/// works end-to-end. r[verify gw.reject.unsupported-hash-algo+4]
+#[tokio::test]
+async fn test_build_paths_md5_fod_substitutable_submitted() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/0000000000000000000000000000000g-legacy-md5-subst.drv";
+    h.store
+        .seed_with_content(drv_path, MD5_FOD_DRV_ATERM.as_bytes());
+    // The declared output is NOT in the store, but the upstream probe
+    // says it is substitutable.
+    h.store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push("/nix/store/ffffffffffffffffffffffffffffffff-fetched".to_string());
+    // After the scheduler's substitute lane completes the build the fetched
+    // output IS in the store, so promote the substitutable path to present
+    // once the exemption probe (the first FindMissingPaths call) has seen
+    // it as missing-but-substitutable — the post-build result verification
+    // (gw.opcode.build-results-honest) then sees what a real store would
+    // contain.
+    h.store
+        .state
+        .promote_substitutable_after_fmp
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    wire_send!(&mut h.stream;
+        u64: 9,                                  // wopBuildPaths
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1, "BuildPaths returns u64(1) on success");
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        1,
+        "substitutable legacy-algo FOD must not block the submission"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildPaths (9): the same cached legacy md5 FOD is REJECTED when its
+/// declared output is not already realized — the build could only fail
+/// after burning a pod. r[verify gw.reject.unsupported-hash-algo+4]
+#[tokio::test]
+async fn test_build_paths_md5_fod_unrealized_rejected() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    let drv_path = "/nix/store/0000000000000000000000000000000d-legacy-md5-missing.drv";
+    h.store
+        .seed_with_content(drv_path, MD5_FOD_DRV_ATERM.as_bytes());
+    // Declared output NOT seeded — the probe reports it missing.
+
+    wire_send!(&mut h.stream;
+        u64: 9,                                  // wopBuildPaths
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("outputHashAlgo 'md5'"),
+        "error names the unsupported algo: {:?}",
+        err.message
+    );
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "unrealized legacy-algo FOD rejection happens BEFORE SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): an inline FIXED-OUTPUT derivation whose declared
+/// path is NOT the one its declared hash derives to is rejected before
+/// SubmitBuild — a junk outputHash cannot exempt a victim path from the
+/// trusted-plane binding, even on the single-node fallback.
+#[tokio::test]
+async fn test_build_derivation_inline_fod_squatted_path_rejected() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    // Store is EMPTY — resolve_derivation fails, single-node fallback.
+    let drv_path = "/nix/store/00000000000000000000000000000008-inline-fod-squat.drv";
+    let squatted = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: squatted,                        // parseable, not derived from the hash
+        string: "sha256",                        // hash_algo → fixed-output
+        string: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: squatted,
+        u64: 0,                                  // build_mode
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("must match the derivation"),
+        "error should name the binding violation: {:?}",
+        err.message
+    );
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "inline FOD squat rejection happens BEFORE SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildPathsWithResults (46): the same squatted-path rejection via the
+/// shared submit_dag pipeline — per-path failure BuildResult (InputRejected
+/// shape), scheduler never called. Covers the second call site of the moved
+/// binding gate.
+#[tokio::test]
+async fn test_build_paths_with_results_squatted_path_rejected() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    let drv_path = "/nix/store/00000000000000000000000000000007-squat46.drv";
+    h.store
+        .seed_with_content(drv_path, SQUATTED_IA_DRV_ATERM.as_bytes());
+
+    let derived_path = format!("{drv_path}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,                                 // wopBuildPathsWithResults
+        strings: std::slice::from_ref(&derived_path),
+        u64: 0,                                  // build_mode = Normal
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1, "one result for one input path");
+    let echoed_path = wire::read_string(&mut h.stream).await?;
+    assert_eq!(echoed_path, derived_path);
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_ne!(status, 0, "status must be a failure code (not Built=0)");
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    assert!(
+        error_msg.contains("must match the derivation"),
+        "errorMsg should name the binding violation, got: {error_msg:?}"
+    );
+    drain_build_result_tail(&mut h.stream).await?;
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "binding rejection happens BEFORE SubmitBuild"
     );
 
     h.finish().await;
@@ -683,8 +2159,17 @@ fn ev(e: build_event::Event) -> types::BuildEvent {
 /// needs this so translate::reconstruct_dag has something to resolve.
 fn seed_minimal_drv(h: &GatewaySession) -> &'static str {
     let drv_path = "/nix/store/00000000000000000000000000000000-scripted.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(h, drv_path);
+    drv_path
+}
+
+/// [`seed_minimal_drv`] without the built output — for tests whose scheduler
+/// outcome is a failure/cancellation (the build never produced outputs, so
+/// the store must not contain them or result verification would honestly
+/// report the target as built).
+fn seed_minimal_drv_unbuilt(h: &GatewaySession) -> &'static str {
+    let drv_path = "/nix/store/00000000000000000000000000000000-scripted.drv";
+    seed_unbuilt_drv(h, drv_path);
     drv_path
 }
 
@@ -876,7 +2361,7 @@ async fn test_build_paths_log_events_become_stderr_next() -> anyhow::Result<()> 
 #[tokio::test]
 async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let target = "/nix/store/aaa-activity-test.drv".to_string();
+    let target = "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-activity-test.drv".to_string();
     h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
         ev(build_event::Event::Started(types::BuildStarted {
             total_derivations: 1,
@@ -949,7 +2434,7 @@ async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()
             assert_eq!(*activity_type, 105, "ActivityType::Build");
             assert_eq!(*level, 3, "lvlInfo");
             assert_eq!(*parent_id, root_id, "parent = actBuilds root");
-            assert!(text.contains("aaa-activity-test.drv"));
+            assert!(text.contains("n2v52szmyja512fxmaax8lixl4dxh4jb-activity-test.drv"));
             // [drvPath, machineName, curRound, nrRounds].
             // machineName is the cluster-stable RIO_GATEWAY_MACHINE_NAME
             // (empty in tests), NOT the per-pod executor_id "w1" — the
@@ -991,7 +2476,7 @@ async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()
 #[tokio::test]
 async fn test_build_paths_redispatch_reuses_activity() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let target = "/nix/store/ccc-redispatch.drv".to_string();
+    let target = "/nix/store/h215ws5mqjq1pnqd7j0incvdyqk96lhp-redispatch.drv".to_string();
     h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
         ev(build_event::Event::Started(types::BuildStarted {
             total_derivations: 1,
@@ -1066,7 +2551,7 @@ async fn test_build_paths_redispatch_reuses_activity() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let target = "/nix/store/bbb-failed.drv".to_string();
+    let target = "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-failed.drv".to_string();
     h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
         ev(build_event::Event::Started(types::BuildStarted {
             total_derivations: 1,
@@ -1141,8 +2626,8 @@ async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Resu
 #[tokio::test]
 async fn test_build_paths_dependency_failed_omits_rio_cli_hint() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let trigger = "/nix/store/aaa-trigger.drv".to_string();
-    let cascaded = "/nix/store/bbb-cascaded.drv".to_string();
+    let trigger = "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-trigger.drv".to_string();
+    let cascaded = "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-cascaded.drv".to_string();
     h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
         ev(build_event::Event::Started(types::BuildStarted {
             total_derivations: 2,
@@ -1234,7 +2719,7 @@ async fn test_build_paths_with_results_cancelled_outcome() -> anyhow::Result<()>
             reason: "user abort".into(),
         })),
     ]));
-    let drv_path = seed_minimal_drv(&h);
+    let drv_path = seed_minimal_drv_unbuilt(&h);
 
     wire_send!(&mut h.stream;
         u64: 46, // wopBuildPathsWithResults
@@ -1280,10 +2765,13 @@ async fn test_build_paths_progress_events_emit_result() -> anyhow::Result<()> {
             ..Default::default()
         })),
         ev(build_event::Event::Derivation(
-            types::DerivationEvent::cached("/nix/store/cached.drv".into(), vec![]),
+            types::DerivationEvent::cached(
+                "/nix/store/rjamm2fxraddla1xqs5dij891nhdrjp1.drv".into(),
+                vec![],
+            ),
         )),
         ev(build_event::Event::Derivation(types::DerivationEvent {
-            derivation_path: "/nix/store/queued.drv".into(),
+            derivation_path: "/nix/store/cw550c9mlwlzml0grcczlldvl85zwly7.drv".into(),
             kind: types::DerivationEventKind::Queued as i32,
             ..Default::default()
         })),
@@ -1362,7 +2850,7 @@ async fn test_build_paths_progress_events_emit_result() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_build_paths_log_and_phase_attached_to_activity() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let target = "/nix/store/ccc-loglines.drv".to_string();
+    let target = "/nix/store/h215ws5mqjq1pnqd7j0incvdyqk96lhp-loglines.drv".to_string();
     h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
         ev(build_event::Event::Started(types::BuildStarted {
             total_derivations: 1,
@@ -1517,7 +3005,7 @@ async fn test_build_paths_first_event_cancelled_short_circuit() -> anyhow::Resul
                 reason: "early cancel".into(),
             }),
         )]));
-    let drv_path = seed_minimal_drv(&h);
+    let drv_path = seed_minimal_drv_unbuilt(&h);
 
     wire_send!(&mut h.stream;
         u64: 46, // wopBuildPathsWithResults — read back the BuildResult
@@ -1571,7 +3059,7 @@ async fn test_build_paths_empty_stream_reconnects_via_header() -> anyhow::Result
     h.scheduler.set_watch_outcome(WatchOutcome {
         scripted_events: Some(vec![ev(build_event::Event::Completed(
             types::BuildCompleted {
-                output_paths: vec!["/nix/store/zzz-out".into()],
+                output_paths: vec!["/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-out".into()],
             },
         ))]),
         ..Default::default()
@@ -1708,7 +3196,7 @@ async fn test_build_paths_reconnect_on_transport_error() -> anyhow::Result<()> {
             sequence: 2,
             timestamp: None,
             event: Some(build_event::Event::Completed(types::BuildCompleted {
-                output_paths: vec!["/nix/store/zzz-output".into()],
+                output_paths: vec!["/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output".into()],
             })),
         }]),
         ..Default::default()
@@ -1855,7 +3343,7 @@ async fn test_build_paths_reconnect_exhausted_returns_failure() -> anyhow::Resul
         fail_count: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(11)),
         scripted_events: None, // irrelevant — fail_count blocks
     });
-    let drv_path = seed_minimal_drv(&h);
+    let drv_path = seed_minimal_drv_unbuilt(&h);
 
     wire_send!(&mut h.stream;
         u64: 46,
@@ -2290,8 +3778,7 @@ async fn over_quota_sends_stderr_error() -> anyhow::Result<()> {
     );
 
     let drv_path = "/nix/store/00000000000000000000000000000000-quota.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     wire_send!(&mut h.stream;
         u64: 9,                                  // wopBuildPaths
@@ -2351,8 +3838,7 @@ async fn under_quota_passes_through() -> anyhow::Result<()> {
         .insert("team-under".to_string(), (50, Some(100)));
 
     let drv_path = "/nix/store/00000000000000000000000000000000-under.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     wire_send!(&mut h.stream;
         u64: 9,
@@ -2389,8 +3875,7 @@ async fn unknown_tenant_fails_open() -> anyhow::Result<()> {
     // QuotaCache caches the negative → classify → Unlimited.
 
     let drv_path = "/nix/store/00000000000000000000000000000000-unseeded.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     wire_send!(&mut h.stream;
         u64: 9,
@@ -2485,12 +3970,12 @@ async fn test_build_derivation_rejects_check_mode() -> anyhow::Result<()> {
         u64: 36,
         string: drv_path,
         u64: 1,
-        string: "out", string: "/nix/store/zzz-output", string: "", string: "",
+        string: "out", string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output", string: "", string: "",
         strings: wire::NO_STRINGS,
         string: "x86_64-linux",
         string: "/bin/sh",
         strings: &["-c", "echo hi"],
-        u64: 1, string: "out", string: "/nix/store/zzz-output",
+        u64: 1, string: "out", string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
         u64: 2, // BuildMode::Check
     );
 
@@ -2529,7 +4014,7 @@ async fn test_reconnect_propagates_jwt() -> anyhow::Result<()> {
     h.scheduler.set_watch_outcome(WatchOutcome {
         scripted_events: Some(vec![ev(build_event::Event::Completed(
             types::BuildCompleted {
-                output_paths: vec!["/nix/store/zzz-out".into()],
+                output_paths: vec!["/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-out".into()],
             },
         ))]),
         ..Default::default()
@@ -2631,29 +4116,34 @@ async fn test_disconnect_cancel_propagates_jwt() -> anyhow::Result<()> {
 // cover exactly the wanted outputs, and a target whose outputs ARE present
 // is not blanket-failed by an unrelated failure elsewhere in the batch.
 //
-// Fixtures use REALISTIC (parseable) output store paths — unlike
-// TEST_DRV_ATERM's `/nix/store/zzz-output`, which is not a valid store path
-// and therefore cannot be asked of the store at all (verification defers to
-// the scheduler outcome for such paths, which is what keeps the older tests
-// above byte-for-byte unchanged).
+// Fixtures use REALISTIC output store paths — parseable AND derivable:
+// the declared paths are exactly what each ATerm derives to via
+// `input_addressed_output_paths`, because the gateway's IA output-path
+// binding gate rejects submissions whose declared paths don't match the
+// derivation before the store verification is ever reached. (Recompute the
+// paths with `input_addressed_output_paths` if an ATerm's
+// system/builder/args/env ever changes.) The flow-level tests above use
+// the same property via `seed_flow_drv`, which also marks the derived
+// output present so verification reflects a successful build.
 
 use rio_nix::protocol::build::{BuildResult, BuildStatus, read_build_result};
 use rio_nix::protocol::handshake::PROTOCOL_VERSION;
 
-/// Single-output IA derivation "honest-a" with a parseable output path.
-const HONEST_A_OUT: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-honest-a-out";
+/// Single-output IA derivation "honest-a"; declared path == derived path.
+const HONEST_A_OUT: &str = "/nix/store/w98s7msla41laac5m7d91f0gb8g87gdi-honest-a";
 const HONEST_A_DRV: &str = "/nix/store/00000000000000000000000000000111-honest-a.drv";
-const HONEST_A_ATERM: &str = r#"Derive([("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-honest-a-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo a"],[("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-honest-a-out")])"#;
+const HONEST_A_ATERM: &str = r#"Derive([("out","/nix/store/w98s7msla41laac5m7d91f0gb8g87gdi-honest-a","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo a"],[("out","/nix/store/w98s7msla41laac5m7d91f0gb8g87gdi-honest-a")])"#;
 
-/// Single-output IA derivation "honest-b" with a parseable output path.
-const HONEST_B_OUT: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-honest-b-out";
+/// Single-output IA derivation "honest-b"; declared path == derived path.
+const HONEST_B_OUT: &str = "/nix/store/65gi8gfmx546lr7jdxyxj066nm6hgdab-honest-b";
 const HONEST_B_DRV: &str = "/nix/store/00000000000000000000000000000222-honest-b.drv";
-const HONEST_B_ATERM: &str = r#"Derive([("out","/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-honest-b-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo b"],[("out","/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-honest-b-out")])"#;
+const HONEST_B_ATERM: &str = r#"Derive([("out","/nix/store/65gi8gfmx546lr7jdxyxj066nm6hgdab-honest-b","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo b"],[("out","/nix/store/65gi8gfmx546lr7jdxyxj066nm6hgdab-honest-b")])"#;
 
-/// Two-output (dev, out) IA derivation for the wanted-only builtOutputs test.
-const MULTI_OUT: &str = "/nix/store/ffffffffffffffffffffffffffffffff-multi-out";
+/// Two-output (dev, out) IA derivation for the wanted-only builtOutputs
+/// test; declared paths == derived paths.
+const MULTI_OUT: &str = "/nix/store/wgv1r5kbp8njwab846hzhsik8l4mj1ln-multi";
 const MULTI_DRV: &str = "/nix/store/00000000000000000000000000000333-multi.drv";
-const MULTI_ATERM: &str = r#"Derive([("dev","/nix/store/dddddddddddddddddddddddddddddddd-multi-dev","",""),("out","/nix/store/ffffffffffffffffffffffffffffffff-multi-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("dev","/nix/store/dddddddddddddddddddddddddddddddd-multi-dev"),("out","/nix/store/ffffffffffffffffffffffffffffffff-multi-out")])"#;
+const MULTI_ATERM: &str = r#"Derive([("dev","/nix/store/0wkcfl7grhnj4mnxwcfbcgfvvqzg67vg-multi-dev","",""),("out","/nix/store/wgv1r5kbp8njwab846hzhsik8l4mj1ln-multi","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("dev","/nix/store/0wkcfl7grhnj4mnxwcfbcgfvvqzg67vg-multi-dev"),("out","/nix/store/wgv1r5kbp8njwab846hzhsik8l4mj1ln-multi")])"#;
 
 /// Floating-CA derivation (declared output path empty) for the
 /// no-realisation case.
@@ -3110,6 +4600,254 @@ async fn test_build_derivation_store_error_during_verification() -> anyhow::Resu
         err.message
     );
 
+    h.finish().await;
+    Ok(())
+}
+
+// ===========================================================================
+// Priority classification (gw.hook.ifd-detection+3)
+// ===========================================================================
+
+/// Helper: assert the priority_class of the only SubmitBuild call.
+fn assert_only_submit_priority(h: &GatewaySession, expected: &str) {
+    let submits = h.scheduler.submit_calls.read().unwrap();
+    assert_eq!(submits.len(), 1, "exactly one SubmitBuild expected");
+    assert_eq!(
+        submits[0].priority_class, expected,
+        "priority_class should be {expected:?}"
+    );
+}
+
+/// Drain a successful bPWR response (count + per-entry path/result tail).
+async fn drain_bpwr_success(stream: &mut tokio::io::DuplexStream) -> anyhow::Result<()> {
+    drain_stderr_until_last(stream).await?;
+    let count = wire::read_u64(stream).await?;
+    for _ in 0..count {
+        let _path = wire::read_string(stream).await?;
+        let status = wire::read_u64(stream).await?;
+        assert_eq!(status, 0, "expected Built status");
+        let _error_msg = wire::read_string(stream).await?;
+        let _times_built = wire::read_u64(stream).await?;
+        let _is_non_det = wire::read_bool(stream).await?;
+        let _start = wire::read_u64(stream).await?;
+        let _stop = wire::read_u64(stream).await?;
+        let cpu_user_tag = wire::read_u64(stream).await?;
+        if cpu_user_tag == 1 {
+            let _ = wire::read_u64(stream).await?;
+        }
+        let cpu_system_tag = wire::read_u64(stream).await?;
+        if cpu_system_tag == 1 {
+            let _ = wire::read_u64(stream).await?;
+        }
+        let built_outputs = wire::read_u64(stream).await?;
+        for _ in 0..built_outputs {
+            let _id = wire::read_string(stream).await?;
+            let _realisation = wire::read_string(stream).await?;
+        }
+    }
+    Ok(())
+}
+
+/// First bPWR of the session with a single all-outputs target — the
+/// build-remote hook shape — is classified "interactive".
+/// r[verify gw.hook.ifd-detection+3]
+#[tokio::test]
+async fn test_bpwr_hook_shape_first_is_interactive() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+    seed_flow_drv(&h, drv_path);
+
+    wire_send!(&mut h.stream;
+        u64: 46,                                 // wopBuildPathsWithResults
+        strings: &[format!("{drv_path}!*")],
+        u64: 0,
+    );
+    drain_bpwr_success(&mut h.stream).await?;
+    assert_only_submit_priority(&h, "interactive");
+
+    h.finish().await;
+    Ok(())
+}
+
+/// First bPWR with a single NAMED-output target (`drv!out`, the
+/// remote-store-mode shape) stays "ci". r[verify gw.hook.ifd-detection+3]
+#[tokio::test]
+async fn test_bpwr_named_output_first_is_ci() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+    seed_flow_drv(&h, drv_path);
+
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+    drain_bpwr_success(&mut h.stream).await?;
+    assert_only_submit_priority(&h, "ci");
+
+    h.finish().await;
+    Ok(())
+}
+
+/// First bPWR with TWO targets stays "ci". r[verify gw.hook.ifd-detection+3]
+#[tokio::test]
+async fn test_bpwr_multi_target_first_is_ci() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_a = "/nix/store/00000000000000000000000000000000-test.drv";
+    let drv_b = "/nix/store/00000000000000000000000000000001-other.drv";
+    seed_flow_drv(&h, drv_a);
+    seed_flow_drv_cmd(&h, drv_b, "echo other");
+
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: &[format!("{drv_a}!*"), format!("{drv_b}!*")],
+        u64: 0,
+    );
+    drain_bpwr_success(&mut h.stream).await?;
+    assert_only_submit_priority(&h, "ci");
+
+    h.finish().await;
+    Ok(())
+}
+
+/// A SECOND hook-shaped bPWR on the same session stays "ci".
+/// r[verify gw.hook.ifd-detection+3]
+#[tokio::test]
+async fn test_bpwr_hook_shape_second_is_ci() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+    seed_flow_drv(&h, drv_path);
+
+    for _ in 0..2 {
+        wire_send!(&mut h.stream;
+            u64: 46,
+            strings: &[format!("{drv_path}!*")],
+            u64: 0,
+        );
+        drain_bpwr_success(&mut h.stream).await?;
+    }
+    {
+        let submits = h.scheduler.submit_calls.read().unwrap();
+        assert_eq!(submits.len(), 2);
+        assert_eq!(
+            submits[0].priority_class, "interactive",
+            "first is the hook shape"
+        );
+        assert_eq!(
+            submits[1].priority_class, "ci",
+            "second bPWR is a CI driver"
+        );
+    }
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildPaths (opcode 9) with a single all-outputs target stays "ci"
+/// — the hook shape only applies to bPWR. r[verify gw.hook.ifd-detection+3]
+#[tokio::test]
+async fn test_build_paths_single_all_outputs_is_ci() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+    seed_flow_drv(&h, drv_path);
+
+    wire_send!(&mut h.stream;
+        u64: 9,                                  // wopBuildPaths
+        strings: &[format!("{drv_path}!*")],
+        u64: 0,
+    );
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1);
+    assert_only_submit_priority(&h, "ci");
+
+    h.finish().await;
+    Ok(())
+}
+
+/// The wopBuildDerivation heuristic is unchanged: the first one on a
+/// session is "interactive", and one arriving after a bPWR is "ci".
+/// r[verify gw.hook.ifd-detection+3]
+#[tokio::test]
+async fn test_build_derivation_ifd_heuristic_unchanged() -> anyhow::Result<()> {
+    // First wopBuildDerivation on a fresh session → interactive.
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+    seed_flow_drv(&h, drv_path);
+    wire_send!(&mut h.stream;
+        u64: 36,
+        string: drv_path,
+        u64: 1,
+        string: "out",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
+        string: "",
+        string: "",
+        strings: wire::NO_STRINGS,
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,
+        string: "out",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
+        u64: 0,
+    );
+    drain_stderr_until_last(&mut h.stream).await?;
+    let _status = wire::read_u64(&mut h.stream).await?;
+    let _error_msg = wire::read_string(&mut h.stream).await?;
+    drain_build_result_tail(&mut h.stream).await?;
+    assert_only_submit_priority(&h, "interactive");
+    h.finish().await;
+
+    // A bPWR first, then wopBuildDerivation → the latter is "ci".
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+    seed_flow_drv(&h, drv_path);
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+    drain_bpwr_success(&mut h.stream).await?;
+    wire_send!(&mut h.stream;
+        u64: 36,
+        string: drv_path,
+        u64: 1,
+        string: "out",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
+        string: "",
+        string: "",
+        strings: wire::NO_STRINGS,
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,
+        string: "out",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
+        u64: 0,
+    );
+    drain_stderr_until_last(&mut h.stream).await?;
+    let _status = wire::read_u64(&mut h.stream).await?;
+    let _error_msg = wire::read_string(&mut h.stream).await?;
+    drain_build_result_tail(&mut h.stream).await?;
+    {
+        let submits = h.scheduler.submit_calls.read().unwrap();
+        assert_eq!(submits.len(), 2);
+        assert_eq!(
+            submits[1].priority_class, "ci",
+            "post-bPWR wopBuildDerivation is ci"
+        );
+    }
     h.finish().await;
     Ok(())
 }

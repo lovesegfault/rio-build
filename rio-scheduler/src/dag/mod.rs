@@ -1,15 +1,19 @@
 //! In-memory derivation DAG.
 //!
 //! The DAG tracks all derivation nodes and their dependency edges across all
-//! concurrent builds. Nodes are deduplicated by `drv_hash` (input-addressed:
-//! store path; CA: modular derivation hash). Each node tracks which builds
-//! are interested in it.
+//! concurrent builds. Nodes are deduplicated by `drv_hash`, which SubmitBuild
+//! ingress binds to the declared `.drv` store path (`drv_path`); CA content
+//! identity is tracked separately via the 32-byte modular hash
+//! (`ca_modular_hash`), which keys realisations, not the DAG. Each node
+//! tracks which builds are interested in it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use uuid::Uuid;
 
-use crate::state::{DerivationState, DerivationStatus, DrvHash, union_wanted_saturating};
+use crate::state::{
+    DefinitionEvidence, DerivationState, DerivationStatus, DrvHash, union_wanted_saturating,
+};
 
 /// CA-cutoff cascade result-size cap. Bounds the number of nodes
 /// transitioned `Queued`→`Skipped` per cascade so an adversarial DAG
@@ -31,6 +35,310 @@ pub enum DagError {
         path: String,
         source: rio_nix::store_path::StorePathError,
     },
+    /// A submission claimed authoritative inline derivation content for a
+    /// node that already holds DIFFERENT authoritative content. Those
+    /// bytes are the only copy of their derivation anywhere, so silently
+    /// joining would let the second submitter redefine what the first
+    /// one's build runs and what recovery rebuilds. Returned while the
+    /// existing claim is live or `Failed` (still owned by the retry
+    /// machinery — `RefusedInFlight`), or settled with a definition-
+    /// evidence rank ≥ the displacer's (`RefusedSettledOutranked`;
+    /// authoritative displacers carry `content_bound_claim`, so a
+    /// settled authoritative claim is never redefined by another
+    /// authoritative claim) — once it parks in a terminal failure
+    /// state the byte-different submission displaces it instead of
+    /// being rejected. Maps to `FAILED_PRECONDITION` (client-actionable
+    /// conflict, not an internal invariant breach).
+    #[error(
+        "conflicting authoritative derivation content for {drv_path}: a node \
+         with different inline content already exists"
+    )]
+    AuthoritativeContentMismatch { drv_path: String },
+    /// A store-backed (non-authoritative) submission's verifiable identity
+    /// (system, output names, fixed-output flag, content-addressed flag,
+    /// declared expected output paths, plus content-bound evidence — a
+    /// shared fixed-output path or a matching CA modular hash) conflicts
+    /// with a node that carries authoritative inline content and is
+    /// either still in flight or settled without being strictly
+    /// outranked. Joining would attribute that node's results to a
+    /// derivation that either provably differs or cannot be shown to be
+    /// the same; erasing a settled (Completed/Skipped) record takes
+    /// STRICTLY higher definition evidence than the settled node's rank
+    /// (`sched.merge.evidence-ranked-displacement`) — a bare store-backed
+    /// echo (`unverified_claim`) never qualifies, while an
+    /// ingress-byte-bound submission (`path_bound_bytes`) displaces a
+    /// content-bound squat. Maps to `FAILED_PRECONDITION`; once the
+    /// conflicting node sits in a terminal FAILURE state the verifiable
+    /// definition displaces it regardless of rank. (An identity-MATCHING
+    /// store-backed submission never sees this error: it joins the node,
+    /// or displaces it without error when the node is poison-locked —
+    /// terminal failure, no longer retriable on resubmit.) A legitimate
+    /// bare-resubmission claimant hitting this against a settled squat
+    /// is self-service: upload the genuine `.drv` to the store and
+    /// resubmit — the merge-time store-evidence check
+    /// (`sched.merge.store-evidence-displacement+3`) verifies the claim
+    /// against the store's text-CA-bound bytes and raises it past the
+    /// squat's rank.
+    #[error(
+        "derivation {drv_path} carries authoritative inline content that \
+         conflicts with this submission's declared identity; if the \
+         existing record is a squat on your derivation's path, upload \
+         your .drv to the store and resubmit store-backed — the \
+         scheduler verifies the store derivation and displaces the squat"
+    )]
+    ConflictingInFlightContent { drv_path: String },
+    /// The inverse direction of [`Self::ConflictingInFlightContent`]: a
+    /// submission claiming authoritative inline content landed on an
+    /// existing STORE-BACKED node that is eligible for the
+    /// resubmit-reset, and its verifiable identity does not match the
+    /// existing node's. Admitting it would let the claim redefine a
+    /// parked (failed / cancelled / poison-reset) store-backed
+    /// definition through the reset, carrying the prior builds' interest
+    /// onto bytes only the claimant can see. An identity-matching claim
+    /// is admitted through the normal resubmit-reset instead, and an
+    /// authoritative claim never displaces a store-backed node. Maps to
+    /// `FAILED_PRECONDITION` (client-actionable conflict, not an
+    /// internal invariant breach).
+    #[error(
+        "authoritative inline content for {drv_path} conflicts with the \
+         existing store-backed derivation definition (no matching \
+         content-bound identity evidence); if this is your own \
+         derivation, re-upload the .drv and resubmit store-backed, ask \
+         an operator to clear the parked definition, or wait for its \
+         retention window to expire"
+    )]
+    AuthoritativeClaimIdentityConflict { drv_path: String },
+}
+
+/// Three-valued comparison of two recorded modular hashes.
+///
+/// Shared by BOTH identity matchers ([`verifiable_identity_matches`]
+/// and the settled-row matcher in `actor::merge`) so the hash clause
+/// cannot drift between them: a present-but-DIFFERENT pair is a
+/// conflict in its own right (`Differs` vetoes the match outright),
+/// never silently folded into "no hash evidence". A side that records
+/// no usable hash (absent, or a persisted blob that is not 32 bytes)
+/// contributes `Absent` — the matchers then fall back to path evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModularHashEvidence {
+    /// Both sides record a 32-byte hash and the bytes are equal.
+    Match,
+    /// Both sides record a 32-byte hash and the bytes DIFFER — the two
+    /// definitions are provably not the same derivation; the matchers
+    /// MUST veto regardless of path agreement.
+    Differs,
+    /// At least one side records no usable hash: no hash evidence in
+    /// either direction.
+    Absent,
+}
+
+// r[impl sched.merge.identity-hash-veto]
+/// Classify the modular-hash relationship between two identity records.
+/// Accepts raw byte slices so both matchers (in-memory `[u8; 32]` and
+/// persisted `bytea`) normalize through the same length check.
+pub(crate) fn modular_hash_evidence(
+    existing: Option<&[u8]>,
+    incoming: Option<&[u8]>,
+) -> ModularHashEvidence {
+    match (existing, incoming) {
+        (Some(a), Some(b)) if a.len() == 32 && b.len() == 32 => {
+            if a == b {
+                ModularHashEvidence::Match
+            } else {
+                ModularHashEvidence::Differs
+            }
+        }
+        _ => ModularHashEvidence::Absent,
+    }
+}
+
+/// `sched.merge.authoritative-conflict` cross-check: does the submission's
+/// verifiable identity agree with an existing authoritative node?
+///
+/// Public attributes are compared first: `system`, output names
+/// (order-insensitive), the fixed-output flag, the content-addressed flag,
+/// and expected output paths for output names where BOTH sides declare one
+/// (an empty path carries no information — floating-CA outputs declare
+/// `""`). Public attributes alone are never sufficient — they are copyable
+/// from the victim's public derivation — so a match additionally requires
+/// at least one piece of CONTENT-BOUND evidence:
+///
+///   - fixed-output: at least one output whose expected path is non-empty
+///     on both sides and equal (the path commits to the declared output
+///     hash, and ingress binds it to the authoritative bytes), or
+///   - floating-CA: a byte-equal `ca_modular_hash` on both sides (forging
+///     it requires a SHA-256 preimage). The hook fallback is built from an
+///     already-RESOLVED derivation (no `inputDrvs`), so its modular hash
+///     equals the full-form hash a store-backed submission of the same
+///     derivation computes — identical content still joins.
+///
+/// Present-but-DIFFERING modular hashes veto the match outright
+/// (`sched.merge.identity-hash-veto` via [`modular_hash_evidence`]) —
+/// path agreement cannot override a provable definition difference. No
+/// evidence at all (the degenerate floating-CA case where a side
+/// carries no hash and no path agreement exists) is likewise a conflict
+/// and falls through to the reject-in-flight / displace-when-terminal
+/// arms.
+///
+/// Also used in the INVERSE direction
+/// (`sched.merge.authoritative-claim-no-redefine`): an incoming
+/// authoritative claim landing on a store-backed node that is eligible
+/// for the resubmit-reset must prove the same verifiable identity, with
+/// the same evidence rules and the same no-evidence-is-conflict stance —
+/// `existing` is then the store-backed node and `node` the claimant.
+pub(crate) fn verifiable_identity_matches(
+    existing: &DerivationState,
+    node: &crate::domain::DerivationNode,
+) -> bool {
+    if existing.system != node.system
+        || existing.is_fixed_output != node.is_fixed_output
+        || existing.ca.is_ca != node.is_content_addressed
+    {
+        return false;
+    }
+    let mut existing_names: Vec<&str> = existing.output_names.iter().map(String::as_str).collect();
+    let mut incoming_names: Vec<&str> = node.output_names.iter().map(String::as_str).collect();
+    existing_names.sort_unstable();
+    incoming_names.sort_unstable();
+    if existing_names != incoming_names {
+        return false;
+    }
+    // r[impl sched.merge.identity-hash-veto]
+    // Present-but-differing modular hashes are a conflict in their own
+    // right — two definitions whose hashes both exist and differ are
+    // provably different derivations, and path agreement (copyable
+    // public data) must not override that. Veto BEFORE the path fold.
+    let hash_evidence = modular_hash_evidence(
+        existing.ca.modular_hash.as_ref().map(|h| h.as_slice()),
+        node.ca_modular_hash.as_ref().map(|h| h.as_slice()),
+    );
+    if hash_evidence == ModularHashEvidence::Differs {
+        return false;
+    }
+    let existing_paths: HashMap<&str, &str> = existing
+        .output_names
+        .iter()
+        .zip(existing.expected_output_paths.iter())
+        .map(|(n, p)| (n.as_str(), p.as_str()))
+        .collect();
+    let mut path_evidence = false;
+    for (name, path) in node
+        .output_names
+        .iter()
+        .zip(node.expected_output_paths.iter())
+    {
+        if path.is_empty() {
+            continue;
+        }
+        if let Some(existing_path) = existing_paths.get(name.as_str())
+            && !existing_path.is_empty()
+        {
+            if *existing_path != path.as_str() {
+                return false;
+            }
+            // Both sides declare this output's path and they agree.
+            path_evidence = true;
+        }
+    }
+    if path_evidence || hash_evidence == ModularHashEvidence::Match {
+        return true;
+    }
+    // CLAIMS-FREE incoming against a STORE-ANCHORED resident: beyond
+    // the public attributes (already equal above), the submission
+    // declares NOTHING — every expected path empty, no modular hash.
+    // Nothing it asserts can contradict the resident definition, a
+    // resident join is interest-only (no row rewrite, no
+    // displacement), and a bare resident's claims are re-verified
+    // against the store at dispatch before anything is signed —
+    // refusing here would demand evidence from a submission that
+    // makes no claims, which is the shape every hash-less
+    // re-reference of a resident floating node takes. Restricted to
+    // NON-authoritative residents: an authoritative claim's identity
+    // is unverifiable until byte-anchored, and a claims-free join
+    // would let such a squat CAPTURE bare submitters (the
+    // squat-capture defense pinned by
+    // floating_ca_squat_without_evidence_conflicts_in_flight). The
+    // positive-evidence bar also stays where re-CREATION happens —
+    // the settled-ROW matcher (its joins refresh the row's creation
+    // snapshot) and the displacement arbitration.
+    //
+    // SETTLED residents (Completed/Skipped) take this arm too, and
+    // that is a DECLARED residual, not an oversight (round-17
+    // bug_121 re-discovered it; the round-15 RESIDUAL STATES section
+    // of 8db56a2ce declared it): a Skipped bare squat CAN serve its
+    // recorded outputs to a claims-free rejoin without the budgeted
+    // store-evidence arbitration re-running. The proposed gate —
+    // exclude settled-below-PathBoundBytes residents from this arm —
+    // was evaluated and REJECTED: it regresses the substitution
+    // reprobe flow (a Skipped floating-CA node whose outputs were
+    // substituted holds rank UnverifiedClaim with a REALIZED path; a
+    // claims-free re-reference must keep joining it or every
+    // post-substitution rebuild re-arbitrates), pinned by
+    // reprobe_substitute_floating_ca_preserves_realized_path. The
+    // residual's bound: capture requires the squat to have settled
+    // WITHOUT byte evidence, which the gateway's populate pass makes
+    // a non-default flow (TODO below).
+    if !existing.drv_content_authoritative
+        && node.ca_modular_hash.is_none()
+        && node.expected_output_paths.iter().all(|p| p.is_empty())
+    {
+        return true;
+    }
+    // r[impl sched.persist.settled-identity-freeze+4]
+    // M_070 bases, resident form — the row matcher's twin clauses
+    // (settled_row_identity_matches): a STRIPPED resident node
+    // (floating-CA/deferred-IA: every expected path empty, live hash
+    // None) retains no classical evidence, so without these an honest
+    // resident-window rebuild reads as a conflict and the settled
+    // bare x bare gate arm would refuse it — the resident-window form
+    // of the merged_bug_038 brick. Preserved-claim: byte-equal
+    // re-presentation of the stripped declaration (positive basis
+    // only; differing preserved values fall through, never veto).
+    // Dual-anchor: a byte-anchored node's identity was derived from
+    // the text-CA bytes its declared path names; an incoming claim of
+    // the same path with agreeing public attributes and no
+    // contradicting evidence anchors to the same definition.
+    if existing.ca.modular_hash.is_none()
+        && let (Some(preserved), Some(incoming)) = (
+            existing.ca.modular_hash_stripped.as_ref(),
+            node.ca_modular_hash.as_ref(),
+        )
+        && preserved == incoming
+    {
+        return true;
+    }
+    // Dual-anchor is restricted to NON-authoritative incomings: an
+    // authoritative claim's bytes are bound to themselves, not to the
+    // declared path (the reverse-squat axiom), so there is no second
+    // anchor — and granting it identity-by-rank would let a
+    // hook-fallback-shaped claim with deliberately evidence-free
+    // claims ride the resubmit-reset into adopting its bytes over a
+    // byte-anchored definition (the claim-no-redefine guard's
+    // population). Bare and inline-bound incomings are the production
+    // rebuild shapes and carry no adoptable bytes.
+    !node.drv_content_authoritative && existing.evidence >= DefinitionEvidence::PathBoundBytes
+}
+
+/// Per-hash grant minted by the actor's merge-time store-evidence
+/// verification (Steps 0.5/0.6) and consumed by
+/// [`DerivationDag::merge_with_evidence`] at node creation. A grant
+/// means the store's text-CA-bound bytes verified the submission's
+/// claimed identity (possibly MODULO an unverifiable declared modular
+/// hash — then `stripped_declared_hash` carries the strip): the
+/// created node displaces with `path_bound_bytes` standing, records
+/// the BYTE-DERIVED resolve flag (never the submitter's echo,
+/// `sched.dispatch.claims-derived+5`), and applies the strip with
+/// M_070 preservation when present
+/// (`sched.merge.store-evidence-displacement+3` — one verdict, one
+/// consequence, identical at the merge and dispatch consumers).
+#[derive(Debug, Clone, Copy)]
+pub struct StoreEvidenceGrant {
+    /// Dispatch-resolve requirement derived from the verified bytes.
+    pub needs_resolve: bool,
+    /// `Some(declared)` iff the verdict was
+    /// `VerifiedExceptDeclaredHash`: the created node's live hash is
+    /// cleared and the declared value preserved out-of-band (M_070).
+    pub stripped_declared_hash: Option<[u8; 32]>,
 }
 
 /// Result of a successful `merge()` operation. Surfaces all the rollback
@@ -50,15 +358,111 @@ pub struct MergeResult {
     /// (`Cancelled`/`Failed`/`DependencyFailed`/`Poisoned`-under-limit)
     /// removed and reinserted fresh by the resubmit-retry path. Surfaced
     /// so the actor can `db.clear_poison` them — `batch_upsert_derivations`'
-    /// ON CONFLICT does not touch `poisoned_at`/`failed_builders`.
+    /// ON CONFLICT does not touch `poisoned_at`/`failed_builders` for
+    /// same-definition re-creations.
     pub reset_on_resubmit: Vec<DrvHash>,
-    /// Full prior state of each retriable node destructively removed by
-    /// the resubmit-retry path. `rollback_merge` re-inserts these AFTER
-    /// scrubbing `newly_inserted` so a failed merge restores the exact
-    /// pre-merge DAG (status, `interested_builds`, `retry.count`).
-    /// Without this, a `{retriable-X, cycle}` submission would wipe X
-    /// and reset its `POISON_RESUBMIT_RETRY_LIMIT` accumulator (I-169).
+    /// Subset of `reset_on_resubmit` where the removed retriable node
+    /// carried authoritative inline content and the re-creating
+    /// submission is store-backed (an authority takeover through the
+    /// resubmit-reset, e.g. an identity-matching store-backed
+    /// resubmission of a parked authoritative claim). Disjoint from
+    /// `displaced`. These rows get the full definition-change
+    /// accumulator reset inside the recreate-refresh upsert
+    /// (`sched.merge.displaced-failure-reset`), and their in-memory
+    /// state starts with a fresh poison-resubmit budget — so the actor
+    /// must NOT also run `clear_poison_batch` on them (it would
+    /// re-increment `resubmit_cycles` in PG and diverge from memory).
+    /// Their children edges are scrubbed exactly like displacement
+    /// (recorded in `displaced_scrubbed_edges`), and the actor chains
+    /// these hashes into the durable parent-side `derivation_edges`
+    /// delete (`sched.merge.displaced-edge-scrub`).
+    pub authority_takeovers: Vec<DrvHash>,
+    /// Subset of `newly_inserted` that DISPLACED a terminal authoritative
+    /// node (`sched.merge.authoritative-conflict`): a store-backed
+    /// submission whose verifiable identity conflicted with the terminal
+    /// node, an identity-MATCHING store-backed submission landing on a
+    /// poison-locked node no longer retriable on resubmit, or an
+    /// authoritative submission with byte-different content landing on a
+    /// node parked in a terminal failure state. Mutually exclusive with
+    /// `reset_on_resubmit`: a hash appears in exactly one of the two.
+    /// Unlike the resubmit-reset path, displacement carries NO prior
+    /// interest and starts `resubmit_cycles` at 0 — the fresh node is
+    /// the replacing definition taking over the hash, not a retry of
+    /// the squat. The actor uses this to reset the displaced row's
+    /// poison/failure accounting (including its resource floors), to
+    /// scrub its persisted dependency edges, and to prune the displaced
+    /// hash from prior interested builds' completion accounting.
+    pub displaced: Vec<DrvHash>,
+    /// Full prior state of every pre-existing node this merge
+    /// destructively removed — resubmit-reset of retriable nodes and
+    /// displacement of terminal authoritative-content nodes
+    /// (`sched.merge.authoritative-conflict`). `rollback_merge`
+    /// re-inserts these AFTER scrubbing `newly_inserted` so a failed
+    /// merge restores the exact pre-merge DAG (status,
+    /// `interested_builds`, `retry.count`). Without this, a
+    /// `{retriable-X, cycle}` submission would wipe X and reset its
+    /// `POISON_RESUBMIT_RETRY_LIMIT` accumulator (I-169).
     pub removed_retriable: Vec<(DrvHash, DerivationState)>,
+    /// Dependency (children) edges scrubbed from displaced or
+    /// taken-over nodes (`sched.merge.displaced-edge-scrub`), keyed by
+    /// the removed hash. `rollback_merge` re-attaches them when
+    /// restoring the node, and `persist_merge_to_db` mirrors the scrub
+    /// durably by deleting those rows' parent-side `derivation_edges`
+    /// in the same transaction.
+    pub displaced_scrubbed_edges: Vec<(DrvHash, HashSet<DrvHash>)>,
+    /// Submitted edges skipped by the creation-scoped edge gate
+    /// (`sched.merge.edge-creation-scoped`) whose parent does NOT carry
+    /// the `closure_hole` breadcrumb: their parent is a resident node
+    /// this submission did NOT (re)create and that is not a
+    /// topdown-pruned root awaiting its dependency top-up, and the edge
+    /// did not already exist. They never enter the in-memory DAG, are
+    /// never persisted (Batch 3 sources `derivation_edges` rows from
+    /// `new_edges`), and are not part of rollback. Surfaced so the
+    /// actor can count them (`rio_scheduler_merge_foreign_edge_skipped_total`)
+    /// — this hostile-or-bug shape is disjoint from
+    /// `rejoin_parent_edges_skipped`.
+    pub foreign_parent_edges_skipped: Vec<(DrvHash, DrvHash)>,
+    /// Submitted edges skipped by the creation-scoped edge gate whose
+    /// parent DOES carry the `closure_hole` breadcrumb: the signature of
+    /// a legitimate full-closure rejoin of a node whose children were
+    /// reaped out from under it (the submitter re-declares the full
+    /// inputDrvs set, but the gate cannot attach edges to a resident
+    /// node it did not re-create). Surfaced separately
+    /// (`rio_scheduler_merge_rejoin_edge_skipped_total`, debug-level)
+    /// because this shape is expected traffic, not hostility — and the
+    /// vetoed parent deliberately stays OUT of `healed_parents`.
+    pub rejoin_parent_edges_skipped: Vec<(DrvHash, DrvHash)>,
+    // r[impl sched.merge.heal-accepted-edges+1]
+    /// Parents whose ENTIRE declared edge set was accepted by this
+    /// merge (every declared edge attached or an exact re-declaration;
+    /// any gate-skipped or unresolvable-child edge vetoes). This is the
+    /// heal TRIGGER and the `topdown_pruned` clear-candidate seed — but
+    /// acceptance alone no longer heals (round-15 merged_bug_073:
+    /// "every declared edge accepted" is satisfiable by a SUBSET
+    /// re-declaration of the surviving children, which would launder
+    /// reap-truncation evidence into Vouched). The heal itself is
+    /// `healed_parents`.
+    pub accepted_edge_parents: Vec<DrvHash>,
+    // r[impl sched.merge.heal-accepted-edges+1]
+    /// Parents this merge may HEAL: accepted trigger ∧ positive
+    /// re-supply coverage — every recorded missing child
+    /// (`ClosureHole::missing`, the 069 witness set) is among the
+    /// parent's post-insert children. Un-holed parents are trivially
+    /// covered (subset over the empty set), preserving the stale-PG
+    /// total-clear semantics: the persisted bit can outlive the
+    /// in-memory hole (reap+reinsert, poisoned-stub recovery, lost
+    /// best-effort heal write), so an un-holed accepted parent still
+    /// clears the column. The paired [`HealWitness`] is constructible
+    /// ONLY by the coverage branch in `merge()` — possession proves
+    /// the subset check ran (`sched.evidence.positive-witness`).
+    pub healed_parents: Vec<(DrvHash, HealWitness)>,
+    /// Accepted-trigger parents REFUSED the heal: holed, and the
+    /// re-declared set does not cover the witness set (subset
+    /// re-declaration, junk top-up, or the recovery LOST_WITNESS
+    /// sentinel — uncoverable by construction). Surfaced via
+    /// `rio_scheduler_closure_heal_refused_total`; the hole (and its
+    /// fail-fast routing) survives.
+    pub heal_refused_parents: Vec<DrvHash>,
     /// Hashes of pre-existing nodes whose empty `traceparent` was
     /// upgraded to `submitter_traceparent` by this merge. Rollback
     /// clears it back to `""` so a rejected build's trace ID does not
@@ -84,6 +488,52 @@ pub struct MergeResult {
     pub contributions_recorded: Vec<(DrvHash, Option<Vec<String>>)>,
 }
 
+/// Verdict of [`DerivationDag::displace`] — the single displacement
+/// primitive every merge arm delegates to
+/// (`sched.merge.evidence-ranked-displacement`). Non-`Displaced`
+/// verdicts leave the victim untouched; the calling arm maps them to
+/// its own `DagError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisplaceVerdict {
+    /// The victim was removed with full displacement bookkeeping.
+    Displaced,
+    /// The victim is live / `Failed` (non-terminal): first-writer-wins
+    /// while a claim is in flight or owned by the retry machinery.
+    RefusedInFlight,
+    /// The victim is store-anchored (no authoritative bytes):
+    /// categorical refusal — the store holds at most one text-CA
+    /// `.drv` per path, so nothing outranks it about a store-backed
+    /// definition.
+    RefusedStoreAnchored,
+    /// The victim settled (`Completed`/`Skipped`) and its evidence
+    /// rank is ≥ the displacer's: a settled record is erased only by
+    /// STRICTLY higher definition evidence.
+    RefusedSettledOutranked,
+}
+
+/// Borrowed displacement bookkeeping threaded into
+/// [`DerivationDag::displace`] by the merge loop: the same three
+/// accumulators every arm already feeds (`removed_retriable` for
+/// rollback, `displaced_scrubbed_edges` for edge restoration and the
+/// durable parent-side delete, `displaced` for the link prune /
+/// accumulator reset / accounting). A struct instead of three
+/// parameters so the primitive's call sites cannot mis-wire one.
+pub(crate) struct DisplacementBookkeeping<'a> {
+    pub(crate) removed_retriable: &'a mut Vec<(DrvHash, DerivationState)>,
+    pub(crate) displaced_scrubbed_edges: &'a mut Vec<(DrvHash, HashSet<DrvHash>)>,
+    pub(crate) displaced: &'a mut Vec<DrvHash>,
+}
+
+/// Zero-size proof that the positive re-supply coverage check ran for
+/// a healed parent: `missing(p) ⊆ post-insert children(p)`. The only
+/// constructor is the coverage branch in [`DerivationDag::merge`] —
+/// holding one (even by reference) is what authorizes
+/// [`crate::state::ClosureHole::clear_for_heal`]
+/// (`sched.evidence.positive-witness`); no other code path can mint
+/// the token, so an absence-of-objection heal is unwritable.
+#[derive(Debug)]
+pub struct HealWitness(());
+
 /// Result of [`DerivationDag::remove_build_interest_and_reap`].
 #[derive(Debug, Default)]
 pub struct ReapOutcome {
@@ -99,14 +549,19 @@ pub struct ReapOutcome {
     pub surviving_parents: Vec<DrvHash>,
     /// The subset of `surviving_parents` that lost at least one
     /// UN-PRODUCED child to this reap — exactly the nodes whose
-    /// in-memory `closure_hole` breadcrumb this reap just set. Reported
-    /// separately so the leader-gated survivor hook can persist the
-    /// breadcrumb (`migrations/064`, `set_closure_hole_by_hashes`)
-    /// without re-deriving "holed by THIS reap" from node state (which
-    /// would also re-fire for holes set by earlier reaps and miss
-    /// survivors the hook's verdict loop skips as terminal /
-    /// zero-interest).
-    pub holed_parents: Vec<DrvHash>,
+    /// in-memory `closure_hole` breadcrumb this reap just set. The
+    /// witness vec carries the FULL removed child set (produced and
+    /// un-produced alike, round-16 bug_076 /
+    /// `sched.merge.substitute-topdown+15`): the heal's coverage check
+    /// judges against it, so an under-representative re-declaration
+    /// (just the un-produced subset) can no longer clear the hole and
+    /// later pass the parent off as Vouched. Reported separately so
+    /// the leader-gated survivor hook can persist the breadcrumb
+    /// (`migrations/064`+`069`, `set_closure_holes`) without
+    /// re-deriving "holed by THIS reap" from node state (which would
+    /// also re-fire for holes set by earlier reaps and miss survivors
+    /// the hook's verdict loop skips as terminal / zero-interest).
+    pub holed_parents: Vec<(DrvHash, Vec<DrvHash>)>,
 }
 
 /// Trust classification of a node's current DAG child set as evidence
@@ -326,6 +781,93 @@ impl DerivationDag {
         self.nodes.values()
     }
 
+    // r[impl sched.merge.evidence-ranked-displacement]
+    /// THE displacement primitive: every merge arm that removes a
+    /// pre-existing node in favor of an incoming definition delegates
+    /// the decision AND the bookkeeping here, so the
+    /// settled-protection predicate exists exactly once and a future
+    /// arm cannot re-introduce a divergent carve-out.
+    ///
+    /// Verdict contract (in evaluation order):
+    /// - victim absent → `debug_assert` (caller bug: arms only call
+    ///   this for resident victims) and `RefusedInFlight` as the safe
+    ///   release no-op;
+    /// - NON-SETTLED store-anchored victim (no authoritative bytes —
+    ///   its truth lives in the store, which holds at most one
+    ///   text-CA `.drv` per path) → `RefusedStoreAnchored`: while the
+    ///   claim is live or parked in the retry machinery, in-flight
+    ///   joins are dedup and dispatch re-verifies bare claims against
+    ///   the store before signing. SETTLED bare victims are NOT
+    ///   exempt (sched.merge.store-evidence-displacement+3,
+    ///   rank-uniform; bug_072): a settled bare node's recorded
+    ///   outputs are served as cache hits, so its protection is the
+    ///   same strict rank rule as every other settled form — a
+    ///   cache-hit squat at `unverified_claim` is displaced by
+    ///   byte-anchored standing;
+    /// - non-terminal victim → `RefusedInFlight` (first-writer-wins
+    ///   while the claim is live or owned by the retry machinery);
+    /// - settled victim (`Completed`/`Skipped`) with
+    ///   `victim.evidence >= displacer` → `RefusedSettledOutranked`
+    ///   (strict-inequality rank rule: a settled record is erased
+    ///   only by STRICTLY higher definition evidence);
+    /// - otherwise → `Displaced` with the shared bookkeeping: the
+    ///   prior state rides `removed_retriable` for rollback, the
+    ///   children edges are scrubbed
+    ///   (`sched.merge.displaced-edge-scrub`), and the hash joins
+    ///   `displaced` for the durable link prune / accumulator reset /
+    ///   accounting. Terminal-FAILURE victims (Poisoned / Cancelled /
+    ///   DependencyFailed) displace REGARDLESS of rank — the
+    ///   anti-squat arms' existing semantics: a parked failure must
+    ///   not lock later legitimate submissions out of the hash.
+    fn displace(
+        &mut self,
+        drv_hash: &DrvHash,
+        displacer: DefinitionEvidence,
+        bk: &mut DisplacementBookkeeping<'_>,
+    ) -> DisplaceVerdict {
+        let Some(victim) = self.nodes.get(drv_hash) else {
+            debug_assert!(false, "displace() called for an absent victim");
+            return DisplaceVerdict::RefusedInFlight;
+        };
+        let status = victim.status();
+        let settled = matches!(
+            status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        );
+        // r[impl sched.merge.store-evidence-displacement+3]
+        // Store-anchored exemption is scoped to NON-settled victims;
+        // settled bare nodes are rank-arbitrated below (rank-uniform
+        // with the row arbitration — bug_072: the categorical
+        // exemption is what let a cache-hit squat sit undisplaceable
+        // while serving forged outputs).
+        if !victim.drv_content_authoritative && !settled {
+            return DisplaceVerdict::RefusedStoreAnchored;
+        }
+        if !status.is_terminal() {
+            return DisplaceVerdict::RefusedInFlight;
+        }
+        if settled && victim.evidence >= displacer {
+            return DisplaceVerdict::RefusedSettledOutranked;
+        }
+        let old = self
+            .nodes
+            .remove(drv_hash)
+            .expect("resident victim checked above");
+        bk.removed_retriable.push((drv_hash.clone(), old));
+        // r[impl sched.merge.displaced-edge-scrub+2]
+        // The displacing submission is a different definition: drop
+        // the dependency edges earlier submissions attached to this
+        // hash so the fresh node's dep set is exactly this
+        // submission's edge list (recorded for rollback restoration).
+        let scrubbed = self.scrub_dependency_edges(drv_hash);
+        if !scrubbed.is_empty() {
+            bk.displaced_scrubbed_edges
+                .push((drv_hash.clone(), scrubbed));
+        }
+        bk.displaced.push(drv_hash.clone());
+        DisplaceVerdict::Displaced
+    }
+
     /// Merge a set of nodes and edges from a new build into the global DAG.
     ///
     /// Returns a `MergeResult` with the hashes of newly-inserted nodes,
@@ -339,7 +881,15 @@ impl DerivationDag {
     /// successful merge should call `rollback_merge()` with the returned
     /// `MergeResult` fields if their persistence fails, to avoid in-memory
     /// DAG state drifting from the DB.
-    // r[impl sched.merge.poisoned-resubmit-bounded+2]
+    ///
+    /// Equivalent to [`Self::merge_with_evidence`] with an empty
+    /// store-evidence set: every displacement decision sees only the
+    /// submission's ingress shape rank.
+    // Production enters via merge_with_evidence (the actor threads the
+    // store-evidence set); this convenience wrapper keeps the ~190
+    // existing test call sites stable, so outside cfg(test) it has no
+    // callers by design.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn merge(
         &mut self,
         build_id: Uuid,
@@ -347,10 +897,56 @@ impl DerivationDag {
         edges: &[crate::domain::DerivationEdge],
         submitter_traceparent: &str,
     ) -> Result<MergeResult, DagError> {
+        self.merge_with_evidence(
+            build_id,
+            nodes,
+            edges,
+            submitter_traceparent,
+            &HashMap::new(),
+        )
+    }
+
+    /// [`Self::merge`] with merge-time STORE evidence: hashes in
+    /// `store_evidence` were verified by the actor against the store's
+    /// own text-CA-enforced `.drv` bytes
+    /// (`sched.merge.store-evidence-displacement+3`), so their incoming
+    /// nodes displace with `PathBoundBytes` standing instead of their
+    /// bare ingress shape rank. The set only ever RAISES a displacer's
+    /// rank — victims' protection ranks are read from their own state.
+    /// Each grant additionally carries the byte-derived facts the
+    /// created node must record ([`StoreEvidenceGrant`]).
+    // r[impl sched.merge.poisoned-resubmit-bounded+2]
+    // r[impl sched.merge.evidence-ranked-displacement]
+    pub fn merge_with_evidence(
+        &mut self,
+        build_id: Uuid,
+        nodes: &[crate::domain::DerivationNode],
+        edges: &[crate::domain::DerivationEdge],
+        submitter_traceparent: &str,
+        store_evidence: &HashMap<DrvHash, StoreEvidenceGrant>,
+    ) -> Result<MergeResult, DagError> {
         let mut newly_inserted = HashSet::new();
         let mut reset_on_resubmit = Vec::new();
+        let mut authority_takeovers: Vec<DrvHash> = Vec::new();
+        let mut displaced: Vec<DrvHash> = Vec::new();
+        // Children edges scrubbed from displaced nodes, for rollback
+        // restoration and the durable parent-side edge delete.
+        let mut displaced_scrubbed_edges: Vec<(DrvHash, HashSet<DrvHash>)> = Vec::new();
         // Track newly-inserted edges for rollback (pairs of hashes)
         let mut new_edges: Vec<(DrvHash, DrvHash)> = Vec::new();
+        // Submitted edges skipped because their parent is a resident node
+        // this submission did not (re)create (sched.merge.edge-creation-scoped),
+        // split by whether the parent carries the closure_hole breadcrumb
+        // (rejoin signature) or not (hostile / gateway-bug signature).
+        let mut foreign_parent_edges_skipped: Vec<(DrvHash, DrvHash)> = Vec::new();
+        let mut rejoin_parent_edges_skipped: Vec<(DrvHash, DrvHash)> = Vec::new();
+        // Per-parent edge-admission bookkeeping for healed_parents
+        // (sched.merge.heal-accepted-edges+1): the TRIGGER is computed iff every
+        // declared edge naming it was accepted (attached or already
+        // present). Vetoes: gate-skipped edge (either kind) or an edge
+        // whose child endpoint did not resolve.
+        let mut edge_parents_declared: HashSet<DrvHash> = HashSet::new();
+        let mut edge_parents_vetoed: HashSet<DrvHash> = HashSet::new();
         // Track pre-existing nodes that gained interest in this merge, so
         // rollback only removes interest from these (not from nodes where
         // build_id was already present from a prior successful merge).
@@ -365,11 +961,12 @@ impl DerivationDag {
         // nodes where this merge recorded the submitting build's
         // contribution, so rollback can remove/restore it.
         let mut contributions_recorded: Vec<(DrvHash, Option<Vec<String>>)> = Vec::new();
-        // Full prior state of retriable nodes destructively removed below
-        // for resubmit-reset. rollback_merge restores these so a failed
-        // merge leaves the DAG exactly as it was (status, interest set,
-        // retry.resubmit_cycles toward POISON_RESUBMIT_RETRY_LIMIT all
-        // preserved).
+        // Full prior state of every pre-existing node destructively
+        // removed below (resubmit-reset of retriable nodes, displacement
+        // of terminal authoritative-content squats). rollback_merge
+        // restores these so a failed merge leaves the DAG exactly as it
+        // was (status, interest set, retry.resubmit_cycles toward
+        // POISON_RESUBMIT_RETRY_LIMIT all preserved).
         let mut removed_retriable: Vec<(DrvHash, DerivationState)> = Vec::new();
         // Pre-existing nodes whose empty traceparent was upgraded below.
         let mut traceparent_upgraded: Vec<DrvHash> = Vec::new();
@@ -386,9 +983,278 @@ impl DerivationDag {
                 .canonical(node.drv_hash.as_str())
                 .unwrap_or_else(|| node.drv_hash.as_str().into());
 
+            // r[impl sched.merge.authoritative-conflict+6]
+            // Authoritative-content protection. Evaluated BEFORE the
+            // resubmit-reset below so the existing node is examined in
+            // EVERY lifecycle state — running it after the reset would
+            // structurally exempt retriable nodes (Failed / Cancelled /
+            // DependencyFailed / Poisoned-under-budget), letting the only
+            // copy of their derivation be silently redefined with
+            // inherited interest. When the existing node carries the only
+            // copy of its derivation (content-bound hook fallback), a
+            // later submission for the same drv_hash must not be able to
+            // redefine it:
+            //   - another AUTHORITATIVE submission must be byte-identical
+            //     (identical hook resubmissions — the only legitimate
+            //     producer — are) while the existing claim is live,
+            //     Failed (still owned by the retry machinery), or
+            //     finished successfully; once the existing claim is
+            //     parked in a TERMINAL FAILURE state (Poisoned /
+            //     Cancelled / DependencyFailed), a byte-different
+            //     authoritative submission DISPLACES it instead — the
+            //     hook-fallback population submits authoritatively and
+            //     has no store-backed form, so without this arm a failed
+            //     squat would lock those victims out of the hash for the
+            //     rest of its poison TTL;
+            //   - a store-backed (non-authoritative) submission whose
+            //     verifiable identity conflicts is rejected while the
+            //     node is in flight OR finished successfully
+            //     (Completed/Skipped — a settled record is never
+            //     erased by an unverified claim), and DISPLACES it once
+            //     the node sits in a terminal FAILURE state — which
+            //     includes a poison-budget-exhausted squat — (the
+            //     verifiable definition wins; prior interest is NOT
+            //     carried and the fresh node starts with a fresh poison
+            //     budget: it is a different definition, not a retry of
+            //     the old one); an identity-MATCHING store-backed
+            //     submission joins as usual, EXCEPT when the node sits
+            //     in a poison-locked terminal failure state (no longer
+            //     retriable on resubmit): then it displaces the node
+            //     too, so a locked claim cannot capture later legitimate
+            //     submissions for the rest of its poison TTL;
+            //   - the INVERSE direction is gated too
+            //     (sched.merge.authoritative-claim-no-redefine): an
+            //     authoritative claim landing on a STORE-BACKED node
+            //     that is eligible for the resubmit-reset must prove the
+            //     same verifiable identity or be rejected — on a match
+            //     it is admitted through the normal reset and its bytes
+            //     are adopted; it never displaces the store-backed node.
+            // Store-backed existing nodes are otherwise exempt — live,
+            // or terminal but not retriable on resubmit: their truth
+            // lives in the store, so a later submission's bytes are
+            // ignored and the node joins as before.
+            // Per-node displacer standing: the ingress shape rank,
+            // raised to PathBoundBytes when the actor verified this
+            // hash against the store's own text-CA-enforced bytes
+            // (sched.merge.store-evidence-displacement+3). Computed once
+            // per node, consumed by every displace() call in the arms.
+            let displacer_evidence = {
+                let shape = DefinitionEvidence::from_node_shape(node);
+                if store_evidence.contains_key(&drv_hash) {
+                    shape.max(DefinitionEvidence::PathBoundBytes)
+                } else {
+                    shape
+                }
+            };
+            if let Some(existing) = self.nodes.get(&drv_hash) {
+                if node.drv_content_authoritative && existing.drv_content_authoritative {
+                    if existing.drv_content != node.drv_content {
+                        // Byte-different authoritative content. The
+                        // displacement primitive owns the inner
+                        // decision (sched.merge.evidence-ranked-
+                        // displacement): a claim that finished
+                        // successfully (Completed/Skipped) is never
+                        // redefined by an equal-or-lower-ranked
+                        // claimant, a live or Failed claim keeps
+                        // first-writer-wins (RefusedInFlight), and a
+                        // claim parked in a terminal failure state is
+                        // displaced by the redefinition — same
+                        // bookkeeping as the store-backed displacement
+                        // arm below, so the link prune, in-tx
+                        // accumulator reset, edge scrub, and
+                        // accounting all apply to it.
+                        let verdict = self.displace(
+                            &drv_hash,
+                            displacer_evidence,
+                            &mut DisplacementBookkeeping {
+                                removed_retriable: &mut removed_retriable,
+                                displaced_scrubbed_edges: &mut displaced_scrubbed_edges,
+                                displaced: &mut displaced,
+                            },
+                        );
+                        if verdict != DisplaceVerdict::Displaced {
+                            self.rollback_merge(
+                                &newly_inserted,
+                                &new_edges,
+                                &interest_added,
+                                &traceparent_upgraded,
+                                &wanted_grown,
+                                &contributions_recorded,
+                                build_id,
+                                removed_retriable,
+                                displaced_scrubbed_edges,
+                            );
+                            return Err(DagError::AuthoritativeContentMismatch {
+                                drv_path: node.drv_path.clone(),
+                            });
+                        }
+                    }
+                } else if !node.drv_content_authoritative && existing.drv_content_authoritative {
+                    let identity_matches = verifiable_identity_matches(existing, node);
+                    // Poison-locked: a terminal failure state the
+                    // resubmit-reset can no longer clear (today this is
+                    // exactly Poisoned with the resubmit budget
+                    // exhausted; written broadly as defense-in-depth).
+                    // An identity-MATCHING store-backed submission must
+                    // displace such a node rather than join it —
+                    // joining would attach the submitter to a build
+                    // that can never run again, so the locked claim
+                    // would capture every later legitimate submission
+                    // of the derivation for the rest of its poison TTL.
+                    let locked_terminal_failure = existing.status().is_terminal()
+                        && !matches!(
+                            existing.status(),
+                            DerivationStatus::Completed | DerivationStatus::Skipped
+                        )
+                        && !existing.is_retriable_on_resubmit();
+                    if !identity_matches || locked_terminal_failure {
+                        // The displacement primitive owns the inner
+                        // decision (sched.merge.evidence-ranked-
+                        // displacement). Settled (Completed/Skipped)
+                        // victims are protected by the strict rank
+                        // rule — a bare store-backed echo
+                        // (UnverifiedClaim) never erases the record of
+                        // a successful build (bug_076), while an
+                        // ingress-byte-bound or store-evidence-backed
+                        // displacer (PathBoundBytes) strictly outranks
+                        // a content-bound squat and reclaims the hash.
+                        // Terminal-failure victims displace regardless
+                        // of rank: the fresh store-backed definition is
+                        // inserted below as a brand-new node
+                        // (prior=None → no interest carry,
+                        // resubmit_cycles=0, not in reset_on_resubmit);
+                        // the prior state rides removed_retriable so
+                        // rollback_merge restores it if a LATER node in
+                        // this same submission fails the merge.
+                        let verdict = self.displace(
+                            &drv_hash,
+                            displacer_evidence,
+                            &mut DisplacementBookkeeping {
+                                removed_retriable: &mut removed_retriable,
+                                displaced_scrubbed_edges: &mut displaced_scrubbed_edges,
+                                displaced: &mut displaced,
+                            },
+                        );
+                        if verdict != DisplaceVerdict::Displaced {
+                            // Reachable on an identity conflict against
+                            // a live, Failed, or settled-and-outranking
+                            // (Completed/Skipped) node — a poison-locked
+                            // node is a terminal failure by
+                            // construction, so the identity-MATCHING
+                            // case never lands here.
+                            self.rollback_merge(
+                                &newly_inserted,
+                                &new_edges,
+                                &interest_added,
+                                &traceparent_upgraded,
+                                &wanted_grown,
+                                &contributions_recorded,
+                                build_id,
+                                removed_retriable,
+                                displaced_scrubbed_edges,
+                            );
+                            return Err(DagError::ConflictingInFlightContent {
+                                drv_path: node.drv_path.clone(),
+                            });
+                        }
+                    }
+                } else if !node.drv_content_authoritative
+                    && !existing.drv_content_authoritative
+                    && matches!(
+                        existing.status(),
+                        DerivationStatus::Completed | DerivationStatus::Skipped
+                    )
+                    && !verifiable_identity_matches(existing, node)
+                {
+                    // r[impl sched.merge.store-evidence-displacement+3]
+                    // Settled bare x bare identity conflict (bug_072):
+                    // the store-backed join exemption is for nodes
+                    // whose truth lives in the store — but a SETTLED
+                    // bare node's recorded outputs are served as a
+                    // cache hit to every joiner, so a conflicting
+                    // incoming claim must never silently attach (the
+                    // genuine owner would be handed a squat's forged
+                    // outputs). The displacement primitive owns the
+                    // decision, rank-uniform with every other settled
+                    // victim form: a store-evidence-granted incoming
+                    // (PathBoundBytes, verified by Step 0.6 against
+                    // the store's own text-CA bytes) displaces an
+                    // UnverifiedClaim/ContentBoundClaim squat; an
+                    // ungranted conflicting echo is REFUSED — fail
+                    // closed, never join-by-default. Identity-MATCHING
+                    // bare resubmissions (incl. the M_070
+                    // preserved-claim/dual-anchor bases) never reach
+                    // this arm and keep the join semantics.
+                    let verdict = self.displace(
+                        &drv_hash,
+                        displacer_evidence,
+                        &mut DisplacementBookkeeping {
+                            removed_retriable: &mut removed_retriable,
+                            displaced_scrubbed_edges: &mut displaced_scrubbed_edges,
+                            displaced: &mut displaced,
+                        },
+                    );
+                    if verdict != DisplaceVerdict::Displaced {
+                        self.rollback_merge(
+                            &newly_inserted,
+                            &new_edges,
+                            &interest_added,
+                            &traceparent_upgraded,
+                            &wanted_grown,
+                            &contributions_recorded,
+                            build_id,
+                            removed_retriable,
+                            displaced_scrubbed_edges,
+                        );
+                        return Err(DagError::ConflictingInFlightContent {
+                            drv_path: node.drv_path.clone(),
+                        });
+                    }
+                } else if node.drv_content_authoritative
+                    && !existing.drv_content_authoritative
+                    && existing.is_retriable_on_resubmit()
+                    && !verifiable_identity_matches(existing, node)
+                {
+                    // r[impl sched.merge.authoritative-claim-no-redefine]
+                    // The claim would otherwise be ADOPTED by the
+                    // resubmit-reset below (`is_retriable_on_resubmit`
+                    // is exactly the reset's admission set), redefining
+                    // a parked store-backed definition with bytes only
+                    // the claimant can see — so a conflicting identity
+                    // is rejected here, leaving the existing node
+                    // untouched. A matching identity falls through and
+                    // takes the normal reset (bytes adopted, prior
+                    // interest carried, resubmit cycle accumulated).
+                    // Live and non-retriable store-backed nodes never
+                    // reach this arm: they keep the join-and-ignore
+                    // semantics, and an authoritative claim never
+                    // displaces a store-backed node.
+                    self.rollback_merge(
+                        &newly_inserted,
+                        &new_edges,
+                        &interest_added,
+                        &traceparent_upgraded,
+                        &wanted_grown,
+                        &contributions_recorded,
+                        build_id,
+                        removed_retriable,
+                        displaced_scrubbed_edges,
+                    );
+                    return Err(DagError::AuthoritativeClaimIdentityConflict {
+                        drv_path: node.drv_path.clone(),
+                    });
+                }
+            }
+
             // Resubmit-retry: if the existing node is Cancelled or Failed,
             // remove it so the else-branch below re-inserts fresh state and
             // it flows through `compute_initial_states` → `newly_inserted`.
+            // The authoritative-conflict gate above has already admitted
+            // this submission (byte-identical authoritative retry,
+            // identity-matching store-backed resubmit, or a store-backed
+            // existing node), so the reset only ever recreates the SAME
+            // derivation definition. A displaced node is already gone from
+            // `self.nodes` at this point, so `prior` stays `None` for it.
             // Defense-in-depth: reap now removes Cancelled nodes for terminal
             // builds, so the reset is only load-bearing during the
             // TERMINAL_CLEANUP_DELAY window or for nodes shared with a
@@ -397,9 +1263,14 @@ impl DerivationDag {
             // newly-inserted, and `handle_merge_dag`'s pre-existing-node
             // match ignores Cancelled — the resubmitted build would hang.
             //
-            // Edges are NOT scrubbed: `children`/`parents` are keyed by hash
-            // string, so they stay valid across the remove+reinsert. The merge's
-            // own edge loop re-adds this submission's edges idempotently.
+            // Edges are NOT scrubbed for same-definition resets (including
+            // byte-identical authoritative retries): `children`/`parents`
+            // are keyed by hash string, so they stay valid across the
+            // remove+reinsert and the merge's own edge loop re-adds this
+            // submission's edges idempotently. An authority takeover
+            // (authoritative squat replaced by a store-backed definition)
+            // is a definition change and gets the same children scrub as
+            // displacement — see below.
             // Because the (possibly reap-truncated) child set survives the
             // reset without being re-declared, the `closure_hole`
             // breadcrumb that qualifies it must ride along in the carry
@@ -429,12 +1300,37 @@ impl DerivationDag {
                 .is_some_and(DerivationState::is_retriable_on_resubmit)
             {
                 let old = self.nodes.remove(&drv_hash).expect("just checked is_some");
+                // Authority takeover: the removed retriable node carried
+                // authoritative inline content and the re-creating
+                // submission is store-backed (the gate above only admits
+                // this shape on a verifiable identity match). The fresh
+                // node is the store-backed definition taking over the
+                // hash, so the squat's consumed poison budget must not
+                // carry over (sched.merge.displaced-failure-reset).
+                let authority_flip =
+                    old.drv_content_authoritative && !node.drv_content_authoritative;
+                if authority_flip {
+                    // r[impl sched.merge.displaced-edge-scrub+2]
+                    // Definition change ⇒ the same children scrub as
+                    // displacement: the squat's dependency edges must not
+                    // carry onto the store-backed definition taking over
+                    // the hash. Recorded in displaced_scrubbed_edges so a
+                    // failed merge restores them with the node, and so the
+                    // persist deletes the parent-side rows in the same
+                    // transaction. Same-definition resets (the
+                    // !authority_flip path) keep their edges.
+                    let scrubbed = self.scrub_dependency_edges(&drv_hash);
+                    if !scrubbed.is_empty() {
+                        displaced_scrubbed_edges.push((drv_hash.clone(), scrubbed));
+                    }
+                }
                 let carry = (
                     old.interested_builds.clone(),
                     old.retry.resubmit_cycles,
                     old.wanted_output_names.clone(),
                     old.wanted_by_build.clone(),
-                    old.closure_hole,
+                    old.closure_hole.clone(),
+                    authority_flip,
                 );
                 removed_retriable.push((drv_hash.clone(), old));
                 Some(carry)
@@ -515,6 +1411,7 @@ impl DerivationDag {
                             &contributions_recorded,
                             build_id,
                             removed_retriable,
+                            displaced_scrubbed_edges,
                         );
                         return Err(DagError::InvalidDrvPath {
                             path: node.drv_path.clone(),
@@ -530,6 +1427,40 @@ impl DerivationDag {
                 // featureless pools count it (subset vacuously true),
                 // kvm pool skips it (I-181 ∅ guard).
                 self.apply_soft_features(&mut state);
+                // r[impl sched.merge.evidence-ranked-displacement]
+                // Merge-time store evidence is a PathBoundBytes SOURCE
+                // (sched.derivation.evidence-rank): the actor verified
+                // this hash's incoming identity against the store's own
+                // text-CA-enforced bytes, so the created node — and the
+                // row the creation-scoped upsert persists from it —
+                // carries the verified standing, not the bare echo's
+                // shape rank. Same value the displacement verdict used.
+                state.evidence = state.evidence.max(displacer_evidence);
+                // r[impl sched.dispatch.claims-derived+5]
+                // A store-evidence-created node's resolve flag is the
+                // BYTE-DERIVED one computed at the classification site
+                // (VerifiedDefinition.needs_resolve) — the proto echo
+                // try_from_node copied is overwritten so nothing
+                // downstream of a verified creation can consult the
+                // submitter's claim.
+                if let Some(grant) = store_evidence.get(&drv_hash) {
+                    state.ca.needs_resolve = grant.needs_resolve;
+                    // r[impl sched.merge.store-evidence-displacement+3]
+                    // Strip consequence parity (merged_bug_020/038):
+                    // when the verification verdict was
+                    // VerifiedExceptDeclaredHash, the grant carries the
+                    // strip — the created node sheds the submitter's
+                    // unverifiable declared hash exactly like the
+                    // dispatch strip arm (an unverifiable claim is no
+                    // claim), and the claim is PRESERVED out-of-band
+                    // (M_070) so the row this node settles into stays
+                    // matchable. One verdict, one consequence, at both
+                    // consumers.
+                    if let Some(stripped) = grant.stripped_declared_hash {
+                        state.ca.modular_hash = None;
+                        state.ca.modular_hash_stripped = Some(stripped);
+                    }
+                }
                 state.interested_builds.insert(build_id);
                 // The submitting build's per-build contribution — the
                 // counterpart of the existing-node path's insert.
@@ -551,21 +1482,52 @@ impl DerivationDag {
                 // resubmitter's own entry authoritative. The closure-hole
                 // breadcrumb rides along too — the kept edges were not
                 // re-declared by this reset (see the carry site above).
+                //
+                // r[impl sched.merge.displaced-failure-reset+2]
+                // Exception: an authority takeover (the removed node was
+                // authoritative, the re-creating submission store-backed)
+                // is a definition change, not a retry of the prior
+                // definition — it starts with a fresh poison budget
+                // (cycles = 0, mirroring the in-tx row reset) and is
+                // surfaced in `authority_takeovers` so the actor skips
+                // the cycle-incrementing `clear_poison_batch` for it.
                 if let Some((
                     prior_interest,
                     prior_cycles,
                     prior_wanted,
                     prior_contributions,
                     prior_closure_hole,
+                    authority_flip,
                 )) = prior
                 {
                     state.interested_builds.extend(prior_interest);
-                    state.retry.resubmit_cycles = prior_cycles + 1;
+                    state.retry.resubmit_cycles = if authority_flip { 0 } else { prior_cycles + 1 };
+                    if authority_flip {
+                        authority_takeovers.push(drv_hash.clone());
+                    }
                     state.union_wanted(&prior_wanted);
                     for (b, w) in prior_contributions {
                         state.wanted_by_build.entry(b).or_insert(w);
                     }
-                    state.closure_hole = prior_closure_hole;
+                    // r[impl sched.closure.witness-epoch]
+                    // The witness rides a same-definition resubmit and
+                    // dies at an authority takeover — the same boundary
+                    // that already scrubbed the squat's edges and reset
+                    // its poison budget above. Carrying it across would
+                    // demand the genuine definition "re-supply" the
+                    // squat's junk children, which its real inputDrvs
+                    // can never contain: every re-declaration would be
+                    // heal-refused and the node permanently
+                    // fail-fast-routed (round-16 bug_011). The durable
+                    // half (PG flag+rows, kept alive by the upsert's
+                    // OR semantics) is cleared by the merge
+                    // transaction's definition-change clear in
+                    // `persist_merge_to_db`.
+                    state.closure_hole = prior_closure_hole.carry_across(if authority_flip {
+                        crate::state::DefinitionTransition::AuthorityTakeover
+                    } else {
+                        crate::state::DefinitionTransition::SameDefinition
+                    });
                     reset_on_resubmit.push(drv_hash.clone());
                 }
                 state.traceparent = submitter_traceparent.to_string();
@@ -580,6 +1542,26 @@ impl DerivationDag {
         }
 
         // Insert edges
+        //
+        // SubmitBuild ingress guarantees both endpoints of every edge name
+        // nodes of the same request (sched.merge.ingress-edge-endpoints),
+        // so in production these lookups only miss on path aliasing (a
+        // node joined under a different drv_path than the resident one)
+        // or when merge() is driven by a non-gRPC caller. The warn-skip
+        // stays as the last line of defense: an unresolved endpoint must
+        // not attach edges to nodes the submission never declared.
+        //
+        // Ingress only constrains edges to THIS request's nodes; it cannot
+        // know which of them are resident. A node's dependency set is
+        // intrinsic to its `.drv`, so only the submission that (re)creates
+        // a node may define its children — a later submission that merely
+        // joins a resident node may re-declare the existing edges (silent
+        // no-ops) but must not extend them, or any submitter could attach
+        // a failing junk dependency to someone else's resident node. The
+        // one exception is a topdown-pruned root: its creating submission
+        // deliberately dropped the dependency edges, and a later full
+        // merge is expected to top them up while the node is resident
+        // (see handle_substitute_complete).
         for edge in edges {
             // Edges reference drv_path; resolve to drv_hash
             let Some(parent_hash) = self
@@ -593,14 +1575,77 @@ impl DerivationDag {
                 );
                 continue;
             };
+            // Every edge whose parent resolves declares that parent's
+            // (partial or full) dependency set — track it for the
+            // healed_parents computation regardless of what happens to
+            // the edge below.
+            edge_parents_declared.insert(parent_hash.clone());
             let Some(child_hash) = self.path_to_hash.get(edge.child_drv_path.as_str()).cloned()
             else {
                 tracing::warn!(
                     child_path = %edge.child_drv_path,
                     "edge references unknown child drv_path, skipping"
                 );
+                // An unresolvable child means this parent's declared set
+                // could not be fully attached → its child set is not
+                // representative of its closure → veto the heal.
+                edge_parents_vetoed.insert(parent_hash);
                 continue;
             };
+
+            // r[impl sched.merge.edge-creation-scoped]
+            // Creation-scoped edge gate: attach the edge only when this
+            // submission (re)created the parent (plain insert,
+            // resubmit-reset, displacement, authority takeover — all of
+            // which land in `newly_inserted`) or the resident parent is a
+            // topdown-pruned root awaiting its dependency top-up.
+            // Re-declarations of an edge that already exists stay accepted
+            // as silent no-ops (the gateway re-emits each parent's full
+            // edge set on every full-closure join).
+            let already_present = self
+                .children
+                .get(&parent_hash)
+                .is_some_and(|cs| cs.contains(&child_hash));
+            let parent_creation_scoped = newly_inserted.contains(&parent_hash)
+                || self
+                    .nodes
+                    .get(&parent_hash)
+                    .is_some_and(|s| s.topdown_pruned);
+            if !parent_creation_scoped && !already_present {
+                // r[impl sched.merge.heal-accepted-edges+1]
+                // A gate-skipped edge vetoes its parent's heal either way;
+                // the split below only decides observability. A parent
+                // carrying the closure_hole breadcrumb is the legitimate
+                // post-reap rejoin signature (full-closure re-declaration
+                // of a node whose children were reaped); anything else is
+                // a hostile direct submitter or a gateway bug.
+                edge_parents_vetoed.insert(parent_hash.clone());
+                let parent_holed = self
+                    .nodes
+                    .get(&parent_hash)
+                    .is_some_and(|s| s.closure_hole.is_holed());
+                if parent_holed {
+                    tracing::debug!(
+                        parent_path = %edge.parent_drv_path,
+                        child_path = %edge.child_drv_path,
+                        %build_id,
+                        "edge parent is a closure-holed resident node not (re)created \
+                         by this submission; skipping rejoin dependency edge \
+                         (hole stays until the node is re-created)"
+                    );
+                    rejoin_parent_edges_skipped.push((parent_hash, child_hash));
+                } else {
+                    tracing::warn!(
+                        parent_path = %edge.parent_drv_path,
+                        child_path = %edge.child_drv_path,
+                        %build_id,
+                        "edge parent is a resident node not (re)created by this \
+                         submission; skipping foreign dependency edge"
+                    );
+                    foreign_parent_edges_skipped.push((parent_hash, child_hash));
+                }
+                continue;
+            }
 
             let inserted_child = self
                 .children
@@ -617,10 +1662,47 @@ impl DerivationDag {
             }
         }
 
+        // r[impl sched.merge.heal-accepted-edges+1]
+        // r[impl sched.evidence.positive-witness]
+        // accepted = declared − vetoed (the TRIGGER); healed = accepted
+        // ∧ witness-set coverage. The subset check runs over the
+        // post-insert children map — both operands scheduler-owned
+        // (sched.evidence.positive-witness): the witness set was
+        // recorded by the truncation that removed the children, and
+        // the children map reflects what THIS merge actually attached.
+        let accepted_edge_parents: Vec<DrvHash> = edge_parents_declared
+            .into_iter()
+            .filter(|p| !edge_parents_vetoed.contains(p))
+            .collect();
+        let mut healed_parents: Vec<(DrvHash, HealWitness)> = Vec::new();
+        let mut heal_refused_parents: Vec<DrvHash> = Vec::new();
+        for p in &accepted_edge_parents {
+            let covered = match self.nodes.get(p).map(|s| s.closure_hole.missing()) {
+                // Un-holed (or no longer resident): trivially covered —
+                // the stale-PG total-clear semantics (see the field doc).
+                None => true,
+                Some(missing) if missing.is_empty() => true,
+                Some(missing) => {
+                    let children = self.children.get(p);
+                    missing
+                        .iter()
+                        .all(|c| children.is_some_and(|cs| cs.contains(c)))
+                }
+            };
+            if covered {
+                // The ONLY HealWitness constructor (see the type doc).
+                healed_parents.push((p.clone(), HealWitness(())));
+            } else {
+                heal_refused_parents.push(p.clone());
+            }
+        }
+
         // Cycle check: DFS from each newly-inserted node AND from each parent
         // endpoint of new edges. The latter catches cycles formed by new edges
         // between two pre-existing nodes (no new nodes inserted, so the
-        // newly_inserted loop alone would miss them).
+        // newly_inserted loop alone would miss them) — under the
+        // creation-scoped edge gate above this is only reachable through
+        // the topdown-pruned carve-out, but the coverage stays.
         let mut color: HashMap<String, u8> = HashMap::new();
         let mut dfs_starts: Vec<&str> = newly_inserted.iter().map(|s| s.as_str()).collect();
         for (parent, _child) in &new_edges {
@@ -642,6 +1724,7 @@ impl DerivationDag {
                     &contributions_recorded,
                     build_id,
                     removed_retriable,
+                    displaced_scrubbed_edges,
                 );
                 return Err(DagError::CycleDetected);
             }
@@ -650,9 +1733,17 @@ impl DerivationDag {
         Ok(MergeResult {
             newly_inserted,
             reset_on_resubmit,
+            authority_takeovers,
+            displaced,
             new_edges,
             interest_added,
             removed_retriable,
+            displaced_scrubbed_edges,
+            foreign_parent_edges_skipped,
+            rejoin_parent_edges_skipped,
+            accepted_edge_parents,
+            healed_parents,
+            heal_refused_parents,
             traceparent_upgraded,
             wanted_grown,
             contributions_recorded,
@@ -732,8 +1823,9 @@ impl DerivationDag {
     /// Rollback a failed merge: remove newly-inserted nodes and edges,
     /// remove build interest from pre-existing nodes that gained it during
     /// this merge (but not from nodes where build_id was already present),
-    /// and restore any retriable nodes that the resubmit-reset path
-    /// destructively removed.
+    /// and restore every node the merge destructively removed
+    /// (resubmit-reset and displacement alike), re-attaching the
+    /// dependency edges the displacement arms scrubbed.
     // The parameters mirror `MergeResult`'s fields one-to-one (the two
     // inline callers in `merge()` hold them as locals, not as a
     // `MergeResult`); a struct param would just rename the args.
@@ -748,6 +1840,7 @@ impl DerivationDag {
         contributions_recorded: &[(DrvHash, Option<Vec<String>>)],
         build_id: Uuid,
         removed_retriable: Vec<(DrvHash, DerivationState)>,
+        displaced_scrubbed_edges: Vec<(DrvHash, HashSet<DrvHash>)>,
     ) {
         // Remove newly-inserted edges
         for (parent, child) in new_edges {
@@ -766,9 +1859,13 @@ impl DerivationDag {
         }
 
         // Hashes being restored below — their children[X]/parents[X]
-        // entries are pre-existing (the resubmit-reset path removed only
-        // nodes[X], never edges) and must NOT be scrubbed. The new_edges
-        // loop above already reverted any edges THIS merge added to them.
+        // entries are pre-existing and must NOT be scrubbed: the
+        // same-definition resubmit-reset removes only nodes[X] (never
+        // edges), while the displacement arms and the authority-takeover
+        // reset remove nodes[X] plus the children direction, which is
+        // re-attached from `displaced_scrubbed_edges` at the end of this
+        // rollback. The new_edges loop above already reverted any edges
+        // THIS merge added to them.
         // Owned (not borrowed) because the per-field restore loops at the
         // bottom also consult it, after `removed_retriable` is consumed.
         let restoring: HashSet<DrvHash> =
@@ -780,7 +1877,8 @@ impl DerivationDag {
                 self.path_to_hash.remove(state.drv_path().as_str());
             }
             // Also clean up any edge entries keyed on this hash — but only
-            // for truly-fresh nodes. For resubmit-reset nodes, these entries
+            // for truly-fresh nodes. For restored nodes (resubmit-reset or
+            // displacement), these entries
             // are the prior node's pre-existing edges; scrubbing them would
             // leave dangling one-way edges (e.g. children[W]∋X survives,
             // parents[X]∋W gone → X completes but W never sees it).
@@ -790,13 +1888,30 @@ impl DerivationDag {
             }
         }
 
-        // Restore retriable nodes that were destructively removed for
-        // resubmit-reset. Runs AFTER newly_inserted removal so the fresh
+        // Restore the nodes this merge destructively removed
+        // (resubmit-reset or displacement). Runs AFTER newly_inserted
+        // removal so the fresh
         // replacement (same hash key) is gone first.
         for (hash, state) in removed_retriable {
             self.path_to_hash
                 .insert(state.drv_path().to_string(), hash.clone());
             self.nodes.insert(hash, state);
+        }
+
+        // r[impl sched.merge.displaced-edge-scrub+2]
+        // Re-attach the dependency edges scrubbed by the displacement
+        // arms and the authority-takeover reset, so a failed merge
+        // restores the removed node together with its (possibly
+        // squatter-attached) children edges — exactly the pre-merge DAG.
+        // Runs after the node restore so both endpoints exist again.
+        for (hash, children) in displaced_scrubbed_edges {
+            for c in &children {
+                self.parents
+                    .entry(c.clone())
+                    .or_default()
+                    .insert(hash.clone());
+            }
+            self.children.entry(hash).or_default().extend(children);
         }
 
         // Remove build interest only from pre-existing nodes that gained it
@@ -902,11 +2017,12 @@ impl DerivationDag {
     /// an un-produced terminal child dropped at load), and by the
     /// poison-clear removals (admin `ClearPoison` and the poison-TTL
     /// sweep), and healed by the merge-time edge re-declaration.
+    // r[impl sched.evidence.positive-witness]
     pub fn closure_evidence(&self, drv_hash: &str) -> ClosureEvidence {
         let Some(node) = self.nodes.get(drv_hash) else {
             return ClosureEvidence::Broken;
         };
-        if node.closure_hole {
+        if node.closure_hole.is_holed() {
             return ClosureEvidence::Broken;
         }
         let Some(children) = self.children.get(drv_hash) else {
@@ -1263,8 +2379,11 @@ impl DerivationDag {
     /// re-evaluation.
     ///
     /// Survivors that lost at least one UN-PRODUCED child (status not
-    /// Completed/Skipped at reap time) additionally get the in-memory
-    /// `closure_hole` breadcrumb set, and are reported back as
+    /// Completed/Skipped at reap time) — and survivors ALREADY carrying
+    /// the breadcrumb that lost ANY child, produced included
+    /// (round-17 merged_bug_024: the witness is cumulative since the
+    /// hole was last whole) — additionally get the in-memory
+    /// `closure_hole` breadcrumb set/extended, and are reported back as
     /// [`ReapOutcome::holed_parents`]: their remaining DAG children no
     /// longer represent their pruned input closure, so the actor's
     /// children-keyed `topdown_pruned` verdicts must not trust the
@@ -1311,17 +2430,100 @@ impl DerivationDag {
         }
 
         let mut surviving_parents: BTreeSet<DrvHash> = BTreeSet::new();
-        let mut holed_parents: BTreeSet<DrvHash> = BTreeSet::new();
+        // r[impl sched.merge.substitute-topdown+15]
+        // Hole trigger: at least one UN-PRODUCED child removed (a
+        // produced-only reap of an UN-watched parent leaves outputs in
+        // the store — the pre-existing posture), or the parent is
+        // already watched (`witness_watched` below — any removal
+        // extends a live witness). Witness CONTENT: the FULL removed set,
+        // produced and un-produced alike (round-16 bug_076). The heal's
+        // coverage check is `missing ⊆ re-declared`; recording only the
+        // un-produced subset let ANY submission re-declare just those
+        // reconstructible hashes, get the hole healed, and — once the
+        // witness children produced — have the parent judged Vouched
+        // over an under-representative child set: topdown_pruned
+        // cleared, from-source dispatch re-armed, ENOENT on whichever
+        // produced-but-reaped input had been GC'd in the interim. With
+        // the full set on the witness, ANY healing submission (owner or
+        // foreign) must re-supply every removed child — a foreign full
+        // re-declaration is functionally an honest top-up, which is why
+        // interest-scoping the heal was rejected (it would break the
+        // designed no-recreation top-up for pruned roots).
+        //
+        // PERF SHAPE (the I-140 reap-all bound): the trigger set is
+        // computed FIRST — un-produced removals plus the watched
+        // survivors below — and the full-set capture runs ONLY for
+        // triggered parents. A sole-build completion reap (every child
+        // produced, no watched parents — the 150k-node hot path) takes
+        // the empty-trigger fast path and does, beyond one deduped
+        // breadcrumb lookup per unique surviving parent, exactly the
+        // pre-+14 work; the naive per-edge accumulation regressed
+        // reap-all past its 2000ms budget.
+        // r[impl sched.merge.substitute-topdown+15]
+        // witness_watched (round-17 merged_bug_024, reap tier): a parent
+        // ALREADY carrying the breadcrumb extends its witness on ANY
+        // child removal — produced children included. The witness
+        // contract is cumulative since the hole was last whole: the
+        // heal's coverage check is `missing ⊆ re-declared`, so a
+        // produced child reaped from a watched parent and left OFF the
+        // witness lets a heal that re-supplies only the older recorded
+        // set re-arm the parent over an under-representative child set
+        // (the reap-tier twin of the recovery-side all-produced
+        // laundering). Un-watched parents losing only produced children
+        // keep the pre-existing posture: outputs are in the store, no
+        // hole exists, nothing to extend.
+        //
+        // Cost shape: dedup-first, single pass — candidate parents are
+        // deduped (unordered HashSet; order is irrelevant pre-trigger)
+        // in the SAME parents-map walk that builds the un-produced
+        // trigger, and the breadcrumb probe runs once per unique
+        // candidate, never per edge. The mirrored watched-parent index
+        // was rejected on desync risk; the per-edge accumulation was
+        // rejected on the measured I-140 regression (see PERF SHAPE
+        // above).
+        let mut hole_trigger: BTreeSet<DrvHash> = BTreeSet::new();
+        let mut watched_candidates: HashSet<DrvHash> = HashSet::new();
+        for (hash, _, unproduced) in &to_reap {
+            if let Some(ps) = self.parents.get(hash) {
+                if *unproduced {
+                    hole_trigger.extend(ps.iter().cloned());
+                }
+                watched_candidates.extend(ps.iter().cloned());
+            }
+        }
+        for p in watched_candidates {
+            if !hole_trigger.contains(&p)
+                && self
+                    .nodes
+                    .get(&p)
+                    .is_some_and(|s| s.closure_hole.is_holed())
+            {
+                hole_trigger.insert(p);
+            }
+        }
+        let mut removed_children: std::collections::BTreeMap<DrvHash, Vec<DrvHash>> =
+            std::collections::BTreeMap::new();
+        if !hole_trigger.is_empty() {
+            for (hash, _, _) in &to_reap {
+                if let Some(ps) = self.parents.get(hash) {
+                    for p in ps {
+                        if hole_trigger.contains(p) {
+                            removed_children
+                                .entry(p.clone())
+                                .or_default()
+                                .push(hash.clone());
+                        }
+                    }
+                }
+            }
+        }
         let mut reaped_paths = Vec::with_capacity(to_reap.len());
-        for (hash, path, unproduced) in to_reap {
+        for (hash, path, _) in to_reap {
             // Capture the parents BEFORE `remove_node` scrubs the edge maps —
             // afterwards neither the reaped hash nor its former parents are
             // recoverable from the DAG.
             if let Some(ps) = self.parents.get(&hash) {
                 surviving_parents.extend(ps.iter().cloned());
-                if unproduced {
-                    holed_parents.extend(ps.iter().cloned());
-                }
             }
             self.remove_node(&hash);
             reaped_paths.push(path);
@@ -1329,14 +2531,15 @@ impl DerivationDag {
         // Drop entries that were themselves reaped (or otherwise no longer
         // exist) so only true survivors are reported.
         surviving_parents.retain(|p| self.nodes.contains_key(p));
-        holed_parents.retain(|p| self.nodes.contains_key(p));
-        // Breadcrumb the survivors whose reaped children include an
-        // un-produced one: their child set is no longer representative of
-        // their input closure (see `DerivationState::closure_hole`).
-        for parent in &holed_parents {
-            if let Some(state) = self.nodes.get_mut(parent) {
-                state.closure_hole = true;
+        let mut holed_parents: Vec<(DrvHash, Vec<DrvHash>)> = Vec::new();
+        for (parent, missing) in removed_children {
+            if !self.nodes.contains_key(&parent) {
+                continue;
             }
+            if let Some(state) = self.nodes.get_mut(&parent) {
+                state.closure_hole.stamp(missing.iter().cloned());
+            }
+            holed_parents.push((parent, missing));
         }
         ReapOutcome {
             reaped_paths,
@@ -1345,15 +2548,45 @@ impl DerivationDag {
         }
     }
 
+    /// Scrub the DEPENDENCY (children) direction of a node's edges:
+    /// remove `children[hash]` and drop `hash` from `parents[c]` for each
+    /// former child `c`. Returns the scrubbed child set so the caller can
+    /// record it for rollback restoration.
+    ///
+    /// Used by the displacement arms of `merge()` and by the
+    /// authority-takeover path of the resubmit-reset
+    /// (`sched.merge.displaced-edge-scrub`): the replacing submission is
+    /// a DIFFERENT definition, so the dependency edges earlier
+    /// submissions attached to the hash must not constrain the fresh node
+    /// — `compute_initial_states` would otherwise seed it
+    /// `DependencyFailed` (or park it `Queued` forever) from a dependency
+    /// set the replacing submission never declared. The PARENTS
+    /// direction is deliberately preserved: nodes that depend on this
+    /// hash still want its output, whichever definition produces it.
+    /// Same-definition resubmit-resets keep their edge-preserving
+    /// semantics (same definition ⇒ same dependency set).
+    fn scrub_dependency_edges(&mut self, hash: &DrvHash) -> HashSet<DrvHash> {
+        let children = self.children.remove(hash).unwrap_or_default();
+        for c in &children {
+            if let Some(ps) = self.parents.get_mut(c) {
+                ps.remove(hash);
+                if ps.is_empty() {
+                    self.parents.remove(c);
+                }
+            }
+        }
+        children
+    }
+
     /// Remove a single node and scrub all edge references to it.
     ///
     /// Used by poison-clear paths (admin ClearPoison, TTL expiry) so the
     /// next merge treats the derivation as newly-inserted: it receives full
     /// proto fields and flows through `compute_initial_states`. Resetting
-    /// status in-place instead would leave stub fields from
-    /// `from_poisoned_row` (empty `output_names`, empty
-    /// `expected_output_paths`) and `compute_initial_states` only iterates
-    /// `newly_inserted` — the node would sit in Created forever.
+    /// status in-place instead would leave the node stuck — `merge()` on a
+    /// pre-existing non-retriable node only touches `interested_builds` +
+    /// `traceparent`, and `compute_initial_states` only iterates
+    /// `newly_inserted` — so it would sit in Created forever.
     pub fn remove_node(&mut self, hash: &DrvHash) {
         if let Some(state) = self.nodes.remove(hash) {
             self.path_to_hash.remove(state.drv_path().as_str());

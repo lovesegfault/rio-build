@@ -166,7 +166,7 @@ enum TerminationReason {
   TERMINATION_REASON_ERROR = 5;
   // Job.status.conditions has type=Failed reason=DeadlineExceeded —
   // activeDeadlineSeconds backstop fired (worker wedged past its own
-  // daemon_timeout). → bump `resource_floor.deadline_secs` (same
+  // build_timeout). → bump `resource_floor.deadline_secs` (same
   // bounded ladder as worker-reported TimedOut). Reported by JOB name
   // (pod is already deleted by Job controller); scheduler prefix-
   // matches recently_disconnected.

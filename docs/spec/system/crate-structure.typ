@@ -139,16 +139,42 @@ Notable edges:
   ],
   "rio-nix": [
     #r(
-      "nix.hash.algos",
-    )[`HashAlgo` is `{SHA256, SHA512, SHA1}` — the set Nix accepts for `outputHashAlgo` and store-path computation. SHA-1 is included for legacy fixed-output derivations (`fetchgit` historically defaulted to it). BLAKE3 is used internally by rio-build for chunk addressing but is NOT a `HashAlgo` variant — it never crosses the Nix-facing protocol boundary.]
+      "nix.hash.algos+2",
+    )[`HashAlgo` is `{SHA256, SHA512, SHA1}` — the set Nix accepts for `outputHashAlgo` and store-path computation — and its name parse MUST be case-exact, matching CppNix `parseHashAlgoOpt` (`hash.cc:468-483`): `"SHA256"` is an unknown algorithm, not an alias. `outputHashAlgo` declarations (optional case-sensitive `r:` ingestion prefix + algorithm) MUST be parsed only through `OutputHashAlgo::parse`, which mirrors `ContentAddressMethod::parsePrefix` + `parseHashAlgo` (`derivations.cc:306-317`, `content-address.cc:84-95`) — every gate consuming a declared algo (gateway verifiability screen and declared-hash gate, scheduler authoritative-content validation, worker glue declaration check, fetch-verify, floating-CA finalizer spec, the result pipeline's FOD descriptor stamping, the modulo-hash FOD fingerprint canonicalization, hashed-mirror env) parses through this one constructor, so a spelling accepted at one gate and rejected at another is unrepresentable. The residue of open-coded `r:` strip sites is count-pinned by the `single-source-conformance` check: the owner itself, the line-by-line oracle port, the floating-CA classification helper (which keeps the raw string for population classification, not algo parsing), and the two ContentAddress WIRE-format parsers (`fixed:r:` colon descriptors — a different grammar that embeds the prefix). SHA-1 is included for legacy fixed-output derivations (`fetchgit` historically defaulted to it). BLAKE3 is used internally by rio-build for chunk addressing but is NOT a `HashAlgo` variant — it never crosses the Nix-facing protocol boundary.]
 
     #r(
       "nix.hash.sri",
     )[`NixHash::parse_sri`/`to_sri` handle the SRI form (`sha256-BASE64=`); `parse_colon`/`to_colon` handle the Nix colon form (`sha256:nixbase32`). `NixHash::parse` auto-detects by separator.]
 
     #r(
-      "nix.narinfo.verify-sig",
-    )[`NarInfo::verify_sig` checks each `Sig:` line against a list of trusted `name:base64(ed25519-pubkey)` keys. The fingerprint is reconstructed from `store_path`/`nar_hash`/`nar_size`/`references` (basenames re-prefixed with the store dir, sorted). Malformed keys or sigs are treated as non-matching, never errors. Returns the first matching key name or `None`.]
+      "nix.hash.fod-decode+1",
+    )[`NixHash::parse_nonsri_unprefixed(algo, s)` MUST be the only decoder for declared `outputHash` values (fixed-output derivations), and it MUST discriminate the encoding — base16 / nixbase32 / base64 — by encoded length for the given algorithm, the same selection as CppNix `baseFromSize` (`hash.cc:123-143`), rejecting every other length. Every consumer of a declared hash — the gateway declared-hash gate, the scheduler's authoritative-content validation, the worker glue's FOD declaration check, the result pipeline's descriptor stamping, the fetcher's hash verification, the hashed-mirror env, and the modulo-hash FOD fingerprint — calls this one function, so no two components can decode the same declaration differently.]
+
+    Within the discriminated codec rio decodes *strictly*; the deltas from the oracle's lax base64 are the registered divergence #rref("nix.divergence.fod-base64-strict"), and the undecodable-hash fallback at the fingerprint/mirror sites is #rref("nix.divergence.fod-fallback-fingerprint+1"). Wire `narHash` fields are deliberately excluded from `nix.hash.fod-decode+1`: the Nix worker protocol sends them hex-only (`gw.wire.narhash-hex`), so those sites keep `hex::decode` + `NixHash::new`. The modulo fingerprint and the hashed-mirror env additionally re-encode the decoded hash to canonical lowercase base16 (CppNix `derivations.cc:904` / `fetchurl.cc` parity). Unit-level oracle parity is the test evidence — `nix-instantiate` always emits base16, so the differential corpus cannot exercise the other encodings.
+
+    #r(
+      "nix.divergence.fod-base64-strict",
+    )[rio's base64 arm MUST reject what the oracle's `base64::decode` (`base-n.cc:75-112`) tolerates. The load-bearing case: non-zero trailing bits in the final data symbol — the oracle silently discards leftover bits (`base-n.cc:103-107`), so two distinct 44-character spellings decode to one digest; rio rejects the non-canonical spelling, because a declared hash names immutable content and an aliased spelling is an equivocation surface, not a convenience. Embedded newlines (skipped, `base-n.cc:96-97`) and data after the first `=` (decode stops there, `base-n.cc:94-95`) are rejected by BOTH sides at this entry point — the oracle's skip/stop shortens the payload and fails its length check (and `parseLowLevel`'s catch block, `hash.cc:145-166`, swallows the decoder's `FormatError` into that length error) — so for those two only the error class diverges. `nix-instantiate` emits canonical base16; no honest producer reaches any of these arms.]
+
+    #r(
+      "nix.divergence.fod-fallback-fingerprint+1",
+    )[The modulo-hash FOD fingerprint and the hashed-mirror env MUST fall back to the raw declared string when the declared hash is undecodable by rio (unsupported algorithm — the oracle's `parseHashAlgo` accepts `md5` and `blake3`, `hash.cc:468-490`, where rio's `HashAlgo` does not — or a junk digest), keeping the fallback stable across versions and never erroring. The fallback preserves the gateway's realized-offender exemption flow. Case-variant spellings (`"SHA256"`) are part of the fallback population, not aliases of the supported set: rio's parse is case-exact like the oracle's, both sides reject such a derivation at their submission/eval gates, and no honest `.drv` carries one — the fallback's job for them is only fingerprint stability, never decoding. The rio-rejects-but-oracle-accepts set is exactly `{md5}` (xp-disabled oracle) / `{md5, blake3}` (xp-enabled), pinned by the spelled-string differential. Closing this divergence (decoding the oracle's full algorithm set) would change every fingerprint derived through the fallback and therefore reprices as a frozen-fingerprint migration over the persisted `drv_modulo_cache` (M_068) — close-vs-document is a recorded follow-up decision, not a default.]
+
+    #r(
+      "nix.divergence.output-path-parse",
+    )[Declared output paths MUST get full `StorePath::parse` where the oracle's `validatePath` checks only the leading `/` (`derivations.cc:271-275`): rio forwards declared paths to workers and joins them against the overlay upper store, so "parses as a store path" is the load-bearing property, fail-closed.]
+
+    #r(
+      "nix.divergence.hash-without-algo",
+    )[A declared `hash` without a `hashAlgo` MUST be rejected at the parse boundary where the oracle silently drops the orphan hash on unparse (`derivations.cc:346` reads the pair only under a non-empty algo): byte-faithful round-trips are load-bearing in rio, and no honest producer emits the shape.]
+
+    #r(
+      "nix.narinfo.verify-sig+1",
+    )[`NarInfo::verify_sig` checks each `Sig:` line against a list of trusted `name:base64(ed25519-pubkey)` keys. The `NarHash:` value MUST be accepted in any oracle encoding --- `Hash::parseAnyPrefixed` (`hash.cc:225-238`) length-discriminates base16/nixbase32/base64 after the algo prefix and also accepts SRI; the oracle's narinfo reader parses through exactly that function (`nar-info.cc:23-29`) --- and the fingerprint MUST canonically re-encode the hash as `sha256:<nixbase32>` per `ValidPathInfo::fingerprint` (`path-info.cc:43-50`), never echo the narinfo's own spelling: signatures always cover the canonical form, so echoing a base16 spelling would mis-verify honest upstreams. The rest of the fingerprint is reconstructed from `store_path`/`nar_size`/`references` (basenames re-prefixed with the store dir, sorted). Malformed keys, sigs, or an undecodable `NarHash` are treated as non-matching, never errors. Returns the first matching key name or `None`.]
+
+    #r(
+      "nix.divergence.narinfo-sha256-only",
+    )[A narinfo `NarHash` whose algorithm is not sha256 MUST be rejected (signature verification returns no match; the substituter refuses the narinfo before download) where the oracle's PARSER accepts any algorithm: rio's NarHash storage, fingerprint, and ingest pipeline are `[u8; 32]` SHA-256 throughout, and the oracle itself asserts sha256 on every narinfo it writes (`nar-info.cc:117` --- `assert(narHash.algo == HashAlgorithm::SHA256)`), so no compliant producer emits one. Fail-closed: a non-sha256 NarHash is refused, never coerced.]
 
     #r(
       "nix.client.set-options",
@@ -159,14 +185,35 @@ Notable edges:
     )[`StderrWriter` allocates activity IDs as `(getpid() << 32) + counter` to match upstream Nix's `libutil/logging.cc` convention. Starting at bare `1` would put server-allocated IDs in the same low range a client may use for its own activities (I-206: nom showed completed builds as stuck at their last phase).]
 
     #r(
-      "nix.drv.like-trait",
-    )[`DerivationLike` is the shared predicate trait over `Derivation` and `BasicDerivation`: `outputs()`/`platform()`/`env()` accessors plus the default-method predicates `is_fixed_output`, `has_ca_floating_outputs`, `is_content_addressed`. Inherent accessor methods are kept alongside so existing callers don't need a trait import; callers of the predicate methods must `use DerivationLike`.]
+      "nix.drv.like-trait+1",
+    )[`DerivationLike` is the shared predicate trait over `Derivation` and `BasicDerivation`: `outputs()`/`platform()`/`env()` accessors plus `derivation_type()` — the drv-level classifier (#rref("nix.drv.type-classify+1")) — and the predicates `is_fixed_output`, `has_ca_floating_outputs`, `is_content_addressed`, which MUST be thin wrappers over `derivation_type()` so exactly one classification exists. Inherent accessor methods are kept alongside so existing callers don't need a trait import; callers of the predicate methods must `use DerivationLike`.]
 
     #r(
       "nix.drv.parse-from-nar",
     )[`Derivation::parse_from_nar` extracts the single regular file from a NAR, UTF-8-decodes it, and runs the ATerm parser — the convenience path for `.drv` blobs that arrive NAR-wrapped over the wire.]
 
+    #r(
+      "nix.drv.output-typed",
+    )[`DerivationOutput` MUST classify its `(path, hashAlgo, hash)` field triple at construction into exactly one of the four legal shapes — input-addressed, deferred, fixed-output, floating-CA (CppNix `parseDerivationOutput`, `derivations.cc:306-354`) — and MUST reject every other shape: a non-empty declared path that does not parse as a store path, a floating output declaring a path, a fixed output without one, and a hash without an algo. Both untrusted parsers (the ATerm parser and the wire `read_basic_derivation`) and every public constructor route through this classification, so no consumer past a parse can observe a malformed declared output path.]
+    #r(
+      "nix.drv.type-classify+1",
+    )[`classify_outputs` MUST mirror CppNix `BasicDerivation::type()` (`derivations.cc:795-854`): a derivation's output set classifies to exactly one of input-addressed (concrete or deferred — mixing the two is itself a mix), fixed (single output, named `out`), or floating (uniform hash algorithm, compared after stripping the `r:` method prefix), with the oracle's verbatim error wording for every ill-typed set. The classification domain MUST be the byte-lexicographic name-sorted view of the output set — the oracle's `std::map` iteration order — so error selection over an ill-typed set is a function of the set, never of wire or ATerm field order. An output set containing a duplicate name MUST be rejected before classification, with the oracle eval's verbatim wording (`duplicate derivation output '…'`, `primops.cc:1529`). `Derivation::parse` and `BasicDerivation::new` MUST enforce the classification eagerly, and `hash_derivation_modulo` MUST classify before hashing so an ill-typed value is an error, never a silently masked hash.]
+    The oracle classifies lazily on the first `type()` call; rio rejects at construction so no ill-typed value exists to defer on. `Impure` is omitted (default experimental-feature posture), and `text:`-prefixed floating algos compare raw — fail-closed, gated upstream. The sorted classification domain runs over a borrowed view — storage stays positional, so byte-faithful round-trips of legal inputs are unaffected.
+
+    Four deliberate divergences from the oracle, all fail-closed: declared paths get full `StorePath::parse` (not the leading-`/` check) because rio forwards them to workers and joins them against the overlay upper store (#rref("nix.divergence.output-path-parse")); `hash`-without-`hashAlgo` is rejected rather than silently dropped on unparse (#rref("nix.divergence.hash-without-algo")); the `"impure"` hash sentinel is rejected before the fixed/floating split, in the oracle's own check order (`derivations.cc:318-326`) and with its disabled-feature first clause verbatim — rio's experimental-feature posture is fixed off and ships no enabling knob; and duplicate output names are rejected at parse, where the oracle's *parsers* would first-wins-collapse them into their `std::map` (`outputs.emplace`, `derivations.cc:473/1001`) — its *eval* refuses to construct the shape, so no honest `.drv` carries one, and accepting a collapse would leave rio's name-keyed views silently partial over its positional storage. Junk hash values and algo names remain representable as raw strings: the gateway's realized-offender exemption flow carries them.
+
+    #r(
+      "nix.closure.cycle-safe",
+    )[`closure::ClosureSet::extend` (incremental visited-set BFS, the `computeFSClosure` shape), `closure::find_cycle` (Kahn-style peeling over a closed member set, self-references ignored), and `closure::closure_sizes` (per-member BFS with one reusable scratch set, O(largest closure) auxiliary memory) MUST terminate on arbitrary reference graphs — including cyclic ones — and every rio consumer that traverses adversary-influenceable reference metadata MUST delegate to these primitives instead of hand-rolling the walk. Cycle-safety is a per-consumer obligation in rio because rio-store deliberately admits reference cycles (#rref("store.gc.sweep-cycle-reclaim")) for GC reclamation, unlike CppNix's local store where `registerValidPaths`' topological sort makes cycles unrepresentable.]
+
     Fuzz targets for the parsers live in `fuzz/rio-nix/` (separate workspace, own `Cargo.lock`). A second fuzz workspace at `fuzz/rio-store/` covers the manifest parser. Both are excluded from the main workspace — when a fuzzed crate's deps change, run `cd fuzz/<crate> && cargo update -p <crate>` to sync the independent lockfile.
+  ],
+  "rio-exec": [
+    The build-system-agnostic sandbox executor: callers describe a process, its filesystem view, isolation, and limits as an `ExecutionRequest`; the crate materializes the sandbox (namespaces, bind mounts, seccomp, pivot_root) and supervises it. Its architectural rule — no rio-crate dependencies, no store paths, no derivations, no Nix conventions — is enforced structurally by the `rio-exec-boundary` token check.
+
+    #r(
+      "exec.request.identity",
+    )[The sandbox's `/etc/passwd`/`/etc/group` user and group names MUST come from the request (`SandboxIdentity`, a mandatory `Isolation` field with no crate-side default), and `ExecutionRequest::validate` MUST reject identity fields containing `:`, newline, or NUL (passwd-format injection) or empty user/group names. rio-exec itself carries no build-system identity: the Nix names live in rio-builder's glue (`nix_sandbox_identity()`), where the differential corpus byte-compares them against the oracle.]
   ],
   "rio-test-support": [
     `rio-test-support` is a `[dependencies]` (not dev-dep) of `xtask` — `xtask regen sqlx` reuses `PgServer::bootstrap`. All other crates depend on it under `[dev-dependencies]` only; `rio-store` additionally has it under `[dependencies]` with `optional = true` (`test-utils` feature, not in `default`).
@@ -413,10 +460,10 @@ directory, so a new proto file cannot ship without one.
   columns: (auto, 1fr, auto, 1.2fr),
   align: (left, left, center, left),
   table.header([Dependency], [Purpose], [Phase], [Notes]),
-  [`nix` (the command-line tool)],
-  [Workers invoke `nix-daemon --stdio` for sandboxed build execution],
+  [`busybox-sandbox-shell`, `fuse3`, `util-linux`],
+  [Worker-image runtime tools: the minimal static ash bind-mounted at `/bin/sh` inside every build sandbox (`RIO_SANDBOX_SHELL`), `fusermount3` for the FUSE input store, and `mount`/`umount` for overlay teardown],
   [2],
-  [Runtime dependency, not a Rust crate. Must be present in worker container images. Protocol version must match `rio-nix`'s target (1.35+, Nix 2.18+ / Lix).],
+  [Shipped in the worker container image. Workers invoke no Nix tooling at runtime — sandboxed build execution is native (`rio-exec`); the daemon-era requirement to ship `nix` in worker images is gone.],
 )
 
 == Gotchas

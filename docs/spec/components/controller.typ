@@ -160,7 +160,7 @@ gone.
   `ttlSecondsAfterFinished` reaps.
 ]
 
-#r("ctrl.terminated.deadline-exceeded+2")[
+#r("ctrl.terminated.deadline-exceeded+3")[
   The Job-mode reconciler MUST report each Job with `status.conditions`
   containing `type=Failed, reason=DeadlineExceeded` to the scheduler via
   `AdminService.ReportExecutorTermination{executor_id = job.metadata.name,
@@ -172,7 +172,7 @@ gone.
   prefix-matches the Job name against its `recently_disconnected` map
   (#rref("sched.termination.deadline-exceeded")). Iterates the already-listed
   `jobs.items` --- no extra apiserver call. Best-effort (RPC error logged,
-  reconcile continues). Defense-in-depth behind the worker-side `daemon_timeout`
+  reconcile continues). Defense-in-depth behind the worker-side `build_timeout`
   → `TimedOut` primary path.
 ]
 

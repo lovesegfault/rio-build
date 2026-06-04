@@ -9459,9 +9459,11 @@
         "hostname",
         "mman",
         "mount",
+        "personality",
         "process",
         "sched",
         "signal",
+        "term",
         "uio",
         "user"
       ],
@@ -12560,6 +12562,10 @@
           "packageId": "config"
         },
         {
+          "name": "ed25519-dalek",
+          "packageId": "ed25519-dalek"
+        },
+        {
           "name": "futures-util",
           "packageId": "futures-util"
         },
@@ -12637,7 +12643,8 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "aws"
+        "aws",
+        "signing-keyfmt"
       ],
       "libCrateTypes": [
         "lib"
@@ -16514,6 +16521,7 @@
         "codec",
         "default",
         "io",
+        "io-util",
         "slab",
         "time"
       ],
@@ -19613,6 +19621,10 @@
         },
         {
           "name": "nix",
+          "packageId": "nix"
+        },
+        {
+          "name": "nix",
           "packageId": "nix",
           "target": "aarch64-unknown-linux-gnu"
         },
@@ -20189,6 +20201,10 @@
           "name": "miniz_oxide",
           "packageId": "miniz_oxide",
           "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "nix",
+          "packageId": "nix"
         },
         {
           "name": "nix",

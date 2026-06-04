@@ -249,3 +249,97 @@ async fn test_resubmit_poisoned_node_itself_fails_fast() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.build.failure-evidence-at-source+1]
+/// The at-source persist: a keep_going build's FIRST observed failure
+/// reaches `builds.error_summary` in the same actor turn it is observed
+/// — while the build is still Active, before any terminal transition,
+/// and before any eraser path could possibly run. A second failure does
+/// not overwrite it (first-write-wins, in memory and in PG).
+#[tokio::test]
+async fn test_keep_going_first_failure_persisted_at_source() -> TestResult {
+    let (db, handle, _task, mut rx1) = setup_with_worker("kgs-w1", "x86_64-linux").await?;
+    let mut rx2 = connect_executor(&handle, "kgs-w2", "x86_64-linux").await?;
+
+    // Three nodes, two workers: one node stays queued, so the build
+    // remains Active across BOTH failures below.
+    let build_id = Uuid::new_v4();
+    let _rx = merge_dag(
+        &handle,
+        build_id,
+        vec![make_node("kgsA"), make_node("kgsB"), make_node("kgsC")],
+        vec![],
+        true,
+    )
+    .await?;
+
+    let a1 = recv_assignment(&mut rx1).await;
+    let a2 = recv_assignment(&mut rx2).await;
+    let first_failed = a1.drv_path.clone();
+
+    // First failure → evidence durable at the source, build still Active.
+    complete_failure(
+        &handle,
+        "kgs-w1",
+        &a1.drv_path,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "first failure",
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, build_id).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "keep_going build stays Active after the first failure"
+    );
+    let (evidence,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(build_id)
+            .fetch_one(&db.pool)
+            .await?;
+    let first_evidence = evidence.expect(
+        "first failure must be durable in builds.error_summary in the same \
+         actor turn it is observed — while the build is still Active",
+    );
+
+    // Second failure while still Active → first-write-wins.
+    complete_failure(
+        &handle,
+        "kgs-w2",
+        &a2.drv_path,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "second failure",
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, build_id).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "keep_going build stays Active (third node still pending)"
+    );
+    let (evidence2,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(build_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        evidence2.as_deref(),
+        Some(first_evidence.as_str()),
+        "the persisted evidence is first-write-wins: the second failure \
+         must not overwrite it"
+    );
+    // The first evidence names the first-failed derivation.
+    let first_hash = first_failed
+        .rsplit('/')
+        .next()
+        .unwrap_or(&first_failed)
+        .split('-')
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join("-");
+    assert!(
+        first_evidence.contains(first_hash.trim_end_matches(".drv")),
+        "evidence ({first_evidence:?}) names the first failed derivation ({first_hash:?})"
+    );
+    Ok(())
+}

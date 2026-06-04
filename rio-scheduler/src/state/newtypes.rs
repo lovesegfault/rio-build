@@ -82,13 +82,25 @@ macro_rules! arc_string_newtype {
 }
 
 arc_string_newtype! {
-    /// Derivation hash newtype. The 32-char nixbase32 hash part of a .drv
-    /// store path, plus the name component (`{hash}-{name}.drv`).
+    /// Derivation DAG-key newtype. By the ingress identity binding
+    /// (`sched.merge.ingress-identity-binding`) this IS the full
+    /// `/nix/store/{hash}-{name}.drv` store path — `drv_hash ==
+    /// drv_path` is rejected otherwise at SubmitBuild, so every value
+    /// of this type system-wide is a complete, parseable store path.
     ///
-    /// Distinct from `drv_path` (full `/nix/store/HASH-name.drv` string).
-    /// Prevents accidental swaps — see the post-2a `drv_key` rename where
-    /// `handle_completion` took a `drv_hash: String` that was sometimes
-    /// actually a path.
+    /// Downstream consumers RELY on the path form: the HMAC assignment
+    /// claims carry it verbatim, and the store's IA deriver-proof gate
+    /// resolves `claims.drv_hash` AS a store path to find the deriver
+    /// `.drv`. A "normalization" that strips this back to the bare
+    /// 32-char hash part (the type's pre-binding meaning, and what the
+    /// name still suggests) would fail-closed every descriptor-less IA
+    /// upload — the gate would probe a nonexistent path. Test fixtures
+    /// use short tags; production values are always full paths.
+    ///
+    /// The newtype still prevents hash/path-ROLE swaps in signatures
+    /// (see the post-2a `drv_key` rename where `handle_completion` took
+    /// a `drv_hash: String` that was sometimes a different node's
+    /// path).
     ///
     /// Implements `Borrow<str>` so `HashMap<DrvHash, _>::get(&str)` works.
     /// `Arc<str>` backing — clone is an atomic refcount bump, not alloc.

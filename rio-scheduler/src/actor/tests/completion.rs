@@ -768,7 +768,7 @@ async fn cascade_matches_versioned_stdenv_name() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.completion.output-membership]
+// r[verify sched.completion.output-membership+1]
 /// bug_071 regression: `handle_completion` validated worker-supplied
 /// `built_outputs` only by `StorePath::parse` format, never by
 /// membership in scheduler-trusted `output_names` or by cardinality.
@@ -1574,12 +1574,12 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
     Ok(())
 }
 
-// r[verify sched.timeout.promote-on-exceed+2]
+// r[verify sched.timeout.promote-on-exceed+3]
 /// I-200: `TimedOut` promotes `resource_floor` AND resets to Ready
 /// (bounded by `max_timeout_retries`), then goes terminal `Cancelled`.
 ///
 /// Before I-200, `TimedOut` went straight to Cancelled without
-/// promoting — so a worker-side `daemon_timeout_secs` hit on a small
+/// promoting — so a worker-side `build_timeout_secs` hit on a small
 /// pod gave up immediately instead of retrying with more resources
 /// and a longer deadline. Mutation check: revert
 /// `handle_timeout_failure` to the pre-I-200 terminal-only path →
@@ -1621,7 +1621,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         "to-tiny",
         &drv_path,
         rio_proto::types::BuildResultStatus::TimedOut,
-        "build exceeded daemon_timeout_secs",
+        "build exceeded build_timeout_secs",
     )
     .await?;
 
@@ -1670,7 +1670,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         "to-small",
         &drv_path,
         rio_proto::types::BuildResultStatus::TimedOut,
-        "build exceeded daemon_timeout_secs",
+        "build exceeded build_timeout_secs",
     )
     .await?;
     let info = expect_drv(&handle, drv_hash).await;
@@ -1698,7 +1698,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         "to-medium",
         &drv_path,
         rio_proto::types::BuildResultStatus::TimedOut,
-        "build exceeded daemon_timeout_secs",
+        "build exceeded build_timeout_secs",
     )
     .await?;
     let info = expect_drv(&handle, drv_hash).await;
@@ -2120,7 +2120,7 @@ async fn test_dependency_chain_releases_parent() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// Completion-time clear, worker path: a topdown-pruned parent whose
 /// only child is produced by a normal worker completion must lose the
 /// mark right then — in memory AND in PG — not only at the next merge
@@ -2189,7 +2189,7 @@ async fn test_topdown_pruned_cleared_when_children_complete_normally() -> TestRe
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// Same worker-path clear as above, but with the parent NOT Queued
 /// (forced Substituting — the realistic mid-fetch shape for a flagged
 /// node): the child's completion promotes nothing to Ready, so this
@@ -2257,7 +2257,7 @@ async fn test_topdown_pruned_cleared_when_child_completes_while_parent_not_queue
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// Same clear, substitution/store path: the child completes via
 /// `complete_ready_from_store` (`SubstituteComplete{ok: true}`), which
 /// promotes dependents through its own inline loop rather than
@@ -3315,6 +3315,7 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
             .send_unchecked(ActorCommand::MergeDag {
                 req: MergeDagRequest {
                     build_id,
+                    ingress_stripped: Default::default(),
                     tenant_id: Some(tenant),
                     priority_class: PriorityClass::Scheduled,
                     nodes: vec![make_node(drv_tag)],
@@ -4634,4 +4635,365 @@ async fn cascade_finalizes_reset_ancestor_exec_log() -> TestResult {
          observed execution, against the ancestor's own interested set"
     );
     Ok(())
+}
+
+// r[verify sched.build.terminal-status-settled+2]
+/// A build that already reached a terminal state must not receive further
+/// `BuildProgress` events from shared-node completion fan-outs: a
+/// keep_going build fails, stays resident with its interest retained, the
+/// failed node is resubmitted by another build (carrying that interest),
+/// and when the node then completes only the live build gets Progress —
+/// the terminal build's event stream stays settled after its BuildFailed
+/// and QueryBuildStatus keeps serving the frozen counts.
+#[tokio::test]
+async fn test_terminal_build_skipped_by_completion_progress_fanout() -> TestResult {
+    use rio_proto::types::build_event::Event;
+    let (_db, handle, _task, mut wrx) = setup_with_worker("tsf-w", "x86_64-linux").await?;
+    let x_path = test_drv_path("tsf-x");
+    let x_out = test_store_path("tsf-x-out");
+
+    // B1 (keep_going): single node fails permanently → build Failed,
+    // interest retained on the poisoned node.
+    let b1 = Uuid::new_v4();
+    let mut x = make_node("tsf-x");
+    x.expected_output_paths = vec![x_out.clone()];
+    let mut rx1 = merge_dag(&handle, b1, vec![x], vec![], true).await?;
+    let assn = recv_assignment(&mut wrx).await;
+    assert_eq!(assn.drv_path, x_path);
+    complete_failure(
+        &handle,
+        "tsf-w",
+        &x_path,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "boom",
+    )
+    .await?;
+    barrier(&handle).await;
+    let frozen = query_status(&handle, b1).await?;
+    assert_eq!(frozen.state, rio_proto::types::BuildState::Failed as i32);
+    assert_eq!(frozen.total_derivations, 1);
+    // Drain B1's pre-terminal event history (it ends with BuildFailed).
+    let mut saw_failed = false;
+    while let Ok(ev) = rx1.try_recv() {
+        if matches!(ev.event, Some(Event::Failed(_))) {
+            saw_failed = true;
+        }
+    }
+    assert!(saw_failed, "B1 should have received its BuildFailed");
+
+    // B2 resubmits the same derivation (resubmit-reset carries B1's
+    // interest onto the fresh node) and it now succeeds. Fresh worker
+    // for the re-dispatch (the harness pattern for chained dispatches).
+    disconnect(&handle, "tsf-w").await?;
+    let b2 = Uuid::new_v4();
+    let mut x2 = make_node("tsf-x");
+    x2.expected_output_paths = vec![x_out.clone()];
+    let mut rx2 = merge_dag(&handle, b2, vec![x2], vec![], false).await?;
+    barrier(&handle).await;
+    let mut wrx2 = connect_executor(&handle, "tsf-w2", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut wrx2).await;
+    assert_eq!(assn.drv_path, x_path);
+    complete_success(&handle, "tsf-w2", &x_path, &x_out).await?;
+    barrier(&handle).await;
+
+    // Live build: Progress flowed and it succeeded.
+    assert_eq!(
+        query_status(&handle, b2).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32
+    );
+    let mut b2_saw_progress = false;
+    while let Ok(ev) = rx2.try_recv() {
+        if matches!(ev.event, Some(Event::Progress(_))) {
+            b2_saw_progress = true;
+        }
+    }
+    assert!(b2_saw_progress, "live build still gets Progress");
+
+    // Terminal build: no Progress after BuildFailed (per-derivation
+    // events may still flow; aggregate progress must not).
+    while let Ok(ev) = rx1.try_recv() {
+        assert!(
+            !matches!(ev.event, Some(Event::Progress(_))),
+            "terminal build received a post-BuildFailed BuildProgress: {:?}",
+            ev.event
+        );
+    }
+    // And its served status is still the frozen snapshot.
+    let after = query_status(&handle, b1).await?;
+    assert_eq!(after.state, rio_proto::types::BuildState::Failed as i32);
+    assert_eq!(after.total_derivations, frozen.total_derivations);
+    assert_eq!(after.completed_derivations, frozen.completed_derivations);
+    assert_eq!(after.failed_derivations, frozen.failed_derivations);
+    Ok(())
+}
+
+// r[verify sched.build.terminal-status-settled+2]
+/// A late failure of a shared node must not rewrite a resident terminal
+/// build's settled outcome: the terminal build keeps its first-failure
+/// summary and frozen counts when the node it still holds interest in is
+/// resubmitted by another build and fails again with a different error.
+/// (The sticky first-failure get_or_insert already protects the summary;
+/// the terminal early-return in handle_derivation_failure is the
+/// structural guard that keeps every other side effect away from a
+/// settled build.)
+#[tokio::test]
+async fn test_terminal_build_outcome_not_mutated_by_late_shared_failure() -> TestResult {
+    let (_db, handle, _task, mut wrx) = setup_with_worker("tlf-w", "x86_64-linux").await?;
+    let x_path = test_drv_path("tlf-x");
+    let x_out = test_store_path("tlf-x-out");
+
+    // B1 (keep_going): fails once → Failed with the first error frozen.
+    let b1 = Uuid::new_v4();
+    let mut x = make_node("tlf-x");
+    x.expected_output_paths = vec![x_out.clone()];
+    let _rx1 = merge_dag(&handle, b1, vec![x], vec![], true).await?;
+    let assn = recv_assignment(&mut wrx).await;
+    assert_eq!(assn.drv_path, x_path);
+    complete_failure(
+        &handle,
+        "tlf-w",
+        &x_path,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "first error",
+    )
+    .await?;
+    barrier(&handle).await;
+    let frozen = query_status(&handle, b1).await?;
+    assert_eq!(frozen.state, rio_proto::types::BuildState::Failed as i32);
+    assert!(!frozen.error_summary.is_empty(), "first failure recorded");
+
+    // B2 resubmits the node; it fails again with a different error.
+    // Fresh worker for the re-dispatch (harness chained-dispatch pattern).
+    disconnect(&handle, "tlf-w").await?;
+    let b2 = Uuid::new_v4();
+    let mut x2 = make_node("tlf-x");
+    x2.expected_output_paths = vec![x_out.clone()];
+    let _rx2 = merge_dag(&handle, b2, vec![x2], vec![], false).await?;
+    barrier(&handle).await;
+    let mut wrx2 = connect_executor(&handle, "tlf-w2", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut wrx2).await;
+    assert_eq!(assn.drv_path, x_path);
+    complete_failure(
+        &handle,
+        "tlf-w2",
+        &x_path,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "second error",
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // The other build fails normally; the terminal build's settled
+    // outcome (state, summary, counts) is byte-for-byte unchanged.
+    assert_eq!(
+        query_status(&handle, b2).await?.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "the resubmitting build fails on its own"
+    );
+    let after = query_status(&handle, b1).await?;
+    assert_eq!(after.state, frozen.state);
+    assert_eq!(after.error_summary, frozen.error_summary);
+    assert_eq!(after.total_derivations, frozen.total_derivations);
+    assert_eq!(after.completed_derivations, frozen.completed_derivations);
+    assert_eq!(after.failed_derivations, frozen.failed_derivations);
+    Ok(())
+}
+
+/// Consumer-side guard for gw.dag.modulo-hash-all-nodes: a PLAIN IA node
+/// (is_ca=false, needs_resolve=false, statically-known path) that carries
+/// a populated ca_modular_hash must NOT be treated as CA anywhere — its
+/// completion registers no realisation row, because the realisation gate
+/// keys on is_ca/needs_resolve, never on hash presence.
+// r[verify gw.dag.modulo-hash-all-nodes]
+#[tokio::test]
+async fn plain_ia_modular_hash_does_not_trigger_ca_paths() -> TestResult {
+    let (db, handle, _task, mut wrx) = setup_with_worker("ia-guard-w", "x86_64-linux").await?;
+    let build_id = Uuid::new_v4();
+    let modular_hash = [0x42u8; 32];
+    let static_out = test_store_path("ia-guard-out");
+    let mut node = make_node("ia-guard");
+    node.is_content_addressed = false;
+    node.needs_resolve = false;
+    node.is_fixed_output = false;
+    node.expected_output_paths = vec![static_out.clone()];
+    // The gateway now populates this for plain IA nodes too.
+    node.ca_modular_hash = modular_hash.to_vec();
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    let assn = recv_assignment(&mut wrx).await;
+    assert_eq!(assn.drv_path, test_drv_path("ia-guard"));
+    complete_success(
+        &handle,
+        "ia-guard-w",
+        &test_drv_path("ia-guard"),
+        &static_out,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Build succeeded normally…
+    assert_eq!(
+        query_status(&handle, build_id).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+    );
+    // …and NO realisation row was registered for the hash.
+    let (n_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM realisations WHERE drv_hash = $1")
+        .bind(modular_hash.as_slice())
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        n_rows, 0,
+        "plain IA completion must not register a realisation (gate is is_ca/needs_resolve, not hash presence)"
+    );
+    Ok(())
+}
+
+/// Live-path pin for the deferred-IA realisation contract: a
+/// non-recovered deferred-IA completion (is_ca=false, needs_resolve set
+/// on the submitted node, gateway-provided modular hash) writes the
+/// realisation row that `wopQueryDerivationOutputMap` serves. The
+/// recovery-path counterpart
+/// (`test_recovery_registers_realisation_for_deferred_ia_node`) asserts
+/// the same outcome post-failover; this baseline keeps a regression
+/// there from hiding behind a regression here.
+#[tokio::test]
+async fn test_live_deferred_ia_completion_registers_realisation() -> TestResult {
+    let (db, handle, _task, mut wrx) = setup_with_worker("dia-w", "x86_64-linux").await?;
+    let build_id = Uuid::new_v4();
+    let modular_hash = [0x6bu8; 32];
+    let mut node = make_node("dia-live");
+    node.is_content_addressed = false;
+    node.needs_resolve = true;
+    node.expected_output_paths = vec![String::new()];
+    node.ca_modular_hash = modular_hash.to_vec();
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    let assn = recv_assignment(&mut wrx).await;
+    assert_eq!(assn.drv_path, test_drv_path("dia-live"));
+    complete_ca(
+        &handle,
+        "dia-w",
+        &test_drv_path("dia-live"),
+        &[(
+            "out",
+            "/nix/store/dddddddddddddddddddddddddddddddd-dia-live-out",
+            vec![0x11u8; 32],
+        )],
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let (path,): (String,) = sqlx::query_as(
+        "SELECT output_path FROM realisations WHERE drv_hash = $1 AND output_name = 'out'",
+    )
+    .bind(modular_hash.as_slice())
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        path, "/nix/store/dddddddddddddddddddddddddddddddd-dia-live-out",
+        "live deferred-IA completion registers the realisation row"
+    );
+    Ok(())
+}
+
+// r[verify sched.completion.output-membership+1]
+/// Round-17 bug_100: the completion admission binds each
+/// worker-reported output_path to the scheduler-held claim for that
+/// output's SLOT (index-aligned — exactly what the assignment token's
+/// HMAC signs). Cells: forged path on a known slot → dropped+counted;
+/// permutation across two known slots → both dropped (set-membership
+/// would have admitted them); honest report → bound; floating-CA
+/// empty slot → explicit accept cell; deferred-IA lost claim →
+/// explicit unresolved_slot accept cell (the W2-S1/M_075 done-signal
+/// counter).
+#[test]
+fn admission_binds_reported_paths_to_claim_slots() {
+    use crate::actor::completion::AdmittedOutputs;
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let mk_state = |tag: &str, names: &[&str], paths: &[&str], is_ca: bool| {
+        let mut node = make_node(tag);
+        node.output_names = names.iter().map(|s| s.to_string()).collect();
+        node.expected_output_paths = paths.iter().map(|s| s.to_string()).collect();
+        node.is_content_addressed = is_ca;
+        crate::state::DerivationState::try_from_node(&node.into()).expect("state")
+    };
+    let out = |name: &str, path: &str| crate::domain::BuiltOutput {
+        output_name: name.into(),
+        output_path: path.into(),
+        output_hash: vec![0u8; 32],
+    };
+    let exec: crate::state::ExecutorId = "bind-w".into();
+    let drv: crate::state::DrvHash = "bind-drv".into();
+
+    let p_out = test_store_path("bind-out");
+    let p_dev = test_store_path("bind-dev");
+    let p_evil = test_store_path("bind-evil");
+
+    // Cell 1: forged path on a known slot → dropped + counted.
+    let state = mk_state("bind1", &["out"], &[&p_out], false);
+    let admitted = AdmittedOutputs::admit(vec![out("out", &p_evil)], &state, &exec, &drv);
+    assert!(
+        admitted.as_slice().is_empty(),
+        "forged path must be dropped"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_completion_path_binding_total{result=mismatch_dropped}"),
+        1
+    );
+
+    // Cell 2: permutation across two known slots → BOTH dropped
+    // (index-aligned binding; set-membership would admit both).
+    let state = mk_state("bind2", &["dev", "out"], &[&p_dev, &p_out], false);
+    let admitted = AdmittedOutputs::admit(
+        vec![out("dev", &p_out), out("out", &p_dev)],
+        &state,
+        &exec,
+        &drv,
+    );
+    assert!(
+        admitted.as_slice().is_empty(),
+        "cross-slot permutation is a forgery, not a match"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_completion_path_binding_total{result=mismatch_dropped}"),
+        3,
+        "1 (cell 1) + 2 (both permuted slots)"
+    );
+
+    // Cell 3: honest report → bound + admitted.
+    let state = mk_state("bind3", &["dev", "out"], &[&p_dev, &p_out], false);
+    let admitted = AdmittedOutputs::admit(
+        vec![out("dev", &p_dev), out("out", &p_out)],
+        &state,
+        &exec,
+        &drv,
+    );
+    assert_eq!(admitted.as_slice().len(), 2);
+    assert_eq!(
+        recorder.get("rio_scheduler_completion_path_binding_total{result=bound}"),
+        2
+    );
+
+    // Cell 4: floating-CA — slot path unknowable pre-build; explicit
+    // accept cell, never silent.
+    let state = mk_state("bind4", &["out"], &[""], true);
+    let admitted = AdmittedOutputs::admit(vec![out("out", &p_out)], &state, &exec, &drv);
+    assert_eq!(admitted.as_slice().len(), 1, "floating-CA report admitted");
+    assert_eq!(
+        recorder.get("rio_scheduler_completion_path_binding_total{result=accepted_floating_ca}"),
+        1
+    );
+
+    // Cell 5: deferred-IA (not CA) whose claim did not survive —
+    // unresolved_slot accept cell (the M_075 done-signal counter).
+    let state = mk_state("bind5", &["out"], &[""], false);
+    let admitted = AdmittedOutputs::admit(vec![out("out", &p_out)], &state, &exec, &drv);
+    assert_eq!(admitted.as_slice().len(), 1);
+    assert_eq!(
+        recorder
+            .get("rio_scheduler_completion_path_binding_total{result=accepted_unresolved_slot}"),
+        1
+    );
 }

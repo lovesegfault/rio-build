@@ -770,6 +770,84 @@ fn parse_name_too_long_rejected() {
     );
 }
 
+/// The name bound IS the kernel's `NAME_MAX`: a 256-byte name parses
+/// under a 256 bound but cannot be materialized — `create`/`mkdir`
+/// fails `ENAMETOOLONG` after the payload was fully downloaded, and an
+/// errno-classifying retry ladder re-downloads it per attempt
+/// (round-17 merged_bug_022). 255 must be accepted (real Linux
+/// filesystems hold such names); 256 must be a typed parse reject.
+// r[verify builder.nar.restore-bounds]
+#[test]
+fn name_bound_is_kernel_name_max() {
+    assert_eq!(
+        MAX_NAME_LEN, 255,
+        "MAX_NAME_LEN must equal Linux NAME_MAX — a larger bound re-opens \
+         the payload-deterministic ENAMETOOLONG retry hole"
+    );
+    // 256 (the old bound) is now a typed reject.
+    let buf = nar_bytes_with_oversized_len(
+        &[NAR_MAGIC, "(", "type", "directory", "entry", "(", "name"],
+        256,
+    );
+    let err = parse(&mut Cursor::new(&buf)).unwrap_err();
+    assert!(
+        matches!(err, NarError::NameTooLong(256)),
+        "expected NameTooLong(256), got {err:?}"
+    );
+    // A 255-byte name passes the LENGTH check (the parse then fails on
+    // the truncated stream, not on NameTooLong).
+    let mut buf = Vec::new();
+    for t in &[NAR_MAGIC, "(", "type", "directory", "entry", "(", "name"] {
+        write_str(&mut buf, t).unwrap();
+    }
+    write_bytes(&mut buf, "n".repeat(255).as_bytes()).unwrap();
+    let err = parse(&mut Cursor::new(&buf)).unwrap_err();
+    assert!(
+        !matches!(err, NarError::NameTooLong(_)),
+        "a NAME_MAX-length name must not be length-rejected, got {err:?}"
+    );
+}
+
+/// Per-component bounds compose to ~64 KiB at allowed depth; every
+/// syscall on such a path fails `ENAMETOOLONG` only after the payload
+/// was fully downloaded. The cumulative bound rejects at the joined
+/// path with a typed error instead (round-17 merged_bug_022).
+// r[verify builder.nar.restore-bounds]
+#[test]
+fn restore_rejects_cumulative_path_over_path_max() {
+    // 25 nested directories with 200-byte names: cumulative path
+    // length ≈ 25 × 201 ≈ 5 KiB > PATH_MAX, while every component and
+    // the depth are individually within bounds.
+    const DEPTH: usize = 25;
+    let name = "d".repeat(200);
+    let mut buf = Vec::new();
+    write_str(&mut buf, NAR_MAGIC).unwrap();
+    for _ in 0..DEPTH {
+        for t in &["(", "type", "directory", "entry", "("] {
+            write_str(&mut buf, t).unwrap();
+        }
+        write_str(&mut buf, "name").unwrap();
+        write_bytes(&mut buf, name.as_bytes()).unwrap();
+        write_str(&mut buf, "node").unwrap();
+    }
+    // Innermost: an empty directory, then close every frame.
+    for t in &["(", "type", "directory", ")"] {
+        write_str(&mut buf, t).unwrap();
+    }
+    for _ in 0..DEPTH {
+        write_str(&mut buf, ")").unwrap(); // entry frame
+        write_str(&mut buf, ")").unwrap(); // directory frame
+    }
+
+    let dst_dir = tempfile::TempDir::new().unwrap();
+    let dst = dst_dir.path().join("out");
+    let err = restore_path_streaming(&mut Cursor::new(&buf), &dst).unwrap_err();
+    assert!(
+        matches!(err, NarError::RestorePathTooLong { len } if len > MAX_RESTORE_PATH_LEN),
+        "expected RestorePathTooLong, got {err:?}"
+    );
+}
+
 #[test]
 fn parse_symlink_target_too_long_rejected() {
     // ( type symlink target <len=MAX+1>

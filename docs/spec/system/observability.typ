@@ -32,7 +32,7 @@ pagination, and TTL retention.
   how many builds are interested in the derivation.
 ]
 
-A derivation is built once even if N builds want it (`sched.merge.dedup`), so
+A derivation is built once even if N builds want it (`sched.merge.dedup+2`), so
 keying by `(build_id, drv_hash)` would write N PG rows pointing at one blob ---
 or, in the prior model, N copies of the blob under N keys. Keying by
 `(drv_hash, exec_id)` stores the log once and lets `build_derivations.exec_id`
@@ -266,10 +266,17 @@ holds at the log level too.
 
 == Log Lifecycle
 
-#r("obs.log.batch-64-100ms")[
+#r("obs.log.batch-64-100ms+1")[
   Log lines are batched (up to 64 lines or 100ms, whichever first) in
-  `BuildLogBatch` messages.
+  `BuildLogBatch` messages. A batch MAY additionally carry up to two
+  out-of-band marker lines (one rate-suppression marker, one relay-shed
+  marker) beyond the 64-line cap; markers MUST NOT be deferred to a
+  later batch and MUST NOT trigger an early flush.
 ]
+
+Markers ride the batch whose assembly drained their count --- deferral
+would detach the count from its batch, and an early flush would let
+marker traffic change the delivery cadence the cap exists to bound.
 
 #r("obs.log.ring-byte-cap")[
   The scheduler-side per-derivation ring buffer is bounded by both line count
@@ -294,7 +301,7 @@ holds at the log level too.
     _seq(
       "Executor",
       "Scheduler",
-      comment: [`BuildLogBatch` (batched, ≤64 lines or 100ms)],
+      comment: [`BuildLogBatch` (batched, 64-line/100ms cadence)],
     )
     _note(
       "over",
@@ -309,8 +316,8 @@ holds at the log level too.
 )
 
 + Executors stream log lines to the scheduler via `BuildLogBatch` messages in
-  the `BuildExecution` stream. Lines are batched (up to 64 lines or 100ms,
-  whichever comes first) for efficiency.
+  the `BuildExecution` stream. Lines are batched per
+  #rref("obs.log.batch-64-100ms+1") for efficiency.
 + The scheduler buffers logs in an in-memory ring buffer per active
   derivation.
 + On derivation completion, the scheduler asynchronously flushes the buffer
@@ -414,14 +421,6 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
   MUST follow the `rio_builder_*` naming prefix.
 ]
 
-#r("obs.metric.input-materialization-failures")[
-  #(refs.metric)("rio_builder_input_materialization_failures_total")
-  (counter): incremented each time a daemon `MiscFailure` is reclassified as
-  `InfrastructureFailure` under #rref("builder.result.input-enoent-is-infra").
-  Sustained nonzero rate indicates `JIT_MIN_THROUGHPUT_BPS` is set above
-  actual store→builder throughput.
-]
-
 #r("obs.metric.transfer-volume")[
   Transfer-volume byte counters (`*_bytes_total`) are emitted at each hop:
   gateway (#(refs.metric)("rio_gateway_bytes_total")`{direction}`), store
@@ -432,6 +431,14 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
   `rate(rio_builder_upload_bytes_total[5m])` shows whether an executor is
   input-bound or output-bound.
 ]
+
+The kill-verdict canary
+(#(refs.metric)("rio_builder_kill_verdict_outputs_present_total")) counts
+corroborated limit-kill verdicts whose declared outputs all materialized.
+Contract, producer set, and the alert-on-rate condition are defined by
+#rref("builder.exec.kill-canary") (the natural-137 coincidence makes
+isolated increments benign; sustained rate is the regression signal) ---
+inspect the worker's logs for the named derivation either way.
 
 #r("obs.metric.builder-util")[
   Builder utilization gauges (`rio_builder_{cpu,memory}_fraction`) are polled
@@ -558,11 +565,11 @@ Build (gateway)
 │   └── Schedule (scheduler)
 │       ├── Assign derivation-A (scheduler → executor-0)
 │       │   ├── Fetch inputs (executor-0 → store)
-│       │   ├── Build (executor-0, nix sandbox)
+│       │   ├── Build (executor-0, rio-exec sandbox)
 │       │   └── Upload output (executor-0 → store)
 │       └── Assign derivation-B (scheduler → executor-1)
 │           ├── Fetch inputs (executor-1 → store)
-│           ├── Build (executor-1, nix sandbox)
+│           ├── Build (executor-1, rio-exec sandbox)
 │           └── Upload output (executor-1 → store)
 └── Return result (gateway → client)
 ```

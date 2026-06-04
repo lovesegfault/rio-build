@@ -94,8 +94,8 @@ impl DagActor {
         }
 
         // Send CancelSignal + transition Cancelled. The worker's
-        // cgroup.kill SIGKILLs the daemon tree → run_daemon_build
-        // Errs → worker reports BuildResultStatus::Cancelled →
+        // cgroup.kill SIGKILLs the build tree → the native execution
+        // errs → worker reports BuildResultStatus::Cancelled →
         // completion handler is a no-op (we already transitioned).
         //
         // try_send (not send): fire-and-forget. If the worker's
@@ -263,6 +263,16 @@ impl DagActor {
             return Ok(false);
         }
 
+        // r[impl sched.build.terminal-status-settled+2]
+        // Refresh the build's counts from the DAG once, BEFORE the
+        // cancellation tears its interest out of the DAG
+        // (cancel_build_derivations ends with remove_build_interest, so a
+        // later recompute would see zero interested nodes): the values
+        // frozen by the Cancelled transition are then the build's actual
+        // progress at cancel time, which is what the terminal status
+        // short-circuit serves afterwards.
+        self.update_build_counts(build_id).await;
+
         self.cancel_build_derivations(build_id, &format!("build {build_id} cancelled: {reason}"))
             .await;
 
@@ -314,6 +324,32 @@ impl DagActor {
         // r[impl sched.tenant.authz+2]
         if caller_tenant.is_some() && build.tenant_id != caller_tenant {
             return Err(ActorError::PermissionDenied { build_id });
+        }
+
+        // r[impl sched.build.terminal-status-settled+2]
+        // A terminal build's progress is settled at its terminal
+        // transition: serve the frozen counts rather than recomputing
+        // from the DAG, which keeps mutating while the build stays
+        // resident for the cleanup window (a displacement removes the
+        // build's interest from the fresh node, so a recompute would
+        // shrink the served counts of a build that already finished).
+        if build.state().is_terminal() {
+            return Ok(rio_proto::types::BuildStatus {
+                build_id: build_id.to_string(),
+                state: build.state().into(),
+                total_derivations: build.total_count,
+                completed_derivations: build.recovered_completed + build.completed_count,
+                cached_derivations: build.cached_count,
+                running_derivations: 0,
+                failed_derivations: build.failed_count,
+                queued_derivations: 0,
+                submitted_at: None,
+                started_at: None,
+                finished_at: None,
+                error_summary: build.error_summary.clone().unwrap_or_default(),
+                critical_path_remaining_secs: Some(0),
+                assigned_executors: Vec::new(),
+            });
         }
 
         let summary = self.dag.build_summary(build_id);
@@ -379,19 +415,17 @@ impl DagActor {
         {
             let terminal_event = match build.state() {
                 BuildState::Succeeded => {
-                    // Reconstruct output_paths from DAG roots (same as complete_build).
-                    let roots = self.dag.find_roots(build_id);
-                    let output_paths: Vec<String> = roots
-                        .iter()
-                        .flat_map(|h| {
-                            self.dag
-                                .node(h)
-                                .map(|s| s.output_paths.clone())
-                                .unwrap_or_default()
-                        })
-                        .collect();
+                    // r[impl sched.build.terminal-status-settled+2]
+                    // Replay the output paths captured at complete_build
+                    // time instead of re-walking the DAG: the build's
+                    // roots may have been mutated since (e.g. a
+                    // displacement drops the build's interest from the
+                    // fresh node), and the settled value is what the
+                    // original BuildCompleted event carried.
                     rio_proto::types::build_event::Event::Completed(
-                        rio_proto::types::BuildCompleted { output_paths },
+                        rio_proto::types::BuildCompleted {
+                            output_paths: build.output_paths.clone(),
+                        },
                     )
                 }
                 BuildState::Failed => {
@@ -463,6 +497,19 @@ impl DagActor {
         let Some(build) = self.builds.get_mut(&build_id) else {
             return;
         };
+        // r[impl sched.merge.authoritative-conflict+6]
+        // A terminal build's progress accounting is settled at its
+        // terminal transition (counts are persisted immediately before
+        // complete_build / transition_build_to_failed runs). Terminal
+        // builds stay resident — and in nodes' interested_builds — for
+        // TERMINAL_CLEANUP_DELAY, so shared-node fan-outs
+        // (release_downstream, displacement re-checks, dispatch-time
+        // cache hits) can still reach here; freezing structurally keeps
+        // any of them (e.g. a displaced node vanishing from the build
+        // summary) from rewriting the settled counts.
+        if build.state().is_terminal() {
+            return;
+        }
         build.completed_count = summary.completed;
         build.failed_count = summary.failed;
         // I-103: persist denormalized counts so list_builds is O(LIMIT).
@@ -553,6 +600,15 @@ impl DagActor {
                     .unwrap_or_default()
             })
             .collect();
+        // r[impl sched.build.terminal-status-settled+2]
+        // Capture the settled output paths on the build: the WatchBuild
+        // terminal re-send replays this value for late subscribers, so a
+        // DAG mutation during the cleanup window (e.g. a displacement
+        // dropping this build's interest) cannot change what a re-sent
+        // BuildCompleted reports.
+        if let Some(build) = self.builds.get_mut(&build_id) {
+            build.output_paths = output_paths.clone();
+        }
 
         self.events.emit(
             build_id,
@@ -783,7 +839,7 @@ impl DagActor {
             debug!(build_id = %build_id, reaped = reap.reaped_paths.len(), "reaped orphaned terminal DAG nodes");
         }
 
-        // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.merge.substitute-topdown+15]
         // Re-evaluate the surviving parents that just lost children to this
         // reap. The hook lives HERE (the terminal-build reap) and not in
         // `dag::remove_node` because the poison-TTL sweep and admin
@@ -849,7 +905,9 @@ impl DagActor {
             // the fail-fast's PG clear is mark-only — so the stamp's
             // position relative to the loop no longer changes the
             // outcome: the persisted hole stays set either way until a
-            // later full merge re-declares the parent's edges. That
+            // later full merge HEALS the parent (`healed_parents`:
+            // accepted trigger ∧ witness coverage — see its defining
+            // field doc on `MergeResult`). That
             // persistence is intended — the directed resubmit the
             // fail-fast solicits re-prunes, and its stamp gates need the
             // breadcrumb so the produced survivors cannot pass for
@@ -858,8 +916,12 @@ impl DagActor {
             // hole — set by the reap above on leader and standby alike —
             // still guards this tenure), never the cleanup itself.
             if !reap.holed_parents.is_empty() {
-                let holed: Vec<String> = reap.holed_parents.iter().map(|h| h.to_string()).collect();
-                if let Err(e) = self.db.set_closure_hole_by_hashes(&holed).await {
+                let holed: Vec<(String, Vec<String>)> = reap
+                    .holed_parents
+                    .iter()
+                    .map(|(p, cs)| (p.to_string(), cs.iter().map(|c| c.to_string()).collect()))
+                    .collect();
+                if let Err(e) = self.db.set_closure_holes(&holed).await {
                     warn!(build_id = %build_id, count = holed.len(), error = %e,
                           "failed to persist closure_hole for reap survivors (continuing)");
                 }

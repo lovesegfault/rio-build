@@ -133,7 +133,8 @@ pkgs.testers.runNixOSTest {
         "mkdir -p /srv/sha256 && "
         "ln -sf ${drvs.coldBootstrapBusybox} /srv/busybox && "
         "echo ok > /srv/ok && "
-        "printf 'rio-hashed-mirror-probe\\n' > /srv/sha256/${drvs.hashedMirrorProbeHex}"
+        "printf 'rio-hashed-mirror-probe\\n' > /srv/sha256/${drvs.hashedMirrorProbeHex} && "
+        "printf 'rio-bad-hash-actual\\n' > /srv/bad-hash"
     )
     # /busybox is delayed 30s so the one-shot fetcher pod stays Running
     # long enough for the netns probe below. /ok and / serve immediately
@@ -241,7 +242,22 @@ pkgs.testers.runNixOSTest {
     # FOD (held to ~30s by the slow /busybox handler); the builder pod
     # won't exist until the FOD completes, so waiting for it first
     # guarantees the fetcher is already gone.
-    fetcher_vm, fetcher_pid = netns_handle(fetcher_pod, "${nsFetchers}")
+    try:
+        fetcher_vm, fetcher_pid = netns_handle(fetcher_pod, "${nsFetchers}")
+    except Exception:
+        # "no running container" here means the one-shot fetcher exited
+        # almost immediately — the slow /busybox origin holds a HEALTHY
+        # fetch open for ~30s, so a fast exit means the FOD attempt
+        # failed (or never reached the origin). Surface the pod state,
+        # its log, and the client-side build log before re-raising.
+        print("=== fetcher pod exited early: diagnostic dump ===")
+        print(k3s_server.execute(
+            "k3s kubectl -n ${nsFetchers} get job,pod -o wide 2>&1; "
+            f"k3s kubectl -n ${nsFetchers} logs {fetcher_pod} --tail=150 2>&1"
+        )[1])
+        print("=== /tmp/split-build.log (background nix-build) ===")
+        print(client.execute("cat /tmp/split-build.log 2>&1")[1])
+        raise
     # Snapshot pod spec NOW for fetcher-node-dedicated below — the
     # one-shot pod is reaped (ttlSecondsAfterFinished) before that
     # subtest runs.
@@ -250,6 +266,54 @@ pkgs.testers.runNixOSTest {
     )["spec"]
     def fetcher_exec(cmd):
         return fetcher_vm.execute(f"nsenter -t {fetcher_pid} -n -- {cmd}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # fetch-runs-unprivileged — the __builtin-fetchurl re-exec is the
+    # build user, not root
+    # ══════════════════════════════════════════════════════════════════
+    # The slow /busybox origin holds the fetch open ~30s; during that
+    # window the re-exec'd `rio-builder __builtin-fetchurl` process is
+    # alive on the fetcher node and its credentials are visible from
+    # the host at /proc/<pid>/status. rio-exec's child setgid/setuid()s
+    # to the build user before execve (no userns remapping), so every
+    # Uid/Gid field must be non-zero. Probe FIRST in the window — the
+    # child exists strictly within the pod's lifetime the netns probes
+    # below also rely on. The pgrep pattern uses [-] so the probe's own
+    # sh -c cmdline never matches itself.
+    with subtest("fetch-runs-unprivileged: builtin:fetchurl re-exec is the build user"):
+        probe_cmd = (
+            "for p in $(pgrep -f '__builtin[-]fetchurl'); do "
+            "echo PID=$p; "
+            "grep -E '^(Uid|Gid|CapEff):' /proc/$p/status 2>/dev/null; "
+            "done"
+        )
+        status_out = ""
+        for _ in range(20):
+            rc, status_out = fetcher_vm.execute(probe_cmd)
+            if rc == 0 and "Uid:" in status_out:
+                break
+            time.sleep(1)
+        else:
+            raise AssertionError(
+                "never observed a __builtin-fetchurl process on the fetcher "
+                "node within 20s — either the re-exec never spawned or the "
+                "slow /busybox window was already over (check the fetcher "
+                f"pod log and /tmp/split-build.log).\nlast probe output:\n{status_out}"
+            )
+        print(f"fetch process credentials:\n{status_out}")
+        ids = [
+            (line.split()[0].rstrip(":"), line.split()[1:])
+            for line in status_out.splitlines()
+            if line.startswith(("Uid:", "Gid:"))
+        ]
+        assert ids, f"no Uid/Gid lines parsed from:\n{status_out}"
+        for kind, fields in ids:
+            assert all(f != "0" for f in fields), (
+                f"{kind} of the __builtin-fetchurl process contains root "
+                f"({kind} {' '.join(fields)}) — the fetch must run as the "
+                f"unprivileged build user.\n{status_out}"
+            )
+        print("fetch-runs-unprivileged PASS: all Uid/Gid fields non-root")
 
     sched_ip = kubectl(
         "get svc rio-scheduler -o jsonpath='{.spec.clusterIP}'"
@@ -309,7 +373,19 @@ pkgs.testers.runNixOSTest {
     # consumer drv keeps it alive for these probes. Positive control
     # first: scheduler ClusterIP MUST connect (builder-egress explicitly
     # allows it). Then the origin probe.
-    builder_pod = wait_worker_pod()
+    try:
+        builder_pod = wait_worker_pod()
+    except Exception:
+        # The builder pod only ever exists if the consumer drv is
+        # dispatched, and the consumer is only dispatched once its FOD
+        # dependency succeeds. When this wait times out, the usual root
+        # cause is the FOD build failing on the fetcher pod — and the
+        # only artifact that names that error from the client's side is
+        # the background nix-build log. Print it before re-raising so
+        # the failure is diagnosable from the driver log alone.
+        print("=== /tmp/split-build.log (background nix-build) ===")
+        print(client.execute("cat /tmp/split-build.log 2>&1")[1])
+        raise
     builder_vm, builder_pid = netns_handle(builder_pod, "${nsBuilders}")
     # Snapshot for fetcher-isolation below — the one-shot pod is reaped
     # before that subtest runs.
@@ -425,16 +501,70 @@ pkgs.testers.runNixOSTest {
         print("dispatch PASS: FOD→fetcher, consumer→builder")
 
     # ══════════════════════════════════════════════════════════════════
+    # mirror-admission-reject — the CEL accept-set at the apiserver
+    # ══════════════════════════════════════════════════════════════════
+    # r17 merged_bug_003: the hashedMirrors accept-set is single-sourced
+    # from the terminal fetch consumers. Out-of-set entries — a scheme
+    # the candidate loop skips (s3://) or bytes the env transports
+    # mangle (NBSP) — must die at the apiserver, not in fetch latency.
+    # Server-side dry-run = the real cel-go evaluator with the real
+    # cost budget (r16 lesson: YAML drift is not acceptance evidence —
+    # an over-budget rule rejects the whole CRD at apply). The accept
+    # control doubles as the cost-budget witness for THIS rule.
+    # NBSP enters via printf escapes only — never raw bytes in source.
+    with subtest("mirror-admission-reject: CEL rejects out-of-accept-set mirrors"):
+        head = (
+            "apiVersion: rio.build/v1alpha1\\nkind: Pool\\n"
+            "metadata: {name: mirror-admission-probe, namespace: ${nsFetchers}}\\n"
+            "spec: {kind: Builder, image: probe, systems: [x86_64-linux], "
+        )
+        # s3:// — scheme outside the candidate loop's set.
+        k3s_server.succeed(
+            f"printf '{head}hashedMirrors: [s3://bucket/prefix]}}\\n' "
+            "> /tmp/pool-s3.yaml"
+        )
+        out = k3s_server.fail(
+            "k3s kubectl apply --dry-run=server -f /tmp/pool-s3.yaml 2>&1"
+        )
+        assert "must be http(s) URLs of printable ASCII" in out, (
+            f"s3 mirror rejection missing the accept-set message: {out!r}"
+        )
+        # NBSP (U+00A0, bytes c2 a0) — outside printable ASCII; the r16
+        # CEL class admitted it and the reconciler then dropped it.
+        k3s_server.succeed(
+            "printf 'https://m.example/a\\xc2\\xa0b' > /tmp/nbsp-url"
+        )
+        k3s_server.succeed(
+            f"{{ printf '{head}hashedMirrors: [\"'; cat /tmp/nbsp-url; "
+            "printf '\"]}\\n'; } > /tmp/pool-nbsp.yaml"
+        )
+        out = k3s_server.fail(
+            "k3s kubectl apply --dry-run=server -f /tmp/pool-nbsp.yaml 2>&1"
+        )
+        assert "must be http(s) URLs of printable ASCII" in out, (
+            f"NBSP mirror rejection missing the accept-set message: {out!r}"
+        )
+        # Accept control: an in-set mirror list dry-runs clean (and
+        # witnesses the rule fits the apiserver's CEL cost budget).
+        k3s_server.succeed(
+            f"printf '{head}hashedMirrors: [https://tarballs.nixos.org/]}}\\n' "
+            "> /tmp/pool-ok.yaml"
+        )
+        k3s_server.succeed(
+            "k3s kubectl apply --dry-run=server -f /tmp/pool-ok.yaml"
+        )
+        print("mirror-admission-reject PASS: s3 + NBSP rejected, control accepted")
+
+    # ══════════════════════════════════════════════════════════════════
     # fod-dead-origin — hashed-mirrors fallback for flat-hash FODs
     # ══════════════════════════════════════════════════════════════════
     # Origin URL is a 404 path on upstream-v4; the ONLY way this build
-    # succeeds is via {mirror}/sha256/{hex}. CppNix builtin:fetchurl
-    # tries hashed-mirrors first for FileIngestionMethod::Flat, then
-    # falls back to mainUrl. nixConf.hashedMirrors = http://upstream-v4/
-    # via extraValues (default.nix) → rio-nix-conf ConfigMap → fetcher
-    # pod's nix.conf. A regression (typo'd setting, ConfigMap not
-    # mounted, wrong URL format) → mirror not tried → origin 404 →
-    # build fails here.
+    # succeeds is via {mirror}/sha256/{hex}. rio's builtin:fetchurl
+    # tries hashed mirrors first for flat-hash FODs, then falls back to
+    # the origin. The fetcher pool's `hashedMirrors` (Pool spec, see
+    # default.nix) reaches the pod as RIO_HASHED_MIRRORS. A regression
+    # (typo'd setting, env not injected, wrong URL format) → mirror not
+    # tried → origin 404 → build fails here.
     with subtest("fod-dead-origin: flat FOD succeeds via hashed-mirrors"):
         rc, out = client.execute(
             "timeout 180 nix-build --no-out-link --store ssh-ng://k3s-server "
@@ -451,6 +581,81 @@ pkgs.testers.runNixOSTest {
             )
         assert "rio-mirror-probe" in out, f"unexpected output {out!r}"
         print(f"fod-dead-origin PASS: {out.strip().splitlines()[-1]}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # fod-s3-origin — s3:// origin must not veto the hashed mirrors
+    # ══════════════════════════════════════════════════════════════════
+    # The origin uses the unsupported s3:// transport. A correct
+    # builtin:fetchurl skips that ONE candidate (per-candidate
+    # divergence) and serves the content from {mirror}/sha256/{hex} —
+    # the same entry fod-dead-origin uses. A regression to the
+    # whole-fetch s3 bail (round-16 bug_067) fails this build without
+    # ever consulting the mirror.
+    with subtest("fod-s3-origin: s3 origin skipped, mirror serves"):
+        rc, out = client.execute(
+            "timeout 180 nix-build --no-out-link --store ssh-ng://k3s-server "
+            "${drvs.fodS3Origin} 2>&1"
+        )
+        if rc != 0:
+            raise AssertionError(
+                f"fod-s3-origin build failed (rc={rc}); the s3:// origin "
+                f"must be skipped per-candidate and the hashed mirror at "
+                f"/sha256/${drvs.hashedMirrorProbeHex} must serve.\n{out}"
+            )
+        assert "rio-s3-mirror-probe" in out, f"unexpected output {out!r}"
+        print(f"fod-s3-origin PASS: {out.strip().splitlines()[-1]}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # fod-bad-hash — wrong origin content is rejected BEFORE upload
+    # ══════════════════════════════════════════════════════════════════
+    # /bad-hash serves 200 with a body whose sha256 differs from the
+    # FOD's declared outputHash, and no /sha256/{hex} mirror entry
+    # exists for that hash. builtin:fetchurl does no content
+    # verification (builtin_fetchurl.rs); the FOD gate in the result
+    # path (verify_fod_hashes, executor/outputs.rs) must reject the
+    # output before any upload. Two observable halves: the client sees
+    # a hash-mismatch failure, and the output path never appears in the
+    # rio store — that absence is the integrity boundary that makes the
+    # egress-open fetcher NetworkPolicy safe.
+    with subtest("fod-bad-hash: mismatched FOD is rejected, never stored"):
+        bad_drv = client.succeed(
+            "nix-instantiate ${drvs.fodBadHash}"
+        ).strip()
+        bad_out = client.succeed(f"nix-store -q --outputs {bad_drv}").strip()
+        rc, out = client.execute(
+            "timeout 180 nix-build --no-out-link --store ssh-ng://k3s-server "
+            "${drvs.fodBadHash} 2>&1"
+        )
+        assert rc != 0, (
+            f"fod-bad-hash unexpectedly SUCCEEDED — /bad-hash serves a body "
+            f"that cannot match the declared outputHash:\n{out}"
+        )
+        lowered = out.lower()
+        assert "hash" in lowered and (
+            "mismatch" in lowered or "verification failed" in lowered
+        ), (
+            f"fod-bad-hash failed for a reason other than the FOD hash gate "
+            f"(expected a hash-mismatch rejection):\n{out}"
+        )
+        # Absence must be positively confirmed: path-info has to fail
+        # WITH an invalid-path error. A bare non-zero rc could also be a
+        # transport/ssh failure, which would vacuously "pass".
+        rc_info, info_out = client.execute(
+            f"nix path-info --store ssh-ng://k3s-server {bad_out} 2>&1"
+        )
+        info_lowered = info_out.lower()
+        path_absent = rc_info != 0 and (
+            "is not valid" in info_lowered
+            or "does not exist" in info_lowered
+            or "invalid path" in info_lowered
+        )
+        assert path_absent, (
+            f"fod-bad-hash: expected {bad_out} to be ABSENT from the rio store "
+            f"(path-info must fail with an invalid-path error, rc={rc_info}) — "
+            f"either the rejected output reached the store or the query failed "
+            f"for an unrelated reason.\n{info_out}"
+        )
+        print(f"fod-bad-hash PASS: rejected (rc={rc}), {bad_out} absent from store")
 
     # ══════════════════════════════════════════════════════════════════
     # fod-dir — recursive-hash FOD with directory output

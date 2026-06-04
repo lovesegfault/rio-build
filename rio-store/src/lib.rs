@@ -104,6 +104,36 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         "rio_store_check_available_duration_seconds",
         SUBSTITUTE_DURATION_BUCKETS,
     ),
+    (
+        // Work UNITS (not seconds): cached fast path = 1; the measured
+        // 1,963-drv real-world closure ≈ 3.9k cold; cap 16,384. Buckets
+        // resolve "warm vs cold-walk" and "approaching the cap"
+        // (PROOF_WALK_WORK_MAX sizing note in metadata/drv_modulo.rs).
+        "rio_store_ia_proof_work_units",
+        &[
+            1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 2048.0, 4096.0, 8192.0, 12288.0, 16384.0,
+        ],
+    ),
+    (
+        // BYTES retained per proof walk (not seconds): warm walks
+        // retain 0; the measured real-world closure retains single-digit
+        // MiB; cap PROOF_WALK_ARENA_BYTES_MAX = 256 MiB. Buckets resolve
+        // "warm vs cold" and "approaching the byte cap" (sizing note in
+        // metadata/drv_modulo.rs; the wipe-deploy runbook watches this
+        // during the post-wipe cold-cache window).
+        "rio_store_ia_proof_arena_bytes",
+        &[
+            0.0,
+            65_536.0,      // 64 KiB
+            1_048_576.0,   // 1 MiB
+            8_388_608.0,   // 8 MiB
+            33_554_432.0,  // 32 MiB
+            67_108_864.0,  // 64 MiB
+            134_217_728.0, // 128 MiB
+            201_326_592.0, // 192 MiB
+            268_435_456.0, // 256 MiB (cap)
+        ],
+    ),
 ];
 
 /// Registers prometheus metric descriptions. The help strings here are
@@ -126,6 +156,74 @@ pub fn describe_metrics() {
          Sustained high deadlock/connection rate = PG-side problem."
     );
     describe_histogram!("rio_store_put_path_duration_seconds", "PutPath latency");
+    describe_counter!(
+        "rio_store_ia_proof_total",
+        "IA deriver-proof gate outcomes on descriptor-less input-addressed \
+         uploads (store.put.ia-deriver-proof+4). Gate-level results: ok | \
+         rejected (claimed path is not store-derived from the named \
+         deriver) | deferred_exempt (deriver's own paths come from \
+         realisations; membership-only). Walk-level results: proven | \
+         not_resident (a closure .drv has no complete manifest) | \
+         unparseable (resident but unusable bytes) | cycle (no \
+         derivation order) | over_budget (work cap hit; proven rows \
+         persisted, retry resumes)"
+    );
+    describe_histogram!(
+        "rio_store_ia_proof_work_units",
+        "Work units consumed per deriver-proof walk (cap \
+         PROOF_WALK_WORK_MAX=16384; 1/probe + 1/fetch + 1/chunk). \
+         Sustained approach to the cap means real closures are \
+         outgrowing the budget — raise the const, do not let \
+         RESOURCE_EXHAUSTED retries discover it"
+    );
+    describe_counter!(
+        "rio_store_ia_proof_admission_total",
+        "Proof-walk/heal admission decisions (PROOF_WALK_CONCURRENCY=4 \
+         shared permits; round-16 bug_080), labeled by event: fast_path \
+         (cached row, no permit consumed) | admitted (cold walk holds a \
+         permit) | heal_admitted (best-effort heal holds a permit — the \
+         visible holder when saturation skips fire; round-17 bug_085) | \
+         heal_skipped_memo (negative memo fresh — this path \
+         failed to populate within the 10-min TTL) | \
+         heal_skipped_inflight (another heal of the same path is \
+         running) | heal_skipped_saturated (no permit free; heal is \
+         best-effort and the proof-time read-through owns correctness) | \
+         heal_skipped_transient (the heal failed on store/DB \
+         availability — no memo recorded, nothing learned about the \
+         path; round-17 merged_bug_056). \
+         Sustained heal_skipped_saturated alongside cold-walk latency \
+         means walk concurrency is the bottleneck"
+    );
+    describe_histogram!(
+        "rio_store_ia_proof_arena_bytes",
+        "Arena bytes RETAINED per deriver-proof walk (cap \
+         PROOF_WALK_ARENA_BYTES_MAX=256MiB; fetched-but-uncomputed .drv \
+         bytes charged before retention). Warm walks record 0. \
+         Sustained approach to the cap means real closures are \
+         outgrowing the byte budget (or a tenant is byte-flooding the \
+         walk with padded .drvs) — see the const's sizing note before \
+         raising it"
+    );
+    describe_counter!(
+        "rio_store_drv_modulo_cache_total",
+        "Store-side derivation modulo-cache population events at .drv \
+         ingestion (store.ingest.drv-modulo-cache+2), labeled by event: \
+         populated | skipped_missing_input (out-of-order upload; \
+         proof-time read-through completes it; TERMINAL — recorded \
+         once per .drv when its ingestion's retry scope is exhausted, \
+         never per fixpoint pass) | parse_failed (text-CA-valid bytes \
+         that are not a derivation) | seed_load_failed (database error \
+         loading input rows — an infrastructure failure, NOT an \
+         out-of-order upload)"
+    );
+    describe_counter!(
+        "rio_store_drv_modulo_orphans_reclaimed_total",
+        "Orphaned drv_modulo_cache rows reclaimed by the GC tail (no \
+         narinfo for the deriver AND older than the 90-day orphan TTL; \
+         store.db.per-path-registry's Survive{orphan-TTL} declaration). \
+         Steady growth here is normal churn; a sudden spike means a \
+         mass deriver GC aged out"
+    );
     describe_counter!(
         "rio_store_put_path_bytes_total",
         "Bytes accepted via PutPath (nar_size on success)"
@@ -165,6 +263,11 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_chunk_cache_misses_total",
         "moka chunk cache misses"
+    );
+    describe_counter!(
+        "rio_store_chunk_cache_corrupt_hits_total",
+        "LRU hits whose bytes failed BLAKE3 verification (process-local corruption; \
+         the entry is invalidated and the request falls through to the backend)"
     );
     describe_counter!(
         "rio_store_gc_path_resurrected_total",

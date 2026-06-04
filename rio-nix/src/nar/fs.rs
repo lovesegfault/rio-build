@@ -16,7 +16,8 @@ use super::sync_wire::{
     write_str, write_u64,
 };
 use super::{
-    MAX_DIRECTORY_ENTRIES, MAX_NAR_DEPTH, NAR_MAGIC, NarError, Result, validate_entry_name,
+    MAX_DIRECTORY_ENTRIES, MAX_NAR_DEPTH, MAX_RESTORE_PATH_LEN, NAR_MAGIC, NarError, Result,
+    validate_entry_name,
 };
 #[cfg(any(test, feature = "test-oracle"))]
 use super::{NarEntry, NarNode, writer::serialize};
@@ -270,6 +271,17 @@ pub fn restore_path_streaming(r: &mut impl Read, dest: &std::path::Path) -> Resu
 fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Result<()> {
     if depth > MAX_NAR_DEPTH {
         return Err(NarError::NestingTooDeep(depth));
+    }
+    // Cumulative bound at the joined path, where it is first known:
+    // per-component bounds compose to ~64 KiB at allowed depth, which
+    // the kernel rejects ENAMETOOLONG only after the payload was fully
+    // downloaded — a typed reject here is payload-deterministic and
+    // classified permanent by the fetch retry ladder (round-17
+    // merged_bug_022).
+    // r[impl builder.nar.restore-bounds]
+    let len = dest.as_os_str().len();
+    if len > MAX_RESTORE_PATH_LEN {
+        return Err(NarError::RestorePathTooLong { len });
     }
     expect_str(r, "(")?;
     expect_str(r, "type")?;

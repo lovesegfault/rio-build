@@ -7,7 +7,7 @@
     "setns": "join another namespace — defeats namespace isolation (worker CREATES namespaces via unshare/clone, never JOINS existing ones)",
     "process_vm_writev": "cross-process memory write — no test harness needs to WRITE another process's memory; the read side is what tracers use"
   },
-  "//kept-from-cap-sys-admin": "mount/umount/umount2/unshare/clone/clone3/fsconfig/fsmount/fsopen/fspick/mount_setattr/move_mount/open_tree/pivot_root — worker needs these for overlayfs per-build isolation + Nix sandbox namespace setup. pivot_root is NOT in containerd's RuntimeDefault CAP_SYS_ADMIN block (upstream gap) but nix-daemon's build sandbox requires it; added here so the Localhost profile works where RuntimeDefault doesn't. fanotify_init/lookup_dcookie/perf_event_open/quotactl/quotactl_fd/setdomainname/sethostname/syslog kept for RuntimeDefault parity (low risk, removing them is a behavior change vs RuntimeDefault beyond the plan scope).",
+  "//kept-from-cap-sys-admin": "mount/umount/umount2/unshare/clone/clone3/fsconfig/fsmount/fsopen/fspick/mount_setattr/move_mount/open_tree/pivot_root — worker needs these for overlayfs per-build isolation + the rio-exec sandbox's namespace setup. pivot_root is NOT in containerd's RuntimeDefault CAP_SYS_ADMIN block (upstream gap) but the build sandbox requires it; added here so the Localhost profile works where RuntimeDefault doesn't. fanotify_init/lookup_dcookie/perf_event_open/quotactl/quotactl_fd/setdomainname/sethostname/syslog kept for RuntimeDefault parity (low risk, removing them is a behavior change vs RuntimeDefault beyond the plan scope).",
   "defaultAction": "SCMP_ACT_ERRNO",
   "defaultErrnoRet": 1,
   "architectures": [
@@ -462,7 +462,7 @@
       "action": "SCMP_ACT_ALLOW"
     },
     {
-      "//": "CAP_SYS_ADMIN block from RuntimeDefault, MINUS bpf + setns, PLUS pivot_root (containerd omits it from the CAP_SYS_ADMIN allowlist but nix-daemon's sandbox requires it). Worker has CAP_SYS_ADMIN so under RuntimeDefault these are all allowed except pivot_root; here we drop the two that grant lateral movement and add the one RuntimeDefault forgot.",
+      "//": "CAP_SYS_ADMIN block from RuntimeDefault, MINUS bpf + setns, PLUS pivot_root (containerd omits it from the CAP_SYS_ADMIN allowlist but the rio-exec build sandbox requires it). Worker has CAP_SYS_ADMIN so under RuntimeDefault these are all allowed except pivot_root; here we drop the two that grant lateral movement and add the one RuntimeDefault forgot.",
       "names": [
         "clone",
         "clone3",

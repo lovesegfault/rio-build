@@ -14,8 +14,13 @@ use thiserror::Error;
 
 mod aterm;
 mod hash;
+mod structured;
+pub mod typed;
 
-pub use hash::hash_derivation_modulo;
+pub use hash::{
+    hash_derivation_modulo, hash_derivation_modulo_input_form, input_addressed_output_paths,
+};
+pub use structured::{SizingHint, StructuredAttrError, StructuredEnv};
 
 /// Errors from parsing or hashing ATerm derivations.
 #[derive(Debug, Error)]
@@ -47,9 +52,6 @@ pub enum DerivationError {
     #[error("cycle detected in derivation graph at: {0}")]
     CycleDetected(String),
 
-    #[error("derivation graph too deep at '{0}' (max {MAX_HASH_RECURSION_DEPTH} levels)")]
-    RecursionLimitExceeded(String),
-
     #[error("NAR extraction failed: {0}")]
     NarExtract(#[from] crate::nar::NarError),
 
@@ -58,82 +60,44 @@ pub enum DerivationError {
 
     #[error("computed output path is invalid: {0}")]
     InvalidOutputPath(#[from] crate::store_path::StorePathError),
-}
 
-/// Maximum recursion depth for `hash_derivation_modulo` (DoS prevention).
-const MAX_HASH_RECURSION_DEPTH: usize = 512;
+    #[error("content-addressing derivation output should not specify output path (output '{0}')")]
+    FloatingCaDeclaredPath(String),
+
+    #[error("bad path '' in derivation (fixed output '{0}' must specify its output path)")]
+    FixedOutputNoPath(String),
+
+    #[error(
+        "derivation output '{0}' specifies a hash without outputHashAlgo (the reference \
+         parser silently drops such hashes on unparse, breaking byte-faithful round-trips)"
+    )]
+    HashWithoutAlgo(String),
+
+    #[error("experimental Nix feature 'impure-derivations' is disabled (output '{0}')")]
+    ImpureUnsupported(String),
+
+    #[error("ill-typed derivation outputs: {0}")]
+    IllTypedOutputs(#[from] output::DerivationTypeError),
+    #[error(
+        "internal: fill_deferred refused non-deferred output '{0}' \
+         (deferred-filter/fill drift — report this)"
+    )]
+    NonDeferredFill(String),
+
+    #[error(
+        "derivation '{0}' is not plain input-addressed (fixed-output and floating-CA \
+         outputs derive their paths from content, not from the derivation hash)"
+    )]
+    NotInputAddressed(String),
+}
 
 /// Maximum number of items in any ATerm list (DoS prevention).
 const MAX_ATERM_LIST_ITEMS: usize = 1_048_576;
 
-/// A single derivation output.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DerivationOutput {
-    /// Output name (e.g., "out", "dev", "lib").
-    name: String,
-    /// Store path for this output.
-    path: String,
-    /// Hash algorithm for fixed-output derivations (empty for input-addressed).
-    hash_algo: String,
-    /// Expected hash for fixed-output derivations (empty for input-addressed).
-    hash: String,
-}
-
-impl DerivationOutput {
-    /// Create a new derivation output.
-    ///
-    /// Returns an error if `name` is empty.
-    pub fn new(
-        name: impl Into<String>,
-        path: impl Into<String>,
-        hash_algo: impl Into<String>,
-        hash: impl Into<String>,
-    ) -> Result<Self, DerivationError> {
-        let name = name.into();
-        if name.is_empty() {
-            return Err(DerivationError::EmptyOutputName(0));
-        }
-        Ok(DerivationOutput {
-            name,
-            path: path.into(),
-            hash_algo: hash_algo.into(),
-            hash: hash.into(),
-        })
-    }
-
-    /// The output name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The output store path.
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-
-    /// Hash algorithm (empty for input-addressed).
-    pub fn hash_algo(&self) -> &str {
-        &self.hash_algo
-    }
-
-    /// Expected hash (empty for input-addressed).
-    pub fn hash(&self) -> &str {
-        &self.hash
-    }
-
-    /// Whether this output has a `hash_algo` set.
-    ///
-    /// Returns true for *any* content-addressed output — both
-    /// fixed-output (hash_algo AND hash set) and floating-CA
-    /// (hash_algo set, hash empty). To distinguish FOD from
-    /// floating-CA, check `!hash().is_empty()`.
-    ///
-    /// See [`DerivationLike::is_fixed_output`] for the strict FOD
-    /// predicate (single `out` output with both fields set).
-    pub fn has_hash_algo(&self) -> bool {
-        !self.hash_algo.is_empty()
-    }
-}
+pub mod output;
+pub use output::{
+    DerivationOutput, DerivationType, DerivationTypeError, OutputKind, classify_outputs,
+};
 
 /// Common accessor surface for [`Derivation`] and [`BasicDerivation`].
 ///
@@ -149,7 +113,7 @@ impl DerivationOutput {
 /// becomes the *single* source of the predicate implementations;
 /// callers of `is_fixed_output()` / `has_ca_floating_outputs()` must
 /// `use DerivationLike`.
-// r[impl nix.drv.like-trait]
+// r[impl nix.drv.like-trait+1]
 pub trait DerivationLike {
     /// Output definitions.
     fn outputs(&self) -> &[DerivationOutput];
@@ -158,8 +122,22 @@ pub trait DerivationLike {
     /// Environment variables.
     fn env(&self) -> &BTreeMap<String, String>;
 
-    /// Strict FOD predicate: single output named `out` with both
-    /// `hash_algo` AND `hash` set.
+    /// The drv-level type of this derivation's output set —
+    /// [`classify_outputs`] over `outputs()` (CppNix
+    /// `BasicDerivation::type()` parity).
+    ///
+    /// Constructor-reachable values are always classifiable
+    /// ([`Derivation::parse`] and [`BasicDerivation::new`] enforce it),
+    /// so `Err` is only observable on values built before that gate
+    /// existed (none remain) or through in-crate test literals.
+    fn derivation_type(&self) -> Result<DerivationType, DerivationTypeError> {
+        classify_outputs(self.outputs())
+    }
+
+    /// Strict FOD predicate: thin wrapper over [`DerivationLike::derivation_type`]
+    /// (`DerivationType::Fixed` ⇔ single output named `out` with both
+    /// `hash_algo` AND `hash` set — the truth table is identical to the
+    /// historical per-field check on every constructor-reachable value).
     ///
     /// Contrast [`DerivationOutput::has_hash_algo`] which is the
     /// loose per-output "has hash_algo" check (covers floating-CA
@@ -167,21 +145,14 @@ pub trait DerivationLike {
     /// callers wanting "is this output content-addressed in any
     /// way" use the per-output predicate.
     fn is_fixed_output(&self) -> bool {
-        let outs = self.outputs();
-        outs.len() == 1
-            && outs[0].name() == "out"
-            && !outs[0].hash_algo().is_empty()
-            && !outs[0].hash().is_empty()
+        matches!(self.derivation_type(), Ok(DerivationType::Fixed))
     }
 
-    /// Any output is CA-floating (`hash_algo` set, `hash` empty).
-    ///
-    /// Impure derivations also match this pattern and follow the same
-    /// `hashDerivationModulo` code path (output masking).
+    /// Any output is CA-floating — wrapper over
+    /// [`DerivationLike::derivation_type`] (uniform sets make "any" ⇔
+    /// "all"; ill-typed sets are unreachable past construction).
     fn has_ca_floating_outputs(&self) -> bool {
-        self.outputs()
-            .iter()
-            .any(|o| !o.hash_algo().is_empty() && o.hash().is_empty())
+        matches!(self.derivation_type(), Ok(DerivationType::Floating))
     }
 
     /// Content-addressed in ANY form: either a strict FOD (hash_algo AND
@@ -217,8 +188,148 @@ pub trait DerivationLike {
     /// Contrast [`has_ca_floating_outputs`](Self::has_ca_floating_outputs)
     /// which is true only for the floating-CA leaf, not for the
     /// deferred-IA nodes above it.
+    /// Public since round-17 merged_bug_062: the gateway's floating
+    /// detection open-coded this exact probe; the floatingness-probe
+    /// xtask lint now denies that form outside this module, so the
+    /// parsed-drv surface is part of the owner API.
     fn has_unknown_output_paths(&self) -> bool {
         self.outputs().iter().any(|o| o.path().is_empty())
+    }
+}
+
+/// Whether dispatch must resolve this derivation's inputs before
+/// building — the ONE owner of the predicate the gateway stamps as
+/// proto `needs_resolve`, the scheduler's claims derivation recomputes
+/// from verified bytes, and recovery degrades from persisted state
+/// ([`should_resolve_from_expected_paths`]).
+///
+/// Mirrors CppNix `Derivation::shouldResolve` (pinned 2.34.7,
+/// derivations.cc:1125-1155), clause for clause:
+///
+/// 1. **No input drvs ⇒ `false`** — "nothing to resolve". A floating-CA
+///    leaf with no inputs builds unresolved on both sides (its
+///    realisation registers at completion via `is_ca`; the resolve walk
+///    would visit zero children — a proven no-op).
+/// 2. **Type clause** (oracle `typeNeedsResolve`):
+///    - input-addressed ⇒ resolve iff *deferred*;
+///    - floating-CA ⇒ always resolve;
+///    - fixed-output ⇒ **`false` by type**. DELIBERATE NARROWING: the
+///      oracle resolves fixed outputs only under
+///      `Xp::CaDerivations` ("optionally … good for avoiding
+///      unnecessary rebuilds" — an optimization, not a correctness
+///      need); rio's default experimental-feature posture keeps it
+///      off. Correctness is preserved by clause 3: a fixed drv whose
+///      env embeds a floating child's placeholder MUST resolve, and
+///      does.
+/// 3. **Unresolved-input clause**: any input drv whose outputs are not
+///    statically known (floating-CA or deferred-IA child) forces a
+///    resolve — the parent's env/args reference that child's
+///    placeholder path (ADR-018 Appendix B). The oracle reaches the
+///    same population structurally (`derivationStrict` marks every IA
+///    consumer of an unknown-path input as Deferred, caught by clause
+///    2; fixed consumers by `Xp::CaDerivations`); rio's parsed-.drv
+///    vantage checks the children directly. `lookup` returning `None`
+///    (child not available — BFS inconsistency, store miss) degrades
+///    to "not unknown", matching the gateway's documented skip.
+///
+/// The oracle's trailing dynamic-derivations clause
+/// (`hasDynamicInputs`) has no rio analog: rio's `input_drvs` model
+/// carries no child maps (dynamic derivations unsupported, default
+/// posture).
+///
+/// Ill-typed output sets are unreachable past the parse boundary; if
+/// one is met through a test escape hatch the predicate fails closed
+/// (`true` — a spurious resolve attempt is a no-op, a missed required
+/// one is a broken build).
+pub fn should_resolve(
+    drv: &Derivation,
+    mut child_has_unknown_output_paths: impl FnMut(&str) -> Option<bool>,
+) -> bool {
+    if drv.input_drvs().is_empty() {
+        return false;
+    }
+    let type_needs_resolve = match drv.derivation_type() {
+        Ok(DerivationType::InputAddressed { deferred }) => deferred,
+        Ok(DerivationType::Floating) => true,
+        Ok(DerivationType::Fixed) => false,
+        Err(_) => true,
+    };
+    type_needs_resolve
+        || drv
+            .input_drvs()
+            .keys()
+            .any(|child| child_has_unknown_output_paths(child).unwrap_or(false))
+}
+
+/// LEGACY-ONLY degrade of [`should_resolve`], owned in the same place
+/// as the full predicate: an empty persisted expected output path
+/// means the path is unknown until placeholder resolution
+/// (floating-CA self, or deferred-IA whose floating input has not
+/// resolved).
+///
+/// Since M_071 (`sched.recovery.deferred-resolve+1`), the scheduler
+/// PERSISTS the authoritative flag and recovery restores it verbatim;
+/// this function is consulted only for pre-071 rows whose persisted
+/// flag is NULL, and by the scheduler's live `child_unknown` probe
+/// shape (which reads the same emptiness signal off RESIDENT
+/// children's preserved ingress paths — round-16 bug_094).
+///
+/// Two asymmetries vs the full predicate — the reason it was demoted
+/// (round-16 bug_053 falsified the old "consequence-free" claim):
+/// - a FOD with a floating input is UNDER-approximated (its expected
+///   path is statically known): at a persisted `path_bound_bytes`
+///   rank the dispatch gate trusts the recorded flag, so the
+///   recovered-false FOD shipped with literal placeholders in
+///   env/args and poisoned deterministically. NOT consequence-free —
+///   the realisation-gate `is_ca` coverage applies to completion-time
+///   REGISTRATION, not the dispatch-time placeholder REWRITE.
+/// - a floating leaf with no inputs is OVER-approximated (clause 1
+///   needs `input_drvs`, which the row no longer carries) — the
+///   resolve walk visits zero children and is a no-op.
+pub fn should_resolve_from_expected_paths<S: AsRef<str>>(expected_output_paths: &[S]) -> bool {
+    expected_output_paths.iter().any(|p| p.as_ref().is_empty())
+}
+
+/// The OWNER of the child-path-knowledge question (round-17
+/// merged_bug_062): "are this node's output paths unknown until
+/// placeholder resolution?", answered from its claimed/expected path
+/// list AND its kind — total over every legal list shape.
+///
+/// The non-empty arm is the classic per-slot emptiness signal
+/// ([`should_resolve_from_expected_paths`]). The EMPTY arm is the fix:
+/// an omitted list (`[]`, a legal ingress shape) carries no slot
+/// signal at all, and the open-coded probes mapped it to "paths
+/// known" — fail-OPEN for exactly the floating-CA/deferred population
+/// whose paths are definitionally unknown (`needs_resolve=false` was
+/// then persisted for parents, which shipped literal placeholders in
+/// env/args and failed deterministically). With the kind in hand the
+/// empty arm answers honestly: a non-FOD that is content-addressed or
+/// already flagged `needs_resolve` has unknown paths; a fixed-output
+/// node's path is statically known regardless of list shape; a plain
+/// input-addressed node with an omitted list has computable paths.
+///
+/// Probes for NON-RESIDENT nodes (no row, no node) must answer
+/// `Some(true)` — unknown — never `None`-degraded-to-false: the
+/// consequence of a spurious `true` is one `maybe_resolve_ca` walk at
+/// dispatch that finds concrete paths and rewrites nothing
+/// (consequence-free); the consequence of a spurious `false` is the
+/// deterministic placeholder failure above. The blanket
+/// `unwrap_or(true)` flip inside [`should_resolve`] was REJECTED in
+/// favor of feeders answering totally: `None` stays reserved for
+/// probes that genuinely cannot answer, and the conservative default
+/// at the consumption site stays visibly false so a silent new
+/// feeder that returns `None` under-approximates loudly in tests
+/// rather than resolving everything.
+pub fn output_paths_unknown_from_claims<S: AsRef<str>>(
+    claims: &[S],
+    is_fixed_output: bool,
+    is_ca: bool,
+    needs_resolve: bool,
+) -> bool {
+    if claims.is_empty() {
+        !is_fixed_output && (is_ca || needs_resolve)
+    } else {
+        should_resolve_from_expected_paths(claims)
     }
 }
 
@@ -254,6 +365,27 @@ pub struct Derivation {
     env: BTreeMap<String, String>,
 }
 
+#[cfg(test)]
+impl Derivation {
+    /// Test-only escape hatch past the drv-level shape gate: builds a
+    /// `Derivation` whose OUTPUT SET may be ill-typed (each output is
+    /// still individually well-formed — `OutputRepr` admits nothing
+    /// else). Exists so classify-first propagation (`hash_derivation_modulo`
+    /// rejecting ill-typed subjects) is testable; production paths can
+    /// only obtain classified values.
+    pub(crate) fn new_unchecked_for_tests(outputs: Vec<DerivationOutput>) -> Self {
+        Self {
+            outputs,
+            input_drvs: BTreeMap::new(),
+            input_srcs: BTreeSet::new(),
+            platform: "x86_64-linux".into(),
+            builder: "/bin/sh".into(),
+            args: vec![],
+            env: BTreeMap::new(),
+        }
+    }
+}
+
 impl Derivation {
     /// Convert to a `BasicDerivation` by stripping `input_drvs`.
     ///
@@ -269,6 +401,30 @@ impl Derivation {
             self.env.clone(),
         )
         .expect("Derivation always has outputs")
+    }
+
+    /// Lift a [`BasicDerivation`] into a full `Derivation` with empty
+    /// `input_drvs` — the inverse of [`Derivation::to_basic`] and the
+    /// Rust analog of CppNix's `Derivation(const BasicDerivation&)`
+    /// upcast constructor (derivations.hh).
+    ///
+    /// Used to compute `staticOutputHashes`-equivalent realisation keys
+    /// over a derivation received inline on the wire
+    /// (`wopBuildDerivation`): CppNix keys the returned `builtOutputs`
+    /// of `Store::buildDerivation` by `hashDerivationModulo` over
+    /// exactly this inputDrvs-less view of the received derivation, so
+    /// hashing the lifted value reproduces the id the client registers
+    /// and looks up.
+    pub fn from_basic(basic: &BasicDerivation) -> Self {
+        Self {
+            outputs: basic.outputs().to_vec(),
+            input_drvs: BTreeMap::new(),
+            input_srcs: basic.input_srcs().clone(),
+            platform: basic.platform().to_string(),
+            builder: basic.builder().to_string(),
+            args: basic.args().to_vec(),
+            env: basic.env().clone(),
+        }
     }
 
     /// Parse a derivation from NAR bytes containing a single `.drv` file.
@@ -366,6 +522,9 @@ impl BasicDerivation {
         if outputs.is_empty() {
             return Err(DerivationError::NoOutputs);
         }
+        // Drv-level shape rule (oracle BasicDerivation::type() parity):
+        // ill-typed output sets are unrepresentable past construction.
+        output::classify_outputs(&outputs)?;
         Ok(BasicDerivation {
             outputs,
             input_srcs,
@@ -424,7 +583,7 @@ impl BasicDerivation {
             .outputs
             .iter()
             .enumerate()
-            .filter(|(_, o)| o.path.is_empty() && o.hash_algo.is_empty())
+            .filter(|(_, o)| matches!(o.kind(), OutputKind::Deferred))
             .map(|(i, _)| i)
             .collect();
         if deferred.is_empty() {
@@ -437,9 +596,16 @@ impl BasicDerivation {
 
         let mut filled = Vec::with_capacity(deferred.len());
         for i in deferred {
-            let out_name = self.outputs[i].name.clone();
-            let path = StorePath::make_output(&out_name, &drv_hash, drv_name)?.to_string();
-            self.outputs[i].path = path.clone();
+            let out_name = self.outputs[i].name().to_string();
+            let typed = StorePath::make_output(&out_name, &drv_hash, drv_name)?;
+            let path = typed.to_string();
+            // The pre-filter above selected exactly the Deferred
+            // indices, so a refusal here is unreachable; surfacing it
+            // (instead of the old silent overwrite) keeps the typed
+            // boundary honest if the filter and the fill ever drift.
+            if !self.outputs[i].fill_deferred(typed) {
+                return Err(DerivationError::NonDeferredFill(out_name));
+            }
             self.env.insert(out_name.clone(), path.clone());
             filled.push((out_name, path));
         }
@@ -493,9 +659,138 @@ impl DerivationLike for BasicDerivation {
 mod tests {
     use super::*;
 
+    /// Oracle truth table for [`should_resolve`] (CppNix
+    /// `Derivation::shouldResolve`, pinned 2.34.7
+    /// derivations.cc:1125-1155), including the one deliberate
+    /// narrowing (fixed-output by type) and its correctness escape
+    /// (clause 3).
+    /// Round-17 merged_bug_062: the owner helper's full matrix —
+    /// list shape × kind. The empty-list column is the fix: the
+    /// open-coded probes answered false (paths known) for every kind.
+    #[test]
+    fn output_paths_unknown_matrix() {
+        use super::output_paths_unknown_from_claims as unknown;
+        let empty: &[&str] = &[];
+        // Empty list: kind decides.
+        assert!(
+            !unknown(empty, true, false, false),
+            "FOD: path statically known"
+        );
+        assert!(
+            !unknown(empty, true, true, true),
+            "FOD wins over CA/resolve flags"
+        );
+        assert!(unknown(empty, false, true, false), "floating-CA: unknown");
+        assert!(
+            unknown(empty, false, false, true),
+            "deferred (needs_resolve): unknown"
+        );
+        assert!(
+            !unknown(empty, false, false, false),
+            "plain IA with omitted list: computable, not unknown"
+        );
+        // Non-empty list: per-slot emptiness signal, kind ignored.
+        assert!(
+            unknown(&[""], true, false, false),
+            "empty slot wins even for FOD shape"
+        );
+        assert!(unknown(&["/nix/store/x", ""], false, false, false));
+        assert!(
+            !unknown(&["/nix/store/x"], false, true, true),
+            "all slots concrete: known"
+        );
+    }
+
+    #[test]
+    fn should_resolve_oracle_truth_table() -> anyhow::Result<()> {
+        let dep = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep.drv";
+        let known = |_: &str| Some(false);
+        let floating_child = |_: &str| Some(true);
+        let missing_child = |_: &str| None;
+
+        // Clause 1: no input drvs ⇒ false, even floating-CA self.
+        let floating_leaf =
+            Derivation::parse(r#"Derive([("out","","r:sha256","")],[],[],"x","/bin/sh",[],[])"#)?;
+        assert!(
+            !should_resolve(&floating_leaf, known),
+            "oracle: empty inputDrvs short-circuits to false"
+        );
+
+        // Floating with inputs ⇒ true (type clause).
+        let floating = Derivation::parse(&format!(
+            r#"Derive([("out","","r:sha256","")],[("{dep}",["out"])],[],"x","/bin/sh",[],[])"#
+        ))?;
+        assert!(should_resolve(&floating, known));
+
+        // Deferred-IA with inputs ⇒ true (type clause).
+        let deferred = Derivation::parse(&format!(
+            r#"Derive([("out","","","")],[("{dep}",["out"])],[],"x","/bin/sh",[],[])"#
+        ))?;
+        assert!(should_resolve(&deferred, known));
+
+        // Concrete IA with concrete inputs ⇒ false.
+        let ia = Derivation::parse(&format!(
+            r#"Derive([("out","/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-out","","")],[("{dep}",["out"])],[],"x","/bin/sh",[],[])"#
+        ))?;
+        assert!(!should_resolve(&ia, known));
+        // …and true when the child's paths are unknown (the ADR-018
+        // ia.deferred propagation, checked directly off the child).
+        assert!(should_resolve(&ia, floating_child));
+
+        // Fixed-output: false by type (the deliberate narrowing — the
+        // oracle's `Xp::CaDerivations` optimization arm is off in rio)…
+        let fod = Derivation::parse(&format!(
+            r#"Derive([("out","/nix/store/cccccccccccccccccccccccccccccccc-fod","sha256","0123abcd")],[("{dep}",["out"])],[],"x","/bin/sh",[],[])"#
+        ))?;
+        assert!(
+            !should_resolve(&fod, known),
+            "fixed with concrete inputs: narrowing pinned"
+        );
+        // …but a FOD whose input is floating MUST resolve (its env
+        // embeds the child's placeholder) — the correctness pin.
+        assert!(
+            should_resolve(&fod, floating_child),
+            "FOD-with-floating-input resolves"
+        );
+        // Missing child (BFS inconsistency / store miss) degrades to
+        // not-unknown, like the gateway's documented skip.
+        assert!(!should_resolve(&fod, missing_child));
+
+        // Recovery degrade: any empty expected path ⇒ true.
+        assert!(should_resolve_from_expected_paths(&["", "x"]));
+        assert!(!should_resolve_from_expected_paths(&["x"]));
+        assert!(!should_resolve_from_expected_paths::<&str>(&[]));
+        Ok(())
+    }
+
+    #[test]
+    fn from_basic_round_trips_and_hashes_like_inputless_aterm() -> anyhow::Result<()> {
+        // A floating-CA derivation text with no inputDrvs: lifting its
+        // BasicDerivation back to a Derivation must preserve every
+        // field, and hashing the lifted value must equal hashing the
+        // parsed original (the staticOutputHashes parity the gateway
+        // relies on for inline hook fallbacks).
+        let aterm = r#"Derive([("out","","r:sha256","")],[],["/nix/store/cccccccccccccccccccccccccccccccc-src"],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out",""),("big","x")])"#;
+        let drv = Derivation::parse(aterm)?;
+        let lifted = Derivation::from_basic(&drv.to_basic());
+        assert_eq!(lifted, drv, "no-input derivation survives the round-trip");
+        assert!(lifted.input_drvs().is_empty());
+
+        let path = "/nix/store/dddddddddddddddddddddddddddddddd-lift.drv";
+        let mut cache_a = std::collections::HashMap::new();
+        let mut cache_b = std::collections::HashMap::new();
+        let h_orig = super::hash::hash_derivation_modulo(&drv, path, &|_| None, &mut cache_a)?;
+        let h_lift = super::hash::hash_derivation_modulo(&lifted, path, &|_| None, &mut cache_b)?;
+        assert_eq!(
+            h_orig, h_lift,
+            "modular hash is identical over the lifted view"
+        );
+        Ok(())
+    }
+
     #[test]
     fn to_basic_strips_input_drvs() -> anyhow::Result<()> {
-        let aterm = r#"Derive([("out","/nix/store/abc-hello","","")],[("/nix/store/abc-bash.drv",["out"])],["/nix/store/abc-source.sh"],"x86_64-linux","/bin/bash",["-e","script.sh"],[("name","hello"),("system","x86_64-linux")])"#;
+        let aterm = r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-hello","","")],[("/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-bash.drv",["out"])],["/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-source.sh"],"x86_64-linux","/bin/bash",["-e","script.sh"],[("name","hello"),("system","x86_64-linux")])"#;
 
         let drv = Derivation::parse(aterm)?;
         let basic = drv.to_basic();

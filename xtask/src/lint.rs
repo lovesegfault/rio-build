@@ -25,6 +25,14 @@ pub enum Lint {
     /// scheduler helm template. Catches a `[sla]` field helm forgot to
     /// surface to operators.
     HelmSla,
+    /// No open-coded floatingness probe (`any(|p| p.is_empty())`
+    /// over an output-path list) outside the rio-nix owner
+    /// (`output_paths_unknown_from_claims` /
+    /// `should_resolve_from_expected_paths`). Round-17 merged_bug_062:
+    /// the open-coded probes read the omitted-`[]` ingress shape as
+    /// "paths known" — fail-open for exactly the floating/deferred
+    /// population — and a new probe site re-creates the bug class.
+    FloatingnessProbe,
     /// `nix/nixos-node/seccomp/{rio-builder,rio-fetcher}.json` are
     /// allowlists (`defaultAction: SCMP_ACT_ERRNO`), the denied
     /// syscalls are absent from every ALLOW block, the
@@ -47,7 +55,12 @@ impl Lint {
     /// subcommand list clap derives from the enum, so a variant added
     /// to the enum but not here fails `cargo test -p xtask`.
     fn all() -> Vec<Lint> {
-        vec![Lint::SchemaLiveness, Lint::HelmSla, Lint::SeccompAllowlist]
+        vec![
+            Lint::SchemaLiveness,
+            Lint::HelmSla,
+            Lint::FloatingnessProbe,
+            Lint::SeccompAllowlist,
+        ]
     }
 }
 
@@ -56,6 +69,7 @@ pub fn run(lint: &Lint) -> Result<()> {
     match lint {
         Lint::SchemaLiveness => schema_liveness(),
         Lint::HelmSla => helm_sla(),
+        Lint::FloatingnessProbe => floatingness_probe(),
         Lint::SeccompAllowlist => seccomp_allowlist(),
     }
 }
@@ -110,6 +124,98 @@ pub fn run_all() -> Result<()> {
 /// **A new table this lint flags as dead:** either it IS dead (delete
 /// the migration before it ships), or add it to `ALLOW_DEAD` below
 /// with a one-line rationale naming the consumer-to-be.
+/// Round-17 merged_bug_062 (RC17-07): the floatingness question —
+/// "are this node's output paths unknown until placeholder
+/// resolution?" — has ONE owner, `rio_nix::derivation::
+/// output_paths_unknown_from_claims` (with
+/// `should_resolve_from_expected_paths` as its non-empty-list
+/// primitive). An open-coded `any(|p| p.is_empty())` probe answers the
+/// omitted-`[]` shape with "known" — fail-open — so new probe sites
+/// are denied here rather than hoped against in review. Carve-out:
+/// the owner file itself, count-pinned (the primitive's body); the
+/// helper calls the primitive, so exactly ONE literal instance exists.
+fn floatingness_probe() -> Result<()> {
+    let root = repo_root();
+    // The probe shape: `.any(|<v>| <v>.is_empty())` (incl. the
+    // `.as_ref().is_empty()` spelling). Negated probes
+    // (`!p.is_empty()`, "has any concrete path") and all-quantified
+    // forms (`all(|p| p.is_empty())`, "no classical evidence surface")
+    // are DIFFERENT predicates and stay legal.
+    let needle = |line: &str| {
+        let l = line.trim_start();
+        if l.starts_with("//") || l.starts_with("///") {
+            return false;
+        }
+        (line.contains(".any(|"))
+            && (line.contains(".is_empty())"))
+            && !line.contains("!")
+            && (line.contains("path") || line.contains("|p|") || line.contains("|p:"))
+    };
+    const OWNER: &str = "rio-nix/src/derivation/mod.rs";
+    // 2 pinned sites: the should_resolve_from_expected_paths body (the
+    // claims-list primitive the helper delegates to) and
+    // Derivation::has_unknown_output_paths (the PARSED-drv surface —
+    // it reads the ATerm's own output fields, not a claims list, and
+    // feeds derivation_type()'s deferred detection).
+    const OWNER_PIN: usize = 2;
+    let consumer_roots = [
+        "rio-scheduler/src",
+        "rio-gateway/src",
+        "rio-builder/src",
+        "rio-store/src",
+        "rio-nix/src",
+    ];
+    let mut violations: Vec<String> = Vec::new();
+    let mut owner_hits = 0usize;
+    for cr in consumer_roots {
+        let dir = root.join(cr);
+        if !dir.is_dir() {
+            continue;
+        }
+        walk_rs(&dir, &mut |path| {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .to_str()
+                .with_context(|| format!("non-UTF-8 path: {}", path.display()))?
+                .replace('\\', "/");
+            // Tests may construct probe-shaped fixtures deliberately.
+            if rel.contains("/tests/") {
+                return Ok(());
+            }
+            let text =
+                fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+            for (i, line) in text.lines().enumerate() {
+                if needle(line) {
+                    if rel == OWNER {
+                        owner_hits += 1;
+                    } else {
+                        violations.push(format!("{rel}:{}: {}", i + 1, line.trim()));
+                    }
+                }
+            }
+            Ok(())
+        })?;
+    }
+    ensure!(
+        owner_hits == OWNER_PIN,
+        "floatingness-probe: owner file {OWNER} has {owner_hits} probe-shaped \
+         sites, pinned {OWNER_PIN} (should_resolve_from_expected_paths body + \
+         Derivation::has_unknown_output_paths). A NEW literal means a probe \
+         stopped delegating — re-point it at the owner helpers and update the \
+         pin WITH its reason."
+    );
+    ensure!(
+        violations.is_empty(),
+        "floatingness-probe: open-coded output-path emptiness probe(s) outside \
+         the rio-nix owner — answer through \
+         rio_nix::derivation::output_paths_unknown_from_claims (kind-aware, \
+         total over the omitted-[] shape) instead:\n{}",
+        violations.join("\n")
+    );
+    Ok(())
+}
+
 fn schema_liveness() -> Result<()> {
     let root = repo_root();
 

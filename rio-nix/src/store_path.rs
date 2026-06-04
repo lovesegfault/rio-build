@@ -17,6 +17,13 @@ pub const STORE_PREFIX: &str = "/nix/store/";
 /// basename (`{hash}-{name}`). Returns `None` if `s` doesn't start with
 /// [`STORE_PREFIX`]. Prefer the infallible [`StorePath::basename`] when you
 /// already hold a parsed [`StorePath`].
+///
+/// Declared OUTPUT paths MUST NOT come through here: they are typed at
+/// the parse boundary (`DerivationOutput::store_path()` /
+/// `OutputKind`), and host-side joins over output locations take the
+/// typed basename (`builder.exec.declared-path-validated+1`). This
+/// helper remains for input/closure/proto-string paths whose origin is
+/// not a derivation's output table.
 pub fn basename(s: &str) -> Option<&str> {
     s.strip_prefix(STORE_PREFIX)
 }
@@ -77,7 +84,7 @@ pub enum StorePathError {
     InvalidBase32Padding,
 
     #[error(
-        "fixed-output path with references requires recursive SHA-256 (got {algo}, recursive={recursive})"
+        "fixed-output path with references or self-reference requires recursive SHA-256 (got {algo}, recursive={recursive})"
     )]
     FixedOutputRefsNotAllowed { algo: &'static str, recursive: bool },
 
@@ -225,6 +232,38 @@ impl StorePath {
         is_recursive: bool,
         references: &[StorePath],
     ) -> Result<Self, StorePathError> {
+        Self::make_fixed_output_with_self(name, hash, is_recursive, references, false)
+    }
+
+    /// [`make_fixed_output`](Self::make_fixed_output) with self-reference
+    /// support — the form needed for floating-CA outputs whose content
+    /// embeds their own store path.
+    ///
+    /// `references` must contain only the *other* paths the content
+    /// references (the path under construction must NOT be in the
+    /// slice — it cannot be, since it isn't known yet); the
+    /// self-reference is expressed solely via `self_reference = true`,
+    /// which appends Nix's `:self` token to the type string *after*
+    /// the sorted references (`source:ref1:ref2:self`, mirroring
+    /// `StoreDirConfig::makeType`).
+    ///
+    /// `hash` is the content hash **modulo self-references** — the
+    /// output of [`HashModuloSink`](crate::ca::HashModuloSink) over the
+    /// NAR (recursive) or flat file contents — not the plain content
+    /// hash. Like references, a self-reference is only representable
+    /// for recursive SHA-256 ingestion; any other combination returns
+    /// [`StorePathError::FixedOutputRefsNotAllowed`] (Nix has the same
+    /// restriction).
+    ///
+    /// Golden-tested against real `nix` 2.34 self-referencing CA
+    /// builds in `tests/ca_golden.rs`.
+    pub fn make_fixed_output_with_self(
+        name: &str,
+        hash: &crate::hash::NixHash,
+        is_recursive: bool,
+        references: &[StorePath],
+        self_reference: bool,
+    ) -> Result<Self, StorePathError> {
         use crate::hash::HashAlgo;
 
         if is_recursive && hash.algo() == HashAlgo::SHA256 {
@@ -236,6 +275,9 @@ impl StorePath {
                 type_str.push(':');
                 type_str.push_str(r);
             }
+            if self_reference {
+                type_str.push_str(":self");
+            }
             let fingerprint = format!(
                 "{type_str}:sha256:{}:{STORE_DIR}:{name}",
                 hex::encode(hash.digest()),
@@ -243,7 +285,7 @@ impl StorePath {
             return Self::from_fingerprint(name, &fingerprint);
         }
 
-        if !references.is_empty() {
+        if !references.is_empty() || self_reference {
             return Err(StorePathError::FixedOutputRefsNotAllowed {
                 algo: hash.algo().as_str(),
                 recursive: is_recursive,
@@ -264,6 +306,46 @@ impl StorePath {
             hex::encode(inner_digest),
         );
         Self::from_fingerprint(name, &fingerprint)
+    }
+
+    /// Compute the deterministic *scratch* path a floating-CA output is
+    /// built into before its real (content-derived) path is known.
+    ///
+    /// Mirrors Nix `DerivationBuilderImpl::makeFallbackPath(OutputName)`:
+    ///
+    /// ```text
+    /// makeStorePath("rewrite:{drv basename}:name:{output_name}",
+    ///               sha256(zero digest),
+    ///               outputPathName(drv_name, output_name))
+    /// ```
+    ///
+    /// where the hash is the **all-zero** 32-byte digest (CppNix's
+    /// default-constructed `Hash(HashAlgorithm::SHA256)`), not
+    /// `sha256("")`. The exact recipe is internal to the builder — it
+    /// never affects the final CA path, because the final path is
+    /// computed from the content with this path's hash part zeroed out
+    /// ([`HashModuloSink`](crate::ca::HashModuloSink)) — but it must be
+    /// deterministic, unique per `(drv, output)`, and a structurally
+    /// valid store path so the build can write to it and reference
+    /// scanning can find it. We match Nix's construction so that
+    /// debugging a half-finished build looks familiar.
+    ///
+    /// `drv_path` is the derivation's store path (`…-{name}.drv`).
+    pub fn make_scratch_output_path(
+        drv_path: &StorePath,
+        output_name: &str,
+    ) -> Result<Self, StorePathError> {
+        let drv_name = drv_path
+            .name()
+            .strip_suffix(".drv")
+            .unwrap_or(drv_path.name());
+        let path_name = output_path_name(drv_name, output_name);
+        let type_str = format!("rewrite:{}:name:{output_name}", drv_path.basename());
+        let fingerprint = format!(
+            "{type_str}:sha256:{}:{STORE_DIR}:{path_name}",
+            hex::encode([0u8; 32]),
+        );
+        Self::from_fingerprint(&path_name, &fingerprint)
     }
 
     /// Compute the store path for an input-addressed derivation output.
@@ -339,6 +421,27 @@ impl StorePath {
         );
         Self::from_fingerprint(name, &fingerprint)
     }
+}
+
+/// Compute Nix's `hashPlaceholder(outputName)` string.
+///
+/// This is the value the Nix *language* `placeholder "<output>"`
+/// builtin evaluates to, and the value `derivationStrict` writes into a
+/// derivation's env for content-addressed outputs whose path is unknown
+/// at eval time: `"/" + nixbase32(sha256("nix-output:" + outputName))`.
+/// At build time the builder-side `inputRewrites` map replaces every
+/// occurrence of this string (in argv, env values, `passAsFile`
+/// contents, and `.attrs.{json,sh}`) with the output's actual in-sandbox
+/// path.
+///
+/// The leading `/` makes the placeholder an "impossible path": it can
+/// never collide with a real store path (those start with
+/// `/nix/store/`), so an unrewritten placeholder is loudly wrong rather
+/// than silently plausible.
+pub fn hash_placeholder(output_name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("nix-output:{output_name}").as_bytes());
+    format!("/{}", nixbase32::encode(&digest))
 }
 
 impl std::str::FromStr for StorePath {
@@ -543,6 +646,22 @@ pub mod nixbase32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hash_placeholder_matches_nix() {
+        // Golden value: `nix eval --expr 'builtins.placeholder "out"'`
+        // (also the canonical hashPlaceholder("out") env value Nix
+        // writes for CA outputs — see derivation/hash.rs's
+        // ca_floating_leaf fixture, captured from a real .drv).
+        assert_eq!(
+            hash_placeholder("out"),
+            "/1rz4g4znpzjwh1xymhjpm42vipw92pr73vdgl6xs1hycac8kf2n9"
+        );
+        // Distinct outputs get distinct placeholders.
+        assert_ne!(hash_placeholder("out"), hash_placeholder("dev"));
+        assert!(hash_placeholder("dev").starts_with('/'));
+        assert!(!hash_placeholder("dev").starts_with("/nix/store/"));
+    }
 
     #[test]
     fn test_parse_valid_store_path() -> anyhow::Result<()> {
@@ -836,6 +955,65 @@ mod tests {
         )?;
         let p_uniq = StorePath::make_fixed_output("s", &hash, true, &[r_a, r_b])?;
         assert_eq!(p_dup, p_uniq, "duplicate refs must not affect path");
+        Ok(())
+    }
+
+    /// `make_fixed_output` is a thin wrapper over the `_with_self`
+    /// form with `self_reference = false`; the two must agree, and the
+    /// `:self` token must change the path.
+    #[test]
+    fn test_make_fixed_output_with_self_changes_path() -> anyhow::Result<()> {
+        let hash = crate::hash::NixHash::new(crate::hash::HashAlgo::SHA256, vec![7u8; 32])?;
+        let plain = StorePath::make_fixed_output("thing", &hash, true, &[])?;
+        let no_self = StorePath::make_fixed_output_with_self("thing", &hash, true, &[], false)?;
+        let with_self = StorePath::make_fixed_output_with_self("thing", &hash, true, &[], true)?;
+        assert_eq!(plain, no_self);
+        assert_ne!(plain, with_self, ":self must alter the fingerprint");
+        Ok(())
+    }
+
+    /// Self-references are only representable for recursive SHA-256
+    /// ingestion (same restriction as references).
+    #[test]
+    fn test_make_fixed_output_self_rejected_unless_recursive_sha256() -> anyhow::Result<()> {
+        let sha256 = crate::hash::NixHash::new(crate::hash::HashAlgo::SHA256, vec![0u8; 32])?;
+        let sha512 = crate::hash::NixHash::new(crate::hash::HashAlgo::SHA512, vec![0u8; 64])?;
+        assert!(matches!(
+            StorePath::make_fixed_output_with_self("x", &sha256, false, &[], true),
+            Err(StorePathError::FixedOutputRefsNotAllowed { .. })
+        ));
+        assert!(matches!(
+            StorePath::make_fixed_output_with_self("x", &sha512, true, &[], true),
+            Err(StorePathError::FixedOutputRefsNotAllowed { .. })
+        ));
+        Ok(())
+    }
+
+    /// The scratch path is deterministic, distinct per output name, and
+    /// carries the `outputPathName` naming convention (`{drv}-{output}`
+    /// for non-`out` outputs).
+    #[test]
+    fn test_make_scratch_output_path() -> anyhow::Result<()> {
+        let drv = StorePath::parse(
+            "/nix/store/xbf5ny8bisqlv1l2prskl0nj004hs5ia-rio-selfref-fixture.drv",
+        )?;
+        let out = StorePath::make_scratch_output_path(&drv, "out")?;
+        let out2 = StorePath::make_scratch_output_path(&drv, "out")?;
+        let dev = StorePath::make_scratch_output_path(&drv, "dev")?;
+        assert_eq!(out, out2, "scratch path must be deterministic");
+        assert_ne!(out, dev, "different outputs get different scratch paths");
+        assert_eq!(out.name(), "rio-selfref-fixture");
+        assert_eq!(dev.name(), "rio-selfref-fixture-dev");
+        // Pin the exact value so an accidental change to the recipe is
+        // loud (the recipe itself is internal — see the doc comment —
+        // but determinism across versions of rio matters for resumed
+        // builds and debugging). The literal was produced by this very
+        // function and cross-checked against the construction documented
+        // above; it is a regression pin, not an external golden value.
+        assert_eq!(
+            out.as_str(),
+            "/nix/store/j59587sic2b090w3ckpv8l82rhfiwm3i-rio-selfref-fixture"
+        );
         Ok(())
     }
 

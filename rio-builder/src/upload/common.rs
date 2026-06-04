@@ -1,22 +1,19 @@
 //! Mechanics shared by [`single`](super::single) and [`batch`](super::batch):
-//! the streaming-tee sink, ref-scan pre-pass, trailer-mode `PathInfo`
-//! construction, assignment-token header, and retry/backpressure constants.
+//! the streaming-tee sink, trailer-mode `PathInfo` construction,
+//! assignment-token header, and retry/backpressure constants.
 //!
 //! Everything here is `pub(super)` — the public surface is
 //! [`upload_all_outputs`](super::upload_all_outputs).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use rio_common::backoff::{Backoff, Jitter};
-use rio_common::grpc::GRPC_STREAM_TIMEOUT;
 use rio_nix::nar;
-use rio_nix::refscan::{CandidateSet, RefScanSink};
 use rio_nix::store_path::StorePath;
 use rio_proto::types::{PathInfo, PutPathRequest, PutPathTrailer, put_path_request};
 use rio_proto::validated::ValidatedPathInfo;
@@ -122,16 +119,17 @@ pub(super) const STREAM_CHANNEL_BUF: usize = 4;
 
 /// Construct a `ValidatedPathInfo` for a freshly-uploaded output.
 ///
-/// `references` are full `/nix/store/...` paths from the ref-scan
-/// candidate set, which was built from already-validated input-closure
-/// paths plus declared output paths — `StorePath::parse` cannot fail on
-/// them. A parse failure here is an invariant violation (CandidateSet
-/// returned a path it didn't validate) and is surfaced as
+/// `references` are full `/nix/store/...` paths recorded by the result
+/// pipeline, which resolved them against already-validated input-closure
+/// and output paths — `StorePath::parse` cannot fail on them. A parse
+/// failure here is an invariant violation (the pipeline recorded a path
+/// it didn't validate) and is surfaced as
 /// [`UploadError::InvalidReference`] rather than silently dropped:
 /// dropping would corrupt the output's reference graph and break GC
 /// reachability. `deriver` may be empty (dev mode), which maps to
-/// `None`. Fields not known at upload time (`registration_time`,
-/// `signatures`, `content_address`, …) are left default; the store
+/// `None`. `content_address` carries the output's own CA descriptor
+/// when it has one. Fields not known at upload time
+/// (`registration_time`, `signatures`, …) are left default; the store
 /// fills them server-side.
 pub(super) fn uploaded_info(
     store_path: StorePath,
@@ -139,6 +137,7 @@ pub(super) fn uploaded_info(
     nar_size: u64,
     references: Vec<String>,
     deriver: &str,
+    content_address: Option<String>,
 ) -> Result<ValidatedPathInfo, UploadError> {
     let references = references
         .into_iter()
@@ -154,98 +153,36 @@ pub(super) fn uploaded_info(
         registration_time: 0,
         ultimate: false,
         signatures: Vec::new(),
-        content_address: None,
+        content_address,
     })
 }
 
-/// Pre-scan an output for store-path references via `dump_path_streaming`
-/// → `RefScanSink`. spawn_blocking because the dump is sync I/O.
+/// One output's per-upload-invariant prep: parsed store path + the
+/// reference set recorded by the native result pipeline. Built once by
+/// `upload_all_outputs` and consumed by both the batch and per-output
+/// upload paths, so prep is never interleaved with streaming.
 ///
-/// Single extra disk read through `RefScanSink` ONLY (no hash, no
-/// network). Done OUTSIDE the upload retry loop so retries don't
-/// re-scan — the scan is deterministic. At NVMe speeds a 4 GiB output
-/// adds ~4s wall time; the Boyer-Moore skip-scan does ~memcpy speed on
-/// binary sections (skips ~31/32 bytes).
-///
-/// Why a separate pass instead of a three-way tee inside the upload:
-/// references go in `PathInfo`, which is the FIRST gRPC message
-/// (trailer-mode protocol requires metadata at index 0). We can't know
-/// refs until the dump finishes. Changing the proto to send refs in the
-/// trailer would ripple into store-side `put_path.rs`, `ValidatedPathInfo`,
-/// and the re-sign path — see TODO(P0433) trailer-refs extension.
-pub(super) async fn scan_references(
-    output_path: &Path,
-    candidates: &Arc<CandidateSet>,
-) -> Result<Vec<String>, tonic::Status> {
-    let scan_path = output_path.to_path_buf();
-    let cands = Arc::clone(candidates);
-    // Bounded join: a blocking thread parked in open()/read() (FIFO in
-    // $out, wedged FUSE) never returns and tokio cannot abort it; without
-    // the timeout this await would hang the worker forever. One output's
-    // local-disk scan is ≪ 300s; this fires only on a true hang.
-    await_dump_bounded(
-        "ref-scan",
-        GRPC_STREAM_TIMEOUT,
-        tokio::task::spawn_blocking(move || {
-            let mut sink = RefScanSink::new(cands.hashes());
-            nar::dump_path_streaming(&scan_path, &mut sink)
-                .map(|_| cands.resolve(&sink.into_found()))
-        }),
-    )
-    .await?
-    .map_err(|e| nar_err_to_status(output_path, e))
-}
-
-/// One output's per-upload-invariant prep: parsed store path + scanned
-/// references. Built once by [`prepare_output`] and consumed by both the
-/// batch and per-output upload paths, so prep is never interleaved with
-/// streaming and metric emission has a single chokepoint.
+/// References are the pipeline's recorded set
+/// (post-`unsafeDiscardReferences`, post-CA-finalization) — the upload
+/// does not re-scan outputs for references.
 #[derive(Clone, Debug)]
 pub(super) struct PreparedOutput {
-    /// Basename under `upper_store` (`"abc…-hello"`).
-    pub basename: String,
-    /// `"/nix/store/{basename}"` — the string form sent in `PathInfo`.
+    /// Full `/nix/store/...` path — the string form sent in `PathInfo`.
     pub store_path: String,
+    /// On-disk location of the output's bytes (the NAR dump source).
+    pub host_path: std::path::PathBuf,
     /// Validated parse of `store_path`.
     pub parsed: StorePath,
-    /// Sorted resolved references from [`scan_references`].
+    /// Sorted full-store-path references to register.
     pub references: Vec<String>,
-}
-
-/// Single prep chokepoint: parse → scan_references (timeout-bounded) →
-/// emit `rio_builder_upload_references_count`. Called once per output,
-/// BEFORE any byte is sent to the store, so a prep failure on output k
-/// cannot leave outputs 0..k-1 partially committed
-/// (`r[store.atomic.multi-output]`).
-///
-/// This is the ONLY emission site for `rio_builder_upload_references_count`
-/// — both batch and single paths route through here.
-// r[impl builder.upload.references-scanned]
-pub(super) async fn prepare_output(
-    upper_store: &Path,
-    basename: &str,
-    candidates: &Arc<CandidateSet>,
-) -> Result<PreparedOutput, UploadError> {
-    let store_path = format!("/nix/store/{basename}");
-    let parsed = StorePath::parse(&store_path).map_err(|e| UploadError::UploadExhausted {
-        path: store_path.clone(),
-        source: tonic::Status::invalid_argument(format!(
-            "output store path {store_path:?} from overlay upper is malformed: {e}"
-        )),
-    })?;
-    let references = scan_references(&upper_store.join(basename), candidates)
-        .await
-        .map_err(|source| UploadError::UploadExhausted {
-            path: store_path.clone(),
-            source,
-        })?;
-    metrics::histogram!("rio_builder_upload_references_count").record(references.len() as f64);
-    Ok(PreparedOutput {
-        basename: basename.to_string(),
-        store_path,
-        parsed,
-        references,
-    })
+    /// Content-address descriptor (`fixed:[r:]<algo>:<base32>`) for
+    /// content-addressed outputs — floating-CA finalization or a
+    /// fixed-output derivation's declared hash, recorded by the native
+    /// result pipeline. `None` for input-addressed outputs. Threaded
+    /// into both the PutPath metadata and the returned
+    /// `ValidatedPathInfo` so substituting clients see the `CA:`
+    /// narinfo field.
+    pub content_address: Option<String>,
 }
 
 /// Construct the trailer-mode `PathInfo` (empty hash/size → store
@@ -256,6 +193,7 @@ pub(super) fn trailer_mode_path_info(
     store_path: &str,
     deriver: &str,
     references: &[String],
+    content_address: Option<&str>,
 ) -> PathInfo {
     PathInfo {
         store_path: store_path.to_string(),
@@ -267,7 +205,7 @@ pub(super) fn trailer_mode_path_info(
         registration_time: 0,
         ultimate: false,
         signatures: Vec::new(),
-        content_address: String::new(),
+        content_address: content_address.unwrap_or_default().to_string(),
     }
 }
 

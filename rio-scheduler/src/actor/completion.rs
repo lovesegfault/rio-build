@@ -8,9 +8,166 @@ use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
-use crate::state::{DerivationStatus, DrvHash, ExecutorId};
+use crate::state::{BuildStateExt, DerivationStatus, DrvHash, ExecutorId};
 
 use super::DagActor;
+
+/// Built outputs ADMITTED past the completion trust boundary — the ONE
+/// owner of every check between a worker-reported `BuildResult` and
+/// the trusted-plane consumers (`state.output_paths` → GC pins +
+/// `path_tenants`, realisations, cutoff-compare, client output report).
+///
+/// r[impl sched.completion.output-membership+1]
+/// Construction is the boundary: [`AdmittedOutputs::admit`] takes the
+/// raw outputs by value (`mem::take` at the sole call site — the raw
+/// vector is gone after admission, so no consumer can read
+/// pre-admission data), and every check lives INSIDE the constructor.
+/// The conformance check `completion-admission-conformance` denies
+/// `.built_outputs` reads anywhere else in the actor, so a future
+/// consumer cannot compile-or-CI around the boundary.
+pub(super) struct AdmittedOutputs(Vec<crate::domain::BuiltOutput>);
+
+impl AdmittedOutputs {
+    /// Admit worker-reported outputs against the scheduler-trusted
+    /// declaration. Checks, in order:
+    /// 1. Path SHAPE: `output_path` parses as a store path (malformed
+    ///    paths never reach PG/realisations/path_tenants).
+    /// 2. Name MEMBERSHIP + dedup: only outputs the `.drv` declares
+    ///    (parsed at DAG-merge time), at most once each — bounds the
+    ///    list at `declared.len()` against report stuffing.
+    /// 3. SLOT BINDING (round-17 bug_100): for every output whose
+    ///    slot the scheduler holds a path for — the dispatch claim
+    ///    (`claim_output_paths`, exactly what the assignment token's
+    ///    HMAC signs) — the worker-reported path MUST equal it,
+    ///    INDEX-ALIGNED by the slot, never set-membership (a
+    ///    permutation across slots is a forgery, not a match). Slots
+    ///    the scheduler holds no path for are admitted through
+    ///    explicit per-reason accept cells, each counted:
+    ///    `accepted_floating_ca` (CA outputs get content-derived
+    ///    paths the scheduler cannot know pre-build — verifying the
+    ///    path against the reported NAR hash needs the output
+    ///    descriptor, which scheduler state does not hold; see
+    ///    [`Self::verify_built_output_store_evidence`]) and
+    ///    `accepted_unresolved_slot` (a deferred-IA claim that did
+    ///    not survive — the W2-S1/M_075 persistence closes this cell;
+    ///    its counter staying ~0 after that lands is that stream's
+    ///    done-signal).
+    pub(super) fn admit(
+        raw: Vec<crate::domain::BuiltOutput>,
+        state: &crate::state::DerivationState,
+        executor_id: &ExecutorId,
+        drv_hash: &DrvHash,
+    ) -> Self {
+        let declared = &state.output_names;
+        let claims = state.claim_output_paths();
+        let mut seen: HashSet<String> = HashSet::with_capacity(declared.len());
+        let admitted = raw
+            .into_iter()
+            .filter(|o| {
+                if rio_nix::store_path::StorePath::parse(&o.output_path).is_err() {
+                    warn!(
+                        executor_id = %executor_id,
+                        drv_hash = %drv_hash,
+                        output_name = %o.output_name,
+                        output_path = %o.output_path,
+                        "dropping malformed worker-supplied output_path"
+                    );
+                    metrics::counter!("rio_scheduler_malformed_built_output_total").increment(1);
+                    return false;
+                }
+                let Some(slot) = declared.iter().position(|n| n == &o.output_name) else {
+                    warn!(
+                        executor_id = %executor_id,
+                        drv_hash = %drv_hash,
+                        output_name = %o.output_name,
+                        "dropping worker-supplied output not declared by derivation"
+                    );
+                    metrics::counter!("rio_scheduler_undeclared_built_output_total").increment(1);
+                    return false;
+                };
+                // r[impl sched.completion.output-membership+1]
+                // Slot binding: the claim list is index-aligned with
+                // output_names (the dispatch invariant the HMAC
+                // signs); names are pairwise-distinct by ingress
+                // invariant, so `position` IS the slot.
+                match claims.get(slot).map(String::as_str) {
+                    Some(trusted) if !trusted.is_empty() => {
+                        if o.output_path != trusted {
+                            warn!(
+                                executor_id = %executor_id,
+                                drv_hash = %drv_hash,
+                                output_name = %o.output_name,
+                                reported = %o.output_path,
+                                trusted = %trusted,
+                                "dropping worker-reported output path contradicting the scheduler-held claim"
+                            );
+                            metrics::counter!(
+                                "rio_scheduler_completion_path_binding_total",
+                                "result" => "mismatch_dropped"
+                            )
+                            .increment(1);
+                            return false;
+                        }
+                        metrics::counter!(
+                            "rio_scheduler_completion_path_binding_total",
+                            "result" => "bound"
+                        )
+                        .increment(1);
+                    }
+                    _ => {
+                        // Typed accept cells — the scheduler holds no
+                        // path for this slot; admission is explicit
+                        // and counted, never a silent fall-through.
+                        let reason = if state.ca.is_ca && !state.is_fixed_output {
+                            "accepted_floating_ca"
+                        } else {
+                            "accepted_unresolved_slot"
+                        };
+                        metrics::counter!(
+                            "rio_scheduler_completion_path_binding_total",
+                            "result" => reason
+                        )
+                        .increment(1);
+                    }
+                }
+                // Dedup by output_name (keep first).
+                seen.insert(o.output_name.clone())
+            })
+            .collect();
+        Self(admitted)
+    }
+
+    /// FOD / floating-CA STORE-EVIDENCE binding — deliberately
+    /// unimplemented (R1(c) dangling symbol, round-17 bug_100):
+    /// `BuiltOutput.output_hash` is the NAR hash of what the worker
+    /// SAYS it built; binding a content-derived output path to it
+    /// requires the output descriptor (`r:sha256` method + declared
+    /// digest for FODs, the realisation chain for floating-CA), which
+    /// scheduler state does not hold — the store's upload admission
+    /// (`store.put.*`) is where those bytes are actually verified.
+    /// The accept cells above name this symbol; the deliberately
+    /// UNCOVERED rule `sched.completion.store-evidence-binding`
+    /// (visible in `tracey query uncovered`) is the wiring checklist:
+    /// implementing this without the store-side descriptor read
+    /// surface would launder a worker claim into evidence.
+    #[expect(
+        dead_code,
+        reason = "store-evidence binding restorer skeleton — the accept \
+                  cells doc names this symbol; wiring requires the store \
+                  descriptor read surface (see doc)"
+    )]
+    fn verify_built_output_store_evidence() {
+        // Deliberately unimplemented; see the doc comment.
+    }
+
+    pub(super) fn as_slice(&self) -> &[crate::domain::BuiltOutput] {
+        &self.0
+    }
+
+    pub(super) fn iter(&self) -> std::slice::Iter<'_, crate::domain::BuiltOutput> {
+        self.0.iter()
+    }
+}
 
 /// Timeout for the CA cutoff-compare realisation lookup.
 ///
@@ -79,6 +236,46 @@ impl DagActor {
             error!(drv_hash = %drv_hash, ?status, error = %e,
                    "failed to persist derivation status");
         }
+        self.persist_settle_evidence(std::slice::from_ref(&drv_hash.as_str()), status)
+            .await;
+    }
+
+    // r[impl sched.derivation.evidence-rank]
+    /// Ride-along for the settle persists: when a settle transition's
+    /// in-memory chokepoint upgraded the node to `VerifiedBuilt`
+    /// (`DerivationState::transition`, only ever from
+    /// `PathBoundBytes`), persist the upgraded rank best-effort.
+    /// Riding `persist_status` / `persist_status_batch` means no
+    /// settle-persist call site can forget it — the same chokepoint
+    /// shape as the in-memory half. Reads the CURRENT in-memory rank,
+    /// so re-persisting an already-settled node is an idempotent
+    /// no-op write, and non-upgraded nodes (cache-hit echoes,
+    /// content-bound claims) cost nothing. A lost write degrades to
+    /// the persisted ingress rank at recovery (documented on
+    /// `persist_evidence_rank`).
+    async fn persist_settle_evidence(&self, drv_hashes: &[&str], status: DerivationStatus) {
+        use crate::state::{DefinitionEvidence, DerivationStatus as DS};
+        if !matches!(status, DS::Completed | DS::Skipped) {
+            return;
+        }
+        for hash in drv_hashes {
+            let Some(state) = self.dag.node(&DrvHash::from(*hash)) else {
+                continue;
+            };
+            if state.evidence != DefinitionEvidence::VerifiedBuilt {
+                continue;
+            }
+            if let Err(e) = self
+                .db
+                // M_071: None — the settle upgrade re-derives nothing;
+                // COALESCE leaves the persisted resolve flag untouched.
+                .persist_evidence_rank(hash, DefinitionEvidence::VerifiedBuilt, None)
+                .await
+            {
+                error!(drv_hash = %hash, error = %e,
+                       "failed to persist settle evidence-rank upgrade (best-effort)");
+            }
+        }
     }
 
     /// Best-effort atomic persist of `status='poisoned'` + `poisoned_at=now()`.
@@ -119,6 +316,7 @@ impl DagActor {
             error!(count = drv_hashes.len(), ?status, error = %e,
                    "failed to batch-persist derivation status");
         }
+        self.persist_settle_evidence(drv_hashes, status).await;
     }
 
     /// Batch variant of [`unpin_best_effort`]. Same best-effort
@@ -187,7 +385,7 @@ impl DagActor {
             .await;
     }
 
-    // r[impl sched.merge.substitute-topdown+10]
+    // r[impl sched.merge.substitute-topdown+15]
     /// Completion-time `topdown_pruned` clear: walk the (deduped) DAG
     /// parents of every hash in `completed` and drop the mark from any
     /// flagged parent whose closure is now vouched for
@@ -208,7 +406,8 @@ impl DagActor {
     /// breadcrumb are never Vouched and so are skipped: an un-produced
     /// child was reaped out from under them, so their produced children
     /// are a truncated view of the pruned closure — the fail-fast or a
-    /// later full merge re-declaring their edges resolves them instead.
+    /// later full merge whose re-declared edges are all accepted
+    /// (sched.merge.heal-accepted-edges+1) resolves them instead.
     /// Per-parent work is flag-gated (one node lookup) before the
     /// children scan; the PG write is one batched best-effort statement
     /// (warn-and-continue, same posture as the lazy and fail-fast
@@ -691,28 +890,11 @@ impl DagActor {
         // stays proto-typed so `actor/tests/` keeps constructing it
         // unchanged (b03 reconciles post-integration).
         let mut result: crate::domain::BuildResult = result.into();
-        // Threat model: builders are untrusted. `built_outputs.
-        // output_path` reaches PG `realisations` (ca_insert_
-        // realisations) and `path_tenants` (state.output_paths →
-        // upsert_path_tenants_for) and the gateway reads both for
-        // client-facing responses. Filter to valid store paths HERE,
-        // at the boundary, so every consumer sees only well-formed
-        // data. `ca_cutoff_compare`'s `is_empty()` guard becomes
-        // defense-in-depth.
-        result.built_outputs.retain(|o| {
-            if rio_nix::store_path::StorePath::parse(&o.output_path).is_ok() {
-                true
-            } else {
-                warn!(
-                    executor_id = %executor_id,
-                    output_name = %o.output_name,
-                    output_path = %o.output_path,
-                    "dropping malformed worker-supplied output_path"
-                );
-                metrics::counter!("rio_scheduler_malformed_built_output_total").increment(1);
-                false
-            }
-        });
+        // Threat model: builders are untrusted. Every check between
+        // the raw report and the trusted-plane consumers lives in
+        // [`AdmittedOutputs::admit`] — invoked ONCE below, after the
+        // DAG state (the trusted declaration) is resolved. Until then
+        // the raw vector is not consulted.
         let status = result.status;
 
         // Resolve drv_key (which may be a drv_path or a drv_hash) to drv_hash.
@@ -786,37 +968,21 @@ impl DagActor {
             warn!(drv_hash = %drv_hash, "completion for unknown derivation, ignoring");
             return;
         };
-        // r[impl sched.completion.output-membership]
-        // Threat-model boundary, part 2: now that `state` is available,
-        // bound `built_outputs` to the scheduler-trusted `output_names`
-        // (parsed from the .drv at DAG-merge time). The format-filter
-        // above runs before `state` is resolved and validates path
-        // SHAPE only — it does not check membership or cardinality. A
-        // compromised worker reporting on its own assigned drv could
-        // otherwise stuff ~30k fabricated entries (4MB tonic limit ÷
-        // ~130B/entry), all reaching `state.output_paths` →
-        // `upsert_path_tenants` (arbitrary worker-chosen paths pinned
-        // against GC) and, for CA drvs, the sequential
-        // `insert_realisation` loop (~150s actor stall — same I-139
-        // shape called out at the cascade-dispatch comment). After
-        // this retain, `built_outputs.len() ≤ output_names.len()`.
-        let declared = &state.output_names;
-        let mut seen: HashSet<String> = HashSet::with_capacity(declared.len());
-        result.built_outputs.retain(|o| {
-            if !declared.contains(&o.output_name) {
-                warn!(
-                    executor_id = %executor_id,
-                    drv_hash = %drv_hash,
-                    output_name = %o.output_name,
-                    "dropping worker-supplied output not declared by derivation"
-                );
-                metrics::counter!("rio_scheduler_undeclared_built_output_total").increment(1);
-                return false;
-            }
-            // Dedup by output_name (keep first). `insert` returns
-            // false on dup → drop.
-            seen.insert(o.output_name.clone())
-        });
+        // r[impl sched.completion.output-membership+1]
+        // THE admission boundary: now that `state` (the trusted
+        // declaration) is available, the raw worker report is taken by
+        // value and admitted through the chokepoint. Shape, membership,
+        // cardinality (`admitted.len() ≤ output_names.len()` against
+        // ~30k-entry report stuffing → path_tenants GC pinning + the
+        // sequential insert_realisation actor stall), and dedup all
+        // live INSIDE `AdmittedOutputs::admit`; the raw vector is gone
+        // after this statement.
+        let admitted = AdmittedOutputs::admit(
+            std::mem::take(&mut result.built_outputs),
+            state,
+            executor_id,
+            drv_hash,
+        );
         let current_status = state.status();
 
         // Idempotency: completed -> completed is a no-op
@@ -889,7 +1055,7 @@ impl DagActor {
             | rio_proto::types::BuildResultStatus::AlreadyValid => {
                 self.handle_success_completion(
                     drv_hash,
-                    &result,
+                    (&result, &admitted),
                     executor_id,
                     (peak_memory_bytes, peak_cpu_cores),
                     (node_name, hw_class),
@@ -971,10 +1137,50 @@ impl DagActor {
         self.dispatch_ready().await;
     }
 
+    /// F2 — the verifying re-establisher for stripped modular hashes
+    /// (staged follow-up; fix-discipline R1(c): an unimplemented
+    /// promise must be a DANGLING SYMBOL, not prose — the prose-only
+    /// form of this promise at the realisation_insert skip log was the
+    /// literal R1(c) violation merged_bug_038's chain rode in on).
+    ///
+    /// Contract when wired: for a Completed CA/resolve node whose
+    /// `ca.modular_hash` is `None` (ingress- or dispatch-stripped),
+    /// fetch the node's `.drv` bytes from the store, verify them
+    /// text-CA against the declared path (the same
+    /// `classify_store_evidence` discipline — store transport is never
+    /// trusted), recompute `hash_derivation_modulo` over the verified
+    /// bytes with store-read input digests (blocked on the M_068
+    /// read RPC, the same surface as the round-15 C3c7 rank floor),
+    /// and ONLY THEN write the realisation row and restore the live
+    /// hash. The preserved `ca.modular_hash_stripped` value (M_070) is
+    /// the candidate to verify FIRST — byte-equality with the
+    /// recompute upgrades it from preserved claim to verified
+    /// evidence; mismatch keeps it segregated forever.
+    ///
+    /// Counted population: `rio_scheduler_ca_bookkeeping_skipped_total`
+    /// (consumer="realisation_insert") — every increment is a node
+    /// this fn would heal.
+    #[expect(
+        dead_code,
+        reason = "F2 restorer skeleton — the realisation_insert skip log \
+                  names this symbol; wiring is staged on the M_068 store \
+                  read RPC (see doc)"
+    )]
+    fn reestablish_stripped_modular_hash() {
+        // Deliberately unimplemented: the store-side read surface
+        // (M_068 deriver-proof RPC) does not exist yet; implementing a
+        // non-verifying restore would launder a preserved claim into
+        // evidence, which M_070 forbids by construction.
+    }
+
     pub(super) async fn handle_success_completion(
         &mut self,
         drv_hash: &DrvHash,
-        result: &crate::domain::BuildResult,
+        // The raw result (status/log metadata) and the ADMITTED outputs
+        // — tupled to stay under clippy's 7-arg limit; the outputs were
+        // taken from the result at the admission boundary, so the pair
+        // is the complete completion record.
+        (result, admitted): (&crate::domain::BuildResult, &AdmittedOutputs),
         executor_id: &ExecutorId,
         // Same tuple pattern as handle_completion — clippy 7-arg limit.
         (peak_memory_bytes, peak_cpu_cores): (u64, f64),
@@ -1010,16 +1216,12 @@ impl DagActor {
                 return;
             }
 
-            // Store output paths from built_outputs
-            state.output_paths = result
-                .built_outputs
-                .iter()
-                .map(|o| o.output_path.clone())
-                .collect();
+            // Store output paths from the ADMITTED outputs.
+            state.output_paths = admitted.iter().map(|o| o.output_path.clone()).collect();
         }
 
         let skipped_interested = self
-            .complete_ca_bookkeeping(drv_hash, &result.built_outputs)
+            .complete_ca_bookkeeping(drv_hash, admitted.as_slice())
             .await;
 
         // I-209: persist_status(.., Completed, ..) now also closes the
@@ -1195,48 +1397,84 @@ impl DagActor {
         // `needs_resolve=true`) ALSO needs a realisation row — the
         // .drv on disk has `path=""`, so the gateway's
         // `wopQueryDerivationOutputMap` realisation-lookup is the only
-        // way the client learns the post-resolve output path.
+        // way the client learns the post-resolve output path. Both
+        // conjuncts survive failover: the hash AND the resolve flag
+        // are restored from their persisted columns
+        // (sched.persist.ca-modular-hash,
+        // sched.recovery.deferred-resolve+1 / M_071 — verbatim, with
+        // the expected-path re-derivation demoted to the NULL-legacy
+        // fallback), so a post-failover completion registers the
+        // realisation exactly like a live one.
         if let Some(state) = self.dag.node(drv_hash)
             && (state.ca.is_ca || state.ca.needs_resolve)
-            && let Some(modular_hash) = state.ca.modular_hash
         {
-            // Log the hash in the same hex-encoding the gateway's
-            // wopQueryRealisation handler uses — if nix-build's later
-            // QueryRealisation finds nothing, grep both logs for
-            // `drv_hash=` and compare. A mismatch = our
-            // hash_derivation_modulo diverges from CppNix (the
-            // maskOutputs env-masking gap was one such divergence).
-            info!(
-                drv_hash = %hex::encode(modular_hash),
-                outputs = built_outputs.len(),
-                "insert_realisation: CA build complete, writing realisations"
-            );
-            for output in built_outputs {
-                let Ok(output_hash): Result<[u8; 32], _> = output.output_hash.as_slice().try_into()
-                else {
-                    debug!(
-                        drv_hash = %drv_hash,
-                        output_name = %output.output_name,
-                        hash_len = output.output_hash.len(),
-                        "realisation insert: output_hash not 32 bytes, skipping"
-                    );
-                    continue;
-                };
-                if let Err(e) = crate::ca::insert_realisation(
-                    self.db.pool(),
-                    &modular_hash,
-                    &output.output_name,
-                    &output.output_path,
-                    &output_hash,
-                )
-                .await
-                {
+            // r[impl sched.ca.absent-hash-surfaced]
+            // Exhaustive over the hash's presence (fix-discipline R1):
+            // the ingress strip made None a LEGAL state for exactly
+            // this population — a CA/resolve node whose declared hash
+            // was unverifiable. The if-let skip here was bug_048: the
+            // warm rebuild completed, no realisation row was written,
+            // and nothing said so.
+            match state.ca.modular_hash {
+                None => {
                     warn!(
                         drv_hash = %drv_hash,
-                        output_name = %output.output_name,
-                        error = %e,
-                        "realisation insert failed (best-effort; dependent resolve will retry)"
+                        consumer = "realisation_insert",
+                        restorer = stringify!(reestablish_stripped_modular_hash),
+                        "CA bookkeeping skipped: node has no modular hash \
+                         (ingress-stripped or never computed) — the \
+                         realisation is NOT registered and clients cannot \
+                         resolve this build's outputs by derivation until \
+                         the verifying re-establisher runs (staged \
+                         follow-up F2; see the named fn's doc)"
                     );
+                    metrics::counter!(
+                        "rio_scheduler_ca_bookkeeping_skipped_total",
+                        "consumer" => "realisation_insert"
+                    )
+                    .increment(1);
+                }
+                Some(modular_hash) => {
+                    // Log the hash in the same hex-encoding the gateway's
+                    // wopQueryRealisation handler uses — if nix-build's later
+                    // QueryRealisation finds nothing, grep both logs for
+                    // `drv_hash=` and compare. A mismatch = our
+                    // hash_derivation_modulo diverges from CppNix (the
+                    // maskOutputs env-masking gap was one such divergence).
+                    info!(
+                        drv_hash = %hex::encode(modular_hash),
+                        outputs = built_outputs.len(),
+                        "insert_realisation: CA build complete, writing realisations"
+                    );
+                    for output in built_outputs {
+                        let Ok(output_hash): Result<[u8; 32], _> =
+                            output.output_hash.as_slice().try_into()
+                        else {
+                            debug!(
+                                drv_hash = %drv_hash,
+                                output_name = %output.output_name,
+                                hash_len = output.output_hash.len(),
+                                "realisation insert: output_hash not 32 bytes, skipping"
+                            );
+                            continue;
+                        };
+                        if let Err(e) = crate::ca::insert_realisation(
+                            self.db.pool(),
+                            &modular_hash,
+                            &output.output_name,
+                            &output.output_path,
+                            &output_hash,
+                        )
+                        .await
+                        {
+                            warn!(
+                                drv_hash = %drv_hash,
+                                output_name = %output.output_name,
+                                error = %e,
+                                "realisation insert failed (best-effort; dependent resolve will retry)"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1286,6 +1524,25 @@ impl DagActor {
         // can't be skipped. Per-output granularity is a later
         // refinement.
         let mut prior_seeds: Vec<(Vec<u8>, String)> = Vec::new();
+        if let Some(state) = self.dag.node(drv_hash)
+            && state.ca.is_ca
+        {
+            // r[impl sched.ca.absent-hash-surfaced]
+            if state.ca.modular_hash.is_none() {
+                warn!(
+                    drv_hash = %drv_hash,
+                    consumer = "cutoff_compare",
+                    "CA bookkeeping skipped: no modular hash — early-cutoff \
+                     compare cannot consult prior realisations, downstream \
+                     rebuilds run in full"
+                );
+                metrics::counter!(
+                    "rio_scheduler_ca_bookkeeping_skipped_total",
+                    "consumer" => "cutoff_compare"
+                )
+                .increment(1);
+            }
+        }
         if let Some(state) = self.dag.node(drv_hash)
             && state.ca.is_ca
             && let Some(modular_hash) = state.ca.modular_hash
@@ -1462,6 +1719,25 @@ impl DagActor {
                         state.output_paths =
                             prior_outs.iter().map(|o| o.output_path.clone()).collect();
                     }
+                    if self
+                        .dag
+                        .node(hash)
+                        .is_some_and(|s| s.ca.modular_hash.is_none())
+                    {
+                        // r[impl sched.ca.absent-hash-surfaced]
+                        warn!(
+                            drv_hash = %hash,
+                            consumer = "cutoff_skipped_copy",
+                            "CA bookkeeping skipped: cutoff-skipped node has \
+                             no modular hash — its prior realisation is not \
+                             copied forward"
+                        );
+                        metrics::counter!(
+                            "rio_scheduler_ca_bookkeeping_skipped_total",
+                            "consumer" => "cutoff_skipped_copy"
+                        )
+                        .increment(1);
+                    }
                     if let Some(state) = self.dag.node(hash)
                         && let Some(modular) = state.ca.modular_hash
                     {
@@ -1521,7 +1797,14 @@ impl DagActor {
                 );
                 for build_id in interested {
                     self.events.emit(build_id, event.clone());
-                    if let Some(b) = self.builds.get_mut(&build_id) {
+                    // r[impl sched.build.terminal-status-settled+2]
+                    // A resident terminal build's served accounting is
+                    // frozen — the per-drv DerivationCached event above
+                    // still flows, but its cached_derivations count must
+                    // not drift after the terminal transition.
+                    if let Some(b) = self.builds.get_mut(&build_id)
+                        && !b.state().is_terminal()
+                    {
                         b.cached_count += 1;
                     }
                 }
@@ -1580,6 +1863,26 @@ impl DagActor {
         // Best-effort: PG blip → warn, don't abort completion.
         // `realisation_deps` is rio's derived-build-trace cache
         // (ADR-018:45), not correctness-critical for the build.
+        if let Some(state) = self.dag.node(drv_hash)
+            && state.ca.modular_hash.is_none()
+            && !state.ca.pending_realisation_deps.is_empty()
+        {
+            // r[impl sched.ca.absent-hash-surfaced]
+            // Pre-fix the pending deps silently lingered (the if-let
+            // below never took them); the lingering is harmless
+            // per-execution state but the SKIP is surfaced now.
+            warn!(
+                drv_hash = %drv_hash,
+                consumer = "realisation_deps",
+                "CA bookkeeping skipped: no modular hash — the resolved \
+                 dependency trace is not recorded for this completion"
+            );
+            metrics::counter!(
+                "rio_scheduler_ca_bookkeeping_skipped_total",
+                "consumer" => "realisation_deps"
+            )
+            .increment(1);
+        }
         if let Some(state) = self.dag.node_mut(drv_hash)
             && let Some(modular_hash) = state.ca.modular_hash
             && !state.ca.pending_realisation_deps.is_empty()
@@ -1857,10 +2160,14 @@ impl DagActor {
             // fresh — root priority dropped when this drv went
             // terminal) and BEFORE check_build_completion (which may
             // emit BuildCompleted; a final Progress showing 0
-            // remaining is still useful right before that).
+            // remaining is still useful right before that) — so a build
+            // completing on THIS fan-out is still non-terminal here and
+            // gets its final Progress; only builds that were ALREADY
+            // terminal (resident shared-node interest) are skipped by
+            // the wrapper's freeze.
             // _with bypasses debounce: completion always carries
             // user-visible state change, and the scan is already paid.
-            self.events.emit_progress_with(build_id, &summary);
+            self.emit_progress_with(build_id, &summary);
             // r[impl gw.activity.progress-before-stop]
             // Per-drv terminal event AFTER Progress: nom marks an
             // actBuild ✔ only when Progress.done increments while the
@@ -1984,9 +2291,13 @@ impl DagActor {
             // doesn't go through release_downstream, so this is
             // emitted inline (cost: one extra build_summary scan per
             // failure — rare, and handle_derivation_failure recomputes
-            // it anyway after cascade mutates the DAG).
+            // it anyway after cascade mutates the DAG). This runs BEFORE
+            // handle_derivation_failure flips a !keep_going build
+            // terminal, so a build failing on THIS event still gets its
+            // final Progress; already-terminal resident builds are
+            // skipped by the wrapper's freeze.
             let summary = self.dag.build_summary(*build_id);
-            self.events.emit_progress_with(*build_id, &summary);
+            self.emit_progress_with(*build_id, &summary);
             self.events.emit(
                 *build_id,
                 rio_proto::types::build_event::Event::Derivation(
@@ -2091,6 +2402,147 @@ impl DagActor {
         }
     }
 
+    // r[impl sched.poison.clear-failure-evidence]
+    /// Persist the sticky first-failure summary of every still-running
+    /// interested build BEFORE a poison-clear prune removes `drv_hash`.
+    ///
+    /// DEFENSE-IN-DEPTH BACKSTOP. Since the at-source persist
+    /// (`record_failure_evidence`, sched.build.failure-evidence-at-source+1)
+    /// landed, a build's first failure is normally already durable in
+    /// `builds.error_summary` by the time any eraser path runs — this
+    /// pre-clear persist only matters when the at-source write failed
+    /// (PG blip at observation time) AND no tick-retry sweep has
+    /// succeeded since. It stays because it is cheap (the COALESCE write
+    /// is a no-op when the evidence is already durable) and because it
+    /// keeps the eraser paths' fail-closed contract self-contained
+    /// rather than dependent on another component's earlier success.
+    ///
+    /// `db.clear_poison` resets the derivation row to `status='created'`
+    /// (poison fields NULLed), so the surviving `build_derivations` link
+    /// reconstructs nothing at recovery: the row loads back as a
+    /// non-failed node and contributes zero to `failed_count`. Mirrors
+    /// the displacement-path persist
+    /// (`sched.merge.displaced-failure-evidence`); not gated on
+    /// `keep_going` because a non-terminal `!keep_going` interested build
+    /// cannot exist at poison time, and the COALESCE write is an
+    /// idempotent no-op if it somehow did.
+    ///
+    /// First error aborts: callers run this evidence-first and refuse to
+    /// clear the poison if the persist failed.
+    pub(super) async fn persist_interested_failure_evidence(
+        &self,
+        drv_hash: &DrvHash,
+    ) -> Result<(), sqlx::Error> {
+        for build_id in self.get_interested_builds(drv_hash) {
+            let Some(build) = self.builds.get(&build_id) else {
+                continue;
+            };
+            if build.state().is_terminal() {
+                continue;
+            }
+            let Some(summary) = build.error_summary.as_deref() else {
+                continue;
+            };
+            let failed = build.failed_derivation.as_deref();
+            self.db
+                .persist_build_error_summary(build_id, summary, failed)
+                .await?;
+        }
+        Ok(())
+    }
+
+    // r[impl sched.build.failure-evidence-at-source+1]
+    /// THE failure-evidence chokepoint: record a build's first observed
+    /// derivation failure in memory and make it durable in the SAME
+    /// actor turn it is observed.
+    ///
+    /// This closes the recurring "failure evidence lost on path X"
+    /// class structurally: with evidence persisted at the source, no
+    /// row-erasing operation (displacement, ClearPoison, poison-TTL,
+    /// resubmit-reset, or any future eraser) needs to know that some
+    /// Active keep_going build's only durable failure evidence was
+    /// reconstructible from the row it is about to erase. The per-path
+    /// pre-erase persists remain as defense-in-depth backstops.
+    ///
+    /// Persistence failure is non-fatal here (warn + flag left false):
+    /// the tick-retry sweep (`persist_pending_failure_evidence`) and the
+    /// eraser-path backstops re-attempt it. Losing evidence now requires
+    /// a PG outage at observation time AND a failover before any retry
+    /// succeeded — three independent failures instead of one.
+    pub(super) async fn record_failure_evidence(&mut self, build_id: Uuid, drv_hash: &DrvHash) {
+        let Some(build) = self.builds.get_mut(&build_id) else {
+            return;
+        };
+        if build.state().is_terminal() {
+            return;
+        }
+        // First-failure wins, in memory exactly as in PG (COALESCE).
+        build
+            .error_summary
+            .get_or_insert_with(|| format!("derivation {drv_hash} failed"));
+        build
+            .failed_derivation
+            .get_or_insert_with(|| drv_hash.to_string());
+        self.persist_evidence_if_pending(build_id).await;
+    }
+
+    /// Shared persist half of [`Self::record_failure_evidence`] and
+    /// [`Self::persist_pending_failure_evidence`] — one implementation so
+    /// the chokepoint and its retry sweep cannot diverge. Persists one
+    /// build's in-memory evidence iff the build is non-terminal, the
+    /// evidence is not yet durable, and a summary exists.
+    async fn persist_evidence_if_pending(&mut self, build_id: Uuid) {
+        let Some(build) = self.builds.get(&build_id) else {
+            return;
+        };
+        if build.state().is_terminal() || build.failure_evidence_durable {
+            return;
+        }
+        let Some(summary) = build.error_summary.clone() else {
+            return;
+        };
+        let failed = build.failed_derivation.clone();
+        match self
+            .db
+            .persist_build_error_summary(build_id, &summary, failed.as_deref())
+            .await
+        {
+            Ok(()) => {
+                if let Some(b) = self.builds.get_mut(&build_id) {
+                    b.failure_evidence_durable = true;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    build_id = %build_id, error = %e,
+                    "failed to persist failure evidence at source \
+                     (left pending; tick sweep and eraser-path backstops will retry)"
+                );
+            }
+        }
+    }
+
+    // r[impl sched.build.failure-evidence-at-source+1]
+    /// Tick-retry sweep: re-attempt the at-source persist for every
+    /// build whose in-memory failure evidence is not yet durable.
+    /// Runs every housekeeping tick BEFORE the poison-TTL eraser, and
+    /// once at the end of recovery (a failed_count-based reconstruction
+    /// is a fresh observation that must be re-persisted before the new
+    /// leader serves traffic).
+    pub(super) async fn persist_pending_failure_evidence(&mut self) {
+        let pending: Vec<Uuid> = self
+            .builds
+            .iter()
+            .filter(|(_, b)| {
+                !b.state().is_terminal() && !b.failure_evidence_durable && b.error_summary.is_some()
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for build_id in pending {
+            self.persist_evidence_if_pending(build_id).await;
+        }
+    }
+
     // r[impl sched.admin.clear-poison]
     /// Clear poison state for a derivation (admin-initiated via
     /// `AdminService.ClearPoison`). Returns `true` if cleared.
@@ -2111,22 +2563,38 @@ impl DagActor {
             Some(s) if s != DerivationStatus::Poisoned => return false,
             Some(_) => {}
         }
+        // r[impl sched.poison.clear-failure-evidence]
+        // Evidence first, fail closed: persist the interested builds'
+        // sticky failure BEFORE the PG clear resets the row to 'created'.
+        // On error nothing has been mutated — the operator's retry finds
+        // the node still Poisoned, same contract as a clear_poison failure.
+        if let Err(e) = self.persist_interested_failure_evidence(drv_hash).await {
+            error!(drv_hash = %drv_hash, error = %e,
+                   "ClearPoison: failed to persist sticky failure evidence \
+                    (poison NOT cleared; retry-safe)");
+            return false;
+        }
         if let Err(e) = self.db.clear_poison(drv_hash).await {
             error!(drv_hash = %drv_hash, error = %e,
                    "ClearPoison: PG clear failed (in-mem untouched; retry-safe)");
             return false;
         }
         // Remove from DAG so next merge treats it as newly-inserted.
-        // Resetting status in-place would strand stub fields from
-        // `from_poisoned_row` and `compute_initial_states` only iterates
-        // `newly_inserted` — node would sit in Created forever. Poisoned
+        // Resetting status in-place would leave the node stuck: a merge
+        // onto a pre-existing non-retriable node only touches
+        // `interested_builds` + `traceparent`, and
+        // `compute_initial_states` only iterates `newly_inserted` — the
+        // node would sit in Created forever. Poisoned
         // nodes have no interested keep_going=false builds (build already
         // terminated); keep_going=true builds are pruned from
         // derivation_hashes here. The sticky `error_summary` set by
         // `handle_derivation_failure` keeps such builds on track to Fail
-        // even after the node (and its `failed_count` contribution) is gone.
+        // even after the node (and its `failed_count` contribution) is
+        // gone — and it survives a failover because it was persisted to
+        // `builds.error_summary` above, before the row reset erased the
+        // only other durable trace of the failure.
         //
-        // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.merge.substitute-topdown+15]
         // Capture the parents BEFORE `remove_node` scrubs the edge maps:
         // a Poisoned child is by definition un-produced, so removing it
         // truncates each surviving parent's child set relative to the
@@ -2140,11 +2608,11 @@ impl DagActor {
         let holed_parents = self.dag.get_parents(drv_hash);
         self.prune_interested_keep_going(drv_hash);
         self.dag.remove_node(drv_hash);
-        let mut holed: Vec<String> = Vec::new();
+        let mut holed: Vec<(String, Vec<String>)> = Vec::new();
         for parent in &holed_parents {
             if let Some(state) = self.dag.node_mut(parent) {
-                state.closure_hole = true;
-                holed.push(parent.to_string());
+                state.closure_hole.stamp([drv_hash.clone()]);
+                holed.push((parent.to_string(), vec![drv_hash.to_string()]));
             }
         }
         if !holed.is_empty() {
@@ -2156,7 +2624,7 @@ impl DagActor {
             // relies on — so no redundant gate here. A lost write costs
             // only the breadcrumb's durability across a failover; the
             // in-memory stamp covers this tenure.
-            if let Err(e) = self.db.set_closure_hole_by_hashes(&holed).await {
+            if let Err(e) = self.db.set_closure_holes(&holed).await {
                 warn!(drv_hash = %drv_hash, count = holed.len(), error = %e,
                       "failed to persist closure_hole after admin poison clear (continuing)");
             }
@@ -2560,7 +3028,7 @@ impl DagActor {
     /// cascade/events/build-fail side-effects as
     /// `handle_permanent_failure` — the build still fails THIS time,
     /// just without the 24h resubmit lockout.
-    // r[impl sched.timeout.promote-on-exceed+2]
+    // r[impl sched.timeout.promote-on-exceed+3]
     pub(super) async fn handle_timeout_failure(
         &mut self,
         drv_hash: &DrvHash,
@@ -2744,27 +3212,41 @@ impl DagActor {
     }
 
     pub(super) async fn handle_derivation_failure(&mut self, build_id: Uuid, drv_hash: &DrvHash) {
+        // r[impl sched.build.terminal-status-settled+2]
+        // A build that already reached a terminal state keeps its settled
+        // outcome: a shared node failing later (resubmitted by another
+        // build during the cleanup window) must not rewrite this build's
+        // error_summary/failed_derivation — the frozen QueryBuildStatus
+        // arm serves those — nor re-run its failure handling. Interest
+        // cleanup for resident terminal builds is owned by
+        // handle_cleanup_terminal_build.
+        if self
+            .builds
+            .get(&build_id)
+            .is_some_and(|b| b.state().is_terminal())
+        {
+            return;
+        }
         // Sync counts from DAG ground truth. The cascade may have transitioned
         // additional parents to DependencyFailed; those must be counted here.
         self.update_build_counts(build_id).await;
 
-        let Some(build) = self.builds.get_mut(&build_id) else {
+        // r[impl sched.build.keep-going]
+        // r[impl sched.build.failure-evidence-at-source+1]
+        // Record FIRST-failure summary regardless of keep_going — and
+        // persist it durably in this same actor turn, through the
+        // evidence chokepoint. The previous `!keep_going`-only
+        // assignment meant a keep_going build's eventual `BuildFailed`
+        // had `error_message=""`; the previous memory-only recording
+        // meant a failover before the build terminated lost the
+        // evidence whenever an eraser path had dropped the failed row
+        // (the 4-rounds-recurring bug class). First failure wins across
+        // multiple calls under keep_going.
+        self.record_failure_evidence(build_id, drv_hash).await;
+
+        let Some(build) = self.builds.get(&build_id) else {
             return;
         };
-
-        // r[impl sched.build.keep-going]
-        // Record FIRST-failure summary regardless of keep_going. The
-        // previous `!keep_going`-only assignment meant a keep_going
-        // build's eventual `BuildFailed` had `error_message=""` and
-        // `failed_derivation=""` (transition_build_to_failed
-        // `.unwrap_or_default()`s both). `get_or_insert` keeps the
-        // first failure across multiple calls under keep_going.
-        build
-            .error_summary
-            .get_or_insert_with(|| format!("derivation {drv_hash} failed"));
-        build
-            .failed_derivation
-            .get_or_insert_with(|| drv_hash.to_string());
 
         if !build.keep_going {
             // Fail the entire build immediately. Cancel remaining

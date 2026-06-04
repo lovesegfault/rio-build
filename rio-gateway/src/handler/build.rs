@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rio_common::tenant::NormalizedName;
-use rio_nix::derivation::Derivation;
+use rio_nix::derivation::{Derivation, DerivationLike};
 use rio_nix::protocol::build::{
     BuildMode, BuildResult, BuildStatus, read_basic_derivation, write_build_result,
 };
@@ -192,6 +192,34 @@ async fn quota_check<W: AsyncWrite + Unpin>(
             Ok(true)
         }
     }
+}
+
+/// Run the declared-output-path binding gate
+/// ([`translate::validate_output_path_bindings`]) on the blocking
+/// pool. The gate is O(total .drv bytes) of ATerm serialization +
+/// SHA-256 — far too much to run on the session reactor task — so the
+/// drv cache is `mem::take`n (O(1), no clone of a potentially-GB map),
+/// moved into `spawn_blocking` together with the nodes, and restored
+/// afterwards.
+///
+/// On a blocking-pool panic (`JoinError`) the cache is left empty:
+/// degraded but correct — the session re-fetches .drvs from the store
+/// on demand. The verdict is returned separately from the transport
+/// error so both call sites keep their existing rejection delivery
+/// (BuildResult `InputRejected` for wopBuildDerivation /
+/// wopBuildPathsWithResults, `stderr_err!` for wopBuildPaths).
+async fn enforce_output_path_bindings(
+    nodes: Vec<types::DerivationNode>,
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+) -> anyhow::Result<(Vec<types::DerivationNode>, Result<(), String>)> {
+    let cache = std::mem::take(drv_cache);
+    let (nodes, cache, verdict) = tokio::task::spawn_blocking(move || {
+        let verdict = translate::validate_output_path_bindings(&nodes, &cache);
+        (nodes, cache, verdict)
+    })
+    .await?;
+    *drv_cache = cache;
+    Ok((nodes, verdict))
 }
 
 /// STDERR-activity state that survives `process_build_events`
@@ -775,6 +803,46 @@ enum BuildEventOutcome {
     },
 }
 
+/// Classify a failed `SubmitBuild` call: a scheduler `INVALID_ARGUMENT` /
+/// `FAILED_PRECONDITION` means the scheduler validated the submission and
+/// REFUSED it — retrying the identical submission can never succeed —
+/// while every other failure (timeout, `UNAVAILABLE`, transport) is
+/// infrastructure trouble.
+///
+/// `with_timeout` wraps the tonic error into `anyhow::Error`, which
+/// preserves the concrete `tonic::Status` for downcasting (verified by
+/// the wire test: a mock InvalidArgument surfaces as `SchedulerRejected`).
+// r[impl gw.build.scheduler-rejection-permanent]
+fn classify_scheduler_error(e: anyhow::Error) -> GatewayError {
+    if let Some(status) = e.downcast_ref::<tonic::Status>()
+        && matches!(
+            status.code(),
+            tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition
+        )
+    {
+        return GatewayError::SchedulerRejected(status.message().to_owned());
+    }
+    GatewayError::Scheduler(format!("SubmitBuild failed: {e}"))
+}
+
+/// Convert a build-submission error into the `BuildResult` failure the
+/// client sees: scheduler rejections are permanent (`InputRejected`),
+/// everything else is retryable (`TransientFailure`).
+// r[impl gw.build.scheduler-rejection-permanent]
+fn submit_failure_result(e: &anyhow::Error) -> BuildResult {
+    if let Some(GatewayError::SchedulerRejected(reason)) = e.downcast_ref::<GatewayError>() {
+        BuildResult::failure(
+            BuildStatus::InputRejected,
+            format!("scheduler rejected the submission: {reason}"),
+        )
+    } else {
+        BuildResult::failure(
+            BuildStatus::TransientFailure,
+            format!("scheduler error: {e}"),
+        )
+    }
+}
+
 /// Issue the `SubmitBuild` RPC and read its initial response metadata
 /// (`x-rio-build-id`, `x-rio-trace-id`). Records `build_id` in
 /// `active_build_ids` at seq=0 so a stream error before event 0 is
@@ -813,7 +881,7 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
             // Sending STDERR_ERROR here would produce the exact
             // ERROR→LAST desync remediation 07 fixes.
             let _ = stderr.log(&format!("SubmitBuild RPC failed: {e}\n")).await;
-            return Err(GatewayError::Scheduler(format!("SubmitBuild failed: {e}")).into());
+            return Err(classify_scheduler_error(e).into());
         }
     };
 
@@ -1076,7 +1144,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     //      channel_close → ChannelSession::Drop → proto_task.abort(),
     //      no cancel logic anywhere.
     //
-    // Result: build leaks until r[sched.backstop.timeout+3]. For a 6h
+    // Result: build leaks until r[sched.backstop.timeout+4]. For a 6h
     // nixpkgs build, that's a 6h worker-slot leak per dropped client.
     //
     // Fix is two-part (both needed — step 3 and step 6 compound):
@@ -1126,8 +1194,8 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
 }
 
 // r[impl gw.opcode.build-derivation+2]
-// r[impl gw.hook.single-node-dag]
-// r[impl gw.hook.ifd-detection+2]
+// r[impl gw.hook.single-node-dag+2]
+// r[impl gw.hook.ifd-detection+3]
 /// wopBuildDerivation (36): Build a derivation via scheduler.
 ///
 /// Receives an inline BasicDerivation (no inputDrvs). Recovers the full
@@ -1156,8 +1224,16 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         Err(e) => stderr_err!(stderr, "wopBuildDerivation: {e}"),
     };
     tracing::Span::current().record("path", drv_path_str.as_str());
-    let Ok(basic_drv) = read_basic_derivation(reader).await else {
-        stderr_err!(stderr, "wopBuildDerivation: failed to read BasicDerivation");
+    // The wire parser now classifies output shapes at construction
+    // (typed parse boundary): a malformed declared output path, a
+    // floating output with a declared path, or a hash without an algo
+    // fails HERE, mid-payload. STDERR_ERROR-then-close posture is
+    // mandatory — the payload is partially consumed, so continuing
+    // the opcode loop would desync the stream (protocol-wire.md).
+    // r[impl gw.reject.floating-ca-declared-path+1]
+    let basic_drv = match read_basic_derivation(reader).await {
+        Ok(drv) => drv,
+        Err(e) => stderr_err!(stderr, "wopBuildDerivation: invalid BasicDerivation: {e}"),
     };
     read_build_mode_normal_only(reader, stderr, "wopBuildDerivation").await?;
 
@@ -1170,7 +1246,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
 
     let is_ifd_hint = !*has_seen_build_paths_with_results;
 
-    // r[impl gw.reject.nochroot]
+    // r[impl gw.reject.nochroot+2]
     // Check __noChroot on the BasicDerivation DIRECTLY. validate_dag
     // (called below) checks drv_cache entries, but if the full drv
     // isn't available (single-node fallback below), the drv is never
@@ -1180,12 +1256,79 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     // A malicious client could send __noChroot=1 via wopBuildDerivation
     // (which sends an inline BasicDerivation, not a store path) to
     // escape the sandbox. This catches it at the gateway.
-    if translate::StructuredEnv::new(basic_drv.env()).bool("__noChroot") == Some(true) {
-        warn!(drv_path = %drv_path_str, "rejecting __noChroot via inline BasicDerivation");
-        stderr_err!(
-            stderr,
-            "derivation requests __noChroot (sandbox escape) — not permitted"
-        );
+    match translate::StructuredEnv::new(basic_drv.env()).bool_attr("__noChroot") {
+        Ok(Some(true)) => {
+            warn!(drv_path = %drv_path_str, "rejecting __noChroot via inline BasicDerivation");
+            stderr_err!(
+                stderr,
+                "derivation requests __noChroot (sandbox escape) — not permitted"
+            );
+        }
+        Ok(_) => {}
+        // Fail-closed: wrong-typed __noChroot or an unparseable __json
+        // blob is rejected, never guessed at (oracle getBoolean throws).
+        Err(e) => {
+            warn!(drv_path = %drv_path_str, error = %e, "rejecting unreadable __noChroot via inline BasicDerivation");
+            stderr_err!(
+                stderr,
+                "derivation __noChroot is unreadable (wrong-typed sandbox attribute) — not permitted"
+            );
+        }
+    }
+
+    // r[impl gw.reject.unsupported-hash-algo+4]
+    // Same treatment for unverifiable hash algorithms as validate_dag
+    // applies to the cached DAG: the builder's FOD hash gate and
+    // floating-CA finalization are both fail-closed, so an
+    // `outputHashAlgo` they cannot handle — declared with a hash (FOD)
+    // or without one (floating-CA) — can only ever fail the build after
+    // burning a pod… unless the declared outputs are already realized,
+    // in which case the node cache-cuts and never dispatches. The
+    // realization probe decides; rejection keeps the existing
+    // STDERR_ERROR delivery. The inline BasicDerivation is all we have
+    // on the single-node fallback path.
+    // (A floating output declaring a path can no longer arrive here:
+    // read_basic_derivation rejects the shape at the wire parse.)
+    let mut inline_offender_realized = false;
+    let unverifiable = |o: &rio_nix::derivation::DerivationOutput| {
+        use rio_nix::derivation::OutputKind;
+        matches!(
+            o.kind(),
+            OutputKind::Fixed { hash_algo, .. } | OutputKind::Floating { hash_algo }
+                if !translate::fod_algo_verifiable(hash_algo)
+        )
+    };
+    if let Some(out) = basic_drv.outputs().iter().find(|o| unverifiable(o)) {
+        let offender = translate::UnverifiableFodOffender {
+            drv_path: drv_path_str.clone(),
+            output_name: out.name().to_string(),
+            algo: out.hash_algo().to_string(),
+            declared_paths: basic_drv
+                .outputs()
+                .iter()
+                .map(|o| o.path().to_string())
+                .collect(),
+        };
+        if let Err(reason) = translate::reject_unrealized_fod_offenders(
+            std::slice::from_ref(&offender),
+            store_client,
+            jwt.token(),
+        )
+        .await
+        {
+            warn!(
+                drv_path = %drv_path_str,
+                output = out.name(),
+                algo = out.hash_algo(),
+                "rejecting unverifiable outputHashAlgo via inline BasicDerivation"
+            );
+            stderr_err!(stderr, "{reason}");
+        }
+        // All declared outputs are already realized: the node will
+        // cache-cut at the scheduler. Skip the declared-hash binding
+        // below — the algo cannot be parsed for it, and there is
+        // nothing to build from this derivation.
+        inline_offender_realized = true;
     }
 
     // Recover full Derivation from drv_cache (BasicDerivation has no inputDrvs).
@@ -1212,45 +1355,194 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
             }
         }
         Err(e) => {
-            debug!(error = %e, "full derivation not available, using single-node DAG");
-            // Single-node fallback skips reconstruct_dag (which is
-            // where the BFS root gets flagged), so mark the requested
-            // target here. Behaviour-neutral for a 1-node submission
-            // (it is trivially a structural root) but keeps the
-            // "client named it" marker consistent across opcodes.
-            let mut node = translate::build_node(&drv_path_str, &basic_drv);
-            node.explicitly_requested = true;
-            (vec![node], Vec::new())
+            // r[impl gw.reject.output-path-mismatch+2]
+            // Declared-hash (fixed-output) outputs on the inline
+            // BasicDerivation get the same trusted-plane binding the
+            // cached path gets via validate_dag: declared path must
+            // derive from the declared hash, single-'out' shape rule.
+            // Without this, a junk outputHash on an inline derivation
+            // would exempt an arbitrary declared path from validation.
+            // Skipped only when the realization probe above exempted an
+            // unverifiable-algo offender (its algo cannot be parsed and
+            // nothing will be built from it).
+            if !inline_offender_realized
+                && let Err(reason) =
+                    translate::validate_declared_hash_outputs(&drv_path_str, basic_drv.outputs())
+            {
+                warn!(
+                    drv_path = %drv_path_str,
+                    reason = %reason,
+                    "rejecting inline derivation: declared fixed-output path does not bind"
+                );
+                stderr_err!(stderr, "{reason}");
+            }
+            // r[impl gw.reject.output-path-mismatch+2]
+            // The precedent for inline checks is the __noChroot check
+            // above; this one closes the same bypass for output paths.
+            //
+            // CppNix's daemon refuses wopBuildDerivation for
+            // input-addressed derivations from untrusted clients
+            // outright ("you are not privileged to build
+            // input-addressed derivations"): with only an inline
+            // BasicDerivation there is nothing binding declared
+            // input-addressed output paths to the derivation, so
+            // accepting them here would let a client squat any
+            // not-yet-built store path by never uploading the .drv
+            // (the path-binding gate only sees cached full
+            // derivations). Mirror that posture fail-closed: the
+            // single-node fallback is acceptable only when every
+            // output is content-bound (fixed-output / floating-CA —
+            // their paths are governed by the content-hash rules).
+            // ANY input-addressed output rejects: a parseable declared
+            // path is the squat shape, a malformed declared path is a
+            // tenant-controlled string the trusted plane must not
+            // forward to workers, and an empty declared path
+            // (deferred IA) has no validatable identity at all — the
+            // oracle's isCA() check draws the same line.
+            //
+            // Conforming clients never hit this for IA derivations:
+            // the handshake reports NotTrusted (2), so build-remote in
+            // Nix >= 2.16 and Lix copies the .drv closure and drives
+            // wopBuildPathsWithResults instead. This branch remains
+            // reachable for pre-2.16 hook clients, hand-rolled
+            // clients, and replayed old flows — the error text tells
+            // them what to do.
+            if let Some(out) = basic_drv
+                .outputs()
+                .iter()
+                .find(|o| o.hash_algo().is_empty())
+            {
+                warn!(
+                    drv_path = %drv_path_str,
+                    output = out.name(),
+                    declared = out.path(),
+                    "rejecting inline input-addressed derivation: full .drv unavailable, \
+                     declared output path cannot be validated"
+                );
+                let declared_desc = if out.path().is_empty() {
+                    "no declared path (deferred input-addressed output)".to_owned()
+                } else {
+                    format!("declares '{}'", out.path())
+                };
+                stderr_err!(
+                    stderr,
+                    "cannot build '{}': the full derivation is not in the store ({}) and \
+                     inline input-addressed derivations cannot be validated — upload the \
+                     .drv first (output '{}' {}). Nix >= 2.16 and Lix handle \
+                     this automatically because the gateway reports itself untrusted; \
+                     otherwise use --store ssh-ng:// or `nix copy --derivation` before \
+                     building",
+                    drv_path_str,
+                    e,
+                    out.name(),
+                    declared_desc
+                );
+            }
+            // r[impl gw.reject.unsupported-hash-algo+4]
+            // Realized unverifiable-algo offenders are still rejected on
+            // THIS path: with no resolvable .drv there is nothing that
+            // binds the inline claim (drv_path, output names, declared
+            // paths) to real derivation text, so forwarding it would
+            // mint an unvalidated node under a client-claimed drv_path —
+            // exactly the squat shape the scheduler's merge protections
+            // exist to prevent (sched.merge.authoritative-conflict). The
+            // realization exemption still applies on the cached-DAG path
+            // once the .drv is resolvable: uploading it first makes the
+            // node store-backed and it cache-cuts there.
+            if inline_offender_realized {
+                warn!(
+                    drv_path = %drv_path_str,
+                    "rejecting realized unverifiable-algo inline derivation: full .drv unavailable"
+                );
+                stderr_err!(
+                    stderr,
+                    "cannot build '{drv_path_str}': its declared outputs are already \
+                     available, but the full derivation is not in the store and its \
+                     outputHashAlgo cannot be verified, so the gateway cannot validate \
+                     the inline derivation — copy the outputs directly instead of \
+                     building, or upload the .drv first with `nix copy --derivation` \
+                     or by using --store ssh-ng:// (the realized outputs then \
+                     cache-cut at the scheduler)"
+                );
+            }
+            // r[impl gw.hook.inline-drv-content+4]
+            // Content-bound fallback: the .drv exists in no store (the
+            // client never uploaded it), so the worker can only execute
+            // this build if the serialized derivation rides along in
+            // the submission. Oversized derivations are rejected with
+            // remediation — there is no other delivery path for them.
+            // The node is unconditionally marked as carrying the
+            // authoritative copy: every fallback that reaches this point
+            // passed (or was never subject to) the gates above, and the
+            // scheduler's authoritative-content ingress validation binds
+            // the bytes before they are persisted for recovery.
+            debug!(
+                error = %e,
+                "full derivation not available, using single-node DAG with inline drv_content"
+            );
+            match translate::build_fallback_node(&drv_path_str, &basic_drv) {
+                Ok(mut node) => {
+                    // Single-node fallback skips reconstruct_dag (which is
+                    // where the BFS root gets flagged), so mark the requested
+                    // target here. Behaviour-neutral for a 1-node submission
+                    // (it is trivially a structural root) but keeps the
+                    // "client named it" marker consistent across opcodes.
+                    node.explicitly_requested = true;
+                    (vec![node], Vec::new())
+                }
+                Err(reason) => {
+                    warn!(
+                        drv_path = %drv_path_str,
+                        reason = %reason,
+                        "rejecting oversized inline single-node fallback"
+                    );
+                    stderr_err!(stderr, "{reason}");
+                }
+            }
         }
     };
 
     let priority_class = if is_ifd_hint { "interactive" } else { "ci" };
 
-    // Validate BEFORE inlining (no point doing FindMissingPaths +
-    // inline for a DAG we're about to reject). __noChroot check +
-    // early MAX_DAG_NODES.
-    if let Err(reason) = translate::validate_dag(&nodes, drv_cache) {
-        warn!(reason = %reason, "rejecting build: DAG validation failed");
-        // Do NOT send STDERR_ERROR here — it is a terminal frame.
-        // The client receives the rejection via BuildResult.errorMsg
-        // after STDERR_LAST. See build.rs:160-164 for the inverse
-        // invariant (STDERR_ERROR → STDERR_LAST is equally invalid).
+    // Cheap validation BEFORE anything else (no point rate-limiting or
+    // hashing a DAG we can reject from the node list alone):
+    // __noChroot check + early MAX_DAG_NODES + declared-hash binding;
+    // unverifiable-algo offenders come back classified and are decided
+    // by the bounded realization probe right after.
+    let offenders = match translate::validate_dag(&nodes, drv_cache) {
+        Ok(offenders) => offenders,
+        Err(reason) => {
+            warn!(reason = %reason, "rejecting build: DAG validation failed");
+            // Do NOT send STDERR_ERROR here — it is a terminal frame.
+            // The client receives the rejection via BuildResult.errorMsg
+            // after STDERR_LAST. See build.rs:160-164 for the inverse
+            // invariant (STDERR_ERROR → STDERR_LAST is equally invalid).
+            let failure = BuildResult::failure(BuildStatus::InputRejected, reason);
+            stderr.finish().await?;
+            write_build_result(stderr.inner_mut(), &failure, negotiated_version).await?;
+            return Ok(());
+        }
+    };
+    // r[impl gw.reject.unsupported-hash-algo+4]
+    // Unverifiable-algo offenders are exempt only when every declared
+    // output is already realized (the node cache-cuts and never
+    // dispatches); otherwise the submission is rejected fail-closed,
+    // with the same delivery as a validate_dag rejection.
+    if let Err(reason) =
+        translate::reject_unrealized_fod_offenders(&offenders, store_client, jwt.token()).await
+    {
+        warn!(reason = %reason, "rejecting build: unverifiable outputHashAlgo not already realized");
         let failure = BuildResult::failure(BuildStatus::InputRejected, reason);
         stderr.finish().await?;
         write_build_result(stderr.inner_mut(), &failure, negotiated_version).await?;
         return Ok(());
     }
 
-    // Inline .drv content for will-dispatch nodes. Mutable because
-    // this fills node.drv_content in-place. On store error: skips
-    // silently (safe degrade; worker fetches).
-    let mut nodes = nodes;
-    translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;
-
-    // Rate limit + quota BEFORE SubmitBuild. Checked after wire reads
-    // + validation (those are cheap; the expensive part is the
-    // scheduler RPC + stream). A rate-limited / over-quota client
-    // gets STDERR_ERROR; the connection stays open.
+    // Rate limit + quota BEFORE the expensive work (output-path
+    // binding, FindMissingPaths/inline, the scheduler RPC + stream).
+    // A rate-limited / over-quota client gets STDERR_ERROR and must
+    // not be able to make the gateway hash its closure first; the
+    // connection stays open.
     if rate_limit_check(stderr, limiter, tenant_name.as_ref()).await? {
         return Ok(());
     }
@@ -1265,6 +1557,25 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     {
         return Ok(());
     }
+
+    // Declared-output-path binding gate: O(closure) hashing, so it runs
+    // on the blocking pool and only after the cheap gates above.
+    // Rejection delivery matches the validate_dag rejection: BuildResult
+    // InputRejected after STDERR_LAST.
+    let (nodes, binding_verdict) = enforce_output_path_bindings(nodes, drv_cache).await?;
+    if let Err(reason) = binding_verdict {
+        warn!(reason = %reason, "rejecting build: declared output paths do not bind");
+        let failure = BuildResult::failure(BuildStatus::InputRejected, reason);
+        stderr.finish().await?;
+        write_build_result(stderr.inner_mut(), &failure, negotiated_version).await?;
+        return Ok(());
+    }
+
+    // Inline .drv content for will-dispatch nodes. Mutable because
+    // this fills node.drv_content in-place. On store error: skips
+    // silently (safe degrade; worker fetches).
+    let mut nodes = nodes;
+    translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;
 
     let request =
         translate::build_submit_request(nodes, edges, priority_class, tenant_name.as_ref());
@@ -1281,10 +1592,8 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "build submission failed");
-            BuildResult::failure(
-                BuildStatus::TransientFailure,
-                format!("scheduler error: {e}"),
-            )
+            // r[impl gw.build.scheduler-rejection-permanent]
+            submit_failure_result(&e)
         }
     };
 
@@ -1293,55 +1602,71 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     // result_with_wanted_outputs — declared paths for IA/fixed-CA outputs,
     // registered realisations for floating-CA — and a missing or unrealized
     // output demotes the result to an honest failure instead of shipping an
-    // empty outPath the client asserts on (nix-build.cc:722). Needs the full
-    // Derivation (with inputDrvs) for hash_derivation_modulo; the inline
-    // BasicDerivation lacks inputDrvs so the modular hash would diverge from
-    // CppNix for non-leaf drvs. If full_drv resolve failed (single-node
-    // fallback above), there is nothing to verify against — leave
-    // builtOutputs empty, no worse than before, and IA output paths are
-    // still recoverable client-side from the BasicDerivation it sent.
-    // Store errors during verification abort via stderr_err! inside
+    // empty outPath the client asserts on (nix-build.cc:722). Store errors
+    // during verification abort via stderr_err! inside
     // check_targets_against_store, before stderr.finish().
+    //
+    // Which derivation to verify and enrich from:
+    // - Resolved full Derivation (with inputDrvs): use it — for
+    //   non-leaf drvs the modular hash needs the transitive closure.
+    // - Resolve failed (content-bound single-node fallback): lift the
+    //   inline BasicDerivation. CppNix keys buildDerivation's
+    //   builtOutputs by `staticOutputHashes` over exactly that
+    //   inputDrvs-less derivation (the hook delegates the *resolved*
+    //   drv), so `hash_derivation_modulo(Derivation::from_basic(..))`
+    //   reproduces the id build-remote registers and looks up; the
+    //   floating-CA realized path comes from the realisations row the
+    //   scheduler wrote under the same hash carried on the node.
+    // - Resolve failed and the inline derivation is not content-bound:
+    //   leave builtOutputs empty (no CppNix flow to mirror; IA output
+    //   paths are recoverable client-side from the BasicDerivation).
     // r[impl gw.opcode.build-results-honest+2]
-    if build_result.status.is_success()
-        && let Ok(drv) = &full_drv
-    {
-        let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
-        // wopBuildDerivation has no per-target output selection — every
-        // declared output is wanted.
-        let targets = HashMap::from([(
-            0usize,
-            TargetDemand {
-                drv_path: drv_path_str.clone(),
-                drv: drv.clone(),
-                spec: OutputSpec::All,
-            },
-        )]);
-        let checks = check_targets_against_store(stderr, ctx, &targets, &mut hash_cache).await?;
-        if let Some(check) = checks.get(&0) {
-            if check.missing.is_empty() {
-                build_result = result_with_wanted_outputs(
-                    build_result,
-                    &targets[&0],
-                    check,
-                    &ctx.drv_cache,
-                    &mut hash_cache,
-                );
-            } else {
-                // Wrong-success: the scheduler says Built but the store does
-                // not hold what the client is owed.
-                warn!(
-                    drv = %drv_path_str,
-                    missing = ?check.missing,
-                    "demoting successful wopBuildDerivation result: outputs not in store"
-                );
-                build_result = BuildResult::failure(
-                    BuildStatus::MiscFailure,
-                    format!(
-                        "build completed but requested outputs are not in the store: {}",
-                        check.missing.join("; ")
-                    ),
-                );
+    // r[impl gw.hook.fallback-built-outputs]
+    if build_result.status.is_success() {
+        let enrich_from: Option<Derivation> = match &full_drv {
+            Ok(drv) => Some(drv.clone()),
+            Err(_) if basic_drv.is_content_addressed() => Some(Derivation::from_basic(&basic_drv)),
+            Err(_) => None,
+        };
+        if let Some(drv) = enrich_from {
+            let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
+            // wopBuildDerivation has no per-target output selection — every
+            // declared output is wanted.
+            let targets = HashMap::from([(
+                0usize,
+                TargetDemand {
+                    drv_path: drv_path_str.clone(),
+                    drv,
+                    spec: OutputSpec::All,
+                },
+            )]);
+            let checks =
+                check_targets_against_store(stderr, ctx, &targets, &mut hash_cache).await?;
+            if let Some(check) = checks.get(&0) {
+                if check.missing.is_empty() {
+                    build_result = result_with_wanted_outputs(
+                        build_result,
+                        &targets[&0],
+                        check,
+                        &ctx.drv_cache,
+                        &mut hash_cache,
+                    );
+                } else {
+                    // Wrong-success: the scheduler says Built but the store does
+                    // not hold what the client is owed.
+                    warn!(
+                        drv = %drv_path_str,
+                        missing = ?check.missing,
+                        "demoting successful wopBuildDerivation result: outputs not in store"
+                    );
+                    build_result = BuildResult::failure(
+                        BuildStatus::MiscFailure,
+                        format!(
+                            "build completed but requested outputs are not in the store: {}",
+                            check.missing.join("; ")
+                        ),
+                    );
+                }
             }
         }
     }
@@ -1656,10 +1981,11 @@ enum DagSubmitOutcome {
     /// Rate-limited or quota-exceeded. `STDERR_ERROR` already sent by
     /// the respective check; caller should `return Ok(())`.
     Gated,
-    /// `validate_dag` rejected the DAG before submission. No
-    /// `STDERR_ERROR` sent — caller decides whether to surface as
-    /// `stderr_err!` (wopBuildPaths) or as a per-path
-    /// `BuildResult::failure(InputRejected, …)` (wopBuildPathsWithResults).
+    /// `validate_dag` or the output-path binding gate rejected the DAG
+    /// before submission. No `STDERR_ERROR` sent — caller decides
+    /// whether to surface as `stderr_err!` (wopBuildPaths) or as a
+    /// per-path `BuildResult::failure(InputRejected, …)`
+    /// (wopBuildPathsWithResults).
     Rejected(String),
     /// Build was submitted and the scheduler returned a result
     /// (success OR failure — caller inspects `.status`).
@@ -1667,23 +1993,34 @@ enum DagSubmitOutcome {
 }
 
 /// Shared DAG-submit pipeline:
-/// `dedup → validate → rate-limit → quota → inline-drv → SubmitBuild`.
+/// `dedup → validate (cheap) → realization probe (offenders only) →
+/// rate-limit → quota → output-path binding (blocking pool) →
+/// inline-drv → SubmitBuild`.
 ///
 /// Runs every gate between DAG reconstruction and the scheduler RPC.
 /// Gate ORDER is fixed here so the two build-paths opcodes cannot drift:
-/// validate first (cheap, no I/O), then rate/quota (may send
-/// `STDERR_ERROR`), then inline (store I/O), then submit. Prior to this
-/// extraction the two handlers ran inline at different points relative
-/// to rate/quota — harmless but inconsistent.
+/// cheap validation first (no I/O, no hashing), then the bounded
+/// unverifiable-algo realization probe (a single `FindMissingPaths`,
+/// fired only when `validate_dag` classified offenders — same I/O
+/// class as the GetPath BFS both flows already performed), then
+/// rate/quota (may send `STDERR_ERROR`) so a limited client cannot
+/// trigger the expensive work, then the declared-output-path binding
+/// gate on the blocking pool, then inline (store I/O), then submit.
+/// `handle_build_derivation` follows the same order.
 ///
 /// Returns `Err` only when `submit_and_process_build` itself errors
 /// (scheduler transport/timeout); caller decides whether that is
 /// session-terminal (`stderr_err!`) or a per-path `TransientFailure`.
+///
+/// `priority_class` is decided by the caller: `wopBuildPaths` is always
+/// `"ci"`, `wopBuildPathsWithResults` passes `"interactive"` for the
+/// hook-shaped first request of a session (`gw.hook.ifd-detection+3`).
 async fn submit_dag<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     ctx: &mut SessionContext,
     mut nodes: Vec<types::DerivationNode>,
     mut edges: Vec<types::DerivationEdge>,
+    priority_class: &'static str,
 ) -> anyhow::Result<DagSubmitOutcome> {
     let SessionContext {
         store_client,
@@ -1699,8 +2036,20 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
 
     dedup_dag(&mut nodes, &mut edges);
 
-    if let Err(reason) = translate::validate_dag(&nodes, drv_cache) {
-        warn!(reason = %reason, "rejecting build: DAG validation failed");
+    let offenders = match translate::validate_dag(&nodes, drv_cache) {
+        Ok(offenders) => offenders,
+        Err(reason) => {
+            warn!(reason = %reason, "rejecting build: DAG validation failed");
+            return Ok(DagSubmitOutcome::Rejected(reason));
+        }
+    };
+    // r[impl gw.reject.unsupported-hash-algo+4]
+    // Unverifiable-algo offenders: exempt only when already realized
+    // (single bounded FindMissingPaths probe, fail-closed).
+    if let Err(reason) =
+        translate::reject_unrealized_fod_offenders(&offenders, store_client, jwt.token()).await
+    {
+        warn!(reason = %reason, "rejecting build: unverifiable outputHashAlgo not already realized");
         return Ok(DagSubmitOutcome::Rejected(reason));
     }
 
@@ -1719,9 +2068,20 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
         return Ok(DagSubmitOutcome::Gated);
     }
 
+    // Declared-output-path binding: expensive (O(closure) hashing), so
+    // it sits behind rate-limit/quota and runs on the blocking pool.
+    let (returned_nodes, binding_verdict) =
+        enforce_output_path_bindings(std::mem::take(&mut nodes), drv_cache).await?;
+    nodes = returned_nodes;
+    if let Err(reason) = binding_verdict {
+        warn!(reason = %reason, "rejecting build: declared output paths do not bind");
+        return Ok(DagSubmitOutcome::Rejected(reason));
+    }
+
     translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;
 
-    let request = translate::build_submit_request(nodes, edges, "ci", tenant_name.as_ref());
+    let request =
+        translate::build_submit_request(nodes, edges, priority_class, tenant_name.as_ref());
     let result = submit_and_process_build(
         stderr,
         scheduler_client,
@@ -1822,7 +2182,10 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     }
 
     if !all_nodes.is_empty() {
-        match submit_dag(stderr, ctx, all_nodes, all_edges).await {
+        // Remote-store-mode DAG submissions are CI-shaped: the goal DAG
+        // arrives via opcode 9/46 with the IFD trigger being a separate
+        // wopBuildDerivation — see gw.hook.ifd-detection+3.
+        match submit_dag(stderr, ctx, all_nodes, all_edges, "ci").await {
             Ok(DagSubmitOutcome::Gated) => return Ok(()),
             Ok(DagSubmitOutcome::Rejected(reason)) => {
                 stderr_err!(stderr, "build rejected: {reason}")
@@ -1871,11 +2234,42 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
     stderr: &mut StderrWriter<&mut W>,
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    // r[impl gw.hook.ifd-detection+3]
+    // Hook-shape classification. Stock build-remote (Nix >= 2.16, Lix)
+    // delegates one derivation per SSH session in build-hook mode: it
+    // copies the .drv closure and drives a single
+    // wopBuildPathsWithResults whose only target is `<drv>!*`
+    // (DerivedPath::Built with OutputSpec::All). That request gets the
+    // interactive priority class the wopBuildDerivation flow already
+    // gets — a developer is blocked on it right now. Everything else
+    // stays "ci": opcode 9, named-output targets ("drv!out" — the
+    // remote-store-mode CI shape), multi-target or mixed batches, and
+    // any second bPWR on the same session (a CI driver pushing many
+    // DAGs through one connection). The flag is captured-then-set HERE
+    // (not in the dispatcher) so this call can observe whether it is
+    // the session's first.
+    let first_bpwr_of_session = !ctx.has_seen_build_paths_with_results;
+    ctx.has_seen_build_paths_with_results = true;
+
     let raw_paths = wire::read_strings(reader).await?;
     read_build_mode_normal_only(reader, stderr, "wopBuildPathsWithResults").await?;
 
     tracing::Span::current().record("count", raw_paths.len());
     debug!(count = raw_paths.len(), "wopBuildPathsWithResults");
+
+    let hook_shaped = raw_paths.len() == 1
+        && matches!(
+            DerivedPath::parse(&raw_paths[0]),
+            Ok(DerivedPath::Built {
+                outputs: rio_nix::protocol::derived_path::OutputSpec::All,
+                ..
+            })
+        );
+    let priority_class: &'static str = if first_bpwr_of_session && hook_shaped {
+        "interactive"
+    } else {
+        "ci"
+    };
 
     let mut results = Vec::new();
 
@@ -1950,7 +2344,8 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
     }
 
     if !all_nodes.is_empty() {
-        let build_result = match submit_dag(stderr, ctx, all_nodes, all_edges).await {
+        let build_result = match submit_dag(stderr, ctx, all_nodes, all_edges, priority_class).await
+        {
             Ok(DagSubmitOutcome::Gated) => return Ok(()),
             Ok(DagSubmitOutcome::Rejected(reason)) => {
                 BuildResult::failure(BuildStatus::InputRejected, reason)
@@ -1960,10 +2355,8 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                 warn!(error = %e, "wopBuildPathsWithResults: build submission failed");
                 metrics::counter!("rio_gateway_errors_total", "type" => "scheduler_submit")
                     .increment(1);
-                BuildResult::failure(
-                    BuildStatus::TransientFailure,
-                    format!("scheduler error: {e}"),
-                )
+                // r[impl gw.build.scheduler-rejection-permanent]
+                submit_failure_result(&e)
             }
         };
 

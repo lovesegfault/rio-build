@@ -38,6 +38,12 @@ rec {
   # submit. Drives vm-ca-cutoff-standalone.
   caChain = "${dir}/ca-chain.nix";
 
+  # Floating-CA outputs in the non-default modes (flat hashing,
+  # sha512): builder-side CA finalization and store-side verification
+  # must agree on the declared method for the upload to register.
+  # Built by ca-cutoff.nix with `-A flat` / `-A sha512`.
+  caModes = "${dir}/ca-modes.nix";
+
   # 300KiB single-file output → exceeds INLINE_THRESHOLD, forces the
   # chunked PutPath. Drives the chunks.nix chunk-count assertion.
   bigblob = "${dir}/bigblob.nix";
@@ -72,6 +78,13 @@ rec {
   # fetcher-split fod-dead-origin subtest.
   fodDeadOrigin = "${dir}/fod-dead-origin.nix";
 
+  # Flat-hash FOD with an s3:// origin URL (unsupported transport).
+  # Succeeds only if the s3 limitation is per-candidate so the hashed
+  # mirror is still consulted (round-16 bug_067). Shares the
+  # fod-dead-origin probe body/hex. fetcher-split fod-s3-origin.
+  fodS3Origin = "${dir}/fod-s3-origin.nix";
+  ergOnDrv = "${dir}/erg-on-drv.nix";
+
   # Recursive-hash FOD whose output is a directory (`mkdir $out`).
   # Regression: whiteout-on-output → EIO on mkdir. fetcher-split fod-dir.
   fodDir = "${dir}/fod-dir.nix";
@@ -80,6 +93,11 @@ rec {
   # P0308 regression: failure must propagate without FUSE-lookup hang.
   # fetcher-split fod-fail.
   fodFail = "${dir}/fod-fail.nix";
+
+  # Flat-hash FOD whose origin serves wrong content (200, body ≠
+  # declared hash). The FOD hash gate must reject it before upload and
+  # the output may never reach the store. fetcher-split fod-bad-hash.
+  fodBadHash = "${dir}/fod-bad-hash.nix";
 
   # sha256 hex of the body fod-dead-origin.nix expects. Computed from
   # the same literal so the served path and the FOD's outputHash agree.

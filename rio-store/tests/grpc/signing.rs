@@ -20,7 +20,7 @@ const CLUSTER_SIGNING_SEED: [u8; 32] = [0xCC; 32];
 const TENANT_SIGNING_SEED: [u8; 32] = [0xDD; 32];
 
 fn make_test_signer() -> Signer {
-    Signer::from_seed("test.cache.org-1", &TEST_SIGNING_SEED)
+    Signer::from_seed("test.cache.org-1", &TEST_SIGNING_SEED).unwrap()
 }
 
 /// PutPath with a signer: signature lands in narinfo.signatures and is
@@ -256,7 +256,7 @@ async fn put_path_with_tenant_jwt_signs_with_tenant_key() -> TestResult {
         .await?;
 
     // --- 2. Build service with TenantSigner(cluster, pool) ------------
-    let cluster = Signer::from_seed("cluster-e2e-1", &CLUSTER_SIGNING_SEED);
+    let cluster = Signer::from_seed("cluster-e2e-1", &CLUSTER_SIGNING_SEED).unwrap();
     let ts = TenantSigner::new(cluster, db.pool.clone());
     let service = StoreServiceImpl::new(db.pool.clone()).with_signer(ts);
 
@@ -337,7 +337,7 @@ async fn put_path_without_jwt_claims_falls_back_to_cluster_key() -> TestResult {
     use base64::Engine;
     use ed25519_dalek::{Signature, SigningKey, Verifier};
 
-    let cluster = Signer::from_seed("cluster-e2e-1", &CLUSTER_SIGNING_SEED);
+    let cluster = Signer::from_seed("cluster-e2e-1", &CLUSTER_SIGNING_SEED).unwrap();
     // new_with_signer wraps in TenantSigner internally.
     let mut s = StoreSession::new_with_signer(cluster).await?;
 

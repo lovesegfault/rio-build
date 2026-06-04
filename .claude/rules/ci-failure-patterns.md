@@ -21,6 +21,7 @@ Reference catalog of CI-gate failure signatures that have bitten this project at
 | **statix style** | statix lint → shows under the `pre-commit` check, not standalone | `inherit (pkgs) lib` not `lib = pkgs.lib`. Mechanical fix. |
 | **stdenv pipefail SIGPIPE** | `runCommand` build fails exit-1 with no stderr; buildCommand has a `producer | head -c N` shape | stdenv sets `set -o pipefail`; head closes pipe → producer SIGPIPE → exit≠0. Reverse to `head -c N input | consumer`, or prefix `set +o pipefail;`. |
 | **Cilium config no-restart** | `helm upgrade cilium --reuse-values --set X` succeeds but `cilium-dbg config` still shows old value | Chart doesn't checksum-annotate `cilium-config` ConfigMap → DS pods don't restart. `kubectl -n kube-system rollout restart ds/cilium` after. |
+| **Untracked file invisible to flake eval** | `nix build` fails with "path ... does not exist" / a check passes locally via cargo but the flake check can't see a new file | Flake eval reads the GIT INDEX, not the working tree. `git add -A` before any `nix build`/eval of a tree with new files. Bit twice in rounds 14-15. |
 
 ## Flaky tests
 
@@ -35,6 +36,7 @@ Reference catalog of CI-gate failure signatures that have bitten this project at
 | **Parallel test order-dependence** | Passes solo, fails under `nextest` parallelism | Shared fs state or global mutable. Add a nextest `[test-groups.<name>]` with `max-threads = 1` in `.config/nextest.toml`, then `[[profile.default.overrides]]` filter (see `golden-daemon`, `postgres` groups). Or actually fix the shared state. |
 | **Envoy LB to standby replica** | `dashboard-gateway` body-grep for `grpc-status:0` finds nothing; HTTP 200 | `scheduler.replicas=2` → envoy load-balances; standby returns `Unavailable` as Trailers-Only (status in HTTP *headers*, empty body). Fixed via `BackendTrafficPolicy` retry-on-unavailable (`dashboard-gateway-policy.yaml`). If seen again, check the policy's `Accepted` status. |
 | **nginx LB to standby replica** | `vm-dashboard-k3s` "gRPC-Web … via nginx" 60s timeout; nginx access log all `200 0` (zero body bytes) | Same standby Trailers-Only as above, but nginx → ClusterIP has no retry policy and the backend choice does NOT re-roll per attempt (observed 60/60 to the standby). Fixed by scaling the scheduler to 1 replica before the nginx subtests (`dashboard.nix`). If seen again with one replica, the lone pod lost the lease — check its logs, not the LB. |
+| **k3s pool-CR bootstrap timeout under gateway load** | `vm-dashboard-k3s` fails at the shared `k3s-full.nix` "Pool reconciled" wait (120s); dump shows the Pool CR present with empty READY/DESIRED, controller `--tail=80` all DEBUG h2 frames plus benign standby `NotServing` probes | Bring-up tail under heavy concurrent VM-test load (the only `gatewayEnabled` scenario; budget already widened 60→120s in db364c0ae). Passes solo — re-run the single check first. If it recurs, make the dump useful (filter the h2 noise, add scheduler logs + `get pods -o wide`) before widening the budget again. |
 
 **Strategy preference:** structural > retry > widen. Retry is cheap but hides drift; structural fixes the root.
 

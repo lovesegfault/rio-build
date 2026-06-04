@@ -25,8 +25,8 @@ distinguished by `RIO_EXECUTOR_KIND`.
 - Set up the build's overlay filesystem: FUSE mount as lower layer, local SSD
   as upper layer; the overlay's merged dir is bind-mounted at `/nix/store`
   inside the build's mount namespace
-- Execute build: invoke `nix-daemon --stdio` locally for sandboxed build
-  execution
+- Execute build: construct a rio-exec sandbox and run the derivation's
+  builder in it natively
 - Stream build logs back to scheduler via gRPC bidirectional streaming
 - After build: upload output @nar to rio-store (chunked), report completion
 - Heartbeat / health checking to scheduler
@@ -44,7 +44,7 @@ to lazily fetch @store-path content on demand.
 
 #figure(
   caption: [Builder pod store layout. The FUSE mount is the overlay's lower;
-    nix-daemon's chroot store points at the merged dir.],
+    the build sandbox mounts the merged dir writable at `/nix/store`.],
   diagram(
     spacing: (16mm, 11mm),
     node-stroke: 0.5pt,
@@ -76,7 +76,9 @@ to lazily fetch @store-path content on demand.
     ),
     node(
       (0, 3.2),
-      align(left)[nix sandbox\ #text(size: 0.8em)[(user/mount/PID/net ns)]],
+      align(
+        left,
+      )[rio-exec sandbox\ #text(size: 0.8em)[(mount/PID/IPC/UTS/cgroup ns)]],
       name: <sb>,
       stroke: (dash: "dashed"),
     ),
@@ -133,16 +135,20 @@ to lazily fetch @store-path content on demand.
   coreutils, etc.) stay warm at the storage layer even though every pod-level
   FUSE cache is fresh.
 
-#r("builder.platform.i686")[
-  The per-build daemon's `nix.conf` MUST set `extra-platforms` to the worker's
-  resolved `RIO_SYSTEMS` (minus the `builtin` pseudo-system). This keeps
-  daemon acceptance consistent with what the heartbeat advertises to the
-  scheduler: an x86_64 Pool with `systems: [x86_64-linux, i686-linux]` routes
-  i686 derivations to its pods, and the daemon accepts them because
-  `extra-platforms = x86_64-linux i686-linux`. The host system appearing in
-  `extra-platforms` is a no-op; on aarch64 builders the line contains only
-  `aarch64-linux` so the setting is inert.
+#r("builder.platform.i686+2")[
+  When a worker executes a derivation whose `system` is a 32-bit platform
+  hosted by its 64-bit kernel (`i686-linux` on an `x86_64-*` worker, 32-bit
+  ARM on an `aarch64-*` worker), the executor MUST set the 32-bit
+  architecture personality (`PER_LINUX32`) on the build process before
+  `execve`, so `uname -m` and the syscall ABI observed by the build match
+  the declared system.
 ]
+Routing is unchanged: a Pool advertising `systems: [x86_64-linux, i686-linux]`
+still receives i686 derivations via the heartbeat. The personality switch
+(`personality_for` in the request glue, applied by rio-exec before exec) is
+what makes the accepted build behave as i686 --- the daemon-era
+`extra-platforms` `nix.conf` mechanism is gone with the daemon, and the
+multi-ABI seccomp filter already admits the 32-bit syscall ABI.
 
 #r("builder.fuse.cache-ephemeral-memory")[
   The SQLite cache index is `:memory:` --- the pod's filesystem is discarded
@@ -160,6 +166,29 @@ to lazily fetch @store-path content on demand.
   a compromised store could otherwise write arbitrary files on builder nodes
   via the FUSE fetch path.
 ]
+
+#r("builder.nar.restore-bounds")[
+  NAR materialization bounds MUST be kernel-equivalent and typed: entry
+  names are bounded at parse to 255 bytes (Linux `NAME_MAX`) and the
+  RESTORED path --- destination root plus every joined component --- is
+  bounded at the join to 4095 bytes (`PATH_MAX - 1`), each rejection a
+  typed `NarError`, never a deferred syscall errno.
+]
+
+This is a registered divergence from the oracle, which has no
+parse-time bounds (the kernel itself rejects at materialization with
+`ENAMETOOLONG`). Rio rejects earlier because its in-process fetch
+retry ladder classifies failures by their producing statement: a
+payload that deterministically cannot be materialized must surface as
+a typed payload property (permanent for the candidate), not as an
+errno-bearing `io::Error` indistinguishable from a worker-local disk
+fault --- under the pre-bound shape such payloads re-entered the
+transient retry ladder and re-downloaded the full body per attempt
+(round-17 merged_bug_022; up to 5 attempts × the per-attempt transfer
+cap of payload movement). Per-component bounds alone do not compose:
+255-byte names at the allowed nesting depth join to a ~64 KiB path
+that every syscall rejects, hence the cumulative bound at the joined
+path, where it is first known.
 
 #r("builder.nar.canonical-mtime")[
   Regular files and directories restored from a NAR MUST have their
@@ -412,30 +441,47 @@ affect the FUSE daemon implementation:
   fallback not activated.*
 ]
 
-= Builder Nix Configuration
+= Sandbox Configuration
 
-Builder pods ship a minimal `nix.conf` with an optional operator override from
-the `rio-nix-conf` ConfigMap, mounted *as a directory* at `/etc/rio/nix-conf/`
-(not via `subPath` --- an optional ConfigMap with `subPath` produces an empty
-directory rather than a clean ENOENT, which caused `substitute=true` to
-silently re-enable and hang on DNS). `setup_nix_conf` checks
-`/etc/rio/nix-conf/nix.conf` first; if present, it's copied into the overlay.
-Otherwise the compiled-in default is used:
+The native executor needs no `nix.conf`: every behavior the daemon-era
+configuration carried is either structural (substitution cannot happen ---
+inputs come exclusively through the FUSE-backed store view), enforced in code
+(the rio-exec sandbox is always on and never falls back to an unsandboxed
+build), or expressed as explicit worker configuration:
 
-```ini
-# Prevent build hook recursion --- workers ARE the builders
-builders =
-# All substitution handled by rio-store; don't try external substituters
-substitute = false
-# Enable sandbox for build purity
-sandbox = true
-# Hard-fail if sandbox setup fails (never fall back to unsandboxed builds)
-sandbox-fallback = false
-# Prevent derivations from accessing paths outside the Nix store during eval
-restrict-eval = true
-# Content-addressed derivation support (Phase 2c+)
-experimental-features = ca-derivations
-```
+#r("builder.sandbox.shell")[
+  `RIO_SANDBOX_SHELL` MUST point at a statically linked POSIX shell in the
+  worker image; the executor bind-mounts it read-only at `/bin/sh` inside
+  every build sandbox. nixpkgs builds assume `/bin/sh` exists. An empty value
+  disables the mount and is only viable for corpora whose builders never
+  invoke `/bin/sh`.
+]
+
+#r("builder.sandbox.identity")[
+  Every sandbox request the builder constructs MUST carry the Nix sandbox
+  identity --- user `nixbld`, group `nixbld`, GECOS `Nix build user` ---
+  obtained from the glue's single construction point
+  (`nix_sandbox_identity()`); the generic and `builtin:fetchurl` request
+  paths MUST NOT assemble the identity independently.
+]
+
+The names are CppNix sandbox ABI, not decoration: they are observable from
+inside the build (`whoami`, `id`, getpwuid) and get baked into outputs
+("built by" banners, perl's `Config.pm`), so the differential corpus
+byte-compares them (`build-user` / `sandbox-identity` entries). The executor
+side is deliberately ignorant of the value: `SandboxIdentity` is a mandatory
+`rio-exec` request field with no default (#rref("exec.request.identity")),
+which is what lets the `rio-exec-boundary` check ban the literal from the
+executor crate entirely.
+
+- `RIO_CA_BUNDLE` --- host path of the CA bundle exposed read-only at
+  `/etc/ssl/certs/ca-certificates.crt` inside network (fixed-output) sandboxes
+  (default: the worker image's `cacert` bundle).
+- `RIO_EXTRA_SANDBOX_PATHS` --- additional host paths bind-mounted read-only
+  into every sandbox, for site-local impurities.
+- `RIO_HASHED_MIRRORS` --- content-addressed mirrors consulted by
+  `builtin:fetchurl` (#rref("fetcher.mirrors.hashed")), injected by the
+  controller from the Pool spec.
 
 #info(title: [Security note])[
   `__noChroot` derivations (which disable the sandbox) are rejected at the
@@ -443,8 +489,11 @@ experimental-features = ca-derivations
   the security chapter.
 ]
 
-This configuration ensures workers only build derivations locally and never
-attempt to delegate or substitute externally.
+#warning(title: [Recursive Nix is not supported])[
+  Derivations that invoke Nix internally (`recursive-nix`) fail: there is no
+  Nix inside the sandbox to invoke, no daemon socket to talk to, and inputs
+  are limited to the declared closure. This remains an explicit non-goal.
+]
 
 == Builder Capabilities
 
@@ -476,123 +525,594 @@ can route derivations:
   instance, significantly complicating the builder architecture.
 ]
 
-= rio-nix Client Protocol
+= Native Build Execution
 
-#r("builder.daemon.stdio-client")[
-  Builders invoke `nix-daemon --stdio` and must speak the Nix worker protocol
-  as a *client*. The `rio-nix` crate implements both server-side (gateway:
-  responds to opcodes from Nix clients) and client-side (builder: sends
-  `wopBuildDerivation` to the local daemon and receives `BuildResult`)
-  protocol handling.
+The builder executes derivations itself: the request glue translates the
+parsed derivation and its resolved input closure into a build-system-agnostic
+`rio_exec::ExecutionRequest`, the rio-exec sandbox runs it, and the native
+result pipeline classifies the exit and processes the outputs. No Nix binary
+is present in the worker image and no external process is delegated to.
+Derivations whose builder is a `builtin:` program (today `builtin:fetchurl`)
+are no exception: the worker implements them natively by re-exec'ing its own
+binary in fetch mode inside the same rio-exec sandbox --- network reachable
+only because such derivations are fixed-output --- as specified in the
+fetcher component (#rref("fetcher.fetchurl.sandboxed")).
+
+#r("builder.exec.sandbox+3")[
+  Every build runs inside a rio-exec sandbox constructed from fresh Linux
+  namespaces: mount, PID, IPC, UTS, and cgroup for every build, plus a fresh
+  (loopback-only) network namespace for every build EXCEPT fixed-output
+  derivations --- FODs skip the network namespace so they retain network
+  access for their fetch. The input closure is bind-mounted read-only inside a
+  writable per-build store view, a private `/proc`, `/dev` and `/etc`
+  population, `pivot_root` into the per-build root, a multi-ABI seccomp
+  filter (covering the native, 32-bit sibling, and x32 syscall ABIs) that
+  denies setting setuid/setgid mode bits with `EPERM` and denies the
+  extended-attribute get/set families --- including their kernel ≥ 6.13
+  `*xattrat` forms --- with `ENOTSUP`, `PR_SET_NO_NEW_PRIVS`, and a drop to
+  the unprivileged build user before `execve`. Sandbox construction failure
+  MUST fail the build attempt (never fall back to an unsandboxed build).
 ]
 
-#r("builder.daemon.no-unwrap-stdio")[
-  When spawning `nix-daemon --stdio`, never `.unwrap()` on
-  `daemon.stdin.take()` / `daemon.stdout.take()` --- use `.ok_or_else()`.
+#r("builder.exec.structured-attrs")[
+  A derivation is treated as structured-attrs iff its environment carries the
+  `__json` blob (the same detection as Nix's `ParsedDerivation`); the
+  `__structuredAttrs` name never appears as an env var in instantiated
+  derivations. For structured-attrs builds the executor materializes
+  `.attrs.json` and `.attrs.sh` in the build directory and exports only
+  `NIX_ATTRS_JSON_FILE`/`NIX_ATTRS_SH_FILE` alongside the base environment.
 ]
 
-#r("builder.daemon.timeout-wrap")[
-  Wrap all daemon communication in `tokio::time::timeout` (default: 2h,
-  configurable via `RIO_DAEMON_TIMEOUT_SECS` / `--daemon-timeout-secs` /
-  `builder.toml`).
+#r("builder.exec.env-precedence")[
+  The builder environment MUST be assembled in CppNix `initEnv`'s statement
+  order — base values, then the derivation's (desugared) env, then the
+  build-directory variables, then `NIX_OUTPUT_CHECKED=1` for fixed-output
+  derivations, then `impureEnvVars`, and finally `NIX_LOG_FD=2` and
+  `TERM=xterm-256color` — with a later layer overwriting an earlier one on
+  key collision. In particular: a derivation attribute MUST NOT override
+  `NIX_OUTPUT_CHECKED`, a listed `impureEnvVars` name MAY (oracle parity),
+  and `NIX_LOG_FD`/`TERM` always win over everything including
+  `impureEnvVars`.
 ]
 
-#r("builder.daemon.kill-both-paths")[
-  Always `daemon.kill().await` in both success and error paths, and set
-  `kill_on_drop` on the Command to guard against early-exit leaks.
+The layer order is encoded once (`EnvLayer`/`LAYER_ORDER` in the request
+glue) and each layer cites its statement range in the pinned oracle source.
+The value source for `impureEnvVars` remains the operator-configured map
+only — never the worker process's environment — which is a deliberate,
+documented divergence in value *source*, not in layer *position*. The
+`fod-env-precedence` differential entry executes both sides with adversarial
+attribute collisions and a declared FOD hash equal to the oracle-order
+answer, so any future precedence drift turns the merge gate red instead of
+surviving as a misread of the C++.
+
+#r("builder.exec.attrs-sh-numeric")[
+  The `.attrs.sh` rendering of a JSON number MUST match the oracle's
+  `handleSimpleType`: the value is emitted iff its `float` (f32) view is
+  integral, and the emitted text is the `int` (i32) conversion of the stored
+  value — modular wrapping for 64-bit integers, and the x86-64
+  `cvttsd2si` result (truncation toward zero; out-of-range and NaN yield
+  `-2147483648`) for doubles. `.attrs.json` MUST keep the full-precision
+  value; only the shell surface is 32-bit.
 ]
 
-#r("builder.daemon.negotiated-version")[
-  The builder MUST pass the version negotiated by `client_handshake` to all
-  subsequent version-dependent wire reads (notably `read_build_result`).
-  Hardcoding `PROTOCOL_VERSION` desyncs on the next protocol bump if the
-  pinned daemon lags, or on any container rebuild with a daemon that
-  negotiates lower. `client_handshake` enforces a `MIN_DAEMON_VERSION` floor
-  (mirroring `server_handshake`'s `MIN_CLIENT_VERSION`) so an
-  unexpectedly-old daemon fails at handshake with a clear error rather than a
-  wire desync at result-read.
+The f32 gate means a non-integral double whose f32 view rounds to an
+integer (16777217.5 → 16777218.0f) IS emitted — as its f64 truncation —
+while 2.5 is skipped; and 5000000000 renders as 705032704. These are
+nlohmann/x86-64 artifacts, not design: stdenv sources `.attrs.sh`, so the
+bytes are observable by every structured-attrs build and parity is the only
+correct behavior. The boundary values live in the `structured-attrs`
+differential entry (the one that byte-compares `.attrs.sh`), so the gate
+executes the oracle on the wrap and rounding edges rather than trusting
+this paragraph.
+
+#r("builder.exec.structured-attrs-typed")[
+  Every read of a *behavioral* structured attribute — output policy
+  (`outputChecks`, `unsafeDiscardReferences`), graph expansion
+  (`exportReferencesGraph`), env semantics (`impureEnvVars`, `passAsFile`),
+  and sandbox shape (`__noChroot`) — MUST go through the fail-closed typed
+  accessors mirroring the oracle's `json-utils.cc` getters: a wrong-typed
+  value or an unparseable `__json` blob is an error, never a silent skip,
+  coercion, element drop, or fallback to a default. Lenient
+  (degrade-to-absent) reads are permitted ONLY for the scheduling-hint
+  attributes enumerated by the `SizingHint` type.
 ]
 
-#r("builder.retry.daemon-transient")[
-  The build-spawn loop retries `execute_build` locally when the failure is
-  daemon-transient: `DaemonSpawn` (nix-daemon failed to exec), `Handshake`
-  (daemon died before protocol negotiation), or `Wire(Io(UnexpectedEof))`
-  (daemon crashed mid-conversation --- core dump, OOM-kill, SIGABRT). Up to
-  `DAEMON_RETRY_MAX=3` attempts with backoff `500ms/1s/2s` (no jitter --- one
-  daemon per pod, no herd). After exhaustion the error propagates as
-  `InfrastructureFailure` and the scheduler's own retry policy takes over. The
-  retry MUST short-circuit if the build's cancelled flag is set.
-  `BuildFailed`, network-side errors (`Upload`/`Grpc`/`MetadataFetch`), and
-  deterministic setup failures (`Overlay`/`SynthDb`/`NixConf`) are NOT retried
-  locally. Rationale: a scheduler round-trip re-dispatches + re-fetches
-  closure + re-generates synth DB; without the local retry a hot-loop daemon
-  crash flooded the scheduler with 800+ `InfrastructureFailure` reports in
-  \<10min.
+The pre-fix readers were fail-open three ways: unparseable `__json`
+neutralized every behavioral attribute at once (`outputChecks` simply
+vanished), wrong-typed values fell through to defaults (`maxSize: "1024"`
+meant *no* size limit), and `filter_map` silently shrank lists
+(`allowedReferences: ["ok", 42]` dropped the 42 — and with it the error the
+oracle raises). The oracle throws on all three (`getBoolean`/`getString`/
+`getStringList`/`getObject`, plus nlohmann's implicit `uint64` conversion
+for `maxSize`, whose float-truncation and signed-wrap acceptance is
+mirrored, not "fixed" — divergence here would reject derivations the
+oracle builds). The `SizingHint` enum is the compile-time bound on the
+lenient tier: pod-sizing hints read at submission time, where failing a
+build over a bad `pname` would reject derivations the oracle accepts;
+widening the enum is the only way to add a lenient read, so every new
+exemption is a one-line reviewable diff.
+
+#r("builder.glue.pure")[
+  The request glue MUST hold no filesystem capability: every input byte it
+  consumes --- derivation text for `exportReferencesGraph` expansion
+  included --- arrives as a parameter resolved upstream at input
+  resolution. Resolution I/O failures MUST be classified
+  infrastructure-transient at the resolve step, never inside the glue: a
+  `GlueError` is always a permanent property of the inputs.
 ]
 
-#r("builder.silence.timeout-kill")[
+The capability deletion is what closes the blocking-in-async family: the
+glue runs on the blocking pool as pure CPU (parse + closure walk +
+serialization), and a future glue change *cannot* reintroduce a FUSE-backed
+read because there is no store directory, no path join, and no `std::fs`
+call to reach for --- the `ClosureIndex` consumes a caller-supplied
+derivation-text table. The table is the retained input-drv texts plus the
+declaration-derived demand below; the original "residual closure `.drv`s
+(typically none)" premise was structurally false --- by the text-CA
+invariant every transitive `.drv` is in the input closure, so for deep
+dependency chains the residual was the entire transitive `.drv` closure,
+re-fetched on every build whether or not anything would read it (the
+I-110 amplification shape).
+
+#r("builder.glue.drv-table-demand")[
+  The derivation texts fetched for the glue's table MUST be exactly the
+  demand derived from the build's own `exportReferencesGraph`
+  declaration --- the only demand origin, since the glue's `.drv`
+  expansion only ever parses `.drv` members of a declared graph's
+  reference closure. The demand MUST be derived with the SAME
+  reference-closure walk the glue's expansion uses, so the producer and
+  the consumer cannot diverge; a build with no declaration incurs zero
+  graph-purpose `.drv` fetches at any closure depth. A declaration the
+  glue would reject contributes no demand: the glue owns the canonical
+  rejection, and the demand model neither duplicates nor pre-empts it.
+]
+
+#r("builder.exec.refs-graph-acyclic")[
+  `exportReferencesGraph` materialization MUST terminate with auxiliary
+  memory linear in the closure size, and MUST reject cyclic reference
+  metadata (any cycle other than a self-reference) as a permanent input
+  rejection naming the paths involved --- never as a worker-transient
+  failure. Both render forms --- the flat registration-text file and the
+  structured-attrs JSON array --- MUST reject identically, before any
+  graph output is produced.
+]
+
+CppNix never faces this case: its local store's `registerValidPaths` runs a
+topological sort that makes cyclic reference metadata unrepresentable, so
+`exportReferences` may assume acyclic input. rio-store deliberately admits
+cycles so GC can reclaim mutually-referencing garbage
+(#rref("store.gc.sweep-cycle-reclaim")), which moves the acyclicity check to
+the consumer. Transient classification would convert one hostile
+registration into an unbounded retry storm: the rejection is structurally
+excluded from the glue's transient-I/O bucket, and the traversal itself is
+delegated to `rio_nix::closure` (#rref("nix.closure.cycle-safe")) so no
+hand-rolled walk can reintroduce the hang.
+
+#r("builder.exec.ca-finalize")[
+  Floating content-addressed outputs are built at deterministic scratch paths
+  and finalized by the result pipeline in topological order: accumulated
+  sibling rewrites are applied *before* hashing, the content address is the
+  hash of the rewritten content modulo the output's own scratch hash, the
+  final store path is computed with the self-reference flag when the output
+  references itself, and the output is moved to its realized path with its
+  references remapped. Realized paths (not scratch paths) are reported to the
+  scheduler and uploaded to the store with their content-address descriptor.
+]
+
+#r("builder.exec.declared-path-validated+1")[
+  A malformed declared output path MUST be unrepresentable in the glue's
+  input type: the typed parse boundary (#rref("nix.drv.output-typed"))
+  validates every non-empty declared output path with `StorePath::parse`
+  at construction, and every host-side filesystem join over an output
+  location MUST use the basename of the TYPED store path — the free
+  string re-derivation has no remaining data source.
+]
+
+#r("builder.exec.output-types-unmixed+1")[
+  A derivation in which a floating content-addressed output coexists with
+  an output of any other kind MUST be unrepresentable in the glue's and
+  the result pipeline's input types: the drv-level classifier
+  (#rref("nix.drv.type-classify+1")) rejects the mix at construction with
+  CppNix's wording ("can't mix derivation output types"), so neither
+  component carries a re-check.
+]
+
+Only floating outputs are restored through the CA finalization's rewriting
+sink; a non-CA sibling in the same derivation would get its *references*
+remapped to the final CA paths while its *bytes* still name the scratch
+paths — a corrupt artifact that is now structurally impossible to ask the
+pipeline to produce (`nix-instantiate` refuses the shape too, which is why
+the differential corpus cannot pin this rule; unit tests against the
+oracle's wording are the evidence). Both rules are structural inheritance
+of the parse boundary across the sandbox, builtin, and differential paths.
+
+Defense in depth under #rref("sec.trust.workers-untrusted"): the
+authoritative rejection is the gateway's binding gate
+(#rref("gw.reject.output-path-mismatch+2")) and the scheduler's ingress shape
+check (#rref("sched.merge.ingress-output-path-shape")); a malformed
+declaration reaching the worker means both were bypassed. The planning-time
+invariant matters because the joins run in the builder's root context against
+the overlay upper store — with a raw-string fallback, a declared "path" like
+`/build/exfil` would strip to itself and the join would escape the upper
+store entirely (an absolute path replaces the join target).
+
+#r("builder.exec.canonicalise-xattr-errno")[
+  The xattr-strip pass of output canonicalisation MUST dispose of syscall
+  errnos exactly as the oracle's `canonicalisePathMetaData_`
+  (`posix-fs-canonicalise.cc:67-84`) does, arm by arm: the `llistxattr`
+  size probe tolerates `ENOTSUP` (no xattr support) and `ENODATA`
+  (SSHFS-class filesystems answer the list probe with it) as
+  success-empty and fails the build on anything else; the `llistxattr`
+  buffer fill tolerates nothing; `lremovexattr` skips the kernel-owned
+  ACL names of the oracle's `ignored-acls` default
+  (`security.selinux`, `system.nfs4_acl`, `security.csm` —
+  `local-settings.hh:590-600`) before attempting removal. The single
+  registered divergence: rio additionally tolerates
+  `ENOTSUP`/`ENODATA` from `lremovexattr` itself, where the oracle
+  would fail the build on a benign list→remove race (an attribute
+  removed concurrently, or xattr support vanishing mid-walk) — strictly
+  more permissive only for an attribute that is already gone, never for
+  one that remains.
+]
+
+The errno tables are the parity unit, kept in one test-reachable
+function (`xattr_errno_tolerated`) precisely because the load-bearing
+answers cannot be produced by local filesystems in a unit test:
+`ENODATA` from a *list* call is an SSHFS-class translation (the bug
+this rule pins was every build on such a filesystem failing permanently
+as an output rejection where stock Nix succeeds), and `ENOTSUP` from a
+*fill* call requires xattr support to vanish between two adjacent
+syscalls. A table the tests can pin is the difference between "exact
+parity" as a doc claim and as an artifact.
+
+== Sandbox process-tree lifecycle
+
+The executor forks twice (parent → intermediate → sandbox child) and
+supervises the resulting tree through pipes whose EOF carries protocol
+meaning: go-pipe EOF means "the parent died before releasing the build",
+status-pipe EOF means "the program exec'd". The rules in this subsection make
+the tree's lifetime and those EOF semantics structural guarantees ---
+properties of types and call ordering --- rather than conventions each call
+site re-implements.
+
+#r("builder.exec.fd-keep-set+1")[
+  Every forked executor process MUST close all inherited file descriptors
+  outside its explicit keep set before its first blocking read: the
+  intermediate immediately after fork, keeping only the status-pipe write
+  end, the go-pipe read end, the placement-socket write end, and the
+  capture fds; and again down to stdio immediately after forking the
+  sandbox child and sending the placement message. A forked process MUST
+  NOT hold a copy of a pipe end whose EOF it (or its supervisor) waits
+  on. The go pipe carries a two-byte gate --- byte 1 releases the
+  intermediate once the parent has attached it to the cgroup, byte 2
+  releases the sandbox child once the parent has placed it in the build
+  sub-cgroup --- so the intermediate MUST keep the read end open across
+  its own gate (the child it forks inherits the live byte-2 gate) and
+  MUST shed its copy in the post-fork sweep, which is what keeps both
+  gates' EOF semantics parent-only.
+]
+
+The keep-set sweep is what turns go-pipe EOF into a genuine parent-death
+signal: before it, the intermediate inherited the parent's copy of the go
+pipe's write end, so the "parent died before releasing the sandbox" branch
+could never fire and a crashed parent left the intermediate parked forever.
+CppNix's `userNamespaceSync` pipe relies on the same discipline (the child
+side closes its inherited write end immediately after fork in
+`linux-derivation-builder.cc`). The sweep also caps what the sandbox child
+can ever inherit at the keep set, independent of which fds the embedding
+process (rio-builder, a test harness) happens to have open --- a future fd
+added to the worker cannot silently leak into the sandbox or re-break the
+EOF protocols. The placement socket is the keep set's fifth member: the
+intermediate uses it once, between forking the sandbox child and the
+sweep, to hand the parent the child's pid plus a pidfd (`SCM_RIGHTS`) ---
+the recycle-proof principal handle that the sub-cgroup placement and
+every later principal-directed kill consume.
+
+#r("builder.exec.pdeathsig-first")[
+  The sandbox child MUST arm its parent-death signal (`PR_SET_PDEATHSIG`
+  delivering `SIGKILL`) as the *first* statement of its setup sequence ---
+  before the session, stdio, mount, pivot, and hardening steps --- and MUST
+  re-arm it immediately after the credential drop, because the kernel clears
+  the death signal on `setuid`. Intermediate death therefore cascades to the
+  sandbox child throughout setup, not only after the privilege drop.
+]
+
+This is oracle parity: CppNix's `runChild` arms `dieWithParent` as its first
+action (`processes.cc`), and the post-`setuid` re-arm mirrors its
+`preserveDeathSignal` handling. Without a per-build cgroup, two residual
+windows remain where intermediate death does not cascade --- the handful of
+instructions in [fork, first arm] and [`setuid`, re-arm]; with a cgroup the
+executor's cgroup kill covers both. The windows and the deferred
+`CLONE_PARENT`/`sendPid` alternative (a recycled-pid kill hazard under this
+executor's reaping topology) are documented at the executor's kill guard.
+
+#r("builder.exec.tree-ownership")[
+  A forked sandbox process tree MUST be owned by a kill guard that is armed
+  *before* the fork is submitted for execution. Adoption into the guard is
+  the only path by which a forked pid becomes known to the executor; a fork
+  whose guard has already been dropped MUST destroy (kill and reap) the
+  process it just created instead of publishing it. Dropping the guard at
+  any await point kills the adopted tree --- and reaps it when no dedicated
+  reaper task is attached yet --- and a kill MUST never target a pid that
+  has already been reaped.
+]
+
+The rule exists because the prior design had two per-path holes: the kill
+guard was armed only *after* the fork's `spawn_blocking` await resumed, so a
+future dropped during that window leaked the freshly forked tree (and the
+caller's child-side pipe fds, dropped with the future, could be recycled
+into the in-flight fork); and the no-cgroup kill relied on the pid being
+un-reaped without anything enforcing it (3cfe38c36 fixed one instance of
+that by hand). The armed → adopted → reaped/dead state machine makes both
+impossible by construction: pids exist only inside the state machine, and
+every transition that could race (adopt vs. guard drop, kill vs. reap) is
+serialized by it.
+
+#r("builder.exec.caller-serialization")[
+  rio-exec performs no execution-level concurrency control: the caller MUST
+  NOT overlap executions of the same executor instance. The sandbox identity
+  is a singleton host uid (no user namespace), and `fork(2)` copies the fd
+  table, so overlapping executions could observe and signal each other's
+  process trees and inherit each other's pipes. rio-builder satisfies this
+  contract with `BuildSlot`: one build per pod; an assignment arriving while
+  the slot is busy is rejected, never queued.
+]
+
+The rule's home matters as much as its text: the implementation marker sits
+on `BuildSlot::try_claim` --- the code that actually enforces the contract
+--- not on rio-exec, which only documents it. A future claim that "the
+executor rejects concurrent executions" (the rustdoc fiction this rule
+replaces) would now be a tracey-visible broken reference instead of prose
+nobody can falsify.
+
+#r("builder.exec.limits-isolated+2")[
+  The executor's limit enforcement --- the wall-clock timeout, the
+  max-silent deadline, and the log-volume cap --- MUST execute in a
+  dedicated watchdog task that performs no channel sends and owns only
+  the kill handle, its deadline timers, and an activity watch fed at
+  raw-read time by the capture readers. No event-consumer behavior may
+  delay a limit kill. A recorded limit kill MUST be attributed to the
+  exit outcome only when the wait status is one the kill, *as
+  targeted*, could have produced: a post-placement principal kill is
+  corroborated only by the relay's forwarded `128+9` (the relay
+  survives such a kill by construction, so a relay that itself died of
+  `SIGKILL` does not corroborate); a pre-placement tree kill is
+  corroborated by either the direct `SIGKILL` death or the forwarded
+  form. A natural exit MUST win over a kill that raced it --- including
+  a kill that fired between the principal's exit and the relay's
+  forward. The exit MUST be observed (`waitid` + `WNOWAIT`) and the
+  tree marked settled before the wait status is consumed, so no kill
+  path can ever signal a recycled pid.
+]
+
+This is CppNix parity at the architectural level: the daemon's worker
+loop updates `lastOutput` when it *reads* builder output
+(`worker.cc:491`), computes its deadlines from that clock and the build
+start (`worker.cc:426-431`), and kills on expiry (`worker.cc:500-507`)
+--- none of which waits on any log consumer. Pre-FU1, rio-exec's
+deadline arms lived in the same `select!` as the awaited event send, so
+a stalled receiver (scheduler-link backpressure filling the worker's
+channels --- merged_bug_019) suspended every kill with it.
+
+Verdicts derive from the authoritative event, in two layers. The
+watchdog's recorded claim is the *narrowing* layer --- it exists only
+when a kill was issued against a tree the executor's phase machine
+still believed live (kill-under-the-claim-mutex; a deadline firing
+after the tree settled records nothing), and it carries the kill's
+target. But the phase machine necessarily lags the kernel by the
+window between the exit happening and the supervisor observing it, so
+the recorded claim alone is not a verdict. The wait status is the
+*deciding* layer, and what corroborates depends on the target. A
+principal kill (#rref("builder.exec.kill-targets-principal")) never
+signals the relay, so the relay always survives to forward what the
+principal actually died of: our `SIGKILL` arrives as the forwarded
+`128+9` and nothing else --- the kill machinery structurally cannot
+manufacture its own corroboration by destroying the status carrier,
+which is exactly the third-window failure (a deadline firing between
+the principal's `_exit(0)` and the relay's forward relabeled a
+completed build) that two rounds of single-process corroboration
+hardening could not close. A pre-placement tree kill still accepts
+both SIGKILL shapes; it is safe against the same window because the
+release gate guarantees no tenant instruction --- hence no completed
+build --- existed when it acted. Reap ordering closes the recycled-pid
+hazard: the exit is observed without being consumed, the phase flips
+to settled, and only then is the status reaped, so by the instant the
+kernel may recycle the pid every kill path is already disarmed.
+
+Three residuals remain, accepted and enumerated at `map_exit`. (1) A
+build that genuinely exits `137` (or is SIGKILLed by something else
+*inside* the kill scope) while an executor kill raced it is attributed
+to the executor's kill --- bit-identical at the wait level, the cost
+of the forwarding convention; bounded operationally by the canary
+metric #(refs.metric)("rio_builder_kill_verdict_outputs_present_total") (corroborated kill
+verdict + fully materialized declared outputs = the coincidence
+signature, an ISOLATED increment by construction --- the alert
+condition is a sustained rate, per
+#rref("builder.exec.kill-canary")), and irreducible without
+kernel-level exit-reason attribution, which `waitid` does not
+expose. (2) A relay stuck past the escalation grace
+after a principal kill is taken down claim-free; its `signaled(9)`
+status fails corroboration, so the verdict degrades to the honest
+`Signaled(9)` --- the claim is dropped, never honored on manufactured
+evidence. (3) An external `SIGKILL` of the relay itself (node OOM
+killer, operator) loses the forwarded status with the relay and
+likewise lands on `Signaled(9)` --- uncertainty degrades toward
+"supervision failed", never toward relabeling a build. One residual
+semantics shift from the FU1 restructure also stands: a build whose
+*writes* are blocked by a worker-internal stalled consumer can be
+silence-killed where it previously froze alongside its enforcement ---
+reaching that state requires a worker bug, since the worker's own
+consumer is structurally non-stalling (#rref("builder.relay.log-shed")).
+
+#r("builder.exec.kill-canary")[
+  The kill-verdict canary
+  (#(refs.metric)("rio_builder_kill_verdict_outputs_present_total")) MUST
+  be judged on the relay-forwarded (corroborated) exit, before any
+  builder-side log-cap override is applied for classification; its
+  producer set (TimedOut, Silent, LogLimitExceeded, maintained as an
+  exhaustive match) MUST equal the set its registered HELP text
+  documents; and the operator contract is approximately-zero with the
+  alert on a sustained rate, never on a single increment (the
+  natural-137 coincidence is benign and reachable).
+]
+
+#r("builder.exec.kill-targets-principal")[
+  The executor MUST supervise the build principal --- the sandbox
+  child, the root of the tree that runs tenant code --- as its own
+  kill target, distinct from the relay: the relay MUST hand the parent
+  the principal's pid and pidfd (over the placement socket) before the
+  principal passes its release gate, the parent MUST place the
+  principal in the `build` sub-cgroup before releasing it, and a limit
+  kill issued after placement MUST signal only the principal's kill
+  scope --- the build sub-cgroup and the pidfd --- never the relay.
+  The relay's forwarded exit status is the corroborating evidence for
+  every kill verdict and MUST NOT be destroyable by the executor's own
+  limit-kill machinery.
+]
+
+Three iterations of the same race preceded this rule (071cac1ca's
+mutex, c46da633e's acted-kill narrowing, 890de547f's corroboration
+layer), each correct about the window it named and each leaving the
+next: with kills aimed at the relay, a deadline firing inside the
+[child exit, status forward] window destroyed the only carrier of the
+natural exit and *manufactured its own corroboration* --- the relay's
+death by our SIGKILL was indistinguishable from a killed build, so a
+completed build could still be relabeled `TimedOut`/`Silent`
+(merged_bug_046/074). Supervising the principal makes that window
+unexpressible rather than narrower: the relay is never a target, so it
+always survives to forward what the principal actually did, and the
+forwarded status either corroborates the kill (`128+9`) or convicts it
+of losing the race (anything else). The placement handshake closes the
+bootstrap gap --- no tenant instruction runs before the principal is
+inside its kill scope --- and the pidfd makes the principal handle
+recycle-proof (a pidfd names the process instance, not a reusable
+number) and namespace-correct (the principal is pid 1 of the new PID
+namespace; a pidfd signals it from outside without pid translation).
+
+#r("builder.exec.event-budget")[
+  The pending-event queue between the executor's supervision loop and the
+  caller's receiver MUST charge every queued event its full retained
+  footprint --- the fixed event-struct size plus the line buffer's heap
+  capacity --- against its byte budget, so the backpressure cascade
+  (queue → chunk channel → readers → pipe → the build's own writes)
+  engages for every input shape, including floods of empty or short
+  lines whose payload bytes alone never reach the cap.
+]
+
+Charging payload length only re-opened the bound the budget exists to
+provide: a zero-payload line retains a queue slot (the event struct)
+while charging nothing, so an empty-line flood grew the queue without
+limit under a stalled receiver. With the footprint charge the queue
+length is bounded at `cap / size_of::<ExecEvent>()` (65,536 events at
+the current sizes) and the retained memory at ≈ 2--5 MiB across all
+input classes --- strictly tighter, per class, than both the pre-FU1
+256-slot channel bound (whose max-line class allowed ≈ 256 MiB) and the
+payload-only byte cap (whose zero-payload class was unbounded).
+
+#r("builder.exec.setup-error-surfaced")[
+  A sandbox-setup failure reported on the status pipe MUST reach the
+  caller as the typed setup error (failing phase, errno, and resolved
+  path for indexed phases) even when the supervisor abandons the spawn
+  before the go signal: the abort path MUST kill and reap the tree,
+  then drain the status pipe, and prefer a decoded setup report over
+  the generic abort cause.
+]
+
+The status reader exists from the instant the fork can produce a
+report --- before the first abortable step --- so there is no pre-go
+window in which a child can report a failure that nothing is positioned
+to read. The drain is bounded by construction: once the reap has
+completed, every write end of the status pipe is closed (the parent's
+copy drops inside the fork closure; the children's copies die with the
+tree), so the reader sees a full report or EOF. The pre-go report
+producers are real since the fd-sweep landed as the forked children's
+first setup step; before this rule, their typed reports were discarded
+and the caller saw only the downstream symptom (a cgroup attach failing
+`ESRCH` against a child that had already died of the actual error).
+Classification is unchanged --- both the typed and the generic arm are
+worker-local infrastructure failures; the rule is about diagnosis
+fidelity.
+
+#r("builder.retry.infra-transient")[
+  The build-spawn loop retries `execute_build` locally when the failure is a
+  transient worker-local infrastructure failure --- sandbox setup
+  (`SandboxSetup`: mount race, FUSE blip while binding an input). Up to
+  `INFRA_RETRY_MAX=3` attempts with backoff `500ms/1s/2s`. After exhaustion
+  the error propagates as `InfrastructureFailure` and the scheduler's own
+  retry policy takes over. The retry MUST short-circuit if the build's
+  cancelled flag is set. `BuildFailed`, glue rejections, network-side errors
+  (`Upload`/`Grpc`/`MetadataFetch`), and deterministic setup failures
+  (`Overlay`) are NOT retried locally.
+]
+
+#r("builder.silence.timeout-kill+3")[
   `maxSilentTime` (seconds, forwarded from client `--option max-silent-time`)
-  is enforced rio-side in the stderr read loop: on each `STDERR_NEXT` and
-  `STDERR_RESULT BuildLogLine` (types 101/107 --- the output-producing
-  messages), reset `last_output`; a `select!` arm fires at `last_output +
-  max_silent_time` → `BuildResult { status: TimedOut, error_msg: "no output
-  for Ns (maxSilentTime)" }` → caller's unconditional `cgroup.kill()`.
-  Activity/Progress chatter does NOT reset the timer --- a build spinning
-  progress updates with no stderr output is still "silent". The local
-  nix-daemon MAY also enforce it (forwarded via `client_set_options`) ---
-  rio-side is the authoritative backstop ensuring the correct `TimedOut`
-  status regardless.
+  is enforced by the executor: captured build output resets the silence
+  deadline, and when the deadline passes with no output the build is killed
+  via the per-build cgroup and reported as `BuildStatus::TimedOut` with an
+  error message naming the silence window. All builder output counts as
+  activity, including `@nix` side-channel frames (`setPhase` and friends):
+  the deadline is reset by the raw pty bytes before any frame is consumed,
+  matching CppNix, where any builder stderr output resets the silence clock.
+  The enforcement is rio-side and authoritative; nothing else in the build
+  path enforces it.
 ]
 
 Before the build process starts, the worker writes a 3-line `rio:` header
 (`exec`, `builder`, `started`) as a direct `BuildLogBatch` at line 0; after the
 process exits it writes a 2-line footer (`exec`, `result`) at the final line
 offset. Both are sent on the same `BuildExecution` stream as build output, *not*
-through the `LogBatcher` (which is created and consumed inside the daemon
+through the `LogBatcher` (which is created and consumed inside the build
 lifecycle). The `LogBatcher` is seeded with the header line count so the
 build's real output numbers after the header. The header carries the
 `WorkAssignment.exec_id`, the system + `hw_class`, and the assigned resource
 triple --- never pod or node identity. The banner is per-execution, not
-per-attempt: the daemon-transient retry loop
-(#rref("builder.retry.daemon-transient")) re-invokes the executor up to
-`DAEMON_RETRY_MAX` more times for one `exec_id`, but the header is sent only on
+per-attempt: the infra-transient retry loop
+(#rref("builder.retry.infra-transient")) re-invokes the executor up to
+`INFRA_RETRY_MAX` more times for one `exec_id`, but the header is sent only on
 the first attempt and the footer once after the loop with the most recent
-daemon-running attempt's outcome (overridden to `cancelled` by the assignment's
-cancel flag) --- re-emitting the banner per attempt would
+output-producing attempt's outcome (overridden to `cancelled` by the
+assignment's cancel flag) --- re-emitting the banner per attempt would
 write conflicting `rio: result` lines and break the scheduler ring buffer's
 line-number monotonicity. Subsequent attempts seed the `LogBatcher` with the
 prior attempt's final line count so output line numbers continue. The normative
 requirement and the display-only / no-pod-identity rationale live in
 #rref("obs.log.worker-header") in the observability spec.
 
-#r("builder.daemon.stderr-result-logs")[
-  Modern `nix-daemon` sends build output via `STDERR_RESULT` with
-  `BuildLogLine`, NOT raw `STDERR_NEXT`. The builder's stderr loop MUST handle
-  `STDERR_RESULT` --- otherwise all build logs are silently dropped.
+#r("builder.stderr.forward-set-phase+2")[
+  The build-log loop consumes nixpkgs' `@nix {"action":"setPhase", ...}`
+  side-channel lines (they never appear in the persisted build log) and
+  forwards each phase change as a `BuildPhase{derivation_path, phase}`
+  `ExecutorMessage`. Phase is a state edge, not log content --- it is sent
+  unbatched, and forwarding it plays no part in silence accounting (the
+  max-silent deadline is governed by the builder's raw output, which
+  includes the frame itself; see #rref("builder.silence.timeout-kill")).
 ]
 
-#r("builder.stderr.forward-set-phase")[
-  The builder's stderr loop forwards the daemon's `STDERR_RESULT{SetPhase}`
-  (result type 104) as a `BuildPhase{derivation_path, phase}`
-  `ExecutorMessage`. Phase is a state edge, not log content --- it is sent
-  unbatched and does not reset the max-silent-time deadline.
-]
+Phase delivery is subject to the relay's log-shed policy
+(#rref("builder.relay.log-shed")): a phase edge shed under scheduler-link
+backpressure is display loss only, never control-plane loss.
 
 #r("builder.stderr.msg-cap")[
-  The stderr loop enforces a hard cap of `MAX_BUILD_STDERR_MESSAGES` (10M)
-  protocol frames per build, counted at `dispatch()` so every variant
-  including `SetPhase`/activity-lifecycle is covered. Exceeding it terminates
-  with `BuildStatus::LogLimitExceeded` --- same non-retryable semantics as the
-  byte limit.
+  The build-log loop enforces a hard cap of 10M captured lines per build,
+  counted before filtering so phase frames and suppressed lines are covered.
+  Exceeding it terminates with `BuildStatus::LogLimitExceeded` --- same
+  non-retryable semantics as the byte limit.
 ]
 
-#r("builder.log-limit+2")[
+#r("builder.log-limit+4")[
   The log batcher enforces per-build `LogLimits`. `total_bytes` (cumulative
   across flushed batches) is a hard cap: a line whose PROSPECTIVE total would
-  exceed it is rejected, `add_line` returns `LimitExceeded{reason}`, the
-  stderr loop flushes already-buffered lines and breaks with
-  `BuildStatus::LogLimitExceeded` --- terminal, non-retryable (same build on a
-  different executor spews the same logs). Maps to
+  exceed it is rejected, `add_line` returns `LimitExceeded{trip}` carrying a
+  typed `LogCapTrip` --- WHICH cap tripped with both sides of the comparison
+  --- and the stderr loop kills the build's PRINCIPAL scope (`<cg>/build`,
+  never the build root: the relay MUST survive a cap kill so the forwarded
+  wait status survives with it, per `builder.exec.kill-targets-principal`)
+  and breaks with `BuildStatus::LogLimitExceeded` --- terminal, non-retryable
+  (same build on a different executor spews the same logs). The verdict
+  message MUST carry the trip's per-attempt figures (CppNix reports only the
+  limit, `derivation-building-goal.cc:1230-1237`; rio reports both sides ---
+  registered superset). Maps to
   #(refs.metric)("rio_builder_builds_total")`{outcome="log_limit"}`.
   `rate_lines_per_sec` (1-second tumbling window, monotonic `Instant`) is a
   suppression threshold: excess lines within a window are DROPPED, and a
@@ -600,15 +1120,29 @@ requirement and the display-only / no-pod-identity rationale live in
   injected at the next window reset. The build continues. Dropped lines do not
   count toward `total_bytes`. Maps to
   #(refs.metric)("rio_builder_log_lines_suppressed_total"). Either limit set
-  to `0` means unlimited.
+  to `0` means unlimited. On loop exit the batcher MUST be consumed
+  (`finish`), which unconditionally drains the final suppression window and
+  the relay-shed tally --- the final window's marker and metric MUST NOT be
+  lost when the build exits within a suppression window, including when no
+  buffered lines remain, and the terminal line count is obtainable only by
+  consuming the batcher.
 ]
+
+The terminal-drain clause is structural, not procedural: `final_line_count`
+--- which every exit path needs for the footer banner and retry seeding ---
+exists only as `finish(self)`'s return value, so an exit path that skips the
+terminal drain does not compile. The previous shape (a terminal flush gated
+on `has_pending()`, which sees buffered lines but not pending window drops)
+lost the marker exactly when the final window's accepted lines had already
+been flushed by a tick.
 
 = Overlay Store Architecture
 
 #r("builder.overlay.per-build")[
   Each active build gets its own overlayfs mount with a separate upper
-  directory and work directory. A synthetic Nix store SQLite database is
-  placed in each overlay's upper layer so that Nix recognizes the input paths.
+  directory and work directory; the merged view is what the sandbox mounts
+  writable at `/nix/store`, so reads of input paths fall through to the
+  FUSE-backed lower layer and outputs copy-up into the per-build upper layer.
 ]
 
 #r("builder.exec.build-id-sanitized")[
@@ -624,30 +1158,23 @@ requirement and the display-only / no-pod-identity rationale live in
 
 #r("builder.overlay.stacked-lower+2")[
   The overlay lower is the FUSE mount only (`lowerdir={fuse_mount}`). The host
-  `/nix/store` is *not* in the lowerdir: `nix-daemon` runs with `--store
-  'local?root={build_dir}'` and reads its own binary + libs from the host
-  store directly, while its store operations target `{build_dir}/nix/store`.
-  The per-build store therefore contains exactly the build's input closure
-  (lower) plus its outputs (upper) --- the daemon's runtime closure is
-  structurally outside it (see I-060 in @sec-ns-order).
+  `/nix/store` is *not* in the lowerdir: the per-build store view contains
+  exactly the build's input closure (lower) plus its outputs (upper). The
+  worker's own runtime closure is structurally outside it --- nothing the
+  build can reach through `/nix/store` exists unless it is in the declared
+  input closure.
 ]
 
 #r("builder.overlay.userns-exdev")[
-  *Userns directory-rename constraint (I-185):* When the builder pod runs with
+  *Userns mount constraint (I-185):* When the builder pod runs with
   `hostUsers: false` (ADR-012), `setup_overlay`'s `mount(2)` happens inside a
   non-init user namespace; the kernel forces `redirect_dir=off` (and refuses
-  `redirect_dir=on`) on such mounts. overlayfs without `redirect_dir` returns
-  `EXDEV` for any `rename(2)` of a *directory* whose target parent is a
-  merge-type dir --- and the overlay root (= the chroot-store `realStoreDir`)
-  is always merge-type (its dentry stack carries both the upper root and the
-  lower root by construction). nix-daemon's post-build
-  `movePath(chrootRootDir/nix/store/{out} → realStoreDir/{out})` is a raw
-  `std::filesystem::rename` with no fallback, so every directory-typed output
-  fails; file-typed outputs rename fine. nix's `moveFile()` temp-then-rename
-  fallback also targets the overlay root and hits the same `EXDEV`. The
-  builder image ships a patched `nix` whose `movePath()` falls back to a
-  recursive copy on `EXDEV`
-  (`nix/patches/nix-movepath-exdev-fallback.patch`).
+  `redirect_dir=on`) on such mounts. The mount therefore MUST NOT request
+  `redirect_dir` explicitly, and nothing in the build pipeline may depend on
+  cross-layer directory renames over the merged root: builds write outputs
+  through the merged view (copy-up), and the executor never `rename(2)`s a
+  directory across it. (The daemon-era `movePath` step that tripped this
+  constraint --- and the Nix patch that worked around it --- are gone.)
 ]
 
 #r("builder.overlay.upper-not-overlayfs")[
@@ -668,12 +1195,12 @@ After build completes:
 + Chunk and upload to rio-store (@cas). Each `PutPath` request carries the
   scheduler-issued HMAC @assignment-token in the `x-rio-assignment-token` gRPC
   metadata header; the store verifies the token and rejects uploads for paths
-  not in `claims.expected_outputs` (see #rref("common.hmac.claims"))
+  not in `claims.expected_outputs` (see #rref("common.hmac.claims+1"))
 + Register path metadata (@narinfo, references)
 + Discard upper layer
 
 *Teardown failure handling:* Overlay teardown (`umount2`) can fail if the
-mount is stuck busy (open file handles, zombie `nix-daemon`, FUSE hang). A
+mount is stuck busy (open file handles, a leaked build process, FUSE hang). A
 leaked mount increments
 #(refs.metric)("rio_builder_overlay_teardown_failures_total"); the pod is
 one-shot, so the leak is bounded to that single build and discarded with the
@@ -712,21 +1239,24 @@ pod's emptyDir.
     is done store-side.
 ]
 
-#r("builder.upload.references-scanned")[
-  Before the retry loop, `upload_output` performs a *pre-scan pass*: a single
-  extra disk read through `RefScanSink` only (no hash, no network). The NAR is
-  dumped via `dump_path_streaming` into the scanner, which finds every
-  candidate hash part embedded anywhere in the stream (including inside
-  binaries, RPATH strings, symlink targets, directory names). The candidate
-  set is the *transitive input closure* ∪ `drv.outputs()`: every path
-  reachable via BFS over store references from the derivation's inputs, plus
-  all of this derivation's own outputs (for self-references and cross-output
-  references). This matches Nix's `computeFSClosure`
-  (`derivation-building-goal.cc:444,450` / `derivation-builder.cc:1335-1344`).
-  A build can legitimately embed any transitively-reachable path --- e.g.
-  `hello-2.12.2` references `glibc`, which is not a direct input but arrives
-  via `closure(stdenv)`. The resolved reference list is *sorted* (affects the
-  narinfo signature fingerprint --- must be deterministic).
+#r("builder.upload.references-scanned+2")[
+  The references registered for each output are the reference sets the
+  result pipeline recorded — scanned once during output processing,
+  post-`unsafeDiscardReferences`, with floating-CA self/sibling references
+  remapped to their final paths — and they are delivered unchanged in
+  `PathInfo`; the upload performs no additional reference scan of its own.
+  The pipeline's scan finds every candidate hash part embedded anywhere in
+  the output (including inside binaries, RPATH strings, symlink targets,
+  directory names) against the candidate set *transitive input closure* ∪
+  `drv.outputs()`: every path reachable via BFS over store references from
+  the derivation's inputs, plus all of this derivation's own outputs (for
+  self-references and cross-output references). This matches Nix's
+  `computeFSClosure` (`derivation-building-goal.cc:444,450` /
+  `derivation-builder.cc:1335-1344`). A build can legitimately embed any
+  transitively-reachable path --- e.g. `hello-2.12.2` references `glibc`,
+  which is not a direct input but arrives via `closure(stdenv)`. The
+  registered reference list is *sorted* (affects the narinfo signature
+  fingerprint --- must be deterministic).
 ]
 
 #r("builder.upload.deriver-populated")[
@@ -745,18 +1275,29 @@ pod's emptyDir.
   message) --- deferred to a later phase.
 ]
 
-#r("builder.upload.batch+2")[
+#r("builder.upload.batch+3")[
   For *multi-output derivations (≥2 outputs)*, the builder uses
   `PutPathBatch`: all outputs stream serially on one RPC, the store commits
   them in ONE database transaction. If any output fails validation, zero
   outputs are registered --- atomic per #rref("store.atomic.multi-output").
   All per-output prep (path parse, reference scan) is done BEFORE the first
   byte is sent, so a local prep failure on output $k$ cannot leave outputs
-  $0..k-1$ committed. The batch RPC's stream timeout scales with output count
-  (`GRPC_STREAM_TIMEOUT × N`, capped at `MAX_BATCH_OUTPUTS`). Batch retries up
-  to `MAX_UPLOAD_RETRIES` on transient errors; on `FailedPrecondition` it
-  falls through to independent `PutPath` calls (pre-P0267 behavior:
-  `buffer_unordered(MAX_PARALLEL_UPLOADS)`, no cross-output atomicity).
+  $0..k-1$ committed. `MAX_BATCH_OUTPUTS` equals the protocol's
+  `MAX_OUTPUT_NAMES` (256, compile-asserted), so every parseable derivation
+  fits the batch path; the builder pre-checks the prepared count and routes
+  capacity overruns (internal callers only) straight to the independent
+  fallback without opening a stream. The batch deadline is derived from the
+  byte budget, not the count: `GRPC_STREAM_TIMEOUT + 15 s × N` --- one
+  stream-timeout covers the bytes of any batch the server admits (the
+  server caps cumulative charged bytes at one `MAX_NAR_SIZE`), and the
+  per-output term covers fixed bookkeeping. Batch retries up to
+  `MAX_UPLOAD_RETRIES` on transient errors; on `FailedPrecondition`
+  (capacity: count or cumulative bytes) it falls through to independent
+  `PutPath` calls (pre-P0267 behavior:
+  `buffer_unordered(MAX_PARALLEL_UPLOADS)`, no cross-output atomicity); on
+  `InvalidArgument` (a deterministic request defect) it fails permanently
+  WITHOUT retry --- resending identical bytes cannot change a
+  deterministic verdict.
 ]
 
 For *single-output derivations*, the builder uses independent `PutPath`
@@ -786,38 +1327,14 @@ output on the original builder is lost when the overlay is discarded.
   I-125b.
 ]
 
-= Store Database Management
+= Store Metadata
 
-#r("builder.synth-db.per-build")[
-  Nix requires a functional store database (SQLite at
-  `/nix/var/nix/db/db.sqlite`) to operate. It refuses to build derivations
-  whose inputs are not registered in the local database, even if the paths
-  physically exist on disk.
-]
-
-For each build, the builder synthesizes a minimal SQLite database in the
-overlay upper layer:
-
-+ Query rio-store's PostgreSQL for path metadata of the build's input closure
-  (deriver, NAR hash, NAR size, references, sigs, ca).
-+ Generate the database via direct SQLite writes into the overlay's upper
-  layer at `var/nix/db/db.sqlite`. Use a single transaction with `PRAGMA
-  journal_mode=WAL` and `PRAGMA synchronous=OFF` for maximum speed (the DB is
-  ephemeral).
-+ The database must include the `ValidPaths`, `Refs`, and `DerivationOutputs`
-  tables with proper indexes (`IndexValidPathsPath`, `IndexValidPathsHash`).
-  The `SchemaVersion` in the `Config` table must match the Nix version running
-  in the builder (target: Nix 2.20+ schema).
-+ The database contains only path registrations for that specific build's
-  input closure --- not the entire store.
-+ After the build completes, the synthetic database is discarded along with
-  the rest of the overlay upper layer.
-
-#r("builder.synth-db.derivation-outputs")[
-  The `DerivationOutputs` table MUST be populated --- `nix-daemon`'s
-  `queryPartialDerivationOutputMap()` reads it. Empty → `scratchPath =
-  makeFallbackPath(drvPath)` → `OutputRejected`.
-]
+The native executor needs no per-build store database: input paths are
+bind-mounted from the closure the scheduler already resolved, reference and
+closure metadata flow from rio-store's `QueryPathInfo` responses captured
+during input resolution, and output registration happens by uploading to
+rio-store --- there is no SQLite anywhere in the build path. (The daemon-era
+synthetic store DB, its schema pin, and its risks are gone with the daemon.)
 
 #r("builder.executor.resolve-input-drvs")[
   The executor must merge resolved inputDrv outputs into `BasicDerivation`
@@ -828,40 +1345,21 @@ overlay upper layer:
 #r("builder.executor.kind-gate")[
   Per ADR-019, the executor re-derives `is_fod` from the `.drv` (ground truth,
   not the scheduler-sent flag) and checks it against `config.executor_kind`
-  BEFORE overlay setup or daemon spawn. If `is_fod != (executor_kind ==
+  BEFORE overlay setup or sandbox construction. If `is_fod != (executor_kind ==
   Fetcher)`, the build fails with `ExecutorError::WrongKind`.
   Defense-in-depth --- the scheduler's `hard_filter` should never misroute,
   but a bug or stale-generation race must not grant a builder internet access
   even transiently.
 ]
 
-#r("builder.synth-db.refs-table")[
-  *Critical (validated in Phase 1a spike):* The `Refs` table must accurately
-  reflect each path's references. When `sandbox = true`, Nix resolves the
-  derivation's input closure by walking the `Refs` table to determine which
-  store paths to bind-mount into the sandbox chroot. If references are
-  missing, the sandbox will not bind-mount transitive dependencies (e.g.,
-  `glibc` needed by `bash`), causing builds to fail with "No such file or
-  directory" errors when the builder's dynamic linker cannot be found.
+#r("builder.exec.input-closure-binds")[
+  *Critical:* the full transitive input closure (not just the direct inputs)
+  MUST be bind-mounted into the sandbox. The closure comes from the
+  `QueryPathInfo` reference walk performed during input resolution; if
+  references are missing, transitive dependencies (e.g. `glibc` needed by
+  `bash`) are invisible inside the sandbox and builds fail with "No such file
+  or directory" from the dynamic linker.
 ]
-
-Performance: direct SQLite writes handle 1000+ paths in \<50ms. The bottleneck
-is the PostgreSQL metadata query, not the SQLite generation.
-
-== Synthetic DB Risks
-
-- *Schema version coupling*: Nix store DB schema (currently version 10) is an
-  internal API with no stability guarantees. Pin to a specific Nix version and
-  test schema compatibility on upgrade.
-- *`Realisations` table*: Required for Phase 5 CA support. Add the table
-  structure proactively but leave empty until CA early cutoff is activated.
-- *`registrationTime`*: Set to 0 for input paths (not locally built). Only
-  outputs built on this builder get a real timestamp.
-- *`ultimate`*: Always 0 for input paths (they were not built on this
-  builder). Set to 1 only for locally built outputs.
-- *Journal mode*: Create with `journal_mode=WAL` (matching Nix's expectation)
-  instead of `journal_mode=OFF`. While the DB is ephemeral, Nix may check the
-  journal mode on open.
 
 = Concurrent Build Isolation
 
@@ -917,21 +1415,21 @@ The per-build sub-cgroup is *measurement and cancellation only*: cgroup v2
 (#rref("builder.cgroup.kill-on-teardown")) without touching the rio-builder
 process or its FUSE threads.
 
-#r("builder.cores.cgroup-clamp+2")[
-  The executor MUST clamp `build_cores` (passed to nix-daemon via
-  `wopSetOptions`, becomes `NIX_BUILD_CORES` → `make -jN`) to
+#r("builder.cores.cgroup-clamp+3")[
+  The executor MUST clamp `build_cores` (exported to the build as
+  `NIX_BUILD_CORES` → `make -jN`) to
   `ceil(quota/period)` from the pod cgroup's `cpu.max`, minimum 1. It MUST NOT
-  pass `build_cores=0`: nix-daemon resolves 0 to host nproc, and cgroup CPU
+  pass `build_cores=0`: 0 means "use nproc", and cgroup CPU
   quota does not reduce visible cores --- a 0.5-core pod on a 16-core node
   would run `make -j16`, OOM-loop on compiler RSS (I-196). A client-requested
   `build_cores > 0` is capped at the same ceiling. When `cpu.max` reads `max`
   (no quota), use host nproc --- but builder/fetcher pools set `limits.cpu ==
   requests.cpu` (I-197, hard limits, no burst) so production pods always see a
   real quota; the `max` fallback only fires in VM tests / bare-metal dev. The
-  same clamped value MUST also be written to the per-build `nix.conf` as
-  `cores = N` and `max-jobs = 1`, appended after any operator override (later
-  lines win): defense-in-depth against an upstream `wopSetOptions` regression
-  where the daemon would otherwise fall back to nix.conf → host nproc.
+  executor MUST export the clamped value as `NIX_BUILD_CORES` in the sandbox
+  environment --- with the daemon-era per-build `nix.conf` gone, that variable
+  is the only channel through which a build learns its core budget, so this
+  clamp is the single point of enforcement.
 ]
 
 #r("builder.oom.cgroup-watch+3")[
@@ -954,11 +1452,11 @@ process or its FUSE threads.
 ]
 
 The overlay is per-build. Each build gets its own overlayfs mount with
-separate upper and work directories. The Nix sandbox provides process-level
-isolation (user, mount, PID, and network namespaces). Even if the Nix sandbox
-is compromised, the per-build overlay upper layer ensures rogue writes are
-isolated and discarded; the next build runs in a fresh pod and sees none of
-it.
+separate upper and work directories. The rio-exec sandbox provides
+process-level isolation (mount, PID, IPC, UTS, and cgroup namespaces, plus a
+network namespace for non-FOD builds). Even if the sandbox is compromised,
+the per-build overlay upper layer ensures rogue writes are isolated and
+discarded; the next build runs in a fresh pod and sees none of it.
 
 = Fixed-Output Derivation (FOD) Handling
 
@@ -970,24 +1468,23 @@ it.
   binary runs when invoked as a fetcher (`RIO_EXECUTOR_KIND=fetcher`).
 ]
 
-#r("builder.fod.verify-hash")[
+#r("builder.fod.verify-hash+2")[
   Fixed-output derivations (FODs) have a known output hash declared in
   `outputHash`. They require special handling:
   + *Detection*: A derivation is a FOD if its `outputHash` attribute is
     non-empty.
-  + *Network access*: Unlike regular derivations, FODs are allowed network
-    access inside the sandbox. This is handled by `nix-daemon` internally ---
-    when it sees `outputHash` set on a derivation via `wopBuildDerivation`, it
-    automatically relaxes network namespace isolation for that build.
-    `sandbox = true` in `nix.conf` is sufficient (Nix's sandbox is
-    FOD-aware). Network
-    egress is governed at the pod level by the fetcher NetworkPolicy
-    (#rref("fetcher.netpol.egress-open")).
+  + *Network access*: Unlike regular derivations, FODs run with the sandbox's
+    network namespace isolation relaxed (the executor sets
+    `Isolation::network` for them and binds the resolver configuration and CA
+    bundle). Network egress is governed at the pod level by the fetcher
+    NetworkPolicy (#rref("fetcher.netpol.egress-open")).
   + *Output verification*: After the build completes, the executor computes
-    the hash of the output and verifies it matches the declared `outputHash`.
-    A mismatch is reported as `BuildResultStatus::OutputRejected` (NOT
-    `BuildFailed`) and the output is discarded locally without entering the
-    store.
+    the hash of the output (flat or recursive per `outputHashMode`) and
+    verifies it matches the declared `outputHash`. The executor is the SOLE
+    verifier and is fail-closed: an `outputHashAlgo` it cannot verify is
+    rejected, never skipped. A mismatch is reported as
+    `BuildResultStatus::OutputRejected` (NOT `BuildFailed`) and the output is
+    discarded locally without entering the store.
   + *Caching*: FODs are cached by their output hash, not their derivation
     hash. Two FODs with different `src` attributes but the same `outputHash`
     share the same cached output.
@@ -996,27 +1493,32 @@ it.
 = Namespace Ordering
 <sec-ns-order>
 
-#r("builder.ns.order+2")[
-  Overlayfs and the Nix sandbox both use mounts; the per-build store is
-  reached via Nix's chroot-store mechanism, not by bind-mounting at
-  `/nix/store`. The ordering is:
+#r("builder.ns.order+4")[
+  Overlayfs and the rio-exec sandbox both use mounts; the per-build store
+  is bind-mounted writable at `/nix/store` inside the sandbox (the merged
+  overlay view), with the input closure nested read-only inside it. The
+  ordering is:
   + Builder sets up the FUSE mount at `/var/rio/fuse-store` and creates the
     per-build overlayfs (lower: FUSE only; upper: SSD; merged at
     `{build_dir}/nix/store`) --- all in the builder's mount namespace.
-  + Builder forks `nix-daemon --stdio --store 'local?root={build_dir}'` in a
-    thin child mount namespace (`unshare(CLONE_NEWNS)`). The namespace exists
-    *only* so `/proc` can be remounted unmasked for the daemon (containerd
-    masks `/proc` paths in non-privileged pods; nix-daemon's
-    `mountAndPidNamespacesSupported()` probe needs an unmasked `/proc`, and
-    PSA rejects `procMount: Unmasked` with `hostUsers: true` per KEP-4265).
-    The child's `/nix/store` is the host's; nothing is bind-mounted there.
-  + Nix sandbox does its own `unshare(CLONE_NEWNS)` for the build itself.
-  + Inside the sandbox, Nix bind-mounts each input from
-    `{build_dir}/nix/store/{hash}` (its `realStoreDir`) to the chroot's
-    `/nix/store/{hash}` (`storeDir`).
-  + Nix calls `pivot_root` to enter the chroot.
-  The builder must NOT drop `CAP_SYS_ADMIN` between overlay setup and Nix
-  invocation, as both operations require it.
+  + The executor compiles the sandbox plan and materializes the chroot
+    skeleton (the plan's directory tree, inline files, and symlinks)
+    host-side under the per-build chroot directory --- still in the
+    builder's mount namespace, before any sandbox process exists.
+  + The executor forks the rio-exec sandbox: the intermediate unshares fresh
+    mount/PID/IPC/UTS/cgroup (and, for non-FOD builds, network) namespaces;
+    the child applies the planned binds --- the merged store writable at
+    `/nix/store`, each input closure path read-only nested inside it,
+    `/build` writable, the static sandbox shell at `/bin/sh`, and a fresh
+    unmasked `/proc` for the new PID namespace (containerd masks `/proc`
+    paths in non-privileged pods, and PSA rejects `procMount: Unmasked`
+    with `hostUsers: true` per KEP-4265).
+  + The child enters the new root with `pivot_root` (plus a belt-and-braces
+    `chroot`), lazily detaches the old root, applies the seccomp filter, and
+    drops to the build user before `execve`.
+  The builder must NOT drop `CAP_SYS_ADMIN` between overlay setup and the
+  rio-exec spawn: the overlay mounts and the child's bind/`pivot_root`
+  sequence (performed before the privilege drop) both require it.
 ]
 
 #info(title: [History (I-060)])[
@@ -1033,7 +1535,8 @@ it.
 = Security Context
 
 Workers require elevated privileges for FUSE mounts, overlayfs mounts, and the
-Nix sandbox (user/mount/PID/network namespaces).
+rio-exec sandbox (mount/PID/IPC/UTS/cgroup namespaces --- plus a network
+namespace for non-FOD builds --- entered via `pivot_root`).
 
 *Required capabilities:* `CAP_SYS_ADMIN` + `CAP_SYS_CHROOT`. Do NOT use
 `privileged: true` --- it disables @seccomp profiles entirely.
@@ -1053,7 +1556,7 @@ Nix sandbox (user/mount/PID/network namespaces).
 `seccomp-rio-builder.json` when `privileged != true`. The profile is a
 default-deny allowlist derived from moby `default.json` v27.5.1 (see
 #rref("builder.seccomp.localhost-profile")), permitting the namespace/mount
-syscalls the FUSE mount + overlayfs + nix-daemon sandbox need --- plus the
+syscalls the FUSE mount + overlayfs + rio-exec sandbox need --- plus the
 read-side trace syscalls (`ptrace`, `process_vm_readv`) that
 sanitizer/debugger-based check phases require, Yama-confined to descendants ---
 while blocking `bpf`, `setns`, `process_vm_writev`, `kexec_load`,
@@ -1161,50 +1664,37 @@ findings:
   layer.
 ]
 
-= Nix Version Pinning
+= Nix at Build Time Only
 
-#r("builder.nix.pinned-schema")[
-  The synthetic SQLite store database generated per-build in the overlay upper
-  layer is coupled to Nix's internal DB schema (version 10). This schema
-  (`ValidPaths`, `Refs`, `DerivationOutputs` tables) is an internal API with
-  no stability guarantees from the Nix project.
-]
-
-*Requirements:*
-- Pin the Nix version in the builder container image (e.g., `nix_2_24` from
-  nixpkgs)
-- CI must test synthetic DB generation against the pinned Nix version (Phase
-  3a validation checklist)
-- Nix version upgrades should be treated as potentially breaking changes: test
-  the synthetic DB against the new version before rolling out
-- Document the pinned Nix version and the expected schema version in the
-  builder configuration
+Nix builds the rio images and runs in CI (the gateway's golden protocol tests
+and the differential parity harness drive real Nix daemons), but no deployed
+rio component ships or invokes a Nix binary at runtime. There is no schema,
+protocol-version, or binary pin to manage on the worker.
 
 = Future: Privilege Splitting
 
 The current design holds `CAP_SYS_ADMIN` throughout build execution because
-both overlayfs setup and the Nix sandbox require it. A sandbox escape gives
+both overlayfs setup and the rio-exec sandbox require it. A sandbox escape gives
 the attacker full `CAP_SYS_ADMIN` capabilities.
 
 A future improvement would split the builder into two processes:
 
 + *Privileged setup process* (`rio-builder-setup`): Runs with
-  `CAP_SYS_ADMIN`. Creates the overlayfs mount, generates the synthetic SQLite
-  DB, and prepares the build environment. After setup, it forks the
-  unprivileged supervisor and exits (or drops capabilities).
+  `CAP_SYS_ADMIN`. Creates the overlayfs mount and prepares the build
+  environment. After setup, it forks the unprivileged supervisor and exits
+  (or drops capabilities).
 
 + *Unprivileged build supervisor* (`rio-builder-supervisor`): Runs WITHOUT
-  `CAP_SYS_ADMIN`. Invokes `nix-daemon --stdio` within the pre-configured
-  overlay (which is already mounted). Streams logs, monitors the build
-  process, and uploads outputs via gRPC. The Nix sandbox itself uses
-  `CLONE_NEWUSER` which does not require `CAP_SYS_ADMIN` when user namespaces
-  are enabled (requires `sysctl kernel.unprivileged_userns_clone=1`).
+  `CAP_SYS_ADMIN`. Drives the rio-exec sandbox within the pre-configured
+  overlay (which is already mounted), streams logs, monitors the build
+  process, and uploads outputs via gRPC. rio-exec's sandbox could construct
+  its namespaces via `CLONE_NEWUSER`, which does not require `CAP_SYS_ADMIN`
+  when unprivileged user namespaces are enabled.
 
-*Open question:* Can `nix-daemon --stdio` operate without `CAP_SYS_ADMIN` if
-the mount namespace is already set up? The answer depends on whether the Nix
-sandbox uses `mount()` directly (requires capability) or only
-`unshare(CLONE_NEWNS)` + `pivot_root()` (may work with user namespaces). This
-requires empirical testing against the target Nix version.
+*Open question:* which parts of sandbox construction (overlayfs mount, FUSE
+mount, bind mounts inside the new mount namespace) genuinely require the
+capability once the mount namespace is pre-created. This requires empirical
+testing.
 
 *Status:* Deferred. Will be investigated when the basic builder architecture
 is stable (post Phase 3).
@@ -1213,8 +1703,10 @@ is stable (post Phase 3).
 
 #r("builder.status.nix-to-proto")[
   The mapping from `rio_nix::BuildStatus` to `proto::BuildResultStatus` MUST
-  be exhaustive (no `_` arm). Adding a Nix variant is a compile error until
-  the mapping is extended.
+  be exhaustive (no `_` arm). Adding a status variant is a compile error until
+  the mapping is extended. (The gateway still translates these statuses for
+  Nix clients; on the builder side the native exit classification produces
+  `proto::BuildResultStatus` directly.)
 ]
 
 #r("builder.timeout.no-reassign")[
@@ -1239,8 +1731,8 @@ is stable (post Phase 3).
   A cancel that arrives before the per-build cgroup exists (`cgroup.kill` →
   ENOENT) MUST leave the cancelled flag set. The executor MUST check the flag
   before the prefetch/register phase and abort with `Cancelled` status without
-  spawning nix-daemon. The pre-cgroup window is overlay setup → resolve →
-  prepare_sandbox → register_inputs + prefetch_manifests --- sub-second since
+  starting the build. The pre-cgroup window is overlay setup → resolve →
+  glue → register_inputs + prefetch_manifests --- sub-second since
   the I-043 redesign deleted the warm phase (which I-165 showed could stall
   for tens of minutes). The misclassification risk (a later unrelated `Err`
   reported as `Cancelled`) is the lesser evil vs. an unkillable builder
@@ -1303,10 +1795,14 @@ is stable (post Phase 3).
   anyway.
 ]
 
-#r("builder.relay.reconnect")[
+#r("builder.relay.reconnect+1")[
   Running builds send `CompletionReport`/`BuildLogBatch`/`PrefetchComplete` to
   a process-lifetime `mpsc::channel(256)` (the permanent sink), NOT to the
-  gRPC outbound channel directly. A `relay_loop` task pumps the sink into
+  gRPC outbound channel directly. Submission into the sink is split by
+  message class: `CompletionReport`, `PrefetchComplete`, and the pre-build
+  `WorkAssignmentAck` are awaited, guaranteed sends; `BuildLogBatch` and
+  `BuildPhase` reach the sink only through the shedding log sender
+  (#rref("builder.relay.log-shed")). A `relay_loop` task pumps the sink into
   whichever gRPC outbound channel is currently live, tracked via
   `watch::channel<Option<Sender>>`. On `BuildExecution` stream close/error the
   reconnect loop swaps the watch to `None` (relay blocks on `changed()`, sink
@@ -1317,27 +1813,85 @@ is stable (post Phase 3).
   `biased;` on `target.changed()` BEFORE `sink_rx.recv()` --- `grpc_tx.send()`
   may keep succeeding into a zombie tonic `ReceiverStream` that outlived its
   network stream (I-032: completions silently lost for \~20min after scheduler
-  failover). Why a permanent sink: `stderr_loop` breaks the build with
-  `MiscFailure` if its log send fails; handing build tasks the gRPC channel
-  directly would kill every running build on scheduler failover.
+  failover). Why a permanent sink: handing build tasks the gRPC channel
+  directly would kill every running build on scheduler failover; the sink
+  decouples build lifetime from stream lifetime, and the shed/guaranteed
+  split decouples build *progress* from sink occupancy.
 ]
 
-#r("builder.result.input-enoent-is-infra+2")[
-  When the nix-daemon returns `MiscFailure` with an error message indicating a
-  missing input path (`getting attributes of path '<p>'`) and `<p>`'s basename
-  matches an entry in the build's computed input closure, the builder MUST
-  report `BuildResultStatus::InfrastructureFailure` (not `PermanentFailure`).
-  The input was verified present in rio-store by `compute_input_closure`; its
-  absence at sandbox-setup time is a worker-local materialization failure (JIT
-  fetch EIO, overlay negative-dentry race), not a build defect. I-178b: the
-  matcher MUST strip ANSI SGR escapes before parsing (the daemon colors the
-  path) and MUST match by basename only --- the daemon reports the overlay
-  path (`/var/rio/overlays/<build_id>/nix/store/<hash>-<name>`), not the bare
-  store path the closure holds. The errno suffix is NOT load-bearing: both `No
-  such file or directory` and `Input/output error` (I-179) are
-  materialization failures.
+#r("builder.relay.log-shed")[
+  `BuildLogBatch` and `BuildPhase` messages MUST be submitted to the
+  permanent sink with a non-blocking `try_send` through the worker's
+  shedding log sender: a full sink sheds the message, counts it in
+  #(refs.metric)("rio_builder_log_messages_shed_total") (by `kind`), and
+  the next delivered batch MUST carry a single suppression marker line
+  reporting the shed count. `CompletionReport`, `PrefetchComplete`, and
+  `WorkAssignmentAck` MUST remain awaited, guaranteed sends, and MUST
+  NOT be constructible through the shedding sender.
 ]
 
+The type is the boundary: `SheddingLogSender` exposes only
+`try_send_batch`/`try_send_phase` (plus the lease-free `try_send_banner` for
+batches built outside the batcher), so routing a control message through the
+best-effort path is a compile error, not a review catch. Every display
+construction site goes through it --- the log loop's five sends and
+`send_banner_batch` with both its callers (the executor header, the runtime
+footer) --- so a degraded scheduler link degrades the *display* stream only:
+builds keep running, limit kills keep firing
+(#rref("builder.exec.limits-isolated+2")), completions keep their guaranteed
+delivery. The marker clause holds by construction, not by delivery-site
+discipline: the shed tally is drained inside the batcher's `flush()`, so
+every assembled batch --- batch-full, tick, phase boundary, terminal
+`finish` --- carries the marker for everything shed since the last flush.
+The drain is provisional until the rule's own quantifier --- the next
+*delivered* batch --- is decided: the drained count travels with the
+assembled batch as a shed lease and is settled by the sender at the sink
+boundary (accepted: consumed; shed or closed: restored to the tally), so a
+suppression marker whose carrier batch itself sheds re-emerges, with the
+dead carrier added, in the next delivered batch's marker instead of dying
+with its carrier. The marker consumes a line number and counts toward the
+byte cap exactly like the rate-suppression marker, so persisted logs show a
+forward line-number gap over the shed span (the `obs.log.gap-span` shape the
+scheduler ring buffer already accepts); marker *delivery* at the terminal
+boundary remains best-effort --- a shed terminal batch restores its lease
+with no later batch to ride, a bounded display gap
+(#rref("builder.log-limit+4") guarantees its assembly, not its delivery).
+
+#r("builder.result.input-materialization-is-infra+6")[
+  A build failure caused by an input path that was verified present in
+  rio-store during input resolution but could not be materialized on the
+  worker (FUSE JIT-fetch error, overlay race) MUST be reported as
+  `BuildResultStatus::InfrastructureFailure` (not `PermanentFailure`): it is a
+  worker-local fault, not a build defect. The native executor detects this
+  structurally --- the input bind-mount fails during sandbox setup, which is
+  an infrastructure-transient error (#rref("builder.retry.infra-transient"))
+  --- rather than by parsing error text. The same classification applies at
+  the resolve step itself: a store fetch that fails while assembling the
+  request glue's derivation-text table is a `MetadataFetch` infrastructure
+  failure, surfaced BEFORE the glue runs --- the glue holds no I/O capability
+  (#rref("builder.glue.pure")), so no transient-I/O class exists inside it.
+  A closure member the resolve step DROPS as not-found (store read lag, GC
+  race) MUST carry that fact as evidence to the executor's glue-rejection
+  arbitration: a glue rejection attributable to a dropped member --- by
+  canonical-path membership for closure-walk and `.drv`-expansion misses,
+  by store-path containment for root targets --- is the same residency gap
+  re-surfacing, and MUST be classified `MetadataFetch` infrastructure (a
+  re-dispatch re-resolves), never `InputRejected`. Not-found is not a
+  fault, so it slips past the resolve step's fault classification; without
+  the dropped-set evidence it deterministically launders into a permanent
+  rejection of a build that an immediate re-dispatch would fix. Resolve-time
+  residency gaps (closure members the store could not answer for at
+  resolve) are typed evidence consulted by EVERY verdict-producing arm:
+  glue rejections hinging on a gap, `execve` ENOENT/ENOTDIR with gaps on
+  record, exit classification of failed gap-dispatched builds (below
+  OOM/disk-full, above network-transient, never overriding kill-class),
+  and registration --- an output whose recorded references include a
+  dropped member MUST NOT register (the gap members ride the reference
+  scan detection-only, and the gate precedes the policy passes so a
+  gap-caused reference cannot re-launder as a policy verdict). All four
+  re-attributions are bounded by the scheduler's infrastructure retry
+  caps.
+]
 = Shutdown
 
 #r("builder.idle-exit+2")[
@@ -1396,8 +1950,8 @@ is stable (post Phase 3).
   On the shutdown path, the builder MUST abort the FUSE connection (write `1`
   to `/sys/fs/fuse/connections/<dev_minor>/abort`) BEFORE dropping the
   `BackgroundSession`. The builder serves the FUSE mount (fuser threads) while
-  nix-daemon consumes it (overlay→FUSE `lstat` during JIT input fetch); if the
-  runtime tears down while the daemon's threads are parked in the kernel's
+  the sandboxed build consumes it (overlay→FUSE `lstat` during JIT input
+  fetch); if the runtime tears down while build threads are parked in the kernel's
   FUSE request queue, those threads enter uninterruptible D-state waiting for
   a userspace reply that will never come (I-165: main thread zombie, 4×
   D-state stat threads). Aborting the connection makes the kernel return
@@ -1426,7 +1980,7 @@ is stable (post Phase 3).
     [`Config` + `CliArgs` (two-struct config split) and `detect_system()`],
 
     src("rio-builder/src/executor/"),
-    [Build execution (spawns nix-daemon in mount namespace, drives protocol)],
+    [Build execution (request glue → rio-exec sandbox → result pipeline)],
 
     src("rio-builder/src/overlay.rs"), [overlayfs setup and teardown],
     src("rio-builder/src/fuse/mod.rs"),
@@ -1452,9 +2006,6 @@ is stable (post Phase 3).
     src("rio-builder/src/fuse/fetch/"),
     [`ensure_cached`: NAR fetch + extract from rio-store (prefetch +
       on-demand)],
-
-    src("rio-builder/src/synth_db.rs"),
-    [Synthetic SQLite DB generation for nix-daemon],
 
     src("rio-builder/src/upload.rs"),
     [Chunk and upload build outputs (streaming NAR → rio-store PutPath)],
@@ -1524,9 +2075,9 @@ immutability so cached data never needs invalidation. Each build gets a
 per-build overlayfs (#rref("builder.overlay.stacked-lower+2")): the lower
 layer is the FUSE mount only; the upper layer is `{overlay_base_dir}/{build_id}/upper/nix/store/` on a local-disk emptyDir volume (must be a real
 filesystem --- overlayfs-as-upperdir cannot create `trusted.*` xattrs and
-fails with `EINVAL`); the merged dir is mounted at `{build_dir}/nix/store` as
-nix-daemon's `realStoreDir` for the chroot store. A synthetic SQLite store DB
-at `{build_dir}/nix/var/nix/db` is generated per-build from rio-store's
+fails with `EINVAL`); the merged dir is mounted at `{build_dir}/nix/store`
+and bind-mounted writable at `/nix/store` inside the build sandbox. Path
+metadata for the closure comes straight from rio-store's
 PostgreSQL metadata, containing only the paths relevant to that build. On
 completion, built outputs are scanned from the upper layer and uploaded to
 rio-store.
@@ -1540,8 +2091,8 @@ closures (e.g., GHC) can be tens of gigabytes --- and wastes bandwidth
 re-copying paths already present from previous builds. Container image
 layering (store paths as OCI layers) is creative but OCI layer limits (\~128),
 layer size overhead, and image build latency make it impractical for builds
-with hundreds of store paths. Running a real nix-daemon per worker with its
-own store (copying paths in via `nix copy`) works but duplicates store
+with hundreds of store paths. Running a full Nix installation per worker with
+its own store (copying paths in via `nix copy`) works but duplicates store
 management logic, requires daemon lifecycle management, and the SQLite DB
 becomes a bottleneck under concurrent builds.
 
@@ -1558,8 +2109,8 @@ changes.
 *The hard part: executor store lifecycle.* The FUSE + overlay approach
 introduces ordering complexity --- upper layer cleanup must be deterministic
 (unique per-build directory, discarded with the pod), and the namespace
-ordering (FUSE mount → overlayfs → nix sandbox) must be correct
-(#rref("builder.ns.order+2")). The decided approach is that each executor runs
+ordering (FUSE mount → overlayfs → rio-exec sandbox) must be correct
+(#rref("builder.ns.order+4")). The decided approach is that each executor runs
 the FUSE layer that lazily fetches store paths from rio-store; each build gets
 a per-build overlayfs with the FUSE mount as lower and a per-build synthetic
 SQLite database in the upper layer. This avoids shared mutable state,
@@ -1603,7 +2154,7 @@ and multiplexes all communication; natural backpressure prevents worker
 overload without explicit rate limiting; incremental log streaming gives
 dashboard users real-time build output. On the negative side: long-lived
 streams are sensitive to network instability and require robust reconnection
-logic with state reconciliation (#rref("builder.relay.reconnect")), and
+logic with state reconciliation (#rref("builder.relay.reconnect+1")), and
 debugging stream-level issues is harder than debugging individual
 request/response RPCs.
 
@@ -1694,13 +2245,13 @@ churn) → P0541 (SPO → Bottlerocket bootstrap-container) → ADR-021
 (Bottlerocket → NixOS AMI, profiles baked in) → SPO + `seccompPreinstalled`
 removed once k3s VM tests adopted the same tmpfiles delivery.
 
-*The hard part: executor pod security.* overlayfs and the Nix sandbox both
+*The hard part: executor pod security.* overlayfs and the rio-exec sandbox both
 require `CAP_SYS_ADMIN` + `CAP_SYS_CHROOT`, which conflicts with
 PodSecurityStandards on managed Kubernetes clusters. Mitigations: dedicated
 node pools with relaxed pod security policies for executor pods, custom
 seccomp profiles that allow only the specific syscalls needed (mount,
 pivot_root), and NetworkPolicy isolation to restrict executor pod network
-access. The Nix sandbox is NOT a security boundary --- it's a purity mechanism
+access. The rio-exec sandbox is NOT a security boundary --- it's a purity mechanism
 that prevents builds from accessing paths outside their declared inputs. For
 multi-tenant deployments, the actual security boundary is the executor pod and
 node isolation provided by Kubernetes.

@@ -9,6 +9,15 @@ use rio_builder::config::{CliArgs, Config};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // In-sandbox re-exec path for builtin:fetchurl derivations: the
+    // executor runs `rio-builder __builtin-fetchurl` as the sandboxed
+    // build process (see executor::glue::builtin). It must not parse
+    // the normal CLI, read config, or start telemetry — it has no
+    // scheduler/store connectivity inside the sandbox.
+    if std::env::args().nth(1).as_deref() == Some("__builtin-fetchurl") {
+        std::process::exit(rio_builder::builtin_fetchurl::run().await);
+    }
+
     let cli = CliArgs::parse();
     let rio_common::server::Bootstrap::<Config> {
         cfg,

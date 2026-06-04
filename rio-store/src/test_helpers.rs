@@ -250,7 +250,7 @@ impl TenantSeed {
         .expect("TenantSeed INSERT failed");
 
         if let Some(seed) = self.ed25519_seed {
-            let key_name = self.key_name.unwrap_or_else(|| format!("{}-1", &self.name));
+            let key_name = self.key_name.unwrap_or_else(|| format!("{}-1", self.name));
             sqlx::query(
                 "INSERT INTO tenant_keys (tenant_id, key_name, ed25519_seed) \
                  VALUES ($1, $2, $3)",
@@ -487,3 +487,96 @@ impl ChunkSeed {
         hash
     }
 }
+
+// ---------------------------------------------------------------------------
+// Deriver-proof walk probe (store.put.ia-deriver-proof+4 test seam)
+// ---------------------------------------------------------------------------
+
+/// Structural report from one proof walk, for integration tests that
+/// assert budget semantics (ops counted, monotone persistence) without
+/// reaching into `pub(crate)` internals.
+#[cfg(feature = "server")]
+#[derive(Debug)]
+pub struct ProofWalkReport {
+    /// The walk concluded with a proven row.
+    pub proven: bool,
+    /// Verdict label for absent outcomes
+    /// (`not_resident|unparseable|over_budget|cycle`).
+    pub reason: Option<&'static str>,
+    /// TOTAL rows this attempt made durable (eager computes + exit
+    /// drain — both route through the walk owner's sole persist
+    /// chokepoint, so this equals the SQL row delta; round-16
+    /// merged_bug_086). Surfaced on the over-budget arm; other arms
+    /// report 0 here — count rows via SQL.
+    pub persisted: usize,
+    /// Work units consumed.
+    pub work_used: usize,
+}
+
+/// Run the deriver-proof walk with an explicit work cap. Production
+/// always uses `PROOF_WALK_WORK_MAX` (re-exported as
+/// [`PROOF_WALK_WORK_MAX_FOR_TESTS`]); tests shrink the cap to exercise
+/// over-budget monotone resumption. Arena byte cap stays at the
+/// production const — use [`proof_walk_with_caps`] to shrink it.
+#[cfg(feature = "server")]
+pub async fn proof_walk_for_tests(
+    pool: &sqlx::PgPool,
+    chunks: Option<&crate::cas::ChunkCache>,
+    drv_path: &str,
+    cap: usize,
+) -> anyhow::Result<ProofWalkReport> {
+    proof_walk_with_caps(
+        pool,
+        chunks,
+        drv_path,
+        cap,
+        crate::metadata::drv_modulo::PROOF_WALK_ARENA_BYTES_MAX,
+    )
+    .await
+}
+
+/// [`proof_walk_for_tests`] with BOTH caps explicit (work units, arena
+/// retention bytes) — the seam for byte-flood scale tests (bug_079).
+#[cfg(feature = "server")]
+pub async fn proof_walk_with_caps(
+    pool: &sqlx::PgPool,
+    chunks: Option<&crate::cas::ChunkCache>,
+    drv_path: &str,
+    cap: usize,
+    arena_cap: usize,
+) -> anyhow::Result<ProofWalkReport> {
+    use crate::metadata::drv_modulo::{AbsentReason, ProofOutcome, prove_drv_modulo_with_caps};
+    let (outcome, work_used) =
+        prove_drv_modulo_with_caps(pool, chunks, drv_path, cap, arena_cap).await?;
+    Ok(match outcome {
+        ProofOutcome::Proven(_) => ProofWalkReport {
+            proven: true,
+            reason: None,
+            persisted: 0,
+            work_used,
+        },
+        ProofOutcome::Absent(r) => {
+            let (reason, persisted) = match r {
+                AbsentReason::NotResident { .. } => ("not_resident", 0),
+                AbsentReason::Unparseable { .. } => ("unparseable", 0),
+                AbsentReason::Cycle => ("cycle", 0),
+                AbsentReason::OverBudget { persisted, .. } => ("over_budget", persisted),
+            };
+            ProofWalkReport {
+                proven: false,
+                reason: Some(reason),
+                persisted,
+                work_used,
+            }
+        }
+    })
+}
+
+/// Production work cap, re-exported for scale tests.
+#[cfg(feature = "server")]
+pub const PROOF_WALK_WORK_MAX_FOR_TESTS: usize = crate::metadata::drv_modulo::PROOF_WALK_WORK_MAX;
+
+/// Production arena-retention byte cap, re-exported for scale tests.
+#[cfg(feature = "server")]
+pub const PROOF_WALK_ARENA_BYTES_MAX_FOR_TESTS: usize =
+    crate::metadata::drv_modulo::PROOF_WALK_ARENA_BYTES_MAX;

@@ -129,6 +129,8 @@ let
     "build_result_parsing"
     "refscan"
     "stderr_message_parsing"
+    "closure_walk"
+    "fod_hash_decode"
   ];
 
   # Flat list of (target, fuzzBins, corpusRoot) for generating the

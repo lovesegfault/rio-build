@@ -24,6 +24,12 @@ test-fixtures = ["dep:toml"]
 
 [dependencies]
 rio-common = { workspace = true }
+# Native sandbox executor (namespaces, seccomp, pty capture). Two
+# consumers until activation wires the full pipeline: the request glue
+# (executor/glue/) translates derivations into build-system-agnostic
+# ExecutionRequests, and the result classification (executor/native_result)
+# consumes ExitOutcome. Nothing Nix-specific lives below that boundary.
+rio-exec = { workspace = true }
 rio-nix = { workspace = true }
 rio-proto = { workspace = true }
 schemars = { workspace = true }
@@ -34,8 +40,11 @@ tonic = { workspace = true }
 # Scheduler's build_samples insert is gated on both being Some.
 prost-types = { workspace = true }
 fuser = { workspace = true }
-sqlx = { workspace = true }
 nix = { workspace = true }
+# llistxattr/lremovexattr in output canonicalisation (executor/
+# native_result/canonicalise.rs) — the `nix` crate does not wrap the
+# xattr family.
+libc = { workspace = true }
 sha2 = { workspace = true }
 # FOD hash verification: Nix FODs can declare sha1/sha256/sha512.
 # Round 4 Z8: sha1 FODs were rejected with a false-positive because
@@ -57,8 +66,20 @@ scopeguard = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true, optional = true }
-# I-178b: ANSI-escape strip in is_input_materialization_failure.
-regex = { workspace = true }
+# Native builtin:fetchurl (the __builtin-fetchurl re-exec subcommand):
+# streaming HTTP download of FOD sources. rustls via the workspace
+# feature set; "stream" for bytes_stream() → file/decoder piping.
+reqwest = { workspace = true, features = ["stream"] }
+# builtin:fetchurl builds a no-trust rustls config when the sandbox has
+# no CA bundle (plain-HTTP fetches must keep working there); shares the
+# workspace aws-lc-rs provider already linked via tonic/reqwest.
+rustls = { workspace = true }
+# xz decode for `unpack = true` fetchurl payloads (same crate the store
+# uses for substituter NARs; only the xz codec is exercised here).
+async-compression = { workspace = true }
+# SyncIoBridge: drives the async xz decoder from the blocking thread
+# that runs the synchronous NAR restore.
+tokio-util = { workspace = true, features = ["io-util"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]

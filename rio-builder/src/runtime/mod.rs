@@ -103,8 +103,8 @@ pub struct BuildSpawnContext {
     /// task is cheap. Worker-wide (set once at startup from config), not
     /// per-assignment — the limits are a worker policy, not a build option.
     pub log_limits: log_stream::LogLimits,
-    /// nix-daemon subprocess timeout (from `Config.daemon_timeout_secs`).
-    pub daemon_timeout: std::time::Duration,
+    /// Per-build execution timeout (from `Config.build_timeout_secs`).
+    pub build_timeout: std::time::Duration,
     /// Silence timeout default (from `Config.max_silent_time`).
     /// Used when WorkAssignment's BuildOptions.max_silent_time is 0.
     /// 0 = disabled.
@@ -119,14 +119,17 @@ pub struct BuildSpawnContext {
     /// Builder or Fetcher (from `Config.executor_kind`). Threaded into
     /// each spawned task's `ExecutorEnv` for the wrong-kind gate.
     pub executor_kind: rio_proto::types::ExecutorKind,
-    /// Advertised target systems (resolved `RIO_SYSTEMS`). Threaded to
-    /// `setup_nix_conf` so the per-build daemon's `extra-platforms`
-    /// matches what the heartbeat told the scheduler — a drv routed for
-    /// `i686-linux` is then accepted by the x86_64 daemon.
+    /// Advertised target systems (resolved `RIO_SYSTEMS` / the Pool's
+    /// `spec.systems`) — the same list the heartbeat advertises to the
+    /// scheduler. Threaded into each spawned build's `ExecutorEnv` so the
+    /// executor accepts exactly the systems this worker advertised; the
+    /// first entry also seeds `SandboxEnvConfig::host_system` (in
+    /// `setup()`), which drives the `PER_LINUX32` personality decision
+    /// for 32-bit guests.
     pub systems: Arc<[String]>,
     /// Handle to the FUSE local cache. Threaded into `ExecutorEnv` so
     /// the executor can `register_inputs` (JIT allowlist) and
-    /// `prefetch_manifests` (I-110c) before daemon spawn.
+    /// `prefetch_manifests` (I-110c) before the build executes.
     pub fuse_cache: Arc<crate::fuse::cache::Cache>,
     /// Base per-fetch gRPC timeout for the FUSE cache's `GetPath`.
     /// JIT lookup scales it per path via `jit_fetch_timeout(this,
@@ -169,6 +172,9 @@ pub struct BuildSpawnContext {
     /// `relay_loop`. The drain machinery gates exit on this (NOT
     /// `slot.is_busy()` alone) — see `wait_build_flushed`. bug_472.
     pub completion_pending: Arc<AtomicBool>,
+    /// Worker-level sandbox configuration for the native executor
+    /// (shell, CA bundle, extra mounts, hashed mirrors, host system).
+    pub sandbox: Arc<executor::SandboxEnvConfig>,
 }
 
 impl BuildSpawnContext {
@@ -220,7 +226,7 @@ impl BuildSpawnContext {
             overlay_base_dir: self.overlay_base_dir.clone(),
             executor_id: self.executor_id.clone(),
             log_limits: self.log_limits,
-            daemon_timeout: self.daemon_timeout,
+            build_timeout: self.build_timeout,
             max_silent_time: self.max_silent_time,
             cgroup_parent: self.cgroup_parent.clone(),
             executor_kind: self.executor_kind,
@@ -241,6 +247,7 @@ impl BuildSpawnContext {
             fuse_cache: Some(Arc::clone(&self.fuse_cache)),
             fuse_fetch_timeout: self.fuse_fetch_timeout,
             cancelled,
+            sandbox: Arc::clone(&self.sandbox),
         }
     }
 }
@@ -325,6 +332,14 @@ pub async fn spawn_build_task(
         tracing::error!(error = %e, "failed to send ACK");
         return; // Guard drops, no build spawned.
     }
+
+    // Display-stream sender for this assignment: every LogBatch/Phase
+    // (the log loop's batches, the header and footer banners) goes
+    // through it and sheds on a full sink instead of blocking. Control
+    // messages (the ACK above, CompletionReport, PrefetchComplete)
+    // stay on the raw `ctx.stream_tx` with awaited, guaranteed sends.
+    // r[impl builder.relay.log-shed]
+    let shedding_log_tx = crate::log_stream::SheddingLogSender::new(ctx.stream_tx.clone());
 
     // ADR-023 phase-10: now that we have an assignment token, harvest
     // the resolve→bench task (spawned at init, runs concurrently with
@@ -442,16 +457,16 @@ pub async fn spawn_build_task(
         // during the pre-cgroup phase (I-166).
         let build_env = ctx.executor_env(Arc::clone(&cancelled));
 
-        // Daemon-transient retry: if nix-daemon crashes mid-handshake
-        // (core dump, OOM-kill) the error surfaces as early-EOF on the
-        // wire. Retrying locally is cheaper than a scheduler round-trip
-        // (re-dispatch + re-fetch closure + re-generate synth DB) and
-        // keeps a hot-loop daemon bug from flooding the scheduler with
-        // InfrastructureFailure reports — without this, a crashing
-        // daemon caused 800+ retries in <10min (scheduler re-dispatches
-        // InfrastructureFailure immediately, no backoff). The retry
-        // budget is small (DAEMON_RETRY_MAX=3, exponential backoff
-        // r[impl builder.retry.daemon-transient]
+        // Infra-transient retry: if the native sandbox fails to set up
+        // (mount race, FUSE blip while binding an input) the build
+        // never ran. Retrying locally is cheaper than a scheduler
+        // round-trip (re-dispatch + re-fetch closure) and keeps a
+        // hot-loop worker fault from flooding the scheduler with
+        // InfrastructureFailure reports — historically a crashing
+        // build backend caused 800+ retries in <10min (scheduler
+        // re-dispatches InfrastructureFailure immediately, no backoff).
+        // The retry budget is small (INFRA_RETRY_MAX=3, exponential backoff
+        // r[impl builder.retry.infra-transient]
         // 0.5/1/2s); after exhaustion the error propagates as
         // InfrastructureFailure and the scheduler's own retry policy
         // takes over. Cancelled builds short-circuit the loop — the
@@ -480,20 +495,19 @@ pub async fn spawn_build_task(
         let mut attempt = 0u32;
         let mut prev_line_count = 0u64;
         // Most recent attempt's footer string (`Some(...)` only when a
-        // daemon ran in that attempt). Tracked across the loop so a
-        // footer is sent whenever ANY attempt ran a daemon — without
-        // this, a final attempt that fails pre-daemon (e.g.
-        // `DaemonSpawn` after a prior `Wire(UnexpectedEof)`) would
-        // silently drop the footer despite output being in the log.
+        // build process ran in that attempt). Tracked across the loop
+        // so a footer is sent whenever ANY attempt ran one — without
+        // this, a final attempt that fails during sandbox setup (after
+        // a prior attempt produced output) would silently drop the
+        // footer despite output being in the log.
         let mut last_footer_result: Option<String> = None;
         let outcome = loop {
             // First-attempt invariant: `execute_build` gates the
             // banner header on `first_line == 0`, which is true ONLY
             // on the first attempt. Every error in
-            // `is_daemon_transient()` fires AFTER the header
-            // (`DaemonSpawn`/`Handshake`/`Wire(UnexpectedEof)` all
-            // require a daemon spawn attempt, which is post-header),
-            // so a retried attempt always sees
+            // `is_infra_transient()` fires AFTER the header
+            // (`SandboxSetup` requires the pre-exec block to have run,
+            // which is post-header), so a retried attempt always sees
             // `prev_line_count >= HEADER_LINE_COUNT`. If a future
             // transient variant fires pre-header (new ExecutorError,
             // refactor of the early-return order), this catches the
@@ -507,7 +521,7 @@ pub async fn spawn_build_task(
                 &assignment,
                 &build_env,
                 &mut store_client,
-                &ctx.stream_tx,
+                &shedding_log_tx,
                 prev_line_count,
             )
             .await;
@@ -518,19 +532,19 @@ pub async fn spawn_build_task(
 
             match &o.result {
                 Err(e)
-                    if e.is_daemon_transient()
-                        && attempt < executor::DAEMON_RETRY_MAX
+                    if e.is_infra_transient()
+                        && attempt < executor::INFRA_RETRY_MAX
                         && !cancelled.load(std::sync::atomic::Ordering::Acquire) =>
                 {
-                    let delay = executor::DAEMON_RETRY_BACKOFF.duration(attempt);
+                    let delay = executor::INFRA_RETRY_BACKOFF.duration(attempt);
                     attempt += 1;
                     tracing::warn!(
                         drv_path = %drv_path,
                         attempt,
-                        max = executor::DAEMON_RETRY_MAX,
+                        max = executor::INFRA_RETRY_MAX,
                         retry_in = ?delay,
                         error = %e,
-                        "daemon transient failure; retrying locally"
+                        "transient sandbox-setup failure; retrying locally"
                     );
                     tokio::time::sleep(delay).await;
                 }
@@ -584,7 +598,7 @@ pub async fn spawn_build_task(
             cancelled.load(std::sync::atomic::Ordering::Acquire),
         ) {
             executor::send_banner_batch(
-                &ctx.stream_tx,
+                &shedding_log_tx,
                 &drv_path,
                 &build_env.executor_id,
                 final_line_count,
@@ -593,8 +607,7 @@ pub async fn spawn_build_task(
                     footer_result,
                     assignment_start.elapsed(),
                 ),
-            )
-            .await;
+            );
         }
         let stamp = ctx.completion_stamp(peak_disk_bytes);
         let completion = match result {
@@ -1225,7 +1238,7 @@ enum StreamEnd {
 /// "in tonic's body buffer", which a raw `build_stream` drop discards
 /// via h2 RST_STREAM(CANCEL); the `BuildComplete` arm's park+drain
 /// gives tonic a graceful end-of-stream to flush against.
-// r[impl builder.relay.reconnect]
+// r[impl builder.relay.reconnect+1]
 pub(super) async fn relay_loop(
     mut sink_rx: mpsc::Receiver<ExecutorMessage>,
     mut target: watch::Receiver<Option<mpsc::Sender<ExecutorMessage>>>,
@@ -1696,7 +1709,7 @@ mod tests {
     /// message whose `send()` failed AFTER the drop. The negative half
     /// of this test demonstrates that loss path so the swap-after-Ok
     /// ordering in `run()` is visibly load-bearing.
-    // r[verify builder.relay.reconnect]
+    // r[verify builder.relay.reconnect+1]
     #[tokio::test]
     async fn relay_sink_preserved_across_failed_connect_window() {
         // ── Positive: fixed connect sequence (no swap on failed try) ──
@@ -1786,6 +1799,7 @@ mod tests {
     /// is nondeterministic, and nextest's per-process model means a
     /// stray SIGTERM kills the test binary. The k3s VM scenarios do
     /// real SIGTERM via `k3s kubectl delete pod`.
+    // r[verify builder.exec.caller-serialization]
     #[tokio::test]
     async fn drain_wait_slot_synchronization() {
         let slot = Arc::new(BuildSlot::default());
@@ -1796,6 +1810,8 @@ mod tests {
             .expect("idle slot → wait_idle returns immediately");
 
         let guard = slot.try_claim("/nix/store/aaa-x.drv").unwrap();
+        // The caller-serialization contract: a second claim while busy
+        // is rejected (never queued).
         assert!(slot.try_claim("/nix/store/bbb-y.drv").is_none(), "busy");
         assert_eq!(slot.running().as_deref(), Some("/nix/store/aaa-x.drv"));
 

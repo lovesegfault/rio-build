@@ -116,6 +116,19 @@ pub(crate) fn storage_error(context: &str, e: anyhow::Error) -> Status {
 ///
 /// Logs the full error (including sqlx source chain) server-side; the
 /// gRPC message is a scrubbed summary.
+/// The ONE client-facing message for backend auth refusals: static
+/// remediation, NOTHING from the error chain. AWS error chains carry
+/// endpoint URLs, request IDs, and key-shaped identifiers; untrusted
+/// callers must not receive them (round-15 trusted-plane scrub rule,
+/// the 9075dcd8b precedent — full chains go to server-side logs only).
+/// Single-sourced so every reader (GetChunk, GetPath, metadata_status)
+/// serves byte-identical text and the no-leak pin covers all of them.
+pub(crate) fn backend_auth_status() -> Status {
+    Status::failed_precondition(
+        "chunk backend authentication failed; check S3 credentials/IAM permissions",
+    )
+}
+
 pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Status {
     use metadata::MetadataError as M;
     match &e {
@@ -146,6 +159,16 @@ pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Stat
             Status::aborted("upload placeholder concurrently deleted; retry")
         }
         M::CorruptManifest { .. } => Status::data_loss("stored manifest data is corrupt"),
+        // Transient chunk-backend failure (round-16 bug_027): retriable
+        // UNAVAILABLE, derived from the variant — NEVER conflated with
+        // the data-integrity verdicts below.
+        M::ChunkBackend(_) => Status::unavailable("chunk backend unavailable; retry"),
+        // Auth refusal (round-17 merged_bug_061): FAILED_PRECONDITION
+        // with the static remediation — deterministic until an operator
+        // fixes the role; retrying as unavailable hides the
+        // misconfiguration. The chain was already logged above.
+        M::BackendAuth(_) => backend_auth_status(),
+        M::DataLoss(_) => Status::data_loss("stored chunk data is lost or corrupt"),
         // Backpressure: PG pool exhausted, signature count cap, etc.
         // Client should retry with backoff. Distinct from Connection
         // (unavailable → try-another-replica): this is "slow down",
@@ -172,9 +195,12 @@ pub(crate) fn putpath_metadata_status(context: &str, e: metadata::MetadataError)
         M::PlaceholderMissing { .. } => Some("placeholder_missing"),
         M::Connection(_) => Some("connection"),
         M::ResourceExhausted(_) => Some("resource_exhausted"),
+        // Transient chunk-backend failure → unavailable → the worker
+        // upload loop retries it (round-16 bug_027 split).
+        M::ChunkBackend(_) => Some("chunk_backend"),
         // Non-retriable (NotFound/Conflict/Invariant/Malformed/Corrupt/
-        // Other) — not counted; the client won't retry an `internal`/
-        // `data_loss`/`already_exists`.
+        // DataLoss/Other) — not counted; the client won't retry an
+        // `internal`/`data_loss`/`already_exists`.
         _ => None,
     };
     if let Some(reason) = reason {
@@ -578,8 +604,14 @@ pub(super) fn substitute_status(e: SubstituteError) -> Status {
         // demoted to build-from-source.
         SubstituteError::RateLimited { .. } => Status::unavailable("upstream rate-limited; retry"),
         SubstituteError::Admission(a) => a.into(),
+        // AdmissionRefused: the upstream served bytes that fail
+        // residency admission (a non-preimage `.drv` NAR — the forged
+        // modulo-row vector, round-17 merged_bug_063). Like the other
+        // per-upstream integrity failures it is hostile-or-corrupt
+        // upstream data, not a caller error.
         SubstituteError::HashMismatch { .. }
         | SubstituteError::SizeMismatch { .. }
+        | SubstituteError::AdmissionRefused(_)
         | SubstituteError::NarInfo(_)
         | SubstituteError::Ingest(_) => Status::internal("substitute ingest failed"),
     }

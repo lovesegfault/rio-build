@@ -12,6 +12,11 @@ description = "Shared configuration, observability, and error types for rio-buil
 # Shared aws-sdk-s3 client builder (s3.rs). Only rio-store +
 # rio-scheduler enable this.
 aws = ["dep:aws-config", "dep:aws-sdk-s3"]
+# Signing-key entry codec (signing_keyfmt.rs) — the single owner of the
+# name:base64 secret/public byte contract. Only rio-cli (keygen /
+# derive-pub) and rio-store (Signer::parse delegation) enable this;
+# pulls ed25519-dalek, which the lean consumers don't need.
+signing-keyfmt = ["dep:ed25519-dalek"]
 
 [dependencies]
 # JSON Schema derivation for Config structs (`docs/gen/config.json`).
@@ -19,6 +24,8 @@ schemars = { workspace = true }
 # Optional: shared S3 client builder (aws feature).
 aws-config = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
+# Optional: signing-key derivation for the signing-keyfmt codec.
+ed25519-dalek = { workspace = true, optional = true }
 
 # Logging & metrics
 tracing = { workspace = true }

@@ -28,22 +28,22 @@ use super::{DagActor, snapshot};
 /// entry won't be re-detected — this TTL is the repeat window.
 pub(super) const HUNG_NODE_REPEAT_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Backstop timeout floor: DEFAULT_DAEMON_TIMEOUT (the worker-side
+/// Backstop timeout floor: DEFAULT_BUILD_TIMEOUT (the worker-side
 /// timeout). A build can't legitimately run longer than this — the
 /// worker would have killed the daemon already. The scheduler-side
 /// check at this floor is belt-and-suspenders for "worker heartbeating
 /// but not enforcing its own timeout" (worker bug or clock skew).
 ///
 /// Same cfg(test) shadow pattern as POISON_TTL: 7200s in prod (matches
-/// worker's daemon_timeout default), short in tests so backstop can be
+/// worker's build_timeout default), short in tests so backstop can be
 /// observed without waiting 2h.
 #[cfg(not(test))]
-const BACKSTOP_DAEMON_TIMEOUT_SECS: u64 = 7200;
+const BACKSTOP_BUILD_TIMEOUT_SECS: u64 = 7200;
 #[cfg(test)]
-const BACKSTOP_DAEMON_TIMEOUT_SECS: u64 = 0; // tests control via est_duration
+const BACKSTOP_BUILD_TIMEOUT_SECS: u64 = 0; // tests control via est_duration
 
-/// Slack on top of BACKSTOP_DAEMON_TIMEOUT_SECS. The worker's timeout
-/// fires → daemon killed → CompletionReport sent → scheduler receives
+/// Slack on top of BACKSTOP_BUILD_TIMEOUT_SECS. The worker's timeout
+/// fires → build killed → CompletionReport sent → scheduler receives
 /// → completion handler runs. 10 minutes covers that round-trip plus
 /// gRPC retry/reconnect slack.
 #[cfg(not(test))]
@@ -172,6 +172,12 @@ impl DagActor {
         self.tick_process_backstop_timeouts(&backstop_timeouts)
             .await;
         self.tick_check_build_timeouts().await;
+        // r[impl sched.build.failure-evidence-at-source+1]
+        // Retry any failure evidence whose at-source persist failed (PG
+        // blip at observation time). Must run BEFORE the poison-TTL
+        // eraser below so pending evidence reaches PG before any eraser
+        // can drop the row that would otherwise reconstruct it.
+        self.persist_pending_failure_evidence().await;
         self.tick_recheck_stuck_completions().await;
         self.tick_check_orphaned_builds().await;
         self.tick_process_expired_poisons(expired_poisons).await;
@@ -321,7 +327,7 @@ impl DagActor {
     ///
     /// Returns `(expired_poisons, backstop_timeouts)` — backstop tuple is
     /// `(drv_hash, drv_path, executor_id)`.
-    // r[impl sched.backstop.timeout+3]
+    // r[impl sched.backstop.timeout+4]
     fn tick_scan_dag(&self, now: Instant) -> (Vec<DrvHash>, Vec<(DrvHash, String, ExecutorId)>) {
         let mut expired_poisons: Vec<DrvHash> = Vec::new();
         // (drv_hash, drv_path, executor_id) for backstop-timed-out builds
@@ -359,11 +365,11 @@ impl DagActor {
             //
             // Threshold: max(est_duration × 3, 7200s + 600s). The
             // first term catches builds that exceed their estimate
-            // by 3×; the second is a floor at daemon_timeout + 10
+            // by 3×; the second is a floor at build_timeout + 10
             // minutes slack (even with no estimate, a build can't
             // legitimately run longer than the daemon timeout
             // plus some grace for reporting). 7200 = DEFAULT_
-            // DAEMON_TIMEOUT; 600 = arbitrary slack.
+            // BUILD_TIMEOUT; 600 = arbitrary slack.
             if state.status() == DerivationStatus::Running
                 && let Some(running_since) = state.running_since
             {
@@ -383,7 +389,7 @@ impl DagActor {
                     } else {
                         0.0
                     };
-                let floor_secs = (BACKSTOP_DAEMON_TIMEOUT_SECS + BACKSTOP_SLACK_SECS) as f64;
+                let floor_secs = (BACKSTOP_BUILD_TIMEOUT_SECS + BACKSTOP_SLACK_SECS) as f64;
                 let backstop_secs = est_3x_secs.max(floor_secs);
 
                 if elapsed.as_secs_f64() > backstop_secs
@@ -460,7 +466,7 @@ impl DagActor {
                 // post-completion drain.
                 worker.draining = true;
             }
-            // r[impl sched.backstop.timeout+3]
+            // r[impl sched.backstop.timeout+4]
             // Backstop is the no-CompletionReport path — completion.rs
             // will never account this attempt. Record it here so
             // `is_poisoned()` in `reassign_derivations` caps the loop
@@ -503,10 +509,18 @@ impl DagActor {
             warn!(build_id = %build_id, timeout_secs = timeout, "per-build timeout exceeded; cancelling derivations and failing build");
             metrics::counter!("rio_scheduler_build_timeouts_total").increment(1);
 
-            // Set error_summary FIRST so transition_build_to_failed picks it
-            // up for the BuildFailed event + DB error_summary column.
+            // Seed error_summary FIRST so transition_build_to_failed picks
+            // it up for the BuildFailed event + DB error_summary column —
+            // through the chokepoint form (round-17 bug_043): first-failure
+            // wins, so a timeout on a build that already recorded a
+            // derivation failure keeps the at-source evidence and the
+            // timeout reason only fills a previously-evidence-free build.
+            // The DB tier converges identically via COALESCE in both
+            // `persist_build_error_summary_tx` and the terminal arm of
+            // `update_build_status_tx`. (`paired-writer-seal` denies the
+            // plain `= Some(..)` assignment form outside the chokepoint.)
             if let Some(build) = self.builds.get_mut(&build_id) {
-                build.error_summary = Some(reason.clone());
+                build.error_summary.get_or_insert_with(|| reason.clone());
             }
             // Reuse the CancelBuild derivation-cancellation path (sends
             // CancelSignal, transitions drvs to Cancelled, removes build
@@ -630,9 +644,12 @@ impl DagActor {
     /// ordering as `handle_clear_poison`: a PG blip here leaves in-mem
     /// still Poisoned, so the next tick's scan retries. Previous order
     /// meant a blip left in-mem gone → scan never finds it again →
-    /// PG clear deferred to next scheduler restart).
+    /// PG clear deferred to next scheduler restart). Failure evidence is
+    /// persisted before the clear, so the interested builds' outcome
+    /// survives a failover even though the cleared row reconstructs
+    /// nothing.
     async fn tick_process_expired_poisons(&mut self, expired_poisons: Vec<DrvHash>) {
-        // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.merge.substitute-topdown+15]
         // Surviving parents of the removed children, collected across
         // the loop for one batched closure-hole stamp below — the
         // TTL-sweep twin of the admin ClearPoison stamp and of the
@@ -641,9 +658,20 @@ impl DagActor {
         // surviving parent's child set relative to the parent's declared
         // closure, and children-keyed `topdown_pruned` verdicts must not
         // trust the truncated set (see `DerivationState::closure_hole`).
-        let mut holed_parents: Vec<DrvHash> = Vec::new();
+        let mut holed_parents: std::collections::BTreeMap<DrvHash, Vec<DrvHash>> =
+            std::collections::BTreeMap::new();
         for drv_hash in expired_poisons {
             info!(drv_hash = %drv_hash, "poison TTL expired, removing from DAG");
+            // r[impl sched.poison.clear-failure-evidence]
+            // Evidence first: same rationale as handle_clear_poison. On
+            // error skip this hash — the node stays Poisoned in memory
+            // and PG, so the next tick's scan retries the whole sequence.
+            if let Err(e) = self.persist_interested_failure_evidence(&drv_hash).await {
+                error!(drv_hash = %drv_hash, error = %e,
+                       "poison TTL: failed to persist sticky failure evidence; \
+                        deferring clear to next tick");
+                continue;
+            }
             if let Err(e) = self.db.clear_poison(&drv_hash).await {
                 error!(drv_hash = %drv_hash, error = %e, "failed to clear poison in PG");
                 continue;
@@ -651,7 +679,12 @@ impl DagActor {
             // Capture the parents AFTER the PG clear succeeded (only
             // then is the child actually removed below) and BEFORE
             // `remove_node` scrubs the edge maps.
-            holed_parents.extend(self.dag.get_parents(&drv_hash));
+            for parent in self.dag.get_parents(&drv_hash) {
+                holed_parents
+                    .entry(parent)
+                    .or_default()
+                    .push(drv_hash.clone());
+            }
             // r[impl sched.poison.ttl-persist]
             // Prune BEFORE remove_node (reads interested_builds from
             // the node). keep_going=true builds still Active would
@@ -672,14 +705,16 @@ impl DagActor {
             self.dag.remove_node(&drv_hash);
         }
         // Stamp the surviving parents (skipping any that were themselves
-        // removed above): in memory first, then one best-effort PG write.
-        holed_parents.sort();
-        holed_parents.dedup();
-        let mut holed: Vec<String> = Vec::new();
-        for parent in &holed_parents {
+        // removed above): in memory first, then one best-effort PG write
+        // — recording WHICH expired children went missing (069).
+        let mut holed: Vec<(String, Vec<String>)> = Vec::new();
+        for (parent, missing) in &holed_parents {
             if let Some(state) = self.dag.node_mut(parent) {
-                state.closure_hole = true;
-                holed.push(parent.to_string());
+                state.closure_hole.stamp(missing.iter().cloned());
+                holed.push((
+                    parent.to_string(),
+                    missing.iter().map(|c| c.to_string()).collect(),
+                ));
             }
         }
         if !holed.is_empty() {
@@ -690,7 +725,7 @@ impl DagActor {
             // redundant gate here. A lost write costs only the
             // breadcrumb's durability across a failover; the in-memory
             // stamp covers this tenure.
-            if let Err(e) = self.db.set_closure_hole_by_hashes(&holed).await {
+            if let Err(e) = self.db.set_closure_holes(&holed).await {
                 warn!(count = holed.len(), error = %e,
                       "failed to persist closure_hole after poison-TTL sweep (continuing)");
             }

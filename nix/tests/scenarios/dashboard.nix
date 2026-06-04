@@ -170,18 +170,27 @@
       # Discriminate "the lone replica still answers Trailers-Only"
       # (access log full of 200s with 0 body bytes — the replica lost
       # the lease or never finished recovery) from "connections hang"
-      # (504s / connect timeouts) from "leader not in the endpoint set".
+      # (504s / connect timeouts) from "leader not in the endpoint set"
+      # — visible in the grpc-status response header and the scheduler
+      # logs below.
       print("== DIAGNOSTIC: nginx -> scheduler gRPC-Web proxy path ==")
+      # -D - dumps response headers: a Trailers-Only error carries
+      # grpc-status/grpc-message THERE, not in the (empty) body.
       print(k3s_server.execute(
           "printf '\\x00\\x00\\x00\\x00\\x00' | "
-          "curl -sv --max-time 5 -X POST http://localhost:18081/rio.admin.AdminService/ClusterStatus "
+          "curl -s -D - -o /dev/null --max-time 5 -X POST http://localhost:18081/rio.admin.AdminService/ClusterStatus "
           "-H 'content-type: application/grpc-web+proto' "
-          "-H 'x-grpc-web: 1' --data-binary @- 2>&1 | head -40"
+          "-H 'x-grpc-web: 1' --data-binary @- 2>&1"
       )[1])
       print(k3s_server.execute(
-          "k3s kubectl -n ${ns} logs deploy/rio-dashboard --tail=80 2>&1"
+          "k3s kubectl -n ${ns} logs deploy/rio-dashboard --tail=60 2>&1; "
+          "k3s kubectl -n ${ns} logs deploy/rio-dashboard --previous --tail=30 2>&1 || true"
       )[1])
       print(k3s_server.execute(
+          "k3s kubectl -n ${ns} logs -l app.kubernetes.io/name=rio-scheduler --prefix --tail=40 2>&1"
+      )[1])
+      print(k3s_server.execute(
+          "k3s kubectl -n ${ns} get svc rio-scheduler -o yaml 2>&1; "
           "k3s kubectl -n ${ns} get endpointslices -l kubernetes.io/service-name=rio-scheduler -o yaml 2>&1; "
           "k3s kubectl -n ${ns} get pods -o wide 2>&1; "
           "k3s kubectl -n ${ns} get lease rio-scheduler-leader -o jsonpath='{.spec.holderIdentity}' 2>&1"

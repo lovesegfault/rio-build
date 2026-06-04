@@ -12,10 +12,10 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
-    Capabilities, ConfigMapVolumeSource, Container, ContainerPort, DownwardAPIVolumeFile,
-    DownwardAPIVolumeSource, EmptyDirVolumeSource, EnvVar, EnvVarSource, HostPathVolumeSource,
-    NodeSelectorRequirement, NodeSelectorTerm, ObjectFieldSelector, PodSecurityContext, PodSpec,
-    SeccompProfile, SecurityContext, Toleration, Volume, VolumeMount,
+    Capabilities, Container, ContainerPort, DownwardAPIVolumeFile, DownwardAPIVolumeSource,
+    EmptyDirVolumeSource, EnvVar, EnvVarSource, HostPathVolumeSource, NodeSelectorRequirement,
+    NodeSelectorTerm, ObjectFieldSelector, PodSecurityContext, PodSpec, SeccompProfile,
+    SecurityContext, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::ResourceExt;
@@ -70,11 +70,6 @@ const READ_ONLY_ROOT_MOUNTS: &[(&str, &str, Option<&str>, Option<&str>)] = &[
     // hit EROFS without a mount. Actual store contents go via the
     // kernel FUSE layer — this is just the mountpoint directory.
     ("fuse-store", "/var/rio/fuse-store", None, None),
-    // nix-daemon writes /nix/var/nix/{profiles,temproots,gcroots,...}
-    // AND /nix/var/log/nix/drvs/. Mounted at /nix/var (not
-    // /nix/var/nix) to cover both. main.rs chmods nix/ to 0755 and
-    // creates nix/db/ at startup.
-    ("nix-var", "/nix/var", None, None),
 ];
 
 /// Default FUSE cache emptyDir sizeLimit for builder pods. Kubelet
@@ -185,6 +180,18 @@ pub use rio_common::config::UpstreamAddrs;
 fn is_fetcher(pool: &Pool) -> bool {
     pool.spec.kind == ExecutorKind::Fetcher
 }
+
+// r16 bug_097 / r17 merged_bug_003: the runtime mirror filter is the
+// SAME predicate the CRD CEL rule derives from
+// (`rio_crds::pool::hashed_mirror_entry_admissible` —
+// `HASHED_MIRROR_URL_PATTERN`, one definition in rio-crds). The r16
+// shape — an independent, deliberately-looser local spelling ("only
+// the transport-fatal class") — meant three accept-sets that drifted:
+// the CEL admitted NBSP this filter then dropped, and this filter
+// admitted s3:// the candidate loop then skipped, each layer
+// mislabeling the population the next one saw. The filter exists at
+// all only for CRs admitted under OLDER rules (or past a bypassed
+// webhook): same set, skip-and-warn, never silently mangle.
 
 /// §13e: Fetcher Pools advertise `[fetcher]`, NOT empty. FODs route by
 /// `effective_features(state) = [fetcher]` at the scheduler chokepoint
@@ -694,18 +701,6 @@ pub fn build_executor_pod_spec(
                     ..Default::default()
                 });
             }
-            // nix.conf ConfigMap. `optional: true` so a missing
-            // ConfigMap mounts an empty dir → setup_nix_conf falls
-            // back to WORKER_NIX_CONF.
-            v.push(Volume {
-                name: "nix-conf".into(),
-                config_map: Some(ConfigMapVolumeSource {
-                    name: "rio-nix-conf".into(),
-                    optional: Some(true),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
             // Coverage propagation: test-only hostPath when the
             // controller is running under -Cinstrument-coverage.
             if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
@@ -938,6 +933,43 @@ fn build_executor_container(
                     ));
                 }
             }
+            // builtin:fetchurl hashed mirrors (both kinds: fetchers run
+            // the builtin path; builders may run non-builtin FODs that
+            // simply ignore it). Comma-separated per the RIO_ env
+            // layer's comma_vec convention.
+            //
+            // r16 bug_097 / r17 merged_bug_003: entries outside the
+            // single-source accept-set (delimiters fragment the env
+            // transport; non-http(s) schemes are dead candidates) are
+            // rejected at admission by the CEL derivation of the SAME
+            // predicate. This filter only sees them on CRs admitted
+            // under older rules — skip and WARN, never silently mangle.
+            if let Some(mirrors) = &pool.spec.hashed_mirrors
+                && !mirrors.is_empty()
+            {
+                let (valid, malformed): (Vec<&String>, Vec<&String>) = mirrors
+                    .iter()
+                    .partition(|m| rio_crds::pool::hashed_mirror_entry_admissible(m));
+                for m in &malformed {
+                    tracing::warn!(
+                        mirror = %m,
+                        "skipping hashedMirrors entry outside the admission \
+                         accept-set (the CRD CEL rule rejects these; this CR \
+                         was admitted under an older rule or past a bypassed \
+                         admission check)"
+                    );
+                }
+                if !valid.is_empty() {
+                    e.push(env(
+                        "RIO_HASHED_MIRRORS",
+                        &valid
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ));
+                }
+            }
             // Coverage + RUST_LOG passthrough (test-only / operator
             // knob respectively). `$(RIO_EXECUTOR_ID)` (downward-API
             // metadata.name, defined ABOVE so kubelet's dependent-var
@@ -993,12 +1025,6 @@ fn build_executor_container(
                     ..Default::default()
                 });
             }
-            m.push(VolumeMount {
-                name: "nix-conf".into(),
-                mount_path: "/etc/rio/nix-conf".into(),
-                read_only: Some(true),
-                ..Default::default()
-            });
             if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
                 m.push(VolumeMount {
                     name: "cov".into(),
@@ -1012,11 +1038,11 @@ fn build_executor_container(
         security_context: Some(SecurityContext {
             privileged: privileged.then_some(true),
             capabilities: Some(Capabilities {
-                // nix-daemon sandbox cap set. See builderpool/
+                // Build-sandbox cap set. See builderpool/
                 // builders.rs pre-extraction commentary for the
-                // per-cap rationale (SETUID/GID for nixbld drop,
-                // NET_ADMIN for lo up in newns, SETPCAP for the
-                // inheritable-caps dance post-CVE-2022-24769, etc).
+                // per-cap rationale (SETUID/GID to drop to the build
+                // user, NET_ADMIN for lo up in the netns, SETPCAP for
+                // the inheritable-caps dance post-CVE-2022-24769, etc).
                 add: Some(vec![
                     "SYS_ADMIN".into(),
                     "SYS_CHROOT".into(),
@@ -1186,6 +1212,42 @@ mod tests {
         // unknown → no constraint
         assert_eq!(nix_systems_to_k8s_arch(&s(&["riscv64-linux"])), None);
         assert_eq!(nix_systems_to_k8s_arch(&[]), None);
+    }
+
+    /// r16 bug_097 / r17 merged_bug_003: the runtime filter IS the
+    /// admission predicate (one definition in rio-crds; the axis
+    /// matrix lives at `mirror_accept_set_derivations_agree` next to
+    /// the pattern). This pin covers the populations the FILTER's
+    /// callers care about — what reaches `RIO_HASHED_MIRRORS` and
+    /// what gets the skip-warn — including the r17 FLIP: s3:// and
+    /// schemeless entries, which the r16 filter deliberately passed
+    /// ("fails one candidate loudly"), are now filtered here exactly
+    /// as admission rejects them, because a candidate the fetch loop
+    /// skips or the HTTP client cannot serve is dead weight that
+    /// burns the per-candidate retry ladder on every FOD.
+    #[test]
+    fn mirror_filter_matches_admission() {
+        use rio_crds::pool::hashed_mirror_entry_admissible as admissible;
+        // Survivors: the terminal consumers can use these.
+        assert!(admissible("https://tarballs.nixos.org"));
+        assert!(admissible("http://mirror.internal:8080/hashed"));
+        // FLIPPED r17: previously survived this filter, now outside
+        // the single-source accept-set.
+        assert!(!admissible("s3://bucket/prefix?region=us-east-2"));
+        assert!(!admissible("tarballs.nixos.org/hashed"));
+        // RFC 3986 sub-delim comma inside a legal URL — the bug_097
+        // shape: would fragment at the comma_vec split.
+        assert!(!admissible("https://cdn.example/v1,v2/mirror"));
+        // Whitespace variants — would fragment at the space split.
+        assert!(!admissible("https://a.example /mirror"));
+        assert!(!admissible("https://a.example\tx"));
+        assert!(!admissible("https://a.example\nx"));
+        // The merged_bug_003 hole: Unicode the r16 CEL admitted but
+        // this filter (then `char::is_whitespace`) dropped — the
+        // population the false "predates it" warn mislabeled.
+        assert!(!admissible("https://m.example/a\u{00a0}b"));
+        // Empty contributes nothing but a leading/trailing comma.
+        assert!(!admissible(""));
     }
 
     // r[verify ctrl.pool.fetcher-hardening+2]

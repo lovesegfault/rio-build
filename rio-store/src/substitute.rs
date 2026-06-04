@@ -33,7 +33,7 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use rio_common::limits::{
     MAX_CACHE_INFO_BYTES, MAX_NAR_SIZE, MAX_NARINFO_BYTES, MAX_REFERENCES, MAX_SIGNATURES,
-    MIN_NAR_CHUNK_CHARGE,
+    MIN_NAR_CHUNK_CHARGE, nar_size_cap,
 };
 
 use crate::admission::{AdmissionError, AdmissionGate};
@@ -100,17 +100,19 @@ const SUBSTITUTE_PROBE_CACHE_CAP: u64 = 100_000;
 /// `reqwest::Client` has only `connect_timeout` — without a per-request
 /// body timeout a slow-loris upstream holds 128 probe slots indefinitely
 /// and stalls `FindMissingPaths`. The NAR GET is intentionally NOT
-/// timeboxed (a multi-GB body legitimately runs long; the
-/// [`MAX_NAR_SIZE`] decompressed cap and 5-min stale-reclaim bound it).
+/// timeboxed (a multi-GB body legitimately runs long; the class-capped
+/// decompressed bound and 5-min stale-reclaim bound it).
 #[cfg(not(test))]
 const SUBSTITUTE_SMALL_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const SUBSTITUTE_SMALL_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Decompressed-NAR size cap applied in [`Substituter::fetch_nar`].
-/// Equals [`MAX_NAR_SIZE`] in production; overridable to a small value
-/// in tests so the bomb-protection path is exercisable without
-/// allocating 4 GiB.
+/// Decompressed-NAR size-cap CEILING applied in
+/// [`Substituter::fetch_nar`] — the effective cap is
+/// `min(nar_size_cap(is_derivation), this)`, so `.drv` fetches are
+/// bounded at `MAX_DRV_NAR_BYTES` (16 MiB) and everything else at
+/// [`MAX_NAR_SIZE`]. Overridable to a small value in tests so the
+/// bomb-protection path is exercisable without allocating 4 GiB.
 #[cfg(not(test))]
 const SUBSTITUTE_NAR_DECOMPRESSED_CAP: u64 = MAX_NAR_SIZE;
 #[cfg(test)]
@@ -191,6 +193,17 @@ pub enum SubstituteError {
     /// whose own signatures don't verify.
     #[error("NAR size mismatch: narinfo declared {declared}, got {actual} decompressed bytes")]
     SizeMismatch { declared: u64, actual: u64 },
+
+    /// The NAR failed residency admission (`ingest::AdmittedNar`):
+    /// for `.drv` paths, the bytes are not the text-CA preimage of the
+    /// claimed path (or not a single-file NAR). Upstream signing keys
+    /// are tenant-supplied — a verified sig is NOT a trust boundary —
+    /// so without this gate a hostile upstream could park non-preimage
+    /// bytes at a victim `.drv` path and seed forged
+    /// `drv_modulo_cache` rows consumed as trusted evidence by the IA
+    /// deriver-proof gate (round-17 merged_bug_063).
+    #[error("NAR refused at admission: {0}")]
+    AdmissionRefused(String),
 
     /// Transient placeholder-claim: another uploader holds the slot.
     /// Same-replica `try_substitute*` callers coalesce at the moka
@@ -310,8 +323,13 @@ pub struct Substituter {
     /// modes fall back to `keep` behavior (we can't sign without a
     /// key). Per-tenant key resolution inside.
     signer: Option<Arc<TenantSigner>>,
-    // r[impl store.singleflight]
-    /// Singleflight: `(tenant_id, store_path)` → cached result. TTL
+    // NOT a store.singleflight implementation site: that rule's +2
+    // obligations (typed Clone error carrier, producer-owned inflight
+    // cleanup, auth fail-fast) describe the CHUNK-fetch coalescer in
+    // cas.rs. This is a moka TTL result cache that happens to coalesce
+    // — its contract is the substitution admission machinery
+    // (store.substitute.admission), not the chunk singleflight.
+    /// Singleflight-shaped: `(tenant_id, store_path)` → cached result. TTL
     /// keeps a recently-substituted path hot for the next caller
     /// without re-checking PG. Entries are cheap (the `PathInfo` is
     /// already in narinfo; this is just the gRPC-shaped copy). moka
@@ -723,7 +741,9 @@ impl Substituter {
                     // reach `grpc/mod.rs`.
                     if matches!(
                         e,
-                        SubstituteError::HashMismatch { .. } | SubstituteError::SizeMismatch { .. }
+                        SubstituteError::HashMismatch { .. }
+                            | SubstituteError::SizeMismatch { .. }
+                            | SubstituteError::AdmissionRefused(_)
                     ) {
                         metrics::counter!(
                             "rio_store_substitute_integrity_failures_total",
@@ -841,15 +861,25 @@ impl Substituter {
         // ValidatedPathInfo + the post-decompress hash check.
         let expected_hash = parse_nar_hash(&ni.nar_hash)?;
 
-        // r[impl store.substitute.untrusted-upstream+3]
-        // Declared-size gate. `trusted_keys` is also tenant-supplied so
-        // a verified sig is NOT a trust boundary; gate before download.
-        // The decompressed cap in `fetch_nar` catches a narinfo that
-        // lies about `NarSize`.
-        if ni.nar_size > MAX_NAR_SIZE {
+        // r[impl store.substitute.untrusted-upstream+4]
+        // Declared-size gate at the path's CLASS cap. `trusted_keys`
+        // is also tenant-supplied so a verified sig is NOT a trust
+        // boundary; gate before download. The decompressed cap in
+        // `fetch_nar` catches a narinfo that lies about `NarSize`.
+        //
+        // The class split matters for `.drv` paths: the W1 admission
+        // bound (`MAX_DRV_NAR_BYTES`, 16 MiB) is what every consumer
+        // fetch caps on (gateway drv_cache, worker glue — over-cap is
+        // PERMANENT there) and what the proof-walk arena sizing
+        // assumes. Substituting a multi-GiB ".drv" under the generic
+        // 4 GiB cap would mint a resident row no consumer can ever
+        // fetch — a permanent wedge for any DAG referencing it.
+        // Suffix-keyed like every .drv detection site (F3 unifies).
+        let class_cap = nar_size_cap(store_path.ends_with(".drv"));
+        if ni.nar_size > class_cap {
             return Err(SubstituteError::TooLarge {
                 what: "NarSize",
-                limit: MAX_NAR_SIZE,
+                limit: class_cap,
             });
         }
 
@@ -935,12 +965,13 @@ impl Substituter {
                     &nar_url,
                     &ni.compression,
                     ni.nar_size,
+                    class_cap,
                     base,
                     progress,
                 )
                 .await?;
 
-            // r[impl store.substitute.untrusted-upstream+3]
+            // r[impl store.substitute.untrusted-upstream+4]
             // Size check: actual decompressed length MUST equal the
             // narinfo's `NarSize:` line. The Nix signature fingerprint
             // is `1;path;hash;size;refs`; persisting an unchecked size
@@ -979,13 +1010,36 @@ impl Substituter {
                 .sigs_for_mode(tenant_id, upstream.sig_mode, &ni, &info)
                 .await;
 
+            // r[impl store.put.drv-text-ca+3]
+            // Residency admission (class cap + .drv text-CA binding +
+            // single preimage extraction). Substitution is an ingest
+            // route like PutPath/PutPathBatch: the persistence core
+            // only accepts the witness, so this route can no longer
+            // park non-preimage bytes at a `.drv` path or feed
+            // populate_on_ingest unbound bytes (round-17
+            // merged_bug_063 — the round-16 W2-S7 rider made
+            // substitution a modulo-cache producer without the
+            // binding the other producers' module doc presumes).
+            let mut admitted = ingest::AdmittedNar::admit(&info, nar_bytes.to_vec())
+                .map_err(|d| SubstituteError::AdmissionRefused(d.to_string()))?;
+
+            // Substituted .drvs feed the modulo cache too (round-16
+            // W2-S7 rider, plan Q8): substitution was the one ingest
+            // route that never fired populate_on_ingest, leaving every
+            // substituted deriver row-less until a proof-time
+            // read-through paid the cold walk. Take the preimage
+            // BEFORE persist consumes the witness (mirrors
+            // finalize_single's ordering); it was extracted once and
+            // text-CA-bound at admission.
+            let drv_bytes_for_cache: Option<Vec<u8>> = admitted.take_drv_preimage();
+
             // — Step 5-6: persist via the shared write-ahead core —
             ingest::persist_nar(
                 &self.pool,
                 self.chunk_backend.as_ref(),
                 &info,
                 claim,
-                nar_bytes.into(),
+                admitted,
                 self.chunk_upload_max_concurrent,
                 SUBSTITUTE_HOOKS,
             )
@@ -993,13 +1047,28 @@ impl Substituter {
             .map_err(|e| match e {
                 PersistError::Chunked(e) => SubstituteError::Ingest(e.to_string()),
                 PersistError::Inline(e) => SubstituteError::Ingest(e.to_string()),
-            })
+            })?;
+            // Carried out for the post-persist modulo population.
+            Ok(drv_bytes_for_cache)
         }
         .await;
 
         match persist {
-            Ok(()) => {
+            Ok(drv_bytes_for_cache) => {
                 placeholder_guard.defuse();
+                // Best-effort, AFTER the NAR is durable — population
+                // failure never fails the substitution. Single-shot
+                // scope: MissingInput records terminally (bug_085
+                // cadence contract), same as finalize_single.
+                if let Some(bytes) = drv_bytes_for_cache
+                    && crate::metadata::drv_modulo::populate_on_ingest(
+                        &self.pool, store_path, &bytes,
+                    )
+                    .await
+                        == crate::metadata::drv_modulo::PopulateOutcome::MissingInput
+                {
+                    crate::metadata::drv_modulo::record_missing_input(store_path);
+                }
                 Ok(UpstreamOutcome::Hit(Box::new(info)))
             }
             Err(e) => {
@@ -1024,6 +1093,12 @@ impl Substituter {
     /// the [`nar_bytes_budget`](Self::nar_bytes_budget) permits backing
     /// them; caller holds the permits until after `persist_nar`.
     ///
+    /// `class_cap` is the path's class size bound
+    /// (`nar_size_cap(is_derivation)`); the decompressed-side cap is
+    /// `min(class_cap, SUBSTITUTE_NAR_DECOMPRESSED_CAP)` so a `.drv`
+    /// fetch is bounded at 16 MiB even when the narinfo lied about
+    /// `NarSize` (and the test-profile 64 KiB override keeps working).
+    ///
     /// Accumulates fully before ingest — `cas::put_chunked` needs the
     /// whole `&[u8]` for FastCDC. Streaming-chunker would avoid the
     /// full buffer but isn't here yet; TODO(P0463) tracks it.
@@ -1035,6 +1110,7 @@ impl Substituter {
         nar_url: &str,
         compression: &str,
         expected_nar_size: u64,
+        class_cap: u64,
         upstream_base: &str,
         progress: Option<&SubstProgressFn>,
     ) -> Result<(Bytes, Vec<OwnedSemaphorePermit>), SubstituteError> {
@@ -1066,7 +1142,7 @@ impl Substituter {
                 resp.status()
             )));
         }
-        // r[impl store.substitute.untrusted-upstream+3]
+        // r[impl store.substitute.untrusted-upstream+4]
         // bytes_stream → StreamReader → decoder → `.take(cap+1)` →
         // budgeted read loop. The `.take()` wraps the DECOMPRESSED
         // side so a zstd bomb is bounded regardless of what `NarSize`
@@ -1079,9 +1155,13 @@ impl Substituter {
             .map_err(|e| std::io::Error::other(format!("NAR stream: {e}")));
         let reader = StreamReader::new(stream);
 
-        let cap = SUBSTITUTE_NAR_DECOMPRESSED_CAP;
+        // r[impl store.substitute.untrusted-upstream+4]
+        // Decompressed-side cap at the path's CLASS bound (16 MiB for
+        // `.drv`, 4 GiB otherwise), min'd with the profile override so
+        // the 64 KiB test cap still exercises the bomb arm cheaply.
+        let cap = class_cap.min(SUBSTITUTE_NAR_DECOMPRESSED_CAP);
         use async_compression::tokio::bufread as ac;
-        // r[impl store.substitute.compression]
+        // r[impl store.substitute.compression+1]
         let mut capped: Box<dyn AsyncRead + Unpin + Send> = match compression {
             "xz" => Box::new(ac::XzDecoder::new(reader).take(cap + 1)),
             "zstd" => Box::new(ac::ZstdDecoder::new(reader).take(cap + 1)),
@@ -1547,7 +1627,7 @@ fn is_not_found(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 404 | 403 | 410)
 }
 
-// r[impl store.substitute.untrusted-upstream+3]
+// r[impl store.substitute.untrusted-upstream+4]
 /// Read a small text body (`.narinfo`, `/nix-cache-info`) with a hard
 /// size cap. `tenant_upstreams` rows are tenant-supplied; an unbounded
 /// `.text()` against a hostile upstream is an OOM vector for the
@@ -1574,11 +1654,30 @@ async fn bounded_text(
     String::from_utf8(buf).map_err(|e| SubstituteError::NarInfo(format!("{what} not UTF-8: {e}")))
 }
 
-/// Parse a narinfo `NarHash:` value (`sha256:nixbase32...`) into raw
-/// 32 bytes.
+/// Parse a narinfo `NarHash:` value into raw 32 bytes.
+///
+/// Accepts every oracle encoding — the upstream narinfo reader parses
+/// `NarHash:` with `Hash::parseAnyPrefixed` (`nar-info.cc:23-29`,
+/// `hash.cc:225-238`), which length-discriminates base16 / nixbase32 /
+/// base64 after the `sha256:` prefix and also takes SRI. cache.nixos.org
+/// serves nixbase32, but base16/base64 narinfo producers are
+/// oracle-legal and previously fell out of the substitution (and
+/// therefore the modulo-population) path entirely.
+///
+/// Non-sha256 algorithms are rejected — registered divergence
+/// `nix.divergence.narinfo-sha256-only` (the oracle parses any algo
+/// but asserts sha256 on every narinfo it WRITES, `nar-info.cc:117`;
+/// rio's pipeline is `[u8; 32]` SHA-256 throughout).
 fn parse_nar_hash(s: &str) -> Result<[u8; 32], SubstituteError> {
-    let h = rio_nix::hash::NixHash::parse_colon(s)
+    let h = rio_nix::hash::NixHash::parse_any_prefixed(s)
         .map_err(|e| SubstituteError::NarInfo(format!("NarHash {s:?}: {e}")))?;
+    // r[impl nix.divergence.narinfo-sha256-only]
+    if h.algo() != rio_nix::hash::HashAlgo::SHA256 {
+        return Err(SubstituteError::NarInfo(format!(
+            "NarHash {s:?}: algorithm {} is not sha256 (rio's narinfo pipeline is sha256-only)",
+            h.algo()
+        )));
+    }
     h.digest()
         .try_into()
         .map_err(|_| SubstituteError::NarInfo(format!("NarHash {s:?}: not 32 bytes")))
@@ -1595,7 +1694,7 @@ fn narinfo_to_validated(
 ) -> Result<ValidatedPathInfo, SubstituteError> {
     use rio_proto::types::PathInfo;
 
-    // r[impl store.substitute.untrusted-upstream+3]
+    // r[impl store.substitute.untrusted-upstream+4]
     // Per-node count caps — parity with PutPath (`put_path/common.rs`).
     // `ValidatedPathInfo::try_from` validates per-element syntax only;
     // it does NOT bound the count.
@@ -1690,7 +1789,7 @@ mod tests {
         use base64::Engine;
 
         let seed = [0x42u8; 32];
-        let signer = Signer::from_seed(key_name, &seed);
+        let signer = Signer::from_seed(key_name, &seed).unwrap();
         let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
         let trusted_key = format!(
             "{key_name}:{}",
@@ -1787,7 +1886,7 @@ mod tests {
         use base64::Engine;
 
         let seed = [0x42u8; 32];
-        let signer = Signer::from_seed(key_name, &seed);
+        let signer = Signer::from_seed(key_name, &seed).unwrap();
         let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
         let trusted_key = format!(
             "{key_name}:{}",
@@ -1871,6 +1970,38 @@ mod tests {
         (path, nar)
     }
 
+    /// `parse_nar_hash` accepts every oracle `NarHash:` encoding
+    /// (base16/nixbase32/base64 behind `sha256:`, plus SRI) and
+    /// rejects non-sha256 algorithms.
+    // r[verify nix.divergence.narinfo-sha256-only]
+    #[test]
+    fn parse_nar_hash_oracle_encodings() {
+        use base64::Engine as _;
+        let raw: [u8; 32] = *b"0123456789abcdef0123456789abcdef";
+        let b16 = format!("sha256:{}", hex::encode(raw));
+        let b32 = format!("sha256:{}", rio_nix::store_path::nixbase32::encode(&raw));
+        let b64 = format!(
+            "sha256:{}",
+            base64::engine::general_purpose::STANDARD.encode(raw)
+        );
+        for s in [&b16, &b32, &b64] {
+            assert_eq!(
+                parse_nar_hash(s).unwrap(),
+                raw,
+                "spelling {s:?} must decode"
+            );
+        }
+        // sha512 decodes upstream but is the registered sha256-only
+        // divergence here: refused before download.
+        let sha512 = format!("sha512:{}", hex::encode([0u8; 64]));
+        assert!(matches!(
+            parse_nar_hash(&sha512),
+            Err(SubstituteError::NarInfo(m)) if m.contains("sha256-only")
+        ));
+        // No type prefix: rejected.
+        assert!(parse_nar_hash(&hex::encode(raw)).is_err());
+    }
+
     // r[verify store.substitute.upstream]
     // r[verify store.substitute.sig-mode]
     #[tokio::test]
@@ -1915,6 +2046,164 @@ mod tests {
             .expect("path should be in narinfo table");
         assert_eq!(stored.nar_size, nar.len() as u64);
         assert_eq!(stored.signatures.len(), 1);
+    }
+
+    // r[verify store.ingest.drv-modulo-cache+2]
+    /// THE W2-S7 substitution rider (plan Q8): a substituted `.drv`
+    /// populates the modulo cache like every other ingest route.
+    /// Pre-fix, substitution was the ONE completion path that never
+    /// fired populate_on_ingest — every substituted deriver landed
+    /// row-less and the first IA proof against it paid a cold
+    /// read-through walk (the systematic row-less source behind
+    /// bug_083's trigger).
+    #[tokio::test]
+    async fn substituted_drv_populates_modulo_cache() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-drv-modulo").await;
+
+        // A LEAF derivation (no inputs) so population cannot defer.
+        let drv_text = br#"Derive([("out","/nix/store/cccccccccccccccccccccccccccccccc-leaf","","")],[],[],"x86_64-linux","/bin/sh",["-c","x"],[("name","leaf"),("out","/nix/store/cccccccccccccccccccccccccccccccc-leaf")])"#;
+        // GENUINE text-CA path of the fixture bytes (round-17
+        // merged_bug_063): the pre-witness fixture used an arbitrary
+        // test path — the very unbound write the admission witness now
+        // refuses. `make_text(name, sha256(bytes), [])` is what the
+        // gate derives; serving the narinfo at that path is what an
+        // honest upstream does.
+        let path = {
+            use std::io::Write as _;
+            let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
+            w.write_all(drv_text).unwrap();
+            rio_nix::store_path::StorePath::make_text("substituted-leaf.drv", &w.finish(), &[])
+                .unwrap()
+                .as_str()
+                .to_string()
+        };
+        let (nar, _hash) = rio_test_support::fixtures::make_nar(drv_text);
+        let fake = spawn_fake_upstream(&path, nar.clone(), "cache.drvmod").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let sub = test_substituter(db.pool.clone());
+        let got = sub.try_substitute(tid, &path).await.unwrap();
+        assert!(got.is_some(), "upstream has the .drv");
+
+        let row: i64 =
+            sqlx::query_scalar("SELECT count(*)::bigint FROM drv_modulo_cache WHERE drv_path = $1")
+                .bind(&path)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            row, 1,
+            "substitution must populate the modulo cache (pre-fix: row-less)"
+        );
+
+        // Non-.drv substitution stays population-free (no spurious rows).
+        let (path2, nar2) = make_path();
+        let fake2 = spawn_fake_upstream(&path2, nar2, "cache.drvmod2").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake2.url,
+            60,
+            std::slice::from_ref(&fake2.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+        sub.try_substitute(tid, &path2).await.unwrap();
+        let total: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM drv_modulo_cache")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "non-.drv substitution adds no modulo rows");
+    }
+
+    // r[verify store.put.drv-text-ca+3]
+    /// merged_bug_063 (binding half): an upstream serving NON-PREIMAGE
+    /// bytes at a victim `.drv` path — valid sig (attacker-configured
+    /// key), valid NarHash (hash of the attacker's own bytes), neither
+    /// of which binds bytes↔path — must be refused at admission:
+    /// nothing registers, and no `drv_modulo_cache` row is minted from
+    /// the forged bytes (pre-witness, the row inserted and was
+    /// consumed as trusted evidence by the IA deriver-proof gate).
+    #[tokio::test]
+    async fn substituted_drv_non_preimage_refused() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-drv-forged").await;
+
+        // Victim path: a syntactically-valid .drv path that is NOT the
+        // text-CA of the served bytes.
+        let victim = rio_test_support::fixtures::test_store_path("victim-deriver.drv");
+        let forged = br#"Derive([("out","/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-evil","","")],[],[],"x86_64-linux","/bin/sh",["-c","x"],[("name","evil"),("out","/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-evil")])"#;
+        let (nar, _hash) = rio_test_support::fixtures::make_nar(forged);
+        let fake = spawn_fake_upstream(&victim, nar, "cache.forged").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let sub = test_substituter(db.pool.clone());
+        // Per-upstream variant: AdmissionRefused with the binding
+        // message (try_upstream is the per-upstream unit; do_substitute
+        // swallows per-upstream errors as try-next).
+        let http = sub.http.as_ref().unwrap();
+        let upstreams = metadata::upstreams::list_for_tenant(&db.pool, tid)
+            .await
+            .unwrap();
+        let hp = StorePath::parse(&victim).unwrap().hash_part();
+        let err = sub
+            .try_upstream(http, tid, &upstreams[0], &victim, &hp, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SubstituteError::AdmissionRefused(m) if m.contains("text content-address")),
+            "non-preimage .drv must be refused at admission, got {err:?}"
+        );
+        // System behavior: the whole substitution treats the hostile
+        // upstream as failed (miss), never ingesting.
+        assert!(
+            sub.try_substitute(tid, &victim).await.unwrap().is_none(),
+            "forged upstream must yield a miss, not a hit"
+        );
+
+        // Nothing registered, nothing minted.
+        assert!(
+            metadata::query_path_info(&db.pool, &victim)
+                .await
+                .unwrap()
+                .is_none(),
+            "victim path must not register"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM drv_modulo_cache")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "no modulo row from forged bytes");
+        // Placeholder cleaned up (explicit-abort path) — the next
+        // honest substitution attempt is not wedged.
+        let sp = StorePath::parse(&victim).unwrap();
+        assert!(
+            metadata::manifest_uploading_age(&db.pool, &sp.sha256_digest())
+                .await
+                .unwrap()
+                .is_none(),
+            "abort_placeholder must run on AdmissionRefused"
+        );
     }
 
     // r[verify store.substitute.progress-stream]
@@ -2052,7 +2341,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.compression]
+    // r[verify store.substitute.compression+1]
     /// `fetch_nar` decodes every `Compression:` value reference Nix's
     /// `libutil/compression.cc` accepts, end-to-end through
     /// `try_substitute` so the NarHash check proves the decompressed
@@ -2110,7 +2399,7 @@ mod tests {
 
         // Signer with a distinct key name so we can tell upstream vs
         // rio sigs apart.
-        let cluster = Signer::from_seed("rio-cluster-1", &[0x99u8; 32]);
+        let cluster = Signer::from_seed("rio-cluster-1", &[0x99u8; 32]).unwrap();
         let ts = Arc::new(TenantSigner::new(cluster, db.pool.clone()));
         let sub = test_substituter(db.pool.clone()).with_signer(ts);
 
@@ -2148,7 +2437,7 @@ mod tests {
         .await
         .unwrap();
 
-        let cluster = Signer::from_seed("rio-cluster-2", &[0x88u8; 32]);
+        let cluster = Signer::from_seed("rio-cluster-2", &[0x88u8; 32]).unwrap();
         let ts = Arc::new(TenantSigner::new(cluster, db.pool.clone()));
         let sub = test_substituter(db.pool.clone()).with_signer(ts);
 
@@ -3525,7 +3814,7 @@ mod tests {
         use base64::Engine;
 
         let seed = [0x42u8; 32];
-        let signer = Signer::from_seed(key_name, &seed);
+        let signer = Signer::from_seed(key_name, &seed).unwrap();
         let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
         let trusted_key = format!(
             "{key_name}:{}",
@@ -3662,7 +3951,7 @@ mod tests {
         nar_size_override: Option<u64>,
     ) -> String {
         let seed = [0x42u8; 32];
-        let signer = Signer::from_seed(key_name, &seed);
+        let signer = Signer::from_seed(key_name, &seed).unwrap();
         let nar_hash: [u8; 32] = sha2::Sha256::digest(nar).into();
         let nar_hash_str = format!(
             "sha256:{}",
@@ -3816,7 +4105,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.untrusted-upstream+3]
+    // r[verify store.substitute.untrusted-upstream+4]
     /// bug_172: oversized narinfo body → `TooLarge`, NAR endpoint never
     /// hit.
     #[tokio::test]
@@ -3862,7 +4151,7 @@ mod tests {
         assert_eq!(fake.nar_hits.load(Ordering::SeqCst), 0);
     }
 
-    // r[verify store.substitute.untrusted-upstream+3]
+    // r[verify store.substitute.untrusted-upstream+4]
     /// bug_093: a NAR larger than the decompressed cap → `TooLarge`.
     /// Uses the test-only 64 KiB `SUBSTITUTE_NAR_DECOMPRESSED_CAP` so
     /// this doesn't allocate 4 GiB.
@@ -3903,6 +4192,119 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "abort_placeholder must run on TooLarge"
+        );
+    }
+
+    // r[verify store.substitute.untrusted-upstream+4]
+    /// merged_bug_063: the declared-size gate is CLASS-split. A `.drv`
+    /// narinfo declaring NarSize over `MAX_DRV_NAR_BYTES` (16 MiB) is
+    /// refused BEFORE download (the NAR endpoint is never hit) even
+    /// though it is far under the generic 4 GiB bound — pre-fix,
+    /// substitution was the one ingest route on the generic cap, so a
+    /// hostile upstream could mint a resident `.drv` row every capped
+    /// consumer (gateway drv_cache, worker glue) permanently fails to
+    /// fetch. The same declared size on a NON-drv path passes the
+    /// declared gate (its class cap is 4 GiB) and proceeds to the
+    /// download, failing only on the post-fetch size mismatch — the
+    /// asymmetry pins the split, not just a tighter global bound.
+    #[tokio::test]
+    async fn declared_drv_nar_size_capped_at_class_bound() {
+        use rio_common::limits::MAX_DRV_NAR_BYTES;
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-drv-cap").await;
+
+        // .drv path: declared 17 MiB → refused at the declared gate.
+        let drv_path = rio_test_support::fixtures::test_store_path("oversized.drv");
+        let (nar, _h) = rio_test_support::fixtures::make_nar(b"tiny");
+        let hp = StorePath::parse(&drv_path).unwrap().hash_part();
+        let body = signed_narinfo_for(
+            &drv_path,
+            &nar,
+            "cache.drvcap",
+            &hp,
+            Some(MAX_DRV_NAR_BYTES + 1024 * 1024),
+        );
+        let fake = spawn_flex_upstream(
+            &drv_path,
+            nar.clone(),
+            "cache.drvcap",
+            FlexCfg {
+                narinfo_override: Some(body),
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_flex(&db.pool, tid, &fake, 50).await;
+
+        let sub = test_substituter(db.pool.clone());
+        let http = sub.http.as_ref().unwrap();
+        let upstreams = metadata::upstreams::list_for_tenant(&db.pool, tid)
+            .await
+            .unwrap();
+        let err = sub
+            .try_upstream(http, tid, &upstreams[0], &drv_path, &hp, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SubstituteError::TooLarge {
+                    what: "NarSize",
+                    limit,
+                } if limit == MAX_DRV_NAR_BYTES
+            ),
+            "17 MiB declared .drv must be refused at the 16 MiB class cap, got {err:?}"
+        );
+        assert_eq!(
+            fake.nar_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "refused before download — the NAR endpoint must never be hit"
+        );
+
+        // Same declared size, non-.drv path: passes the declared gate
+        // (class cap 4 GiB) and reaches the download.
+        let (plain_path, nar2) = make_path();
+        let hp2 = StorePath::parse(&plain_path).unwrap().hash_part();
+        let body2 = signed_narinfo_for(
+            &plain_path,
+            &nar2,
+            "cache.drvcap2",
+            &hp2,
+            Some(MAX_DRV_NAR_BYTES + 1024 * 1024),
+        );
+        let fake2 = spawn_flex_upstream(
+            &plain_path,
+            nar2,
+            "cache.drvcap2",
+            FlexCfg {
+                narinfo_override: Some(body2),
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_flex(&db.pool, tid, &fake2, 60).await;
+        let upstreams = metadata::upstreams::list_for_tenant(&db.pool, tid)
+            .await
+            .unwrap();
+        let up2 = upstreams.iter().find(|u| u.url == fake2.url).unwrap();
+        let err2 = sub
+            .try_upstream(http, tid, up2, &plain_path, &hp2, None)
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(
+                err2,
+                SubstituteError::TooLarge {
+                    what: "NarSize",
+                    ..
+                }
+            ),
+            "non-.drv path must pass the declared gate at the same size, got {err2:?}"
+        );
+        assert_eq!(
+            fake2.nar_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "non-.drv proceeds to the download (fails later on size mismatch)"
         );
     }
 
@@ -4168,7 +4570,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.untrusted-upstream+3]
+    // r[verify store.substitute.untrusted-upstream+4]
     /// bug_005: a narinfo whose `NarSize` differs from the actual
     /// decompressed length MUST be rejected (integrity failure).
     /// Signatures are computed over `nar_size`; persisting an unchecked
@@ -4289,7 +4691,7 @@ mod tests {
         .await
         .unwrap();
         let cluster_seed = [0x77u8; 32];
-        let cluster = Signer::from_seed("rio-ac-1", &cluster_seed);
+        let cluster = Signer::from_seed("rio-ac-1", &cluster_seed).unwrap();
         let ts = Arc::new(TenantSigner::new(cluster, db.pool.clone()));
         let sub_b = test_substituter(db.pool.clone()).with_signer(ts);
 
@@ -4418,7 +4820,7 @@ mod tests {
         assert_eq!(got2.nar_size, nar.len() as u64);
     }
 
-    // r[verify store.substitute.untrusted-upstream+3]
+    // r[verify store.substitute.untrusted-upstream+4]
     /// bug_144: `narinfo_to_validated` MUST reject `References:` count
     /// > MAX_REFERENCES (parity with PutPath).
     #[test]

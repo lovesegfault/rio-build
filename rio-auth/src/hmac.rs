@@ -50,7 +50,7 @@ pub trait HmacClaims: Serialize + serde::de::DeserializeOwned {
 /// [`crate::jwt::TenantClaims`] — both appear together in PutPath
 /// handlers, and `hmac::Claims` vs `jwt::Claims` was a recurring
 /// source of confusion.
-// r[impl common.hmac.claims]
+// r[impl common.hmac.claims+1]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AssignmentClaims {
@@ -80,6 +80,25 @@ pub struct AssignmentClaims {
     /// for) a path that doesn't match the content it actually sent —
     /// same blast radius as IA (one content-determined path per NAR).
     pub is_ca: bool,
+    /// Fixed-output derivation (FOD): the assignment's expected output
+    /// is content-bound by a hash *declared in the derivation*, so the
+    /// store MUST NOT accept a descriptor-less upload for it — the
+    /// worker has to present its `fixed:` content-address descriptor,
+    /// which the store then recomputes from the uploaded bytes and
+    /// re-derives the claimed path from
+    /// (`r[sec.authz.ca-path-derived]`). Workers are untrusted: without
+    /// this signed bit the verification trigger would be the
+    /// worker-supplied descriptor itself, and a compromised worker
+    /// could simply omit it and fall back to membership-only
+    /// acceptance. `false` for input-addressed and floating-CA
+    /// assignments (their gates are unchanged).
+    ///
+    /// The scheduler signs this for every fixed-output assignment —
+    /// it is a core guarantee of the system, not an opt-in. The serde
+    /// attributes are purely cosmetic for the wire body (`false` is
+    /// the implied default and is omitted from non-FOD tokens).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_fixed_output: bool,
     /// Unix timestamp (seconds). Token invalid after this. Scheduler
     /// sets it to ~2× build_timeout; a worker legitimately uploading
     /// after build completion is well within that window. Prevents
@@ -478,6 +497,7 @@ mod tests {
                 "/nix/store/bbb-hello-dev".into(),
             ],
             is_ca: false,
+            is_fixed_output: false,
             expiry_unix: (now as i64 + expiry_offset_secs).max(0) as u64,
             tenant: None,
         }
@@ -833,6 +853,53 @@ mod tests {
             .expect("pre-tenant store must accept a tenant-less body");
         assert_eq!(parsed.executor_id, without_tenant.executor_id);
         assert_eq!(parsed.expiry_unix, without_tenant.expiry_unix);
+    }
+
+    /// `is_fixed_output` serde shape: a FOD token round-trips the bit,
+    /// `false` omits the key from the wire body (it is the implied
+    /// default), and a missing key reads as `false`.
+    #[test]
+    fn assignment_claims_fixed_output_round_trip() {
+        let key = HmacKey::from_key(TEST_KEY.to_vec());
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let claims_body = |c: &AssignmentClaims| -> Vec<u8> {
+            let token = key.sign(c);
+            let (claims_b64, _) = token.split_once('.').unwrap();
+            b64.decode(claims_b64).unwrap()
+        };
+
+        // FOD token: bit emitted and round-tripped.
+        let mut fod = test_claims(3600);
+        fod.is_fixed_output = true;
+        let body = claims_body(&fod);
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("\"is_fixed_output\""),
+            "true must emit the key"
+        );
+        let tok = key.sign(&fod);
+        assert!(
+            key.verify::<AssignmentClaims>(&tok)
+                .unwrap()
+                .is_fixed_output
+        );
+
+        // Non-FOD token: key omitted, reads back as false.
+        let plain = test_claims(3600); // is_fixed_output: false
+        let body = claims_body(&plain);
+        assert!(
+            !std::str::from_utf8(&body)
+                .unwrap()
+                .contains("is_fixed_output"),
+            "false must NOT emit the key (implied default)"
+        );
+        let tok = key.sign(&plain);
+        assert!(
+            !key.verify::<AssignmentClaims>(&tok)
+                .unwrap()
+                .is_fixed_output
+        );
     }
 
     #[test]

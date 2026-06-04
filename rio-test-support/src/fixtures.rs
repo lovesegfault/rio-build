@@ -68,6 +68,7 @@ pub fn make_derivation_node(tag: &str, system: &str) -> DerivationNode {
         wanted_output_names: vec![],
         explicitly_requested: false,
         drv_content: Vec::new(),
+        drv_content_authoritative: false,
         is_content_addressed: false,
         ca_modular_hash: Vec::new(),
         needs_resolve: false,
@@ -166,6 +167,38 @@ pub fn make_path_info(store_path: &str, nar: &[u8], nar_hash: [u8; 32]) -> Valid
 pub fn make_path_info_for_nar(store_path: &str, nar: &[u8]) -> ValidatedPathInfo {
     let digest: [u8; 32] = Sha256::digest(nar).into();
     make_path_info(store_path, nar, digest)
+}
+
+/// Build a `.drv`-shaped single-file NAR plus its CANONICAL store path:
+/// the text content-address nix's `writeDerivation` mints for these
+/// bytes (`make_text(name, sha256(text), references)`).
+///
+/// Tests that upload `.drv` blobs should claim THIS path — both the
+/// store (`store.put.drv-text-ca+3`) and the gateway's session cache
+/// (`gw.dag.drv-cache-text-ca`) reject/skip `.drv` content presented
+/// under any other path.
+pub fn make_drv_nar(name: &str, drv_text: &[u8], references: &[&str]) -> (String, Vec<u8>) {
+    use std::io::Write as _;
+    let node = NarNode::Regular {
+        executable: false,
+        contents: drv_text.to_vec(),
+    };
+    let mut nar = Vec::new();
+    rio_nix::nar::serialize(&mut nar, &node).expect("NAR serialize to Vec is infallible");
+    let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
+    w.write_all(drv_text)
+        .expect("hashing in-memory bytes is infallible");
+    let hash = w.finish();
+    let refs: Vec<rio_nix::store_path::StorePath> = references
+        .iter()
+        .map(|r| {
+            rio_nix::store_path::StorePath::parse(r)
+                .unwrap_or_else(|e| panic!("test fixture reference {r:?} is invalid: {e}"))
+        })
+        .collect();
+    let path =
+        rio_nix::store_path::StorePath::make_text(name, &hash, &refs).expect("sha256 text path");
+    (path.to_string(), nar)
 }
 
 /// Seed an output file at `{tmp}/nix/store/{basename}` with the given

@@ -149,6 +149,12 @@ in
   # + KWOK Stage rules here so the §13b nodeclaim_pool reconciler can
   # be exercised without EC2.
   extraManifests ? { },
+  # Extra NixOS module merged into the k3s-server node. The
+  # prod-parity overlay runs an in-VM Secrets Manager mock here so
+  # the bootstrap Job's awscli2 has a faithful endpoint (genuine
+  # ResourceNotFoundException → create → converge) instead of
+  # credential-less failures.
+  extraServerModule ? { },
 }:
 let
   ciliumRender = mkCiliumRender gatewayEnabled;
@@ -515,6 +521,7 @@ let
       imports = [
         k3sBase
         k3sV6Only
+        extraServerModule
       ];
       networking.hostName = "k3s-server";
 
@@ -803,18 +810,84 @@ rec {
             )
         except Exception:
             print(f"=== wait_worker_pod TIMEOUT pool={pool} ns={ns} ===")
-            print(k3s_server.execute(
-                f"k3s kubectl -n {ns} get pool,job,pod -o wide 2>&1; "
-                f"k3s kubectl -n {ns} describe pod -l rio.build/pool={pool} 2>&1; "
-                f"echo '--- pod logs ---'; "
-                f"k3s kubectl -n {ns} logs -l rio.build/pool={pool} --tail=80 2>&1; "
-                "echo '--- controller (INFO+) ---'; "
-                "k3s kubectl -n rio-system logs deploy/rio-controller --tail=400 2>&1 "
-                "  | grep -E '\"level\":\"(INFO|WARN|ERROR)\"' | tail -30; "
-                "echo '--- scheduler (INFO+) ---'; "
-                "k3s kubectl -n rio-system logs deploy/rio-scheduler --tail=400 2>&1 "
-                "  | grep -E '\"level\":\"(INFO|WARN|ERROR)\"' | tail -30"
-            )[1])
+
+            # Each section is its own execute()/print so one wedged or
+            # failing kubectl invocation cannot swallow the rest of the
+            # evidence (the original single-command dump was observed to
+            # stop after the controller section). A crash-looping
+            # dependency (store, gateway) leaves the worker namespace
+            # empty, so dump every service the build depends on, not just
+            # the worker pool. The store section reads the kubelet's
+            # container log files directly so crash-looped containers are
+            # covered even when `kubectl logs --previous` has rotated.
+            def _dump(title, cmd):
+                print(f"--- {title} ---")
+                print(k3s_server.execute(cmd + " 2>&1")[1])
+
+            _dump("worker ns", f"k3s kubectl -n {ns} get pool,job,pod -o wide")
+            _dump(
+                "worker pods",
+                f"k3s kubectl -n {ns} describe pod -l rio.build/pool={pool} | tail -60",
+            )
+            _dump(
+                "worker logs",
+                f"k3s kubectl -n {ns} logs -l rio.build/pool={pool} --tail=60",
+            )
+            _dump(
+                "warning events",
+                "k3s kubectl get events -A --field-selector type=Warning "
+                "--sort-by=.lastTimestamp | tail -40",
+            )
+            _dump("rio-store pods", "k3s kubectl -n rio-store get pods -o wide")
+            _dump(
+                "rio-store container log files",
+                "tail -n 80 /var/log/pods/rio-store_rio-store-*/store/*.log",
+            )
+            _dump(
+                "gateway log tail",
+                "k3s kubectl -n rio-system logs deploy/rio-gateway --tail=40",
+            )
+            _dump(
+                "controller log tail",
+                "k3s kubectl -n rio-system logs deploy/rio-controller --tail=60",
+            )
+            _dump(
+                "scheduler log tail",
+                "k3s kubectl -n rio-system logs deploy/rio-scheduler --tail=60",
+            )
+            # The tails above are usually all DEBUG h2 noise; the lines
+            # that explain a stuck dispatch are the WARN/ERROR ones
+            # buried further back.
+            _dump(
+                "scheduler WARN+ERROR",
+                "k3s kubectl -n rio-system logs deploy/rio-scheduler --tail=4000"
+                " | grep -E '\"level\":\"(WARN|ERROR)\"' | tail -40",
+            )
+            _dump(
+                "controller WARN+ERROR",
+                "k3s kubectl -n rio-system logs deploy/rio-controller --tail=4000"
+                " | grep -E '\"level\":\"(WARN|ERROR)\"' | tail -40",
+            )
+            _dump(
+                "gateway WARN+ERROR",
+                "k3s kubectl -n rio-system logs deploy/rio-gateway --tail=4000"
+                " | grep -E '\"level\":\"(WARN|ERROR)\"' | tail -40",
+            )
+            _dump("fetcher ns", "k3s kubectl -n ${nsFetchers} get job,pod -o wide")
+            # A consumer build that never dispatches usually means its FOD
+            # dependency failed on the fetcher pod — the fetcher Job still
+            # shows Complete (the agent exits 0 after reporting a failed
+            # build), so the only place the actual fetch error surfaces is
+            # the fetcher container log. Dump every Job's log in both
+            # worker namespaces while the pod objects still exist
+            # (ttlSecondsAfterFinished reaps them shortly after).
+            for jns in ("${nsFetchers}", ns):
+                _dump(
+                    f"job logs ({jns})",
+                    f"for j in $(k3s kubectl -n {jns} get jobs -o name); do "
+                    'echo "== $j =="; '
+                    f"k3s kubectl -n {jns} logs $j --tail=150; done",
+                )
             raise
         # Race: the pod can transition out of Running (build finished)
         # between the wait above and a second `succeed()` re-query —

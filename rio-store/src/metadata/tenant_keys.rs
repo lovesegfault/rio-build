@@ -50,7 +50,13 @@ pub(crate) async fn get_active_signer(
         ))
     })?;
 
-    Ok(Some(Signer::from_seed(name, &seed)))
+    let signer = Signer::from_seed(&name, &seed).map_err(|e| {
+        MetadataError::InvariantViolation(format!(
+            "tenant_keys.key_name for tenant {tenant_id} key {name:?} is not a \
+             publishable key name: {e}"
+        ))
+    })?;
+    Ok(Some(signer))
 }
 
 /// All unrevoked tenant signing keys as `name:base64(pubkey)` trusted-key
@@ -91,7 +97,13 @@ pub(crate) async fn trusted_key_entries(
                      {seed_len} bytes, expected 32"
                 ))
             })?;
-            Ok(Signer::from_seed(name, &seed).trusted_key_entry())
+            let signer = Signer::from_seed(&name, &seed).map_err(|e| {
+                MetadataError::InvariantViolation(format!(
+                    "tenant_keys.key_name for tenant {tenant_id} key {name:?} is not a \
+                     publishable key name: {e}"
+                ))
+            })?;
+            Ok(signer.trusted_key_entry())
         })
         .collect()
 }
@@ -276,8 +288,12 @@ mod tests {
         // Entries are name:base64(pubkey) — derive expected from the
         // seeds to prove we got the PUBKEY, not the seed.
         let mut expected = vec![
-            Signer::from_seed("tenant-e-1", &[0x01u8; 32]).trusted_key_entry(),
-            Signer::from_seed("tenant-e-2", &[0x02u8; 32]).trusted_key_entry(),
+            Signer::from_seed("tenant-e-1", &[0x01u8; 32])
+                .unwrap()
+                .trusted_key_entry(),
+            Signer::from_seed("tenant-e-2", &[0x02u8; 32])
+                .unwrap()
+                .trusted_key_entry(),
         ];
         expected.sort();
         assert_eq!(entries, expected);

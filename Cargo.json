@@ -8,6 +8,7 @@
     "rio-common": "rio-common",
     "rio-controller": "rio-controller",
     "rio-crds": "rio-crds",
+    "rio-exec": "rio-exec",
     "rio-gateway": "rio-gateway",
     "rio-lease": "rio-lease",
     "rio-migrations": "rio-migrations",
@@ -15246,9 +15247,11 @@
         "hostname",
         "mman",
         "mount",
+        "personality",
         "process",
         "sched",
         "signal",
+        "term",
         "uio",
         "user"
       ],
@@ -19052,6 +19055,10 @@
           "packageId": "anyhow"
         },
         {
+          "name": "async-compression",
+          "packageId": "async-compression"
+        },
+        {
           "name": "axum",
           "packageId": "axum"
         },
@@ -19072,6 +19079,10 @@
           "packageId": "hex"
         },
         {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
           "name": "metrics",
           "packageId": "metrics"
         },
@@ -19084,12 +19095,16 @@
           "packageId": "prost-types"
         },
         {
-          "name": "regex",
-          "packageId": "regex"
+          "name": "reqwest",
+          "packageId": "reqwest"
         },
         {
           "name": "rio-common",
           "packageId": "rio-common"
+        },
+        {
+          "name": "rio-exec",
+          "packageId": "rio-exec"
         },
         {
           "name": "rio-nix",
@@ -19098,6 +19113,10 @@
         {
           "name": "rio-proto",
           "packageId": "rio-proto"
+        },
+        {
+          "name": "rustls",
+          "packageId": "rustls"
         },
         {
           "name": "schemars",
@@ -19124,10 +19143,6 @@
           "packageId": "sha2 0.11.0"
         },
         {
-          "name": "sqlx",
-          "packageId": "sqlx"
-        },
-        {
           "name": "thiserror",
           "packageId": "thiserror"
         },
@@ -19138,6 +19153,10 @@
         {
           "name": "tokio-stream",
           "packageId": "tokio-stream"
+        },
+        {
+          "name": "tokio-util",
+          "packageId": "tokio-util"
         },
         {
           "name": "toml",
@@ -19188,6 +19207,10 @@
       ],
       "crateBin": [
         {
+          "name": "differential-driver",
+          "path": "src/bin/differential-driver.rs"
+        },
+        {
           "name": "rio-builder",
           "path": "src/main.rs"
         }
@@ -19213,8 +19236,16 @@
           "packageId": "anyhow"
         },
         {
+          "name": "base64",
+          "packageId": "base64 0.22.1"
+        },
+        {
           "name": "clap",
           "packageId": "clap"
+        },
+        {
+          "name": "ed25519-dalek",
+          "packageId": "ed25519-dalek"
         },
         {
           "name": "hex",
@@ -19227,6 +19258,10 @@
         {
           "name": "kube",
           "packageId": "kube"
+        },
+        {
+          "name": "rand",
+          "packageId": "rand 0.10.1"
         },
         {
           "name": "rio-auth",
@@ -19277,6 +19312,10 @@
         {
           "name": "rstest",
           "packageId": "rstest"
+        },
+        {
+          "name": "tempfile",
+          "packageId": "tempfile"
         }
       ],
       "crateBin": [
@@ -19321,6 +19360,10 @@
         {
           "name": "config",
           "packageId": "config"
+        },
+        {
+          "name": "ed25519-dalek",
+          "packageId": "ed25519-dalek"
         },
         {
           "name": "futures-util",
@@ -19426,7 +19469,8 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "aws"
+        "aws",
+        "signing-keyfmt"
       ],
       "libCrateTypes": [
         "lib"
@@ -19614,10 +19658,63 @@
           "packageId": "workspace-hack"
         }
       ],
+      "devDependencies": [
+        {
+          "name": "regex",
+          "packageId": "regex"
+        }
+      ],
       "crateBin": [
         {
           "name": "crdgen",
           "path": "src/bin/crdgen.rs"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
+    "rio-exec": {
+      "crateName": "rio-exec",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-exec"
+      },
+      "dependencies": [
+        {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
+          "name": "nix",
+          "packageId": "nix 0.31.3"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
+        }
+      ],
+      "devDependencies": [
+        {
+          "name": "tempfile",
+          "packageId": "tempfile"
         }
       ],
       "libCrateTypes": [
@@ -20552,6 +20649,10 @@
         {
           "name": "config",
           "packageId": "config"
+        },
+        {
+          "name": "metrics-util",
+          "packageId": "metrics-util"
         },
         {
           "name": "proptest",
@@ -25207,6 +25308,7 @@
         "codec",
         "default",
         "io",
+        "io-util",
         "slab",
         "time"
       ],
@@ -28873,6 +28975,10 @@
         },
         {
           "name": "nix",
+          "packageId": "nix 0.31.3"
+        },
+        {
+          "name": "nix",
           "packageId": "nix 0.31.3",
           "target": "aarch64-unknown-linux-gnu"
         },
@@ -29449,6 +29555,10 @@
           "name": "miniz_oxide",
           "packageId": "miniz_oxide",
           "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "nix",
+          "packageId": "nix 0.31.3"
         },
         {
           "name": "nix",

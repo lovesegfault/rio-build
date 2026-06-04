@@ -196,6 +196,29 @@ pub(crate) struct RecoveryBuildRow {
     pub total_drvs: i32,
     pub completed_drvs: i32,
     pub cached_drvs: i32,
+    /// Sticky first-failure summary persisted while the build was still
+    /// running. Primary writer: the at-source chokepoint
+    /// (`sched.build.failure-evidence-at-source+1`) in the same actor turn
+    /// the failure is observed. Backstop writers: the eraser-path
+    /// persists (`sched.merge.displaced-failure-evidence` for the
+    /// displacement prune and the resubmit-reset,
+    /// `sched.poison.clear-failure-evidence` for the admin ClearPoison /
+    /// poison-TTL prunes). A keep_going build whose failed derivation
+    /// was displaced has no failed node linked to it anymore, and a
+    /// poison-cleared row is reset to `'created'` so the surviving link
+    /// reconstructs nothing — this column is the durable evidence either
+    /// way. `NULL` for builds that never observed a failure (terminal
+    /// transitions also write the column, but those rows aren't loaded
+    /// here).
+    pub error_summary: Option<String>,
+    /// The other half of the sticky first-failure PAIR (M_072,
+    /// round-16 bug_100): which derivation failed first. Written by
+    /// the same single-statement COALESCE as the summary; restored
+    /// together so a post-failover terminal `BuildFailed` never ships
+    /// an `error_message` with `failed_derivation=""`. NULL = no
+    /// failure recorded, a backstop-only write that had no hash, or a
+    /// pre-072 row.
+    pub failed_derivation: Option<String>,
     /// PG-side `now() - submitted_at` so the caller can reconstruct an
     /// `Instant` (same pattern as [`PoisonedDerivationRow`]). Seeds
     /// `BuildInfo::submitted_at` so `r[sched.timeout.per-build]` and
@@ -204,29 +227,94 @@ pub(crate) struct RecoveryBuildRow {
     pub submitted_age_secs: f64,
 }
 
-/// Row from `load_poisoned_derivations`. Minimal — poisoned rows
-/// aren't dispatched, just TTL-tracked + resubmit-bound checked
-/// (`is_retriable_on_resubmit` reads `resubmit_cycles`). `elapsed_secs`
-/// is computed PG-side (`now() - poisoned_at`) so the caller can
-/// reconstruct an `Instant` via
-/// `Instant::now() - Duration::from_secs_f64(elapsed)`.
+/// Row from `load_poisoned_derivations`. Carries the same creation-time
+/// snapshot as [`RecoveryDerivationRow`] (identity, expected outputs,
+/// authoritative inline content, floors) plus the PG-computed
+/// `elapsed_secs`: the merge gate (`sched.merge.authoritative-conflict`)
+/// keys on the existing node's authoritative content and verifiable
+/// identity, so a poisoned row recovered as an empty stub would silently
+/// disable the gate after failover (and historically did — I-057 grew
+/// `is_fixed_output` for the same reason before the row was unified).
+/// Poisoned rows are still only TTL-tracked + resubmit-bound checked
+/// (`is_retriable_on_resubmit` reads `resubmit_cycles`), never
+/// dispatched. `elapsed_secs` is computed PG-side
+/// (`now() - poisoned_at`) so the caller can reconstruct an `Instant`
+/// via `Instant::now() - Duration::from_secs_f64(elapsed)`.
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct PoisonedDerivationRow {
-    pub derivation_id: Uuid,
+    /// Full creation-time recovery snapshot (same columns as the
+    /// non-terminal recovery query; `exec_id` / `assigned_builder_id`
+    /// are selected as NULL because poisoned executions are already
+    /// finalized by `persist_poisoned`).
+    #[sqlx(flatten)]
+    pub base: RecoveryDerivationRow,
+    pub elapsed_secs: f64,
+}
+
+/// Input-form columns of a derivation row, loaded by drv PATH for the
+/// unseeded-input read-through (`sched.dispatch.claims-derived+5`,
+/// bug_029). Selected narrow on purpose: the consumer
+/// (`InputFormSeed::from_persisted_rows`) needs exactly the recorded
+/// hash plus the two flags its not-floating predicate reads.
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct InputFormRow {
+    pub drv_path: String,
+    pub ca_modular_hash: Option<Vec<u8>>,
+    pub is_fixed_output: bool,
+    pub is_ca: bool,
+    /// Persisted definition-evidence rank, re-checked by the
+    /// constructor (`InputFormSeed::from_persisted_rows`) against
+    /// `DefinitionEvidence::seeds_input_form` — the second tier of the
+    /// seed rank floor (`sched.evidence.seed-rank-floor`); the first
+    /// is the SQL predicate in `load_input_form_rows`. Fail-closed:
+    /// an undecodable rank does not seed.
+    pub evidence_rank: String,
+}
+
+/// Identity columns of a SETTLED (`completed`/`skipped`) derivation row,
+/// loaded by `load_settled_identity_rows` for the pre-merge
+/// settled-identity freeze (`sched.persist.settled-identity-freeze+4`).
+/// Compared against an incoming submission node by
+/// `actor::merge::settled_row_identity_matches` — the row-level twin of
+/// `dag::verifiable_identity_matches`.
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct SettledIdentityRow {
     pub drv_hash: String,
     pub drv_path: String,
-    pub pname: Option<String>,
     pub system: String,
-    pub failed_builders: Vec<String>,
-    pub elapsed_secs: f64,
-    /// I-057: previously hardcoded false in `from_poisoned_row`. A
-    /// poison-recovered FOD with `is_fixed_output: false` would route
-    /// to a builder via the kind XOR in `hard_filter`, hit `WrongKind`
-    /// at executor/mod.rs:390, and re-poison. Thread it through.
+    pub output_names: Vec<String>,
+    pub expected_output_paths: Vec<String>,
     pub is_fixed_output: bool,
-    /// `M_051`: resubmit-bound counter; persisted so the bound survives
-    /// failover (bug_001).
-    pub resubmit_cycles: i32,
+    pub is_ca: bool,
+    /// Raw bytes of the persisted CA modular hash (`bytea`). The
+    /// gateway populates the hash on every node it can compute
+    /// (`gw.dag.modulo-hash-all-nodes`), so NULL means the creating
+    /// submission carried none — a plain IA node with static output
+    /// paths, a direct submitter's bare node, or an ingress-stripped
+    /// unverifiable claim — never "not populated yet".
+    pub ca_modular_hash: Option<Vec<u8>>,
+    /// Persisted definition-evidence rank (`M_067`,
+    /// `sched.derivation.evidence-rank`). Read by the settled-row
+    /// protection so a rank-uniform refusal applies even when no DAG
+    /// node is resident (the post-reap window): a settled row at
+    /// `path_bound_bytes`/`verified_built` is never displaced by
+    /// store-evidence disambiguation — store bytes cannot contradict
+    /// byte-derived identity.
+    // First reader is the merge-time store-evidence enrichment's
+    // row-only rank gate (lands with sched.merge.store-evidence-
+    // displacement); the column is selected now so the loader and the
+    // gate cannot drift.
+    #[allow(dead_code)]
+    pub evidence_rank: String,
+    /// Preserved stripped declared hash (`M_070`) — written by the
+    /// strip writers (ingress move, dispatch
+    /// `persist_evidence_rank_and_strip_modular_hash`); selected here
+    /// so the loader and its reader (the settled-row matcher's
+    /// preserved-claim basis, `sched.persist.settled-identity-freeze+4`)
+    /// cannot drift. NEVER evidence: the matcher admits a byte-equal
+    /// value as match basis but a differing value falls through (an
+    /// unverified value cannot contradict).
+    pub ca_modular_hash_stripped: Option<Vec<u8>>,
 }
 
 /// Row from `load_nonterminal_derivations`. Mirrors the INSERT
@@ -245,6 +333,11 @@ pub(crate) struct RecoveryDerivationRow {
     pub retry_count: i32,
     pub resubmit_cycles: i32,
     pub expected_output_paths: Vec<String>,
+    /// M_075 (round-17 merged_bug_099): dispatch-resolved claim paths,
+    /// NULL for legacy/never-resolved rows. Restored verbatim so a
+    /// surviving worker's deferred-IA build keeps its GC pin and its
+    /// completion path-binding across failover.
+    pub claim_output_paths: Option<Vec<String>>,
     pub output_names: Vec<String>,
     /// Demand-driven wanted-output set (`migrations/062`). Empty = all
     /// declared outputs wanted (also the pre-migration default, so old
@@ -266,7 +359,7 @@ pub(crate) struct RecoveryDerivationRow {
     /// was removed out from under the node (a terminal build's cleanup
     /// reap, a poison-clear removal, or a recovery-time edge drop), so
     /// its persisted children are a truncated view of its pruned input
-    /// closure. Written best-effort via `set_closure_hole_by_hashes`
+    /// closure. Written best-effort via `set_closure_holes` (069 witness rows in the same transaction)
     /// (the leader's reap hook, the recovery-time stamp, and the two
     /// poison-clear paths), restored verbatim by `from_recovery_row`
     /// (`from_poisoned_row` keeps `false`), and consulted by the
@@ -281,6 +374,36 @@ pub(crate) struct RecoveryDerivationRow {
     pub floor_mem_bytes: i64,
     pub floor_disk_bytes: i64,
     pub floor_deadline_secs: i64,
+    /// Persisted authoritative inline derivation (`M_062`) — `Some`
+    /// only for content-bound hook-fallback nodes; rehydrated into
+    /// `DerivationState::drv_content` so post-failover dispatch still
+    /// carries the only copy of the derivation.
+    pub drv_content: Option<Vec<u8>>,
+    /// Persisted ingress-provided CA modular hash (`M_066`) — the
+    /// content-bound identity evidence for CA rows. Restored into
+    /// `CaState::modular_hash` when the recompute-from-bytes branch does
+    /// not apply (store-backed CA rows have no persisted bytes), so the
+    /// merge gate's evidence survives failover. `NULL` for non-CA rows
+    /// and rows whose creating submission carried no hash; wrong-length
+    /// values degrade to unset at hydration.
+    pub ca_modular_hash: Option<Vec<u8>>,
+    /// Preserved stripped declared hash (`M_070`) — restored verbatim
+    /// into `CaState::modular_hash_stripped`; never evidence (see the
+    /// field doc there). Wrong-length values degrade to unset.
+    pub ca_modular_hash_stripped: Option<Vec<u8>>,
+    /// Persisted definition-evidence rank (`M_067`). Restored verbatim
+    /// by `from_recovery_row`, floored at `content_bound_claim` when
+    /// authoritative bytes are present; unparseable values degrade to
+    /// the `unverified_claim` floor (`DefinitionEvidence::parse_lossy`).
+    pub evidence_rank: String,
+    /// Persisted dispatch-resolve flag (`M_071`, round-16 bug_053).
+    /// `Some` is restored VERBATIM by `from_recovery_row` — it is the
+    /// byte-derived value the creation upsert or a dispatch raise
+    /// recorded; `None` marks a pre-071 legacy row, the only case the
+    /// lossy `should_resolve_from_expected_paths` degrade still
+    /// covers (it cannot see a FOD's floating inputs, which is the
+    /// exact under-approximation that poisoned post-failover FODs).
+    pub needs_resolve: Option<bool>,
     /// Per-execution identifier from the active `assignments` row
     /// (`migrations/061`). `None` unless the drv is currently dispatched
     /// (`assigned_builder_id IS NOT NULL`) — a reset drv's assignments row
@@ -309,6 +432,7 @@ impl RecoveryDerivationRow {
             retry_count: 0,
             resubmit_cycles: 0,
             expected_output_paths: vec![],
+            claim_output_paths: None,
             output_names: vec!["out".into()],
             wanted_output_names: vec![],
             is_fixed_output: false,
@@ -319,6 +443,11 @@ impl RecoveryDerivationRow {
             floor_mem_bytes: 0,
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,
+            evidence_rank: "unverified_claim".into(),
+            needs_resolve: None,
+            drv_content: None,
+            ca_modular_hash: None,
+            ca_modular_hash_stripped: None,
             exec_id: None,
         }
     }
@@ -326,7 +455,8 @@ impl RecoveryDerivationRow {
 
 /// Row from `load_build_graph` nodes query. Thin — ~200B.
 /// Mirrors proto `GraphNode` (NOT `DerivationNode`, which carries
-/// ≤64KB `drv_content`). `pname` and `assigned_builder_id` are COALESCE'd
+/// inline `drv_content` — typically ≤64KB, up to 1 MiB for
+/// hook-fallback nodes). `pname` and `assigned_builder_id` are COALESCE'd
 /// to empty-string SQL-side to match proto3's non-optional string fields.
 ///
 /// `derivation_id` is NOT in the proto — it's collected here so the edge
@@ -405,17 +535,61 @@ pub(crate) struct DerivationRow {
     /// Closure-hole breadcrumb (`migrations/064`). Merge-time rows
     /// always bind `false` — the upsert is never a stamping site for
     /// the breadcrumb (the setters, all via
-    /// `set_closure_hole_by_hashes`, are the leader-gated reap hook,
+    /// `set_closure_holes`, are the leader-gated reap hook,
     /// the recovery-time stamp in `load_dag_from_rows`, and the
     /// poison-clear paths — admin ClearPoison and the poison-TTL
     /// sweep) — and the OR-on-conflict SET keeps any persisted hole,
     /// so a later merge of the same drv can never launder it away.
     /// Cleared together with `topdown_pruned` by the batched
     /// Vouched-keyed `clear_topdown_pruned_by_hashes` helper and on
-    /// its own by the merge-time heal (`clear_closure_hole_by_hashes`);
+    /// its own by the merge-time heal (`clear_closure_hole_by_hashes`,
+    /// keyed on `MergeResult::healed_parents` — accepted trigger ∧
+    /// witness coverage; see its defining field doc);
     /// the single-row `clear_topdown_pruned_by_hash` is mark-only, so
     /// the topdown fail-fast retains the hole it leaves behind.
     pub closure_hole: bool,
+    /// Authoritative inline derivation bytes (content-bound hook
+    /// fallback) — `Some` only when the gateway marked the node
+    /// `drv_content_authoritative` (and SubmitBuild ingress validated
+    /// the bytes against the node's claimed identity); `None` for every
+    /// other node. Refreshed or cleared only by the submission that
+    /// (re)creates the node (sched.persist.creation-scoped);
+    /// submissions that join a live node never reach the upsert.
+    pub drv_content: Option<Vec<u8>>,
+    /// Ingress-provided CA modular hash (`M_066`) — content-bound
+    /// identity evidence and realisation key, persisted so it survives
+    /// failover for store-backed CA rows (whose bytes are never
+    /// persisted) and for deferred-IA rows (is_ca=false but the
+    /// gateway populates the hash). `None` for plain-IA nodes with
+    /// statically-known output paths or submissions that carried no
+    /// hash. Snapshot identity: refreshed unconditionally on
+    /// (re)creation, never part of the definition-change accumulator
+    /// reset. r[impl sched.persist.ca-modular-hash+2]
+    pub ca_modular_hash: Option<[u8; 32]>,
+    /// Definition-evidence rank (`M_067`,
+    /// `sched.derivation.evidence-rank`) — the ingress shape-based
+    /// rank of the CREATING submission
+    /// (`DefinitionEvidence::from_node_shape`). Creation-snapshot
+    /// `EXCLUDED` semantics on conflict (rank monotonicity is scoped
+    /// per node lifecycle; a re-creation starts a new lifecycle at its
+    /// own ingress rank). Settle/dispatch upgrades use the separate
+    /// runtime `persist_evidence_rank` writer.
+    pub evidence_rank: crate::state::DefinitionEvidence,
+    /// M_071 dispatch-resolve flag — the merge-time authoritative
+    /// value (store-evidence grant's byte-derived flag for verified
+    /// creations, gateway echo otherwise). Always present at creation;
+    /// the column is nullable only to mark pre-071 legacy rows for
+    /// recovery's degrade fallback.
+    pub needs_resolve: bool,
+    /// Preserved stripped declared hash (`M_070`). `Some` only when
+    /// the creating submission's INGRESS strip removed an unverifiable
+    /// declared hash; the dispatch strip writes the column through its
+    /// own single-statement mover
+    /// (`persist_evidence_rank_and_strip_modular_hash`), never this
+    /// upsert. On conflict the upsert supersedes the preserved value
+    /// with NULL when the re-creation carries a live hash (strictly
+    /// better evidence), else carries the prior value forward.
+    pub ca_modular_hash_stripped: Option<[u8; 32]>,
 }
 
 /// Shared SELECT / FROM clause for `list_builds` and

@@ -49,6 +49,8 @@ pub(crate) type StoreAdminClient = StoreAdminServiceClient<
 mod builds;
 mod derivations;
 mod gc;
+mod invalidate_path;
+mod keygen;
 mod logs;
 mod poison;
 mod pool;
@@ -356,6 +358,19 @@ enum Cmd {
         #[command(subcommand)]
         cmd: upstream::UpstreamCmd,
     },
+    /// Invalidate a store path's cache metadata (narinfo, manifests,
+    /// path_tenants, and by default its realisations) so the next
+    /// submission misses the cache and re-executes. Operator
+    /// remediation for wrong-content uploads; chunk refcounts are
+    /// decremented and zeroed chunks queued for backend deletion. Talks
+    /// to StoreAdminService directly.
+    InvalidatePath(invalidate_path::Args),
+    /// Generate an ed25519 narinfo signing keypair in Nix's
+    /// `name:base64` format (what `signing_key_path` loads and what
+    /// `trusted-public-keys` entries look like). Purely local — no
+    /// cluster connection. The bootstrap Job uses this to mint
+    /// `rio/signing-key{,-pub}`.
+    Keygen(keygen::KeygenArgs),
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -379,6 +394,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     match cmd {
+        // Purely local — no K8s, no gRPC. Must not gate on a reachable
+        // scheduler/store: the bootstrap Job runs this before any rio
+        // service exists.
+        Cmd::Keygen(a) => keygen::run(a),
         // kube-only — talks to the K8s apiserver via KUBECONFIG /
         // in-cluster config; no gRPC connect at all.
         Cmd::Pool { cmd } => pool::run(as_json, cmd).await,
@@ -390,6 +409,9 @@ async fn main() -> anyhow::Result<()> {
             upstream::run(as_json, &mut sc, &cfg, cmd).await
         }
         Cmd::VerifyChunks(a) => verify_chunks::run(&mut cfg.connect_store_admin().await?, a).await,
+        Cmd::InvalidatePath(a) => {
+            invalidate_path::run(as_json, &mut cfg.connect_store_admin().await?, a).await
+        }
         // Everything else talks to AdminService — connect once.
         admin => {
             let mut c = cfg.connect_admin().await?;
@@ -408,7 +430,11 @@ async fn main() -> anyhow::Result<()> {
                 Cmd::PoisonList => poison::run_list(as_json, &mut c).await,
                 Cmd::DrainExecutor(a) => workers::run_drain(as_json, &mut c, a).await,
                 Cmd::Sla { cmd } => sla::run(as_json, &mut c, cmd).await,
-                Cmd::Pool { .. } | Cmd::Upstream { .. } | Cmd::VerifyChunks(_) => {
+                Cmd::Pool { .. }
+                | Cmd::Upstream { .. }
+                | Cmd::VerifyChunks(_)
+                | Cmd::InvalidatePath(_)
+                | Cmd::Keygen(_) => {
                     unreachable!("handled above")
                 }
             }

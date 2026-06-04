@@ -28,6 +28,21 @@
       "doc": "Worker log banner: a `rio:`-prefixed header at the start of every"
     },
     {
+      "path": "bin/",
+      "depth": 0,
+      "doc": ""
+    },
+    {
+      "path": "bin/differential-driver.rs",
+      "depth": 1,
+      "doc": "Differential-harness driver binary."
+    },
+    {
+      "path": "builtin_fetchurl.rs",
+      "depth": 0,
+      "doc": "Native `builtin:fetchurl` — the in-sandbox half."
+    },
+    {
       "path": "cgroup.rs",
       "depth": 0,
       "doc": "Per-build cgroup v2 resource tracking."
@@ -43,19 +58,44 @@
       "doc": "Build executor: receives WorkAssignment from scheduler, runs builds."
     },
     {
-      "path": "executor/daemon/",
+      "path": "executor/differential.rs",
       "depth": 1,
-      "doc": "nix-daemon subprocess management."
+      "doc": "Differential-harness driver: build one derivation with the native"
     },
     {
-      "path": "executor/daemon/spawn.rs",
-      "depth": 2,
-      "doc": "Spawn `nix-daemon --stdio` for a chroot store at the per-build dir."
+      "path": "executor/dropped.rs",
+      "depth": 1,
+      "doc": "Resolve-time residency-gap evidence, typed (round-17 merged_bug_054"
     },
     {
-      "path": "executor/daemon/stderr_loop.rs",
+      "path": "executor/glue/",
+      "depth": 1,
+      "doc": "Nix request glue: `Derivation` → [`rio_exec::ExecutionRequest`]."
+    },
+    {
+      "path": "executor/glue/attrs.rs",
       "depth": 2,
-      "doc": "Daemon I/O after spawn: handshake, wopBuildDerivation, STDERR loop, log batching."
+      "doc": "`__structuredAttrs` materialization: `.attrs.json` and `.attrs.sh`."
+    },
+    {
+      "path": "executor/glue/builtin.rs",
+      "depth": 2,
+      "doc": "Request construction for `builtin:fetchurl` derivations."
+    },
+    {
+      "path": "executor/glue/env.rs",
+      "depth": 2,
+      "doc": "Builder environment materialization and placeholder rewriting."
+    },
+    {
+      "path": "executor/glue/log.rs",
+      "depth": 2,
+      "doc": "The `@nix` log side-channel filter."
+    },
+    {
+      "path": "executor/glue/refs_graph.rs",
+      "depth": 2,
+      "doc": "`exportReferencesGraph` materialization."
     },
     {
       "path": "executor/inputs.rs",
@@ -68,14 +108,29 @@
       "doc": "Per-build cgroup monitor tasks: CPU peak poller, OOM watcher, drain."
     },
     {
-      "path": "executor/outputs.rs",
+      "path": "executor/native_result/",
       "depth": 1,
-      "doc": "Output collection: FOD verify, upload, daemon→proto BuildResult mapping."
+      "doc": "Native-executor result processing: everything nix-daemon does between"
     },
     {
-      "path": "executor/sandbox.rs",
+      "path": "executor/native_result/ca.rs",
+      "depth": 2,
+      "doc": "Floating content-addressed output finalization."
+    },
+    {
+      "path": "executor/native_result/canonicalise.rs",
+      "depth": 2,
+      "doc": "Output canonicalisation: the filesystem-normalization pass nix-daemon"
+    },
+    {
+      "path": "executor/native_result/policy.rs",
+      "depth": 2,
+      "doc": "Output policy checks: `allowedReferences` / `disallowedReferences` /"
+    },
+    {
+      "path": "executor/outputs.rs",
       "depth": 1,
-      "doc": "Sandbox setup: synthetic SQLite DB, nix.conf."
+      "doc": "Output collection: FOD verify, upload, proto BuildResult mapping."
     },
     {
       "path": "fixture.rs",
@@ -203,11 +258,6 @@
       "doc": "Single-build occupancy tracking and cancellation."
     },
     {
-      "path": "synth_db.rs",
-      "depth": 0,
-      "doc": "Synthetic Nix store SQLite database generation."
-    },
-    {
       "path": "upload/",
       "depth": 0,
       "doc": "Output upload to rio-store after build completion."
@@ -243,6 +293,16 @@
       "path": "gc.rs",
       "depth": 0,
       "doc": "`rio-cli gc` — trigger a store garbage-collection sweep."
+    },
+    {
+      "path": "invalidate_path.rs",
+      "depth": 0,
+      "doc": "`rio-cli invalidate-path` — operator remediation for a path that was"
+    },
+    {
+      "path": "keygen.rs",
+      "depth": 0,
+      "doc": "`rio-cli keygen` — ed25519 narinfo signing-key operations."
     },
     {
       "path": "logs.rs",
@@ -350,6 +410,11 @@
       "path": "signal.rs",
       "depth": 0,
       "doc": "Graceful shutdown signal handling."
+    },
+    {
+      "path": "signing_keyfmt.rs",
+      "depth": 0,
+      "doc": "Signing-key entry codec — the single owner of the `name:base64`"
     },
     {
       "path": "task.rs",
@@ -511,6 +576,48 @@
       "doc": "Pool CRD: spawns one-shot rio-builder Jobs (builder OR fetcher mode)."
     }
   ],
+  "rio-exec": [
+    {
+      "path": "child.rs",
+      "depth": 0,
+      "doc": "The post-fork sandbox construction sequence."
+    },
+    {
+      "path": "execute.rs",
+      "depth": 0,
+      "doc": "The `execute()` entry point: parent-side orchestration of one"
+    },
+    {
+      "path": "lib.rs",
+      "depth": 0,
+      "doc": "Build-system-agnostic Linux sandbox executor."
+    },
+    {
+      "path": "outcome.rs",
+      "depth": 0,
+      "doc": "The execution outcome: what happened when the request was run."
+    },
+    {
+      "path": "plan.rs",
+      "depth": 0,
+      "doc": "The sandbox plan: a fully-resolved, ordered description of every"
+    },
+    {
+      "path": "request.rs",
+      "depth": 0,
+      "doc": "The execution request: a complete, concrete description of a process"
+    },
+    {
+      "path": "seccomp.rs",
+      "depth": 0,
+      "doc": "The multi-ABI seccomp purity filter."
+    },
+    {
+      "path": "skeleton.rs",
+      "depth": 0,
+      "doc": "Host-side sandbox preparation: materialize a [`SandboxPlan`]'s"
+    }
+  ],
   "rio-gateway": [
     {
       "path": "config.rs",
@@ -634,6 +741,16 @@
   ],
   "rio-nix": [
     {
+      "path": "ca.rs",
+      "depth": 0,
+      "doc": "Content-addressing primitives for floating-CA outputs."
+    },
+    {
+      "path": "closure.rs",
+      "depth": 0,
+      "doc": "Cycle-safe reference-closure traversal primitives."
+    },
+    {
       "path": "derivation/",
       "depth": 0,
       "doc": "Nix ATerm derivation (`.drv`) parser and serializer."
@@ -649,9 +766,29 @@
       "doc": "Modular derivation hashing (Nix `hashDerivationModulo`)."
     },
     {
+      "path": "derivation/output.rs",
+      "depth": 1,
+      "doc": "Typed derivation outputs — the parse-boundary chokepoint."
+    },
+    {
+      "path": "derivation/structured.rs",
+      "depth": 1,
+      "doc": "`__structuredAttrs`-aware attribute lookup."
+    },
+    {
+      "path": "derivation/typed.rs",
+      "depth": 1,
+      "doc": "Fail-closed typed accessors over structured-attrs JSON values."
+    },
+    {
       "path": "hash.rs",
       "depth": 0,
       "doc": "Nix hash types: SHA-256, SHA-512, SHA-1."
+    },
+    {
+      "path": "hash_oracle.rs",
+      "depth": 0,
+      "doc": "Vendored line-by-line port of CppNix 2.34.7's non-SRI unprefixed"
     },
     {
       "path": "lib.rs",
@@ -866,6 +1003,11 @@
       "path": "actor/recovery.rs",
       "depth": 1,
       "doc": "State recovery on leader acquisition."
+    },
+    {
+      "path": "actor/settled.rs",
+      "depth": 1,
+      "doc": "Settled-row identity and displacement arbitration — the ONE owner"
     },
     {
       "path": "actor/snapshot.rs",
@@ -1310,9 +1452,24 @@
       "doc": "Prior cluster signing keys (`cluster_key_history` table, migration 027)."
     },
     {
+      "path": "metadata/drv_modulo.rs",
+      "depth": 1,
+      "doc": "Store-side derivation modulo-hash cache (`drv_modulo_cache`, M_068)."
+    },
+    {
       "path": "metadata/inline.rs",
       "depth": 1,
       "doc": "Inline write-ahead: small NARs stored directly in `manifests.inline_blob`."
+    },
+    {
+      "path": "metadata/invalidate.rs",
+      "depth": 1,
+      "doc": "Admin invalidation of a store path's cache metadata."
+    },
+    {
+      "path": "metadata/per_path.rs",
+      "depth": 1,
+      "doc": "The per-path table lifecycle registry."
     },
     {
       "path": "metadata/queries.rs",

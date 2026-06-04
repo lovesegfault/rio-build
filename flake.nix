@@ -638,6 +638,12 @@
                     # and the client isn't instrumented). Excluding keeps
                     # after_n_builds stable.
                     "vm-protocol-warm-lix-standalone"
+                    # The differential parity harness builds every corpus
+                    # entry twice (oracle + native); a coverage-mode third
+                    # variant would roughly double the slowest VM job for
+                    # little marginal coverage. Excluded until the corpus
+                    # stabilizes post-activation.
+                    "vm-differential-standalone"
                   ];
 
               # --------------------------------------------------------------

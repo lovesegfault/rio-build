@@ -74,8 +74,15 @@ let
         process.rlimits = [
           {
             type = "RLIMIT_NOFILE";
+            # Match nix-daemon.service's LimitNOFILE (1048576): rio-exec
+            # pins the same value inside every sandbox so builds see one
+            # limit regardless of delivery path, and keeping the pod's
+            # own soft limit identical avoids a confusing "container
+            # says 65536, build says 1048576" split for anything that
+            # inspects limits outside the sandbox (fetcher re-exec,
+            # debugging shells).
             hard = 1048576;
-            soft = 65536;
+            soft = 1048576;
           }
         ];
         linux = {

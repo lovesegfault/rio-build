@@ -32,6 +32,7 @@ use rio_proto::types::{
 
 use rio_common::grpc::StatusExt;
 
+use crate::cas;
 use crate::metadata::{self, ManifestKind};
 
 use super::{StoreServiceImpl, metadata_status, validate_store_path};
@@ -354,12 +355,40 @@ impl StoreServiceImpl {
                         while let Some(result) = chunk_stream.next().await {
                             let chunk_bytes = match result {
                                 Ok(b) => b,
+                                // Transient backend failure (round-16
+                                // bug_027): UNAVAILABLE — retriable,
+                                // says nothing about the chunk's
+                                // existence. Split from the integrity
+                                // verdicts below.
+                                Err(e @ cas::ChunkError::Backend { .. }) => {
+                                    error!(error = %e, "GetPath: chunk backend fetch failed");
+                                    let _ = tx
+                                        .send(Err(Status::unavailable(format!(
+                                            "chunk fetch failed; retry: {e}"
+                                        ))))
+                                        .await;
+                                    return;
+                                }
+                                // Auth refusal: FAILED_PRECONDITION with
+                                // the remediation — NOT the data-loss
+                                // catch-all below, and NOT retried
+                                // (round-17 merged_bug_061).
+                                Err(e @ cas::ChunkError::AuthFailed { .. }) => {
+                                    // Full chain server-side ONLY; the
+                                    // client gets the single-sourced
+                                    // static remediation (round-15
+                                    // scrub rule, 9075dcd8b precedent).
+                                    error!(error = %e, "GetPath: chunk backend auth failed");
+                                    let _ = tx.send(Err(crate::grpc::backend_auth_status())).await;
+                                    return;
+                                }
                                 Err(e) => {
                                     error!(error = %e, "GetPath: chunk fetch/verify failed");
                                     // DATA_LOSS: the manifest says this
-                                    // chunk exists, but we can't get
-                                    // good bytes for it. S3 lost it,
-                                    // or it's corrupt.
+                                    // chunk exists, but the backend
+                                    // authoritatively lacks it (NotFound)
+                                    // or its bytes fail verification
+                                    // (Corrupt).
                                     let _ = tx
                                         .send(Err(Status::data_loss(format!(
                                             "chunk reassembly failed: {e}"

@@ -68,6 +68,29 @@ impl StoreServiceImpl {
         &self,
         request: &Request<T>,
     ) -> Result<Option<rio_auth::hmac::AssignmentClaims>, Status> {
+        self.verify_assignment_token_inner(request, false)
+    }
+
+    // r[impl store.put.ia-deriver-proof+4]
+    /// PutPath/PutPathBatch variant of [`Self::verify_assignment_token`]:
+    /// the WRITE side. The scheduler's service token is NOT a bypass
+    /// here — the scheduler has no PutPath flow (its token serves the
+    /// read-side substitution probe), and honoring it would let a
+    /// scheduler credential skip every registration gate including the
+    /// IA deriver proof. Capability split, not a knob: hardcoded,
+    /// unconditional.
+    pub(super) fn verify_assignment_token_put<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<Option<rio_auth::hmac::AssignmentClaims>, Status> {
+        self.verify_assignment_token_inner(request, true)
+    }
+
+    fn verify_assignment_token_inner<T>(
+        &self,
+        request: &Request<T>,
+        put_side: bool,
+    ) -> Result<Option<rio_auth::hmac::AssignmentClaims>, Status> {
         let Some(verifier) = &self.hmac_verifier else {
             // Verifier not configured = dev mode, accept all.
             return Ok(None);
@@ -87,7 +110,8 @@ impl StoreServiceImpl {
                     if self
                         .service_bypass_callers
                         .iter()
-                        .any(|a| a == &claims.caller) =>
+                        .any(|a| a == &claims.caller)
+                        && !(put_side && claims.caller == "rio-scheduler") =>
                 {
                     metrics::counter!(
                         "rio_store_service_token_accepted_total",
@@ -101,7 +125,9 @@ impl StoreServiceImpl {
                                      "reason" => "service_caller_not_allowlisted")
                     .increment(1);
                     return Err(Status::permission_denied(format!(
-                        "service-token caller {:?} not in allowlist",
+                        "service-token caller {:?} has no bypass for this method \
+                         (scheduler tokens carry probe rights only; PutPath requires \
+                         a per-build assignment token)",
                         claims.caller
                     )));
                 }
@@ -158,7 +184,7 @@ impl StoreServiceImpl {
         let store_path_hash = info.store_path_hash.clone();
         debug!(store_path = %info.store_path.as_str(), "PutPath: received metadata");
 
-        // r[impl sec.authz.ca-path-derived+2]
+        // r[impl sec.authz.ca-path-derived+9]
         // For is_ca tokens, validate_put_metadata skips the
         // `store_path ∈ expected_outputs` membership check (the path is
         // content-derived). The CA authorization gate —
@@ -172,6 +198,12 @@ impl StoreServiceImpl {
         // IA → claim BEFORE ingest (path is HMAC-bound); CA → claim
         // AFTER ingest (path is now content-bound). Matches
         // PutPathBatch's verify-then-claim ordering.
+        //
+        // Fixed-output uploads (is_ca=false WITH a `fixed:` descriptor)
+        // follow the IA ordering: membership already restricts the
+        // claimable paths to this worker's own assignment, and the CA
+        // gate still runs post-ingest — a content/path mismatch aborts
+        // the upload and releases the placeholder before finalize.
         let is_ca_caller = auth.hmac_claims.as_ref().is_some_and(|c| c.is_ca);
 
         let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
@@ -184,6 +216,29 @@ impl StoreServiceImpl {
             {
                 Ok(Some(c)) => {
                     let g = self.spawn_placeholder_guard(store_path_hash.clone(), c);
+                    // r[impl store.put.ia-deriver-proof+4]
+                    // The proof gate runs ONLY for uploads that own a
+                    // fresh placeholder (idempotency precedence): an
+                    // already-complete path returned `created: false`
+                    // above without consulting the proof — re-upload of
+                    // complete content is governed by idempotency, and
+                    // demanding a registration proof for a no-op
+                    // re-registration rejected honest re-uploads whose
+                    // deriver was registered claimslessly (bug_092,
+                    // fix-child of 8930770dd — pattern R5: the gate made
+                    // lifecycle position load-bearing without a
+                    // population audit). Proof failure releases the
+                    // placeholder before propagating, so a denied upload
+                    // leaves no `'uploading'` squat behind.
+                    if let Err(e) = self
+                        .verify_ia_registration_proof(&info, auth.hmac_claims.as_ref(), "PutPath")
+                        .await
+                    {
+                        g.defuse();
+                        self.abort_upload(&store_path_hash, c).await;
+                        drain_stream(&mut stream).await;
+                        return Err(e);
+                    }
                     (Some(c), Some(g))
                 }
                 Ok(None) => {
@@ -261,6 +316,28 @@ impl StoreServiceImpl {
             Ok(PlaceholderClaim::Owned(claim)) => Ok(Some(claim)),
             Ok(PlaceholderClaim::AlreadyComplete) => {
                 debug!(%store_path, "PutPath: path already complete");
+                // store.ingest.drv-modulo-cache+2: probe-first heal for
+                // complete .drvs whose cache row is missing (spawned;
+                // best-effort; no-op when the row exists).
+                // TODO: F3 (round-15 C4 follow-up) — this branch keys on the
+                // `.drv` NAME SUFFIX, not a parsed upload type. After UploadClass
+                // (C4c2) the gate arms are typed, but the .drv detection sites
+                // remain suffix-keyed; F3 unifies them on a typed PathKind so a
+                // source path NAMED `*.drv` and a real derivation cannot diverge
+                // by call-site discipline. See store.put.drv-text-ca+3.
+                if store_path.ends_with(".drv") {
+                    let pool = self.pool.clone();
+                    let chunks = self.chunk_cache.clone();
+                    let path = store_path.to_owned();
+                    tokio::spawn(async move {
+                        crate::metadata::drv_modulo::heal_if_missing(
+                            &pool,
+                            chunks.as_deref(),
+                            &path,
+                        )
+                        .await;
+                    });
+                }
                 Ok(None)
             }
             Ok(PlaceholderClaim::Concurrent) => {

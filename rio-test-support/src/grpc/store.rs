@@ -64,6 +64,17 @@ pub struct MockStoreState {
     /// BLAKE3 digest → chunk bytes. dataplane2: backs the in-memory
     /// `ChunkService.GetChunk` impl. Seed via [`MockStore::seed_chunked`].
     pub chunks: Arc<RwLock<HashMap<Vec<u8>, Vec<u8>>>>,
+    /// When non-zero, each `find_missing_paths` call decrements this after
+    /// computing its response; the call that brings it to zero then
+    /// promotes every currently-substitutable path into `paths` (minimal
+    /// PathInfo, tiny NAR) and clears `substitutable`. Models the
+    /// scheduler's substitute lane having fetched the path into the store
+    /// between an early probe (which must still see the path as
+    /// missing-but-substitutable) and a later post-build verification
+    /// (which must see it present) — gateway wire tests pair the
+    /// unsupported-algo substitutable exemption with the
+    /// build-results-honesty gate this way.
+    pub promote_substitutable_after_fmp: Arc<AtomicU32>,
 }
 
 /// Call recorders. The [`StoreService`] / [`ChunkService`] impls write
@@ -109,6 +120,11 @@ pub struct MockStoreCalls {
     /// (`None` = absent). For `r[gw.jwt.propagate]` — floating-CA
     /// output resolution in `wopBuildPathsWithResults`.
     pub query_realisation_metadata: Arc<RwLock<Vec<Option<String>>>>,
+    /// `x-rio-tenant-token` value on each FindMissingPaths call
+    /// (`None` = absent). For the gateway's tenant-scoped
+    /// unverifiable-algo exemption probe
+    /// (`r[gw.reject.unsupported-hash-algo]`).
+    pub find_missing_metadata: Arc<RwLock<Vec<Option<String>>>>,
 }
 
 /// Fault injection knobs. All default to "no fault"; tests flip them
@@ -118,6 +134,12 @@ pub struct MockStoreCalls {
 pub struct MockStoreFaults {
     /// If > 0, put_path decrements and returns Unavailable. For retry tests.
     pub fail_next_puts: Arc<AtomicU32>,
+    /// If > 0, put_path/put_path_batch decrements and returns
+    /// InvalidArgument ("mock: injected malformed-request rejection").
+    /// For the round-17 bug_111 R1(e) no-retry tests: deterministic
+    /// rejections must be classified permanent at the producing
+    /// statement, never retried.
+    pub invalid_next_puts: Arc<AtomicU32>,
     /// If > 0, put_path decrements and returns `Aborted("concurrent
     /// PutPath in progress for this path; retry")` — matching the real
     /// store's placeholder-contention response (`put_path.rs`). For
@@ -428,6 +450,18 @@ impl StoreService for MockStore {
         }
         if self
             .faults
+            .invalid_next_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            return Err(Status::invalid_argument(
+                "mock: injected malformed-request rejection",
+            ));
+        }
+        if self
+            .faults
             .abort_next_puts
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 (n > 0).then(|| n - 1)
@@ -556,6 +590,18 @@ impl StoreService for MockStore {
             .is_ok()
         {
             return Err(Status::unavailable("mock: injected batch put failure"));
+        }
+        if self
+            .faults
+            .invalid_next_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            return Err(Status::invalid_argument(
+                "mock: injected malformed-request rejection",
+            ));
         }
 
         let mut stream = request.into_inner();
@@ -845,6 +891,13 @@ impl StoreService for MockStore {
         request: Request<types::FindMissingPathsRequest>,
     ) -> Result<Response<types::FindMissingPathsResponse>, Status> {
         self.calls.find_missing_calls.fetch_add(1, Ordering::SeqCst);
+        self.calls.find_missing_metadata.write().unwrap().push(
+            request
+                .metadata()
+                .get(rio_proto::TENANT_TOKEN_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+        );
         if self.faults.fail_find_missing.load(Ordering::SeqCst) {
             return Err(Status::unavailable("mock: injected find_missing failure"));
         }
@@ -874,6 +927,21 @@ impl StoreService for MockStore {
             .filter(|p| ind.contains(p))
             .cloned()
             .collect();
+        drop(ind);
+        drop(subs);
+        drop(paths);
+        // Substitution-completion simulation: see
+        // `MockStoreState::promote_substitutable_after_fmp`. The response
+        // computed above still reports the paths as missing/substitutable;
+        // only LATER calls observe them as present.
+        let knob = &self.state.promote_substitutable_after_fmp;
+        if knob.load(Ordering::SeqCst) > 0 && knob.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let to_promote: Vec<String> =
+                std::mem::take(&mut *self.state.substitutable.write().unwrap());
+            for p in to_promote {
+                self.seed_with_content(&p, b"substituted");
+            }
+        }
         Ok(Response::new(types::FindMissingPathsResponse {
             missing_paths: missing,
             substitutable_paths: substitutable,

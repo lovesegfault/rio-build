@@ -10,8 +10,7 @@
 use std::collections::HashMap;
 
 use rio_common::grpc::{DEFAULT_GRPC_TIMEOUT, GRPC_STREAM_TIMEOUT};
-use rio_common::limits::MAX_NAR_SIZE;
-use rio_nix::derivation::Derivation;
+use rio_nix::derivation::{Derivation, DerivationLike};
 use rio_nix::store_path::StorePath;
 use rio_proto::client::NAR_CHUNK_SIZE;
 use rio_proto::validated::ValidatedPathInfo;
@@ -184,7 +183,10 @@ pub(super) async fn resolve_floating_outputs(
     hash_cache: &mut HashMap<String, [u8; 32]>,
 ) -> anyhow::Result<(Option<[u8; 32]>, HashMap<String, String>)> {
     let mut realized: HashMap<String, String> = HashMap::new();
-    let has_floating = drv.outputs().iter().any(|o| o.path().is_empty());
+    // Owner probe (round-17 merged_bug_062): the parsed-drv surface
+    // lives in rio-nix; the open-coded copy is denied by the
+    // floatingness-probe lint.
+    let has_floating = drv.has_unknown_output_paths();
     if !has_floating {
         return Ok((None, realized));
     }
@@ -457,6 +459,14 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
 /// Fetch NAR data from store via gRPC GetPath.
 /// Returns (PathInfo, NAR bytes) or None if not found.
 ///
+/// `max_nar_bytes` is the sealed class cap (`NarSizeCap`): callers
+/// fetching general paths pass `NarSizeCap::general()`; the `.drv` BFS
+/// resolution passes `NarSizeCap::derivation()` so 32-way derivation
+/// fan-out cannot buffer GiB-scale "derivations" (round-16 bug_095) —
+/// the collector's leading `Info.nar_size` pre-check makes the
+/// over-cap case byte-free, and the sealed type makes a private or
+/// divergent bound unwritable at any call site (round-17 bug_030).
+///
 /// Delegates to `rio_proto::client::get_path_nar` — DO NOT inline that
 /// helper's await structure here. Under `#[tokio::test(start_paused =
 /// true)]`, the exact suspend-point layout determines whether tokio's
@@ -470,6 +480,7 @@ pub(crate) async fn grpc_get_path(
     store_client: &mut StoreServiceClient<Channel>,
     jwt_token: Option<&str>,
     store_path: &str,
+    max_nar_bytes: rio_common::limits::NarSizeCap,
 ) -> anyhow::Result<Option<(ValidatedPathInfo, Vec<u8>)>> {
     use rio_proto::client::NarCollectError;
     let md = jwt_metadata(jwt_token);
@@ -484,7 +495,7 @@ pub(crate) async fn grpc_get_path(
             store_client,
             store_path,
             GRPC_STREAM_TIMEOUT,
-            MAX_NAR_SIZE,
+            max_nar_bytes,
             None,
             &md,
         )

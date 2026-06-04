@@ -261,6 +261,61 @@ in
   #   empty-connection grace once the last protocol session ends — NOT
   #   on last-session-close, which would kill a ControlMaster
   #   mid-batch); `ssh gateway echo` (rejected exec) must exit ≠124.
+  # r[verify builder.stderr.forward-set-phase+2]
+  #   phase-reporter entry: the @nix setPhase frames are consumed by the
+  #   native log filter (none may reach the forwarded log) and surface
+  #   as ordered phases in the driver report.
+  # r[verify builder.fod.verify-hash+2]
+  #   fod-flat / fod-recursive / fod-mismatch / fod-unknown-algo entries:
+  #   the declared fixed-output hash is verified fail-closed by the
+  #   native result path (mismatch and unverifiable algorithms are
+  #   rejections, never skips).
+  # r[verify builder.exec.env-precedence]
+  #   fod-env-precedence entry: the output bytes are the contested env
+  #   values and the declared FOD hash is the oracle-order answer, so
+  #   any initEnv layer-order drift on either side is a hash mismatch.
+  # r[verify builder.exec.attrs-sh-numeric]
+  #   structured-attrs entry (the .attrs.sh byte-comparer) carries
+  #   bigInt/negBigInt/roundEdgeFloat: the int32 wrap and f32-gate
+  #   rounding edges are executed against the oracle, byte-for-byte.
+  # r[verify builder.exec.structured-attrs-typed]
+  #   outputchecks-maxsize-{float,string} / outputchecks-list-wrong-type /
+  #   outputchecks-spec-not-object / unsafe-discard-wrong-type /
+  #   erg-wrong-type / erg-nested-array entries: wrong-typed structured
+  #   attrs reject on both sides (and the float cap truncates+enforces,
+  #   and nested erg arrays flatten) — executed against the oracle, so a
+  #   future fail-open reader regression turns the merge gate red.
+  # r[verify builder.sandbox.identity]
+  #   build-user / sandbox-identity entries: the synthesized passwd/group
+  #   identity (nixbld / Nix build user) is byte-compared against the
+  #   oracle's sandbox — the glue's single construction point feeds both
+  #   request paths.
+  # r[verify sec.authz.ca-path-derived+9]
+  #   fod-nul-run entry: a flat FOD whose body is a 1 KiB NUL run —
+  #   the modulo sink's zeroing pattern — builds, registers, and
+  #   byte-compares identically on both sides, witnessing that the
+  #   declared-hash (plain-equality, no-modulo) verification path is
+  #   lossless at system scale.
+  # r[verify nix.drv.output-typed]
+  #   impure-output entry: the oracle's own eval (per-entry feature
+  #   hook, instantiate-only) emits the real `"impure"` sentinel .drv;
+  #   the daemon at the default posture refuses it at realise and rio's
+  #   parse boundary rejects it with the oracle's disabled-feature
+  #   clause — the impure divergence pinned against emitter bytes, not
+  #   a hand-written fixture.
+  vm-differential-standalone = import ./scenarios/differential.nix {
+    inherit pkgs rio-workspace;
+  };
+
+  # r[verify gw.handshake.untrusted]
+  # r[verify gw.hook.single-node-dag+2]
+  # r[verify builder.glue.drv-table-demand]
+  #   erg-native subtests: an exportReferencesGraph build succeeds
+  #   through the native scheduler path (registration content asserted
+  #   in-script — demand under-supply fails the build), and the journal
+  #   carries ZERO residual graph-fetch lines across the whole scenario,
+  #   the ERG build included (its demand is covered by retained
+  #   input-drv texts).
   vm-protocol-warm-standalone = protocol {
     inherit pkgs common;
     fixture = standalone {
@@ -310,6 +365,15 @@ in
 
   # r[verify sched.ca.cutoff-propagate+2]
   # r[verify sched.ca.resolve+3]
+  # r[verify sched.persist.settled-identity-freeze+4]
+  # r[verify sched.merge.store-evidence-displacement+3]
+  #   stripped-ca-resubmit: warm deferred-IA consumer over the realized
+  #   b1 chain is ingress-STRIPPED with M_070 preservation (live NULL +
+  #   ca_modular_hash_stripped set, asserted via psql); after a
+  #   scheduler restart (settled rows become row-only) the resubmission
+  #   REJOINS through the preserved-claim/dual-anchor bases instead of
+  #   bricking FAILED_PRECONDITION (merged_bug_038), observable as
+  #   rio_scheduler_merge_stripped_rejoin_total >= 1.
   #   Build CA-on-CA chain (A→B→C, all __contentAddressed=true),
   #   then resubmit with a different marker (A's drv hash differs,
   #   but A's output content is marker-independent → same nar_hash).
@@ -334,6 +398,8 @@ in
     };
   };
 
+  # r[verify gw.hook.inline-drv-content+4]
+  # r[verify gw.hook.fallback-built-outputs]
   vm-protocol-cold-standalone = protocol {
     inherit pkgs common;
     fixture = standalone {
@@ -499,7 +565,7 @@ in
         name = "core";
         subtests = [
           # r[verify builder.overlay.stacked-lower+2]
-          # r[verify builder.ns.order+2]
+          # r[verify builder.ns.order+4]
           # r[verify builder.fuse.lookup-caches+2]
           # r[verify builder.fuse.jit-lookup]
           # r[verify builder.fuse.jit-register]
@@ -526,8 +592,8 @@ in
       {
         name = "disrupt";
         subtests = [
-          # r[verify builder.silence.timeout-kill]
-          # r[verify sched.timeout.promote-on-exceed+2]
+          # r[verify builder.silence.timeout-kill+3]
+          # r[verify sched.timeout.promote-on-exceed+3]
           "max-silent-time"
           # r[verify gw.opcode.set-options.propagation+2]
           # setoptions-unreachable greps ALL gateway journal history —
@@ -572,7 +638,7 @@ in
 
   # r[verify gw.jwt.dual-mode+2]
   # r[verify sec.boundary.grpc-hmac]
-  # r[verify gw.reject.nochroot]
+  # r[verify gw.reject.nochroot+2]
   # r[verify gw.rate.per-tenant]
   # r[verify store.gc.tenant-quota-enforce]
   # r[verify sec.executor.identity-token+2]
@@ -629,6 +695,20 @@ in
   # is standalone + a proxy systemd unit on control; see fixtures/
   # toxiproxy.nix for why not a separate VM (scheduler connect_store
   # boot race). ~4-5min.
+  # r[verify builder.exec.limits-isolated+2]
+  #   sched-stall-timeout-still-fires: the build-timeout kill lands
+  #   DURING a 75s scheduler SIGSTOP — no process in the build cgroup
+  #   10s past the deadline, while the scheduler link is still frozen —
+  #   proving enforcement owns no channel path a stalled consumer could
+  #   park. With the principal split this same gate also exercises the
+  #   <cg>/build scope: the emptiness probe reads the parent cgroup, so
+  #   it passes only if the principal kill cleared the sub-tree.
+  # r[verify builder.relay.log-shed]
+  #   sched-stall-build-survives: a chatty build keeps consuming CPU
+  #   through a 60s scheduler SIGSTOP (cgroup cpu.stat advances
+  #   mid-stall), completes after recovery, and the worker's
+  #   rio_builder_log_messages_shed_total shows the display stream shed
+  #   instead of freezing the build.
   vm-chaos-standalone = chaos {
     inherit pkgs common;
     fixture = toxiproxy { };
@@ -690,6 +770,11 @@ in
       "cancel-cgroup-kill"
       # r[verify builder.cgroup.kill-on-teardown]
       # r[verify builder.timeout.no-reassign]
+      # r[verify builder.exec.kill-targets-principal]
+      #   build-timeout: the deadline kill on a real k3s worker now
+      #   travels the principal path (build sub-cgroup + pidfd, relay
+      #   spared); the subtest's TimedOut completion proves the
+      #   forwarded-137 corroboration end to end.
       "build-timeout"
       # r[verify ctrl.pool.reconcile]
       # r[verify ctrl.crd.pool]
@@ -712,8 +797,9 @@ in
     subtests = [
       "gc-dry-run"
       # r[verify store.gc.tenant-retention]
+      # r[verify store.realisation.gc-sweep+2]
       "gc-sweep"
-      # r[verify builder.upload.references-scanned]
+      # r[verify builder.upload.references-scanned+2]
       # r[verify builder.upload.deriver-populated]
       # r[verify store.gc.two-phase]
       "refs-end-to-end"
@@ -937,6 +1023,9 @@ in
       # r[verify sched.lease.deletion-cost]
       "graceful-release"
       "failover"
+      # r[verify sched.closure.witness-epoch]
+      # r[verify sched.merge.substitute-topdown+15]
+      "holed-parent-failover"
     ];
   };
 
@@ -1107,12 +1196,13 @@ in
   #   builder pod. fetcher-isolation asserts the pod-level partition the
   #   chokepoint produces: fetcher pod tolerates rio.build/fetcher and
   #   NOT rio.build/kvm; builder pod tolerates NEITHER.
-  # r[verify fetcher.nixconf.hashed-mirrors]
+  # r[verify fetcher.mirrors.hashed+3]
   #   fod-dead-origin subtest: flat-hash FOD with a 404 origin URL
-  #   builds via {mirror}/sha256/{hex}. nixConf.hashedMirrors below
-  #   points the rio-nix-conf ConfigMap at the in-VM upstream-v4 node
-  #   (reached via DNS64+NAT64 from the v6-only fetcher pod).
-  # r[verify builder.fod.verify-hash]
+  #   builds via {mirror}/sha256/{hex}. The fetcher pool's
+  #   `hashedMirrors` (Pool spec → RIO_HASHED_MIRRORS) points at the
+  #   in-VM upstream-v4 node (reached via DNS64+NAT64 from the v6-only
+  #   fetcher pod).
+  # r[verify builder.fod.verify-hash+2]
   #   fod-dir subtest: recursive-hash FOD with directory output
   #   (`mkdir $out`). Regression: a whiteout at the output path
   #   makes overlayfs mkdir return EIO.
@@ -1120,13 +1210,34 @@ in
   #   fod-fail subtest: failing FOD propagates within 60s. Daemon's
   #   post-fail stat($out) hits FUSE; NotInput → ENOENT without
   #   store contact. P0308 hang would push elapsed past timeout 90.
+  # r[verify fetcher.upload.hash-verify-before]
+  #   fod-bad-hash subtest: the origin serves 200 with content that
+  #   cannot match the declared outputHash. The FOD hash gate rejects
+  #   before upload — the client sees a hash-mismatch failure and the
+  #   output path stays absent from the rio store (path-info via
+  #   ssh-ng://k3s-server must fail).
+  # r[verify fetcher.fetchurl.sandboxed]
+  #   fetch-runs-unprivileged subtest: during the slow /busybox fetch,
+  #   /proc/<pid>/status of the __builtin-fetchurl re-exec on the
+  #   fetcher node shows non-root Uid/Gid in every field (rio-exec
+  #   setuid/setgids to the build user before execve).
+  # r[verify fetcher.divergence.s3-transport]
+  #   fod-s3-origin subtest: an s3:// origin is skipped per-candidate
+  #   and the build succeeds via the hashed mirror; a regression to the
+  #   whole-fetch bail fails the build before the mirror is consulted.
+  # r[verify fetcher.mirrors.admission-accept-set]
+  #   mirror-admission-reject subtest: server-side dry-run against the
+  #   real apiserver (the real cel-go evaluator + cost budget) rejects
+  #   an s3:// mirror and an NBSP mirror with the accept-set message,
+  #   and accepts an in-set control. End-to-end witness that admission
+  #   enforces the single-source pattern — YAML drift is not
+  #   acceptance evidence (r16 CEL cost-budget lesson).
   vm-fetcher-split-k3s = fetcher-split {
     inherit pkgs common drvs;
     fixture = k3sFull {
       withV4Nodes = true;
       extraValues = {
         "networkPolicy.enabled" = "true";
-        "nixConf.hashedMirrors" = "http://upstream-v4/";
       };
       # pools via values file (not --set-string) so types stay correct.
       extraValuesFiles = [
@@ -1148,6 +1259,10 @@ in
               # containerd cgroup-chown gap; vmtest-full-nonpriv.yaml).
               privileged: null
               seccompProfile: null
+              # builtin:fetchurl reads RIO_HASHED_MIRRORS, injected by
+              # the controller from the Pool spec.
+              hashedMirrors:
+                - http://upstream-v4/
         '')
       ];
     };
@@ -1158,19 +1273,22 @@ in
   # root cause: VM tests use minimal config; prod uses bootstrap.
   # enabled=true. The bootstrap Job never rendered in CI. This fixture
   # flips it on so the PSA-restricted exec path (readOnlyRootFilesystem
-  # + HOME=/tmp for awscli2 cache) runs at merge-gate. The Job will
-  # FAIL (aws secretsmanager unreachable in the airgapped VM) —
-  # expected; bootstrap-job-ran asserts no-EROFS + script-progress,
-  # not completion. ~5min (k3s bring-up + bootstrap Job backoff).
+  # + HOME=/tmp for awscli2 cache) runs at merge-gate. The Job runs the
+  # real awscli2 against an in-VM Secrets Manager mock
+  # (k3s-prod-parity.nix) and COMPLETES — bootstrap-job-ran asserts
+  # no-EROFS + genuine not-found classification + full convergence
+  # (which also pins the image tool envelope: round 17 found grep/cmp
+  # missing from the production image while the old credential-less
+  # fixture masked everything). ~5min (k3s bring-up + Job).
   vm-lifecycle-prod-parity-k3s = lifecycleProdParityMod.mkTest {
     name = "prod-parity";
     subtests = [
       # r[verify sec.psa.control-plane-restricted]
       #   bootstrap-job-ran: Job's pod-template has
-      #   readOnlyRootFilesystem=true + HOME=/tmp, logs show
-      #   "[bootstrap] generating rio/hmac" (past env-check +
-      #   awscli2 init), logs DON'T contain "Read-only file
-      #   system". The a28e4b65 regression signature.
+      #   readOnlyRootFilesystem=true + HOME=/tmp, the Job reaches
+      #   condition=Complete against the in-VM mock (genuine
+      #   not-found → openssl → creates → keygen), logs DON'T
+      #   contain "Read-only file system" (a28e4b65 signature).
       #   vm-security-nonpriv-k3s above verifies PSA on the
       #   builder side; this verifies it on control-plane Jobs.
       "bootstrap-job-ran"

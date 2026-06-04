@@ -11,9 +11,9 @@
 # openssl, rustls) land in reusable layers. Pulling a second rio image only
 # fetches the component-specific top layer.
 #
-# Worker is the outlier: it needs the `nix` binary (spawns `nix-daemon --stdio`)
-# + `fuse3` + `util-linux` (mount/umount for overlay teardown) + passwd/group
-# stubs (nix-daemon drops privs to nixbld). Gateway/scheduler/store are minimal.
+# Worker is the outlier: it needs `fuse3` + `util-linux` (mount/umount for
+# overlay teardown), a static /bin/sh for the build sandbox, and the CA
+# bundle for fetcher TLS. Gateway/scheduler/store are minimal.
 {
   pkgs,
   # Per-crate stripped bin derivations, keyed rio-gateway / rio-builder
@@ -116,8 +116,8 @@ let
   # variant. The skopeo OCI layout itself IS reproducible (Q9.2 — and
   # verified again here: extracted contents diff clean across builders);
   # what leaks is tar metadata: readdir-order entry sequencing, build
-  # wall-clock mtimes, and the sandbox UID's username (nixbld vs nixbld1
-  # on different hosts). gzip's -n already strips its own mtime header.
+  # wall-clock mtimes, and the building user's name on different hosts.
+  # gzip's -n already strips its own mtime header.
   #
   # The N transcodes run in PARALLEL into per-image layouts that are
   # merged afterwards. Serially they were the longest single link in
@@ -217,85 +217,49 @@ let
 
   # ── Worker runtime extras ────────────────────────────────────────────
   # Factored out so the `all` aggregate image (VM-test-only) can reuse
-  # them. Worker is the only component that needs nix/fuse/mount at
+  # them. Worker is the only component that needs fuse/mount at
   # runtime, but the aggregate must be a superset of every component.
   #
-  # nixForBuilder: pkgs.nix with movePath() patched to fall back to a
-  # recursive copy on EXDEV (I-185). When the builder pod runs with
-  # hostUsers:false (ADR-012), rio-builder's overlayfs mount happens
-  # inside a non-init user namespace; the kernel then forces
-  # redirect_dir=off (and refuses redirect_dir=on). overlayfs without
-  # redirect_dir returns EXDEV for ANY rename(2) of a directory whose
-  # target parent is a merge-type dir — and the overlay root (= the
-  # chroot-store realStoreDir) is always merge-type. nix-daemon's
-  # post-build movePath(chroot/{out} -> realStoreDir/{out}) is a raw
-  # std::filesystem::rename with no fallback, so every DIRECTORY output
-  # fails (file outputs rename fine — the kernel restriction is
-  # directory-only). nix's moveFile() temp-then-rename fallback also
-  # hits the same EXDEV. The patch makes movePath() copy on EXDEV.
-  #
-  # appendPatches re-derives the whole nix component scope from the
-  # patched source; only nix-store and its reverse-deps actually
-  # rebuild differently. Rebuild is cached until pkgs.nix.src bumps.
-  #
-  # `.nix-cli` (not the umbrella nix-everything): nix-everything pulls
-  # in nix-functional-tests as a build-time dep; the local-overlay-
-  # store/stale-file-handle test fails in OUR build sandbox regardless
-  # of the patch (verified with a no-op README patch — same FAIL). The
-  # test exercises nix's own local-overlay:// store backend, which we
-  # don't use; nix-cli has bin/nix-daemon and is all the executor needs.
-  #
-  # Tracey: r[impl builder.overlay.userns-exdev] lives in overlay.rs
-  # (the mount that triggers the kernel restriction); docker.nix is
-  # outside the tracey impls.include set.
-  nixForBuilder = (pkgs.nix.appendPatches [ ./patches/nix-movepath-exdev-fallback.patch ]).nix-cli;
+  # sandboxShell: the minimal static ash (`busybox-sandbox-shell`) exposed
+  # at /bin/sh inside every build sandbox (RIO_SANDBOX_SHELL). nixpkgs
+  # builds assume /bin/sh exists; the native executor bind-mounts this
+  # store path read-only into each sandbox. This is the same shell CppNix
+  # uses for its sandbox and the one the differential parity gate runs
+  # both arms with — keeping production identical to what the gate
+  # validates (and avoiding the full multi-call busybox's extra applets
+  # being reachable through /bin/sh argv[0] dispatch).
+  sandboxShell = "${pkgs.busybox-sandbox-shell}/bin/busybox";
 
   builderExtraContents = [
-    nixForBuilder # nix-daemon --stdio, spawned per-build
     pkgs.fuse3 # fusermount3, required by the fuser crate's AutoUnmount
     pkgs.util-linuxMinimal # mount, umount for overlay teardown
+    pkgs.busybox-sandbox-shell # minimal static ash for the build sandbox (RIO_SANDBOX_SHELL)
+    pkgs.pkgsStatic.busybox # in-image /bin/sh + utilities (debugging/exec); NOT the sandbox shell
 
-    # nix-daemon drops privs to a nixbld{N} user inside its sandbox.
-    # It enumerates build users via getgrnam("nixbld")->gr_mem — the
-    # EXPLICIT member list in /etc/group. A user's primary group (gid
-    # field in passwd) does NOT appear in gr_mem; the member list must
-    # be populated or daemon fails: "nixbld group has no members".
-    #
-    # 8 users: nix-daemon's nested sandbox claims one per build.
-    # P0537: only one build runs per pod, so one would suffice; eight
-    # costs nothing and matches the NixOS convention (nixbld1 at
-    # 30001, etc).
-    (pkgs.writeTextDir "etc/passwd" (
-      ''
-        root:x:0:0:root:/root:/bin/sh
-      ''
-      + lib.concatMapStrings (
-        n: "nixbld${toString n}:x:${toString (30000 + n)}:30000:Nix build user ${toString n}:/:/bin/false\n"
-      ) (lib.range 1 8)
-    ))
+    # The worker process runs as root and the sandbox writes its own
+    # /etc/passwd inside each chroot; the image-level stubs only serve
+    # libraries that look up uid 0.
+    (pkgs.writeTextDir "etc/passwd" ''
+      root:x:0:0:root:/root:/bin/sh
+    '')
     (pkgs.writeTextDir "etc/group" ''
       root:x:0:
-      nixbld:x:30000:${lib.concatMapStringsSep "," (n: "nixbld${toString n}") (lib.range 1 8)}
-    '')
-    # The executor sets NIX_CONF_DIR per build; this image-level conf
-    # is what `nix --version` etc. see when probed outside a build.
-    (pkgs.writeTextDir "etc/nix/nix.conf" ''
-      build-users-group = nixbld
-      sandbox = true
-      experimental-features = nix-command
     '')
   ];
 
   builderExtraEnv = [
-    # nix-daemon --stdio must be findable. The worker's executor does
-    # `Command::new("nix-daemon")` (no absolute path), relying on PATH.
+    # mount/umount and fusermount3 must be findable by the executor.
     "PATH=${
       lib.makeBinPath [
-        nixForBuilder
         pkgs.fuse3
         pkgs.util-linuxMinimal
       ]
     }"
+    # Static shell exposed as /bin/sh inside every build sandbox.
+    "RIO_SANDBOX_SHELL=${sandboxShell}"
+    # CA bundle mounted read-only into network (fixed-output) sandboxes;
+    # same bundle SSL_CERT_FILE already points at for the worker itself.
+    "RIO_CA_BUNDLE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
   ];
 
   # /tmp: nix-daemon's sandbox needs a tmpdir. Containers don't have
@@ -481,14 +445,37 @@ rec {
   # them back into k8s Secrets. Public signing key goes to rio/signing-
   # key-pub so operators can read it without touching the private half.
   #
-  # Needs nix-store (--generate-binary-cache-key), awscli2, openssl.
-  # IRSA via the rio-bootstrap ServiceAccount gives it
-  # secretsmanager:CreateSecret/PutSecretValue/DescribeSecret on rio/*.
+  # Needs rio-cli (keygen), awscli2, openssl. No Nix closure: the
+  # signing keypair comes from `rio-cli keygen`, which emits the same
+  # name:base64 format `nix-store --generate-binary-cache-key` did.
+  # IRSA grants: defined ONLY in infra/eks/secrets.tf
+  # (aws_iam_policy.rio_bootstrap); bootstrap-iam-parity pins every
+  # (action, resource) pair against this script's calls.
   #
   # Exposed (not let-local) so the bootstrap-idempotent check
   # (nix/misc-checks.nix) can run it against a mocked aws CLI and
   # assert the signing-key block converges from partial state.
+  #
+  # r[impl infra.bootstrap.secret-state-probe]
+  # (The script body lives in bootstrap-job.sh — outside tracey's
+  # extension set; this export is the scannable anchor. secret_state
+  # is the sole describe-secret site, pinned by
+  # bootstrap-probe-conformance.)
+  # r[verify infra.bootstrap.secret-state-probe]
+  # (bootstrap-idempotent scenarios J-M: deletion arm per secret
+  # class + fail-closed create-only guards; bootstrap-probe-conformance:
+  # the count-pinned deny.)
+  # r[impl infra.bootstrap.pair-probe-byte-exact]
+  # r[verify infra.bootstrap.pair-probe-byte-exact]
+  # (bootstrap-idempotent scenario N: a newline-corrupted pub planted
+  # directly in provider state must detect, heal to canonical bytes,
+  # and settle consistent.)
   bootstrapScript = pkgs.writeShellScript "rio-bootstrap" (builtins.readFile ./bootstrap-job.sh);
+  # The real rio-cli package, exported so the bootstrap-idempotent
+  # check runs the genuine binary (round-16 MP4: the previous mock
+  # could not represent the seed-only secret population whose
+  # mishandling was bug_023; byte-faithful harnesses only).
+  rioCli = rio-crates.rio-cli;
   bootstrap = buildZstd {
     name = "rio-bootstrap";
     tag = "dev";
@@ -500,9 +487,17 @@ rec {
         pkgs.awscli2
         pkgs.openssl
         pkgs.openssh
-        nixForBuilder
+        rio-crates.rio-cli
         pkgs.bash
         pkgs.coreutils
+        # cmp — the pair-consistency probe (r16) byte-compares the
+        # stored pub against the derivation. Absent until round-17's
+        # tool-envelope audit: the steady-state probe (both halves
+        # present, i.e. every upgrade after the first install) would
+        # have died 'cmp: command not found' in the real pod. The
+        # bootstrap-idempotent harness now confines run() to exactly
+        # this PATH so a script tool the image lacks fails CI.
+        pkgs.diffutils
       ];
     config = {
       Entrypoint = [ "${bootstrapScript}" ];
@@ -518,8 +513,9 @@ rec {
             pkgs.awscli2
             pkgs.openssl
             pkgs.openssh
-            nixForBuilder
+            rio-crates.rio-cli
             pkgs.coreutils
+            pkgs.diffutils
           ]
         }"
       ];

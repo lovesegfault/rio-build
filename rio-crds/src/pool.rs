@@ -52,6 +52,68 @@ impl ExecutorKind {
     }
 }
 
+/// The `hashedMirrors` admission accept-set, single-sourced (r17
+/// merged_bug_003). One DEFINITION (this pattern); two DERIVATIONS:
+/// the CEL `matches()` rule on `PoolSpec.hashedMirrors` (RE2, rune
+/// semantics) and [`hashed_mirror_entry_admissible`] (structural
+/// Rust, byte semantics). `mirror_accept_set_derivations_agree` pins
+/// the derivations equal axis by axis; the
+/// `mirror-pattern-single-source` misc-check denies copies of the
+/// pattern outside this file.
+///
+/// The set is the INTERSECTION of every terminal consumer's contract:
+///
+/// - **scheme ∈ {http, https}**: the candidate loop skips `s3://`
+///   per candidate (`fetcher.divergence.s3-transport`) and the HTTP
+///   client serves only http(s) — any other scheme is a dead
+///   candidate that burns the full per-candidate retry ladder on
+///   every FOD consulting it. Reject at admission, where the
+///   operator learns immediately, not via fetch latency.
+/// - **printable ASCII minus comma** (`!`..`~` except `,`): the
+///   value transits a comma-joined env (`RIO_HASHED_MIRRORS`,
+///   `comma_vec`) and a whitespace-split env
+///   (`RIO_FETCHURL_MIRRORS`, `split_whitespace`). ASCII-only is
+///   deliberately tighter than "no Unicode whitespace": the r16 CEL
+///   class `[^,\t\r\n ]` admitted NBSP and friends, which the
+///   reconciler's `char::is_whitespace` filter then dropped — three
+///   spellings, three accept-sets, and a "this CR predates the rule"
+///   diagnostic that was simply false. Keeping the admitted bytes
+///   inside the set every transport layer treats identically leaves
+///   no rune/byte split-semantics gap to audit.
+///
+/// The character class (dash, then bang..plus, then dot..tilde) is
+/// printable ASCII minus comma. The pattern bytes contain no
+/// backslash and no quote, so the SAME bytes embed verbatim in a
+/// Rust literal, a CEL single-quoted string, and the generated YAML
+/// (`mirror_pattern_embeds_verbatim` pins this).
+// r[impl fetcher.mirrors.admission-accept-set]
+macro_rules! hashed_mirror_url_pattern {
+    () => {
+        "^https?://[-!-+.-~]+$"
+    };
+}
+pub const HASHED_MIRROR_URL_PATTERN: &str = hashed_mirror_url_pattern!();
+
+/// Structural derivation of [`HASHED_MIRROR_URL_PATTERN`] for Rust
+/// consumers (the reconciler's filter for CRs admitted under older
+/// rules). Equality with the regex derivation is pinned by
+/// `mirror_accept_set_derivations_agree` — change one, the test
+/// names the other.
+pub fn hashed_mirror_entry_admissible(entry: &str) -> bool {
+    let rest = entry
+        .strip_prefix("https://")
+        .or_else(|| entry.strip_prefix("http://"));
+    match rest {
+        Some(rest) => {
+            !rest.is_empty()
+                && rest
+                    .bytes()
+                    .all(|b| (0x21..=0x7e).contains(&b) && b != b',')
+        }
+        None => false,
+    }
+}
+
 /// Spec for a pool. The derive generates a `Pool` struct with
 /// `.metadata`, `.spec` (this), `.status`.
 ///
@@ -206,6 +268,29 @@ impl ExecutorKind {
         "kind=Builder forbids nodeSelector['rio.build/fetcher'] — the fetcher taint repels Builder pods (no toleration) so the pod would be permanently Pending (r35 bug_044)"
     )
 )]
+// r16 bug_097: hashedMirrors values traverse two delimiter round
+// trips on the way to builtin:fetchurl — comma-joined into
+// RIO_HASHED_MIRRORS by the reconciler, comma-split by the worker's
+// `comma_vec`, then space-joined/space-split again into the fetch
+// path. Commas are legal unescaped URL sub-delims (RFC 3986), so an
+// entry containing one silently fragments into garbage candidates.
+// r17 merged_bug_003: the rule is built from the single-source
+// pattern above (`hashed_mirror_url_pattern!`) so the CEL accept-set
+// IS the terminal consumers' accept-set — http(s) only (the
+// candidate loop skips s3://) and printable ASCII minus comma (the
+// previous negated class admitted NBSP/Unicode whitespace that the
+// reconciler filter then had to drop). The reconciler skip-warns
+// entries on CRs admitted under older rules — same predicate, one
+// definition (`hashed_mirror_entry_admissible`).
+#[x_kube(
+    validation = Rule::new(concat!(
+        "!has(self.hashedMirrors) || self.hashedMirrors.all(m, m.matches('",
+        hashed_mirror_url_pattern!(),
+        "'))"
+    )).message(
+        "hashedMirrors entries must be http(s) URLs of printable ASCII without commas — the accept-set is single-sourced from the terminal fetch consumers (comma/space env transports; http(s)-only candidate loop), so a mirror the worker cannot consume is rejected here instead of dying silently in the fetch path (r16 bug_097, r17 merged_bug_003)"
+    )
+)]
 pub struct PoolSpec {
     /// Builder or Fetcher. Required — there is no sensible default
     /// (the two have opposite network postures).
@@ -280,6 +365,24 @@ pub struct PoolSpec {
     /// is_fixed_output alone.
     #[serde(default)]
     pub features: Vec<String>,
+
+    /// Hashed-mirror base URLs for the native `builtin:fetchurl`
+    /// (tried as `<mirror>/<algo>/<base16-hash>` before the origin
+    /// URL). Maps to `RIO_HASHED_MIRRORS`. Mostly relevant for
+    /// `kind=Fetcher` pools, but allowed on both kinds — builders may
+    /// also run non-builtin FODs that never consult it. `None` = no
+    /// mirrors (origin URLs only). CEL-validated against the
+    /// single-source accept-set ([`HASHED_MIRROR_URL_PATTERN`]):
+    /// http(s) URLs of printable ASCII without commas (r16 bug_097,
+    /// r17 merged_bug_003).
+    /// Bounds (32 entries x 2048 chars) exist for the apiserver's CEL
+    /// cost estimator: an unbounded array of unbounded strings under a
+    /// `matches()` rule exceeds the per-schema cost budget >100x and
+    /// the CRD is REJECTED at apply (observed: every k3s scenario dead
+    /// at bring-up). Generous for real mirror lists (typically 1-4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 32), inner(length(max = 2048)))]
+    pub hashed_mirrors: Option<Vec<String>>,
 
     /// Container imagePullPolicy. None = K8s default (IfNotPresent
     /// for tagged images, Always for `:latest`). Airgap/dev clusters
@@ -562,6 +665,153 @@ mod tests {
         assert!(
             json.contains(r#""required":["image","kind","systems"]"#),
             "spec.required drifted"
+        );
+    }
+
+    /// r17 merged_bug_003: the two derivations of the hashedMirrors
+    /// accept-set — the RE2/CEL pattern and the structural Rust
+    /// predicate — agree on every axis. Axis-isolated cases first
+    /// (one property varied per case), then an exhaustive ASCII byte
+    /// sweep and a multibyte-rune sweep so a future edit to either
+    /// derivation that forgets the other fails HERE with both names.
+    // r[verify fetcher.mirrors.admission-accept-set]
+    #[test]
+    fn mirror_accept_set_derivations_agree() {
+        let re = regex::Regex::new(HASHED_MIRROR_URL_PATTERN).expect("pattern compiles");
+        let agree = |s: &str| {
+            assert_eq!(
+                hashed_mirror_entry_admissible(s),
+                re.is_match(s),
+                "derivations disagree on {s:?}: structural={}, regex={}",
+                hashed_mirror_entry_admissible(s),
+                re.is_match(s),
+            );
+        };
+
+        // Scheme axis (everything else held legal).
+        for s in [
+            "https://tarballs.nixos.org",          // accept
+            "http://mirror.internal:8080/hashed",  // accept
+            "s3://bucket/prefix?region=us-east-2", // reject: dead candidate (s3 skip)
+            "ftp://mirror.example/pub",            // reject: client can't serve it
+            "file:///srv/mirror",                  // reject
+            "HTTPS://tarballs.nixos.org",          // reject: case-exact, lowercase canonical
+            "httpss://x",                          // reject: not a scheme match
+            "tarballs.nixos.org/hashed",           // reject: schemeless
+            "//tarballs.nixos.org",                // reject
+        ] {
+            agree(s);
+            // Spot-pin the intent, not just agreement:
+            let expect = s.starts_with("http://") || s.starts_with("https://");
+            assert_eq!(
+                hashed_mirror_entry_admissible(s),
+                expect,
+                "intent pin: {s:?}"
+            );
+        }
+
+        // Emptiness axis: a scheme with nothing after it.
+        for s in ["https://", "http://", ""] {
+            agree(s);
+            assert!(
+                !hashed_mirror_entry_admissible(s),
+                "empty rest must reject: {s:?}"
+            );
+        }
+
+        // Delimiter axis — the bug_097 transport set.
+        for s in [
+            "https://cdn.example/v1,v2/mirror", // comma: comma_vec fragmentation
+            "https://a.example /mirror",        // space: split_whitespace fragmentation
+            "https://a.example\tx",
+            "https://a.example\nx",
+            "https://a.example\rx",
+        ] {
+            agree(s);
+            assert!(
+                !hashed_mirror_entry_admissible(s),
+                "delimiter must reject: {s:?}"
+            );
+        }
+
+        // Unicode axis — the merged_bug_003 hole: the r16 negated
+        // class admitted these; the reconciler filter then dropped
+        // some (NBSP) and passed others (é) into the env transport.
+        for s in [
+            "https://m.example/a\u{00a0}b", // NBSP — Unicode whitespace
+            "https://m.example/a\u{3000}b", // ideographic space
+            "https://m\u{00e9}.example/",   // é — non-whitespace non-ASCII
+            "https://m.example/\u{2603}",   // snowman
+        ] {
+            agree(s);
+            assert!(
+                !hashed_mirror_entry_admissible(s),
+                "non-ASCII must reject: {s:?}"
+            );
+        }
+
+        // Exhaustive ASCII sweep: every byte value in rest position.
+        for b in 0u8..=0x7f {
+            let s = format!("https://x{}y", b as char);
+            agree(&s);
+            let expect = (0x21..=0x7e).contains(&b) && b != b',';
+            assert_eq!(
+                hashed_mirror_entry_admissible(&s),
+                expect,
+                "ASCII byte 0x{b:02x} in rest position",
+            );
+        }
+
+        // Class-boundary pins (the union edges of the class).
+        for (s, expect) in [
+            ("https://x!y", true),       // 0x21 lower edge
+            ("https://x+y", true),       // 0x2b upper edge of !-+
+            ("https://x,y", false),      // 0x2c excluded
+            ("https://x-y", true),       // 0x2d via leading dash
+            ("https://x.y", true),       // 0x2e lower edge of .-~
+            ("https://x~y", true),       // 0x7e upper edge
+            ("https://x\u{7f}y", false), // DEL: above the class
+        ] {
+            agree(s);
+            assert_eq!(
+                hashed_mirror_entry_admissible(s),
+                expect,
+                "boundary pin {s:?}"
+            );
+        }
+    }
+
+    /// r17 merged_bug_003: the pattern's bytes embed verbatim at every
+    /// derivation site. Pinned properties: (a) no backslash/quote in
+    /// the pattern (the property that MAKES verbatim embedding safe
+    /// across Rust/CEL/YAML quoting contexts); (b) the generated CRD
+    /// schema carries the exact rule string built from the same macro
+    /// (a silently-dropped or escaped-in-transit rule fails here, the
+    /// r16 lesson that YAML drift is not acceptance evidence).
+    // r[verify fetcher.mirrors.admission-accept-set]
+    #[test]
+    fn mirror_pattern_embeds_verbatim() {
+        assert!(
+            !HASHED_MIRROR_URL_PATTERN.contains(['\\', '\'', '"']),
+            "pattern must stay quote/backslash-free so the same bytes \
+             embed in Rust, CEL single-quoted, and YAML contexts"
+        );
+        let json = serde_json::to_string(&Pool::crd()).expect("serializes to JSON");
+        // Built FROM the const — this test introduces no second copy
+        // of the pattern bytes (the mirror-pattern-single-source
+        // misc-check pins exactly one literal in this file).
+        let rule = format!(
+            "!has(self.hashedMirrors) || self.hashedMirrors.all(m, \
+             m.matches('{HASHED_MIRROR_URL_PATTERN}'))"
+        );
+        assert!(
+            json.contains(&rule),
+            "generated schema must carry the single-source rule verbatim \
+             (got neither dropped nor escaped in transit): {rule}"
+        );
+        assert!(
+            json.contains("must be http(s) URLs of printable ASCII"),
+            "hashedMirrors rule message missing from schema"
         );
     }
 }

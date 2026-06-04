@@ -38,6 +38,73 @@ let
   # Warm-path derivation: distinct marker so it doesn't DAG-dedup with
   # any other scenario's builds.
   trivialDrv = drvs.mkTrivial { marker = "proto-warm"; };
+  # Built ONLY via build-hook mode (--max-jobs 0 --builders), so the
+  # hook subtest exercises a real dispatch (not a scheduler cache hit).
+  hookDrv = drvs.mkTrivial { marker = "proto-hook"; };
+  # Fixed-output derivation built ONLY via build-hook mode and never
+  # copied as a .drv: build-remote sends it inline (wopBuildDerivation,
+  # content-bound single-node fallback), so the gateway must carry the
+  # serialized derivation in the submission for the fetcher to execute
+  # (gw.hook.inline-drv-content). echo appends a newline — the declared
+  # hash is over "rio hook inline fod\n".
+  hookFodContent = "rio hook inline fod\n";
+  hookFodDrv = drvs.mkCustom {
+    name = "rio-proto-hook-inline-fod";
+    script = ''
+      echo 'rio hook inline fod' > $out
+    '';
+    extraAttrs = {
+      outputHashMode = "flat";
+      outputHashAlgo = "sha256";
+      outputHash = builtins.hashString "sha256" hookFodContent;
+    };
+  };
+
+  # Floating-CA derivation built ONLY via build-hook mode: build-remote
+  # sends any CA derivation inline (wopBuildDerivation) and never copies
+  # the .drv, so this exercises the content-bound fallback end to end —
+  # including the consumable result: the gateway must return builtOutputs
+  # keyed by the modular hash of the inline derivation and the realized
+  # path must be registered (gw.hook.fallback-built-outputs).
+  hookCaDrv = drvs.mkCustom {
+    name = "rio-proto-hook-inline-ca";
+    script = ''
+      echo 'rio hook inline ca' > $out
+    '';
+    extraAttrs = {
+      __contentAddressed = true;
+      outputHashAlgo = "sha256";
+      outputHashMode = "recursive";
+    };
+  };
+
+  # Result-pipeline probes (run through the real builder → upload →
+  # store path; the differential harness preps its own build dir and
+  # never uploads, so these two properties need a production-path
+  # scenario):
+  #  - tmpdirProbeDrv: writes to $TMPDIR before producing $out — fails
+  #    EACCES if the sandbox's /build is not writable for the build
+  #    user.
+  #  - strayProbeDrv: writes a stray store path next to $out — the
+  #    stray must never be registered in the rio store.
+  tmpdirProbeDrv = drvs.mkCustom {
+    name = "rio-test-proto-tmpdir";
+    script = ''
+      set -e
+      echo "tmpdir scratch" > "$TMPDIR/scratch-file"
+      ''${busybox}/bin/cat "$TMPDIR/scratch-file" > $out
+    '';
+  };
+  inherit (drvs) ergOnDrv;
+  strayProbeDrv = drvs.mkCustom {
+    name = "rio-test-proto-stray";
+    script = ''
+      set -e
+      ''${busybox}/bin/mkdir -p /nix/store/cccccccccccccccccccccccccccccccc-rio-proto-stray
+      echo leftover > /nix/store/cccccccccccccccccccccccccccccccc-rio-proto-stray/file
+      echo "real output" > $out
+    '';
+  };
 
   name = if cold then "protocol-cold" else "protocol-warm";
 
@@ -148,6 +215,64 @@ let
         assert nb == 1, f"worker journald shows {nb} builds, expected 1"
         nf = journal_builds_succeeded(fetcher)
         assert nf == 1, f"fetcher journald shows {nf} builds, expected 1"
+
+    # ── hook-mode FOD: inline derivation carried in the submission ─────
+    # Lives in the COLD variant only: FODs hard-split-route to the
+    # fetcher pool (P0452), and only this fixture provisions one — in
+    # the warm fixture the build would sit unroutable until the global
+    # timeout. Runs AFTER the exact-count metric assertions above, which
+    # this extra build would otherwise perturb.
+    with subtest("hook-mode FOD without .drv upload (inline drv_content)"):
+        # A fixed-output derivation in build-hook mode takes the
+        # content-bound single-node fallback: build-remote sends the
+        # derivation inline via wopBuildDerivation and never uploads the
+        # .drv, so the gateway must embed the serialized derivation in
+        # the submission for the fetcher to execute it. Before
+        # gw.hook.inline-drv-content this flow was accepted but always
+        # failed at the worker ("derivation not found in store").
+        out_fod = client.succeed(
+            "nix build --no-link --print-out-paths "
+            f"--max-jobs 0 --builders '{store_url} x86_64-linux' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "-f ${hookFodDrv} 2>&1 | tail -n1"
+        ).strip()
+        assert out_fod.startswith("/nix/store/"), (
+            f"hook-mode FOD build did not produce a store path: {out_fod!r}"
+        )
+        assert "hook-inline-fod" in out_fod, (
+            f"unexpected hook-mode FOD output name: {out_fod!r}"
+        )
+        # Registered in the rio store → the fetcher really executed the
+        # inline derivation and uploaded the verified output.
+        client.succeed(f"nix path-info --store '{store_url}' {out_fod}")
+
+    # ── hook-mode floating-CA: consumable result via inline fallback ───
+    with subtest("hook-mode floating-CA without .drv upload (consumable result)"):
+        # A floating-CA derivation in build-hook mode also takes the
+        # content-bound single-node fallback (build-remote sends any CA
+        # derivation inline and never copies the .drv). The build only
+        # helps the client if the result is consumable: the gateway must
+        # return builtOutputs keyed by the modular hash of the inline
+        # derivation so build-remote can register the realisation and
+        # print the realized path. The builders spec advertises the
+        # ca-derivations system feature — without it build-remote
+        # declines the machine for CA derivations.
+        out_ca = client.succeed(
+            "nix build --no-link --print-out-paths "
+            f"--max-jobs 0 --builders '{store_url} x86_64-linux - 1 1 ca-derivations' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "-f ${hookCaDrv} 2>&1 | tail -n1"
+        ).strip()
+        assert out_ca.startswith("/nix/store/"), (
+            f"hook-mode floating-CA build did not produce a store path: {out_ca!r}"
+        )
+        assert "hook-inline-ca" in out_ca, (
+            f"unexpected hook-mode floating-CA output name: {out_ca!r}"
+        )
+        # The realized path is registered in the rio store (uploaded by
+        # the worker, realisation written by the scheduler under the
+        # modular hash the gateway carried on the node).
+        client.succeed(f"nix path-info --store '{store_url}' {out_ca}")
   '';
 
   warmScript = ''
@@ -248,7 +373,98 @@ let
             labels='{source="existing"}',
         )
 
+    # ── build-hook mode (untrusted handshake steers the .drv-upload flow) ──
+    with subtest("build-hook mode (--max-jobs 0 --builders ssh-ng://)"):
+        # The gateway reports itself NotTrusted, so build-remote
+        # (Nix >= 2.16 / Lix) copies the .drv closure and drives
+        # wopBuildPathsWithResults instead of sending an inline
+        # input-addressed BasicDerivation (which the gateway refuses).
+        # A successful hook-mode build of a fresh derivation therefore
+        # proves the untrusted handshake + .drv-upload + full-DAG
+        # pipeline end-to-end against a stock client.
+        out_hook = client.succeed(
+            "nix build --no-link --print-out-paths "
+            f"--max-jobs 0 --builders '{store_url} x86_64-linux' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "-f ${hookDrv} 2>&1 | tail -n1"
+        ).strip()
+        assert out_hook.startswith("/nix/store/"), (
+            f"hook-mode build did not produce a store path: {out_hook!r}"
+        )
+        assert "rio-test-proto-hook" in out_hook or "proto-hook" in out_hook, (
+            f"unexpected hook-mode output name: {out_hook!r}"
+        )
+        # The output is registered in the rio store — the build went
+        # through the gateway, not a local fallback builder.
+        client.succeed(f"nix path-info --store '{store_url}' {out_hook}")
+
     ${pkgs.lib.optionalString withNomExitTest nomExitScript}
+
+    # ── result-pipeline properties through the production path ────────
+    # (the differential harness preps its own build dir and never
+    # uploads; these assertions need the real builder → upload → store
+    # chain.)
+
+    with subtest("build that uses $TMPDIR succeeds (sandbox /build writable)"):
+        out_tmp = client.succeed(
+            f"nix-build --no-out-link --store '{store_url}' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${tmpdirProbeDrv}"
+        ).strip()
+        assert "rio-test-proto-tmpdir" in out_tmp, f"unexpected output: {out_tmp!r}"
+        client.succeed(f"nix path-info --store '{store_url}' {out_tmp}")
+
+    with subtest("stray store path created by a build is not registered"):
+        out_stray = client.succeed(
+            f"nix-build --no-out-link --store '{store_url}' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${strayProbeDrv}"
+        ).strip()
+        client.succeed(f"nix path-info --store '{store_url}' {out_stray}")
+        # The stray scratch path the build wrote next to $out must not
+        # have been uploaded or registered.
+        client.fail(
+            f"nix path-info --store '{store_url}' "
+            "/nix/store/cccccccccccccccccccccccccccccccc-rio-proto-stray"
+        )
+
+    with subtest("erg-native: exportReferencesGraph through the scheduler path"):
+        # Two fresh builds (inner + the graph consumer). The consumer
+        # script greps the registration file for the inner .drv before
+        # copying it to $out — closure expansion is asserted by the
+        # build succeeding, not by trusting the file exists.
+        out_erg = client.succeed(
+            f"nix-build --no-out-link --store '{store_url}' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${ergOnDrv}"
+        ).strip()
+        assert "rio-test-erg-native" in out_erg, f"unexpected output: {out_erg!r}"
+        client.succeed(f"nix path-info --store '{store_url}' {out_erg}")
+
+    with subtest("erg-native demand observability: zero residual graph fetches"):
+        # The fleet-scale zero-residual property at VM level: across
+        # the WHOLE journal — the ERG build above included — no build
+        # performed a residual graph .drv fetch. The replaced
+        # closure-membership prefetch fetched on EVERY deep-closure
+        # build; the demand model fetches only what a declaration
+        # demands beyond the already-retained input-drv texts, and for
+        # the erg-native build that set is empty (drvPath context makes
+        # the graph .drv a direct inputDrv, so its text was retained at
+        # the input-drv loop). Demand UNDER-supply cannot hide here: it
+        # fails the erg-native build subtest itself with a glue error.
+        # journalctl|grep -c exits 1 on zero matches; execute()
+        # tolerates it so the count is honest either way.
+        rc, n = worker.execute(
+            "journalctl -u rio-builder --no-pager | "
+            "grep -c 'fetching declaration-demanded graph'"
+        )
+        n = int(n.strip() or "0")
+        assert n == 0, (
+            f"expected zero residual graph .drv fetches across the scenario, got {n} — "
+            "a build fetched graph texts beyond the retained input-drv set "
+            "(bug_081 closure-membership fetching returning, or input-drv "
+            "retention regressed)"
+        )
   '';
 
   # ── nom-exit / SSH connection teardown ────────────────────────────────

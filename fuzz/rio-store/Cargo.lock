@@ -3973,6 +3973,7 @@ dependencies = [
  "axum",
  "base64",
  "config",
+ "ed25519-dalek",
  "futures-util",
  "metrics-exporter-prometheus",
  "opentelemetry",

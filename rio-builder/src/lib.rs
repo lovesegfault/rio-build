@@ -1,8 +1,8 @@
 //! Build executor with FUSE store for rio-build.
 //!
-//! Receives build assignments from the scheduler, runs builds using
-//! nix-daemon within an overlayfs+FUSE environment, and uploads
-//! results to the store.
+//! Receives build assignments from the scheduler, runs builds in a
+//! native rio-exec sandbox within an overlayfs+FUSE environment, and
+//! uploads results to the store.
 //!
 //! # Architecture
 //!
@@ -17,15 +17,17 @@
 //! |   +-- lookup/getattr -> StoreService.QueryPathInfo
 //! |   +-- read/readdir -> SSD cache or StoreService.GetPath
 //! |   +-- Ephemeral local-disk cache (cache.rs)
-//! +-- Build executor (executor.rs)
+//! +-- Build executor (executor/)
 //! |   +-- Overlay management (overlay.rs)
-//! |   +-- Synthetic DB generation (synth_db.rs)
+//! |   +-- Sandbox request glue (executor/glue/)
+//! |   +-- Exit classification + output pipeline (executor/native_result/)
 //! |   +-- Log streaming (log_stream.rs)
 //! |   +-- Output upload (upload.rs)
 //! +-- Heartbeat loop (runtime.rs, 10s interval)
 //! ```
 
 pub(crate) mod banner;
+pub mod builtin_fetchurl;
 pub mod cgroup;
 pub mod config;
 pub mod executor;
@@ -39,7 +41,6 @@ pub mod log_stream;
 pub(crate) mod overlay;
 pub mod quota;
 pub mod runtime;
-pub(crate) mod synth_db;
 pub(crate) mod upload;
 
 /// Recover the guard from a poisoned [`std::sync`] lock result.
@@ -139,18 +140,41 @@ pub fn describe_metrics() {
          high rate = pathological producer."
     );
     describe_counter!(
+        "rio_builder_graph_drv_fetch_total",
+        ".drv texts fetched at input resolution because the build's \
+         exportReferencesGraph declaration demands them (the glue's only \
+         .drv readers). Expected ~0 fleet-wide — nearly all builds declare \
+         no graph. A sustained nonzero rate without a corresponding ERG \
+         workload is the I-110 closure-prefetch amplification returning."
+    );
+    describe_counter!(
+        "rio_builder_log_messages_shed_total",
+        "Display-stream messages (BuildLogBatch / BuildPhase, by `kind`) \
+         shed because the permanent sink was full — scheduler-link \
+         backpressure. The build and its limit enforcement continue; the \
+         next delivered batch carries a `[rio: N log messages shed …]` \
+         marker. Sustained growth = degraded scheduler link, not a build \
+         problem. Control messages (CompletionReport, PrefetchComplete) \
+         are never shed."
+    );
+    describe_counter!(
+        "rio_builder_kill_verdict_outputs_present_total",
+        "Corroborated limit-kill verdicts (producers: TimedOut, Silent, \
+         LogLimitExceeded) whose declared outputs ALL materialized — \
+         judged on the relay-forwarded exit, never the builder-side log \
+         cap override. Expected ~0: an ISOLATED increment is the \
+         documented natural-137 coincidence (the build exited 137 on its \
+         own as a deadline raced it); a SUSTAINED RATE is a \
+         kill-supervision regression re-opening the completed-build \
+         relabel window the principal-targeted kill closed. Alert on \
+         rate; pull the worker's logs for the named drv either way."
+    );
+    describe_counter!(
         "rio_builder_cgroup_oom_total",
         "Builds killed by the cgroup OOM watcher (memory.events oom_kill \
          incremented during build). Reported as InfrastructureFailure for \
          scheduler resource_floor bump (I-196). Nonzero = pool's memory \
          limit is undersized for its workload."
-    );
-    describe_counter!(
-        "rio_builder_input_materialization_failures_total",
-        "Daemon MiscFailure reclassified as InfrastructureFailure because the \
-         missing path is in the build's input closure (I-178). Sustained \
-         nonzero = JIT_MIN_THROUGHPUT_BPS is set above actual store→builder \
-         throughput; lower the floor."
     );
     describe_counter!(
         "rio_builder_fuse_cache_hits_total",

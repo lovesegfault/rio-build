@@ -9,7 +9,7 @@ use super::insert_test_derivation;
 use crate::db::SchedulerDb;
 use crate::state::{BuildOptions, BuildState, PriorityClass};
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// `load_parents_with_all_children_produced` only counts produced
 /// children that are vouched for (via `build_derivations`) by a LIVE
 /// (`pending`/`active`) build that ALSO owns the parent: parent A's
@@ -240,7 +240,7 @@ async fn test_load_parents_with_failed_deps_requires_live_co_owning_voucher() ->
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+15]
 /// `load_parents_with_unproduced_terminal_children` returns exactly the
 /// recovered parents with ≥1 persisted child in a non-produced terminal
 /// status (`cancelled`/`dependency_failed`/`poisoned`) — the children
@@ -315,11 +315,17 @@ async fn test_load_parents_with_unproduced_terminal_children_ignores_produced_an
     let holed = db
         .load_parents_with_unproduced_terminal_children(&[a, b, c])
         .await?;
+    let holed_parents: Vec<uuid::Uuid> = holed.iter().map(|(p, _)| *p).collect();
     assert_eq!(
-        holed,
+        holed_parents,
         vec![a],
         "only parents with ≥1 non-produced terminal child are returned; produced \
          and unbuilt children alone never mark a truncation"
+    );
+    assert_eq!(
+        holed.len(),
+        1,
+        "exactly one (parent, missing-child) pair: the cancelled child"
     );
     Ok(())
 }

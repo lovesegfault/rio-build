@@ -9,16 +9,30 @@
 # PSA-restricted (readOnlyRootFilesystem + runAsNonRoot) and the
 # a28e4b65 EROFS regression class is caught at merge-gate.
 #
-# The bootstrap script (nix/docker.nix bootstrap attr) calls
-# `aws secretsmanager describe-secret` / `create-secret` — unreachable
-# in the airgapped VM. The Job will FAIL at the aws create-secret step
-# after backoffLimit retries. That's EXPECTED: we're testing PSA
-# compatibility, not AWS integration. The bootstrap-job-ran subtest
-# (scenarios/lifecycle.nix) asserts the script progressed past the
-# env-check + awscli2 init + openssl /tmp write WITHOUT hitting EROFS.
-flakeArgs@{ dockerImages, ... }:
+# The bootstrap script (nix/docker.nix bootstrap attr) talks to a
+# faithful in-VM Secrets Manager mock (mock-secretsmanager.py on the
+# k3s-server node; AWS_ENDPOINT_URL + dummy creds via
+# bootstrap.extraEnv). The REAL awscli2 gets GENUINE
+# ResourceNotFoundException wire shapes for the first-run probes,
+# creates every secret, and the Job COMPLETES — bootstrap-job-ran
+# asserts full convergence under PSA-restricted with no EROFS.
+# History: before round 17 this fixture had no credentials at all;
+# every describe died NoCredentials and the old raw `if aws describe`
+# guard collapsed that into "missing", so the scenario asserted
+# "describe returned not-found" while never exercising it. The
+# round-17 fail-closed probe (refusing to guess on non-not-found
+# errors) exposed the latent collapse; the mock makes the stated
+# intent real.
+flakeArgs@{ dockerImages, pkgs, ... }:
 let
   k3sFull = import ./k3s-full.nix flakeArgs;
+  # k3s-server's test-driver-assigned v6 address. Deterministic for
+  # THIS fixture's node set (sorted: client-v6=1, edge=2, k3s-agent=3,
+  # k3s-server=4, upstream-v6=5 → 2001:db8:1::4 — the same address
+  # the apiserver advertises). If the node set changes, the
+  # mock-reachable assert in bootstrap-job-ran fails loudly (the Job
+  # logs show connect errors, not not-found).
+  serverV6 = "2001:db8:1::4";
 in
 {
   extraValuesTyped ? { },
@@ -54,6 +68,17 @@ k3sFull (
       # fails (no creds, no endpoint) — bootstrap-job-ran expects it.
       "global.region" = "vm-test";
       "store.chunkBackend.bucket" = "vm-test-bucket";
+      # Real awscli2 against the in-VM mock: dummy SigV4 creds (the
+      # mock doesn't verify signatures — they just satisfy the
+      # credential chain so the CLI signs and sends) + the explicit
+      # endpoint (which awscli2 honors over AWS_USE_DUALSTACK_ENDPOINT
+      # — explicit URLs skip endpoint resolution entirely).
+      "bootstrap.extraEnv[0].name" = "AWS_ACCESS_KEY_ID";
+      "bootstrap.extraEnv[0].value" = "vm-test-dummy-key";
+      "bootstrap.extraEnv[1].name" = "AWS_SECRET_ACCESS_KEY";
+      "bootstrap.extraEnv[1].value" = "vm-test-dummy-secret";
+      "bootstrap.extraEnv[2].name" = "AWS_ENDPOINT_URL";
+      "bootstrap.extraEnv[2].value" = "http://[${serverV6}]:5000";
       # rio.image helper (_helpers.tpl) builds `{repo}:{global.image.tag}`.
       # vmtest-full.yaml sets global.image.tag=dev; dockerImages.bootstrap
       # (nix/docker.nix) builds rio-bootstrap:dev. String match → pod pulls
@@ -66,5 +91,20 @@ k3sFull (
     # "bootstrap excluded"). Without this preload the Job pod goes
     # ImagePullBackOff (airgapped — no registry to pull from).
     extraImages = [ dockerImages.bootstrap ] ++ extraImages;
+    # The Secrets Manager mock, listening on [::]:5000 of the server
+    # node (pods reach node addresses via cilium host routing).
+    # Stdlib-only python; Restart=always rides any blip; started at
+    # multi-user so it's up long before k3s applies 02-workloads.
+    extraServerModule = {
+      systemd.services.mock-secretsmanager = {
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig = {
+          ExecStart = "${pkgs.python3}/bin/python3 ${./mock-secretsmanager.py}";
+          Restart = "always";
+          DynamicUser = true;
+        };
+      };
+      networking.firewall.allowedTCPPorts = [ 5000 ];
+    };
   }
 )

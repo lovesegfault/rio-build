@@ -76,6 +76,8 @@ const ALL_SUBCOMMANDS: &[&str] = &[
     "sla",
     "verify-chunks",
     "upstream",
+    "invalidate-path",
+    "keygen",
 ];
 
 #[test]
@@ -217,6 +219,30 @@ fn per_subcommand_help_renders() {
 )]
 #[case::upstream_remove_no_url(&["upstream", "remove", "--tenant", "t1"], false)]
 #[case::upstream_bare(&["upstream"], false)]
+// invalidate-path: one required positional (the store path) + the
+// optional --keep-realisations flag. Parse-only (connect-refused after
+// clap, same pattern as the other store-admin subcommands).
+#[case::invalidate_path_ok(
+    &["invalidate-path", "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-foo"],
+    true
+)]
+#[case::invalidate_path_keep(
+    &["invalidate-path", "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-foo", "--keep-realisations"],
+    true
+)]
+#[case::invalidate_path_bare(&["invalidate-path"], false)]
+// keygen: subcommands — `new` takes three required positionals
+// (name, secret path, public path); `derive-pub` takes none (secret
+// entry arrives on stdin so it can never land in /proc/*/cmdline).
+// The "parses" case points at a nonexistent directory so execution
+// fails with ENOENT (exit 1) instead of writing key files from a
+// parse test — same fail-after-clap pattern as the connect-refused
+// subcommands above.
+#[case::keygen_new_ok(&["keygen", "new", "k", "/nonexistent-rio-cli-test/k.sec", "/nonexistent-rio-cli-test/k.pub"], true)]
+#[case::keygen_new_missing_pub(&["keygen", "new", "k", "/tmp/k.sec"], false)]
+#[case::keygen_derive_pub_ok(&["keygen", "derive-pub"], true)]
+#[case::keygen_derive_pub_rejects_args(&["keygen", "derive-pub", "secret-on-argv"], false)]
+#[case::keygen_bare(&["keygen"], false)]
 // --json is #[arg(global = true)] — accepted before OR after the subcommand.
 #[case::json_before(&["--json", "status"], true)]
 #[case::json_after(&["status", "--json"], true)]

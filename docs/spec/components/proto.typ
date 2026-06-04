@@ -49,8 +49,9 @@ mandatory.
     [`ASSIGNMENT_TOKEN_HEADER`],
     [`x-rio-assignment-token`],
     [executor → store (request metadata on `PutPath` / `PutPathBatch`)],
-    [HMAC-SHA256 token signed by scheduler; store verifies (executor_id,
-      drv_hash, expected_outputs, expiry)],
+    [HMAC-SHA256 token signed by scheduler; store verifies the seven-field
+      `AssignmentClaims` (executor_id, drv_hash, expected_outputs, is_ca,
+      is_fixed_output, tenant, expiry_unix)],
 
     [`TENANT_TOKEN_HEADER`],
     [`x-rio-tenant-token`],
@@ -67,10 +68,13 @@ mandatory.
   between MergeDag commit and the first `BuildEvent`.
 ]
 
-#r("proto.metadata.assignment-token")[
+#r("proto.metadata.assignment-token+2")[
   `x-rio-assignment-token` is the *only* input the store trusts when
   authorizing `PutPath`. The token is minted scheduler-side at dispatch (HMAC
-  over executor_id + drv_hash + expected_outputs + expiry) and carried through
+  over the seven-field `AssignmentClaims` tuple --- executor_id, drv_hash,
+  expected_outputs, is_ca, is_fixed_output, tenant, expiry_unix; optional
+  fields use serde defaults --- see
+  #rref("common.hmac.claims+1")) and carried through
   the executor verbatim. The store MUST reject uploads with a missing,
   expired, or mismatched-output token. Builder pods are airgapped and
   untrusted --- builder-supplied data MUST NOT drive authorization; the token
@@ -285,8 +289,8 @@ to the batcher's 100ms / 64-line buffering.
 
 === BuildLogBatch
 
-Log lines are *batched* for efficiency rather than sent per-line. The executor
-buffers up to 64 lines or 100ms (whichever comes first) and sends a batch. Use
+Log lines are *batched* for efficiency rather than sent per-line, on the
+cadence and caps defined by #rref("obs.log.batch-64-100ms+1"). Use
 `bytes` (not `string`) for log content since build output may contain non-UTF-8
 data.
 
@@ -421,7 +425,8 @@ message SubmitBuildRequest {
 
 message DerivationNode {
   string drv_path = 1;             // Store path of the .drv file
-  string drv_hash = 2;             // Input-addressed: store path; CA: modular hash
+  string drv_hash = 2;             // Scheduler DAG key == the declared .drv store path (ingress-enforced);
+                                   //   CA content identity lives in ca_modular_hash, which keys realisations.
   string pname = 3;                // Package name (for duration estimation)
   string system = 4;               // e.g. "x86_64-linux"
   repeated string required_features = 5;
@@ -432,13 +437,18 @@ message DerivationNode {
                                               //  TOCTOU between gateway FindMissingPaths
                                               //  and DAG merge)
   bytes drv_content = 9;           // Inline ATerm-serialized .drv. Empty = executor fetches from store.
-                                   // Populated by gateway's filter_and_inline_drv ONLY for nodes with
-                                   // missing outputs (≤64KB per node, 16MB total DAG budget).
+                                   // Two gateway producers: filter_and_inline_drv for cache-resident nodes
+                                   // with missing outputs (≤64KB per node, 16MB total DAG budget) and the
+                                   // content-bound hook fallback (≤1MiB, rio-common MAX_DRV_CONTENT_BYTES).
   reserved 10;                     // was input_srcs_nar_size (closure-size proxy; ADR-023 supersedes)
   bool is_content_addressed = 11;  // CA cutoff: set by gateway from has_ca_floating_outputs() ||
                                    // is_fixed_output(). Gates scheduler's hash-compare on completion.
-  bytes ca_modular_hash = 12;      // 32-byte blake3 modular derivation hash (CA nodes from gateway BFS only;
-                                   // empty for IA and single-node BasicDerivation fallback)
+  bytes ca_modular_hash = 12;      // 32-byte SHA-256 modular derivation hash (hashDerivationModulo). Empty for
+                                   // IA nodes with statically-known output paths; populated from gateway BFS for
+                                   // CA nodes AND deferred-IA nodes (so the realisation row answering
+                                   // wopQueryDerivationOutputMap exists) and for content-addressed single-node
+                                   // fallbacks, and must match the authoritative drv_content when a
+                                   // floating-CA output is present.
   bool needs_resolve = 13;         // ADR-018 shouldResolve: this node needs dispatch-time placeholder resolution
                                    // (CA floating OR IA with a CA-floating input's placeholder in env/args)
 }

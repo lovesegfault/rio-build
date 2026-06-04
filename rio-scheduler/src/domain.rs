@@ -68,6 +68,10 @@ pub struct DerivationNode {
     /// crate — the one extra copy at the boundary is per-merge, not
     /// per-tick.
     pub drv_content: Vec<u8>,
+    /// True when `drv_content` is the only copy of the derivation
+    /// anywhere (content-bound hook fallback) — the scheduler must
+    /// persist those bytes with the derivation row for recovery.
+    pub drv_content_authoritative: bool,
     pub is_content_addressed: bool,
     /// Decoded `ca_modular_hash` — `Some` iff the wire field was
     /// exactly 32 bytes. The proto carries raw `bytes`; downstream
@@ -75,6 +79,16 @@ pub struct DerivationNode {
     /// floating-CA lane) wants `[u8; 32]`. Decoding once here means
     /// callers branch on `Option`, not length.
     pub ca_modular_hash: Option<[u8; 32]>,
+    /// A declared modular hash the INGRESS strip removed because it
+    /// could not be recomputed (`ingress-inline-drv-binding+1`):
+    /// preserved out-of-band so the settled-row matcher can later
+    /// admit a byte-equal re-presentation of the same claim
+    /// (M_070, `sched.persist.settled-identity-freeze+4`). Never set
+    /// from the wire (`From<proto>` always maps it to `None`); the
+    /// only producer is the SubmitBuild ingress validator's strip
+    /// phase, applied at the actor's proto→domain boundary. Never
+    /// evidence: no consumer ranks, vetoes, or keys on it.
+    pub ca_modular_hash_stripped: Option<[u8; 32]>,
     pub needs_resolve: bool,
     /// ADR-023 sizing inputs — gateway extracts from drv.env. All
     /// optional: absent ≠ false/empty (see dag.proto field comments).
@@ -88,6 +102,9 @@ impl From<proto::DerivationNode> for DerivationNode {
     fn from(n: proto::DerivationNode) -> Self {
         Self {
             ca_modular_hash: n.ca_modular_hash.as_slice().try_into().ok(),
+            // Wire nodes never carry a preserved stripped claim — it is
+            // scheduler-internal state minted by the ingress strip.
+            ca_modular_hash_stripped: None,
             drv_path: n.drv_path,
             drv_hash: n.drv_hash,
             pname: n.pname,
@@ -99,6 +116,7 @@ impl From<proto::DerivationNode> for DerivationNode {
             wanted_output_names: n.wanted_output_names,
             explicitly_requested: n.explicitly_requested,
             drv_content: n.drv_content.to_vec(),
+            drv_content_authoritative: n.drv_content_authoritative,
             is_content_addressed: n.is_content_addressed,
             needs_resolve: n.needs_resolve,
             version: n.version,

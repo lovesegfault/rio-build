@@ -68,6 +68,13 @@ pub struct HeartbeatPayload {
 pub struct MergeDagRequest {
     pub build_id: Uuid,
     pub tenant_id: Option<Uuid>,
+    /// Declared modular hashes the SubmitBuild ingress strip removed
+    /// (unverifiable: floating store-backed input missing from the
+    /// seeds), keyed by `drv_hash`. Applied to the domain nodes at the
+    /// actor's proto→domain boundary so the preserved claim (M_070)
+    /// rides the creation snapshot. Always empty for test-constructed
+    /// requests unless the test exercises the strip itself.
+    pub ingress_stripped: std::collections::HashMap<String, [u8; 32]>,
     pub priority_class: PriorityClass,
     pub nodes: Vec<rio_proto::types::DerivationNode>,
     pub edges: Vec<rio_proto::types::DerivationEdge>,
@@ -889,12 +896,15 @@ pub enum ActorError {
     #[error("DAG merge failed: {0}")]
     Dag(#[from] crate::dag::DagError),
 
-    /// Invariant violation: an edge references a derivation that was never
-    /// persisted to PG. Merge assigns db_ids to every node before processing
-    /// edges; if `DerivationDag::db_id_for_path` returns None for an endpoint, the
-    /// node was never in the submission (malformed request) or the id_map
-    /// build loop has a bug.
-    #[error("edge references unpersisted derivation (db_id missing): {drv_path}")]
+    /// Invariant violation: merge persistence needed a derivation's
+    /// `db_id` and none exists. Two producers: the build→derivation
+    /// link loop (a node this submission merely joins should have had
+    /// its `db_id` committed by the merge that created it) and edge
+    /// endpoint resolution (id_map for rows this merge wrote, the live
+    /// DAG for everything else). Either way the node was never part of
+    /// a committed submission (malformed request) or the resolution
+    /// logic has a bug.
+    #[error("merge persistence references an unpersisted derivation (db_id missing): {drv_path}")]
     MissingDbId { drv_path: String },
 
     /// Store service is unreachable (cache-check circuit breaker is open).
@@ -916,6 +926,71 @@ pub enum ActorError {
     /// so BalancedChannel clients retry against the new leader.
     #[error("not leader (standby replica)")]
     NotLeader,
+
+    /// `r[sched.persist.settled-identity-freeze+4]`: a submission tried to
+    /// (re)create a derivation whose persisted row is SETTLED
+    /// (completed/skipped — the durable record of a successful build,
+    /// possibly already reaped from the DAG) under a conflicting
+    /// identity. Maps to FAILED_PRECONDITION (client-actionable
+    /// conflict). The `remediation` is GENERATED from the arbitration
+    /// verdict's refuse arm (`sched.merge.store-evidence-displacement+3`,
+    /// fix-discipline R6) — a refused class structurally cannot emit a
+    /// remediation its verdict does not support.
+    #[error(
+        "derivation {drv_path} has a settled (successfully built) record \
+         with a different identity; re-creating it would erase that \
+         record. {remediation}"
+    )]
+    SettledIdentityConflict {
+        drv_path: String,
+        remediation: String,
+    },
+
+    /// `r[sched.merge.store-evidence-displacement+3]`: a settled-conflict
+    /// resolution needed store evidence and the store stayed SILENT
+    /// (fetch failure, absent path, transport-grade noise). TRANSIENT:
+    /// maps to UNAVAILABLE so clients retry when the store recovers —
+    /// silence must never harden into the permanent
+    /// FAILED_PRECONDITION the conflict itself would carry.
+    #[error(
+        "store evidence unavailable ({reason}) while resolving a settled \
+         identity conflict for {drv_path}; retry when the store recovers"
+    )]
+    SettledConflictEvidenceUnavailable {
+        drv_path: String,
+        reason: &'static str,
+    },
+
+    /// `r[sched.merge.store-evidence-displacement+3]`: the per-merge
+    /// store-evidence fetch budget was exhausted before this settled
+    /// conflict could be verified. Maps to RESOURCE_EXHAUSTED with
+    /// actionable guidance (split the submission); partial
+    /// displacements from earlier conflicts in the SAME submission are
+    /// not persisted — the merge is atomic
+    /// (`sched.persist.atomic-activation`).
+    #[error(
+        "the per-merge store-evidence budget was exhausted before the \
+         settled conflict for {drv_path} could be verified; split the \
+         submission into smaller batches or retry after earlier \
+         conflicts resolve"
+    )]
+    SettledConflictEvidenceBudget { drv_path: String },
+
+    /// `r[sched.merge.store-evidence-displacement+3]`: the merge-time
+    /// store-evidence check fetched the `.drv` the submission's
+    /// declared `drv_path` names, verified its text content-address,
+    /// and the parsed derivation CONTRADICTS the submission's claimed
+    /// identity — the store, not the prior record, disproves the
+    /// claim. Maps to FAILED_PRECONDITION: the submitter's declared
+    /// identity does not belong to the derivation at that path, so no
+    /// retry of the same claim can succeed (fix the submission, or the
+    /// `.drv` upload it references).
+    #[error(
+        "the store derivation at {drv_path} contradicts this \
+         submission's claimed identity; the declared outputs/flags do \
+         not derive from the .drv bytes the store holds at that path"
+    )]
+    StoreEvidenceContradicts { drv_path: String },
 }
 
 /// Read-only view of the actor's backpressure state.

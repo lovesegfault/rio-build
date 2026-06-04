@@ -120,8 +120,10 @@ any critical-path value).
       per pod)? system match? Candidates that fail are excluded entirely.
    c. Assign to the first eligible executor via the bidirectional BuildExecution stream.
       The WorkAssignment carries an HMAC-SHA256-signed assignment token (Claims:
-      executor_id, drv_hash, expected_outputs, is_ca, expiry_unix). The store verifies
-      the token on PutPath and rejects uploads for paths not in expected_outputs.
+      executor_id, drv_hash, expected_outputs, is_ca, is_fixed_output, tenant,
+      expiry_unix — the optional fields use serde defaults). The
+      store verifies the token on PutPath and rejects uploads for paths not in
+      expected_outputs.
 8. As builds complete (reported via BuildExecution stream):
    a. Upload output to rio-store (executor does this before reporting)
    b. For CA derivations: check if output content matches any existing CAS entry
@@ -148,17 +150,54 @@ any critical-path value).
   state.
 ]
 
-#r("sched.completion.output-membership")[
-  `handle_completion` MUST drop any worker-supplied `BuiltOutput` whose
-  `output_name` is not in the derivation's scheduler-trusted `output_names`
-  (parsed from the `.drv` at DAG-merge time), and MUST drop duplicates by
-  `output_name`. Builders are untrusted; without this filter a compromised
-  worker reporting on its own assigned drv could write arbitrary worker-chosen
-  paths to `path_tenants` (pinning them against GC) and stall the actor via the
-  sequential `insert_realisation` loop. After filtering, `built_outputs.len() ≤
-  output_names.len()`. Dropped entries increment
-  #(refs.metric)("rio_scheduler_undeclared_built_output_total").
+#r("sched.completion.output-membership+1")[
+  Worker-supplied built outputs MUST reach trusted-plane consumers
+  (`state.output_paths` and its GC-pin / `path_tenants` readers,
+  realisations, cutoff-compare, the client output report) only through
+  ONE admission chokepoint that takes the raw report by value, so no
+  consumer can read pre-admission data. The chokepoint MUST drop any
+  `BuiltOutput` whose `output_name` is not in the derivation's
+  scheduler-trusted `output_names` (parsed from the `.drv` at
+  DAG-merge time), MUST drop duplicates by `output_name`, MUST drop
+  malformed `output_path` values (store-path parse), and MUST bind
+  each remaining output's `output_path` to the scheduler-held claim
+  for that output's slot: for every output whose dispatch-time claim
+  or merge-time expected path is non-empty, a worker-reported path
+  that differs from it MUST be dropped (index-aligned by the slot the
+  assignment token signs --- never set-membership, which would admit
+  cross-slot permutations), counted per reason; outputs whose slot the
+  scheduler holds no path for (floating-CA, or a deferred-IA slot
+  whose claim did not survive) MUST be admitted through an explicit
+  per-reason accept cell, also counted. Builders are untrusted;
+  without the membership bound a compromised worker reporting on its
+  own assigned drv could write arbitrary worker-chosen paths to
+  `path_tenants` (pinning them against GC) and stall the actor via
+  the sequential `insert_realisation` loop; without the binding it
+  could substitute ANY well-formed path for a known slot. After
+  admission, `len() ≤ output_names.len()`. Dropped entries increment
+  #(refs.metric)("rio_scheduler_undeclared_built_output_total") or
+  #(refs.metric)("rio_scheduler_completion_path_binding_total") by
+  reason.
 ]
+
+#r("sched.completion.store-evidence-binding")[
+  A completion admission MUST NOT treat a worker-reported NAR hash as
+  evidence binding a content-derived output path (FOD or floating-CA)
+  to its content: that binding requires the output descriptor (the
+  declared method and digest for a fixed output; the realisation chain
+  for floating-CA), and any consumer holding only the report MUST
+  delegate the verification to the store's upload admission rather
+  than re-deriving it from worker-controlled fields.
+]
+
+This rule is DELIBERATELY UNCOVERED (no `impl` marker; it appears in
+`tracey query uncovered` by design): the scheduler's accept cells
+(`accepted_floating_ca` / `accepted_unresolved_slot`) name the dormant
+restorer `verify_built_output_store_evidence`, and wiring it without
+the store-side descriptor read surface would launder a worker claim
+into evidence --- the rule IS the wiring checklist, kept visible until
+the store grows that surface (round-17 bug_100; the same posture as
+`fetcher.netrc.delivery-unwired`).
 
 #r("sched.log.batch-binding")[
   The `BuildLogBatch` ingestion path MUST drop batches whose `derivation_path`
@@ -166,7 +205,7 @@ any critical-path value).
   batch for an unsolicited derivation MUST NOT allocate a buffer entry.
 ]
 
-This is the log-path analogue of #rref("sched.completion.output-membership").
+This is the log-path analogue of #rref("sched.completion.output-membership+1").
 The completion check runs inside the actor with `state.assigned_executor` in
 scope; the log batch ingestion path deliberately bypasses the actor (so a
 chatty build can't fill the actor's bounded mpsc), so the gate is colocated
@@ -425,6 +464,42 @@ epilogue in the success path).
   (now() - poisoned_at))`, so the 24h TTL check survives scheduler restart.
 ]
 
+#r("sched.retry.revival-total-reset+2")[
+  A revival of a previously-failed derivation (any revival-resettable
+  origin --- `Poisoned`, `DependencyFailed`, or `Failed` --- revived
+  because the output now exists: cache-hit, deferred re-probe, or
+  substitutable-upstream) MUST reset the COMPLETE failure-tracking
+  state --- every retry counter, every capped deferral budget, every
+  backoff deadline, and the failure attribution set --- not an
+  enumerated subset, AND MUST reset it at BOTH durability tiers: the
+  in-memory `RetryState` and the persisted failure-history columns,
+  so a leader failover between the revival and the next status
+  persist cannot resurrect moot failure history. The origin-status
+  population MUST be one shared predicate consumed by every revival
+  site at both tiers; the in-memory reset MUST be implemented so that
+  adding a failure-tracking field without deciding its revival
+  disposition fails compilation.
+]
+The clause exists because the enumerated-subset form regressed twice on
+the same shape (round-16 merged_bug_022): `claims_unavailable_count`
+and `backoff_until` were silently omitted from `RetryState::clear()`,
+so a revived node with a maxed claims budget re-poisoned on its FIRST
+post-revival store blip (the charge gate saw the stale counter at cap,
+emitting a message that falsely claimed the full ladder had run), and a
+stale pre-revival backoff deadline silently deferred the re-probe
+dispatch by up to a full backoff window. Exhaustive destructuring in
+`clear()` makes the omission a compile error; a future field that must
+survive revival gets an explicit no-op arm with rationale, never a
+silent omission. The `+2` tier extension exists because the same
+omission shape recurred one level up (round-17 merged_bug_073): the
+in-memory reset ran at every revival site while the persisted
+`retry_count`/`failed_builders`/`resubmit_cycles`/`poisoned_at`
+columns were cleared only on a per-site status subset — a failover
+after a `Failed`-origin revival restored the moot history verbatim,
+and the substitutable lane never cleared PG at all. One population
+predicate (`DerivationStatus::is_revival_resettable`) and one
+history-column reset (`clear_revival_history`) now span both tiers.
+
 #r("sched.retry.per-executor-budget")[
   `BuildResultStatus::InfrastructureFailure` does NOT count toward the poison
   threshold. It routes through a separate `handle_infrastructure_failure`
@@ -674,7 +749,7 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
   queried directly to compare its view against the leader's.
 ]
 
-#r("sched.gc.live-pins")[
+#r("sched.gc.live-pins+2")[
   On dispatch, the scheduler writes the assigned derivation's input-closure
   paths to the `scheduler_live_pins` PG table; on completion (success or
   failure) it deletes those rows; a periodic stale-sweep clears rows older than
@@ -682,9 +757,14 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
   mark CTE reads `scheduler_live_pins` directly as additional roots, so an
   in-flight build's inputs survive a concurrent sweep even if no narinfo
   references them yet. The complementary output side is `AdminQuery::GcRoots`,
-  which returns `expected_output_paths ∪ output_paths` for all non-terminal
-  derivations as extra mark-phase roots covering outputs the executor hasn't
-  uploaded.
+  which MUST return the three-way union `expected_output_paths ∪
+  claim_output_paths ∪ output_paths` (empty slots filtered) for all
+  non-terminal derivations as extra mark-phase roots covering outputs the
+  executor hasn't uploaded --- the claim term is the deferred-IA node's
+  dispatch-RESOLVED real paths, which its expected slots do not contain by
+  construction, and it MUST survive leader failover via the persisted claim
+  column (M_075) so a surviving worker's about-to-upload paths stay pinned
+  while the new leader recovers.
 ]
 
 #r("sched.heartbeat.adopt")[
@@ -741,15 +821,340 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
 
 = Multi-Build DAG Merging
 
-#r("sched.merge.dedup")[
+#r("sched.merge.dedup+2")[
   The scheduler maintains a single global DAG across all concurrent build
-  requests. When a new derivation DAG arrives from the gateway, it is merged
-  into the global graph:
-  - *Input-addressed derivations*: deduplicated by store path
-  - *#gls("ca", display: "Content-addressed") derivations*: deduplicated by @modular-hash
-    (as computed by `hashDerivationModulo` --- excludes output paths, depends
-    only on the derivation's fixed attributes)
+  requests. When a new derivation DAG arrives, it is merged into the global
+  graph: nodes are deduplicated by `drv_hash`, which ingress binds to the
+  declared `.drv` store path
+  (#rref("sched.merge.ingress-identity-binding")), so submissions of the same
+  `.drv` share one node regardless of submitter.
 ]
+
+The DAG key is the `.drv` store path for every node shape — including
+#gls("ca", display: "content-addressed") derivations. Equivalent CA content
+built from textually different `.drv`s is not collapsed at the DAG: that
+dedup happens through realisations keyed by the 32-byte @modular-hash
+(`ca_modular_hash`, as computed by `hashDerivationModulo` --- excludes output
+paths, depends only on the derivation's fixed attributes), which drives the
+CA early-cutoff rules. Earlier revisions of this rule described the CA case
+as "deduplicated by modular hash"; that described the realisation layer, not
+the DAG key.
+
+#r("sched.merge.ingress-identity-binding")[
+  `SubmitBuild` ingress MUST reject any node whose `drv_hash` is not exactly
+  the declared `drv_path`, whose `ca_modular_hash` is neither empty nor 32
+  bytes, or which sets `is_fixed_output` without `is_content_addressed`.
+]
+
+The DAG, the persisted `derivations` row, the HMAC assignment claims, and the
+authoritative-content / identity conflict gates are all keyed by `drv_hash`,
+while edges, dispatch, and recovery resolve the declared `drv_path`. The
+gateway always submits the two equal; only a hostile or buggy direct
+submitter can split them — registering a node under someone else's
+predictable DAG key while pointing `drv_path` at a decoy the workers would
+fetch, or aliasing one path onto two keys to corrupt the reverse index.
+Binding them at ingress makes every downstream gate reason about one
+identity. The two flag checks are declaration consistency: a malformed-length
+`ca_modular_hash` would otherwise be silently dropped at the domain boundary,
+and `is_fixed_output` without `is_content_addressed` would skip the CA gates.
+Ingress deliberately does NOT require `ca_modular_hash` to be present for CA
+nodes (the gateway's hash population is best-effort and FOD-only fallbacks may
+omit it) and does NOT forbid it on non-CA nodes (deferred-IA nodes carry one).
+
+#r("sched.merge.ingress-edge-endpoints")[
+  `SubmitBuild` ingress MUST reject any edge whose `parent_drv_path` or
+  `child_drv_path` is not the `drv_path` of a node in the same request.
+]
+
+This gate is request-shape consistency: every endpoint must be a declared
+node, so a dangling or typo'd endpoint is a clean `INVALID_ARGUMENT` instead
+of an opaque `Internal` at persist time. It deliberately does not decide
+whether the submitter may *define* dependencies for those nodes — joining a
+resident node and re-declaring it (full-closure resubmission) is legitimate
+and routine. Protection of resident nodes' dependency sets is the merge-time
+rule #rref("sched.merge.edge-creation-scoped") below. Every legitimate
+producer satisfies both: the gateway emits each edge together with its parent
+node and includes every child as a node of the same request, and the hook
+fallback submits a single node with no edges.
+
+#r("sched.merge.ingress-output-path-shape")[
+  `SubmitBuild` ingress MUST reject any node carrying an
+  `expected_output_paths` entry that is neither empty nor a valid non-`.drv`
+  store path.
+]
+
+Declared output paths flow into `FindMissingPaths` cache-hit probing, the
+HMAC assignment-claims output allowlist that authorizes worker uploads, and
+the merge gate's fixed-output path-agreement evidence. Empty entries are the
+legitimate floating-CA / deferred shape (the real path is computed at
+resolution time); anything else that is not a store path is either hostile or
+garbage, and rejecting it at ingress keeps tenant-controlled non-store-path
+strings out of every downstream consumer — the same trusted-plane line the
+gateway draws for its own clients (#rref("gw.reject.output-path-mismatch+2")).
+The shape check is deliberately weaker than the gateway's binding check (the
+scheduler has no derivation bytes for store-backed nodes to re-derive paths
+from); content-binding for inline submissions is the authoritative-content
+validation, and full evidence-ranked binding for store-backed claims is a
+documented follow-up.
+
+#r("sched.merge.ingress-output-names-unique")[
+  SubmitBuild ingress MUST reject any node whose `output_names` carry a
+  duplicate entry, for every node — bare store-backed nodes included —
+  before any DAG state, claims derivation, or store probe consults the
+  list.
+]
+The scheduler's name-keyed views (validator zips over
+`output_names ⇄ expected_output_paths`, dispatch `position()` lookups,
+the HMAC claims allowlist) assume pairwise-distinct names; a collapsed
+duplicate leaves them silently partial over positional storage. The
+round-15 fix-genealogy lesson is recorded here deliberately
+(merged_bug_072, pattern R2): the rio-nix parse boundary rejects
+duplicates inside derivation BYTES (`nix.drv.type-classify+1`), but a
+bare proto echo carries no bytes — a cross-crate invariant needs a
+chokepoint per ingestion surface, and "the other crate validates it"
+is exactly how the Nth surface gets missed. The two layers are
+independent and independently tested.
+
+#r("sched.merge.ingress-output-arity")[
+  SubmitBuild ingress MUST reject any node whose non-empty
+  `expected_output_paths` length differs from its `output_names`
+  length, for every node --- bare store-backed nodes included ---
+  before any DAG state, claims derivation, or store probe consults
+  either list. A fully empty `expected_output_paths` (the no-claims
+  form) MUST remain accepted.
+]
+The arity sibling of #rref("sched.merge.ingress-output-names-unique"),
+added by the round-16 sibling-invariants lesson (bug_098, pattern R5):
+the same name-keyed consumers that assume distinct names also assume
+the two lists are positionally PAIRED --- the
+`output_names ⇄ expected_output_paths` zips in the settled-row and
+resident identity matchers, the HMAC claims allowlist, and recovery's
+deferred-resolve re-derivation all silently TRUNCATE on a misaligned
+pair, so a hostile bare submission with a short or long path list
+could persist mis-paired path evidence and later manufacture a false
+`SettledIdentityConflict` against the honest, correctly-aligned
+resubmission of the same derivation. The byte-carrying validators
+(authoritative and inline) enforce arity against the parsed
+derivation; this rule covers the bare proto echo those validators
+never see. Sweeping per CONSUMER (what else do the zip consumers
+assume?) rather than per invariant across surfaces is what surfaces
+the sibling: distinctness landed in round 15, arity is the same
+consumers' second assumption.
+
+#r("sched.merge.ingress-inline-drv-binding+1")[
+  `SubmitBuild` ingress MUST validate every node that carries non-empty
+  `drv_content` without the authoritative flag (the gateway's
+  inline-`.drv` optimization): the bytes MUST be the canonical ATerm
+  serialization of a derivation whose text content-address
+  (`makeTextPath` over the bytes and the derivation's `inputSrcs` and
+  `inputDrvs` references) equals the declared `drv_path`; the node's
+  declared `system`, output names, fixed-output flag, and
+  content-addressed flag MUST equal the parsed derivation's; declared
+  expected output paths MUST be bound per output kind --- fixed-output
+  paths to their declared hash (single output named `out`), floating-CA
+  and deferred entries empty, and input-addressed paths equal to the
+  paths recomputed from the bytes with inputs resolved from sibling
+  inline derivations and sibling `ca_modular_hash` declarations; and a
+  non-empty `ca_modular_hash` MUST equal the modulo hash recomputed over
+  the bytes, with only siblings whose published hash IS the
+  input-position (unmasked) form in the seed --- store-backed
+  input-addressed, fixed-output, and deferred entries; never inline or
+  store-backed floating-CA ones --- and never the node's own
+  declaration. Submissions that fail any of these MUST be rejected with
+  `INVALID_ARGUMENT`. When the recompute is impossible because a
+  transitive input is a store-backed floating-CA derivation (its
+  unmasked form is underivable without its bytes), the declared
+  `ca_modular_hash` MUST be discarded at ingress rather than forwarded
+  unverified --- an unverifiable claim is no claim --- and the
+  submission MUST otherwise be accepted.
+]
+This closes the variant-1 squat for inline content: before the binding, a
+direct submitter could attach inline bytes describing one derivation while
+declaring another derivation's identity fields (expected output paths,
+flags) --- the worker builds what the bytes say, but upload authorization
+and the merge gate's evidence comparisons trust the declared fields, so
+attacker content could be registered at a victim derivation's
+not-yet-built input-addressed path by an honest worker. With the binding,
+every declared field is recomputed from (or checked against) the bytes
+themselves, and the bytes are bound to the declared `.drv` path by the
+text content-address --- forging any of it requires a SHA-256 second
+preimage. The sibling-seeded input resolution is what makes the check
+feasible without store access (#rref("gw.dag.modulo-hash-all-nodes")); a
+forged sibling hash cannot steer a derived path onto a victim's path,
+only away from every honest path. Store-backed nodes (no inline bytes)
+remain declaration-trusted at ingress --- their binding is the
+documented follow-up (store-evidence displacement), and the residual is
+exploitable only by a compromised worker, which the trust model already
+assumes hostile.
+
+The seed restriction and the discard clause exist because a floating-CA
+derivation's *published* modular hash is its masked-subject form
+(`mask_outputs = has_ca_floating_outputs()`, oracle parity), while the
+recompute's cache consumes input-position (unmasked) digests --- seeding
+the masked form poisons every consumer's recompute and false-rejects
+legitimate gateway-built CA chains. Discard-not-reject because the warm
+gateway shape (inline will-dispatch consumer of an already-realized
+floating drv whose bytes are not re-inlined) is honest traffic whose
+hash is genuinely unverifiable at ingress; discard-not-accept because an
+unverified declaration would otherwise flow into merge-gate identity
+evidence, realisation keys, and the persisted row. NO automatic
+re-establisher exists yet: a stripped node completes with its
+completion-time CA bookkeeping skipped — surfaced, never silent
+(#rref("sched.ca.absent-hash-surfaced")) — and the verifying
+re-establisher is the staged follow-up F2 (`ModularHashState`); until
+it lands, prose anywhere claiming the hash "is re-established" is the
+round-15 bug_048 pattern (R6) and must not return.
+
+#r("sched.merge.edge-creation-scoped")[
+  The merge MUST attach a submitted dependency edge to its parent node only
+  when this submission (re)creates that parent (a newly inserted node, a
+  resubmit-reset re-creation, a displacement, or an authority takeover) or
+  the resident parent is a topdown-pruned root awaiting its dependency
+  top-up. Any other submitted edge that is not an exact re-declaration of an
+  existing edge MUST be skipped without failing the merge, MUST NOT enter the
+  in-memory DAG, and MUST NOT be persisted to `derivation_edges`.
+]
+
+A node's dependency set is intrinsic to its `.drv`, so only the submission
+that (re)creates a node may define it. Without this rule any authenticated
+submitter could *join* someone else's resident node (deduplication is by
+design — #rref("sched.merge.dedup")) and attach a junk child to it: when the
+junk fails, the dependency-failure cascade fails the victim's node, a
+cross-tenant denial of service the ingress endpoint gate cannot see because
+both endpoints are nodes of the attacker's own request. Exact re-declarations
+of existing edges stay accepted as silent no-ops — the gateway re-emits each
+parent's full edge set on every full-closure join — and skipped foreign
+edges are observable (a per-merge warning plus the
+#(refs.metric)("rio_scheduler_merge_foreign_edge_skipped_total") counter) rather than a
+rejection, matching the edge loop's existing unresolved-endpoint posture.
+The topdown-pruned carve-out exists because a pruned root's creating
+submission deliberately dropped its dependency edges; the later full merge
+that re-adds them joins the resident root rather than re-creating it.
+Residual exposure, accepted: the *first* submitter of a predictable
+store-backed path still fixes its dependency set (the scheduler never sees
+store-backed `.drv` bytes to validate edges against `inputDrvs` — a possible
+future gateway-consistency cross-check for nodes that carry inline content),
+and a topdown-pruned root accepts dependency top-ups from any submitter
+while the flag is set.
+
+#r("sched.merge.heal-accepted-edges+1")[
+  Every post-merge consumer of "what this submission's edges did" --- the
+  closure-hole heal, the `topdown_pruned` clear-candidate seeding, the
+  persisted edge rows, and the edge-skip metrics --- MUST be derived from the
+  merge's *accepted*-edge bookkeeping (`MergeResult`), never from the
+  submitter's raw declared edge list. The closure-hole breadcrumb of a
+  resident node MUST be cleared by a merge only when that node's *entire*
+  declared edge set was accepted (each declared edge either attached or an
+  exact re-declaration of an existing edge) AND the merge positively covers
+  the recorded truncation: every missing child on the node's closure-hole
+  witness set MUST be among the node's post-merge children. A declared edge
+  skipped by the creation-scoped gate or naming an unresolvable child MUST
+  veto the heal for its parent; an accepted re-declaration that does not
+  cover the witness set MUST leave the hole (and its fail-fast routing)
+  intact and MUST be surfaced rather than silently retried.
+]
+
+The closure-hole breadcrumb is reap-truncation *evidence*: it records that a
+node's child set is no longer representative of its `.drv` closure. Healing
+it on the strength of edges the merge refused to attach would launder that
+evidence — a joining submission whose top-up edges are gate-skipped (the
+node was not re-created, so the creation-scoped rule rejects them) would
+flip the node's closure evidence from Broken to Vouched while its child set
+is still truncated, re-arming exactly the doomed from-source dispatch the
+breadcrumb exists to prevent. Deriving every consumer from `MergeResult`
+(computed by the same loop that enforces admission) makes this structural:
+any future tightening of edge admission automatically propagates to the
+heal, the clear pass, the persist, and the metrics. Skips whose parent
+carries the breadcrumb are the expected rejoin signature and are counted
+separately (#(refs.metric)("rio_scheduler_merge_rejoin_edge_skipped_total"))
+from hostile-shaped skips
+(#(refs.metric)("rio_scheduler_merge_foreign_edge_skipped_total")); the
+rejoined node's hole stays set until a submission re-creates the node with
+its full dependency set.
+
+#r("sched.evidence.positive-witness")[
+  A trusted-plane evidence UPGRADE --- clearing a closure hole, vouching a
+  node's closure, displacing settled state, or any future transition that
+  widens what the scheduler asserts about a derivation --- MUST be
+  authorized by a positive witness whose operands are owned by the
+  recording authority: the upgrade names what was previously recorded as
+  missing or contradicted, and proves the new state covers it. An upgrade
+  MUST NOT be derived from the absence of objection over a
+  submitter-controlled set (edges a submission happened to declare,
+  children that happened to complete, claims that happened not to
+  conflict).
+]
+
+The genealogy that forced this rule: 6799b70b5 derived the topdown clear
+from "children all produced" over whatever children remained (reap
+truncation made the set unrepresentative); 606390ea7 re-keyed the heal to
+"every declared edge accepted" (round-15 merged_bug_073: a subset
+re-declaration satisfies it); the witnessed heal
+(#rref("sched.merge.heal-accepted-edges+1")) closes the family by
+demanding coverage of the recorded witness set --- both operands
+scheduler-owned (the truncation recorded what it removed; the merge knows
+what it attached). Prior art in the same shape: the displacement
+primitive's evidence ranks (#rref("sched.merge.store-evidence-displacement+3"))
+refuse re-definition unless the incoming claim PROVES rank over the
+recorded row, and the born-holed prune stamp
+(#rref("sched.merge.substitute-topdown+15")) records the dropped closure
+at the only site that knows it. The `HealWitness` token is the mechanical
+form: mintable only by the coverage branch, demanded by the only clear
+path, so an absence-of-objection upgrade is unwritable rather than merely
+unreviewed.
+
+#r("sched.evidence.seed-rank-floor")[
+  A persisted derivation row MUST NOT seed trusted-plane claims
+  verification unless its recorded definition evidence is byte-anchored
+  (`path_bound_bytes` or `verified_built`): below that floor the row's
+  recorded modular hash is a submitter echo --- `unverified_claim` is
+  the bare store-backed shape and `content_bound_claim` binds bytes to
+  themselves rather than to the declared path --- and seeding from it
+  would let a planted row convert an attacker-chosen digest into a
+  trusted input seed for another submission's verification. The floor
+  MUST be one predicate consulted by every tier that selects or admits
+  seed rows (the row query and the seed constructor), the predicate
+  MUST be exhaustive over the rank enumeration so a new rank cannot
+  ship without a seeding decision, and an undecodable persisted rank
+  MUST NOT seed.
+]
+
+The floor is round-17 bug_077: the unseeded-input read-through
+(#rref("sched.dispatch.claims-derived+5")) consulted persisted rows by
+path with no rank filter, so a hostile submission could plant a bare
+store-backed row (rank `unverified_claim`) carrying a chosen 32-byte
+digest at a path another tenant's verification would later read through
+--- the echo became the seed that "proved" or refuted the victim's
+declared hash. Rows at or above the floor carry ingress text-CA byte
+binding (`sched.merge.ingress-inline-drv-binding`), which is what makes
+their recorded input form evidence rather than echo.
+
+#r("sched.closure.witness-epoch")[
+  A closure-hole witness testifies about ONE definition epoch. Any
+  definition-changing transition --- an authority takeover through the
+  resubmit-reset, a displacement, or a row-only store-evidence
+  displacement --- MUST drop the carried witness in memory and clear the
+  persisted flag and witness rows in the same transaction that commits
+  the new definition. A witness MUST NOT survive onto a definition it
+  does not testify about.
+]
+
+The witness records children a truncation removed FROM A SPECIFIC
+DECLARED CLOSURE; the heal demands the new submission cover exactly that
+set (#rref("sched.merge.heal-accepted-edges+1")). A definition change
+replaces the closure the witness was recorded against: the new
+definition's real `inputDrvs` can never contain a squat's junk children,
+so a carried-over witness would refuse every honest re-declaration and
+route the node to the bounded fail-fast permanently (round-16 bug_011 ---
+the in-memory carry rode `authority_flip` unconditionally while the
+upsert's OR semantics preserved the dead epoch's flag and rows for
+recovery to resurrect). The mechanical form is
+`ClosureHole::carry_across(DefinitionTransition)` (the only way to move a
+witness across the resubmit carry) paired with the merge transaction's
+definition-change clear, which runs after the creation upsert and before
+the born-holed stamp so a re-creating submission that is itself a pruned
+stamping parent ends the transaction with its own epoch's witness, never
+a union of eras.
 
 #r("sched.merge.dep-failed-transitive")[
   When a newly-merged node transitively depends on a node already in a
@@ -858,7 +1263,7 @@ submitted after the failover record contributions as usual).
   origin URL.
 ]
 
-#r("sched.merge.substitute-topdown+10")[
+#r("sched.merge.substitute-topdown+15")[
   Before merging a submission's full DAG, the scheduler MUST first check
   whether the submission's *demand set* --- its structural roots (nodes with
   no parent edge in the submission) ∪ every node the client explicitly
@@ -877,14 +1282,34 @@ submitted after the failover record contributions as usual).
   (#rref("sched.substitute.detached"), no inline `QueryPathInfo`); kept
   nodes whose dependency closure the prune dropped (a kept node whose
   dependencies are already produced in the DAG, or one with no closure to
-  drop, is not marked) are marked `topdown_pruned` --- a mark that MUST
+  drop, is not marked) are marked `topdown_pruned` AND born holed: the
+  prune MUST record the dropped children on the node's closure-hole
+  witness set --- the flag and its witness rows written by ONE paired
+  transactional writer covering newly created and merely joined kept
+  nodes alike, in the same transaction as the mark --- so the node's
+  closure evidence is Broken from birth and a single junk child
+  completing cannot vouch it --- a mark that MUST
   be applied only after the merge has committed, MUST be persisted and
   restored at leader-failover recovery, and MUST be cleared (in PG and in
   memory) only once the node's children are all already produced in the
   DAG and no un-produced child has been reaped out from under it since
   (the closure-hole breadcrumb is recorded in memory and persisted
   alongside the mark, is carried across a resubmit retry of the node, and is
-  dropped when a later full merge re-declares its edges), or
+  dropped only when a later full merge re-declares its edges, *the merge
+  accepts every one of them*, and the re-supply covers the recorded
+  witness set --- a skipped edge, an unresolvable child, or an uncovered
+  missing child vetoes the heal; the witness content is CUMULATIVE since
+  the hole was last whole: a truncation that removes an un-produced
+  child MUST record the FULL removed child set --- produced and
+  un-produced alike --- and EVERY subsequent truncation of a node
+  already carrying the breadcrumb MUST extend the witness with its full
+  removed or dropped set, whichever producer performs it (a terminal
+  interested build's reap, a poison clear, or a recovery edge-drop ---
+  where the trigger is an un-produced drop or the restored breadcrumb
+  itself, and the content is every dropped terminal child), so the
+  coverage requirement cannot be satisfied by an under-representative
+  subset at any point in the hole's lifetime,
+  #rref("sched.merge.heal-accepted-edges+1")), or
   when the fail-fast below consumes it --- a merge that gives it only
   unbuilt children leaves the mark in place. The scheduler MUST
   fall through to the full merge and the bottom-up `check_cached_outputs`
@@ -919,6 +1344,25 @@ so the prune can never be more permissive than the post-merge classification
 of a shared node: a submission-only criterion could prune this build's
 dependency closure while another live build's wants keep the node on the
 from-source path, leaving this build hostage to that interest staying alive.
+The +13 paired-writer clause is round-16 bug_045's lesson: the flag rode the
+creation-scoped row bind while the witness rows were inserted for both
+populations, so a merely-joined pruned parent committed `topdown_pruned =
+true, closure_hole = false` plus orphan witness rows --- recovery hydrated it
+un-holed, enrolled it as a mark-clear candidate, and re-armed exactly the
+doomed from-source dispatch the born-holed witness suppresses. One paired
+writer (`set_closure_holes_tx`) makes the two populations congruent by
+construction (fix-discipline R2-PAIRED-WRITERS).
+The +14 full-removed-set clause is round-16 bug_076: the reap recorded
+only UN-PRODUCED removals on the witness, so any submission could
+re-declare just those (publicly reconstructible) hashes, clear the
+hole, and --- once the witness children produced --- have the parent
+judged Vouched over a child set that silently omitted the
+produced-but-reaped inputs; the cleared mark re-armed exactly the
+from-source dispatch the breadcrumb suppresses, ENOENTing on whichever
+omitted input had been GC'd. Recording the full removed set makes any
+healing re-declaration --- owner or foreign --- supply the complete
+closure, which is also why the heal stays interest-unscoped: a foreign
+full re-declaration is functionally an honest top-up.
 The own-selector resolvability guard covers the fallback corner where no
 prior interested build is live and post-merge classification degrades to
 exactly this submission's (possibly bogus) selector. The `topdown_pruned`
@@ -1180,6 +1624,155 @@ to complete; if it cannot finish within the grace period, it is reassigned.
   crosses the wire; `wopRegisterDrvOutput`'s `dependentRealisations` field is
   always `{}` from current Nix.
 ]
+
+#r("sched.ca.absent-hash-surfaced")[
+  Every completion-time CA bookkeeping consumer of a derivation's
+  modular hash (realisation registration, early-cutoff comparison and
+  skipped-node realisation copy, dependency-trace recording) MUST
+  handle the hash's absence EXHAUSTIVELY: when the node's gate
+  conditions hold but the hash is `None` — the population the ingress
+  strip legalizes (#rref("sched.merge.ingress-inline-drv-binding+1"))
+  — the consumer MUST surface the skip with a warning naming the node
+  and consumer and an increment of
+  #(refs.metric)("rio_scheduler_ca_bookkeeping_skipped_total") (labeled
+  by consumer), never skip silently.
+]
+The strip turned `ca.modular_hash = None` into a legal state for
+CA/resolve nodes, and three `if let Some` consumers absorbed it
+silently — a warm CA rebuild completed with no realisation row and no
+signal (round-15 bug_048, pattern R1: lifecycle changed, readers
+unaudited). Surfacing is part 1; the verifying re-establisher that
+makes the realisation-insert skip impossible again is the staged
+follow-up F2 (`ModularHashState` lifecycle enum) — no prose in this
+spec may claim that writer exists until it does (R6).
+
+#r("sched.dispatch.path-shape-totality")[
+  The dispatch-time merge of resolved deferred-IA output paths into
+  the claim vector MUST be total over every legal ingress shape of
+  `expected_output_paths` --- in particular the omitted/empty `[]`
+  form: the merge base MUST be resized to the declared output arity
+  (with the empty-string unresolved sentinel) BEFORE any resolved
+  path is placed, so that a resolved path is either placed at its
+  name's index or the placement is a structural impossibility ---
+  never a silent drop. The ingress list itself MUST NOT be reshaped:
+  a padded `expected_output_paths` is identity-bearing in the
+  authoritative-conflict matcher and padding would manufacture false
+  identity agreement between a path-omitting submission and a
+  path-declaring one.
+]
+The rule exists because the open-coded merge indexed into an
+un-resized clone of the ingress list (round-17 bug_033): for the legal
+omitted shape every `get_mut` returned `None`, the resolved real paths
+vanished, and the assignment token's HMAC `expected_outputs` claim plus
+the GC pin carried nothing while the worker built real paths --- the
+upload then failed authorization against an empty allowlist. One owner
+method (`merge_resolved_claim_paths`) now performs resize-then-merge
+and is the claim field's sole writer.
+
+#r("sched.dispatch.claims-derived+5")[
+  When assignment tokens are signed, the scheduler MUST NOT sign
+  upload-authorization claims (`expected_outputs`, `is_ca`,
+  `is_fixed_output`) or forward worker build instructions for a
+  store-backed derivation from submitter-echoed data: for every
+  store-backed node whose definition evidence is below
+  `path_bound_bytes`, dispatch MUST first fetch the `.drv` the declared
+  path names, re-derive its text content-address in the actor, and prove
+  the recorded claims against the parsed derivation with the same
+  validator SubmitBuild ingress applies to inline content; the
+  resolve-need MUST be derived from those verified bytes, never from the
+  submitter's `needs_resolve` echo, and deferred output paths MUST come
+  only from realisations resolved over those bytes. The byte-derived
+  resolve-need MUST be RECORDED on the node in the same motion as every
+  evidence raise to `path_bound_bytes` (the verified and
+  stripped-verified dispatch arms, and merge-time store-evidence node
+  creation), the dispatch resolve gate MUST read only that recorded
+  state, and SubmitBuild ingress MUST normalize each inline node's
+  `needs_resolve` echo to the value derived from its validated bytes
+  (the shared oracle predicate `rio_nix::derivation::should_resolve`).
+  The verdict's
+  consequence MUST follow its typed permanence, and no arm may retry
+  unbounded on deterministic inputs: a contradiction MUST poison the
+  node without signing; STORE SILENCE — a transient verdict —
+  MUST roll the assignment back with dispatch backoff, bounded by its
+  own budget; INSTANT permanence MUST be restricted to CONTENT-BOUND
+  reasons (an unparseable declared path, a contradiction, content-bound
+  unparseable bytes, or a derivation-text NAR exceeding the class
+  transfer cap — a denial the store reports byte-free off the declared
+  size, which no retry can shrink and which MUST NOT be folded into
+  store silence) — a verification blocked on MISSING INPUT IDENTITY
+  MUST NOT be concluded permanent from resident state alone, because
+  residency is scheduler-mutated (terminal reap and leader failover
+  both erase a completed input's node without touching content):
+  the verifier MUST first re-seed from the persisted derivation rows
+  (one batched lookup of the missing inputs' recorded input-form
+  hashes, under the same not-floating predicate as every other seed
+  source AND the byte-anchored rank floor of
+  `sched.evidence.seed-rank-floor`, performed at the shared
+  verification chokepoint so the merge and dispatch consumers get it
+  uniformly), and only a
+  POST-read-through unseeded verdict may have consequences: at
+  dispatch, bounded backoff on a dedicated budget whose exhaustion
+  poisons with remediation generated from the post-read-through fact
+  set; at merge, synchronous refusal with the same generated
+  remediation (the submitter is present). A node whose declared
+  modular hash cannot be recomputed
+  against otherwise-fully-verified store bytes MUST have the
+  declaration STRIPPED — cleared in memory and in the persisted row,
+  exact ingress-strip parity (an unverifiable claim is no claim) — and
+  proceed on the verified bytes at `path_bound_bytes`. Ingress-byte-bound
+  nodes (inline or authoritative content) sign their ingress-bound
+  recorded values; nodes already at `path_bound_bytes` or higher skip
+  the re-fetch. Unsigned dev mode mints no claims and is exempt.
+]
+The rank-floor clause is round-17 bug_077 (the +5 delta): the +4
+read-through admitted ANY row with a recorded hash, including
+submitter-echoed bare rows --- the floor (one predicate, both tiers)
+makes the read-through seed only byte-anchored evidence; see
+#rref("sched.evidence.seed-rank-floor") for the full population
+argument.
+The over-cap clause is round-17 bug_030 (the +4 delta): the
+dispatch-side fetch carried a private 1 MiB cap while every other
+derivation-text site admitted the shared 16 MiB class bound, so any
+over-1-up-to-16 MiB `.drv` — necessarily bare store-backed, since the inline
+path caps at 1 MiB — was admitted everywhere and then
+deterministically denied HERE, with the denial folded into store
+silence: transient backoff, budget burn, poison blaming store health.
+The class cap is one sealed type
+(`rio_common::limits::MAX_DRV_NAR_BYTES`) and the denial is typed
+content-bound at the fetch, so the verdict carries its own permanence.
+The unseeded-input clause is round-16 bug_029 (the +3 delta): the +2
+text's "an input neither submitted nor resident" arm typed a fact about
+MUTABLE STATE as structural permanence. A guaranteed deploy failover
+erases every completed input's residency at once — recovery rehydrates
+non-terminal rows only — so the first post-failover dispatch of any
+bare deferred-IA node whose inputs had completed instant-poisoned
+honest in-flight builds through the claims gate; terminal reap produced
+the same shape one node at a time. The persisted row is CONTENT-DERIVED
+state that survives both erasers, which is what qualifies it as the
+read-through source. Read-through outcomes are observable on
+#(refs.metric)("rio_scheduler_claims_row_readthrough_total") (seeded /
+miss / error — a PG error defers as transient silence, never a
+permanence verdict) and deferrals on
+#(refs.metric)("rio_scheduler_dispatch_claims_unseeded_total");
+dashboards keyed on
+#(refs.metric)("rio_scheduler_dispatch_claims_unverifiable_total") see
+the unseeded population move out (it now counts only content-bound
+structural poisons).
+This is the dispatch half of the worker-claims story (CppNix parity:
+`Store::queryPartialDerivationOutputMap` consults the store's own copy of
+the derivation, `store-api.cc:396-410` --- never a client's claim about
+it). The child-seed trust posture is deliberate: static-IA derivation
+seeds child modulo hashes from the DAG's length-checked echoes for direct
+submissions, bounded by second-preimage hardness (a forged child hash
+moves every derived path AWAY from honest paths --- see the soundness
+note on `input_addressed_output_paths` in rio-nix `derivation/hash.rs`);
+the byte-bound authority for membership is the STORE-side modulo cache,
+which reads only the store's own backend --- which is why the store-side
+deriver proof (`store.put.ia-deriver-proof+4`, landing with the store
+workstream) is the authoritative parity surface, and this rule is the
+trusted-plane signing gate in front of it. A submitter who never uploads
+its `.drv` parks in dispatch backoff forever --- correct under the trust
+model: an honest worker could not have fetched the derivation either.
 
 Queue-level preemption is fully supported:
 - High-priority derivations jump ahead of lower-priority queued (not yet
@@ -1468,6 +2061,83 @@ Queue-level preemption is fully supported:
     or API call).
 ]
 
+#r("sched.build.failure-evidence-at-source+1")[
+  A build's first observed derivation failure MUST be made durable as the
+  PAIR `(error_summary, failed_derivation)` in the same actor turn it is
+  observed --- one statement, first write wins on both columns,
+  independent of any later operation on the failed derivation's row. A
+  writer that knows only a reconstructed summary MUST NOT blank the
+  paired hash (a NULL bind is a no-op, never an overwrite). If that
+  persist fails, the scheduler MUST retry it on every housekeeping
+  tick --- before the poison-TTL eraser runs --- until it succeeds or the
+  build terminates; recovery MUST restore the pair together and treat
+  PG-restored evidence as already durable, and MUST persist any failure
+  summary it reconstructs from still-linked failed derivations before
+  the new leader serves traffic.
+]
+The +1 pair clause is round-16 bug_100: the chokepoint records two
+in-memory fields with first-write-wins semantics, but only the summary
+had a column --- after a failover, a `keepGoing` build's terminal
+`BuildFailed` carried the restored `error_message` with
+`failed_derivation=""`, half of the exact empty-field symptom this
+machinery exists to close (M_072 adds the column; the single-statement
+write keeps the halves from ever splitting across a failover).
+
+This rule closes a four-times-recurring bug class structurally. Rounds 12,
+13, and 14 of adversarial review each found another path that erases a
+failed derivation's row while an Active `keepGoing` build's only durable
+failure evidence was reconstructible from that row (displacement, admin
+poison clear, poison-TTL expiry, same-definition resubmit-reset) ---
+each previously fixed by adding a pre-erase persist to that path. The root
+cause was the dependency itself: evidence durability relied on row state
+surviving until the build terminated. With the failure persisted at the
+*source* --- the moment it is observed --- no eraser path needs to know
+about build evidence at all, and a future eraser cannot reintroduce the
+class: losing evidence now requires a PG outage at the failure-observation
+moment AND a leader failover before any tick retry or eraser-side backstop
+succeeded, instead of a single unfortunate failover. The per-path persists
+(#rref("sched.merge.displaced-failure-evidence"),
+#rref("sched.poison.clear-failure-evidence")) are retained as
+defense-in-depth backstops for exactly that narrowed window. Behavioral
+note: `builds.error_summary` is now populated for Active `keepGoing` builds
+that have observed a failure, not only for terminal or pruned-evidence
+builds --- admin build listings surface the pending failure earlier.
+
+#r("sched.build.terminal-status-settled+2")[
+  Once a build reaches a terminal state, the progress and result data
+  served for it MUST be the values settled at its terminal transition:
+  `QueryBuildStatus` MUST serve the counts frozen at that transition
+  rather than recomputing them from live DAG state, a re-sent terminal
+  `BuildCompleted` event MUST carry the output paths captured when the
+  build completed, and a cancellation MUST refresh the build's counts
+  from the DAG once before the terminal transition freezes them. After
+  the terminal transition no further `BuildProgress` event may be
+  emitted for the build, and its served progress accounting (including
+  `cached_derivations` and the sticky failure summary) MUST NOT be
+  mutated --- shared-node fan-outs MUST skip interested builds that are
+  already terminal.
+]
+Terminal builds stay resident — and queryable, and re-subscribable via
+`WatchBuild` — for the terminal-cleanup window while the global DAG keeps
+evolving: shared-node re-probes, later submissions, and displacement of a
+node the build was interested in
+(#rref("sched.merge.authoritative-conflict")) all mutate the state a live
+recompute would read, so a finished build's served progress could shrink
+(or its re-sent completion event lose output paths) after the fact.
+Serving the settled values keeps a terminal build's externally visible
+history immutable, matching the persisted-count freeze at the terminal
+transition. The frozen consumers are the `QueryBuildStatus` terminal arm,
+the `WatchBuild` terminal re-send, the count-persist path, the
+`BuildProgress` emitters (the debounced per-build emitter and the
+precomputed-summary fan-outs in completion and dispatch), the dispatch
+and CA-cutoff `cached_derivations` writers, and the per-derivation
+failure handler — a `BuildProgress` sequenced after `BuildCompleted`
+would otherwise be persisted to the event log and replayed to
+re-subscribers with totals shrunk by whatever mutated the DAG since.
+Per-derivation events (`DerivationCached`, `DerivationFailed`) still
+flow to a resident terminal build's channel; they are facts about the
+derivation, not aggregate progress of the finished build.
+
 = Leader Transition Protocol
 
 The scheduler uses a leader-elected model for the in-memory global DAG. On
@@ -1560,6 +2230,793 @@ tables) during state recovery.
   flag --- `dispatch_ready` is a no-op until recovery finishes, preventing a
   partially-loaded DAG from issuing assignments.
 ]
+
+#r("sched.recovery.inline-drv-durability+3")[
+  A `DerivationNode` submitted with authoritative inline derivation content
+  (`drv_content_authoritative`, the content-bound hook fallback) MUST have
+  those bytes persisted with the derivation row at merge time and restored
+  into the in-memory state on recovery, so a post-failover dispatch carries
+  the same content. Before persisting, `SubmitBuild` ingress MUST validate
+  the claim: a single-node submission whose bytes parse as a content-bound
+  derivation consistent with the node's declared system, output names,
+  fixed-output flag, content-addressed flag, expected output paths (exactly
+  one entry per output: the hash-derived path for a fixed output, empty for
+  a floating output), and `ca_modular_hash` --- submitters are untrusted,
+  and unvalidated authoritative bytes would let one tenant poison the
+  persisted content rebuilt under another derivation's identity after a
+  failover. When any output declares a fixed hash, the derivation MUST
+  have exactly one output and it MUST be named `out` (CppNix: "only one
+  fixed output is allowed for now" / "single fixed output must be named
+  `out`") --- a multi-output or differently-named fixed shape is rejected
+  before any per-output binding is checked. The persisted bytes are
+  dispatch payload only --- they MUST never be written to any store or
+  served as a store object.
+]
+The column is `NULL` for every other derivation. Refresh and clearing follow
+node lifecycle, not submission order: the row is written by the submission
+that (re)creates the in-memory node (#rref("sched.persist.creation-scoped")),
+so a retriable re-creation (resubmit after failure / cancel / poison reset)
+refreshes or clears the bytes, while submissions that merely join a live node
+leave its persisted content untouched. Rows written before the column existed
+(or by a pre-upgrade scheduler) recover with empty content and keep the
+pre-durability failure mode for that one window. Restoration applies to
+poisoned-row recovery as well: a recovered `poisoned` node carries the same
+bytes, authoritative flag, identity, and recomputed CA modular hash it held
+while live, so the authoritative-conflict gate keeps holding across a leader
+failover instead of being silently disabled for poisoned nodes.
+
+#r("sched.recovery.inline-drv-ca-hash+3")[
+  A recovered derivation carrying authoritative inline content that is
+  content-addressed MUST have its CA modular hash rederived from the restored
+  bytes during recovery (`hashDerivationModulo` over the parsed content with
+  no input resolution --- the same computation `SubmitBuild` ingress
+  validated), so a post-failover completion still registers its realisation
+  under the key returned to the hook client and merge-time realisation cache
+  hits still apply. Every other recovered derivation MUST restore the
+  modular hash persisted with its row
+  (#rref("sched.persist.ca-modular-hash")) when one is present ---
+  content-addressed or not (deferred input-addressed rows carry one); a
+  row that persisted none keeps it unset.
+]
+Recompute-from-bytes stays the source of truth wherever bytes exist: it
+keeps the realisation key inseparable from the content actually persisted
+(the two cannot drift), and a row whose bytes fail to parse degrades to an
+unset hash (the build still completes; only realisation registration is
+lost, with a warning). The recompute leg stays scoped to authoritative
+content-addressed rows because the no-input-resolution recompute is only
+valid for the lifted single-node fallback shape; everything else ---
+store-backed CA nodes and deferred input-addressed nodes alike --- has no
+bytes to recompute from, so the persisted ingress value is the only
+faithful source of the evidence and of the realisation key.
+
+#r("sched.recovery.deferred-resolve+1")[
+  The dispatch-time resolve flag MUST be persisted at every site that
+  computes it authoritatively --- the creation upsert (the store-evidence
+  grant's byte-derived value for verified creations, the gateway echo
+  otherwise) and the dispatch-raise writers, in the same statement as the
+  evidence rank they accompany --- and a recovered derivation MUST be
+  restored with the persisted flag VERBATIM. The expected-output-path
+  re-derivation (an empty entry means "unknown until placeholder
+  resolution") is permitted ONLY as the fallback for legacy rows whose
+  persisted flag is absent; it MUST NOT shadow a persisted value, because
+  it cannot see a fixed-output derivation's floating inputs.
+]
+The +1 verbatim-restore clause is round-16 bug_053's lesson: the
+re-derivation under-approximates exactly the FOD-with-floating-input
+population (its own expected paths are all concrete), and the prior
+posture's "consequence-free --- covered by the content-addressed flag at
+the realisation gate" justification conflated completion-time realisation
+REGISTRATION with the dispatch-time placeholder REWRITE. A FOD recovered
+with the flag false at the persisted `path_bound_bytes` rank skips the
+byte re-derivation, dispatches with literal placeholder strings in
+env/args, and poisons deterministically --- a build that succeeded before
+the failover. M_071 makes the column nullable so NULL ("never persisted",
+pre-071 row) is distinguishable from an authoritative false; the COALESCE
+raise writers and the always-bound creation snapshot keep every post-071
+row authoritative. This supersedes both the earlier wholly-lossy posture
+and the re-derivation posture.
+
+#r("sched.recovery.claim-paths-restored")[
+  The dispatch-resolved claim paths of a deferred-IA derivation MUST be
+  persisted at their sole set site (the dispatch-time resolve, in the
+  same actor turn) and restored VERBATIM by recovery --- index-aligned
+  with `output_names`, resolved slots carrying real store paths and
+  still-unresolved slots carrying the empty-string sentinel. A recovered
+  derivation whose persisted claim is absent (legacy row, or a node that
+  never reached the deferred-IA resolve) MUST restore with an empty
+  claim vector so the read accessor falls back to the expected paths. A
+  definition change MUST clear the persisted claim in the same statement
+  that resets the other per-definition accumulators.
+]
+The rule exists because the claim paths feed two consumers that outlive
+the leader (round-17 merged_bug_099): the GC root union --- a surviving
+worker's in-flight deferred-IA build pins its REAL output paths, and a
+failover that dropped the claim left those paths sweepable in the window
+before a re-dispatch happened to re-resolve them --- and the completion
+path-binding gate, whose resolved-slot/unresolved-slot distinction is
+exactly the persisted vec's shape. A floating-CA node never reaches the
+set site, so its column stays NULL --- the persisted form can never
+present the `""` sentinel as a resolved claim slot.
+
+#r("sched.merge.authoritative-conflict+6")[
+  A node whose in-memory state carries authoritative inline derivation
+  content MUST NOT be redefined by a later submission for the same
+  `drv_hash`: a submission that itself claims authoritative content with
+  bytes that are not identical to the existing node's MUST be rejected
+  while the existing node is live or `Failed`, and
+  MUST displace it as a fresh node once it sits in a terminal failure
+  state (`Poisoned`, `Cancelled`, or `DependencyFailed`); a store-backed
+  (non-authoritative) submission MUST only join the node when its
+  verifiable identity matches --- the public attributes (system, output
+  names, fixed-output flag, content-addressed flag, declared expected
+  output paths) AND at least one piece of content-bound evidence: agreement
+  on a non-empty fixed-output expected path, or a byte-equal CA modular
+  hash. A store-backed submission whose identity conflicts --- or that
+  carries no content-bound evidence --- MUST be rejected while the node is
+  non-terminal, and MUST
+  displace it as a fresh node once it sits in a terminal failure
+  state. A node that finished successfully (`Completed`/`Skipped`) MUST be
+  rejected unless the displacer presents STRICTLY higher definition
+  evidence than the settled node's persisted rank
+  (#rref("sched.derivation.evidence-rank")) --- a settled record is never
+  erased by an equal-or-lower-ranked claim, and every settled-displacement
+  decision MUST be made by the single displacement primitive
+  (#rref("sched.merge.evidence-ranked-displacement")), never by a per-arm
+  carve-out. A store-backed submission whose identity matches MUST also
+  displace the node --- rather than join it --- when the node sits in a
+  terminal failure state that is no longer retriable on resubmit, so a
+  poison-locked authoritative claim cannot capture later legitimate
+  submissions for the remainder of its poison TTL. Displacement MUST NOT carry the displaced
+  node's interest or failure accounting into the fresh node, MUST refresh
+  the persisted recovery row to the displacing submission's verifiable
+  identity with its status reset to the creation snapshot, and MUST remove
+  the displaced node from the completion accounting of prior interested
+  builds that are still non-terminal at displacement time --- builds
+  already terminal at that moment keep their settled accounting --- and
+  that removal MUST survive leader failover. All rejections surface as
+  `FAILED_PRECONDITION`.
+]
+The byte-equality arm makes the legitimate producer's behaviour (identical
+hook-fallback resubmissions) a no-op while closing the cross-tenant
+pre-squat: a predictable `drv_path` cannot be claimed with attacker bytes
+and then silently joined by --- or built on behalf of --- the victim's
+submission. First-writer-wins for byte-different authoritative content is
+deliberately scoped to claims that are live, still owned by the retry
+machinery, or already built: the hook-fallback population (the gateway
+always submits the content-bound fallback authoritatively) has no
+store-backed form to displace a squat with, so without the
+terminal-failure displacement arm a pre-squat that fails and parks would
+hold those victims out of the hash for the rest of its poison TTL ---
+exactly the lockout the store-backed arms already refuse. A successfully
+finished claim is never redefined, so an attacker cannot use the arm to
+rewrite a built derivation; while the claim is live the rejection is
+unchanged, so nothing can yank a definition out from under a running
+build. The Completed/Skipped carve-out is uniform across both conflict
+arms: both delegate the settled decision to the displacement
+primitive's strict rank comparison --- displacement erases the
+record (interest accounting, registered outputs, the inline bytes) of a
+build that finished, and an unverified submitter claim must never
+out-rank verified-built state. Under the rank rule the lockout a
+content-bound squat that *completes* before its victim submits can
+impose is scoped to displacers that do not outrank it: a bare
+store-backed echo (`unverified_claim`) is still rejected, while an
+ingress-byte-bound submission (`path_bound_bytes` --- its bytes were
+text-CA-bound to the declared `.drv` path at SubmitBuild admission)
+strictly outranks the squat's `content_bound_claim` and reclaims the
+hash with no store round-trip; merge-time store-evidence displacement
+extends the same self-service to bare store-backed resubmissions by
+fetching the proof from the store's text-CA-bound `.drv`.
+Public attributes alone are copyable from the victim's public
+derivation, and floating-CA expected paths are empty by construction, so a
+match must additionally rest on content evidence. The two forms guarantee
+different things: for a floating-CA derivation the modular hash is
+recomputed from the bytes at ingress, so agreement means byte-level
+knowledge of the same derivation (forging it requires a SHA-256 preimage);
+for a fixed-output derivation the expected path commits only to the
+declared output hash --- it is derivable from the public `(name, algo,
+hash)` triple --- so agreement guarantees the same content-defined output
+(which the store independently verifies on upload), not knowledge of the
+same builder. That weaker FOD guarantee is deliberate: covering builder,
+arguments, or environment would over-reject legitimate identical-output
+joins, and the residual harm is availability-only --- a squat that joins
+and fail-fasts can cost a joiner one spurious failure or a bounded wait,
+and a genuinely dead FOD at most one extra poison cycle --- which the
+displacement clauses bound by refusing to let a failed claim hold the
+hash for its TTL, whichever submission shape (store-backed or
+authoritative) the later legitimate producer uses. Tenant-scoped
+poisoning and stronger FOD
+evidence were considered and rejected as disproportionate. Identical
+content still joins: the hook receives an already-resolved derivation ---
+CppNix resolves CA derivations before hook dispatch (the building goal
+asserts `inputDrvs` is empty) --- so the fallback's modular hash equals the
+full-form hash a store-backed submission of the same derivation computes.
+The gate is evaluated against the existing node in every lifecycle state
+(before any resubmit-reset is applied), and terminal includes a
+poison-budget-exhausted node, so a squat cannot dodge the rule by parking
+in a retriable or poisoned state. Displaced interest is not carried;
+instead the displaced hash stops counting toward still-running prior
+interested builds (they keep any results already received), so those
+builds neither hang nor get silently re-pointed at a definition they never
+submitted, while builds that already finished are history and keep their
+settled counts. Removal is total: when the pruned result had not been
+received yet, the build's absolute totals (in memory and in
+`builds.total_drvs`) shrink with the slot in the same transaction, so the
+build can still reach `completed == total`; a result already received
+keeps both the credit and the total. The removal is made durable by
+deleting those prior builds' `build_derivations` links in the same
+transaction as the recreate-refresh, so a recovery rebuilt purely from
+the database cannot re-point them at the displacing definition.
+
+#r("sched.merge.evidence-ranked-displacement")[
+  Exactly one displacement primitive MUST exist in the merge gate, and
+  every arm that removes a pre-existing node in favor of an incoming
+  definition MUST delegate both the decision and the bookkeeping to it.
+  The primitive MUST refuse, in order: a store-anchored victim (no
+  authoritative bytes --- its definition lives in the store, which holds
+  at most one text-CA `.drv` per path), categorically and regardless of
+  rank; a non-terminal victim (live or `Failed` --- first-writer-wins
+  while a claim is in flight or owned by the retry machinery); and a
+  settled victim (`Completed`/`Skipped`) whose definition-evidence rank
+  (#rref("sched.derivation.evidence-rank")) is greater than or equal to
+  the displacer's. A victim parked in a terminal failure state
+  (`Poisoned`, `Cancelled`, `DependencyFailed`) MUST be displaced
+  regardless of rank. A displacement MUST apply the full shared
+  bookkeeping: prior state recorded for rollback, dependency edges
+  scrubbed, and the displaced hash surfaced for the durable link prune,
+  accumulator reset, and accounting.
+]
+The primitive is the structural fix for the per-arm carve-out class: the
+settled-protection predicate (`bug_076`) previously existed as two
+open-coded `Completed`/`Skipped` matches that had to agree, and a future
+arm could ship without either. Centralizing decision AND bookkeeping
+means a new merge arm cannot displace at all except through the
+primitive, and the rank comparison gives the protection a single
+monotone vocabulary instead of a per-arm boolean. The deliberate
+strict-inequality consequence: an ingress-validated inline
+`path_bound_bytes` submission displaces a settled `content_bound_claim`
+squat with NO store fetch --- its bytes were already text-CA-bound to
+the declared `.drv` path at SubmitBuild admission, which is exactly the
+store-anchoring the squat's self-bound bytes lack. The store-anchored
+refusal is categorical rather than ranked because no claim about a
+store-backed definition can outrank the store itself; the in-flight
+refusal preserves the long-standing guarantee that nothing yanks a
+definition out from under a running build; and terminal-failure
+displacement stays rank-free because the anti-squat arms exist
+precisely so a parked failure cannot lock later legitimate submissions
+out of the hash.
+
+#r("sched.merge.authoritative-claim-no-redefine")[
+  A submission claiming authoritative inline content that lands on an
+  existing store-backed (non-authoritative) node MUST NOT redefine it
+  through the resubmit path: when the existing node is eligible for a
+  resubmit-reset, the claim MUST be rejected as `FAILED_PRECONDITION`
+  unless its verifiable identity matches the existing node's, in which case
+  it is admitted through the normal resubmit-reset and its bytes are
+  adopted. An authoritative claim MUST NOT displace a store-backed node.
+]
+A live or non-retriable store-backed node keeps its existing semantics: the
+incoming claim joins it and the claimed bytes are ignored. Without this arm
+a parked (failed, cancelled, or poison-reset) store-backed definition could
+be silently redefined by an attacker's claim through the resubmit-reset,
+carrying the prior builds' interest onto attacker-chosen content; with it,
+an authoritative claim can only ever adopt a definition it can prove it
+shares. The evidence the gate compares survives leader failover --- the
+store-backed node's CA modular hash is persisted with its row
+(#rref("sched.persist.ca-modular-hash")) and restored at recovery --- so
+the legitimate producer's identical resubmission keeps being adopted after
+a failover. The remaining fail-closed residual is a store-backed node
+whose creating submission never carried any content-bound evidence at
+all: an authoritative claim landing on it while it is parked is still
+rejected (admitting it would reopen the redefinition attack), and the
+rejection's error text points at the remediations (resubmit store-backed
+by re-uploading the `.drv`, an administrative poison clear, or waiting
+out the retention window).
+
+#r("sched.merge.displaced-failure-reset+2")[
+  Any (re)creation of a derivation row whose previously persisted content
+  was authoritative and whose incoming content is not byte-identical to it
+  --- displacement, an identity-matching store-backed resubmission taking
+  over a parked authoritative claim, or a fresh re-creation after the
+  prior node was reaped --- MUST reset every failure-derived column of the
+  persisted row (poison state, failed-builder set, retry and resubmit
+  counters, status, and the reactive resource floors) in the same
+  transaction as the recreate-refresh, and the (re)creating definition's
+  in-memory node MUST NOT inherit the prior node's resource floors or its
+  consumed poison-resubmit budget. Administrative poison clears, TTL
+  expiry, and same-definition resubmits keep their floor-preserving
+  semantics.
+]
+Failure attribution and reactive sizing must not cross the definition
+boundary: the floors were ratcheted by the prior definition's failures, and
+letting the replacing definition inherit them would permanently dispatch
+the victim at ceiling sizes (the floors never decay and survive failover);
+the consumed resubmit budget and avoid-list would likewise charge the
+victim for the squat's deliberate failures. The detector is row-level ---
+prior content present and incoming content different --- so it covers every
+takeover path uniformly: displacement of a conflicting or poison-locked
+claim, the identity-matching resubmit takeover, and a re-creation of a
+reaped authoritative row, whether or not the in-memory node still existed.
+Doing the reset inside the recreate-refresh transaction (rather than as a
+post-commit step) means a leader crash cannot leave the squat's
+accumulators paired with the replacing definition's identity. Accepted
+cost: a hook-fallback definition later resubmitted store-backed re-learns
+its resource floor once (one extra failure-and-resize cycle); same-content
+authoritative resubmits and store-origin rows are unaffected.
+
+#r("sched.merge.displaced-edge-scrub+2")[
+  Displacement and the authority takeover through the resubmit-reset MUST
+  scrub the removed node's dependency (children) edges: the in-memory
+  children edges are dropped when the node is removed for re-creation,
+  and the persisted `derivation_edges` rows whose parent is that
+  derivation MUST be deleted in the same transaction as its
+  recreate-refresh, before the replacing submission's own edges are
+  inserted. Edges in the dependent (parents) direction MUST be preserved;
+  same-definition resubmit-resets and byte-identical authoritative
+  retries MUST keep their edges; and a merge that fails after the scrub
+  MUST restore the scrubbed edges together with the node.
+]
+The replacing submission is a different definition: evaluating its
+initial state against dependency edges earlier submissions attached to the
+hash would hand the squatter a denial-of-service handle that survives the
+replacement --- a failing or never-completing attacker child seeds the
+fresh node `DependencyFailed` (or parks it `Queued` forever), and the
+persisted rows would resurrect the inherited dependency set after a
+leader failover. The boundary is the definition change, so it applies
+identically whether the new definition arrives by displacing a terminal
+squat or by taking over a parked-but-retriable authoritative claim
+through the resubmit-reset (the same path
+#rref("sched.merge.displaced-failure-reset") already treats as a
+definition change for the failure accumulators). Same-definition
+resubmit-resets keep their edge-preserving semantics, and nodes that
+depend ON the removed hash keep their edges --- they want its output
+whichever definition produces it. Accepted trade: a taken-over node's
+prior legitimate dependency edges are dropped unless the takeover
+submission re-declares them (gateway full-closure submissions always
+do). Known residual: a reaped authoritative row later re-created
+store-backed has no in-memory node to scrub, so stale persisted
+parent-side edges it left behind survive until a future row-level sweep.
+
+#r("sched.merge.displaced-failure-evidence")[
+  When the displacement interest prune removes a displaced derivation
+  from a still-running prior build that has already observed a failure,
+  the build's sticky first-failure summary MUST be persisted in the same
+  transaction as the link prune, and recovery MUST seed a recovered
+  non-terminal build's sticky failure from that persisted value. A prior
+  build with no observed failure MUST NOT be marked failed by the prune.
+]
+This rule predates #rref("sched.build.failure-evidence-at-source+1") and is
+retained as its defense-in-depth backstop. With evidence persisted at the
+source, the deleted `build_derivations` link is normally no longer the only
+failover-recoverable trace of the failure --- the in-transaction persist
+matters only when the at-source write failed (PG unavailable at the
+observation moment) and no tick retry has succeeded since. The same in-tx
+backstop also runs for the non-displacement destructive removals --- the
+same-definition resubmit-reset and the authority takeover, whose
+recreate-refresh resets the row's failure state without pruning interest
+--- so every eraser inside the merge transaction carries its own evidence
+persist regardless of which removal arm fired. It rides an
+existing transaction (atomicity is free), keeps the displacement path's
+evidence contract self-contained rather than dependent on another
+component's earlier success, and the COALESCE first-write-wins makes the
+overlap idempotent. The no-observed-failure clause keeps joining a
+later-displaced node from being treated as a failure (the displaced
+result, if already received, stays credited per
+#rref("sched.merge.authoritative-conflict")). The administrative prune
+paths (poison clear, TTL expiry) reset the derivation row to a non-failed
+state (`'created'`), so they carry the same residual hazard and persist
+the same backstop evidence per
+#rref("sched.poison.clear-failure-evidence").
+
+#r("sched.poison.clear-failure-evidence")[
+  When the scheduler removes a poisoned derivation while interested
+  builds are resident --- via the administrative `ClearPoison` call or the
+  poison-TTL sweep --- it MUST persist the sticky first-failure summary of
+  every still-running interested build that has already observed a
+  failure (first write wins) BEFORE clearing the persisted poison state,
+  MUST NOT clear the poison if that persist fails, and MUST NOT mark a
+  build with no observed failure as failed.
+]
+This rule predates #rref("sched.build.failure-evidence-at-source+1") and is
+retained as its defense-in-depth backstop on the poison-clear paths. The
+cleared row recovers as `'created'`: it contributes nothing to the
+failed-count reconstruction, so `builds.error_summary` is what survives a
+leader failover --- normally written at the failure's observation moment
+by the at-source chokepoint, with this pre-clear persist covering the
+window where that write failed and no retry has succeeded yet. Persisting
+evidence first preserves the PG-first retry contract of both prune paths:
+a failed persist leaves the node Poisoned in memory and in PG, so the
+operator retry (or the next sweep tick) re-runs the whole sequence; the
+COALESCE first-write-wins makes the retry idempotent. The formerly
+out-of-scope paths --- the recovery-time expired-at-load clear and the
+re-probe cache-hit `clear_poison` callers --- are now covered by the
+at-source rule itself: the former because recovery re-persists
+reconstructed evidence before serving traffic, the latter because they
+never erased evidence in the first place.
+
+#r("sched.persist.creation-scoped")[
+  The scheduler MUST write a derivation's persisted recovery row only from
+  the submission that (re)creates its in-memory node. Submissions that join
+  an existing live node MUST NOT rewrite or clear that node's persisted
+  recovery columns (declared identity, expected output paths, authoritative
+  inline content).
+]
+This makes persistence follow the in-memory first-writer-wins truth: the SQL
+upsert stays last-write-wins, but the only writers are creations, so an
+in-flight node's recovery row can no longer be overwritten --- or its
+authoritative inline content cleared --- by a submission that did not create
+it. The substitution-planning marks (`topdown_pruned`, `closure_hole`) are
+not part of that creation-time snapshot: they have their own dedicated
+writers (the joined-node stamp inside the merge transaction, the
+closure-hole setters, and the produced/vouched clear passes), so persisting
+them for a node a submission merely joined does not violate this rule.
+
+#r("sched.persist.recreate-refresh+2")[
+  A submission that (re)creates a derivation's in-memory node MUST refresh
+  the persisted row's full creation-time snapshot --- declared identity
+  (pname, system, required features), the declared `.drv` store path,
+  output names, expected output paths, content flags, inline content, and
+  status --- and MUST NOT touch the row's live accumulator columns (poison
+  timestamps, failed builders, retry and resubmit counters, resource
+  floors), which have their own writers, except for the definition-change
+  reset required by #rref("sched.merge.displaced-failure-reset").
+]
+Same `drv_hash` no longer implies same content: a displacing submission
+(#rref("sched.merge.authoritative-conflict")) carries a different verifiable
+identity, and without the snapshot refresh a leader failover would rebuild
+the node from the displaced squatter's identity, silently undoing the
+displacement. The `.drv` store path is part of that snapshot: recovery and
+post-failover dispatch read the path from the row, so a squatter-declared
+decoy path surviving the refresh would leave the displacing definition
+undispatchable (workers would be told to fetch a `.drv` that exists in no
+store). Reap-then-resubmit and crash-retry re-creations get the same
+refresh for free.
+
+#r("sched.persist.settled-identity-freeze+4")[
+  A persisted derivation row whose status is `completed` or `skipped`
+  MUST NOT be re-created under a conflicting identity: before any state
+  is written for a submission, every submitted hash that has no resident
+  DAG node MUST be checked against the settled rows, and a submission
+  whose declared identity does not match a settled row's --- the public
+  attributes (system, sorted output names, fixed-output flag,
+  content-addressed flag, expected output paths declared by both sides)
+  plus at least one piece of content-bound evidence --- MUST be
+  rejected with `FAILED_PRECONDITION`, unless the conflicting
+  re-creation was approved by the store-evidence check
+  (#rref("sched.merge.store-evidence-displacement+3")). Admissible
+  match bases are: agreement on a shared non-empty expected output
+  path; a byte-equal LIVE CA modular hash; a byte-equal PRESERVED
+  stripped claim (the segregated column a strip writer moved an
+  unverifiable declaration into --- admitted as a positive match basis
+  ONLY: it MUST NOT rank, MUST NOT veto, and a differing preserved
+  value MUST fall through to the remaining bases rather than reject);
+  and, for rows whose persisted evidence rank is byte-anchored
+  (`path_bound_bytes` or `verified_built`), two byte-bound bases:
+  the double byte anchor of an INLINE-BOUND incoming (ingress
+  text-CA-bound the submission's non-authoritative bytes to the same
+  declared path --- two anchors to one text-CA path are anchors to
+  one definition, and a differing UNVERIFIED declared hash between
+  them cannot contradict that), and --- for a BARE incoming --- the
+  row's byte anchor crossed with the incoming's IDENTITY-SILENCE: the
+  bare submission MUST present no identity content of its own (no
+  declared modular hash, no non-empty expected path) for the
+  dual-anchor basis to grant. Every match basis MUST declare its
+  positive witness, the basis enumeration MUST be exhaustive over
+  that declaration, and a basis MUST NOT grant on the absence of
+  contradiction over submitter-controlled fields
+  (#rref("sched.evidence.positive-witness") --- round-17
+  merged_bug_020: the pre-+4 dual anchor admitted a bare submission
+  ADDING an uncorroborated hash, which rode the settled join's
+  creation-snapshot refresh as a forged re-creation). An
+  authoritative claim's bytes are bound to themselves, not to the
+  declared path, so it has no second anchor and MUST prove identity
+  through the classical bases --- including against the row's own
+  preserved stripped claim (re-presenting a stripped declaration
+  authoritatively is a self-displacement channel, refused). An undecodable persisted
+  rank MUST NOT grant the dual-anchor basis, and on the settled VICTIM
+  side an undecodable persisted rank MUST take the refusal arm of the
+  displacement arbitration --- never a low-rank floor (flooring a
+  victim demotes exactly the protection the persisted rank provides;
+  the displacer-conservative lossy decode MUST be unreachable from
+  victim-side call sites by construction). The
+  persistence layer MUST additionally refuse to update a settled row
+  whose public identity conflicts with the incoming re-creation,
+  independent of the pre-merge check, admitting only the per-merge
+  hash list that check approved --- and its conflict predicate MUST
+  cover the same axes with the same semantics as the pre-merge
+  matcher: output names compared as sorted sets (a set-equal
+  reordered resubmission is NOT a conflict), expected output paths
+  compared per output name where both sides declare one, and a
+  present-on-both-sides-but-differing live CA modular hash vetoing
+  the update, plus the adds-data mirrors of the silence gate: an
+  un-arbitrated re-creation that is not inline-bound and ADDS a
+  modular hash the row holds neither live nor preserved-equal, or
+  adds a non-empty expected path where the row's is empty, or
+  presents authoritative content against a row with no classical
+  evidence surface, MUST be refused by the persistence guard exactly
+  as the matcher refuses it. Axis parity between the two
+  implementations MUST be pinned by a differential test driving both
+  over the same single-axis mutations, and the differential MUST
+  include REFUSAL-soundness cells whose expected verdict is asserted
+  absolutely (agreement alone proves nothing when both sides share a
+  hole --- the +3 instrument faithfully ratified the pre-+4 dual
+  anchor).
+]
+The two M_070 bases exist because the strip writers (ingress and
+dispatch) leave exactly the rows they processed with NO classical
+evidence: a stripped floating-CA / deferred-IA row has every expected
+output path empty and a NULL live hash, so the pre-M_070 matcher could
+never match ANY resubmission of it --- one successful stripped build
+permanently bricked every rebuild-after-GC of that derivation behind a
+deterministic `FAILED_PRECONDITION` (round-16 merged_bug_038). The
+preserved-claim basis covers re-presentations of the same declaration;
+the dual-anchor basis covers resubmissions that (correctly) no longer
+declare the unverifiable hash at all. Rejoins through either basis are
+counted (#(refs.metric)("rio_scheduler_merge_stripped_rejoin_total"))
+--- each increment is a rebuild the previous matcher refused.
+The freeze covers the window the merge gate cannot:
+#rref("sched.merge.authoritative-conflict") protects a settled node only
+while it is resident in the DAG, but terminal cleanup reaps nodes after
+`TERMINAL_CLEANUP_DELAY` while their rows --- the durable record that the
+derivation was built, what identity it was built under, and (for
+content-bound claims) the bytes it was built from --- live on. Without the
+freeze, a fresh submission for a reaped hash is indistinguishable from a
+first-ever creation: it flows into the creation-scoped upsert and rewrites
+settled history, which is exactly the erasure
+#rref("sched.merge.authoritative-conflict") forbids while the node is
+resident. A matching-identity re-creation (a legitimate rebuild after the
+store garbage-collected the outputs) is admitted and refreshes the row
+normally. The persistence-layer guard exists because the pre-merge check
+and the upsert run at different times in the same merge: a row that
+settles between them (racing completion fan-out) or a future caller that
+bypasses the check (bug) must still find the row immovable; the upsert
+skips such rows entirely, which surfaces as a loud merge failure rather
+than silent history rewrite. The store-evidence carve-out does not weaken
+the guard's posture: the approved-hash list is computed by the same
+pre-merge check inside the same merge, scoped to that one transaction,
+and empty for every other writer --- the freeze stays unconditional
+except where the store's own bytes (or strictly higher ingress-bound
+evidence) proved the settled record is the impostor.
+
+#r("sched.merge.store-evidence-displacement+3")[
+  When a store-backed submission's declared identity conflicts with a
+  SETTLED record below byte-anchored rank --- a resident settled node
+  whether its evidence is authoritative content-bound OR a bare
+  store-backed echo, or a settled row whose persisted rank is below
+  `path_bound_bytes` --- the scheduler MUST attempt to verify the claim
+  against the store's own copy of the derivation before rejecting it
+  (rank-uniform: no settled victim form below the byte-anchored ranks
+  may be exempted from the check, and in particular a resident settled
+  BARE node MUST NOT silently join a conflicting incoming claim):
+  fetch the `.drv` the declared path names (subject to a per-merge
+  fetch budget), re-derive its text content-address in the actor and
+  require it to equal the declared path, and compare the parsed
+  derivation against the submission's claimed identity with the same
+  validator SubmitBuild ingress applies to inline content. A verified
+  claim MUST displace the settled squat --- through the displacement
+  primitive for resident victims, and through a per-merge
+  approved-hash carve-out of the settled-row freeze (with the old
+  row's persisted parent-side dependency edges scrubbed in the same
+  transaction) for row-only victims. A verification that succeeds
+  EXCEPT for an unverifiable declared modular hash MUST have the SAME
+  consequence as at the dispatch consumer (one verdict, one
+  consequence): the declaration is STRIPPED --- cleared from the live
+  evidence and PRESERVED in the segregated column --- and the
+  displacement approved on the verified bytes; the merge consumer MUST
+  NOT refuse with remediation the production submission path cannot
+  follow. A contradiction MUST reject the submission with
+  `FAILED_PRECONDITION`. The row-level decision MUST be an exhaustive
+  arbitration over every (row rank, incoming rank) pair: byte-anchored
+  rows (`path_bound_bytes`, `verified_built`) refuse every claim
+  class; a `content_bound_claim` row is displaced by strictly higher
+  ingress-byte-bound evidence with no store fetch, or by a bare
+  store-verified resubmission; an `unverified_claim` row is displaced
+  by ingress-byte-bound evidence or a bare store-verified
+  resubmission, and MUST NOT be displaced by `content_bound_claim`
+  rank alone (an authoritative claim's bytes are bound to themselves,
+  not to the declared path). Every refusal's remediation text MUST be
+  generated from its arbitration arm. Store silence --- fetch failure,
+  absent path, or non-canonical / non-text-CA-consistent bytes ---
+  MUST NOT count as evidence in either direction AND MUST surface as
+  `UNAVAILABLE`, never hardening into the conflict's permanent
+  `FAILED_PRECONDITION`; permanent unprovability (an unseedable
+  declared-IA input after the persisted-row read-through,
+  content-bound non-derivation bytes, or a derivation-text NAR
+  exceeding the class transfer cap — a byte-free deterministic denial
+  that MUST NOT be folded into store silence) keeps
+  `FAILED_PRECONDITION` with the generated remediation. Exhaustion of
+  the per-merge fetch budget MUST fail the merge with
+  `RESOURCE_EXHAUSTED` and no partial displacement persisted.
+]
+This is the self-service path for `bug_076`-class squats: the victim of a
+content-bound squat on its predictable `drv_path` uploads the genuine
+`.drv` (text-CA-enforced at store ingestion, #rref("store.put.drv-text-ca+3"))
+and resubmits store-backed; the scheduler verifies the store derivation
+and erases the squat --- no operator involved. The verification is
+self-contained in the actor because store transport is not part of the
+trust boundary for identity decisions: the fetched bytes must re-derive
+the declared path as their text content-address before anything is
+believed, so a confused or hostile store answer cannot smuggle unrelated
+bytes into the comparison. The fetch budget (8 per merge) bounds the
+single-threaded actor's exposure to a submission manufactured to carry
+many settled conflicts; exhaustion fails the whole merge with
+`RESOURCE_EXHAUSTED` and split-the-submission guidance, observable
+(`over_budget` on the
+#(refs.metric)("rio_scheduler_merge_store_evidence_total") counter) ---
+a load condition must never be reported through the conflict's permanent
+code, and partial displacement is rejected by design
+(#rref("sched.persist.atomic-activation+2")). The `unverified_claim`
+arbitration arm restores the advertised self-service for store-backed
+victims whose row was squatted by a bare echo --- the previous
+categorical refusal of that rank contradicted the remediation text the
+rejection itself emitted --- while the reverse-squat guard keeps
+hook-fallback-shaped forgeries from erasing genuine store-backed history
+by rank alone. The strip-parity clause exists because the two consumers
+of the same verification verdict had drifted (round-16 merged_bug_020):
+dispatch stripped-and-proceeded while merge refused with "resubmit
+WITHOUT the declared ca_modular_hash" --- remediation the gateway makes
+unfollowable (`populate_ca_modular_hashes` stamps the hash on every
+submission it can compute one for) and the verdict deterministic for
+CA-chain/deferred-IA nodes, so a settled squat on such a node was
+permanently undisplaceable through the advertised self-service path.
+Stripped-displacement approvals are observable as the `stripped` result
+label on
+#(refs.metric)("rio_scheduler_merge_store_evidence_total"); dashboards
+keyed on `result=unavailable` see that population move. The
+rank-uniform victim clause closes the resident bare x bare cell
+(round-16 bug_072): a DAG-resident settled BARE squat previously
+escaped both the row check (resident hashes are skipped) and the
+resident scan (which gated on authoritative content), so a
+genuine owner's conflicting store-backed submission silently JOINED
+the squat and was served its forged outputs as a cache hit. One
+residual is deliberate: a CLAIMS-FREE submission (no expected paths,
+no declared hash) of a resident store-anchored node still joins ---
+it asserts nothing the resident could contradict, a resident join
+rewrites no state, and refusing would demand evidence from the shape
+every hash-less re-reference of a floating node takes; gateway
+submissions always carry a hash or paths and are therefore never in
+this population. The rank gate on byte-anchored row-only victims is
+uniform with the displacement primitive's settled rule
+(#rref("sched.merge.evidence-ranked-displacement")); it is also
+unreachable in honest operation --- store bytes cannot contradict an
+identity that was itself derived from byte-bound evidence --- which is
+exactly why it is enforced in code rather than argued. The displaced
+squat's registered store content (if any) remains until garbage
+collection; this is harmless because realisations are keyed by
+`(modular hash, output name)` and the squat's modular hash differs from
+the genuine derivation's, so stale realisations cannot poison the
+victim's resolution.
+
+#r("sched.merge.input-form-seed")[
+  Modular-hash seeds consumed by store-evidence verification MUST be
+  built only through a constructor that owns the input-form predicate:
+  a node or resident child contributes its recorded modular hash only
+  when it is not floating-content-addressed
+  (`is_fixed_output || !is_content_addressed`). A floating derivation's
+  published hash is the masked-subject form and MUST NOT be used as an
+  input-position digest.
+]
+A floating-CA derivation's own `hashDerivationModulo` masks its output
+slots (oracle parity), so the value the gateway publishes for the node is
+NOT the digest its consumers fold over in input position --- those come
+from the unmasked recursion. Seeding a masked form silently steers every
+derived input-addressed path away from the honest paths: against an
+honest submission that is a wrongful contradiction (poison), and against
+a crafted one it is a wrongful verification. The predicate was originally
+enforced by call-site discipline at three sites; the fourth (dispatch's
+DAG-children seed, added hours before the sweep) shipped without it ---
+the constructor is the chokepoint that makes a fifth unfiltered site
+unwritable rather than merely unlikely. Floating inputs that genuinely
+matter to a verification land in the unseeded-inputs population, whose
+consequence is the bounded read-through-then-defer arm defined by
+`sched.dispatch.claims-derived` (deferral on the dedicated budget ---
+never instant poison, never unbounded store-silence retry), which is
+the fail-closed direction under the trust model.
+
+#r("sched.merge.identity-hash-veto")[
+  In every identity matcher that compares a submission against a prior
+  definition (the resident-node matcher and the settled-row matcher),
+  two recorded 32-byte modular hashes that are both present and DIFFER
+  MUST veto the match regardless of any other agreement; the comparison
+  MUST go through the single shared classifier so the two matchers
+  cannot drift on the hash clause.
+]
+Expected output paths are public, copyable data --- a squatter can echo
+the victim's paths verbatim --- while a modular hash is content-derived.
+Before this rule the matchers treated a differing hash as merely "no
+hash evidence" and could still declare a match on path agreement,
+letting a definition that provably differs (its hash exists and
+disagrees) join or displace as if identical. The two matchers enforce
+the same identity rule at the two places a prior definition lives
+(resident DAG node, settled PG row); the previous "MUST stay in sync"
+comment pair is exactly the call-site-discipline shape that R2 retires
+--- the shared `modular_hash_evidence` classifier is the chokepoint.
+Scope note: the bare-vs-bare join consults neither matcher; closing
+that channel is the rank-gated-seed work staged behind this rule.
+
+#r("sched.persist.atomic-activation+2")[
+  The merge-time persistence of (re)created derivation rows --- including
+  the definition-change accumulator reset of
+  #rref("sched.merge.displaced-failure-reset") --- build-derivation links,
+  edges, and the durable displacement prune MUST commit in the same
+  transaction as the owning build's `pending` to `active` status update. A
+  merge that fails before that single commit point MUST leave every
+  pre-existing derivation row --- including displaced and resubmit-reset
+  nodes' status, identity, authoritative inline content, and failure
+  accumulators --- exactly as its prior creation persisted it. Best-effort
+  accounting resets (same-definition poison clears, the redundant
+  displaced-row reset) MUST run only after that commit.
+]
+With one commit point, "the build was accepted" and "its rows are durable"
+are the same event: a submission rejected late (or a leader that dies
+mid-merge) leaves either nothing or a `pending` build row that orphan
+handling already covers, never a half-committed displacement, a cleared
+authoritative blob, or a wiped failure history for a build that was never
+activated, and recovery needs no compensating logic.
+
+#r("sched.persist.ca-modular-hash+2")[
+  A derivation's ingress-provided CA modular hash --- carried by
+  content-addressed nodes and by deferred input-addressed nodes --- MUST be
+  persisted with its derivation row by the creation-scoped upsert and
+  refreshed on every (re)creation like the rest of the creation-time
+  snapshot. The persisted value is declared identity evidence only: it
+  MUST NOT relax authoritative-content ingress validation, the
+  byte-equality arm, or any displacement predicate of
+  #rref("sched.merge.authoritative-conflict").
+]
+The merge gate accepts a CA modular hash as content-bound identity
+evidence, and for a floating-CA derivation it is the only possible
+evidence (expected output paths are empty by construction). An
+authoritative row regains its hash after failover by recomputing it from
+its persisted bytes; a store-backed CA row has no persisted bytes, so
+without this column its evidence was simply lost on failover and a
+byte-identical authoritative resubmission of the same derivation could
+never again be adopted (#rref("sched.merge.authoritative-claim-no-redefine")).
+The hash also keys realisation registration --- for deferred
+input-addressed nodes it is what lets `wopQueryDerivationOutputMap` answer
+with the post-resolve output path, which is why the gateway populates it
+for them even though they are not content-addressed --- so persisting and
+restoring it keeps post-failover completions registering under the key
+clients were given. Scoping the column to `is_ca` rows would silently
+regress exactly that failover guarantee. Stored as part of the identity
+snapshot --- never inside the definition-change accumulator reset --- and
+absent (`NULL`) when the creating submission carried none, which keeps the
+fail-closed posture for evidence-less rows.
+
+#r("sched.derivation.evidence-rank")[
+  Every derivation MUST carry a definition-evidence rank from the ordered
+  lattice `unverified_claim < content_bound_claim < path_bound_bytes <
+  verified_built`, computed shape-based at ingress (store-backed
+  submission → `unverified_claim`; authoritative inline content →
+  `content_bound_claim`; ingress-validated non-authoritative inline
+  content → `path_bound_bytes`), persisted with the derivation row under
+  creation-snapshot semantics, and restored at recovery (floored at
+  `content_bound_claim` when authoritative bytes are present;
+  unparseable values floor to `unverified_claim`). Within one node
+  lifecycle the rank MUST only upgrade, at exactly two chokepoints: the
+  settle transition upgrades `path_bound_bytes` --- and ONLY
+  `path_bound_bytes` --- to `verified_built` on `Completed`/`Skipped`,
+  and the dispatch-time claims derivation upgrades a store-backed node
+  to `path_bound_bytes` after its `.drv` is fetched, text-CA-verified
+  against the DAG key, and found to match the recorded claims.
+]
+The lattice is the single vocabulary for trusted-plane authority
+decisions (displacement, settled-row protection, claims signing) ---
+rank comparison replaces per-arm carve-outs, so a future merge arm
+cannot re-introduce a divergent settled-protection predicate. The
+`verified_built`-only-from-`path_bound_bytes` restriction is
+load-bearing: a content-bound squat that completes stays
+`content_bound_claim` and remains displaceable by store evidence, while
+a genuine store-backed build passes dispatch derivation and settles
+unreachable (the maximum displacer rank is `path_bound_bytes`).
+Monotonicity is scoped PER NODE LIFECYCLE (creation → settle): a
+legitimate matching-identity re-creation after store GC or displacement
+starts a new lifecycle at its fresh ingress rank --- the persistence
+upsert applies creation-snapshot `EXCLUDED` semantics, deliberately not
+`MAX` --- so the rank always describes the definition the CURRENT
+lifecycle was admitted with. Settle/dispatch upgrades persist
+best-effort outside the merge transaction; a lost write degrades to the
+persisted ingress rank at recovery, which never weakens a victim's
+protection because no displacer outranks `path_bound_bytes`.
 
 #r("sched.recovery.failed-dep-cascade+2")[
   Recovery loads only non-terminal derivations and edges between them; edges to
@@ -1687,7 +3144,7 @@ to a builder under pressure. A queued FOD is preferable to a builder with
 internet access. The #(refs.metric)("rio_scheduler_queue_depth")`{kind}` gauge
 tracks queued derivations per kind.
 
-#r("sched.timeout.promote-on-exceed+2")[
+#r("sched.timeout.promote-on-exceed+3")[
   A `BuildResultStatus::TimedOut` completion MUST double
   `resource_floor.deadline_secs` (#rref("sched.sla.reactive-floor")) and reset
   the derivation to `Ready` for re-dispatch, NOT terminal-cancel. The next
@@ -1701,7 +3158,7 @@ tracks queued derivations per kind.
   masked by the infra time-window reset. I-200: before this, `TimedOut` went
   straight to `Cancelled` and the I-199/I-197 promotion only fired on the
   K8s-deadline-kill → disconnect path, not on the executor-side
-  `daemon_timeout_secs` → clean `TimedOut` report path.
+  `build_timeout_secs` → clean `TimedOut` report path.
 ]
 
 #r("sched.reassign.no-promote-on-ephemeral-disconnect+4")[
@@ -1722,7 +3179,7 @@ tracks queued derivations per kind.
   I-188 race at the source.
 ]
 
-#r("sched.termination.deadline-exceeded+2")[
+#r("sched.termination.deadline-exceeded+3")[
   A `ReportExecutorTermination(DeadlineExceeded)` MUST double
   `resource_floor.deadline_secs` (or increment `timeout_retry_count` if already
   at the 24h cap, #rref("sched.sla.reactive-floor")) for the derivation that
@@ -1731,7 +3188,7 @@ tracks queued derivations per kind.
   so the controller observes the Job condition `Failed/DeadlineExceeded`
   instead, #rref("ctrl.terminated.deadline-exceeded")); the scheduler
   prefix-matches `recently_disconnected` keys (pod name = `{job}-{5char}`).
-  This is defense-in-depth behind the worker-side `daemon_timeout` →
+  This is defense-in-depth behind the worker-side `build_timeout` →
   `BuildResultStatus::TimedOut` primary path
   (#rref("sched.timeout.promote-on-exceed")): with
   #rref("ctrl.ephemeral.intent-deadline") the scheduler-computed
@@ -1795,10 +3252,10 @@ tracks queued derivations per kind.
   transitioned back to `ready` for reassignment.
 ]
 
-#r("sched.backstop.timeout+3")[
+#r("sched.backstop.timeout+4")[
   *Backstop timeout:* Separately from executor deregistration, `handle_tick`
   checks each `running` derivation's `running_since` timestamp. If elapsed time
-  exceeds `max(est_duration × 3, daemon_timeout + 10min)` --- where
+  exceeds `max(est_duration × 3, build_timeout + 10min)` --- where
   `est_duration` is reference-seconds denormalized to wall-clock via the
   slowest fleet `hw_factor` per #rref("sched.sla.hw-ref-seconds") --- the
   scheduler sends a CancelSignal to the executor, marks the executor draining
@@ -2013,7 +3470,7 @@ CREATE INDEX builds_status_idx ON builds (status) WHERE status IN ('pending', 'a
 CREATE TABLE derivations (
     derivation_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id           UUID REFERENCES tenants(tenant_id) ON DELETE SET NULL,  -- nullable; single-tenant mode leaves NULL
-    drv_hash            TEXT NOT NULL,          -- input-addressed: store path; CA: modular derivation hash
+    drv_hash            TEXT NOT NULL,          -- the declared .drv store path (== drv_path, ingress-enforced); CA identity lives in realisations
     drv_path            TEXT NOT NULL,          -- full /nix/store/...-foo.drv path
     pname               TEXT,
     system              TEXT NOT NULL,
@@ -2837,4 +4294,8 @@ Mitigations: profile memory and throughput against a 60K-node DAG target
 (#rref("sched.actor.dispatch-decoupled")); bound individual submissions at
 `MAX_DAG_NODES = 1,048,576` / `MAX_DAG_EDGES = 5,242,880` --- global
 compile-time constants in #src("rio-common/src/limits.rs"), not per-tenant
-(SubmitBuild rejects DAGs exceeding either limit before merge).
+(SubmitBuild rejects DAGs exceeding either limit before merge). The same
+module owns the per-node `drv_content` ingress bound
+(`MAX_DRV_CONTENT_BYTES` = 1 MiB), which the gateway's content-bound
+hook-fallback cap aliases so the producer and consumer limits cannot
+drift apart.

@@ -180,6 +180,15 @@ pub enum GatewayError {
     #[error("scheduler gRPC: {0}")]
     Scheduler(String),
 
+    /// The scheduler VALIDATED the submission and refused it
+    /// (`INVALID_ARGUMENT` / `FAILED_PRECONDITION`). Unlike
+    /// [`GatewayError::Scheduler`] this is not infrastructure trouble:
+    /// retrying the identical submission can never succeed, so callers
+    /// that convert errors into `BuildResult`s must report
+    /// `InputRejected`, never `TransientFailure`.
+    #[error("scheduler rejected the submission: {0}")]
+    SchedulerRejected(String),
+
     /// gRPC stream/channel error (channel closed, task panicked).
     #[error("gRPC stream: {0}")]
     GrpcStream(String),
@@ -315,8 +324,13 @@ pub struct SessionContext {
     pub store_client: StoreServiceClient<Channel>,
     pub scheduler_client: SchedulerServiceClient<Channel>,
     pub drv_cache: HashMap<StorePath, Derivation>,
-    /// IFD detection: wopBuildDerivation without prior wopBuildPathsWithResults
-    /// is likely an IFD or build-hook request.
+    /// Hook/IFD detection state: set by `handle_build_paths_with_results`
+    /// as its first action. Two consumers (`gw.hook.ifd-detection+3`):
+    /// `wopBuildDerivation` without a prior `wopBuildPathsWithResults`
+    /// is likely an IFD or pre-2.16 build-hook request, and the FIRST
+    /// `wopBuildPathsWithResults` of a session (when it has the
+    /// build-remote single-target shape) is a hook-mode delegation —
+    /// both classify as "interactive".
     pub has_seen_build_paths_with_results: bool,
     /// Active build IDs for scheduler failover: build_id → last_sequence.
     pub active_build_ids: HashMap<String, u64>,
@@ -448,7 +462,10 @@ where
         Some(BuildDerivation) => handle_build_derivation(reader, &mut stderr, ctx).await,
         Some(BuildPaths) => handle_build_paths(reader, &mut stderr, ctx).await,
         Some(BuildPathsWithResults) => {
-            ctx.has_seen_build_paths_with_results = true;
+            // The "seen" flag is set INSIDE the handler (first
+            // statement) so it can also observe whether THIS call is
+            // the session's first bPWR — the hook-shape half of
+            // gw.hook.ifd-detection+3.
             handle_build_paths_with_results(reader, &mut stderr, ctx).await
         }
         Some(RegisterDrvOutput) => handle_register_drv_output(reader, &mut stderr, ctx).await,
