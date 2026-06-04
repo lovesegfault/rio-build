@@ -19,8 +19,10 @@ in
     databaseUrl = lib.mkOption {
       type = lib.types.str;
       description = ''
-        PostgreSQL connection URL (`RIO_DATABASE_URL`).
-        rio-scheduler applies migrations (sqlx migrate) on startup.
+        PostgreSQL connection URL (`RIO_DATABASE_URL`). rio-scheduler
+        does NOT migrate on startup — it only verifies the schema is
+        current; the store module's `rio-migrate` oneshot applies
+        migrations (see the assertion below).
       '';
     };
 
@@ -89,6 +91,30 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        # The ONLY migration runner on NixOS is the store module's
+        # rio-migrate oneshot (the `rio-store migrate` subcommand
+        # ships in the store binary). A scheduler-only host — or one
+        # pointing at a different database than the store — would
+        # assert_current-churn forever with no one ever migrating.
+        # Eval-time error instead of silent runtime churn. A per-URL
+        # parameterized migrate unit is deferred until a real split
+        # topology exists (every current fixture co-locates).
+        assertion =
+          config.services.rio ? store
+          && config.services.rio.store.enable
+          && cfg.databaseUrl == config.services.rio.store.databaseUrl;
+        message = ''
+          services.rio.scheduler needs the rio-migrate oneshot from
+          services.rio.store on the SAME host and the SAME databaseUrl
+          (scheduler only verifies the schema at startup; the store
+          module's rio-migrate unit is the only runner). Enable
+          services.rio.store with a matching databaseUrl, or add a
+          dedicated migrate unit for the scheduler's database.
+        '';
+      }
+    ];
     # TOML config for settings that don't map to flat env vars (nested
     # arrays like [sla.tiers]). The config layering: compiled defaults <
     # /etc/rio/scheduler.toml < RIO_* env < CLI. So env vars above
@@ -102,6 +128,12 @@ in
       description = "rio-scheduler DAG-aware build scheduler";
       extraAfter = [
         "postgresql.service"
+        # Migrations run in the store module's rio-migrate oneshot;
+        # startup only asserts the schema is current. After= is a
+        # no-op when that unit doesn't exist (scheduler without the
+        # store module) — Restart=on-failure then churns until
+        # someone migrates.
+        "rio-migrate.service"
         # Store connection is non-fatal (scheduler warns + disables cache check),
         # but starting after store is still the common-case ordering.
         "rio-store.service"

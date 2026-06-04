@@ -69,7 +69,7 @@ scope: with scope; ''
       # pods deleted — the Terminating pod lingers through its
       # grace period, so a bare label-selector query can still
       # return it as .items[0] (P0489).
-      # 120s: store pod startup = image pull (cached) + sqlx migrate
+      # 120s: store pod startup = image pull (cached) + schema check
       # + listen, ~30-60s under KVM.
       k3s_server.wait_until_succeeds(
           "k3s kubectl -n ${nsStore} rollout status "

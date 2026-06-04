@@ -259,14 +259,6 @@ let
       };
 
       rio-scheduler = {
-        preStart = ''
-          for _ in $(seq 1 60); do
-            ${pkgs.netcat}/bin/nc -z localhost 9002 && exit 0
-            sleep 0.5
-          done
-          echo "rio-store port 9002 not open after 30s" >&2
-          exit 1
-        '';
         after = lib.mkIf withOtel [ "opentelemetry-collector.service" ];
       };
 

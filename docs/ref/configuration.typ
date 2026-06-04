@@ -248,7 +248,7 @@ across transaction boundaries.
 == Schema Migration
 
 Migrations are managed via `sqlx migrate` with numbered migration files in
-each crate's `migrations/` directory.
+the `rio-migrations` crate's `migrations/` directory.
 
 - *Forward-compatible:* New columns use `ADD COLUMN ... DEFAULT` so old code
   tolerates new schema.
@@ -256,8 +256,11 @@ each crate's `migrations/` directory.
   versions may run simultaneously. Migrations must be compatible with both.
 - *Forward-only:* Migrations have no `down.sql`. Rollback is by deploying the
   previous binary version (it ignores unknown columns/tables).
-- *Migration on startup:* Each component runs pending migrations on startup
-  (with an advisory lock to prevent concurrent migration).
+- *Deploy-time, not startup:* The `rio-migrate` Job (k8s) or the
+  `rio-migrate` systemd oneshot (standalone NixOS) runs `rio-store migrate`
+  before components start; an advisory lock serializes concurrent runs.
+  Components verify the schema at startup and fail with an error naming the
+  runner if it is missing or stale.
 
 = Configuration via CRD (Runtime)
 

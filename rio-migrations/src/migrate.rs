@@ -32,7 +32,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Run `migrator` under a try-then-wait advisory lock instead of
 /// sqlx's default blocking `pg_advisory_lock`.
 ///
-// r[impl store.db.migrate-try-lock]
+// r[impl store.db.migrate-try-lock+2]
 /// **Why not sqlx's built-in lock (I-194):** `Migrator::run` calls
 /// blocking `pg_advisory_lock(...)` and holds it for the whole run.
 /// Migrations 011 and 022 do `CREATE INDEX CONCURRENTLY` (under
@@ -102,5 +102,62 @@ pub async fn run(pool: &PgPool, mut migrator: Migrator) -> Result<(), MigrateErr
         .execute(&mut lock_conn)
         .await;
 
+    Ok(())
+}
+
+/// Verify every embedded migration has been applied, without running
+/// any. Services call this at startup instead of [`run`] — migrations
+/// execute out-of-band (`rio-store migrate`: the helm `rio-migrate`
+/// Job on k8s, the `rio-migrate` systemd oneshot on standalone
+/// NixOS), so a pod that comes up against a missing or stale schema
+/// fails HERE with a message naming the runner, not minutes later
+/// with "relation does not exist" mid-request.
+///
+/// Only `embedded ⊆ applied` is checked. Applied-but-not-embedded
+/// versions are EXPECTED during a rolling upgrade: the migrate Job
+/// lands the newer schema first, then old-binary replicas may still restart
+/// against the newer schema (migrations are forward-compatible by
+/// policy — see `docs/spec/system/deployment.typ`). Checksums are
+/// not compared either; `migration_checksums_frozen` pins them at CI
+/// time and [`run`] rejects mismatches at apply time.
+// r[impl store.db.schema-current+2]
+pub async fn assert_current(pool: &PgPool) -> anyhow::Result<()> {
+    const RUNNER_HINT: &str = "run `rio-store migrate` (helm: the rio-migrate Job, \
+         standalone NixOS: rio-migrate.service) against this database";
+
+    // `_sqlx_migrations` is created by the first migrator run; its
+    // absence means no migration has ever been applied here. ONLY
+    // undefined_table (42P01) gets the "schema missing — run the
+    // migration runner" context: a transient connection drop, an
+    // exhausted pool, or a permission error here is NOT a missing
+    // schema, and pointing the operator at the runner for those sends
+    // the diagnosis in exactly the wrong direction.
+    let applied: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| {
+                let undefined_table = matches!(
+                    &e,
+                    sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01")
+                );
+                if undefined_table {
+                    anyhow::anyhow!(e).context(format!(
+                        "database schema missing (no _sqlx_migrations table); {RUNNER_HINT}"
+                    ))
+                } else {
+                    anyhow::anyhow!(e).context("schema check query failed (_sqlx_migrations)")
+                }
+            })?;
+
+    let missing: Vec<i64> = crate::MIGRATOR
+        .iter()
+        .map(|m| m.version)
+        .filter(|v| !applied.contains(v))
+        .collect();
+    anyhow::ensure!(
+        missing.is_empty(),
+        "database schema is stale: migrations {missing:?} are not applied; {RUNNER_HINT}"
+    );
     Ok(())
 }

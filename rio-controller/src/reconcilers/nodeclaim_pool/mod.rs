@@ -3169,18 +3169,27 @@ pub(crate) struct CoverResult {
     pub rejected: Vec<rio_proto::types::IntentVerdict>,
 }
 
-/// Connect the reconciler's PG pool. Separate from the scheduler/store
-/// `init_db_pool` because the controller does NOT run migrations —
-/// store/scheduler own the migrator and run before this reconciler
-/// reaches `CellSketches::load_seeded` (controller's `connect_forever` to the
-/// scheduler in main.rs already orders that). Max 4 connections: persist
-/// is one upsert per cell per 10s tick.
+/// Connect the reconciler's PG pool, then verify the schema and run
+/// the reconciler. The controller does NOT run migrations — the
+/// rio-migrate Job (`rio-store migrate`) does, before this reconciler
+/// reaches `CellSketches::load_seeded` (controller's `connect_forever`
+/// to the scheduler in main.rs already orders that). Max 4
+/// connections: persist is one upsert per cell per 10s tick.
 /// `connect_pg` + `NodeClaimPoolReconciler::{new, run}` as a single
 /// `async fn`. Standalone (not an `async move` block in main.rs)
 /// because `connect_forever`'s inner `async ||` closure plus a
 /// borrowed param inside a nested `async move` block trips rustc's
 /// HRTB Send check (rust-lang/rust issue 102211 family); a named
 /// `async fn` desugars without the higher-ranked lifetime.
+///
+/// Failure delivery: this task is DETACHED (spawn_monitored with the
+/// JoinHandle dropped; main blocks on the two kube controllers), so
+/// returning an error could never crash the pod — permanent failures
+/// exit the process explicitly instead. Accepted blast radius: a
+/// crash-looping controller also restarts the Pool/ComponentScaler
+/// reconcilers and the node informer, which don't need PG — but the
+/// PlaceableGate is fail-closed while PG is absent anyway, and the
+/// kube reconcilers are level-triggered and reconverge after restart.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_nodeclaim_pool(
     kube: kube::Client,
@@ -3196,6 +3205,19 @@ pub async fn run_nodeclaim_pool(
     let Some(pg) = connect_pg(&pg_tokens, &shutdown).await else {
         return;
     };
+    // Third-PG-consumer parity with store/scheduler: verify the
+    // schema before touching it, and EXIT on failure — the detached
+    // task can't surface an error any other way (see fn docs), and a
+    // stale schema must not leave the pod Running/Ready while the
+    // reconciler corrupts/fails its persist path.
+    // r[impl store.db.schema-current+2]
+    if let Err(e) = rio_migrations::migrate::assert_current(&pg).await {
+        error!(
+            error = format!("{e:#}"),
+            "database schema check failed; exiting so the pod restarts visibly"
+        );
+        std::process::exit(1);
+    }
     NodeClaimPoolReconciler::new(kube, admin, pg, leader, hooks, cfg, hw_config, placeable_tx)
         .await
         .run(shutdown)
@@ -3209,7 +3231,8 @@ pub async fn run_nodeclaim_pool(
 /// permanent error here is a real misconfiguration that must
 /// crash-loop the pod visibly instead of warn-retrying forever with
 /// the pod Running/Ready. Note 3D000 is permanent HERE (unbounded
-/// loop) — see `rio_common::pg_error`.
+/// loop) while the migrate runner's bounded poll treats it transient
+/// — see `rio_common::pg_error`.
 async fn connect_pg(
     tokens: &std::sync::Arc<rio_common::pg_iam::TokenSource>,
     shutdown: &rio_common::signal::Token,

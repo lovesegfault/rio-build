@@ -52,8 +52,8 @@ pub mod reconcilers;
 /// Re-export of the shared embedded migrator from `rio-migrations` for
 /// `nodeclaim_pool::sketch` PG tests. Same migration set as
 /// rio-store/rio-scheduler — controller doesn't run this in `main()`
-/// (store/scheduler own startup migration), only the
-/// `TestDb::new(&MIGRATOR)` fixtures do.
+/// (the out-of-band `rio-store migrate` runner owns migration), only
+/// the `TestDb::new(&MIGRATOR)` fixtures do.
 #[cfg(test)]
 pub use rio_migrations::MIGRATOR;
 

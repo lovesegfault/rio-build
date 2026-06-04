@@ -134,6 +134,12 @@ images weren't pushed (no image at that tag in ECR). Re-run `cargo
 xtask k8s -p eks up --push`. Check the current release values:
 `helm get values rio -n rio-system | grep tag`.
 
+**Scheduler/store CrashLoopBackOff with "database schema" errors:**
+Most common cause: the rio-migrate Job hasn't completed (or failed) —
+app pods verify the schema at startup and crash-restart until the
+Job lands it. Check `kubectl -n rio-system get jobs -l
+app.kubernetes.io/name=rio-migrate` and the newest Job's pod logs.
+
 **Scheduler/store CrashLoopBackOff with PG connection errors:**
 Check the rio-postgres Secret: `kubectl -n rio-system get secret
 rio-postgres -o jsonpath='{.data.url}' | base64 -d`. If it's

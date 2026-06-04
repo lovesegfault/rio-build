@@ -12716,6 +12716,10 @@
       },
       "dependencies": [
         {
+          "name": "anyhow",
+          "packageId": "anyhow"
+        },
+        {
           "name": "sqlx",
           "packageId": "sqlx"
         },

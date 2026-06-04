@@ -259,8 +259,9 @@ rec {
   # use closureInfo to be defensive against unexpected refs.
   busyboxClosure = pkgs.closureInfo { rootPaths = [ busybox ]; };
 
-  # PostgreSQL connection URL — both store and scheduler run migrations on
-  # startup (sqlx migrate, advisory-lock serialized), so no separate oneshot.
+  # PostgreSQL connection URL — shared by store, scheduler, and the
+  # store module's rio-migrate oneshot (the only migration runner;
+  # store/scheduler just verify the schema at startup).
   databaseUrl = "postgres://postgres@localhost/rio";
 
   # ── P0560 fixture-tenancy stopgap (DELETED by P0593) ────────────────
@@ -504,6 +505,10 @@ rec {
         rio-store.environment = extraServiceEnv // covEnv;
         rio-scheduler.environment = extraServiceEnv // extraSchedulerEnv // covEnv;
         rio-gateway.environment = extraServiceEnv // covEnv;
+        # The migrate oneshot exits at boot — atexit profraw flush, no
+        # SIGTERM dance needed. Without covEnv its coverage silently
+        # lands in an unwritable default path and is lost.
+        rio-migrate.environment = covEnv;
       };
 
       services.rio = {

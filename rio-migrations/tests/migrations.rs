@@ -108,7 +108,7 @@ async fn migration_091_backfills_preexisting_tombstones() {
 /// well under 5s; the timeout is the deadlock detector. NOT
 /// `tokio::time::pause()`-able — `pg_try_advisory_lock` round-trips
 /// to a real server, and CIC's vxid wait is server-side.
-// r[verify store.db.migrate-try-lock]
+// r[verify store.db.migrate-try-lock+2]
 #[tokio::test]
 async fn concurrent_migrations_no_deadlock() {
     let db = rio_test_support::TestDb::new_empty().await;
@@ -151,6 +151,71 @@ async fn concurrent_migrations_no_deadlock() {
         .await
         .unwrap();
     assert_eq!(applied, MIGRATOR.iter().count() as i64);
+}
+
+/// `assert_current` is what store/scheduler run at startup instead of
+/// migrating (migrations run out-of-band via `rio-store migrate`).
+/// It must catch BOTH failure shapes a mis-ordered deploy
+/// produces — never-migrated database and partially-migrated database
+/// — with an error naming the migration runner, and must accept a
+/// fully-migrated one.
+// r[verify store.db.schema-current+2]
+#[tokio::test]
+async fn assert_current_schema_check() {
+    let db = rio_test_support::TestDb::new_empty().await;
+
+    // Fresh database: no _sqlx_migrations table at all.
+    let err = rio_migrations::migrate::assert_current(&db.pool)
+        .await
+        .expect_err("empty database must fail the schema check");
+    assert!(
+        format!("{err:#}").contains("rio-store migrate"),
+        "schema-missing error must name the runner, got: {err:#}"
+    );
+
+    // Fully migrated: check passes.
+    rio_migrations::migrate::run(&db.pool, rio_migrations::migrator())
+        .await
+        .expect("migrations apply on the ephemeral PG");
+    rio_migrations::migrate::assert_current(&db.pool)
+        .await
+        .expect("current schema must pass");
+
+    // Stale: simulate a binary that embeds one migration more than
+    // the database has applied (deleting the newest applied row is
+    // equivalent — `assert_current` only compares version sets, and
+    // the gap sits at the tail like a real missed hook run).
+    let newest: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+        .bind(newest)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let err = rio_migrations::migrate::assert_current(&db.pool)
+        .await
+        .expect_err("stale database must fail the schema check");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(&newest.to_string()) && msg.contains("rio-store migrate"),
+        "stale error must name the missing version and the runner, got: {msg}"
+    );
+
+    // Non-42P01 failure (closed pool here; connection drops or
+    // permission errors in production) must NOT claim the schema is
+    // missing — the runner hint would send the operator to re-run
+    // migrations when the actual problem is connectivity.
+    db.pool.close().await;
+    let err = rio_migrations::migrate::assert_current(&db.pool)
+        .await
+        .expect_err("closed pool must fail the schema check");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("schema check query failed") && !msg.contains("rio-store migrate"),
+        "non-42P01 error must use the neutral context, got: {msg}"
+    );
 }
 
 /// M_050 regression: 020's `[[:space:]]` / `trim()` are ASCII-only;

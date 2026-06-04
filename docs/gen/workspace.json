@@ -128,11 +128,11 @@
         "rio-common",
         "rio-crds",
         "rio-lease",
+        "rio-migrations",
         "rio-proto"
       ],
       "optional": [],
       "dev": [
-        "rio-migrations",
         "rio-test-support"
       ]
     },

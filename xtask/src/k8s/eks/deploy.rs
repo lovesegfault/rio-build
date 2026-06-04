@@ -445,13 +445,23 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // from kube-prometheus-stack (infra/eks/monitoring.tf), which
             // tofu apply lands before this runs.
             .set("monitoring.enabled", "true")
-            .wait(Duration::from_secs(600))
+            // --wait (+ --wait-for-jobs, helm.rs) on every deploy,
+            // fresh installs included: the rio-migrate Job is a plain
+            // resource applied in the same pass, and app pods
+            // crash-restart on the schema check until it completes.
+            // 900s budget: ESO first-sync (~1min) + image pull +
+            // Aurora connect + migration + crash-loop tail
+            // (CrashLoopBackOff max backoff 300s → post-migration
+            // readiness can lag up to 5min even when healthy).
+            .wait(Duration::from_secs(900))
             // AMI bring-up chicken-and-egg: the chart's post-install
             // hook smoke-tests through the gateway, which needs working
             // builder nodes, which need a validated AMI, which is what
             // we're trying to deploy to test. --deploy-no-hooks skips
             // the hook so the chart lands; operator runs `k8s qa --health`
-            // manually once nodes are up.
+            // manually once nodes are up. Migrations are NOT affected:
+            // rio-migrate is a plain Job, not a hook — it applies and
+            // runs on every deploy regardless of this flag.
             .no_hooks(no_hooks);
         if let Some(arn) = &controller_arn {
             helm_cmd = helm_cmd.set(
@@ -461,6 +471,14 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         }
         let r = helm_cmd.run().await;
         progress.abort();
+        if let Err(e) = &r {
+            // A failed migration surfaces as a --wait timeout with
+            // crash-looping Deployments instead of a named hook
+            // failure — print the Job + migrate-pod state so the
+            // operator doesn't have to reconstruct it.
+            warn!("helm upgrade failed: {e:#}; dumping rio-migrate state");
+            print_migrate_diagnostics();
+        }
         r
     })
     .await?;
@@ -494,6 +512,25 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         wait_drift_settled(&client, DRIFT_SKIP_NODEPOOLS).await?;
     }
     Ok(())
+}
+
+/// On deploy failure: dump migrate-Job status + last rio-migrate pod
+/// log tail. Best-effort — every command error is swallowed (we are
+/// already on the error path).
+fn print_migrate_diagnostics() {
+    let Ok(sh) = crate::sh::shell() else { return };
+    if let Ok(jobs) = crate::sh::read(crate::sh::cmd!(
+        sh,
+        "kubectl -n {NS} get jobs -l app.kubernetes.io/name=rio-migrate -o wide"
+    )) {
+        warn!("rio-migrate Jobs:\n{jobs}");
+    }
+    if let Ok(logs) = crate::sh::read(crate::sh::cmd!(
+        sh,
+        "kubectl -n {NS} logs -l app.kubernetes.io/name=rio-migrate --tail=30 --prefix --ignore-errors"
+    )) {
+        warn!("rio-migrate pod logs (tail):\n{logs}");
+    }
 }
 
 /// NodePools whose NodeClaims `--wait-drift` ignores. `rio-general`
