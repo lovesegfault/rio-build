@@ -259,6 +259,19 @@ impl LogTailSet {
     }
 }
 
+/// Drop-safety chokepoint (merged_bug_130): EVERY drop path of the set
+/// — the session loop's early returns, error exits, panics — aborts
+/// every subscription, without enumerating the callers. The kernel's
+/// `Orphaned` exit is the defense-in-depth twin for any relay whose
+/// abort has not landed yet (or any future ownership shape that drops
+/// the drain sender while a task lives): belt at the owner, suspenders
+/// in the law.
+impl Drop for LogTailSet {
+    fn drop(&mut self) {
+        self.abort_all();
+    }
+}
+
 /// Why one driven `TailLog` stream stopped yielding, as observed by
 /// [`drive_stream`]. The kernel's [`tail_next`] — not this enum —
 /// decides whether the subscription re-opens or exits.
@@ -275,11 +288,13 @@ enum DriveEnd {
 }
 
 // r[impl store.log.tail-reconnect]
-// r[impl store.log.tail-grace-drain]
+// r[impl store.log.tail-grace-drain+1]
 /// One subscription's lifetime: open → drive → (backoff → re-open)*,
 /// with the exit decision delegated to the kernel's [`tail_next`] law:
-/// exit only when the post-terminal grace expired, or the stream ended
-/// naturally with the derivation terminal and the served log complete.
+/// exit only when the post-terminal grace expired, the relay is
+/// orphaned (the set's drain sender vanished — no consumer remains),
+/// or the stream ended naturally with the derivation terminal and the
+/// served log complete.
 async fn run_tail(
     mut client: LogServiceClient<Channel>,
     jwt_token: Option<String>,
@@ -323,6 +338,24 @@ async fn run_tail(
     // status code" breadcrumb next to it.
     let mut warned_open_failure = false;
     loop {
+        // An orphaned relay must never open another stream: the drain
+        // sender vanishing means the owning set is gone (and with it
+        // every consumer), so the law exits unconditionally — proven
+        // by `check_tail_next_orphan_always_exits`. Checked BEFORE the
+        // open so a death observed during backoff costs zero further
+        // store connections (merged_bug_130: this exact shape used to
+        // skip every backoff and hot-loop opens at full speed).
+        if drain.has_changed().is_err() {
+            let verdict = tail_next(
+                TailStopCause::Orphaned,
+                *drain.borrow(),
+                grace_deadline.is_some_and(|d| Instant::now() >= d),
+                served_complete,
+            );
+            debug_assert_eq!(verdict, TailNext::Exit);
+            debug!("log tail orphaned (subscription set gone); exiting");
+            return;
+        }
         arm_grace(&mut grace_deadline, &drain, config.terminal_grace);
         let since_line = last_relayed.map_or(0, |n| n.saturating_add(1));
         let mut request = tonic::Request::new(TailLogRequest {
@@ -401,8 +434,14 @@ async fn run_tail(
                 TailStopCause::OpenFailed
             }
         };
-        // The drain signal may have flipped while the stream was being
-        // driven or opened; observe it before deciding.
+        // The drain signal may have flipped — or its sender may have
+        // vanished — while the stream was being driven or opened;
+        // observe both before deciding.
+        let cause = if drain.has_changed().is_err() {
+            TailStopCause::Orphaned
+        } else {
+            cause
+        };
         arm_grace(&mut grace_deadline, &drain, config.terminal_grace);
         let terminal = *drain.borrow();
         let grace_expired = grace_deadline.is_some_and(|d| Instant::now() >= d);
@@ -420,7 +459,14 @@ async fn run_tail(
                     "reason" => reconnect_reason(cause)
                 )
                 .increment(1);
-                backoff_capped(&mut drain, config.reconnect_backoff, grace_deadline).await;
+                match backoff_capped(&mut drain, config.reconnect_backoff, grace_deadline).await {
+                    // The next loop iteration's top-of-loop orphan
+                    // check consults the law and exits before any
+                    // open — no stream is ever opened for a dead
+                    // consumer.
+                    BackoffEnd::Orphaned => continue,
+                    BackoffEnd::Slept | BackoffEnd::DrainSignal => {}
+                }
             }
         }
     }
@@ -432,6 +478,9 @@ fn reconnect_reason(cause: TailStopCause) -> &'static str {
         TailStopCause::NaturalEnd | TailStopCause::TransportErr => "stream_ended",
         TailStopCause::OpenFailed => "open_failed",
         TailStopCause::GapObserved => "gap_observed",
+        // Orphaned never reaches a Reopen verdict: the law exits on it
+        // unconditionally (kani: check_tail_next_orphan_always_exits).
+        TailStopCause::Orphaned => unreachable!("Orphaned never reopens (kernel law)"),
     }
 }
 
@@ -444,6 +493,23 @@ fn arm_grace(deadline: &mut Option<Instant>, drain: &watch::Receiver<bool>, grac
     }
 }
 
+/// How one backoff sleep ended — the caller needs to distinguish a
+/// completed sleep / drain flip (keep looping) from the drain SENDER
+/// dying (the relay is orphaned; the law exits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackoffEnd {
+    /// The sleep ran its full (grace-capped) duration.
+    Slept,
+    /// The drain signal flipped; wake early so the loop can arm the
+    /// grace deadline and consult [`tail_next`].
+    DrainSignal,
+    /// The drain sender was dropped: the owning set is gone and no
+    /// signal can ever arrive. Treating this as a plain wake-up was
+    /// the merged_bug_130 hot-loop — every backoff returned
+    /// instantly, forever.
+    Orphaned,
+}
+
 /// Sleep for `backoff`, capped at the remaining grace budget, waking
 /// early if the drain signal flips (so the loop can arm the grace
 /// deadline and consult [`tail_next`] — going terminal during a
@@ -452,17 +518,17 @@ async fn backoff_capped(
     drain: &mut watch::Receiver<bool>,
     backoff: Duration,
     deadline: Option<Instant>,
-) {
+) -> BackoffEnd {
     let dur = match deadline {
         Some(d) => backoff.min(d.saturating_duration_since(Instant::now())),
         None => backoff,
     };
     tokio::select! {
-        _ = tokio::time::sleep(dur) => {}
-        // Err = sender dropped; the set aborts this task on removal so
-        // this is unreachable, and waking early is the safe
-        // interpretation either way.
-        _ = drain.changed() => {}
+        _ = tokio::time::sleep(dur) => BackoffEnd::Slept,
+        changed = drain.changed() => match changed {
+            Ok(()) => BackoffEnd::DrainSignal,
+            Err(_) => BackoffEnd::Orphaned,
+        },
     }
 }
 
@@ -1110,7 +1176,7 @@ mod tests {
         assert!(set.tasks.is_empty(), "no task spawned");
     }
 
-    // r[verify store.log.tail-grace-drain]
+    // r[verify store.log.tail-grace-drain+1]
     /// A transport error after the terminal signal does not end the
     /// subscription while grace budget remains — the final lines may be
     /// on a replica that is restarting right now.
@@ -1188,7 +1254,7 @@ mod tests {
         h.set.abort_all();
     }
 
-    // r[verify store.log.tail-grace-drain]
+    // r[verify store.log.tail-grace-drain+1]
     /// A natural stream end after terminal with the store NOT claiming
     /// completeness re-opens (the served log is incomplete and there is
     /// budget left); the re-opened stream's complete final exits it.
@@ -1263,5 +1329,67 @@ mod tests {
         );
         assert_eq!(lines[55].0, 104);
         h.set.abort_all();
+    }
+
+    // r[verify store.log.tail-grace-drain+1]
+    /// An orphaned relay — the drain sender gone without an abort —
+    /// exits via the kernel law instead of hot-looping stream opens
+    /// (merged_bug_130). Pre-fix the dead watch channel turned every
+    /// backoff into an instant wake: this test observed the open
+    /// counter climbing unboundedly at zero backoff.
+    #[tokio::test]
+    async fn orphaned_relay_exits_without_reopening() {
+        let mock = MockTail::default();
+        let router = Server::builder().add_service(LogServiceServer::new(mock.clone()));
+        let (addr, _server) = spawn_grpc_server(router).await;
+        let client = rio_proto::LogServiceClient::connect(format!("http://{addr}"))
+            .await
+            .expect("connect to the mock LogService");
+        let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+        // Orphan the relay before it ever runs: the owning set is gone.
+        drop(drain_tx);
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let task = tokio::spawn(super::run_tail(
+            client,
+            None,
+            DRV.to_string(),
+            EXEC_A.to_string(),
+            out_tx,
+            drain_rx,
+            test_config(),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("orphaned relay exited (pre-fix: hot-looped forever)")
+            .expect("relay task completed cleanly");
+        assert_eq!(
+            mock.request_count(),
+            0,
+            "an orphaned relay must never open a stream"
+        );
+    }
+
+    /// Dropping the set — ANY drop path: session-loop early return,
+    /// error exit, panic unwind — aborts every subscription without
+    /// the caller remembering to call `abort_all` (the merged_bug_130
+    /// ownership chokepoint).
+    #[tokio::test]
+    async fn dropping_the_set_aborts_subscriptions() {
+        let mut h = harness().await;
+        // A held-open session: the subscription would otherwise live
+        // (and re-open) indefinitely.
+        h.mock.push_script(vec![chunk(0, 1)], SessionEnd::Hold);
+        h.set.on_started(DRV, EXEC_A);
+        let _ = recv_lines(&mut h.out_rx, 1).await;
+        let count_at_drop = h.mock.request_count();
+        drop(h.set);
+        // Give an un-aborted task ample room to re-open (pre-fix the
+        // drop did nothing: the orphaned task kept opening streams).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            h.mock.request_count(),
+            count_at_drop,
+            "dropping the set must abort its subscriptions (no further opens)"
+        );
     }
 }

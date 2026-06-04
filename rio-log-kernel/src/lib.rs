@@ -256,6 +256,15 @@ pub enum TailStopCause {
     /// gap-discipline path: re-open once at the gap before relaying a
     /// disclosure).
     GapObserved,
+    /// The relay itself is orphaned: its consumer-side lifecycle
+    /// channel's sender vanished without an abort (the owning set was
+    /// dropped on a path that never reached `remove`/`abort_all`).
+    /// No consumer remains and no drain signal will ever arrive —
+    /// re-opening is the merged_bug_130 hot-loop. The law exits
+    /// unconditionally. Gateway-only by design: the dashboard's TS
+    /// mirror is deliberately NOT extended (a browser stream owns its
+    /// consumer in the same task; orphanhood is unrepresentable there).
+    Orphaned,
 }
 
 /// The verdict of [`tail_next`].
@@ -272,21 +281,25 @@ pub enum TailNext {
 /// The relay's exit-decision kernel: may a `TailLog` subscription stop
 /// re-opening?
 ///
-/// The law (merged_bug_076): **Exit iff the grace budget is spent, or
+/// The law (merged_bug_076, merged_bug_130): **Exit iff the grace
+/// budget is spent, or the relay is orphaned (no consumer remains), or
 /// the stream ended naturally with the derivation terminal and the
 /// served log complete.** Every other shape re-opens — a transport
 /// error after terminal, an open failure at terminal, a natural end
 /// with an incomplete served log, a gap awaiting its second chance:
 /// all of these have lines that may still be servable and budget to
 /// fetch them with. "Give up with grace unspent and the log
-/// incomplete" is unrepresentable by this function.
+/// incomplete" is unrepresentable by this function — and so is "keep
+/// opening streams nobody reads": an orphaned relay has no consumer to
+/// lose lines for, so exiting loses nothing and re-opening burns a
+/// store connection per backoff tick forever.
 ///
 /// `terminal` is "the derivation reached a terminal status";
 /// `grace_expired` is "the armed-once post-terminal grace deadline has
 /// passed" (false whenever the deadline is not yet armed);
 /// `served_complete` is the most recent final message's `is_complete`
 /// — the store's own claim that everything durable was served.
-// r[impl store.log.tail-grace-drain]
+// r[impl store.log.tail-grace-drain+1]
 pub fn tail_next(
     cause: TailStopCause,
     terminal: bool,
@@ -297,6 +310,7 @@ pub fn tail_next(
         return TailNext::Exit;
     }
     match cause {
+        TailStopCause::Orphaned => TailNext::Exit,
         TailStopCause::NaturalEnd if terminal && served_complete => TailNext::Exit,
         TailStopCause::NaturalEnd
         | TailStopCause::TransportErr
@@ -772,30 +786,35 @@ mod proofs {
 
     /// [`tail_next`] never exits prematurely: with grace budget
     /// remaining and the served log not complete, the verdict is
-    /// Reopen for EVERY cause/terminal combination — the three
-    /// premature-exit shapes of merged_bug_076 (Err conflated to
+    /// Reopen for EVERY non-orphan cause/terminal combination — the
+    /// three premature-exit shapes of merged_bug_076 (Err conflated to
     /// drained, open-failure at terminal, natural end with an
-    /// incomplete log) are unrepresentable. Exhaustive over the
-    /// 4x2x2x2 input domain.
+    /// incomplete log) are unrepresentable. `Orphaned` is exempt by
+    /// design: with no consumer left there are no lines to lose, so
+    /// its exit is not premature (merged_bug_130 — the proof below
+    /// pins it as an unconditional exit). Exhaustive over the
+    /// 5x2x2 input domain.
     #[kani::proof]
     fn check_tail_next_no_premature_exit() {
         let cause: u8 = kani::any();
-        kani::assume(cause < 4);
+        kani::assume(cause < 5);
         let cause = match cause {
             0 => TailStopCause::NaturalEnd,
             1 => TailStopCause::TransportErr,
             2 => TailStopCause::OpenFailed,
-            _ => TailStopCause::GapObserved,
+            3 => TailStopCause::GapObserved,
+            _ => TailStopCause::Orphaned,
         };
         let terminal: bool = kani::any();
         let served_complete: bool = kani::any();
-        // Grace unspent + log not served-complete => never Exit.
-        if !served_complete {
+        // Grace unspent + log not served-complete + a consumer still
+        // listening => never Exit.
+        if !served_complete && cause != TailStopCause::Orphaned {
             assert!(tail_next(cause, terminal, false, served_complete) == TailNext::Reopen);
         }
-        // Grace unspent + not a natural end => never Exit, even when
-        // complete (an erred stream gets its retry).
-        if cause != TailStopCause::NaturalEnd {
+        // Grace unspent + not a natural end + not orphaned => never
+        // Exit, even when complete (an erred stream gets its retry).
+        if cause != TailStopCause::NaturalEnd && cause != TailStopCause::Orphaned {
             assert!(tail_next(cause, terminal, false, served_complete) == TailNext::Reopen);
         }
     }
@@ -803,24 +822,46 @@ mod proofs {
     /// [`tail_next`] always honours the spent grace budget: Exit for
     /// every cause/terminal/completeness combination once
     /// `grace_expired` — the loop is provably finite past the
-    /// deadline. And the one legitimate early exit is exactly
-    /// (NaturalEnd && terminal && served_complete).
+    /// deadline. And the early-exit cell is exactly
+    /// (NaturalEnd && terminal && served_complete) ∨ Orphaned.
     #[kani::proof]
     fn check_tail_next_grace_exit() {
         let cause: u8 = kani::any();
-        kani::assume(cause < 4);
+        kani::assume(cause < 5);
         let cause = match cause {
             0 => TailStopCause::NaturalEnd,
             1 => TailStopCause::TransportErr,
             2 => TailStopCause::OpenFailed,
-            _ => TailStopCause::GapObserved,
+            3 => TailStopCause::GapObserved,
+            _ => TailStopCause::Orphaned,
         };
         let terminal: bool = kani::any();
         let served_complete: bool = kani::any();
         assert!(tail_next(cause, terminal, true, served_complete) == TailNext::Exit);
         // The early-exit cell, exactly.
         let early = tail_next(cause, terminal, false, served_complete) == TailNext::Exit;
-        assert!(early == (cause == TailStopCause::NaturalEnd && terminal && served_complete));
+        let natural_drained = cause == TailStopCause::NaturalEnd && terminal && served_complete;
+        assert!(early == (natural_drained || cause == TailStopCause::Orphaned));
+    }
+
+    /// `Orphaned` always exits: with the consumer-side lifecycle
+    /// channel gone there is nothing to serve and nothing to lose —
+    /// every re-open would be the merged_bug_130 hot-loop (a store
+    /// connection per backoff tick, forever, for nobody). Exhaustive
+    /// over terminal x grace x completeness.
+    #[kani::proof]
+    fn check_tail_next_orphan_always_exits() {
+        let terminal: bool = kani::any();
+        let grace_expired: bool = kani::any();
+        let served_complete: bool = kani::any();
+        assert!(
+            tail_next(
+                TailStopCause::Orphaned,
+                terminal,
+                grace_expired,
+                served_complete
+            ) == TailNext::Exit
+        );
     }
 
     /// Verify [`visit_object`] against its contracts for every
@@ -1165,21 +1206,23 @@ mod tests {
         }
     }
 
-    /// The full tail_next decision table: 4 causes x terminal x
-    /// grace_expired x served_complete. Exit cells: every
-    /// grace_expired row, plus exactly (NaturalEnd, terminal,
-    /// !grace_expired, served_complete).
+    /// The full tail_next decision table: 5 causes x terminal x
+    /// grace_expired x served_complete = 40 rows. Exit cells: every
+    /// grace_expired row, every Orphaned row, plus exactly
+    /// (NaturalEnd, terminal, !grace_expired, served_complete).
+    // r[verify store.log.tail-grace-drain+1]
     #[test]
     fn tail_next_decision_table() {
         use TailNext::*;
         use TailStopCause::*;
-        let causes = [NaturalEnd, TransportErr, OpenFailed, GapObserved];
+        let causes = [NaturalEnd, TransportErr, OpenFailed, GapObserved, Orphaned];
         for cause in causes {
             for terminal in [false, true] {
                 for grace_expired in [false, true] {
                     for served_complete in [false, true] {
                         let got = tail_next(cause, terminal, grace_expired, served_complete);
                         let want = if grace_expired
+                            || cause == Orphaned
                             || (cause == NaturalEnd && terminal && served_complete)
                         {
                             Exit

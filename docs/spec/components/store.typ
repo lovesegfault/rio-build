@@ -1694,17 +1694,22 @@ stored-to-live seam. A `TailLog` reaching a replica that does not hold the
 execution's ingest session is proxied one hop to the owner; on proxy failure
 it degrades to the manifest-only view rather than erroring.
 
-#r("store.log.tail-grace-drain")[
+#r("store.log.tail-grace-drain+1")[
   A live-tail relay MUST NOT stop re-subscribing while it still has grace
   budget and the served log is not complete. The exit decision is one total
   function over (stop cause, terminal, grace expired, served complete):
-  exit exactly when the post-terminal grace has expired, or when the stream
-  ended naturally with the execution terminal and the store's final message
+  exit exactly when the post-terminal grace has expired, or when the relay
+  is orphaned (its consumer-side lifecycle channel is gone --- no reader
+  remains and no signal can ever arrive), or when the stream ended
+  naturally with the execution terminal and the store's final message
   claiming the served log complete. Transport errors and open failures
   after terminal re-open within the remaining grace; the post-terminal
   grace deadline is armed exactly once per subscription. A forward jump in
   the served stream is re-opened at the gap exactly once before being
-  accepted and disclosed inline.
+  accepted and disclosed inline. An orphaned relay MUST NOT open another
+  stream --- its exit is unconditional --- and relay ownership MUST be
+  drop-safe: dropping the owning subscription set aborts every relay, so
+  no drop path can leave one running unowned.
 ]
 
 The conflations this rule forbids each lost final lines in production
@@ -1716,7 +1721,11 @@ subscription outright; and a natural end was treated as drained without
 consulting the store's own completeness claim, which the relay discarded
 unread. The served-complete bit is load-bearing: it is the only signal
 that distinguishes "the session closed because everything durable was
-served" from "the session closed mid-upload".
+served" from "the session closed mid-upload". The orphan clause closes
+the inverse failure (merged_bug_130): a relay whose owning set was
+dropped without an abort observed its lifecycle channel's death as a
+wake-up, skipped every backoff, and hot-looped stream opens at full
+speed --- for a consumer that no longer existed.
 
 #r("store.log.tail-fanout-recovery")[
   The live-tail fan-out MAY drop batches (a slow reader must never
