@@ -48,6 +48,14 @@ leader-gating, and histogram bucket policy are specified normatively in
 = Controller <tbl-metrics-controller>
 #_metric-table("controller")
 
+= Shared (rio-common) <tbl-metrics-pg-iam>
+
+The `rio_pg_iam_*` family is emitted by `rio_common::pg_iam` and
+appears on every PG-consuming component (store, scheduler,
+controller) — see the carve-out in Observability §Metrics.
+
+#_metric-table("pg")
+
 = Retired and renamed
 
 Historical notes the source `describe_*!` help cannot carry (the metric

@@ -1011,7 +1011,7 @@ in
           # values.
           # r[verify obs.metric.scheduler+2]
           # r[verify obs.metric.builder]
-          # r[verify obs.metric.store]
+          # r[verify obs.metric.store+2]
           "load-50drv"
           # warm-gate and sigint-graceful were unwired at the T-1c.2b
           # standalone re-point (delivery is pull now; neither can run

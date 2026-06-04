@@ -75,7 +75,7 @@ struct ActiveStreamGuard(Arc<AtomicUsize>);
 impl ActiveStreamGuard {
     fn new(counter: Arc<AtomicUsize>) -> Self {
         counter.fetch_add(1, Ordering::Relaxed);
-        // r[impl obs.metric.store]
+        // r[impl obs.metric.store+2]
         metrics::gauge!("rio_store_get_path_active").increment(1.0);
         Self(counter)
     }

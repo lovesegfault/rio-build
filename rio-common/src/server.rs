@@ -214,15 +214,7 @@ where
     C: DeserializeOwned + Default + Serialize + ValidateConfig + HasCommonConfig,
     A: Serialize,
 {
-    // rustls CryptoProvider MUST be installed before any TLS use.
-    // The workspace links a single provider (aws-lc-rs — kube is
-    // default-features=false + aws-lc-rs, matching aws-sdk and the
-    // rest of the TLS stack); the explicit install is a guard against
-    // a future transitive dep re-enabling `ring`, which would
-    // re-create the rustls 0.23 dual-provider can't-auto-select panic
-    // on first TLS handshake. `let _`: Err if already installed —
-    // can't happen at top-of-main, discard.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    install_crypto_provider();
 
     let otel_guard = crate::observability::init_tracing(component)?;
     let cfg: C = crate::config::load(component, cli)
@@ -481,6 +473,23 @@ pub async fn wait_for_active_drain(
         tracing::info!(remaining = n, "active drain: waiting for in-flight streams");
         tick.tick().await;
     }
+}
+
+/// Install the workspace's single rustls CryptoProvider (aws-lc-rs).
+///
+/// MUST run before any TLS use. The workspace links one provider
+/// (kube is default-features=false + aws-lc-rs, matching aws-sdk and
+/// the rest of the TLS stack); the explicit install is a guard
+/// against a future transitive dep re-enabling `ring`, which would
+/// re-create the rustls 0.23 dual-provider can't-auto-select panic on
+/// first TLS handshake. `let _`: Err means already installed —
+/// harmless, discard.
+///
+/// Public because one-shot subcommands that skip [`bootstrap`]
+/// entirely (`rio-store migrate`, which does verify-full TLS to
+/// Aurora) need the same guard.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 #[cfg(test)]

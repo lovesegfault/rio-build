@@ -104,6 +104,14 @@ aws-config = { version = "1", default-features = false, features = [
   "sso",
 ] }
 
+# RDS IAM auth-token minting (rio-common's pg-iam feature).
+aws-sigv4 = { version = "1", default-features = false, features = [
+  "sign-http",
+] }
+aws-credential-types = { version = "1", default-features = false }
+aws-smithy-runtime-api = { version = "1", default-features = false }
+url = "2"
+
 # FUSE. Pinned to master for ReplyOpen::wrap_backing/BackingId::into_raw:
 # the unprivileged castore-FUSE replies open() with a backing_id allocated
 # by rio-mountd's privileged BACKING_OPEN ioctl, and 0.17.0 can only mint

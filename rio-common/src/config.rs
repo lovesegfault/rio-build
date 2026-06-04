@@ -523,6 +523,32 @@ pub struct JwtConfig {
     pub key_path: Option<PathBuf>,
 }
 
+/// How the PostgreSQL password is obtained. Field `pg_auth` in each
+/// PG-consuming binary's `Config` (env `RIO_PG_AUTH`, controller:
+/// `RIO_NODECLAIM_POOL__PG_AUTH`).
+///
+/// `Password` is the default so k3s/local deployments and the
+/// password→IAM transition keep working with no config change. `Iam`
+/// replaces the static (7-day auto-rotating) Aurora password with a
+/// 15-minute SigV4 token minted from the pod's IRSA role and refreshed
+/// in the background — full rationale in the `pg_iam` module docs.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum PgAuthMode {
+    /// Static password embedded in `database_url` (k3s/local, and EKS
+    /// during the password→IAM transition).
+    #[default]
+    Password,
+    /// RDS IAM auth: `database_url` is passwordless and MUST carry
+    /// `sslmode=verify-full` + `sslrootcert=<RDS CA bundle>` — the
+    /// minted token is a bearer credential, and only verify-full
+    /// guarantees it is never sent to an unverified server. Enforced
+    /// in `pg_iam::pg_connect_options`.
+    Iam,
+}
+
 /// Deserialize `Vec<String>` from EITHER a comma-separated string
 /// (env var layer) OR a sequence (TOML layer). The env layer gives
 /// strings; the TOML layer gives sequences. A bare

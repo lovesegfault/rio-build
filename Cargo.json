@@ -19574,8 +19574,20 @@
           "packageId": "aws-config"
         },
         {
+          "name": "aws-credential-types",
+          "packageId": "aws-credential-types"
+        },
+        {
           "name": "aws-sdk-s3",
           "packageId": "aws-sdk-s3"
+        },
+        {
+          "name": "aws-sigv4",
+          "packageId": "aws-sigv4"
+        },
+        {
+          "name": "aws-smithy-runtime-api",
+          "packageId": "aws-smithy-runtime-api"
         },
         {
           "name": "axum",
@@ -19592,6 +19604,10 @@
         {
           "name": "futures-util",
           "packageId": "futures-util"
+        },
+        {
+          "name": "metrics",
+          "packageId": "metrics"
         },
         {
           "name": "metrics-exporter-prometheus",
@@ -19630,6 +19646,10 @@
           "packageId": "serde_json"
         },
         {
+          "name": "sqlx",
+          "packageId": "sqlx"
+        },
+        {
           "name": "thiserror",
           "packageId": "thiserror"
         },
@@ -19660,6 +19680,10 @@
         {
           "name": "tracing-subscriber",
           "packageId": "tracing-subscriber"
+        },
+        {
+          "name": "url",
+          "packageId": "url"
         },
         {
           "name": "workspace-hack",
@@ -19693,7 +19717,8 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "aws"
+        "aws",
+        "pg-iam"
       ],
       "libCrateTypes": [
         "lib"

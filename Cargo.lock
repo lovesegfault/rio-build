@@ -6209,12 +6209,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-s3",
+ "aws-sigv4",
+ "aws-smithy-runtime-api",
  "axum",
  "base64 0.22.1",
  "config",
  "futures-util",
  "libc",
+ "metrics",
  "metrics-exporter-prometheus",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -6225,6 +6229,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sqlx",
  "tempfile",
  "thiserror",
  "tokio",
@@ -6236,6 +6241,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "workspace-hack",
 ]
 

@@ -2291,8 +2291,15 @@ in
         # ref/metrics.typ derives FROM metrics.json now so no exemption.
         comps=$(jq -r '.names[] | capture("^rio_(?<c>[a-z]+)_").c' $metricsJson \
           | sort -u | paste -sd'|')
+        # Family-prefix GLOBS (`rio_X_*`) are speech about a namespace,
+        # not a metric reference. Single-token components escape the
+        # regex naturally ([a-z_]+ cannot match the literal *), but the
+        # two-token rio_pg_iam_* family (component capture = "pg")
+        # does not — exclude its glob form; concrete rio_pg_iam_...
+        # names stay linted.
         if grep -rn --include='*.typ' -E "\`rio_($comps)_[a-z_]+" $typSrc \
-             | grep -v 'lib/refs\.typ'; then
+             | grep -v 'lib/refs\.typ' \
+             | grep -v 'rio_pg_iam_\*'; then
           echo "FAIL: raw metric name — use #(refs.metric)(\"…\")" >&2
           fail=1
         fi
