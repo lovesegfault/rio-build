@@ -1084,8 +1084,25 @@ struct NetrcEntry {
 ///   stream (under curl, `account password login Z` stores `login` as
 ///   the password, `netrc.c:290-299`). Rejected — except `account`
 ///   itself, a real netrc keyword whose value is consumed and ignored.
+///
+/// Comment lines ARE oracle-parity, not a divergence: curl drops them
+/// at LOAD time in `file2memory` (`netrc.c:91-94`) — pass leading
+/// blanks, then `*line == '#'` drops the whole line — before the
+/// tokenizer ever sees them. "Blank" is `ISBLANK` = space or tab
+/// EXACTLY (`curl_ctype.h:45`), deliberately narrower than Unicode
+/// whitespace: a line led by VT/FF is NOT a comment to curl even if
+/// `#` follows, so it must not be one here either (it flows to the
+/// tokenizer, where the strict parser rejects the `#` token — curl
+/// would skip it; that residue is the registered unknown-token
+/// divergence above, not a comment-handling one).
 // r[impl fetcher.divergence.netrc-strict-parse]
 fn parse_netrc(contents: &str) -> anyhow::Result<Vec<NetrcEntry>> {
+    /// `file2memory`'s load-time comment test (`netrc.c:91-94`):
+    /// leading ISBLANK (space/tab ONLY, `curl_ctype.h:45`) passed,
+    /// then a `#` first byte drops the line.
+    fn is_comment_line(line: &str) -> bool {
+        line.trim_start_matches([' ', '\t']).starts_with('#')
+    }
     // Quote rejection applies in EVERY token position, value positions
     // included: the oracle would unquote `login "u"` to `u`, while a
     // whitespace tokenizer would store the quotes verbatim — a silent
@@ -1115,7 +1132,14 @@ fn parse_netrc(contents: &str) -> anyhow::Result<Vec<NetrcEntry>> {
         Ok(tok)
     }
     let mut entries: Vec<NetrcEntry> = Vec::new();
-    let mut tokens = contents.split_whitespace();
+    // One cursor over the comment-filtered lines: `flat_map` keeps a
+    // single token stream, so consume-on-key still means no token is
+    // ever scanned twice (the filter only removes whole lines the
+    // oracle never tokenizes either).
+    let mut tokens = contents
+        .lines()
+        .filter(|line| !is_comment_line(line))
+        .flat_map(str::split_whitespace);
     while let Some(tok) = tokens.next() {
         let tok = unquoted_keyword(tok)?;
         // Keyword recognition is case-insensitive like the oracle's
@@ -1483,6 +1507,54 @@ mod tests {
                 "{contents:?}: expected {needle:?} in {err:#}"
             );
         }
+    }
+
+    /// Comment lines are dropped at load like the oracle's
+    /// `file2memory` (`netrc.c:91-94`): bare `#`, space- and TAB-led
+    /// `#` lines vanish before tokenization — a comment-headed
+    /// operator netrc (the common documented form) parses instead of
+    /// bricking every fetchurl in the pool, and credential-shaped
+    /// text inside a comment never reaches the entry table.
+    // r[verify fetcher.divergence.netrc-strict-parse]
+    #[test]
+    fn netrc_comment_lines_are_skipped_at_load() {
+        let contents = "# operator notes: machine bogus.example login trap\n\
+                        \t # also a comment\n\
+                        machine a.example\n\
+                        login u\n\
+                        # password not-the-real-one\n\
+                        password p\n";
+        let entries = parse_netrc(contents).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "comment machine lines must not open entries"
+        );
+        assert_eq!(entries[0].machine.as_deref(), Some("a.example"));
+        assert_eq!(entries[0].login.as_deref(), Some("u"));
+        assert_eq!(
+            entries[0].password.as_deref(),
+            Some("p"),
+            "the commented `password` line must not override the real one"
+        );
+    }
+
+    /// ISBLANK counter-fixture: curl passes ONLY space/tab before the
+    /// `#` test (`curl_ctype.h:45`), so a VT-led `#` line is NOT a
+    /// comment to the oracle — and must not be one here. It flows to
+    /// the tokenizer, where the strict parser rejects the `#` token
+    /// (the registered unknown-token divergence; curl would skip it
+    /// one token at a time). A wider "trim all whitespace" comment
+    /// test would silently drop a line the oracle tokenizes.
+    // r[verify fetcher.divergence.netrc-strict-parse]
+    #[test]
+    fn netrc_vt_led_hash_line_is_not_a_comment() {
+        let err = parse_netrc("\u{0B}# machine a.example\nmachine b.example login u password p")
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unrecognized token"),
+            "VT-led `#` must reach the tokenizer and fail closed, not vanish: {err:#}"
+        );
     }
 
     /// The error-surface pin: a quoted CREDENTIAL is rejected without
