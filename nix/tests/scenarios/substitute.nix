@@ -621,9 +621,12 @@ let
             "grep -q 'claim released in place'",
             timeout=120,
         )
+        # bug_081: the abort is upstream-LOCAL now — the loop fails over
+        # ('trying next') instead of stopping; with no second upstream
+        # configured here the post-loop fold still surfaces Stalled.
         ${gatewayHost}.succeed(
             "journalctl -u rio-store --no-pager | "
-            "grep -q 'download stalled, stopping'"
+            "grep -q 'download stalled, trying next'"
         )
         assert_metric_exact(
             ${gatewayHost}, 9092,

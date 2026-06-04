@@ -135,7 +135,7 @@ const SUBSTITUTE_NAR_DECOMPRESSED_CAP: u64 = 64 * 1024;
 /// (one `SubstituteProgress` BuildEvent per callback, routed via the
 /// log broadcast ring so a Lagged drop is harmless).
 ///
-/// Test override mirrors [`SUBSTITUTE_NAR_DECOMPRESSED_CAP`]'s: the
+/// Test override mirrors `SUBSTITUTE_NAR_DECOMPRESSED_CAP`'s: the
 /// in-flight tick path (expected leading done — merged_bug_195's pin)
 /// must be exercisable under the 64 KiB test NAR cap.
 #[cfg(not(test))]
