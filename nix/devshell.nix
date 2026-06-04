@@ -804,6 +804,11 @@ let
       if [ "$RIO_STORE_COVERS_ROOT" = 1 ]; then
         # Exact-root/ancestor contract — see header. No stamp either:
         # there is no epoch boundary inside the configured store.
+        # Tombstones ARE still swept before exiting: .reap-* names are
+        # exclusively this script's own half-deleted-epoch debris
+        # (never user content), and skipping the sweep here would
+        # preserve them indefinitely for exact-root configs.
+        rm -rf -- "$root"/.reap-* 2>/dev/null || true
         echo "rio-kache-epoch-gc: RIO_KACHE_CACHE_DIR ($RIO_KACHE_CACHE_DIR) covers the epoch root ($root) — epoch pruning disabled while so configured; configure a subdirectory instead (e.g. $root/mystore)" >&2
         exit 0
       fi

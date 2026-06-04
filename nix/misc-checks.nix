@@ -1544,11 +1544,17 @@ in
     root=$HOME/.cache/rio-build/kache
     mkdir -p "$root/abcdefabcdef"
     touch -d '20 days ago' "$root/abcdefabcdef/.last-used"
+    # Pre-existing tombstone: must be swept even on the COVERS_ROOT
+    # path (kills the sweep line placed ABOVE the early exit —
+    # .reap-* names are exclusively the GC's own debris).
+    mkdir -p "$root/.reap-deadbeef0000.99"
     RIO_KACHE_CACHE_DIR="$root" "$gc" 2>"$TMPDIR/s8.err"
     grep -q 'covers the epoch root' "$TMPDIR/s8.err" \
       || { echo "FAIL S8: exact-root config did not warn" >&2; exit 1; }
     [ -d "$root/abcdefabcdef" ] \
       || { echo "FAIL S8: child epoch pruned under an exact-root config" >&2; exit 1; }
+    [ ! -e "$root/.reap-deadbeef0000.99" ] \
+      || { echo "FAIL S8: tombstone not swept under exact-root config" >&2; exit 1; }
     RIO_KACHE_CACHE_DIR="$HOME/.cache/rio-build" "$gc" 2>"$TMPDIR/s8b.err"
     grep -q 'covers the epoch root' "$TMPDIR/s8b.err" \
       || { echo "FAIL S8: ancestor config did not warn" >&2; exit 1; }
