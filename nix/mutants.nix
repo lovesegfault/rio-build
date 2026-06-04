@@ -168,7 +168,9 @@ let
           # dependents on each of cargo-mutants' per-mutation build+test
           # invocations (~2 x ~320 mutations, plus the whole-workspace
           # baseline) — pure waste in a sandbox with no rustc-wrapper
-          # cache, and 3 cargo:warning lines of spam per invocation.
+          # cache, and 6 cargo:warning lines of spam per invocation
+          # (2 per sqlx tracker: the once-per-script-run store-cost
+          # advisory + the degraded-state line).
           # Absolute on purpose: the tracker refuses relative paths.
           # Guarded on existence so it stays inert in mutants-smoke,
           # which stages no .sqlx and compiles no sqlx crate (rio-auth ->

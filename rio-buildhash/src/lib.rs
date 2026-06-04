@@ -30,6 +30,10 @@
 //!   values cannot survive);
 //! - crate2nix sandbox builds set it as a derivation env var pointing at
 //!   the `.sqlx` fileset (nix/crate2nix.nix `sqlxOffline`);
+//! - the cargo-mutants derivation exports it from its buildPhase once the
+//!   unpacked workspace's `$PWD` is known, guarded on `.sqlx` existing so
+//!   the mutants-smoke variant (which stages no `.sqlx` and compiles no
+//!   sqlx crate) stays inert (nix/mutants.nix);
 //! - the pre-commit `sqlx-prepare-check` re-pins it from its own toplevel.
 //!
 //! # Degraded states are unkeyed, never aliased
@@ -60,8 +64,8 @@
 //! emitted only when the tracked dir is provably the only cache the
 //! macros can read — when a fallthrough candidate (`<manifest>/.sqlx` or
 //! the workspace root's `.sqlx`) exists with diverging macro-visible
-//! content, the build is unkeyed exactly like the degraded arms (see
-//! `divergent_fallthrough`).
+//! content, or exists but cannot be verified, the build is unkeyed
+//! exactly like the degraded arms (see `divergent_fallthrough`).
 //!
 //! Hashing covers exactly the macro-visible sets — top-level
 //! `query-*.json` for the offline cache, top-level `<i64>_*.sql` for
@@ -81,7 +85,9 @@
 //! platforms, runs, and toolchains. It only needs to *change* when content
 //! changes; it is not a security boundary.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -93,10 +99,73 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// watch — keep the name obscure and do not create it.
 const ALWAYS_RERUN_SENTINEL: &str = ".rio-buildhash-always-rerun";
 
+/// Process-global latch for the store-cost advisory in [`unreplayable`]:
+/// one build-script run is one process, so the advisory prints at most
+/// once per script run even if a future script calls BOTH trackers (or
+/// hits unkeyed and churn in the same run).
+static ADVISORY_PRINTED: AtomicBool = AtomicBool::new(false);
+
 fn fnv1a(state: u64, bytes: &[u8]) -> u64 {
     bytes.iter().fold(state, |acc, b| {
         (acc ^ u64::from(*b)).wrapping_mul(FNV_PRIME)
     })
+}
+
+/// Cargo-directive emitter: every `cargo:` line this crate produces goes
+/// through one of these methods, so tests can assert exact emission per
+/// arm against a `Vec<u8>` and production code cannot fork the format.
+/// `advisory_printed` backs the once-per-run store-cost advisory in
+/// [`unreplayable`]; production uses the process-global
+/// [`ADVISORY_PRINTED`], tests pass a fresh `AtomicBool`.
+struct Emitter<'a, W: Write> {
+    out: W,
+    advisory_printed: &'a AtomicBool,
+}
+
+impl<W: Write> Emitter<'_, W> {
+    /// `cargo:rerun-if-env-changed=<var>`.
+    fn watch_env(&mut self, var: &str) {
+        self.line(format_args!("cargo:rerun-if-env-changed={var}"));
+    }
+
+    /// `cargo:rerun-if-changed=<path>`.
+    fn watch(&mut self, path: &Path) {
+        self.line(format_args!("cargo:rerun-if-changed={}", path.display()));
+    }
+
+    /// Watch a never-existing path: cargo re-runs the script on EVERY
+    /// build (verified primitive — `stale: missing <path>` in cargo's
+    /// fingerprint log). Emitting a different `rustc-env` value alone
+    /// does NOT re-run a script, so this is the only way a
+    /// degraded/churned state can heal on the next build.
+    fn always_rerun(&mut self) {
+        self.line(format_args!(
+            "cargo:rerun-if-changed={ALWAYS_RERUN_SENTINEL}"
+        ));
+    }
+
+    /// `cargo:warning=rio-buildhash: <msg>`.
+    fn warning(&mut self, msg: &str) {
+        self.line(format_args!("cargo:warning=rio-buildhash: {msg}"));
+    }
+
+    /// `cargo:rustc-env=<name>=<value>`.
+    fn rustc_env(&mut self, name: &str, value: &str) {
+        self.line(format_args!("cargo:rustc-env={name}={value}"));
+    }
+
+    fn line(&mut self, args: std::fmt::Arguments<'_>) {
+        writeln!(self.out, "{args}").expect("rio-buildhash: writing a cargo directive failed");
+    }
+}
+
+/// Production emitter: locked stdout (the cargo directive channel) plus
+/// the process-global advisory latch.
+fn stdout_emitter() -> Emitter<'static, std::io::StdoutLock<'static>> {
+    Emitter {
+        out: std::io::stdout().lock(),
+        advisory_printed: &ADVISORY_PRINTED,
+    }
 }
 
 /// Track the sqlx offline query cache as the `RIO_SQLX_HASH` env-dep.
@@ -106,33 +175,42 @@ fn fnv1a(state: u64, bytes: &[u8]) -> u64 {
 /// (`const _: &str = env!("RIO_SQLX_HASH");`) or no env-dep is recorded
 /// and the tracking silently does nothing.
 pub fn track_sqlx() {
-    println!("cargo:rerun-if-env-changed=SQLX_OFFLINE_DIR");
+    let mut em = stdout_emitter();
+    em.watch_env("SQLX_OFFLINE_DIR");
     let value = match sqlx_resolution(std::env::var_os("SQLX_OFFLINE_DIR").map(PathBuf::from)) {
         SqlxResolution::Untracked => unkeyed(
+            &mut em,
             "SQLX_OFFLINE_DIR unset — the sqlx macros may still find a cache via their own \
              discovery, so this build is keyed uniquely (uncacheable); build inside the dev \
              shell or a nix sandbox for keyed builds",
         ),
         SqlxResolution::EmptyValue => unkeyed(
+            &mut em,
             "SQLX_OFFLINE_DIR is set but empty — the sqlx macros fall through to their own \
              discovery; keying this build uniquely (uncacheable); unset it or point it at \
              the real .sqlx",
         ),
-        SqlxResolution::NonAbsolute(dir) => unkeyed(&format!(
-            "refusing relative SQLX_OFFLINE_DIR ({}) — the build script resolves it against \
-             the package dir but sqlx-macros resolve it inside rustc against the workspace \
-             root; keying this build uniquely (uncacheable); set an absolute path",
-            dir.display()
-        )),
-        SqlxResolution::Absent(dir) => unkeyed(&format!(
-            "SQLX_OFFLINE_DIR={} is not a directory — the sqlx macros fall through to their \
-             own discovery and may still compile, so this build is keyed uniquely \
-             (uncacheable); fix the variable (a dangling export from a removed worktree?) \
-             or restore the cache (git checkout -- .sqlx)",
-            dir.display()
-        )),
+        SqlxResolution::NonAbsolute(dir) => unkeyed(
+            &mut em,
+            &format!(
+                "refusing relative SQLX_OFFLINE_DIR ({}) — the build script resolves it against \
+                 the package dir but sqlx-macros resolve it inside rustc against the workspace \
+                 root; keying this build uniquely (uncacheable); set an absolute path",
+                dir.display()
+            ),
+        ),
+        SqlxResolution::Absent(dir) => unkeyed(
+            &mut em,
+            &format!(
+                "SQLX_OFFLINE_DIR={} is not a directory — the sqlx macros fall through to their \
+                 own discovery and may still compile, so this build is keyed uniquely \
+                 (uncacheable); fix the variable (a dangling export from a removed worktree?) \
+                 or restore the cache (git checkout -- .sqlx)",
+                dir.display()
+            ),
+        ),
         SqlxResolution::Track(dir) => {
-            println!("cargo:rerun-if-changed={}", dir.display());
+            em.watch(&dir);
             // Package root, the same assumption track_migrations relies
             // on for its cwd fallback: cargo and buildRustCrate both set
             // CARGO_MANIFEST_DIR and run the script from the package dir.
@@ -140,23 +218,10 @@ pub fn track_sqlx() {
                 .map(PathBuf::from)
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_default();
-            match divergent_fallthrough(&dir, &manifest_dir) {
-                Some(twin) => unkeyed(&format!(
-                    "SQLX_OFFLINE_DIR={} diverges from the fallthrough cache at {} — \
-                     sqlx-macros resolve each query-<hash>.json independently \
-                     (find-first-existing), so a json missing under the tracked dir \
-                     silently loads from the fallthrough copy this hash never saw; \
-                     keying this build uniquely (uncacheable); re-point \
-                     SQLX_OFFLINE_DIR at the cache you mean, or remove the divergent \
-                     copy",
-                    dir.display(),
-                    twin.display()
-                )),
-                None => settled_hash(&dir, is_sqlx_query_file),
-            }
+            tracked_value(&mut em, &dir, &manifest_dir)
         }
     };
-    println!("cargo:rustc-env=RIO_SQLX_HASH={value}");
+    em.rustc_env("RIO_SQLX_HASH", &value);
 }
 
 /// Track the crate's `migrations/` directory (top-level `<i64>_*.sql`,
@@ -173,11 +238,10 @@ pub fn track_migrations() {
         "rio-buildhash: migrations/ missing next to {}",
         std::env::current_dir().unwrap_or_default().display(),
     );
-    println!("cargo:rerun-if-changed={}", dir.display());
-    println!(
-        "cargo:rustc-env=RIO_MIGRATIONS_HASH={}",
-        settled_hash(dir, is_migration_file)
-    );
+    let mut em = stdout_emitter();
+    em.watch(dir);
+    let value = settled_hash(&mut em, dir, is_migration_file);
+    em.rustc_env("RIO_MIGRATIONS_HASH", &value);
 }
 
 /// Where the sqlx offline cache is, per the `SQLX_OFFLINE_DIR` contract.
@@ -208,9 +272,71 @@ fn sqlx_resolution(var: Option<PathBuf>) -> SqlxResolution {
     }
 }
 
-/// A fallthrough `.sqlx` candidate that exists, is not the tracked dir,
-/// and whose macro-visible content differs from it — `Some(path)` means
-/// the Track arm must NOT emit a replayable key.
+/// The Track arm's value: route the fallthrough verdict to the settled
+/// hash (threading the comparison snapshot into the three-way check) or
+/// to the matching unkeyed diagnosis. Extracted from [`track_sqlx`] so
+/// tests can drive verdict→emission against a captured buffer.
+fn tracked_value<W: Write>(em: &mut Emitter<'_, W>, dir: &Path, manifest_dir: &Path) -> String {
+    match divergent_fallthrough(em, dir, manifest_dir) {
+        FallthroughVerdict::Divergent(twin) => unkeyed(
+            em,
+            &format!(
+                "SQLX_OFFLINE_DIR={} diverges from the fallthrough cache at {} — \
+                 sqlx-macros resolve each query-<hash>.json independently \
+                 (find-first-existing), so a json missing under the tracked dir \
+                 silently loads from the fallthrough copy this hash never saw; \
+                 keying this build uniquely (uncacheable); re-point \
+                 SQLX_OFFLINE_DIR at the cache you mean, or remove the divergent \
+                 copy",
+                dir.display(),
+                twin.display()
+            ),
+        ),
+        FallthroughVerdict::ProbeError(path, err) => unkeyed(
+            em,
+            &format!(
+                "could not verify the fallthrough cache at {}: {err} — sqlx-macros \
+                 resolve each query-<hash>.json independently and may still read \
+                 from it, so a replayable key cannot claim to cover it; keying \
+                 this build uniquely (uncacheable); fix the path's permissions or \
+                 remove it",
+                path.display()
+            ),
+        ),
+        FallthroughVerdict::Benign(prior) => {
+            settled_hash_against(em, dir, is_sqlx_query_file, prior.as_ref())
+        }
+    }
+}
+
+/// What the fallthrough probe concluded about the Track arm's right to
+/// emit a replayable key.
+///
+/// Policy is by ROLE, not by error site: the TRACKED dir is an input the
+/// build NEEDS — environmental failure there stays a loud deterministic
+/// panic (via [`hash_matching_files`]). A fallthrough CANDIDATE is an
+/// input the build does not need but cannot rule out — any probe failure
+/// there degrades to an unkeyed build with a could-not-verify diagnosis:
+/// never a panic, and never the content-divergence wording (an error is
+/// a failed observation, not evidence of divergence).
+#[derive(Debug)]
+enum FallthroughVerdict {
+    /// No surviving foreign candidate diverges. Carries the tracked
+    /// snapshot hashed during candidate comparison (`None` when no
+    /// comparison happened) so [`settled_hash_against`] can require
+    /// three-way agreement — the settled hash must describe the same
+    /// tracked state the benign verdict was computed against.
+    Benign(Option<DirHash>),
+    /// A foreign candidate exists with diverging macro-visible content.
+    Divergent(PathBuf),
+    /// A candidate exists (or appears to) but could not be verified:
+    /// canonicalize or hashing failed at the carried path with the
+    /// carried error.
+    ProbeError(PathBuf, std::io::Error),
+}
+
+/// Probe the fallthrough `.sqlx` candidates and decide whether the Track
+/// arm may emit a replayable key (see [`FallthroughVerdict`]).
 ///
 /// Why: sqlx-macros-core 0.9.0 resolves the offline cache PER QUERY at
 /// the FILE level — `src/query/mod.rs:97-101` builds the candidate list
@@ -237,85 +363,148 @@ fn sqlx_resolution(var: Option<PathBuf>) -> SqlxResolution {
 /// member dirs (never under `fuzz/<ws>/`) in the dev shell, and isolated
 /// single-crate sources in the sandbox.
 ///
+/// Watch rule, by construction: a candidate that EXISTS in any form is
+/// watched at its LEXICAL spelling (single emission point, before any
+/// verdict); a NotFound candidate is NEVER watched — cargo treats a
+/// missing watched path as always-stale, and `<manifest>/.sqlx` never
+/// exists in the dev shell, so watching it would force a rebuild on
+/// every build. The lexical (not canonical) path keeps the watch alive
+/// through the same-dir and non-dir skip arms, so a candidate later
+/// replaced by a real cache dir, or a candidate symlink repointed at a
+/// foreign tree, re-fires this script via the path's followed mtime. In
+/// the dev shell this watches `<manifest>/../.sqlx` — a second lexical
+/// spelling of the already-watched tracked dir; harmless, cargo stats
+/// each watched path independently.
+///
 /// Per candidate: canonicalize NotFound => skip (an absent dir serves no
-/// file — sqlx's `exists()` runs on the joined FILE path);
-/// canonicalize-equal to the tracked dir => skip (it IS the tracked dir,
-/// the devshell shape; canonical comparison is robust to symlinks);
-/// non-directory => skip (nothing joins under it); any other probe
-/// error => divergent (never claim replayability on a partial
-/// observation). A surviving foreign candidate is watched with
-/// `rerun-if-changed` (a later edit to it must re-run this script —
-/// cargo re-runs only on watched-path/env changes, never on emitted env
-/// VALUES) and compared by macro-visible content hash: both passes
-/// `Hash` and equal => benign (identical bytes cannot leak anything the
-/// tracked hash does not cover); anything else => divergent. Whole-set
-/// equality deliberately over-fires when the divergence is confined to
-/// files the tracked dir also contains (per-query masking means those
-/// bytes cannot leak) — precision there would only buy cacheability
-/// inside an already-misconfigured state, and the over-fire is loud and
-/// self-heals once the twin is removed.
+/// file — sqlx's `exists()` runs on the joined FILE path); any other
+/// canonicalize error (ELOOP self-loop, EACCES on an unsearchable
+/// parent) => `ProbeError`; canonicalize-equal to the tracked dir =>
+/// skip (it IS the tracked dir, the devshell shape; canonical comparison
+/// is robust to symlinks); non-directory => skip (nothing joins under
+/// it). A surviving foreign candidate is compared by macro-visible
+/// content hash against the tracked snapshot — hashed lazily AT MOST
+/// ONCE per run via the panicking wrapper (tracked-side environmental
+/// failure stays loud). The candidate side uses the non-panicking core:
+/// hash error => `ProbeError`; `DirVanished` => skip (the same fact the
+/// NotFound arm observes, just later — the already-emitted watch on a
+/// now-missing path costs exactly one extra re-run, after which
+/// canonicalize reports NotFound and the watch is no longer emitted);
+/// `FileVanished` => `ProbeError` (a dangling entry in the CANDIDATE is
+/// a failed observation, not content divergence). When the TRACKED
+/// snapshot itself is non-`Hash` (the tracked dir is churning or has a
+/// dangling entry), comparison is skipped for this and all remaining
+/// candidates — they still get watches — and the snapshot flows out in
+/// `Benign` so the three-way settled check routes to churn with correct
+/// attribution (the persistent-dangling diagnostic then names the
+/// tracked entry, not the candidate). Both hashes settled and equal =>
+/// benign (identical bytes cannot leak anything the tracked hash does
+/// not cover); settled and unequal => `Divergent`. Whole-set equality
+/// deliberately over-fires when the divergence is confined to files the
+/// tracked dir also contains (per-query masking means those bytes cannot
+/// leak) — precision there would only buy cacheability inside an
+/// already-misconfigured state, and the over-fire is loud and self-heals
+/// once the twin is removed.
 ///
-/// Returns `None` when `tracked` itself fails to canonicalize (vanished
-/// after the `is_dir` check) — `settled_hash`'s double-pass then reports
-/// the vanish with the churn wording.
+/// Returns `Benign(None)` when `tracked` itself fails to canonicalize
+/// (vanished after the `is_dir` check) — `settled_hash_against`'s double
+/// pass then reports the vanish with the churn wording.
 ///
-/// Accepted residual: a twin CREATED after a settled compile is unseen
+/// Accepted residuals: a twin CREATED after a settled compile is unseen
 /// until a watched input changes — watching a not-yet-existing path IS
 /// the always-stale primitive (`ALWAYS_RERUN_SENTINEL`) and would defeat
-/// caching entirely. Same residual class as the in-rustc re-read window
-/// in the module docs; the motivating stale-sibling case has the twin
-/// existing at script time and is caught.
-fn divergent_fallthrough(tracked: &Path, manifest_dir: &Path) -> Option<PathBuf> {
+/// caching entirely; the motivating stale-sibling case has the twin
+/// existing at script time and is caught. Symlink-repoint coverage of
+/// the lexical watches is PARTIAL under cargo's followed-mtime
+/// semantics: repointing a candidate symlink at a tree whose mtime is
+/// older than the script stamp does not re-fire — not closable without
+/// that same always-stale watch. A `Divergent`/`ProbeError` early return
+/// skips watching any LATER candidate that run; healing relies on the
+/// always-rerun sentinel the unkeyed arm emits (one-build latency).
+fn divergent_fallthrough<W: Write>(
+    em: &mut Emitter<'_, W>,
+    tracked: &Path,
+    manifest_dir: &Path,
+) -> FallthroughVerdict {
     let tracked_canon = match tracked.canonicalize() {
         Ok(canon) => canon,
-        Err(_) => return None,
+        Err(_) => return FallthroughVerdict::Benign(None),
     };
     let candidates = [
         manifest_dir.join(".sqlx"),
         manifest_dir.join("..").join(".sqlx"),
     ];
+    let mut snapshot: Option<DirHash> = None;
     for candidate in candidates {
-        let canon = match candidate.canonicalize() {
+        let canon_result = candidate.canonicalize();
+        if matches!(&canon_result, Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+            // NEVER watch a missing candidate (see the watch rule above).
+            continue;
+        }
+        // The candidate exists in some form: the single watch-emission
+        // point, lexical spelling, before any verdict.
+        em.watch(&candidate);
+        let canon = match canon_result {
             Ok(canon) => canon,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Some(candidate),
+            Err(e) => return FallthroughVerdict::ProbeError(candidate, e),
         };
         if canon == tracked_canon || !canon.is_dir() {
             continue;
         }
-        println!("cargo:rerun-if-changed={}", canon.display());
-        let tracked_hash = hash_matching_files(tracked, is_sqlx_query_file);
-        let candidate_hash = hash_matching_files(&canon, is_sqlx_query_file);
-        match (tracked_hash, candidate_hash) {
-            (DirHash::Hash(a), DirHash::Hash(b)) if a == b => {}
-            _ => return Some(canon),
+        let prior =
+            snapshot.get_or_insert_with(|| hash_matching_files(tracked, is_sqlx_query_file));
+        let DirHash::Hash(tracked_hash) = prior else {
+            // Tracked dir churning or dangling: no comparison against it
+            // is meaningful. Keep watching the remaining candidates and
+            // let the three-way settled check route to churn.
+            continue;
+        };
+        match try_hash_matching_files(&canon, is_sqlx_query_file) {
+            Err(e) => return FallthroughVerdict::ProbeError(canon, e),
+            Ok(DirHash::DirVanished) => continue,
+            Ok(DirHash::FileVanished(path)) => {
+                return FallthroughVerdict::ProbeError(
+                    path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "listed but unreadable (broken symlink?)",
+                    ),
+                );
+            }
+            Ok(DirHash::Hash(candidate_hash)) => {
+                if *tracked_hash != candidate_hash {
+                    return FallthroughVerdict::Divergent(canon);
+                }
+            }
         }
     }
-    None
+    FallthroughVerdict::Benign(snapshot)
 }
 
 /// Degraded-state emission: warn, force a re-run on every build, and key
 /// this build with a value nothing can ever replay. See the module docs
 /// for why degraded states must be unkeyed rather than pinned to a
 /// constant sentinel.
-fn unkeyed(why: &str) -> String {
-    println!(
-        "cargo:warning=rio-buildhash: builds in this state are uncacheable but still \
-         written to the kache store under never-replayable keys — for prolonged \
-         sessions in this state, set KACHE_DISABLED=1"
-    );
-    println!("cargo:warning=rio-buildhash: {why}");
-    emit_always_rerun();
-    unique_value("unkeyed")
+fn unkeyed<W: Write>(em: &mut Emitter<'_, W>, why: &str) -> String {
+    unreplayable(em, "unkeyed", why)
 }
 
-/// Watch a never-existing path: cargo re-runs the script on EVERY build
-/// (verified primitive — `stale: missing <path>` in cargo's fingerprint
-/// log). Emitting a different `rustc-env` value alone does NOT re-run a
-/// script, so this is the only way a degraded/churned state can heal on
-/// the next build.
-fn emit_always_rerun() {
-    println!("cargo:rerun-if-changed={ALWAYS_RERUN_SENTINEL}");
+/// The single unique-key emitter: every state that must not be replayable
+/// — the degraded arms ([`unkeyed`]) and the settled churn arm — routes
+/// through here. Emits the store-cost advisory at most once per
+/// build-script run (the `advisory_printed` latch), the state-specific
+/// warning, the always-stale watch, and returns a per-run-unique value.
+fn unreplayable<W: Write>(em: &mut Emitter<'_, W>, prefix: &str, why: &str) -> String {
+    if !em.advisory_printed.swap(true, Ordering::Relaxed) {
+        em.warning(
+            "builds in this state are uncacheable but still written to the kache store \
+             under never-replayable keys — for prolonged sessions in this state, set \
+             KACHE_DISABLED=1",
+        );
+    }
+    em.warning(why);
+    em.always_rerun();
+    unique_value(prefix)
 }
 
 /// A value that is unique per build-script run: wall-clock nanos plus OS
@@ -362,37 +551,56 @@ enum DirHash {
     FileVanished(PathBuf),
 }
 
-/// Hash the matching set twice; any disagreement, vanish, or partial read
-/// is churn: warn, force a re-run next build, and key this build uniquely
-/// (it can never be replayed; the next build re-hashes the settled state
-/// because of the always-stale watch — NOT because the env value changed,
-/// which cargo ignores).
-fn settled_hash(dir: &Path, pred: fn(&str) -> bool) -> String {
+/// [`settled_hash_against`] with no fallthrough-comparison snapshot — the
+/// migrations tracker and every shape where no candidate survived.
+fn settled_hash<W: Write>(em: &mut Emitter<'_, W>, dir: &Path, pred: fn(&str) -> bool) -> String {
+    settled_hash_against(em, dir, pred, None)
+}
+
+/// Hash the matching set twice; emit the hash only on three-way
+/// agreement: both passes `Hash` and equal, AND equal to `prior` when the
+/// fallthrough comparison took a snapshot (the benign verdict described
+/// THAT tracked state — a settled hash differing from it would be a
+/// replayable key the comparison never vouched for). Any disagreement,
+/// vanish, or partial read is churn: warn, force a re-run next build, and
+/// key this build uniquely (it can never be replayed; the next build
+/// re-hashes the settled state because of the always-stale watch — NOT
+/// because the env value changed, which cargo ignores).
+fn settled_hash_against<W: Write>(
+    em: &mut Emitter<'_, W>,
+    dir: &Path,
+    pred: fn(&str) -> bool,
+    prior: Option<&DirHash>,
+) -> String {
     let first = hash_matching_files(dir, pred);
     let second = hash_matching_files(dir, pred);
     match (first, second) {
-        (DirHash::Hash(a), DirHash::Hash(b)) if a == b => a,
+        (DirHash::Hash(a), DirHash::Hash(b))
+            if a == b && prior.is_none_or(|p| matches!(p, DirHash::Hash(h) if *h == a)) =>
+        {
+            a
+        }
         (first, second) => {
-            println!(
-                "cargo:warning=rio-buildhash: {}",
-                churn_warning(dir, &first, &second)
-            );
-            emit_always_rerun();
-            unique_value("churn")
+            let why = churn_warning(dir, prior, &first, &second);
+            unreplayable(em, "churn", &why)
         }
     }
 }
 
-/// Diagnostic for a double-pass disagreement. BOTH passes failing on the
-/// SAME listed-but-unreadable path is not transient churn: only
-/// `ErrorKind::NotFound` reaches `FileVanished` (other read errors panic
-/// in `hash_matching_files`, so "permission denied" is never this arm),
-/// and a NotFound that holds across two passes is a persistent dangling
-/// entry — typically a broken symlink. The transient wording's "the next
-/// build re-hashes the settled state" would be a misdiagnosis there:
-/// nothing settles until the entry is removed. Every other combination
-/// keeps the transient-churn wording.
-fn churn_warning(dir: &Path, first: &DirHash, second: &DirHash) -> String {
+/// Diagnostic for a settling disagreement (callers: [`settled_hash_against`]
+/// from both trackers' settle paths). BOTH passes failing on the SAME
+/// listed-but-unreadable path is not transient churn: only
+/// `ErrorKind::NotFound` reaches `FileVanished` (other read errors are
+/// `Err` in `try_hash_matching_files` — the tracked-dir wrapper panics on
+/// them, so "permission denied" is never this arm), and a NotFound that
+/// holds across two passes is a persistent dangling entry — typically a
+/// broken symlink. The transient wording's "the next build re-hashes the
+/// settled state" would be a misdiagnosis there: nothing settles until
+/// the entry is removed. Passes that AGREE but contradict the
+/// fallthrough-comparison snapshot are the compare-then-settle window —
+/// named as such, since "changed while hashing" would point at the wrong
+/// window. Every other combination keeps the transient-churn wording.
+fn churn_warning(dir: &Path, prior: Option<&DirHash>, first: &DirHash, second: &DirHash) -> String {
     match (first, second) {
         (DirHash::FileVanished(a), DirHash::FileVanished(b)) if a == b => format!(
             "{} is listed but absent on read in both hashing passes — a persistent \
@@ -400,6 +608,16 @@ fn churn_warning(dir: &Path, first: &DirHash, second: &DirHash) -> String {
              uniquely (uncacheable) on every build until the entry is removed",
             a.display()
         ),
+        (DirHash::Hash(a), DirHash::Hash(b))
+            if a == b && prior.is_some_and(|p| !matches!(p, DirHash::Hash(h) if h == a)) =>
+        {
+            format!(
+                "{} changed between the fallthrough comparison and settling — keying \
+                 this build uniquely (uncacheable); the next build re-hashes the \
+                 settled state",
+                dir.display()
+            )
+        }
         _ => format!(
             "{} changed while hashing — keying this build uniquely (uncacheable); the \
              next build re-hashes the settled state",
@@ -413,29 +631,42 @@ fn churn_warning(dir: &Path, first: &DirHash, second: &DirHash) -> String {
 /// non-matching files.
 ///
 /// Error policy: a directory or listed file vanishing mid-pass returns the
-/// corresponding variant (the caller treats it as churn — a hash over a
-/// partially-read set would alias the legitimate hash of a smaller set and
-/// replay a stale artifact with zero diagnostics). Per-entry iterator
-/// errors and non-NotFound read errors PANIC: they are environmental
-/// failures, not races, and must stay loud.
-fn hash_matching_files(dir: &Path, pred: fn(&str) -> bool) -> DirHash {
+/// corresponding `Ok` variant (the caller treats it as churn — a hash over
+/// a partially-read set would alias the legitimate hash of a smaller set
+/// and replay a stale artifact with zero diagnostics). Every other probe
+/// failure — `read_dir` on an existing-but-unreadable dir, a per-entry
+/// iterator error, a non-NotFound read — is `Err`, with the failing op and
+/// path in the message and the original `ErrorKind` preserved for the
+/// caller's taxonomy. POLICY LIVES IN THE CALLERS: the tracked dir goes
+/// through the panicking wrapper [`hash_matching_files`]; fallthrough
+/// candidates call this directly and degrade to
+/// [`FallthroughVerdict::ProbeError`].
+fn try_hash_matching_files(dir: &Path, pred: fn(&str) -> bool) -> Result<DirHash, std::io::Error> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DirHash::DirVanished,
-        Err(e) => panic!("rio-buildhash: read_dir({}) failed: {e}", dir.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(DirHash::DirVanished),
+        Err(e) => {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("read_dir({}) failed: {e}", dir.display()),
+            ));
+        }
     };
-    let mut names: Vec<String> = entries
-        .filter_map(|entry| {
-            let entry = entry.unwrap_or_else(|e| {
-                panic!(
-                    "rio-buildhash: dir entry under {} failed: {e}",
-                    dir.display()
-                )
-            });
-            let name = entry.file_name().into_string().ok()?;
-            (pred(&name) && !entry.path().is_dir()).then_some(name)
-        })
-        .collect();
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("dir entry under {} failed: {e}", dir.display()),
+            )
+        })?;
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if pred(&name) && !entry.path().is_dir() {
+            names.push(name);
+        }
+    }
     names.sort();
 
     let mut state = FNV_OFFSET;
@@ -449,9 +680,14 @@ fn hash_matching_files(dir: &Path, pred: fn(&str) -> bool) -> DirHash {
             // dangling entry (same path both passes) from transient
             // churn.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return DirHash::FileVanished(path);
+                return Ok(DirHash::FileVanished(path));
             }
-            Err(e) => panic!("rio-buildhash: read({}) failed: {e}", path.display()),
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("read({}) failed: {e}", path.display()),
+                ));
+            }
         };
         state = fnv1a(state, name.as_bytes());
         // Separator that cannot appear in UTF-8 name bytes, so
@@ -460,23 +696,47 @@ fn hash_matching_files(dir: &Path, pred: fn(&str) -> bool) -> DirHash {
         state = fnv1a(state, &(contents.len() as u64).to_le_bytes());
         state = fnv1a(state, &contents);
     }
-    DirHash::Hash(format!("{state:016x}"))
+    Ok(DirHash::Hash(format!("{state:016x}")))
+}
+
+/// Tracked-dir policy wrapper over [`try_hash_matching_files`]:
+/// environmental failure on an input the build NEEDS (the tracked sqlx
+/// cache, `migrations/`) stays a loud deterministic panic, with the
+/// failing op, path, and errno preserved in the message.
+fn hash_matching_files(dir: &Path, pred: fn(&str) -> bool) -> DirHash {
+    try_hash_matching_files(dir, pred)
+        .unwrap_or_else(|e| panic!("rio-buildhash: hashing {} failed: {e}", dir.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DirHash, SqlxResolution, churn_warning, divergent_fallthrough, hash_matching_files,
-        is_migration_file, is_sqlx_query_file, settled_hash, sqlx_resolution, unique_value,
+        DirHash, Emitter, FallthroughVerdict, SqlxResolution, churn_warning, divergent_fallthrough,
+        hash_matching_files, is_migration_file, is_sqlx_query_file, settled_hash,
+        settled_hash_against, sqlx_resolution, tracked_value, try_hash_matching_files,
+        unique_value, unkeyed,
     };
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicBool;
 
-    fn sqlx_hash(dir: &std::path::Path) -> String {
+    fn sqlx_hash(dir: &Path) -> String {
         match hash_matching_files(dir, is_sqlx_query_file) {
             DirHash::Hash(h) => h,
             other => panic!("expected settled hash, got {other:?}"),
         }
+    }
+
+    /// Buffer-backed emitter for asserting exact directive emission.
+    fn capture(flag: &AtomicBool) -> Emitter<'_, Vec<u8>> {
+        Emitter {
+            out: Vec::new(),
+            advisory_printed: flag,
+        }
+    }
+
+    fn output(em: Emitter<'_, Vec<u8>>) -> String {
+        String::from_utf8(em.out).expect("utf8 directives")
     }
 
     fn setup() -> tempfile::TempDir {
@@ -486,14 +746,52 @@ mod tests {
         dir
     }
 
+    /// chmod `dir` to 0o000 and hand back a guard restoring 0o755 on drop
+    /// (BEFORE the TempDir drops, so cleanup never leaks). Returns `None`
+    /// — after restoring — when the kernel does not enforce the mode
+    /// (root / CAP_DAC_OVERRIDE), so callers can skip gracefully.
+    struct ModeGuard(PathBuf);
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+    fn deny_all(dir: &Path) -> Option<ModeGuard> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let guard = ModeGuard(dir.to_path_buf());
+        if fs::read_dir(dir).is_ok() {
+            return None; // not enforced; guard drop restores the mode
+        }
+        Some(guard)
+    }
+
     #[test]
     fn stable_across_calls() {
         let dir = setup();
         assert_eq!(sqlx_hash(dir.path()), sqlx_hash(dir.path()));
         // And the settled (double-pass) wrapper agrees on a quiet dir.
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
         assert_eq!(
-            settled_hash(dir.path(), is_sqlx_query_file),
+            settled_hash(&mut em, dir.path(), is_sqlx_query_file),
             sqlx_hash(dir.path())
+        );
+        assert!(em.out.is_empty(), "a quiet settle emits no directives");
+    }
+
+    #[test]
+    fn hash_value_pinned_canary() {
+        // Structural guard on the FNV accumulation: this literal was
+        // computed by the PRE-refactor hash_matching_files over this
+        // exact fixture (the `setup()` files). If it moves, every settled
+        // key in every kache store shifts — that is a cache-wide
+        // invalidation, not a refactor.
+        let dir = setup();
+        assert_eq!(
+            hash_matching_files(dir.path(), is_sqlx_query_file),
+            DirHash::Hash("f63e7c0a1d10f318".into())
         );
     }
 
@@ -566,6 +864,64 @@ mod tests {
     }
 
     #[test]
+    fn try_hash_missing_dir_is_dir_vanished() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            try_hash_matching_files(&root.path().join("gone"), is_sqlx_query_file).unwrap(),
+            DirHash::DirVanished
+        );
+    }
+
+    #[test]
+    fn try_hash_dangling_entry_is_file_vanished() {
+        let dir = setup();
+        let dangling = dir.path().join("query-dd.json");
+        std::os::unix::fs::symlink("nonexistent", &dangling).unwrap();
+        assert_eq!(
+            try_hash_matching_files(dir.path(), is_sqlx_query_file).unwrap(),
+            DirHash::FileVanished(dangling)
+        );
+    }
+
+    #[test]
+    fn try_hash_unreadable_dir_is_err_with_context() {
+        let dir = setup();
+        let Some(_guard) = deny_all(dir.path()) else {
+            eprintln!("skipping: directory permissions not enforced (root or CAP_DAC_OVERRIDE)");
+            return;
+        };
+        let err = try_hash_matching_files(dir.path(), is_sqlx_query_file).unwrap_err();
+        // Kind survives for the caller's taxonomy; op + path survive for
+        // the diagnostic.
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        let msg = err.to_string();
+        assert!(msg.contains("read_dir("), "{msg}");
+        assert!(msg.contains(&dir.path().display().to_string()), "{msg}");
+    }
+
+    #[test]
+    fn tracked_policy_wrapper_panics_loud() {
+        let dir = setup();
+        let shown = dir.path().display().to_string();
+        let Some(_guard) = deny_all(dir.path()) else {
+            eprintln!("skipping: directory permissions not enforced (root or CAP_DAC_OVERRIDE)");
+            return;
+        };
+        let path = dir.path().to_path_buf();
+        let payload =
+            std::panic::catch_unwind(move || hash_matching_files(&path, is_sqlx_query_file))
+                .expect_err("tracked-dir policy must stay a loud panic");
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_else(|| "non-string panic payload".into());
+        assert!(msg.contains("rio-buildhash: hashing"), "{msg}");
+        assert!(msg.contains("read_dir("), "{msg}");
+        assert!(msg.contains(&shown), "{msg}");
+        assert!(msg.contains("Permission denied"), "{msg}");
+    }
+
+    #[test]
     fn vanished_file_routes_to_churn() {
         // A listed-but-unreadable file (dangling symlink stands in for the
         // delete-between-list-and-read race) must NOT silently alias the
@@ -578,10 +934,15 @@ mod tests {
             hash_matching_files(dir.path(), is_sqlx_query_file),
             DirHash::FileVanished(dir.path().join("query-dd.json"))
         );
-        let churned = settled_hash(dir.path(), is_sqlx_query_file);
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let churned = settled_hash(&mut em, dir.path(), is_sqlx_query_file);
         assert!(churned.starts_with("churn-"), "{churned}");
         // And it is unique per call, never replayable.
-        assert_ne!(churned, settled_hash(dir.path(), is_sqlx_query_file));
+        assert_ne!(
+            churned,
+            settled_hash(&mut em, dir.path(), is_sqlx_query_file)
+        );
     }
 
     #[test]
@@ -590,6 +951,7 @@ mod tests {
         let gone = dir.join("query-dd.json");
         let msg = churn_warning(
             &dir,
+            None,
             &DirHash::FileVanished(gone.clone()),
             &DirHash::FileVanished(gone.clone()),
         );
@@ -620,11 +982,38 @@ mod tests {
             // Whole directory vanished.
             (DirHash::DirVanished, DirHash::DirVanished),
         ] {
-            let msg = churn_warning(&dir, &first, &second);
+            let msg = churn_warning(&dir, None, &first, &second);
             assert!(msg.contains("changed while hashing"), "{msg}");
             assert!(msg.contains("/cache/.sqlx"), "{msg}");
             assert!(!msg.contains("persistent"), "{msg}");
         }
+    }
+
+    #[test]
+    fn churn_warning_prior_mismatch_names_the_window() {
+        let dir = PathBuf::from("/cache/.sqlx");
+        // Passes agree with each other but contradict the snapshot the
+        // fallthrough comparison was benign against.
+        let msg = churn_warning(
+            &dir,
+            Some(&DirHash::Hash("aaaa".into())),
+            &DirHash::Hash("bbbb".into()),
+            &DirHash::Hash("bbbb".into()),
+        );
+        assert!(
+            msg.contains("changed between the fallthrough comparison and settling"),
+            "{msg}"
+        );
+        assert!(msg.contains("/cache/.sqlx"), "{msg}");
+        assert!(!msg.contains("changed while hashing"), "{msg}");
+        // Pass disagreement stays the transient wording even with a prior.
+        let transient = churn_warning(
+            &dir,
+            Some(&DirHash::Hash("bbbb".into())),
+            &DirHash::Hash("bbbb".into()),
+            &DirHash::Hash("cccc".into()),
+        );
+        assert!(transient.contains("changed while hashing"), "{transient}");
     }
 
     #[test]
@@ -637,8 +1026,18 @@ mod tests {
             hash_matching_files(&gone, is_sqlx_query_file),
             DirHash::DirVanished
         );
-        let churned = settled_hash(&gone, is_sqlx_query_file);
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let churned = settled_hash(&mut em, &gone, is_sqlx_query_file);
         assert!(churned.starts_with("churn-"), "{churned}");
+        // The settled churn arm routes through the same unique-key
+        // emitter as the degraded arms — store-cost advisory included.
+        let out = output(em);
+        assert!(
+            out.contains("uncacheable but still written to the kache store"),
+            "{out}"
+        );
+        assert!(out.contains(".rio-buildhash-always-rerun"), "{out}");
     }
 
     #[test]
@@ -647,6 +1046,35 @@ mod tests {
         let b = unique_value("unkeyed");
         assert_ne!(a, b);
         assert!(a.starts_with("unkeyed-"));
+    }
+
+    #[test]
+    fn advisory_printed_once_per_emitter_session() {
+        let root = tempfile::tempdir().unwrap();
+        let gone = root.path().join("gone");
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        // Two unique-key routes in one script run: a degraded arm, then
+        // the settled churn arm.
+        let a = unkeyed(&mut em, "first degraded state");
+        let b = settled_hash(&mut em, &gone, is_sqlx_query_file);
+        assert!(a.starts_with("unkeyed-"), "{a}");
+        assert!(b.starts_with("churn-"), "{b}");
+        let out = output(em);
+        assert_eq!(
+            out.matches("uncacheable but still written to the kache store")
+                .count(),
+            1,
+            "{out}"
+        );
+        assert!(out.contains("first degraded state"), "{out}");
+        assert!(out.contains("changed while hashing"), "{out}");
+        // Both routes still emit their own always-stale watch.
+        assert_eq!(
+            out.matches(".rio-buildhash-always-rerun").count(),
+            2,
+            "{out}"
+        );
     }
 
     #[test]
@@ -660,7 +1088,7 @@ mod tests {
 
     /// A two-file macro-visible query set; `tag` differentiates content
     /// generations (v1 vs v2) without changing the name set.
-    fn write_queries(dir: &std::path::Path, tag: &str) {
+    fn write_queries(dir: &Path, tag: &str) {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join("query-aa.json"), format!("{{\"q\": \"{tag}-1\"}}")).unwrap();
         fs::write(dir.join("query-bb.json"), format!("{{\"q\": \"{tag}-2\"}}")).unwrap();
@@ -669,50 +1097,110 @@ mod tests {
     #[test]
     fn divergence_absent_candidates_benign() {
         // The crate2nix sandbox shape: neither <manifest>/.sqlx nor
-        // <manifest>/../.sqlx exists — nothing to fall through to.
+        // <manifest>/../.sqlx exists — nothing to fall through to, and
+        // (the bug_005 NEVER-rule) nothing watched: a missing watched
+        // path is always-stale to cargo.
         let root = tempfile::tempdir().unwrap();
         let tracked = root.path().join("tracked-cache");
         write_queries(&tracked, "v1");
         let manifest = root.path().join("crate");
         fs::create_dir(&manifest).unwrap();
-        assert_eq!(divergent_fallthrough(&tracked, &manifest), None);
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let verdict = divergent_fallthrough(&mut em, &tracked, &manifest);
+        assert!(
+            matches!(verdict, FallthroughVerdict::Benign(None)),
+            "{verdict:?}"
+        );
+        assert!(em.out.is_empty(), "NotFound candidates are never watched");
     }
 
     #[test]
     fn divergence_manifest_dotsqlx_identical_benign() {
         // A byte-identical manifest/.sqlx serves nothing the tracked
-        // hash does not already cover.
+        // hash does not already cover; the comparison snapshot flows out
+        // for the three-way settled check.
         let root = tempfile::tempdir().unwrap();
         let tracked = root.path().join("tracked-cache");
         write_queries(&tracked, "v1");
         let manifest = root.path().join("crate");
         write_queries(&manifest.join(".sqlx"), "v1");
-        assert_eq!(divergent_fallthrough(&tracked, &manifest), None);
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let verdict = divergent_fallthrough(&mut em, &tracked, &manifest);
+        assert!(
+            matches!(
+                &verdict,
+                FallthroughVerdict::Benign(Some(DirHash::Hash(h))) if *h == sqlx_hash(&tracked)
+            ),
+            "{verdict:?}"
+        );
+        let out = output(em);
+        assert!(
+            out.contains(&format!(
+                "cargo:rerun-if-changed={}",
+                manifest.join(".sqlx").display()
+            )),
+            "{out}"
+        );
     }
 
     #[test]
     fn divergence_workspace_self_benign() {
         // The devshell no-op in unit form: tracked IS the workspace
-        // root's .sqlx, reached via the manifest/../.sqlx probe.
+        // root's .sqlx, reached via the manifest/../.sqlx probe. The
+        // same-dir skip still watches the candidate at its LEXICAL
+        // spelling — a duplicate spelling of the tracked-dir watch,
+        // harmless (cargo stats each watched path independently), and
+        // the hook that re-fires the script if the path is ever
+        // repointed at a foreign tree.
         let root = tempfile::tempdir().unwrap();
         let tracked = root.path().join(".sqlx");
         write_queries(&tracked, "v1");
         let manifest = root.path().join("crate");
         fs::create_dir(&manifest).unwrap();
-        assert_eq!(divergent_fallthrough(&tracked, &manifest), None);
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let verdict = divergent_fallthrough(&mut em, &tracked, &manifest);
+        assert!(
+            matches!(verdict, FallthroughVerdict::Benign(None)),
+            "{verdict:?}"
+        );
+        assert_eq!(
+            output(em),
+            format!(
+                "cargo:rerun-if-changed={}\n",
+                manifest.join("..").join(".sqlx").display()
+            )
+        );
     }
 
     #[test]
     fn divergence_symlinked_tracked_benign() {
         // Same-dir detection must survive symlinks: manifest/.sqlx is a
-        // symlink TO the tracked dir, not a second cache.
+        // symlink TO the tracked dir, not a second cache. The candidate
+        // is still watched (lexically) so a later repoint re-fires.
         let root = tempfile::tempdir().unwrap();
         let tracked = root.path().join("real-cache");
         write_queries(&tracked, "v1");
         let manifest = root.path().join("crate");
         fs::create_dir(&manifest).unwrap();
         std::os::unix::fs::symlink(&tracked, manifest.join(".sqlx")).unwrap();
-        assert_eq!(divergent_fallthrough(&tracked, &manifest), None);
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let verdict = divergent_fallthrough(&mut em, &tracked, &manifest);
+        assert!(
+            matches!(verdict, FallthroughVerdict::Benign(None)),
+            "{verdict:?}"
+        );
+        let out = output(em);
+        assert!(
+            out.contains(&format!(
+                "cargo:rerun-if-changed={}",
+                manifest.join(".sqlx").display()
+            )),
+            "{out}"
+        );
     }
 
     #[test]
@@ -726,9 +1214,17 @@ mod tests {
         let twin = manifest.join(".sqlx");
         write_queries(&twin, "v1");
         fs::write(twin.join("query-cc.json"), b"{\"q\": \"extra\"}").unwrap();
-        assert_eq!(
-            divergent_fallthrough(&tracked, &manifest),
-            Some(twin.canonicalize().unwrap())
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let verdict = divergent_fallthrough(&mut em, &tracked, &manifest);
+        let FallthroughVerdict::Divergent(path) = verdict else {
+            panic!("expected Divergent, got {verdict:?}");
+        };
+        assert_eq!(path, twin.canonicalize().unwrap());
+        let out = output(em);
+        assert!(
+            out.contains(&format!("cargo:rerun-if-changed={}", twin.display())),
+            "{out}"
         );
     }
 
@@ -747,9 +1243,21 @@ mod tests {
         write_queries(&workspace_sqlx, "v2");
         let manifest = this_worktree.path().join("crate");
         fs::create_dir(&manifest).unwrap();
-        assert_eq!(
-            divergent_fallthrough(&tracked, &manifest),
-            Some(workspace_sqlx.canonicalize().unwrap())
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let verdict = divergent_fallthrough(&mut em, &tracked, &manifest);
+        let FallthroughVerdict::Divergent(path) = verdict else {
+            panic!("expected Divergent, got {verdict:?}");
+        };
+        assert_eq!(path, workspace_sqlx.canonicalize().unwrap());
+        // Watched at the lexical ../.sqlx spelling it was probed under.
+        let out = output(em);
+        assert!(
+            out.contains(&format!(
+                "cargo:rerun-if-changed={}",
+                manifest.join("..").join(".sqlx").display()
+            )),
+            "{out}"
         );
     }
 
@@ -765,20 +1273,283 @@ mod tests {
         write_queries(&twin, "v1");
         fs::write(twin.join("README.md"), b"docs").unwrap();
         fs::write(twin.join(".query-aa.json.swp"), b"vim").unwrap();
-        assert_eq!(divergent_fallthrough(&tracked, &manifest), None);
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let verdict = divergent_fallthrough(&mut em, &tracked, &manifest);
+        assert!(
+            matches!(verdict, FallthroughVerdict::Benign(Some(DirHash::Hash(_)))),
+            "{verdict:?}"
+        );
     }
 
     #[test]
     fn divergence_non_dir_candidate_benign() {
         // A regular FILE named .sqlx serves no query json (sqlx joins
         // filenames under it and exists() fails) — skip, don't hash it.
+        // It IS watched: if it is later replaced by a real cache dir,
+        // the script must re-run.
         let root = tempfile::tempdir().unwrap();
         let tracked = root.path().join("tracked-cache");
         write_queries(&tracked, "v1");
         let manifest = root.path().join("crate");
         fs::create_dir(&manifest).unwrap();
         fs::write(manifest.join(".sqlx"), b"not a directory").unwrap();
-        assert_eq!(divergent_fallthrough(&tracked, &manifest), None);
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let verdict = divergent_fallthrough(&mut em, &tracked, &manifest);
+        assert!(
+            matches!(verdict, FallthroughVerdict::Benign(None)),
+            "{verdict:?}"
+        );
+        let out = output(em);
+        assert!(
+            out.contains(&format!(
+                "cargo:rerun-if-changed={}",
+                manifest.join(".sqlx").display()
+            )),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn unreadable_candidate_is_probe_error_not_panic() {
+        // The verified F.i case: an existing-but-000 candidate twin used
+        // to PANIC the consumer's build via hash_matching_files; it is a
+        // probe failure on an input the build does not need — degrade.
+        let root = tempfile::tempdir().unwrap();
+        let tracked = root.path().join("tracked-cache");
+        write_queries(&tracked, "v1");
+        let manifest = root.path().join("crate");
+        let twin = manifest.join(".sqlx");
+        write_queries(&twin, "v2");
+        let twin_canon = twin.canonicalize().unwrap();
+        let Some(_guard) = deny_all(&twin) else {
+            eprintln!("skipping: directory permissions not enforced (root or CAP_DAC_OVERRIDE)");
+            return;
+        };
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let verdict = divergent_fallthrough(&mut em, &tracked, &manifest);
+        let FallthroughVerdict::ProbeError(path, err) = verdict else {
+            panic!("expected ProbeError, got {verdict:?}");
+        };
+        assert_eq!(path, twin_canon);
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("read_dir("), "{err}");
+        // Watched before the verdict: the candidate exists.
+        let out = output(em);
+        assert!(
+            out.contains(&format!("cargo:rerun-if-changed={}", twin.display())),
+            "{out}"
+        );
+        // Full Track arm: unkeyed could-not-verify, never the
+        // divergence wording, no panic.
+        let flag2 = AtomicBool::new(false);
+        let mut em2 = capture(&flag2);
+        let value = tracked_value(&mut em2, &tracked, &manifest);
+        assert!(value.starts_with("unkeyed-"), "{value}");
+        let out2 = output(em2);
+        assert!(
+            out2.contains("could not verify the fallthrough cache at"),
+            "{out2}"
+        );
+        assert!(out2.contains(&twin_canon.display().to_string()), "{out2}");
+        assert!(!out2.contains("diverges from"), "{out2}");
+    }
+
+    #[test]
+    fn self_loop_candidate_is_probe_error_with_watch() {
+        // The verified F.iii case: ELOOP at candidate canonicalize used
+        // to take the divergence arm with the divergence wording; it is
+        // a probe failure — could-not-verify, with the lexical path
+        // carried and watched.
+        let root = tempfile::tempdir().unwrap();
+        let tracked = root.path().join("tracked-cache");
+        write_queries(&tracked, "v1");
+        let manifest = root.path().join("crate");
+        fs::create_dir(&manifest).unwrap();
+        let candidate = manifest.join(".sqlx");
+        std::os::unix::fs::symlink(&candidate, &candidate).unwrap();
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let verdict = divergent_fallthrough(&mut em, &tracked, &manifest);
+        let FallthroughVerdict::ProbeError(path, err) = verdict else {
+            panic!("expected ProbeError, got {verdict:?}");
+        };
+        assert_eq!(path, candidate);
+        // ErrorKind::FilesystemLoop is still unstable (io_error_more);
+        // assert the preserved raw errno instead: ELOOP == 40 on Linux.
+        assert_eq!(err.raw_os_error(), Some(40), "{err}");
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+        let out = output(em);
+        assert!(
+            out.contains(&format!("cargo:rerun-if-changed={}", candidate.display())),
+            "{out}"
+        );
+        // And the Track arm degrades with the could-not-verify wording.
+        let flag2 = AtomicBool::new(false);
+        let mut em2 = capture(&flag2);
+        let value = tracked_value(&mut em2, &tracked, &manifest);
+        assert!(value.starts_with("unkeyed-"), "{value}");
+        let out2 = output(em2);
+        assert!(
+            out2.contains("could not verify the fallthrough cache at"),
+            "{out2}"
+        );
+        assert!(!out2.contains("diverges from"), "{out2}");
+    }
+
+    #[test]
+    fn dangling_candidate_entry_is_probe_error_not_divergent() {
+        // The candidate half of verified F.ii: a dangling entry inside
+        // the CANDIDATE used to fall into the divergence arm — it is a
+        // failed observation of the candidate, not content divergence.
+        let root = tempfile::tempdir().unwrap();
+        let tracked = root.path().join("tracked-cache");
+        write_queries(&tracked, "v1");
+        let manifest = root.path().join("crate");
+        let twin = manifest.join(".sqlx");
+        write_queries(&twin, "v1");
+        std::os::unix::fs::symlink("nonexistent", twin.join("query-dd.json")).unwrap();
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let verdict = divergent_fallthrough(&mut em, &tracked, &manifest);
+        let FallthroughVerdict::ProbeError(path, err) = verdict else {
+            panic!("expected ProbeError, got {verdict:?}");
+        };
+        assert_eq!(path, twin.canonicalize().unwrap().join("query-dd.json"));
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("listed but unreadable"), "{err}");
+    }
+
+    #[test]
+    fn tracked_dangling_entry_settles_to_persistent_churn() {
+        // The tracked half of verified F.ii: a dangling entry in the
+        // TRACKED dir with a healthy foreign candidate used to be
+        // misattributed as candidate divergence; the snapshot now flows
+        // into the three-way settled check and the persistent-dangling
+        // diagnostic fires naming the TRACKED entry.
+        let root = tempfile::tempdir().unwrap();
+        let tracked = root.path().join("tracked-cache");
+        write_queries(&tracked, "v1");
+        let dangling = tracked.join("query-dd.json");
+        std::os::unix::fs::symlink("nonexistent", &dangling).unwrap();
+        let manifest = root.path().join("crate");
+        write_queries(&manifest.join(".sqlx"), "v1");
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let verdict = divergent_fallthrough(&mut em, &tracked, &manifest);
+        let FallthroughVerdict::Benign(Some(prior)) = verdict else {
+            panic!("expected Benign(Some(FileVanished)), got {verdict:?}");
+        };
+        assert_eq!(prior, DirHash::FileVanished(dangling.clone()));
+        // The candidate is still watched.
+        let watched = format!(
+            "cargo:rerun-if-changed={}",
+            manifest.join(".sqlx").display()
+        );
+        assert!(
+            String::from_utf8(em.out.clone())
+                .unwrap()
+                .contains(&watched),
+            "missing candidate watch"
+        );
+        // Settling against that prior fires the persistent-dangling
+        // diagnostic with tracked-side attribution.
+        let value = settled_hash_against(&mut em, &tracked, is_sqlx_query_file, Some(&prior));
+        assert!(value.starts_with("churn-"), "{value}");
+        let out = output(em);
+        assert!(out.contains("persistent dangling entry"), "{out}");
+        assert!(out.contains(&dangling.display().to_string()), "{out}");
+        assert!(!out.contains("diverges from"), "{out}");
+    }
+
+    #[test]
+    fn three_way_mismatch_routes_to_churn() {
+        // Benign comparison takes a snapshot; the tracked dir changes
+        // before settling; the three-way check refuses the replayable
+        // key and names the window.
+        let root = tempfile::tempdir().unwrap();
+        let tracked = root.path().join("tracked-cache");
+        write_queries(&tracked, "v1");
+        let manifest = root.path().join("crate");
+        write_queries(&manifest.join(".sqlx"), "v1");
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let verdict = divergent_fallthrough(&mut em, &tracked, &manifest);
+        let FallthroughVerdict::Benign(Some(prior)) = verdict else {
+            panic!("expected Benign(Some), got {verdict:?}");
+        };
+        assert!(matches!(prior, DirHash::Hash(_)), "{prior:?}");
+        fs::write(tracked.join("query-aa.json"), b"{\"q\": \"mutated\"}").unwrap();
+        let value = settled_hash_against(&mut em, &tracked, is_sqlx_query_file, Some(&prior));
+        assert!(value.starts_with("churn-"), "{value}");
+        let out = output(em);
+        assert!(
+            out.contains("changed between the fallthrough comparison and settling"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn settled_with_agreeing_prior_matches_plain() {
+        // Three-way agreement is the no-op case: same hash as the plain
+        // settled path, no directives emitted.
+        let dir = setup();
+        let h = sqlx_hash(dir.path());
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let against = settled_hash_against(
+            &mut em,
+            dir.path(),
+            is_sqlx_query_file,
+            Some(&DirHash::Hash(h.clone())),
+        );
+        assert_eq!(against, h);
+        assert!(em.out.is_empty(), "agreement emits no directives");
+    }
+
+    #[test]
+    fn tracked_value_settles_when_benign() {
+        // End-to-end Track arm, healthy identical-twin shape: the
+        // comparison snapshot agrees with both settled passes and the
+        // replayable hash is emitted with zero warnings.
+        let root = tempfile::tempdir().unwrap();
+        let tracked = root.path().join("tracked-cache");
+        write_queries(&tracked, "v1");
+        let manifest = root.path().join("crate");
+        write_queries(&manifest.join(".sqlx"), "v1");
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let value = tracked_value(&mut em, &tracked, &manifest);
+        assert_eq!(value, sqlx_hash(&tracked));
+        let out = output(em);
+        assert!(!out.contains("cargo:warning"), "{out}");
+    }
+
+    #[test]
+    fn tracked_value_divergent_keeps_divergence_wording() {
+        let root = tempfile::tempdir().unwrap();
+        let tracked = root.path().join("tracked-cache");
+        write_queries(&tracked, "v1");
+        let manifest = root.path().join("crate");
+        let twin = manifest.join(".sqlx");
+        write_queries(&twin, "v2");
+        let flag = AtomicBool::new(false);
+        let mut em = capture(&flag);
+        let value = tracked_value(&mut em, &tracked, &manifest);
+        assert!(value.starts_with("unkeyed-"), "{value}");
+        let out = output(em);
+        assert!(
+            out.contains("diverges from the fallthrough cache at"),
+            "{out}"
+        );
+        // Names both paths.
+        assert!(out.contains(&tracked.display().to_string()), "{out}");
+        assert!(
+            out.contains(&twin.canonicalize().unwrap().display().to_string()),
+            "{out}"
+        );
     }
 
     #[test]
