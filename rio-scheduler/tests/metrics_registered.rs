@@ -26,7 +26,7 @@
 //! (P0321): described, emitted, spec'd with suggested buckets — but
 //! `init_metrics` had no Matcher for it.
 
-// r[verify obs.metric.scheduler]
+// r[verify obs.metric.scheduler+2]
 rio_test_support::metrics_suite! {
     describe_fn: rio_scheduler::describe_metrics,
     crate_name: "rio-scheduler",
@@ -46,4 +46,20 @@ rio_test_support::metrics_suite! {
         // 200×-under to 10×-over which is the full useful range.
         "rio_scheduler_sla_prediction_ratio",
     ],
+}
+
+// r[verify obs.metric.pg-iam]
+#[test]
+fn pg_iam_shared_family_described() {
+    // The shared rio_pg_iam_* family escapes the per-crate prefix
+    // filter above (different prefix), so assert it explicitly: each
+    // PG consumer must register it from its own describe_metrics().
+    rio_test_support::metrics::assert_spec_metrics_described(
+        &[
+            "rio_pg_iam_mint_failures_total",
+            "rio_pg_iam_token_minted_timestamp_seconds",
+        ],
+        rio_scheduler::describe_metrics,
+        "rio-scheduler",
+    );
 }

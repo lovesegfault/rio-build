@@ -13,6 +13,10 @@ pub mod k8s;
 pub mod limits;
 pub mod newtype;
 pub mod observability;
+#[cfg(feature = "pg-iam")]
+pub mod pg_error;
+#[cfg(feature = "pg-iam")]
+pub mod pg_iam;
 #[cfg(feature = "aws")]
 pub mod s3;
 pub mod server;

@@ -166,6 +166,12 @@
         "description": "PostgreSQL connection URL."
       },
       {
+        "key": "pg_auth",
+        "type": "PgAuthMode",
+        "default": "password",
+        "description": "PostgreSQL authentication mode (`RIO_PG_AUTH`): `password` (default, embedded in `database_url`) or `iam` (RDS IAM auth, see `rio_common::config::PgAuthMode`)."
+      },
+      {
         "key": "metrics_addr",
         "type": "string",
         "default": "[::]:9091",
@@ -334,6 +340,12 @@
         "type": "string",
         "default": "",
         "description": "PostgreSQL connection URL."
+      },
+      {
+        "key": "pg_auth",
+        "type": "PgAuthMode",
+        "default": "password",
+        "description": "PostgreSQL authentication mode (`RIO_PG_AUTH`): `password` (default, embedded in `database_url`) or `iam` (RDS IAM auth, see `rio_common::config::PgAuthMode`)."
       },
       {
         "key": "metrics_addr",
@@ -722,6 +734,12 @@
         "type": "string",
         "default": "",
         "description": "PostgreSQL URL for [`CellSketches`] persist/load."
+      },
+      {
+        "key": "nodeclaim_pool.pg_auth",
+        "type": "PgAuthMode",
+        "default": "password",
+        "description": "PostgreSQL authentication mode (`RIO_NODECLAIM_POOL__PG_AUTH`): `password` (default, embedded in `database_url`) or `iam` (RDS IAM auth, see `rio_common::config::PgAuthMode`)."
       },
       {
         "key": "nodeclaim_pool.lease_name",

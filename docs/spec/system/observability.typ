@@ -365,10 +365,11 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
 
 == Scheduler Metrics
 
-#r("obs.metric.scheduler")[
+#r("obs.metric.scheduler+2")[
   rio-scheduler MUST expose the metrics in
   #xref(<tbl-metrics-scheduler>, [the scheduler metric reference]). All
-  metrics MUST follow the `rio_scheduler_*` naming prefix.
+  metrics MUST follow the `rio_scheduler_*` naming prefix, except the
+  shared `rio_pg_iam_*` family (#rref("obs.metric.pg-iam")).
 ]
 
 #r("obs.metric.scheduler-leader-gate+2")[
@@ -391,10 +392,11 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
 
 == Store Metrics
 
-#r("obs.metric.store")[
+#r("obs.metric.store+2")[
   rio-store MUST expose the metrics in
   #xref(<tbl-metrics-store>, [the store metric reference]). All metrics MUST
-  follow the `rio_store_*` naming prefix.
+  follow the `rio_store_*` naming prefix, except the shared
+  `rio_pg_iam_*` family (#rref("obs.metric.pg-iam")).
 ]
 
 #r("obs.metric.store-pg-pool")[
@@ -459,10 +461,28 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
   cells packing \~1 intent per node. See `consolidate_after()`.
 ]
 
-#r("obs.metric.controller")[
+#r("obs.metric.controller+2")[
   rio-controller MUST expose the metrics in
   #xref(<tbl-metrics-controller>, [the controller metric reference]). All
-  metrics MUST follow the `rio_controller_*` naming prefix.
+  metrics MUST follow the `rio_controller_*` naming prefix, except the
+  shared `rio_pg_iam_*` family (#rref("obs.metric.pg-iam")).
+]
+
+== Shared (rio-common) Metrics
+
+#r("obs.metric.pg-iam")[
+  The `rio_pg_iam_*` family is the sanctioned exception to the
+  per-component prefix rules: it is emitted by `rio_common::pg_iam`
+  and appears identically on every PG-consuming component (store,
+  scheduler, controller). Each consumer MUST register the family by
+  calling `rio_common::pg_iam::describe_metrics()` from its own
+  `describe_metrics()` — registration and emission are separate call
+  sites, and rio-common installs no exporter of its own. Members:
+  #(refs.metric)("rio_pg_iam_mint_failures_total") (counter) and
+  #(refs.metric)("rio_pg_iam_token_minted_timestamp_seconds") (gauge;
+  alert on `time() - x` approaching the 900s token TTL — set per
+  successful mint, never per refresher tick, so the PromQL age is the
+  true token age).
 ]
 
 == Histogram Buckets

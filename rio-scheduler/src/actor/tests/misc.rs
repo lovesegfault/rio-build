@@ -2058,7 +2058,7 @@ async fn spawn_intents_end_to_end_and_deadline_clamp() -> TestResult {
 // P0539c metrics: mailbox_depth, dispatch_wait_seconds
 // ---------------------------------------------------------------------------
 
-// r[verify obs.metric.scheduler]
+// r[verify obs.metric.scheduler+2]
 /// Mailbox-depth gauge is set on every dequeued command. Send a Tick,
 /// barrier (request-reply, also dequeued), and assert the gauge was
 /// touched. Value is non-deterministic (depends on how many commands
@@ -2083,7 +2083,7 @@ async fn test_mailbox_depth_gauge_set_per_command() -> TestResult {
     Ok(())
 }
 
-// r[verify obs.metric.scheduler]
+// r[verify obs.metric.scheduler+2]
 /// dispatch_wait_seconds is recorded on Ready→Assigned. Connect a
 /// worker, merge a single-node DAG (enters Ready immediately — no
 /// deps), wait for the assignment to land, then assert the histogram

@@ -73,6 +73,8 @@
     "rio_mountd_promote_inflight",
     "rio_mountd_promote_reject_total",
     "rio_mountd_request_seconds",
+    "rio_pg_iam_mint_failures_total",
+    "rio_pg_iam_token_minted_timestamp_seconds",
     "rio_scheduler_actor_cmd_seconds",
     "rio_scheduler_actor_mailbox_depth",
     "rio_scheduler_assignments_total",
@@ -600,6 +602,18 @@
         "name": "rio_mountd_request_seconds",
         "kind": "histogram",
         "help": "UDS request latency (labeled by op: mount/backing_open/backing_close/promote/promote_chunks)"
+      }
+    ],
+    "pg": [
+      {
+        "name": "rio_pg_iam_mint_failures_total",
+        "kind": "counter",
+        "help": "RDS IAM auth token mint failures (STS/credential errors). Sustained nonzero rate = new PG connections will start failing once the cached token passes its 15-minute TTL."
+      },
+      {
+        "name": "rio_pg_iam_token_minted_timestamp_seconds",
+        "kind": "gauge",
+        "help": "Unix timestamp of the last successful RDS IAM token mint. Alert on time() - this approaching 900 (the token TTL): it means mints are failing or the refresher died."
       }
     ],
     "scheduler": [

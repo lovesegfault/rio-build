@@ -124,9 +124,14 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
 /// Registers prometheus metric descriptions. The help strings here are
 /// the source for `docs/ref/metrics.typ` — see
 /// `xtask/src/regen/docs_data.rs::metrics()` for the data-flow.
-// r[impl obs.metric.scheduler]
+// r[impl obs.metric.scheduler+2]
 pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
+
+    // Shared rio_pg_iam_* family (rio-common emits; each PG consumer
+    // registers — registration and emission are separate call sites,
+    // and rio-common has no exporter of its own).
+    rio_common::pg_iam::describe_metrics();
 
     describe_counter!(
         "rio_scheduler_builds_total",

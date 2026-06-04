@@ -72,6 +72,10 @@ pub struct Config {
     pub listen_addr: std::net::SocketAddr,
     /// PostgreSQL connection URL. Required.
     pub database_url: String,
+    /// PostgreSQL authentication mode (`RIO_PG_AUTH`): `password`
+    /// (default, embedded in `database_url`) or `iam` (RDS IAM auth,
+    /// see `rio_common::config::PgAuthMode`).
+    pub pg_auth: rio_common::config::PgAuthMode,
     #[serde(flatten)]
     pub common: rio_common::config::CommonConfig,
     /// Where chunks live. Default: inline (no backend). See
@@ -172,6 +176,7 @@ impl Default for Config {
         Self {
             listen_addr: rio_common::default_addr(9002),
             database_url: String::new(),
+            pg_auth: rio_common::config::PgAuthMode::default(),
             common: rio_common::config::CommonConfig::new(9092),
             chunk_backend: ChunkBackendKind::default(),
             // 2 GiB. Matches ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES

@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
         rio_store::HISTOGRAM_BUCKETS,
     )?;
 
-    let pool = init_db_pool(&cfg.database_url, cfg.pg_max_connections).await?;
+    let pool = init_db_pool(&cfg.database_url, cfg.pg_auth, cfg.pg_max_connections).await?;
 
     // grpc.health.v1.Health. The NAMED `rio.store.StoreService` is unset
     // (probe → NotFound, which kubelet treats as failure) until the
@@ -336,19 +336,42 @@ async fn main() -> anyhow::Result<()> {
 /// are reserved`. Setting `idle_timeout=60s` + `min_connections=2`
 /// shrinks the pool back to baseline within a minute of burst end
 /// (I-171).
-async fn init_db_pool(database_url: &str, max_connections: u32) -> anyhow::Result<sqlx::PgPool> {
+///
+/// IAM-mode watch item: RDS caps NEW IAM-authenticated connections at
+/// ~200/s cluster-wide. With idle_timeout=60s the pool sheds and
+/// regrows around bursts; at current scale (ComponentScaler max 14
+/// store replicas x 20 conns) full-fleet regrowth stays well under
+/// the ceiling, so no tuning now — the tripwire is
+/// rio_pg_iam_mint_failures_total plus connect-error logs. Revisit
+/// (iam-mode min_connections/idle_timeout, jittered regrowth) when
+/// componentScaler.store.max or pgMaxConnections rises; if the
+/// tripwire fires, the escalation is to front Aurora with RDS Proxy —
+/// the app side keeps IAM auth while the proxy holds the warm
+/// connection pool, making the per-connection ceiling irrelevant.
+async fn init_db_pool(
+    database_url: &str,
+    pg_auth: rio_common::config::PgAuthMode,
+    max_connections: u32,
+) -> anyhow::Result<sqlx::PgPool> {
     info!(
         url = %rio_common::config::redact_db_url(database_url),
+        ?pg_auth,
         max_connections,
         "connecting to PostgreSQL"
     );
+    // TokenSource::new is the config preflight: bad URL / weak TLS /
+    // missing rootcert / unresolvable AWS region all fail HERE (and
+    // crash-loop the pod visibly) before any retry machinery runs.
+    let tokens =
+        std::sync::Arc::new(rio_common::pg_iam::TokenSource::new(database_url, pg_auth).await?);
     let pool = PgPoolOptions::new()
         .max_connections(max_connections)
         .min_connections(2)
         .idle_timeout(std::time::Duration::from_secs(60))
-        .connect(database_url)
+        .connect_with(tokens.fresh_options().await?)
         .await?;
     info!("PostgreSQL connection established");
+    tokens.spawn_refresher(pool.clone());
 
     // r[impl store.db.migrate-try-lock] — try-then-wait advisory
     // lock; sqlx's default blocking `pg_advisory_lock` deadlocks

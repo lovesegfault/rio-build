@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 rio-auth = { workspace = true }
-rio-common = { workspace = true }
+rio-common = { workspace = true, features = ["pg-iam"] }
 rio-crds = { workspace = true }
 rio-lease = { workspace = true }
 rio-proto = { workspace = true }

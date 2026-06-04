@@ -52,6 +52,7 @@
         "$ref": "#/$defs/NodeClaimPoolConfig",
         "default": {
           "database_url": "",
+          "pg_auth": "password",
           "lease_name": null,
           "lease_namespace": null,
           "reference_hw_class": "",
@@ -123,6 +124,11 @@
             "description": "PostgreSQL URL for [`CellSketches`] persist/load. Same DB as\nstore/scheduler (migration 059 lives there). Required —\ncontroller doesn't otherwise hold a PG handle.",
             "type": "string",
             "default": ""
+          },
+          "pg_auth": {
+            "description": "PostgreSQL authentication mode (`RIO_NODECLAIM_POOL__PG_AUTH`):\n`password` (default, embedded in `database_url`) or `iam` (RDS\nIAM auth, see `rio_common::config::PgAuthMode`).",
+            "$ref": "#/$defs/PgAuthMode",
+            "default": "password"
           },
           "lease_name": {
             "description": "Lease object name for leader election. `None` → non-K8s mode\n(always-leader, see [`rio_lease::LeaseConfig::from_parts`]).",
@@ -229,6 +235,21 @@
             "default": true
           }
         }
+      },
+      "PgAuthMode": {
+        "description": "How the PostgreSQL password is obtained. Field `pg_auth` in each\nPG-consuming binary's `Config` (env `RIO_PG_AUTH`, controller:\n`RIO_NODECLAIM_POOL__PG_AUTH`).\n\n`Password` is the default so k3s/local deployments and the\npassword→IAM transition keep working with no config change. `Iam`\nreplaces the static (7-day auto-rotating) Aurora password with a\n15-minute SigV4 token minted from the pod's IRSA role and refreshed\nin the background — full rationale in the `pg_iam` module docs.",
+        "oneOf": [
+          {
+            "description": "Static password embedded in `database_url` (k3s/local, and EKS\nduring the password→IAM transition).",
+            "type": "string",
+            "const": "password"
+          },
+          {
+            "description": "RDS IAM auth: `database_url` is passwordless and MUST carry\n`sslmode=verify-full` + `sslrootcert=<RDS CA bundle>` — the\nminted token is a bearer credential, and only verify-full\nguarantees it is never sent to an unverified server. Enforced\nin `pg_iam::pg_connect_options`.",
+            "type": "string",
+            "const": "iam"
+          }
+        ]
       }
     }
   },
@@ -249,6 +270,7 @@
     "gc_interval_hours": 24,
     "nodeclaim_pool": {
       "database_url": "",
+      "pg_auth": "password",
       "lease_name": null,
       "lease_namespace": null,
       "reference_hw_class": "",
