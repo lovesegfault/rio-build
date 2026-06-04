@@ -687,21 +687,6 @@ impl DagActor {
         }
     }
 
-    /// Establishment sweep for open pull-mode attempts — the single
-    /// scheduler-side time-based repair the pull path keeps. Every open
-    /// attempt (the durable view) is visited every sweep; one whose age
-    /// exceeds its intent deadline plus `establishment_report_slack`
-    /// with no terminal row is resolved by the store-probe arm (all
-    /// verifiable wanted outputs present → adopted as completed, never
-    /// charged) or established exactly once as an unreported executor
-    /// crash (charged through the same append+decide discipline as
-    /// every other establishment vehicle) and requeued. Also refreshes
-    /// `rio_scheduler_open_attempts` (one query serves both; the gauge
-    /// is durable-backed so it survives failover exactly like the rows
-    /// it counts). Leader-only via the `handle_tick` early-return; the
-    /// establishing transaction additionally carries the same
-    /// generation-floor fence as the pull transaction.
-    // r[impl sched.attempt.establishment-window+5]
     // r[impl sched.attempt.cancel-close-driven+1]
     /// Re-drive failed status-batch persists. FIFO; drains the WHOLE
     /// queue on Ok (a healed PG clears the backlog in one tick) and
@@ -800,6 +785,24 @@ impl DagActor {
         metrics::gauge!("rio_scheduler_status_outbox_depth").set(self.status_outbox.len() as f64);
     }
 
+    /// Establishment sweep for open pull-mode attempts — the single
+    /// scheduler-side time-based repair the pull path keeps
+    /// (merged_bug_004: this doc anchors HERE, on the sweep itself,
+    /// not on the outbox flusher above it). Every open attempt (the
+    /// durable view) is visited every sweep; one whose age exceeds its
+    /// intent deadline plus `establishment_report_slack` with no
+    /// terminal row is resolved by the store-probe arm (all verifiable
+    /// wanted outputs present → adopted as completed, never charged)
+    /// or established exactly once as an unreported executor crash
+    /// (charged through the same append+decide discipline as every
+    /// other establishment vehicle) and requeued. Also refreshes
+    /// `rio_scheduler_open_attempts` (one query serves both; the gauge
+    /// is durable-backed so it survives failover exactly like the rows
+    /// it counts). Leader-only via the `handle_tick` early-return plus
+    /// the `DagAuthority` witness; the establishing transaction
+    /// additionally carries the same generation-floor fence as the
+    /// pull transaction.
+    // r[impl sched.attempt.establishment-window+5]
     pub(super) async fn tick_sweep_open_pull_attempts(&mut self, _authority: &super::DagAuthority) {
         let opens = match self.db.list_open_pull_attempts().await {
             Ok(rows) => rows,
@@ -1113,9 +1116,16 @@ impl DagActor {
             }
             EstablishmentAction::Defer => {
                 // No probe evidence in either direction: the attempt
-                // stays open for a pass with a working probe. (The
-                // current caller mapping cannot produce this arm —
-                // §4.R2's probe-axis owner wires it.)
+                // stays open for a pass with a working probe. Produced
+                // when the batch FindMissingPaths probe fails or times
+                // out (StoreProbe::Unavailable → the kernel's
+                // Unavailable axis) for a live-wanted BUILD attempt —
+                // the merged_bug_232 fix; reachability is pinned
+                // executably by
+                // `probe_unavailable_defers_build_establishment`
+                // (merged_bug_005: this arm IS producible — the old
+                // "cannot produce this arm" parenthetical predated the
+                // probe-axis wiring).
                 debug!(drv_hash = %attempt.drv_hash, exec_id = %attempt.exec_id,
                        "establishment sweep: probe evidence unavailable; attempt stays open");
                 return;
