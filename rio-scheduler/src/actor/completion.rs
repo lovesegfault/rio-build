@@ -67,6 +67,53 @@ pub(super) struct FailureReportCtx<'a> {
     pub(super) store_degraded: bool,
 }
 
+/// Total status→report-context classifier: the SOLE producer of
+/// [`FailureReportCtx`] on the completion intake path. Every failure
+/// arm of `handle_completion`'s routing match calls this instead of
+/// constructing the ctx inline, so the status→evidence mapping lives
+/// in exactly one table.
+///
+/// `Cancelled` synthesizes its message (the worker sent a status the
+/// scheduler never initiated — the wire message is untrusted noise on
+/// that arm); every other arm borrows the worker's `error_msg`.
+pub(super) fn failure_ctx_for<'a>(
+    status: rio_proto::types::BuildResultStatus,
+    result: &'a crate::domain::BuildResult,
+    report_line_count: Option<i64>,
+) -> FailureReportCtx<'a> {
+    use rio_proto::types::BuildResultStatus as S;
+    match status {
+        S::InfrastructureFailure => FailureReportCtx {
+            final_line_count: report_line_count,
+            error_msg: &result.error_msg,
+            store_degraded: result.store_degraded,
+        },
+        S::PermanentFailure
+        | S::CachedFailure
+        | S::DependencyFailed
+        | S::LogLimitExceeded
+        | S::OutputRejected
+        | S::NotDeterministic
+        | S::InputRejected => FailureReportCtx {
+            final_line_count: report_line_count,
+            error_msg: &result.error_msg,
+            store_degraded: result.store_degraded,
+        },
+        S::Cancelled => FailureReportCtx {
+            final_line_count: report_line_count,
+            error_msg: "worker reported Cancelled without scheduler-initiated cancel",
+            store_degraded: false,
+        },
+        // Transient, TimedOut, Unspecified-as-transient, and the
+        // (unreachable here) success statuses: no store evidence.
+        _ => FailureReportCtx {
+            final_line_count: report_line_count,
+            error_msg: &result.error_msg,
+            store_degraded: false,
+        },
+    }
+}
+
 /// Whether a Phase-1b-collapsed failure handler completed its appending
 /// transaction. [`Self::RecordFailed`] means nothing was recorded and no
 /// state changed — the derivation is still in its pre-report state and
@@ -1162,11 +1209,7 @@ impl DagActor {
                     .handle_transient_failure(
                         drv_hash,
                         executor_id,
-                        FailureReportCtx {
-                            final_line_count: report_line_count,
-                            error_msg: &result.error_msg,
-                            store_degraded: false,
-                        },
+                        failure_ctx_for(status, &result, report_line_count),
                     )
                     .await;
                 match handling {
@@ -1193,11 +1236,7 @@ impl DagActor {
                     .handle_infrastructure_failure(
                         drv_hash,
                         executor_id,
-                        FailureReportCtx {
-                            final_line_count: report_line_count,
-                            error_msg: &result.error_msg,
-                            store_degraded: result.store_degraded,
-                        },
+                        failure_ctx_for(status, &result, report_line_count),
                     )
                     .await;
                 match handling {
@@ -1231,11 +1270,7 @@ impl DagActor {
                     .handle_permanent_failure(
                         drv_hash,
                         executor_id,
-                        FailureReportCtx {
-                            final_line_count: report_line_count,
-                            error_msg: &result.error_msg,
-                            store_degraded: result.store_degraded,
-                        },
+                        failure_ctx_for(status, &result, report_line_count),
                     )
                     .await;
                 match handling {
@@ -1264,11 +1299,7 @@ impl DagActor {
                     .handle_timeout_failure(
                         drv_hash,
                         executor_id,
-                        FailureReportCtx {
-                            final_line_count: report_line_count,
-                            error_msg: &result.error_msg,
-                            store_degraded: false,
-                        },
+                        failure_ctx_for(status, &result, report_line_count),
                     )
                     .await;
                 match handling {
@@ -1304,11 +1335,7 @@ impl DagActor {
                     .handle_infrastructure_failure(
                         drv_hash,
                         executor_id,
-                        FailureReportCtx {
-                            final_line_count: report_line_count,
-                            error_msg: "worker reported Cancelled without scheduler-initiated cancel",
-                            store_degraded: false,
-                        },
+                        failure_ctx_for(status, &result, report_line_count),
                     )
                     .await;
                 match handling {
@@ -1340,11 +1367,7 @@ impl DagActor {
                     .handle_transient_failure(
                         drv_hash,
                         executor_id,
-                        FailureReportCtx {
-                            final_line_count: report_line_count,
-                            error_msg: &result.error_msg,
-                            store_degraded: false,
-                        },
+                        failure_ctx_for(status, &result, report_line_count),
                     )
                     .await;
                 match handling {
