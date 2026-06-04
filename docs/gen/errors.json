@@ -162,6 +162,69 @@
       "doc": ""
     },
     {
+      "enum": "NetrcError",
+      "name": "Parse",
+      "crate": "rio-builder",
+      "msg": "parsing netrc",
+      "doc": "The file read fine and parsed the same way it always will."
+    },
+    {
+      "enum": "NetrcError",
+      "name": "Read",
+      "crate": "rio-builder",
+      "msg": "reading netrc {path}",
+      "doc": "`read_to_string` failed. The PATH is operator config (the sandbox netrc location), never tenant input — safe to name."
+    },
+    {
+      "enum": "NetrcParseError",
+      "name": "CredentialBeforeEntry",
+      "crate": "rio-builder",
+      "msg": "netrc: `{key}` before any `machine`/`default` entry",
+      "doc": ""
+    },
+    {
+      "enum": "NetrcParseError",
+      "name": "Macdef",
+      "crate": "rio-builder",
+      "msg": "netrc: `macdef` is not supported — its body ends at a blank line, which a whitespace tokenizer cannot see (fetcher.divergence.netrc-strict-parse)",
+      "doc": ""
+    },
+    {
+      "enum": "NetrcParseError",
+      "name": "MachineMissingName",
+      "crate": "rio-builder",
+      "msg": "netrc: `machine` is missing its host name",
+      "doc": ""
+    },
+    {
+      "enum": "NetrcParseError",
+      "name": "MissingValue",
+      "crate": "rio-builder",
+      "msg": "netrc: `{key}` is missing its value",
+      "doc": ""
+    },
+    {
+      "enum": "NetrcParseError",
+      "name": "QuotedKeyword",
+      "crate": "rio-builder",
+      "msg": "netrc: quoted token in keyword position ({0}) is not supported (fetcher.divergence.netrc-strict-parse)",
+      "doc": ""
+    },
+    {
+      "enum": "NetrcParseError",
+      "name": "QuotedValue",
+      "crate": "rio-builder",
+      "msg": "netrc: quoted value for `{key}` is not supported (fetcher.divergence.netrc-strict-parse)",
+      "doc": ""
+    },
+    {
+      "enum": "NetrcParseError",
+      "name": "Unrecognized",
+      "crate": "rio-builder",
+      "msg": "netrc: unrecognized token in keyword position ({0}) (fetcher.divergence.netrc-strict-parse)",
+      "doc": ""
+    },
+    {
       "enum": "OverlayError",
       "name": "DirCreate",
       "crate": "rio-builder",
@@ -1666,6 +1729,16 @@
       "name": "FetchError",
       "crate": "rio-builder",
       "doc": "Closed permanence classification for one fetch attempt. Every failure source inside [`try_fetch_one`] must choose a class at the point where the error is produced — there is deliberately no `From<anyhow::Error>` impl and no default bucket, so a future failure source cannot silently inherit retryability (the downcast-marker shape this replaces let exactly that happen: any error NOT carrying the marker was retryable by omission). The retry loop matches exhaustively."
+    },
+    {
+      "name": "NetrcError",
+      "crate": "rio-builder",
+      "doc": "netrc failure split at its two producing statements: reading the file and parsing its contents are different error sources with different permanence, and folding them into one arm is exactly the composite blanket amended R1(e) forbids."
+    },
+    {
+      "name": "NetrcParseError",
+      "crate": "rio-builder",
+      "doc": ""
     },
     {
       "name": "OverlayError",
