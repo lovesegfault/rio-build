@@ -1694,6 +1694,11 @@
       "doc": "Criterion-style local baselines: `.fsbench/baselines/<name>.json`,"
     },
     {
+      "path": "k8s/fsbench/coldreps.rs",
+      "depth": 2,
+      "doc": "`fsbench cold-reps` — N cold reps of the full bench with a cache"
+    },
+    {
       "path": "k8s/fsbench/compare.rs",
       "depth": 2,
       "doc": "The compare engine: identity-key gate, thresholded per-metric"
@@ -1702,6 +1707,11 @@
       "path": "k8s/fsbench/cotenancy.rs",
       "depth": 2,
       "doc": "Build→node attribution + passive co-tenancy tagging."
+    },
+    {
+      "path": "k8s/fsbench/evict.rs",
+      "depth": 2,
+      "doc": "Cold the builder node(s) between cold-reps by evicting every mountd"
     },
     {
       "path": "k8s/fsbench/parse.rs",

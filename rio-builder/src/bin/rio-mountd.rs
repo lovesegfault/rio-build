@@ -7,7 +7,8 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use anyhow::Context;
+use clap::{Parser, Subcommand};
 use rio_builder::castore_fuse::mountd::{self, DEFAULT_MAX_PROMOTE_BYTES, MountdConfig};
 
 #[derive(Parser, Debug)]
@@ -43,17 +44,43 @@ struct Args {
     /// file's permissions are the only access control — there is no
     /// peer-credential check; executor pods reach the socket via the
     /// controller-mounted hostPath dir and connect with a matching
-    /// runAsGroup.
+    /// runAsGroup. Required to run the daemon; unused by `evict-cache`.
     #[arg(long)]
-    allowed_gid: u32,
+    allowed_gid: Option<u32>,
     /// Prometheus exporter listen address.
     #[arg(long, default_value = "[::]:9095")]
     metrics_addr: std::net::SocketAddr,
+    /// Optional subcommand. Absent → run the daemon (the DaemonSet
+    /// invocation, which passes only flags).
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Delete every entry under the chunk and backing caches (reads
+    /// `--chunks-dir`/`--cache-dir`; never touches staging/ or castore/)
+    /// and exit. Returns the node-shared promote caches to a cold state
+    /// so a cold-read measurement can be repeated. A separate short-lived
+    /// process — safe under a live daemon (see `sweep::evict_all`).
+    EvictCache,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    // `evict-cache` runs as its own short-lived process: do the deletion
+    // and exit BEFORE any tracing/metrics init — a second metrics
+    // listener would collide with the daemon's on :9095, and the cache
+    // reset needs neither.
+    if let Some(Cmd::EvictCache) = args.cmd {
+        let freed = rio_builder::castore_fuse::evict_all(&args.cache_dir, &args.chunks_dir);
+        println!("{}", serde_json::json!({ "freed": freed }));
+        return Ok(());
+    }
+    let allowed_gid = args
+        .allowed_gid
+        .context("--allowed-gid is required to run the daemon")?;
     // Not `rio_common::server::bootstrap`: that path exists for
     // binaries with a layered TOML config and a CommonConfig
     // embed. mountd has eight flags and no config file; the full
@@ -87,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
         chunks_dir: args.chunks_dir,
         staging_quota_bytes: args.staging_quota_bytes,
         max_promote_bytes: args.max_promote_bytes,
-        allowed_gid: args.allowed_gid,
+        allowed_gid,
     });
     tokio::select! {
         r = serve => r,

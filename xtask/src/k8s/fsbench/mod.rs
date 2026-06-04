@@ -10,13 +10,15 @@
 //! Operator tooling, not CI: no checks.* entry, no wall-clock gates.
 
 mod baseline;
+mod coldreps;
 mod compare;
 mod cotenancy;
+mod evict;
 mod parse;
 mod result;
 mod submit;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -55,6 +57,28 @@ enum FsbenchCmd {
         #[arg(long, default_value_t = 1.0)]
         threshold_scale: f64,
     },
+    /// Run N cold reps of the full bench, evicting the builder cache
+    /// between each, and write `.fsbench/{ts}/cold-reps.json` with
+    /// mean/stddev/stderr aggregates. Before/after-agnostic: it
+    /// measures whatever image is deployed.
+    ColdReps(ColdRepsOpts),
+}
+
+#[derive(clap::Args)]
+struct ColdRepsOpts {
+    /// Number of accepted cold reps to collect.
+    #[arg(long, default_value_t = 5)]
+    reps: u32,
+    /// Dataset seed (fixed by default so the dataset drv is reused).
+    #[arg(long, default_value = DEFAULT_SEED)]
+    seed: String,
+    /// Also write the aggregate to this path (e.g. before.json).
+    #[arg(long, value_name = "FILE")]
+    save: Option<PathBuf>,
+    /// Cap on dropped reps (wrong node / dishonest cold / failed
+    /// build) before giving up and emitting whatever was accepted.
+    #[arg(long, default_value_t = 10)]
+    max_redos: u32,
 }
 
 /// Default dataset seed — FIXED so the dataset drv is stable: the
@@ -111,6 +135,7 @@ pub async fn run(
             force,
             threshold_scale,
         } => cmd_compare(&a, &b, force, threshold_scale),
+        FsbenchCmd::ColdReps(opts) => coldreps::run(opts, p, kind, cfg).await,
     }
 }
 
@@ -152,37 +177,24 @@ fn print_compare(o: &compare::Outcome) {
     }
 }
 
-#[allow(clippy::print_stderr)]
-async fn cmd_run(
-    opts: RunOpts,
+/// One full bench run: submit, sample co-tenancy, parse + validate the
+/// PERF stream, assemble the result, and write `<dir>/result.json`.
+/// Returns the assembled result so the caller can summarize, compare,
+/// or loop over it (cold-reps).
+pub(super) async fn run_single(
     p: &dyn Provider,
     kind: ProviderKind,
     cfg: &XtaskConfig,
-) -> Result<i32> {
-    let seed = opts.seed.clone();
-    // Per-run nonce = run id. It keys ONLY the bench-run drv: with the
-    // fixed default seed both fsbench drvs would otherwise hash
-    // identically run-over-run, the previous run's output would
-    // already be valid remotely, and nix would skip executing the
-    // benchmark entirely. Alphanumeric so it can live in store-path
-    // names.
-    let nonce: String = rand::rng()
-        .sample_iter(&Alphanumeric)
-        .take(12)
-        .map(|c| char::from(c).to_ascii_lowercase())
-        .collect();
-
-    let ts = jiff::Timestamp::now().as_second();
-    let dir = repo_root().join(".fsbench").join(ts.to_string());
-    std::fs::create_dir_all(&dir)?;
-    info!("run dir: {} (seed {seed}, nonce {nonce})", dir.display());
-
+    dir: &Path,
+    seed: &str,
+    nonce: &str,
+) -> Result<ResultV1> {
     // SIGINT registered before spawning anything — same rationale as
     // stress.rs: default disposition would skip ProcessGuard's killpg
     // and leak the tunnel (I-158).
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
-    let mut submission = submit::submit(p, cfg, &dir, &seed, &nonce).await?;
+    let mut submission = submit::submit(p, cfg, dir, seed, nonce).await?;
 
     // Co-tenancy watcher. Attribution failing (no rio-cli tunnel, drv
     // never observed) degrades the run to `unattributed` — it does not
@@ -232,7 +244,7 @@ async fn cmd_run(
     let parsed = parse::parse_log(&log_text);
     parse::validate(&parsed)?;
     anyhow::ensure!(
-        parsed.meta.get("seed").map(String::as_str) == Some(seed.as_str()),
+        parsed.meta.get("seed").map(String::as_str) == Some(seed),
         "echoed seed {:?} != submitted seed {seed} — a stale eval-cache drv was built",
         parsed.meta.get("seed")
     );
@@ -246,9 +258,38 @@ async fn cmd_run(
         "workload_version {workload_version} unknown to this xtask — update the workload handling"
     );
 
-    let mut assembled = assemble(&parsed, &report, &seed, &nonce, kind, workload_version)?;
+    let assembled = assemble(&parsed, &report, seed, nonce, kind, workload_version)?;
+    result::write(&assembled, &dir.join("result.json"))?;
+    Ok(assembled)
+}
+
+#[allow(clippy::print_stderr)]
+async fn cmd_run(
+    opts: RunOpts,
+    p: &dyn Provider,
+    kind: ProviderKind,
+    cfg: &XtaskConfig,
+) -> Result<i32> {
+    let seed = opts.seed.clone();
+    // Per-run nonce = run id. It keys ONLY the bench-run drv: with the
+    // fixed default seed both fsbench drvs would otherwise hash
+    // identically run-over-run, the previous run's output would
+    // already be valid remotely, and nix would skip executing the
+    // benchmark entirely. Alphanumeric so it can live in store-path
+    // names.
+    let nonce: String = rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(12)
+        .map(|c| char::from(c).to_ascii_lowercase())
+        .collect();
+
+    let ts = jiff::Timestamp::now().as_second();
+    let dir = repo_root().join(".fsbench").join(ts.to_string());
+    std::fs::create_dir_all(&dir)?;
+    info!("run dir: {} (seed {seed}, nonce {nonce})", dir.display());
+
+    let mut assembled = run_single(p, kind, cfg, &dir, &seed, &nonce).await?;
     let path = dir.join("result.json");
-    result::write(&assembled, &path)?;
     eprintln!();
     print_summary(&assembled, &path);
 

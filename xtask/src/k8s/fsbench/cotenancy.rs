@@ -272,6 +272,21 @@ async fn pod_uid(client: &kube::Client, pod: &str) -> Result<Option<String>> {
     Ok(pods.get_opt(pod).await?.and_then(|p| p.metadata.uid))
 }
 
+/// All mountd pod names in the builder namespace (cold-reps evicts the
+/// cache on every one of them — a missed pod is a warm node that would
+/// fail the per-rep honesty gate).
+pub(super) async fn all_mountd_pods(client: &kube::Client) -> Result<Vec<String>> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), NS_BUILDERS);
+    let list = pods
+        .list(&kube::api::ListParams::default().labels(MOUNTD_LABEL))
+        .await?;
+    Ok(list
+        .items
+        .into_iter()
+        .filter_map(|p| p.metadata.name)
+        .collect())
+}
+
 async fn mountd_on_node(client: &kube::Client, node: &str) -> Option<String> {
     let pods: Api<Pod> = Api::namespaced(client.clone(), NS_BUILDERS);
     let list = pods
