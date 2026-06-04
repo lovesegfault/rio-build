@@ -36,11 +36,17 @@
 # Subtest 2 (relay-breaker-neutrality) is a separate small campaign
 # against the same booted cluster: the supply stage's relay rung fetches
 # large payloads from an HTTPS relay whose NAR bodies are TRUNCATED
-# (mid-body death, the payload-source shape). The gateway circuit
-# breaker must stay closed — per-path FAILED settlements, no
-# "gateway unreachable" skip-stamps, no "supply upload collapse" PAUSE —
-# and the campaign completes with both roots substituted (the in-band
-# success exemption keeps the failed-supply rollup from retiring them).
+# (mid-body death, the payload-source shape). The witnesses: every relay
+# path settles its own payload-source FAILED row, zero "gateway
+# unreachable" skip-stamps and no "supply upload collapse" PAUSE (the
+# breaker stays closed), the doomed root — whose required inputs really
+# are undeliverable — retires supply-failed BEFORE submission and is
+# never submitted, and the clean sibling's drv text is DELIVERED by the
+# same prewarm pass that watched the 16 payload deaths, then submits and
+# substitutes. (The batch-settle rollup's in-band success exemption is
+# NOT exercised here — the doomed unit never reaches a batch; that cell
+# is pinned at unit level by
+# collect_pass_retires_supply_starved_members_before_classification.)
 #
 # Verify markers live at the default.nix subtests entries (house rule).
 {

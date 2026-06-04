@@ -571,8 +571,10 @@ in
           #   NARs behind intact narinfos) — nearly 3× the collapse
           #   threshold — and the breaker stays closed: per-path
           #   payload-source FAILED rows, zero "gateway unreachable"
-          #   skip-stamps, no supply-collapse PAUSE, and the campaign
-          #   completes with both roots substituted.
+          #   skip-stamps, no supply-collapse PAUSE; the doomed root
+          #   retires supply-failed pre-submission (never submitted)
+          #   while the clean sibling is delivered by the same prewarm
+          #   pass and target-substitutes.
           "relay-breaker-neutrality"
         ];
       };
