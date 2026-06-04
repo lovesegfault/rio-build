@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use rio_common::grpc::{DEFAULT_GRPC_TIMEOUT, GRPC_STREAM_TIMEOUT};
-use rio_nix::derivation::Derivation;
+use rio_nix::derivation::{Derivation, DerivationLike};
 use rio_nix::store_path::StorePath;
 use rio_proto::client::NAR_CHUNK_SIZE;
 use rio_proto::validated::ValidatedPathInfo;
