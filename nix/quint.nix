@@ -351,6 +351,11 @@ let
       # hours verdict-less, starving every gate on the host. Raise only
       # with a measured runtime documented at the check.
       modelTimeoutSec ? 1800,
+      # bughunt-2 (slot 11): per-invariant-leaf vacuity exemptions for the
+      # quint-policy lint — { <leaf> = { class = "boundsOK"|"scope-bound"|
+      # "pre-r2-untwinned"; reason = "..."; }; }. P1 demands a live-import
+      # falsify twin for every holds-invariant leaf unless exempted here.
+      vacuityExempt ? { },
     }:
     pkgs.runCommand "quint-${name}"
       {
@@ -358,6 +363,15 @@ let
         # bug_383: the SAME binding that sizes the JVM below — exported
         # for gen_matrix.py's heavy-shard isolation.
         meta.serverHeapMb = serverHeapMb;
+        # bughunt-2 (slot 11): wiring facts for the quint-policy lint — the
+        # only channel besides the parse IR that policy enforcement reads.
+        meta.quintPolicy = {
+          kind = "holds";
+          inherit spec main extraSpecs;
+          inherit invariants;
+          step = if step == null then "step" else step;
+          inherit vacuityExempt;
+        };
         # Only the named .qnt files. A model that imports another file
         # (a shared harness, an override module's parent model) extends
         # the fileset via extraSpecs — keeping it narrow means an
@@ -489,6 +503,15 @@ let
         # for gen_matrix.py's heavy-shard isolation (a check raised
         # past the 4096 default moves itself into a singleton shard).
         meta.serverHeapMb = serverHeapMb;
+        # bughunt-2 (slot 11): wiring facts for the quint-policy lint — the
+        # only channel besides the parse IR that policy enforcement reads.
+        meta.quintPolicy = {
+          kind = "witness";
+          inherit spec main extraSpecs;
+          inherit witness;
+          step = if step == null then "step" else step;
+          vacuityExempt = { };
+        };
         # Same fileset narrowing as mkQuintCheck.
         src = lib.fileset.toSource {
           root = modelsDir;
@@ -604,6 +627,15 @@ let
     pkgs.runCommand "quint-${name}"
       {
         nativeBuildInputs = [ pkgs.quint ];
+        # bughunt-2 (slot 11): wiring facts for the quint-policy lint — the
+        # only channel besides the parse IR that policy enforcement reads.
+        meta.quintPolicy = {
+          kind = "witness-sim";
+          inherit spec main extraSpecs;
+          inherit witness;
+          step = if step == null then "step" else step;
+          vacuityExempt = { };
+        };
         # Same fileset narrowing as mkQuintCheck.
         src = lib.fileset.toSource {
           root = modelsDir;
@@ -697,10 +729,21 @@ let
       # checker's budget from the cold init — the controller-113
       # respawn-cancel pair). null means quint's default (`init`).
       init ? null,
+      # Same semantics as mkQuintCheck's vacuityExempt (quint-policy P1).
+      vacuityExempt ? { },
     }:
     pkgs.runCommand "quint-${name}"
       {
         nativeBuildInputs = [ pkgs.quint ];
+        # bughunt-2 (slot 11): wiring facts for the quint-policy lint — the
+        # only channel besides the parse IR that policy enforcement reads.
+        meta.quintPolicy = {
+          kind = "holds-sim";
+          inherit spec main extraSpecs;
+          inherit invariants;
+          step = if step == null then "step" else step;
+          inherit vacuityExempt;
+        };
         # Same fileset narrowing as mkQuintCheck.
         src = lib.fileset.toSource {
           root = modelsDir;
@@ -778,6 +821,13 @@ let
     pkgs.runCommand "quint-${name}"
       {
         nativeBuildInputs = [ pkgs.quint ];
+        # bughunt-2 (slot 11): wiring facts for the quint-policy lint.
+        meta.quintPolicy = {
+          kind = "run";
+          inherit spec main extraSpecs;
+          step = "step";
+          vacuityExempt = { };
+        };
         src = lib.fileset.toSource {
           root = modelsDir;
           fileset = lib.fileset.unions (map (s: modelsDir + "/${s}.qnt") ([ spec ] ++ extraSpecs));
@@ -808,8 +858,63 @@ let
           exit 1
         fi
       '';
+
+  # bughunt-2 (slot 11): the falsify-twin-required corpus lint (P1-P6).
+  # Zero quint-semantic work: wiring facts from the constructor meta
+  # manifest (nix eval), structural facts from `quint parse --out` IR
+  # only; an in-derivation canary pins the IR shape. See
+  # nix/quint_policy.py for the rule statements and the vehicle ruling.
+  mkPolicyCheck =
+    corpus:
+    let
+      manifest = pkgs.writeText "quint-policy-manifest.json" (
+        builtins.toJSON (lib.mapAttrs (_: c: c.meta.quintPolicy or null) corpus)
+      );
+    in
+    pkgs.runCommand "quint-policy"
+      {
+        nativeBuildInputs = [
+          pkgs.quint
+          pkgs.python3
+        ];
+        # The FULL corpus: every live model and every calibration file —
+        # the whole point is whole-corpus structural coverage.
+        src = lib.fileset.toSource {
+          root = modelsDir;
+          fileset = modelsDir;
+        };
+        inherit manifest;
+        policyScript = ./quint_policy.py;
+      }
+      ''
+        set -euo pipefail
+        cd "$TMPDIR"
+        mkdir ir
+        # IR-shape canary: parsed in-derivation; quint_policy.py asserts
+        # the expected shape before trusting any verdict.
+        {
+          echo 'module policyCanary {'
+          echo '  var x: int'
+          echo "  action init = x' = 0"
+          echo "  action step = x' = x + 1"
+          echo '  val invX = x >= 0'
+          echo '}'
+        } > policyCanary.qnt
+        quint parse --out ir/__canary__.json policyCanary.qnt
+        i=0
+        while IFS= read -r -d "" f; do
+          rel="''${f#./}"
+          i=$((i + 1))
+          quint parse --out "ir/$i.json" "$src/$rel"
+        done < <(cd "$src" && find . -name '*.qnt' -print0 | sort -z)
+        python3 "$policyScript" \
+          --manifest "$manifest" \
+          --ir-dir ir \
+          --models-dir "$src" | tee "$out"
+      '';
+
 in
-{
+rec {
   # Expose the constructors so a future cross-model aggregate (or an
   # ad-hoc spike) can build its own checks without going through the
   # attrs below.
@@ -851,7 +956,7 @@ in
   # Per-model checks. Imported by flake.nix as the quintChecks binding,
   # which merges them into checks.* and hands the same attrset to the
   # CI matrix's `formal` kind.
-  checks = {
+  quintCorpus = {
     # rio-lease's leader-election protocol over a Kubernetes Lease
     # object: per-node clocks (bounded skew), the observed-record
     # staleness clock, local self-fencing, crash/recovery, and the
@@ -6808,5 +6913,12 @@ in
       modelTimeoutSec = 120;
       witness = "noFaultNeverCharged";
     };
+  };
+
+  # bughunt-2 (slot 11) funnel: flake.nix consumes ONLY `checks`, so a
+  # wired check is inside the quint-policy lint domain BY CONSTRUCTION —
+  # there is no second list to forget.
+  checks = quintCorpus // {
+    quint-policy = mkPolicyCheck quintCorpus;
   };
 }
