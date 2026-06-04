@@ -253,10 +253,10 @@ fn parse_alerts(body: &str) -> Result<serde_json::Value> {
             if let Some(r) = cur.as_mut() {
                 r.for_ = c[1].to_string();
             }
-        } else if let Some(c) = severity_re.captures(line) {
-            if let Some(r) = cur.as_mut() {
-                r.severity = c[1].to_string();
-            }
+        } else if let Some(c) = severity_re.captures(line)
+            && let Some(r) = cur.as_mut()
+        {
+            r.severity = c[1].to_string();
         }
     }
     if let Some(r) = cur.take() {
@@ -310,10 +310,10 @@ fn migrations() -> Result<serde_json::Value> {
     let mut stems: Vec<String> = Vec::new();
     for entry in fs::read_dir(dir)? {
         let p = entry?.path();
-        if p.extension().is_some_and(|x| x == "sql") {
-            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                stems.push(stem.to_string());
-            }
+        if p.extension().is_some_and(|x| x == "sql")
+            && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+        {
+            stems.push(stem.to_string());
         }
     }
     stems.sort();

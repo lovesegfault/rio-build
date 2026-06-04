@@ -20,4 +20,4 @@
 //! pull mint creates the row inside its fenced statement
 //! (`open_attempts.rs::mint_pull_attempt_fenced`) — the stream-era
 //! `insert_drv_execution` dispatch writer it replaced was deleted
-//! when the module-level `#[allow(dead_code)]` shields came off.
+//! when the module-level dead-code shields came off.
