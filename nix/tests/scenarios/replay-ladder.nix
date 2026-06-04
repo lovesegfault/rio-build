@@ -727,15 +727,30 @@ let
               f"a failing relay must never skip-stamp uploads against a "
               f"healthy gateway (breaker mischarge): {skip_stamped}"
           )
-          # Only relay payloads failed; nothing else in the journal is
-          # failure-shaped (the embedded busybox upload either delivered
-          # or was already present from the first campaign).
-          other_failures = [
+          # The ONLY other failure-shaped rows are the bounded dependent
+          # cascade: each relay-leg drv text references failed relay
+          # blobs, so its own embedded upload settles failed-with-skip
+          # ("reference X failed its earlier upload"). That cascade must
+          # name a relay blob and reach nothing else — busybox and every
+          # unrelated upload stay clean. (The drv texts still reach the
+          # cluster through the per-batch submission import, which is
+          # why the campaign completes regardless.)
+          dependent_skips = [
               row for row in supply
               if row["outcome"] in ("failed", "refused")
               and row["path"] not in set(relay_paths)
           ]
-          assert not other_failures, other_failures
+          for row in dependent_skips:
+              assert "failed its earlier upload" in (row.get("detail") or ""), (
+                  f"unexpected non-relay supply failure: {row}"
+              )
+              assert any(p in row["detail"] for p in relay_paths), (
+                  f"dependent skip must name a failed relay blob: {row}"
+              )
+              assert row["path"].endswith(".drv"), (
+                  f"the cascade may only reach the relay-leg drv texts: {row}"
+              )
+          assert len(dependent_skips) <= 2, dependent_skips
           # The supply-collapse PAUSE never fired (no PAUSE file exists
           # now, and the engine exited instead of waiting on one).
           assert client.execute(f"test -f {state}/PAUSE")[0] != 0
