@@ -590,3 +590,201 @@ async fn test_merge_seeded_node_not_reemitted_by_later_cascade() -> TestResult {
     );
     Ok(())
 }
+
+/// The carried-interest re-seed duplicate cell: resubmitting a failed
+/// closure while an EARLIER interested build is still active re-seeds
+/// the reset `DependencyFailed` parent (`is_retriable_on_resubmit` is
+/// unconditional for `DependencyFailed`; `dag.merge` carries the old
+/// node's `interested_builds` across the reset), and the seed emission
+/// targets EVERY interested build — so the earlier build receives a
+/// SECOND `DerivationFailed` for a node it already holds a terminal
+/// for (its runtime-cascade copy).
+///
+/// This is spec-coherent, pinned here deliberately: the
+/// derivation-terminal event rule is per-TRANSITION, and the reset +
+/// re-seed IS a new transition of the shared node — suppressing the
+/// carried-interest copy would special-case the seed emission away
+/// from the cascade's per-transition shape and silently break the NEW
+/// build's relay if the interest sets ever partially overlap. The
+/// duplicate is absorbed downstream at the gateway's relay chokepoint:
+/// `BuildActivityState::record_terminal` is first-wins ("a duplicate
+/// cannot overwrite it"), pinned gateway-side by
+/// `terminal_retains_only_requested_roots` in
+/// rio-gateway/src/handler/build.rs — the earlier build's recorded
+/// terminal (the cascade copy, carrying the runtime failure text) is
+/// never overwritten by the merge-seed copy. Asserted scheduler-side
+/// here because the gateway's relay state machine is private to its
+/// crate; the named gateway pin owns the absorption half.
+// r[verify sched.event.derivation-terminal]
+// r[verify sched.merge.dep-failed-transitive+2]
+#[tokio::test]
+async fn test_reseed_duplicates_terminal_to_carried_interest_build() -> TestResult {
+    let (_db, handle, _task, mut w1_rx) = setup_with_worker("carry-w1", "x86_64-linux").await?;
+    let mut w2_rx = connect_executor(&handle, "carry-w2", "x86_64-linux").await?;
+
+    // Build A (keep-going): the doomed closure P → D plus an unrelated
+    // node R whose pending execution keeps A ACTIVE after the closure
+    // fails — the cell needs the earlier build live at resubmit time.
+    let build_a = Uuid::new_v4();
+    let mut rx_a = merge_dag(
+        &handle,
+        build_a,
+        vec![
+            make_node("carryP"),
+            make_node("carryD"),
+            make_node("carryR"),
+        ],
+        vec![make_test_edge("carryP", "carryD")],
+        true,
+    )
+    .await?;
+
+    // Both leaves (D, R) dispatch — one per capacity-1 worker. Identify
+    // which worker holds D so its failure report is addressable.
+    let a1 = recv_assignment(&mut w1_rx).await;
+    let a2 = recv_assignment(&mut w2_rx).await;
+    let d_worker = if a1.drv_path.contains("carryD") {
+        "carry-w1"
+    } else {
+        assert!(
+            a2.drv_path.contains("carryD"),
+            "one of the two workers must hold carryD; got {} / {}",
+            a1.drv_path,
+            a2.drv_path
+        );
+        "carry-w2"
+    };
+
+    // D fails permanently → Poisoned; the runtime cascade transitions P
+    // to DependencyFailed and emits P's terminal to A.
+    complete_failure(
+        &handle,
+        d_worker,
+        &test_drv_path("carryD"),
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "carryD failed",
+    )
+    .await?;
+    assert_eq!(
+        expect_drv(&handle, "carryP").await.status,
+        DerivationStatus::DependencyFailed,
+        "P cascades when its dep poisons"
+    );
+    assert_eq!(
+        query_status(&handle, build_a).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "R is still in flight — the earlier build must be ACTIVE for this cell"
+    );
+
+    // A now holds P's FIRST terminal: the cascade copy, carrying the
+    // runtime failure text through the shared producer formatter.
+    let cascade_msg =
+        rio_proto::dependency_failed_summary(&test_drv_path("carryD"), "carryD failed");
+    let first = drain_failed_derivation_events(&mut rx_a);
+    let p_first: Vec<_> = first
+        .iter()
+        .filter(|d| d.derivation_path == test_drv_path("carryP"))
+        .collect();
+    assert_eq!(
+        p_first.len(),
+        1,
+        "exactly one cascade terminal for P before the resubmit: {first:?}"
+    );
+    assert_eq!(p_first[0].error_message, cascade_msg);
+
+    // Pin D at the poison resubmit limit so build B's merge keeps it
+    // Poisoned (the under-limit lane would reset it into a retry).
+    assert!(
+        handle
+            .debug_force_poisoned("carryD", crate::state::POISON_RESUBMIT_RETRY_LIMIT)
+            .await?
+    );
+
+    // Build B resubmits the failed closure while A is still active.
+    // P (DependencyFailed) resets into the seeding path with A's
+    // interest carried; D (at-limit Poisoned) stays for the
+    // pre-existing reconciliation arm.
+    let build_b = Uuid::new_v4();
+    let mut rx_b = merge_dag(
+        &handle,
+        build_b,
+        vec![make_node("carryP"), make_node("carryD")],
+        vec![make_test_edge("carryP", "carryD")],
+        false,
+    )
+    .await?;
+
+    let seed_msg = rio_proto::dependency_failed_summary(
+        &test_drv_path("carryD"),
+        "already poisoned when this build merged",
+    );
+
+    // B's own stream: the seeded P terminal plus D's remembered
+    // failure — the resubmitted build is fully evidenced.
+    let b_failed = drain_failed_derivation_events(&mut rx_b);
+    let p_to_b: Vec<_> = b_failed
+        .iter()
+        .filter(|d| d.derivation_path == test_drv_path("carryP"))
+        .collect();
+    assert_eq!(p_to_b.len(), 1, "one seeded P terminal to B: {b_failed:?}");
+    assert_eq!(p_to_b[0].error_message, seed_msg);
+    let d_to_b: Vec<_> = b_failed
+        .iter()
+        .filter(|d| d.derivation_path == test_drv_path("carryD"))
+        .collect();
+    assert_eq!(
+        d_to_b.len(),
+        1,
+        "one CACHED_FAILURE for pre-existing D to B: {b_failed:?}"
+    );
+    assert_eq!(
+        d_to_b[0].failure_status(),
+        rio_proto::types::BuildResultStatus::CachedFailure
+    );
+
+    // THE CELL: A receives a SECOND DerivationFailed for P — the
+    // re-seed emission to the carried interest — distinguishable from
+    // the cascade copy by its merge-time message tail (both built by
+    // the shared producer formatter, never hand-written).
+    let second = drain_failed_derivation_events(&mut rx_a);
+    let p_second: Vec<_> = second
+        .iter()
+        .filter(|d| d.derivation_path == test_drv_path("carryP"))
+        .collect();
+    assert_eq!(
+        p_second.len(),
+        1,
+        "the re-seed emits P's terminal to the carried-interest build: {second:?}"
+    );
+    assert_eq!(
+        p_second[0].failure_status(),
+        rio_proto::types::BuildResultStatus::DependencyFailed
+    );
+    assert_eq!(
+        p_second[0].error_message, seed_msg,
+        "the duplicate is the merge-seed copy (merge-time tail), not a cascade replay"
+    );
+    assert_ne!(
+        seed_msg, cascade_msg,
+        "the two copies differ by tail — the duplicate is attributable to the re-seed"
+    );
+
+    // The pre-existing reconciliation arm stays targeted: D's
+    // CACHED_FAILURE went to the merging build only, never to A.
+    assert!(
+        second
+            .iter()
+            .all(|d| d.derivation_path != test_drv_path("carryD")),
+        "reconcile_preexisting must not re-emit D to prior builds: {second:?}"
+    );
+
+    // The duplicate is bookkeeping-only for A: its build state is
+    // untouched (R still in flight). The gateway-side absorption is
+    // the named first-wins pin cited in the doc comment.
+    assert_eq!(
+        query_status(&handle, build_a).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "the carried-interest duplicate must not perturb the earlier build's state"
+    );
+    Ok(())
+}
