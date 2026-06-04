@@ -28,7 +28,7 @@ impl SchedulerDb {
     /// the scheduler re-dispatches after a worker-reported failure
     /// before the completion handler has transitioned the prior
     /// assignment to a terminal status — a race, not a logic bug.
-    pub async fn insert_assignment(
+    pub(crate) async fn insert_assignment(
         &self,
         derivation_id: Uuid,
         executor_id: &ExecutorId,
@@ -63,7 +63,7 @@ impl SchedulerDb {
     /// Update an assignment status. Terminal statuses
     /// (`Completed`/`Failed`/`Cancelled`) also stamp
     /// `completed_at = now()`; `Pending` leaves it alone.
-    pub async fn update_assignment_status(
+    pub(crate) async fn update_assignment_status(
         &self,
         derivation_id: Uuid,
         status: AssignmentStatus,

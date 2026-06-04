@@ -12,7 +12,7 @@ impl SchedulerDb {
     /// Link a build to a derivation. Test-only singular form; production
     /// path is [`Self::batch_insert_build_derivations`].
     #[cfg(test)]
-    pub async fn insert_build_derivation(
+    pub(crate) async fn insert_build_derivation(
         &self,
         build_id: Uuid,
         derivation_id: Uuid,
@@ -164,7 +164,7 @@ impl SchedulerDb {
     }
 
     /// Batch-insert build_derivations links.
-    pub async fn batch_insert_build_derivations(
+    pub(crate) async fn batch_insert_build_derivations(
         tx: &mut PgConnection,
         build_id: Uuid,
         derivation_ids: &[Uuid],
@@ -189,7 +189,7 @@ impl SchedulerDb {
     }
 
     /// Batch-insert edges.
-    pub async fn batch_insert_edges(
+    pub(crate) async fn batch_insert_edges(
         tx: &mut PgConnection,
         edges: &[(Uuid, Uuid)],
     ) -> Result<(), sqlx::Error> {

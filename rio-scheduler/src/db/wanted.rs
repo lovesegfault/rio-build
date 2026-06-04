@@ -86,6 +86,11 @@ impl SchedulerDb {
     /// Phase A actor smoke test and Phase B's reprobe-lane creation).
     /// Returns [`FencedOutcome::Fenced`] (nothing written) when
     /// `serving_generation` is below the durable claims floor.
+    /// Test-battery form (merged_bug_284 sweep): production wanted
+    /// writes flow through the merge transaction's union upsert
+    /// (`batch.rs`, union-on-conflict); this fenced singular IS the
+    /// relation's specification and db/tests/wanted.rs pins it.
+    #[cfg(test)]
     pub(crate) async fn record_wanted_fenced(
         &self,
         serving_generation: i64,

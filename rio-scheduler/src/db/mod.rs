@@ -27,21 +27,10 @@ mod derivations;
 mod executions;
 mod history;
 mod live_pins;
-// Substitution-replacement Phase A (design §6): the materialization-job
-// table. Dead code by design until the Wave-3 scheduler wiring calls it
-// flag-gated (the campaign plan's T-3.3/T-3.4); the
-// db/tests/materialization.rs battery exercises it now.
-#[allow(dead_code)]
 pub(crate) mod materialization;
 pub(crate) mod open_attempts;
 mod recovery;
 mod tenants;
-// Substitution-replacement Phase A (design §6): the durable per-(build,
-// derivation) wanted relation. Dead code by design until the Wave-3
-// scheduler wiring calls it flag-gated from the merge transaction and
-// the actor (the campaign plan's T-3.4); the db/tests/wanted.rs battery
-// exercises it now.
-#[allow(dead_code)]
 pub(crate) mod wanted;
 
 #[cfg(test)]
@@ -529,12 +518,6 @@ impl FencedTx {
     /// borrow ends before `commit`.
     pub(crate) fn conn(&mut self) -> &mut PgConnection {
         &mut self.tx
-    }
-
-    /// The generation this transaction was fenced at.
-    #[allow(dead_code)]
-    pub(crate) fn serving_generation(&self) -> i64 {
-        self.serving_generation
     }
 
     /// Commit the fenced transaction.

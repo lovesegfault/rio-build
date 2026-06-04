@@ -15,7 +15,7 @@ impl SchedulerDb {
     /// Pin a batch of store paths as live-build inputs for a drv.
     /// SHA-256 each path for store_path_hash (matches narinfo keying).
     /// ON CONFLICT DO NOTHING: re-pin is idempotent.
-    pub async fn pin_live_inputs(
+    pub(crate) async fn pin_live_inputs(
         &self,
         drv_hash: &DrvHash,
         store_paths: &[String],
@@ -64,7 +64,7 @@ impl SchedulerDb {
     ///
     /// Returns `rows_affected()` so callers/tests can assert on the
     /// delta (0 on re-call = idempotence proof).
-    pub async fn upsert_path_tenants(
+    pub(crate) async fn upsert_path_tenants(
         &self,
         output_paths: &[String],
         tenant_ids: &[Uuid],
@@ -96,7 +96,7 @@ impl SchedulerDb {
     /// instead of N. Same UNNEST + `ON CONFLICT DO NOTHING` semantics.
     ///
     /// [`upsert_path_tenants`]: Self::upsert_path_tenants
-    pub async fn upsert_path_tenants_raw(
+    pub(crate) async fn upsert_path_tenants_raw(
         &self,
         hashes: &[Vec<u8>],
         tids: &[Uuid],
@@ -131,7 +131,7 @@ impl SchedulerDb {
     /// `'build_input'` default, so the predicate selects exactly the
     /// rows it always did.
     // r[impl sched.materialize.pinning]
-    pub async fn unpin_live_inputs(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
+    pub(crate) async fn unpin_live_inputs(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "DELETE FROM scheduler_live_pins \
              WHERE drv_hash = $1 AND pin_kind = 'build_input'",
@@ -153,7 +153,10 @@ impl SchedulerDb {
     /// [`unpin_live_inputs`]: Self::unpin_live_inputs
     /// [`update_derivation_status_batch`]: Self::update_derivation_status_batch
     // r[impl sched.materialize.pinning]
-    pub async fn unpin_live_inputs_batch(&self, drv_hashes: &[&str]) -> Result<u64, sqlx::Error> {
+    pub(crate) async fn unpin_live_inputs_batch(
+        &self,
+        drv_hashes: &[&str],
+    ) -> Result<u64, sqlx::Error> {
         if drv_hashes.is_empty() {
             return Ok(0);
         }
@@ -180,7 +183,7 @@ impl SchedulerDb {
     /// inputs no longer in use") is false for materialization pins,
     /// whose release is the all-interest-terminal rule (PP-2).
     // r[impl sched.materialize.pinning]
-    pub async fn sweep_stale_live_pins(&self) -> Result<u64, sqlx::Error> {
+    pub(crate) async fn sweep_stale_live_pins(&self) -> Result<u64, sqlx::Error> {
         // Compile-time splice of the terminal-status tuple — see
         // terminal_status_sql! for why it isn't a bind param.
         let result = sqlx::query(terminal_status_sql!(
@@ -218,7 +221,13 @@ impl SchedulerDb {
     /// shared PG (bug_192; PD-13: rio-store cannot link rio-scheduler,
     /// both link rio-migrations).
     // r[impl sched.materialize.pinning]
-    pub async fn pin_materialized_paths(
+    /// Test-seeding twin (merged_bug_284 sweep): the PRODUCTION
+    /// pin-at-ingest executes the same
+    /// [`rio_migrations::sql::PIN_MATERIALIZED_UPSERT_SQL`] from
+    /// rio-store; this scheduler-side twin seeds the release-rule
+    /// batteries against the EXACT production upsert shape.
+    #[cfg(test)]
+    pub(crate) async fn pin_materialized_paths(
         &self,
         job_id: Uuid,
         drv_hash: &DrvHash,
@@ -257,7 +266,9 @@ impl SchedulerDb {
     /// release_materialization_pins_best_effort), and the recovery
     /// sweep (actor/recovery.rs). The battery pins the rule.
     // r[impl sched.materialize.pinning]
-    pub async fn release_materialization_pins_for_resolved_jobs(&self) -> Result<u64, sqlx::Error> {
+    pub(crate) async fn release_materialization_pins_for_resolved_jobs(
+        &self,
+    ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
             "DELETE FROM scheduler_live_pins p \
               WHERE p.pin_kind = 'materialization' \

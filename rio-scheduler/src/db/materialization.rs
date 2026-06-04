@@ -28,19 +28,17 @@ use crate::db::attempts::AttemptRow;
 use crate::state::{JobOrigin, JobState};
 
 /// One materialization-job row, as the store poll and the consumption
-/// transaction read it.
+/// transaction read it. Carries exactly the fields the descriptor
+/// consumer reads (merged_bug_284 dead-code sweep trimmed the five
+/// load-only columns); the raw row still SELECTs and PARSES the full
+/// vocabulary — `try_from` is the CHECK-drift tripwire and validates
+/// `state` even though no production reader keeps it.
 #[derive(Debug, Clone)]
 pub(crate) struct MaterializationJobRow {
     pub job_id: Uuid,
-    pub derivation_id: Uuid,
     pub drv_hash: String,
     pub tenant_id: Option<Uuid>,
     pub origin: JobOrigin,
-    pub state: JobState,
-    /// Epoch seconds; `None` = not parked.
-    pub park_until_epoch: Option<f64>,
-    pub created_generation: i64,
-    pub resolution_exec_id: Option<Uuid>,
 }
 
 /// Raw FromRow shape for the claimable-list query: TEXT enums come back
@@ -51,14 +49,10 @@ pub(crate) struct MaterializationJobRow {
 #[derive(Debug, sqlx::FromRow)]
 struct RawJobRow {
     job_id: Uuid,
-    derivation_id: Uuid,
     drv_hash: String,
     tenant_id: Option<Uuid>,
     origin: String,
     state: String,
-    park_until_epoch: Option<f64>,
-    created_generation: i64,
-    resolution_exec_id: Option<Uuid>,
 }
 
 impl TryFrom<RawJobRow> for MaterializationJobRow {
@@ -71,22 +65,21 @@ impl TryFrom<RawJobRow> for MaterializationJobRow {
                     .into(),
             )
         };
+        // Vocabulary validation for the dropped-by-the-consumer column:
+        // a `state` outside the rust-side alphabet is schema/code drift
+        // and must surface as a decode error, not load silently.
+        let _: JobState = raw
+            .state
+            .parse()
+            .map_err(|_| parse_err("state", &raw.state))?;
         Ok(Self {
             job_id: raw.job_id,
-            derivation_id: raw.derivation_id,
             tenant_id: raw.tenant_id,
             origin: raw
                 .origin
                 .parse()
                 .map_err(|_| parse_err("origin", &raw.origin))?,
-            state: raw
-                .state
-                .parse()
-                .map_err(|_| parse_err("state", &raw.state))?,
             drv_hash: raw.drv_hash,
-            park_until_epoch: raw.park_until_epoch,
-            created_generation: raw.created_generation,
-            resolution_exec_id: raw.resolution_exec_id,
         })
     }
 }
@@ -355,9 +348,7 @@ impl SchedulerDb {
         limit: i64,
     ) -> Result<Vec<MaterializationJobRow>, sqlx::Error> {
         let raw: Vec<RawJobRow> = sqlx::query_as(
-            "SELECT j.job_id, j.derivation_id, j.drv_hash, j.tenant_id, j.origin, j.state, \
-                    EXTRACT(EPOCH FROM j.park_until)::float8 AS park_until_epoch, \
-                    j.created_generation, j.resolution_exec_id \
+            "SELECT j.job_id, j.drv_hash, j.tenant_id, j.origin, j.state \
                FROM materialization_jobs j \
               WHERE j.state = 'pending' \
                 AND (j.park_until IS NULL OR j.park_until <= now()) \
@@ -523,6 +514,10 @@ impl SchedulerDb {
 
     /// Dormancy probe (Wave 6 / VM subtest support): row counts of
     /// `(materialization_jobs, build_wanted_outputs)`.
+    /// Test diagnostic (merged_bug_284 sweep): row-count assertions
+    /// for the db/tests + actor/tests materialization batteries; no
+    /// production reader.
+    #[cfg(test)]
     pub(crate) async fn count_materialization_rows(&self) -> Result<(i64, i64), sqlx::Error> {
         let row: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM materialization_jobs), \

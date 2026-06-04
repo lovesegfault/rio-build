@@ -357,6 +357,40 @@ in
         touch $out
       '';
 
+  # merged_bug_284: the scheduler db mutator surface is crate-private
+  # and dead_code keeps authority. The two module-level
+  # #[allow(dead_code)] shields ("until Wave-3 wiring" — long expired)
+  # came off; every shielded fn was deleted (insert_drv_execution, the
+  # FencedTx::serving_generation accessor) or wired-with-justification
+  # (#[cfg(test)] battery twins, each why-commented). ONE public
+  # mutator is allowlisted: delete_samples_older_than — the bin
+  # target's build-samples retention sweep calls it from outside the
+  # lib crate. Formal-coverage rationale (none-sensible): visibility
+  # policy; the tripwire is the closure.
+  db-mutator-visibility =
+    pkgs.runCommand "rio-db-mutator-visibility"
+      {
+        nativeBuildInputs = [ pkgs.gnugrep ];
+        src = pkgs.lib.fileset.toSource {
+          root = ../rio-scheduler/src/db;
+          fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src/db;
+        };
+      }
+      ''
+        fail=0
+        if grep -rn '^[[:space:]]*pub async fn' $src --include='*.rs' \
+             | grep -v 'tests/' | grep -v 'delete_samples_older_than'; then
+          echo "FAIL: public db mutator — db/ is pub(crate); only delete_samples_older_than (the main.rs retention sweep) is allowlisted" >&2
+          fail=1
+        fi
+        if grep -rn 'allow(dead_code)' $src --include='*.rs' | grep -v 'tests/'; then
+          echo "FAIL: dead_code shield in rio-scheduler/src/db/ — delete the fn or wire it with a recorded justification" >&2
+          fail=1
+        fi
+        [[ $fail -eq 0 ]]
+        touch $out
+      '';
+
   # merged_bug_353 (lint half): every rio_* token a shipped dashboard
   # expr or PrometheusRule expr reads must be a LIVE described metric
   # (docs/gen/metrics.json .names — the describe_*! scrape). Histogram

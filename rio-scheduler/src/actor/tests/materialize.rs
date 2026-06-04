@@ -164,8 +164,15 @@ async fn flag_on_pruned_root_creates_job_at_merge() -> TestResult {
          not the post-commit probe site)"
     );
     assert_eq!(jobs[0].drv_hash, "maton-prune-root");
+    // (the descriptor row no longer carries created_generation — the
+    // merged_bug_284 sweep trimmed load-only columns; pin via SQL)
+    let created_gen: i64 =
+        sqlx::query_scalar("SELECT created_generation FROM materialization_jobs WHERE job_id = $1")
+            .bind(jobs[0].job_id)
+            .fetch_one(&db.pool)
+            .await?;
     assert_eq!(
-        jobs[0].created_generation, 1,
+        created_gen, 1,
         "created with the merge transaction's serving generation (always-leader = 1)"
     );
 

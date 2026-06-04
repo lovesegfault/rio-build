@@ -95,7 +95,7 @@ impl SchedulerDb {
     /// `update_derivation_status_in_tx` instead (their fence lives at
     /// the transaction owner).
     // r[impl sched.evidence.durability+4]
-    pub async fn update_derivation_status(
+    pub(crate) async fn update_derivation_status(
         &self,
         drv_hash: &DrvHash,
         status: DerivationStatus,
@@ -177,7 +177,7 @@ impl SchedulerDb {
     ///
     /// [`update_derivation_status`]: Self::update_derivation_status
     // r[impl sched.evidence.durability+4]
-    pub async fn update_derivation_status_batch(
+    pub(crate) async fn update_derivation_status_batch(
         &self,
         drv_hashes: &[&str],
         status: DerivationStatus,
@@ -217,7 +217,7 @@ impl SchedulerDb {
     ///   in-memory base can never lower a dimension the fence cannot
     ///   see (the debug force-floor path is in-memory only and never
     ///   reaches this writer).
-    pub async fn update_resource_floor(
+    pub(crate) async fn update_resource_floor(
         &self,
         drv_hash: &DrvHash,
         floor: &crate::state::ResourceFloor,
@@ -300,7 +300,7 @@ impl SchedulerDb {
     /// `persist_poisoned_in_tx` instead (their fence lives at the
     /// transaction owner).
     // r[impl sched.evidence.durability+4]
-    pub async fn persist_poisoned(
+    pub(crate) async fn persist_poisoned(
         &self,
         drv_hash: &DrvHash,
         serving_generation: i64,
@@ -332,7 +332,7 @@ impl SchedulerDb {
     /// Claims-floor fenced: the repair sweep runs at recovery with the
     /// new tenure's generation — a deposed replica's concurrent sweep
     /// writes nothing.
-    pub async fn sweep_stale_assignments(
+    pub(crate) async fn sweep_stale_assignments(
         &self,
         serving_generation: i64,
     ) -> Result<FencedOutcome, sqlx::Error> {
@@ -391,7 +391,7 @@ impl SchedulerDb {
     /// use `clear_poison_in_tx` instead (their fence lives at the
     /// transaction owner).
     // r[impl sched.evidence.durability+4]
-    pub async fn clear_poison(
+    pub(crate) async fn clear_poison(
         &self,
         drv_hash: &DrvHash,
         serving_generation: i64,
@@ -432,7 +432,12 @@ impl SchedulerDb {
     /// [`clear_poison`]: Self::clear_poison
     /// [`update_derivation_status_batch`]: Self::update_derivation_status_batch
     // r[impl sched.evidence.durability+4]
-    pub async fn clear_poison_batch(
+    /// Test-battery twin (merged_bug_284 sweep): the production batch
+    /// clear is the in-tx form (`clear_poison_batch_in_tx`,
+    /// completion.rs resubmit path); this pool-direct twin seeds and
+    /// pins the db/tests/derivations.rs battery.
+    #[cfg(test)]
+    pub(crate) async fn clear_poison_batch(
         &self,
         drv_hashes: &[DrvHash],
         serving_generation: i64,
@@ -510,7 +515,10 @@ impl SchedulerDb {
     /// on both endpoints (orphans never loaded — correctness OK), but
     /// the table still grows unbounded at avg-fanout× the I-169.2
     /// churn rate (1.16M derivations) without the edge delete.
-    pub async fn gc_orphan_terminal_derivations(&self, limit: i64) -> Result<u64, sqlx::Error> {
+    pub(crate) async fn gc_orphan_terminal_derivations(
+        &self,
+        limit: i64,
+    ) -> Result<u64, sqlx::Error> {
         // Compile-time splice of the terminal-status tuple — see
         // terminal_status_sql! for why it isn't a bind param.
         let result = sqlx::query(terminal_status_sql!(

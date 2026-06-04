@@ -82,7 +82,7 @@ impl SchedulerDb {
     /// distribution, not a smoothed scalar. `completed_at` is
     /// server-side `now()`; `outlier_excluded` keeps its DEFAULT FALSE
     /// (the MAD sweep flips it later).
-    pub async fn write_build_sample(&self, row: &BuildSampleRow) -> Result<(), sqlx::Error> {
+    pub(crate) async fn write_build_sample(&self, row: &BuildSampleRow) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "INSERT INTO build_samples
                (pname, system, tenant, duration_secs, peak_memory_bytes,
@@ -119,6 +119,10 @@ impl SchedulerDb {
     ///
     /// Range delete on `completed_at` — covered by
     /// `build_samples_completed_at_idx` (migration 013).
+    /// `pub` (not `pub(crate)`): the ONE intentionally-public db
+    /// mutator — the bin target's build-samples retention sweep
+    /// (`main.rs` `spawn_periodic("build-samples-retention", …)`)
+    /// calls it from outside the lib crate (merged_bug_284 sweep).
     pub async fn delete_samples_older_than(&self, days: u32) -> Result<u64, sqlx::Error> {
         // `$1 * interval '1 day'` with an i32 bind — PG interval
         // arithmetic. Avoids the `($1 || ' days')::interval` text-cast
@@ -136,13 +140,13 @@ impl SchedulerDb {
     /// excluding MAD-flagged outliers. Feeds [`SlaEstimator::refresh`] —
     /// the estimator only needs to know WHICH `(pname, system, tenant)`
     /// keys were touched since the last tick; the actual fit re-reads
-    /// the per-key ring via [`Self::read_build_samples_for_key`].
+    /// the per-key ring via `read_build_samples_for_key`.
     ///
     /// Range on `completed_at` — covered by `build_samples_incremental_idx`
     /// (migration 039).
     ///
     /// [`SlaEstimator::refresh`]: crate::sla::SlaEstimator::refresh
-    pub async fn read_build_samples_incremental(
+    pub(crate) async fn read_build_samples_incremental(
         &self,
         since_epoch: f64,
     ) -> Result<Vec<BuildSampleRow>, sqlx::Error> {
@@ -170,7 +174,7 @@ impl SchedulerDb {
     /// incremental reads already filter `WHERE NOT outlier_excluded`,
     /// so flagged samples drop out of the next refit without a DELETE.
     /// Empty `ids` → no-op (skips the round-trip).
-    pub async fn mark_outliers_excluded(&self, ids: &[i64]) -> Result<(), sqlx::Error> {
+    pub(crate) async fn mark_outliers_excluded(&self, ids: &[i64]) -> Result<(), sqlx::Error> {
         if ids.is_empty() {
             return Ok(());
         }
@@ -194,12 +198,17 @@ impl SchedulerDb {
     /// DESC LIMIT`, so this is an index-only top-N; the outer reverse is
     /// in-memory on ≤`limit` rows.
     ///
-    /// `rn <= limit OR rn_c = 1` mirrors [`Self::trim_build_samples`]'s
+    /// `rn <= limit OR rn_c = 1` mirrors `trim_build_samples`'s
     /// dual window so an anchor row preserved past `limit` by recency is
     /// still loaded — bug_029: trim kept the anchor at `rn=limit+1` but
     /// the recency-only `LIMIT` here skipped it, so cold-leader refit
     /// saw `span=1.0` and collapsed to flat-median.
-    pub async fn read_build_samples_for_key(
+    /// Test-battery form (merged_bug_284 sweep): production reads go
+    /// through the batch twin below; this per-key singular IS the
+    /// batch's specification and the db/tests/history.rs ring
+    /// batteries pin it.
+    #[cfg(test)]
+    pub(crate) async fn read_build_samples_for_key(
         &self,
         pname: &str,
         system: &str,
@@ -258,7 +267,10 @@ impl SchedulerDb {
     ///
     /// [`SlaEstimator::refresh`]: crate::sla::SlaEstimator::refresh
     /// [`AnchorRing`]: crate::sla::ingest::AnchorRing
-    pub async fn trim_build_samples(
+    /// Test-battery form (merged_bug_284 sweep): production trims go
+    /// through the batch twin; the singular IS its specification.
+    #[cfg(test)]
+    pub(crate) async fn trim_build_samples(
         &self,
         pname: &str,
         system: &str,
@@ -297,7 +309,7 @@ impl SchedulerDb {
         Ok(r.rows_affected())
     }
 
-    /// Batch [`Self::read_build_samples_for_key`]: most-recent `limit`
+    /// Batch `read_build_samples_for_key`: most-recent `limit`
     /// rows per `(pname, system, tenant)` for every key in the parallel
     /// arrays, in a single round-trip. Returned ASC per key; keys are
     /// interleaved — caller groups in-memory.
@@ -311,7 +323,7 @@ impl SchedulerDb {
     /// of N keys is one query, not N sequential awaits on the actor.
     ///
     /// [`SlaEstimator::refresh`]: crate::sla::SlaEstimator::refresh
-    pub async fn read_build_samples_for_keys(
+    pub(crate) async fn read_build_samples_for_keys(
         &self,
         pnames: &[String],
         systems: &[String],
@@ -357,7 +369,7 @@ impl SchedulerDb {
         .await
     }
 
-    /// Batch [`Self::trim_build_samples`]: delete all but the `keep_n`
+    /// Batch `trim_build_samples`: delete all but the `keep_n`
     /// most-recent NON-OUTLIER rows — plus one anchor per distinct
     /// `round(cpu_limit_cores)` — for every `(pname, system, tenant)`
     /// in the parallel arrays, in a single round-trip. Returns total
@@ -365,7 +377,7 @@ impl SchedulerDb {
     /// single-key variant; same `NOT outlier_excluded` filter so
     /// outliers don't occupy ring slots (they're age-swept by
     /// `delete_samples_older_than` instead).
-    pub async fn trim_build_samples_batch(
+    pub(crate) async fn trim_build_samples_batch(
         &self,
         pnames: &[String],
         systems: &[String],
@@ -431,7 +443,7 @@ impl SchedulerDb {
     /// written with `cluster:"prod-east"` would match in every region.
     ///
     /// [`SlaEstimator::refresh`]: crate::sla::SlaEstimator::refresh
-    pub async fn read_sla_overrides(
+    pub(crate) async fn read_sla_overrides(
         &self,
         cluster: &str,
         pname: Option<&str>,
@@ -460,7 +472,7 @@ impl SchedulerDb {
     /// Insert one override. Returns the row with server-assigned `id` /
     /// `created_at`. `expires_at` round-trips as epoch f64 →
     /// `to_timestamp($n)`.
-    pub async fn insert_sla_override(
+    pub(crate) async fn insert_sla_override(
         &self,
         row: &SlaOverrideRow,
     ) -> Result<SlaOverrideRow, sqlx::Error> {
@@ -498,7 +510,7 @@ impl SchedulerDb {
 
     /// Delete one override by id. Idempotent — returns rows affected
     /// (0 if already gone).
-    pub async fn delete_sla_override(&self, id: i64) -> Result<u64, sqlx::Error> {
+    pub(crate) async fn delete_sla_override(&self, id: i64) -> Result<u64, sqlx::Error> {
         let r = sqlx::query!("DELETE FROM sla_overrides WHERE id = $1", id)
             .execute(&self.pool)
             .await?;
@@ -510,7 +522,7 @@ impl SchedulerDb {
     /// dispatch falls back to the cold-start probe path.
     ///
     /// [`SlaEstimator::evict`]: crate::sla::SlaEstimator::evict
-    pub async fn delete_build_samples_for_key(
+    pub(crate) async fn delete_build_samples_for_key(
         &self,
         pname: &str,
         system: &str,

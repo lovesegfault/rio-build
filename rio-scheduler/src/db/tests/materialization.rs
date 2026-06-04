@@ -199,7 +199,15 @@ async fn list_claimable_excludes_claimed_and_parked() -> anyhow::Result<()> {
         "claimable list is oldest-first"
     );
     assert_eq!(claimable[0].origin, JobOrigin::CacheOpportunity);
-    assert_eq!(claimable[0].state, JobState::Pending);
+    // state is WHERE-clause-pinned ('pending') and vocabulary-validated
+    // by the loader's try_from; the descriptor row no longer carries it
+    // (merged_bug_284 trim) — assert the durable value directly.
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE job_id = $1")
+            .bind(claimable[0].job_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(state, "pending");
 
     // The limit caps the list (oldest win).
     let capped = db.list_claimable_materialization_jobs(2).await?;

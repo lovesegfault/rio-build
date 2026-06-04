@@ -15,41 +15,9 @@
 //! a sync chokepoint that fires the write through `spawn_monitored`
 //! (the `record_exec_correlation` pattern), so the SQL sits next to
 //! that call in `actor/event.rs`.
-
-use uuid::Uuid;
-
-use super::SchedulerDb;
-use crate::state::ExecutorId;
-
-impl SchedulerDb {
-    /// Create the lifecycle row for a freshly-minted execution.
-    ///
-    /// `drv_hash` is the `drv_log_hash()` 32-char form (the same value
-    /// the `logs/{drv_hash}/…` S3 chunk keys use) —
-    /// NOT the `derivations.drv_hash` DAG key. rio-store normalizes a
-    /// reader's derivation argument through the same helper before
-    /// querying this column.
-    ///
-    /// `ON CONFLICT DO NOTHING`: a daemon-transient retry keeps the
-    /// same `exec_id` and re-runs the dispatch path — the second
-    /// INSERT is a no-op and the original `started_at` is preserved.
-    /// A scheduler re-dispatch mints a new `exec_id` → a new row.
-    pub async fn insert_drv_execution(
-        &self,
-        exec_id: Uuid,
-        drv_hash: &str,
-        executor_id: &ExecutorId,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "INSERT INTO drv_executions (exec_id, drv_hash, executor_id, started_at) \
-             VALUES ($1, $2, $3, now()) \
-             ON CONFLICT (exec_id) DO NOTHING",
-        )
-        .bind(exec_id)
-        .bind(drv_hash)
-        .bind(executor_id.as_str())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-}
+//!
+//! No CRUD lives here anymore (merged_bug_284 dead-code sweep): the
+//! pull mint creates the row inside its fenced statement
+//! (`open_attempts.rs::mint_pull_attempt_fenced`) — the stream-era
+//! `insert_drv_execution` dispatch writer it replaced was deleted
+//! when the module-level `#[allow(dead_code)]` shields came off.

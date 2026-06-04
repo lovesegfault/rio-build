@@ -377,7 +377,7 @@ impl SchedulerDb {
     ///
     /// `GREATEST` of two NULLs is NULL: BIGINT → i64 → u64 cast at the
     /// caller, `None` = fresh cluster (no assignments, no claims).
-    pub async fn max_known_generation(&self) -> Result<Option<i64>, sqlx::Error> {
+    pub(crate) async fn max_known_generation(&self) -> Result<Option<i64>, sqlx::Error> {
         let row: (Option<i64>,) = sqlx::query_as(
             r#"
             SELECT GREATEST(
@@ -413,7 +413,7 @@ impl SchedulerDb {
     /// pod reuses `HOSTNAME`, but the predecessor is dead before the
     /// successor starts.
     // r[impl sched.lease.generation-claim+2]
-    pub async fn claim_generation(
+    pub(crate) async fn claim_generation(
         &self,
         generation: i64,
         holder_id: &str,
@@ -445,7 +445,9 @@ impl SchedulerDb {
     ///   [`Self::claim_generation`] means someone owns that exact
     ///   generation; if it is us the claim is idempotent, otherwise the
     ///   claimer re-targets past this row's generation.
-    pub async fn max_claimed_generation(&self) -> Result<Option<(i64, String)>, sqlx::Error> {
+    pub(crate) async fn max_claimed_generation(
+        &self,
+    ) -> Result<Option<(i64, String)>, sqlx::Error> {
         sqlx::query_as(
             "SELECT generation, holder_id FROM leader_generation_claims \
              ORDER BY generation DESC LIMIT 1",

@@ -106,7 +106,7 @@ impl SchedulerDb {
 
     /// Persist denormalized derivation counts to `builds` (I-103).
     /// Best-effort write — caller logs and continues on error.
-    pub async fn persist_build_counts(
+    pub(crate) async fn persist_build_counts(
         &self,
         build_id: Uuid,
         total: u32,
@@ -151,7 +151,7 @@ impl SchedulerDb {
     /// `recover_from_pg()` reads them back to rebuild BuildInfo.
     /// `options` is serialized to JSONB (`sqlx::types::Json`
     /// wrapper handles the serde round-trip).
-    pub async fn insert_build(
+    pub(crate) async fn insert_build(
         &self,
         build_id: Uuid,
         tenant_id: Option<Uuid>,
@@ -203,7 +203,7 @@ impl SchedulerDb {
     /// build_wanted_outputs orphans behind, and a deposed replica's
     /// late rollback cannot destroy a successor's rows.
     // r[impl sched.db.table-retention]
-    pub async fn delete_build(
+    pub(crate) async fn delete_build(
         &self,
         build_id: Uuid,
         serving_generation: i64,
@@ -267,7 +267,7 @@ impl SchedulerDb {
     /// the terminal transition (`update_build_counts_with` no-ops on
     /// settled builds, so nothing can shrink them afterwards —
     /// merged_bug_097's PG leg).
-    pub async fn update_build_status(
+    pub(crate) async fn update_build_status(
         &self,
         build_id: Uuid,
         status: BuildState,
