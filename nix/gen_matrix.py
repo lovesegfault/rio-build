@@ -71,12 +71,14 @@
 #   GITHUB_OUTPUT=/dev/stdout nix run .#gen-matrix
 # Self-test (no nix needed):
 #   python3 nix/gen_matrix.py --self-test
+import collections
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import unittest
 from collections import defaultdict
 
@@ -113,25 +115,22 @@ MATRIX_KINDS = ("checks", "formal", "fuzz", "vm-test", "coverage")
 # nowait partition there would always be empty.
 SPLIT_KINDS = ("checks", "formal")
 
-# Apalache server heap (MiB) assumed for a formal check whose
-# derivation exports no meta.serverHeapMb (bug_383): matches
-# quint.nix's constructor default. Checks at or below this ride the
-# round-robin shards; anything above is isolated into a singleton
-# shard named for the check.
-DEFAULT_SERVER_HEAP_MB = 4096
-
-# Documentation constant (bug_383): the per-shard memory envelope the
-# ci.yml formal jobs are budgeted against. Derivation: a shard builds
-# with `nix build --max-jobs 2`, so the worst case is two concurrent
-# DEFAULT_SERVER_HEAP_MB Apalache servers + TLC + node overhead
-# (~2×(4GiB + ~0.5GiB) ≈ 9-10GiB) — inside a 16GiB runner. A check
-# that RAISES serverHeapMb past the default would break that envelope
-# inside a shared shard (8GiB server × 2 jobs > 16GiB), which is
-# exactly why cluster_formal isolates it as a singleton (one heavy
-# server + one light neighbor at most ≈ 12-13GiB, still inside
-# 16GiB). The value is exported by the quint.nix constructors as
-# derivation meta — ONE binding sizes the JVM and the shard placement.
-FORMAL_SHARD_BUDGET_MB = 2 * DEFAULT_SERVER_HEAP_MB
+# The per-shard memory envelope the ci.yml formal jobs are budgeted
+# against (bug_383; bughunt-2 bug_292). A LITERAL property of the
+# 16GiB runner class, not a derived value: a shard builds with
+# `nix build --max-jobs 2`, so two concurrent Apalache servers must
+# fit under this envelope alongside TLC + node overhead.
+#
+# bughunt-2 bug_292: the former DEFAULT_SERVER_HEAP_MB mirror of
+# quint.nix's constructor default is DELETED — classification reads
+# ONLY the constructor-exported meta.serverHeapMb (absent = light,
+# i.e. the check never raised its heap). A check is heavy — needs a
+# singleton shard — iff its exported heap exceeds HALF this envelope
+# (two such servers no longer co-fit under --max-jobs 2). Both silent
+# drift directions are now impossible: raising the quint.nix default
+# flows through the exported meta automatically, and there is no
+# second copy here to fall out of sync.
+FORMAL_SHARD_BUDGET_MB = 8192
 
 # Target shard width for the `formal` kind (see cluster_formal).
 # Override with FORMAL_SHARD_SIZE (validated by formal_shard_size --
@@ -211,12 +210,11 @@ def pending(results):
         out[kind][name] = {
             "drv": r["drvPath"],
             "needed": frozenset(r.get("neededBuilds", [])),
-            # bug_383: absent for non-quint kinds and for derivations
-            # that predate the meta export — both default to the
-            # constructor's 4096, i.e. "not heavy".
-            "serverHeapMb": (r.get("meta") or {}).get(
-                "serverHeapMb", DEFAULT_SERVER_HEAP_MB
-            ),
+            # bug_383/bug_292: absent for non-quint kinds and for
+            # derivations that never raised their heap — absent means
+            # "light"; no default is materialized here (the deleted
+            # DEFAULT_SERVER_HEAP_MB mirror is the bug_292 subject).
+            "serverHeapMb": (r.get("meta") or {}).get("serverHeapMb"),
         }
     return dict(out)
 
@@ -476,7 +474,10 @@ def cluster_formal(names, shard_size=None, heap_by_name=None):
     # Isolate each into a singleton named for the check (the kani
     # pattern: exact attribution, no neighbor to starve).
     def is_heavy(n):
-        return heap_by_name.get(n, DEFAULT_SERVER_HEAP_MB) > DEFAULT_SERVER_HEAP_MB
+        # bug_292: absent meta = light; heavy iff the exported heap
+        # exceeds half the shard envelope (two such servers no longer
+        # co-fit under --max-jobs 2).
+        return (heap_by_name.get(n) or 0) > FORMAL_SHARD_BUDGET_MB // 2
 
     nonkani = [n for n in names if not n.startswith("kani-")]
     heavy = sorted(n for n in nonkani if is_heavy(n))
@@ -542,7 +543,7 @@ def build_outputs(results):
             cluster_formal(
                 sorted(pend.get(kind, {})),
                 heap_by_name={
-                    n: m.get("serverHeapMb", DEFAULT_SERVER_HEAP_MB)
+                    n: m.get("serverHeapMb")
                     for n, m in pend.get(kind, {}).items()
                 },
             )
@@ -646,9 +647,22 @@ def run_nix_eval_jobs(workers):
         file=sys.stderr,
     )
     lines = []
+    # merged_bug_192: nix-eval-jobs failure diagnostics arrive on
+    # stderr — draining it to DEVNULL made every eval failure an
+    # opaque "exited N". A bounded deque keeps the tail without
+    # risking unbounded memory on chatty evals; the drain thread
+    # prevents the child blocking on a full stderr pipe.
+    stderr_tail = collections.deque(maxlen=200)
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
+
+    def drain_stderr():
+        for eline in proc.stderr:
+            stderr_tail.append(eline.rstrip("\n"))
+
+    drainer = threading.Thread(target=drain_stderr, daemon=True)
+    drainer.start()
     for line in proc.stdout:
         line = line.rstrip("\n")
         if not line.strip():
@@ -662,8 +676,14 @@ def run_nix_eval_jobs(workers):
             f"  {attr.get('attr', '?')} {attr.get('cacheStatus', 'ERROR')}",
             file=sys.stderr,
         )
-    if proc.wait() != 0:
-        sys.exit(f"nix-eval-jobs exited {proc.returncode}")
+    rc = proc.wait()
+    drainer.join(timeout=10)
+    if rc != 0:
+        tail = "\n".join(stderr_tail) or "<no stderr captured>"
+        sys.exit(
+            f"nix-eval-jobs exited {proc.returncode}; stderr tail "
+            f"(last {len(stderr_tail)} lines):\n{tail}"
+        )
     return parse_results(lines)
 
 
@@ -819,19 +839,19 @@ class FilterTests(unittest.TestCase):
                     "b": {
                         "drv": "/d/checks.b.drv",
                         "needed": frozenset({"/d/dep.drv"}),
-                        "serverHeapMb": DEFAULT_SERVER_HEAP_MB,
+                        "serverHeapMb": None,
                     },
                     "c": {
                         "drv": "/d/checks.c.drv",
                         "needed": frozenset(),
-                        "serverHeapMb": DEFAULT_SERVER_HEAP_MB,
+                        "serverHeapMb": None,
                     },
                 },
                 "fuzz": {
                     "d": {
                         "drv": "/d/fuzz.d.drv",
                         "needed": frozenset(),
-                        "serverHeapMb": DEFAULT_SERVER_HEAP_MB,
+                        "serverHeapMb": None,
                     },
                 },
             },
@@ -1180,7 +1200,7 @@ class FormalClusterTests(unittest.TestCase):
         heap = {
             "quint-heavy-a": 8192,
             "quint-heavy-b": 8192,
-            # absent entries default to DEFAULT_SERVER_HEAP_MB
+            # absent entries are light (bug_292: no default mirror)
         }
         got = cluster_formal(names, shard_size=3, heap_by_name=heap)
         by_name = {c["name"]: c["targets"] for c in got}
