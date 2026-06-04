@@ -3815,13 +3815,39 @@ in
         "storeDegradedNeverPoisons"
         "storeDegradedDrawsNoBudget"
         "storeDegradedMintsNoExclusion"
+        # Bughunt-2 slot 3 (m032): the uncharged store-degraded run
+        # never exceeds the kernel bound (admit_store_degraded's gate;
+        # falsify twin: the retry-032-unbounded-degraded calibration;
+        # witnesses keep the bound edge AND the charged fallthrough
+        # reachable).
+        "boundedStoreDegradedRun"
       ];
     };
     quint-retry-policy-pull-runs-store-outage = mkQuintRunCheck {
       name = "retry-policy-pull-runs-store-outage";
       spec = "retryPolicy";
       main = "retryPolicyPullStoreDegraded";
-      match = "correlatedStoreOutageRun";
+      match = "correlatedStoreOutageRun|sustainedOutageChargesPastBound";
+    };
+    # m032: the store-degraded run actually reaches the kernel bound —
+    # boundedStoreDegradedRun's contended edge is reachable (three
+    # consecutive uncharged store-degraded closes).
+    quint-retry-policy-sd-witness-run-bound = mkQuintWitnessCheck {
+      name = "retry-policy-sd-witness-run-bound";
+      spec = "retryPolicy";
+      main = "retryPolicyPullStoreDegraded";
+      step = "pullStep";
+      witness = "canReachStoreDegradedBound";
+    };
+    # m032: the charged fallthrough actually fires past the bound (the
+    # liveness direction — sustained outage eventually charges; the
+    # bound is a gate, not a dead arm).
+    quint-retry-policy-sd-witness-charge-past-bound = mkQuintWitnessCheck {
+      name = "retry-policy-sd-witness-charge-past-bound";
+      spec = "retryPolicy";
+      main = "retryPolicyPullStoreDegraded";
+      step = "pullStep";
+      witness = "canChargePastBound";
     };
     # The pre-fix fold (TLC, first-violation; no tracey markers on
     # calibration checks).
@@ -3832,6 +3858,17 @@ in
       extraSpecs = [ "retryPolicy" ];
       step = "calibStep";
       witness = "storeDegradedDrawsNoBudget";
+    };
+    # m032 falsify twin: the pre-bound intake (no admission guard, no
+    # charged fallthrough) lets the uncharged run pass the kernel bound
+    # (TLC, first-violation; no tracey markers on calibration checks).
+    quint-retry-policy-calib-032-unbounded-degraded = mkQuintWitnessCheck {
+      name = "retry-policy-calib-032-unbounded-degraded";
+      spec = "calibration/retry-032-unbounded-degraded";
+      main = "retryCalibUnboundedDegraded";
+      extraSpecs = [ "retryPolicy" ];
+      step = "calibStep";
+      witness = "boundedStoreDegradedRun";
     };
 
     # ------------------------------------------------------------------

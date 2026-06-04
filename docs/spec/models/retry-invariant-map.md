@@ -2679,14 +2679,22 @@ marching to the poison threshold. Recorded red (bug_408): eleven
 flagged reports left `left: Poisoned` — a store outage poisoned the
 derivation and excluded every builder that honestly reported it.
 
-The rule (`sched.retry.store-degraded-uncharged`) carve-out amended
-`sched.retry.attempts-bounded` to **+3**: an uncharged store-degraded
-close is bounded by TIME (the backoff curve), not by count — the
-pacing carve-out is the boundedness argument for the class, exactly as
-the worker-abort carve-out is count-bounded at
-`WORKER_ABORT_FREE_CLOSES`. Intake side: the scheduler's report path
-skips the floor bump for the class and writes the fold's deadline
-through the live-backoff carve-out (B1-s2 commit 2).
+The rule (`sched.retry.store-degraded-uncharged`, now **+2**)
+carve-out amended `sched.retry.attempts-bounded` to **+4**: the
+uncharged store-degraded run is bounded by COUNT
+(`STORE_DEGRADED_FREE_RUN = 12`; `admit_store_degraded` walks the
+ledger suffix exactly as `admit_worker_abort` does) — bughunt-2 slot 3
+(m032) closed round 1\'s worker-trusted unbounded posture: the bound-th
+consecutive flagged close is the last uncharged one; past it the
+report folds CHARGED as plain worker infra (the RunBound disposition),
+breaking the run so a recovering store earns a fresh gate. Intake
+side: the scheduler additionally requires CORROBORATION before
+believing the flag (a second node\'s sighting inside the 600s window or
+the store-health leg — `StoreDegradedDisposition`), so a single lying
+worker paces only itself uncharged-bounded and never skips the floor.
+The report path skips the floor bump only for believed-store
+dispositions and writes the fold\'s deadline through the live-backoff
+carve-out (B1-s2 commit 2; bughunt-2 C2).
 
 **Proof surface.** Kani: `check_store_degraded_uncharged_requeue`
 (decide over N store-degraded rows ⇒ Requeue, all counters zero,
@@ -2705,6 +2713,37 @@ consecutive store-degraded closes across both workers leave the
 derivation requeued, all counters zero, exclusion empty). The curve
 arithmetic itself is below the model's untimed-backoff floor, the same
 posture as the establishment window's timing.
+
+**Bughunt-2 slot 3 addendum (m032, the run bound).** Model: `var
+storeDegradedRun` (QNT000-framed across the full alphabet: SD closes
+increment, every other Build-row write zeroes — including the
+uncharged worker-abort rows, which ARE ledger rows — non-row actions
+frame, failover frames because the rows are durable);
+`pullStoreDegraded` gains the admission guard (`storeDegradedRun <
+STORE_DEGRADED_FREE_RUN`, scaled 3); `pullStoreDegradedRunBound` is
+the charged fallthrough (FInfra fold, distinct `OStoreDegradedCharged`
+observation so the uncharged triple stays exact). Invariant
+`boundedStoreDegradedRun` holds exhaustively in
+`retryPolicyPullStoreDegraded`; falsify twin
+`retry-032-unbounded-degraded` (the pre-bound intake: guard removed,
+fallthrough removed) violates it with the trace passing
+`storeDegradedRun = 3 → 4` uncharged; witnesses
+`canReachStoreDegradedBound` (the bound edge is reachable) and
+`canChargePastBound` (the fallthrough actually fires — the liveness
+direction the uncharged triple alone could never falsify) are both
+violation-wired; scenario pin `sustainedOutageChargesPastBound` (three
+uncharged closes exhaust the gate, the fourth charges and breaks the
+run). SD-regime exhaustive re-measure with the run plane: 291.6M
+states generated / 58.6M distinct / 5min13s (was 260.5M/268s — 1.12×,
+the run variable correlates with history instead of multiplying it). Kani: `check_store_degraded_admission_bounded` (symbolic-bound
+admission table + growth lemma; rio-retry-kernel 16 harnesses).
+**Model-boundary narrowing:** the corroboration gate (the C2
+two-sighting/health-leg requirement and its 600s window) is BELOW this
+model\'s abstraction floor — the model\'s single-derivation view has no
+second node to corroborate with and no wall clock; what the model pins
+is the per-derivation run bound and the charged fallthrough, which
+hold regardless of the corroboration verdict (corroboration only
+narrows which closes are believed, never widens the uncharged run).
 
 **None-sensible record (B1's two formal-delta omissions, per the §2
 formal delta items 5–6).** (a) `IdleClock` (the builder's

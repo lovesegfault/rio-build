@@ -55,6 +55,10 @@ module retryCalibSdAsInfra {
     attempt == Running(n),
     dStatus == DRunning,
     freeCloseRun' = 0,
+    // The charged-as-Infra row is not a store-degraded-class row: the
+    // trailing run breaks (and the pre-fix world never grows it — the
+    // class did not exist).
+    storeDegradedRun' = 0,
     val applied = specApply(spec, FInfra({ at: now, exempt: false, atCap: false }), eligibleFleet)
     all {
       spec' = applied.c,

@@ -389,6 +389,11 @@ module retryPolicy {
     | OE9Dispatch | OResubmit | OCacheHit | OPoisonClear | OTtlExpire | OFailover
     // Bughunt wave B1 (bug_408): the store-degraded paced requeue.
     | OStoreDegraded
+    // Bughunt-2 slot 3 (m032): the run-bound charged fallthrough — a
+    // store-degraded report past STORE_DEGRADED_FREE_RUN folds as
+    // plain worker infra (charged); distinct kind so the uncharged
+    // contract triple stays exact and the fallthrough is witnessable.
+    | OStoreDegradedCharged
   type LastObs = {
     kind: ObsKind,
     chargedAny: bool,       // some budget counter was charged by this event
@@ -736,6 +741,23 @@ module retryPolicy {
   /// keep in lockstep with the kernel constant.
   pure val WORKER_ABORT_FREE_CLOSES: int = 3
 
+  /// Bughunt-2 slot 3 (m032/merged_bug_032): the trailing run of
+  /// consecutive uncharged store-degraded closes. Mirrors the kernel's
+  /// admit_store_degraded suffix walk: a store-degraded row extends it,
+  /// any other Build-kind row (charged reports, uncharged worker-abort
+  /// rows, establishment) breaks it, history resets zero it, and it
+  /// survives failover (the rows are durable; recovery recomputes the
+  /// same suffix).
+  var storeDegradedRun: int
+
+  /// Mirror of rio-retry-kernel's STORE_DEGRADED_FREE_RUN (12 in
+  /// production — configuration, not a normative number; scaled like
+  /// WORKER_ABORT_FREE_CLOSES so the bound edge stays reachable in a
+  /// small state space). A pure val, not a const: no instance-module
+  /// binding to forget (the hazard the calibration-import const gap
+  /// taught).
+  pure val STORE_DEGRADED_FREE_RUN: int = 3
+
   /// The eligible fleet as the fleet-exhaust check sees it: registered,
   /// non-draining slots (static eligibility -- kind/system/features --
   /// is uniform here).
@@ -1072,6 +1094,24 @@ module retryPolicy {
   /// admission gate's contended edge is reachable — non-vacuity for
   /// boundedFreeRequeues).
   val canReachFreeCloseBound = not(freeCloseRun == WORKER_ABORT_FREE_CLOSES)
+
+  /// Bughunt-2 slot 3 (m032): the trailing run of uncharged
+  /// store-degraded closes never exceeds the kernel bound — a degraded
+  /// (or lying) worker cannot mint unlimited uncharged requeues; past
+  /// the bound only the charged fallthrough is admissible. Maintained
+  /// by pullStoreDegraded's admission guard, exactly as
+  /// admit_store_degraded gates the production intake. Falsify twin:
+  /// the retry-032-unbounded-degraded calibration (the pre-bound
+  /// intake) violates this.
+  val boundedStoreDegradedRun = storeDegradedRun <= STORE_DEGRADED_FREE_RUN
+  /// Violated when the store-degraded run actually reaches the bound
+  /// (the admission gate's contended edge is reachable — non-vacuity
+  /// for boundedStoreDegradedRun).
+  val canReachStoreDegradedBound = not(storeDegradedRun == STORE_DEGRADED_FREE_RUN)
+  /// Violated when the charged fallthrough actually fires (the
+  /// liveness direction: sustained outage DOES eventually charge — the
+  /// bound is a gate, not a dead arm).
+  val canChargePastBound = not(last.kind == OStoreDegradedCharged)
   /// Violated when a leader failover happens with a non-empty,
   /// under-budget recovered history (the failover-budget contention is
   /// reachable).
@@ -1118,6 +1158,7 @@ module retryPolicy {
   /// classifying report or by establishment, never silently dropped.)
   action tick = all {
     freeCloseRun' = freeCloseRun,
+    storeDegradedRun' = storeDegradedRun,
     now < MAX_TIME,
     now' = now + 1,
     execs' = execs,
@@ -1140,6 +1181,7 @@ module retryPolicy {
   /// dual-observation shape sched.retry.no-double-count is about.
   action buildEndsReported(w: str, class: ReportClass, dual: bool): bool = all {
     freeCloseRun' = 0,
+    storeDegradedRun' = 0,
     ENABLE_WORKER,
     attempt == Running(w),
     dual implies (class == RcTimeout and ENABLE_PODDEATH),
@@ -1164,6 +1206,7 @@ module retryPolicy {
   /// say about (the C2 shape -- its charge arrives at establishment).
   action buildEndsPodDeath(w: str, kind: DeathKind): bool = all {
     freeCloseRun' = 0,
+    storeDegradedRun' = 0,
     attempt == Running(w),
     match kind {
       | DkOom => ENABLE_PODDEATH
@@ -1256,6 +1299,7 @@ module retryPolicy {
   /// its classifier and charge vehicle.
   action ctrlReportLost(w: str): bool = all {
     freeCloseRun' = freeCloseRun,
+    storeDegradedRun' = storeDegradedRun,
     execs.get(w).ctrl != NoCtrl,
     execs' = execs.put(w, { ...execs.get(w), ctrl: NoCtrl }),
     now' = now, dStatus' = dStatus, live' = live, poisonSrc' = poisonSrc,
@@ -1284,6 +1328,7 @@ module retryPolicy {
   //          requeue_failure_completion.
   action attemptTxFails(w: str): bool = all {
     freeCloseRun' = freeCloseRun,
+    storeDegradedRun' = storeDegradedRun,
     txFaultsLeft > 0,
     match attempt { | Reported(r) => r.exec == w | _ => false },
     dStatus == DRunning,
@@ -1310,6 +1355,7 @@ module retryPolicy {
   //          merge.rs + derivation.rs::is_retriable_on_resubmit.
   action resubmitReset = all {
     freeCloseRun' = 0,
+    storeDegradedRun' = 0,
     ENABLE_RESETS,
     or {
       dStatus == DCancelled,
@@ -1344,6 +1390,7 @@ module retryPolicy {
   //          reprobe lane (the Poisoned arm).
   action cacheHitClear = all {
     freeCloseRun' = 0,
+    storeDegradedRun' = 0,
     ENABLE_RESETS,
     dStatus == DPoisoned,
     val applied = specApply(spec, FCacheHitClear(now), eligibleFleet)
@@ -1375,6 +1422,7 @@ module retryPolicy {
   //          db::clear_poison (the full reset).
   action poisonTtlExpires = all {
     freeCloseRun' = freeCloseRun,
+    storeDegradedRun' = storeDegradedRun,
     ENABLE_RESETS,
     dStatus == DPoisoned,
     poisonTtlElapsed,
@@ -1420,6 +1468,7 @@ module retryPolicy {
     justFailedOver' = false,
     everFailedBuilders' = Set(),
     freeCloseRun' = 0,
+    storeDegradedRun' = 0,
     // The materialization attempt class (substitution-replacement Phase A).
     matInfraCount' = 0,
     matSchedulerInfraCount' = 0,
@@ -1603,6 +1652,7 @@ module retryPolicy {
   //          hard_filter.
   action pullOpensAttempt(n: str): bool = all {
     freeCloseRun' = freeCloseRun,
+    storeDegradedRun' = storeDegradedRun,
     dStatus == DReady,
     backoffElapsed,
     physAttempts < MAX_ATTEMPTS,
@@ -1644,6 +1694,7 @@ module retryPolicy {
   //          append_and_decide_in_tx (charging semantics unchanged).
   action pullReportOutcome(n: str, class: ReportClass, dual: bool, promoted: bool, atCap: bool): bool = all {
     freeCloseRun' = 0,
+    storeDegradedRun' = 0,
     attempt == Reported({ exec: n, class: class, dual: dual }),
     // the floor oracle, exactly as for the stream-path intake
     promoted implies (class == RcInfraOom and promotionsLeft > 0),
@@ -1793,6 +1844,7 @@ module retryPolicy {
   //          OOMKilled / EvictedDiskPressure.
   action pullAttemptOutcomeOom(n: str, promoted: bool, atCap: bool): bool = all {
     freeCloseRun' = 0,
+    storeDegradedRun' = 0,
     match attempt { | PodDead(p) => p.exec == n and p.kind == DkOom | _ => false },
     execs.get(n).ctrl == CtrlOom,
     promoted implies promotionsLeft > 0,
@@ -1861,6 +1913,7 @@ module retryPolicy {
   //          DeadlineExceeded.
   action pullAttemptOutcomeDeadline(n: str): bool = all {
     freeCloseRun' = 0,
+    storeDegradedRun' = 0,
     match attempt { | PodDead(p) => p.exec == n and p.kind == DkDeadline | _ => false },
     execs.get(n).ctrl == CtrlDeadline,
     val e = execs.get(n)
@@ -1919,6 +1972,7 @@ module retryPolicy {
   //          (sched.attempt.no-attempt-no-op).
   action pullAttemptOutcomeNoOp(n: str): bool = all {
     freeCloseRun' = freeCloseRun,
+    storeDegradedRun' = storeDegradedRun,
     execs.get(n).ctrl != NoCtrl,
     // the pending report's own attempt is no longer open: anything but a
     // PodDead attempt on this source means the row it targets is closed
@@ -1954,6 +2008,7 @@ module retryPolicy {
     dStatus' = DReady,
     execs' = execs.put(n, { ...execs.get(n), runningOurs: false }),
     freeCloseRun' = freeCloseRun + 1,
+    storeDegradedRun' = 0,
     // charge-free: no fold event, no counter movement, no backoff.
     spec' = spec, specVerdict' = specVerdict, live' = live,
     pg' = pg, last' = noObs,
@@ -1987,11 +2042,18 @@ module retryPolicy {
     ENABLE_STORE_DEGRADED,
     attempt == Running(n),
     dStatus == DRunning,
+    // Bughunt-2 slot 3 (m032): admit_store_degraded's gate — the
+    // uncharged paced close is admitted only strictly below the run
+    // bound; at the bound the report can only take the charged
+    // fallthrough (pullStoreDegradedRunBound), exactly as the kernel
+    // returns ChargedFallthrough.
+    storeDegradedRun < STORE_DEGRADED_FREE_RUN,
     attempt' = NoAttempt,
     dStatus' = DReady,
     execs' = execs.put(n, { ...execs.get(n), runningOurs: false }),
     // a non-abort row breaks the worker-abort trailing run
     freeCloseRun' = 0,
+    storeDegradedRun' = storeDegradedRun + 1,
     // pacing, not charges: no fold event, nothing moves.
     spec' = spec, specVerdict' = specVerdict, live' = live,
     pg' = pg,
@@ -2001,6 +2063,72 @@ module retryPolicy {
     promotionsLeft' = promotionsLeft, physAttempts' = physAttempts,
     failoversLeft' = failoversLeft, txFaultsLeft' = txFaultsLeft,
     lastPoisonReason' = lastPoisonReason, justFailedOver' = false,
+    everFailedBuilders' = everFailedBuilders,
+  }
+
+  /// Bughunt-2 slot 3 (m032): the run-bound charged fallthrough.
+  /// The (STORE_DEGRADED_FREE_RUN+1)-th consecutive store-degraded
+  /// report cannot take the uncharged paced close (admit_store_degraded
+  /// answers ChargedFallthrough); the intake folds it as plain worker
+  /// infra — budget drawn, exclusion key minted, poison reachable at
+  /// the cap. The charged row is NOT a store-degraded-class row, so the
+  /// trailing run breaks: a recovering store gets a fresh free run.
+  /// Distinct observation kind (OStoreDegradedCharged) keeps the
+  /// uncharged contract triple exact and the fallthrough witnessable.
+  // Mirrors: rio-retry-kernel admit_store_degraded's ChargedFallthrough
+  //          arm behind the scheduler intake's RunBound disposition.
+  action pullStoreDegradedRunBound(n: str): bool = all {
+    ENABLE_STORE_DEGRADED,
+    attempt == Running(n),
+    dStatus == DRunning,
+    storeDegradedRun >= STORE_DEGRADED_FREE_RUN,
+    freeCloseRun' = 0,
+    storeDegradedRun' = 0,
+    val applied = specApply(spec, FInfra({ at: now, exempt: false, atCap: false }), eligibleFleet)
+    all {
+      spec' = applied.c,
+      specVerdict' = applied.v,
+      live' = applied.c,
+      execs' = execs.put(n, { ...execs.get(n), runningOurs: false }),
+      attempt' = NoAttempt,
+      promotionsLeft' = promotionsLeft,
+      match applied.v {
+        | VPoison(r) => all {
+          dStatus' = DPoisoned,
+          poisonSrc' = EventPoison,
+          lastPoisonReason' = r,
+          pg' = { status: PgPoisoned, poisonedAt: At(now), ledger: applied.c },
+          depStatus' = DepFailed,
+          everFailureTerminal' = true,
+          last' = { ...noObs, kind: OStoreDegradedCharged, chargedAny: true,
+            exclusionMinted: true, terminal: true },
+        }
+        | VRequeue => all {
+          dStatus' = DReady,
+          poisonSrc' = poisonSrc,
+          lastPoisonReason' = lastPoisonReason,
+          pg' = { ...pg, ledger: applied.c },
+          depStatus' = depStatus,
+          everFailureTerminal' = everFailureTerminal,
+          last' = { ...noObs, kind: OStoreDegradedCharged, chargedAny: true,
+            exclusionMinted: true },
+        }
+        | VCancel => all {
+          dStatus' = DReady,
+          poisonSrc' = poisonSrc,
+          lastPoisonReason' = lastPoisonReason,
+          pg' = { ...pg, ledger: applied.c },
+          depStatus' = depStatus,
+          everFailureTerminal' = everFailureTerminal,
+          last' = { ...noObs, kind: OStoreDegradedCharged, chargedAny: true,
+            exclusionMinted: true },
+        }
+      },
+    },
+    now' = now,
+    physAttempts' = physAttempts,
+    failoversLeft' = failoversLeft, txFaultsLeft' = txFaultsLeft,
+    justFailedOver' = false,
     everFailedBuilders' = everFailedBuilders,
   }
 
@@ -2018,6 +2146,7 @@ module retryPolicy {
   //          charge half; the window timing itself is not modeled).
   action pullEstablish(n: str): bool = all {
     freeCloseRun' = 0,
+    storeDegradedRun' = 0,
     match attempt {
       | NoAttempt => false
       | Running(w) => w == n
@@ -2091,6 +2220,7 @@ module retryPolicy {
   //          fleet-exhaust mapping (still-Ready only).
   action spawnGateExhaust = all {
     freeCloseRun' = freeCloseRun,
+    storeDegradedRun' = storeDegradedRun,
     dStatus == DReady,
     backoffElapsed,
     attempt == NoAttempt,
@@ -2119,6 +2249,7 @@ module retryPolicy {
   /// running build is the pod-death event, already modeled.
   action sourceLeavesPool(n: str): bool = all {
     freeCloseRun' = freeCloseRun,
+    storeDegradedRun' = storeDegradedRun,
     execs.get(n).registered,
     not(execs.get(n).runningOurs),
     execs' = execs.put(n, { ...execs.get(n), registered: false }),
@@ -2149,6 +2280,7 @@ module retryPolicy {
   //          time-based repair (sched.attempt.establishment-window+3).
   action pullLeaderFailover = all {
     freeCloseRun' = freeCloseRun,
+    storeDegradedRun' = storeDegradedRun,
     failoversLeft > 0,
     val gone = dStatus == DAbsent or dStatus == DCompleted
     val expiredInDowntime = and {
@@ -2228,6 +2360,9 @@ module retryPolicy {
   action pullAttemptOutcomeNoOpAny = { nondet n = EXECUTORS.oneOf() pullAttemptOutcomeNoOp(n) }
   action pullWorkerAbortAny = { nondet n = EXECUTORS.oneOf() pullWorkerAbort(n) }
   action pullStoreDegradedAny = { nondet n = EXECUTORS.oneOf() pullStoreDegraded(n) }
+  action pullStoreDegradedRunBoundAny = {
+    nondet n = EXECUTORS.oneOf() pullStoreDegradedRunBound(n)
+  }
   action pullEstablishAny = { nondet n = EXECUTORS.oneOf() pullEstablish(n) }
   action sourceLeavesPoolAny = { nondet n = EXECUTORS.oneOf() sourceLeavesPool(n) }
 
@@ -2422,6 +2557,7 @@ module retryPolicy {
   /// exactly as if it had not happened.
   action matLeavesBuildUntouched = all {
     freeCloseRun' = freeCloseRun,
+    storeDegradedRun' = storeDegradedRun,
     now' = now,
     dStatus' = dStatus,
     live' = live,
@@ -2525,6 +2661,7 @@ module retryPolicy {
     all { pullAttemptOutcomeNoOpAny, buildLeavesMatUntouched },
     all { pullWorkerAbortAny, buildLeavesMatUntouched },
     all { pullStoreDegradedAny, buildLeavesMatUntouched },
+    all { pullStoreDegradedRunBoundAny, buildLeavesMatUntouched },
     all { ctrlReportLostAny, buildLeavesMatUntouched },
     all { pullEstablishAny, buildLeavesMatUntouched },
     all { sourceLeavesPoolAny, buildLeavesMatUntouched },
@@ -2665,6 +2802,34 @@ module retryPolicyPullStoreDegraded {
         last.kind == OStoreDegraded,
         not(last.chargedAny),
         not(last.exclusionMinted),
+      })
+  }
+
+  /// Bughunt-2 slot 3 (m032), the sustained outage: the free run is a
+  /// GATE, not blanket immunity. Three consecutive store-degraded
+  /// closes exhaust the scaled bound (the third leaves the run AT the
+  /// bound — the canReachStoreDegradedBound edge); the fourth report
+  /// cannot take the uncharged close and falls through CHARGED: budget
+  /// drawn, exclusion ghost minted, the run broken (a recovering store
+  /// would get a fresh free run).
+  run sustainedOutageChargesPastBound = {
+    init
+      .then(all { pullOpensAttempt("n1"), buildLeavesMatUntouched })
+      .then(all { pullStoreDegraded("n1"), buildLeavesMatUntouched })
+      .then(all { pullOpensAttempt("n1"), buildLeavesMatUntouched })
+      .then(all { pullStoreDegraded("n1"), buildLeavesMatUntouched })
+      .then(all { pullOpensAttempt("n2"), buildLeavesMatUntouched })
+      .then(all { pullStoreDegraded("n2"), buildLeavesMatUntouched })
+      .expect(storeDegradedRun == STORE_DEGRADED_FREE_RUN)
+      .then(all { pullOpensAttempt("n2"), buildLeavesMatUntouched })
+      .then(all { pullStoreDegradedRunBound("n2"), buildLeavesMatUntouched })
+      .expect(and {
+        last.kind == OStoreDegradedCharged,
+        last.chargedAny,
+        last.exclusionMinted,
+        storeDegradedRun == 0,
+        live.infraCount == 1,
+        dStatus == DReady,
       })
   }
 
