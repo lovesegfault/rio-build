@@ -365,7 +365,13 @@ pub async fn run_gc(
 /// deriver keeps its proof") for exactly the long-lived derivers most
 /// likely to have mid-flight consumers.
 ///
-/// Three passes per GC tail, each batched and shutdown-checked:
+/// Three passes per GC tail (passes 2 and 3 batched and
+/// shutdown-checked; pass 1 is deliberately ONE unbatched UPDATE with
+/// no shutdown check — it only RESTORES grace, so cancelling it
+/// mid-flight could strand resurrected rows stamped, while letting it
+/// finish is bounded by the orphaned-row population, which passes 2-3
+/// keep small; round-17 merged_bug_090 site 4 re-trued the "each
+/// batched" claim):
 /// 1. UN-MARK resurrection: rows with `orphaned_at` set whose deriver
 ///    is resident again (re-upload routes that skip
 ///    `populate_on_ingest`'s conflict-clear, e.g. the AlreadyComplete

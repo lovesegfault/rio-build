@@ -2899,8 +2899,11 @@ enforced by call-site discipline at three sites; the fourth (dispatch's
 DAG-children seed, added hours before the sweep) shipped without it ---
 the constructor is the chokepoint that makes a fifth unfiltered site
 unwritable rather than merely unlikely. Floating inputs that genuinely
-matter to a verification resolve to store-silence (unseedable input)
-instead, which is the fail-closed direction under the trust model.
+matter to a verification land in the unseeded-inputs population, whose
+consequence is the bounded read-through-then-defer arm defined by
+`sched.dispatch.claims-derived` (deferral on the dedicated budget ---
+never instant poison, never unbounded store-silence retry), which is
+the fail-closed direction under the trust model.
 
 #r("sched.merge.identity-hash-veto")[
   In every identity matcher that compares a submission against a prior

@@ -392,8 +392,11 @@ fn close_fd_range(first: libc::c_uint, last: libc::c_uint) -> Result<(), Errno> 
 /// Close every inherited file descriptor outside the keep set.
 ///
 /// Run as the **first statement** of the intermediate process — before
-/// its first blocking read. The keep set is exactly the four
-/// [`ChildFds`] fds plus stdio (0–2); everything else the fork
+/// its first blocking read. The keep set is exactly the five
+/// [`ChildFds`] fds plus stdio (0–2) — the count and membership are
+/// owned by the type; `placement_sock_w` joined in round-16 W2-S9
+/// (round-17 merged_bug_090 site 6 re-trued the stale "four" here);
+/// everything else the fork
 /// duplicated — the parent's ends of every pipe (including the go
 /// pipe's write end), the pty master, the async runtime's internals —
 /// is closed via `close_range(2)` over the gaps between the (sorted)
@@ -406,9 +409,9 @@ fn close_fd_range(first: libc::c_uint, last: libc::c_uint) -> Result<(), Errno> 
 ///
 /// # Safety contract
 ///
-/// Async-signal-safe: stack-only bookkeeping (at most 4 fds, sorted in
-/// place) plus `close_range(2)` syscalls. Must only be called between
-/// `fork` and `exec`/`_exit`.
+/// Async-signal-safe: stack-only bookkeeping (the five [`ChildFds`]
+/// fds, sorted in place) plus `close_range(2)` syscalls. Must only be
+/// called between `fork` and `exec`/`_exit`.
 // r[impl builder.exec.fd-keep-set+1]
 pub(crate) fn shed_inherited_fds(keep: &ChildFds) -> Result<(), SetupError> {
     let mut kept: [i64; 5] = [

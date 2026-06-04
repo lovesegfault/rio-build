@@ -599,8 +599,12 @@ mod matcher_tests {
             Some(SettledMatchBasis::PreservedClaim),
         );
 
-        // Undecodable rank: dual-anchor fails CLOSED (parse_lossy
-        // floors to unverified_claim).
+        // Undecodable rank: dual-anchor fails CLOSED via the
+        // module-owned STRICT decode (Err -> no basis, round-16
+        // bug_073) — NOT via parse_lossy, which never reaches a
+        // victim (round-17 merged_bug_090 site 3 re-trued this
+        // attribution; see the module header and
+        // arbitrate_settled_row's doc for the ownership argument).
         let garbled = crate::db::SettledIdentityRow {
             evidence_rank: "garbled-rank".into(),
             ..stripped_floating_row(None)
