@@ -1696,6 +1696,7 @@ in
             fail=1
           fi
         done < <(grep -rohE '\b[0-9]{3}_[a-z][a-z0-9_]*' $typSrc $crossSrc \
+          | grep -vE '^[0-9]{3}_(u(8|16|32|64|128|size)|i(8|16|32|64|128|size)|f(32|64))$' \
           | sort -u)
         # bug_136 canary: these regexes hardcode a 3-digit stem width.
         # Synthesized from the live inventory so it expires LOUDLY
