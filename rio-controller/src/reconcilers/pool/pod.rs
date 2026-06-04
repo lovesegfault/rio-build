@@ -45,15 +45,6 @@ pub(super) const KVM_FEATURE: &str = "kvm";
 /// keys the toleration set on it.
 const KVM_NODE_LABEL: &str = "rio.build/kvm";
 
-/// AD5 (P8): `terminationGracePeriodSeconds` for every executor pod —
-/// a cast of the single-source grace constant the builder partitions
-/// into its abort-drain + reserved-report slices
-/// (`rio_common::transport::GraceBudget`). SIGTERM is an abort
-/// (cgroup-kill + one bounded report attempt + log finalization), not
-/// a drain. Pull is the only dispatch protocol (the `dispatchMode`
-/// knob is retired), so this value is unconditional: there is no spec
-/// override and no per-kind drain grace left.
-#[allow(clippy::cast_possible_wrap)] // 45 ≪ i64::MAX
 /// Builder idle-exit bound, rendered into the pod env as
 /// `RIO_IDLE_SECS` (merged_bug_221 leg 2): pod env wins over image
 /// env, so the effective value is pinned HERE — the orphan-reap grace
@@ -72,6 +63,19 @@ const _: () = assert!(
     "ORPHAN_REAP_GRACE must exceed the rendered RIO_IDLE_SECS plus propagation slack"
 );
 
+/// AD5 (P8): `terminationGracePeriodSeconds` for every executor pod —
+/// a cast of the single-source grace constant the builder partitions
+/// into its abort-drain + reserved-report slices
+/// (`rio_common::transport::GraceBudget`). SIGTERM is an abort
+/// (cgroup-kill + one bounded report attempt + log finalization), not
+/// a drain. Pull is the only dispatch protocol (the `dispatchMode`
+/// knob is retired), so this value is unconditional: there is no spec
+/// override and no per-kind drain grace left.
+///
+/// (bug_228: this doc block and the cast allow live HERE, on the const
+/// that casts — POOL_IDLE_EXIT_SECS was inserted between them once and
+/// silently absorbed both; third insert-between instance this branch.)
+#[allow(clippy::cast_possible_wrap)] // 45 ≪ i64::MAX
 pub(super) const PULL_MODE_TGPS_SECS: i64 =
     rio_common::limits::PULL_MODE_TERMINATION_GRACE_SECS as i64;
 

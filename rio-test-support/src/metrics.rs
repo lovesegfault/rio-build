@@ -657,7 +657,12 @@ pub struct GaugeExemption {
 ///   indent ends it.
 ///
 /// ScaledObjects carry `query: "<promql>"` instead of `expr:` — the
-/// same inline shape, matched by the same key logic.
+/// same inline shape, matched by the same key logic. ScaledObjects
+/// built through the `rio.promTrigger` helm helper carry the promql
+/// as a positional `include` argument instead of a literal `query:`
+/// key — those lines (from `include "rio.promTrigger"` to the closing
+/// `}}`) are scanned too; only QUOTED strings in them count, so the
+/// surrounding template plumbing never contributes tokens.
 ///
 /// Histogram-suffixed tokens (`_bucket`/`_sum`/`_count`) are stripped
 /// to their base name; callers classify the base via the describe
@@ -668,9 +673,23 @@ pub fn extract_alert_metric_names(yaml_bodies: &[String], prefix: &str) -> BTree
     let mut out = BTreeSet::new();
     for body in yaml_bodies {
         let mut block_indent: Option<usize> = None; // inside `expr: |` at this key indent
+        let mut in_trigger = false; // inside an `include "rio.promTrigger"` arg list
         for line in body.lines() {
             let indent = line.len() - line.trim_start().len();
             let trimmed = line.trim_start();
+            if in_trigger || trimmed.contains("include \"rio.promTrigger\"") {
+                // Quoted args only (the promql + threshold metric name);
+                // unquoted template plumbing never contributes.
+                let mut rest = trimmed;
+                while let Some(start) = rest.find('"') {
+                    let tail = &rest[start + 1..];
+                    let Some(end) = tail.find('"') else { break };
+                    collect_tokens(&token_re, &tail[..end], &mut out);
+                    rest = &tail[end + 1..];
+                }
+                in_trigger = !trimmed.contains("}}");
+                continue;
+            }
             if let Some(key_indent) = block_indent {
                 if !trimmed.is_empty() && indent <= key_indent {
                     block_indent = None; // block ended; fall through to re-test this line

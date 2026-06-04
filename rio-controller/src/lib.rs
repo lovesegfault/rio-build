@@ -45,6 +45,7 @@ pub mod config;
 pub(crate) mod error;
 #[cfg(test)]
 pub(crate) mod fixtures;
+pub mod observability;
 pub mod reconcilers;
 
 /// Re-export of the shared embedded migrator from `rio-migrations` for
@@ -109,8 +110,13 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
 // Hoisted from main.rs so the `tests/metrics_registered.rs` integration
 // test can call it — consistency with the other four components.
 // r[impl obs.metric.controller]
+// r[impl obs.metric.alert-counter-seeded]
 pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
+
+    // merged_bug_236: birth every alert-referenced counter series at 0
+    // (the bug_322 birth-gap class — see observability.rs).
+    observability::seed_alert_counters();
 
     describe_histogram!(
         "rio_controller_reconcile_duration_seconds",

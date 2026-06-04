@@ -431,6 +431,84 @@ in
         touch $out
       '';
 
+  # merged_bug_236 (bughunt-2 slot 5, THE CLASS chokepoint): every
+  # component whose metrics appear in a shipped alert/scaler expr must
+  # carry the alert-parity adoption test (tests/alert_metrics.rs) — the
+  # per-crate test then enforces seeding/ownership for every referenced
+  # series (the bug_322 birth-gap class). This check makes ADOPTION
+  # itself mechanical: a new component's first alert without the parity
+  # test is CI-red here, not a silent birth gap in production.
+  # Red-verified standalone pre-adoption (controller leg).
+  alert-parity-adoption =
+    let
+      components = [
+        "builder"
+        "controller"
+        "gateway"
+        "scheduler"
+        "store"
+      ];
+      adopted = builtins.filter (
+        c: builtins.pathExists (../. + "/rio-${c}/tests/alert_metrics.rs")
+      ) components;
+    in
+    pkgs.runCommand "rio-alert-parity-adoption"
+      {
+        nativeBuildInputs = [ pkgs.gawk ];
+        templates = [
+          ../infra/helm/rio-build/templates/prometheusrule.yaml
+          ../infra/helm/rio-build/templates/store-scaledobject.yaml
+          ../infra/helm/rio-build/templates/gateway-scaledobject.yaml
+        ];
+        inherit adopted;
+      }
+      ''
+        # Extract rio_<component>_ prefixes from expr:/query: blocks only
+        # (annotations/descriptions mentioning a metric do not count —
+        # same scoping as the in-crate extractor).
+        for t in $templates; do
+          awk '
+            function indent(line) { match(line, /[^ ]/); return RSTART - 1 }
+            {
+              if (intrigger) {
+                # rio.promTrigger include args: quoted strings carry the
+                # promql + threshold metric (same scoping as the in-crate
+                # extractor).
+                print
+                if ($0 ~ /}}/) { intrigger = 0 }
+                next
+              }
+              if ($0 ~ /include "rio\.promTrigger"/) {
+                print
+                if ($0 !~ /}}/) { intrigger = 1 }
+                next
+              }
+              if (inblock) {
+                if ($0 ~ /[^ ]/ && indent($0) <= key_indent) { inblock = 0 }
+                else { print; next }
+              }
+              if ($0 ~ /^[ ]*(expr|query):/) {
+                if ($0 ~ /:[ ]*[|>][-+]?[ ]*$/) { inblock = 1; key_indent = indent($0) }
+                else { print }
+              }
+            }
+          ' "$t"
+        done | grep -ohE 'rio_[a-z]+_' | sort -u | sed -E 's/^rio_([a-z]+)_$/\1/' > $TMPDIR/referenced
+        fail=0
+        while read -r comp; do
+          ok=0
+          for a in $adopted; do
+            [[ "$a" == "$comp" ]] && ok=1
+          done
+          if [[ $ok -eq 0 ]]; then
+            echo "FAIL: rio_''${comp}_ metrics are referenced in shipped alert/scaler exprs but rio-''${comp}/tests/alert_metrics.rs does not exist — adopt the alert-parity test (see rio-scheduler/tests/alert_metrics.rs) so every referenced series is seeded/owned from boot" >&2
+            fail=1
+          fi
+        done < $TMPDIR/referenced
+        [[ $fail -eq 0 ]]
+        touch $out
+      '';
+
   # bug_030: migration bodies are DDL plus exactly one commentary
   # pointer. For NNN >= 082: line 1 is verbatim
   # `-- Commentary: see rio-migrations/src/migrations.rs M_NNN` (NNN

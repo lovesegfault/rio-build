@@ -130,11 +130,11 @@ in
       # fs::read_to_string). Lives outside any crate dir,
       # so the per-member overlay never supplies it.
       (unfilteredRoot + "/docs/gen/metrics.json")
-      # alert_metrics parity tests (rio-scheduler/rio-store)
-      # read the PrometheusRule/ScaledObject templates at
-      # runtime — without these in the sandbox fileset the
-      # check passes locally and fails sandboxed (or worse,
-      # the reverse).
+      # alert_metrics parity tests (rio-scheduler/rio-store/
+      # rio-controller/rio-gateway) read the PrometheusRule/
+      # ScaledObject templates at runtime — without these in
+      # the sandbox fileset the check passes locally and
+      # fails sandboxed (or worse, the reverse).
       alertTemplates
     ];
   };

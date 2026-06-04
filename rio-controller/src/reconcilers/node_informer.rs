@@ -385,6 +385,17 @@ impl HwClassConfig {
                         "GetHwClassConfig loaded"
                     );
                     self.set(hw_classes, global);
+                    // merged_bug_236: birth the reasons × cells reaped
+                    // series for the by-(cell) ICE alert — the cell
+                    // axis is config-derived so it seeds here, on every
+                    // load/refresh (absolute(0) is idempotent).
+                    crate::observability::seed_reaped_cells(self.names().into_iter().flat_map(
+                        |h| {
+                            self.capacity_types_for(&h).into_iter().map(move |c| {
+                                crate::reconcilers::nodeclaim_pool::Cell(h.clone(), c).to_string()
+                            })
+                        },
+                    ));
                     return;
                 }
                 Err(e) => {

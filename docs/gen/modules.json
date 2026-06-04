@@ -409,6 +409,11 @@
       "doc": "rio-controller binary."
     },
     {
+      "path": "observability.rs",
+      "depth": 0,
+      "doc": "Metric series ownership: boot-seeded alert series (merged_bug_236 —"
+    },
+    {
       "path": "reconcilers/",
       "depth": 0,
       "doc": "Reconciliation loops."
