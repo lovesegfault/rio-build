@@ -485,16 +485,26 @@ impl DagActor {
             Err(e) => {
                 error!(count = drv_hashes.len(), ?status, error = %e,
                        "failed to batch-persist derivation status; latched in the outbox");
-                // r[impl sched.attempt.cancel-close-driven]
+                // r[impl sched.attempt.cancel-close-driven+1]
                 // The persist is what closes the batch's assignment
                 // rows: latch the owned batch for the housekeeping
-                // tick's flusher, dropped only on a later Ok. This is
-                // idempotent to re-drive — the UPDATE is absolute and
-                // the assignment close is guarded by
-                // status IN ('pending','acknowledged').
+                // tick's flusher, dropped only on a later Ok or when
+                // the flush-time re-derivation finds the node
+                // advanced past the latch. The active exec_ids are
+                // latched NOW (memory is the only source — PG is
+                // down): the replay's close is scoped to exactly
+                // these, so a successor attempt minted between latch
+                // and flush is untouchable (merged_bug_011 — the
+                // absolute derivation-scoped close cancelled a
+                // resubmitted build's fresh attempt).
+                let exec_ids: Vec<uuid::Uuid> = drv_hashes
+                    .iter()
+                    .filter_map(|h| self.dag.node(h).and_then(|s| s.exec_id))
+                    .collect();
                 self.status_outbox.push_back(super::StatusBatch {
                     drv_hashes: drv_hashes.iter().map(|s| s.to_string()).collect(),
                     status,
+                    exec_ids,
                     enqueued_at: std::time::Instant::now(),
                 });
                 metrics::gauge!("rio_scheduler_status_outbox_depth")

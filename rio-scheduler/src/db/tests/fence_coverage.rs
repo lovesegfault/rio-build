@@ -289,6 +289,51 @@ fn dag_authority_single_mint_site() {
     );
 }
 
+/// The absolute batch status writer is FRESH-WRITE ONLY
+/// (merged_bug_011): `update_derivation_status_batch`'s absolute
+/// UPDATE + derivation-scoped close are sound exactly at the
+/// in-memory transition. Census of allowed callers:
+///
+/// - `completion.rs`: 1 — `persist_status_batch` (the at-transition
+///   writer; its FAILURE latches into the outbox).
+/// - `merge.rs`: 2 — the merge tail's reset/lane persists (statuses
+///   the merge just decided, same transaction epoch).
+///
+/// `housekeeping.rs` MUST be 0: the outbox flush re-drives through
+/// `replay_status_batch_guarded` (flush-time re-derivation +
+/// exec-scoped close). A new absolute caller anywhere else is the
+/// stale-replay regression class reopening — route it here by name.
+#[test]
+fn absolute_status_batch_writer_callers_pinned() {
+    const ALLOWED: &[(&str, usize)] = &[("completion.rs", 1), ("merge.rs", 2)];
+    let mut offenders = Vec::new();
+    for (file, src) in ACTOR_SOURCES {
+        let hits = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && l.contains(".update_derivation_status_batch(")
+            })
+            .count();
+        let allowed = ALLOWED
+            .iter()
+            .find(|(f, _)| f == file)
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        if hits != allowed {
+            offenders.push(format!(
+                "{file}: {hits} absolute batch-writer calls (allowed {allowed})"
+            ));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "absolute status-batch writer outside the fresh-write census \
+         (merged_bug_011 class — re-drives use replay_status_batch_guarded):\n{}",
+        offenders.join("\n")
+    );
+}
+
 /// The `ServingGeneration` stamp has exactly TWO production
 /// constructors: the boot stamp (`DagActor::new`) and the
 /// claim stamp (`handle_leader_acquired`). A third

@@ -2949,16 +2949,28 @@ deadline its pod really runs under; the residual gap between the Job's
 report slack. The kernel routing makes the decision axes explicit; the
 cancelled/absent-node row is normative below.
 
-#r("sched.attempt.cancel-close-driven")[
+#r("sched.attempt.cancel-close-driven+1")[
   A cancel-driven attempt close MUST be driven to durability: when the
-  terminal status persist that closes the attempt's assignment row fails,
-  the scheduler MUST retain the batch in a leader-scoped outbox and retry
-  it on the housekeeping tick until a persist succeeds (dropping the entry
-  on success only); the outbox MUST be cleared on leadership loss. And the
-  establishment sweep MUST close an expired attempt whose node is
-  cancelled or absent from the DAG charge-free: the assignment row closes,
-  no attempt row is appended, no exclusion is seeded, and no establishment
-  metric increments.
+  status persist that closes the attempt's assignment row fails, the
+  scheduler MUST latch the batch — together with the affected
+  derivations' ACTIVE exec_ids read from the in-memory DAG at failure
+  time — in a leader-scoped outbox and retry it on the housekeeping
+  tick; the outbox MUST be cleared on leadership loss. The retry is a
+  REPLAY, not a repeat: before re-driving, each latched derivation MUST
+  be re-derived against the authoritative in-memory DAG — kept when its
+  node still carries the latched status or has left the DAG, DROPPED
+  when the node is present with a different status (a resubmit reset or
+  later transition made the latch stale; replaying it would regress
+  newer state) — and the replay's assignment close MUST be scoped to
+  the latched exec_ids (never the derivation), so an attempt minted
+  after the latch is untouchable by construction. On a healthy persist
+  the flush MUST drain the entire outbox in the same tick (fail-fast
+  applies to failures only — one attempt per tick on a dead PG, never a
+  one-batch-per-tick trickle on a healed one). And the establishment
+  sweep MUST close an expired attempt whose node is cancelled or absent
+  from the DAG charge-free: the assignment row closes, no attempt row
+  is appended, no exclusion is seeded, and no establishment metric
+  increments.
 ]
 The two halves are one liveness property (the `openAttempts.qnt` model's
 `openAttemptHasDriver`): an open attempt for cancelled work always has a

@@ -325,7 +325,7 @@ async fn establishment_skips_synthesized_closed_attempt() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.cancel-close-driven]
+// r[verify sched.attempt.cancel-close-driven+1]
 /// Cancelled work is NEVER charged, even when the cancel's terminal
 /// persist fails: the failed batch latches in the status outbox
 /// (assignment stays open meanwhile), the next tick's flush re-drives
@@ -614,6 +614,240 @@ async fn establishment_terminal_settled_node_closes_charge_free() -> TestResult 
         expect_drv(&handle, "est-ts").await.retry.failure_count,
         0,
         "no crash verdict enters the retry fold of settled work"
+    );
+    Ok(())
+}
+
+/// merged_bug_011 trigger A (bughunt-2 wave): a latched stale batch
+/// must never touch a resubmitted derivation's fresh attempt. The
+/// cancel's persist fails (latched: Cancelled + exec1); the user
+/// resubmits — the reset persists fresh state and the new pull's
+/// upsert rewrites the active assignment row to exec2. The flush's
+/// replay must DROP the entry (present-different: the node advanced),
+/// never regress the row to cancelled or force-close exec2's pending
+/// assignment (pre-fix the derivation-scoped absolute close hit it).
+// r[verify sched.attempt.cancel-close-driven+1]
+#[tokio::test]
+async fn outbox_stale_replay_never_touches_resubmitted_attempt() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let build1 = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build1, "est-rsb", PriorityClass::Scheduled).await?;
+    let assignment1 = pull_deliver(&handle, "est-rsb").await;
+    let exec1: uuid::Uuid = assignment1.exec_id.parse()?;
+
+    // The cancel's terminal persist fails: batch latched with exec1.
+    sqlx::query("ALTER TABLE derivations RENAME TO derivations_hidden")
+        .execute(&db.pool)
+        .await?;
+    cancel_build(&handle, build1).await?;
+    sqlx::query("ALTER TABLE derivations_hidden RENAME TO derivations")
+        .execute(&db.pool)
+        .await?;
+
+    // Resubmit: the reset path revives the node; the new pull's
+    // active-row upsert rewrites the assignment to exec2.
+    let build2 = Uuid::new_v4();
+    let _ev2 = merge_single_node(&handle, build2, "est-rsb", PriorityClass::Scheduled).await?;
+    let assignment2 = pull_deliver(&handle, "est-rsb").await;
+    let exec2: uuid::Uuid = assignment2.exec_id.parse()?;
+    assert_ne!(exec1, exec2, "the resubmitted attempt is a fresh exec");
+
+    // The flush tick: the stale Cancelled batch must be dropped.
+    tick(&handle).await?;
+
+    let drv_status: String =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = 'est-rsb'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_ne!(
+        drv_status, "cancelled",
+        "a stale latched batch must never regress a resubmitted \
+         derivation (the node advanced past the latch)"
+    );
+    let (row_exec, row_status): (uuid::Uuid, String) = sqlx::query_as(
+        "SELECT a.exec_id, a.status FROM assignments a \
+         JOIN derivations d ON d.derivation_id = a.derivation_id \
+         WHERE d.drv_hash = 'est-rsb'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        row_exec, exec2,
+        "the active row belongs to the fresh attempt"
+    );
+    assert_eq!(
+        row_status, "pending",
+        "the fresh attempt's assignment must survive the stale replay \
+         (pre-fix the derivation-scoped close cancelled it)"
+    );
+    Ok(())
+}
+
+/// merged_bug_011 trigger B (bughunt-2 wave): a terminal row never
+/// regresses. Same latch shape as trigger A, but the resubmitted
+/// attempt COMPLETES (durable 'completed') before the flush fires —
+/// the stale Cancelled replay must be dropped, not rewrite completed
+/// work back to cancelled (pre-fix fallout: a failover re-dispatches
+/// already-built work, dual execution).
+// r[verify sched.attempt.cancel-close-driven+1]
+#[tokio::test]
+async fn outbox_stale_replay_never_regresses_completed_row() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let build1 = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build1, "est-cmp", PriorityClass::Scheduled).await?;
+    let assignment1 = pull_deliver(&handle, "est-cmp").await;
+    let exec1: uuid::Uuid = assignment1.exec_id.parse()?;
+    let _ = exec1;
+
+    sqlx::query("ALTER TABLE derivations RENAME TO derivations_hidden")
+        .execute(&db.pool)
+        .await?;
+    cancel_build(&handle, build1).await?;
+    sqlx::query("ALTER TABLE derivations_hidden RENAME TO derivations")
+        .execute(&db.pool)
+        .await?;
+
+    // Resubmit and complete: durable row reaches 'completed'.
+    let build2 = Uuid::new_v4();
+    let _ev2 = merge_single_node(&handle, build2, "est-cmp", PriorityClass::Scheduled).await?;
+    let assignment2 = pull_deliver(&handle, "est-cmp").await;
+    let exec2: uuid::Uuid = assignment2.exec_id.parse()?;
+    pull_report_exec(
+        &handle,
+        exec2,
+        "est-cmp",
+        pull_payload(rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::Built.into(),
+            built_outputs: vec![rio_proto::types::BuiltOutput {
+                output_name: "out".into(),
+                output_path: test_store_path("est-cmp-out"),
+                output_hash: vec![0u8; 32],
+            }],
+            ..Default::default()
+        }),
+    )
+    .await?;
+    let pre: String =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = 'est-cmp'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        pre, "completed",
+        "the resubmitted attempt completed durably"
+    );
+
+    tick(&handle).await?;
+
+    let post: String =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = 'est-cmp'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        post, "completed",
+        "a stale latched Cancelled batch must never regress a \
+         completed derivation"
+    );
+    Ok(())
+}
+
+/// merged_bug_011 drain half (the bug_291 component): a healed PG
+/// drains the WHOLE outbox in one tick — the one-batch throttle is
+/// for the Err path only (fail fast once per tick), not a 6/minute
+/// trickle after recovery (each queued tick was another window for a
+/// latched batch's derivations to advance).
+// r[verify sched.attempt.cancel-close-driven+1]
+#[tokio::test]
+async fn outbox_drains_fully_on_ok_in_one_tick() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let mut builds = Vec::new();
+    for tag in ["est-dr-a", "est-dr-b", "est-dr-c"] {
+        let build_id = Uuid::new_v4();
+        let _ev = merge_single_node(&handle, build_id, tag, PriorityClass::Scheduled).await?;
+        let _assignment = pull_deliver(&handle, tag).await;
+        builds.push(build_id);
+    }
+    // Three separate failed persists → three latched batches.
+    sqlx::query("ALTER TABLE derivations RENAME TO derivations_hidden")
+        .execute(&db.pool)
+        .await?;
+    for build_id in builds {
+        cancel_build(&handle, build_id).await?;
+    }
+    sqlx::query("ALTER TABLE derivations_hidden RENAME TO derivations")
+        .execute(&db.pool)
+        .await?;
+
+    // ONE tick on healed PG: every batch flushes.
+    tick(&handle).await?;
+
+    for tag in ["est-dr-a", "est-dr-b", "est-dr-c"] {
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = $1")
+                .bind(tag)
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!(
+            status, "cancelled",
+            "{tag}: a healed PG drains the whole outbox in one tick \
+             (got {status})"
+        );
+    }
+    Ok(())
+}
+
+/// merged_bug_011 keep-when-reaped contract pin: a latched batch whose
+/// node left the DAG (terminal cleanup reaped it) still flushes — the
+/// close must land even though nothing in memory wants the node — and
+/// the exec-scoped close touches exactly the latched attempt. Pins the
+/// CleanupTerminalBuild contract the DROP rule depends on (reap only
+/// removes in-memory-terminal nodes, so absent ⇒ the latched terminal
+/// status is still the node's truth).
+// r[verify sched.attempt.cancel-close-driven+1]
+#[tokio::test]
+async fn outbox_reaped_node_batch_still_flushes() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build_id, "est-rp", PriorityClass::Scheduled).await?;
+    let assignment = pull_deliver(&handle, "est-rp").await;
+    let exec1: uuid::Uuid = assignment.exec_id.parse()?;
+
+    sqlx::query("ALTER TABLE derivations RENAME TO derivations_hidden")
+        .execute(&db.pool)
+        .await?;
+    cancel_build(&handle, build_id).await?;
+    sqlx::query("ALTER TABLE derivations_hidden RENAME TO derivations")
+        .execute(&db.pool)
+        .await?;
+    // Reap the terminal build now (bypassing TERMINAL_CLEANUP_DELAY):
+    // the node leaves the DAG entirely.
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id })
+        .await?;
+    barrier(&handle).await;
+    let gone = handle.debug_query_derivation("est-rp").await?;
+    assert!(gone.is_none(), "the reap removed the cancelled node");
+
+    tick(&handle).await?;
+
+    let drv_status: String =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = 'est-rp'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        drv_status, "cancelled",
+        "an absent (reaped) node's latched batch still flushes"
+    );
+    let (row_exec, row_status): (uuid::Uuid, String) = sqlx::query_as(
+        "SELECT a.exec_id, a.status FROM assignments a \
+         JOIN derivations d ON d.derivation_id = a.derivation_id \
+         WHERE d.drv_hash = 'est-rp'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(row_exec, exec1);
+    assert_eq!(
+        row_status, "cancelled",
+        "the exec-scoped close lands on exactly the latched attempt"
     );
     Ok(())
 }

@@ -153,8 +153,79 @@ impl SchedulerDb {
         Ok(result.rows_affected())
     }
 
+    /// Outbox replay (merged_bug_011): re-drive a latched status batch
+    /// with the assignment close scoped to the LATCHED exec_ids — the
+    /// in-memory active attempts at persist-failure time — never the
+    /// derivation. A successor attempt minted between latch and flush
+    /// carries a different exec_id, so the close cannot match it by
+    /// construction (the absolute writer's derivation-scoped close
+    /// cancelled a resubmitted build's fresh `pending` row). The
+    /// caller (the outbox flusher) re-derives the kept derivation set
+    /// against the authoritative in-memory DAG first — this writer
+    /// trusts that set for the derivation UPDATE and trusts ONLY the
+    /// latched exec_ids for the close.
+    ///
+    /// Runtime-bound (not `query!`): `cargo xtask regen sqlx`
+    /// self-builds this crate (the same posture as the other fenced
+    /// writers added since).
+    ///
+    /// Claims-floor fenced like every evidence writer.
+    // r[impl sched.attempt.cancel-close-driven+1]
+    // r[impl sched.evidence.durability+4]
+    pub(crate) async fn replay_status_batch_guarded(
+        &self,
+        drv_hashes: &[&str],
+        status: DerivationStatus,
+        latched_exec_ids: &[uuid::Uuid],
+        serving_generation: ServingGeneration,
+    ) -> Result<FencedOutcome, sqlx::Error> {
+        if drv_hashes.is_empty() {
+            return Ok(FencedOutcome::Applied(0));
+        }
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
+            FencedBegin::Open(ftx) => ftx,
+        };
+        let result = sqlx::query(
+            "UPDATE derivations \
+             SET status = $2, assigned_builder_id = NULL, updated_at = now() \
+             WHERE drv_hash = ANY($1::text[])",
+        )
+        .bind(drv_hashes)
+        .bind(status.as_str())
+        .execute(tx.conn())
+        .await?;
+        if let Some(assign_status) = terminal_assignment_status(status)
+            && !latched_exec_ids.is_empty()
+        {
+            sqlx::query(
+                "UPDATE assignments \
+                 SET status = $2, completed_at = now() \
+                 WHERE exec_id = ANY($1::uuid[]) \
+                   AND status IN ('pending', 'acknowledged')",
+            )
+            .bind(latched_exec_ids)
+            .bind(assign_status.as_str())
+            .execute(tx.conn())
+            .await?;
+        }
+        let updated = result.rows_affected();
+        tx.commit().await?;
+        Ok(FencedOutcome::Applied(updated))
+    }
+
     /// Batch variant of [`update_derivation_status`]: set the same
     /// status on many derivations in one round-trip.
+    ///
+    /// FRESH-WRITE ONLY (merged_bug_011): the absolute UPDATE and the
+    /// derivation-scoped assignment close are sound exactly when the
+    /// write happens AT the in-memory transition (the caller just
+    /// made this status the node's truth). Delayed re-drives go
+    /// through [`Self::replay_status_batch_guarded`] — replaying an
+    /// absolute batch after the world moved regresses newer rows and
+    /// closes successor attempts. The policy census in
+    /// `db/tests/fence_coverage.rs` pins the production caller set to
+    /// `persist_status_batch` alone.
     ///
     /// Used by `cancel_build_derivations` (N derivations → Cancelled)
     /// where the per-item variant caused N sequential PG round-trips

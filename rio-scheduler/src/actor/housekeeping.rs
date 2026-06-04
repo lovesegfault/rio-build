@@ -702,52 +702,99 @@ impl DagActor {
     /// establishing transaction additionally carries the same
     /// generation-floor fence as the pull transaction.
     // r[impl sched.attempt.establishment-window+5]
-    // r[impl sched.attempt.cancel-close-driven]
-    /// Re-drive failed terminal-status persists: FIFO, ONE batch per
-    /// tick attempt (a dead PG fails fast once per tick instead of
-    /// stalling the actor on N retries), entry dropped on Ok ONLY.
-    /// Leader-gated by `handle_tick`; the outbox itself is cleared on
-    /// leadership loss in `clear_persisted_state`.
+    // r[impl sched.attempt.cancel-close-driven+1]
+    /// Re-drive failed status-batch persists. FIFO; drains the WHOLE
+    /// queue on Ok (a healed PG clears the backlog in one tick) and
+    /// fail-fasts on the first Err/Fenced (a dead PG costs one attempt
+    /// per tick — the throttle rationale applies to failures only;
+    /// pre-fix it throttled the success path to 6 batches/minute,
+    /// scaling the stale-replay window linearly with depth).
+    ///
+    /// Each batch is re-derived against the authoritative in-memory
+    /// DAG before replay (we hold the `DagAuthority` witness):
+    /// - KEEP a derivation whose node still carries the latched
+    ///   status (present-equal: the latch is still the truth), or
+    ///   whose node left the DAG (absent: terminal cleanup reaps only
+    ///   in-memory-terminal nodes, so the latched terminal status IS
+    ///   the node's last truth and the close must still land);
+    /// - DROP a derivation whose node is present with a DIFFERENT
+    ///   status (resubmit reset or advanced): replaying the latch
+    ///   would regress newer state (merged_bug_011 — a stale
+    ///   Cancelled batch rewrote a resubmitted build to cancelled and
+    ///   force-closed its fresh attempt).
+    ///
+    /// The replay goes through `replay_status_batch_guarded`, whose
+    /// assignment close is scoped to the LATCHED exec_ids — never the
+    /// derivation — so a successor attempt is untouchable by
+    /// construction. Leader-gated by `handle_tick`; the outbox is
+    /// cleared on leadership loss in `clear_persisted_state`.
+    // r[impl sched.attempt.cancel-close-driven+1]
     async fn tick_flush_status_outbox(&mut self, _authority: &super::DagAuthority) {
-        let Some(front) = self.status_outbox.front() else {
-            return;
-        };
-        let age = front.enqueued_at.elapsed();
-        if age > std::time::Duration::from_secs(300) {
-            warn!(
-                depth = self.status_outbox.len(),
-                age_secs = age.as_secs(),
-                "status outbox head is old; PG persists keep failing                  (cancelled derivations' attempts stay open until this drains)"
-            );
-        }
-        let batch = self
-            .status_outbox
-            .pop_front()
-            .expect("front() was Some above");
-        let refs: Vec<&str> = batch.drv_hashes.iter().map(String::as_str).collect();
-        match self
-            .db
-            .update_derivation_status_batch(&refs, batch.status, self.serving_generation())
-            .await
-        {
-            Ok(crate::db::FencedOutcome::Fenced) => {
-                // Deposed mid-tick: keep the entry for visibility;
-                // LeaderLost clears the whole outbox momentarily.
-                self.note_fenced_evidence_write("status outbox flush");
-                self.status_outbox.push_front(batch);
-            }
-            Ok(_) => {
-                info!(
-                    count = batch.drv_hashes.len(),
-                    status = ?batch.status,
-                    remaining = self.status_outbox.len(),
-                    "status outbox: batch flushed (attempt rows closed)"
+        while let Some(front) = self.status_outbox.front() {
+            let age = front.enqueued_at.elapsed();
+            if age > std::time::Duration::from_secs(300) {
+                warn!(
+                    depth = self.status_outbox.len(),
+                    age_secs = age.as_secs(),
+                    "status outbox head is old; PG persists keep failing \
+                     (the latched batches' attempt rows stay open until this drains)"
                 );
             }
-            Err(e) => {
-                warn!(count = batch.drv_hashes.len(), error = %e,
-                      "status outbox: flush failed; retrying next tick");
-                self.status_outbox.push_front(batch);
+            let batch = self
+                .status_outbox
+                .pop_front()
+                .expect("front() was Some above");
+            // Flush-time re-derivation vs the live DAG.
+            let (kept, dropped): (Vec<&str>, Vec<&str>) = batch
+                .drv_hashes
+                .iter()
+                .map(String::as_str)
+                .partition(|h| match self.dag.node(h) {
+                    None => true,
+                    Some(s) => s.status() == batch.status,
+                });
+            if !dropped.is_empty() {
+                info!(
+                    dropped = dropped.len(),
+                    status = ?batch.status,
+                    drvs = ?dropped,
+                    "status outbox: dropped stale entries (nodes advanced past the latch)"
+                );
+            }
+            if kept.is_empty() {
+                continue;
+            }
+            match self
+                .db
+                .replay_status_batch_guarded(
+                    &kept,
+                    batch.status,
+                    &batch.exec_ids,
+                    self.serving_generation(),
+                )
+                .await
+            {
+                Ok(crate::db::FencedOutcome::Fenced) => {
+                    // Deposed mid-tick: keep the entry for visibility;
+                    // LeaderLost clears the whole outbox momentarily.
+                    self.note_fenced_evidence_write("status outbox flush");
+                    self.status_outbox.push_front(batch);
+                    break;
+                }
+                Ok(_) => {
+                    info!(
+                        count = kept.len(),
+                        status = ?batch.status,
+                        remaining = self.status_outbox.len(),
+                        "status outbox: batch flushed (latched attempt rows closed)"
+                    );
+                }
+                Err(e) => {
+                    warn!(count = kept.len(), error = %e,
+                          "status outbox: flush failed; retrying next tick");
+                    self.status_outbox.push_front(batch);
+                    break;
+                }
             }
         }
         metrics::gauge!("rio_scheduler_status_outbox_depth").set(self.status_outbox.len() as f64);
@@ -960,7 +1007,7 @@ impl DagActor {
 
         match establish_expired_attempt(kind, node, probe, verifiable_refs.as_deref()) {
             EstablishmentAction::CloseChargeFree => {
-                // r[impl sched.attempt.cancel-close-driven]
+                // r[impl sched.attempt.cancel-close-driven+1]
                 // Nobody wants this work any more: close the assignment
                 // row and write NOTHING else — no AttemptRow (no
                 // exclusion seed), no pull_establishments_total (the

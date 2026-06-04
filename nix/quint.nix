@@ -5751,7 +5751,7 @@ in
 
     # Open-attempt closure under cancellation: the status outbox + the
     # establishment kernel's charge-free arm (bug_347). Tier-1.
-    # r[verify sched.attempt.cancel-close-driven]
+    # r[verify sched.attempt.cancel-close-driven+1]
     quint-open-attempts = mkQuintCheck {
       name = "open-attempts";
       spec = "openAttempts";

@@ -218,13 +218,23 @@ pub(crate) struct AuthBinding {
     pub deadline_secs: Option<u32>,
 }
 
-/// The DAG actor state.
-/// One failed terminal-status persist, owned for the outbox.
+/// One failed status-batch persist, owned for the outbox. EVERY
+/// `persist_status_batch` status latches on failure — Cancelled and
+/// DependencyFailed (cancel paths), Completed, Ready, Queued (the
+/// dispatch/merge batch persists) — not just terminal cancels.
 /// See `DagActor::status_outbox`.
 #[derive(Debug)]
 pub(super) struct StatusBatch {
     pub(super) drv_hashes: Vec<String>,
     pub(super) status: crate::state::DerivationStatus,
+    /// The batch derivations' ACTIVE exec_ids, latched at
+    /// persist-failure time from the in-memory DAG (the only source —
+    /// PG was down). The replay's assignment close is scoped to
+    /// exactly these (`WHERE exec_id = ANY(..) AND status IN
+    /// ('pending','acknowledged')`): a successor attempt minted after
+    /// the latch carries a different exec_id, so the replay cannot
+    /// touch it by construction (merged_bug_011).
+    pub(super) exec_ids: Vec<Uuid>,
     pub(super) enqueued_at: std::time::Instant,
 }
 
@@ -334,7 +344,7 @@ pub struct DagActor {
     /// (`materialization_jobs` + the partial-unique dedup index);
     /// recovery rebuild is Phase B.
     materialization_jobs: materialize::JobViewState,
-    // r[impl sched.attempt.cancel-close-driven]
+    // r[impl sched.attempt.cancel-close-driven+1]
     /// Terminal-status batches whose persist FAILED, latched for the
     /// housekeeping tick to re-drive until a persist succeeds ("latch
     /// on Ok only"). The persist is what closes the batch's assignment
@@ -1024,7 +1034,7 @@ impl DagActor {
         // creates are fenced anyway; the dropped-carrier accounting is
         // the PG-authority class documented on the field.
         pending_carriers.clear();
-        // r[impl sched.attempt.cancel-close-driven]
+        // r[impl sched.attempt.cancel-close-driven+1]
         // The outbox is leader-scoped: a deposed leader must not
         // re-drive status writes (they would be fenced anyway); the
         // rows now belong to the successor's recovery + the
