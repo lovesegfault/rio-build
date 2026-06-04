@@ -1828,7 +1828,17 @@ impl DagActor {
         let store = self.store_client.clone()?;
         let tenants = self.live_tenants_of(drv_hash);
         let mut per_tenant: Vec<ReprobeAnswer> = Vec::with_capacity(tenants.len());
+        // One AttemptBudget prices the whole reprobe (bug_127, the
+        // same law as the dispatch sweep): T tenants share a single
+        // grpc_timeout instead of paying it each; an expired budget
+        // poisons the answer exactly like a per-tenant failure (B3:
+        // a partial view must not confirm).
+        // r[impl sched.dispatch.probe-budget]
+        let budget = rio_common::transport::AttemptBudget::new(self.grpc_timeout);
         for tenant in tenants {
+            if budget.expired() {
+                return None;
+            }
             let probe = self.probe_service_meta_for(Some(tenant));
             let can_confirm = !probe.is_empty();
             let mut req = tonic::Request::new(rio_proto::types::FindMissingPathsRequest {
@@ -1841,12 +1851,14 @@ impl DagActor {
             }
             // ANY tenant's RPC failure poisons the whole answer (B3:
             // a partial view must not confirm).
-            let resp =
-                tokio::time::timeout(self.grpc_timeout, store.clone().find_missing_paths(req))
-                    .await
-                    .ok()?
-                    .ok()?
-                    .into_inner();
+            let resp = tokio::time::timeout(
+                budget.attempt_bound(self.grpc_timeout),
+                store.clone().find_missing_paths(req),
+            )
+            .await
+            .ok()?
+            .ok()?
+            .into_inner();
             let missing: std::collections::HashSet<String> =
                 resp.missing_paths.into_iter().collect();
             let substitutable: std::collections::HashSet<String> =

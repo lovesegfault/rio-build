@@ -2364,3 +2364,55 @@ async fn spawn_intents_exclude_backoff_window() -> TestResult {
     );
     Ok(())
 }
+
+/// The sweep-budget law (bug_127), red and green side by side on a
+/// paused clock with 8 hung tenants (every probe future pends
+/// forever):
+///
+/// RED (kept as the falsify twin): the pre-budget shape — sequential
+/// awaits, each under its own full timeout — pays 8 x 30 s = 240 s.
+/// GREEN: `fan_out_probes` under ONE `AttemptBudget` completes the
+/// same 8 hung probes in exactly one grpc_timeout (30 s), every
+/// outcome `TimedOut` → the dropped-from-fold arm.
+// r[verify sched.dispatch.probe-budget]
+#[tokio::test(start_paused = true)]
+async fn hung_tenant_sweep_is_bounded_by_one_timeout() {
+    use crate::actor::dispatch::{ProbeOutcome, fan_out_probes};
+    const T: usize = 8;
+    let grpc_timeout = std::time::Duration::from_secs(30);
+
+    // RED: the sequential pre-budget shape.
+    let t0 = tokio::time::Instant::now();
+    for _ in 0..T {
+        let hung = std::future::pending::<()>();
+        assert!(
+            tokio::time::timeout(grpc_timeout, hung).await.is_err(),
+            "a hung probe answered — the recorded red would be stale"
+        );
+    }
+    assert_eq!(
+        t0.elapsed(),
+        grpc_timeout * T as u32,
+        "sequential awaits pay T x timeout — the bug_127 shape"
+    );
+
+    // GREEN: the budgeted fan-out.
+    let budget = rio_common::transport::AttemptBudget::new(grpc_timeout);
+    let probes: Vec<(usize, ())> = (0..T).map(|i| (i, ())).collect();
+    let t0 = tokio::time::Instant::now();
+    let fold = fan_out_probes(probes, &budget, grpc_timeout, |()| {
+        std::future::pending::<Result<tonic::Response<()>, tonic::Status>>()
+    })
+    .await;
+    assert_eq!(fold.len(), T);
+    assert!(
+        fold.iter()
+            .all(|(_, o)| matches!(o, ProbeOutcome::TimedOut)),
+        "every hung probe must fold as TimedOut (dropped from the fold)"
+    );
+    assert_eq!(
+        t0.elapsed(),
+        grpc_timeout,
+        "the whole hung sweep costs exactly ONE grpc_timeout"
+    );
+}

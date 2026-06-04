@@ -1577,6 +1577,24 @@ fires at exactly the wrong time for materialization output pins --- its premise
 "terminal drv ⇒ inputs no longer in use" is true for build-input pins and false
 for materialization output pins.
 
+#r("sched.dispatch.probe-budget")[
+  Every actor-side store-probe sweep (the dispatch-time
+  `batch_probe_cached_ready` fan-out and the materialization reprobe)
+  MUST be priced by ONE `AttemptBudget` of a single `grpc_timeout`:
+  per-tenant attempts are clamped to the budget's remainder, an expired
+  budget short-circuits the remaining tenants into the same
+  dropped-from-fold (or answer-poisoned) arm as a per-tenant failure,
+  and the worst-case actor stall is one timeout regardless of tenant
+  count.
+]
+
+The pre-budget shape awaited each tenant sequentially under a full
+`grpc_timeout` — T hung tenants stalled the single-threaded DAG actor
+T x 30 s, unbounded in tenant count; heartbeats and dispatch stalled
+behind it. Any future partitioning of the probe groups inherits the
+bound by construction because the budget, not the loop shape, owns the
+clock.
+
 #r("sched.dispatch.fod-substitute+3")[
   The dispatch-time store-check (`batch_probe_cached_ready` and the
   per-derivation `ready_check_or_spawn` fallback) MUST probe upstream

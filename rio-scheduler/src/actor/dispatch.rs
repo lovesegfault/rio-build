@@ -13,6 +13,7 @@
 //! with the pull mint).
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 
 use uuid::Uuid;
 
@@ -102,7 +103,9 @@ impl DagActor {
         if candidates.is_empty() {
             return HashSet::new();
         }
-        // Belt under the store-side 4096 cap. The truncated tail is
+        // Belt under the actor's own per-sweep cap (the wire's
+        // max_batch_paths bound is far larger; the actor budget below
+        // is what really prices a sweep). The truncated tail is
         // inserted into `checked` (so the drain loop skips the per-drv
         // `ready_check_or_spawn` fallback) but NOT stamped with
         // `probed_generation` — the next inline `dispatch_ready` (same
@@ -169,17 +172,39 @@ impl DagActor {
         // probe failure degrades to cache-miss (per-drv fallback /
         // next pass retries), not StoreUnavailable. The breaker is for
         // merge-time admission only — here the call IS the work.
-        for (tenant, store_paths) in probe_groups {
-            let probe = self.probe_service_meta_for(tenant);
-            let probe_meta: Vec<(&'static str, &str)> =
-                probe.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
-            Self::inject_probe_meta(req.metadata_mut(), &probe_meta);
-            match tokio::time::timeout(self.grpc_timeout, store.clone().find_missing_paths(req))
-                .await
-            {
-                Ok(Ok(r)) => {
-                    let r = r.into_inner();
+        //
+        // ONE AttemptBudget prices the whole sweep (bug_127): the old
+        // shape awaited each tenant sequentially under a full
+        // grpc_timeout, so T hung tenants stalled the actor T x 30 s —
+        // unbounded in tenant count. Probes now fan out
+        // buffer_unordered(min(T, MAX_PROBE_CONCURRENCY)) with each
+        // attempt clamped to the budget's remainder, and an expired
+        // budget short-circuits straight into the dropped-from-fold
+        // arm. Worst-case actor stall: 1 x grpc_timeout regardless of
+        // tenant count — inherited by any future partitioning of the
+        // probe groups by construction.
+        // r[impl sched.dispatch.probe-budget]
+        let budget = rio_common::transport::AttemptBudget::new(self.grpc_timeout);
+        let probes: Vec<(Option<Uuid>, tonic::Request<FindMissingPathsRequest>)> = probe_groups
+            .into_iter()
+            .map(|(tenant, store_paths)| {
+                let probe = self.probe_service_meta_for(tenant);
+                let probe_meta: Vec<(&'static str, &str)> =
+                    probe.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
+                Self::inject_probe_meta(req.metadata_mut(), &probe_meta);
+                (tenant, req)
+            })
+            .collect();
+        let grpc_timeout = self.grpc_timeout;
+        let fold = fan_out_probes(probes, &budget, grpc_timeout, |req| {
+            let mut client = store.clone();
+            async move { client.find_missing_paths(req).await }
+        })
+        .await;
+        for (tenant, outcome) in fold {
+            match outcome {
+                ProbeOutcome::Answered(r) => {
                     answers.insert(
                         tenant,
                         ProbeAnswer {
@@ -189,7 +214,7 @@ impl DagActor {
                         },
                     );
                 }
-                Ok(Err(e)) => {
+                ProbeOutcome::Failed(e) => {
                     debug!(?tenant, error = %e,
                         "per-tenant Ready store-check FindMissingPaths failed; \
                          that tenant's answers drop from this pass's fold");
@@ -198,10 +223,15 @@ impl DagActor {
                     // store-degraded corroboration gate.
                     self.last_store_rpc_failure = Some(std::time::Instant::now());
                 }
-                Err(_) => {
-                    debug!(?tenant, timeout = ?self.grpc_timeout,
-                        "per-tenant Ready store-check timed out; \
-                         that tenant's answers drop from this pass's fold");
+                ProbeOutcome::TimedOut => {
+                    debug!(?tenant, timeout = ?grpc_timeout,
+                        "per-tenant Ready store-check timed out (or the sweep \
+                         budget expired); that tenant's answers drop from this \
+                         pass's fold");
+                    // merged_bug_032: a timed-out probe is store-unhealth
+                    // evidence exactly like a Failed one — the budget-expiry
+                    // shape included (the budget is sized to the same
+                    // grpc_timeout the per-attempt clamp came from).
                     self.last_store_rpc_failure = Some(std::time::Instant::now());
                 }
             }
@@ -1280,4 +1310,59 @@ impl DagActor {
         }
         inputs
     }
+}
+
+/// One probe's outcome in the budgeted fan-out fold.
+pub(super) enum ProbeOutcome<R> {
+    /// The store answered (the RPC's own success).
+    Answered(R),
+    /// The store answered with an error.
+    Failed(tonic::Status),
+    /// The per-attempt bound elapsed — or the sweep budget was already
+    /// expired when this probe's turn came (short-circuited without
+    /// issuing the RPC).
+    TimedOut,
+}
+
+/// Fan probes out `buffer_unordered(min(T, MAX_PROBE_CONCURRENCY))`,
+/// every attempt clamped to the shared [`AttemptBudget`]'s remainder
+/// (floored at 1 ms by `attempt_bound`; `expired()` short-circuits the
+/// not-yet-started tail straight to `TimedOut`). Total wall-clock is
+/// bounded by the budget regardless of how many probes hang — the
+/// bug_127 class (T sequential awaits x full timeout) is unwriteable
+/// through this entry point.
+///
+/// Generic over the probe so the budget law is testable with hung
+/// futures and a paused clock; production passes the
+/// `find_missing_paths` call.
+// r[impl sched.dispatch.probe-budget]
+pub(super) async fn fan_out_probes<K, Req, R, F, Fut>(
+    probes: Vec<(K, Req)>,
+    budget: &rio_common::transport::AttemptBudget,
+    per_attempt_cap: std::time::Duration,
+    mut probe: F,
+) -> Vec<(K, ProbeOutcome<R>)>
+where
+    F: FnMut(Req) -> Fut,
+    Fut: Future<Output = Result<tonic::Response<R>, tonic::Status>>,
+{
+    use futures_util::stream::StreamExt;
+    let concurrency = probes.len().min(super::MAX_PROBE_CONCURRENCY).max(1);
+    futures_util::stream::iter(probes.into_iter().map(|(key, req)| {
+        let fut = probe(req);
+        async move {
+            if budget.expired() {
+                return (key, ProbeOutcome::TimedOut);
+            }
+            let bound = budget.attempt_bound(per_attempt_cap);
+            match tokio::time::timeout(bound, fut).await {
+                Ok(Ok(resp)) => (key, ProbeOutcome::Answered(resp.into_inner())),
+                Ok(Err(status)) => (key, ProbeOutcome::Failed(status)),
+                Err(_elapsed) => (key, ProbeOutcome::TimedOut),
+            }
+        }
+    }))
+    .buffer_unordered(concurrency)
+    .collect()
+    .await
 }

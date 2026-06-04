@@ -217,6 +217,12 @@ const TERMINAL_CLEANUP_DELAY: std::time::Duration = std::time::Duration::from_se
 /// the head).
 pub(crate) const DISPATCH_PROBE_BATCH_CAP: usize = 2048;
 
+/// Concurrency ceiling for the per-tenant store-probe fan-out (the
+/// sweep's wall-clock is owned by its `AttemptBudget`, not this knob;
+/// this only caps simultaneous in-flight FindMissingPaths RPCs so a
+/// many-tenant sweep cannot dogpile the store).
+pub(crate) const MAX_PROBE_CONCURRENCY: usize = 8;
+
 /// Entry in [`DagActor::authoritative_binding`]: kube-authoritative
 /// `spec.nodeName` from the controller's pod informer, plus the
 /// scheduler-side tenant attribution captured at Ack time. Bundled so
