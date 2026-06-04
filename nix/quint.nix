@@ -3790,7 +3790,7 @@ in
     # reports to Poisoned); the reachability pin is
     # correlatedStoreOutageRun (the fleet-correlated outage).
     # ------------------------------------------------------------------
-    # r[verify sched.retry.store-degraded-uncharged]
+    # r[verify sched.retry.store-degraded-uncharged+2]
     quint-retry-policy-pull-store-degraded = mkQuintCheck {
       name = "retry-policy-pull-store-degraded";
       spec = "retryPolicy";

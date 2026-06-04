@@ -747,7 +747,7 @@ pub fn exhausts_fleet<Id: Ord>(failed_builders: &IdSet<Id>, fleet: &FleetView<Id
 
 // r[impl sched.retry.counters-refine-history+2]
 // r[impl sched.retry.transient-budget+2]
-// r[impl sched.retry.attempts-bounded+3]
+// r[impl sched.retry.attempts-bounded+4]
 // r[impl sched.retry.verdict-channel-invariant]
 /// Fold an observed failure-event history into the ten retry counters and
 /// the budget verdict.
@@ -1538,7 +1538,7 @@ pub fn decide<Id: Ord + Clone>(
     let fleet = FleetView::default();
     let mut counters = initial;
     let mut verdict = Verdict::Requeue;
-    // r[impl sched.retry.store-degraded-uncharged]
+    // r[impl sched.retry.store-degraded-uncharged+2]
     // bug_408: the consecutive run of store-degraded rows. Pure
     // pacing — drives ONLY the backoff curve; reset by any other
     // folded event. Fold-local by design: not one of the ten
@@ -1559,7 +1559,7 @@ pub fn decide<Id: Ord + Clone>(
         // `None`), so `apply()` structurally cannot charge it; the
         // verdict stays whatever the charged history decided, and only
         // the backoff advances — wait out the outage at the curve's
-        // cap (`sched.retry.attempts-bounded+3`'s pacing carve-out).
+        // cap (`sched.retry.attempts-bounded+4`'s pacing carve-out).
         if row.event_kind == AttemptEventKind::Attempt
             && row.outcome_class == OutcomeClass::StoreDegraded
         {
@@ -1947,6 +1947,69 @@ pub fn admit_worker_abort<Id>(rows: &[LedgerRow<Id>], bound: u32) -> WorkerAbort
     WorkerAbortAdmission::Uncharged
 }
 
+/// How many CONSECUTIVE store-degraded reports are admitted into the
+/// uncharged pacing class before the next one is charged
+/// (merged_bug_032, bughunt-2 slot 3). The flag is WORKER-SUPPLIED
+/// evidence: without a bound, a worker stamping every report
+/// `store_degraded=true` mints unbounded uncharged requeues — bug_279's
+/// shape reproduced inside bug_408's own fix. Twelve free runs ≈ 35min
+/// of minimum paced outage at the default backoff curve (and exceeds
+/// the landed 11-report pacing test, whose assertions survive); a real
+/// store outage longer than that falls through into the counted infra
+/// budget and becomes operator-visible poison ~10 attempts later —
+/// never instant. Signed: bughunt-2 §5-S Q5 (2026-06-04).
+// r[impl sched.retry.store-degraded-uncharged+2]
+pub const STORE_DEGRADED_FREE_RUN: u32 = 12;
+
+/// The single source of truth for UNCHARGED outcome classes and their
+/// consecutive-run bounds. Every class whose fold treatment is
+/// charge-free pacing MUST appear here with a finite bound — the
+/// `uncharged_classes_are_bounded_or_marked` disposition lint forces
+/// every `OutcomeClass` variant (present and future) to declare which
+/// bucket it lives in, so an unbounded uncharged class cannot be
+/// introduced by review miss again.
+pub const BOUNDED_UNCHARGED: &[(OutcomeClass, u32)] = &[
+    (OutcomeClass::Disconnected, WORKER_ABORT_FREE_CLOSES),
+    (OutcomeClass::StoreDegraded, STORE_DEGRADED_FREE_RUN),
+];
+
+/// Admit one store-degraded report against the attempt history: count
+/// the TRAILING run of build-lane store-degraded pacing rows
+/// (`Attempt ∧ StoreDegraded ∧ Worker` — exactly the row the uncharged
+/// paced write appends) and admit `Uncharged` only while the run is
+/// strictly below `bound`; at the bound the report falls through to
+/// the CHARGED infra path (counted budget → operator-visible poison),
+/// mirroring [`admit_worker_abort`]'s discipline.
+///
+/// Lane discipline (the kind partition): MATERIALIZATION-lane rows are
+/// skipped exactly as [`decide`]'s fold skips them; any OTHER
+/// build-lane row (a charged classification, a reset, a worker abort)
+/// breaks the run — the unbounded-mint signature is consecutive
+/// flagged reports with nothing else happening to the lane.
+// r[impl sched.retry.store-degraded-uncharged+2]
+pub fn admit_store_degraded<Id>(rows: &[LedgerRow<Id>], bound: u32) -> WorkerAbortAdmission {
+    let mut run: u32 = 0;
+    let mut i = rows.len();
+    while i > 0 {
+        i -= 1;
+        let r = &rows[i];
+        if r.kind != AttemptKind::Build {
+            continue;
+        }
+        let is_paced = r.event_kind == AttemptEventKind::Attempt
+            && r.outcome_class == OutcomeClass::StoreDegraded
+            && r.reporting_party == ReportingParty::Worker;
+        if !is_paced {
+            break;
+        }
+        run += 1;
+        if run >= bound {
+            return WorkerAbortAdmission::ChargedFallthrough;
+        }
+    }
+    WorkerAbortAdmission::Uncharged
+}
+
 /// Sweep eligibility of one `drv_executions` lifecycle ROW (not a
 /// ledger row): the second deleter of the retention story
 /// (`store.log.sweep-ownership` — the store's log TTL sweep no longer
@@ -2104,7 +2167,7 @@ pub fn classify(event: &ObservedFailure<'_>, floor: FloorOutcomeView) -> Outcome
         ObservedFailure::ControllerDeadlineExceeded => OutcomeClass::Timeout,
         ObservedFailure::BackstopTimeout => OutcomeClass::Backstop,
         ObservedFailure::UnreportedCrash => OutcomeClass::ExecutorCrash,
-        // r[impl sched.retry.store-degraded-uncharged]
+        // r[impl sched.retry.store-degraded-uncharged+2]
         ObservedFailure::WorkerStoreDegraded => OutcomeClass::StoreDegraded,
     }
 }
@@ -2181,6 +2244,88 @@ mod tests {
     //! a verdict, and the proof-representation pins (the
     //! [`BoundedIdSet`]↔`BTreeSet` differential battery and the
     //! substring-predicate↔`str::contains` agreement).
+
+    /// bughunt-2 slot 3 disposition lint (merged_bug_032's class
+    /// close): EVERY `OutcomeClass` variant — present and future — must
+    /// declare its charge disposition in the exhaustive no-wildcard
+    /// match below; a new variant fails to compile until classified,
+    /// and a class declared `BoundedUncharged` without (or with a
+    /// mismatched) [`super::BOUNDED_UNCHARGED`] entry fails the
+    /// asserts. bug_279 → merged_bug_032 (an uncharged class shipped
+    /// without a bound, twice) cannot recur as a review miss.
+    #[test]
+    fn uncharged_classes_are_bounded_or_marked() {
+        use super::OutcomeClass as C;
+
+        #[derive(PartialEq)]
+        enum Disposition {
+            /// Charged into a counted budget (or counted-exempt).
+            ChargedAlphabet,
+            /// Lane reset marker — cuts a suffix, never a charge.
+            ResetMarker,
+            /// Routing/dispatch verdict marker — fold no-op.
+            VerdictMarker,
+            /// Uncharged pacing class — MUST carry a finite
+            /// consecutive-run bound in `BOUNDED_UNCHARGED`.
+            BoundedUncharged,
+        }
+
+        let disposition = |class: C| -> Disposition {
+            match class {
+                C::Transient
+                | C::Infra
+                | C::ExemptInfra
+                | C::Timeout
+                | C::Permanent
+                | C::Cascade
+                | C::Backstop
+                | C::ExecutorCrash
+                | C::MaterializationInfra => Disposition::ChargedAlphabet,
+                C::ResubmitReset
+                | C::CacheHitClear
+                | C::PoisonCleared
+                | C::MaterializationReset => Disposition::ResetMarker,
+                C::FleetExhaust | C::MaterializationUnobtainable => Disposition::VerdictMarker,
+                C::Disconnected | C::StoreDegraded => Disposition::BoundedUncharged,
+            }
+        };
+
+        let all = [
+            C::Transient,
+            C::Infra,
+            C::ExemptInfra,
+            C::Timeout,
+            C::Permanent,
+            C::Cascade,
+            C::Backstop,
+            C::Disconnected,
+            C::ExecutorCrash,
+            C::FleetExhaust,
+            C::ResubmitReset,
+            C::CacheHitClear,
+            C::PoisonCleared,
+            C::MaterializationUnobtainable,
+            C::MaterializationInfra,
+            C::MaterializationReset,
+            C::StoreDegraded,
+        ];
+        for class in all {
+            let bounded = super::BOUNDED_UNCHARGED
+                .iter()
+                .any(|(c, bound)| *c == class && *bound >= 1);
+            assert_eq!(
+                disposition(class) == Disposition::BoundedUncharged,
+                bounded,
+                "{class:?}: BoundedUncharged classes and BOUNDED_UNCHARGED \
+                 entries must match exactly (finite bound required)"
+            );
+        }
+        assert_eq!(
+            super::BOUNDED_UNCHARGED.len(),
+            2,
+            "every BOUNDED_UNCHARGED entry must be a classified variant"
+        );
+    }
 
     use std::collections::BTreeSet;
 
@@ -3224,7 +3369,7 @@ mod proofs {
     /// the four messages (52 bytes) plus the 28-byte marker; without an
     /// explicit bound CBMC keeps unwinding the search/compare loops far
     /// past anything the concrete messages can reach.
-    // r[verify sched.retry.store-degraded-uncharged]
+    // r[verify sched.retry.store-degraded-uncharged+2]
     /// bug_408: a history whose ATTEMPT rows are all build-lane
     /// store-degraded (reset rows and materialization-kind rows may
     /// interleave freely) charges nothing — every count counter zero,
@@ -3662,6 +3807,59 @@ mod proofs {
         rows[n].outcome_class = OutcomeClass::Disconnected;
         rows[n].reporting_party = ReportingParty::Worker;
         assert!(trailing_free_run(&rows[..n + 1]) == run + 1);
+    }
+
+    /// sched.retry.store-degraded-uncharged (merged_bug_032): for EVERY
+    /// bounded history, `admit_store_degraded` answers `Uncharged` iff
+    /// the trailing build-lane store-degraded run is strictly below the
+    /// bound (forward-scan recount vs the production reverse-break
+    /// loop); and the paced write the admission authorizes STRICTLY
+    /// grows that run — so consecutive uncharged store-degraded
+    /// admissions are bounded at `STORE_DEGRADED_FREE_RUN` by
+    /// induction, closing the worker-supplied unbounded-mint.
+    // r[verify sched.retry.store-degraded-uncharged+2]
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn check_store_degraded_admission_bounded() {
+        const MAX: usize = 4;
+        // A small symbolic bound (≤3) keeps the proof domain-complete
+        // without unwinding the production constant's 12-row run; the
+        // induction transfers to any bound.
+        let bound: u32 = kani::any();
+        kani::assume(bound >= 1 && bound <= 3);
+
+        /// Forward-scan recount: reset on any non-paced build-lane
+        /// row, skip materialization-lane rows.
+        fn trailing_paced_run(rows: &[LedgerRow<u8>]) -> u32 {
+            let mut run: u32 = 0;
+            let mut i = 0;
+            while i < rows.len() {
+                let r = &rows[i];
+                if r.kind == AttemptKind::Build {
+                    let is_paced = r.event_kind == AttemptEventKind::Attempt
+                        && r.outcome_class == OutcomeClass::StoreDegraded
+                        && r.reporting_party == ReportingParty::Worker;
+                    run = if is_paced { run + 1 } else { 0 };
+                }
+                i += 1;
+            }
+            run
+        }
+
+        let (mut rows, n) = any_history::<MAX>();
+        kani::assume(n < MAX); // room for the appended paced row
+
+        let admit = admit_store_degraded(&rows[..n], bound);
+        let run = trailing_paced_run(&rows[..n]);
+        assert!((admit == WorkerAbortAdmission::Uncharged) == (run < bound));
+
+        // Growth lemma: the authorized paced write appends exactly the
+        // four pinned discriminants.
+        rows[n].kind = AttemptKind::Build;
+        rows[n].event_kind = AttemptEventKind::Attempt;
+        rows[n].outcome_class = OutcomeClass::StoreDegraded;
+        rows[n].reporting_party = ReportingParty::Worker;
+        assert!(trailing_paced_run(&rows[..n + 1]) == run + 1);
     }
 
     // r[verify store.log.sweep-ownership]

@@ -503,28 +503,35 @@ the only one among the failure classes (infra, timeout, disconnect, and
 backstop requeues are immediate) --- the asymmetry is recorded in the
 invariant map as a Phase-1 policy decision, not specified away here.
 
-#r("sched.retry.store-degraded-uncharged")[
+#r("sched.retry.store-degraded-uncharged+2")[
   An infrastructure failure carrying the builder's
   `BuildResult.store_degraded` flag
-  (#rref("builder.outcome.store-degraded")) MUST be recorded with the
-  dedicated `store_degraded` outcome class and MUST be uncharged: the
-  fold advances no transient/infra/timeout/poison counter, records no
-  `failed_builders` exclusion, and never produces a poison verdict from
-  such rows; the verdict MUST be a requeue paced by the derivation
-  backoff curve computed from the consecutive run of store-degraded
-  rows (`backoff_until = at + backoff(run)`, run reset by any other
-  folded event), so a correlated store outage is waited out at the
-  backoff cap instead of draining budgets fleet-wide or excluding
-  healthy nodes.
+  (#rref("builder.outcome.store-degraded")) MUST be ADMITTED before it
+  is believed: admission requires corroboration --- at least two
+  distinct controller-authoritative node bindings flagging within the
+  corroboration window (600 s), or the scheduler's own store RPCs
+  failing inside that window --- AND a consecutive store-degraded run
+  strictly below the kernel bound `STORE_DEGRADED_FREE_RUN` (12). An
+  admitted report MUST be recorded with the dedicated `store_degraded`
+  outcome class and MUST be uncharged: the fold advances no
+  transient/infra/timeout/poison counter, records no `failed_builders`
+  exclusion, and never produces a poison verdict from such rows; the
+  verdict MUST be a requeue paced by the derivation backoff curve
+  computed from the consecutive run of store-degraded rows
+  (`backoff_until = at + backoff(run)`, run reset by any other folded
+  event). A NON-admitted report (uncorroborated, or at the run bound)
+  MUST be charged as plain infrastructure --- the flag is
+  worker-supplied evidence and cannot mint unbounded uncharged
+  requeues.
 ] The class is attributable to the STORE, not to the build or the node:
 charging any per-derivation or per-executor budget would convert a long
 store outage into poison verdicts and fleet-wide exclusion churn — the
 exact amplification the heartbeat-era capacity flag absorbed and the 1d
 collapse traded away (see the builder spec's retired-block note). The
-pacing bound (#rref("sched.retry.attempts-bounded+3")'s carve-out) is
+pacing bound (#rref("sched.retry.attempts-bounded+4")'s carve-out) is
 the breaker's own evidence threshold compounded with the backoff cap.
 
-#r("sched.retry.attempts-bounded+3")[
+#r("sched.retry.attempts-bounded+4")[
   Every failure-driven retry loop MUST be bounded: every counted attempt
   charges at least one of the named budgets --- the per-cycle transient
   count (`max_retries`), the non-exempt infrastructure count
@@ -535,12 +542,27 @@ the breaker's own evidence threshold compounded with the backoff cap.
   finite cap whose exhaustion produces a terminal state (`Poisoned` or
   `Cancelled`), no single attempt charges the same budget more than once,
   and an attempt exempted from one budget MUST be charged to another,
-  with exactly one carve-out: a `store_degraded` attempt
+  with exactly one carve-out, itself finite: an ADMITTED
+  `store_degraded` attempt
   (#rref("sched.retry.store-degraded-uncharged")) charges no count
-  budget BY DESIGN and is bounded by pacing instead --- the backoff
-  curve over its consecutive run, capped at `backoff_max_secs`, behind
-  the breaker's own evidence threshold.
+  budget BY DESIGN and is bounded by pacing --- the backoff curve over
+  its consecutive run, capped at `backoff_max_secs` --- while the
+  consecutive run stays strictly below `STORE_DEGRADED_FREE_RUN` (12)
+  and the outage is corroborated; past the bound, or uncorroborated,
+  the report falls through CHARGED into the non-exempt infrastructure
+  budget, so even this carve-out drains a finite budget and terminates
+  in an operator-visible poison.
 ]
+// SIGNED 2026-06-04 (owner, bughunt-2 fix-wave §5-S Q5): two-layer
+// close for merged_bug_032 — unconditional kernel run bound
+// STORE_DEGRADED_FREE_RUN = 12 (mirrors WORKER_ABORT_FREE_CLOSES
+// discipline) + corroboration gate (≥2 distinct controller-bound nodes
+// in 600 s OR scheduler store-health); bound-exceeded = charged
+// fallthrough into the counted infra budget (operator-visible poison
+// ~10 attempts later), not instant poison; both ship as documented
+// consts, not config (no BLESS); the attempts-bounded carve-out above
+// is re-worded accordingly (+4) with this signature as the
+// counter-signed authorization.
 The budget values are configuration (`[retry]` / `[poison]` tables above),
 not normative numbers. The two clauses that bite: an attempt charged to no
 budget is an unbounded retry loop (the 9,748-redispatch incident, the

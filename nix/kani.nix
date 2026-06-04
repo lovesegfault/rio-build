@@ -293,7 +293,7 @@ in
   #     reset emptied the view and flipped parked verdicts back to
   #     Claimable: merged_bug_011's resurrection class).
   # r[verify sched.retry.transient-budget+2]
-  # r[verify sched.retry.attempts-bounded+3]
+  # r[verify sched.retry.attempts-bounded+4]
   # r[verify sched.retry.exempt-infra-cap]
   # r[verify sched.retry.per-executor-budget+4]
   # r[verify sched.dispatch.fleet-exhaust+5]
@@ -308,7 +308,7 @@ in
     # A3's check_materialization_counters_window (the per-job budget window) +
     # B1-s2's check_store_degraded_uncharged_requeue (the pacing class
     # charges nothing — sched.retry.store-degraded-uncharged).
-    expectedHarnesses = 15;
+    expectedHarnesses = 16;
   };
 
   # rio-evidence-kernel: the scheduler's closure-evidence decision kernel

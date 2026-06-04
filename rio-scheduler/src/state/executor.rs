@@ -29,7 +29,7 @@ pub fn kind_for_drv(is_fixed_output: bool) -> ExecutorKind {
 /// fields mean this is a BITWISE compare — acceptable for config
 /// (the test just asserts default-constructed identity, not
 /// computed-value equality).
-// r[impl sched.retry.attempts-bounded+3]
+// r[impl sched.retry.attempts-bounded+4]
 // The budget caps. Every failure-driven retry loop is bounded by one
 // of these (or by `PoisonConfig.threshold` / POISON_RESUBMIT_RETRY_
 // LIMIT); the per-site charge/check discipline is the reference fold
