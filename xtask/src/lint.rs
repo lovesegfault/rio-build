@@ -3835,7 +3835,7 @@ impl Other {\n\
     /// universe equals the grep-derived declaration inventory by
     /// construction. (The same accounting runs inside the lint over the
     /// REAL docs/spec tree on every `xtask lint` / xtask-lint CI run —
-    /// 549 declarations + 1 commented mention today — which is where
+    /// 554 declarations + 1 commented mention today — which is where
     /// the real-tree parity is enforced; the nextest sandbox stages no
     /// docs/spec, so a unit test cannot see the real tree without going
     /// vacuous.)
