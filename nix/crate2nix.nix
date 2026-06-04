@@ -392,8 +392,10 @@ let
   # and //! doc comments), then substring-match the call shape on what
   # remains. A bare hasInfix over the whole file would count a
   # doc-comment MENTION as a real call (rio-migrations/build.rs
-  # discusses the sibling tracker in prose). Documented residual: a
-  # trailing INLINE comment containing the pattern on a code line
+  # discusses the sibling tracker in prose). Documented residuals: a
+  # trailing INLINE comment containing the pattern on a code line, and
+  # a string literal naming it ("see track_sqlx( ..."), each on a code
+  # line
   # still matches — full-line stripping only — but that over-inclusion
   # is loud, not silent: spurious membership immediately trips the
   # pairing assert below.
@@ -428,10 +430,13 @@ let
   # docs). Scan scope is src/lib.rs ONLY (where all four consts live
   # today) and the throw says so: a const moved elsewhere fails LOUD
   # with remediation, never silently. Forced through this binding —
-  # consumed by defaultCrateOverrides, hence on every tree
-  # instantiation/eval — so a const-deletion commit fails eval even
-  # though the pre-commit hook structurally cannot see it (the hook
-  # fires only on staged query!-shaped .rs edits).
+  # consumed by defaultCrateOverrides, hence by every eval that
+  # evaluates ANY Rust crate derivation (all clippy/nextest/doc
+  # checks; a non-Rust-only eval like .#checks.<sys>.deny does not
+  # force it, but no CI path evaluates Rust-free) — so a
+  # const-deletion commit fails eval even though the pre-commit hook
+  # structurally cannot see it (the hook fires only on staged
+  # query!-shaped .rs edits).
   sqlxQueryCrates =
     let
       wired = lib.filter (n: codeHasInfix "track_sqlx(" (../. + "/${n}/build.rs")) localNames;
