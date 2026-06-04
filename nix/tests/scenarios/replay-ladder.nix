@@ -83,10 +83,14 @@ let
     map mk [ ${pkgs.lib.concatMapStringsSep " " (n: ''"${n}"'') ladderJobNames} ]
   '';
 
-  # Two relay-leg jobs, each referencing 8 of the 16 relay blobs as
-  # input sources (the `pads` env var puts the store paths into the
-  # drv's inputSrcs, which is where the recorder's closure records and
-  # the engine's supply planner read them from).
+  # Two relay-leg jobs: rdoomed owns ALL 16 relay blobs as input
+  # sources (the `pads` env var puts the store paths into the drv's
+  # inputSrcs, which is where the recorder's closure records and the
+  # engine's supply planner read them from); rclean owns none. The
+  # split is the discriminator: rdoomed's supply is genuinely
+  # undeliverable (per-path retirement is correct), while rclean is
+  # exactly the "unrelated upload" a mischarged breaker would
+  # skip-stamp and wedge.
   relayJobsExpr = pkgs.writeText "replay-relay-jobs.nix" ''
     { busybox, relayPaths }:
     let
@@ -100,12 +104,10 @@ let
           "''${busybox}/bin/busybox mkdir -p $out && ''${busybox}/bin/busybox echo ''${name}-v1 > $out/x"
         ];
       };
-      first = n: list: if n == 0 then [ ] else [ (builtins.head list) ] ++ first (n - 1) (builtins.tail list);
-      drop = n: list: if n == 0 then list else drop (n - 1) (builtins.tail list);
     in
     [
-      (mk "r00" (first 8 relayPaths))
-      (mk "r01" (drop 8 relayPaths))
+      (mk "rdoomed" relayPaths)
+      (mk "rclean" [ ])
     ]
   '';
 
@@ -657,17 +659,18 @@ let
               if p.strip()
           ]
           assert len(drvs) == 2, drvs
-          jobs = {"r00.x86_64-linux": drvs[0], "r01.x86_64-linux": drvs[1]}
-          # Both roots are pre-published on the TENANT upstream: the
-          # campaign must complete via substitution even though every
-          # relay-sourced input failed to deliver (the in-band success
-          # exemption — a substituted root must not be retired by its
-          # batch's settled-FAILED supply rows).
-          outs = [
-              client.succeed(f"nix-store --realise {d} 2>/dev/null").strip()
-              for d in drvs
-          ]
-          publish(outs)
+          doomed_job, clean_job = "rdoomed.x86_64-linux", "rclean.x86_64-linux"
+          jobs = {doomed_job: drvs[0], clean_job: drvs[1]}
+          # Only the CLEAN root is published on the tenant upstream: it
+          # must submit and substitute despite the sibling carnage. The
+          # doomed root is deliberately unpublished — if the
+          # supply-failed retirement regressed and it submitted anyway,
+          # it would land in some other class and fail the exact-split
+          # assertion below.
+          clean_out = client.succeed(
+              f"nix-store --realise {jobs[clean_job]} 2>/dev/null"
+          ).strip()
+          publish([clean_out])
 
           busybox_refs = [
               r.strip()
@@ -727,30 +730,33 @@ let
               f"a failing relay must never skip-stamp uploads against a "
               f"healthy gateway (breaker mischarge): {skip_stamped}"
           )
-          # The ONLY other failure-shaped rows are the bounded dependent
-          # cascade: each relay-leg drv text references failed relay
+          # The ONLY other failure-shaped row is the bounded dependent
+          # cascade: the doomed drv text references the failed relay
           # blobs, so its own embedded upload settles failed-with-skip
-          # ("reference X failed its earlier upload"). That cascade must
-          # name a relay blob and reach nothing else — busybox and every
-          # unrelated upload stay clean. (The drv texts still reach the
-          # cluster through the per-batch submission import, which is
-          # why the campaign completes regardless.)
+          # ("reference X failed its earlier upload"). The cascade must
+          # name a relay blob and reach NOTHING else — the clean drv
+          # text and busybox stay deliverable.
           dependent_skips = [
               row for row in supply
               if row["outcome"] in ("failed", "refused")
               and row["path"] not in set(relay_paths)
           ]
-          for row in dependent_skips:
-              assert "failed its earlier upload" in (row.get("detail") or ""), (
-                  f"unexpected non-relay supply failure: {row}"
-              )
-              assert any(p in row["detail"] for p in relay_paths), (
-                  f"dependent skip must name a failed relay blob: {row}"
-              )
-              assert row["path"].endswith(".drv"), (
-                  f"the cascade may only reach the relay-leg drv texts: {row}"
-              )
-          assert len(dependent_skips) <= 2, dependent_skips
+          assert [row["path"] for row in dependent_skips] == [jobs[doomed_job]], (
+              f"the cascade may only reach the doomed drv text: {dependent_skips}"
+          )
+          assert all(
+              "failed its earlier upload" in (row.get("detail") or "")
+              and any(p in row["detail"] for p in relay_paths)
+              for row in dependent_skips
+          ), dependent_skips
+          # The sibling-delivery witness: the CLEAN drv text was
+          # delivered by the same prewarm pass that watched 16 serial
+          # payload deaths — a mischarged breaker would have
+          # skip-stamped it instead.
+          clean_rows = [row for row in supply if row["path"] == jobs[clean_job]]
+          assert any(row["outcome"] == "delivered" for row in clean_rows), (
+              f"the clean drv text must deliver: {clean_rows}"
+          )
           # The supply-collapse PAUSE never fired (no PAUSE file exists
           # now, and the engine exited instead of waiting on one).
           assert client.execute(f"test -f {state}/PAUSE")[0] != 0
@@ -760,19 +766,31 @@ let
               "payload deaths"
           )
 
-          # The campaign itself completed cleanly: both roots
-          # substituted (never retired by the failed supply rows).
+          # Exact final split: the doomed unit retires supply-failed
+          # (its required inputs really are undeliverable — per-path
+          # attribution, gate-excluded), and the clean sibling runs the
+          # full submit path and substitutes. A breaker mischarge fails
+          # this on either side: the collapse PAUSE wedges the campaign
+          # (no exit), or the clean unit is starved by skip-stamps.
           results = latest_per_job(jsonl(f"{state}/results.jsonl"))
           assert set(results) == set(jobs), sorted(results)
-          for job, record in results.items():
-              assert record.get("disposition") == "target-substituted", (
-                  f"{job}: substituted root must classify "
-                  f"target-substituted, got {record.get('verdict')}"
-                  f"/{record.get('disposition')}"
-              )
+          assert results[doomed_job].get("disposition") == "supply-failed", (
+              f"doomed unit must retire supply-failed: {results[doomed_job]}"
+          )
+          assert results[clean_job].get("disposition") == "target-substituted", (
+              f"clean unit must substitute: {results[clean_job]}"
+          )
+          batches = jsonl(f"{state}/batches.jsonl")
+          assert batches and all(not b.get("probe") for b in batches), (
+              f"the clean unit submits through normal batches: {batches}"
+          )
+          assert not any(
+              jobs[doomed_job] in b.get("rootDrvs", []) for b in batches
+          ), "the doomed unit must never be submitted"
           print(
               f"relay-breaker-neutrality PASS: {len(payload_failures)} "
-              "payload-source rows, breaker closed, campaign drained"
+              "payload-source rows, breaker closed, clean sibling "
+              "delivered and substituted"
           )
     '';
   };
