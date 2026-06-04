@@ -161,10 +161,12 @@ spec:
             # A records (no hostname/subdomain in the pod spec), so
             # `<pod>.rio-store-headless` does not resolve — the IP is
             # the only thing another replica can actually dial. The
-            # template brackets {pod} for the v6-only pod IPs
-            # (RFC 2732 host literal). Without this pairing the proxy
-            # never connects and every cross-replica live tail silently
-            # serves the history-only view (observable only via
+            # template stays UNBRACKETED: the store binary brackets a
+            # v6 identity itself at dial time (RFC 2732), so a
+            # pre-bracketed template would double-bracket and never
+            # connect. Without this pairing the proxy never connects
+            # and every cross-replica live tail silently serves the
+            # history-only view (observable only via
             # rio_store_log_tail_proxy_failures_total).
             - name: RIO_STORE_REPLICA_ID
               valueFrom:

@@ -154,12 +154,13 @@ pub enum PeerResolver {
 
 impl PeerResolver {
     /// `None` = this resolver cannot name the peer (only possible for
-    /// the test map); counted as a proxy failure by the caller.
+    /// the test map); counted as a proxy failure by the caller. A
+    /// disabled proxy is unrepresentable here — `LogServiceImpl`
+    /// holds `Option<PeerResolver>` and an empty template constructs
+    /// `None` at the boundary, so a constructed resolver always has a
+    /// template.
     fn uri_for(&self, pod: &str) -> Option<String> {
         match self {
-            // Empty template = the proxy is disabled (fail-closed
-            // config default; the chart supplies the real template).
-            PeerResolver::Template(t) if t.is_empty() => None,
             PeerResolver::Template(t) => {
                 // The address-form rule, in exactly one place: an
                 // identity that parses as an IPv6 address is
@@ -259,7 +260,7 @@ pub struct LogServiceImpl {
     replica_pod: String,
     /// How a `TailLog` reader landing on this replica dials the replica
     /// that owns an execution's live ingest session.
-    peer_resolver: PeerResolver,
+    peer_resolver: Option<PeerResolver>,
     /// Per-stream ingest tuning (cut threshold, cut interval, the
     /// per-execution byte cap), built from the store config.
     ingest_config: IngestConfig,
@@ -295,7 +296,7 @@ impl LogServiceImpl {
             // Empty = proxy disabled until with_peer_url_template
             // supplies the deployment's template (fail-closed; matches
             // Config::default).
-            peer_resolver: PeerResolver::Template(String::new()),
+            peer_resolver: None,
             ingest_config,
             max_chunks_per_exec: 100_000,
             stream_permits: Arc::new(tokio::sync::Semaphore::new(256)),
@@ -348,8 +349,17 @@ impl LogServiceImpl {
         self
     }
 
+    /// An EMPTY template means the proxy is disabled — decided HERE,
+    /// at construction, not deep in `uri_for`: a disabled deployment
+    /// never queries `lookup_live`, never dials, never increments
+    /// rio_store_log_tail_proxy_failures_total, and never warns per
+    /// read. Disabled is a configuration, not a failure.
     pub fn with_peer_url_template(mut self, template: String) -> Self {
-        self.peer_resolver = PeerResolver::Template(template);
+        self.peer_resolver = if template.is_empty() {
+            None
+        } else {
+            Some(PeerResolver::Template(template))
+        };
         self
     }
 
@@ -357,7 +367,7 @@ impl LogServiceImpl {
     /// listen on ephemeral ports).
     #[cfg(test)]
     fn with_peer_resolver(mut self, resolver: PeerResolver) -> Self {
-        self.peer_resolver = resolver;
+        self.peer_resolver = Some(resolver);
         self
     }
 
@@ -708,7 +718,14 @@ impl LogServiceImpl {
                 }
             }
             None => {
+                // Disabled proxy (peer_resolver None): skip the
+                // lookup_live query entirely — a disabled deployment
+                // pays no per-read PG roundtrip, counts no proxy
+                // failures, and emits no warns. The boot log is the
+                // single statement of the disabled posture.
+                // r[impl store.log.proxy-disabled-not-failure]
                 if !proxied
+                    && let Some(resolver) = self.peer_resolver.as_ref()
                     && let Ok(Some(live)) = sessions::lookup_live(&self.pool, exec_id).await
                     && live.replica_pod != self.replica_pod
                 {
@@ -720,7 +737,12 @@ impl LogServiceImpl {
                     // will find the new owner once the builder
                     // re-establishes its ingest stream.
                     match self
-                        .proxy_tail(&live.replica_pod, req.clone(), tenant_token.clone())
+                        .proxy_tail(
+                            resolver,
+                            &live.replica_pod,
+                            req.clone(),
+                            tenant_token.clone(),
+                        )
                         .await
                     {
                         Ok(upstream) => {
@@ -784,12 +806,12 @@ impl LogServiceImpl {
     /// 30 s staleness window.
     async fn proxy_tail(
         &self,
+        resolver: &PeerResolver,
         owner_pod: &str,
         req: TailLogRequest,
         tenant_token: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     ) -> Result<Streaming<TailLogChunk>, anyhow::Error> {
-        let uri = self
-            .peer_resolver
+        let uri = resolver
             .uri_for(owner_pod)
             .ok_or_else(|| anyhow::anyhow!("no peer URI mapping for replica {owner_pod:?}"))?;
         let endpoint = tonic::transport::Endpoint::from_shared(uri.clone())
@@ -2771,6 +2793,57 @@ mod tests {
             .expect("relay drains cleanly")
             .is_some()
         {}
+    }
+
+    /// bug_039: a deployment with the proxy DISABLED (no peer
+    /// template — the single-replica/dev default) serves the
+    /// history-only view with zero proxy machinery: no `lookup_live`
+    /// query, no dial, no rio_store_log_tail_proxy_failures_total
+    /// increment, no per-read warn. The never-fires contract is
+    /// structural — `let Some(resolver)` gates the entire proxy arm,
+    /// so a disabled deployment cannot reach the failure counter by
+    /// construction (the boot warn is the one statement of the
+    /// disabled posture).
+    // r[verify store.log.proxy-disabled-not-failure]
+    #[tokio::test]
+    async fn disabled_proxy_serves_history_without_proxy_machinery() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let chunk_store = Arc::new(MemoryLogChunkStore::default());
+        // B has NO peer resolver (the construction default): the
+        // proxy is disabled, not failing.
+        let (mut client_a, _active_a, server_a, _uri_a) =
+            spawn_replica(&db.pool, &chunk_store, "store-a", 256, |s| s).await;
+        let (mut client_b, _active_b, server_b, _uri_b) =
+            spawn_replica(&db.pool, &chunk_store, "store-b", 256, |s| s).await;
+        let exec = seed_assignment(&db.pool, "builder-0").await;
+        let tok = token("builder-0", DRV);
+
+        let big = "x".repeat(3000);
+        let (tx, mut acks) = open_append(&mut client_a, &tok, vec![header_msg(exec)])
+            .await
+            .expect("open on A");
+        tx.send(batch_msg(0, &[&big, &big])).await.unwrap();
+        let ack = acks.message().await.expect("ack").expect("present");
+        assert_eq!(ack.durable_through_line, 1);
+
+        // The session is live and owned by store-a; B's proxy is
+        // disabled, so B serves the committed history directly.
+        let resp = client_b
+            .tail_log(tail_req(exec, false))
+            .await
+            .expect("tail via B with the proxy disabled");
+        let (lines, is_complete) = collect_tail(resp.into_inner())
+            .await
+            .expect("history-only view");
+        assert_eq!(
+            lines.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![0, 1],
+            "disabled proxy = history-only view, not an error"
+        );
+        assert!(!is_complete);
+        drop(tx);
+        server_a.abort();
+        server_b.abort();
     }
 
     #[tokio::test]

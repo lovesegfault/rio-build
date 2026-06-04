@@ -219,7 +219,14 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_hmac_rejected_total",
-        "PutPath rejections by HMAC assignment-token check (labeled by reason)"
+        "Upload/log-ingest rejections by the HMAC assignment-token gate, by \
+         reason: missing_token / invalid_token (no or unverifiable \
+         x-rio-assignment-token), path_not_in_claims (token valid but the \
+         uploaded path is not in its claim set), ca_path_mismatch (CA-derived \
+         path does not match the claimed output), service_token_invalid / \
+         service_caller_not_allowlisted / service_caller_not_permitted (the \
+         x-rio-service-token bypass failed verification or allowlisting). \
+         Sustained non-zero from one builder = a stale or forged token source."
     );
     describe_counter!(
         "rio_store_service_token_accepted_total",
@@ -506,9 +513,13 @@ pub fn describe_metrics() {
          per-batch, stream stays open), past_final_line_count (lines at or \
          past the execution's recorded end after the completeness seal \
          lands; per-batch, stream stays open, also counted once per \
-         straddling batch that is truncated rather than dropped whole) or \
-         byte_cap (per-execution cap, stream-fatal). Sustained non-zero = \
-         a misbehaving or hostile builder."
+         straddling batch that is truncated rather than dropped whole), \
+         byte_cap (per-execution cap, stream-fatal), chunk_cap (the \
+         per-execution chunk-count bound refused at admission), or the \
+         replica-wide admission gates max_streams / byte_budget (this \
+         replica is at capacity; the builder retries elsewhere). Sustained \
+         non-zero on the per-batch reasons = a misbehaving or hostile \
+         builder; on the admission gates = the fleet is undersized."
     );
     describe_counter!(
         "rio_store_log_chunks_written_total",
@@ -543,10 +554,14 @@ pub fn describe_metrics() {
         "AppendLog streams aborted server-side, by reason: cut_failures \
          (3 consecutive failed chunk commits), stale_buffer (buffered \
          lines older than 2x the cut interval), lease_lost (another \
-         replica stole the ingest session), or chunk_cap (the \
-         per-execution chunk-count bound). The builder reconnects and \
-         replays its un-acked tail to another replica. Alert on \
-         sustained non-zero: this replica cannot durably store logs."
+         replica stole the ingest session), chunk_cap (the per-execution \
+         chunk-count bound), displaced (a newer ingest session for the \
+         same execution took the registry slot; the old stream exits), or \
+         inbound_idle (empty buffer and no inbound traffic for four \
+         heartbeats — the driver refuses to renew the lease for a \
+         vanished builder). The builder reconnects and replays its \
+         un-acked tail. Alert on sustained cut_failures/stale_buffer: \
+         this replica cannot durably store logs."
     );
     describe_counter!(
         "rio_store_log_read_data_loss_total",

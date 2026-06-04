@@ -103,8 +103,13 @@ pub fn describe_metrics() {
          reason: open_failed = the TailLog RPC itself was rejected, the live \
          tail is dark until the store is reachable; stream_ended = an \
          established stream closed before the derivation finished, normal \
-         during a store deploy). A sustained open_failed rate means every \
-         watched build's live tail is degraded fleet-wide; the lines remain \
-         durable in the store and readable via `rio-cli logs` regardless."
+         during a store deploy; gap_observed = the store's stream jumped past \
+         the relay floor and the subscription re-opened at the gap to give the \
+         missing span one more chance — occasional increments are normal under \
+         tail fan-out drops, a sustained rate on one derivation means its \
+         stored log has a hole, check rio_store_log_read_data_loss_total). A \
+         sustained open_failed rate means every watched build's live tail is \
+         degraded fleet-wide; the lines remain durable in the store and \
+         readable via `rio-cli logs` regardless."
     );
 }

@@ -291,7 +291,9 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_pull_rejected_total",
         "Pull-mode unaries rejected for identity reasons (labels: rpc = \
-         pull_assignment|report_outcome, reason = unauthenticated|token_mismatch). \
+         pull_assignment|report_outcome, reason = unauthenticated|token_mismatch|\
+         kind_unauthorized — the executor token verified but its kind is not \
+         allowed to take this attempt kind). \
          A sustained rate means a pod fleet holds mis-bound/expired executor \
          tokens or an HMAC rotation skew — the rejected pods exit nonzero and \
          their logs are ephemeral, so this counter is the alertable trace."

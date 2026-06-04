@@ -695,6 +695,39 @@ in
         touch $out
       '';
 
+  # Reason-label <-> HELP sync: every literal (or same-file
+  # helper-resolved) `"reason" => ...` label on a counter must appear
+  # in that metric's describe_counter! HELP — an operator triaging a
+  # labeled counter reads the HELP, so an unmentioned reason is an
+  # undocumented failure mode. Born red on 16 drifts (2026-06-04):
+  # the bug_110 headline (gap_observed missing from
+  # rio_gateway_log_tail_reconnects_total) PLUS 15 siblings the class
+  # lint caught across hmac_rejected / log_ingest_rejected /
+  # log_ingest_streams_aborted / pull_rejected — including the
+  # inbound_idle reason added by this very wave two commits earlier.
+  # Out-of-scope shapes (method-call/variable reasons, dynamic metric
+  # names, no-describe metrics) are CENSUSED in the build log, never
+  # silently dropped. In-scanner planted self-test.
+  metric-reason-help-sync =
+    pkgs.runCommand "rio-metric-reason-help-sync"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-gateway/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-store/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-controller/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-builder/src)
+          ];
+        };
+        nativeBuildInputs = [ pkgs.python3 ];
+      }
+      ''
+        python3 ${../nix/metric_reason_help_sync.py} $src
+        touch $out
+      '';
+
   # r[verify proto.client.streaming-open-bounded]
   streaming-open-ban =
     pkgs.runCommand "rio-streaming-open-ban"
@@ -1169,7 +1202,7 @@ in
         # phrases (legitimately appear in code as historical context);
         # deny_cross adds case/separator variants needed for nix/infra
         # that would FP docs' "Squid FOD proxy is deleted" prose.
-        deny_shared='\bBuilderPool\b|\bFetcherPools?\b|rio-cli bps\b|`bps`|vm-lifecycle-bps|RIO_TLS__|\bTlsError\b|rio-common/src/tls\.rs|load_client_tls|init_client_tls|spec\.sizing|Sizing::|fuseCacheBudget|logBudget|migration-lock mechanism|trigger-gc|--grace-period-hours|mTLS client[- ]cert|mTLS cert mount|mTLS main port|VMs: mTLS|plaintext-health listener|TLS and plaintext ports|mTLS bypass|mTLS-identified|mTLS identifies|falls? back to mTLS|mTLS peer cert|\bplaintext port\b|CN-allowlist\)|\(gateway cert|dev-mode/dev-mode|TLS is env-only|\bTLS init\b|without relying on service tokens|replacement for the service-HMAC|RIO_JWT_SIGNING_KEY_PATH|rio\.jwt(Verify|Sign)Env|worker\.seccomp|`tls` / `metrics_addr`|\brio-worker\b|\bReadyQueue\b|\bpush_ready\b|\bqueue_priority\b|\bINTERACTIVE_BOOST\b|\bseed_ready_queue\b|\brearm_materialization_job\b|\btrim_chunk\b|\bDEFAULT_PEER_URL_TEMPLATE\b|\btick_publish_gauges\b|\bpull_attempt_seen_open\b|\bclosure_vouched\b|\bFencedWrite\b|\brollback_assignment\b|\bCOLLECT_CURSOR\b|\bCOLLECT_BACKLOG_ESTIMATE\b|rio_scheduler_workers_active|rio_scheduler_queue_depth|rio-scheduler/src/logs/|store-side 4096'
+        deny_shared='\bBuilderPool\b|\bFetcherPools?\b|rio-cli bps\b|`bps`|vm-lifecycle-bps|RIO_TLS__|\bTlsError\b|rio-common/src/tls\.rs|load_client_tls|init_client_tls|spec\.sizing|Sizing::|fuseCacheBudget|logBudget|migration-lock mechanism|trigger-gc|--grace-period-hours|mTLS client[- ]cert|mTLS cert mount|mTLS main port|VMs: mTLS|plaintext-health listener|TLS and plaintext ports|mTLS bypass|mTLS-identified|mTLS identifies|falls? back to mTLS|mTLS peer cert|\bplaintext port\b|CN-allowlist\)|\(gateway cert|dev-mode/dev-mode|TLS is env-only|\bTLS init\b|without relying on service tokens|replacement for the service-HMAC|RIO_JWT_SIGNING_KEY_PATH|rio\.jwt(Verify|Sign)Env|worker\.seccomp|`tls` / `metrics_addr`|\brio-worker\b|\bReadyQueue\b|\bpush_ready\b|\bqueue_priority\b|\bINTERACTIVE_BOOST\b|\bseed_ready_queue\b|\brearm_materialization_job\b|\btrim_chunk\b|\bDEFAULT_PEER_URL_TEMPLATE\b|\btick_publish_gauges\b|\bpull_attempt_seen_open\b|\bclosure_vouched\b|\bFencedWrite\b|\brollback_assignment\b|\bCOLLECT_CURSOR\b|\bCOLLECT_BACKLOG_ESTIMATE\b|rio_scheduler_workers_active|rio_scheduler_queue_depth|rio-scheduler/src/logs/|store-side 4096|[Tt]emplate brackets \\{pod\\}|Bracketed for v6-only'
         deny_docs="$deny_shared|\bmTLS\b|fod-proxy|bundled into the scheduler|kubectl exec deploy/rio-scheduler -- rio-cli"
         deny_cross="$deny_shared|[Ff][Oo][Dd][- ]proxy"
         # builder.typ's "Formerly `rio-worker`" info-box is the rename

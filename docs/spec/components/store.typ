@@ -1699,6 +1699,20 @@ immortal lease-renewer at worst and a leaked slot at best. The two
 named ack forms and the single named cut form are the only callable
 shapes; an in-file self-scan pins the census.
 
+#r("store.log.proxy-disabled-not-failure")[
+  A replica whose cross-replica tail proxy is disabled (no peer URL
+  template) MUST treat the disabled state as configuration, not
+  failure: it performs no live-owner lookup, dials nothing, increments
+  no proxy-failure counter, and logs nothing per read — one boot-time
+  statement of the disabled posture is the only signal.
+]
+
+Disabledness is decided once, at construction (`Option<PeerResolver>`;
+an empty template constructs `None`), so the proxy arm — lookup,
+dial, failure counter, warn — is structurally unreachable for a
+disabled deployment rather than reached-and-failing on every read of
+a non-owned execution.
+
 #r("store.log.tail-reconnect")[
   A `follow`-mode `TailLog` stream ends when the ingest session it is
   attached to closes, which does not imply the execution is finished. A
