@@ -495,7 +495,10 @@ pub(crate) async fn collect_cycle(
         CollectMode::Shadow { simulated_swept } => Some(simulated_swept.as_slice()),
         CollectMode::Live => None,
     };
-    let mut conn = pool.acquire().await?;
+    // SessionConn from the FIRST await (merged_bug_223): every exit
+    // before the explicit release detaches, so the session temp table
+    // can never ride a pooled connection back to a sibling task.
+    let mut conn = super::lock::SessionConn::acquire(pool).await?;
 
     // One read phase = one transaction = one MVCC snapshot (see the
     // function doc). Not READ ONLY: PostgreSQL forbids CREATE TEMP
@@ -503,7 +506,7 @@ pub(crate) async fn collect_cycle(
     // the Transaction, which queues a ROLLBACK — the SET LOCAL budget
     // and the (uncommitted) temp table die with it on every exit path
     // before the commit, so nothing leaks back into the shared pool.
-    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    let mut tx = sqlx::Connection::begin(&mut **conn.conn()).await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .execute(&mut *tx)
         .await?;
@@ -721,8 +724,6 @@ pub(crate) async fn collect_cycle(
     // not reach the cleanup detaches (closes) the connection — the
     // temp table dies with the session instead of leaking into the
     // shared pool.
-    let mut conn = super::lock::SessionConn::new(conn);
-
     let mut cursor: Vec<u8> = resume_cursor.unwrap_or_default();
     let mut victims_collected: u64 = 0;
     let mut victim_bytes: u64 = 0;

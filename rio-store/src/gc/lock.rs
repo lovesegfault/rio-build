@@ -34,6 +34,17 @@ impl SessionConn {
         Self { conn: Some(conn) }
     }
 
+    /// Acquire a pooled connection ALREADY wrapped: the RAII guard
+    /// exists before the caller's first cancellation point, so a
+    /// future dropped mid-probe/mid-setup detaches the connection
+    /// instead of returning it to the pool with session state
+    /// attached (merged_bug_223 — the pre-wrap window is
+    /// unrepresentable; the raw pool checkout itself creates no
+    /// session state, so cancellation inside it is safe).
+    pub(crate) async fn acquire(pool: &PgPool) -> Result<Self, sqlx::Error> {
+        Ok(Self::new(pool.acquire().await?))
+    }
+
     /// The live connection. Panics only if called after consumption,
     /// which the consuming signatures make unreachable.
     pub(crate) fn conn(&mut self) -> &mut PoolConnection<Postgres> {
@@ -89,18 +100,24 @@ impl PgSessionLock {
         pool: &PgPool,
         lock_id: i64,
     ) -> Result<Option<Self>, sqlx::Error> {
-        let mut conn = pool.acquire().await?;
+        // The guard exists BEFORE the probe await (merged_bug_223):
+        // a cancellation while pg_try_advisory_lock is in flight —
+        // after PG granted the lock server-side but before the client
+        // read the result — drops `conn` ⇒ detach ⇒ PG frees the lock
+        // with the session. The pre-fix shape held a bare
+        // PoolConnection across that await; its drop returned the
+        // lock-holding connection to the shared pool.
+        let mut conn = SessionConn::acquire(pool).await?;
         let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
             .bind(lock_id)
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut **conn.conn())
             .await?;
         if !acquired {
+            // Clean miss: a failed try-lock leaves no session state.
+            conn.release_to_pool();
             return Ok(None);
         }
-        Ok(Some(Self {
-            conn: SessionConn::new(conn),
-            lock_id,
-        }))
+        Ok(Some(Self { conn, lock_id }))
     }
 
     /// The lock-holding connection (for statements that must share the
@@ -160,6 +177,90 @@ mod tests {
             .await
             .unwrap();
         assert!(second.is_none(), "lock is exclusive while held");
+        held.release().await.unwrap();
+    }
+
+    /// merged_bug_223 source pin: every pooled acquire in gc/
+    /// production sources routes through [`SessionConn::acquire`] —
+    /// `pool.acquire(` appears nowhere outside this file (and exactly
+    /// once inside it). Test modules are excluded (they may construct
+    /// freely). RED (recorded pre-fix): lock.rs try_acquire's bare
+    /// pre-wrap acquire + collect.rs cycle acquire + sweep.rs sweep
+    /// acquire.
+    #[test]
+    fn gc_pool_acquires_route_through_session_conn() {
+        fn production_half(src: &str) -> &str {
+            // Cut at the tests MODULE (not the first cfg(test)
+            // attribute — files carry cfg(test) consts mid-body).
+            src.split("#[cfg(test)]\nmod tests").next().unwrap_or(src)
+        }
+        let outside = [
+            ("collect.rs", include_str!("collect.rs")),
+            ("sweep.rs", include_str!("sweep.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            ("state.rs", include_str!("state.rs")),
+            ("orphan.rs", include_str!("orphan.rs")),
+            ("drain.rs", include_str!("drain.rs")),
+            ("mark.rs", include_str!("mark.rs")),
+            ("tenant.rs", include_str!("tenant.rs")),
+        ];
+        for (name, src) in outside {
+            let hits = production_half(src).matches("pool.acquire(").count();
+            assert_eq!(
+                hits, 0,
+                "{name}: bare pool.acquire( in gc production code — route through SessionConn::acquire"
+            );
+        }
+        let own = production_half(include_str!("lock.rs"))
+            .matches("pool.acquire(")
+            .count();
+        assert_eq!(own, 1, "lock.rs holds the single pooled-acquire site");
+    }
+
+    /// merged_bug_223: cancelling `try_acquire` at ANY await point —
+    /// including mid-probe after PG granted the lock server-side —
+    /// must never return a lock-holding connection to the pool. Sweep
+    /// cancellation points with stepped timeouts, then prove the lock
+    /// is acquirable and no advisory lock leaked.
+    #[tokio::test]
+    async fn cancelled_acquire_never_pools_the_lock() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        for k in 0..30u64 {
+            let fut = PgSessionLock::try_acquire(&db.pool, TEST_LOCK_ID);
+            // Stepped deadline: 0..~1.5ms cancels across the acquire
+            // and probe awaits; longer steps complete normally.
+            match tokio::time::timeout(std::time::Duration::from_micros(k * 50), fut).await {
+                Ok(Ok(Some(l))) => l.release().await.unwrap(),
+                Ok(Ok(None)) => panic!("lock contended in a single-test database"),
+                Ok(Err(e)) => panic!("acquire error: {e}"),
+                Err(_) => { /* cancelled mid-flight — the case under test */ }
+            }
+        }
+        // After the sweep: the lock must be acquirable (no leaked
+        // holder on a pooled connection) and exactly our hold shows.
+        let mut held = None;
+        for _ in 0..100 {
+            if let Some(l) = PgSessionLock::try_acquire(&db.pool, TEST_LOCK_ID)
+                .await
+                .unwrap()
+            {
+                held = Some(l);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let held = held.expect("lock must be acquirable after cancellation sweep");
+        let advisory: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = ($1::bigint & x'FFFFFFFF'::bigint)::oid",
+        )
+        .bind(TEST_LOCK_ID)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            advisory, 1,
+            "exactly the live hold — no leaked advisory locks"
+        );
         held.release().await.unwrap();
     }
 

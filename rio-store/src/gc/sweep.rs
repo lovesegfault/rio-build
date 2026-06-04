@@ -393,9 +393,14 @@ pub async fn sweep(
     // defensive DROP IF EXISTS handles the case where a prior sweep
     // crashed mid-run and this call happens to reacquire that same
     // pooled connection with stale state.
-    let mut conn = pool.acquire().await?;
+    // SessionConn from the FIRST await (merged_bug_223): the sweep's
+    // session temp table can no longer ride a pooled connection back
+    // to a sibling on ANY exit — clean completion included, the
+    // session detaches and the temp table dies with it (the defensive
+    // DROP IF EXISTS in setup becomes belt-and-braces).
+    let mut session = super::lock::SessionConn::acquire(pool).await?;
 
-    setup_sweep_unreachable(&mut conn, &unreachable).await?;
+    setup_sweep_unreachable(session.conn(), &unreachable).await?;
 
     // Referrer-first iteration order: Y before its dep Z so a mid-loop
     // resurrection of Y closure-removes Z before Z's batch. Computed
@@ -404,7 +409,7 @@ pub async fn sweep(
     // so an order computed AFTER it would skip drained paths and lose
     // their `paths_resurrected` accounting.
     // r[impl store.gc.sweep-referrer-order]
-    let ordered = select_sweep_order(&mut conn).await?;
+    let ordered = select_sweep_order(session.conn()).await?;
     let total = ordered.len();
 
     // Pass 1 (whole-sweep): drain resurrections from sweep_unreachable.
@@ -420,7 +425,7 @@ pub async fn sweep(
         if shutdown.is_cancelled() {
             return Err(SweepAbort::Shutdown);
         }
-        let mut tx = conn.begin().await?;
+        let mut tx = sqlx::Connection::begin(&mut **session.conn()).await?;
         for store_path_hash in batch {
             // Cheap PK probe: skip items an earlier closure-delete
             // already removed (avoids the heavier referrer query).
@@ -467,11 +472,11 @@ pub async fn sweep(
         // manifest-row and narinfo locks now, but PG can still 40P01
         // under index-page-split contention). The `?` propagates
         // SweepAbort::Db on the second failure.
-        let (delta, batch_swept) = match sweep_one_batch(&mut conn, batch, dry_run).await {
+        let (delta, batch_swept) = match sweep_one_batch(session.conn(), batch, dry_run).await {
             Err(e) if is_deadlock(&e) => {
                 warn!(error = %e, "sweep: 40P01 on batch tx; retrying once");
                 tokio::time::sleep(crate::metadata::jitter()).await;
-                sweep_one_batch(&mut conn, batch, dry_run).await?
+                sweep_one_batch(session.conn(), batch, dry_run).await?
             }
             r => r?,
         };
