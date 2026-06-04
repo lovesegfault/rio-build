@@ -126,6 +126,111 @@ let
     }
   '';
 
+  # Single source of truth for store-path resolution — interpolated into
+  # BOTH writeShellApplications below (the wrapper and the epoch-GC
+  # script), same precedent as kacheDisabledFn. Contract: every
+  # store-path comparison downstream is canonical-vs-canonical. Both
+  # scripts pin coreutils in runtimeInputs, so `realpath -m` is
+  # in-closure regardless of caller PATH.
+  #
+  # Why canonicalization, not lexical compares: the keep-alive stamp
+  # gates and the prune prefix-skip used to be lexical string compares
+  # done twice with two different spellings, so ANY aliased spelling of
+  # the configured store — symlinked $HOME/.cache, a `//` or `/./`
+  # component, a symlink VALUE, the exact prune root — defeated
+  # keep-alive and/or the skip, and the entry-time prune could rm -rf a
+  # configured, in-use store (verified empirically: all six alias
+  # spellings pruned; only canonical spellings survived). Resolving
+  # both sides through `realpath -m` once, here, collapses the whole
+  # class: every later compare sees one spelling.
+  #
+  # rio_store_resolve sets (never exports — callers decide):
+  #  - RIO_PRUNE_ROOT: canonical $HOME/.cache/rio-build/kache, "" when
+  #    HOME is unset/unresolvable. A symlinked FINAL component is now
+  #    resolved before any walk, so epochs behind it are MANAGED
+  #    (pruned when idle, skip-protected when configured) — the old
+  #    "never pruned behind a symlinked root" leak was already
+  #    inconsistent with intermediate symlinks, which the kernel
+  #    resolved anyway.
+  #  - RIO_KACHE_CACHE_DIR: rewritten IN PLACE to canonical form when
+  #    absolute; a relative (or unresolvable, e.g. symlink-loop) value
+  #    gets ONE stderr warning and is unset — both scripts now share
+  #    the warn+unset+fall-back-to-default posture (the GC used to
+  #    silently no-op, seeding nothing, while the wrapper fell back).
+  #  - RIO_STORE_TOP: first path component of the configured store
+  #    under the canonical root (component-boundary), "" when the
+  #    store is not parked there.
+  #  - RIO_STORE_COVERS_ROOT: 1 when the canonical store equals the
+  #    canonical root or is an ancestor of it. In that shape every
+  #    12-hex child of the prune root is INSIDE the configured store,
+  #    so the GC warns once and skips the prune entirely while so
+  #    configured (deletion beats hardening — the prune structurally
+  #    cannot run inside a configured store), and the wrapper skips
+  #    stamping (no epoch boundary exists) while still honoring the
+  #    canonical path for compiles.
+  #
+  # rio_store_stamp <path>: the liveness dual-touch, ONCE for both
+  # scripts (the wrapper job-4 copy and the GC configured-arm copy
+  # used to hand-roll it with different prefix spellings — that drift
+  # was the bug surface). Touches <path>/.last-used, plus the
+  # top-level epoch component's stamp when the store is parked under
+  # the root (that depth-2 stamp is the one the prune reads, so
+  # sibling shells without this config see it fresh during real use;
+  # for flat shapes both touches hit the same file — harmless). All
+  # failure-guarded: a read-only HOME never aborts a compile or entry.
+  kacheStoreLib = ''
+    rio_store_resolve() {
+      RIO_PRUNE_ROOT=""
+      RIO_STORE_TOP=""
+      RIO_STORE_COVERS_ROOT=0
+      if [ -n "''${HOME:-}" ]; then
+        RIO_PRUNE_ROOT="$(realpath -m -- "$HOME/.cache/rio-build/kache" 2>/dev/null || true)"
+      fi
+      if [ -n "''${RIO_KACHE_CACHE_DIR:-}" ]; then
+        case "$RIO_KACHE_CACHE_DIR" in
+          /*)
+            local canon
+            canon="$(realpath -m -- "$RIO_KACHE_CACHE_DIR" 2>/dev/null || true)"
+            if [ -n "$canon" ]; then
+              RIO_KACHE_CACHE_DIR="$canon"
+            else
+              echo "''${0##*/}: ignoring unresolvable RIO_KACHE_CACHE_DIR ($RIO_KACHE_CACHE_DIR) — realpath failed (symlink loop?)" >&2
+              unset RIO_KACHE_CACHE_DIR
+            fi
+            ;;
+          *)
+            echo "''${0##*/}: ignoring relative RIO_KACHE_CACHE_DIR ($RIO_KACHE_CACHE_DIR) — use an absolute path" >&2
+            unset RIO_KACHE_CACHE_DIR
+            ;;
+        esac
+      fi
+      if [ -n "''${RIO_KACHE_CACHE_DIR:-}" ] && [ -n "$RIO_PRUNE_ROOT" ]; then
+        # Slash-suffixed prefix test so "store == root", "store is an
+        # ancestor of root", and the degenerate "/" all land in the
+        # COVERS_ROOT arm (realpath never emits a trailing slash
+        # except for "/" itself, which %/ normalizes to "").
+        case "$RIO_PRUNE_ROOT/" in
+          "''${RIO_KACHE_CACHE_DIR%/}/"*) RIO_STORE_COVERS_ROOT=1 ;;
+          *)
+            case "$RIO_KACHE_CACHE_DIR" in
+              "$RIO_PRUNE_ROOT"/*)
+                RIO_STORE_TOP="''${RIO_KACHE_CACHE_DIR#"$RIO_PRUNE_ROOT/"}"
+                RIO_STORE_TOP="''${RIO_STORE_TOP%%/*}"
+                ;;
+              *) ;;
+            esac
+            ;;
+        esac
+      fi
+    }
+    rio_store_stamp() {
+      { mkdir -p "$1" && touch "$1/.last-used"; } 2>/dev/null || true
+      if [ -n "$RIO_STORE_TOP" ] && [ -n "$RIO_PRUNE_ROOT" ]; then
+        touch "$RIO_PRUNE_ROOT/$RIO_STORE_TOP/.last-used" 2>/dev/null || true
+      fi
+    }
+  '';
+
   # Policy wrapper around kache. The policy must live IN THE BINARY:
   # env hygiene done in the shellHook does not survive everything that
   # re-loads user config into a child environment (xtask's dotenvy
@@ -148,15 +253,18 @@ let
   #     and output-only logging knobs.
   #  2. Pin the config (KACHE_CONFIG) so kache's config search can
   #     never reach a user-level ~/.config/kache/config.toml.
-  #  3. Validate + map the rio-namespaced knobs (policy in the binary —
+  #  3. Validate + map RIO_KACHE_MAX_SIZE (policy in the binary —
   #     values arrive via dotenvy/direnv paths that never saw the
   #     shellHook loader). Post-scrub by construction, so the mapped
-  #     KACHE_CACHE_DIR/KACHE_MAX_SIZE exports survive to the exec.
+  #     KACHE_MAX_SIZE export survives to the exec.
   #  4. Store resolution + liveness stamp, BEFORE any bypass so
   #     bypass-heavy sessions (fuzz loops, online checks) stay live for
-  #     the prune — stamping gated on KACHE_DISABLED so an opted-out
-  #     user's dead store can age out instead of being stamped (and
-  #     even mkdir'd) forever.
+  #     the prune. RIO_KACHE_CACHE_DIR validation + canonicalization
+  #     live here too, via kacheStoreLib's rio_store_resolve (shared
+  #     with the epoch-GC script) — KACHE_CACHE_DIR is exported
+  #     CANONICAL, and stamping is gated on KACHE_DISABLED so an
+  #     opted-out user's dead store can age out instead of being
+  #     stamped (and even mkdir'd) forever.
   #  5. One argv scan: -Z detection plus the sweep coordinates
   #     (--out-dir + this unit's -C extra-filename, both rustc
   #     spellings) feeding sweep_debris (see its comment for the
@@ -264,23 +372,43 @@ let
           "") return 1 ;;
           */*) [ -x "$1" ] ;;
           rustc | clippy-driver | rustdoc) command -v "$1" >/dev/null 2>&1 ;;
-          # Escape hatch: honor a bare argv[1] equal to a user-exported
-          # RUSTC iff it resolves on PATH. cargo passes a user RUSTC
-          # VERBATIM as wrapper argv[1] on every invocation (no PATH
-          # resolution, no validation — verified empirically on real
-          # cargo), so equality (not basename) recognizes exactly the
-          # word cargo was told to use; a slash-containing RUSTC
-          # already takes the */* arm. An explicit RUSTC export is
-          # user intent, not a kache CLI word, so the init/sync
-          # PATH-collision rationale above does not apply here — kache
-          # CLI words still can never satisfy this arm unless the user
-          # literally exported RUSTC to that word (RUSTC=sync), at
-          # which point cargo itself would invoke that word as the
-          # compiler the same way: pathological, self-inflicted, and
-          # accepted as the edge of the escape hatch.
+          # Escape hatches: honor a bare argv[1] equal to a
+          # user-exported RUSTC or RUSTC_WORKSPACE_WRAPPER iff it
+          # resolves on PATH. cargo passes a user RUSTC VERBATIM as
+          # wrapper argv[1] on every invocation (no PATH resolution,
+          # no validation — verified empirically on real cargo), so
+          # equality (not basename) recognizes exactly the word cargo
+          # was told to use; a slash-containing value already takes
+          # the */* arm. RUSTC_WORKSPACE_WRAPPER composes the same
+          # way for WORKSPACE MEMBERS (verified empirically): cargo
+          # invokes RUSTC_WRAPPER with argv[1] = the workspace-wrapper
+          # value verbatim and argv[2] = rustc (non-members get
+          # argv[1] = rustc only), so `run_real "$@"` execs the chain
+          # exactly as cargo composed it — the workspace wrapper runs
+          # with rustc as ITS argv[1]. The devshell itself never sets
+          # RUSTC_WORKSPACE_WRAPPER; this arm serves user/tool-
+          # exported chains. The `[build] rustc` config route is NOT
+          # coverable here: it hands the wrapper the verbatim word
+          # with RUSTC unset (verified empirically), so a bare word
+          # there is unrecognizable by construction — the job-6
+          # tripwire's remediation says to use an absolute path for
+          # that route. An explicit export is user intent, not a kache
+          # CLI word, so the init/sync PATH-collision rationale above
+          # does not apply here — kache CLI words still can never
+          # satisfy these arms unless the user literally exported one
+          # of the vars to that word (RUSTC=sync), at which point
+          # cargo itself would invoke that word as the compiler the
+          # same way: pathological, self-inflicted, and accepted as
+          # the edge of the escape hatch.
           *)
-            [ -n "''${RUSTC:-}" ] && [ "$1" = "$RUSTC" ] \
-              && command -v "$1" >/dev/null 2>&1
+            if [ -n "''${RUSTC:-}" ] && [ "$1" = "$RUSTC" ]; then
+              command -v "$1" >/dev/null 2>&1
+            elif [ -n "''${RUSTC_WORKSPACE_WRAPPER:-}" ] \
+              && [ "$1" = "$RUSTC_WORKSPACE_WRAPPER" ]; then
+              command -v "$1" >/dev/null 2>&1
+            else
+              return 1
+            fi
             ;;
         esac
       }
@@ -295,6 +423,10 @@ let
       # kacheDisabledFn nix binding (shared with the epoch-GC script;
       # rationale + v0.4.0 cite live there).
       ${kacheDisabledFn}
+      # Store resolution — single-sourced from the kacheStoreLib nix
+      # binding (shared with the epoch-GC script; the canonicalization
+      # contract + COVERS_ROOT rule live there).
+      ${kacheStoreLib}
 
       # Job 3: validate + map the rio-namespaced knobs. Post-scrub by
       # construction, so these exports are the only KACHE_CACHE_DIR/
@@ -328,15 +460,10 @@ let
           echo "kache wrapper: ignoring RIO_KACHE_MAX_SIZE ($RIO_KACHE_MAX_SIZE) — expected <integer><KiB|MiB|GiB|TiB>, e.g. 512GiB" >&2
         fi
       fi
-      if [ -n "''${RIO_KACHE_CACHE_DIR:-}" ]; then
-        case "$RIO_KACHE_CACHE_DIR" in
-          /*) ;;
-          *)
-            echo "kache wrapper: ignoring relative RIO_KACHE_CACHE_DIR ($RIO_KACHE_CACHE_DIR) — use an absolute path" >&2
-            unset RIO_KACHE_CACHE_DIR
-            ;;
-        esac
-      fi
+      # (RIO_KACHE_CACHE_DIR validation — relative → warn+unset,
+      # absolute → canonicalized in place — moved into
+      # rio_store_resolve, called in job 4 below, so the wrapper and
+      # the epoch-GC script can never drift on the posture.)
 
       # Job 4: store resolution + liveness stamp, BEFORE any bypass so
       # bypass-heavy sessions (fuzz loops, online checks) stay live for
@@ -345,34 +472,36 @@ let
       # store (v0.4.0's CLI ignores the flag for stats/list); only the
       # stamp is gated on KACHE_DISABLED, so a permanently opted-out
       # user's dead store can age out instead of being stamped (and
-      # even mkdir'd) forever.
+      # even mkdir'd) forever. KACHE_CACHE_DIR is exported CANONICAL
+      # (rio_store_resolve rewrites the override; the default is
+      # constructed from the canonical root): kache sees one spelling
+      # regardless of user aliasing, and every stamp/skip compare
+      # downstream is canonical-vs-canonical by construction. Note a
+      # later symlink retarget along a previously-aliased config is
+      # therefore picked up at the next shell entry / compile, not
+      # mid-session (documented in .env.local.example).
+      rio_store_resolve
       no_store=0
       if [ -n "''${RIO_KACHE_CACHE_DIR:-}" ]; then
         export KACHE_CACHE_DIR="$RIO_KACHE_CACHE_DIR"
-      elif [ -n "''${HOME:-}" ]; then
-        export KACHE_CACHE_DIR="$HOME/.cache/rio-build/kache/${kacheEnvSalt}"
+      elif [ -n "$RIO_PRUNE_ROOT" ]; then
+        export KACHE_CACHE_DIR="$RIO_PRUNE_ROOT/${kacheEnvSalt}"
       else
         no_store=1
       fi
-      if [ "$no_store" = 0 ] && ! kache_disabled; then
+      # Stamp default epochs AND relocated stores parked under the
+      # prune root (a salt-shaped RIO_KACHE_CACHE_DIR would otherwise
+      # look idle to the entry-time epoch GC and be reaped mid-use) —
+      # rio_store_stamp covers the depth-2 stamp the prune reads for
+      # nested shapes. Skipped when the configured store COVERS the
+      # prune root (no epoch boundary exists to stamp; the GC skips
+      # the prune entirely in that shape) and for stores parked
+      # outside the root (never pruned, nothing to keep alive).
+      # Failures never break a compile.
+      if [ "$no_store" = 0 ] && ! kache_disabled \
+        && [ -n "$RIO_PRUNE_ROOT" ] && [ "$RIO_STORE_COVERS_ROOT" = 0 ]; then
         case "$KACHE_CACHE_DIR" in
-          # Stamp default epochs AND relocated stores parked under the
-          # prune root (a salt-shaped RIO_KACHE_CACHE_DIR would
-          # otherwise look idle to the entry-time epoch GC and be
-          # rm -rf'd mid-use). For nested shapes root/<12hex>/store the
-          # stamp the prune READS is the depth-2 one — refresh the
-          # top-level path component's stamp too, so sibling shells
-          # without this config see a fresh stamp while the store is
-          # in active use (for the default shape both touches hit the
-          # same file — harmless). Failures never break a compile.
-          "''${HOME:-/nonexistent}/.cache/rio-build/kache/"*)
-            { mkdir -p "$KACHE_CACHE_DIR" && touch "$KACHE_CACHE_DIR/.last-used"; } 2>/dev/null || true
-            top="''${KACHE_CACHE_DIR#"''${HOME:-/nonexistent}/.cache/rio-build/kache/"}"
-            top="''${top%%/*}"
-            if [ -n "$top" ]; then
-              touch "''${HOME:-/nonexistent}/.cache/rio-build/kache/$top/.last-used" 2>/dev/null || true
-            fi
-            ;;
+          "$RIO_PRUNE_ROOT"/*) rio_store_stamp "$KACHE_CACHE_DIR" ;;
           *) ;;
         esac
       fi
@@ -405,21 +534,30 @@ let
         esac
         prev="$a"
       done
+      # Raw compile marker for the job-6 tripwire, captured BEFORE the
+      # shape validation below resets non-conforming values: the gate
+      # cares whether the spawner passed the flag at all (compile
+      # shape), not whether the value is sweep-safe.
+      extra_raw="$extra"
       # Glob-injection hygiene, NOT cargo modeling: $extra lands inside
       # a `find -name` glob in sweep_debris, so only cargo's shape —
-      # leading dash + nonempty lowercase hex — is trusted. Anything
-      # else (a hand-rolled spawner passing `*`, spaces, uppercase)
-      # resets to "" and takes the conservative fallback arm. Watch
-      # item (alongside job 6's -Z auto-injection one): if a future
-      # cargo ever stops passing -C extra-filename on a deps/-writing
-      # invocation, or changes its shape past this validation, the
-      # sweep silently degrades to that fallback — symptom: "output
-      # file … is not writeable" returns on disabled rebuilds (nlink-1
-      # reflink restores the fallback must not touch).
+      # leading dash + EXACTLY 16 lowercase hex (the verified cargo
+      # shape on both toolchains this repo uses) — is trusted.
+      # Anything else (a hand-rolled spawner passing `*`, spaces,
+      # uppercase, or an odd-width hex like -a1b2) resets to "" and
+      # takes the conservative fallback arm — a short hex value would
+      # otherwise render an over-broad `*-a*`-style glob that can
+      # sweep SIBLING units' read-only restores. Watch item (alongside
+      # job 6's -Z auto-injection one): if a future cargo ever stops
+      # passing -C extra-filename on a deps/-writing invocation, or
+      # changes its shape (hash width included) past this validation,
+      # the sweep silently degrades to that fallback — symptom:
+      # "output file … is not writeable" returns on disabled rebuilds
+      # (nlink-1 reflink restores the fallback must not touch).
       case "$extra" in
         "") ;;
         -*[!0-9a-f]* | -) extra="" ;;
-        -*) ;;
+        -*) [ "''${#extra}" -eq 17 ] || extra="" ;;
         *) extra="" ;;
       esac
 
@@ -497,19 +635,29 @@ let
         fi
       }
 
-      # Tripwire for the is_compiler allowlist: cargo always passes
-      # --crate-name on real compiles, so compile-shaped argv with an
-      # unrecognized argv[1] means every bypass arm below is dead —
-      # the KACHE_DISABLED bypass cannot fire (disabled rebuilds lose
-      # the debris sweep, so read-only restores EACCES), the -Z and
-      # online-sqlx bypasses cannot fire (unkeyable / wrong-keyspace
-      # compiles fall through to kache), and kache will be handed
-      # argv[1] verbatim as the compiler to run and key. One loud
-      # line; CLI words (`kache stats`) never carry --crate-name and
-      # never warn. crate_name is captured in job 5 for exactly this
-      # gate — the sweep no longer uses it.
-      if [ -n "$crate_name" ] && ! is_compiler "''${1:-}"; then
-        echo "kache wrapper: compile-shaped invocation but argv[1] (''${1:-}) is not a recognized compiler — no bypass arm can fire (KACHE_DISABLED rebuilds lose the debris sweep and EACCES on read-only restores; -Z/online-sqlx compiles fall through), and kache will exec argv[1] verbatim. Use an absolute-path RUSTC, or rustc/clippy-driver/rustdoc, or export RUSTC to this exact word." >&2
+      # Tripwire for the is_compiler allowlist: compile-shaped argv
+      # with an unrecognized argv[1] means every bypass arm below is
+      # dead — the KACHE_DISABLED bypass cannot fire (disabled
+      # rebuilds lose the debris sweep, so read-only restores EACCES),
+      # the -Z and online-sqlx bypasses cannot fire (unkeyable /
+      # wrong-keyspace compiles fall through to kache), and kache will
+      # be handed argv[1] verbatim as the compiler to run and key.
+      # "Compile-shaped" is crate_name AND (out_dir OR a raw
+      # -C extra-filename token): --crate-name alone over-matches in
+      # BOTH directions — the repo's own documented CLI flow
+      # `kache purge --crate-name <crate>` (see shellPackages) carries
+      # it (verified: the old crate_name-only gate fired on it, a
+      # false positive contradicting its own rationale), and cargo's
+      # `--crate-name ___` --print probe carries it too. The
+      # discriminator (verified empirically): every deps-writing cargo
+      # compile carries --out-dir AND -C extra-filename; the
+      # -vV/--print probes carry neither; `kache purge`'s entire clap
+      # surface is --crate-name/--help so it CANNOT carry either.
+      # Both markers come out of the job-5 scan, pre-validation.
+      if [ -n "$crate_name" ] \
+        && { [ -n "$out_dir" ] || [ -n "$extra_raw" ]; } \
+        && ! is_compiler "''${1:-}"; then
+        echo "kache wrapper: compile-shaped invocation but argv[1] (''${1:-}) is not a recognized compiler — no bypass arm can fire (KACHE_DISABLED rebuilds lose the debris sweep and EACCES on read-only restores; -Z/online-sqlx compiles fall through), and kache will exec argv[1] verbatim. Use an absolute-path RUSTC or [build] rustc (config-route words arrive verbatim with RUSTC unset, so a bare word there is unrecognizable — use an absolute path), or rustc/clippy-driver/rustdoc, or export RUSTC / RUSTC_WORKSPACE_WRAPPER to this exact word." >&2
       fi
 
       # Job 6: routing. run_real is the single plain-compiler
@@ -564,15 +712,30 @@ let
   # regardless of caller PATH. Reads HOME / KACHE_DISABLED /
   # RIO_KACHE_CACHE_DIR from env (the shellHook calls it AFTER the
   # .env.local knob loader) and bakes the salt. Scope and safety:
+  #  - ALL store-path compares are canonical-vs-canonical: the prune
+  #    root and the configured store are resolved through
+  #    kacheStoreLib's rio_store_resolve (realpath -m) before any
+  #    stamp/skip/prune decision, so aliased spellings (symlinked
+  #    $HOME/.cache, `//`, `/./`, symlink VALUES) cannot defeat the
+  #    keep-alive or the skip. A relative/unresolvable value gets one
+  #    stderr warning and falls back to the DEFAULT-epoch arm —
+  #    seeded and protected like any unconfigured entry (the old
+  #    silent no-op seeded nothing while the wrapper fell back);
+  #  - exact-root rule: a configured store equal to the root (or an
+  #    ancestor of it) makes every 12-hex child part of the
+  #    configured store, so the prune is skipped ENTIRELY for the
+  #    session after one warning — deletion beats hardening. Cost
+  #    (documented in .env.local.example): epochs under the root stop
+  #    aging out while so configured;
   #  - a configured RIO_KACHE_CACHE_DIR parked UNDER the root is
-  #    re-stamped UNCONDITIONALLY: configuring the path is explicit
-  #    intent, so it must stay live even under KACHE_DISABLED (the
-  #    wrapper's per-compile stamp stays disabled-gated, making this
-  #    entry-time stamp the only one a disabled-but-configured store
-  #    gets). For nested shapes root/<12hex>/store the top-level path
-  #    component is stamped too — that depth-2 stamp is the one the
-  #    prune reads, so sibling shells without the config see it fresh
-  #    while the store is in active use;
+  #    re-stamped UNCONDITIONALLY (rio_store_stamp): configuring the
+  #    path is explicit intent, so it must stay live even under
+  #    KACHE_DISABLED (the wrapper's per-compile stamp stays
+  #    disabled-gated, making this entry-time stamp the only one a
+  #    disabled-but-configured store gets). For nested shapes
+  #    root/<12hex>/store the top-level component is stamped too —
+  #    that depth-2 stamp is the one the prune reads, so sibling
+  #    shells without the config see it fresh during real use;
   #  - the default salt epoch is seeded only when NOT disabled: an
   #    opted-out user's dead default store must age out, not be
   #    re-mkdir'd at every entry;
@@ -594,12 +757,26 @@ let
   #  - the prune runs even when RIO_KACHE_CACHE_DIR is set or caching
   #    is disabled (only seeding is gated) so relocated and opted-out
   #    users still age out stale epochs instead of leaking 256GiB;
-  #  - find runs with explicit -P (the GNU/POSIX default, pinned so
-  #    the safety property survives future flag edits): a symlinked
-  #    ROOT is not followed — the destructive walk cannot cross the
-  #    link. Accepted flip side: epochs under a symlinked root are
-  #    never pruned (the root is HOME-anchored; symlinked INTERMEDIATE
-  #    path components are still kernel-resolved and prune normally);
+  #  - deletion is TOMBSTONE-FIRST: each stale epoch is renamed to
+  #    "$root/.reap-<epochname>.$$" (same-parent mv -T — atomic
+  #    rename(2) by construction), then the tombstone is rm -rf'd; on
+  #    mv failure the entry is SKIPPED, never in-place rm'd. The
+  #    dot-prefixed non-12hex tombstone name is structurally invisible
+  #    to the seed glob ("$root"/*/ excludes dotfiles) and to the
+  #    prune regex ([0-9a-f]{12}), so an interrupted prune leaves only
+  #    tombstones — never a half-deleted 12-hex husk the seed loop
+  #    would re-lease for 14 days. Stray tombstones are swept
+  #    best-effort at each entry;
+  #  - a symlinked FINAL root component is canonicalized BEFORE the
+  #    walk, so epochs behind it are MANAGED — pruned when idle,
+  #    skip-protected when configured (the old "never pruned behind a
+  #    symlinked root" leak was inconsistent with intermediate
+  #    symlinks, which the kernel resolved anyway). find keeps
+  #    explicit -P as the guard for symlinks WITHIN the walk, and the
+  #    seed loop skips depth-1 symlink entries: a salt-shaped symlink
+  #    is never stamped THROUGH, never seeded, never pruned, never
+  #    deleted — explicitly unmanaged (a user may have parked an
+  #    epoch on another disk; we won't rm their link);
   #  - every statement is failure-guarded: a read-only HOME or a
   #    racing sibling prune must not abort shell entry (the shellHook
   #    additionally `|| true`s the whole call);
@@ -615,32 +792,48 @@ let
       # KACHE_DISABLED truthiness — single-sourced from the
       # kacheDisabledFn nix binding (shared with the kache wrapper).
       ${kacheDisabledFn}
+      # Store resolution — single-sourced from the kacheStoreLib nix
+      # binding (shared with the kache wrapper), so the two scripts
+      # can never drift on canonicalization or the relative-value
+      # posture.
+      ${kacheStoreLib}
       [ -n "''${HOME:-}" ] || exit 0
-      root="$HOME/.cache/rio-build/kache"
+      rio_store_resolve
+      root="$RIO_PRUNE_ROOT"
+      [ -n "$root" ] || exit 0
+      if [ "$RIO_STORE_COVERS_ROOT" = 1 ]; then
+        # Exact-root/ancestor contract — see header. No stamp either:
+        # there is no epoch boundary inside the configured store.
+        echo "rio-kache-epoch-gc: RIO_KACHE_CACHE_DIR ($RIO_KACHE_CACHE_DIR) covers the epoch root ($root) — epoch pruning disabled while so configured; configure a subdirectory instead (e.g. $root/mystore)" >&2
+        exit 0
+      fi
       if [ -n "''${RIO_KACHE_CACHE_DIR:-}" ]; then
-        # Configured store: re-stamp it (and, for nested shapes, the
-        # top-level epoch dir the prune actually reads) regardless of
-        # KACHE_DISABLED — see header. A relative/garbage value never
-        # matches the case arm: same posture as wrapper job 3.
+        # Configured store parked under the root: re-stamp it (and,
+        # for nested shapes, the depth-2 stamp the prune actually
+        # reads) regardless of KACHE_DISABLED — see header. A store
+        # parked OUTSIDE the root is never pruned, so there is
+        # nothing to keep alive. (Relative/unresolvable values were
+        # already warned about and unset by rio_store_resolve and
+        # take the default-seed elif below.)
         case "$RIO_KACHE_CACHE_DIR" in
-          "$root"/*)
-            { mkdir -p "$RIO_KACHE_CACHE_DIR" \
-              && touch "$RIO_KACHE_CACHE_DIR/.last-used"; } 2>/dev/null || true
-            top="''${RIO_KACHE_CACHE_DIR#"$root/"}"
-            top="''${top%%/*}"
-            if [ -n "$top" ]; then
-              touch "$root/$top/.last-used" 2>/dev/null || true
-            fi
-            ;;
+          "$root"/*) rio_store_stamp "$RIO_KACHE_CACHE_DIR" ;;
           *) ;;
         esac
       elif ! kache_disabled; then
         # Default salt epoch — seeding stays disabled-gated.
-        { mkdir -p "$root/${kacheEnvSalt}" \
-          && touch "$root/${kacheEnvSalt}/.last-used"; } 2>/dev/null || true
+        rio_store_stamp "$root/${kacheEnvSalt}"
       fi
       if [ -d "$root" ]; then
+        # Sweep tombstones a previously interrupted prune left behind
+        # (best-effort; the glob is a no-op literal when nothing
+        # matches and rm's failure is guarded).
+        rm -rf -- "$root"/.reap-* 2>/dev/null || true
         for epoch in "$root"/*/; do
+          # Depth-1 symlink epochs are unmanaged — never stamped
+          # THROUGH (the trailing-slash glob matches symlinks-to-dirs
+          # and touch would follow), never pruned (find -P lstats
+          # them at depth 1), never deleted. See header.
+          if [ -L "''${epoch%/}" ]; then continue; fi
           epoch_name="$(basename "$epoch")"
           case "$epoch_name" in
             *[!0-9a-f]*) continue ;;
@@ -649,15 +842,27 @@ let
           [ -e "$epoch.last-used" ] || touch "$epoch.last-used" 2>/dev/null || true
         done
         while IFS= read -r -d "" stale; do
-          # Path-prefix skip of the configured store. Component-
-          # boundary matching: the appended slash on the test string
-          # plus the quoted-"$stale"/* pattern also covers the
-          # exact-match shape, since * matches empty.
+          # Path-prefix skip of the configured store — BOTH sides are
+          # canonical here ($stale walks the canonical root;
+          # RIO_KACHE_CACHE_DIR was canonicalized by
+          # rio_store_resolve), so an aliased config spelling cannot
+          # defeat the skip. Component-boundary matching: the
+          # appended slash on the test string plus the quoted
+          # "$stale"/* pattern also covers the exact-match shape,
+          # since * matches empty.
           case "''${RIO_KACHE_CACHE_DIR:-}/" in
             "$stale"/*) continue ;;
             *) ;;
           esac
-          rm -rf -- "$stale" 2>/dev/null || true
+          # Tombstone-first delete: same-parent rename (atomic), then
+          # rm the tombstone. On mv failure SKIP — never fall back to
+          # in-place rm: an interrupted in-place rm -rf leaves a
+          # half-deleted 12-hex husk that the seed loop would
+          # re-lease for another 14 days.
+          tomb="$root/.reap-''${stale##*/}.$$"
+          if mv -T -- "$stale" "$tomb" 2>/dev/null; then
+            rm -rf -- "$tomb" 2>/dev/null || true
+          fi
         done < <(find -P "$root" -mindepth 2 -maxdepth 2 -name .last-used \
           -regextype posix-extended -regex '.*/[0-9a-f]{12}/\.last-used' \
           -mtime +14 -printf '%h\0' 2>/dev/null)
@@ -933,11 +1138,17 @@ let
             # of invocation cwd (bug_022: `cd docs && shiroa serve .`
             # otherwise writes to docs/docs/.cache/). Derived from
             # rio_root (one rev-parse for both) so `nix develop` from a
-            # subdirectory also resolves correctly; left unset outside a
-            # git repo instead of exporting the garbage absolute path
-            # /docs/.cache/typst-xdg.
-            if [ -n "$rio_root" ]; then
+            # subdirectory also resolves correctly. Gated on the same
+            # uniquely-rio marker as SQLX_OFFLINE_DIR and the knob
+            # loader below — a bare rev-parse gate would export a
+            # FOREIGN repo's root when this shell is entered from
+            # inside one. The else-arm unset mirrors SQLX_OFFLINE_DIR:
+            # a stale sibling-worktree value (IDE-captured env) must
+            # not retarget the shiroa cache sync in a foreign checkout.
+            if [ -f "$rio_root/rio-buildhash/Cargo.toml" ]; then
               export RIO_TYPST_XDG="$rio_root/docs/.cache/typst-xdg"
+            else
+              unset RIO_TYPST_XDG
             fi
             # Single-channel sqlx contract: this is the one variable both
             # sqlx-macros-core (first in its own discovery chain) and

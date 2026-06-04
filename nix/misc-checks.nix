@@ -1097,23 +1097,42 @@ in
   # output identity — so a bypassed compile can never unlink a SIBLING
   # unit's restores (bin+lib double units, feature-config twins,
   # duplicate dep versions all share a crate name). The warning-probe
-  # path falls through to `exec kache`, which pulls the kache flake
-  # input build into this check's closure — accepted (caller-faithful
-  # beats stubbing the exec).
+  # and purge-CLI paths fall through to `exec kache`, which pulls the
+  # kache flake input build into this check's closure — accepted
+  # (caller-faithful beats stubbing the exec). Every other scenario —
+  # including the ENABLED-mode ones — exits via a bypass exec before
+  # kache ever runs, so the check needs no daemon/store beyond that.
   kache-wrapper-test =
     pkgs.runCommand "rio-kache-wrapper-test" { nativeBuildInputs = [ pkgs.gnugrep ]; }
       ''
         set -euo pipefail
         wrapper=${kacheWrapped}/bin/kache
+        salt=${kacheEnvSalt}
         export HOME=$TMPDIR/home
         mkdir -p "$HOME" "$TMPDIR/bin"
         export STUB_LOG=$TMPDIR/stub.log
         : > "$STUB_LOG"
         # PATH stubs: bypass arms exec argv[1], so a recorded stub run
-        # is the observable "bypass fired" signal.
-        for s in rustc myrustc; do
-          printf '#!%s\necho "stub-%s ran" >> "$STUB_LOG"\nexit 0\n' \
-            '${pkgs.runtimeShell}' "$s" > "$TMPDIR/bin/$s"
+        # is the observable "bypass fired" signal. Each invocation
+        # appends exactly ONE line: argv plus the stub's view of the
+        # KACHE_* env at the exec boundary. The line count is the
+        # mutation discriminator for enabled-mode bypass arms — a
+        # deleted arm sends the invocation through real kache, whose
+        # toolchain key probes (-vV etc.) run the stub extra times
+        # with probe-shaped argv; the env dump pins scrub/mapping/
+        # no-HOME behavior.
+        for s in rustc myrustc wkspc-wrap; do
+          cat > "$TMPDIR/bin/$s" <<EOF
+        #!${pkgs.runtimeShell}
+        {
+          printf 'stub-$s ran argv:'
+          for a in "\$@"; do printf ' %s' "\$a"; done
+          printf ' | KACHE_CACHE_DIR=%s KACHE_MAX_SIZE=%s KACHE_DISABLED=%s KACHE_CONFIG=%s\n' \
+            "\''${KACHE_CACHE_DIR-<unset>}" "\''${KACHE_MAX_SIZE-<unset>}" \
+            "\''${KACHE_DISABLED-<unset>}" "\''${KACHE_CONFIG-<unset>}"
+        } >> "\$STUB_LOG"
+        exit 0
+        EOF
           chmod +x "$TMPDIR/bin/$s"
         done
         export PATH=$TMPDIR/bin:$PATH
@@ -1205,13 +1224,14 @@ in
 
         # Bare exported RUSTC: cargo passes the value verbatim as
         # argv[1]; the equality escape hatch must take the bypass with
-        # NO warning.
+        # NO warning. (16-hex extra so this keeps exercising the
+        # extra-anchored sweep arm under the exactly-16 tightening.)
         acc=$TMPDIR/acc
         mkdir -p "$acc"
         echo k > "$acc/keepme"
         chmod 0444 "$acc/keepme"
         RUSTC=myrustc KACHE_DISABLED=1 "$wrapper" myrustc --crate-name x \
-          --out-dir "$acc" -C extra-filename=-dead0000 --version 2>"$TMPDIR/err.accept"
+          --out-dir "$acc" -C extra-filename=-dead0000dead0000 --version 2>"$TMPDIR/err.accept"
         grep -q 'stub-myrustc ran' "$STUB_LOG" \
           || { echo "FAIL: bare exported RUSTC did not take the bypass" >&2; exit 1; }
         if grep -q 'not a recognized compiler' "$TMPDIR/err.accept"; then
@@ -1225,24 +1245,172 @@ in
         # exec hands argv to kache, which fails to spawn the fake
         # compiler — that exit is expected).
         KACHE_DISABLED=1 "$wrapper" not-a-compiler --crate-name x \
-          --out-dir "$gi" -C extra-filename=-dead0000 --version \
+          --out-dir "$gi" -C extra-filename=-dead0000dead0000 --version \
           2>"$TMPDIR/err.warn" || true
         grep -q 'not a recognized compiler' "$TMPDIR/err.warn" \
           || { echo "FAIL: compile-shaped foreign argv[1] did not warn" >&2; exit 1; }
         [ -e "$gi/canary" ] \
           || { echo "FAIL: foreign argv[1] path swept files" >&2; exit 1; }
+
+        # ---- Enabled-mode bypass arms (each scenario names the guard
+        # line whose deletion turns it red) ----
+
+        # Enabled -Z bypass — kills job 6's `[ "$zflag" = 1 ] &&
+        # is_compiler` arm: no KACHE_DISABLED, a -Z token, RUSTC
+        # escape hatch. Exactly ONE stub line with the original argv;
+        # a deleted arm falls through to real kache, whose key probes
+        # re-run the stub with probe argv (count != 1).
+        : > "$STUB_LOG"
+        RUSTC=myrustc "$wrapper" myrustc --crate-name zee -Zunpretty=hir \
+          --out-dir "$TMPDIR/zd" -C extra-filename=-cafecafecafecafe --version
+        [ "$(wc -l < "$STUB_LOG")" -eq 1 ] \
+          || { echo "FAIL: enabled -Z bypass did not exec exactly once" >&2; exit 1; }
+        grep -q 'stub-myrustc ran argv: --crate-name zee -Zunpretty=hir' "$STUB_LOG" \
+          || { echo "FAIL: enabled -Z bypass argv not preserved" >&2; exit 1; }
+
+        # Enabled online-sqlx bypass — kills job 6's `! sqlx_offline_truthy
+        # && DATABASE_URL` arm. SQLX_OFFLINE=0 is FALSY by sqlx's own
+        # parse (only "1"/"true" are offline), so this is online mode.
+        : > "$STUB_LOG"
+        DATABASE_URL=postgres://localhost/db SQLX_OFFLINE=0 "$wrapper" rustc \
+          --crate-name esso --out-dir "$TMPDIR/sq" \
+          -C extra-filename=-beefbeefbeefbeef --version
+        [ "$(wc -l < "$STUB_LOG")" -eq 1 ] \
+          || { echo "FAIL: enabled online-sqlx bypass did not exec exactly once" >&2; exit 1; }
+        grep -q 'stub-rustc ran argv: --crate-name esso' "$STUB_LOG" \
+          || { echo "FAIL: online-sqlx bypass argv not preserved" >&2; exit 1; }
+
+        # No-HOME arm — kills the `if [ "$no_store" = 1 ]` run_real
+        # bypass: the stub must run exactly once with KACHE_DISABLED
+        # still unset (the `export KACHE_DISABLED=1` fall-through line
+        # comes AFTER the bypass; a deleted bypass reaches it and the
+        # stub's env dump shows '1').
+        : > "$STUB_LOG"
+        env -u HOME "$wrapper" rustc --crate-name nohome --version
+        [ "$(wc -l < "$STUB_LOG")" -eq 1 ] \
+          || { echo "FAIL: no-HOME bypass did not exec exactly once" >&2; exit 1; }
+        grep -q 'KACHE_DISABLED=<unset>' "$STUB_LOG" \
+          || { echo "FAIL: no-HOME bypass ran after the disabled fall-through export" >&2; exit 1; }
+        grep -q 'KACHE_CACHE_DIR=<unset>' "$STUB_LOG" \
+          || { echo "FAIL: no-HOME invocation exported a store anyway" >&2; exit 1; }
+
+        # Foreign-env scrub — kills the job-1 allowlist loop: a
+        # pre-exported KACHE_MAX_SIZE (kache's OWN var, not the RIO
+        # one) must be scrubbed, while job 2's pinned KACHE_CONFIG and
+        # job 4's wrapper-authored default KACHE_CACHE_DIR survive to
+        # the exec (scrub-before-export ordering: a reorder would eat
+        # both wrapper-authored values too).
+        : > "$STUB_LOG"
+        KACHE_CACHE_DIR=/foreign/store KACHE_MAX_SIZE=1KiB KACHE_DISABLED=1 \
+          "$wrapper" rustc --crate-name scrubbed --version
+        grep -q 'KACHE_MAX_SIZE=<unset>' "$STUB_LOG" \
+          || { echo "FAIL: foreign KACHE_MAX_SIZE survived the scrub" >&2; exit 1; }
+        grep -qF "KACHE_CACHE_DIR=$HOME/.cache/rio-build/kache/$salt " "$STUB_LOG" \
+          || { echo "FAIL: KACHE_CACHE_DIR is not the wrapper-authored default (scrub/export order broken?)" >&2; exit 1; }
+        grep -q 'KACHE_CONFIG=/nix/store/.*kache-config\.toml' "$STUB_LOG" \
+          || { echo "FAIL: pinned KACHE_CONFIG missing at the exec boundary" >&2; exit 1; }
+
+        # RIO_KACHE_MAX_SIZE mapping — kills the job-3 export (valid
+        # value mapped) and its shape validation (garbage warned +
+        # dropped, never mapped).
+        : > "$STUB_LOG"
+        RIO_KACHE_MAX_SIZE=123GiB KACHE_DISABLED=1 "$wrapper" rustc \
+          --crate-name sized --version
+        grep -q 'KACHE_MAX_SIZE=123GiB' "$STUB_LOG" \
+          || { echo "FAIL: valid RIO_KACHE_MAX_SIZE not mapped" >&2; exit 1; }
+        : > "$STUB_LOG"
+        RIO_KACHE_MAX_SIZE=1.5GiB KACHE_DISABLED=1 "$wrapper" rustc \
+          --crate-name badsize --version 2>"$TMPDIR/err.size"
+        grep -q 'ignoring RIO_KACHE_MAX_SIZE' "$TMPDIR/err.size" \
+          || { echo "FAIL: garbage RIO_KACHE_MAX_SIZE did not warn" >&2; exit 1; }
+        grep -q 'KACHE_MAX_SIZE=<unset>' "$STUB_LOG" \
+          || { echo "FAIL: garbage RIO_KACHE_MAX_SIZE was mapped anyway" >&2; exit 1; }
+
+        # Job-4 liveness stamp on an ENABLED compile — kills the
+        # rio_store_stamp call in job 4 (the -Z bypass keeps the
+        # scenario hermetic; the stamp lands BEFORE routing).
+        export HOME=$TMPDIR/home2
+        mkdir -p "$HOME"
+        RUSTC=myrustc "$wrapper" myrustc --crate-name stampy -Zfoo --version
+        [ -e "$HOME/.cache/rio-build/kache/$salt/.last-used" ] \
+          || { echo "FAIL: enabled compile did not stamp the default epoch" >&2; exit 1; }
+        export HOME=$TMPDIR/home
+
+        # RUSTC_WORKSPACE_WRAPPER chain — kills the is_compiler
+        # workspace-wrapper equality arm: for workspace members cargo
+        # invokes RUSTC_WRAPPER with argv[1] = the workspace-wrapper
+        # value VERBATIM and argv[2] = rustc (verified empirically).
+        # The bypass must exec the chain as cargo composed it (the
+        # stub sees rustc as ITS argv[1]) with NO tripwire warning —
+        # a deleted arm leaves every bypass dead and the compile-
+        # shaped tripwire fires.
+        : > "$STUB_LOG"
+        RUSTC_WORKSPACE_WRAPPER=wkspc-wrap KACHE_DISABLED=1 "$wrapper" wkspc-wrap rustc \
+          --crate-name member --out-dir "$TMPDIR/ww" \
+          -C extra-filename=-feedfeedfeedfeed --version 2>"$TMPDIR/err.ww"
+        if grep -q 'not a recognized compiler' "$TMPDIR/err.ww"; then
+          echo "FAIL: tripwire fired for an honored RUSTC_WORKSPACE_WRAPPER" >&2; exit 1
+        fi
+        [ "$(wc -l < "$STUB_LOG")" -eq 1 ] \
+          || { echo "FAIL: workspace-wrapper bypass did not exec exactly once" >&2; exit 1; }
+        grep -q 'stub-wkspc-wrap ran argv: rustc --crate-name member' "$STUB_LOG" \
+          || { echo "FAIL: workspace-wrapper chain not preserved (rustc must be its argv[1])" >&2; exit 1; }
+
+        # ---- Tripwire shape gate (kills the compile-marker conjunct
+        # `{ out_dir || extra_raw }`) ----
+
+        # The repo's own documented CLI flow `kache purge --crate-name
+        # <crate>` carries --crate-name but can carry neither --out-dir
+        # nor -C extra-filename (its whole clap surface is
+        # --crate-name/--help) — it must NOT warn. --help keeps it
+        # side-effect-free: clap prints help, no purge executes.
+        "$wrapper" purge --crate-name zzz-probe --help >/dev/null 2>"$TMPDIR/err.purge" || true
+        if grep -q 'not a recognized compiler' "$TMPDIR/err.purge"; then
+          echo "FAIL: tripwire fired on the documented kache purge flow" >&2; exit 1
+        fi
+        # Probe shape: --crate-name ___ + --print, no out-dir/extra
+        # (cargo's toolchain probe carries --crate-name too) — silent
+        # even with a foreign argv[1].
+        KACHE_DISABLED=1 "$wrapper" not-a-compiler --crate-name ___ \
+          --print=file-names 2>"$TMPDIR/err.probe" || true
+        if grep -q 'not a recognized compiler' "$TMPDIR/err.probe"; then
+          echo "FAIL: tripwire fired on a probe-shaped invocation (no out-dir/extra)" >&2; exit 1
+        fi
+
+        # Odd-width extra-filename — kills the exactly-16-hex length
+        # check: an 8-hex value must be rejected by shape validation
+        # and take the conservative -links +1 arm, so an nlink-1 0444
+        # canary whose name matches the would-be `*-deadbeef*` glob
+        # survives (a relaxed check renders the over-broad glob and
+        # deletes it).
+        ei=$TMPDIR/ei
+        mkdir -p "$ei"
+        echo c > "$ei/librio_x-deadbeef.rlib"
+        chmod 0444 "$ei/librio_x-deadbeef.rlib"
+        KACHE_DISABLED=1 "$wrapper" rustc --crate-name rio_x --out-dir "$ei" \
+          -C extra-filename=-deadbeef --version 2>/dev/null
+        [ -e "$ei/librio_x-deadbeef.rlib" ] \
+          || { echo "FAIL: 8-hex extra-filename took the extra-anchored arm (length check relaxed?)" >&2; exit 1; }
         touch $out
       '';
 
   # The entry-time epoch GC (rio-kache-epoch-gc) the shellHook runs —
   # scratch-HOME simulations of the stamp/seed/prune contract,
-  # including the merged_bug_011 shapes: a configured nested store
-  # survives the prune and refreshes the depth-2 stamp the prune
-  # reads; disabled-but-configured stores re-stamp instead of aging
-  # out; the disabled default-seed gate stays intact (asserted via the
-  # passthru'd salt); the prune cannot cross a symlinked root (-P
-  # pinned) while intermediate symlinks still prune; and a read-only
-  # HOME never aborts.
+  # including the merged_bug_011 shapes (nested keep-alive, disabled-
+  # but-configured re-stamp, disabled seed gate via the passthru'd
+  # salt, read-only HOME) and the canonical-resolution contract: ALL
+  # store compares are canonical-vs-canonical (aliased config
+  # spellings — intermediate-symlinked HOME/.cache, `//`, `/./`,
+  # symlink VALUES — keep-alive and skip-protect the same physical
+  # store), a symlinked FINAL root component is canonicalized before
+  # the walk (epochs behind it are MANAGED: stale ones prune,
+  # configured ones survive), exact-root/ancestor configs disable the
+  # prune entirely with a warning, relative configs warn + fall back
+  # to the default-seed arm (wrapper parity), deletion is tombstone-
+  # first (stray .reap-* swept, none left behind), and depth-1
+  # symlink epochs are unmanaged (never stamped through, never
+  # deleted). Each scenario names the guard line whose deletion turns
+  # it red.
   kache-epoch-gc-test = pkgs.runCommand "rio-kache-epoch-gc-test" { } ''
     set -euo pipefail
     gc=${rioKacheEpochGc}/bin/rio-kache-epoch-gc
@@ -1319,19 +1487,33 @@ in
     [ -e "$root/eeeeeeeeeeee/.last-used" ] \
       || { echo "FAIL S5: stampless 12-hex dir not seeded" >&2; exit 1; }
 
-    # S6: symlinked prune ROOT — find -P (pinned) must not follow:
-    # nothing is deleted through the link.
+    # S6 (REWRITTEN for the canonical-root contract — kills the
+    # rio_store_resolve canonicalization of the prune root): the
+    # root's FINAL component is a symlink. The root is canonicalized
+    # BEFORE the walk, so epochs behind the link are MANAGED — the
+    # stale unconfigured one IS pruned (the old contract leaked it
+    # forever), while a store CONFIGURED through the link survives via
+    # canonical compare and refreshes the depth-2 stamp at the
+    # CANONICAL location. With a lexical root, the walk would not
+    # cross the link and the through-the-link config spelling would
+    # never match.
     export HOME=$TMPDIR/h6
-    mkdir -p "$HOME/.cache/rio-build" "$TMPDIR/realtree/ffffffffffff"
-    touch -d '20 days ago' "$TMPDIR/realtree/ffffffffffff/.last-used"
+    mkdir -p "$HOME/.cache/rio-build" \
+      "$TMPDIR/realtree/ffffffffffff" "$TMPDIR/realtree/gggggggggggg/store"
+    touch -d '20 days ago' "$TMPDIR/realtree/ffffffffffff/.last-used" \
+      "$TMPDIR/realtree/gggggggggggg/.last-used"
     ln -s "$TMPDIR/realtree" "$HOME/.cache/rio-build/kache"
-    "$gc"
-    [ -d "$TMPDIR/realtree/ffffffffffff" ] \
-      || { echo "FAIL S6: prune crossed a symlinked root" >&2; exit 1; }
+    RIO_KACHE_CACHE_DIR="$HOME/.cache/rio-build/kache/gggggggggggg/store" "$gc"
+    [ ! -e "$TMPDIR/realtree/ffffffffffff" ] \
+      || { echo "FAIL S6: stale epoch behind a symlinked root not pruned (root not canonicalized?)" >&2; exit 1; }
+    [ -d "$TMPDIR/realtree/gggggggggggg/store" ] \
+      || { echo "FAIL S6: configured store behind a symlinked root pruned" >&2; exit 1; }
+    [ "$TMPDIR/realtree/gggggggggggg/.last-used" -nt "$ref" ] \
+      || { echo "FAIL S6: canonical depth-2 stamp not refreshed through the link" >&2; exit 1; }
 
-    # S6b: INTERMEDIATE symlink (HOME/.cache → real dir) is
-    # kernel-resolved — pruning still works behind it (-P protects
-    # only the final component; documented scope).
+    # S6b: INTERMEDIATE symlink (HOME/.cache → real dir) — pruning
+    # works behind it (canonicalized the same as every component now;
+    # the kernel resolved it even under the old lexical root).
     export HOME=$TMPDIR/h7
     mkdir -p "$HOME" "$TMPDIR/realcache/rio-build/kache/cafecafecafe"
     touch -d '20 days ago' "$TMPDIR/realcache/rio-build/kache/cafecafecafe/.last-used"
@@ -1349,6 +1531,148 @@ in
     chmod a-w "$root" "$HOME/.cache/rio-build" "$HOME/.cache" "$HOME"
     "$gc"
     chmod -R u+w "$HOME"
+
+    # S8 (exact-root/ancestor — kills the RIO_STORE_COVERS_ROOT early
+    # exit): a configured value equal to the prune root, or an
+    # ancestor of it, makes every 12-hex child part of the configured
+    # store — the GC must warn and skip the prune ENTIRELY. The
+    # 20-day-stale child survives with NO fresh stamp anywhere, so
+    # skipping alone is load-bearing; deleting the early exit prunes
+    # it (the in-loop skip can't save it: root/ is not a prefix-match
+    # of root/<child>/).
+    export HOME=$TMPDIR/h9
+    root=$HOME/.cache/rio-build/kache
+    mkdir -p "$root/abcdefabcdef"
+    touch -d '20 days ago' "$root/abcdefabcdef/.last-used"
+    RIO_KACHE_CACHE_DIR="$root" "$gc" 2>"$TMPDIR/s8.err"
+    grep -q 'covers the epoch root' "$TMPDIR/s8.err" \
+      || { echo "FAIL S8: exact-root config did not warn" >&2; exit 1; }
+    [ -d "$root/abcdefabcdef" ] \
+      || { echo "FAIL S8: child epoch pruned under an exact-root config" >&2; exit 1; }
+    RIO_KACHE_CACHE_DIR="$HOME/.cache/rio-build" "$gc" 2>"$TMPDIR/s8b.err"
+    grep -q 'covers the epoch root' "$TMPDIR/s8b.err" \
+      || { echo "FAIL S8: ancestor config did not warn" >&2; exit 1; }
+    [ -d "$root/abcdefabcdef" ] \
+      || { echo "FAIL S8: child epoch pruned under an ancestor config" >&2; exit 1; }
+
+    # S9 (relative override — kills the shared warn+unset+fall-back
+    # posture in rio_store_resolve): the GC must warn (wrapper
+    # parity), seed + stamp the DEFAULT salt epoch (the old code
+    # silently no-op'd: no warning, no seed), and the prune must
+    # still run normally (planted stale sibling pruned).
+    export HOME=$TMPDIR/h10
+    root=$HOME/.cache/rio-build/kache
+    mkdir -p "$root/dddddddddddd"
+    touch -d '20 days ago' "$root/dddddddddddd/.last-used"
+    RIO_KACHE_CACHE_DIR=foo/bar "$gc" 2>"$TMPDIR/s9.err"
+    grep -q 'ignoring relative RIO_KACHE_CACHE_DIR' "$TMPDIR/s9.err" \
+      || { echo "FAIL S9: relative override did not warn" >&2; exit 1; }
+    [ -e "$root/$salt/.last-used" ] \
+      || { echo "FAIL S9: default salt epoch not seeded after relative fall-back" >&2; exit 1; }
+    [ ! -e "$root/dddddddddddd" ] \
+      || { echo "FAIL S9: stale sibling not pruned under a relative override" >&2; exit 1; }
+
+    # S10 (aliasing trio — kills the canonical rewrite of
+    # RIO_KACHE_CACHE_DIR in rio_store_resolve): every alias spelling
+    # of a store parked under the root must keep-alive and
+    # skip-protect the SAME physical directory the old lexical
+    # compares deleted.
+    # (i) intermediate-symlinked HOME/.cache + CANONICAL-real config
+    # spelling (the spelling the lexical HOME-prefix gates rejected).
+    export HOME=$TMPDIR/h11
+    mkdir -p "$HOME" "$TMPDIR/realcache11/rio-build/kache/111111111111/store"
+    touch -d '20 days ago' "$TMPDIR/realcache11/rio-build/kache/111111111111/.last-used"
+    ln -s "$TMPDIR/realcache11" "$HOME/.cache"
+    RIO_KACHE_CACHE_DIR="$TMPDIR/realcache11/rio-build/kache/111111111111/store" "$gc"
+    [ -d "$TMPDIR/realcache11/rio-build/kache/111111111111/store" ] \
+      || { echo "FAIL S10i: canonically-spelled store behind symlinked .cache pruned" >&2; exit 1; }
+    [ "$TMPDIR/realcache11/rio-build/kache/111111111111/.last-used" -nt "$ref" ] \
+      || { echo "FAIL S10i: depth-2 stamp not refreshed at the canonical location" >&2; exit 1; }
+    # (ii) `//` (nested — the depth-2 stamp the prune reads must be
+    # refreshed despite the empty path component) and `/./` (the old
+    # lexical top-derivation produced "." and a stray root-level
+    # stamp).
+    export HOME=$TMPDIR/h12
+    root=$HOME/.cache/rio-build/kache
+    mkdir -p "$root/222222222222/store"
+    touch -d '20 days ago' "$root/222222222222/.last-used"
+    RIO_KACHE_CACHE_DIR="$root//222222222222/store" "$gc"
+    [ -d "$root/222222222222/store" ] \
+      || { echo "FAIL S10ii: //-spelled nested store pruned" >&2; exit 1; }
+    [ "$root/222222222222/.last-used" -nt "$ref" ] \
+      || { echo "FAIL S10ii: depth-2 stamp not refreshed for //-spelling" >&2; exit 1; }
+    export HOME=$TMPDIR/h12b
+    root=$HOME/.cache/rio-build/kache
+    mkdir -p "$root/333333333333"
+    touch -d '20 days ago' "$root/333333333333/.last-used"
+    RIO_KACHE_CACHE_DIR="$root/./333333333333" "$gc"
+    [ -d "$root/333333333333" ] \
+      || { echo "FAIL S10ii: /./-spelled store pruned" >&2; exit 1; }
+    [ "$root/333333333333/.last-used" -nt "$ref" ] \
+      || { echo "FAIL S10ii: stamp not refreshed for /./-spelling" >&2; exit 1; }
+    [ ! -e "$root/.last-used" ] \
+      || { echo "FAIL S10ii: stray root-level stamp created (lexical top-derivation back?)" >&2; exit 1; }
+    # (iii) symlink VALUE → root/<ep>: the TARGET must be stamped and
+    # survive (the old gates mismatched on the link spelling and the
+    # prune deleted the target, leaving the config dangling).
+    export HOME=$TMPDIR/h13
+    root=$HOME/.cache/rio-build/kache
+    mkdir -p "$root/444444444444"
+    touch -d '20 days ago' "$root/444444444444/.last-used"
+    ln -s "$root/444444444444" "$TMPDIR/the-link"
+    RIO_KACHE_CACHE_DIR="$TMPDIR/the-link" "$gc"
+    [ -d "$root/444444444444" ] \
+      || { echo "FAIL S10iii: symlink-valued config's target pruned" >&2; exit 1; }
+    [ "$root/444444444444/.last-used" -nt "$ref" ] \
+      || { echo "FAIL S10iii: symlink-valued config's target not stamped" >&2; exit 1; }
+
+    # S11 (tombstone hygiene — kills the entry-time .reap-* sweep AND
+    # the mv→rm pairing): a stray tombstone from an interrupted prune
+    # is swept; a freshly pruned epoch leaves NO tombstone behind;
+    # the tombstone name is never seeded as an epoch (dot-prefixed,
+    # non-12hex).
+    export HOME=$TMPDIR/h14
+    root=$HOME/.cache/rio-build/kache
+    mkdir -p "$root/.reap-cafecafecafe.999/junk" "$root/555555555555"
+    touch -d '20 days ago' "$root/555555555555/.last-used"
+    "$gc"
+    [ ! -e "$root/555555555555" ] \
+      || { echo "FAIL S11: stale epoch survived the tombstone-first prune" >&2; exit 1; }
+    [ "$(find "$root" -maxdepth 1 -name '.reap-*' | wc -l)" -eq 0 ] \
+      || { echo "FAIL S11: .reap-* tombstones left behind (sweep or post-mv rm deleted?)" >&2; exit 1; }
+
+    # S12 (depth-1 symlink epoch — kills the seed loop's -L skip): a
+    # salt-shaped symlink at depth 1 is UNMANAGED — the seed loop must
+    # not stamp THROUGH it (the old loop touch'd elsewhere/.last-used
+    # through the link, granting a foreign directory a 14-day lease
+    # while find -P could never prune it), and the link itself stays.
+    export HOME=$TMPDIR/h15
+    root=$HOME/.cache/rio-build/kache
+    mkdir -p "$root" "$TMPDIR/elsewhere"
+    ln -s "$TMPDIR/elsewhere" "$root/666666666666"
+    "$gc"
+    [ ! -e "$TMPDIR/elsewhere/.last-used" ] \
+      || { echo "FAIL S12: seed loop stamped through a depth-1 symlink epoch" >&2; exit 1; }
+    [ -L "$root/666666666666" ] \
+      || { echo "FAIL S12: depth-1 symlink epoch removed" >&2; exit 1; }
+
+    # S13 (the prune-loop configured-skip `continue` is load-bearing —
+    # kills exactly that line): construct "stale stamp + failed
+    # refresh" with a DANGLING-SYMLINK depth-2 stamp backdated via
+    # touch -h. rio_store_stamp's depth-2 touch follows the link and
+    # fails (guarded); the seed loop's -e test follows it too (false)
+    # and its touch also fails; find -P lstats the link itself —
+    # 20 days old, name and regex match — and selects the epoch. Only
+    # the in-loop skip keeps the configured store alive here; without
+    # it the epoch is tombstoned and reaped while configured.
+    export HOME=$TMPDIR/h16
+    root=$HOME/.cache/rio-build/kache
+    mkdir -p "$root/777777777777/store"
+    ln -s "$TMPDIR/nonexistent-target/stamp" "$root/777777777777/.last-used"
+    touch -h -d '20 days ago' "$root/777777777777/.last-used"
+    RIO_KACHE_CACHE_DIR="$root/777777777777/store" "$gc"
+    [ -d "$root/777777777777/store" ] \
+      || { echo "FAIL S13: configured store reaped when the stamp refresh fails (skip not load-bearing?)" >&2; exit 1; }
     touch $out
   '';
 }

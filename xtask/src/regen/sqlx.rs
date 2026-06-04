@@ -98,14 +98,18 @@ pub async fn run() -> Result<()> {
         // part of the tree" (one unreadable subdir → nonzero, after
         // deleting everything it could reach) with "did nothing".
         // This pass is defense in depth, not a gate — log and
-        // continue rather than abort the whole regen.
+        // continue rather than abort the whole regen. warn!, not
+        // debug!: xtask's EnvFilter is FLOORED at info
+        // (xtask/src/ui.rs build_filter_directive), so a debug-level
+        // line is silent at the default verbosity and the "log and
+        // continue" intent never reached the user.
         if let Err(e) = sh::run(cmd!(
             sh,
             "find {isolated} -type f -links +1 ! -perm -u+w -delete"
         ))
         .await
         {
-            tracing::debug!("scratch-target pre-clean find failed (continuing): {e:#}");
+            tracing::warn!("scratch-target pre-clean find failed (continuing): {e:#}");
         }
     }
 
