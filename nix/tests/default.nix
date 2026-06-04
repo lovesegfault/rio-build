@@ -1024,7 +1024,7 @@ in
       "graceful-release"
       "failover"
       # r[verify sched.closure.witness-epoch]
-      # r[verify sched.merge.substitute-topdown+14]
+      # r[verify sched.merge.substitute-topdown+15]
       "holed-parent-failover"
     ];
   };

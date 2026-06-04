@@ -552,7 +552,7 @@ pub struct ReapOutcome {
     /// in-memory `closure_hole` breadcrumb this reap just set. The
     /// witness vec carries the FULL removed child set (produced and
     /// un-produced alike, round-16 bug_076 /
-    /// `sched.merge.substitute-topdown+14`): the heal's coverage check
+    /// `sched.merge.substitute-topdown+15`): the heal's coverage check
     /// judges against it, so an under-representative re-declaration
     /// (just the un-produced subset) can no longer clear the hole and
     /// later pass the parent off as Vouched. Reported separately so
@@ -2430,7 +2430,7 @@ impl DerivationDag {
         }
 
         let mut surviving_parents: BTreeSet<DrvHash> = BTreeSet::new();
-        // r[impl sched.merge.substitute-topdown+14]
+        // r[impl sched.merge.substitute-topdown+15]
         // Hole trigger: at least one UN-PRODUCED child removed (a
         // produced-only reap of an UN-watched parent leaves outputs in
         // the store — the pre-existing posture), or the parent is
@@ -2459,7 +2459,7 @@ impl DerivationDag {
         // breadcrumb lookup per unique surviving parent, exactly the
         // pre-+14 work; the naive per-edge accumulation regressed
         // reap-all past its 2000ms budget.
-        // r[impl sched.merge.substitute-topdown+14]
+        // r[impl sched.merge.substitute-topdown+15]
         // witness_watched (round-17 merged_bug_024, reap tier): a parent
         // ALREADY carrying the breadcrumb extends its witness on ANY
         // child removal — produced children included. The witness

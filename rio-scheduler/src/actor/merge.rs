@@ -1040,7 +1040,7 @@ impl DagActor {
         // (total, completed, cached) to PG so list_builds is O(LIMIT).
         self.update_build_counts(build_id).await;
 
-        // r[impl sched.merge.substitute-topdown+14]
+        // r[impl sched.merge.substitute-topdown+15]
         // Post-reconciliation `topdown_pruned` clear pass. A node may
         // only lose the mark once its children (in the post-merge DAG)
         // are all already produced — its closure is then in the store,
@@ -1319,7 +1319,7 @@ impl DagActor {
         }
 
         // === Step 0: Top-down demand-set substitution check =========
-        // r[impl sched.merge.substitute-topdown+14]
+        // r[impl sched.merge.substitute-topdown+15]
         // Before merging the full DAG, check if the DEMANDED
         // derivations' outputs are already available. The demand set is
         // the structural roots ∪ every node the gateway marked
@@ -1836,7 +1836,7 @@ impl DagActor {
         phase!("5-persist-and-activate");
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
-        // r[impl sched.merge.substitute-topdown+14]
+        // r[impl sched.merge.substitute-topdown+15]
         // Stamp topdown_pruned on the kept (demanded) nodes only now
         // that the merge is committed (steps 4–5 can no longer fail).
         // The stamp is a cross-build-visible mutation of possibly
@@ -3226,7 +3226,7 @@ impl DagActor {
         self.dag.closure_evidence(drv_hash) == ClosureEvidence::Vouched
     }
 
-    // r[impl sched.merge.substitute-topdown+14]
+    // r[impl sched.merge.substitute-topdown+15]
     /// True when `drv_hash` carries the `topdown_pruned` mark AND its
     /// closure evidence is [`ClosureEvidence::Broken`] (childless or
     /// closure-holed): its dependency closure was dropped from the
@@ -3547,7 +3547,7 @@ impl DagActor {
         if !joined_stamped.is_empty() {
             crate::db::SchedulerDb::stamp_topdown_pruned_tx(&mut tx, &joined_stamped).await?;
         }
-        // r[impl sched.merge.substitute-topdown+14]
+        // r[impl sched.merge.substitute-topdown+15]
         // Born-holed flag + witness rows (069) for EVERY stamped pruned
         // parent — joined and newly-inserted alike — through the ONE
         // paired writer, in the SAME transaction as the row bind and
@@ -4394,7 +4394,7 @@ impl DagActor {
         Ok(Some(resp))
     }
 
-    // r[impl sched.merge.substitute-topdown+14]
+    // r[impl sched.merge.substitute-topdown+15]
     /// Top-down demand-set substitution pre-check (step 0 of
     /// `handle_merge_dag`).
     ///

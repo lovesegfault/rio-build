@@ -228,7 +228,7 @@ impl DagActor {
                 ) => Some((exec_id, executor_id)),
                 _ => None,
             };
-            // r[impl sched.merge.substitute-topdown+14]
+            // r[impl sched.merge.substitute-topdown+15]
             // The recovery-time consult of the persisted closure-hole
             // breadcrumb (`migrations/064`): a holed flagged parent is
             // never enrolled as a clear candidate, however produced its
@@ -424,7 +424,7 @@ impl DagActor {
         }
         info!(count = edge_rows.len(), "loaded edges");
 
-        // r[impl sched.merge.substitute-topdown+14]
+        // r[impl sched.merge.substitute-topdown+15]
         // Produced-children gate on restored `topdown_pruned` marks:
         // drop the mark from any flagged row whose persisted children
         // are ALL produced (`completed`/`skipped`) and vouched for by
@@ -499,7 +499,7 @@ impl DagActor {
             }
         }
 
-        // r[impl sched.merge.substitute-topdown+14]
+        // r[impl sched.merge.substitute-topdown+15]
         // Closure-hole stamp for the edges this load dropped to
         // terminal children: the recovery-side analogue of the reap.
         // The TRIGGER is computed below (un-produced drop, or restored
@@ -522,7 +522,7 @@ impl DagActor {
             .db
             .load_parents_with_unproduced_terminal_children(&drv_ids)
             .await?;
-        // r[impl sched.merge.substitute-topdown+14]
+        // r[impl sched.merge.substitute-topdown+15]
         // TRIGGER (round-17 merged_bug_024, recovery tier): a parent
         // with ≥1 un-produced terminal dropped child (above), OR a
         // parent restored with the watched flag — its persisted

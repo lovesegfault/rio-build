@@ -1097,7 +1097,7 @@ what it attached). Prior art in the same shape: the displacement
 primitive's evidence ranks (#rref("sched.merge.store-evidence-displacement+3"))
 refuse re-definition unless the incoming claim PROVES rank over the
 recorded row, and the born-holed prune stamp
-(#rref("sched.merge.substitute-topdown+14")) records the dropped closure
+(#rref("sched.merge.substitute-topdown+15")) records the dropped closure
 at the only site that knows it. The `HealWitness` token is the mechanical
 form: mintable only by the coverage branch, demanded by the only clear
 path, so an absence-of-objection upgrade is unwritable rather than merely
@@ -1263,7 +1263,7 @@ submitted after the failover record contributions as usual).
   origin URL.
 ]
 
-#r("sched.merge.substitute-topdown+14")[
+#r("sched.merge.substitute-topdown+15")[
   Before merging a submission's full DAG, the scheduler MUST first check
   whether the submission's *demand set* --- its structural roots (nodes with
   no parent edge in the submission) ∪ every node the client explicitly
@@ -1298,10 +1298,17 @@ submitted after the failover record contributions as usual).
   dropped only when a later full merge re-declares its edges, *the merge
   accepts every one of them*, and the re-supply covers the recorded
   witness set --- a skipped edge, an unresolvable child, or an uncovered
-  missing child vetoes the heal; a reap that removes an un-produced
-  child MUST record the FULL removed child set on the witness ---
-  produced and un-produced alike --- so the coverage requirement cannot
-  be satisfied by an under-representative subset,
+  missing child vetoes the heal; the witness content is CUMULATIVE since
+  the hole was last whole: a truncation that removes an un-produced
+  child MUST record the FULL removed child set --- produced and
+  un-produced alike --- and EVERY subsequent truncation of a node
+  already carrying the breadcrumb MUST extend the witness with its full
+  removed or dropped set, whichever producer performs it (a terminal
+  interested build's reap, a poison clear, or a recovery edge-drop ---
+  where the trigger is an un-produced drop or the restored breadcrumb
+  itself, and the content is every dropped terminal child), so the
+  coverage requirement cannot be satisfied by an under-representative
+  subset at any point in the hole's lifetime,
   #rref("sched.merge.heal-accepted-edges+1")), or
   when the fail-fast below consumes it --- a merge that gives it only
   unbuilt children leaves the mark in place. The scheduler MUST

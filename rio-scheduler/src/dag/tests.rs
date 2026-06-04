@@ -4427,7 +4427,7 @@ fn test_subset_redeclaration_does_not_heal_closure_hole() -> anyhow::Result<()> 
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+14]
+// r[verify sched.merge.substitute-topdown+15]
 /// Round-16 bug_076: the reap stamps the FULL removed child set on the
 /// witness — produced and un-produced alike. Pre-fix only the
 /// un-produced child landed there, so re-declaring just that
