@@ -17,6 +17,83 @@ use std::time::Duration;
 
 use rio_migrations::MIGRATOR;
 
+/// bug_354 upgrade-shape fixture: a chunk row soft-deleted BEFORE 091
+/// (no `deleted_at` column yet) must be backfilled by 091's in-place
+/// `UPDATE … SET deleted_at = now() WHERE deleted AND deleted_at IS
+/// NULL` so the pre-upgrade tombstone population becomes reapable —
+/// the exact rows the reaper was added for.
+///
+/// Shape: truncate the migrator to ≤090, migrate, seed a soft-deleted
+/// row through the pre-091 schema, then run the FULL suite (the
+/// normal upgrade path) and assert the backfill stamped the row.
+/// RED (recorded, backfill line removed): deleted_at stays NULL — the
+/// reap predicate (`deleted_at < now() - grace`) can never match.
+#[tokio::test]
+async fn migration_091_backfills_preexisting_tombstones() {
+    let db = rio_test_support::TestDb::new_empty().await;
+
+    // Truncated migrator: everything strictly before 091.
+    let mut pre = rio_migrations::migrator();
+    pre.migrations = pre
+        .migrations
+        .iter()
+        .filter(|m| m.version < 91)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    assert_eq!(
+        pre.migrations.last().map(|m| m.version),
+        Some(90),
+        "fixture expects the pre-091 prefix to top out at 090"
+    );
+    rio_migrations::migrate::run(&db.pool, pre)
+        .await
+        .expect("pre-091 prefix applies");
+
+    // A tombstone the pre-091 world could produce: deleted, no
+    // deleted_at column exists yet.
+    sqlx::query("INSERT INTO chunks (blake3_hash, size, deleted) VALUES ($1, 42, TRUE)")
+        .bind(&[0xB3u8; 32][..])
+        .execute(&db.pool)
+        .await
+        .expect("pre-091 tombstone seeds");
+
+    // The upgrade: the full suite applies 091+ on top.
+    rio_migrations::migrate::run(&db.pool, rio_migrations::migrator())
+        .await
+        .expect("full suite applies over the prefix");
+
+    let stamped: Option<bool> =
+        sqlx::query_scalar("SELECT deleted_at IS NOT NULL FROM chunks WHERE blake3_hash = $1")
+            .bind(&[0xB3u8; 32][..])
+            .fetch_optional(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stamped,
+        Some(true),
+        "091 must backfill deleted_at for pre-091 tombstones"
+    );
+
+    // Reap-shape check: with deleted_at anchored at upgrade time the
+    // row enters the reap predicate's domain once grace elapses
+    // (rio-store's predicate-pin battery keeps the live statement's
+    // conjuncts honest; this asserts the data side).
+    let reapable_once_aged: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chunks \
+         WHERE deleted AND deleted_at <= now() \
+           AND NOT EXISTS (SELECT 1 FROM pending_s3_deletes p \
+                            WHERE p.blake3_hash = chunks.blake3_hash)",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        reapable_once_aged, 1,
+        "the backfilled tombstone is in the reap domain"
+    );
+}
+
 /// I-194 regression: 3 concurrent `rio_migrations::migrate::run()` against
 /// one fresh DB all complete, and the `CREATE INDEX CONCURRENTLY`
 /// migration (022) lands a valid index. (011's CIC index is dropped
@@ -234,7 +311,7 @@ fn migration_checksums_frozen() {
     (88, "ffc918db47cd782757451292b3096e8ebafc128edcd52826bc557a9df0a3c702235e61a89a85ccbc7889ef93c511bd99"),
         (89, "b86bc43a0f76241cf5bcc11e794ed3104837e35558bd9817c511450d3d2281f62e635ce931dbffe4ad2acde0a4ec1fc3"),
         (90, "2cfae4d9a7ed79b10c3c0431266a59a8eba0f26efa5658935b263aebc7d81911e53598c38c0983504f2167417c1514ac"),
-        (91, "d694a6fa3a0418a42954294588ae87a2e6d8c6d09f2a8b54f13e10ea2d0091f41b0df98774a212f45e4422238b8f3469"),
+        (91, "400bff815b3b78d40ec589e483f7632a8128e90b2bdd70305bbf2bddaf304877ff45973b2918b5618a16404bd2afdebe"),
         (92, "a015e5b79a7fbb8d5ce18de91fe8052f8103a067f1d4a59922e8edc17b8c1474146c2ddd1058cd172da7e5539ad36dba"),
         (93, "aaeaf06e1fed0b64593e28ddd3f31ecf5214c14f8c826a34d91495c23246277a33aa1c017163a914c9ba3beabb651100"),
         (94, "cf331bf43708600be422b7d2bdbb30366cf8688920a2cd65894f911795ebc978c2dc7909f2254903c55a148cd9aab744"),

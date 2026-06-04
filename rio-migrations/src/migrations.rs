@@ -2060,6 +2060,24 @@ pub const M_090: () = ();
 /// (outbox row gone) → reaped (row gone); spec rule
 /// store.gc.bounded-garbage-retention carries the row-retention
 /// clause.
+///
+/// **Backfill (bug_354, amended in place 2026-06-04 under the signed
+/// §5-Q9 evidence standard — origin/main tops out at 064, the
+/// introducing commit is contained only in the unmerged feature
+/// branch, and the owner attested no persistent DB was migrated at
+/// ≥091; PINNED row 91 re-pinned in the same commit):** the original
+/// body added the column without backfilling rows soft-deleted BEFORE
+/// 091 — their `deleted_at` stayed NULL, the reap predicate
+/// (`deleted_at < now() - grace`) never matched, and pre-upgrade
+/// tombstones were exactly the permanent rows this migration exists
+/// to make reapable. `UPDATE … SET deleted_at = now() WHERE deleted
+/// AND deleted_at IS NULL` between the ADD COLUMN and the index
+/// anchors their grace clock at upgrade time (retention-erring).
+///
+/// Class rule: a column referenced in a deletion predicate must be
+/// backfilled in the migration that introduces it, or the predicate
+/// must be NULL-total (treat NULL as a match) — an unbackfilled
+/// NULL is an accidental KeepForever.
 pub const M_091: () = ();
 
 /// `migrations/092_manifests_claim_phase.sql`
