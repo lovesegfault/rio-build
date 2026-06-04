@@ -45,16 +45,30 @@ pub async fn run() -> Result<()> {
         let body = fs::read_to_string(&p)?;
         let mut v: Value =
             serde_json::from_str(&body).with_context(|| format!("parse {}", p.display()))?;
+        // merged_bug_098: markers are counted over the WHOLE document
+        // and the rewrite recurses into nested `panels` arrays
+        // (collapsed Grafana rows nest their children) — a marker the
+        // walk cannot reach is a hard error, not a silent skip.
+        let markers = count_rio_metric_markers(&v);
         let mut changed = false;
+        let mut visited = 0usize;
         if let Some(panels) = v.get_mut("panels").and_then(Value::as_array_mut) {
             for panel in panels {
-                if rewrite_panel_description(panel, &help)
+                if rewrite_panel_tree(panel, &help, &mut visited)
                     .with_context(|| format!("panel in {}", p.display()))?
                 {
                     changed = true;
                 }
             }
         }
+        anyhow::ensure!(
+            visited == markers,
+            "{}: {} rioMetric marker(s) in the document but the panel \
+             walk visited {} — marker outside panels[]/nested panels[]?",
+            p.display(),
+            markers,
+            visited,
+        );
         if changed {
             fs::write(&p, serde_json::to_string_pretty(&v)? + "\n")?;
             rewritten += 1;
@@ -62,6 +76,42 @@ pub async fn run() -> Result<()> {
     }
     println!("wrote generated/metric-help.json; rewrote {rewritten} dashboard file(s)");
     Ok(())
+}
+
+/// Recurse one panel AND its nested `panels` array (collapsed rows),
+/// applying the marker rewrite to every level (merged_bug_098 — the
+/// old walk was top-level only, so markers inside collapsed rows were
+/// silently skipped and their descriptions rotted).
+fn rewrite_panel_tree(
+    panel: &mut Value,
+    help: &std::collections::BTreeMap<String, String>,
+    visited: &mut usize,
+) -> Result<bool> {
+    let mut changed = rewrite_panel_description(panel, help)?;
+    if panel.get("rioMetric").is_some() {
+        *visited += 1;
+    }
+    if let Some(children) = panel.get_mut("panels").and_then(Value::as_array_mut) {
+        for child in children {
+            if rewrite_panel_tree(child, help, visited)? {
+                changed = true;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+/// Count every `rioMetric` key anywhere in the document tree — the
+/// census the walk is asserted against.
+fn count_rio_metric_markers(v: &Value) -> usize {
+    match v {
+        Value::Object(m) => {
+            let own = usize::from(m.contains_key("rioMetric"));
+            own + m.values().map(count_rio_metric_markers).sum::<usize>()
+        }
+        Value::Array(a) => a.iter().map(count_rio_metric_markers).sum(),
+        _ => 0,
+    }
 }
 
 /// Apply the marker-keyed description rewrite to one panel. Returns
@@ -122,5 +172,34 @@ mod tests {
         // Unknown marker → hard error (a typo'd marker must not pass).
         let mut unknown = json!({"rioMetric": "rio_nope"});
         assert!(rewrite_panel_description(&mut unknown, &help).is_err());
+    }
+
+    // merged_bug_098 red (pre-fix): the walk was top-level only — a
+    // marker inside a collapsed row's nested panels[] kept its stale
+    // description and nothing complained. The tree walk now reaches
+    // it and the census counts every marker in the document.
+    #[test]
+    fn nested_row_panels_are_rewritten_and_censused() {
+        let mut help = std::collections::BTreeMap::new();
+        help.insert("rio_x_y".to_string(), "Canonical help.".to_string());
+
+        let mut row = json!({
+            "type": "row", "collapsed": true,
+            "panels": [
+                {"rioMetric": "rio_x_y", "description": "stale"},
+                {"title": "unmarked"}
+            ]
+        });
+        let mut visited = 0;
+        assert!(rewrite_panel_tree(&mut row, &help, &mut visited).unwrap());
+        assert_eq!(visited, 1);
+        assert_eq!(row["panels"][0]["description"], "Canonical help.");
+
+        let doc = json!({"panels": [row]});
+        assert_eq!(count_rio_metric_markers(&doc), 1);
+        // A marker the panel walk cannot reach (outside panels[]) is
+        // visible to the census — the caller's ensure! catches it.
+        let stray = json!({"templating": {"rioMetric": "rio_x_y"}, "panels": []});
+        assert_eq!(count_rio_metric_markers(&stray), 1);
     }
 }
