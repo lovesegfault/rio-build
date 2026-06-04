@@ -252,7 +252,24 @@ pub async fn upload_all_outputs(
     // post-idempotency-pre-check set — if 3 outputs exist but 2 are already
     // in the store, only 1 needs upload and PutPath is sufficient. See
     // store.atomic.multi-output in the store spec.
-    if prepared.len() >= 2 {
+    // Capacity pre-check (round-17 bug_111): a prepared set wider than the
+    // batch capacity cannot succeed server-side (the server answers
+    // FailedPrecondition per output_index >= MAX_BATCH_OUTPUTS), so take
+    // the documented independent-PutPath fallback BEFORE streaming any
+    // NAR, not after N streamed NARs x retries. With MAX_BATCH_OUTPUTS
+    // protocol-aligned (= MAX_OUTPUT_NAMES, compile-asserted in batch.rs)
+    // this is unreachable from a parsed derivation; it guards internal
+    // callers handing a hand-built slice.
+    let batch_capacity_ok = prepared.len() <= rio_common::limits::MAX_BATCH_OUTPUTS;
+    if !batch_capacity_ok {
+        tracing::warn!(
+            to_upload = prepared.len(),
+            max = rio_common::limits::MAX_BATCH_OUTPUTS,
+            "output set exceeds batch capacity; using independent PutPath \
+             — partial registration possible"
+        );
+    }
+    if prepared.len() >= 2 && batch_capacity_ok {
         tracing::info!(
             to_upload = prepared.len(),
             skipped = skipped_results.len(),
@@ -275,6 +292,19 @@ pub async fn upload_all_outputs(
                 Ok(mut results) => {
                     results.append(&mut skipped_results);
                     return Ok(results);
+                }
+                Err(UploadError::UploadExhausted { source, path })
+                    if source.code() == tonic::Code::InvalidArgument =>
+                {
+                    // R1(e) (round-17 bug_111 rider): a request the server
+                    // DETERMINISTICALLY rejects cannot become acceptable by
+                    // resending the same bytes — classify permanent at the
+                    // producing statement instead of burning
+                    // MAX_UPLOAD_RETRIES x N re-streamed NARs. Capacity
+                    // overruns are NOT this arm (the server signals those
+                    // as FailedPrecondition, below); this is malformed
+                    // requests only.
+                    return Err(UploadError::UploadExhausted { source, path });
                 }
                 Err(UploadError::UploadExhausted { source, .. })
                     if source.code() == tonic::Code::FailedPrecondition =>
@@ -1169,8 +1199,8 @@ mod tests {
     // Batch atomicity / retry / liveness regressions
     // -----------------------------------------------------------------------
 
-    // r[verify builder.upload.batch+2]
-    // r[verify store.atomic.multi-output]
+    // r[verify builder.upload.batch+3]
+    // r[verify store.atomic.multi-output+1]
     /// bug_392 (adapted): prep failure on output k must NOT leave outputs
     /// 0..k-1 committed server-side. Prep no longer reads disk (references
     /// come precomputed from the result pipeline), so the prep-detectable
@@ -1248,6 +1278,86 @@ mod tests {
             store.faults.fail_next_puts.load(Ordering::SeqCst),
             0,
             "all injected failures consumed"
+        );
+        Ok(())
+    }
+
+    // r[verify builder.upload.batch+3]
+    /// Round-17 bug_111 R1(e) rider: a deterministic `InvalidArgument`
+    /// from the batch RPC is permanent at the producing statement —
+    /// exactly ONE attempt, no fallback. Detector shape: the injection
+    /// knob is set to 2, so a buggy retry loop would consume the second
+    /// injection (or even succeed on attempt 3); the surviving count
+    /// proves exactly one attempt fired.
+    #[tokio::test(start_paused = true)]
+    async fn test_batch_invalid_argument_not_retried() -> anyhow::Result<()> {
+        let (store, client) = spawn_mock_store_inproc().await?;
+        store.faults.invalid_next_puts.store(2, Ordering::SeqCst);
+
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
+        let (b1, b2) = (format!("{DEP_HASH_A}-one"), format!("{DEP_HASH_B}-two"));
+        fs::write(store_dir.join(&b1), b"one")?;
+        fs::write(store_dir.join(&b2), b"two")?;
+
+        let err = upload_all_outputs(
+            &client,
+            "",
+            "",
+            &[out_for(&store_dir, &b1, &[]), out_for(&store_dir, &b2, &[])],
+        )
+        .await
+        .expect_err("deterministic rejection must fail the upload");
+        assert!(
+            matches!(
+                &err,
+                UploadError::UploadExhausted { source, .. }
+                    if source.code() == tonic::Code::InvalidArgument
+            ),
+            "permanent classification carries the original status: {err:?}"
+        );
+        assert_eq!(
+            store.faults.invalid_next_puts.load(Ordering::SeqCst),
+            1,
+            "exactly one batch attempt — no retry burned the second injection"
+        );
+        assert_eq!(
+            store.calls.put_calls.read().unwrap().len(),
+            0,
+            "nothing committed and no per-output fallback attempted"
+        );
+        Ok(())
+    }
+
+    /// Round-17 bug_111 R1(e) rider, single-output flavor: `InvalidArgument`
+    /// on independent PutPath is permanent after exactly one attempt.
+    #[tokio::test(start_paused = true)]
+    async fn test_single_invalid_argument_not_retried() -> anyhow::Result<()> {
+        let (store, client) = spawn_mock_store_inproc().await?;
+        store.faults.invalid_next_puts.store(2, Ordering::SeqCst);
+
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
+        let b1 = format!("{DEP_HASH_A}-solo");
+        fs::write(store_dir.join(&b1), b"solo")?;
+
+        let err = upload_all_outputs(&client, "", "", &[out_for(&store_dir, &b1, &[])])
+            .await
+            .expect_err("deterministic rejection must fail the upload");
+        assert!(
+            matches!(
+                &err,
+                UploadError::UploadExhausted { source, .. }
+                    if source.code() == tonic::Code::InvalidArgument
+            ),
+            "permanent classification carries the original status: {err:?}"
+        );
+        assert_eq!(
+            store.faults.invalid_next_puts.load(Ordering::SeqCst),
+            1,
+            "exactly one PutPath attempt"
         );
         Ok(())
     }

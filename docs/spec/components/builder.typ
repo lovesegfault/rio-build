@@ -1275,18 +1275,29 @@ pod's emptyDir.
   message) --- deferred to a later phase.
 ]
 
-#r("builder.upload.batch+2")[
+#r("builder.upload.batch+3")[
   For *multi-output derivations (≥2 outputs)*, the builder uses
   `PutPathBatch`: all outputs stream serially on one RPC, the store commits
   them in ONE database transaction. If any output fails validation, zero
   outputs are registered --- atomic per #rref("store.atomic.multi-output").
   All per-output prep (path parse, reference scan) is done BEFORE the first
   byte is sent, so a local prep failure on output $k$ cannot leave outputs
-  $0..k-1$ committed. The batch RPC's stream timeout scales with output count
-  (`GRPC_STREAM_TIMEOUT × N`, capped at `MAX_BATCH_OUTPUTS`). Batch retries up
-  to `MAX_UPLOAD_RETRIES` on transient errors; on `FailedPrecondition` it
-  falls through to independent `PutPath` calls (pre-P0267 behavior:
-  `buffer_unordered(MAX_PARALLEL_UPLOADS)`, no cross-output atomicity).
+  $0..k-1$ committed. `MAX_BATCH_OUTPUTS` equals the protocol's
+  `MAX_OUTPUT_NAMES` (256, compile-asserted), so every parseable derivation
+  fits the batch path; the builder pre-checks the prepared count and routes
+  capacity overruns (internal callers only) straight to the independent
+  fallback without opening a stream. The batch deadline is derived from the
+  byte budget, not the count: `GRPC_STREAM_TIMEOUT + 15 s × N` --- one
+  stream-timeout covers the bytes of any batch the server admits (the
+  server caps cumulative charged bytes at one `MAX_NAR_SIZE`), and the
+  per-output term covers fixed bookkeeping. Batch retries up to
+  `MAX_UPLOAD_RETRIES` on transient errors; on `FailedPrecondition`
+  (capacity: count or cumulative bytes) it falls through to independent
+  `PutPath` calls (pre-P0267 behavior:
+  `buffer_unordered(MAX_PARALLEL_UPLOADS)`, no cross-output atomicity); on
+  `InvalidArgument` (a deterministic request defect) it fails permanently
+  WITHOUT retry --- resending identical bytes cannot change a
+  deterministic verdict.
 ]
 
 For *single-output derivations*, the builder uses independent `PutPath`

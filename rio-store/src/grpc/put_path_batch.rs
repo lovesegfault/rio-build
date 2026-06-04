@@ -21,7 +21,7 @@
 //! to `'complete'` together. On batch failure the staged chunks orphan
 //! (refcount-zero after `PlaceholderGuard` drop-reap, GC-eligible).
 //! Bound: ≤1 NAR-size of orphaned blob per failed output.
-// r[impl store.atomic.multi-output]
+// r[impl store.atomic.multi-output+1]
 
 use std::collections::BTreeMap;
 
@@ -322,9 +322,24 @@ impl StoreServiceImpl {
             let idx = msg.output_index;
             // Bound output count. Checked on every message because the
             // highest index can arrive at any point in the stream.
+            //
+            // FailedPrecondition (not InvalidArgument), matching the
+            // cumulative-charge sibling below: both are CAPACITY
+            // overruns of the batch path, and the builder's documented
+            // response to capacity is the independent-PutPath fallback
+            // (atomicity registered-weakened for that population) — not
+            // a request-defect classification, which the client now
+            // treats as permanent without retry (round-17 bug_111: the
+            // old InvalidArgument here was retried 8x with all NARs
+            // re-streamed each attempt). With MAX_BATCH_OUTPUTS aligned
+            // to the protocol's MAX_OUTPUT_NAMES this arm is
+            // unreachable from a parseable derivation; it guards
+            // hand-rolled clients.
+            // r[impl store.atomic.multi-output+1]
             if idx as usize >= MAX_BATCH_OUTPUTS {
-                return Err(Status::invalid_argument(format!(
-                    "output_index {idx} exceeds MAX_BATCH_OUTPUTS ({MAX_BATCH_OUTPUTS})"
+                return Err(Status::failed_precondition(format!(
+                    "PutPathBatch: output_index {idx} exceeds MAX_BATCH_OUTPUTS \
+                     ({MAX_BATCH_OUTPUTS}); fall back to per-output PutPath"
                 )));
             }
             let inner = msg

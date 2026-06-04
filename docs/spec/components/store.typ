@@ -594,11 +594,17 @@ AlreadyComplete-re-upload heal stampedes to one attempt per window
   (I-168).
 ]
 
-#r("store.atomic.multi-output")[
+#r("store.atomic.multi-output+1")[
   Multi-output derivation registration MUST be atomic at the DB level: all
   output rows commit in one transaction, or none do. Blob-store writes are NOT
   rolled back (orphaned blobs are refcount-zero and GC-eligible on the next
-  sweep). The bound is ≤1 NAR-size per failure.
+  sweep). The bound is ≤1 NAR-size per failure. Batch CAPACITY overruns ---
+  `output_index ≥ MAX_BATCH_OUTPUTS` or cumulative charged bytes exceeding
+  one `MAX_NAR_SIZE` --- are signalled as `FailedPrecondition` (never
+  `InvalidArgument`), routing the builder to the documented
+  independent-PutPath fallback whose atomicity weakening is registered in
+  #rref("builder.upload.batch"); request DEFECTS keep `InvalidArgument` and
+  are never retried.
 ]
 
 #r("store.put.nar-bytes-budget+3")[

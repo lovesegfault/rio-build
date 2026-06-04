@@ -98,10 +98,33 @@ pub fn is_hw_class_name(s: &str) -> bool {
 
 /// Maximum number of outputs in a single PutPathBatch request.
 ///
-/// Nix multi-output derivations typically have 2-5 outputs (out, dev, lib,
-/// doc, man). 16 gives generous headroom without allowing a client to open
-/// an unbounded number of per-output accumulation buffers on the server.
-pub const MAX_BATCH_OUTPUTS: usize = 16;
+/// Aligned with `rio_nix::protocol::derived_path::MAX_OUTPUT_NAMES` (= 256;
+/// equality is compile-asserted in `rio-builder/src/upload/batch.rs`, the
+/// consumer that sees both crates — rio-common and rio-nix do not depend on
+/// each other). Every derivation the protocol can EXPRESS now fits in one
+/// atomic batch, so the "wide-output derivation deterministically fails the
+/// batch path" population (round-17 bug_111: 8 retries x 16 streamed NARs,
+/// then InfrastructureFailure) is empty by construction.
+///
+/// R4 re-audit for the 16 -> 256 raise (round-17 bug_111, option (b)):
+/// - MEMORY (count-independent): peak accumulation is bounded by the
+///   per-batch cumulative charge cap (one `MAX_NAR_SIZE` = 4 GiB, enforced
+///   in `put_path_batch` with a FailedPrecondition fallback signal) and the
+///   process-global 32 GiB NAR-byte semaphore
+///   (`r[store.put.nar-bytes-budget+3]`). The raise widens only per-output
+///   bookkeeping: 256 x (`OutputAccum` + ValidatedPathInfo) ~ 1 MiB worst.
+/// - MESSAGE SIZE (count-independent): requests stream 256 KiB chunks; the
+///   unary response carries one `created` entry per output, 256 x ~150 B
+///   ~ 38 KiB, vs the 256 MiB `DEFAULT_MAX_MESSAGE_SIZE` tonic cap.
+/// - TIME: `batch_stream_timeout` derives the deadline from the byte budget
+///   (which bounds what can actually flow), with a fixed per-output
+///   allowance — NOT count-linear (the old `300s x N` formula would be a
+///   21-hour hang ceiling at 256).
+/// - POPULATION: pinned-nixpkgs static maximum is 13 outputs
+///   (nomad-autoscaler's plugin list); >16 arises only from programmatic
+///   outputs lists (genList/dataset splits) and out-of-tree derivations,
+///   legal up to the protocol's 256.
+pub const MAX_BATCH_OUTPUTS: usize = 256;
 
 /// Maximum number of DAG nodes in a single SubmitBuild request.
 ///

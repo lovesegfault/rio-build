@@ -16,16 +16,44 @@ use super::common::{
     spawn_dump_tee, trailer_mode_path_info, uploaded_info,
 };
 
-/// Per-NAR stream budget × N outputs, capped at `MAX_BATCH_OUTPUTS` so a
-/// malformed `prepared` slice can't produce an unbounded deadline.
-/// `GRPC_STREAM_TIMEOUT` is doc-sized for ONE 4 GiB NAR; batch streams
-/// N NARs serially, so the budget must scale.
+/// Compile-time half of the round-17 bug_111 closure: the batch capacity
+/// equals the protocol's output-name capacity, so no parseable derivation
+/// can exceed the batch path. Lives here because rio-common and rio-nix do
+/// not depend on each other; this consumer sees both.
+const _: () = assert!(
+    rio_common::limits::MAX_BATCH_OUTPUTS == rio_nix::protocol::derived_path::MAX_OUTPUT_NAMES
+);
+
+/// Fixed per-output allowance in [`batch_stream_timeout`]: placeholder row
+/// insert + trailer hash/size verification + tee/dump task switchover.
+/// Observed per-output overhead is milliseconds; 15 s is sized so a
+/// 256-output batch on a loaded store cannot trip the deadline on
+/// bookkeeping alone, while still bounding a hung 256-output stream at
+/// ~69 min (300 + 256x15 = 4140 s) — BELOW the old formula's 16-output
+/// ceiling (300x16 = 4800 s), not 16x above it.
+const PER_OUTPUT_STREAM_OVERHEAD: Duration = Duration::from_secs(15);
+
+/// Batch deadline, derived from what can actually FLOW rather than from
+/// the declared output count.
+///
+/// The server caps a batch's cumulative charged NAR bytes at one
+/// `MAX_NAR_SIZE` (4 GiB; beyond that it answers `FailedPrecondition` and
+/// the builder takes the documented independent-PutPath fallback), and
+/// `GRPC_STREAM_TIMEOUT` is doc-sized for streaming exactly that many
+/// bytes (one 4 GiB NAR at the ~14 MB/s floor). One stream-timeout
+/// therefore covers the byte transfer of ANY batch the server will
+/// accept, regardless of count; the count contributes only fixed
+/// per-output overhead. R4 dominance: the deadline tracks the byte
+/// BUDGET, not the declared shape — the previous `GRPC_STREAM_TIMEOUT x N`
+/// formula scaled the byte term by count, which at the protocol-aligned
+/// 256 would be a 21-hour hang ceiling for a transfer the budget caps at
+/// ~5 minutes.
 pub(super) fn batch_stream_timeout(n_outputs: usize) -> Duration {
     rio_common::grpc::GRPC_STREAM_TIMEOUT
-        * (n_outputs.min(rio_common::limits::MAX_BATCH_OUTPUTS) as u32).max(1)
+        + PER_OUTPUT_STREAM_OVERHEAD * (n_outputs.min(rio_common::limits::MAX_BATCH_OUTPUTS) as u32)
 }
 
-// r[impl builder.upload.batch+2]
+// r[impl builder.upload.batch+3]
 /// Batch upload: all outputs in one `PutPathBatch` stream, committed
 /// atomically server-side.
 ///
@@ -181,13 +209,25 @@ mod tests {
     use rio_common::limits::MAX_BATCH_OUTPUTS;
 
     #[test]
-    fn test_batch_stream_timeout_scales() {
-        assert_eq!(batch_stream_timeout(1), GRPC_STREAM_TIMEOUT);
-        assert_eq!(batch_stream_timeout(3), GRPC_STREAM_TIMEOUT * 3);
+    fn test_batch_stream_timeout_budget_derived() {
+        // One byte-budget term plus fixed per-output overhead.
         assert_eq!(
-            batch_stream_timeout(999),
-            GRPC_STREAM_TIMEOUT * MAX_BATCH_OUTPUTS as u32
+            batch_stream_timeout(1),
+            GRPC_STREAM_TIMEOUT + PER_OUTPUT_STREAM_OVERHEAD
         );
+        assert_eq!(
+            batch_stream_timeout(3),
+            GRPC_STREAM_TIMEOUT + PER_OUTPUT_STREAM_OVERHEAD * 3
+        );
+        // Hostile/malformed n clamps at the protocol-aligned capacity...
+        assert_eq!(
+            batch_stream_timeout(usize::MAX),
+            batch_stream_timeout(MAX_BATCH_OUTPUTS)
+        );
+        // ...and the 256-output worst case stays BELOW the old 16-output
+        // ceiling (GRPC_STREAM_TIMEOUT x 16): the deadline tracks the byte
+        // budget, not the count.
+        assert!(batch_stream_timeout(MAX_BATCH_OUTPUTS) < GRPC_STREAM_TIMEOUT * 16);
         // Degenerate: empty slice still gets a non-zero budget.
         assert_eq!(batch_stream_timeout(0), GRPC_STREAM_TIMEOUT);
     }

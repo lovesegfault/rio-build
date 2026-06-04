@@ -134,6 +134,12 @@ pub struct MockStoreCalls {
 pub struct MockStoreFaults {
     /// If > 0, put_path decrements and returns Unavailable. For retry tests.
     pub fail_next_puts: Arc<AtomicU32>,
+    /// If > 0, put_path/put_path_batch decrements and returns
+    /// InvalidArgument ("mock: injected malformed-request rejection").
+    /// For the round-17 bug_111 R1(e) no-retry tests: deterministic
+    /// rejections must be classified permanent at the producing
+    /// statement, never retried.
+    pub invalid_next_puts: Arc<AtomicU32>,
     /// If > 0, put_path decrements and returns `Aborted("concurrent
     /// PutPath in progress for this path; retry")` — matching the real
     /// store's placeholder-contention response (`put_path.rs`). For
@@ -444,6 +450,18 @@ impl StoreService for MockStore {
         }
         if self
             .faults
+            .invalid_next_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            return Err(Status::invalid_argument(
+                "mock: injected malformed-request rejection",
+            ));
+        }
+        if self
+            .faults
             .abort_next_puts
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 (n > 0).then(|| n - 1)
@@ -572,6 +590,18 @@ impl StoreService for MockStore {
             .is_ok()
         {
             return Err(Status::unavailable("mock: injected batch put failure"));
+        }
+        if self
+            .faults
+            .invalid_next_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            return Err(Status::invalid_argument(
+                "mock: injected malformed-request rejection",
+            ));
         }
 
         let mut stream = request.into_inner();

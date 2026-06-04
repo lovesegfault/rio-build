@@ -158,6 +158,26 @@ pub(super) async fn upload_output(
                 );
                 last_error = Some(e);
             }
+            Err(e) if e.code() == tonic::Code::InvalidArgument => {
+                // R1(e) (round-17 bug_111 rider): a request the server
+                // DETERMINISTICALLY rejects cannot become acceptable by
+                // resending the same bytes — classify permanent at the
+                // producing statement instead of burning the remaining
+                // retry budget on full NAR re-streams. (Capacity signals
+                // arrive as FailedPrecondition and never reach this
+                // single-output path.)
+                tracing::warn!(
+                    store_path = %store_path,
+                    attempt,
+                    error = %e,
+                    "upload rejected as malformed; not retrying"
+                );
+                metrics::counter!("rio_builder_uploads_total", "status" => "rejected").increment(1);
+                return Err(UploadError::UploadExhausted {
+                    path: store_path,
+                    source: e,
+                });
+            }
             Err(e) => {
                 tracing::warn!(
                     store_path = %store_path,

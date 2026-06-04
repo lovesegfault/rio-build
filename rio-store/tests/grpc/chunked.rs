@@ -269,7 +269,7 @@ async fn gt13_multi_output_not_atomic() -> TestResult {
     Ok(())
 }
 
-// r[verify store.atomic.multi-output]
+// r[verify store.atomic.multi-output+1]
 /// `PutPathBatch`: all outputs commit in one transaction. Mid-batch
 /// failure → ZERO rows committed (not even the outputs that validated
 /// cleanly before the bad one).
@@ -487,7 +487,7 @@ fn put_path_batch_impl_no_question_mark_bypass() {
 /// That Err path requires PG fault injection mid-handler — covered
 /// statically by [`put_path_batch_impl_no_question_mark_bypass`]
 /// instead. Both paths reach the same `abort_batch` cleanup.
-// r[verify store.atomic.multi-output]
+// r[verify store.atomic.multi-output+1]
 #[tokio::test]
 async fn gt13_batch_placeholder_cleanup_on_midloop_abort() -> TestResult {
     let s = StoreSession::new().await?;
@@ -1030,5 +1030,92 @@ async fn batch_guard_drop_reaps_placeholders() -> TestResult {
     let recreated = put_path(&mut client, out0_info, make_nar(b"guard zero").0).await?;
     assert!(recreated, "output-0 slot freed by guard drop");
 
+    Ok(())
+}
+
+// r[verify store.atomic.multi-output+1]
+// r[verify builder.upload.batch+3]
+/// Round-17 bug_111 scale fixture (the first >16-output batch in the
+/// tree): a full-capacity 256-output batch — `MAX_BATCH_OUTPUTS` is now
+/// protocol-aligned with `MAX_OUTPUT_NAMES` — commits atomically in one
+/// transaction, and the FIRST out-of-capacity index (256) is refused as
+/// `FailedPrecondition` naming the per-output fallback (the capacity
+/// signal), never `InvalidArgument` (which the builder classifies as a
+/// permanent request defect and does not retry).
+///
+/// Ops-counted, not wall-clock (the catalogued flake class): asserts the
+/// response shape and the committed row count.
+#[tokio::test]
+async fn bug111_full_capacity_batch_commits_and_overrun_is_precondition() -> TestResult {
+    let s = StoreSession::new().await?;
+    let mut client = s.client.clone();
+
+    let n = rio_common::limits::MAX_BATCH_OUTPUTS;
+    assert_eq!(n, 256, "protocol-aligned capacity (MAX_OUTPUT_NAMES)");
+
+    // Channel buffer stays small (16) on purpose: the sender must
+    // interleave with server consumption exactly as the worker does.
+    let (tx, rx) = mpsc::channel(16);
+    let send_task = {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            for i in 0..n {
+                let path = test_store_path(&format!("b111-{i:03}"));
+                let (nar, _) = make_nar(format!("output {i} content").as_bytes());
+                let info = make_path_info_for_nar(&path, &nar);
+                send_batch_output(&tx, i as u32, info.into(), nar).await;
+            }
+        })
+    };
+    drop(tx);
+
+    let resp = client
+        .put_path_batch(ReceiverStream::new(rx))
+        .await?
+        .into_inner();
+    send_task.await?;
+    assert_eq!(
+        resp.created.len(),
+        n,
+        "every output of the full-capacity batch registered"
+    );
+    assert!(resp.created.iter().all(|c| *c), "all newly created");
+
+    let complete: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE status = 'complete'")
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert_eq!(complete, n as i64, "one transaction committed all rows");
+
+    // --- output_index == capacity -> FailedPrecondition (fallback signal) ---
+    let (tx, rx) = mpsc::channel(16);
+    let path = test_store_path("b111-over");
+    let (nar, _) = make_nar(b"over-capacity");
+    let info = make_path_info_for_nar(&path, &nar);
+    send_batch_output(&tx, n as u32, info.into(), nar).await;
+    drop(tx);
+
+    let err = client
+        .put_path_batch(ReceiverStream::new(rx))
+        .await
+        .expect_err("index == MAX_BATCH_OUTPUTS must be refused");
+    assert_eq!(
+        err.code(),
+        tonic::Code::FailedPrecondition,
+        "capacity overrun is the fallback signal, not a request defect: {}",
+        err.message()
+    );
+    assert!(
+        err.message().contains("fall back to per-output PutPath"),
+        "remediation names the fallback: {}",
+        err.message()
+    );
+
+    // The overrun batch committed nothing on top of the 256.
+    let complete_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE status = 'complete'")
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert_eq!(complete_after, n as i64, "overrun batch committed nothing");
     Ok(())
 }
