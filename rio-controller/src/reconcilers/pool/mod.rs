@@ -30,7 +30,7 @@ use crate::error::{Error, Result};
 use crate::reconcilers::{Ctx, finalized, standard_error_policy, timed};
 use rio_crds::pool::{ExecutorKind, Pool};
 
-pub(crate) mod candidate;
+pub mod candidate;
 pub mod disruption;
 pub(super) mod job;
 pub(super) mod jobs;

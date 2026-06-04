@@ -334,16 +334,22 @@ two reads.
   field-sensitivity contract test fails).
 ]
 
-#r("ctrl.pool.no-eligible-persist")[
+#r("ctrl.pool.no-eligible-persist+2")[
   The AD2 `NoEligibleSource` REPORT --- the verdict that poisons the
   derivation scheduler-side --- MUST NOT fire on a single-tick exhaustion
   observation: the gate withholds the spawn from the first gated tick,
   and reports only after the exhaustion persists
-  `NO_ELIGIBLE_SOURCE_PERSIST_TICKS` consecutive reconcile ticks for that
-  intent. Streak state MUST reset when the intent leaves the gated set
-  (the universe un-exhausted, the intent left the stream, or it fell
-  outside the spawn window). A controller restart MAY restart streaks
-  (delaying a genuine poison by at most the persistence window).
+  `NO_ELIGIBLE_SOURCE_PERSIST_TICKS` consecutive reconcile ticks OF THE
+  OBSERVING POOL for that intent. Streak state MUST be keyed by
+  (pool, intent): one pool's tick MUST NOT clear or advance another
+  pool's streaks (an intent gated in overlapping pools counts each
+  pool's own observations before the irreversible report). A pool's
+  streak MUST reset when the intent leaves that pool's gated set (the
+  universe un-exhausted, the intent left the stream, or it fell outside
+  the spawn window); entries of a pool that stopped reconciling (removed
+  from config) MUST expire within a bounded orphan window rather than
+  live forever. A controller restart MAY restart streaks (delaying a
+  genuine poison by at most the persistence window).
 ]
 
 #r("ctrl.pool.ack-spawned-soundness")[

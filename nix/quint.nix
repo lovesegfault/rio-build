@@ -4910,14 +4910,14 @@ in
     # C2/077 (area A): the AD2 fleet-exhaust verdict fires only at the
     # third consecutive exhausted-and-wanted tick; a placeable tick
     # resets the streak.
-    # r[verify ctrl.pool.no-eligible-persist]
+    # r[verify ctrl.pool.no-eligible-persist+2]
     quint-spawn-coherence-falsify-exhaust-asbuilt = mkQuintWitnessCheck {
       name = "spawn-coherence-falsify-exhaust-asbuilt";
       spec = "spawnCoherence";
       main = "spawnCoherenceExhaustAsBuilt";
       witness = "noPoisonWhilePlaceable";
     };
-    # r[verify ctrl.pool.no-eligible-persist]
+    # r[verify ctrl.pool.no-eligible-persist+2]
     quint-spawn-coherence-exhaust-persist = mkQuintCheck {
       name = "spawn-coherence-exhaust-persist";
       spec = "spawnCoherence";

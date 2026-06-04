@@ -1216,7 +1216,7 @@ fn no_eligible_source_predicate() {
 }
 
 // r[verify sched.dispatch.fleet-exhaust+5]
-// r[verify ctrl.pool.no-eligible-persist]
+// r[verify ctrl.pool.no-eligible-persist+2]
 /// A gated intent produces exactly one acked `NoEligibleSource` report
 /// carrying the intent's `resubmit_cycle` echo (124(b): the scheduler
 /// ack-no-poisons a stale echo); the gated intent is the one removed

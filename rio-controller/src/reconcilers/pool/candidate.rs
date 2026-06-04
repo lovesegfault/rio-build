@@ -192,15 +192,73 @@ pub(crate) fn no_eligible_source(intent: &SpawnIntent, candidates: &[CandidateNo
 /// anti-affinity anyway) but only REPORTS — i.e. poisons — once the
 /// exhaustion has persisted `NO_ELIGIBLE_SOURCE_PERSIST_TICKS`
 /// consecutive ticks (~30s at the 10s reconcile cadence).
-// r[impl ctrl.pool.no-eligible-persist]
+// r[impl ctrl.pool.no-eligible-persist+2]
 pub(crate) const NO_ELIGIBLE_SOURCE_PERSIST_TICKS: u32 = 3;
 
 /// One streak-map update for one gated tick. Returns the new streak
-/// and whether this tick should report. Callers prune entries for
-/// intents that left the set or whose universe un-exhausted.
+/// and whether this tick should report. [`PoolStreaks::step_and_prune`]
+/// is the only caller in the reconcile path.
 pub(crate) fn exhausted_streak_step(prev: Option<u32>) -> (u32, bool) {
     let streak = prev.unwrap_or(0).saturating_add(1);
     (streak, streak >= NO_ELIGIBLE_SOURCE_PERSIST_TICKS)
+}
+
+/// Orphaned [`PoolStreaks`] entries (a pool removed from config stops
+/// reconciling, so its entries are never pruned by its own tick)
+/// expire after this long. Today's global wipe accidentally GC'd them;
+/// the expiry replaces that accident with a law.
+pub(crate) const POOL_STREAK_ORPHAN_EXPIRY_SECS: u64 = 120;
+
+/// merged_bug_117: pool-keyed exhaustion streaks. The retired shape was
+/// a pool-SHARED `HashMap<intent, u32>` whose per-pool reconcile did
+/// `retain(|id| this_pools_gated.contains(id))` — pool B's tick wiped
+/// pool A's streaks (a persistently exhausted intent in a multi-pool
+/// config NEVER reached the persistence threshold), and an intent
+/// gated in two overlapping pools double-stepped per wall-clock tick
+/// (premature report after 2 ticks of per-pool observation).
+///
+/// The key is `(pool, intent)` and there is exactly ONE mutating
+/// method: [`Self::step_and_prune`], scoped to one pool's tick — a
+/// cross-pool wipe is INEXPRESSIBLE through the API.
+#[derive(Debug, Default)]
+pub struct PoolStreaks(std::collections::HashMap<(String, String), (u32, std::time::Instant)>);
+
+impl PoolStreaks {
+    // r[impl ctrl.pool.no-eligible-persist+2]
+    /// Fold one pool's gated tick: prune THIS pool's entries that left
+    /// the gated set, expire ORPHANED entries (any pool, untouched for
+    /// [`POOL_STREAK_ORPHAN_EXPIRY_SECS`] — a removed pool never ticks
+    /// again), step each gated intent's streak, and return the intent
+    /// ids whose exhaustion persisted [`NO_ELIGIBLE_SOURCE_PERSIST_TICKS`]
+    /// consecutive ticks OF THIS POOL (overlapping pools count their
+    /// OWN observations; an already-reported streak keeps reporting
+    /// harmlessly — duplicate reports are server-side no-ops).
+    pub(crate) fn step_and_prune(
+        &mut self,
+        pool: &str,
+        gated_ids: &std::collections::HashSet<&str>,
+        now: std::time::Instant,
+    ) -> Vec<String> {
+        self.0.retain(|(p, id), (_, touched)| {
+            if p == pool {
+                gated_ids.contains(id.as_str())
+            } else {
+                now.saturating_duration_since(*touched).as_secs() < POOL_STREAK_ORPHAN_EXPIRY_SECS
+            }
+        });
+        let mut report = Vec::new();
+        for id in gated_ids {
+            let key = (pool.to_owned(), (*id).to_owned());
+            let prev = self.0.get(&key).map(|(s, _)| *s);
+            let (streak, fire) = exhausted_streak_step(prev);
+            self.0.insert(key, (streak, now));
+            if fire {
+                report.push((*id).to_owned());
+            }
+        }
+        report.sort();
+        report
+    }
 }
 
 #[cfg(test)]
@@ -383,7 +441,7 @@ mod tests {
 /// universe — these properties pin the algebra of that universe
 /// against a mirror specification, over arbitrary intents and fleets.
 // r[verify ctrl.pool.intent-candidate-set]
-// r[verify ctrl.pool.no-eligible-persist]
+// r[verify ctrl.pool.no-eligible-persist+2]
 #[cfg(test)]
 mod proptests {
     use std::collections::BTreeMap;
@@ -588,5 +646,80 @@ mod proptests {
             let (s1, f1) = exhausted_streak_step(None);
             prop_assert_eq!((s1, f1), (1, false));
         }
+    }
+
+    // r[verify ctrl.pool.no-eligible-persist+2]
+    /// merged_bug_117 law 1 (recorded red: the retired pool-shared map's
+    /// `retain(|id| gated_B.contains(id))` wiped pool A's streaks every
+    /// B tick — a persistently exhausted intent in a multi-pool config
+    /// NEVER reported): interleaved pool ticks each keep their own
+    /// persistence count.
+    #[test]
+    fn cross_pool_ticks_do_not_wipe_each_other() {
+        let mut s = PoolStreaks::default();
+        let t = std::time::Instant::now();
+        let a_gated: std::collections::HashSet<&str> = ["drv-a"].into();
+        let b_gated: std::collections::HashSet<&str> = ["drv-b"].into();
+        // A and B alternate; A's third own tick must report.
+        assert!(s.step_and_prune("pool-a", &a_gated, t).is_empty());
+        assert!(s.step_and_prune("pool-b", &b_gated, t).is_empty());
+        assert!(s.step_and_prune("pool-a", &a_gated, t).is_empty());
+        assert!(s.step_and_prune("pool-b", &b_gated, t).is_empty());
+        assert_eq!(
+            s.step_and_prune("pool-a", &a_gated, t),
+            vec!["drv-a".to_string()],
+            "pool A's third consecutive own observation must report"
+        );
+    }
+
+    // r[verify ctrl.pool.no-eligible-persist+2]
+    /// merged_bug_117 law 2 (recorded red: an intent gated in two
+    /// overlapping pools double-stepped the shared entry — reported
+    /// after 2 wall-clock ticks instead of each pool's own 3): each
+    /// pool counts its OWN observations.
+    #[test]
+    fn overlapping_pools_count_their_own_observations() {
+        let mut s = PoolStreaks::default();
+        let t = std::time::Instant::now();
+        let gated: std::collections::HashSet<&str> = ["drv-x"].into();
+        // Two wall-clock rounds of both pools: 4 steps total, but no
+        // single pool has seen 3 yet.
+        for _ in 0..2 {
+            assert!(s.step_and_prune("pool-a", &gated, t).is_empty());
+            assert!(s.step_and_prune("pool-b", &gated, t).is_empty());
+        }
+        // Each pool's own third observation reports independently.
+        assert_eq!(
+            s.step_and_prune("pool-a", &gated, t),
+            vec!["drv-x".to_string()]
+        );
+        assert_eq!(
+            s.step_and_prune("pool-b", &gated, t),
+            vec!["drv-x".to_string()]
+        );
+    }
+
+    // r[verify ctrl.pool.no-eligible-persist+2]
+    /// Orphan expiry: a pool removed from config never ticks again —
+    /// its entries expire at POOL_STREAK_ORPHAN_EXPIRY_SECS instead of
+    /// living forever (the retired global wipe GC'd them by accident;
+    /// the law replaces the accident). Observable: A's streak restarts
+    /// after the gap instead of resuming.
+    #[test]
+    fn orphaned_pool_entries_expire() {
+        let mut s = PoolStreaks::default();
+        let t0 = std::time::Instant::now();
+        let gated: std::collections::HashSet<&str> = ["drv-a"].into();
+        let other: std::collections::HashSet<&str> = ["drv-b"].into();
+        assert!(s.step_and_prune("pool-a", &gated, t0).is_empty());
+        assert!(s.step_and_prune("pool-a", &gated, t0).is_empty()); // streak 2
+        // pool-a removed from config; only pool-b ticks, past the expiry.
+        let late = t0 + std::time::Duration::from_secs(POOL_STREAK_ORPHAN_EXPIRY_SECS + 1);
+        assert!(s.step_and_prune("pool-b", &other, late).is_empty());
+        // pool-a re-added: its old streak expired, so this is tick 1, not 3.
+        assert!(
+            s.step_and_prune("pool-a", &gated, late).is_empty(),
+            "an expired orphan streak must restart, not resume at 3"
+        );
     }
 }

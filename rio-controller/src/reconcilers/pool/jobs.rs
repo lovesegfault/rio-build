@@ -641,7 +641,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                     to_spawn_intents
                         .into_iter()
                         .partition(|i| candidate::no_eligible_source(i, &candidates));
-                // r[impl ctrl.pool.no-eligible-persist]
+                // r[impl ctrl.pool.no-eligible-persist+2]
                 // Withhold the spawn from tick 1 (the Job would sit
                 // unschedulable behind its own anti-affinity) but only
                 // REPORT — i.e. poison — after the exhaustion persists
@@ -654,18 +654,22 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 // drv leaves the intent stream (duplicate reports are
                 // server-side no-ops).
                 let to_report: Vec<&SpawnIntent> = {
-                    let mut streaks = ctx.exhausted_streak.lock();
                     let gated_ids: HashSet<&str> =
                         gated.iter().map(|i| i.intent_id.as_str()).collect();
-                    streaks.retain(|id, _| gated_ids.contains(id.as_str()));
+                    // Pool-keyed (merged_bug_117): this fold can only
+                    // touch THIS pool's streaks — pool B's tick can no
+                    // longer wipe pool A's persistence count, and an
+                    // intent gated in two overlapping pools counts each
+                    // pool's own 3 observations before the irreversible
+                    // poison_and_cascade.
+                    let fire = ctx.exhausted_streak.lock().step_and_prune(
+                        &name,
+                        &gated_ids,
+                        std::time::Instant::now(),
+                    );
                     gated
                         .iter()
-                        .filter(|intent| {
-                            let prev = streaks.get(&intent.intent_id).copied();
-                            let (streak, report) = candidate::exhausted_streak_step(prev);
-                            streaks.insert(intent.intent_id.clone(), streak);
-                            report
-                        })
+                        .filter(|intent| fire.iter().any(|f| f == &intent.intent_id))
                         .collect()
                 };
                 if !to_report.is_empty() {

@@ -201,7 +201,7 @@ pub struct Ctx {
     /// the spawn but never poisons. In-process only: a controller
     /// restart restarts streaks (delays a genuine poison by ≤3 ticks —
     /// accepted). Pruned when the intent leaves the gated set.
-    pub exhausted_streak: Mutex<HashMap<String, u32>>,
+    pub exhausted_streak: Mutex<super::reconcilers::pool::candidate::PoolStreaks>,
 }
 
 /// ComponentScaler reconciler state.
