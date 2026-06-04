@@ -88,6 +88,10 @@ const OUT_QUEUE_DEPTH: usize = 256;
 pub(super) struct LogTailConfig {
     pub reconnect_backoff: Duration,
     pub terminal_grace: Duration,
+    /// Hard bound on one `TailLog` OPEN await (`TAIL_OPEN_BOUND` in
+    /// production). Test-overridable so the hung-open conformance test
+    /// does not wall-clock 10 s per cut.
+    pub open_bound: Duration,
 }
 
 impl Default for LogTailConfig {
@@ -95,6 +99,7 @@ impl Default for LogTailConfig {
         Self {
             reconnect_backoff: RECONNECT_BACKOFF,
             terminal_grace: TERMINAL_GRACE,
+            open_bound: TAIL_OPEN_BOUND,
         }
     }
 }
@@ -389,7 +394,7 @@ async fn run_tail(
         // re-check below reads the fresh watch state) and a hard bound.
         let open = bounded_open(
             async { _ = drain.changed().await },
-            TAIL_OPEN_BOUND,
+            config.open_bound,
             client.tail_log(request),
         )
         .await;
@@ -813,6 +818,11 @@ mod tests {
         /// (UNAVAILABLE). The request is still recorded — the counter
         /// counts attempts.
         fail_opens: Mutex<u32>,
+        /// How many upcoming `tail_log` calls HANG at the open itself
+        /// (the future never resolves — a wedged store accepting TCP
+        /// but never answering the RPC). The request is still
+        /// recorded.
+        hang_opens: Mutex<u32>,
     }
 
     impl MockTail {
@@ -827,6 +837,12 @@ mod tests {
         /// Fail the next `n` `tail_log` opens with UNAVAILABLE.
         fn fail_next_opens(&self, n: u32) {
             *self.inner.fail_opens.lock().unwrap() = n;
+        }
+
+        /// Hang the next `n` `tail_log` opens forever (the open future
+        /// never resolves). For the bounded-open conformance tests.
+        fn hang_next_opens(&self, n: u32) {
+            *self.inner.hang_opens.lock().unwrap() = n;
         }
 
         /// The next `tail_log` call records its request, then parks
@@ -872,6 +888,20 @@ mod tests {
                     *fails -= 1;
                     return Err(Status::unavailable("scripted open failure"));
                 }
+            }
+            let hang = {
+                let mut hangs = self.inner.hang_opens.lock().unwrap();
+                if *hangs > 0 {
+                    *hangs -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if hang {
+                // The open future never resolves: the caller's bound
+                // (drain race / open_bound) is the only way out.
+                std::future::pending::<()>().await;
             }
             let gate = self.inner.gate.lock().unwrap().take();
             let script = self
@@ -928,6 +958,7 @@ mod tests {
         LogTailConfig {
             reconnect_backoff: Duration::from_millis(50),
             terminal_grace: Duration::from_millis(400),
+            open_bound: Duration::from_millis(100),
         }
     }
 
@@ -1206,6 +1237,67 @@ mod tests {
         h.set.abort_all();
     }
 
+    // r[verify store.log.tail-grace-drain+1]
+    /// merged_bug_194's dedicated gateway twin: a store that ACCEPTS
+    /// the TCP connection but never answers `TailLog` (the open future
+    /// itself hangs) must not park the relay past the drain deadline.
+    /// The first hung open is cut by the drain EDGE (terminal signal,
+    /// raced via `bounded_open`'s abort arm); subsequent hung opens
+    /// are cut by `open_bound`; the grace budget then expires and the
+    /// law exits.
+    ///
+    /// RECORDED RED (pre-C1 shape, `bounded_open` neutered to a bare
+    /// `client.tail_log(request).await`): the task never finishes —
+    /// `wait_for("the relay to exit by the drain deadline")` panics at
+    /// its 2 s cap with the open still parked (the pre-fix relay hung
+    /// on the open await forever; only the unbounded open changed).
+    #[tokio::test]
+    async fn hung_open_abandons_at_drain_deadline() {
+        let mut h = harness().await;
+        // EVERY open hangs: the relay gets no stream, ever.
+        h.mock.hang_next_opens(u32::MAX);
+
+        h.set.on_started(DRV, EXEC_A);
+        wait_for("the first (hung) open to arrive", || {
+            h.mock.request_count() == 1
+        })
+        .await;
+
+        // Terminal while the open is parked: the drain edge must abort
+        // the open (not wait for it), arm the grace, and the loop must
+        // exit once the grace expires — cutting each further hung open
+        // at open_bound (100 ms test scale) along the way.
+        h.set.on_terminal(DRV);
+        let handle = h
+            .set
+            .tasks
+            .get(DRV)
+            .expect("the subscription is still tracked")
+            .task
+            .abort_handle();
+        wait_for("the relay to exit by the drain deadline", || {
+            handle.is_finished()
+        })
+        .await;
+
+        // The exit came from the law (grace expiry), not from a lucky
+        // single attempt: the hung opens were retried and cut at least
+        // once after the drain edge (grace 400 ms / open_bound 100 ms
+        // + backoff 50 ms leaves room for ≥2 further attempts).
+        assert!(
+            h.mock.request_count() >= 2,
+            "expected re-opens after the drain edge, got {}",
+            h.mock.request_count()
+        );
+        // And nothing was ever relayed — the store never served a
+        // chunk.
+        assert!(
+            h.out_rx.try_recv().is_err(),
+            "no chunk should have been relayed from hung opens"
+        );
+        h.set.abort_all();
+    }
+
     /// Rule 1's guard as its own test: a `Started` with an empty
     /// exec_id opens no subscription at all.
     #[tokio::test]
@@ -1284,6 +1376,7 @@ mod tests {
         let mut h = harness_with(LogTailConfig {
             reconnect_backoff: Duration::from_millis(300),
             terminal_grace: Duration::from_millis(800),
+            open_bound: Duration::from_millis(100),
         })
         .await;
         h.mock.push_script(vec![chunk(0, 2)], SessionEnd::Close);
