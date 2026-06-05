@@ -39,7 +39,7 @@ use std::sync::Mutex;
 
 use dashmap::DashMap;
 use sqlx::PgPool;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, instrument, warn};
@@ -52,16 +52,15 @@ use rio_proto::store::{
     AppendLogAck, AppendLogHeader, AppendLogRequest, TailLogChunk, TailLogRequest,
     append_log_request,
 };
-use rio_proto::types::BuildLogBatch;
 
 use super::chunks::LogChunkStore;
 use super::gate::{self, OpenCaps};
 use super::ingest::{
-    AbortReason, AcceptOutcome, CutError, IngestConfig, IngestSession, IngestShared,
+    AbortReason, AcceptOutcome, CutError, FanBatch, IngestConfig, IngestSession, IngestShared,
 };
 use super::sessions::{self, Acquire, HeartbeatOutcome};
 use super::tail::{self, LineCursor};
-use rio_log_kernel::{ChunkVisit, visit_chunk};
+use rio_log_kernel::{ChunkVisit, GapProvenance, visit_chunk, visit_fanout_batch};
 
 /// One live ingest registration: the shared buffer handle a `TailLog`
 /// reader subscribes to, plus the cancel token that tears the driver
@@ -688,9 +687,12 @@ impl LogServiceImpl {
                     // (one lock over the buffer, the in-flight staging
                     // area, and the subscriber list — the seam).
                     let (tx, rx) = mpsc::channel(self.tail_subscriber_queue);
-                    let snapshot = lock_shared(shared).subscribe(tx);
+                    let (snapshot, wake) = {
+                        let mut s = lock_shared(shared);
+                        (s.subscribe(tx, req.since_line), s.drop_watch())
+                    };
                     metrics::gauge!("rio_store_log_tail_subscribers").increment(1.0);
-                    Some((snapshot, rx, Arc::downgrade(shared)))
+                    Some((snapshot, rx, Arc::downgrade(shared), wake))
                 } else {
                     // A non-follow read still wants the not-yet-durable
                     // lines (the dashboard's one-shot view should show
@@ -698,7 +700,7 @@ impl LogServiceImpl {
                     // subscribe() with an immediately-dropped receiver
                     // would register a permanently-full sender;
                     // snapshot without registering instead.
-                    let snapshot = lock_shared(shared).snapshot();
+                    let snapshot = lock_shared(shared).snapshot_since(req.since_line);
                     Some((
                         snapshot,
                         {
@@ -708,6 +710,10 @@ impl LogServiceImpl {
                             rx
                         },
                         Arc::downgrade(shared),
+                        // Never fired (sender dropped immediately):
+                        // the dummy epoch for a subscription-less
+                        // read. The loop disarms it on first Err.
+                        watch::channel(0u64).1,
                     ))
                 }
             }
@@ -1448,12 +1454,18 @@ enum CutStep {
 /// here).
 type LiveSubscription = Option<(
     Vec<(u64, Vec<u8>)>,
-    mpsc::Receiver<Arc<BuildLogBatch>>,
+    mpsc::Receiver<Arc<FanBatch>>,
     // Weak: serve_tail must NOT keep the IngestShared (and with it the
     // fan-out sender registered in `subscribers`) alive — the live
     // loop's rx closes exactly when the driver and the registry drop
     // their Arcs. Upgraded only for the moment of a gap back-fill.
     std::sync::Weak<Mutex<IngestShared>>,
+    // The fan-out drop epoch: bumped when the ingest dropped batches
+    // for ANY subscriber, so a burst-end drop is backfilled without
+    // waiting for output that may never come (merged_bug_187).
+    // Latching — a bump made while the loop was mid-send is observed
+    // at its next select.
+    watch::Receiver<u64>,
 )>;
 
 /// The whole TailLog response body: history (manifest chunks), then the
@@ -1489,7 +1501,7 @@ async fn serve_tail(
 
     // -- Phase 2 + 3: the live snapshot and the subscription. Only
     // present when this replica holds the execution's ingest session.
-    let Some((snapshot, mut rx, shared)) = subscription else {
+    let Some((snapshot, mut rx, shared, mut wake)) = subscription else {
         // History-only. The final (possibly empty) message carries the
         // computed completeness so the CLI/dashboard can render their
         // "(log incomplete)" notice.
@@ -1501,16 +1513,8 @@ async fn serve_tail(
     // The snapshot: every accepted-but-not-yet-manifest-visible line at
     // the instant the subscriber registered. Overlaps with the manifest
     // when a cut committed between the snapshot and the manifest read;
-    // the cursor dedups.
-    let snapshot_lines: Vec<(u64, Vec<u8>)> = snapshot
-        .into_iter()
-        .filter(|(n, _)| *n >= cursor.next_line())
-        .collect();
-    let snapshot_end = snapshot_lines.last().map(|(n, _)| *n);
-    send_lines(tx, &exec_str, snapshot_lines, false).await?;
-    if let Some(end) = snapshot_end {
-        cursor.advance_to(end + 1);
-    }
+    // the kernel verdicts dedup run by run.
+    serve_view_runs(tx, &exec_str, &mut cursor, snapshot).await?;
 
     if !follow {
         let claim = gate::final_claim_for(&pool, exec_id, cursor.next_line()).await?;
@@ -1529,91 +1533,130 @@ async fn serve_tail(
     // queue, and the `tail_subscribers` gauge) parked until the next
     // line arrives.
     // r[impl store.log.tail-fanout-recovery]
+    // r[impl store.log.gap-provenance]
+    let mut wake_armed = true;
     loop {
-        let batch = tokio::select! {
+        enum Pulse {
+            Batch(Arc<FanBatch>),
+            Woken,
+            WakeClosed,
+            Ended,
+        }
+        let pulse = tokio::select! {
             batch = rx.recv() => match batch {
-                Some(b) => b,
-                None => break,
+                Some(b) => Pulse::Batch(b),
+                None => Pulse::Ended,
+            },
+            // Fan-out drops wake every subscriber: a burst that ENDS in
+            // drops is backfilled here instead of parking until the
+            // next accepted batch (which for a quiet build never
+            // comes). A subscriber whose own queue kept the batch
+            // recovers nothing and serves nothing — benign. The watch
+            // epoch LATCHES: a drop that happened while this loop was
+            // blocked in send_lines (the stalled-reader case — exactly
+            // when drops occur) is observed here, not lost.
+            changed = wake.changed(), if wake_armed => match changed {
+                Ok(()) => Pulse::Woken,
+                Err(_) => Pulse::WakeClosed,
             },
             _ = tx.closed() => return Ok(()),
         };
-        match visit_chunk(
-            cursor.next_line(),
-            batch.first_line_number,
-            batch.lines.len() as u64,
-        ) {
-            ChunkVisit::Skip { .. } => {}
-            ChunkVisit::Serve { yield_from, .. } => {
-                let lines: Vec<(u64, Vec<u8>)> = batch
-                    .lines
-                    .iter()
-                    .enumerate()
-                    .map(|(i, l)| (batch.first_line_number + i as u64, l.clone()))
-                    .filter(|(n, _)| *n >= yield_from)
-                    .collect();
-                let end = lines.last().map(|(n, _)| *n);
-                send_lines(tx, &exec_str, lines, false).await?;
-                if let Some(end) = end {
-                    cursor.advance_to(end + 1);
-                }
+        let fan = match pulse {
+            Pulse::Ended => break,
+            Pulse::WakeClosed => {
+                // The session (or the dummy sender) is gone; rx's
+                // None will end the loop. Disarm so a closed watch
+                // cannot busy-spin the select.
+                wake_armed = false;
+                continue;
             }
-            ChunkVisit::GapThenServe { .. } => {
-                // The fan-out is lossy (a full subscriber queue drops
-                // batches); the dropped span was buffered in the SAME
-                // critical section as the drop, so at observation it
-                // is durable (manifest) or still in the live buffer.
-                // Back-fill BOTH before serving the triggering batch —
-                // a served follow stream is gapless by construction
-                // modulo genuine holes the store never accepted.
-                metrics::counter!("rio_store_log_tail_fanout_recovered_total").increment(1);
-                // (a) The live buffer FIRST — `in_flight ++ buffer` in
-                // one critical section, per the IngestShared coverage
-                // contract (ingest.rs): a line leaves that view only
-                // once its cut has COMMITTED, so the manifest read
-                // below is then guaranteed to hold it. Reading the
-                // manifest first opens a commit-window hole: a cut
-                // staged at the SQL read and committed before the
-                // snapshot is in NEITHER view (observed as an interior
-                // missing pair at a cut boundary under load). Overlap
-                // in this order is harmless — the cursor walk dedups.
-                // The session may have ended between the drop and now
-                // — then the manifest walk holds everything.
-                let snap: Vec<(u64, Vec<u8>)> = match shared.upgrade() {
-                    Some(shared) => lock_shared(&shared).snapshot(),
-                    None => Vec::new(),
-                };
-                // (b) Everything cut to chunks since the cursor.
-                let refs = tail::read_manifest_range(&pool, exec_id, cursor.next_line()).await?;
-                for chunk in &refs {
-                    let lines = tail::read_chunk(store.as_ref(), chunk, &mut cursor).await?;
-                    send_lines(tx, &exec_str, lines, false).await?;
+            Pulse::Woken => {
+                backfill_from_views(
+                    &pool,
+                    store.as_ref(),
+                    exec_id,
+                    &exec_str,
+                    &shared,
+                    &mut cursor,
+                    tx,
+                )
+                .await?;
+                continue;
+            }
+            Pulse::Batch(fan) => fan,
+        };
+        let n_lines = fan.batch.lines.len() as u64;
+        let verdict = visit_fanout_batch(
+            cursor.next_line(),
+            fan.batch.first_line_number,
+            n_lines,
+            fan.coverage_floor,
+        );
+        let visit = match verdict.provenance {
+            // No gap — or a gap the store never accepted lines for
+            // (worker-admitted): serve across with the typed verdict.
+            // NO buffer clone, NO manifest read, NO recovery counter —
+            // a worker cannot drive amplification by emitting jumps
+            // (merged_bug_187).
+            None | Some(GapProvenance::AdmittedHole) => verdict.visit,
+            // The missing span WAS accepted and this subscriber's
+            // lossy queue dropped it: ONE counted backfill from
+            // manifest ∪ live buffer, then re-visit.
+            Some(GapProvenance::DroppedSpan { .. }) => {
+                backfill_from_views(
+                    &pool,
+                    store.as_ref(),
+                    exec_id,
+                    &exec_str,
+                    &shared,
+                    &mut cursor,
+                    tx,
+                )
+                .await?;
+                let revisit = visit_fanout_batch(
+                    cursor.next_line(),
+                    fan.batch.first_line_number,
+                    n_lines,
+                    fan.coverage_floor,
+                );
+                if matches!(revisit.provenance, Some(GapProvenance::DroppedSpan { .. })) {
+                    // A residual ACCEPTED gap survived the backfill:
+                    // the ingest coverage contract failed (the span is
+                    // in neither the manifest nor the live buffer).
+                    // Finalize at the UN-advanced cursor — the claim
+                    // is structurally incomplete (the cursor is below
+                    // the sealed end) — and let the client's reconnect
+                    // contract take over. Advancing across the span,
+                    // the old shape, silently disowned the lines
+                    // (merged_bug_205).
+                    let claim = gate::final_claim_for(&pool, exec_id, cursor.next_line()).await?;
+                    send_final(tx, &exec_str, claim).await?;
+                    return Ok(());
                 }
-                // (c-pre) The snapshot, deduplicated through the
-                // post-manifest cursor.
-                let snap: Vec<(u64, Vec<u8>)> = snap
-                    .into_iter()
-                    .filter(|(n, _)| *n >= cursor.next_line())
-                    .collect();
-                let end = snap.last().map(|(n, _)| *n);
-                send_lines(tx, &exec_str, snap, false).await?;
-                if let Some(end) = end {
-                    cursor.advance_to(end + 1);
-                }
-                // (c) The triggering batch through the (advanced)
-                // cursor — usually fully deduplicated by (b), which
-                // snapshotted after this batch was buffered.
-                let lines: Vec<(u64, Vec<u8>)> = batch
-                    .lines
+                revisit.visit
+            }
+        };
+        match visit {
+            ChunkVisit::Skip { .. } => {}
+            ChunkVisit::Serve {
+                yield_from,
+                yield_until,
+                ..
+            }
+            | ChunkVisit::GapThenServe {
+                yield_from,
+                yield_until,
+                ..
+            } => {
+                let first = fan.batch.first_line_number;
+                let lines: Vec<(u64, Vec<u8>)> = fan.batch.lines
+                    [(yield_from - first) as usize..(yield_until - first) as usize]
                     .iter()
                     .enumerate()
-                    .map(|(i, l)| (batch.first_line_number + i as u64, l.clone()))
-                    .filter(|(n, _)| *n >= cursor.next_line())
+                    .map(|(i, l)| (yield_from + i as u64, l.clone()))
                     .collect();
-                let end = lines.last().map(|(n, _)| *n);
                 send_lines(tx, &exec_str, lines, false).await?;
-                if let Some(end) = end {
-                    cursor.advance_to(end + 1);
-                }
+                cursor.advance_to(visit.advance());
             }
         }
     }
@@ -1646,6 +1689,104 @@ async fn serve_tail(
     let claim = gate::final_claim_for(&pool, exec_id, cursor.next_line()).await?;
     send_final(tx, &exec_str, claim).await?;
     Ok(())
+}
+
+/// Serve a window of `(line_number, bytes)` pairs drawn from an
+/// AUTHORITATIVE view — the live snapshot, or the backfill's recovered
+/// buffer — one kernel verdict per contiguous run, the cursor moved
+/// only by sealed advances (merged_bug_205: the open-coded
+/// `filter(>= cursor)` + `advance_to(end + 1)` fold, which silently
+/// absorbed residual gaps, no longer typechecks). A run starting past
+/// the watermark here is an ingest-admitted hole BY CONSTRUCTION (the
+/// view holds every accepted line at or past the cursor), so the
+/// `GapThenServe` verdict serves across it.
+///
+/// Returns `true` if any line was sent (the backfill's recovery
+/// telemetry).
+async fn serve_view_runs(
+    tx: &mpsc::Sender<Result<TailLogChunk, Status>>,
+    exec_id: &str,
+    cursor: &mut LineCursor,
+    lines: Vec<(u64, Vec<u8>)>,
+) -> Result<bool, Status> {
+    let mut served = false;
+    let mut i = 0usize;
+    while i < lines.len() {
+        // The maximal contiguous run starting at i.
+        let first = lines[i].0;
+        let mut len = 1usize;
+        while i + len < lines.len() && lines[i + len].0 == first + len as u64 {
+            len += 1;
+        }
+        let visit = visit_chunk(cursor.next_line(), first, len as u64);
+        match visit {
+            ChunkVisit::Skip { .. } => {}
+            ChunkVisit::Serve {
+                yield_from,
+                yield_until,
+                ..
+            }
+            | ChunkVisit::GapThenServe {
+                yield_from,
+                yield_until,
+                ..
+            } => {
+                let lo = i + (yield_from - first) as usize;
+                let hi = i + (yield_until - first) as usize;
+                let out: Vec<(u64, Vec<u8>)> = lines[lo..hi].to_vec();
+                served |= !out.is_empty();
+                send_lines(tx, exec_id, out, false).await?;
+                cursor.advance_to(visit.advance());
+            }
+        }
+        i += len;
+    }
+    Ok(served)
+}
+
+/// The fan-out drop recovery: everything cut to chunks since the
+/// cursor, then the live buffer's remainder, in the coverage-contract
+/// order (snapshot CLONED first, served after the manifest — a cut
+/// committing between a manifest-first read and the snapshot would
+/// hide its lines from both views; overlap the other way is removed by
+/// the kernel verdicts). Increments the recovery counter only when
+/// lines were actually recovered.
+async fn backfill_from_views(
+    pool: &PgPool,
+    store: &dyn LogChunkStore,
+    exec_id: Uuid,
+    exec_str: &str,
+    shared: &std::sync::Weak<Mutex<IngestShared>>,
+    cursor: &mut LineCursor,
+    tx: &mpsc::Sender<Result<TailLogChunk, Status>>,
+) -> Result<bool, Status> {
+    // (a) The live buffer FIRST — `in_flight ++ buffer` in one critical
+    // section, per the IngestShared coverage contract (ingest.rs): a
+    // line leaves that view only once its cut has COMMITTED, so the
+    // manifest read below is then guaranteed to hold it. The clone is
+    // bounded below by the cursor (snapshot_since) — the reader never
+    // pays in-lock for lines it will discard. The session may have
+    // ended between the drop and now — then the manifest walk holds
+    // everything.
+    let snap: Vec<(u64, Vec<u8>)> = match shared.upgrade() {
+        Some(shared) => lock_shared(&shared).snapshot_since(cursor.next_line()),
+        None => Vec::new(),
+    };
+    // (b) Everything cut to chunks since the cursor.
+    let mut recovered = false;
+    let refs = tail::read_manifest_range(pool, exec_id, cursor.next_line()).await?;
+    for chunk in &refs {
+        let lines = tail::read_chunk(store, chunk, cursor).await?;
+        recovered |= !lines.is_empty();
+        send_lines(tx, exec_str, lines, false).await?;
+    }
+    // (c) The snapshot, deduplicated run-by-run through the
+    // post-manifest cursor.
+    recovered |= serve_view_runs(tx, exec_str, cursor, snap).await?;
+    if recovered {
+        metrics::counter!("rio_store_log_tail_fanout_recovered_total").increment(1);
+    }
+    Ok(recovered)
 }
 
 /// Send a run of `(line_number, bytes)` pairs as ≤[`TAIL_CHUNK_LINES`]-
@@ -1714,6 +1855,7 @@ mod tests {
     use crate::logs::chunks::MemoryLogChunkStore;
     use rio_auth::hmac::{AssignmentClaims, HmacSigner, HmacVerifier};
     use rio_proto::store::log_service_server::LogServiceServer;
+    use rio_proto::types::BuildLogBatch;
     use rio_test_support::TestDb;
     use rio_test_support::grpc::spawn_grpc_server;
     use sqlx::PgPool;
@@ -3005,6 +3147,134 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    // r[verify store.log.gap-provenance]
+    /// A worker-admitted forward jump (the builder transmitted line 0,
+    /// then line 5 — the ingest accepted both) is served ACROSS by the
+    /// follow loop: the missing span was never accepted, so there is
+    /// nothing to recover — no backfill, no drop, every transmitted
+    /// line exactly once. (Pre-fix, every jump took the full
+    /// clone+manifest recovery path — worker-drivable amplification.)
+    #[tokio::test]
+    async fn follow_serves_across_admitted_jump_without_recovery() {
+        let mut h = harness().await;
+        let exec = seed_assignment(&h.db.pool, "builder-0").await;
+        let tok = token("builder-0", DRV);
+
+        let (tx, _acks) = open_append(&mut h.client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("open");
+        tx.send(batch_msg(0, &["line-0"])).await.unwrap();
+        wait_for(|| {
+            h.active
+                .get(&exec)
+                .map(|s| !lock_shared(&s.shared).snapshot().is_empty())
+                .unwrap_or(false)
+        })
+        .await;
+
+        let mut tail = h
+            .client
+            .tail_log(tail_req(exec, true))
+            .await
+            .expect("tail")
+            .into_inner();
+        let first = tail.message().await.expect("snapshot").expect("present");
+        assert_eq!(first.first_line_number, 0);
+
+        // The worker jumps: line 5 next (lines 1..5 never transmitted).
+        tx.send(batch_msg(5, &["line-5"])).await.unwrap();
+        let jumped = tail.message().await.expect("live").expect("present");
+        assert_eq!(
+            jumped.first_line_number, 5,
+            "the admitted hole is served across, not recovered around"
+        );
+        assert_eq!(jumped.lines, vec![b"line-5".to_vec()]);
+        assert_eq!(
+            h.active
+                .get(&exec)
+                .map(|s| lock_shared(&s.shared).tail_dropped),
+            Some(0),
+            "an admitted jump is not a fan-out drop"
+        );
+        drop(tx);
+        let mut final_seen = false;
+        while let Some(chunk) = tail.message().await.expect("stream ok") {
+            if chunk.lines.is_empty() {
+                final_seen = true;
+            }
+        }
+        assert!(final_seen);
+    }
+
+    // r[verify store.log.tail-fanout-recovery]
+    /// RED (merged_bug_187, parked-tail half): a burst that ENDS in
+    /// fan-out drops must be served WITHOUT new output — the drop-side
+    /// wake triggers the backfill. Pre-fix the reader parks until the
+    /// next accepted batch (never, for a quiet build) or session end.
+    #[tokio::test]
+    async fn burst_end_drop_served_without_new_output() {
+        let mut h = harness_with(256, |s| s.with_tail_subscriber_queue(1)).await;
+        let exec = seed_assignment(&h.db.pool, "builder-0").await;
+        let tok = token("builder-0", DRV);
+
+        let (tx, _acks) = open_append(&mut h.client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("open");
+        tx.send(batch_msg(0, &["line-00000"])).await.unwrap();
+        wait_for(|| {
+            h.active
+                .get(&exec)
+                .map(|s| !lock_shared(&s.shared).snapshot().is_empty())
+                .unwrap_or(false)
+        })
+        .await;
+
+        let mut tail = h
+            .client
+            .tail_log(tail_req(exec, true))
+            .await
+            .expect("tail")
+            .into_inner();
+        let first = tail.message().await.expect("snapshot").expect("present");
+        assert_eq!(first.first_line_number, 0);
+
+        // Stall the reader; burst past the 1-slot queue so the TAIL of
+        // the burst drops. The builder then goes quiet (tx stays open —
+        // no session end, no further batches).
+        for i in 1..=30u64 {
+            let payload = format!("line-{i:05}-{}", "x".repeat(4000));
+            tx.send(batch_msg(i, &[&payload])).await.unwrap();
+        }
+        wait_for(|| {
+            h.active
+                .get(&exec)
+                .map(|s| lock_shared(&s.shared).tail_dropped > 0)
+                .unwrap_or(false)
+        })
+        .await;
+
+        // Resume reading. The drop wake must deliver the dropped tail
+        // from manifest ∪ buffer with NO new output and NO session end.
+        let mut got: std::collections::BTreeSet<u64> = [0].into();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while *got.iter().next_back().expect("nonempty") < 30 {
+            let next = tokio::time::timeout_at(deadline, tail.message())
+                .await
+                .expect("the dropped burst tail must be served without new output (drop wake)")
+                .expect("stream ok")
+                .expect("stream open");
+            for (i, _) in next.lines.iter().enumerate() {
+                got.insert(next.first_line_number + i as u64);
+            }
+        }
+        assert_eq!(
+            got.iter().copied().collect::<Vec<u64>>(),
+            (0..=30).collect::<Vec<u64>>(),
+            "every accepted line served exactly once, tail included"
+        );
+        drop(tx);
     }
 
     // r[verify store.log.tail-fanout-recovery]

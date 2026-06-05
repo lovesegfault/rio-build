@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use rio_proto::types::BuildLogBatch;
 use sqlx::PgPool;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tonic::Status;
 use uuid::Uuid;
@@ -195,6 +195,22 @@ pub enum CutError {
     Manifest(#[source] sqlx::Error),
 }
 
+/// One live fan-out delivery: the accepted batch plus the ingest
+/// session's accepted high-water mark at the instant it was fanned out
+/// (the **coverage floor**). The floor is what lets a subscriber type
+/// a forward jump (merged_bug_187): every line below it was accepted —
+/// a gap there means the lossy fan-out dropped batches for THIS
+/// subscriber and a backfill from manifest ∪ live buffer recovers it;
+/// every line at or above it was never accepted — an ingest-admitted
+/// hole no view can serve (`rio_log_kernel::visit_fanout_batch`).
+pub struct FanBatch {
+    /// The session's accepted high-water mark before this batch.
+    pub coverage_floor: u64,
+    /// The accepted batch, post-truncation (exactly what will be
+    /// stored).
+    pub batch: BuildLogBatch,
+}
+
 /// State shared between an ingest session and its live-tail subscribers.
 ///
 /// ONE mutex over the buffer, the in-flight staging area, and the
@@ -218,7 +234,11 @@ pub struct IngestShared {
     /// Accepted-but-not-yet-drained lines, in accept order.
     /// `(absolute line number, post-truncation bytes)`. Line numbers are
     /// non-decreasing and strictly increasing across batches; forward
-    /// gaps (suppressed lines) are legal.
+    /// gaps are legal and are always WORKER-ADMITTED holes — a jump the
+    /// builder transmitted and the ingest accepted (merged_bug_275:
+    /// builder-side suppression never skips numbers; the old
+    /// "(suppressed lines)" attribution here was wrong — see
+    /// rio-builder's contiguity property test).
     buffer: Vec<(u64, Vec<u8>)>,
     /// The contiguous run drained by the cut currently in flight, if
     /// any. Kept here — not in a `cut()` local — so a subscriber that
@@ -242,12 +262,23 @@ pub struct IngestShared {
     /// batch (and only when at least one subscriber exists — most
     /// builds are unwatched) and the per-subscriber cost is a refcount
     /// bump, not a multi-MB lines clone inside the critical section.
-    subscribers: Vec<mpsc::Sender<Arc<BuildLogBatch>>>,
+    subscribers: Vec<mpsc::Sender<Arc<FanBatch>>>,
     /// Batches dropped because a subscriber's queue was full. Exposed
     /// for the handler's `rio_store_log_tail_dropped_total` gauge
     /// reconciliation and asserted by tests; the counter metric is also
     /// emitted at the drop site.
     pub tail_dropped: u64,
+    /// Bumped whenever the fan-out drops batches, so a subscriber
+    /// whose BURST-END batches were dropped can run its backfill
+    /// without waiting for the next accepted batch (which for a build
+    /// that has gone quiet may never come) — merged_bug_187's
+    /// parked-tail half. A `watch` epoch, NOT a `Notify`: the serve
+    /// loop is frequently parked in `send_lines` (a stalled reader is
+    /// exactly the dropping case) when the drop happens, and an
+    /// edge-triggered wake fired with no waiter is lost; the watch
+    /// channel latches — `changed()` observes any bump made while the
+    /// loop was away.
+    drop_epoch: watch::Sender<u64>,
 }
 
 impl IngestShared {
@@ -258,10 +289,20 @@ impl IngestShared {
     /// subsequently delivered on `tx` is the complete log (with
     /// possible line-number overlap between the three, removed by the
     /// reader's dedup — never a gap).
-    pub fn subscribe(&mut self, tx: mpsc::Sender<Arc<BuildLogBatch>>) -> Vec<(u64, Vec<u8>)> {
-        let snapshot = self.snapshot();
+    pub fn subscribe(
+        &mut self,
+        tx: mpsc::Sender<Arc<FanBatch>>,
+        since: u64,
+    ) -> Vec<(u64, Vec<u8>)> {
+        let snapshot = self.snapshot_since(since);
         self.subscribers.push(tx);
         snapshot
+    }
+
+    /// A latching subscription to fan-out drop epochs (see the field
+    /// doc). Held by serve loops outside the lock.
+    pub fn drop_watch(&self) -> watch::Receiver<u64> {
+        self.drop_epoch.subscribe()
     }
 
     /// The not-yet-manifest-visible lines (the in-flight run followed by
@@ -271,9 +312,19 @@ impl IngestShared {
     /// immediately dropped would be pruned on the next fan-out anyway,
     /// but never registering it is cheaper and clearer.
     pub fn snapshot(&self) -> Vec<(u64, Vec<u8>)> {
+        self.snapshot_since(0)
+    }
+
+    /// [`Self::snapshot`] bounded below: only lines at or past `since`
+    /// are cloned, so a reader that is already deep into the log does
+    /// not pay (inside the lock) for a clone of lines its cursor will
+    /// immediately discard (merged_bug_187's in-lock amplification
+    /// half).
+    pub fn snapshot_since(&self, since: u64) -> Vec<(u64, Vec<u8>)> {
         self.in_flight
             .iter()
             .chain(self.buffer.iter())
+            .filter(|(n, _)| *n >= since)
             .cloned()
             .collect()
     }
@@ -360,6 +411,7 @@ impl IngestSession {
                 oldest_pending_since: None,
                 subscribers: Vec::new(),
                 tail_dropped: 0,
+                drop_epoch: watch::channel(0u64).0,
             })),
             config,
             next_seq: 0,
@@ -641,11 +693,20 @@ impl IngestSession {
             // never blocks, so a slow reader can never backpressure
             // ingest.
             if !shared.subscribers.is_empty() {
-                let fanout = Arc::new(BuildLogBatch {
-                    derivation_path: batch.derivation_path,
-                    lines: lines.clone(),
-                    first_line_number: batch.first_line_number,
-                    executor_id: batch.executor_id,
+                let fanout = Arc::new(FanBatch {
+                    // The session's accepted high-water mark BEFORE
+                    // this batch: the subscriber-side gap classifier
+                    // (`visit_fanout_batch`) splits any observed jump
+                    // at this floor — below it the store accepted the
+                    // lines (a drop, recoverable), at or above it the
+                    // worker never sent them (an admitted hole).
+                    coverage_floor: self.high_water_line,
+                    batch: BuildLogBatch {
+                        derivation_path: batch.derivation_path,
+                        lines: lines.clone(),
+                        first_line_number: batch.first_line_number,
+                        executor_id: batch.executor_id,
+                    },
                 });
                 let mut dropped = 0u64;
                 shared
@@ -661,6 +722,11 @@ impl IngestSession {
                 if dropped > 0 {
                     shared.tail_dropped += dropped;
                     metrics::counter!("rio_store_log_tail_dropped_total").increment(dropped);
+                    // Burst-end drops must serve without new output:
+                    // bump the latched epoch so every subscriber's
+                    // serve loop backfills as soon as it next selects,
+                    // even if it was mid-send when the drop happened.
+                    shared.drop_epoch.send_modify(|n| *n = n.wrapping_add(1));
                 }
             }
 
@@ -1491,7 +1557,7 @@ mod tests {
         // snapshot, not its channel.
         session.accept(batch(0, 2)).unwrap();
         let (tx, mut rx) = mpsc::channel(16);
-        let snapshot = session.shared().lock().unwrap().subscribe(tx);
+        let snapshot = session.shared().lock().unwrap().subscribe(tx, 0);
         assert_eq!(
             snapshot.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
             vec![0, 1],
@@ -1502,10 +1568,10 @@ mod tests {
         session.accept(batch(5, 1)).unwrap();
 
         let first = rx.try_recv().expect("first post-subscribe batch");
-        assert_eq!(first.first_line_number, 2);
-        assert_eq!(first.lines.len(), 3);
+        assert_eq!(first.batch.first_line_number, 2);
+        assert_eq!(first.batch.lines.len(), 3);
         let second = rx.try_recv().expect("second post-subscribe batch");
-        assert_eq!(second.first_line_number, 5);
+        assert_eq!(second.batch.first_line_number, 5);
         assert!(rx.try_recv().is_err(), "no further batches");
     }
 
@@ -1513,7 +1579,7 @@ mod tests {
     fn slow_subscriber_is_dropped_not_blocking() {
         let mut session = new_session(test_config());
         let (tx, mut rx) = mpsc::channel(1);
-        session.shared().lock().unwrap().subscribe(tx);
+        session.shared().lock().unwrap().subscribe(tx, 0);
 
         for i in 0..10u64 {
             assert!(
@@ -1532,7 +1598,7 @@ mod tests {
         );
         // The capacity-1 channel got exactly one batch; the other 9 were
         // dropped for this subscriber only.
-        assert_eq!(rx.try_recv().unwrap().first_line_number, 0);
+        assert_eq!(rx.try_recv().unwrap().batch.first_line_number, 0);
         assert!(rx.try_recv().is_err());
         assert_eq!(
             session.shared().lock().unwrap().tail_dropped,
@@ -1626,7 +1692,7 @@ mod tests {
                 "precondition: the drain has moved the lines out of the buffer"
             );
             let (tx, _rx) = mpsc::channel(16);
-            let snapshot = guard.subscribe(tx);
+            let snapshot = guard.subscribe(tx, 0);
             assert_eq!(
                 snapshot.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
                 (0..100).collect::<Vec<u64>>(),
@@ -1660,7 +1726,7 @@ mod tests {
         assert!(session.cut(&store, &db.pool).await.is_err());
 
         let (tx, _rx) = mpsc::channel(16);
-        let snapshot = session.shared().lock().unwrap().subscribe(tx);
+        let snapshot = session.shared().lock().unwrap().subscribe(tx, 0);
         assert_eq!(
             snapshot.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
             (0..10).collect::<Vec<u64>>(),

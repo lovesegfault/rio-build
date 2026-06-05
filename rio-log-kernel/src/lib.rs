@@ -110,6 +110,36 @@ impl ChunkVisit {
             | ChunkVisit::GapThenServe { next_line, .. } => next_line,
         }
     }
+
+    /// Mint the sealed cursor advance for this verdict — the ONLY
+    /// constructor of [`CursorAdvance`] (merged_bug_205): a serve loop
+    /// can move its watermark exclusively to a post-visit position the
+    /// kernel computed. The open-coded `filter(>= cursor)` +
+    /// `advance_to(end + 1)` shape — which silently absorbed residual
+    /// gaps — no longer typechecks.
+    pub fn advance(&self) -> CursorAdvance {
+        CursorAdvance {
+            to: self.next_line(),
+        }
+    }
+}
+
+/// A sealed watermark movement: produced only by
+/// [`ChunkVisit::advance`] (and therefore only from a kernel verdict).
+/// The field is private — a caller cannot fabricate an advance past
+/// lines no verdict served (merged_bug_205: the silent residual-gap
+/// absorption class).
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorAdvance {
+    to: u64,
+}
+
+impl CursorAdvance {
+    /// The verdict-computed post-visit watermark.
+    pub fn to(&self) -> u64 {
+        self.to
+    }
 }
 
 // r[impl store.log.session-keyed]
@@ -427,6 +457,109 @@ pub fn visit_object(
         visit: visit_chunk(next_line, first_line, served),
         divergence,
     }
+}
+
+/// Why a live-tail subscriber observed a forward jump in its fan-out
+/// stream — the typed provenance that routes the recovery policy
+/// (merged_bug_187). The old code treated EVERY jump as a recoverable
+/// drop: a worker-admitted hole (lines the store never accepted)
+/// triggered the full clone + manifest walk + recovery counter on a
+/// span that no view can ever hold — a worker-drivable amplification.
+/// And the old vocabulary blamed "(suppressed lines)" (merged_bug_275):
+/// builder suppression never skips numbers — the only sources of an
+/// admitted hole are worker-side jumps the ingest accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapProvenance {
+    /// The whole missing span was never accepted by the store (the
+    /// batch's coverage floor is at or below the gap): there is
+    /// nothing to recover anywhere. Serve across — no clone, no
+    /// manifest read, no recovery counter.
+    AdmittedHole,
+    /// The span `[gap_from, dropped_until)` WAS accepted (it lies
+    /// below the batch's coverage floor) and this subscriber missed it
+    /// — the lossy fan-out dropped batches for its queue. ONE counted
+    /// backfill from manifest ∪ live buffer, then re-visit the batch;
+    /// any remainder at or above the floor is admitted.
+    DroppedSpan {
+        /// One past the end of the recoverable (accepted) part of the
+        /// gap: `min(coverage_floor, gap_until)`.
+        dropped_until: u64,
+    },
+}
+
+/// The verdict of [`visit_fanout_batch`]: the dedup visit plus the gap
+/// provenance, when there is a gap.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FanoutVisit {
+    /// The dedup verdict over the batch (exactly
+    /// [`visit_chunk`]`(next_line, first_line, n_lines)`).
+    pub visit: ChunkVisit,
+    /// `Some` iff the visit is a [`ChunkVisit::GapThenServe`]: how the
+    /// missing span came to be missing, computed against the batch's
+    /// coverage floor.
+    pub provenance: Option<GapProvenance>,
+}
+
+/// One live fan-out batch's verdict for a subscriber at watermark
+/// `next_line` (`docs/spec/models/logService.qnt::readerDrain`):
+/// the dedup visit, with any gap classified against `coverage_floor` —
+/// the ingest session's accepted high-water mark at the instant the
+/// batch was fanned out. Every line below the floor was accepted by
+/// the store (recoverable from manifest ∪ live buffer); every line at
+/// or above it was never accepted (nothing anywhere can serve it).
+///
+/// Same `BIGINT` precondition as [`visit_chunk`].
+#[cfg_attr(
+    kani,
+    kani::requires(
+        next_line <= i64::MAX as u64
+            && first_line <= i64::MAX as u64
+            && n_lines <= i64::MAX as u64
+            && coverage_floor <= i64::MAX as u64
+    )
+)]
+#[cfg_attr(kani, kani::ensures(|r: &FanoutVisit| {
+    r.visit == visit_chunk(next_line, first_line, n_lines)
+}))]
+#[cfg_attr(kani, kani::ensures(|r: &FanoutVisit| {
+    match (r.visit, r.provenance) {
+        // Provenance exists iff there is a gap.
+        (ChunkVisit::Skip { .. }, None) | (ChunkVisit::Serve { .. }, None) => true,
+        (ChunkVisit::GapThenServe { gap_from, gap_until, .. },
+         Some(GapProvenance::AdmittedHole)) =>
+            coverage_floor <= gap_from && gap_from < gap_until,
+        (ChunkVisit::GapThenServe { gap_from, gap_until, .. },
+         Some(GapProvenance::DroppedSpan { dropped_until })) =>
+            gap_from < coverage_floor
+                && dropped_until == if coverage_floor < gap_until { coverage_floor } else { gap_until }
+                && gap_from < dropped_until,
+        _ => false,
+    }
+}))]
+// r[impl store.log.gap-provenance]
+pub fn visit_fanout_batch(
+    next_line: u64,
+    first_line: u64,
+    n_lines: u64,
+    coverage_floor: u64,
+) -> FanoutVisit {
+    let visit = visit_chunk(next_line, first_line, n_lines);
+    let provenance = match visit {
+        ChunkVisit::Skip { .. } | ChunkVisit::Serve { .. } => None,
+        ChunkVisit::GapThenServe {
+            gap_from,
+            gap_until,
+            ..
+        } => Some(if gap_from < coverage_floor {
+            GapProvenance::DroppedSpan {
+                dropped_until: coverage_floor.min(gap_until),
+            }
+        } else {
+            GapProvenance::AdmittedHole
+        }),
+    };
+    FanoutVisit { visit, provenance }
 }
 
 /// A served-stream completeness claim: the ONLY way to say
@@ -793,6 +926,20 @@ mod proofs {
         let first_line: u64 = kani::any();
         let n_lines: u64 = kani::any();
         let _ = visit_chunk(next_line, first_line, n_lines);
+    }
+
+    /// Verify [`visit_fanout_batch`] against its contracts under the
+    /// BIGINT precondition: the visit IS the dedup verdict, and the
+    /// provenance partition is exact — present iff there is a gap,
+    /// `DroppedSpan` iff the gap dips below the coverage floor, with
+    /// `dropped_until` clamped to the gap. No loops — exhaustive.
+    #[kani::proof_for_contract(visit_fanout_batch)]
+    fn check_visit_fanout_batch_contract() {
+        let next_line: u64 = kani::any();
+        let first_line: u64 = kani::any();
+        let n_lines: u64 = kani::any();
+        let coverage_floor: u64 = kani::any();
+        let _ = visit_fanout_batch(next_line, first_line, n_lines, coverage_floor);
     }
 
     /// Verify [`final_claim`] against its ensures contract over the
@@ -1171,6 +1318,39 @@ mod proofs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fanout_gap_provenance_partition() {
+        // No gap: no provenance.
+        assert_eq!(visit_fanout_batch(5, 5, 3, 5).provenance, None);
+        assert_eq!(visit_fanout_batch(5, 2, 3, 9).provenance, None, "skip");
+        // Gap [5,8) entirely at/above floor 5: admitted — nothing to recover.
+        assert_eq!(
+            visit_fanout_batch(5, 8, 2, 5).provenance,
+            Some(GapProvenance::AdmittedHole)
+        );
+        // Gap [5,8) below floor 8: all accepted — dropped span to 8.
+        assert_eq!(
+            visit_fanout_batch(5, 8, 2, 8).provenance,
+            Some(GapProvenance::DroppedSpan { dropped_until: 8 })
+        );
+        // Mixed: gap [5,9), floor 7 — recoverable [5,7), admitted [7,9).
+        assert_eq!(
+            visit_fanout_batch(5, 9, 1, 7).provenance,
+            Some(GapProvenance::DroppedSpan { dropped_until: 7 })
+        );
+        // The visit half is exactly visit_chunk.
+        assert_eq!(visit_fanout_batch(5, 8, 2, 7).visit, visit_chunk(5, 8, 2));
+    }
+
+    #[test]
+    fn cursor_advance_is_verdict_sealed() {
+        // The only constructor is ChunkVisit::advance(); the advance
+        // carries the post-visit watermark for every variant.
+        assert_eq!(visit_chunk(5, 2, 1).advance().to(), 5, "skip holds");
+        assert_eq!(visit_chunk(5, 5, 3).advance().to(), 8, "serve moves");
+        assert_eq!(visit_chunk(5, 8, 2).advance().to(), 10, "gap-serve moves");
+    }
+
     #[test]
     fn final_claim_law() {
         // complete ⇔ sealed ∧ cursor ≥ sealed ∧ covers

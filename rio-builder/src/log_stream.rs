@@ -364,6 +364,60 @@ mod tests {
         assert_eq!(batch.lines.len(), 1);
     }
 
+    proptest::proptest! {
+        // r[verify store.log.gap-provenance]
+        /// merged_bug_275 (the misattribution freeze): builder-side
+        /// rate SUPPRESSION never skips line numbers. A dropped line
+        /// is never numbered — numbering is assigned at flush, so the
+        /// emitted batches form one contiguous chain regardless of how
+        /// many lines suppression discarded between them. The store's
+        /// admitted-hole vocabulary therefore cannot be a suppression
+        /// artifact: a forward jump on the wire is a WORKER-side jump.
+        #[test]
+        fn suppression_never_skips_numbers(
+            ops in proptest::collection::vec(
+                proptest::prelude::prop_oneof![
+                    3 => proptest::prelude::Just(0u8), // add a line
+                    1 => proptest::prelude::Just(1u8), // flush point
+                ],
+                1..200,
+            ),
+            rate in 1u64..4,
+            initial in 0u64..1000,
+        ) {
+            let mut b = LogBatcher::new(
+                "drv".into(),
+                "exec".into(),
+                LogLimits { rate_lines_per_sec: rate, ..LogLimits::UNLIMITED },
+                initial,
+            );
+            let mut batches: Vec<BuildLogBatch> = Vec::new();
+            for (i, op) in ops.iter().enumerate() {
+                match op {
+                    0 => match b.add_line(format!("l{i}").into_bytes()) {
+                        AddLineResult::BatchReady(batch) => batches.push(batch),
+                        AddLineResult::Buffered => {}
+                        AddLineResult::LimitExceeded { .. } => unreachable!("unlimited bytes"),
+                    },
+                    _ => {
+                        if b.has_pending() {
+                            batches.push(b.flush());
+                        }
+                    }
+                }
+            }
+            batches.push(b.final_flush());
+            let mut expect = initial;
+            for batch in &batches {
+                proptest::prop_assert_eq!(
+                    batch.first_line_number, expect,
+                    "batches must chain contiguously — suppression assigns no numbers"
+                );
+                expect += batch.lines.len() as u64;
+            }
+        }
+    }
+
     #[test]
     fn test_batcher_flush_partial() {
         let mut batcher = mk(LogLimits::UNLIMITED);

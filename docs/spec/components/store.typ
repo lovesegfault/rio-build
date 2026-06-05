@@ -1648,7 +1648,27 @@ helm default (both HMAC keys, no JWT), and the fully-keyed production
 posture all keep booting — dual-mode is permanent doctrine; half-keyed
 authentication is not a mode.
 
-#r("store.log.served-claim")[
+#r("store.log.gap-provenance")[
+  A live-tail subscriber observing a forward jump in its fan-out
+  stream MUST classify the missing span against the batch's coverage
+  floor (the ingest session's accepted high-water mark at fan-out
+  time): a span below the floor was accepted and MUST be recovered by
+  one counted backfill from manifest and live buffer; a span at or
+  above the floor was never accepted and MUST be served across with no
+  recovery work. A recovered backfill that still leaves an accepted
+  span missing MUST finalize the stream at the unadvanced cursor
+  rather than advance past unserved lines.
+]
+The old code treated every jump as recoverable — a worker emitting
+forward jumps drove a buffer clone, a manifest read, and a recovery
+count per jump (merged_bug_187's amplification), and the recovery
+fold's `filter`+`advance` silently absorbed any residual gap
+(merged_bug_205). The typed `GapProvenance` and the sealed
+`CursorAdvance` make both shapes unrepresentable; builder suppression
+is number-free by property test, so "(suppressed lines)" can no longer
+be misattributed (merged_bug_275).
+
+#r("store.log.served-claim")[#r("store.log.served-claim")[
   A `TailLog` final message's `is_complete` MUST be minted as a
   served-stream claim correlated with the reader's served cursor:
   `complete` if and only if the execution's sealed `final_line_count`

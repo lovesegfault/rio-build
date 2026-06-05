@@ -143,13 +143,16 @@ impl LineCursor {
         self.next_line
     }
 
-    /// Advance the watermark past lines yielded from a source other
-    /// than [`read_chunk`] (the live snapshot and the subscription
-    /// stream in the `TailLog` handler use the same cursor to dedup
-    /// across the manifest→snapshot→live seam). A backwards `advance_to`
-    /// is a no-op — the watermark is monotone by definition.
-    pub fn advance_to(&mut self, next_line: u64) {
-        self.next_line = self.next_line.max(next_line);
+    /// Advance the watermark to a kernel-verdict position. The
+    /// argument is sealed (merged_bug_205): only
+    /// `ChunkVisit::advance()` can mint a [`CursorAdvance`], so a
+    /// serve path can move the watermark exclusively to a post-visit
+    /// position some verdict computed — the open-coded
+    /// `filter(>= cursor)` + `advance_to(end + 1)` shape that silently
+    /// absorbed residual gaps no longer typechecks. A backwards
+    /// advance is a no-op — the watermark is monotone by definition.
+    pub fn advance_to(&mut self, adv: rio_log_kernel::CursorAdvance) {
+        self.next_line = self.next_line.max(adv.to());
     }
 }
 
@@ -294,8 +297,8 @@ pub async fn read_chunk(
     }
     let visit = object_visit.visit;
     let (yield_from, yield_until) = match visit {
-        ChunkVisit::Skip { next_line } => {
-            cursor.next_line = next_line;
+        ChunkVisit::Skip { .. } => {
+            cursor.advance_to(visit.advance());
             return Ok(Vec::new());
         }
         ChunkVisit::Serve {
@@ -317,7 +320,7 @@ pub async fn read_chunk(
         }
         out.push((line_no, line));
     }
-    cursor.next_line = visit.next_line();
+    cursor.advance_to(visit.advance());
     Ok(out)
 }
 
