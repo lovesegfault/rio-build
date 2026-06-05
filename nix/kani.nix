@@ -49,6 +49,17 @@ let
       # red check, not a quieter green one. `null` keeps the weaker
       # at-least-one guard only.
       expectedHarnesses ? null,
+      # Wall-clock budget for the whole verify-artifacts batch — the
+      # eternal-gate class fix, kani family (the quint family got the
+      # same bound first: nix/quint.nix modelTimeoutSec). A solver
+      # blowup or non-terminating symex must be a RED CHECK naming its
+      # budget, never a silently-running drv that wedges gates and
+      # starves daemon build locks (two relic clients burned 38h on a
+      # kani drv before this bound existed). Default = generous
+      # headroom over every observed green run of the largest member
+      # (rio-evidence-kernel, ~21 harnesses, single-digit minutes);
+      # raise per-member only with a measured justification.
+      modelTimeoutSec ? 3600,
     }:
     pkgs.runCommand "kani-${name}"
       {
@@ -61,8 +72,11 @@ let
         # `{ lib = <store-path>; }` shim for ad-hoc testing.
         src = crate.lib or crate;
         # Surfaced in `nix log` and error messages.
-        env.MEMBER = name;
-        env.EXPECTED_HARNESSES = if expectedHarnesses == null then "" else toString expectedHarnesses;
+        env = {
+          MEMBER = name;
+          EXPECTED_HARNESSES = if expectedHarnesses == null then "" else toString expectedHarnesses;
+          MODEL_TIMEOUT_SEC = toString modelTimeoutSec;
+        };
       }
       ''
         set -euo pipefail
@@ -90,11 +104,25 @@ let
         # (parallel harness output would otherwise interleave); terse still
         # prints the per-harness verdict + the final
         # `Complete - N successfully verified harnesses` summary line.
-        kani verify-artifacts "$work" \
+        # Wall-clock chokepoint (see modelTimeoutSec above): timeout's
+        # 124 is split from real verification failures so the over-
+        # budget red names the budget and the remedy.
+        rc=0
+        timeout --signal=TERM "$MODEL_TIMEOUT_SEC" \
+          kani verify-artifacts "$work" \
           -Z unstable-options \
           --output-format=terse \
           --jobs="''${NIX_BUILD_CORES:-1}" \
-          2>&1 | tee "$out"
+          2>&1 | tee "$out" || rc=$?
+        if [ "$rc" -eq 124 ]; then
+          echo "kani-$MEMBER: exceeded the ''${MODEL_TIMEOUT_SEC}s wall-clock budget —" >&2
+          echo "non-termination / solver blowup is a FAILURE, not a tail to wait on." >&2
+          echo "Diagnose interactively (cargo kani --harness <name>) and raise" >&2
+          echo "modelTimeoutSec at this member's nix/kani.nix entry only with a" >&2
+          echo "measured justification." >&2
+          exit 1
+        fi
+        [ "$rc" -eq 0 ] || exit "$rc"
 
         # Non-vacuity guard, same discipline as mbt-rio-lease's "N tests
         # run" grep and mkQuintWitnessCheck's violation-report grep
