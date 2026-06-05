@@ -1,4 +1,5 @@
 // -*- mode: Bluespec; -*-
+// quint-policy-latches: viol
 //
 // Model S of the executor-lifecycle campaign, RE-TARGETED to the pull
 // protocol as landed by Phase-1 slices 1a–1c' (the "the assignment IS
@@ -810,6 +811,24 @@ module executorSession {
   /// classification is appended (the exec_id partial-unique index is
   /// the arbiter), fenced by the claims floor, the assignment row
   /// closes in the same transaction, and the derivation requeues.
+  /// ORACLE SEAT (bughunt-2 slot 11, quint-policy P5 — the fencedWrites
+  /// hoist pattern): the establishment charge's apply. The window gate
+  /// is the CALLER's admission decision; the established-before-window
+  /// truth is computed here from the pre-state, whatever the caller
+  /// checked. Under the live guard the oracle is identity; the F4
+  /// calibration drops the guard and the same seat latches honestly.
+  action establishChargeApply(d: str): bool = all {
+    val r = drv(d)
+    st' = { ...st, drvs: st.drvs.set(d, { ...closeOpen(r, false),
+      dag: DReady,
+      charged: r.charged + 1
+    }) },
+    viol' = { ...viol,
+      establishedBeforeWindow: (viol.establishedBeforeWindow or not(drv(d).openWindowClosed))
+    },
+    reach' = { ...reach, established: true }
+  }
+
   action establishCharge(d: str): bool = all {
     drv(d).openRows == 1,
     drv(d).openWindowClosed,
@@ -817,13 +836,7 @@ module executorSession {
     not(drv(d).built),
     drv(d).dag == DOpen,
     drv(d).charged < ATTEMPTS_CEIL,
-    val r = drv(d)
-    st' = { ...st, drvs: st.drvs.set(d, { ...closeOpen(r, false),
-      dag: DReady,
-      charged: r.charged + 1
-    }) },
-    viol' = viol,
-    reach' = { ...reach, established: true }
+    establishChargeApply(d)
   }
 
   // --- 7f. leader failover and the stale authority (fault-leader regime) ----
@@ -845,22 +858,33 @@ module executorSession {
     reach' = reach
   }
 
+  /// ORACLE SEAT (bughunt-2 slot 11, quint-policy P4 — the fencedWrites
+  /// hoist pattern): the stale-authority transaction's apply. The fence
+  /// verdict is the CALLER's decision; the staleWrite truth is computed
+  /// here — a durable mutation by a below-floor authority latches,
+  /// whatever the caller believed. The live caller passes the
+  /// production fence (holds); a calibration perturbs ONLY this
+  /// decision.
+  action staleAuthorityApply(d: str, fenceHolds: bool): bool = all {
+    st' = { ...st, staleLeft: st.staleLeft - 1 },
+    viol' = { ...viol, staleWrite: (viol.staleWrite or not(fenceHolds)) },
+    reach' = { ...reach, staleFenced: true }
+  }
+
   /// A deposed-but-unaware replica (serving generation strictly below
   /// the durable claims floor) attempts the authority-exercising
   /// transactions — a pull mint or an establishment charge. The
   /// transaction-side fence (the GREATEST floor read inside the
   /// transaction; admit_pull's RejectStaleGeneration advisory arm)
   /// rejects it: nothing is minted, nothing is charged, nothing closes.
-  /// The latch viol.staleWrite would record any durable mutation here;
-  /// the production guard makes that branch unreachable, and the
-  /// fault-leader witness canReachStaleFenced pins that the attempt
-  /// itself is reachable.
+  /// The staleWrite oracle is computed in the seat from this caller's
+  /// fence verdict (always holds in production), and the fault-leader
+  /// witness canReachStaleFenced pins that the attempt itself is
+  /// reachable.
   action staleAuthorityAttempt(d: str): bool = all {
     st.staleLeft > 0,
     st.floor > 1, // a failover has happened, so a stale generation exists
-    st' = { ...st, staleLeft: st.staleLeft - 1 },
-    viol' = viol,
-    reach' = { ...reach, staleFenced: true }
+    staleAuthorityApply(d, true)
   }
 
   // --- 8. init ------------------------------------------------------------

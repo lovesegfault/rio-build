@@ -1383,6 +1383,16 @@ rec {
     # r[verify sched.lease.cancelled-write]
     quint-leader-election-dropped-write = mkQuintCheck {
       name = "leader-election-dropped-write";
+      # quint-policy P1 exemption (bughunt-2 slot 11; §5-Q13): the
+      # dropped-write regime conjoins the base invariant set, so the
+      # same untwinned leaf carries the same exemption as its six
+      # sibling regimes.
+      vacuityExempt = {
+        atMostOneCASWinner = {
+          class = "pre-r2-untwinned";
+          reason = "the falsifier needs an apiserver-fault twin (duplicate resourceVersion admission) — a new fault axis priced in the Q13 burn-down headline list";
+        };
+      };
       spec = "leaderElection";
       main = "leaderElectionDroppedWrite";
       step = "midBandStep";
@@ -6925,28 +6935,40 @@ rec {
 
     # Expect-violation calibrations: each freezes one as-shipped design
     # and pins its falsification permanently.
+    # Converted to live-import action-only form (bughunt-2 slot 11,
+    # §4-R4): each imports the live gwBuildResync and perturbs only the
+    # documented decision via calibStep; P3 baselines pair with the
+    # live exhaustive check.
     quint-gwresync-calib-two-map = mkQuintWitnessCheck {
       name = "gwresync-calib-two-map";
       spec = "calibration/gwresync-two-map";
       main = "gwResyncTwoMap";
+      extraSpecs = [ "gwBuildResync" ];
+      step = "calibStep";
       witness = "noStuckDisplay";
     };
     quint-gwresync-calib-no-signal = mkQuintWitnessCheck {
       name = "gwresync-calib-no-signal";
       spec = "calibration/gwresync-no-signal";
       main = "gwResyncNoSignal";
+      extraSpecs = [ "gwBuildResync" ];
+      step = "calibStep";
       witness = "tailCoverage";
     };
     quint-gwresync-calib-kind-blind = mkQuintWitnessCheck {
       name = "gwresync-calib-kind-blind";
       spec = "calibration/gwresync-kind-blind";
       main = "gwResyncKindBlind";
+      extraSpecs = [ "gwBuildResync" ];
+      step = "calibStep";
       witness = "kindedSurfaceAgrees";
     };
     quint-gwresync-calib-no-pg-fallback = mkQuintWitnessCheck {
       name = "gwresync-calib-no-pg-fallback";
       spec = "calibration/gwresync-no-pg-fallback";
       main = "gwResyncNoPgFallback";
+      extraSpecs = [ "gwBuildResync" ];
+      step = "calibStep";
       witness = "terminalVerdictNeverFabricated";
     };
     # r[verify gw.resync.reattach-budget]

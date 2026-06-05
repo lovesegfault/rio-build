@@ -52,23 +52,17 @@ module executorCalibF4PullEstablishEarly {
   ).* from "../executorSession"
 
   /// PRE-FIX establishment charge arm: identical to establishCharge
-  /// except the openWindowClosed precondition is dropped. The latch
-  /// records every charge that fired while the window was still open.
+  /// except the openWindowClosed precondition is dropped. DECISION-ONLY
+  /// perturbation (quint-policy P5): the established-before-window
+  /// oracle is computed in the live model's establishChargeApply seat —
+  /// this action only drops the admission gate.
   action calibEstablishChargeAnyTime(d: str): bool = all {
     drv(d).openRows == 1,
     not(drv(d).openRecorded),
     not(drv(d).built),
     drv(d).dag == DOpen,
     drv(d).charged < ATTEMPTS_CEIL,
-    val r = drv(d)
-    st' = { ...st, drvs: st.drvs.set(d, { ...closeOpen(r, false),
-      dag: DReady,
-      charged: r.charged + 1
-    }) },
-    viol' = { ...viol,
-      establishedBeforeWindow: viol.establishedBeforeWindow or not(drv(d).openWindowClosed)
-    },
-    reach' = { ...reach, established: true }
+    establishChargeApply(d)
   }
 
   /// The live step with the establishment charge arm replaced by the

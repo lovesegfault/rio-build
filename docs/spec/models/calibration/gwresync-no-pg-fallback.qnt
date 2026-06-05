@@ -1,205 +1,85 @@
 // -*- mode: Bluespec; -*-
 //
-// Calibration override / regression pin (bughunt fix wave): the pre-durable-terminal watch attach (merged_bug_323).
-// PRE-FIX behavior modeled (merged_bug_323): the builds row carries no terminal payload; a watcher attaching after cleanup gets BuildNotFound and fabricates the outcome.
-// PREDICTED falsification: terminalVerdictNeverFabricated — the wired expect-violation
-// check pins this falsification permanently: if it ever stops
-// falsifying, the model has drifted away from the defect class it
-// documents. Re-run:
-//   quint run --invariant=terminalVerdictNeverFabricated docs/spec/models/calibration/<this file>
+// Calibration override / regression pin (bughunt fix wave): the
+// pre-durable-terminal watch attach (merged_bug_323).
+//
+// PRE-FIX behavior modeled, BOTH halves of the defect: (a) reaching
+// the build terminal persisted NO durable row (pre-migration-087 — no
+// capture-at-transition payload), and (b) a post-cleanup re-attach,
+// finding neither the resident build nor a row, burned MAX_RECONNECT
+// and FABRICATED a failure trace instead of answering from durable
+// state.
+//
+// Live-import action-only form (bughunt-2 slot 11, §4-R4): the module
+// imports the live gwBuildResync and perturbs exactly those two
+// decisions — the terminal's durable write and the heal's post-cleanup
+// arm. The signal/re-attach machinery is the live model's.
+//
+// PREDICTED falsification: terminalVerdictNeverFabricated.
+//
+// Run (falsification):
+//   quint verify --backend=tlc --main=gwResyncNoPgFallback \
+//     --step=calibStep --invariant=terminalVerdictNeverFabricated \
+//     docs/spec/models/calibration/gwresync-no-pg-fallback.qnt
+// Baseline (as-built step, must HOLD): discharged by P3 pairing with
+// the live exhaustive check (quint-gw-build-resync).
 //
 module gwResyncNoPgFallback {
-  type Drv = D1 | D2
-  type SchedState = SNotStarted | SRunningBuild | SRunningMat | SDone
-  type Display = DispNone | DispBuild | DispSubst
-  type BuildState = BActive | BTerminalResident | BTerminalCleaned
-  type GwOutcome = GWatching | GGotTerminal | GFabricated
+  import gwBuildResync.* from "../gwBuildResync"
 
-  val drvs: Set[Drv] = Set(D1, D2)
-
-  var sched: Drv -> SchedState
-  var build: BuildState
-  var pgRow: bool
-  var display: Drv -> Display
-  var tails: Set[Drv]
-  var pendingResync: bool
-  var outcome: GwOutcome
-
-  action init = all {
-    sched' = drvs.mapBy(d => SNotStarted),
-    build' = BActive,
-    pgRow' = false,
-    display' = drvs.mapBy(d => DispNone),
-    tails' = Set(),
-    pendingResync' = false,
-    outcome' = GWatching,
-  }
-
-  // ---- scheduler-side emissions, each delivered or skipped ----
-
-  // A drv starts as a BUILD. Delivered: the gateway opens the build
-  // display + tail. Skipped: the bridge signals (pendingResync).
-  action startBuildDelivered(d: Drv): bool = all {
-    sched.get(d) == SNotStarted, build == BActive, outcome == GWatching,
-    sched' = sched.set(d, SRunningBuild),
-    display' = display.set(d, DispBuild),
-    tails' = tails.union(Set(d)),
-    build' = build, pgRow' = pgRow,
-    pendingResync' = pendingResync, outcome' = outcome,
-  }
-  action startBuildSkipped(d: Drv): bool = all {
-    sched.get(d) == SNotStarted, build == BActive, outcome == GWatching,
-    sched' = sched.set(d, SRunningBuild),
-    display' = display, tails' = tails,
-    build' = build, pgRow' = pgRow,
-    pendingResync' = true, outcome' = outcome,
-  }
-
-  // A drv starts as a MATERIALIZATION (kinded event path: substitute
-  // display, NO tail).
-  action startMatDelivered(d: Drv): bool = all {
-    sched.get(d) == SNotStarted, build == BActive, outcome == GWatching,
-    sched' = sched.set(d, SRunningMat),
-    display' = display.set(d, DispSubst),
-    tails' = tails,
-    build' = build, pgRow' = pgRow,
-    pendingResync' = pendingResync, outcome' = outcome,
-  }
-  action startMatSkipped(d: Drv): bool = all {
-    sched.get(d) == SNotStarted, build == BActive, outcome == GWatching,
-    sched' = sched.set(d, SRunningMat),
-    display' = display, tails' = tails,
-    build' = build, pgRow' = pgRow,
-    pendingResync' = true, outcome' = outcome,
-  }
-
-  // A running drv finishes. Delivered: the terminal arm closes
-  // whichever display family is open and the tail.
-  action finishDelivered(d: Drv): bool = all {
-    or { sched.get(d) == SRunningBuild, sched.get(d) == SRunningMat },
-    build == BActive, outcome == GWatching,
-    sched' = sched.set(d, SDone),
-    display' = display.set(d, DispNone),
-    tails' = tails.exclude(Set(d)),
-    build' = build, pgRow' = pgRow,
-    pendingResync' = pendingResync, outcome' = outcome,
-  }
-  action finishSkipped(d: Drv): bool = all {
-    or { sched.get(d) == SRunningBuild, sched.get(d) == SRunningMat },
-    build == BActive, outcome == GWatching,
-    sched' = sched.set(d, SDone),
-    display' = display, tails' = tails,
-    build' = build, pgRow' = pgRow,
-    pendingResync' = true, outcome' = outcome,
-  }
-
-  // The build reaches terminal: capture-at-transition persists the
-  // durable row (087) ATOMICALLY with the terminal state. Delivered:
-  // the gateway short-circuits to the outcome.
-  action buildTerminalDelivered = all {
+  /// PRE-FIX (no migration-087 payload): the delivered terminal
+  /// persists nothing durable.
+  action calibBuildTerminalDeliveredNoRow = all {
     drvs.forall(d => sched.get(d) == SDone), build == BActive, outcome == GWatching,
-    // PRE-FIX (no migration-087 payload): nothing durable.
+    consuming,
     build' = BTerminalResident, pgRow' = false,
     sched' = sched, display' = drvs.mapBy(d => DispNone), tails' = Set(),
     pendingResync' = pendingResync,
     outcome' = GGotTerminal,
+    signalled' = signalled, snapshotOwed' = snapshotOwed,
+    resyncStreak' = 0,
+    cyclesSinceOrganic' = 0,
+    frozenDisplay' = frozenDisplay, frozenTails' = frozenTails,
   }
-  action buildTerminalSkipped = all {
+
+  /// PRE-FIX (no migration-087 payload): the skipped terminal
+  /// persists nothing durable either; the bridge still signals.
+  action calibBuildTerminalSkippedNoRow = all {
     drvs.forall(d => sched.get(d) == SDone), build == BActive, outcome == GWatching,
-    // PRE-FIX (no migration-087 payload): nothing durable.
     build' = BTerminalResident, pgRow' = false,
     sched' = sched, display' = display, tails' = tails,
-    pendingResync' = true,
+    pendingResync' = or { pendingResync, consuming },
     outcome' = outcome,
+    signalled' = signalled, snapshotOwed' = snapshotOwed,
+    resyncStreak' = resyncStreak,
+    cyclesSinceOrganic' = cyclesSinceOrganic,
+    frozenDisplay' = frozenDisplay, frozenTails' = frozenTails,
   }
 
-  // Terminal cleanup evicts the resident build; the durable row stays.
-  action cleanup = all {
-    build == BTerminalResident,
-    build' = BTerminalCleaned,
-    sched' = sched, pgRow' = pgRow, display' = display, tails' = tails,
-    pendingResync' = pendingResync, outcome' = outcome,
-  }
-
-  // ---- the gateway's heal: ResyncRequired -> snapshot reconcile ----
-  //
-  // gw.resync.loss-signal: the signal (pendingResync) drives a fresh
-  // WatchBuild whose snapshot reconcile recovers EVERYTHING — the
-  // kinded running set rebuilds the single display map and the tail
-  // set; a terminal build short-circuits (resident snapshot or, post
-  // cleanup, the durable row — never fabrication).
-  action gatewayResync = all {
-    pendingResync, outcome == GWatching,
-    if (build != BActive) all {
-      // PRE-FIX: a post-cleanup attach finds BuildNotFound — the
-      // gateway burns MAX_RECONNECT and fabricates a failure trace.
-      outcome' = if (build == BTerminalCleaned and not(pgRow)) GFabricated
-                 else GGotTerminal,
-      display' = drvs.mapBy(d => DispNone),
-      tails' = Set(),
-    } else all {
-      outcome' = outcome,
-      display' = drvs.mapBy(d =>
-        if (sched.get(d) == SRunningBuild) DispBuild
-        else if (sched.get(d) == SRunningMat) DispSubst
-        else DispNone),
-      tails' = drvs.filter(d => sched.get(d) == SRunningBuild),
-    },
-    pendingResync' = false,
+  /// PRE-FIX: the owed snapshot's terminal arm finds a cleaned build
+  /// and NO durable row — BuildNotFound; the gateway fabricates a
+  /// failure trace instead of consulting durable state.
+  action calibSnapshotApplyFabricates = all {
+    snapshotOwed, outcome == GWatching,
+    build != BActive,
+    outcome' = if (build == BTerminalCleaned and not(pgRow)) GFabricated
+               else GGotTerminal,
+    display' = drvs.mapBy(d => DispNone),
+    tails' = Set(),
+    frozenDisplay' = drvs.mapBy(d => DispNone),
+    frozenTails' = Set(),
+    signalled' = false,
+    snapshotOwed' = false,
+    resyncStreak' = resyncStreak,
+    cyclesSinceOrganic' = cyclesSinceOrganic,
     sched' = sched, build' = build, pgRow' = pgRow,
+    pendingResync' = pendingResync,
   }
 
-  action step = {
-    nondet d = drvs.oneOf()
-    any {
-      startBuildDelivered(d), startBuildSkipped(d),
-      startMatDelivered(d), startMatSkipped(d),
-      finishDelivered(d), finishSkipped(d),
-      buildTerminalDelivered,
-      buildTerminalSkipped,
-      cleanup,
-      gatewayResync,
-    }
-  }
-
-  // ---- invariants ----
-
-  def running(d: Drv): bool =
-    or { sched.get(d) == SRunningBuild, sched.get(d) == SRunningMat }
-
-  // 144: display family matches the running kind whenever the gateway
-  // believes the stream is whole.
-  val kindedSurfaceAgrees =
-    (outcome == GWatching and not(pendingResync)) implies
-      drvs.forall(d => and {
-        (display.get(d) == DispBuild) implies (sched.get(d) == SRunningBuild),
-        (display.get(d) == DispSubst) implies (sched.get(d) == SRunningMat),
-      })
-
-  // 150: no display entry survives its drv's terminal whenever the
-  // gateway believes the stream is whole.
-  val noStuckDisplay =
-    (outcome == GWatching and not(pendingResync)) implies
-      drvs.forall(d => (display.get(d) != DispNone) implies running(d))
-
-  // 153: tails are exactly the running builds whenever the gateway
-  // believes the stream is whole.
-  val tailCoverage =
-    (outcome == GWatching and not(pendingResync)) implies
-      drvs.forall(d => and {
-        (sched.get(d) == SRunningBuild) implies tails.contains(d),
-        (sched.get(d) == SRunningMat) implies not(tails.contains(d)),
-      })
-
-  // 323: the gateway never fabricates a terminal verdict (the durable
-  // row answers post-cleanup attaches; in this post-fix model the
-  // fabricating state is unreachable).
-  val terminalVerdictNeverFabricated = outcome != GFabricated
-
-  val gwBuildResyncInvariants = all {
-    kindedSurfaceAgrees,
-    noStuckDisplay,
-    tailCoverage,
-    terminalVerdictNeverFabricated,
+  action calibStep = any {
+    step,
+    calibBuildTerminalDeliveredNoRow,
+    calibBuildTerminalSkippedNoRow,
+    calibSnapshotApplyFabricates,
   }
 }
