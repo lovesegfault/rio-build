@@ -324,6 +324,11 @@
       "doc": "Single home for the dashboard gRPC-Web CORS contract (bug_355)."
     },
     {
+      "path": "dns.rs",
+      "depth": 0,
+      "doc": "DNS-1123 label identity: ONE alphabet, ONE sanitizer, ONE composer"
+    },
+    {
       "path": "grpc.rs",
       "depth": 0,
       "doc": "Proto-agnostic gRPC helpers shared across rio binaries."

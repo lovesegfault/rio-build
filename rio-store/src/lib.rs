@@ -404,15 +404,23 @@ pub fn describe_metrics() {
          per-replica in-flight ingest signal; sum() across replicas = \
          cluster-wide concurrent NAR uploads."
     );
+    // bug_244: the docs-data scraper requires a string LITERAL here
+    // (regex over describe_*! callsites), so the alphabet cannot be
+    // interpolated — instead the drift gate
+    // (materialize::executor::tests::outcome_label_alphabet_single_source)
+    // captures THIS text through a local recorder and fails if any
+    // OUTCOME_LABELS entry is missing from it.
     describe_counter!(
         "rio_store_materialization_executions_total",
         "Materialization job executions finished by this replica's executor, \
-         labeled by outcome (success | unobtainable | infra). The store-side \
-         half of the substitution-replacement lifecycle rates: pairs with the \
-         scheduler's rio_scheduler_materialization_{claims,jobs_resolved}_total. \
-         A rising infra share means upstream/network trouble (executions are \
-         retried within the scheduler's materialization budget); a rising \
-         unobtainable share means requested paths genuinely left the upstreams."
+         labeled by outcome (success | unobtainable | infra | aborted | \
+         retry_later). The store-side half of the substitution-replacement \
+         lifecycle rates: pairs with the scheduler's \
+         rio_scheduler_materialization_{claims,jobs_resolved}_total. A rising \
+         infra share means upstream/network trouble (executions are retried \
+         within the scheduler's materialization budget); a rising unobtainable \
+         share means requested paths genuinely left the upstreams; retry_later \
+         is the uncharged transient lane (upstream 429s / placeholder races)."
     );
     describe_counter!(
         "rio_store_materialization_pinned_paths_total",

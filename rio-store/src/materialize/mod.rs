@@ -96,7 +96,12 @@ pub fn spawn_materialization_executor(
     // series from boot and the metrics-registered VM assertion sees them
     // before the first job executes. (Without a scheduler_addr this
     // whole function returned above — no executor, no series.)
-    for outcome in ["success", "unobtainable", "infra", "aborted"] {
+    // bug_244: the seed loop iterates THE alphabet const — a label
+    // emitted by the chokepoint but missing here (retry_later was) is
+    // born at its first increment, so rate()/increase() panels miss
+    // the first burst after every rollout and the metrics-registered
+    // VM assertion never sees the series.
+    for outcome in executor::OUTCOME_LABELS {
         metrics::counter!(
             "rio_store_materialization_executions_total",
             "outcome" => outcome

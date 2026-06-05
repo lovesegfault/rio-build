@@ -96,23 +96,51 @@ pub async fn execute_job_with_progress(
     // labeled by outcome class — the dashboard's execution rates and
     // the upstream-health signal (a rising infra/unobtainable share).
     // Sited at this single chokepoint so every return path of the
-    // walk is counted exactly once.
-    let label = match &outcome.outcome {
+    // walk is counted exactly once; the label comes from the ONE
+    // alphabet mapping (bug_244).
+    metrics::counter!(
+        "rio_store_materialization_executions_total",
+        "outcome" => outcome_label(outcome.outcome.as_ref())
+    )
+    .increment(1);
+    outcome
+}
+
+/// The outcome-label alphabet of
+/// `rio_store_materialization_executions_total` — THE single source
+/// (bug_244). The boot-time seed loop iterates this const, the emit
+/// chokepoint maps through [`outcome_label`] (whose exhaustive match
+/// is the only variant→label mapping), and the HELP string
+/// interpolates it ([`super::executions_help`]); the drift test pins
+/// const == match image, so a sixth outcome that misses any tier
+/// fails to compile (non-exhaustive match) or fails the drift test
+/// (label not seeded / not helped). Pre-fix the three tiers
+/// enumerated the alphabet independently: `retry_later` was emitted
+/// but never seeded (its series was born at first increment — every
+/// rate()/increase() panel missed the first deferral burst after
+/// every rollout) and the HELP still advertised the original three
+/// labels.
+pub(crate) const OUTCOME_LABELS: [&str; 5] =
+    ["success", "unobtainable", "infra", "aborted", "retry_later"];
+
+/// The ONLY `MaterializationOutcome` → metric-label mapping (bug_244).
+/// Total over the oneof alphabet plus the absent case — `None` counts
+/// as `infra` (a report with no outcome is an infrastructure shape,
+/// matching the consumer's treatment).
+pub(crate) fn outcome_label(outcome: Option<&materialization_outcome::Outcome>) -> &'static str {
+    match outcome {
         Some(materialization_outcome::Outcome::Success(_)) => "success",
         Some(materialization_outcome::Outcome::Unobtainable(_)) => "unobtainable",
         Some(materialization_outcome::Outcome::InfraFailure(_)) | None => "infra",
         // Synthesized by the claim loop's SIGTERM arm, never by the
-        // walk itself — but counted here like every other outcome so
-        // the chokepoint stays total over the alphabet.
+        // walk itself — but counted like every other outcome so the
+        // chokepoint stays total over the alphabet.
         Some(materialization_outcome::Outcome::Aborted(_)) => "aborted",
         // Transient, uncharged retry (merged_bug_178): raced placeholder
         // or upstream 429 — counted so the dashboard sees deferral
         // rates next to the charged classes.
         Some(materialization_outcome::Outcome::RetryLater(_)) => "retry_later",
-    };
-    metrics::counter!("rio_store_materialization_executions_total", "outcome" => label)
-        .increment(1);
-    outcome
+    }
 }
 
 /// The walk body behind [`execute_job_with_progress`] (split so the
@@ -2575,6 +2603,122 @@ mod tests {
             outcome_infra(&outcome).is_some(),
             "an unconfirmable tenant view must report infra, got {outcome:?}"
         );
+    }
+
+    // ── bug_244: outcome-label alphabet drift gate ────────────────────
+
+    /// bug_244: the three tiers (seed array, emit match, HELP) all
+    /// derive from OUTCOME_LABELS, and this gate pins the const to the
+    /// image of `outcome_label` over the full oneof alphabet + None.
+    /// A sixth outcome that misses any tier fails to compile
+    /// (non-exhaustive match) or fails here. RED (pre-fix, captured by
+    /// pointing the const at the old 4-label seed array): missing
+    /// `retry_later`; and the HELP helper red on the stale 3-label
+    /// text.
+    #[test]
+    fn outcome_label_alphabet_single_source() {
+        use materialization_outcome::*;
+        let image = [
+            outcome_label(Some(&Outcome::Success(Success::default()))),
+            outcome_label(Some(&Outcome::Unobtainable(Unobtainable::default()))),
+            outcome_label(Some(&Outcome::InfraFailure(InfraFailure::default()))),
+            outcome_label(Some(&Outcome::Aborted(Aborted::default()))),
+            outcome_label(Some(&Outcome::RetryLater(RetryLater::default()))),
+            outcome_label(None),
+        ];
+        // Every label producible by the match is in the const…
+        for label in image {
+            assert!(
+                OUTCOME_LABELS.contains(&label),
+                "emit produces {label:?} but OUTCOME_LABELS does not seed it"
+            );
+        }
+        // …every const label is producible (no dead seeds)…
+        for label in OUTCOME_LABELS {
+            assert!(
+                image.contains(&label),
+                "OUTCOME_LABELS seeds {label:?} but outcome_label never emits it"
+            );
+        }
+        // …no duplicate seeds…
+        let mut dedup = OUTCOME_LABELS.to_vec();
+        dedup.sort_unstable();
+        dedup.dedup();
+        assert_eq!(
+            dedup.len(),
+            OUTCOME_LABELS.len(),
+            "duplicate label in const"
+        );
+        // …and the operator-facing HELP (the literal at the
+        // describe_counter! site — the docs-data scraper requires a
+        // literal there, so it cannot interpolate the const) names
+        // every label. Captured through a local recorder so the gate
+        // reads the EXACT text the scraper and Prometheus see.
+        #[derive(Default)]
+        struct HelpCapture(std::sync::Mutex<std::collections::HashMap<String, String>>);
+        impl metrics::Recorder for HelpCapture {
+            fn describe_counter(
+                &self,
+                key: metrics::KeyName,
+                _u: Option<metrics::Unit>,
+                help: metrics::SharedString,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .insert(key.as_str().to_string(), help.into_owned());
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                metrics::Counter::noop()
+            }
+            fn register_gauge(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+            fn register_histogram(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+        let recorder = HelpCapture::default();
+        metrics::with_local_recorder(&recorder, crate::describe_metrics);
+        let help = recorder
+            .0
+            .lock()
+            .unwrap()
+            .get("rio_store_materialization_executions_total")
+            .cloned()
+            .expect("executions counter must be described");
+        for label in OUTCOME_LABELS {
+            assert!(
+                help.contains(label),
+                "HELP must name {label:?}; alphabet text drifted: {help}"
+            );
+        }
     }
 
     // ── bug_115: local-presence visibility ────────────────────────────

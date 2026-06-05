@@ -1270,7 +1270,7 @@
       {
         "name": "rio_store_materialization_executions_total",
         "kind": "counter",
-        "help": "Materialization job executions finished by this replica's executor, labeled by outcome (success | unobtainable | infra). The store-side half of the substitution-replacement lifecycle rates: pairs with the scheduler's rio_scheduler_materialization_{claims,jobs_resolved}_total. A rising infra share means upstream/network trouble (executions are retried within the scheduler's materialization budget); a rising unobtainable share means requested paths genuinely left the upstreams."
+        "help": "Materialization job executions finished by this replica's executor, labeled by outcome (success | unobtainable | infra | aborted | retry_later). The store-side half of the substitution-replacement lifecycle rates: pairs with the scheduler's rio_scheduler_materialization_{claims,jobs_resolved}_total. A rising infra share means upstream/network trouble (executions are retried within the scheduler's materialization budget); a rising unobtainable share means requested paths genuinely left the upstreams; retry_later is the uncharged transient lane (upstream 429s / placeholder races)."
       },
       {
         "name": "rio_store_materialization_pinned_paths_total",
