@@ -1232,6 +1232,26 @@ tenant turned an obtainable path into InfraFailure. Charging evidence still
 outranks back-off advice at the fold (matching the per-upstream loop's
 ordering one level down), and the transient lane still closes uncharged.
 
+#r("store.materialize.worker-identity")[
+  The executor's per-worker wire identity MUST be carried by a
+  validated DNS-1123 label type whose sanitizer budgets the worker
+  suffix INSIDE the 63-character bound and whose `with_worker`
+  composition is the ONLY way to attach a worker index; the
+  scheduler-side validator MUST read the same single-sourced alphabet.
+  The composed `{instance}-w{n}` value --- the value the scheduler
+  actually validates --- MUST be a DNS-1123 label for every raw
+  hostname and worker index.
+]
+The pre-fix shape validated the BASE identity and then composed past the
+bound: any 61--63-char pod name (long Helm release names; the salted
+sanitizer arm lands at exactly 63) composed a 64--66-char wire identity,
+every claim was rejected `InvalidArgument`, and the poll loop
+warn-and-skipped --- a silent, deterministic, fleet-wide materialization
+outage keyed on release-name length. Recorded trade: raws of 59--63 valid
+chars used to pass through unchanged and now truncate+salt to fit the
+budget, so their identity changes once at the deploy boundary; the
+scheduler's establishment sweep absorbs the orphaned claims.
+
 #r("store.materialize.local-visibility")[
   The walk's local-presence probe MUST apply the tenant sig-visibility
   verdict --- the SAME decision body as the tenant-facing read gates,

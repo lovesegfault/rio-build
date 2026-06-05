@@ -132,7 +132,16 @@ pub fn spawn_materialization_executor(
         // Mint `{pod}-w{n}` per worker for BOTH the claim field and
         // the token binding (T-5.1: claim and credential agree); a
         // restarted worker n re-claims as the same `…-w{n}`.
-        let worker_instance = format!("{instance}-w{worker}");
+        //
+        // merged_bug_243: the composition is `Dns1123Label::with_worker`
+        // — the ONLY way to attach a worker index — which keeps the
+        // COMPOSED wire value inside the 63-char bound the scheduler
+        // validates (`sanitize` reserved the suffix budget). The
+        // pre-fix `format!("{instance}-w{worker}")` pushed any
+        // 61–63-char base to 64–66 chars: every claim was rejected
+        // InvalidArgument and warn-and-skipped — a silent fleet-wide
+        // materialization outage keyed on release-name length.
+        let worker_instance = instance.with_worker(worker);
         let transport = match client::SchedulerTransport::connect_lazy(
             &scheduler_addr,
             service_signer.clone(),
@@ -183,7 +192,7 @@ async fn claim_loop<T>(
     cfg: crate::config::MaterializationConfig,
     ctx: executor::ExecutorContext,
     mut transport: T,
-    instance: String,
+    instance: rio_common::dns::Dns1123Label,
     shutdown: rio_common::signal::Token,
 ) where
     T: client::MaterializeTransport + Clone + Send + Sync + 'static,
@@ -336,71 +345,29 @@ async fn claim_loop<T>(
 ///
 /// Values that fail the label check (non-k8s dev hosts with uppercase
 /// or dotted hostnames) are sanitized: lowercased, invalid bytes
-/// replaced with `-`, trimmed to 63 chars, stripped of edge hyphens.
-/// Empty/unset falls back to `"rio-store-dev"`.
-// r[impl store.materialize.executor+5]
-pub fn executor_instance() -> String {
-    let raw = std::env::var("HOSTNAME").unwrap_or_default();
-    sanitize_dns1123_label(&raw)
-}
-
-/// FNV-1a 64 over the raw identity — the deterministic disambiguation
-/// salt for sanitized labels (the same raw always maps to the same
-/// identity across restarts; distinct raws that fold to the same
-/// sanitized base get distinct salts).
-fn fnv1a_64(raw: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in raw.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// Sanitize an arbitrary hostname into a DNS-1123 label (the
-/// scheduler-side validation alphabet — keep in sync with
-/// `is_dns1123_label` in rio-scheduler/src/grpc/executor_service.rs).
+/// replaced with `-`, budget-truncated, stripped of edge hyphens, and
+/// deterministically salted. Empty/unset falls back to a randomly
+/// salted `"rio-store-dev"`.
 ///
-/// merged_bug_158: sanitization must stay injective-enough — `Host_A`,
-/// `host-a` and `host.a` all used to fold to `host-a`, and two
-/// replicas folding to one label can both claim under the same
-/// composite identity. When sanitization ALTERS the raw, a 4-hex
-/// FNV-1a salt of the raw is appended (base truncated to 58 so the
-/// result stays ≤63); an empty/garbage raw gets a per-process random
-/// salt with a loud warning (two unidentifiable replicas must still
-/// not share an identity).
-fn sanitize_dns1123_label(raw: &str) -> String {
-    let mut out: String = raw
-        .chars()
-        .map(|c| match c {
-            'a'..='z' | '0'..='9' | '-' => c,
-            'A'..='Z' => c.to_ascii_lowercase(),
-            _ => '-',
-        })
-        .take(63)
-        .collect();
-    out = out.trim_matches('-').to_string();
-    if out.is_empty() {
-        // No usable identity at all: salt randomly (per process) so two
-        // such replicas never collide, and say so loudly.
-        use std::hash::{BuildHasher, Hasher};
-        let nonce = std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish();
-        warn!(
-            raw,
-            "HOSTNAME provides no usable identity; using a random-salted dev identity"
-        );
-        return format!("rio-store-dev-{:04x}", nonce & 0xffff);
-    }
-    if out == raw {
-        return out;
-    }
-    // Sanitization altered the raw: disambiguate with a deterministic
-    // salt so distinct raws cannot fold to one label.
-    out.truncate(58);
-    let out = out.trim_matches('-');
-    format!("{out}-{:04x}", fnv1a_64(raw) & 0xffff)
+/// merged_bug_243: the identity is a [`rio_common::dns::Dns1123Label`]
+/// sanitized with [`rio_common::dns::WORKER_SUFFIX_RESERVED`] chars of
+/// suffix budget, so the per-worker composition (`with_worker`) stays
+/// inside the 63-char bound the scheduler validates. One alphabet, one
+/// sanitizer, one composer — the scheduler-side validator reads the
+/// SAME `rio_common::dns::is_dns1123_label`. Trade recorded: raws of
+/// 59–63 valid chars used to pass through unchanged and now
+/// truncate+salt; their identity changes once at the deploy boundary
+/// and the scheduler's establishment sweep absorbs the orphaned
+/// claims.
+// r[impl store.materialize.executor+5]
+// r[impl store.materialize.worker-identity]
+pub fn executor_instance() -> rio_common::dns::Dns1123Label {
+    let raw = std::env::var("HOSTNAME").unwrap_or_default();
+    rio_common::dns::Dns1123Label::sanitize(
+        &raw,
+        rio_common::dns::WORKER_SUFFIX_RESERVED,
+        "rio-store-dev",
+    )
 }
 
 #[cfg(test)]
@@ -479,68 +446,28 @@ mod tests {
         shutdown.cancel();
     }
 
-    /// The instance derivation produces a scheduler-acceptable DNS-1123
-    /// label from every input shape: a real pod name passes through
-    /// unchanged; uppercase/dotted dev hostnames are sanitized; empty
-    /// falls back to the dev constant. (The Wave-4 instance-attestation
-    /// obligation, Phase-A form: identity from the pod's own
-    /// environment, alphabet-validated on both sides.)
+    /// The instance derivation produces a label the scheduler accepts
+    /// AND leaves the worker-suffix budget free (merged_bug_243): the
+    /// composed `{instance}-w{n}` — the value actually validated
+    /// scheduler-side — is itself a DNS-1123 label. The sanitizer
+    /// mechanics (injectivity, determinism, fallbacks, proptest over
+    /// raws × workers) live with the type in rio-common/src/dns.rs.
     // r[verify store.materialize.executor+5]
+    // r[verify store.materialize.worker-identity]
     #[test]
-    fn executor_instance_is_always_a_dns1123_label() {
-        let is_label = |s: &str| {
-            !s.is_empty()
-                && s.len() <= 63
-                && s.bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-                && !s.starts_with('-')
-                && !s.ends_with('-')
-        };
-
-        // A real pod name is unchanged (already a valid label — no salt).
-        assert_eq!(
-            sanitize_dns1123_label("rio-store-7d4b8f9c6-x2vpl"),
-            "rio-store-7d4b8f9c6-x2vpl"
-        );
-        // Uppercase / dots / underscores are sanitized, not rejected —
-        // and stay valid labels with the disambiguation salt appended.
-        for raw in [
-            "MyDevBox.local",
-            "host_with_underscores",
-            "UPPER",
-            "a".repeat(100).as_str(),
-            "-leading-and-trailing-",
-            "",
-            "...",
-        ] {
-            let label = sanitize_dns1123_label(raw);
+    fn executor_instance_leaves_worker_budget() {
+        use rio_common::dns::{DNS1123_MAX_LEN, WORKER_SUFFIX_RESERVED, is_dns1123_label};
+        let instance = executor_instance();
+        assert!(is_dns1123_label(instance.as_str()));
+        assert!(instance.as_str().len() <= DNS1123_MAX_LEN - WORKER_SUFFIX_RESERVED);
+        for worker in [0usize, 7, 999] {
+            let composed = instance.with_worker(worker);
             assert!(
-                is_label(&label),
-                "sanitize({raw:?}) produced a non-label: {label:?}"
+                is_dns1123_label(composed.as_str()),
+                "composed identity must be a DNS-1123 label: {:?}",
+                composed.as_str()
             );
         }
-        // merged_bug_158: identities that USED to fold to one label are
-        // now distinct (deterministic FNV salt over the raw).
-        let a = sanitize_dns1123_label("Host_A");
-        let b = sanitize_dns1123_label("host-a");
-        let c = sanitize_dns1123_label("host.a");
-        assert_eq!(
-            b, "host-a",
-            "an already-valid label passes through unsalted"
-        );
-        assert_ne!(a, b, "Host_A no longer folds onto host-a");
-        assert_ne!(c, b, "host.a no longer folds onto host-a");
-        assert_ne!(a, c, "distinct raws get distinct salts");
-        // Determinism: the same raw maps to the same identity across
-        // restarts (re-claims must resume as the same identity).
-        assert_eq!(a, sanitize_dns1123_label("Host_A"));
-        // Empty/garbage input → the dev fallback, randomly salted so two
-        // unidentifiable replicas still cannot share an identity.
-        let e = sanitize_dns1123_label("");
-        assert!(
-            e.starts_with("rio-store-dev-"),
-            "empty input gets the salted dev fallback: {e:?}"
-        );
     }
 
     /// merged_bug_189 (the claim-loop SIGTERM arm): SIGTERM landing
@@ -629,7 +556,12 @@ mod tests {
                 crate::config::MaterializationConfig::default(),
                 ctx,
                 transport,
-                "store-replica-0-w0".into(),
+                rio_common::dns::Dns1123Label::sanitize(
+                    "store-replica-0",
+                    rio_common::dns::WORKER_SUFFIX_RESERVED,
+                    "rio-store-dev",
+                )
+                .with_worker(0),
                 shutdown,
             ),
         )

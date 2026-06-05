@@ -9,6 +9,7 @@
 pub mod backoff;
 pub mod config;
 pub mod cors;
+pub mod dns;
 pub mod grpc;
 pub mod k8s;
 pub mod limits;

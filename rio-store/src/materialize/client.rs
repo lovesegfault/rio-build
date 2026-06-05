@@ -301,7 +301,7 @@ impl ListFailureLatch {
 // r[impl store.materialize.executor+5]
 pub async fn poll_and_claim<T: MaterializeTransport>(
     transport: &mut T,
-    executor_instance: &str,
+    executor_instance: &rio_common::dns::Dns1123Label,
     available_slots: usize,
     ledger: &mut ResumeLedger,
     list_health: &mut ListFailureLatch,
@@ -325,7 +325,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             executor_token: String::new(),
             intent_id: entry.drv_hash.clone(),
             kind: rio_proto::types::AttemptKind::Materialization.into(),
-            executor_instance: executor_instance.to_string(),
+            executor_instance: executor_instance.as_str().to_owned(),
             // The resume credential: the original response never
             // arrived, so no exec_id token exists — the nonce IS the
             // proof of holdership (rule-4b).
@@ -455,7 +455,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             // BC-1: the work class + the per-replica identity ride
             // every claim.
             kind: rio_proto::types::AttemptKind::Materialization.into(),
-            executor_instance: executor_instance.to_string(),
+            executor_instance: executor_instance.as_str().to_owned(),
             // Fresh claims NEVER carry a resume token (merged_bug_158:
             // re-delivery of a Claimed attempt requires a credential,
             // so a colliding identity cannot steal it). A
@@ -742,14 +742,14 @@ impl SchedulerTransport {
     pub fn connect_lazy(
         scheduler_addr: &HostPort,
         signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
-        instance: &str,
+        instance: &rio_common::dns::Dns1123Label,
     ) -> anyhow::Result<Self> {
-        let client = Self::build_client(scheduler_addr, signer.clone(), instance)?;
+        let client = Self::build_client(scheduler_addr, signer.clone(), instance.as_str())?;
         Ok(Self {
             client,
             scheduler_addr: scheduler_addr.clone(),
             signer,
-            instance: instance.to_owned(),
+            instance: instance.as_str().to_owned(),
         })
     }
 
@@ -895,6 +895,17 @@ impl MaterializeTransport for SchedulerTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// merged_bug_243: poll_and_claim takes &Dns1123Label — tests mint
+    /// theirs through the one sanitizer (valid raws pass through, so
+    /// string assertions on the literal stay exact).
+    fn instance(raw: &str) -> rio_common::dns::Dns1123Label {
+        rio_common::dns::Dns1123Label::sanitize(
+            raw,
+            rio_common::dns::WORKER_SUFFIX_RESERVED,
+            "rio-store-dev",
+        )
+    }
     use std::collections::VecDeque;
 
     /// Scripted transport (the builder runtime's `ScriptedTransport`
@@ -1055,7 +1066,7 @@ mod tests {
         );
         let claimed = poll_and_claim(
             &mut t,
-            "store-replica-0",
+            &instance("store-replica-0"),
             8,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
@@ -1099,7 +1110,7 @@ mod tests {
         // slot in the same pass.
         let claimed = poll_and_claim(
             &mut t,
-            "store-replica-0",
+            &instance("store-replica-0"),
             1,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
@@ -1142,7 +1153,7 @@ mod tests {
         );
         let claimed = poll_and_claim(
             &mut t,
-            "store-replica-0",
+            &instance("store-replica-0"),
             2,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
@@ -1169,7 +1180,7 @@ mod tests {
         );
         let claimed = poll_and_claim(
             &mut t,
-            "store-replica-0",
+            &instance("store-replica-0"),
             8,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
@@ -1202,7 +1213,7 @@ mod tests {
         );
         let claimed = poll_and_claim(
             &mut t,
-            "store-replica-0",
+            &instance("store-replica-0"),
             8,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
@@ -1232,7 +1243,7 @@ mod tests {
         );
         let claimed = poll_and_claim(
             &mut t,
-            "store-replica-0",
+            &instance("store-replica-0"),
             2,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
@@ -1249,7 +1260,7 @@ mod tests {
         let mut idle = MockTransport::new(vec![], vec![], vec![]);
         let claimed = poll_and_claim(
             &mut idle,
-            "store-replica-0",
+            &instance("store-replica-0"),
             0,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
@@ -1275,7 +1286,7 @@ mod tests {
         );
         let _ = poll_and_claim(
             &mut t,
-            "store-replica-7",
+            &instance("store-replica-7"),
             8,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
@@ -1515,7 +1526,7 @@ mod tests {
         };
         let claimed = poll_and_claim(
             &mut t,
-            "store-replica-0",
+            &instance("store-replica-0"),
             8,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
@@ -1686,7 +1697,7 @@ mod tests {
         let mut transport = SchedulerTransport::connect_lazy(
             &HostPort::parse(&proxy_addr.to_string()).expect("proxy addr is host:port"),
             None,
-            "store-replica-0",
+            &instance("store-replica-0"),
         )
         .unwrap();
 
@@ -1694,7 +1705,7 @@ mod tests {
         // poll pass comes back empty (UNAVAILABLE answers).
         let claimed = poll_and_claim(
             &mut transport,
-            "store-replica-0",
+            &instance("store-replica-0"),
             1,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
@@ -1719,7 +1730,7 @@ mod tests {
         for _ in 0..5 {
             claimed = poll_and_claim(
                 &mut transport,
-                "store-replica-0",
+                &instance("store-replica-0"),
                 1,
                 &mut ResumeLedger::default(),
                 &mut ListFailureLatch::default(),
@@ -1755,14 +1766,14 @@ mod tests {
         let mut transport = SchedulerTransport::connect_lazy(
             &HostPort::parse(&proxy_addr.to_string()).expect("proxy addr is host:port"),
             None,
-            "store-replica-0",
+            &instance("store-replica-0"),
         )
         .unwrap();
 
         // Pin the connection to the standby with one failing pass.
         let _ = poll_and_claim(
             &mut transport,
-            "store-replica-0",
+            &instance("store-replica-0"),
             1,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
@@ -1814,7 +1825,7 @@ mod tests {
         let mut transport = SchedulerTransport::connect_lazy(
             &HostPort::parse(&proxy_addr.to_string()).expect("proxy addr is host:port"),
             None,
-            "store-replica-0",
+            &instance("store-replica-0"),
         )
         .unwrap();
 
@@ -1875,7 +1886,7 @@ mod tests {
         // recorded, nothing delivered.
         let claimed = poll_and_claim(
             &mut t,
-            "store-replica-0",
+            &instance("store-replica-0"),
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
@@ -1899,7 +1910,7 @@ mod tests {
         // SAME nonce and recovers the assignment.
         let claimed = poll_and_claim(
             &mut t,
-            "store-replica-0",
+            &instance("store-replica-0"),
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
@@ -1942,7 +1953,7 @@ mod tests {
         // Pass 1: unanswered — entry held.
         let _ = poll_and_claim(
             &mut t,
-            "store-replica-0",
+            &instance("store-replica-0"),
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
@@ -1953,7 +1964,7 @@ mod tests {
         // Pass 2: resume answered NotYetReady — entry KEPT.
         let _ = poll_and_claim(
             &mut t,
-            "store-replica-0",
+            &instance("store-replica-0"),
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
@@ -1964,7 +1975,7 @@ mod tests {
         // Pass 3: resume answered Gone — entry dropped.
         let _ = poll_and_claim(
             &mut t,
-            "store-replica-0",
+            &instance("store-replica-0"),
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),

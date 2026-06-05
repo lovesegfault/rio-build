@@ -117,18 +117,16 @@ pub(super) const MAX_ERROR_MSG_LEN: usize = 16 * 1024;
 pub(super) const MAX_EXECUTOR_TOKEN_LEN: usize = 8 * 1024;
 
 /// RFC-1123 DNS label check for `executor_instance` (a k8s pod name
-/// component): lowercase alphanumerics and interior hyphens, 1–63
-/// chars. The instance is interpolated into the composite materialization
-/// ExecutorId (`{intent}@{instance}`), so the alphabet exclusion of `@`
-/// (and everything else) is what keeps that composite unambiguous.
-pub(super) fn is_dns1123_label(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 63
-        && s.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        && !s.starts_with('-')
-        && !s.ends_with('-')
-}
+/// component). merged_bug_243: re-exported from `rio_common::dns` —
+/// the SAME single-sourced alphabet the store's `Dns1123Label`
+/// sanitizer/composer enforces, so the producer and this validator
+/// cannot drift (the pre-fix private copy validated a bound the
+/// store-side composition silently broke). The instance is
+/// interpolated into the composite materialization ExecutorId
+/// (`{intent}@{instance}`), so the alphabet exclusion of `@` (and
+/// everything else) is what keeps that composite unambiguous.
+// r[impl store.materialize.worker-identity]
+pub(super) use rio_common::dns::is_dns1123_label;
 
 /// `ServiceClaims.caller` values whose service token authorizes
 /// materialization operations (the Wave-4 kind-attested store
