@@ -97,6 +97,19 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: critical
+  # RioLogReadDivergence (for:0m): a manifest/object divergence trend
+  # past 10/h fires (warning) — the divergence family split from the
+  # data-loss pager keeps its own non-vacuity case.
+  - interval: 1m
+    input_series:
+      - series: 'rio_store_log_read_divergence_total'
+        values: '0 0 0 15 15 15 15'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: RioLogReadDivergence
+        exp_alerts:
+          - exp_labels:
+              severity: warning
   # merged_bug_235 contract pair: RioSlaHwCostStale must NOT fire when
   # ANY replica is fresh (the standby's stale-seconds gauge climbs
   # forever by design — observability.typ blesses it; the alert must
