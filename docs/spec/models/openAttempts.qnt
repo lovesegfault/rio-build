@@ -1,103 +1,340 @@
 // -*- mode: Bluespec; -*-
+// quint-policy-latches: driverLost, ackedUnsettled, ghostClaim, chargedNoFault
 //
-// Open-attempt closure under cancellation (bughunt fix wave, bug_347;
-// spec rule sched.attempt.cancel-close-driven).
+// openAttempts — one derivation's open pull-mode attempt, RE-STATED
+// over the claim/settlement laws of the materialize-disposition wave
+// (the §4-R2 rework; bughunt-2 bug_357 + bug_182 + merged_bug_055 +
+// bug_251, on the bug_347 base).
 //
 // WHAT IS MODELED
-//   One derivation's open pull-mode attempt and the two mechanisms
-//   that may close it after its build is cancelled:
-//     - the terminal status persist (which closes the assignment row
-//       in the same statement), re-driven by the leader-scoped status
-//       outbox when a persist fails ("latch on Ok only"), and
-//     - the establishment sweep, routed through the total kernel
-//       (rio-evidence-kernel/src/establish.rs): a cancelled or absent
-//       node closes CHARGE-FREE; only live-wanted work may be charged.
-//   Failover is modeled honestly: leadership loss clears the outbox.
-//   If the cancel was never durable, the new leader recovers the
-//   derivation as live (the cancel evaporated — the client re-cancels)
-//   and a charge is then legitimate; if the cancel WAS durable, the
-//   node recovers Cancelled (or was already closed).
+//   The original cancel-closure plane (kept):
+//     - the terminal status persist closing the assignment row, with
+//       the leader-scoped status outbox re-driving a failed persist
+//       ("latch on Ok only"; sched.attempt.cancel-close-driven), and
+//     - the establishment sweep through the total kernel: a cancelled
+//       or absent node closes CHARGE-FREE; only live-wanted work may
+//       be charged. Failover is honest: the outbox clears with the
+//       tenure; a non-durable cancel evaporates.
+//   PLUS the wave's claim plane:
+//     - the mint sets the job-view holder and PERSISTS a redelivery
+//       credential (bug_251: the claim nonce lands in the same fenced
+//       transaction as the mint);
+//     - a mint whose RESPONSE is lost redelivers against that
+//       credential un-charged (`resumeRedeliver`) — only a worker that
+//       really crashed (credential ledger lost) settles through the
+//       charged establishment window, the signed residual;
+//     - the consumption close follows the ack law (bug_182): a
+//       settled close acks and its companion releases the claim; a
+//       FAILED close NACKs retryably and keeps the attempt open for
+//       the store's bounded redelivery;
+//     - a failed companion still RELEASES the claim
+//       (merged_bug_055: claimable-but-unparked dominates
+//       wedged-claimed-forever).
 //
-// THE PROPERTIES
-//   cancelledNeverChargedAsCrash — an attempt is never ClosedCharged
-//     while its node is cancelled/absent, and never after the cancel
-//     became durable (the ghost).
-//   openAttemptHasDriver — an open attempt for a cancelled node always
-//     has a driver: the outbox holds the close, or the sweep's
-//     charge-free arm would close it (the kernel row).
+// bug_357 (the §4-R2 repair): the old `openAttemptHasDriver` was a
+// propositional tautology — its consequent `sweepWouldCloseFree(node)`
+// is constant `true` at `node == NCancelled`, so the invariant could
+// not fail on ANY transition system. It is REPLACED by
+// `notDriverLost`: `driverLost` is a live-computed latch seated at the
+// transition that must arm the driver (`cancelFailApply` — the failed
+// cancel persist MUST latch the outbox; the sweep is the backstop,
+// never the driver), so the law is over the transition relation and
+// the `openattempts-outbox-dropped` twin falsifies it.
 //
-// CALIBRATION (expect-violation): openattempts-charge-blind freezes
-//   the pre-fix world — the failed persist is dropped (no outbox) and
-//   the sweep charges without consulting the node — and both
-//   invariants falsify on the shallow trace cancel-fail/sweep.
+// All four latches are computed LIVE by the oracle-seated sub-actions
+// below — never by calibration overrides (the fencedWrites repair
+// pattern; quint-policy P4/P5). Twins perturb DECISIONS only and route
+// through the same seats:
+//   openattempts-charge-blind      -> cancelledNeverChargedAsCrash
+//   openattempts-outbox-dropped    -> notDriverLost
+//   openattempts-ack-on-failed-close -> ackImpliesSettledOrArmed
+//   openattempts-no-fallback-release -> claimedImpliesOpenAttempt
+//   openattempts-nonceless-mint    -> noFaultNeverCharged
 //
-// Tier-1 budget: |node| * |attempt| * 2 (outbox) * 2 (ghost) = 36
-// states reachable upper bound; TLC exhausts in well under a second.
+// Tier-1 budget: 3 (node) × 4 (attempt) × 2^5 (booleans) × 2^4
+// (latches) = 6,144 reachable upper bound; TLC exhausts in seconds.
 
 module openAttempts {
   type NodeState = NWantedLive | NCancelled | NAbsent
-  type AttemptState = AOpen | AClosedCharged | AClosedFree
+  type AttemptState = ANone | AOpen | AClosedCharged | AClosedFree
 
   var node: NodeState
   var attempt: AttemptState
   var outbox: bool
   // Ghost: the cancel reached durability (persist Ok or flush Ok).
   var cancelDurable: bool
+  // The claim plane (bug_251 / merged_bug_055):
+  // The in-memory job-view holder is set.
+  var viewClaimed: bool
+  // The store still holds a redelivery credential for the open
+  // attempt (resume exec id or persisted claim nonce).
+  var clientHoldsResume: bool
+  // The mint's response never reached the store (the lost-response
+  // no-fault lane; cleared by a successful redelivery).
+  var responseLost: bool
+
+  // --- latches (live-computed; see the header directive) -------------------
+  // The failed cancel persist did not arm its driver (bug_357).
+  var driverLost: bool
+  // An ack was produced while the close was not settled (bug_182).
+  var ackedUnsettled: bool
+  // A close left the view claimed with no open attempt
+  // (merged_bug_055's claimed-no-attempt ghost).
+  var ghostClaim: bool
+  // A charge landed on a no-fault (lost-response) attempt (bug_251).
+  var chargedNoFault: bool
 
   action init = all {
     node' = NWantedLive,
-    attempt' = AOpen,
+    attempt' = ANone,
     outbox' = false,
     cancelDurable' = false,
+    viewClaimed' = false,
+    clientHoldsResume' = false,
+    responseLost' = false,
+    driverLost' = false,
+    ackedUnsettled' = false,
+    ghostClaim' = false,
+    chargedNoFault' = false,
   }
 
-  // The cancel's terminal persist succeeds: one statement closes the
-  // assignment (db/derivations.rs terminal_assignment_status).
-  action cancelPersistOk = all {
-    node == NWantedLive,
-    attempt == AOpen,
-    node' = NCancelled,
-    attempt' = AClosedFree,
-    outbox' = outbox,
-    cancelDurable' = true,
+  // --- oracle seats ----------------------------------------------------------
+  // Shared by live actions AND calibrations: the caller passes its
+  // DECISIONS; the oracles compute the latch truths from them. A twin
+  // that perturbs a decision is observed by the same seat.
+
+  /// Mint seat: deliver the claim. `credentialPersisted` is the
+  /// bug_251 decision (the nonce persists in the mint's fenced
+  /// transaction); `lost` marks the response as never reaching the
+  /// store.
+  action mintApply(credentialPersisted: bool, lost: bool): bool = all {
+    attempt' = AOpen,
+    viewClaimed' = true,
+    clientHoldsResume' = credentialPersisted,
+    responseLost' = lost,
+    // A fresh mint is backed by its open attempt: no ghost here.
+    ghostClaim' = ghostClaim,
+    driverLost' = driverLost,
+    ackedUnsettled' = ackedUnsettled,
+    chargedNoFault' = chargedNoFault,
   }
 
-  // The cancel's terminal persist FAILS: the in-memory transition
-  // stands, the owned batch latches in the outbox, the assignment
-  // stays open (sched.attempt.cancel-close-driven).
-  action cancelPersistErr = all {
-    node == NWantedLive,
-    attempt == AOpen,
+  /// Settled-close seat: one SETTLED attempt close (consumption Ok,
+  /// cancel persist, outbox flush, establishment sweep). The caller
+  /// decides whether the close charges and whether the companion
+  /// releases the claim; the oracles compute:
+  ///   ghostClaim     — the view stayed claimed with no open attempt
+  ///                    (the merged_bug_055 ghost);
+  ///   chargedNoFault — a charge landed while the attempt's only
+  ///                    "fault" was a lost response (bug_251).
+  /// A settled close's ack is lawful (bug_182), so ackedUnsettled is
+  /// framed here; its writer is the failed-close seat below.
+  /// (Seat parameters are deliberately bool-only: a sum-type action
+  /// parameter converts to a silently-disabled arm under quint→TLA —
+  /// the constructor-reachability probes in the header guard this.)
+  action closeSettledApply(charged: bool, releasesClaim: bool): bool = all {
+    attempt' = if (charged) AClosedCharged else AClosedFree,
+    viewClaimed' = (viewClaimed and not(releasesClaim)),
+    ackedUnsettled' = ackedUnsettled,
+    ghostClaim' = or {
+      ghostClaim,
+      viewClaimed and not(releasesClaim),
+    },
+    chargedNoFault' = or {
+      chargedNoFault,
+      charged and responseLost,
+    },
+    driverLost' = driverLost,
+  }
+
+  /// Failed-close seat: the close write did NOT settle — the attempt
+  /// stays open, the claim is kept, and `acks` is the bug_182
+  /// decision: the live action NACKs (false) so the store's bounded
+  /// redelivery re-presents; the ack-on-failed-close twin flips it
+  /// and the oracle latches ackedUnsettled.
+  action closeFailedApply(acks: bool): bool = all {
+    attempt' = attempt,
+    viewClaimed' = viewClaimed,
+    ackedUnsettled' = or { ackedUnsettled, acks },
+    ghostClaim' = ghostClaim,
+    chargedNoFault' = chargedNoFault,
+    driverLost' = driverLost,
+  }
+
+  /// Cancel-failure seat (THE bug_357 restatement): the failed
+  /// terminal persist's one law is that it ARMS the driver —
+  /// `latchesOutbox` is the sched.attempt.cancel-close-driven
+  /// decision. `driverLost` is computed HERE, at the transition that
+  /// must arm the driver, not as a state implication whose consequent
+  /// was constant.
+  action cancelFailApply(latchesOutbox: bool): bool = all {
     node' = NCancelled,
     attempt' = attempt,
-    outbox' = true,
+    outbox' = latchesOutbox,
+    driverLost' = or { driverLost, not(latchesOutbox) },
+    ackedUnsettled' = ackedUnsettled,
+    ghostClaim' = ghostClaim,
+    chargedNoFault' = chargedNoFault,
+  }
+
+  // --- live actions ------------------------------------------------------------
+
+  /// The pull mint commits and the response reaches the store: claim
+  /// held, credential persisted (bug_251), nothing lost.
+  action mintDelivered = all {
+    node == NWantedLive,
+    attempt != AOpen,
+    not(viewClaimed),
+    mintApply(true, false),
+    node' = node,
+    outbox' = outbox,
     cancelDurable' = cancelDurable,
   }
 
-  // tick_flush_status_outbox re-drives the latched batch to Ok:
-  // dropped on Ok only; the close lands.
-  action flushOk = all {
-    outbox,
+  /// The pull mint commits but the RESPONSE is lost (worker timeout,
+  /// stream cut). The credential persisted AT MINT — the fix — so the
+  /// store's next poll can redeliver.
+  action mintResponseLost = all {
+    node == NWantedLive,
+    attempt != AOpen,
+    not(viewClaimed),
+    mintApply(true, true),
     node' = node,
-    attempt' = if (attempt == AOpen) AClosedFree else attempt,
-    outbox' = false,
-    cancelDurable' = true,
+    outbox' = outbox,
+    cancelDurable' = cancelDurable,
   }
 
-  // The flush fails this tick: the entry is pushed back (front).
+  /// The store's next poll presents its credential and the SAME exec
+  /// re-delivers, un-charged (bug_251; kernel
+  /// `redelivery_credential_ok`).
+  action resumeRedeliver = all {
+    attempt == AOpen,
+    responseLost,
+    clientHoldsResume,
+    responseLost' = false,
+    node' = node,
+    attempt' = attempt,
+    outbox' = outbox,
+    cancelDurable' = cancelDurable,
+    viewClaimed' = viewClaimed,
+    clientHoldsResume' = clientHoldsResume,
+    driverLost' = driverLost,
+    ackedUnsettled' = ackedUnsettled,
+    ghostClaim' = ghostClaim,
+    chargedNoFault' = chargedNoFault,
+  }
+
+  /// Consumption close settles and the companion runs (release on
+  /// both companion outcomes — merged_bug_055's law folds the
+  /// companion-failure fallback into the same release decision). The
+  /// settled close acks (bug_182).
+  action consumeCloseOk = all {
+    attempt == AOpen,
+    node == NWantedLive,
+    closeSettledApply(false, true),
+    responseLost' = false,
+    clientHoldsResume' = false,
+    node' = node,
+    outbox' = outbox,
+    cancelDurable' = cancelDurable,
+  }
+
+  /// The consumption close write FAILED: NACK retryably (bug_182 —
+  /// PullRejection::ConsumptionNotDurable). The attempt stays open,
+  /// the claim is kept, and the store's bounded report redelivery
+  /// re-presents the same outcome.
+  action consumeCloseFailedNack = all {
+    attempt == AOpen,
+    node == NWantedLive,
+    closeFailedApply(false),
+    responseLost' = responseLost,
+    clientHoldsResume' = clientHoldsResume,
+    node' = node,
+    outbox' = outbox,
+    cancelDurable' = cancelDurable,
+  }
+
+  /// The cancel's terminal persist succeeds: one statement closes the
+  /// assignment (db/derivations.rs terminal_assignment_status); the
+  /// stamped close family's companion releases the view claim.
+  action cancelPersistOk = all {
+    node == NWantedLive,
+    attempt == AOpen,
+    closeSettledApply(false, true),
+    node' = NCancelled,
+    outbox' = outbox,
+    cancelDurable' = true,
+    responseLost' = false,
+    clientHoldsResume' = false,
+  }
+
+  /// The cancel's terminal persist FAILS: the in-memory transition
+  /// stands and the owned batch latches in the outbox
+  /// (sched.attempt.cancel-close-driven) — the live decision is
+  /// `latchesOutbox = true`; the outbox-dropped twin flips it and the
+  /// seat latches `driverLost`.
+  action cancelPersistErr = all {
+    node == NWantedLive,
+    attempt == AOpen,
+    cancelFailApply(true),
+    cancelDurable' = cancelDurable,
+    viewClaimed' = viewClaimed,
+    clientHoldsResume' = clientHoldsResume,
+    responseLost' = responseLost,
+  }
+
+  /// tick_flush_status_outbox re-drives the latched batch to Ok:
+  /// dropped on Ok only; the close lands, the claim releases.
+  action flushOk = any {
+    all {
+      outbox,
+      attempt == AOpen,
+      closeSettledApply(false, true),
+      node' = node,
+      outbox' = false,
+      cancelDurable' = true,
+      responseLost' = responseLost,
+      clientHoldsResume' = clientHoldsResume,
+    },
+    all {
+      outbox,
+      attempt != AOpen,
+      attempt' = attempt,
+      viewClaimed' = viewClaimed,
+      node' = node,
+      outbox' = false,
+      cancelDurable' = true,
+      responseLost' = responseLost,
+      clientHoldsResume' = clientHoldsResume,
+      driverLost' = driverLost,
+      ackedUnsettled' = ackedUnsettled,
+      ghostClaim' = ghostClaim,
+      chargedNoFault' = chargedNoFault,
+    },
+  }
+
+  /// The flush fails this tick: the entry is pushed back (front).
   action flushErr = all {
     outbox,
     node' = node,
     attempt' = attempt,
     outbox' = outbox,
     cancelDurable' = cancelDurable,
+    viewClaimed' = viewClaimed,
+    clientHoldsResume' = clientHoldsResume,
+    responseLost' = responseLost,
+    driverLost' = driverLost,
+    ackedUnsettled' = ackedUnsettled,
+    ghostClaim' = ghostClaim,
+    chargedNoFault' = chargedNoFault,
   }
 
-  // Leadership loss + successor recovery. The outbox is leader-scoped
-  // (clear_persisted_state). A non-durable cancel evaporates: the
-  // successor rebuilds the derivation live from PG. A durable cancel
-  // either already closed the attempt or (legacy debris) leaves a
-  // cancelled/absent node the sweep closes charge-free.
+  /// Leadership loss + successor recovery. The outbox is
+  /// leader-scoped (clear_persisted_state) and the in-memory view
+  /// wipes with the tenure; the CREDENTIAL survives — it persisted in
+  /// the mint's transaction (bug_251) and the successor recovers it
+  /// off the guarded assignments join. A non-durable cancel
+  /// evaporates; a durable one leaves a node the sweep closes free.
   action failover = all {
     node' = if (node == NCancelled and not(cancelDurable)) NWantedLive
             else if (node == NCancelled) NAbsent
@@ -105,20 +342,56 @@ module openAttempts {
     attempt' = attempt,
     outbox' = false,
     cancelDurable' = cancelDurable,
+    viewClaimed' = false,
+    clientHoldsResume' = clientHoldsResume,
+    responseLost' = responseLost,
+    driverLost' = driverLost,
+    ackedUnsettled' = ackedUnsettled,
+    ghostClaim' = ghostClaim,
+    chargedNoFault' = chargedNoFault,
   }
 
-  // The establishment sweep, post-fix: routed through the total
-  // kernel. Live-wanted expired attempts charge; cancelled/absent
-  // close charge-free (no AttemptRow, no exclusion, no metric).
-  action sweepEstablish = all {
-    attempt == AOpen,
-    attempt' = if (node == NWantedLive) AClosedCharged else AClosedFree,
-    node' = node,
-    outbox' = outbox,
-    cancelDurable' = cancelDurable,
+  /// The establishment sweep, post-fix: routed through the total
+  /// kernel. Live-wanted expired attempts charge; cancelled/absent
+  /// close charge-free. The guard models the window ordering of
+  /// bug_251's signed residual: a lost-response attempt whose
+  /// credential is still held redelivers (the store's 600s report
+  /// window) BEFORE the ~1h establishment window can charge it — the
+  /// charged settle is reachable only when the credential is gone
+  /// (a real crash) or the response was never lost.
+  action sweepEstablish = any {
+    // Live-wanted expired attempt: charged.
+    all {
+      attempt == AOpen,
+      node == NWantedLive,
+      not(responseLost and clientHoldsResume),
+      closeSettledApply(true, true),
+      node' = node,
+      outbox' = outbox,
+      cancelDurable' = cancelDurable,
+      responseLost' = responseLost,
+      clientHoldsResume' = false,
+    },
+    // Cancelled/absent node: charge-free (the kernel's total arm).
+    all {
+      attempt == AOpen,
+      node != NWantedLive,
+      not(responseLost and clientHoldsResume),
+      closeSettledApply(false, true),
+      node' = node,
+      outbox' = outbox,
+      cancelDurable' = cancelDurable,
+      responseLost' = responseLost,
+      clientHoldsResume' = false,
+    },
   }
 
   action step = any {
+    mintDelivered,
+    mintResponseLost,
+    resumeRedeliver,
+    consumeCloseOk,
+    consumeCloseFailedNack,
     cancelPersistOk,
     cancelPersistErr,
     flushOk,
@@ -127,8 +400,7 @@ module openAttempts {
     sweepEstablish,
   }
 
-  // The kernel row: would the sweep close this node charge-free?
-  def sweepWouldCloseFree(n: NodeState): bool = n != NWantedLive
+  // --- invariants ------------------------------------------------------------
 
   // bug_347's exclusion-pollution half: cancelled work is never
   // charged. Two forms — the node form (cancelled/absent is never the
@@ -138,15 +410,33 @@ module openAttempts {
     not(attempt == AClosedCharged and node != NWantedLive)
     and not(attempt == AClosedCharged and cancelDurable)
 
-  // bug_347's liveness half, as a state invariant: an open attempt for
-  // a cancelled node always has a driver — the outbox re-drive, or the
-  // sweep's charge-free arm.
-  val openAttemptHasDriver =
-    (attempt == AOpen and node == NCancelled) implies
-      (outbox or sweepWouldCloseFree(node))
+  // bug_347's liveness half RESTATED over the transition relation
+  // (bug_357 — replaces the tautological openAttemptHasDriver): the
+  // failed cancel persist armed its driver on every step that needed
+  // one.
+  val notDriverLost = not(driverLost)
+
+  // bug_182: every ack the model produced had a settled (or fenced —
+  // folded into settled here, the Q20 posture) close behind it.
+  val ackImpliesSettledOrArmed = not(ackedUnsettled)
+
+  // merged_bug_055: a held view claim is always backed by an open
+  // attempt — both the latch form (a close that strands the claim
+  // latches at its seat) and the state form.
+  val claimedImpliesOpenAttempt = and {
+    not(ghostClaim),
+    viewClaimed implies (attempt == AOpen),
+  }
+
+  // bug_251: an attempt whose only fault was a lost response is never
+  // charged — the credential redelivers it first.
+  val noFaultNeverCharged = not(chargedNoFault)
 
   val openAttemptsInvariants = all {
     cancelledNeverChargedAsCrash,
-    openAttemptHasDriver,
+    notDriverLost,
+    ackImpliesSettledOrArmed,
+    claimedImpliesOpenAttempt,
+    noFaultNeverCharged,
   }
 }

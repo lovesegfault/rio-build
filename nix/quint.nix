@@ -6625,15 +6625,28 @@ in
       witness = "advertisedLegSilent";
     };
 
-    # Open-attempt closure under cancellation: the status outbox + the
-    # establishment kernel's charge-free arm (bug_347). Tier-1.
+    # Open-attempt closure under cancellation + the materialize wave's
+    # claim/settlement laws (bug_347 base; §4-R2 rework: bug_357 +
+    # bug_182 + merged_bug_055 + bug_251). Tier-1: 18 reachable states,
+    # measured <1s exhaustive — budget 120s is ~100x headroom.
+    # openAttemptHasDriver was REPLACED by notDriverLost (bug_357: the
+    # old form was a propositional tautology; the new one is a
+    # live-computed latch seated at the transition that must arm the
+    # driver).
     # r[verify sched.attempt.cancel-close-driven+1]
+    # r[verify sched.materialize.ack-law]
+    # r[verify sched.materialize.claim-coherence]
+    # r[verify sched.materialize.claim-resume]
     quint-open-attempts = mkQuintCheck {
       name = "open-attempts";
       spec = "openAttempts";
+      modelTimeoutSec = 120;
       invariants = [
         "cancelledNeverChargedAsCrash"
-        "openAttemptHasDriver"
+        "notDriverLost"
+        "ackImpliesSettledOrArmed"
+        "claimedImpliesOpenAttempt"
+        "noFaultNeverCharged"
       ];
     };
 
@@ -6732,11 +6745,54 @@ in
       step = "calibStep";
       witness = "pacingEscalatesAbsentProgress";
     };
+    # openAttempts twins (§4-R2): live-import action-only, each
+    # perturbing ONE decision through the model's oracle seats; every
+    # invariant of quint-open-attempts has its falsifier here (P1).
+    # All measured <1s; budget 120s.
     quint-openattempts-calib-charge-blind = mkQuintWitnessCheck {
       name = "openattempts-calib-charge-blind";
       spec = "calibration/openattempts-charge-blind";
+      extraSpecs = [ "openAttempts" ];
       main = "openAttemptsChargeBlind";
+      step = "calibStep";
+      modelTimeoutSec = 120;
       witness = "cancelledNeverChargedAsCrash";
+    };
+    quint-openattempts-calib-outbox-dropped = mkQuintWitnessCheck {
+      name = "openattempts-calib-outbox-dropped";
+      spec = "calibration/openattempts-outbox-dropped";
+      extraSpecs = [ "openAttempts" ];
+      main = "openAttemptsOutboxDropped";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      witness = "notDriverLost";
+    };
+    quint-openattempts-calib-ack-on-failed-close = mkQuintWitnessCheck {
+      name = "openattempts-calib-ack-on-failed-close";
+      spec = "calibration/openattempts-ack-on-failed-close";
+      extraSpecs = [ "openAttempts" ];
+      main = "openAttemptsAckOnFailedClose";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      witness = "ackImpliesSettledOrArmed";
+    };
+    quint-openattempts-calib-no-fallback-release = mkQuintWitnessCheck {
+      name = "openattempts-calib-no-fallback-release";
+      spec = "calibration/openattempts-no-fallback-release";
+      extraSpecs = [ "openAttempts" ];
+      main = "openAttemptsNoFallbackRelease";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      witness = "claimedImpliesOpenAttempt";
+    };
+    quint-openattempts-calib-nonceless-mint = mkQuintWitnessCheck {
+      name = "openattempts-calib-nonceless-mint";
+      spec = "calibration/openattempts-nonceless-mint";
+      extraSpecs = [ "openAttempts" ];
+      main = "openAttemptsNoncelessMint";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      witness = "noFaultNeverCharged";
     };
   };
 }

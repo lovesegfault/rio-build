@@ -5411,3 +5411,50 @@ green at commit 2 (chart renders without the knob).
 
 Net delta across the retirement: −357 lines (467 insertions,
 824 deletions over 42 files, excluding this record).
+
+## openAttempts.qnt — the claim/settlement-law model (§4-R2 rework, 2026-06-05)
+
+The bug_347 cancel-closure model re-stated over the materialize wave's
+claim plane (slot 9): the mint persists a redelivery credential
+(rule 4b, `sched.materialize.claim-resume`), a lost response
+redelivers un-charged, the consumption close follows the ack law
+(`sched.materialize.ack-law`), and a failed companion still releases
+the claim (`sched.materialize.claim-coherence`).
+
+**bug_357 repair (landed here once per §4-R2):** `openAttemptHasDriver`
+was a propositional tautology — its consequent
+`sweepWouldCloseFree(node)` is constant `true` at `node == NCancelled`,
+so no transition system could falsify it. REPLACED by `notDriverLost`:
+the latch is computed at the `cancelFailApply` seat — the transition
+that must arm the driver — and the `openattempts-outbox-dropped` twin
+(357's prescribed falsifier) violates it at depth 2.
+
+All four latches (`driverLost`, `ackedUnsettled`, `ghostClaim`,
+`chargedNoFault`) are live-computed by oracle-seated sub-actions
+(`mintApply`, `closeSettledApply`, `closeFailedApply`,
+`cancelFailApply` — the fencedWrites repair pattern); the
+`quint-policy-latches:` header declares the set; twins perturb
+decisions only. The old charge-blind frozen copy is converted to
+live-import action-only form (quint-policy P2 cleared).
+
+| invariant | meaning | twin (all live-import, `calibStep`) | verdicts |
+|---|---|---|---|
+| cancelledNeverChargedAsCrash | cancelled/absent work never charged; durable cancel never followed by a charge | openattempts-charge-blind | live [ok] / twin [violation] |
+| notDriverLost | the failed cancel persist armed the outbox driver (bug_357 restatement) | openattempts-outbox-dropped | live [ok] / twin [violation] |
+| ackImpliesSettledOrArmed | no ack over an unsettled close (bug_182) | openattempts-ack-on-failed-close | live [ok] / twin [violation] |
+| claimedImpliesOpenAttempt | a held view claim is backed by an open attempt — latch + state form (merged_bug_055) | openattempts-no-fallback-release | live [ok] / twin [violation] |
+| noFaultNeverCharged | a lost-response attempt redelivers against its credential, never charged (bug_251; the signed residual reachable only by real crashes) | openattempts-nonceless-mint | live [ok] / twin [violation] |
+
+Budgets: 18 reachable states, exhaustive TLC <1s measured;
+`modelTimeoutSec = 120` (~100× headroom) on all six checks.
+Reachability evidence (the vacuity guard that caught two authoring
+bugs in this very rework): `attempt != AClosedFree`,
+`attempt != AClosedCharged`, `node != NCancelled`, `node != NAbsent`
+all `[violation]`-reachable under the live step.
+
+**Authoring hazard recorded (wave-log):** in quint actions,
+`x' = a and b` parses as `(x' = a) and b` — the trailing operand
+becomes a GUARD and silently disables every caller whose decision
+makes it false; TLC then "holds" over a truncated graph. Wrap infix
+boolean right-hand sides in parens (`x' = (a and b)`) and always run
+constructor-reachability probes after authoring or reworking a model.
