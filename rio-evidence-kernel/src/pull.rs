@@ -525,6 +525,48 @@ pub fn display_class(kind: PullKind) -> DisplaySurface {
     }
 }
 
+/// Proof that one executor report passed the kind-uniform admission
+/// fold ([`fold_report`]) — the report is the FIRST one for a
+/// still-open attempt. Constructible ONLY by `fold_report` (bug_134):
+/// the materialization consumption transaction REQUIRES this witness
+/// by value, so running consumption on a duplicate, late, or
+/// closed-assignment report no longer typechecks. Deliberately not
+/// `Clone`/`Copy`: one admission admits one processing pass.
+#[derive(Debug)]
+#[must_use = "an admitted report must be processed (or dropped at an intake-level ack arm)"]
+pub struct ProcessAdmission(());
+
+/// What to do with one executor report (the pure half of the report
+/// intake — terminal-row-wins / no-transition-out-of-terminal),
+/// kind-uniform: build completions and materialization consumptions
+/// decide admission from this SAME law. bug_134: the materialization
+/// arm's hand-rolled duplicate gate consulted only the recorded bits
+/// and ignored `assignment_active`, so the two kinds could drift —
+/// the gate is deleted and both kinds fold here.
+#[derive(Debug)]
+pub enum ReportAdmission {
+    /// First report for an open attempt: run the kind's processing
+    /// path, spending the witness.
+    Process(ProcessAdmission),
+    /// Duplicate, post-establishment, superseded, closed, or
+    /// never-pulled: acknowledge and write nothing.
+    AckIgnore,
+}
+
+/// Decide one report from the attempt's durable state. Pure (decision
+/// P10): the report is processed only when the attempt is still open
+/// (assignment active) and no classification row exists for its exec —
+/// a terminal or already-classified row always wins and is never
+/// overwritten or re-charged.
+// r[impl sched.executor.report-idempotent]
+pub fn fold_report(assignment_active: bool, attempt_already_classified: bool) -> ReportAdmission {
+    if assignment_active && !attempt_already_classified {
+        ReportAdmission::Process(ProcessAdmission(()))
+    } else {
+        ReportAdmission::AckIgnore
+    }
+}
+
 /// The node's materialization-job state, as pull admission needs it.
 /// Projected by the scheduler from its in-memory job view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1331,6 +1373,32 @@ mod display_proofs {
             PullKind::Build => assert_eq!(surface, DisplaySurface::Build),
             PullKind::Materialization => {
                 assert_eq!(surface, DisplaySurface::Substitution);
+            }
+        }
+    }
+}
+
+#[cfg(kani)]
+mod report_admission_proofs {
+    //! CBMC sweep of the kind-uniform report-admission law (bug_134):
+    //! the witness is minted EXACTLY on (assignment active ∧ not yet
+    //! classified) — the full 2×2 input table, so a hand-rolled gate
+    //! that drops the `assignment_active` conjunct cannot reappear
+    //! without this proof going red.
+
+    use super::*;
+
+    // r[verify sched.executor.report-idempotent]
+    #[kani::proof]
+    fn check_report_admission_requires_active_assignment() {
+        let assignment_active: bool = kani::any();
+        let attempt_already_classified: bool = kani::any();
+        match fold_report(assignment_active, attempt_already_classified) {
+            ReportAdmission::Process(_witness) => {
+                assert!(assignment_active && !attempt_already_classified);
+            }
+            ReportAdmission::AckIgnore => {
+                assert!(!assignment_active || attempt_already_classified);
             }
         }
     }

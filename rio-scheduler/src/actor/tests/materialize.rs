@@ -892,6 +892,138 @@ async fn retry_later_consumption_closes_uncharged_and_defers() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.materialize.claimability-projection]
+/// bug_170 — listed ⊆ admittable, end-to-end: the leader listing reads
+/// THE SAME [`Claimability`] law admission reads, so it can never
+/// advertise work every claim of which admission refuses (the
+/// store-replica NotYetReady busy-loop). The deferral axis is the
+/// distinguishing case: it is VIEW-ONLY (no durable column — the 178
+/// contract), so the durable listing query alone cannot hide it.
+///
+/// Two jobs: A driven into an active transient deferral (RetryLater
+/// consumption), B fresh. The listing answers exactly [B]; B's claim
+/// delivers; A's claim refuses NotYetReady — listed and admittable
+/// coincide on both rows. Pre-fix RED (view filter strawman'd to
+/// pass-through): the listing answered BOTH jobs —
+/// `left: 2 / right: 1` — while A's every claim was refused.
+#[tokio::test]
+async fn deferred_job_hidden_from_listing_until_admittable() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out_a = test_store_path("matlist-defer-out");
+    let out_b = test_store_path("matlist-fresh-out");
+    {
+        let mut subs = store.state.substitutable.write().unwrap();
+        subs.push(out_a.clone());
+        subs.push(out_b.clone());
+    }
+    let mut a = make_node("matlist-defer");
+    a.expected_output_paths = vec![out_a];
+    let mut b = make_node("matlist-fresh");
+    b.expected_output_paths = vec![out_b];
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![a, b], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Claim A and report RetryLater → uncharged close + view-only
+    // deferral (the production writer of the defer axis).
+    let outcome = handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: "matlist-defer".into(),
+            auth_intent: Some("matlist-defer".into()),
+            kind: rio_evidence_kernel::pull::PullKind::Materialization,
+            executor_instance: Some("store-replica-0-w0".into()),
+            claim_nonce: None,
+            reply,
+            resume_exec_id: None,
+        })
+        .await
+        .expect("actor alive");
+    let assignment = match outcome {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the fresh job's claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    let result = handle
+        .query_unchecked(|reply| ActorCommand::ReportPullOutcome {
+            exec_id,
+            auth_intent: Some("matlist-defer".into()),
+            payload: crate::actor::pull::PullReportPayload {
+                result: rio_proto::types::BuildResult::default(),
+                peak_memory_bytes: 0,
+                peak_cpu_cores: 0.0,
+                node_name: None,
+                hw_class: None,
+                final_resources: None,
+                final_line_count: 0,
+                materialization_outcome: Some(rio_proto::types::MaterializationOutcome {
+                    outcome: Some(
+                        rio_proto::types::materialization_outcome::Outcome::RetryLater(
+                            rio_proto::types::materialization_outcome::RetryLater {
+                                detail: "upstream rate-limited".into(),
+                                retry_after_secs: 60,
+                                class: "rate_limited".into(),
+                            },
+                        ),
+                    ),
+                }),
+            },
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    assert!(
+        result.is_ok(),
+        "RetryLater consumption must ack: {result:?}"
+    );
+    barrier(&handle).await;
+
+    // The listing reads the law: exactly the admittable job survives.
+    let listed = list_materialization_jobs(&handle, 16).await;
+    assert_eq!(
+        listed.len(),
+        1,
+        "exactly the admittable job is listed, got {listed:?}"
+    );
+    assert_eq!(listed[0].drv_hash, "matlist-fresh");
+
+    // The property's two rows: the listed job's claim DELIVERS …
+    let outcome = handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: "matlist-fresh".into(),
+            auth_intent: Some("matlist-fresh".into()),
+            kind: rio_evidence_kernel::pull::PullKind::Materialization,
+            executor_instance: Some("store-replica-1-w0".into()),
+            claim_nonce: None,
+            reply,
+            resume_exec_id: None,
+        })
+        .await
+        .expect("actor alive");
+    assert!(
+        matches!(outcome, Ok(PullOutcome::Deliver(_))),
+        "the listed job must be admittable, got {outcome:?}"
+    );
+    // … and the unlisted job's claim REFUSES (same law, same answer).
+    let outcome = handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: "matlist-defer".into(),
+            auth_intent: Some("matlist-defer".into()),
+            kind: rio_evidence_kernel::pull::PullKind::Materialization,
+            executor_instance: Some("store-replica-1-w0".into()),
+            claim_nonce: None,
+            reply,
+            resume_exec_id: None,
+        })
+        .await
+        .expect("actor alive");
+    assert!(
+        matches!(outcome, Ok(PullOutcome::NotYetReady { .. })),
+        "the unlisted job must be refused, got {outcome:?}"
+    );
+    Ok(())
+}
+
 // r[verify sched.materialize.ack-law]
 /// bug_182 (the NACK law): a consumption close that cannot become
 /// durable must NACK retryably. Pre-fix, every arm acked
@@ -1017,6 +1149,7 @@ async fn failed_close_nacks_retryably_then_redelivery_consumes() -> TestResult {
 /// two sweeps). The two-strike repair releases the claim uncharged on
 /// the second consecutive unbacked observation: strike on tick 1,
 /// repair on tick 2, re-claimable immediately after.
+// r[verify sched.materialize.claim-coherence]
 #[tokio::test]
 async fn claimed_no_attempt_ghost_repaired_after_two_sweeps() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;

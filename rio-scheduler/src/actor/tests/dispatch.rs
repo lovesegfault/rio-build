@@ -779,15 +779,7 @@ async fn spawn_intents_excludes_job_pending_nodes() -> TestResult {
     // The unresolved (pending, unclaimed) job view entry.
     actor.materialization_jobs.insert(
         DrvHash::from("pd7-job-pending"),
-        crate::actor::materialize::JobViewEntry {
-            job_id: Uuid::new_v4(),
-            parked_until: None,
-            claimed_by: None,
-            claimed_unbacked_strike: false,
-            carried_realized_paths: None,
-            parked_at: None,
-            defer_until: None,
-        },
+        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
     );
 
     let snap = actor.compute_spawn_intents(&Default::default());

@@ -476,6 +476,12 @@ in
     #     biconditional — NACK exactly on Failed)
     #   - check_companion_failed_always_releases (the companion law —
     #     the wedged-claim ghost unrepresentable through the law).
-    expectedHarnesses = 23;
+    # 23 → 24: + check_report_admission_requires_active_assignment
+    # (bug_134, pull.rs): the kind-uniform report fold's full 2×2
+    # table — the ProcessAdmission witness is minted exactly on
+    # (assignment active ∧ not yet classified), so the materialization
+    # arm's deleted hand gate (which ignored `assignment_active`)
+    # cannot be reintroduced without this proof going red.
+    expectedHarnesses = 24;
   };
 }

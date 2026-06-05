@@ -58,10 +58,15 @@ pub(super) const RETRY_LATER_MAX_DEFER_SECS: u64 = 300;
 pub(crate) struct JobViewEntry {
     /// `materialization_jobs.job_id`.
     pub job_id: Uuid,
-    /// Backoff expiry while parked; `None` = not parked.
-    pub parked_until: Option<std::time::Instant>,
+    /// Backoff expiry while parked; `None` = not parked. PRIVATE
+    /// (bug_170): armament state is read ONLY through
+    /// [`Self::claimability`] — no consumer hand-derives "claimable".
+    parked_until: Option<std::time::Instant>,
     /// `Some(identity)` while an open materialization attempt exists.
-    pub claimed_by: Option<ExecutorId>,
+    /// PRIVATE (bug_170): mutated only by [`Self::mint_claim`] /
+    /// [`Self::release_claim_if_held`] / the in-module companions, so
+    /// every release is a compare-and-clear on the holder.
+    claimed_by: Option<ExecutorId>,
     /// Ghost-strike flag (merged_bug_055 C, the inverse tripwire): set
     /// when a housekeeping sweep observed this entry CLAIMED with no
     /// open materialization assignment in the same snapshot; a SECOND
@@ -75,7 +80,7 @@ pub(crate) struct JobViewEntry {
     /// ghost. In-memory only (never recovered as set — recovery
     /// rebuilds from rows, so a recovered claim starts at zero
     /// strikes by construction).
-    pub claimed_unbacked_strike: bool,
+    claimed_unbacked_strike: bool,
     /// Realized-path carrier (migration 082, the floating-CA
     /// stale-reset lane) — display copy for the claim-intake
     /// SUBSTITUTING event; the executor and the consumption coverage
@@ -89,7 +94,7 @@ pub(crate) struct JobViewEntry {
     /// leader instead of silently restarting (merged_bug_300). `None`
     /// = never parked (or parked pre-083 — the dwell gate treats it as
     /// unmet, conservatively).
-    pub parked_at: Option<crate::state::RecoveredInstant>,
+    parked_at: Option<crate::state::RecoveredInstant>,
     /// Transient-retry deferral (merged_bug_178): set by the
     /// RetryLater consumption arm (raced placeholder / upstream 429 —
     /// closed UNCHARGED), read by pull admission ONLY. Deliberately
@@ -101,7 +106,148 @@ pub(crate) struct JobViewEntry {
     /// view rebuild leaves it `None` — the job is immediately
     /// claimable again, which is the conservative direction for an
     /// uncharged transient).
-    pub defer_until: Option<std::time::Instant>,
+    defer_until: Option<std::time::Instant>,
+}
+
+/// The one armament classification of a job-view entry — THE
+/// derivation pull admission, the KEDA gauge, and the leader listing
+/// all read (bug_170): no consumer combines the raw fields by hand, so
+/// the three surfaces cannot disagree about what "claimable" means
+/// (the listing advertising a job admission would refuse — the
+/// NotYetReady busy-loop — is unrepresentable at the type).
+///
+/// Precedence: a held claim dominates everything; park (durable
+/// backoff) dominates the view-only transient deferral; otherwise the
+/// job is claimable right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Claimability {
+    /// Unclaimed, unparked, undeferred — a claim would be admitted.
+    ClaimableNow,
+    /// Transient-retry deferral active (merged_bug_178, view-only
+    /// pacing): admission refuses NotYetReady until it lapses.
+    Deferred,
+    /// Durable park backoff unexpired: pacing, not claimable demand.
+    Parked,
+    /// An open materialization attempt holds the job.
+    Claimed,
+}
+
+/// Disposition of one compare-and-clear claim release (bug_170/134):
+/// a release names the holder it acts for, so a stale release (late
+/// companion, ghost repair racing a fresh mint) can never clobber a
+/// claim that now belongs to someone else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimRelease {
+    /// The named holder held the claim; it is now cleared.
+    Released,
+    /// A DIFFERENT identity holds a fresh claim — nothing cleared; the
+    /// caller must not requeue the node (it belongs to the new
+    /// attempt).
+    StaleHolder,
+    /// No claim was held (idempotent re-release).
+    Unclaimed,
+}
+
+impl JobViewEntry {
+    /// A fresh unclaimed, unparked, undeferred entry — the creation
+    /// feed's shape (and the only construction tests get, so a
+    /// fabricated pre-armed entry cannot appear outside this module).
+    pub(crate) fn new_unclaimed(job_id: Uuid, carried_realized_paths: Option<Vec<String>>) -> Self {
+        Self {
+            job_id,
+            parked_until: None,
+            claimed_by: None,
+            claimed_unbacked_strike: false,
+            carried_realized_paths,
+            parked_at: None,
+            defer_until: None,
+        }
+    }
+
+    /// THE armament classification (see [`Claimability`]).
+    // r[impl sched.materialize.claimability-projection]
+    pub(super) fn claimability(&self, now: std::time::Instant) -> Claimability {
+        if self.claimed_by.is_some() {
+            Claimability::Claimed
+        } else if self.parked_until.is_some_and(|until| until > now) {
+            Claimability::Parked
+        } else if self.defer_until.is_some_and(|until| until > now) {
+            Claimability::Deferred
+        } else {
+            Claimability::ClaimableNow
+        }
+    }
+
+    /// The claim holder, for identity comparison (`held_by_puller`)
+    /// and the housekeeping tripwire. Read-only: armament DECISIONS go
+    /// through [`Self::claimability`].
+    pub(super) fn holder(&self) -> Option<&ExecutorId> {
+        self.claimed_by.as_ref()
+    }
+
+    /// Mint the claim to `holder` (the pull mint, post-commit). Resets
+    /// the ghost strike: a fresh mint is a backed claim by definition.
+    pub(super) fn mint_claim(&mut self, holder: ExecutorId) {
+        self.claimed_by = Some(holder);
+        self.claimed_unbacked_strike = false;
+    }
+
+    /// Compare-and-clear the claim on behalf of `expected` (bug_170:
+    /// `release_claim` names its holder). Clears the ghost strike with
+    /// the claim; a holder mismatch clears NOTHING.
+    // r[impl sched.materialize.claim-coherence]
+    pub(super) fn release_claim_if_held(&mut self, expected: &ExecutorId) -> ClaimRelease {
+        match &self.claimed_by {
+            Some(holder) if holder == expected => {
+                self.claimed_by = None;
+                self.claimed_unbacked_strike = false;
+                ClaimRelease::Released
+            }
+            Some(_) => ClaimRelease::StaleHolder,
+            None => ClaimRelease::Unclaimed,
+        }
+    }
+
+    /// Unconditional claim clear — the no-named-executor fallback of
+    /// the park companions ONLY (no production lane reaches it today;
+    /// every release that can race a fresh mint goes through
+    /// [`Self::release_claim_if_held`]).
+    fn clear_claim_unconditional(&mut self) {
+        self.claimed_by = None;
+        self.claimed_unbacked_strike = false;
+    }
+
+    /// Enter park: backoff expiry + the PD-20 dwell anchor (migration
+    /// 083 mirror). Re-park restarts the dwell clock by design.
+    fn park(&mut self, until: std::time::Instant) {
+        self.parked_until = Some(until);
+        self.parked_at = Some(crate::state::RecoveredInstant::fresh_now());
+    }
+
+    /// Test seeding of the park axis (the production writer is the
+    /// park companion).
+    #[cfg(test)]
+    pub(super) fn test_set_parked_until(&mut self, until: Option<std::time::Instant>) {
+        self.parked_until = until;
+    }
+
+    /// Test seeding of the deferral axis (the production writer is the
+    /// RetryLater consumption arm).
+    #[cfg(test)]
+    pub(super) fn test_set_defer_until(&mut self, until: Option<std::time::Instant>) {
+        self.defer_until = until;
+    }
+
+    /// The two-strike ghost flag (merged_bug_055 C), housekeeping's
+    /// read half.
+    pub(super) fn strike_armed(&self) -> bool {
+        self.claimed_unbacked_strike
+    }
+
+    /// Arm/clear the two-strike ghost flag (housekeeping's write half).
+    pub(super) fn set_strike(&mut self, armed: bool) {
+        self.claimed_unbacked_strike = armed;
+    }
 }
 
 /// `#[must_use]` actor-side disposition of a fenced durable write —
@@ -392,21 +538,55 @@ pub(crate) struct CreatedJob {
 impl DagActor {
     /// Leader-served job listing (the store's poll). Standby or no
     /// jobs → empty vec (never an error).
+    ///
+    /// bug_170: the durable query cannot see view-only armament (the
+    /// merged_bug_178 transient deferral has no column; a fresh claim
+    /// can commit between the query and the reply), so the rows are
+    /// over-fetched and filtered through THE SAME [`Claimability`] law
+    /// admission reads: only `view-exists ∧ ClaimableNow` survives.
+    /// A listed job is therefore admittable by construction — the
+    /// listing can no longer advertise work every claim of which the
+    /// admission table refuses (the store-replica NotYetReady
+    /// busy-loop). An Unavailable view answers EMPTY, preserving the
+    /// merged_bug_246/155 fail-closed postures verbatim (advertising
+    /// jobs whose armament we cannot see would hand out claims that
+    /// race the durable holders).
     // r[impl sched.materialize.job+2]
+    // r[impl sched.materialize.claimability-projection]
     pub(super) async fn handle_list_materialization_jobs(
         &mut self,
         limit: u32,
         reply: oneshot::Sender<Vec<JobDescriptor>>,
     ) {
-        let jobs = if !self.leader.is_leader() {
+        let limit = limit.min(256);
+        // Standby, zero limit, and an Unavailable view share one
+        // fail-closed arm: answer empty.
+        let jobs = if !self.leader.is_leader()
+            || limit == 0
+            || self.materialization_jobs.hydrated().is_none()
+        {
             Vec::new()
         } else {
-            match self
-                .db
-                .list_claimable_materialization_jobs(i64::from(limit.min(256)))
-                .await
-            {
-                Ok(rows) => rows.into_iter().map(JobDescriptor::from_row).collect(),
+            // Over-fetch min(2×limit, 512): the view filter below may
+            // drop rows the query believed claimable (deferred /
+            // just-claimed / not-yet-fed), and a second query round
+            // trip per poll is worse than a bounded over-read.
+            let fetch = i64::from(limit).saturating_mul(2).min(512);
+            match self.db.list_claimable_materialization_jobs(fetch).await {
+                Ok(rows) => {
+                    let now = std::time::Instant::now();
+                    rows.into_iter()
+                        .filter(|row| {
+                            self.materialization_jobs
+                                .get(row.drv_hash.as_str())
+                                .is_some_and(|entry| {
+                                    entry.claimability(now) == Claimability::ClaimableNow
+                                })
+                        })
+                        .take(limit as usize)
+                        .map(JobDescriptor::from_row)
+                        .collect()
+                }
                 Err(e) => {
                     warn!(error = %e, "ListMaterializationJobs query failed; answering empty");
                     Vec::new()
@@ -646,18 +826,7 @@ impl DagActor {
             // A genuinely new job cannot have a view entry (the
             // partial-unique index); insert the fresh shape.
             if let Some(view) = self.materialization_jobs.hydrated_mut() {
-                view.entry_or_insert(
-                    drv_hash.clone(),
-                    JobViewEntry {
-                        job_id,
-                        parked_until: None,
-                        claimed_by: None,
-                        claimed_unbacked_strike: false,
-                        carried_realized_paths: None,
-                        parked_at: None,
-                        defer_until: None,
-                    },
-                );
+                view.entry_or_insert(drv_hash.clone(), JobViewEntry::new_unclaimed(job_id, None));
             }
         } else if !have_entry {
             // Dedup'd row, untracked entry: rehydrate from PG.
@@ -784,23 +953,20 @@ impl DagActor {
         };
         match view.get(drv_hash) {
             None => JobView::None,
-            Some(entry) => match &entry.claimed_by {
-                Some(holder) => JobView::Claimed {
-                    held_by_puller: holder == pulling_identity,
+            // One law, three surfaces (bug_170): admission projects
+            // the SAME `claimability` the KEDA gauge and the leader
+            // listing read, so a listed job is admittable by
+            // construction. Park and the view-only transient deferral
+            // (merged_bug_178) both project `parked: true` — the claim
+            // is refused with NotYetReady until they lapse; PD-20 and
+            // the stalled gauge do NOT read the deferral — defer is
+            // pacing for the NEXT claim, never park evidence.
+            Some(entry) => match entry.claimability(std::time::Instant::now()) {
+                Claimability::Claimed => JobView::Claimed {
+                    held_by_puller: entry.holder().is_some_and(|h| h == pulling_identity),
                 },
-                None => {
-                    let now = std::time::Instant::now();
-                    JobView::Pending {
-                        // Admission treats an active transient deferral
-                        // (merged_bug_178, view-only) like a park: the
-                        // claim is refused with NotYetReady until the
-                        // deferral lapses. PD-20 and the stalled gauge
-                        // do NOT read this field — defer is pacing for
-                        // the NEXT claim, never park evidence.
-                        parked: entry.parked_until.is_some_and(|until| until > now)
-                            || entry.defer_until.is_some_and(|until| until > now),
-                    }
-                }
+                Claimability::Parked | Claimability::Deferred => JobView::Pending { parked: true },
+                Claimability::ClaimableNow => JobView::Pending { parked: false },
             },
         }
     }
@@ -811,9 +977,8 @@ impl DagActor {
     // r[impl obs.metric.scheduler]
     pub(super) fn note_materialization_claimed(&mut self, drv_hash: &DrvHash, holder: &ExecutorId) {
         if let Some(entry) = self.materialization_jobs.get_mut(drv_hash) {
-            entry.claimed_by = Some(holder.clone());
             // A fresh mint resets the ghost strike (merged_bug_055 C).
-            entry.claimed_unbacked_strike = false;
+            entry.mint_claim(holder.clone());
         }
         // T-6.2 lifecycle counter: one increment per delivered claim
         // (the open attempt's mint committed — this is called only on
@@ -899,7 +1064,7 @@ impl DagActor {
             None => true,
             Some(view) => view
                 .get(drv_hash)
-                .is_some_and(|entry| entry.claimed_by.is_none()),
+                .is_some_and(|entry| entry.holder().is_none()),
         }
     }
 
@@ -914,17 +1079,13 @@ impl DagActor {
     /// claimable work to autoscalers; advertising unverifiable work
     /// would scale the store against a view we don't have).
     pub(super) fn has_claimable_job(&self, drv_hash: &str, now: std::time::Instant) -> bool {
+        // The SAME law admission and the listing read (bug_170): an
+        // active park OR transient deferral (merged_bug_178) is not
+        // claimable demand — admission refuses it, so advertising it
+        // would scale the store against refusals.
         self.materialization_jobs
             .get(drv_hash)
-            .is_some_and(|entry| {
-                entry.claimed_by.is_none()
-                    && entry.parked_until.is_none_or(|until| until <= now)
-                    // An active transient deferral (merged_bug_178) is
-                    // not claimable demand either — admission refuses
-                    // it, so advertising it would scale the store
-                    // against refusals.
-                    && entry.defer_until.is_none_or(|until| until <= now)
-            })
+            .is_some_and(|entry| entry.claimability(now) == Claimability::ClaimableNow)
     }
 
     /// Whether ANY unresolved job exists for the node (pending,
@@ -1018,6 +1179,12 @@ impl DagActor {
         exec_id: Uuid,
         attempt: &crate::db::open_attempts::MatAttempt,
         outcome: rio_proto::types::materialization_outcome::Outcome,
+        // The kind-uniform admission witness (bug_134): minted ONLY by
+        // the kernel's `fold_report`, so a consumption call that did
+        // not pass the open-attempt/not-yet-classified fold does not
+        // typecheck. Spent here by value — one admission, one
+        // consumption pass.
+        _admission: rio_evidence_kernel::pull::ProcessAdmission,
     ) -> Result<MatAck, super::pull::PullRejection> {
         use rio_proto::types::materialization_outcome::Outcome;
         let drv_hash = DrvHash::from(attempt.core.drv_hash.as_str());
@@ -1547,7 +1714,7 @@ impl DagActor {
         } else {
             // Under budget: the atomic claim release (re-arm + requeue
             // in ONE step — the node is claimable again immediately).
-            self.release_claim(drv_hash, Some(executor)).await;
+            self.release_claim(drv_hash, executor).await;
         }
         Ok((MatAck(()), true))
     }
@@ -1614,7 +1781,7 @@ impl DagActor {
                 warn!(drv_hash = %drv_hash, %exec_id,
                       "job resolve failed after a settled close; releasing the claim \
                        uncharged (companion law)");
-                self.release_claim(drv_hash, Some(executor)).await;
+                self.release_claim(drv_hash, executor).await;
             }
         }
         MatAck(())
@@ -1659,7 +1826,7 @@ impl DagActor {
         {
             entry.defer_until = Some(std::time::Instant::now() + d);
         }
-        self.release_claim(drv_hash, Some(executor)).await;
+        self.release_claim(drv_hash, executor).await;
         MatAck(())
     }
 
@@ -1706,7 +1873,7 @@ impl DagActor {
                 warn!(drv_hash = %drv_hash, %exec_id,
                       "from-source resolve failed after a settled close; releasing the \
                        claim uncharged (companion law)");
-                self.release_claim(drv_hash, Some(executor)).await;
+                self.release_claim(drv_hash, executor).await;
             }
         }
         MatAck(())
@@ -1753,7 +1920,7 @@ impl DagActor {
                 warn!(drv_hash = %drv_hash, %exec_id,
                       "unobtainable resolve failed after a settled close; releasing the \
                        claim uncharged (companion law)");
-                self.release_claim(drv_hash, Some(executor)).await;
+                self.release_claim(drv_hash, executor).await;
             }
         }
         MatAck(())
@@ -1949,18 +2116,33 @@ impl DagActor {
     /// the admission table answers NotYetReady to EVERY identity and
     /// no armed action remains (the skew the housekeeping tripwire
     /// counts). B1's Aborted intake routes through here too.
-    pub(super) async fn release_claim(
-        &mut self,
-        drv_hash: &DrvHash,
-        executor: Option<&ExecutorId>,
-    ) {
-        if let Some(entry) = self.materialization_jobs.get_mut(drv_hash) {
-            entry.claimed_by = None;
+    /// bug_170/134 rider: the release is a COMPARE-AND-CLEAR on the
+    /// holder — every caller names the executor it acts for, so a
+    /// stale release (a late companion or the two-strike ghost repair
+    /// racing a fresh mint across actor turns) clears nothing and,
+    /// crucially, does NOT requeue a node that now belongs to the new
+    /// attempt's Assigned/Running bookkeeping.
+    // r[impl sched.materialize.claim-coherence]
+    pub(super) async fn release_claim(&mut self, drv_hash: &DrvHash, executor: &ExecutorId) {
+        let release = match self.materialization_jobs.get_mut(drv_hash) {
+            Some(entry) => entry.release_claim_if_held(executor),
+            // No view entry (resolved/wiped/unhydrated): nothing to
+            // clear; the requeue below stays level-triggered — the
+            // node bookkeeping is keyed on the durable attempt, not
+            // the view.
+            None => ClaimRelease::Unclaimed,
+        };
+        if release == ClaimRelease::StaleHolder {
+            warn!(
+                drv_hash = %drv_hash, executor = %executor,
+                "stale claim release ignored: a different executor holds a fresh claim"
+            );
+            return;
         }
         self.requeue_after_attempt(
             std::slice::from_ref(drv_hash),
             crate::state::AttemptKind::Materialization,
-            executor,
+            Some(executor),
         )
         .await;
     }
@@ -2011,14 +2193,20 @@ impl DagActor {
         match companion_follow_up(durable) {
             CompanionFollowUp::Settled => {
                 if let Some(entry) = self.materialization_jobs.get_mut(drv_hash) {
-                    entry.claimed_by = None;
-                    entry.parked_until = Some(
+                    // Compare-and-clear when the consuming executor is
+                    // named (bug_170 rider): a stale park companion
+                    // must not strip a fresh foreign claim. The
+                    // unnamed fallback (no caller today) keeps the
+                    // park's original unconditional clear.
+                    match executor {
+                        Some(e) => {
+                            let _ = entry.release_claim_if_held(e);
+                        }
+                        None => entry.clear_claim_unconditional(),
+                    }
+                    entry.park(
                         std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs),
                     );
-                    // The dwell clock (migration 083 mirror): this park
-                    // is the most recent — re-park restarts the clock
-                    // by design.
-                    entry.parked_at = Some(crate::state::RecoveredInstant::fresh_now());
                 }
             }
             // Deposed believer: project nothing over rows the
@@ -2030,7 +2218,12 @@ impl DagActor {
             // a kept holder is exactly the claimed-no-attempt ghost).
             CompanionFollowUp::ReleaseClaimFallback => {
                 if let Some(entry) = self.materialization_jobs.get_mut(drv_hash) {
-                    entry.claimed_by = None;
+                    match executor {
+                        Some(e) => {
+                            let _ = entry.release_claim_if_held(e);
+                        }
+                        None => entry.clear_claim_unconditional(),
+                    }
                 }
             }
         }

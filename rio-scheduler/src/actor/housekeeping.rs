@@ -862,14 +862,14 @@ impl DagActor {
             let mut first_strikes: Vec<crate::state::DrvHash> = Vec::new();
             let mut cleared_strikes: Vec<crate::state::DrvHash> = Vec::new();
             for (drv_hash, entry) in self.materialization_jobs.iter() {
-                match &entry.claimed_by {
+                match entry.holder() {
                     Some(holder) => {
                         if mat_open.contains(drv_hash.as_str()) {
                             // Backed claim: reset any stale strike.
-                            if entry.claimed_unbacked_strike {
+                            if entry.strike_armed() {
                                 cleared_strikes.push(drv_hash.clone());
                             }
-                        } else if entry.claimed_unbacked_strike {
+                        } else if entry.strike_armed() {
                             // Second consecutive unbacked observation:
                             // the claimed-no-attempt ghost.
                             ghosts.push((drv_hash.clone(), holder.clone()));
@@ -901,16 +901,17 @@ impl DagActor {
             }
             for drv_hash in first_strikes {
                 if let Some(entry) = self.materialization_jobs.get_mut(&drv_hash) {
-                    entry.claimed_unbacked_strike = true;
+                    entry.set_strike(true);
                 }
             }
             for drv_hash in cleared_strikes {
                 if let Some(entry) = self.materialization_jobs.get_mut(&drv_hash) {
-                    entry.claimed_unbacked_strike = false;
+                    entry.set_strike(false);
                 }
             }
             ghosts
         };
+        // r[impl sched.materialize.claim-coherence]
         for (drv_hash, holder) in ghosts {
             metrics::counter!(
                 "rio_scheduler_materialization_view_node_skew_total",
@@ -922,7 +923,7 @@ impl DagActor {
                 "claimed-no-attempt ghost (two sweeps unbacked): releasing the claim \
                  uncharged — the job returns to the listing"
             );
-            self.release_claim(&drv_hash, Some(&holder)).await;
+            self.release_claim(&drv_hash, &holder).await;
         }
         if opens.build.is_empty() && opens.materialization.is_empty() {
             return;
@@ -1137,8 +1138,14 @@ impl DagActor {
                             && let Some(entry) =
                                 self.materialization_jobs.get_mut(attempt.drv_hash.as_str())
                         {
-                            entry.claimed_by = None;
-                            entry.claimed_unbacked_strike = false;
+                            // Compare-and-clear on the CLOSED attempt's
+                            // executor (bug_170 rider): if a fresh
+                            // claim was already minted to someone
+                            // else, this late charge-free close must
+                            // not strip it.
+                            let holder =
+                                crate::state::ExecutorId::from(attempt.executor_id.as_str());
+                            let _ = entry.release_claim_if_held(&holder);
                         }
                     }
                     Ok(_) => {

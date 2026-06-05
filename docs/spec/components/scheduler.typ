@@ -1584,6 +1584,43 @@ a deposed-but-serving replica swallows a report and the successor charges
 (#rref("sched.materialize.claim-resume")), and the NACK alternative remains
 a one-line change to the Fenced arm of `consumption_ack`, recorded there.
 
+#r("sched.materialize.claim-coherence")[
+  Every materialization claim release MUST be a compare-and-clear that
+  names the executor it acts for: a release whose named executor no
+  longer holds the claim MUST clear nothing and MUST NOT requeue the
+  node (it belongs to the new attempt). A view entry observed CLAIMED
+  with no open materialization assignment in two consecutive
+  housekeeping snapshots MUST be repaired by an uncharged release
+  through that same compare-and-clear path.
+]
+The claim fields are private to the view entry: mint
+(strike-resetting), compare-and-clear release, and the two-strike ghost
+flag are its only mutators, so an unconditional holder strip cannot be
+reintroduced outside the law. The two-strike guard is clock-free --- a
+claim minted between the housekeeping rows snapshot and the view
+iteration gets one full sweep to appear backed before it can be called
+a ghost --- and the repair lane deliberately carries no fatal assert
+(the ghost has live producers: crash windows between close-commit and
+view update).
+
+#r("sched.materialize.claimability-projection")[
+  Pull admission, the claimable-backlog gauge, and the leader job
+  listing MUST read one shared four-way claimability classification of
+  the job-view entry --- claimed, parked, deferred, claimable-now, in
+  that dominance order --- and the listing MUST answer only
+  view-tracked claimable-now jobs, answering empty under an
+  Unavailable view, so every listed job is admittable by construction.
+]
+The listing over-fetches the durable query (bounded at
+`min(2×limit, 512)`) because the durable axis cannot see view-only
+armament: the transient deferral has no column by design
+(merged_bug_178), and a fresh claim can commit between the query and
+the reply. This rule does NOT re-key
+#rref("sched.materialize.view-settlement"): entry removal still gates
+exclusively on the durable write's settled disposition --- the privacy
+change moves reads behind the classification, not the removal
+discipline.
+
 #r("sched.materialize.conversion-strictness")[
   The parked-job re-evaluation MUST support two independently default-off
   strictness fields on the `[materialization]` config surface ---

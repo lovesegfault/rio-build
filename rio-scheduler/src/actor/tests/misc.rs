@@ -1414,15 +1414,7 @@ async fn snapshot_counts_substituting() {
         actor.test_inject_ready(h, None, "x86_64-linux", false);
         actor.materialization_jobs.insert(
             crate::state::DrvHash::from(h),
-            crate::actor::materialize::JobViewEntry {
-                job_id: Uuid::new_v4(),
-                parked_until: None,
-                claimed_by: None,
-                claimed_unbacked_strike: false,
-                carried_realized_paths: None,
-                parked_at: None,
-                defer_until: None,
-            },
+            crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
         );
     }
     actor.test_inject_ready("q1", None, "x86_64-linux", false);
@@ -2300,4 +2292,58 @@ async fn test_attempt_ledger_gc_tick_leader_sweeps_standby_noops() -> TestResult
         "exactly the pre-reset old attempt row swept; reset + fresh rows survive"
     );
     Ok(())
+}
+
+// r[verify sched.materialize.claimability-projection]
+// r[verify sched.materialize.claim-coherence]
+/// bug_170: the four-way [`Claimability`] precedence grid — the ONE
+/// law admission, the KEDA gauge, and the leader listing read. A held
+/// claim dominates everything; the durable park dominates the
+/// view-only deferral; an expired axis does not count. The raw fields
+/// are private, so no consumer can recombine them differently — this
+/// grid is the law's full truth table.
+#[test]
+fn claimability_precedence_grid() {
+    use crate::actor::materialize::{Claimability, JobViewEntry};
+    let now = std::time::Instant::now();
+    let future = now + std::time::Duration::from_secs(60);
+    let past = now - std::time::Duration::from_secs(60);
+
+    let mut e = JobViewEntry::new_unclaimed(Uuid::new_v4(), None);
+    assert_eq!(e.claimability(now), Claimability::ClaimableNow);
+
+    // Deferral alone.
+    e.test_set_defer_until(Some(future));
+    assert_eq!(e.claimability(now), Claimability::Deferred);
+    // Park dominates deferral.
+    e.test_set_parked_until(Some(future));
+    assert_eq!(e.claimability(now), Claimability::Parked);
+    // Claim dominates both.
+    e.mint_claim(crate::state::ExecutorId::from("store-0-w0"));
+    assert_eq!(e.claimability(now), Claimability::Claimed);
+
+    // Release through the compare-and-clear law: a stale holder
+    // clears nothing; the true holder releases.
+    use crate::actor::materialize::ClaimRelease;
+    assert_eq!(
+        e.release_claim_if_held(&crate::state::ExecutorId::from("store-1-w0")),
+        ClaimRelease::StaleHolder
+    );
+    assert_eq!(e.claimability(now), Claimability::Claimed);
+    assert_eq!(
+        e.release_claim_if_held(&crate::state::ExecutorId::from("store-0-w0")),
+        ClaimRelease::Released
+    );
+    assert_eq!(e.claimability(now), Claimability::Parked);
+    assert_eq!(
+        e.release_claim_if_held(&crate::state::ExecutorId::from("store-0-w0")),
+        ClaimRelease::Unclaimed,
+        "idempotent re-release"
+    );
+
+    // Expired axes do not count.
+    e.test_set_parked_until(Some(past));
+    assert_eq!(e.claimability(now), Claimability::Deferred);
+    e.test_set_defer_until(Some(past));
+    assert_eq!(e.claimability(now), Claimability::ClaimableNow);
 }

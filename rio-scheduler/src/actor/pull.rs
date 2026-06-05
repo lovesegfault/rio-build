@@ -839,34 +839,15 @@ mod kernel_tests {
     }
 }
 
-/// What to do with one `ReportOutcome` (the pure half of the report
-/// intake — terminal-row-wins / no-transition-out-of-terminal).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReportAdmission {
-    /// First report for an open attempt: run the existing
-    /// classification path (the same entry point the stream arm uses).
-    Process,
-    /// Duplicate, post-establishment, superseded, or never-pulled:
-    /// acknowledge and write nothing.
-    AckIgnore,
-}
-
-// r[impl sched.executor.report-idempotent]
-/// Decide one report from the attempt's durable state. Pure (decision
-/// P10): the attempt is processed only when it is still open
-/// (assignment active) and no classification row exists for its exec —
-/// a terminal or already-classified row always wins and is never
-/// overwritten or re-charged.
-pub(crate) fn fold_report(
-    assignment_active: bool,
-    attempt_already_classified: bool,
-) -> ReportAdmission {
-    if assignment_active && !attempt_already_classified {
-        ReportAdmission::Process
-    } else {
-        ReportAdmission::AckIgnore
-    }
-}
+// The report-admission law lives in the kernel (bug_134): BOTH kinds
+// fold through `rio_evidence_kernel::pull::fold_report`, and the
+// materialization consumption REQUIRES the `ProcessAdmission` witness
+// it mints — a consumption call that bypassed the fold no longer
+// typechecks. The kernel harness
+// `check_report_admission_requires_active_assignment` sweeps the full
+// 2×2 input table, so the materialization arm's old hand gate (which
+// ignored `assignment_active`) cannot reappear without a red proof.
+pub(crate) use rio_evidence_kernel::pull::{ReportAdmission, fold_report};
 
 /// The report payload fields forwarded from the gRPC layer — the same
 /// set the stream `ProcessCompletion` arm carries, so the intake can
@@ -951,32 +932,48 @@ impl DagActor {
             crate::db::open_attempts::AttemptRef::Materialization(m) => {
                 return match payload.materialization_outcome {
                     Some(outcome) => {
-                        if m.core.attempt_terminal || m.core.attempt_recorded {
-                            // Terminal-row-wins: a duplicate/late report for
-                            // an already-consumed attempt is acknowledged.
-                            debug!(%exec_id, "duplicate materialization report acknowledged-and-ignored");
-                            return Ok(());
-                        }
-                        match outcome.outcome {
-                            // Intake-level arm: no payload means no
-                            // consumption ran — acknowledged without a
-                            // witness (nothing closed, nothing to ack
-                            // lawfully; same family as AckIgnore).
-                            None => {
-                                warn!(%exec_id,
-                                      "materialization outcome with no payload; \
-                                       acknowledged-and-ignored");
+                        // Kind-uniform admission (bug_134): the SAME
+                        // kernel fold the build arm uses — the old
+                        // hand gate here read only the recorded bits
+                        // and ignored `assignment_active`, so a
+                        // closed-but-unrecorded attempt's late report
+                        // could still reach consumption.
+                        match fold_report(
+                            m.core.assignment_active,
+                            m.core.attempt_recorded || m.core.attempt_terminal,
+                        ) {
+                            ReportAdmission::AckIgnore => {
+                                // Terminal-row-wins: a duplicate/late
+                                // report for a consumed or closed
+                                // attempt is acknowledged.
+                                debug!(%exec_id, "duplicate/late materialization report acknowledged-and-ignored");
                                 Ok(())
                             }
-                            // The consumption proper: the MatAck
-                            // witness proves an ack-lawful state was
-                            // reached (settled close + companion, or
-                            // fenced); a non-durable close surfaces as
-                            // the retryable NACK.
-                            Some(inner) => self
-                                .consume_materialization_outcome(exec_id, m, inner)
-                                .await
-                                .map(|_ack: super::materialize::MatAck| ()),
+                            ReportAdmission::Process(admission) => match outcome.outcome {
+                                // Intake-level arm: no payload means no
+                                // consumption ran — acknowledged without
+                                // a witness (nothing closed, nothing to
+                                // ack lawfully; same family as
+                                // AckIgnore; the admission is dropped
+                                // unspent by design).
+                                None => {
+                                    warn!(%exec_id,
+                                          "materialization outcome with no payload; \
+                                           acknowledged-and-ignored");
+                                    Ok(())
+                                }
+                                // The consumption proper: spends the
+                                // admission witness (the fold is the
+                                // only mint), and the MatAck witness
+                                // proves an ack-lawful state was
+                                // reached (settled close + companion,
+                                // or fenced); a non-durable close
+                                // surfaces as the retryable NACK.
+                                Some(inner) => self
+                                    .consume_materialization_outcome(exec_id, m, inner, admission)
+                                    .await
+                                    .map(|_ack: super::materialize::MatAck| ()),
+                            },
                         }
                     }
                     None => {
@@ -1004,7 +1001,7 @@ impl DagActor {
                 );
                 Ok(())
             }
-            ReportAdmission::Process => {
+            ReportAdmission::Process(_admission) => {
                 let executor_id = ExecutorId::from(b.core.executor_id.as_str());
                 // r[impl sched.attempt.synthesized-verdict+3]
                 // AD5 abort charge class: a pod reporting `Cancelled`
