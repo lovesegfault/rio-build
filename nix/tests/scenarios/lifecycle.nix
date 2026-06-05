@@ -216,6 +216,10 @@ let
   # Fragment architecture: gc-sweep builds its own victim.
   gcVictimDrv = drvs.mkTrivial { marker = "lifecycle-gc-victim"; };
 
+  # authz-matrix fragment: fresh unique drv so the build runs on a
+  # worker (logs + ownership rows written) rather than substituting.
+  authzDrv = drvs.mkTrivial { marker = "lifecycle-authz"; };
+
   # ephemeral-pool: two builds with DISTINCT markers. Same DAG-dedup
   # reasoning as pinDrv/recoveryDrv — the second build must be a fresh
   # derivation, not a cache hit, so reconcile_ephemeral's ClusterStatus
@@ -651,6 +655,8 @@ let
       rolloutPreDrv
       rolloutPostDrv
       refsDrvFile
+      authzDrv
+      signJwt
       ;
   };
   fragments = builtins.mapAttrs (_: f: f scope) (common.importDir ./lifecycle);

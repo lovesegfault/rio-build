@@ -974,6 +974,17 @@ in
       #   a settled state (q==0 r==0 drain at recovery's end), so
       #   store-rollout starts from a clean baseline.
       "store-rollout"
+      # r[verify store.log.tail-ownership]
+      # r[verify store.log.method-credential+2]
+      # r[verify sched.tenant.authz+3]
+      #   authz-matrix: the deployed-cluster leg of the slot-4 authz
+      #   matrix against the jwtEnabled fixture — own-tenant TailLog
+      #   served via the production build-membership chain (the leg
+      #   the dead derivations.tenant_id gate could never pass),
+      #   foreign TailLog absence-shaped NotFound, tokenless
+      #   TailLog/TenantQuota layer-rejected, foreign WatchBuild
+      #   denied. LAST: builds its own drv, no shared state.
+      "authz-matrix"
     ];
   };
 
