@@ -305,10 +305,26 @@ async fn main() -> anyhow::Result<()> {
     // ---- NodeClaim pool (ADR-023 §13b) ----
     // Lease-elected: only the leader replica reconciles. Lease + PG
     // connect run AFTER the scheduler `connect_forever` above so the
-    // table is migrated by the time `CellSketches::load_seeded` reads it
-    // (scheduler/store own the migrator).
+    // table is migrated by the time `CellSketches::load_seeded` reads
+    // it (the rio-migrate Job runs `rio-store migrate` at deploy).
     // r[impl ctrl.nodeclaim.shim-nodepool]
     if nodeclaim_crd {
+        // TokenSource construction is the PG config preflight (bad
+        // URL, weak TLS, missing rootcert, missing AWS region) and
+        // runs BEFORE the spawn: the reconciler task is detached
+        // (spawn_monitored, JoinHandle dropped), so an error inside
+        // it can never crash the pod — a permanent config error
+        // would otherwise warn-retry forever with the pod
+        // Running/Ready, which is silent degradation. Failing here
+        // crash-loops visibly.
+        let pg_tokens = std::sync::Arc::new(
+            rio_common::pg_iam::TokenSource::new(
+                &cfg.nodeclaim_pool.database_url,
+                cfg.nodeclaim_pool.pg_auth,
+            )
+            .await
+            .map_err(|e| e.context("nodeclaim_pool PostgreSQL config preflight"))?,
+        );
         let lease_cfg = rio_lease::LeaseConfig::from_parts(
             cfg.nodeclaim_pool.lease_name.clone(),
             cfg.nodeclaim_pool.lease_namespace.clone(),
@@ -361,6 +377,7 @@ async fn main() -> anyhow::Result<()> {
                 leader,
                 hooks,
                 cfg.nodeclaim_pool.clone(),
+                pg_tokens,
                 hw_config.clone(),
                 pod_requested,
                 placeable_tx.take().expect("placeable_tx not yet taken"),

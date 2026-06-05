@@ -67,8 +67,10 @@ pub mod test_helpers;
 /// Re-export of the shared embedded migrator from `rio-migrations`.
 ///
 /// Gated on `test`/`test-utils` so `rio_store::MIGRATOR` stays out of
-/// the public API for non-test consumers — production code goes through
-/// `rio_migrations::migrate::run` with `rio_migrations::migrator()`. The
+/// the public API for non-test consumers — production migrates via the
+/// `rio-store migrate` subcommand (`rio_migrations::migrate::run` with
+/// `rio_migrations::migrator()`); serving startup only runs
+/// `rio_migrations::migrate::assert_current`. The
 /// re-export exists for the ~200 `TestDb::new(&crate::MIGRATOR)`
 /// callsites in this crate's `#[cfg(test)]` modules. `crate::MIGRATOR`
 /// and `rio_store::MIGRATOR` resolve to the same static.
@@ -109,10 +111,15 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
 /// Registers prometheus metric descriptions. The help strings here are
 /// the source for `docs/ref/metrics.typ` — see
 /// `xtask/src/regen/docs_data.rs::metrics()` for the data-flow.
-// r[impl obs.metric.store]
+// r[impl obs.metric.store+2]
 #[cfg(feature = "server")]
 pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
+
+    // Shared rio_pg_iam_* family (rio-common emits; each PG consumer
+    // registers — registration and emission are separate call sites,
+    // and rio-common has no exporter of its own).
+    rio_common::pg_iam::describe_metrics();
 
     describe_counter!(
         "rio_store_put_path_total",

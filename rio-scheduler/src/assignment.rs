@@ -921,7 +921,7 @@ mod tests {
     }
 
     // r[verify sched.assign.warm-gate]
-    // r[verify obs.metric.scheduler]
+    // r[verify obs.metric.scheduler+2]
     #[test]
     fn warm_gate_fallback_when_no_warm_workers() {
         use rio_test_support::metrics::CountingRecorder;

@@ -50,8 +50,8 @@ pub mod reconcilers;
 /// Re-export of the shared embedded migrator from `rio-migrations` for
 /// `nodeclaim_pool::sketch` PG tests. Same migration set as
 /// rio-store/rio-scheduler — controller doesn't run this in `main()`
-/// (store/scheduler own startup migration), only the
-/// `TestDb::new(&MIGRATOR)` fixtures do.
+/// (the out-of-band `rio-store migrate` runner owns migration), only
+/// the `TestDb::new(&MIGRATOR)` fixtures do.
 #[cfg(test)]
 pub use rio_migrations::MIGRATOR;
 
@@ -94,9 +94,14 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
 //
 // Hoisted from main.rs so the `tests/metrics_registered.rs` integration
 // test can call it — consistency with the other four components.
-// r[impl obs.metric.controller]
+// r[impl obs.metric.controller+2]
 pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
+
+    // Shared rio_pg_iam_* family (rio-common emits; each PG consumer
+    // registers — registration and emission are separate call sites,
+    // and rio-common has no exporter of its own).
+    rio_common::pg_iam::describe_metrics();
 
     describe_histogram!(
         "rio_controller_reconcile_duration_seconds",

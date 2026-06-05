@@ -538,9 +538,9 @@ in
           "cancel-timing"
           # r[verify sched.sla.reactive-floor+2]
           "reassign"
-          # r[verify obs.metric.scheduler]
+          # r[verify obs.metric.scheduler+2]
           # r[verify obs.metric.builder]
-          # r[verify obs.metric.store]
+          # r[verify obs.metric.store+2]
           "load-50drv"
           # r[verify sched.assign.warm-gate]
           #   Placed AFTER load-50drv so the per-assignment PrefetchHint

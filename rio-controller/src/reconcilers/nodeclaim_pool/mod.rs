@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use kube::api::{Api, ListParams, PostParams};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use rio_crds::karpenter::NodeClaim;
 use rio_crds::pool::{ExecutorKind, Pool};
@@ -252,6 +252,10 @@ pub struct NodeClaimPoolConfig {
     /// store/scheduler (migration 059 lives there). Required —
     /// controller doesn't otherwise hold a PG handle.
     pub database_url: String,
+    /// PostgreSQL authentication mode (`RIO_NODECLAIM_POOL__PG_AUTH`):
+    /// `password` (default, embedded in `database_url`) or `iam` (RDS
+    /// IAM auth, see `rio_common::config::PgAuthMode`).
+    pub pg_auth: rio_common::config::PgAuthMode,
     /// Lease object name for leader election. `None` → non-K8s mode
     /// (always-leader, see [`rio_lease::LeaseConfig::from_parts`]).
     pub lease_name: Option<String>,
@@ -534,6 +538,7 @@ impl Default for NodeClaimPoolConfig {
     fn default() -> Self {
         Self {
             database_url: String::new(),
+            pg_auth: rio_common::config::PgAuthMode::default(),
             lease_name: None,
             lease_namespace: None,
             reference_hw_class: String::new(),
@@ -1921,18 +1926,27 @@ pub(crate) struct CoverResult {
     pub created: Vec<(String, Cell)>,
 }
 
-/// Connect the reconciler's PG pool. Separate from the scheduler/store
-/// `init_db_pool` because the controller does NOT run migrations —
-/// store/scheduler own the migrator and run before this reconciler
-/// reaches `CellSketches::load_seeded` (controller's `connect_forever` to the
-/// scheduler in main.rs already orders that). Max 4 connections: persist
-/// is one upsert per cell per 10s tick.
+/// Connect the reconciler's PG pool, then verify the schema and run
+/// the reconciler. The controller does NOT run migrations — the
+/// rio-migrate Job (`rio-store migrate`) does, before this reconciler
+/// reaches `CellSketches::load_seeded` (controller's `connect_forever`
+/// to the scheduler in main.rs already orders that). Max 4
+/// connections: persist is one upsert per cell per 10s tick.
 /// `connect_pg` + `NodeClaimPoolReconciler::{new, run}` as a single
 /// `async fn`. Standalone (not an `async move` block in main.rs)
 /// because `connect_forever`'s inner `async ||` closure plus a
 /// borrowed param inside a nested `async move` block trips rustc's
 /// HRTB Send check (rust-lang/rust issue 102211 family); a named
 /// `async fn` desugars without the higher-ranked lifetime.
+///
+/// Failure delivery: this task is DETACHED (spawn_monitored with the
+/// JoinHandle dropped; main blocks on the two kube controllers), so
+/// returning an error could never crash the pod — permanent failures
+/// exit the process explicitly instead. Accepted blast radius: a
+/// crash-looping controller also restarts the Pool/ComponentScaler
+/// reconcilers and the node informer, which don't need PG — but the
+/// PlaceableGate is fail-closed while PG is absent anyway, and the
+/// kube reconcilers are level-triggered and reconverge after restart.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_nodeclaim_pool(
     kube: kube::Client,
@@ -1940,14 +1954,28 @@ pub async fn run_nodeclaim_pool(
     leader: LeaderState,
     hooks: ControllerLeaseHooks,
     cfg: NodeClaimPoolConfig,
+    pg_tokens: std::sync::Arc<rio_common::pg_iam::TokenSource>,
     hw_config: HwClassConfig,
     pod_requested: PodRequestedCache,
     placeable_tx: tokio::sync::watch::Sender<PlaceableSet>,
     shutdown: rio_common::signal::Token,
 ) {
-    let Some(pg) = connect_pg(&cfg.database_url, &shutdown).await else {
+    let Some(pg) = connect_pg(&pg_tokens, &shutdown).await else {
         return;
     };
+    // Third-PG-consumer parity with store/scheduler: verify the
+    // schema before touching it, and EXIT on failure — the detached
+    // task can't surface an error any other way (see fn docs), and a
+    // stale schema must not leave the pod Running/Ready while the
+    // reconciler corrupts/fails its persist path.
+    // r[impl store.db.schema-current+2]
+    if let Err(e) = rio_migrations::migrate::assert_current(&pg).await {
+        error!(
+            error = format!("{e:#}"),
+            "database schema check failed; exiting so the pod restarts visibly"
+        );
+        std::process::exit(1);
+    }
     NodeClaimPoolReconciler::new(
         kube,
         admin,
@@ -1964,8 +1992,17 @@ pub async fn run_nodeclaim_pool(
     .await;
 }
 
+/// Retry-forever PG connect — TRANSIENT errors only. Permanent errors
+/// (auth 28xxx, undefined objects, 3D000 database-name typo) EXIT the
+/// process: this loop is unbounded, the task is detached, and config
+/// preflight already ran (`TokenSource::new` in main.rs), so a
+/// permanent error here is a real misconfiguration that must
+/// crash-loop the pod visibly instead of warn-retrying forever with
+/// the pod Running/Ready. Note 3D000 is permanent HERE (unbounded
+/// loop) while the migrate runner's bounded poll treats it transient
+/// — see `rio_common::pg_error`.
 async fn connect_pg(
-    database_url: &str,
+    tokens: &std::sync::Arc<rio_common::pg_iam::TokenSource>,
     shutdown: &rio_common::signal::Token,
 ) -> Option<sqlx::PgPool> {
     // Hand-rolled retry (NOT `connect_forever`): the `async ||` form
@@ -1974,24 +2011,45 @@ async fn connect_pg(
     // Same 1→2→4→8→16s-steady backoff schedule.
     let mut delay = Duration::from_secs(1);
     loop {
-        let try_connect = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(4)
-            .min_connections(1)
-            .idle_timeout(Duration::from_secs(60))
-            .connect(database_url);
+        // fresh_options per attempt: in IAM mode each attempt carries
+        // a token no older than ~1 minute, so a retry loop that
+        // outlives a token's 15-minute TTL keeps working, and a
+        // transient STS failure rides the same backoff as a transient
+        // PG failure.
+        let connected = async {
+            let opts = tokens.fresh_options().await?;
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(4)
+                .min_connections(1)
+                .idle_timeout(Duration::from_secs(60))
+                .connect_with(opts)
+                .await?;
+            anyhow::Ok(pool)
+        };
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => return None,
-            r = try_connect => match r {
-                Ok(pg) => return Some(pg),
-                Err(e) => {
-                    warn!(error = %e, "PG connect failed; retrying");
+            r = connected => match r {
+                Ok(pg) => {
+                    tokens.spawn_refresher(pg.clone());
+                    return Some(pg);
+                }
+                Err(e) if rio_common::pg_error::is_transient_anyhow(&e) => {
+                    warn!(error = format!("{e:#}"), "PG connect failed (transient); retrying");
                     tokio::select! {
                         biased;
                         _ = shutdown.cancelled() => return None,
                         _ = tokio::time::sleep(delay) => {}
                     }
                     delay = (delay * 2).min(Duration::from_secs(16));
+                }
+                Err(e) => {
+                    error!(
+                        error = format!("{e:#}"),
+                        "PG connect failed with a PERMANENT error; exiting so the pod \
+                         restarts visibly instead of warn-retrying forever"
+                    );
+                    std::process::exit(1);
                 }
             }
         }

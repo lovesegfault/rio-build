@@ -9,8 +9,9 @@ metadata:
     {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
 spec:
   {{- if not .Values.componentScaler.store.enabled }}
-  # Stateless at runtime (PG + S3 hold everything). sqlx::migrate! takes
-  # a PG advisory lock, so concurrent replica startup is safe.
+  # Stateless at runtime (PG + S3 hold everything). Replicas don't
+  # migrate (the rio-migrate Job does); startup only verifies the
+  # schema, so concurrent replica startup is safe.
   #
   # OMITTED when componentScaler.store.enabled=true: the ComponentScaler
   # reconciler patches deployments/scale; if helm also rendered
@@ -76,11 +77,7 @@ spec:
             - name: RIO_SUBSTITUTE_ADMISSION_PERMITS
               value: {{ $s.substituteAdmissionPermits | quote }}
             {{- end }}
-            - name: RIO_DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: rio-postgres
-                  key: url
+            {{- include "rio.pgEnv" (dict "root" . "authEnv" "RIO_PG_AUTH" "urlEnv" "RIO_DATABASE_URL") | nindent 12 }}
             {{- with $s.chunkBackend }}
             {{- if .kind }}
             - name: RIO_CHUNK_BACKEND__KIND
@@ -103,9 +100,10 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
-            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 12 }}
-          # tonic-health set_serving() runs AFTER migrations in main.rs —
-          # "PG connected + migrations done" = Ready.
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac" "rdsCa")) | nindent 12 }}
+          # tonic-health set_serving() runs AFTER the schema check in
+          # main.rs — "PG connected + schema current" = Ready. Pods
+          # crash-restart until the rio-migrate Job has run.
           readinessProbe:
             grpc:
               port: 9002
@@ -119,7 +117,7 @@ spec:
           resources:
             {{- toYaml $s.resources | nindent 12 }}
       volumes:
-        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 8 }}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac" "rdsCa")) | nindent 8 }}
 # ClusterIP + headless pair (see rio.grpcServicePair). Builders/fetchers
 # resolve the headless name to pod IPs and p2c across them — a sticky
 # single-channel against the ClusterIP means scaling rio-store doesn't

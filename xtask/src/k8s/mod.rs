@@ -37,6 +37,12 @@ use tracing::{debug, info};
 /// code iterates NAMESPACES.
 pub const NS: &str = "rio-system";
 
+/// Label selector for the per-render-named rio-migrate Jobs. The Job
+/// NAME carries a pod-template hash (migrate-job.yaml), so every
+/// kubectl interaction — k3s pre-delete/wait, EKS failure diagnostics
+/// — selects by this stable label instead.
+pub const MIGRATE_JOB_LABEL: &str = "app.kubernetes.io/name=rio-migrate";
+
 /// Store namespace. ADR-019: store moved out of rio-system to run at
 /// PSA baseline. Secrets the store reads (rio-postgres) need a copy
 /// here.
@@ -133,6 +139,13 @@ pub struct UpOpts {
     /// working nodes that don't exist yet.
     #[arg(long = "deploy-no-hooks")]
     deploy_no_hooks: bool,
+    /// Deploy with postgres.authMode=password instead of the iam
+    /// default. Escape hatch for environments whose tfstate predates
+    /// the IAM-auth infra (no controller_iam_role_arn output) —
+    /// without it that state is a hard error pointing at `tofu
+    /// apply`. EKS-only.
+    #[arg(long = "pg-password-mode")]
+    pg_password_mode: bool,
     /// After deploy, block until Karpenter has replaced all Drifted
     /// NodeClaims (AMI rollout complete). Without this, builds started
     /// immediately after `up` may be disrupted by node drift eviction.
@@ -679,6 +692,7 @@ pub(super) async fn run_up(
             tenant: o.deploy_tenant.clone(),
             skip_preflight: o.deploy_skip_preflight,
             no_hooks: o.deploy_no_hooks,
+            pg_password_mode: o.pg_password_mode,
             wait_drift: o.wait_drift,
             // CLI > env: any --public-cidr flag wins; otherwise fall
             // back to RIO_PUBLIC_CIDRS so a bare `up --deploy` keeps

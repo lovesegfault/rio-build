@@ -337,6 +337,16 @@
       "doc": "Observability setup: structured logging, Prometheus metrics, and optional"
     },
     {
+      "path": "pg_error.rs",
+      "depth": 0,
+      "doc": "Shared transient-vs-permanent PostgreSQL error classifier."
+    },
+    {
+      "path": "pg_iam.rs",
+      "depth": 0,
+      "doc": "RDS IAM database authentication: one [`TokenSource`] per database"
+    },
+    {
       "path": "s3.rs",
       "depth": 0,
       "doc": "Shared `aws_sdk_s3::Client` builder."
@@ -611,6 +621,11 @@
     }
   ],
   "rio-migrations": [
+    {
+      "path": "ensure_roles.rs",
+      "depth": 0,
+      "doc": "Runner-owned role and grant management for `rio_app`."
+    },
     {
       "path": "lib.rs",
       "depth": 0,

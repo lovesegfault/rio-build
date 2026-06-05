@@ -68,6 +68,8 @@
     "rio_gateway_opcodes_total",
     "rio_gateway_putpath_aborted_retries_total",
     "rio_gateway_quota_rejections_total",
+    "rio_pg_iam_mint_failures_total",
+    "rio_pg_iam_token_minted_timestamp_seconds",
     "rio_scheduler_actor_cmd_seconds",
     "rio_scheduler_actor_mailbox_depth",
     "rio_scheduler_assignments_total",
@@ -555,6 +557,18 @@
         "name": "rio_gateway_quota_rejections_total",
         "kind": "counter",
         "help": "SubmitBuild rejected because tenant is over store quota (labeled by tenant)"
+      }
+    ],
+    "pg": [
+      {
+        "name": "rio_pg_iam_mint_failures_total",
+        "kind": "counter",
+        "help": "RDS IAM auth token mint failures (STS/credential errors). Sustained nonzero rate = new PG connections will start failing once the cached token passes its 15-minute TTL."
+      },
+      {
+        "name": "rio_pg_iam_token_minted_timestamp_seconds",
+        "kind": "gauge",
+        "help": "Unix timestamp of the last successful RDS IAM token mint. Alert on time() - this approaching 900 (the token TTL): it means mints are failing or the refresher died."
       }
     ],
     "scheduler": [

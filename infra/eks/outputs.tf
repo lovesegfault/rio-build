@@ -18,6 +18,11 @@ output "scheduler_iam_role_arn" {
   value       = module.rio_scheduler_irsa.arn
 }
 
+output "controller_iam_role_arn" {
+  description = "IAM role ARN for rio-controller IRSA (rds-db:connect for IAM-mode postgres; xtask passes as --set controller.serviceAccount.annotations)"
+  value       = module.rio_controller_irsa.arn
+}
+
 output "bootstrap_iam_role_arn" {
   description = "IAM role ARN for the rio-bootstrap Job IRSA (helm pre-install hook that seeds rio/* secrets in Secrets Manager)"
   value       = module.rio_bootstrap_irsa.arn

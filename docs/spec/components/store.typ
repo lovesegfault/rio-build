@@ -1101,12 +1101,12 @@ leaked chunks not covered by manifest-based cleanup.
 = PostgreSQL Schema
 <store-schema>
 
-#r("store.db.migrate-try-lock")[
-  Startup migrations MUST serialize across replicas via a non-blocking
+#r("store.db.migrate-try-lock+2")[
+  Migration runs MUST serialize across concurrent runners via a non-blocking
   `pg_try_advisory_lock` poll loop, with sqlx's built-in blocking
   `pg_advisory_lock` disabled (`Migrator::set_locking(false)`). Migrations 011
   and 022 run `CREATE INDEX CONCURRENTLY`; CIC's final phase waits for every
-  older virtualxid to release. Under sqlx's default lock, a second replica
+  older virtualxid to release. Under sqlx's default lock, a second runner
   blocked in `SELECT pg_advisory_lock(...)` holds such a virtualxid for the
   duration --- the leader's CIC waits on the follower's vxid, the follower
   waits on the leader's advisory lock, and PG's deadlock detector does not see
@@ -1114,6 +1114,48 @@ leaked chunks not covered by manifest-based cleanup.
   probe is a sub-ms SELECT that completes immediately), so the leader's CIC
   proceeds.
 ]
+
+Migrations normally execute in exactly one place — the `rio-migrate` Job
+(`rio-store migrate`, see
+#cross-link("/spec/system/deployment.typ")[Deployment]) — but the lock stays:
+it is what makes concurrent runner invocations safe (an old-named Job still
+running across an upgrade, a legacy in-pod migrator during mid-upgrade skew,
+a manually re-run Job).
+
+#r("store.db.schema-current+2")[
+  Service startup MUST NOT run migrations. It MUST verify that every
+  embedded migration is applied (`rio_migrations::migrate::assert_current`)
+  and fail with an error naming the migration runner (`rio-store migrate` /
+  the `rio-migrate` Job) when the schema is missing or stale.
+  Applied-but-not-embedded versions are accepted: during a rolling upgrade
+  the migrate Job lands the newer schema while old-binary replicas may
+  still restart against it (migrations are forward-compatible by policy).
+]
+
+Running migrations out-of-band, always as the database master, decouples
+schema DDL from app-pod credentials: `postgres.authMode=iam` pods never
+need DDL-capable database privileges.
+
+#r("store.db.ensure-roles")[
+  Every migrate run MUST re-assert the `rio_app` role, its `rds_iam`
+  membership (where that role exists), and its full table/sequence/default
+  privileges (`rio_migrations::ensure_roles`), under the same advisory-lock
+  hold as the migrations themselves; role and grant management MUST NOT
+  ship as checksum-frozen migrations. Where the connected user lacks the
+  required privileges (k3s migrates as the bitnami app user, which has no
+  CREATEROLE), the pass MUST degrade to a warning, not a failure.
+]
+
+Roles and grants are desired state — cluster-wide, environment-dependent
+(`rds_iam` exists only on RDS), and subject to drift from manual incident
+recovery — not schema history. Two live incidents motivated the move out
+of frozen SQL: a role migration's `GRANT rio_app TO <master>` made the
+master inherit `rds_iam` and RDS PAM rejected its password (locking out
+the migration runner itself), and the frozen follow-up's
+`REASSIGN OWNED BY rio_app` rewrote owner-ACL entries and stripped all of
+rio_app's privileges while the migrate Job reported success. Re-asserting
+grants on every run makes both classes self-healing; the advisory lock
+serializes the cluster-wide role DDL across concurrent runner invocations.
 
 #r("store.db.pool-idle-timeout")[
   The PostgreSQL connection pool MUST set `idle_timeout` (60s) and

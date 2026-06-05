@@ -79,7 +79,7 @@ rio-migrations = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 # --- server-only (gated via the `server` feature) ---------------------
-rio-common = { workspace = true, features = ["aws"], optional = true }
+rio-common = { workspace = true, features = ["aws", "pg-iam"], optional = true }
 rio-auth = { workspace = true, optional = true }
 rio-nix = { workspace = true, optional = true }
 rio-proto = { workspace = true, optional = true }

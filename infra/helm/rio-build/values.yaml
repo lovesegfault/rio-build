@@ -92,6 +92,40 @@ externalSecrets:
   # Aurora writer endpoint (hostname only). Set via --set from tofu output.
   auroraEndpoint: ""
 
+# Postgres CLIENT auth for the EKS deployments (store/scheduler/
+# controller). UNRELATED to the k3s-only bitnami `postgresql` subchart
+# block at the bottom of this file — that path (postgres-secret.yaml,
+# in-cluster PG, no TLS) is untouched by these knobs.
+postgres:
+  # password (default): RIO_DATABASE_URL comes from the rio-postgres
+  # Secret (ESO-templated Aurora URL on EKS, chart-rendered on k3s).
+  # iam: RDS IAM auth — a passwordless URL is rendered inline and the
+  # pod's IRSA role mints 15-minute auth tokens (rio_common::pg_iam),
+  # so the 7-day AWS-managed master-password rotation can't strand
+  # running pods. Requires externalSecrets.enabled (rio.pgEnv fails
+  # the render otherwise — the rendered URL points at the rdsCa mount
+  # that family gates on), the rio_app DB role, and tofu
+  # iam_database_authentication_enabled + rds-db:connect on the
+  # store/scheduler/controller IRSA roles.
+  # Safe on a FRESH cluster: the rio-migrate Job (migrate-job.yaml)
+  # always runs as the master and provisions the rio_app role + grants
+  # (rio_migrations::ensure_roles) before any app pod connects as it.
+  # xtask sets iam on every EKS deploy; the chart default stays
+  # password for k3s/dev.
+  #
+  # The DB user is HARDCODED as rio_app (rio.pgEnv): the name is
+  # load-bearing in three uncoordinated places — the tofu
+  # rds-db:connect resource (dbuser:<DbiResourceId>/rio_app), the
+  # role provisioning, and this chart's rendered URL. A knob would
+  # silently break auth whenever set without touching the other two,
+  # so there is none.
+  authMode: password
+  # Mount path of the vendored AWS RDS trust bundle
+  # (files/rds-global-bundle.pem → ConfigMap rio-rds-ca). Referenced by
+  # the ESO password-mode URL template AND the inline iam-mode URL;
+  # the rdsCa mount family (_helpers.tpl) mounts its dirname.
+  caBundlePath: /etc/rio/rds-ca/global-bundle.pem
+
 # Helm pre-install/pre-upgrade hook Job. Idempotent — describe-secret guards.
 # Generates rio/hmac (openssl rand 32) and rio/signing-key (nix-store
 # --generate-binary-cache-key) in Secrets Manager IF THEY DON'T EXIST.
@@ -147,6 +181,11 @@ monitoring:
 controller:
   enabled: true
   image: rio-controller
+  serviceAccount:
+    # EKS IRSA: eks.amazonaws.com/role-arn set via --set from tofu
+    # output. Controller needs rds-db:connect for IAM-mode postgres
+    # (nodeclaim_pool CellSketches persist/load). No other AWS access.
+    annotations: {}
   # Addresses passed through to builder pods via the controller's env.
   # Lazy-connected per-reconcile — transient scheduler outage doesn't kill
   # the controller.
@@ -216,8 +255,9 @@ buildScheduler:
 # rio-store
 # ──────────────────────────────────────────────────────────────────────────
 # PG + S3/inline chunk storage. replicas=1 by default; multi-replica
-# is safe — startup migrations serialize via pg_try_advisory_lock
-# (r[store.db.migrate-try-lock]).
+# is safe — replicas don't migrate (the rio-migrate Job does,
+# serialized via pg_try_advisory_lock, see store.db.migrate-try-lock);
+# startup only verifies the schema (store.db.schema-current).
 store:
   enabled: true
   image: rio-store

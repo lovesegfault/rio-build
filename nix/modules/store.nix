@@ -18,8 +18,9 @@ in
     databaseUrl = lib.mkOption {
       type = lib.types.str;
       description = ''
-        PostgreSQL connection URL (`RIO_DATABASE_URL`).
-        rio-store applies migrations (sqlx migrate) on startup.
+        PostgreSQL connection URL (`RIO_DATABASE_URL`). Also used by
+        the `rio-migrate` oneshot (below) — rio-store itself does not
+        migrate on startup, it only verifies the schema is current.
       '';
     };
 
@@ -72,10 +73,52 @@ in
     environment.etc."rio/store.toml" = lib.mkIf (cfg.extraConfig != "") {
       text = cfg.extraConfig;
     };
+
+    # Database migrations run here, NOT in the services: the systemd
+    # mirror of the k8s rio-migrate Job. rio-store and
+    # rio-scheduler only `assert_current` at startup and fail (with
+    # Restart=on-failure churning them) until this completes. Lives in
+    # the store module because the `rio-store migrate` subcommand ships
+    # in the store binary; scheduler.nix orders After= it (no-op when
+    # the store module is disabled — every current fixture co-locates
+    # both on the control node).
+    systemd.services.rio-migrate = {
+      description = "rio database migrations";
+      wantedBy = [ "multi-user.target" ];
+      # NixOS postgresql.service waits for pg_isready in postStart, so
+      # ordering After it means the one-shot connect attempt succeeds.
+      after = [
+        "network-online.target"
+        "postgresql.service"
+      ];
+      wants = [ "network-online.target" ];
+      environment = {
+        RIO_DATABASE_URL = cfg.databaseUrl;
+        RIO_LOG_FORMAT = config.services.rio.logFormat;
+      };
+      serviceConfig = {
+        Type = "oneshot";
+        # Stay "active" after exit — `systemctl status rio-migrate`
+        # reads as done, not dead, for the rest of the boot.
+        RemainAfterExit = true;
+        ExecStart = "${config.services.rio.package}/bin/rio-store migrate";
+        # Valid with Type=oneshot: systemd refuses only Restart=always/
+        # on-success there (service_verify). RemainAfterExit latches
+        # SUCCESS only — a failed ExecStart still lands the unit in
+        # "failed", so on-failure re-runs it (covers a PG that restarts
+        # mid-migration).
+        Restart = "on-failure";
+        RestartSec = "5s";
+      };
+    };
+
     systemd.services.rio-store = rioLib.mkRioService {
       binary = "rio-store";
       description = "rio-store NAR content-addressable store";
-      extraAfter = [ "postgresql.service" ];
+      extraAfter = [
+        "postgresql.service"
+        "rio-migrate.service"
+      ];
       # Env var naming: the config loader strips the `RIO_` prefix then
       # lowercases to match the Config struct field name (e.g.
       # RIO_LISTEN_ADDR -> `listen_addr`). Each rio binary runs as its own process with its

@@ -15,6 +15,11 @@
         "type": "string",
         "default": ""
       },
+      "pg_auth": {
+        "description": "PostgreSQL authentication mode (`RIO_PG_AUTH`): `password`\n(default, embedded in `database_url`) or `iam` (RDS IAM auth,\nsee `rio_common::config::PgAuthMode`).",
+        "$ref": "#/$defs/PgAuthMode",
+        "default": "password"
+      },
       "metrics_addr": {
         "description": "Prometheus exporter listen address. Per-binary defaults differ\n(gateway 9090, scheduler 9091, …) so each `Config::default()`\nsets this explicitly via [`CommonConfig::new`].",
         "type": "string",
@@ -148,6 +153,21 @@
       }
     },
     "$defs": {
+      "PgAuthMode": {
+        "description": "How the PostgreSQL password is obtained. Field `pg_auth` in each\nPG-consuming binary's `Config` (env `RIO_PG_AUTH`, controller:\n`RIO_NODECLAIM_POOL__PG_AUTH`).\n\n`Password` is the default so k3s/local deployments and the\npassword→IAM transition keep working with no config change. `Iam`\nreplaces the static (7-day auto-rotating) Aurora password with a\n15-minute SigV4 token minted from the pod's IRSA role and refreshed\nin the background — full rationale in the `pg_iam` module docs.",
+        "oneOf": [
+          {
+            "description": "Static password embedded in `database_url` (k3s/local, and EKS\nduring the password→IAM transition).",
+            "type": "string",
+            "const": "password"
+          },
+          {
+            "description": "RDS IAM auth: `database_url` is passwordless and MUST carry\n`sslmode=verify-full` + `sslrootcert=<RDS CA bundle>` — the\nminted token is a bearer credential, and only verify-full\nguarantees it is never sent to an unverified server. Enforced\nin `pg_iam::pg_connect_options`.",
+            "type": "string",
+            "const": "iam"
+          }
+        ]
+      },
       "ChunkBackendKind": {
         "description": "Chunk storage backend selection.\n\nSerde internally-tagged (`kind`): TOML writes\n`[chunk_backend]\\nkind = \"s3\"\\nbucket = \"...\"`. The tag field is\n`kind` not the serde default `type` — `type` is a Rust keyword\nand would need `r#type` everywhere we match on it.\n\nDefault is `Inline`: backward-compatible with existing deployments\nthat have no chunk-backend config. All NARs go into PG\n`manifests.inline_blob` regardless of size. Fine for dev/CI;\nproduction wants `s3` or `filesystem`.",
         "oneOf": [
@@ -228,6 +248,7 @@
   "defaults": {
     "listen_addr": "[::]:9002",
     "database_url": "",
+    "pg_auth": "password",
     "metrics_addr": "[::]:9092",
     "drain_grace_secs": 6,
     "chunk_backend": {

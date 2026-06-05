@@ -46,10 +46,11 @@ pub use state::{PoisonConfig, RetryPolicy};
 pub use actor::DEFAULT_SUBSTITUTE_CONCURRENCY;
 
 /// Re-export of the shared embedded migrator from `rio-migrations`.
-/// Test-only (`TestDb::new(&MIGRATOR)`) — production goes through
-/// `rio_migrations::migrate::run(&pool, rio_migrations::migrator())` in
-/// `main.rs`. Same migration set as rio-store; both consume the single
-/// `rio-migrations` source of truth.
+/// Test-only (`TestDb::new(&MIGRATOR)`) — production migrates via
+/// `rio-store migrate` (helm rio-migrate Job / NixOS oneshot);
+/// `main.rs` only verifies with
+/// `rio_migrations::migrate::assert_current`. Same migration set as
+/// rio-store; both consume the single `rio-migrations` source of truth.
 #[cfg(test)]
 pub use rio_migrations::MIGRATOR;
 
@@ -124,9 +125,14 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
 /// Registers prometheus metric descriptions. The help strings here are
 /// the source for `docs/ref/metrics.typ` — see
 /// `xtask/src/regen/docs_data.rs::metrics()` for the data-flow.
-// r[impl obs.metric.scheduler]
+// r[impl obs.metric.scheduler+2]
 pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
+
+    // Shared rio_pg_iam_* family (rio-common emits; each PG consumer
+    // registers — registration and emission are separate call sites,
+    // and rio-common has no exporter of its own).
+    rio_common::pg_iam::describe_metrics();
 
     describe_counter!(
         "rio_scheduler_builds_total",
