@@ -588,6 +588,11 @@
       "path": "settle.rs",
       "depth": 0,
       "doc": "The materialization settlement laws (bug_182 + merged_bug_055)."
+    },
+    {
+      "path": "visibility.rs",
+      "depth": 0,
+      "doc": "The I-217 tenant-visibility verdict table (bug_115)."
     }
   ],
   "rio-gateway": [
@@ -1591,6 +1596,11 @@
       "path": "test_helpers.rs",
       "depth": 0,
       "doc": "Shared test-only seeding helpers."
+    },
+    {
+      "path": "visibility.rs",
+      "depth": 0,
+      "doc": "Tenant sig-visibility: the ONE body behind every visibility decision"
     }
   ],
   "rio-test-support": [
