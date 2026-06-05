@@ -849,7 +849,7 @@ mod tests {
             ..chunk
         };
         let mut cursor = LineCursor::new(0);
-        let err = read_chunk(&store, None, &boundary, &mut [][..], &mut cursor)
+        let err = read_chunk(&store, None, &boundary, &[], &mut cursor)
             .await
             .expect_err("missing object is still an error, but a GET-shaped one");
         assert!(

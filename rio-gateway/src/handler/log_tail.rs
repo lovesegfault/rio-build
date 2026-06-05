@@ -310,7 +310,7 @@ enum DriveEnd {
 /// `gap_from` and dropped the chunk — so any exit between the first
 /// sighting and the second (grace edge, orphan, terminal-complete)
 /// lost both the fetched lines AND the marker. Holding the sliced
-/// chunk makes the exit flush total: [`accept_and_disclose`] is the
+/// chunk makes the exit flush total: [`flush_pending_gap`] is the
 /// only way out of this state, and every `run_tail` exit path runs it.
 struct PendingGap {
     /// First missing line (== the relay floor at sighting time).

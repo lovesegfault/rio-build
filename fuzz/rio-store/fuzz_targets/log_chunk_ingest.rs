@@ -472,7 +472,7 @@ fuzz_target!(|data: &[u8]| {
         let mut served: Vec<(u64, Vec<u8>)> = Vec::new();
         for (_, _, chunk) in manifest.iter() {
             served.extend(
-                now_or_never(read_chunk(&store, chunk, &mut cursor))
+                now_or_never(read_chunk(&store, None, chunk, &[], &mut cursor))
                     .expect("reading a chunk the harness just stored cannot fail"),
             );
         }
