@@ -283,7 +283,6 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
                         "PullAssignment unanswered; retrying"
                     );
                     maybe_minted = true;
-                    idle.on_non_answer();
                     attempt = attempt.saturating_add(1);
                     RETRY_ENVELOPE.duration(attempt - 1)
                 }
@@ -306,6 +305,12 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
                         } else {
                             Duration::from_secs(u64::from(nyr.retry_after_seconds))
                         };
+                        // r[impl builder.pull.idle-undroppable]
+                        // Errors and empty outcomes between answers are
+                        // structurally invisible to the clock — the
+                        // pair-discard API no longer exists, so the
+                        // armed pair survives to be credited (capped)
+                        // here.
                         idle.on_answer(tokio::time::Instant::now(), suggested);
                         if idle.idle_for() >= idle_timeout {
                             return PullPhaseOutcome::IdleExit;
@@ -316,7 +321,6 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
                     // not an answer — treat like an unservable pull.
                     None => {
                         warn!("PullAssignment returned an empty outcome; retrying");
-                        idle.on_non_answer();
                         attempt = attempt.saturating_add(1);
                         RETRY_ENVELOPE.duration(attempt - 1)
                     }
@@ -329,7 +333,6 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
                 EffectfulOutcome::Resolved(Err(status)) => {
                     warn!(code = ?status.code(), msg = status.message(),
                     "PullAssignment unservable; retrying");
-                    idle.on_non_answer();
                     attempt = attempt.saturating_add(1);
                     RETRY_ENVELOPE.duration(attempt - 1)
                 }

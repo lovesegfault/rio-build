@@ -1,21 +1,35 @@
 //! The idle clock: how long has the scheduler been *telling* this pod
 //! "wanted but not deliverable"?
 //!
-//! The class this closes (merged_bug_209): measuring idleness as
-//! wall-clock since the first `NotYetReady` counts scheduler-outage
-//! time — a 5-minute leader failover between two `NotYetReady` answers
-//! used to mature the whole spawned cohort past `idle_secs` at once,
-//! and the first post-recovery answer triggered a cohort-wide exit 0
-//! right as the queue became servable again.
+//! Two failure polarities bound this design, one per bug:
 //!
-//! [`IdleClock`] makes unanswered time unrepresentable in the
-//! accumulator by construction: the only place the accumulator
-//! advances is [`IdleClock::on_answer`], and the increment is the gap
-//! since the *previous answer*, capped at twice that answer's
-//! suggested re-pull delay (covers the ±20 % pacing jitter plus RPC
-//! latency). Transport errors and empty outcomes call
-//! [`IdleClock::on_non_answer`], which pauses the clock — the next
-//! answer re-seeds the pair without crediting the outage gap.
+//! - **Over-count** (merged_bug_209): measuring idleness as wall-clock
+//!   since the first `NotYetReady` counts scheduler-outage time — a
+//!   5-minute leader failover between two answers used to mature the
+//!   whole spawned cohort past `idle_secs` at once, and the first
+//!   post-recovery answer triggered a cohort-wide exit 0 right as the
+//!   queue became servable again. The CAP is the close: the only place
+//!   the accumulator advances is [`IdleClock::on_answer`], and the
+//!   increment is the gap since the *previous answer*, capped at twice
+//!   that answer's suggested re-pull delay (covers the ±20 % pacing
+//!   jitter plus RPC latency). A 300s failover between two answers
+//!   credits at most 2× the previous suggestion (~10s) — the cap alone
+//!   is the sufficient outage bound.
+//! - **Starvation** (bug_296): the original design ALSO discarded the
+//!   armed answer pair on every transport error or empty outcome — an
+//!   over-correction that made legitimately-idle time uncountable
+//!   under interleaved errors: a flaky-but-answering scheduler kept
+//!   `idle_for` at zero forever, so `idle_timeout` was unreachable.
+//!   That pair-discard API is DELETED (`builder.pull.idle-undroppable`):
+//!   the armed pair survives everything except the next answer, so the
+//!   starvation polarity is unrepresentable — no API can drop an armed
+//!   pair, and the cap already bounds whatever gap the next answer
+//!   credits.
+//!
+//! Threat model in one line: time only accumulates between CONSECUTIVE
+//! answers, at most 2× the pace the scheduler itself suggested —
+//! outages are bounded by the cap, errors are invisible, and only the
+//! scheduler's own answers can mature a pod toward its idle exit.
 
 use std::time::Duration;
 
@@ -26,8 +40,11 @@ use tokio::time::Instant;
 pub(super) struct IdleClock {
     accumulated: Duration,
     /// The previous `NotYetReady` answer: when it arrived and what
-    /// re-pull delay it suggested. `None` until the first answer and
-    /// after every non-answer (transport error / empty outcome).
+    /// re-pull delay it suggested. `None` only until the first answer
+    /// — the armed pair is undroppable thereafter (bug_296: a
+    /// pair-discard on errors starved the accumulator); the cap in
+    /// [`Self::on_answer`] bounds whatever gap the next answer
+    /// credits.
     last: Option<(Instant, Duration)>,
 }
 
@@ -41,12 +58,6 @@ impl IdleClock {
             self.accumulated += now.duration_since(prev).min(prev_suggested * 2);
         }
         self.last = Some((now, suggested));
-    }
-
-    /// A non-answer (transport error, empty outcome): pause. The
-    /// elapsed outage gap will not be credited by the next answer.
-    pub(super) fn on_non_answer(&mut self) {
-        self.last = None;
     }
 
     /// Total answered idle time.
@@ -88,27 +99,78 @@ mod tests {
             clock.on_answer(Instant::now(), suggested);
             assert_eq!(clock.idle_for(), Duration::from_secs(15));
 
-            // An outage: errors pause; the post-outage answer re-seeds
-            // without crediting the 300s gap.
-            clock.on_non_answer();
+            // An outage: a 300s gap (leader failover, transport
+            // errors — the clock cannot tell and does not care) is
+            // credited at the CAP, not at face value: the
+            // merged_bug_209 over-count close, now carried by the cap
+            // alone.
             tokio::time::advance(Duration::from_secs(300)).await;
             clock.on_answer(Instant::now(), suggested);
-            assert_eq!(clock.idle_for(), Duration::from_secs(15));
+            assert_eq!(clock.idle_for(), Duration::from_secs(25));
+        });
+    }
+
+    // r[verify builder.pull.idle-undroppable]
+    /// bug_296 red: interleaved transport errors must not starve the
+    /// accumulator. A scheduler that answers NotYetReady every 5s
+    /// through a flaky transport (one error between every pair of
+    /// answers) is TELLING this pod "wanted but not deliverable" the
+    /// whole time — yet the pre-fix pair-discard zeroed the armed
+    /// state on every error, so idle_for stayed 0 forever and
+    /// idle_timeout became unreachable: the over-count fix inverted
+    /// into a starvation polarity.
+    #[test]
+    fn error_interleaved_answers_still_accumulate_idle() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut clock = IdleClock::default();
+            let suggested = Duration::from_secs(5);
+            clock.on_answer(Instant::now(), suggested);
+            for _ in 0..6 {
+                // Pre-fix, a transport error here called the (now
+                // deleted) pair-discard; the type no longer has any
+                // operation an error path could call — the errors are
+                // structurally invisible to the accumulator.
+                tokio::time::advance(Duration::from_secs(5)).await;
+                clock.on_answer(Instant::now(), suggested);
+            }
+            assert_eq!(
+                clock.idle_for(),
+                Duration::from_secs(30),
+                "six paced 5s answer gaps (each under the 2x cap) must \
+                 accumulate 30s of answered idle time regardless of the \
+                 errors interleaved between them"
+            );
         });
     }
 
     proptest! {
-        /// idle_for == Σ min(gap, 2×prev_suggested) over answer-adjacent
-        /// pairs; intervals interrupted by a non-answer never count.
+        // r[verify builder.pull.idle-undroppable]
+        /// Independent oracle (bug_296 replaced the impl-mirroring
+        /// pair-sum check, which restated the implementation line for
+        /// line and could not have caught a polarity inversion):
+        /// four properties each computed by a DIFFERENT route than the
+        /// accumulator —
+        /// 1. cap bound: idle_for ≤ Σ 2×suggestedᵢ over all answers
+        ///    but the last (each pair credits at most the cap);
+        /// 2. wall bound: idle_for ≤ elapsed between first and last
+        ///    answer (no pair credits more than real time);
+        /// 3. monotone: idle_for never decreases;
+        /// 4. paced exactness: when EVERY inter-answer gap is within
+        ///    its cap, idle_for == last−first exactly (computed from
+        ///    the endpoints, not the pairs — a starved accumulator
+        ///    fails this without the oracle re-deriving the sum).
         /// (Kani none-sensible: rio-builder is a bin crate — kani.nix
-        /// covers lib crates only; this is 30 lines of pure arithmetic
-        /// and the proptest is the recorded coverage.)
+        /// covers lib crates only; this proptest is the recorded
+        /// coverage.)
         #[test]
-        fn idle_for_equals_capped_pair_sum(
-            // (gap_ms, suggested_ms, answered) script, bounded to keep
-            // Instant arithmetic well clear of overflow.
+        fn idle_for_independent_oracle(
             script in proptest::collection::vec(
-                (1u64..600_000, 1u64..60_000, proptest::bool::ANY), 0..40)
+                (1u64..600_000, 1u64..60_000), 1..40)
         ) {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
@@ -117,23 +179,43 @@ mod tests {
                 .expect("runtime");
             runtime.block_on(async {
                 let mut clock = IdleClock::default();
-                let mut expected = Duration::ZERO;
-                let mut prev: Option<(Instant, Duration)> = None;
-                for (gap_ms, suggested_ms, answered) in script {
+                let mut cap_budget = Duration::ZERO;
+                let mut prev_suggested: Option<Duration> = None;
+                let mut first_at: Option<Instant> = None;
+                let mut last_at: Option<Instant> = None;
+                let mut all_paced = true;
+                let mut last_idle = Duration::ZERO;
+                for (gap_ms, suggested_ms) in script {
                     tokio::time::advance(Duration::from_millis(gap_ms)).await;
-                    if answered {
-                        let now = Instant::now();
-                        let suggested = Duration::from_millis(suggested_ms);
-                        if let Some((p, ps)) = prev {
-                            expected += now.duration_since(p).min(ps * 2);
+                    let now = Instant::now();
+                    let suggested = Duration::from_millis(suggested_ms);
+                    if let (Some(prev), Some(ps)) = (last_at, prev_suggested) {
+                        cap_budget += ps * 2;
+                        if now.duration_since(prev) > ps * 2 {
+                            all_paced = false;
                         }
-                        clock.on_answer(now, suggested);
-                        prev = Some((now, suggested));
-                    } else {
-                        clock.on_non_answer();
-                        prev = None;
                     }
-                    prop_assert_eq!(clock.idle_for(), expected);
+                    clock.on_answer(now, suggested);
+                    prop_assert!(
+                        clock.idle_for() >= last_idle,
+                        "idle_for must be monotone"
+                    );
+                    last_idle = clock.idle_for();
+                    first_at.get_or_insert(now);
+                    last_at = Some(now);
+                    prev_suggested = Some(suggested);
+                }
+                let wall = last_at
+                    .zip(first_at)
+                    .map_or(Duration::ZERO, |(l, f)| l.duration_since(f));
+                prop_assert!(clock.idle_for() <= cap_budget, "cap bound");
+                prop_assert!(clock.idle_for() <= wall, "wall bound");
+                if all_paced {
+                    prop_assert_eq!(
+                        clock.idle_for(), wall,
+                        "paced scripts accumulate exactly the endpoint \
+                         elapsed — a starved accumulator fails here"
+                    );
                 }
                 Ok(())
             })?;

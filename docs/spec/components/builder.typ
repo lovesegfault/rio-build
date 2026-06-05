@@ -1382,6 +1382,27 @@ plus the `RIO_DISPATCH_MODE` pod discriminator were retired with it (the
 config loader still tolerates a stray env of that name, but nothing renders
 one).
 
+#r("builder.pull.idle-undroppable")[
+  The idle accumulator MUST be advanced only by scheduler answers — the
+  credit for each pair of consecutive `NotYetReady` answers is the elapsed
+  gap capped at twice the earlier answer's suggested re-pull delay — and the
+  armed answer pair MUST be undroppable: no transport error, empty outcome,
+  or other non-answer event may discard it. The cap is the sole outage
+  bound; an API that can discard an armed pair is forbidden because it
+  makes legitimately-idle time uncountable under interleaved errors.
+]
+
+The two polarities this balances: counting raw wall-clock matured whole
+cohorts through scheduler outages (the over-count, closed by the cap —
+a 300s failover between two answers credits at most twice the previous
+suggestion), while the original over-correction — discarding the armed pair
+on every error — made `idle_timeout` unreachable against a flaky-but-
+answering scheduler (the starvation, bug_296: `idle_for` pinned at zero
+forever). Deleting the discard operation closes the starvation direction
+structurally: the type has no operation an error path could call, so the
+property holds for every current and future caller rather than per call
+site.
+
 #r("builder.pull.retry-loop+2")[
   In pull mode the builder MUST retry a retryably-unservable `PullAssignment`
   (not-leader, recovery-gated, transport error/timeout) with jittered
