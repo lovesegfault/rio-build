@@ -992,4 +992,302 @@ mod tests {
             );
         }
     }
+
+    // ═════════════════════════════════════════════════════════════
+    // §C4 — the composed authorization matrix (bug_237 / merged_bug_122)
+    //
+    // OWNER SIGN-OFF (Q4), transcribed per the R14 signature packet
+    // -------------------------------------------------------------
+    // SIGNED 2026-06-04 (owner, in-conversation R14 packet §5-S,
+    // before any fix worktree branched — bughunt-2 wave):
+    //   "Q4 (matrix governance): SIGNED — composed matrix vs the
+    //    spec-derived const expected table; TenantQuota → TenantJwt +
+    //    handler ownership; the revised C3 dispositions ratified
+    //    (FindMissingPaths batch gate, EndUserRejected polarity rows,
+    //    QueryRealisation disposition, GetPath CapabilityHint);
+    //    PG-bound rows composed-or-signed-layer-only."
+    // The sign-off knowingly covers two residuals:
+    //  (a) the resident-phase existence oracle survives by design:
+    //      foreign+resident = PermissionDenied (scheduler actor arm)
+    //      vs foreign+terminal/absent = NotFound — the spec-pinned
+    //      status asymmetry; lifecyclePhaseIndependence in authz.qnt
+    //      is modeled over {admit, deny} verdicts, not status codes.
+    //  (b) the SigVisibility rows' composed cells are LAYER-ONLY in
+    //      this matrix (the TestDb-declined branch the packet names);
+    //      the handler tier's standing evidence is the sign.rs gate
+    //      battery (PathVisible/VisibleSet/CapabilityHint witnesses:
+    //      sig_visibility_gate{,_batch} tests) plus the typed-witness
+    //      requirement on every formerly-Open data path.
+    // Composed-tier allocation (total — no silently-absent cells):
+    //   TailLog (TenantJwt + ownership)  → TestDb battery in
+    //     logs/service.rs (taillog_*: owner admitted under production
+    //     seeding, swept-arm, foreign absence-shaped, IDOR vectors).
+    //   TenantQuota (TenantJwt + handler ownership) → TestDb battery
+    //     in grpc/mod.rs (tenant_quota_* absence-shaped deny) +
+    //     tenantquota_tokenless layer red (this file).
+    //   HMAC-witness rows (IngestToken/ServiceCaller/EndUserRejected)
+    //     → unit composition in this file + the typed-witness
+    //     constructors' own batteries (put_path / grpc/mod.rs).
+    //   SigVisibility rows → residual (b) above.
+    // EXPECTED_LAYER is derived from the SPEC text
+    // (store.log.method-credential+2, store.authz.declared-verifier,
+    // store.authz.key-coherence) — NEVER from decide(). Editing it is
+    // owner-decision territory.
+    // ═════════════════════════════════════════════════════════════
+
+    /// Spec-derived expectation vocabulary (decoupled from the kernel
+    /// enums so a kernel refactor cannot silently rewrite the table).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Want {
+        Admit,
+        MissingTenant,
+        MissingAssignment,
+        MissingService,
+        ServiceGarbage,
+    }
+
+    fn want_verdict(w: Want) -> LayerVerdict {
+        match w {
+            Want::Admit => LayerVerdict::Admit,
+            Want::MissingTenant => LayerVerdict::Reject(RejectReason::MissingTenantToken),
+            Want::MissingAssignment => LayerVerdict::Reject(RejectReason::MissingAssignmentToken),
+            Want::MissingService => LayerVerdict::Reject(RejectReason::MissingServiceToken),
+            Want::ServiceGarbage => LayerVerdict::Reject(RejectReason::ServiceVerificationFailed),
+        }
+    }
+
+    /// Class-kind key. Exhaustive match: a NEW CredentialClass variant
+    /// fails compilation HERE, forcing total matrix re-review.
+    fn class_kind(class: CredentialClass) -> &'static str {
+        match class {
+            CredentialClass::AssignmentToken => "assignment",
+            CredentialClass::TenantJwt => "tenant",
+            CredentialClass::Service => "service",
+            CredentialClass::Public { .. } => "public",
+            CredentialClass::HandlerEnforced { .. } => "handler",
+        }
+    }
+
+    /// The DECLARED verifier knob per class kind (the spec's
+    /// declared-family law): the table is indexed by this knob alone,
+    /// so any dependence of `decide()` on a foreign knob fails an
+    /// equality somewhere in the exhaustive sweep below.
+    fn declared_knob(kind: &str, cfg: VerifierConfig) -> bool {
+        match kind {
+            "assignment" => cfg.hmac,
+            "tenant" => cfg.jwt,
+            "service" => cfg.service,
+            "public" | "handler" => false,
+            _ => unreachable!("unknown class kind {kind}"),
+        }
+    }
+
+    /// THE owner-signed expected table (§5-S Q4):
+    /// (class kind, declared knob, presented) → layer verdict.
+    /// 3 keyed kinds × 2 knob states × 5 presented + 2 unkeyed kinds
+    /// × 1 state × 5 presented = 40 rows, pinned by the size assert.
+    #[rustfmt::skip]
+    const EXPECTED_LAYER: &[(&str, bool, Presented, Want)] = &[
+        // assignment-token class: enforce-when-configured presence pin
+        // (HMAC binding rides in the stream gate, not the layer).
+        ("assignment", false, Presented::None,             Want::Admit),
+        ("assignment", false, Presented::TenantClaims,     Want::Admit),
+        ("assignment", false, Presented::ServiceVerified,  Want::Admit),
+        ("assignment", false, Presented::ServiceGarbage,   Want::Admit),
+        ("assignment", false, Presented::AssignmentHeader, Want::Admit),
+        ("assignment", true,  Presented::None,             Want::MissingAssignment),
+        ("assignment", true,  Presented::TenantClaims,     Want::MissingAssignment),
+        ("assignment", true,  Presented::ServiceVerified,  Want::MissingAssignment),
+        ("assignment", true,  Presented::ServiceGarbage,   Want::MissingAssignment),
+        ("assignment", true,  Presented::AssignmentHeader, Want::Admit),
+        // tenant-JWT class: verified claims only; NO service bypass
+        // (bug_290) and NO assignment-credential leak.
+        ("tenant", false, Presented::None,             Want::Admit),
+        ("tenant", false, Presented::TenantClaims,     Want::Admit),
+        ("tenant", false, Presented::ServiceVerified,  Want::Admit),
+        ("tenant", false, Presented::ServiceGarbage,   Want::Admit),
+        ("tenant", false, Presented::AssignmentHeader, Want::Admit),
+        ("tenant", true,  Presented::None,             Want::MissingTenant),
+        ("tenant", true,  Presented::TenantClaims,     Want::Admit),
+        ("tenant", true,  Presented::ServiceVerified,  Want::MissingTenant),
+        ("tenant", true,  Presented::ServiceGarbage,   Want::MissingTenant),
+        ("tenant", true,  Presented::AssignmentHeader, Want::MissingTenant),
+        // service class: VERIFIED token only; the dead tenant leg is
+        // dead (bug_237) — TenantClaims never admit; a present-but-
+        // garbage token is named as such.
+        ("service", false, Presented::None,             Want::Admit),
+        ("service", false, Presented::TenantClaims,     Want::Admit),
+        ("service", false, Presented::ServiceVerified,  Want::Admit),
+        ("service", false, Presented::ServiceGarbage,   Want::Admit),
+        ("service", false, Presented::AssignmentHeader, Want::Admit),
+        ("service", true,  Presented::None,             Want::MissingService),
+        ("service", true,  Presented::TenantClaims,     Want::MissingService),
+        ("service", true,  Presented::ServiceVerified,  Want::Admit),
+        ("service", true,  Presented::ServiceGarbage,   Want::ServiceGarbage),
+        ("service", true,  Presented::AssignmentHeader, Want::MissingService),
+        // public: by recorded rationale; transport admits everything.
+        ("public", false, Presented::None,             Want::Admit),
+        ("public", false, Presented::TenantClaims,     Want::Admit),
+        ("public", false, Presented::ServiceVerified,  Want::Admit),
+        ("public", false, Presented::ServiceGarbage,   Want::Admit),
+        ("public", false, Presented::AssignmentHeader, Want::Admit),
+        // handler-enforced: transport admits; the typed witness on the
+        // data path is the enforcement (composed tier).
+        ("handler", false, Presented::None,             Want::Admit),
+        ("handler", false, Presented::TenantClaims,     Want::Admit),
+        ("handler", false, Presented::ServiceVerified,  Want::Admit),
+        ("handler", false, Presented::ServiceGarbage,   Want::Admit),
+        ("handler", false, Presented::AssignmentHeader, Want::Admit),
+    ];
+
+    const MATRIX_PRESENTED: [Presented; 5] = [
+        Presented::None,
+        Presented::TenantClaims,
+        Presented::ServiceVerified,
+        Presented::ServiceGarbage,
+        Presented::AssignmentHeader,
+    ];
+
+    fn matrix_configs() -> impl Iterator<Item = VerifierConfig> {
+        (0u8..8).map(|b| VerifierConfig {
+            jwt: b & 1 != 0,
+            service: b & 2 != 0,
+            hmac: b & 4 != 0,
+        })
+    }
+
+    fn expected_cell(kind: &str, knob: bool, presented: Presented) -> Want {
+        let hits: Vec<Want> = EXPECTED_LAYER
+            .iter()
+            .filter(|(k, b, p, _)| *k == kind && *b == knob && *p == presented)
+            .map(|(_, _, _, w)| *w)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "EXPECTED_LAYER must have exactly one row for ({kind}, {knob}, {presented:?})"
+        );
+        hits[0]
+    }
+
+    /// THE matrix: every METHOD_CREDENTIALS row × all 8 verifier
+    /// states × all 5 presented kinds, layer verdict vs the
+    /// owner-signed table. Refused-boot states assert BootRefused
+    /// (`key_coherence` names the missing knob; those states never
+    /// serve — `validate_key_coherence` runs before bind) and skip
+    /// verdict cells. Because the table is indexed by the DECLARED
+    /// knob only, any foreign-knob dependence in the kernel fails an
+    /// equality here (the kani harness proves the same over all 8
+    /// states including refused ones).
+    ///
+    /// Born-red holes (recorded pre-kernel, fork-1 commits): the
+    /// dead-leg cell (TenantClaims on a keyed Service method ADMITTED
+    /// — grpc-status None vs expected 16) and the tokenless
+    /// TenantQuota cell (Open row admitted with jwt=1). A planted
+    /// table mutation (flipping the ("service", true, TenantClaims)
+    /// row to Admit) was verified to fail this test before commit —
+    /// the table, not the kernel, is the oracle.
+    // r[verify store.log.method-credential+2]
+    // r[verify store.authz.declared-verifier]
+    // r[verify store.authz.key-coherence]
+    #[test]
+    fn composed_authz_matrix_layer_tier() {
+        // Size pins: adding a method, class, presented kind, or table
+        // row forces re-review here.
+        assert_eq!(
+            METHOD_CREDENTIALS.len(),
+            25,
+            "method count changed — re-derive the matrix"
+        );
+        assert_eq!(
+            EXPECTED_LAYER.len(),
+            40,
+            "table rows changed — owner review"
+        );
+        let mut verdict_cells = 0usize;
+        let mut refused_states = 0usize;
+        for (path, class) in METHOD_CREDENTIALS {
+            let kind = class_kind(*class);
+            for cfg in matrix_configs() {
+                if key_coherence(cfg) != KeyCoherence::Coherent {
+                    // BootRefused: exactly the jwt-on half-configs.
+                    assert!(
+                        cfg.jwt && !(cfg.service && cfg.hmac),
+                        "{path}: refused state {cfg:?} is not a jwt half-config"
+                    );
+                    refused_states += 1;
+                    continue;
+                }
+                for presented in MATRIX_PRESENTED {
+                    let want = expected_cell(kind, declared_knob(kind, cfg), presented);
+                    assert_eq!(
+                        decide(*class, cfg, presented),
+                        want_verdict(want),
+                        "matrix cell {path} cfg={cfg:?} presented={presented:?}"
+                    );
+                    verdict_cells += 1;
+                }
+            }
+        }
+        // Totality: 25 methods × (5 bootable × 5 presented) verdict
+        // cells + 25 × 3 refused states — nothing silently skipped.
+        assert_eq!(verdict_cells, 25 * 5 * 5);
+        assert_eq!(refused_states, 25 * 3);
+    }
+
+    /// Multi-credential vector pin 1 (the credential-vector rule's
+    /// first test leg, §C1): verified tenant claims + a GARBAGE
+    /// service header on a TenantJwt method must Admit — the foreign
+    /// credential is invisible to the declared-family classifier and
+    /// can neither widen nor poison. (The dashboard nginx really sends
+    /// a service token on the TailLog location; with claims present
+    /// that header must not flip the verdict.)
+    // r[verify store.authz.declared-verifier]
+    #[tokio::test]
+    async fn vector_tenant_claims_with_garbage_service_header_admits() {
+        let mut s = svc(true, true);
+        let mut r = req("/rio.store.LogService/TailLog");
+        r.extensions_mut().insert(test_claims());
+        r.headers_mut().insert(
+            SERVICE_TOKEN_HEADER,
+            HeaderValue::from_static("garbage-not-a-token"),
+        );
+        let resp = call(&mut s, r).await;
+        assert_eq!(
+            grpc_status(&resp),
+            None,
+            "a foreign (garbage) service header must not poison a TenantJwt admit"
+        );
+    }
+
+    /// Multi-credential vector pin 2: a VALID service token + an
+    /// assignment header on an AssignmentToken method must Admit — the
+    /// service credential is foreign there (scheduler probes carry
+    /// service-token + extra headers; the declared family alone
+    /// decides).
+    // r[verify store.authz.declared-verifier]
+    #[tokio::test]
+    async fn vector_service_token_with_assignment_header_admits() {
+        let mut s = svc(true, true);
+        let tok = rio_auth::hmac::HmacSigner::from_key(SVC_KEY.to_vec()).sign(
+            &rio_auth::hmac::ServiceClaims {
+                caller: "rio-scheduler".into(),
+                expiry_unix: u64::MAX,
+                instance: None,
+            },
+        );
+        let mut r = req("/rio.store.LogService/AppendLog");
+        r.headers_mut().insert(
+            ASSIGNMENT_TOKEN_HEADER,
+            HeaderValue::from_static("opaque-token"),
+        );
+        r.headers_mut()
+            .insert(SERVICE_TOKEN_HEADER, tok.parse().unwrap());
+        let resp = call(&mut s, r).await;
+        assert_eq!(
+            grpc_status(&resp),
+            None,
+            "a foreign (valid) service token must not widen/poison an AssignmentToken admit"
+        );
+    }
 }
