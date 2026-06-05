@@ -1668,7 +1668,7 @@ fold's `filter`+`advance` silently absorbed any residual gap
 is number-free by property test, so "(suppressed lines)" can no longer
 be misattributed (merged_bug_275).
 
-#r("store.log.served-claim")[#r("store.log.served-claim")[
+#r("store.log.served-claim")[
   A `TailLog` final message's `is_complete` MUST be minted as a
   served-stream claim correlated with the reader's served cursor:
   `complete` if and only if the execution's sealed `final_line_count`
@@ -1932,12 +1932,14 @@ object used to serve its excess under the NEXT chunk's line numbers ---
 garbage output that also suppressed the genuine successor lines via the
 advanced watermark; an under-length object was a silent hole presented as
 complete. Both are corruption-grade (the row and object are written from
-the same slice in the same call), so both count toward
-#(refs.metric)("rio_store_log_read_data_loss_total"). The short direction
-splits by coverage (bug_233): the covered topology (a second session's
-overlapping chunk) is fully servable and was previously wedged behind an
-untyped internal error at the relay's 1 Hz re-dial; the uncovered
-topology is genuine unrecoverable loss, typed so readers stop. The
+the same slice in the same call). The short direction splits by coverage
+(bug_233): the covered topology (a second session's overlapping chunk) is
+fully servable and was previously wedged behind an untyped internal error
+at the relay's 1 Hz re-dial — it is disclosed as divergence, not counted
+as loss (#(refs.metric)("rio_store_log_read_data_loss_total") alerts on
+any increment and is reserved for unrecoverable holes); the uncovered
+topology is genuine unrecoverable loss, counted and typed so readers
+stop. The
 seal/read contradiction itself is disclosed, not repaired --- there is no
 in-band repair for a row and object written from one slice that
 disagree.

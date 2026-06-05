@@ -282,11 +282,14 @@ pub async fn read_chunk(
                 .collect();
             match rio_log_kernel::short_object_policy(missing_from, missing_until, &rows) {
                 rio_log_kernel::ShortObjectPolicy::ServeClamped => {
-                    metrics::counter!(
-                        "rio_store_log_read_data_loss_total",
-                        "reason" => "short_object_covered"
-                    )
-                    .increment(1);
+                    // A covered short is a DIVERGENCE disclosure, not
+                    // data loss: every claimed line still serves (from
+                    // the covering rows), so it must not feed
+                    // rio_store_log_read_data_loss_total — that
+                    // counter's contract is alert-on-ANY-increment for
+                    // unrecoverable holes. The error! above carries
+                    // the corruption-grade signal; the warn-severity
+                    // divergence counter family is the m164 reroute.
                 }
                 rio_log_kernel::ShortObjectPolicy::UnservableHole => {
                     metrics::counter!(
