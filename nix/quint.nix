@@ -263,10 +263,23 @@ let
     run_quint_verify() {
       quint_status=0
       for attempt in 1 2 3; do
-        if quint verify --server-endpoint=localhost:8822 "$@" 2>&1 | tee $out; then
+        # Hard wall-clock bound (MODEL_TIMEOUT_SEC, constructor
+        # parameter): a non-terminating model MUST be a RED check with
+        # a log, never an eternal gate. A state-space blowup once ran
+        # 14+ hours verdict-less inside a wave gate (gcCollectState's
+        # first wiring squared its map dimension); the bound turns
+        # that class into a loud failure naming the budget.
+        if timeout "$MODEL_TIMEOUT_SEC" \
+          quint verify --server-endpoint=localhost:8822 "$@" 2>&1 | tee $out
+        then
           quint_status=0
         else
           quint_status=$?
+        fi
+        if [ "$quint_status" -eq 124 ]; then
+          echo "" >&2
+          echo "model exceeded the $MODEL_TIMEOUT_SEC-second budget - non-termination is a failure (state-space blowup? see the model's parameter-ladder doc). Raise modelTimeoutSec ONLY with a measured runtime justifying it." >&2
+          return 0
         fi
         if grep -qE '\[ok\] No violation found|\[violation\] Found an issue' $out; then
           return 0
@@ -331,6 +344,13 @@ let
       # budget; a check whose heap is raised here moves itself out of
       # the round-robin shards automatically.
       serverHeapMb ? 4096,
+      # Wall-clock budget (seconds) for ONE quint-verify attempt. A
+      # model that exceeds it is a RED check naming the budget — never
+      # an eternal gate: gcCollectState's first wiring squared its map
+      # dimension into the state space and four wedged clients sat 14+
+      # hours verdict-less, starving every gate on the host. Raise only
+      # with a measured runtime documented at the check.
+      modelTimeoutSec ? 1800,
     }:
     pkgs.runCommand "quint-${name}"
       {
@@ -347,8 +367,11 @@ let
           fileset = lib.fileset.unions (map (s: modelsDir + "/${s}.qnt") ([ spec ] ++ extraSpecs));
         };
         # Surfaced in `nix log` and error messages.
-        env.MODEL = spec;
-        env.MAIN = main;
+        env = {
+          MODEL = spec;
+          MAIN = main;
+          MODEL_TIMEOUT_SEC = toString modelTimeoutSec;
+        };
       }
       ''
         set -euo pipefail
@@ -456,6 +479,8 @@ let
       serverHeapMb ? 4096,
       # Same semantics as mkQuintCheck's workers (MCI-6 pinning).
       workers ? null,
+      # Same semantics as mkQuintCheck's modelTimeoutSec.
+      modelTimeoutSec ? 1800,
     }:
     pkgs.runCommand "quint-${name}"
       {
@@ -473,6 +498,7 @@ let
           MODEL = spec;
           MAIN = main;
           WITNESS = witness;
+          MODEL_TIMEOUT_SEC = toString modelTimeoutSec;
         };
       }
       ''
@@ -597,7 +623,7 @@ let
         # The violation is the EXPECTED outcome: `quint run` exits
         # nonzero when it finds one, so don't let that abort the script.
         status=0
-        quint run \
+        timeout 1800 quint run \
           --backend=rust \
           --main=${main} \
           ${lib.optionalString (step != null) "--step=${step}"}${
@@ -607,6 +633,11 @@ let
           --max-samples=${toString maxSamples} \
           --max-steps=${toString maxSteps} \
           "$src/${spec}.qnt" 2>&1 | tee $out || status=$?
+        if [ "$status" -eq 124 ]; then
+          echo "" >&2
+          echo "${name}: simulation exceeded the 1800-second wall clock — regime-size regression (see the model's parameter-ladder doc)." >&2
+          exit 1
+        fi
 
         if grep -qF '[ok] No violation found' $out; then
           echo "" >&2
@@ -688,7 +719,7 @@ let
         # A violation exits nonzero; capture the status so the verdict
         # grep below (not the exit code) decides the outcome.
         status=0
-        quint run \
+        timeout 1800 quint run \
           --backend=rust \
           --main=${main} \
           ${lib.optionalString (step != null) "--step=${step}"} \
@@ -697,6 +728,11 @@ let
           --max-samples=${toString maxSamples} \
           --max-steps=${toString maxSteps} \
           "$src/${spec}.qnt" 2>&1 | tee $out || status=$?
+        if [ "$status" -eq 124 ]; then
+          echo "" >&2
+          echo "${name}: simulation exceeded the 1800-second wall clock — regime-size regression (see the model's parameter-ladder doc)." >&2
+          exit 1
+        fi
 
         if grep -qF '[violation] Found an issue' $out; then
           echo "" >&2
@@ -756,7 +792,9 @@ let
         set -euo pipefail
         cd "$TMPDIR"
 
-        quint test \
+        # Bounded: a named-run replay is deterministic and fast; a
+        # wall-clock blowout means the regime regressed.
+        timeout 1800 quint test \
           --main=${main} \
           --match='${match}' \
           "$src/${spec}.qnt" 2>&1 | tee $out
