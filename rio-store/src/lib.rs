@@ -70,8 +70,13 @@ pub(crate) mod metadata;
 pub mod signing;
 #[cfg(feature = "server")]
 pub mod substitute;
+// bug_115: the ONE visibility body shared by the gRPC read gates and
+// the materialization walk's local-presence probe (verdict table in
+// rio-evidence-kernel; this module owns the projections + witness).
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_helpers;
+#[cfg(feature = "server")]
+pub(crate) mod visibility;
 
 /// Re-export of the shared embedded migrator from `rio-migrations`.
 ///

@@ -1232,6 +1232,28 @@ tenant turned an obtainable path into InfraFailure. Charging evidence still
 outranks back-off advice at the fold (matching the per-upstream loop's
 ordering one level down), and the transient lane still closes uncharged.
 
+#r("store.materialize.local-visibility")[
+  The walk's local-presence probe MUST apply the tenant sig-visibility
+  verdict --- the SAME decision body as the tenant-facing read gates,
+  over the I-217 table `(owned, any_built, sig_trusted)` --- before a
+  locally-present row is pinned, counted verified, or used to extend
+  the frontier. A row hidden from EVERY interested tenant MUST degrade
+  to the per-tenant substitute lane (and, failing that, fold into the
+  per-tenant absence verdict); raw physical presence MUST NOT be
+  sufficient to serve.
+]
+Presence is a per-tenant fact (owner Q2). The pre-fix walk treated any
+complete local manifest as servable: a substitution-only row signed by keys
+none of the interested tenants trust, or another tenant's built output
+(I-217 isolation), was counted verified and --- via the consumption path's
+`upsert_path_tenants_for_batch` --- laundered into every interested build's
+durable per-tenant ownership, after which the read gates served it through
+the owned fast-path. The structural form: the kernel's `visibility_verdict`
+is the one table, `rio-store/src/visibility.rs` is the one projection body
+shared by the gRPC gates and the walk, and the walk's `Present` arm
+requires the `TenantVisible` witness that only that body mints --- a
+tenant-blind Present does not compile.
+
 = Two-Phase Garbage Collection
 
 #r("store.gc.two-phase+2")[

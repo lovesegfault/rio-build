@@ -501,6 +501,14 @@ impl Substituter {
         self
     }
 
+    /// The signer, if configured — the materialization walk's
+    /// local-visibility probe needs the cluster(+history) key entries
+    /// for its trusted-set construction (bug_115), and the substituter
+    /// is the executor's only line to the signing context.
+    pub(crate) fn tenant_signer(&self) -> Option<&TenantSigner> {
+        self.signer.as_deref()
+    }
+
     /// Share the process-global NAR-bytes budget. Builder-style.
     /// main.rs wires `StoreServiceImpl::nar_bytes_budget()` here so
     /// PutPath and substitution draw from ONE semaphore — the

@@ -24,6 +24,7 @@ use rio_evidence_kernel::outcome::{
 use rio_proto::types::{MaterializationOutcome, materialization_outcome};
 
 use crate::substitute::{SubstituteError, Substituter};
+use crate::visibility::{TenantVisible, TrustedSetCache, visible_to_tenant};
 
 use super::client::ClaimedJob;
 
@@ -147,6 +148,9 @@ async fn execute_job_inner(
     };
 
     // ── 2–4. Walk loop with final-verification re-read ───────────────
+    // bug_115: the per-job trusted-set memo for the local-visibility
+    // probe (two PG queries per tenant, amortized across the walk).
+    let mut trust_cache = TrustedSetCache::default();
     let mut visited: HashSet<String> = HashSet::new();
     let mut ingested: Vec<String> = Vec::new();
     let mut verified: Vec<String> = Vec::new();
@@ -222,13 +226,18 @@ async fn execute_job_inner(
             // already have). `LocalMiss` is the only way to construct
             // a `ConfirmedAbsent` verdict below: upstream absence
             // alone is uncompilable as a missing-path verdict.
-            let local_witness = match probe_local(ctx, &path).await {
-                Ok(LocalPresence::Present(info)) => {
-                    // Locally present with a complete manifest: pin it,
-                    // count it verified, and extend the frontier from
-                    // the LOCAL row's references — the closure-
-                    // completeness obligation holds without touching
-                    // any upstream.
+            let local_witness = match probe_local(ctx, &path, &tenants, &mut trust_cache).await {
+                Ok(LocalPresence::Present(visible, info)) => {
+                    // Locally present AND visible to an interested
+                    // tenant (bug_115: physical presence alone is NOT
+                    // sufficient — the Present arm structurally
+                    // requires the visibility witness, so a gate-hidden
+                    // row can never be pinned/counted/extended from
+                    // here): pin it, count it verified, and extend the
+                    // frontier from the LOCAL row's references — the
+                    // closure-completeness obligation holds without
+                    // touching any upstream.
+                    let _vis: TenantVisible = visible;
                     if let Err(e) = pin_materialized_path(ctx, claimed, &path).await {
                         return infra_failure(format!("pin-at-ingest failed for {path}: {e}"));
                     }
@@ -522,32 +531,69 @@ enum PathCell {
     Reference,
 }
 
-/// Witness that the LOCAL presence probe ran and answered "absent"
-/// (bug_042). Not constructible outside [`probe_local`] — a
-/// `MissClass::ConfirmedAbsent` verdict therefore PROVES the path is
-/// neither local nor upstream; upstream absence alone no longer
-/// typechecks as a missing-path verdict.
+/// Witness that the LOCAL presence probe ran and answered "absent
+/// under every interested tenant's view" (bug_042 + bug_115): either
+/// no complete local manifest exists, or one exists but the
+/// sig-visibility gate hides it from EVERY interested tenant (presence
+/// is a per-tenant fact — owner Q2). Not constructible outside
+/// [`probe_local`] — a `ConfirmedAbsent`-shaped verdict therefore
+/// PROVES the path is neither locally servable nor upstream; upstream
+/// absence alone no longer typechecks as a missing-path verdict.
 struct LocalMiss(());
 
 /// The local-presence answer for one walk path.
 enum LocalPresence {
-    /// A complete local manifest exists — the full row (references,
-    /// nar_size) drives pin + frontier extension without upstream.
-    Present(Box<rio_proto::validated::ValidatedPathInfo>),
-    /// No complete local manifest.
+    /// A complete local manifest exists AND it is visible to at least
+    /// one interested tenant (bug_115: the witness is a required
+    /// field, so the tenant-blind "physically present ⇒ serve" arm is
+    /// uncompilable) — the full row (references, nar_size) drives pin
+    /// + frontier extension without upstream.
+    Present(TenantVisible, Box<rio_proto::validated::ValidatedPathInfo>),
+    /// No locally-servable manifest: absent, or gate-hidden from every
+    /// interested tenant (the row degrades to the per-tenant
+    /// substitute lane — a tenant whose upstream serves the path
+    /// re-fetches it under its OWN trust view).
     Absent(LocalMiss),
 }
 
 /// The walk's local-presence probe. The error PROPAGATES (bug_042):
 /// a PG blip is infrastructure trouble, never evidence of absence.
+///
+/// bug_115: a physically-present row is servable only if the
+/// sig-visibility verdict (the SAME body as the gRPC read gates —
+/// [`crate::visibility::visible_to_tenant`]) passes for at least one
+/// interested tenant. A gate-hidden row (substitution-only signed by
+/// keys none of the interested tenants trust, or another tenant's
+/// built output per I-217) answers Absent, so the walk falls through
+/// to the per-tenant substitute lane instead of laundering the row
+/// into the interested tenants' durable ownership
+/// (`upsert_path_tenants_for_batch` stamps every interested build's
+/// tenant over the job's verified paths on Success).
+// r[impl store.materialize.local-visibility]
 async fn probe_local(
     ctx: &ExecutorContext,
     store_path: &str,
+    tenants: &[Uuid],
+    trust_cache: &mut TrustedSetCache,
 ) -> Result<LocalPresence, crate::metadata::MetadataError> {
-    match crate::metadata::query_path_info(&ctx.pool, store_path).await? {
-        Some(info) => Ok(LocalPresence::Present(Box::new(info))),
-        None => Ok(LocalPresence::Absent(LocalMiss(()))),
+    let Some(info) = crate::metadata::query_path_info(&ctx.pool, store_path).await? else {
+        return Ok(LocalPresence::Absent(LocalMiss(())));
+    };
+    let signer = ctx.substituter.tenant_signer();
+    for &tid in tenants {
+        if let Some(visible) =
+            visible_to_tenant(&ctx.pool, signer, Some(tid), &info, trust_cache).await?
+        {
+            return Ok(LocalPresence::Present(visible, Box::new(info)));
+        }
     }
+    debug!(
+        path = %store_path,
+        tenants = tenants.len(),
+        "local row is gate-hidden from every interested tenant; \
+         degrading to the per-tenant substitute lane"
+    );
+    Ok(LocalPresence::Absent(LocalMiss(())))
 }
 
 /// Shorthand for the InfraFailure outcome.
@@ -2528,6 +2574,174 @@ mod tests {
         assert!(
             outcome_infra(&outcome).is_some(),
             "an unconfirmable tenant view must report infra, got {outcome:?}"
+        );
+    }
+
+    // ── bug_115: local-presence visibility ────────────────────────────
+
+    /// Seed a COMPLETE local manifest for `path` carrying exactly
+    /// `signatures` (the sign.rs-test idiom: placeholder claim +
+    /// inline completion).
+    async fn seed_local_manifest(pool: &PgPool, path: &str, signatures: Vec<String>) {
+        let (nar, nar_hash) = rio_test_support::fixtures::make_nar(path.as_bytes());
+        let mut info = rio_test_support::fixtures::make_path_info(path, &nar, nar_hash);
+        let sp = StorePath::parse(path).unwrap();
+        let hash = sp.sha256_digest();
+        info.store_path_hash = hash.to_vec();
+        info.signatures = signatures;
+        let claim = metadata::insert_manifest_uploading(pool, &hash, path, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        metadata::complete_manifest_inline(pool, &info, claim, nar.into())
+            .await
+            .unwrap();
+    }
+
+    // r[verify store.materialize.local-visibility]
+    /// bug_115 cell 1 (substitution-only, untrusted sig): a local row
+    /// signed ONLY by a key no interested tenant trusts must NOT be
+    /// served/pinned/verified by the walk — it degrades to the
+    /// per-tenant substitute lane, and with every upstream 404ing the
+    /// job is Unobtainable. RED (pre-fix): raw physical presence was
+    /// sufficient — Success with the hidden row in verified_paths,
+    /// laundered into per-tenant ownership at consumption
+    /// (upsert_path_tenants_for_batch stamps every interested build's
+    /// tenant over the job's verified paths).
+    #[tokio::test]
+    async fn local_row_with_untrusted_sig_is_not_laundered() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "vis-untrusted").await;
+        // The tenant's upstream trusts an unrelated key and serves
+        // NOTHING (404): trust context exists; the path is simply not
+        // obtainable under this tenant's view.
+        let upstream = spawn_status_upstream(axum::http::StatusCode::NOT_FOUND).await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+
+        // Local complete manifest signed ONLY by key K (untrusted).
+        let path = store_path(40, "vis-untrusted");
+        let signer_k = Signer::from_seed("key-K", &[0x7Au8; 32]);
+        let (nar, nar_hash) = rio_test_support::fixtures::make_nar(path.as_bytes());
+        let fp = fingerprint(&path, &nar_hash, nar.len() as u64, &[]);
+        seed_local_manifest(&db.pool, &path, vec![signer_k.sign(&fp)]).await;
+
+        let seeded = seed_job(
+            &db.pool,
+            "vis-untrusted-drv",
+            &[("out", path.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+        let ctx = make_ctx(db.pool.clone());
+        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let unobtainable = outcome_unobtainable(&outcome).unwrap_or_else(|| {
+            panic!("expected Unobtainable (gate-hidden local row must degrade), got {outcome:?}")
+        });
+        assert_eq!(
+            unobtainable.missing_paths,
+            vec![path.clone()],
+            "the hidden row is missing-wanted under this tenant's view"
+        );
+        // Nothing pinned: the hidden row was never treated as served.
+        assert_eq!(
+            pin_count(&db.pool, "vis-untrusted-drv", "materialization").await,
+            0,
+            "a gate-hidden local row must not be pinned"
+        );
+    }
+
+    // r[verify store.materialize.local-visibility]
+    /// bug_115 cell 2 (I-217, built by another tenant only): a local
+    /// row OWNED by tenant B must be invisible to interested tenant
+    /// A's walk regardless of signatures — built-by-another beats
+    /// sig-trust. RED (pre-fix): Success — B's output laundered into
+    /// A's job.
+    #[tokio::test]
+    async fn local_row_built_by_other_tenant_is_hidden_from_walk() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant_a = seed_tenant(&db.pool, "vis-i217-a").await;
+        let tenant_b = seed_tenant(&db.pool, "vis-i217-b").await;
+        let upstream = spawn_status_upstream(axum::http::StatusCode::NOT_FOUND).await;
+        wire_upstream(&db.pool, tenant_a, &upstream).await;
+
+        let path = store_path(41, "vis-i217");
+        seed_local_manifest(&db.pool, &path, vec![]).await;
+        // B built it: a path_tenants row for B only.
+        let sp = StorePath::parse(&path).unwrap();
+        sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+            .bind(sp.sha256_digest().as_slice())
+            .bind(tenant_b)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let seeded = seed_job(
+            &db.pool,
+            "vis-i217-drv",
+            &[("out", path.as_str())],
+            Some(tenant_a),
+            Some(tenant_a),
+            &[],
+        )
+        .await;
+        let ctx = make_ctx(db.pool.clone());
+        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        assert!(
+            outcome_unobtainable(&outcome).is_some(),
+            "I-217: another tenant's built output must be hidden from the walk, got {outcome:?}"
+        );
+    }
+
+    // r[verify store.materialize.local-visibility]
+    /// bug_115 positive control: a local row the interested tenant CAN
+    /// see (signed by a key the tenant's upstream config trusts) is
+    /// served locally — Success with the path verified + pinned, no
+    /// upstream byte fetched (the only wired upstream 404s everything).
+    #[tokio::test]
+    async fn local_row_visible_to_interested_tenant_serves_locally() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "vis-trusted").await;
+        let signer_k = Signer::from_seed("key-K", &[0x7Bu8; 32]);
+        // Upstream serves nothing but carries K in trusted_keys: the
+        // tenant trusts K without being able to fetch anything.
+        let upstream = spawn_status_upstream(axum::http::StatusCode::NOT_FOUND).await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tenant,
+            &upstream.url,
+            50,
+            &[signer_k.trusted_key_entry()],
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let path = store_path(42, "vis-trusted");
+        let (nar, nar_hash) = rio_test_support::fixtures::make_nar(path.as_bytes());
+        let fp = fingerprint(&path, &nar_hash, nar.len() as u64, &[]);
+        seed_local_manifest(&db.pool, &path, vec![signer_k.sign(&fp)]).await;
+
+        let seeded = seed_job(
+            &db.pool,
+            "vis-trusted-drv",
+            &[("out", path.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+        let ctx = make_ctx(db.pool.clone());
+        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let success = outcome_success(&outcome)
+            .unwrap_or_else(|| panic!("expected Success via the local row, got {outcome:?}"));
+        assert_eq!(success.verified_paths, vec![path.clone()]);
+        assert!(success.ingested_paths.is_empty(), "no upstream fetch");
+        assert_eq!(
+            pin_count(&db.pool, "vis-trusted-drv", "materialization").await,
+            1,
+            "locally-served path is pinned at ingest"
         );
     }
 }

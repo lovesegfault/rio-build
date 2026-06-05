@@ -84,6 +84,7 @@ pub mod outcome;
 pub mod pull;
 pub mod routing;
 pub mod settle;
+pub mod visibility;
 
 /// Trust classification of a node's child set as evidence about its
 /// dependency closure — the judgment behind the merge-time

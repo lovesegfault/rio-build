@@ -14,10 +14,12 @@ use std::collections::HashSet;
 use tonic::Status;
 use tracing::{debug, warn};
 
+use rio_evidence_kernel::visibility::{VisibilityVerdict, visibility_verdict};
 use rio_proto::validated::ValidatedPathInfo;
 
 use rio_common::grpc::StatusExt;
 
+#[cfg(test)]
 use crate::metadata::{self};
 
 use super::{StoreServiceImpl, metadata_status};
@@ -100,146 +102,38 @@ impl StoreServiceImpl {
     /// verifies against the requesting tenant's trusted set: upstream
     /// `trusted_keys` ∪ the rio cluster key.
     ///
-    /// Returns `true` if visible, `false` if hidden (caller returns
+    /// `Ok(Some(_))` = visible, `Ok(None)` = hidden (caller returns
     /// NotFound). Unauthenticated requests (`tenant_id = None`) pass
     /// through — `r[store.tenant.narinfo-filter]` defines anonymous
     /// requests as unfiltered.
     ///
-    /// # Substituted-path discriminator
-    ///
-    /// `path_tenants` is populated at build-completion by the scheduler
-    /// (`upsert_path_tenants` in rio-scheduler/src/db/live_pins.rs).
-    /// The Substituter does NOT populate it. So:
-    ///   - ≥1 `path_tenants` row → someone built this → skip gate
-    ///     (built paths are trusted regardless of signature)
-    ///   - 0 rows → substitution-only → apply gate
-    ///
-    /// The PutPath→scheduler timing window (path IS built, count=0
-    /// because the scheduler hasn't yet run `upsert_path_tenants`) is
-    /// handled by the rio-key union below: a rio-signed path verifies
-    /// against the cluster key OR the tenant's own `tenant_keys`
-    /// pubkey (whichever `maybe_sign` used), so it passes the gate
-    /// regardless of the tenant's upstream config. Only paths signed
-    /// ONLY by upstream keys the tenant doesn't trust are gated out.
+    /// The decision body — the substituted-path discriminator, the
+    /// PutPath→scheduler timing-window key union, and the I-217
+    /// verdict table — lives in [`crate::visibility::visible_to_tenant`]
+    /// (bug_115: the materialization walk's local-presence probe
+    /// consults the SAME body, so the two deciders cannot drift).
     pub(super) async fn sig_visibility_gate(
         &self,
         tenant_id: Option<uuid::Uuid>,
         info: &ValidatedPathInfo,
     ) -> Result<Option<PathVisible>, Status> {
-        let Some(tid) = tenant_id else {
-            return Ok(Some(PathVisible(()))); // anonymous → unfiltered
-        };
-        // r[impl gw.jwt.anon-drv-lookup]
-        // .drv files are build INPUTS, not tenant-owned outputs — exempt
-        // from tenant-scoped visibility. Gateway-side `jwt_unless_drv`
-        // already strips the JWT for single-path .drv lookups; this is
-        // the store-side mirror so the policy holds regardless of which
-        // caller (or which batch RPC) sends the path. Without it, a .drv
-        // with zero `path_tenants` rows falls through to sig-verify and
-        // is reported invisible (no upstream sigs on .drvs).
-        if info.store_path.is_derivation() {
-            return Ok(Some(PathVisible(())));
-        }
-
-        let path_hash = info.store_path.sha256_digest();
-
-        // Two checks in one round-trip: does this tenant own it, and
-        // has ANY tenant ever built it?
-        let (owned, any_built): (bool, bool) = sqlx::query_as(
-            "SELECT \
-               bool_or(tenant_id = $2), \
-               count(*) > 0 \
-             FROM path_tenants WHERE store_path_hash = $1",
+        // bug_115: the body lives in crate::visibility (policy
+        // exemptions + the (owned, any_built) projection + the lazy
+        // signature cell + the kernel's I-217 verdict table) so the
+        // materialization walk's local-presence probe consults the
+        // SAME gate. This method is the gRPC-side adapter: Status
+        // mapping + the PathVisible mint.
+        let mut cache = crate::visibility::TrustedSetCache::default();
+        let visible = crate::visibility::visible_to_tenant(
+            &self.pool,
+            self.signer.as_deref(),
+            tenant_id,
+            info,
+            &mut cache,
         )
-        .bind(path_hash.as_slice())
-        .bind(tid)
-        .fetch_one(&self.pool)
         .await
-        .map(|(o, a): (Option<bool>, bool)| (o.unwrap_or(false), a))
-        .status_internal("sig_visibility_gate: path_tenants")?;
-
-        if owned {
-            return Ok(Some(PathVisible(())));
-        }
-        if any_built {
-            // I-217: built by ANOTHER tenant only. Previously this
-            // returned `true` (any-built ⇒ visible), leaking every
-            // tenant's outputs to every other tenant. Isolation is the
-            // policy: not-owned ⇒ not-visible. The chunks underneath
-            // are still shared (dedup) — only narinfo visibility is
-            // gated, so B building the SAME drv later gets its own
-            // `path_tenants` row and becomes `owned`.
-            return Ok(None);
-        }
-
-        // Zero path_tenants rows → substitution-only OR freshly-PutPath
-        // (scheduler hasn't yet upserted). Sig-verify against the
-        // tenant's trusted set ∪ cluster key. With no substituter
-        // configured, the trusted set is just the cluster key (and
-        // tenant's own keypair) — a path the tenant just PutPath'd is
-        // rio-signed and passes; anything else is invisible.
-        let trusted = self.tenant_trusted_set(tid).await?;
-        if trusted.is_empty() {
-            // Tenant trusts no upstream keys AND no signer configured
-            // → any substituted path is invisible. With a signer the
-            // cluster key was pushed above, so this is the no-signer
-            // edge only.
-            return Ok(None);
-        }
-
-        let fp = rio_nix::narinfo::fingerprint(
-            info.store_path.as_str(),
-            &info.nar_hash,
-            info.nar_size,
-            &info
-                .references
-                .iter()
-                .map(|r| r.to_string())
-                .collect::<Vec<_>>(),
-        );
-        Ok(
-            crate::signing::any_sig_trusted(&info.signatures, &trusted, &fp)
-                .is_some()
-                .then_some(PathVisible(())),
-        )
-    }
-
-    // r[impl store.substitute.tenant-sig-visibility+2]
-    /// Construct the requesting tenant's signature trust set: upstream
-    /// `trusted_keys` ∪ cluster key (current + prior history) ∪ the
-    /// tenant's own `tenant_keys` pubkeys. Shared by
-    /// [`sig_visibility_gate`](Self::sig_visibility_gate) and
-    /// [`sig_visibility_gate_batch`](Self::sig_visibility_gate_batch).
-    ///
-    /// The cluster + tenant-own union covers the PutPath→scheduler
-    /// timing window: `maybe_sign` signs with the cluster key OR (when
-    /// `r[store.tenant.sign-key]` applies) the tenant's own key —
-    /// `path_tenants` count=0 → gate fires → without BOTH unioned in,
-    /// a freshly-built path returns `NotFound` to its own tenant.
-    async fn tenant_trusted_set(&self, tid: uuid::Uuid) -> Result<Vec<String>, Status> {
-        let mut trusted = metadata::upstreams::tenant_trusted_keys(&self.pool, tid)
-            .await
-            .map_err(|e| metadata_status("tenant_trusted_set: upstream trusted_keys", e))?;
-        if let Some(ts) = &self.signer {
-            trusted.push(ts.cluster().trusted_key_entry());
-            // r[impl store.key.rotation-cluster-history]
-            // Union prior cluster keys so paths signed under a
-            // rotated-out key stay visible after CASCADE drops their
-            // path_tenants rows. prior_cluster_entries is loaded once
-            // at startup from cluster_key_history WHERE retired_at IS
-            // NULL — no DB hit here.
-            trusted.extend_from_slice(ts.prior_cluster_entries());
-        }
-        // r[impl store.tenant.sign-key]
-        // The tenant's OWN signing pubkey(s). When a tenant_keys row
-        // exists, maybe_sign uses it (not cluster) — without this
-        // union, the tenant's only sig fails to verify against its
-        // own trusted set during the count=0 window.
-        let own = metadata::tenant_keys::trusted_key_entries(&self.pool, tid)
-            .await
-            .map_err(|e| metadata_status("tenant_trusted_set: tenant_keys", e))?;
-        trusted.extend(own);
-        Ok(trusted)
+        .map_err(|e| metadata_status("sig_visibility_gate", e))?;
+        Ok(visible.map(|_witness| PathVisible(())))
     }
 
     // r[impl store.substitute.find-missing-gated]
@@ -313,13 +207,24 @@ impl StoreServiceImpl {
             // (mirrors gateway-side `jwt_unless_drv`). Without this,
             // `wopQueryValidPaths` reports a .drv missing while
             // `wopIsValidPath` reports it valid for the same path/JWT.
-            if p.ends_with(".drv") || owned_hashes.contains(h) {
+            let owned = owned_hashes.contains(h);
+            let any_built = owned || built_not_owned.contains(h);
+            if p.ends_with(".drv") {
                 visible.insert(p.clone());
-            } else if built_not_owned.contains(h) {
-                // I-217: built by another tenant → hidden (NOT visible,
-                // NOT sig-verified).
-            } else {
+            } else if !owned && !any_built {
+                // Substitution-only: the signature cell is needed —
+                // deferred to the batched narinfo fetch below.
                 subst_only.push(p.clone());
+            } else {
+                // bug_115: the verdict comes from the kernel's I-217
+                // table (sig_trusted=false is sound here — K4 proves
+                // the verdict ignores it once owned || any_built).
+                match visibility_verdict(owned, any_built, false) {
+                    VisibilityVerdict::Visible => {
+                        visible.insert(p.clone());
+                    }
+                    VisibilityVerdict::Hidden => {}
+                }
             }
         }
         if subst_only.is_empty() {
@@ -329,7 +234,11 @@ impl StoreServiceImpl {
         // Substitution-only subset: fetch (path, signatures, nar_hash,
         // nar_size, references) in one round-trip and verify each
         // against the same trusted set as the single-path gate.
-        let trusted = self.tenant_trusted_set(tid).await?;
+        let mut cache = crate::visibility::TrustedSetCache::default();
+        let trusted =
+            crate::visibility::trusted_set(&self.pool, self.signer.as_deref(), tid, &mut cache)
+                .await
+                .map_err(|e| metadata_status("sig_visibility_gate_batch: trusted set", e))?;
         if trusted.is_empty() {
             // Tenant trusts nothing → all substitution-only paths hidden.
             return Ok(VisibleSet { set: visible });
@@ -367,8 +276,14 @@ impl StoreServiceImpl {
                 r.nar_size as u64,
                 &r.references,
             );
-            if crate::signing::any_sig_trusted(&r.signatures, &trusted, &fp).is_some() {
-                visible.insert(r.store_path);
+            // bug_115: same kernel table, substitution-only cell.
+            let sig_trusted =
+                crate::signing::any_sig_trusted(&r.signatures, &trusted, &fp).is_some();
+            match visibility_verdict(false, false, sig_trusted) {
+                VisibilityVerdict::Visible => {
+                    visible.insert(r.store_path);
+                }
+                VisibilityVerdict::Hidden => {}
             }
         }
         Ok(VisibleSet { set: visible })
