@@ -1318,6 +1318,30 @@ safety-net scan. No full S3 enumeration needed.
   dry-run.
 ]
 
+#r("store.gc.observation-basis")[
+  The collect cycle's committed observation (the `gc_collect_state`
+  singleton's live-count and backlog estimate) MUST anchor the REAL basis:
+  what is live and what is eligible under NO exclusions, on the cycle's own
+  REPEATABLE READ snapshot. The simulated products of a shadow cycle with a
+  non-empty `simulated_swept` exclusion (the dry-run preview lane) are
+  reporting-only --- `GcStats` carries them, the durable row never does. In
+  code the law is a type: `DurableObservation`'s constructor is private to
+  the real-basis computation (`from_real_basis`), and
+  `CycleCommit::{Shadow, Live}` accept nothing else --- committing a
+  counterfactual mark-set size is unwritable. A shadow cycle with
+  exclusions therefore materializes a second, exclusion-FREE mark product
+  on the same snapshot (2x cost, operator dry runs only); an
+  exclusion-free shadow reuses its preview as the real basis.
+]
+
+Pre-fix, the shadow commit wrote the preview's counts: every pacing and
+alerting consumer of `gc_collect_state` acted on a world where the excluded
+upstreams' manifests were already gone --- live-count too small, backlog
+too large, and the backstop cadence paced against the counterfactual
+(bug_226). The quint model (`gcCollectState.qnt`) carries the pair of basis
+invariants; its calibration twin re-wires the commit to the simulated
+products and both falsify.
+
 #r("store.gc.collect-cadence")[
   The collect cycle's cadence, resume cursor, and gauge sources are CLUSTER
   state, durable in the `gc_collect_state` singleton row (migration 090),

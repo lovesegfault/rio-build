@@ -383,6 +383,7 @@ pub(crate) enum CollectOutcome {
     ParseFailure,
 }
 
+// r[impl store.gc.observation-basis]
 /// The durable observation of one collect cycle — REAL basis only
 /// (bug_226). Private fields, module-private constructor: the sole
 /// mint site is the real-basis computation inside [`collect_cycle`],
@@ -1864,6 +1865,7 @@ mod tests {
     /// simulated-swept: preview mark=1/would=2; durable mark=3/would=0.
     /// RED (recorded, pre-fix routing of the simulated numbers into
     /// the commit): durable carried 1/2 — the counterfactual.
+    // r[verify store.gc.observation-basis]
     #[tokio::test]
     async fn dry_run_commit_anchors_real_basis() {
         let db = TestDb::new(&crate::MIGRATOR).await;

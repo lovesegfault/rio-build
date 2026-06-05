@@ -267,6 +267,22 @@ module chunkCollect {
   /// grace — REAP_BATCH_DELETE_SQL's `deleted_at < now() - grace`).
   /// REAP_GRACE_TICKS >= 1, like GRACE_TICKS.
   const REAP_GRACE_TICKS: int
+
+  /// CALIBRATION ONLY (`chunkCollectReapEpqOuterOnly`): the pre-fix
+  /// reap DELETE whose OUTER qual carried no row-local eligibility
+  /// conjuncts (merged_bug_026). The IN-subquery picked victims at an
+  /// MVCC snapshot; when the DELETE's row lock waits behind a
+  /// concurrent resurrect (PutPath upsert: deleted=FALSE), PG's EPQ
+  /// recheck re-evaluates ONLY the outer qual on the new row version —
+  /// with nothing row-local there, the resurrected (live, referenced)
+  /// row is hard-deleted. Post-fix, `REAP_ROW_LOCAL_PRED` is spliced
+  /// into BOTH the subquery and the outer qual
+  /// (`render_reap_row_local_pred`), so the EPQ recheck re-tests
+  /// eligibility and skips the row. OFF here = the outer qual is
+  /// empty: `reapOne` admits any present row (the composed
+  /// `reapEpqRaceRun` drives the exact race; this module is
+  /// calibration-only and never a holds-check).
+  const ENABLE_REAP_OUTER_QUAL: bool
   /// The shadow arm's simulated-sweep exclusion (bughunt wave D1,
   /// bug_199): TRUE = the shipped anti-join (`shadow_swept` temp
   /// table excluded from mark + would-collect), FALSE = the pre-fix
@@ -1333,12 +1349,18 @@ module chunkCollect {
   }
 
   /// One post-pass tombstone-reap batch row (bughunt wave D1,
-  /// merged_bug_336; `REAP_BATCH_DELETE_SQL`): hard-DELETE a chunks
-  /// row that is soft-deleted at least the reap grace ago and fully
-  /// drained (no pending outbox row). One atomic action = the one
-  /// DELETE statement — its WHERE re-evaluates under the row lock, so
-  /// a resurrect that lands first (deleted = FALSE, deleted_at NULL)
-  /// makes the row ineligible, exactly as in PG. Modeled at the most
+  /// merged_bug_336; `REAP_BATCH_DELETE_SQL`, whose row-local
+  /// eligibility conjuncts render ONCE via `render_reap_row_local_pred`
+  /// into BOTH the IN-subquery and the OUTER DELETE qual —
+  /// merged_bug_026's splice): hard-DELETE a chunks row that is
+  /// soft-deleted at least the reap grace ago and fully drained (no
+  /// pending outbox row). One atomic action = the one DELETE statement
+  /// — its WHERE re-evaluates under the row lock (the EPQ recheck runs
+  /// the OUTER qual against the committed new row version), so a
+  /// resurrect that lands first (deleted = FALSE, deleted_at NULL)
+  /// makes the row ineligible, exactly as in PG — BECAUSE the outer
+  /// qual carries the conjuncts; see ENABLE_REAP_OUTER_QUAL for the
+  /// pre-splice physics this guard models when disabled. Modeled at the most
   /// adversarial granularity: production runs the reap only post-pass
   /// under the cycle lock; the model lets it interleave freely — if
   /// safety holds here it holds under the stricter schedule. After
@@ -1348,9 +1370,14 @@ module chunkCollect {
     val c = chunks.get(h)
     and {
       c.present,
-      c.deleted,
-      c.deletedAge > REAP_GRACE_TICKS,
-      not(outbox.contains(h)),
+      // The OUTER-qual row-local conjuncts (the EPQ-recheck surface).
+      // With the splice disabled (calibration), the DELETE proceeds on
+      // the stale IN-list verdict: any present row is reapable.
+      ENABLE_REAP_OUTER_QUAL implies and {
+        c.deleted,
+        c.deletedAge > REAP_GRACE_TICKS,
+        not(outbox.contains(h)),
+      },
     },
     chunks' = chunks.set(h, NO_CHUNK),
     wit' = { ...wit,
@@ -1518,6 +1545,7 @@ module chunkCollectBase {
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
     REAP_GRACE_TICKS = 1,
+    ENABLE_REAP_OUTER_QUAL = true,
     ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
@@ -1643,6 +1671,7 @@ module chunkCollectCrash {
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
     REAP_GRACE_TICKS = 1,
+    ENABLE_REAP_OUTER_QUAL = true,
     ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
@@ -1724,6 +1753,7 @@ module chunkCollectContend {
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
     REAP_GRACE_TICKS = 1,
+    ENABLE_REAP_OUTER_QUAL = true,
     ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
@@ -1825,6 +1855,7 @@ module chunkCollectCorrupt {
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
     REAP_GRACE_TICKS = 1,
+    ENABLE_REAP_OUTER_QUAL = true,
     ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
@@ -1941,6 +1972,7 @@ module chunkCollectThresholdOrder {
     SCANNER_AFTER = 2,
     GRACE_TICKS = 1,
     REAP_GRACE_TICKS = 1,
+    ENABLE_REAP_OUTER_QUAL = true,
     ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
@@ -1977,6 +2009,7 @@ module chunkCollectNoTouch {
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
     REAP_GRACE_TICKS = 1,
+    ENABLE_REAP_OUTER_QUAL = true,
     ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = false,
     ENABLE_FAIL_CLOSED = true,
@@ -2011,6 +2044,7 @@ module chunkCollectParseSkip {
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
     REAP_GRACE_TICKS = 1,
+    ENABLE_REAP_OUTER_QUAL = true,
     ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = false,
@@ -2055,6 +2089,7 @@ module chunkCollectWriterBounded {
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
     REAP_GRACE_TICKS = 1,
+    ENABLE_REAP_OUTER_QUAL = true,
     ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
@@ -2078,6 +2113,7 @@ module chunkCollectWriterOverrun {
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
     REAP_GRACE_TICKS = 1,
+    ENABLE_REAP_OUTER_QUAL = true,
     ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
@@ -2138,6 +2174,7 @@ module chunkCollectLateMarkGuarded {
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
     REAP_GRACE_TICKS = 1,
+    ENABLE_REAP_OUTER_QUAL = true,
     ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
@@ -2161,6 +2198,7 @@ module chunkCollectLateMarkUnguarded {
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
     REAP_GRACE_TICKS = 1,
+    ENABLE_REAP_OUTER_QUAL = true,
     ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
@@ -2204,6 +2242,7 @@ module chunkCollectShadowEquivalence {
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
     REAP_GRACE_TICKS = 1,
+    ENABLE_REAP_OUTER_QUAL = true,
     ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
@@ -2227,6 +2266,7 @@ module chunkCollectShadowNoExclusion {
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
     REAP_GRACE_TICKS = 1,
+    ENABLE_REAP_OUTER_QUAL = true,
     ENABLE_SHADOW_EXCLUSION = false,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
@@ -2445,4 +2485,75 @@ module gcCoordinationLocalTimers {
     MAX_STAMPS = 3,
     ENABLE_DURABLE_CADENCE = false
   ).*
+}
+
+// =========================================================================
+// CALIBRATION (expect-violation, composed): the reap DELETE without the
+// outer-qual row-local splice (merged_bug_026 pre-fix). The composed
+// reapEpqRaceRun drives the exact production race — victim picked at
+// the IN-subquery snapshot, resurrected by a concurrent PutPath upsert,
+// then hard-deleted anyway because the EPQ recheck finds no row-local
+// conjunct in the outer qual — and reapSafety falsifies. Base regimes
+// keep the splice ON and stay green; if a refactor makes this run pass,
+// the reapOne guard has stopped modeling the splice and the check fails
+// loudly.
+// =========================================================================
+module chunkCollectReapEpqOuterOnly {
+  import chunkCollect(
+    MAX_HASHES = 2,
+    MAX_PATHS = 2,
+    MAX_UPLOADERS = 2,
+    ENABLE_CRASH = false,
+    ENABLE_CORRUPT = false,
+    LIST_CHOICES = Set(Set(1), Set(1, 2)),
+    HB_DEADLINE = 1,
+    HOTPATH_AFTER = 2,
+    SCANNER_AFTER = 3,
+    GRACE_TICKS = 1,
+    REAP_GRACE_TICKS = 1,
+    ENABLE_REAP_OUTER_QUAL = false,
+    ENABLE_SHADOW_EXCLUSION = true,
+    ENABLE_TOUCH = true,
+    ENABLE_FAIL_CLOSED = true,
+    ENABLE_MARK_DELETED_GUARD = true,
+    ENABLE_HB_CONTRACT = true,
+    ENABLE_SPLIT_UPGRADE = false,
+    WRITER_TX_BOUND = 1
+  ).*
+
+  /// The two-connection EPQ race, composed: upload → sweep → collect
+  /// (soft-delete) → drain → grace passes → a SECOND writer resurrects
+  /// the tombstone (PutPath upsert: deleted = FALSE, fresh manifest
+  /// reference) → the reap batch, already holding the stale IN-list,
+  /// hard-deletes the now-live, now-referenced row. Mirrors the
+  /// pre-fix red of `reap_resurrected_row_survives_epq_recheck`
+  /// (collect.rs): reaped=1 with the row referenced.
+  run reapEpqRaceRun =
+    init
+      .then(claimPath(1, 1))
+      .then(upgradeManifest(1, Set(1)))
+      .then(uploadChunks(1))
+      .then(markUploaded(1))
+      .then(completeManifest(1))
+      .then(pathSweepOne(1))
+      .then(tick)
+      .then(tick)
+      .then(collectSnapshot)
+      .then(collectMark)
+      .then(collectSweep(1))
+      .then(collectFinish)
+      .expect(all { chunks.get(1).deleted, outbox == Set(1) })
+      .then(drainOne(1))
+      .then(tick)
+      .then(tick)
+      // The resurrect: writer 2 re-claims the content into a fresh
+      // path — the upsert revives the tombstone and re-references it.
+      .then(claimPath(2, 2))
+      .then(upgradeManifest(2, Set(1)))
+      .expect(all { not(chunks.get(1).deleted), refs(1) != Set() })
+      // The stale reap batch lands: with no outer-qual conjuncts the
+      // EPQ recheck waves it through — a live, referenced row is
+      // hard-deleted.
+      .then(reapOne(1))
+      .expect(all { wit.reapedUnsafely, not(reapSafety) })
 }

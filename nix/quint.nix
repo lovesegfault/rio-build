@@ -1367,11 +1367,14 @@ in
     # split: the STORE pass strips chunks (age-only by design — it
     # never touches the lifecycle row) while the SCHEDULER's gcExecRow
     # reclaims the row behind the kernel eligibility (terminal AND
-    # ledger-unreferenced AND aged out —
-    # `rio_retry_kernel::exec_row_sweep_eligible`); an
-    # expired-but-referenced execution's row survives until the
-    # attempt-ledger GC releases it.
-    # r[verify store.log.sweep-ownership]
+    # ledger-unreferenced AND aged out AND — v3, merged_bug_007 —
+    # artifact-free: no surviving drv_log_chunks row, no live
+    # log_ingest_sessions registry row, where registry liveness covers
+    # the detached-but-undrained session whose disconnect drain is
+    # still flushing); an expired-but-referenced execution's row
+    # survives until the attempt-ledger GC releases it, and a row never
+    # outruns its artifacts (noOrphanLogChunks).
+    # r[verify store.log.sweep-ownership+1]
     quint-log-service-sweep = mkQuintCheck {
       name = "log-service-sweep";
       spec = "logService";
@@ -1387,6 +1390,7 @@ in
         "completenessGate"
         "ingestLossCounted"
         "sweepOnlyTerminalUnreferenced"
+        "noOrphanLogChunks"
       ];
     };
 
@@ -1607,6 +1611,54 @@ in
       spec = "logService";
       main = "logServiceCalibSweepAgeOnly";
       witness = "sweepOnlyTerminalUnreferenced";
+    };
+
+    # CALIBRATION (expect-violation): the execution-row GC without the
+    # artifact-before-row conjuncts (merged_bug_007 pre-fix) reclaims a
+    # row whose drv_log_chunks rows survive — noOrphanLogChunks
+    # falsifies (the orphaned chunks are unreachable to the store's
+    # sweep forever).
+    quint-log-service-calib-gc-row-ignores-artifacts = mkQuintWitnessCheck {
+      name = "log-service-calib-gc-row-ignores-artifacts";
+      spec = "logService";
+      main = "logServiceCalibGcRowIgnoresArtifacts";
+      witness = "noOrphanLogChunks";
+    };
+
+    # A closer-stamped (status terminal, count NULL) execution row is
+    # actually reclaimed in the sweep regime — bug_047's liveness path
+    # is reachable, not merely encoded (noCloseStampedReclaim must
+    # violate).
+    quint-log-service-witness-close-stamped-reclaim = mkQuintWitnessCheck {
+      name = "log-service-witness-close-stamped-reclaim";
+      spec = "logService";
+      main = "logServiceSweep";
+      witness = "noCloseStampedReclaim";
+    };
+
+    # The sweep regime's composed runs: the v2 ownership-split
+    # end-to-end (sweepCompleteLogRun, now through the artifact
+    # conjuncts — the builder disconnect precedes the reclaim) and
+    # bug_047's close-then-sweep liveness on the production red's exact
+    # shape (a never-reporting MATERIALIZATION execution: close stamps,
+    # row ages, ledger releases, gcExecRow reclaims).
+    # r[verify store.log.sweep-ownership+1]
+    # r[verify sched.db.exec-stamp-on-close]
+    quint-log-service-runs-sweep = mkQuintRunCheck {
+      name = "log-service-runs-sweep";
+      spec = "logService";
+      main = "logServiceSweep";
+    };
+
+    # CALIBRATION (composed): the pre-fix assignment close that stamps
+    # nothing — after close, expiry, and ledger release the row is
+    # STILL ineligible: the immortal execution row, demonstrated
+    # step-by-step (closeNoStampImmortalRun).
+    quint-log-service-calib-close-no-stamp = mkQuintRunCheck {
+      name = "log-service-calib-close-no-stamp";
+      spec = "logService";
+      main = "logServiceCalibCloseNoStamp";
+      match = "closeNoStampImmortalRun";
     };
 
     # An expired execution SURVIVES the sweep with its row intact
@@ -2572,6 +2624,64 @@ in
       witness = "deadOwnerReapedW";
     };
 
+    # ── gcCollectState: the collect cycle's COMMIT BASIS law
+    # (bughunt-2 slot 7, bug_226; DurableObservation/CycleCommit in
+    # collect.rs). Standalone on purpose: the basis law is a per-commit
+    # functional property — modeling it inside chunkCollect would fan a
+    # new variable through every frame discipline for no interleaving
+    # value. The committed gc_collect_state row anchors the REAL basis
+    # (live/backlog under NO exclusions at the commit snapshot); the
+    # simulated preview (bug_199's lane) is reporting-only.
+    # r[verify store.gc.observation-basis]
+    quint-gc-collect-state = mkQuintCheck {
+      name = "gc-collect-state";
+      spec = "gcCollectState";
+      main = "gcCollectStateMain";
+      invariants = [
+        "publishedLiveEqualsRealMark"
+        "backlogLeTrueEligible"
+      ];
+    };
+
+    # The operator dry-run anchor run: preview simulates, commit
+    # anchors real — the composed mirror of collect.rs's
+    # dry_run_commit_anchors_real_basis test.
+    # r[verify store.gc.observation-basis]
+    quint-gc-collect-state-runs = mkQuintRunCheck {
+      name = "gc-collect-state-runs";
+      spec = "gcCollectState";
+      main = "gcCollectStateMain";
+    };
+
+    # A commit whose simulated and real bases DIFFER is reachable in
+    # the main regime — the calibration twin's falsification below only
+    # means something if the live module explores the effective-shadow
+    # arm (noEffectiveShadowCommit must violate).
+    quint-gc-collect-state-witness-effective-shadow = mkQuintWitnessCheck {
+      name = "gc-collect-state-witness-effective-shadow";
+      spec = "gcCollectState";
+      main = "gcCollectStateMain";
+      witness = "noEffectiveShadowCommit";
+    };
+
+    # CALIBRATION (expect-violation): the pre-fix commit publishes the
+    # SIMULATED basis — the live-count law falsifies.
+    quint-gc-collect-state-calib-sim-basis-live = mkQuintWitnessCheck {
+      name = "gc-collect-state-calib-sim-basis-live";
+      spec = "gcCollectState";
+      main = "gcCollectStateCalibSimBasis";
+      witness = "publishedLiveEqualsRealMark";
+    };
+
+    # CALIBRATION (expect-violation): same twin, the backlog bound
+    # falsifies (the simulated lane can only inflate backlog).
+    quint-gc-collect-state-calib-sim-basis-backlog = mkQuintWitnessCheck {
+      name = "gc-collect-state-calib-sim-basis-backlog";
+      spec = "gcCollectState";
+      main = "gcCollectStateCalibSimBasis";
+      witness = "backlogLeTrueEligible";
+    };
+
     # ── gcCoordination: the cluster-scoped collect cadence and gauge
     # publication over the durable gc_collect_state row (bughunt wave
     # D1, bug_174 + merged_bug_211; migration 090). Two replicas, a
@@ -2697,6 +2807,21 @@ in
       name = "chunk-collect-runs-corrupt";
       spec = "chunkCollect";
       main = "chunkCollectCorrupt";
+    };
+
+    # CALIBRATION (composed, expect-the-violation-in-run): the reap
+    # DELETE without the outer-qual row-local splice (merged_bug_026
+    # pre-fix). reapEpqRaceRun drives the exact two-connection race —
+    # victim picked at the IN-subquery snapshot, resurrected by a
+    # concurrent PutPath upsert, hard-deleted anyway because the EPQ
+    # recheck finds no row-local conjunct in the outer qual — and
+    # expects reapSafety violated. If a refactor makes the run fail,
+    # the reapOne guard has stopped modeling the splice.
+    quint-chunk-collect-calib-reap-epq-outer = mkQuintRunCheck {
+      name = "chunk-collect-calib-reap-epq-outer";
+      spec = "chunkCollect";
+      main = "chunkCollectReapEpqOuterOnly";
+      match = "reapEpqRaceRun";
     };
 
     # Non-vacuity witnesses for the chunkCollect regimes. Each check

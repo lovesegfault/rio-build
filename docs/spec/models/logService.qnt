@@ -156,9 +156,14 @@ module logService {
   /// `drv_executions.final_line_count` (and, by the column's write
   /// contract, the terminal status that accompanies it): `NoCount`
   /// until the scheduler stamps the lifecycle row terminal with a
-  /// known builder-reported count. SQL NULL and "no terminal status
-  /// yet" collapse here — see the `dbFinalCount` variable's doc.
-  type CountOpt = | NoCount | Count(int)
+  /// known builder-reported count. SQL NULL-status and "no terminal
+  /// status yet" collapse into `NoCount`; `StampedNoCount` is the
+  /// assignment-close stamp (sched.db.exec-stamp-on-close): status
+  /// terminal, count NULL — the no-report path's verdict. Terminal for
+  /// the sweep (`!= NoCount`), countless for the completeness gate
+  /// (no ceiling, never reads complete) — exactly the SQL row
+  /// `(status='failed', final_line_count=NULL)`.
+  type CountOpt = | NoCount | StampedNoCount | Count(int)
 
   /// The completeness ceiling as one ingest session knows it
   /// (`IngestSession::final_line_count`). `NoCeiling` until the session
@@ -319,6 +324,22 @@ module logService {
   /// Production regimes bind false; the calibration check pins that
   /// `ingestLossCounted` falsifies under it.
   const CALIB_LOSS_ESCAPE: bool
+
+  /// CALIBRATION ONLY (`logServiceCalibGcRowIgnoresArtifacts`): the
+  /// execution-row GC WITHOUT the artifact-before-row conjuncts
+  /// (merged_bug_007 pre-fix; store.log.sweep-ownership+1) — the row
+  /// deletes while `drv_log_chunks` rows or a live ingest session
+  /// still key on it, orphaning the artifacts forever
+  /// (`noOrphanLogChunks` falsifies).
+  const CALIB_GC_ROW_IGNORE_ARTIFACTS: bool
+
+  /// CALIBRATION ONLY (`logServiceCalibCloseNoStamp`): the pre-fix
+  /// assignment close that stamps NOTHING (bug_047) — `closeExecStamp`
+  /// degrades to a no-op, the no-report execution's row keeps
+  /// `NoCount` forever, `execRowSweepEligible` never satisfies, and
+  /// the composed `closeNoStampImmortalRun` demonstrates the immortal
+  /// row.
+  const CALIB_CLOSE_NO_STAMP: bool
 
   /// CALIBRATION ONLY (`logServiceCalibSweepAgeOnly`): the pre-fix
   /// age-only sweep SELECT — eligibility ignores the terminal and
@@ -555,6 +576,11 @@ module logService {
     workerGapAppended: bool,
     oversizedRejected: bool,
     oversizedAdmitted: bool,
+    // A closer-stamped (`StampedNoCount`) row was reclaimed by
+    // `gcExecRow` — the close-then-sweep liveness path actually
+    // completed (bug_047's witness; `noCloseStampedReclaim` must
+    // violate in the sweep regime).
+    closeStampedReclaimed: bool,
   }
 
   /// The reader's terminal observation: the serving session's final
@@ -662,6 +688,19 @@ module logService {
     match sessions.get(e).get(s) { | NoSession => Set() | Session(x) => x.buf }
   def sessIsOpen(e: int, s: int): bool = hasSession(e, s) and sessPhase(e, s) == SessOpen
 
+  /// The `log_ingest_sessions` REGISTRY row's liveness, as the
+  /// execution-row GC's sixth conjunct sees it: the row exists from
+  /// `acquire` until the AppendDriver's deregistration scopeguard —
+  /// which runs AFTER the disconnect drain commits the buffered tail.
+  /// So: an OPEN session holds its row, and a DETACHED session holds
+  /// it exactly while its drain is still flushing (non-empty buffer).
+  /// The abort arm wipes the buffer at detach, so an aborted session's
+  /// row dies immediately — both arms mirror service.rs's exit order.
+  def registryLive(e: int, s: int): bool = and {
+    hasSession(e, s),
+    or { sessPhase(e, s) == SessOpen, sessBuf(e, s) != Set() },
+  }
+
   /// The execution's unique Open session index, or 0 if none. The
   /// builder holds one `AppendLog` stream at a time, so at most one
   /// session per execution is ever Open (asserted by `boundsOK`).
@@ -706,6 +745,20 @@ module logService {
       dbFinalCount.get(e) != NoCount,
       not(ledgerReferenced.get(e)),
     },
+    // v3 (store.log.sweep-ownership+1, merged_bug_007): artifact-
+    // before-row is data-structural — the row outlives every log
+    // artifact keyed on it (conjuncts 5/6: NOT EXISTS drv_log_chunks /
+    // log_ingest_sessions), under ANY retention configuration.
+    // The registry conjunct keys on `registryLive`: open sessions AND
+    // detached-but-undrained ones still hold their
+    // `log_ingest_sessions` row (the deregistration scopeguard runs
+    // after the disconnect drain) — found by this model: keying on
+    // open-only admitted a reclaim under an in-flight drain, whose
+    // late chunk INSERT (no FK) would orphan.
+    CALIB_GC_ROW_IGNORE_ARTIFACTS or and {
+      chunks.get(e) == Set(),
+      not(SESSION_IDS.exists(s => registryLive(e, s))),
+    },
   }
 
   // -- The completeness predicate (`gate.rs::log_is_complete`) ---------
@@ -739,6 +792,9 @@ module logService {
     execRowExists.get(e),
     match dbFinalCount.get(e) {
       | NoCount => false
+      // Terminal-by-close with no recorded count: completeness is
+      // unjudgeable, the log never reads complete (disclosed).
+      | StampedNoCount => false
       | Count(n) => manifestCoversUpTo(e, n)
     },
   }
@@ -964,6 +1020,18 @@ module logService {
       expired.get(e),
     })
 
+  /// Artifact-before-row (store.log.sweep-ownership+1,
+  /// merged_bug_007): a reclaimed lifecycle row never strands
+  /// `drv_log_chunks` rows — the execution-row GC refuses rows whose
+  /// artifacts survive, so a missing row implies an empty manifest.
+  val noOrphanLogChunks = EXECS.forall(e =>
+    (e <= dispatched and not(execRowExists.get(e))) implies chunks.get(e) == Set())
+
+  /// Non-vacuity witness for the close-then-sweep liveness path
+  /// (bug_047): MUST VIOLATE in the sweep regime — a closer-stamped
+  /// row actually gets reclaimed (the immortality is gone).
+  val noCloseStampedReclaim = not(wit.closeStampedReclaimed)
+
   /// `NoSilentLineLoss` (the conservation law), the four-disjunct
   /// disclosed-loss form from log-invariant-map.md's campaign close-out:
   /// every line the build emitted into its uploader is, at all times,
@@ -1063,6 +1131,7 @@ module logService {
     | NoFinal => true
     | Final(f) => f.complete implies match dbFinalCount.get(1) {
         | NoCount => true
+        | StampedNoCount => true
         | Count(c) => interval(0, c).subseteq(readerServed)
       }
   }
@@ -1478,7 +1547,14 @@ module logService {
     buildFinished.get(e),
     execRowExists.get(e),
     not(expired.get(e)),
-    dbFinalCount.get(e) == NoCount,
+    // The epilogue commutes with the assignment-close stamp on the
+    // equal verdict: a closer-stamped (StampedNoCount) row still
+    // receives its count (COALESCE final_line_count — the qual
+    // `status IS NULL OR status = $2`).
+    or {
+      dbFinalCount.get(e) == NoCount,
+      dbFinalCount.get(e) == StampedNoCount,
+    },
     dbFinalCount' = dbFinalCount.put(e,
       if (producedEnd.get(e) > 0) Count(producedEnd.get(e)) else NoCount),
     // Avoid a self-loop when the count maps to NULL: the row is
@@ -1568,6 +1644,7 @@ module logService {
       highWater: 0,
       ceiling: match dbFinalCount.get(e) {
         | NoCount => NoCeiling
+        | StampedNoCount => NoCeiling
         | Count(n) => Ceiling({ value: n, hwAtLearn: 0 })
       },
       buf: Set(),
@@ -1985,14 +2062,18 @@ module logService {
     execRowExists.get(e),
     val n = dbFinalCount.get(e)
     all {
-      n != NoCount,
+      match n { | Count(_) => true | _ => false },
       sessions' = sessions.put(e, sessions.get(e).put(s,
         match sessions.get(e).get(s) {
           | NoSession => NoSession
           | Session(x) => Session({
               phase: x.phase,
               highWater: x.highWater,
-              ceiling: match n { | NoCount => NoCeiling | Count(v) => Ceiling({ value: v, hwAtLearn: x.highWater }) },
+              ceiling: match n {
+                | NoCount => NoCeiling
+                | StampedNoCount => NoCeiling
+                | Count(v) => Ceiling({ value: v, hwAtLearn: x.highWater })
+              },
               buf: x.buf,
             })
         })),
@@ -2336,10 +2417,51 @@ module logService {
     execRowSweepEligible(e),
     execRowExists.get(e),
     execRowExists' = execRowExists.put(e, false),
+    wit' = if (dbFinalCount.get(e) == StampedNoCount)
+      { ...wit, closeStampedReclaimed: true }
+    else wit,
     dispatched' = dispatched,
     producedEnd' = producedEnd,
     buildFinished' = buildFinished,
     dbFinalCount' = dbFinalCount,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessions' = sessions,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
+  }
+
+  /// The assignment close stamps the execution row terminal in the
+  /// SAME statement (sched.db.exec-stamp-on-close;
+  /// `close_assignments_sql`'s stamped CTE): the no-report path's
+  /// verdict — a crashed or never-reporting build's assignment closes
+  /// (fenced close, sweep_stale_assignments, the materialization
+  /// cancel) and the row becomes terminal with a NULL count
+  /// (`StampedNoCount`). Guarded `status IS NULL`-first-verdict-wins:
+  /// a row the epilogue already stamped keeps its count. Pre-fix
+  /// (CALIB_CLOSE_NO_STAMP) the close stamped NOTHING — the row kept
+  /// `NoCount` forever and was immortal to `gcExecRow` (bug_047).
+  // Mirrors: rio-scheduler/src/db/mod.rs::close_assignments_sql
+  //          (the stamped CTE arm; status IS NULL guard).
+  action closeExecStamp(e: int): bool = all {
+    readerUnchanged,
+    e <= dispatched,
+    execRowExists.get(e),
+    dbFinalCount.get(e) == NoCount,
+    dbFinalCount' = dbFinalCount.put(e,
+      if (CALIB_CLOSE_NO_STAMP) NoCount else StampedNoCount),
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    execRowExists' = execRowExists,
     expired' = expired,
     sweepChunksDone' = sweepChunksDone,
     uploader' = uploader,
@@ -2811,6 +2933,7 @@ module logService {
       workerGapAppended: false,
       oversizedRejected: false,
       oversizedAdmitted: false,
+      closeStampedReclaimed: false,
     },
     readerAttached' = false,
     readerCursor' = 0,
@@ -2872,6 +2995,7 @@ module logService {
   action executionExpiresAny = { nondet e = EXECS.oneOf() executionExpires(e) }
   action sweepChunksAny = { nondet e = EXECS.oneOf() sweepChunks(e) }
   action gcExecRowAny = { nondet e = EXECS.oneOf() gcExecRow(e) }
+  action closeExecStampAny = { nondet e = EXECS.oneOf() closeExecStamp(e) }
   action ledgerReleasesAny = { nondet e = EXECS.oneOf() ledgerReleases(e) }
 
   action step = any {
@@ -2895,6 +3019,7 @@ module logService {
     executionExpiresAny,
     sweepChunksAny,
     gcExecRowAny,
+    closeExecStampAny,
     ledgerReleasesAny,
     readerSubscribe,
     fanoutDeliverAny,
@@ -2952,6 +3077,8 @@ module logServiceBase {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3075,6 +3202,8 @@ module logServiceRedispatch {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3163,6 +3292,8 @@ module logServiceResend {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3233,10 +3364,15 @@ module logServiceSweep {
     CAP = 9,
     CALIB_SESSION_SCOPED_CAPS = false,
     CALIB_GATE_IGNORES_ROW = false,
-    ENABLE_MAT_DISPATCH = false,
+    // Mat dispatch ON since the close-stamp work: the immortal-row
+    // production red was an aged closed MATERIALIZATION row; the
+    // close-then-sweep witness drives that exact kind.
+    ENABLE_MAT_DISPATCH = true,
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3279,10 +3415,35 @@ module logServiceSweep {
         noSilentLineLoss,
       })
       // The scheduler's reclaim needs the attempt ledger released
-      // first (terminal and aged it already is).
+      // AND the artifact conjuncts clear: the builder disconnects
+      // (the session's registry row dies with it —
+      // store.log.sweep-ownership+1's sixth conjunct), then the row
+      // goes.
+      .then(builderDisconnects(1))
       .then(ledgerReleases(1))
       .then(gcExecRow(1))
       .expect(not(execRowExists.get(1)))
+
+  /// bug_047's liveness path, composed end-to-end on the production
+  /// red's exact shape: a MATERIALIZATION execution that never reports
+  /// — its assignment closes (the close statement stamps the row
+  /// terminal, count NULL), it ages out, the ledger releases, and the
+  /// execution-row GC reclaims it. Pre-fix the close stamped nothing
+  /// and this row was immortal (see logServiceCalibCloseNoStamp).
+  run materializationCloseThenSweptRun =
+    init
+      .then(dispatchMaterialization)
+      .then(closeExecStamp(1))
+      .expect(dbFinalCount.get(1) == StampedNoCount)
+      .then(executionExpires(1))
+      .then(ledgerReleases(1))
+      .expect(execRowSweepEligible(1))
+      .then(gcExecRow(1))
+      .expect(all {
+        not(execRowExists.get(1)),
+        wit.closeStampedReclaimed,
+        noOrphanLogChunks,
+      })
 }
 
 // =========================================================================
@@ -3317,6 +3478,8 @@ module logServiceCalibSessionCaps {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3356,6 +3519,8 @@ module logServiceCalibGateRow {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3400,6 +3565,8 @@ module logServiceKindMix {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3464,6 +3631,8 @@ module logServiceCalibLatestOnly {
     CALIB_GATE_LATEST_ONLY = true,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3504,6 +3673,8 @@ module logServiceCalibLossEscape {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = true,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3544,6 +3715,8 @@ module logServiceCalibSweepAgeOnly {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = true,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3586,6 +3759,8 @@ module logServiceServed {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = true,
     QUEUE_CAP = 1,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3654,6 +3829,8 @@ module logServiceCalibReaderAdvance {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = true,
     QUEUE_CAP = 1,
     CALIB_READER_ADVANCE_PAST = true,
@@ -3739,6 +3916,8 @@ module logServiceWorkerGap {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = true,
     QUEUE_CAP = 1,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3774,6 +3953,8 @@ module logServiceCalibDropWakeLost {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = true,
     QUEUE_CAP = 1,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3810,6 +3991,8 @@ module logServiceCalibStampSkips {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = true,
     QUEUE_CAP = 1,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3847,6 +4030,8 @@ module logServiceCalibRecoveryUngated {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = true,
     QUEUE_CAP = 2,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3882,6 +4067,8 @@ module logServiceCalibResumePastGap {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = true,
     QUEUE_CAP = 1,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3918,6 +4105,8 @@ module logServiceExecAxis {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = true,
     QUEUE_CAP = 2,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3954,6 +4143,8 @@ module logServiceCalibExecSplice {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = true,
     QUEUE_CAP = 2,
     CALIB_READER_ADVANCE_PAST = false,
@@ -3993,6 +4184,8 @@ module logServiceFlood {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
@@ -4027,6 +4220,8 @@ module logServiceCalibOversized {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
@@ -4041,4 +4236,102 @@ module logServiceCalibOversized {
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
   ).*
+}
+
+// =========================================================================
+// CALIBRATION (expect-violation): the execution-row GC without the
+// artifact-before-row conjuncts (merged_bug_007 pre-fix). The reclaim
+// fires while drv_log_chunks rows still key on the execution —
+// noOrphanLogChunks falsifies (the chunks are orphaned forever; the
+// store's TTL sweep can no longer find them through the row).
+// =========================================================================
+module logServiceCalibGcRowIgnoresArtifacts {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 1,
+    MAX_LINE = 3,
+    MAX_BATCH_LINES = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = false,
+    ENABLE_SWEEP = true,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = true,
+    CALIB_CLOSE_NO_STAMP = false,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
+  ).*
+}
+
+// =========================================================================
+// CALIBRATION (composed): the pre-fix assignment close that stamps
+// nothing (bug_047). The same prefix as the sweep regime's
+// close-then-sweep witness, but the close leaves NoCount — after
+// expiry and ledger release the row is STILL ineligible: the immortal
+// execution row, demonstrated deterministically.
+// =========================================================================
+module logServiceCalibCloseNoStamp {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 1,
+    MAX_LINE = 3,
+    MAX_BATCH_LINES = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = false,
+    ENABLE_SWEEP = true,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = true,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = true,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
+  ).*
+
+  /// The immortality, step by step: closed (no stamp), expired,
+  /// released — and STILL not eligible; the row survives. Mirrors the
+  /// pre-fix red: gc_exec_rows returned 0 for the aged closed row.
+  run closeNoStampImmortalRun =
+    init
+      .then(dispatchMaterialization)
+      .then(closeExecStamp(1))
+      // The pre-fix close stamped nothing.
+      .expect(dbFinalCount.get(1) == NoCount)
+      .then(executionExpires(1))
+      .then(ledgerReleases(1))
+      .expect(all {
+        execRowExists.get(1),
+        not(execRowSweepEligible(1)),
+      })
 }
