@@ -326,6 +326,17 @@ pub enum ActorCommand {
     /// gauge values.
     LeaderLost,
 
+    /// Rebound: a holder change observed late on a still-leading round
+    /// (`sched.lease.rebound`) — a compressed lose→acquire pair whose
+    /// standby interval was never locally observed. The actor runs the
+    /// `LeaderEdge` table's Compound lose cells (cost latch, gauge
+    /// family) and then the full acquire path; deliberately NOT the
+    /// lost handler's DAG wipe (the immediately-following recovery
+    /// rebuilds everything the wipe would clear — see
+    /// `handle_leader_rebound`). Sent by the lease hooks' `on_rebound`
+    /// only; fire-and-forget like its siblings.
+    LeaderRebound,
+
     /// `cfg(test)` debug command. See [`DebugCmd`].
     #[cfg(test)]
     Debug(DebugCmd),
@@ -591,6 +602,7 @@ impl ActorCommand {
             Self::ClearPoison { .. } => "ClearPoison",
             Self::LeaderAcquired => "LeaderAcquired",
             Self::LeaderLost => "LeaderLost",
+            Self::LeaderRebound => "LeaderRebound",
             #[cfg(test)]
             Self::Debug(_) => "Debug",
         }

@@ -689,6 +689,21 @@ impl rio_lease::LeaseHooks for ControllerLeaseHooks {
         self.lose.store(true, std::sync::atomic::Ordering::SeqCst);
         metrics::counter!("rio_controller_lease_lost_total").increment(1);
     }
+    fn on_rebound(&self) {
+        // Compound semantics for the controller's two cells: the lose
+        // flag disarms the PlaceableGate (the pre-term tenure's stale
+        // `queued` set must not `reap_excess_pending` the post-term
+        // world), and the epoch bump re-fires the acquire edge actions
+        // (sketch reload, `prev_idle` clear, `pending_evidence` reset)
+        // exactly once — the foreign term may have moved PG and
+        // cluster state under us. Order is irrelevant here (the run
+        // loop reads both flags at the same tick top); each is its own
+        // atomic.
+        self.lose.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.acquire_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        metrics::counter!("rio_controller_lease_rebound_total").increment(1);
+    }
 }
 
 /// The reconciler. Constructed in `main.rs` after PG connect; `run()`

@@ -107,11 +107,15 @@ pub struct DagActorPlumbing {
     /// `spot_price_poller`; the actor reads a snapshot per
     /// `solve_intent_for`. Default → seed prices.
     pub cost_table: Arc<parking_lot::RwLock<crate::sla::cost::CostTable>>,
-    /// Shared edge-reload latch. Written ONLY by
-    /// [`interrupt_housekeeping`](crate::sla::cost::interrupt_housekeeping)
-    /// (the single edge-reload owner); read by `spot_price_poller` AND
-    /// the actor's `handle_ack_spawned_intents` so neither writes the
-    /// pre-reload `cost_table` and gets clobbered by `*cost.write() =
+    /// Shared edge-reload latch. Its writer set is the
+    /// [`LEADER_EDGES`](crate::observability::LEADER_EDGES) cost-latch
+    /// cells (false on every lose-shaped transition: lose AND rebound)
+    /// plus
+    /// [`interrupt_housekeeping`](crate::sla::cost::interrupt_housekeeping)'s
+    /// prelude (the steady-state edges) — consult the registry, never a
+    /// prose enumeration. Read by `spot_price_poller` AND the actor's
+    /// `handle_ack_spawned_intents` so neither writes the pre-reload
+    /// `cost_table` and gets clobbered by `*cost.write() =
     /// CostTable::load(...)`.
     pub cost_was_leader: Arc<std::sync::atomic::AtomicBool>,
     /// Nudge `interrupt_housekeeping` to run its edge-reload promptly

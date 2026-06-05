@@ -3760,18 +3760,27 @@ complete, so the ordering is trivially satisfied there.
   logs a warning and observed-record expiry is the fallback.
 ]
 
-#r("sched.lease.rebound+2")[
+#r("sched.lease.rebound+3")[
   A renew round that resolves Leading while this replica already believes it
   leads, but whose observed `leaseTransitions` count differs from the count
   recorded at this replica's most recent acquire edge or rebound, MUST be
   treated as a late-observed holder change: the lease loop MUST re-record the
   observed count, re-derive the generation from it via `fetch_max`, clear
-  `recovery_complete`, and re-fire the acquire hook so recovery re-runs
-  against the post-change state; `is_leader` MUST NOT be cleared by this
-  transition. The lease loop MUST also mark the leader marks dirty: a foreign
-  term that ran to completion inside the observation gap guarantees the
-  foreign holder's reconcile swept this pod's marks, so the unchanged-polarity
-  argument for skipping the re-patch does not apply.
+  `recovery_complete`, and fire the dedicated rebound hook (`on_rebound`) so
+  the consumer runs its declared rebound effects and recovery re-runs against
+  the post-change state; `is_leader` MUST NOT be cleared by this transition.
+  The rebound hook is a REQUIRED member of the hooks contract (no default),
+  and each consumer-side leadership-edge effect MUST declare its rebound
+  policy explicitly: Compound (lose cell then acquire cell --- the default
+  posture, since a rebound is a compressed lose→acquire pair whose standby
+  interval was never locally observed) or AcquireOnly with a written
+  rationale. The scheduler MUST deliver the rebound as its own actor command
+  that runs the Compound members' lose cells and then the full acquire path
+  --- never the lost handler's state wipe. The lease loop MUST also mark the
+  leader marks dirty: a foreign term that ran to completion inside the
+  observation gap guarantees the foreign holder's reconcile swept this pod's
+  marks, so the unchanged-polarity argument for skipping the re-patch does
+  not apply.
 ]
 
 The shapes this catches land entirely inside this replica's observation gap
@@ -3784,22 +3793,27 @@ delete/recreate can move `leaseTransitions` (renews never write it), and a
 foreign holder still present at the next successful round resolves
 Standby/Conflict through the existing lose edge --- so an unequal count on a
 still-leading round is always a genuine discontinuity, and the cost of acting
-on one is a single recovery re-run with dispatch gated during it. Only the
-acquire hook is re-fired: a synthesized lose would force a pointless wipe of
-state the immediately-following re-recovery rebuilds (and, if the full lose
-edge were synthesized, an `is_leader = false` blip), while
-adding nothing to the dispatch gating the rebound's own `recovery_complete`
-clear already provides; hook delivery is ordered
-(#rref("sched.lease.hook-order")), so the choice is about avoiding wasted
-work, not about reordering. The accepted
-residual is the count coincidence: an observed count that lands exactly back
-on the recorded value is indistinguishable from steady state --- the same
-coincidence pricing as the recovery gate's deletion-ABA note --- and in that
-shape no command is queued, so a recovery loaded across the foreign tenure
-persists until the next real leadership change or rebound. The scheduler's
-acquire-hook counter (#(refs.metric)("rio_scheduler_lease_acquired_total"))
-counts rebounds too; that is deliberate --- a rebound is operationally an
-acquisition-shaped event --- and no separate counter is added.
+on one is a single recovery re-run with dispatch gated during it. The
+dedicated hook (rather than a re-fired acquire) is what lets consumers run
+the lose-shaped HALF of the transition they actually need --- the
+leadership-edge table's Compound lose cells, e.g. the cost-table latch whose
+skipped false-store let a post-rebound housekeeping tick persist prices over
+the foreign tenure's evolved table --- without a synthesized full lose, which
+would force a pointless wipe of state the immediately-following re-recovery
+rebuilds (and, if the full lose edge were synthesized, an
+`is_leader = false` blip), adding nothing to the dispatch gating the
+rebound's own `recovery_complete` clear already provides; hook delivery is
+ordered (#rref("sched.lease.hook-order")), so the split is about running the
+right effects, not about reordering. The accepted residual is the count
+coincidence: an observed count that lands exactly back on the recorded value
+is indistinguishable from steady state --- the same coincidence pricing as
+the recovery gate's deletion-ABA note --- and in that shape no command is
+queued, so a recovery loaded across the foreign tenure persists until the
+next real leadership change or rebound. Rebounds are counted on their own
+counters (#(refs.metric)("rio_scheduler_lease_rebound_total"),
+#(refs.metric)("rio_controller_lease_rebound_total"));
+#(refs.metric)("rio_scheduler_lease_acquired_total") counts acquire edges
+only.
 
 #r("sched.health.shared-reporter+2")[
   The lease toggle calls `set_not_serving`/`set_serving` on the SAME

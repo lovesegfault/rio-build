@@ -196,6 +196,12 @@ pub fn describe_metrics() {
         "nodeclaim_pool lease lose transitions (explicit lose or local self-fence)."
     );
     describe_counter!(
+        "rio_controller_lease_rebound_total",
+        "nodeclaim_pool lease rebounds: holder changes observed late on a \
+         still-leading round. Each disarms the placeable gate and re-fires the \
+         acquire-edge actions (sketch reload, idle/evidence resets) once."
+    );
+    describe_counter!(
         "rio_controller_nodeclaim_reaped_total",
         "nodeclaim_pool NodeClaim deletions by `reason` × `cell`. \
          reason=idle: NA-consolidate break-even; reason=ice: \

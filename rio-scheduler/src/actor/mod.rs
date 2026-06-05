@@ -1460,6 +1460,13 @@ impl DagActor {
                     // the next merge or completion to trigger it.
                     self.sweep_ready_cached().await;
                 }
+                ActorCommand::LeaderRebound => {
+                    self.handle_leader_rebound().await;
+                    // Same post-recovery sweep as the acquire arm: the
+                    // rebound's re-recovery may have loaded Ready
+                    // derivations whose outputs already exist.
+                    self.sweep_ready_cached().await;
+                }
                 ActorCommand::SubstituteProgress {
                     drv_hash,
                     bytes_done,

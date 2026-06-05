@@ -241,9 +241,12 @@ async fn main() -> anyhow::Result<()> {
     // (the controller appends `interrupt_samples` even under Static).
     // `inputs_gen` is derived from the table at poll time — pollers
     // just write; nobody bumps. `cost_was_leader` is shared between both
-    // pollers and written ONLY by interrupt_housekeeping (the
-    // edge-reload owner); the spot poller reads it to skip one body on
-    // the false→true edge so its first fold lands post-reload.
+    // pollers and the actor; its writer set is the
+    // observability::LEADER_EDGES cost-latch cells (lose + rebound
+    // deliveries) plus poller_tick_prelude's steady-state edges — see
+    // the registry, never a prose list. The spot poller reads it to
+    // skip one body on the false→true edge so its first fold lands
+    // post-reload.
     let cost_was_leader = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cost_reload_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     rio_common::task::spawn_monitored(

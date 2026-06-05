@@ -96,16 +96,25 @@ mod mbt_tests;
 pub trait LeaseHooks: Clone + Send + 'static {
     /// Called once per standby→leader transition, AFTER
     /// [`LeaderState::on_acquire`] has written the generation and set
-    /// `is_leader=true`. Also fired on a rebound — a holder change
-    /// observed late on a still-leading round, AFTER
-    /// [`LeaderState::on_rebound`] re-recorded the observed transition
-    /// count and cleared `recovery_complete` — so consumers MUST
-    /// tolerate a second call with no intervening [`on_lose`](Self::on_lose).
+    /// `is_leader=true`.
     fn on_acquire(&self);
     /// Called once per leader→standby transition (explicit lose OR local
     /// self-fence), AFTER [`LeaderState::on_lose`] has cleared `is_leader`
     /// and `recovery_complete`.
     fn on_lose(&self);
+    /// Called once per REBOUND — a holder change observed late on a
+    /// still-leading round (`sched.lease.rebound`), AFTER
+    /// [`LeaderState::on_rebound`] re-recorded the observed transition
+    /// count and cleared `recovery_complete`. A rebound is a compressed
+    /// lose→acquire pair whose standby interval was never locally
+    /// observed; consumers decide per effect which halves to run (the
+    /// scheduler routes it through its leadership-edge table's declared
+    /// rebound policy). REQUIRED, no default: every implementor must
+    /// choose — a silently-inherited acquire-only delivery is exactly
+    /// how the cost-latch lose cell was skipped (merged_bug_212).
+    /// Consumers MUST still tolerate it arriving with no intervening
+    /// [`on_lose`](Self::on_lose).
+    fn on_rebound(&self);
 }
 
 /// Lease TTL as written to the Lease object's `leaseDurationSeconds`.
@@ -871,7 +880,7 @@ impl LeaderState {
     /// on the recorded one — is undetectable here by construction; that
     /// residual is priced at the recovery gate's entry-snapshot comment
     /// in rio-scheduler.
-    // r[impl sched.lease.rebound+2]
+    // r[impl sched.lease.rebound+3]
     // r[impl sched.lease.generation-fence+3]
     pub fn on_rebound(&self, lease_transitions: u64) -> u64 {
         self.recovery_completed_for
@@ -1303,7 +1312,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         // the periodic verify (sched.lease.marks-
                         // verify). Equal counts stay a silent no-op (a
                         // log every 5s would be noisy).
-                        // r[impl sched.lease.rebound+2]
+                        // r[impl sched.lease.rebound+3]
                         let recorded = state.acquired_transitions();
                         if transitions != recorded {
                             // The rebound re-dirty: a guaranteed-
@@ -1320,7 +1329,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                                  unobserved holder change inside our observation gap; \
                                  re-running recovery"
                             );
-                            hooks.on_acquire();
+                            hooks.on_rebound();
                         }
                     }
                     // Steady state: still standby while someone else
@@ -1775,7 +1784,7 @@ mod dirty_gen_proofs {
 
     const MAX_EVENTS: usize = 8;
 
-    /// r[verify sched.lease.rebound+2]
+    /// r[verify sched.lease.rebound+3]
     /// For every event sequence (mark / snapshot / clear-through-last-
     /// snapshot), after any clear: if a mark happened after the
     /// snapshot that clear used, the flag is still dirty.
@@ -2617,7 +2626,7 @@ mod tests {
     /// in-flight recovery result is still valid — that is the recovery
     /// gate's documented keep case, preserved by keying on the epoch
     /// rather than a session counter.
-    // r[verify sched.lease.rebound+2]
+    // r[verify sched.lease.rebound+3]
     #[test]
     fn stale_completion_does_not_override_rebound_clear() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
@@ -2704,7 +2713,7 @@ mod tests {
     /// generation via `fetch_max` (a no-op in the saturated regime),
     /// clears `recovery_complete` so recovery re-runs, refreshes
     /// `leader_for()`, and never touches `is_leader`.
-    // r[verify sched.lease.rebound+2]
+    // r[verify sched.lease.rebound+3]
     #[test]
     fn on_rebound_records_count_and_reruns_recovery() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
@@ -3335,7 +3344,7 @@ mod tests {
     /// site this test stands in for is the rebound arm's re-dirty in
     /// `run_lease_loop_with_client` (the `transitions != recorded`
     /// branch).
-    // r[verify sched.lease.rebound+2]
+    // r[verify sched.lease.rebound+3]
     // r[verify sched.lease.deletion-cost+3]
     #[tokio::test]
     async fn rebound_redirty_survives_inflight_reconcile_clear() {
@@ -3627,6 +3636,7 @@ mod tests {
     struct RecordingHooks {
         acquires: Arc<Mutex<Vec<Instant>>>,
         loses: Arc<Mutex<Vec<Instant>>>,
+        rebounds: Arc<Mutex<Vec<Instant>>>,
     }
 
     impl LeaseHooks for RecordingHooks {
@@ -3638,6 +3648,12 @@ mod tests {
         }
         fn on_lose(&self) {
             self.loses.lock().expect("loses lock").push(Instant::now());
+        }
+        fn on_rebound(&self) {
+            self.rebounds
+                .lock()
+                .expect("rebounds lock")
+                .push(Instant::now());
         }
     }
 
@@ -3941,7 +3957,7 @@ mod tests {
     /// arm stored nothing ("leadership polarity is unchanged") and the
     /// label stayed missing until the next leadership transition — a
     /// dashboard outage with no bound.
-    // r[verify sched.lease.rebound+2]
+    // r[verify sched.lease.rebound+3]
     #[tokio::test(start_paused = true)]
     async fn rebound_marks_leader_marks_dirty() {
         let (client, mock) = MockApiServer::new();
@@ -3997,9 +4013,9 @@ mod tests {
         tokio::time::advance(RENEW_INTERVAL).await;
         settle().await;
         assert_eq!(
-            hooks.acquires.lock().expect("acquires lock").len(),
-            2,
-            "the rebound must re-fire the acquire hook"
+            hooks.rebounds.lock().expect("rebounds lock").len(),
+            1,
+            "the rebound must fire the rebound hook"
         );
         let pod = mock.pod("us").expect("pod still stored");
         assert_eq!(
@@ -4615,7 +4631,7 @@ mod tests {
     /// value is equally undetectable — that count coincidence is the
     /// accepted residual (see the recovery gate's entry-snapshot comment
     /// in rio-scheduler).
-    // r[verify sched.lease.rebound+2]
+    // r[verify sched.lease.rebound+3]
     #[tokio::test(start_paused = true)]
     async fn still_leading_rounds_rebound_on_moved_transition_count() {
         let (client, mock) = MockApiServer::new();
@@ -4706,7 +4722,13 @@ mod tests {
         {
             let acquires = hooks.acquires.lock().expect("acquires lock");
             let loses = hooks.loses.lock().expect("loses lock");
-            assert_eq!(acquires.len(), 2, "the rebound re-fires the acquire hook");
+            let rebounds = hooks.rebounds.lock().expect("rebounds lock");
+            assert_eq!(
+                acquires.len(),
+                1,
+                "the rebound fires its OWN hook, not a second acquire"
+            );
+            assert_eq!(rebounds.len(), 1, "the rebound fires the rebound hook");
             assert_eq!(loses.len(), 0, "the rebound must not fire the lose hook");
         }
 
@@ -4734,10 +4756,12 @@ mod tests {
         {
             let acquires = hooks.acquires.lock().expect("acquires lock");
             let loses = hooks.loses.lock().expect("loses lock");
+            let rebounds = hooks.rebounds.lock().expect("rebounds lock");
+            assert_eq!(acquires.len(), 1, "still exactly one acquire edge");
             assert_eq!(
-                acquires.len(),
-                3,
-                "the 404-recreate rebound re-fires the acquire hook"
+                rebounds.len(),
+                2,
+                "the 404-recreate rebound fires the rebound hook"
             );
             assert_eq!(loses.len(), 0, "still no lose edge");
         }

@@ -1080,16 +1080,18 @@ fn emit_stale_gauge(cost: &parking_lot::RwLock<CostTable>, now: f64) {
 
 /// Spot-only — `main.rs` spawns this only under `hw_cost_source =
 /// Spot`. λ refresh / sweep / persist / leader-edge reload live
-/// in [`interrupt_housekeeping`] (which runs unconditionally). TWO
-/// writers own `was_leader` (the two-writer contract): the prelude in
-/// `poller_tick_prelude` writes the steady-state edges (false on a
-/// standby tick, true after a successful leader reload), and the
-/// actor's `handle_leader_lost` writes false through
-/// `observability::LEADER_EDGES` so a lose→re-acquire flap INSIDE one
-/// 600s tick still presents a false→true edge to the prelude — without
-/// that lose-edge store, the flap left the latch true, the reload was
-/// skipped, and the tick body persisted the deposed tenure's prices
-/// (bug_310).
+/// in [`interrupt_housekeeping`] (which runs unconditionally). The
+/// `was_leader` writer set is keyed by the `observability::LEADER_EDGES`
+/// registry plus the prelude: `poller_tick_prelude` writes the
+/// steady-state edges (false on a standby tick, true after a successful
+/// leader reload), and the table's cost-latch lose cell writes false on
+/// every lose-SHAPED transition — the actor's lost handler AND the
+/// rebound's Compound delivery — so a lose→re-acquire flap or a foreign
+/// term observed late INSIDE one 600s tick still presents a false→true
+/// edge to the prelude. Without the lose-edge store the flap left the
+/// latch true, the reload was skipped, and the tick body persisted the
+/// deposed tenure's prices (bug_310); without the rebound delivery the
+/// same skip followed every unobserved holder change (merged_bug_212).
 /// This poller reads the shared `was_leader` and skips exactly one body
 /// on its own observed false→true edge so its first fold lands on the
 /// freshly-reloaded table, not the stale in-mem one (which the reload
@@ -1166,13 +1168,19 @@ pub async fn spot_price_poller(
 /// main.rs) would be `persist()`ed on the first leader tick,
 /// overwriting the previous leader's evolved EMA.
 ///
-/// **Single edge-reload owner.** This task is the only writer of the
-/// shared `was_leader` flag (via `poller_tick_prelude`); it's the
-/// task that `persist()`s, so it owns the load↔persist symmetry.
-/// [`spot_price_poller`] reads `was_leader` and skips one body on its
-/// observed false→true edge so its first fold lands on the post-reload
-/// table — dual edge-reload would have one task's body write clobbered
-/// by the other's `*cost.write() = fresh`.
+/// **Edge-reload ownership.** This task owns the load↔persist symmetry
+/// (it is the task that `persist()`s); the latch's WRITER SET is the
+/// registry in `observability::LEADER_EDGES` plus `poller_tick_prelude`
+/// — the prelude writes the steady-state edges, and the table's
+/// cost-latch cells write false on every lose-shaped transition (lose
+/// AND rebound) so the next leader tick reloads before it persists.
+/// Enumerating writers by hand here is exactly how bug_310/
+/// merged_bug_212 were missed; the census test in observability.rs
+/// keeps this paragraph honest. [`spot_price_poller`] reads
+/// `was_leader` and skips one body on its observed false→true edge so
+/// its first fold lands on the post-reload table — dual edge-reload
+/// would have one task's body write clobbered by the other's
+/// `*cost.write() = fresh`.
 pub async fn interrupt_housekeeping(
     db: SchedulerDb,
     leader: LeaderState,
@@ -1279,8 +1287,10 @@ pub(crate) fn fold_spot_poll(
 /// (this task runs unconditionally; "stale relative to a source that
 /// doesn't exist" reads as 56 years under Static/None).
 ///
-/// `was_leader` is the shared `Arc<AtomicBool>` written ONLY here; the
-/// spot poller observes it to skip one body on the edge.
+/// `was_leader` is the shared `Arc<AtomicBool>`; its writer set is the
+/// `observability::LEADER_EDGES` cost-latch cells plus this prelude
+/// (see the registry — never enumerate writers in prose). The spot
+/// poller observes it to skip one body on the edge.
 pub(crate) async fn poller_tick_prelude(
     was_leader: &std::sync::atomic::AtomicBool,
     is_leader: bool,
@@ -2157,7 +2167,7 @@ mod tests {
         );
     }
 
-    /// bug_009 single edge-reload owner. (a) standby: returns false,
+    /// bug_009 prelude edge behavior. (a) standby: returns false,
     /// does NOT reload, `was_leader` stays false (so the spot poller
     /// keeps skipping). The standby `_hw_cost_stale_seconds` emit moved
     /// inline to `spot_price_poller` (pre-leader-gate) — observability

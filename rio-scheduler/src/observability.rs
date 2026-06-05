@@ -282,6 +282,28 @@ pub struct LeaderEdge {
     pub name: &'static str,
     pub on_acquire: fn(&crate::actor::DagActor),
     pub on_lose: fn(&crate::actor::DagActor),
+    /// What a REBOUND transition (holder change observed late on a
+    /// still-leading round — `sched.lease.rebound`) runs for this
+    /// member. A required field, not a defaulted method: a new member
+    /// cannot be silently skipped on the rebound axis — the struct
+    /// literal will not compile without an explicit choice
+    /// (merged_bug_212: the cost latch was Compound in spirit but the
+    /// rebound delivered acquire-only, so its lose cell never ran).
+    pub rebound: ReboundPolicy,
+}
+
+/// Per-member rebound disposition for [`LeaderEdge`].
+pub enum ReboundPolicy {
+    /// Run the lose cell, then the acquire cell — the rebound is a
+    /// compressed lose→acquire pair whose standby interval was never
+    /// locally observed; members whose lose cell repairs state the
+    /// foreign term may have invalidated need both halves.
+    Compound,
+    /// Run only the acquire cell. Carries the member's written
+    /// rationale — opting out of the lose half must say why it is
+    /// sound (e.g. an idempotent acquire that re-derives everything).
+    #[allow(dead_code)] // No member opts out today; the variant is the policy surface.
+    AcquireOnly(&'static str),
 }
 
 /// The leadership-edge effect table (bug_310's structural close).
@@ -309,6 +331,12 @@ pub const LEADER_EDGES: &[LeaderEdge] = &[
         // `cost_was_leader == true`, the prelude skips the reload, and
         // the tick persists prices from the deposed tenure.
         on_lose: |a| a.cost_was_leader.store(false, Ordering::Relaxed),
+        // The false-store is the fix (merged_bug_212): a foreign term
+        // may have persisted its own prices, so the post-rebound
+        // housekeeping tick must reload before it persists. The
+        // momentary false on a still-leading replica is monotone-safe:
+        // one spurious PG reload.
+        rebound: ReboundPolicy::Compound,
     },
     LeaderEdge {
         name: "leader-gauge-family",
@@ -317,6 +345,12 @@ pub const LEADER_EDGES: &[LeaderEdge] = &[
         // here would race the first tick for no benefit.
         on_acquire: |_| {},
         on_lose: |_| reset_leader_gauges(),
+        // Declared reset on rebound: leader gauges momentarily drop to
+        // their reset values until the next leader tick republishes
+        // from ground truth — alert-neutral by design (stalled/
+        // divergence alerts evaluate over windows ≫ one tick; the
+        // reset values are each family member's declared neutral).
+        rebound: ReboundPolicy::Compound,
     },
 ];
 
@@ -395,12 +429,58 @@ mod tests {
 
     /// Every LEADER_EDGES row is named and total — both cells written.
     /// (Totality is structural — fn-pointer fields can't be omitted —
-    /// this pins the names stay meaningful and the table non-empty.)
+    /// this pins the names stay meaningful and the table non-empty.
+    /// The rebound axis is equally structural: `rebound` is a required
+    /// field, so a member cannot merge without declaring its policy.)
     #[test]
     fn leader_edges_table_is_named_and_nonempty() {
         assert!(!LEADER_EDGES.is_empty());
         for e in LEADER_EDGES {
             assert!(!e.name.is_empty(), "LEADER_EDGES rows carry owner names");
+            if let ReboundPolicy::AcquireOnly(rationale) = e.rebound {
+                assert!(
+                    !rationale.is_empty(),
+                    "an AcquireOnly member must carry a written rationale"
+                );
+            }
+        }
+    }
+
+    /// merged_bug_212 rider: the prose writer enumerations for the
+    /// cost-table latch must reference the LEADER_EDGES registry
+    /// instead of listing writers by hand — a hand list goes stale the
+    /// moment the table gains a member or an edge axis, which is
+    /// exactly how bug_310's missing lose writer and the rebound's
+    /// acquire-only delivery survived review. include_str! so a future
+    /// re-enumeration is a red suite, not a review hope.
+    #[test]
+    fn cost_latch_writer_docs_reference_the_edge_table() {
+        const SITES: &[(&str, &str)] = &[
+            ("sla/cost.rs", include_str!("sla/cost.rs")),
+            ("main.rs", include_str!("main.rs")),
+            ("actor/config.rs", include_str!("actor/config.rs")),
+        ];
+        const STALE: &[&str] = &[
+            "written only here",
+            "written only by",
+            "only writer of the shared",
+            "single edge-reload owner",
+            "two-writer contract",
+        ];
+        for (name, src) in SITES {
+            let lower = src.to_lowercase();
+            for stale in STALE {
+                assert!(
+                    !lower.contains(stale),
+                    "{name}: stale writer enumeration {stale:?} — point at \
+                     observability::LEADER_EDGES instead"
+                );
+            }
+            assert!(
+                src.contains("LEADER_EDGES"),
+                "{name}: the latch writer doc must reference the \
+                 LEADER_EDGES registry"
+            );
         }
     }
 }

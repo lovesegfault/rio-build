@@ -99,10 +99,9 @@ impl crate::lease::LeaseHooks for SchedulerLeaseHooks {
         // scenario polls this to confirm the lease loop actually
         // acquired (vs silently failing kube-client init and running
         // standby forever). The info! log has the same signal but
-        // metrics are less brittle for VM grep. Also fired on a rebound
-        // (a holder change observed late on a still-leading round —
-        // `sched.lease.rebound`), so this counter counts rebounds too;
-        // deliberate, no separate counter.
+        // metrics are less brittle for VM grep. Rebounds are counted
+        // separately (`on_rebound`); this counter is acquire edges
+        // only.
         metrics::counter!("rio_scheduler_lease_acquired_total").increment(1);
         self.enqueue(ActorCommand::LeaderAcquired, "LeaderAcquired");
     }
@@ -110,6 +109,16 @@ impl crate::lease::LeaseHooks for SchedulerLeaseHooks {
     fn on_lose(&self) {
         metrics::counter!("rio_scheduler_lease_lost_total").increment(1);
         self.enqueue(ActorCommand::LeaderLost, "LeaderLost");
+    }
+
+    fn on_rebound(&self) {
+        // A holder change observed late on a still-leading round —
+        // delivered as its own command so the actor runs the Compound
+        // lose cells (cost latch, gauge family) before the re-acquire
+        // path; plain LeaderAcquired delivery skipped every lose cell
+        // (merged_bug_212).
+        metrics::counter!("rio_scheduler_lease_rebound_total").increment(1);
+        self.enqueue(ActorCommand::LeaderRebound, "LeaderRebound");
     }
 }
 

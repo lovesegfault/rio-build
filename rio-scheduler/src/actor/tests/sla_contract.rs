@@ -3707,6 +3707,43 @@ async fn leader_lost_writes_cost_latch_false() {
 }
 
 /// The paired-hook table is total: every edge has BOTH cells written
+// r[verify sched.lease.rebound+3]
+/// merged_bug_212: a REBOUND transition (holder change observed late on
+/// a still-leading round) must run the Compound lose cells — the cost
+/// latch in particular — before its re-acquire effects. Pre-fix the
+/// rebound delivered plain `LeaderAcquired` (the lease loop fired
+/// `on_acquire`), which runs only the acquire cells: `cost_was_leader`
+/// stayed true, so the first housekeeping tick after the foreign term
+/// skipped the edge reload and persisted prices over the foreign
+/// tenure's evolved EMA — bug_310's defect class escaping through the
+/// edge table's missing rebound axis.
+#[tokio::test]
+async fn rebound_runs_cost_latch_lose_cell() {
+    use std::sync::atomic::Ordering;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // The latch state of a leading tenure whose housekeeping already
+    // reloaded (the steady state a rebound interrupts).
+    actor.cost_was_leader.store(true, Ordering::Relaxed);
+
+    actor.handle_leader_rebound().await;
+
+    assert!(
+        !actor.cost_was_leader.load(Ordering::Relaxed),
+        "a rebound transition must run the cost-latch lose cell \
+         (cost_was_leader=false) before its re-acquire effects — \
+         otherwise the post-foreign-term housekeeping tick skips the \
+         edge reload and persists prices from the pre-term table"
+    );
+    // And the acquire half still ran: the cost-latch acquire cell's
+    // housekeeping nudge is observable as a stored notify permit.
+    assert!(
+        futures_util::FutureExt::now_or_never(actor.cost_reload_notify.notified()).is_some(),
+        "the rebound's acquire half must nudge the housekeeping reload"
+    );
+}
+
 /// (no-ops are explicit fn pointers, so this is a compile-time
 /// property), and the acquire cell of the cost latch actually nudges
 /// the housekeeping notify (permit-based — observable as an immediate

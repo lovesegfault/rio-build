@@ -1062,6 +1062,35 @@ impl DagActor {
     /// a build while half-recovered (the DAG would be inconsistent).
     /// MergeDag from a standby-period SubmitBuild would queue in the
     /// mpsc channel and get processed after.
+    // r[impl sched.lease.rebound+3]
+    /// Handle `LeaderRebound`: a holder change observed late on a
+    /// still-leading round (`sched.lease.rebound`). The rebound is a
+    /// compressed lose→acquire pair whose standby interval was never
+    /// locally observed, so it runs the [`LeaderEdge`] table's
+    /// **Compound** members' lose cells first — the cost latch's
+    /// false-store (the foreign term may have persisted its own
+    /// prices; the next housekeeping tick must reload before it
+    /// persists) and the gauge-family reset (republished from ground
+    /// truth on the next leader tick) — then the full acquire path
+    /// (`handle_leader_acquired`: claim, recovery, completion gate).
+    ///
+    /// Deliberately NOT `handle_leader_lost`: the lost handler wipes
+    /// the in-memory DAG and invalidates the recovery completion ahead
+    /// of a re-acquire that is *queued behind it*; on a rebound the
+    /// immediately-following recovery rebuilds everything anyway, and
+    /// the wipe would add an is_leader-adjacent dispatch blip for no
+    /// gating benefit (recovery's own entry clear already re-gates).
+    /// The edge cells are the part of the lose half a rebound MUST
+    /// keep; the wipe is the part it must not.
+    pub(super) async fn handle_leader_rebound(&mut self) {
+        for edge in crate::observability::LEADER_EDGES {
+            if matches!(edge.rebound, crate::observability::ReboundPolicy::Compound) {
+                (edge.on_lose)(self);
+            }
+        }
+        self.handle_leader_acquired().await;
+    }
+
     pub(super) async fn handle_leader_acquired(&mut self) {
         // This tenure has not (re)proven its DAG against PG yet.
         // Redundant on the single-threaded actor — recover_from_pg's

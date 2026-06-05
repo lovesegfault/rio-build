@@ -38,6 +38,7 @@
     "rio_controller_job_terminal_report_seconds",
     "rio_controller_lease_acquired_total",
     "rio_controller_lease_lost_total",
+    "rio_controller_lease_rebound_total",
     "rio_controller_node_wedge_marked_total",
     "rio_controller_nodeclaim_consolidate_threshold_seconds",
     "rio_controller_nodeclaim_created_total",
@@ -105,6 +106,7 @@
     "rio_scheduler_generation_floor_read_failed_total",
     "rio_scheduler_lease_acquired_total",
     "rio_scheduler_lease_lost_total",
+    "rio_scheduler_lease_rebound_total",
     "rio_scheduler_malformed_built_output_total",
     "rio_scheduler_materialization_carrier_dropped_total",
     "rio_scheduler_materialization_claims_total",
@@ -420,6 +422,11 @@
         "name": "rio_controller_lease_lost_total",
         "kind": "counter",
         "help": "nodeclaim_pool lease lose transitions (explicit lose or local self-fence)."
+      },
+      {
+        "name": "rio_controller_lease_rebound_total",
+        "kind": "counter",
+        "help": "nodeclaim_pool lease rebounds: holder changes observed late on a still-leading round. Each disarms the placeable gate and re-fires the acquire-edge actions (sketch reload, idle/evidence resets) once."
       },
       {
         "name": "rio_controller_node_wedge_marked_total",
@@ -759,6 +766,11 @@
         "name": "rio_scheduler_lease_lost_total",
         "kind": "counter",
         "help": "K8s Lease losses (stepped down, partition, or preempted)"
+      },
+      {
+        "name": "rio_scheduler_lease_rebound_total",
+        "kind": "counter",
+        "help": "Lease rebounds: holder changes observed late on a still-leading round (a foreign term ran entirely inside our observation gap). Each runs the Compound leadership-edge lose cells and then a full re-recovery."
       },
       {
         "name": "rio_scheduler_malformed_built_output_total",

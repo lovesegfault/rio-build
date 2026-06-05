@@ -492,6 +492,12 @@ pub fn describe_metrics() {
         "K8s Lease losses (stepped down, partition, or preempted)"
     );
     describe_counter!(
+        "rio_scheduler_lease_rebound_total",
+        "Lease rebounds: holder changes observed late on a still-leading round \
+         (a foreign term ran entirely inside our observation gap). Each runs the \
+         Compound leadership-edge lose cells and then a full re-recovery."
+    );
+    describe_counter!(
         "rio_scheduler_sla_refit_total",
         "SLA estimator refresh ticks (≈60s cadence; VM-test sync barrier — \
          increments regardless of [sla] gate)"
