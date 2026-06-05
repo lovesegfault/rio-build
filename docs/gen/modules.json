@@ -1478,6 +1478,11 @@
       "doc": "The per-stream ingest state machine for `LogService.AppendLog`."
     },
     {
+      "path": "logs/loss.rs",
+      "depth": 1,
+      "doc": "The read path's loss ledger: data-loss is counted per HOLE"
+    },
+    {
       "path": "logs/mbt_tests.rs",
       "depth": 1,
       "doc": "Model-based testing: replay traces generated from the LogService"

@@ -30,7 +30,7 @@ use rio_common::grpc::StatusExt;
 use rio_nix::store_path::drv_log_hash;
 use sqlx::PgPool;
 use tonic::Status;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use super::chunks::{LogChunkError, LogChunkStore, decompress_lines};
@@ -174,6 +174,7 @@ impl LineCursor {
 // r[impl store.log.read-divergence+1]
 pub async fn read_chunk(
     store: &dyn LogChunkStore,
+    manifest: Option<&PgPool>,
     chunk: &ChunkRef,
     remaining: &[ChunkRef],
     cursor: &mut LineCursor,
@@ -221,34 +222,56 @@ pub async fn read_chunk(
         return Err(status);
     }
 
-    let blob = store.get(&chunk.s3_key).await.map_err(|e| match e {
-        LogChunkError::NotFound { key } => {
-            // The one condition in this file that means "lines are
-            // gone": the manifest row is written only after the object
-            // PUT succeeds, so a missing object is data loss (a deleted
-            // or lifecycle-expired object whose row outlived it), not a
-            // race. error! so the operator has a signal beyond the
-            // client-visible Status. (A read-side data-loss counter
-            // lands with the handler's metrics.)
+    let blob = match store.get(&chunk.s3_key).await {
+        Ok(blob) => blob,
+        Err(LogChunkError::NotFound { key }) => {
+            // A missing object is data loss ONLY while its manifest row
+            // still stands (the row is written after the PUT succeeds).
+            // The sweep deletes object-then-row, so a reader holding a
+            // manifest snapshot from before the sweep can observe
+            // object-gone/row-gone: a benign race, not a hole — the
+            // next manifest read no longer lists the chunk, and the
+            // completeness fold reflects whatever rows remain. Re-check
+            // the row before declaring loss (merged_bug_164's
+            // sweep-race leg).
+            if let Some(pool) = manifest {
+                let row_stands: Option<(i32,)> =
+                    sqlx::query_as("SELECT 1 FROM drv_log_chunks WHERE s3_key = $1")
+                        .bind(&key)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(|e| {
+                            warn!(key = %key, error = %e, "TailLog: sweep-race re-check failed");
+                            Status::internal("TailLog: chunk fetch failed")
+                        })?;
+                if row_stands.is_none() {
+                    debug!(
+                        s3_key = %key,
+                        exec_id = %chunk.exec_id,
+                        "TailLog: chunk swept between manifest read and GET (clean skip)"
+                    );
+                    return Ok(Vec::new());
+                }
+            }
+            // The row stands and the object is gone: an unrecoverable
+            // hole. error! so the operator has a signal beyond the
+            // client-visible Status; the counter goes through the loss
+            // ledger so N readers (or re-reads) of one hole page once.
             error!(
                 s3_key = %key,
                 exec_id = %chunk.exec_id,
                 "TailLog: manifest references a missing chunk object (data loss)"
             );
-            metrics::counter!(
-                "rio_store_log_read_data_loss_total",
-                "reason" => "missing_object"
-            )
-            .increment(1);
-            Status::internal(format!(
+            super::loss::note_hole(chunk.exec_id, &key, "missing_object");
+            return Err(Status::internal(format!(
                 "TailLog: manifest references a missing chunk object (data loss): {key}"
-            ))
+            )));
         }
-        other => {
+        Err(other) => {
             warn!(key = %chunk.s3_key, error = %other, "TailLog: chunk fetch failed");
-            Status::internal("TailLog: chunk fetch failed")
+            return Err(Status::internal("TailLog: chunk fetch failed"));
         }
-    })?;
+    };
     let lines = decompress_lines(&blob).map_err(|e| {
         warn!(key = %chunk.s3_key, error = %e, "TailLog: chunk decode failed");
         Status::internal(format!(
@@ -318,18 +341,15 @@ pub async fn read_chunk(
                     // A covered short is a DIVERGENCE disclosure, not
                     // data loss: every claimed line still serves (from
                     // the covering rows), so it must not feed
-                    // rio_store_log_read_data_loss_total — that
+                    // the loss counter — that
                     // counter's contract is alert-on-ANY-increment for
                     // unrecoverable holes. The error! above carries
                     // the corruption-grade signal; the warn-severity
-                    // divergence counter family is the m164 reroute.
+                    // family carries the trend.
+                    super::loss::note_divergence("short_object_covered");
                 }
                 rio_log_kernel::ShortObjectPolicy::UnservableHole => {
-                    metrics::counter!(
-                        "rio_store_log_read_data_loss_total",
-                        "reason" => "short_object"
-                    )
-                    .increment(1);
+                    super::loss::note_hole(chunk.exec_id, &chunk.s3_key, "short_object");
                     let mut status = Status::internal(format!(
                         "TailLog: chunk object holds fewer lines than its manifest row \
                          (data loss, lines {missing_from}..{missing_until} missing): {}",
@@ -352,11 +372,11 @@ pub async fn read_chunk(
                 "TailLog: chunk object holds more lines than its manifest row; \
                  excess discarded"
             );
-            metrics::counter!(
-                "rio_store_log_read_data_loss_total",
-                "reason" => "overlong_object"
-            )
-            .increment(1);
+            // Served-anyway divergence, NOT loss (merged_bug_164's
+            // reroute red: pre-fix this fed the page-on-any-increment
+            // loss counter once per visit): every line the row claims
+            // serves normally; only the unclaimed excess is discarded.
+            super::loss::note_divergence("overlong");
         }
         None => {}
     }
@@ -407,7 +427,7 @@ async fn stream_chunks(
     let mut cursor = LineCursor::new(since_line);
     let mut out = Vec::new();
     for (i, chunk) in refs.iter().enumerate() {
-        out.extend(read_chunk(store, chunk, &refs[i + 1..], &mut cursor).await?);
+        out.extend(read_chunk(store, None, chunk, &refs[i + 1..], &mut cursor).await?);
     }
     Ok(out)
 }
@@ -655,6 +675,136 @@ mod tests {
     /// A full store path that normalizes to [`DRV_HASH_32`].
     const DRV_PATH: &str = "/nix/store/0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm-hello-2.12.drv";
 
+    /// Local metrics recorder for the m164 alert-contract trio: the
+    /// loss counter's PrometheusRule pages on any increment, so the
+    /// tests assert the EXACT delta, not a structural proxy.
+    fn loss_counter_delta(snapshot: metrics_util::debugging::Snapshot) -> u64 {
+        snapshot
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| key.key().name() == "rio_store_log_read_data_loss_total")
+            .map(|(_, _, _, v)| match v {
+                metrics_util::debugging::DebugValue::Counter(n) => n,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    // r[verify store.log.loss-event-identity]
+    /// merged_bug_164 trio leg 1 (recorded red: pre-fix delta was 1 —
+    /// the overlong arm fed the page-on-any-increment loss counter):
+    /// an overlong object serves every claimed line; the loss counter
+    /// must not move. The divergence family carries the event instead.
+    #[tokio::test]
+    async fn overlong_object_does_not_feed_loss_counter() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _g = metrics::set_default_local_recorder(&recorder);
+
+        let store = MemoryLogChunkStore::default();
+        // Object holds 3 lines; the row claims 2.
+        let blob = compress_lines(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]).unwrap();
+        store.put("logs/overlong", blob).await.unwrap();
+        let chunk = ChunkRef {
+            exec_id: Uuid::now_v7(),
+            s3_key: "logs/overlong".into(),
+            first_line: 0,
+            line_count: 2,
+        };
+        let mut cursor = LineCursor::new(0);
+        let lines = read_chunk(&store, None, &chunk, &[], &mut cursor)
+            .await
+            .expect("overlong serves the claimed lines");
+        assert_eq!(lines.len(), 2, "exactly the claimed lines serve");
+        assert_eq!(
+            loss_counter_delta(snapshotter.snapshot()),
+            0,
+            "served-anyway divergence must not page"
+        );
+    }
+
+    // r[verify store.log.loss-event-identity]
+    /// merged_bug_164 trio leg 2 (recorded red: pre-fix this was
+    /// Err("missing chunk object (data loss)") + a counter increment):
+    /// object gone AND row gone = the sweep deleted the chunk between
+    /// the reader's manifest snapshot and its GET — a benign race, a
+    /// clean skip, delta 0.
+    #[tokio::test]
+    async fn sweep_race_is_clean_end_not_loss() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _g = metrics::set_default_local_recorder(&recorder);
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        // No object in the store, and NO drv_log_chunks row: exactly
+        // the post-sweep world a stale manifest snapshot points into.
+        let chunk = ChunkRef {
+            exec_id: Uuid::now_v7(),
+            s3_key: "logs/swept-away".into(),
+            first_line: 0,
+            line_count: 3,
+        };
+        let mut cursor = LineCursor::new(0);
+        let lines = read_chunk(&store, Some(&db.pool), &chunk, &[], &mut cursor)
+            .await
+            .expect("a swept chunk is a clean skip, not an error");
+        assert!(lines.is_empty());
+        assert_eq!(loss_counter_delta(snapshotter.snapshot()), 0);
+        // The cursor did NOT advance past the swept span: coverage is
+        // decided by the rows that remain, not by silent advancement.
+        assert_eq!(cursor.next_line(), 0);
+    }
+
+    // r[verify store.log.loss-event-identity]
+    /// merged_bug_164 trio leg 3 (recorded red: pre-fix N re-reads of
+    /// one missing object incremented N times — delta was 3): a hole
+    /// is counted once per identity, however many readers hit it. The
+    /// row STANDS here (seeded), so this is genuine loss.
+    #[tokio::test]
+    async fn re_reads_of_one_hole_count_once() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _g = metrics::set_default_local_recorder(&recorder);
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let exec_id = Uuid::now_v7();
+        seed_execution(&db.pool, exec_id, Some("succeeded"), Some(3)).await;
+        let session_id = Uuid::now_v7();
+        // Manifest row WITHOUT its object: the genuine hole. (seed_chunk
+        // writes both; insert the row alone.)
+        let key = log_chunk_key(DRV_HASH_32, &exec_id, &session_id, 0);
+        sqlx::query(
+            "INSERT INTO drv_log_chunks \
+                 (exec_id, session_id, chunk_seq, first_line, line_count, byte_size, s3_key) \
+             VALUES ($1, $2, 0, 0, 3, 64, $3)",
+        )
+        .bind(exec_id)
+        .bind(session_id)
+        .bind(&key)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let chunk = ChunkRef {
+            exec_id,
+            s3_key: key,
+            first_line: 0,
+            line_count: 3,
+        };
+        for _ in 0..3 {
+            let mut cursor = LineCursor::new(0);
+            read_chunk(&store, Some(&db.pool), &chunk, &[], &mut cursor)
+                .await
+                .expect_err("a standing row with a missing object is loss");
+        }
+        assert_eq!(
+            loss_counter_delta(snapshotter.snapshot()),
+            1,
+            "one hole identity = one page, not three"
+        );
+    }
+
     // r[verify store.log.write-read-bound+2]
     /// bug_298's read-axis red: a manifest row claiming more lines than
     /// any decodable payload could frame. Pre-fix, `read_chunk` went to
@@ -676,7 +826,7 @@ mod tests {
             line_count: rio_log_kernel::MAX_CHUNK_LINES_ABS + 1,
         };
         let mut cursor = LineCursor::new(0);
-        let err = read_chunk(&store, &chunk, &[], &mut cursor)
+        let err = read_chunk(&store, None, &chunk, &[], &mut cursor)
             .await
             .expect_err("a row past the absolute line bound must refuse");
         assert_eq!(err.code(), tonic::Code::Internal);
@@ -699,7 +849,7 @@ mod tests {
             ..chunk
         };
         let mut cursor = LineCursor::new(0);
-        let err = read_chunk(&store, &boundary, &mut [][..], &mut cursor)
+        let err = read_chunk(&store, None, &boundary, &mut [][..], &mut cursor)
             .await
             .expect_err("missing object is still an error, but a GET-shaped one");
         assert!(

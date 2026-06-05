@@ -38,6 +38,7 @@
 pub mod chunks;
 pub mod gate;
 pub mod ingest;
+mod loss;
 pub use rio_log_kernel as kernel;
 #[cfg(test)]
 mod mbt_tests;

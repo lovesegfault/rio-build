@@ -530,7 +530,7 @@ impl LogService for LogServiceImpl {
             .map_err(|_| {
                 metrics::counter!("rio_store_log_ingest_rejected_total", "reason" => "max_streams")
                     .increment(1);
-                Status::resource_exhausted(
+                gate::replica_capacity_status(
                     "AppendLog: this replica is at its concurrent log-stream cap; \
                      reconnect to another replica",
                 )
@@ -540,7 +540,7 @@ impl LogService for LogServiceImpl {
             .map_err(|_| {
                 metrics::counter!("rio_store_log_ingest_rejected_total", "reason" => "byte_budget")
                     .increment(1);
-                Status::resource_exhausted(
+                gate::replica_capacity_status(
                     "AppendLog: this replica's log ingest buffer budget is exhausted; \
                      reconnect to another replica",
                 )
@@ -1018,10 +1018,10 @@ impl AppendDriver {
         // cannot commit chunks (the drain would just burn three more
         // failed attempts) — the builder's retransmit buffer still
         // holds every un-acked line.
-        let drain_failed = if matches!(exit, LoopExit::ClientFinished) {
-            self.drain(&ack_tx).await.is_err()
+        let drain_stop = if matches!(exit, LoopExit::ClientFinished) {
+            self.drain(&ack_tx).await.err()
         } else {
-            false
+            None
         };
 
         // 3. The lease. Released on every path except a stolen lease
@@ -1043,14 +1043,33 @@ impl AppendDriver {
         // received is the durable set); an abort sends the status.
         match exit {
             LoopExit::ClientFinished => {
-                if drain_failed {
-                    ack_try_send(
-                        &ack_tx,
-                        Err(Status::unavailable(
-                            "AppendLog: the final chunk flush failed; \
-                             un-acked lines were not stored — reconnect and replay",
-                        )),
-                    );
+                match drain_stop {
+                    None => {}
+                    // Replica-local failure: retry-elsewhere is correct.
+                    Some(DrainStop::CutFailed) => {
+                        ack_try_send(
+                            &ack_tx,
+                            Err(Status::unavailable(
+                                "AppendLog: the final chunk flush failed; \
+                                 un-acked lines were not stored — reconnect and replay",
+                            )),
+                        );
+                    }
+                    // Per-execution cap: replaying anywhere cannot
+                    // succeed — the typed class stops the re-dial.
+                    Some(DrainStop::CapExhausted) => {
+                        ack_try_send(
+                            &ack_tx,
+                            Err(gate::cap_rejection(
+                                "cap",
+                                format!(
+                                    "AppendLog: execution exceeded the {}-chunk cap \
+                                     during the final drain; un-acked lines were not stored",
+                                    self.max_chunks_per_exec
+                                ),
+                            )),
+                        );
+                    }
                 }
             }
             LoopExit::Abort(status) => {
@@ -1324,10 +1343,19 @@ impl AppendDriver {
                 "reason" => "chunk_cap"
             )
             .increment(1);
-            return CutStep::Exit(LoopExit::Abort(Status::resource_exhausted(format!(
-                "AppendLog: execution exceeded the {}-chunk cap",
-                self.max_chunks_per_exec
-            ))));
+            // bug_068: this status used to be bare RESOURCE_EXHAUSTED —
+            // per-replica capacity vocabulary for a per-EXECUTION cap.
+            // The builder's classifier read it as retryable-elsewhere
+            // and re-dialed at 1 Hz forever; FAILED_PRECONDITION +
+            // x-rio-log-reject: cap maps it onto
+            // AbandonReason::CapExhausted (one disclosure, done).
+            return CutStep::Exit(LoopExit::Abort(gate::cap_rejection(
+                "cap",
+                format!(
+                    "AppendLog: execution exceeded the {}-chunk cap",
+                    self.max_chunks_per_exec
+                ),
+            )));
         }
         // Watchdog semantics (merged_bug_119) live in cut_bounded: a
         // hung PUT/INSERT is abandoned at one cut interval, the
@@ -1378,20 +1406,27 @@ impl AppendDriver {
     /// failure (the builder's retransmit buffer still holds the
     /// un-acked tail; burning two more attempts against a failing
     /// backend helps nobody).
+    ///
+    /// The stop reason is TYPED (bug_068's drain surface): the caller
+    /// turns `CapExhausted` into the gate's permanent cap rejection —
+    /// telling a builder to "reconnect and replay" against a
+    /// per-execution cap is the same 1 Hz storm the mid-stream arm
+    /// had — while `CutFailed` keeps the retry-elsewhere semantics
+    /// (the failure is this replica's, the lines are still replayable).
     async fn drain(
         &mut self,
         ack_tx: &mpsc::Sender<Result<AppendLogAck, Status>>,
-    ) -> Result<(), ()> {
+    ) -> Result<(), DrainStop> {
         loop {
             if self.session.chunk_attempts() >= self.max_chunks_per_exec {
-                return Err(());
+                return Err(DrainStop::CapExhausted);
             }
             match self.cut_bounded().await {
                 // Watchdog-abandoned mid-drain: stop. The builder's
                 // retransmit buffer still holds the un-acked tail, and
                 // a wedged backend must not hang stream teardown (the
                 // raw cut here used to await unbounded).
-                None => return Err(()),
+                None => return Err(DrainStop::CutFailed),
                 Some(Ok(None)) => return Ok(()),
                 Some(Ok(Some(durable_through_line))) => {
                     // Best-effort: the builder may already be gone (or
@@ -1409,7 +1444,7 @@ impl AppendDriver {
                         error = %e,
                         "AppendLog: final drain cut failed; un-acked lines not stored"
                     );
-                    return Err(());
+                    return Err(DrainStop::CutFailed);
                 }
             }
         }
@@ -1436,6 +1471,20 @@ impl AppendDriver {
 }
 
 /// Outcome of one `do_cut` call, for the two cut-trigger call sites.
+/// Why the final drain stopped before emptying the buffer (bug_068:
+/// the two reasons demand OPPOSITE builder dispositions, so the bit
+/// must travel typed — `CapExhausted` becomes the gate's permanent
+/// cap-class rejection, `CutFailed` keeps retry-elsewhere).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainStop {
+    /// The per-execution chunk-count cap: permanent for this
+    /// execution everywhere.
+    CapExhausted,
+    /// A cut attempt failed or was watchdog-abandoned: this replica's
+    /// problem; the un-acked tail replays elsewhere.
+    CutFailed,
+}
+
 enum CutStep {
     /// A chunk was committed and acked.
     Committed,
@@ -1496,7 +1545,14 @@ async fn serve_tail(
     // -- Phase 1: the manifest (everything already durably chunked).
     let refs = tail::read_manifest_range(&pool, exec_id, since_line).await?;
     for (i, chunk) in refs.iter().enumerate() {
-        let lines = tail::read_chunk(store.as_ref(), chunk, &refs[i + 1..], &mut cursor).await?;
+        let lines = tail::read_chunk(
+            store.as_ref(),
+            Some(&pool),
+            chunk,
+            &refs[i + 1..],
+            &mut cursor,
+        )
+        .await?;
         send_lines(tx, &exec_str, lines, false).await?;
     }
 
@@ -1676,7 +1732,14 @@ async fn serve_tail(
     // the manifest walk below holds everything.
     let refs = tail::read_manifest_range(&pool, exec_id, cursor.next_line()).await?;
     for (i, chunk) in refs.iter().enumerate() {
-        let lines = tail::read_chunk(store.as_ref(), chunk, &refs[i + 1..], &mut cursor).await?;
+        let lines = tail::read_chunk(
+            store.as_ref(),
+            Some(&pool),
+            chunk,
+            &refs[i + 1..],
+            &mut cursor,
+        )
+        .await?;
         recovered |= !lines.is_empty();
         send_lines(tx, &exec_str, lines, false).await?;
     }
@@ -1777,7 +1840,7 @@ async fn backfill_from_views(
     let mut recovered = false;
     let refs = tail::read_manifest_range(pool, exec_id, cursor.next_line()).await?;
     for (i, chunk) in refs.iter().enumerate() {
-        let lines = tail::read_chunk(store, chunk, &refs[i + 1..], cursor).await?;
+        let lines = tail::read_chunk(store, Some(pool), chunk, &refs[i + 1..], cursor).await?;
         recovered |= !lines.is_empty();
         send_lines(tx, exec_str, lines, false).await?;
     }
@@ -2812,6 +2875,60 @@ mod tests {
     // ------------------------------------------------------------------
     // 8. Admission
     // ------------------------------------------------------------------
+
+    // r[verify store.log.cap-reject-class]
+    /// bug_068's recorded red: the mid-stream chunk cap aborted with
+    /// bare RESOURCE_EXHAUSTED and no reject-class metadata (pre-fix:
+    /// `left: ResourceExhausted, right: FailedPrecondition` plus a
+    /// missing x-rio-log-reject) — per-replica vocabulary for a
+    /// per-execution fact, which the builder retried at 1 Hz forever.
+    /// Now: FAILED_PRECONDITION + x-rio-log-reject: cap, the exact
+    /// shape `abandon_reason_for_rejection` maps to CapExhausted.
+    #[tokio::test]
+    async fn mid_stream_chunk_cap_is_typed_permanent() {
+        let mut h = harness_with(4, |s| {
+            s.with_max_chunks_per_exec(1)
+                .with_ingest_config(IngestConfig {
+                    // Every non-empty batch is immediately cut_due.
+                    cut_threshold_bytes: 1,
+                    ..IngestConfig::default()
+                })
+        })
+        .await;
+        let exec = seed_assignment(&h.db.pool, "builder-0").await;
+        let tok = token("builder-0", DRV);
+        let (tx, mut acks) = open_append(&mut h.client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("open");
+
+        // Two batches with cut_threshold=1: the first cut commits
+        // (attempts -> 1), the next due cut hits the cap check. The
+        // ack/abort interleaving on the response stream is not the
+        // subject — the STATUS SHAPE is. Read until the error.
+        tx.send(batch_msg(0, &["one"])).await.unwrap();
+        tx.send(batch_msg(1, &["two"])).await.unwrap();
+        let err = loop {
+            match acks.message().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("stream ended without the cap status"),
+                Err(status) => break status,
+            }
+        };
+        assert_eq!(
+            err.code(),
+            tonic::Code::FailedPrecondition,
+            "per-execution cap, not replica capacity: {}",
+            err.message()
+        );
+        assert_eq!(
+            err.metadata()
+                .get(rio_proto::LOG_REJECT_METADATA_KEY)
+                .and_then(|v| v.to_str().ok()),
+            Some("cap"),
+            "the class the builder's CapExhausted mapping consumes"
+        );
+        assert!(err.message().contains("chunk cap"));
+    }
 
     #[tokio::test]
     async fn stream_count_semaphore_rejects_at_capacity() {

@@ -25,7 +25,7 @@
 //! a crash between the two leaves orphaned objects (unreachable from
 //! PG, bounded by the S3 lifecycle rule on `logs/`) rather than
 //! manifest rows pointing at deleted objects — which the read path
-//! surfaces as data loss (`rio_store_log_read_data_loss_total`). An
+//! surfaces as data loss (the read path’s loss counter). An
 //! object-delete failure is logged and skipped for the same reason: the
 //! rows are already gone, so the orphaned objects are invisible to
 //! readers and the lifecycle rule collects them.

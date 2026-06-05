@@ -685,6 +685,55 @@ in
   # renamed or deleted consumer breaks here instead of silently
   # rotting the registry. Pairing is positional (anchor_file then
   # anchor_symbol per struct literal, enforced by a count equality).
+  # bughunt2 slot 6 (bug_068 + merged_bug_164): the log plane's status
+  # and loss-counter chokepoints. Three producer-set pins, each grep
+  # planted-red-verified at introduction:
+  #  1. `resource_exhausted` in rio-store/src/logs/ only in gate.rs
+  #     (replica_capacity_status) — a per-execution cap hand-rolled as
+  #     RESOURCE_EXHAUSTED re-creates the builder's 1 Hz re-dial storm.
+  #  2. x-rio-log-reject metadata inserts only in gate.rs
+  #     (cap_rejection) — one constructor stamps the class alphabet.
+  #  3. the loss-counter name only in logs/loss.rs (note_hole, the
+  #     dedup) and lib.rs (describe/alphabet/seed) — any other file
+  #     mentioning it is a new increment path dodging hole-identity
+  #     dedup (or a comment that should say "the loss counter").
+  log-cap-status-chokepoint =
+    pkgs.runCommand "rio-log-cap-status-chokepoint"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = ../rio-store/src;
+        };
+        nativeBuildInputs = [ pkgs.ripgrep ];
+      }
+      ''
+        fail=0
+        cd $src/rio-store/src
+        bad=$(rg -l 'resource_exhausted' logs/ | rg -v '^(\./)?logs/gate\.rs$' || true)
+        if [[ -n "$bad" ]]; then
+          echo "FAIL: resource_exhausted outside gate.rs in the log plane:" >&2
+          echo "$bad" >&2
+          echo "  (per-replica capacity goes through gate::replica_capacity_status;" >&2
+          echo "   per-execution caps through gate::cap_rejection — store.log.cap-reject-class)" >&2
+          fail=1
+        fi
+        bad=$(rg -lU 'metadata_mut\(\)\s*\.insert\(\s*rio_proto::LOG_REJECT_METADATA_KEY' . | rg -v '^(\./)?logs/gate\.rs$' || true)
+        if [[ -n "$bad" ]]; then
+          echo "FAIL: x-rio-log-reject inserted outside gate.rs:" >&2
+          echo "$bad" >&2
+          fail=1
+        fi
+        bad=$(rg -lU 'metrics::counter!\(\s*"rio_store_log_read_data_loss_total"' . | rg -v '^(\./)?logs/loss\.rs$' || true)
+        if [[ -n "$bad" ]]; then
+          echo "FAIL: a loss-counter increment site outside loss.rs:" >&2
+          echo "$bad" >&2
+          echo "  (increments go through loss::note_hole — store.log.loss-event-identity)" >&2
+          fail=1
+        fi
+        [[ $fail -eq 0 ]]
+        touch $out
+      '';
+
   consumer-registry-anchors =
     pkgs.runCommand "rio-consumer-registry-anchors"
       {

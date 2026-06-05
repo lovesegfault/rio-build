@@ -923,6 +923,38 @@ fn abandon_reason_for_rejection(status: &Status) -> AbandonReason {
 
 #[cfg(test)]
 mod tests {
+    // r[verify store.log.cap-reject-class]
+    /// bug_068's builder half, pinned: the store's two cap
+    /// constructors land in OPPOSITE dispositions. The per-execution
+    /// shape (FAILED_PRECONDITION + x-rio-log-reject: cap — what
+    /// gate::cap_rejection emits for the byte cap, the mid-stream
+    /// chunk cap, and the drain's cap arm) is permanent and maps to
+    /// AbandonReason::CapExhausted; the bare RESOURCE_EXHAUSTED shape
+    /// (replica_capacity_status) is NOT permanent — retry elsewhere.
+    /// Pre-fix the server sent the second shape for the first fact;
+    /// this test is the contract that makes that drift visible from
+    /// the builder's side.
+    #[test]
+    fn cap_class_maps_to_cap_exhausted_and_capacity_stays_retryable() {
+        let mut cap = tonic::Status::failed_precondition("execution exceeded the 2-chunk cap");
+        cap.metadata_mut().insert(
+            rio_proto::LOG_REJECT_METADATA_KEY,
+            tonic::metadata::MetadataValue::from_static("cap"),
+        );
+        assert!(super::is_permanent_rejection(&cap));
+        assert_eq!(
+            super::abandon_reason_for_rejection(&cap),
+            super::AbandonReason::CapExhausted
+        );
+
+        let capacity =
+            tonic::Status::resource_exhausted("this replica is at its concurrent log-stream cap");
+        assert!(
+            !super::is_permanent_rejection(&capacity),
+            "replica capacity must stay retryable-elsewhere"
+        );
+    }
+
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::Duration;

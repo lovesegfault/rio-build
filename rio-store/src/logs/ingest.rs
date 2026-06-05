@@ -696,15 +696,13 @@ impl IngestSession {
                 "reason" => "byte_cap"
             )
             .increment(1);
-            let mut status = Status::failed_precondition(format!(
-                "AppendLog: execution exceeded the {}-byte log ingest cap",
-                self.config.per_exec_byte_cap
+            return Err(super::gate::cap_rejection(
+                "cap",
+                format!(
+                    "AppendLog: execution exceeded the {}-byte log ingest cap",
+                    self.config.per_exec_byte_cap
+                ),
             ));
-            status.metadata_mut().insert(
-                rio_proto::LOG_REJECT_METADATA_KEY,
-                tonic::metadata::MetadataValue::from_static("cap"),
-            );
-            return Err(status);
         }
 
         // -- Buffer + fan out under one critical section. The fan-out

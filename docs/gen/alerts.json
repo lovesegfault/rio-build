@@ -5,6 +5,7 @@
     "RioControllerRestarts",
     "RioLogChunkWriteFailures",
     "RioLogReadDataLoss",
+    "RioLogReadDivergence",
     "RioNodeclaimPoolAllCellsIceMasked",
     "RioNodeclaimPoolBootTimeoutLoop",
     "RioNodeclaimPoolIceMaskedHigh",
@@ -63,6 +64,15 @@
       "severity": "critical",
       "metrics": [
         "rio_store_log_read_data_loss_total"
+      ]
+    },
+    {
+      "name": "RioLogReadDivergence",
+      "expr": "sum(increase(rio_store_log_read_divergence_total[1h])) > 10",
+      "for": "0m",
+      "severity": "warning",
+      "metrics": [
+        "rio_store_log_read_divergence_total"
       ]
     },
     {

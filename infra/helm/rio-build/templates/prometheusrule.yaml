@@ -657,6 +657,25 @@ spec:
               logs for the s3_key/exec_id (logged at error!) and audit
               the S3 lifecycle rule and any manual deletions under logs/.
 
+        # merged_bug_164: served-anyway manifest/object divergence
+        # (overlong objects, covered shorts). Every claimed line still
+        # served — this is a trend signal about the cutter/manifest
+        # write path, deliberately split from the page-on-any-increment
+        # loss alert above so recoverable divergence cannot page.
+        - alert: RioLogReadDivergence
+          expr: sum(increase(rio_store_log_read_divergence_total[1h])) > 10
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: rio-store build-log manifest/object divergence trend
+            description: >-
+              TailLog reads observed {{`{{ $value | humanize }}`}}
+              manifest/object divergence event(s) in the last hour
+              (kind label: overlong / short_object_covered). Lines all
+              served; investigate the cutter and manifest write path
+              for inconsistent row/object pairs.
+
         # refcount-formal Wave A1: the chunk collector's mark phase is
         # fail-closed -- ANY existing manifest whose chunk_list fails
         # validation aborts the collect cycle before anything is

@@ -568,13 +568,28 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_log_read_data_loss_total",
-        "TailLog reads that hit unrecoverable stored-log loss, by \
-         reason: missing_object (a drv_log_chunks manifest row whose S3 \
-         object is gone), short_object (the object holds fewer lines \
-         than its row claims), overlong_object (the object holds more \
-         lines than its row claims; the unclaimed excess is discarded). \
-         Each increment is a hole in a stored build log that cannot be \
-         recovered. Alert on ANY increment."
+        "Unrecoverable holes in stored build logs, counted once per \
+         hole identity (exec_id, s3_key) per process — never per read \
+         visit — by reason: missing_object (a drv_log_chunks manifest \
+         row that still stands but whose S3 object is gone; a row swept \
+         between manifest read and GET is a benign race, not counted), \
+         short_object (the object holds fewer lines than its row claims \
+         and no remaining row covers the missing span). Served-anyway \
+         divergence (overlong, covered-short) is the warn-severity \
+         rio_store_log_read_divergence_total family instead. Alert on \
+         ANY increment."
+    );
+    describe_counter!(
+        "rio_store_log_read_divergence_total",
+        "Manifest-row/object divergence the read path served across, by \
+         kind: overlong (the object holds more lines than its row \
+         claims; the unclaimed excess is discarded, every claimed line \
+         serves), short_object_covered (the object holds fewer lines \
+         than its row claims but remaining rows cover the span; every \
+         claimed line serves). Warn-severity trend signal — deliberately \
+         excluded from the page-on-any-increment loss alert; sustained \
+         growth means the cutter/manifest write path is producing \
+         inconsistent pairs."
     );
     describe_counter!(
         "rio_store_log_tail_proxied_total",
@@ -680,9 +695,16 @@ pub const PUTPATH_RETRY_REASONS: &[&str] = &[
     "concurrent_upload",
 ];
 
-/// Log read-path data-loss reasons (logs/tail.rs `read_chunk`).
+/// Log read-path data-loss reasons (logs/loss.rs `note_hole`, the sole
+/// increment site). `overlong_object` left this alphabet when overlong
+/// became a served-anyway divergence kind (merged_bug_164).
 #[cfg(feature = "server")]
-pub const LOG_READ_LOSS_REASONS: &[&str] = &["missing_object", "short_object", "overlong_object"];
+pub const LOG_READ_LOSS_REASONS: &[&str] = &["missing_object", "short_object"];
+
+/// Log read-path served-anyway divergence kinds (logs/loss.rs
+/// `note_divergence`).
+#[cfg(feature = "server")]
+pub const LOG_READ_DIVERGENCE_KINDS: &[&str] = &["overlong", "short_object_covered"];
 
 /// GC chunk-collect cycle outcomes.
 #[cfg(feature = "server")]
@@ -704,6 +726,10 @@ pub const ALERT_SEEDED_COUNTERS: &[SeededSeries] = &[
     SeededSeries {
         name: "rio_store_log_read_data_loss_total",
         label: Some(("reason", LOG_READ_LOSS_REASONS)),
+    },
+    SeededSeries {
+        name: "rio_store_log_read_divergence_total",
+        label: Some(("kind", LOG_READ_DIVERGENCE_KINDS)),
     },
     // The original .absolute(0) precedent (gc-collect): the staleness
     // alert (sum(increase(...{outcome="ok"}[25h])) == 0) and the

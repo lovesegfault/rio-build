@@ -75,17 +75,45 @@ pub struct OpenCaps {
     pub max_chunks_per_exec: u32,
 }
 
-/// A permanent `AppendLog` rejection: `FAILED_PRECONDITION` plus the
-/// `x-rio-log-reject` metadata naming the reason class (`cap`,
-/// `complete`, `superseded`) so the builder's uploader can map it onto
-/// its loss-disclosure `AbandonReason` without parsing messages.
-fn reject_permanent(class: &'static str, msg: String) -> Status {
+// r[impl store.log.cap-reject-class]
+/// THE constructor for permanent per-execution `AppendLog` rejections:
+/// `FAILED_PRECONDITION` plus the `x-rio-log-reject` metadata naming
+/// the reason class (`cap`, `complete`, `superseded`) so the builder's
+/// uploader maps it onto its loss-disclosure `AbandonReason` without
+/// parsing messages.
+///
+/// SOLE producer (bug_068): every cap/seal surface — the gate's
+/// open-time checks here, ingest's lifetime byte cap, the driver's
+/// mid-stream chunk cap, and the final drain's cap arm — builds its
+/// status through this function. The defect class this kills: a
+/// per-execution cap hand-rolled as bare `RESOURCE_EXHAUSTED`
+/// (per-replica capacity vocabulary), which the builder dutifully
+/// retried against another replica at 1 Hz forever — the cap travels
+/// with the EXECUTION, so no retry anywhere can succeed. The
+/// `log-cap-status-chokepoint` misc-check pins the producer set: this
+/// file is the only `x-rio-log-reject` insert site and
+/// [`replica_capacity_status`] the only `resource_exhausted` site in
+/// the log plane.
+pub(super) fn cap_rejection(class: &'static str, msg: String) -> Status {
     let mut status = Status::failed_precondition(msg);
     status.metadata_mut().insert(
         rio_proto::LOG_REJECT_METADATA_KEY,
         tonic::metadata::MetadataValue::from_static(class),
     );
     status
+}
+
+// r[impl store.log.cap-reject-class]
+/// THE constructor for per-REPLICA capacity refusals:
+/// `RESOURCE_EXHAUSTED`, no reject-class metadata. The builder's
+/// uploader treats this as retryable-elsewhere (fail over to another
+/// replica and replay) — the correct semantics for the admission gates
+/// (stream-count cap, buffer byte budget), and PRECISELY the wrong one
+/// for anything per-execution, which is why the two vocabularies get
+/// two constructors and the misc-check forbids `resource_exhausted`
+/// anywhere else in the log plane.
+pub(super) fn replica_capacity_status(msg: &'static str) -> Status {
+    Status::resource_exhausted(msg)
 }
 
 /// The execution's durable log account: committed chunk count and
@@ -232,7 +260,7 @@ pub async fn check_append_open(
         // execution lifecycle row is missing (the kind cannot be
         // verified — absence is not authorization). Distinct cases,
         // one disposition: the permanent `superseded` class.
-        return Err(reject_permanent(
+        return Err(cap_rejection(
             "superseded",
             "AppendLog: the claimed execution is not a recorded assignment \
              of this derivation (it may have been re-assigned in place)"
@@ -240,7 +268,7 @@ pub async fn check_append_open(
         ));
     };
     if claimed_builder != claims.executor_id {
-        return Err(reject_permanent(
+        return Err(cap_rejection(
             "superseded",
             "AppendLog: this execution was not assigned to this executor".to_string(),
         ));
@@ -249,7 +277,7 @@ pub async fn check_append_open(
         // A materialization execution has no build log; admitting one
         // as an append target would let chunk rows shadow the real
         // build's log under the kind-blind reader.
-        return Err(reject_permanent(
+        return Err(cap_rejection(
             "superseded",
             "AppendLog: the claimed execution is not a build attempt".to_string(),
         ));
@@ -283,7 +311,7 @@ pub(super) async fn finish_open(
     if let Some(up_to) = final_line_count
         && manifest_covers(pool, exec_id, up_to).await?
     {
-        return Err(reject_permanent(
+        return Err(cap_rejection(
             "complete",
             "AppendLog: this execution's log is already complete".to_string(),
         ));
@@ -300,7 +328,7 @@ pub(super) async fn finish_open(
     if prior_accounted_bytes >= caps.per_exec_byte_cap {
         metrics::counter!("rio_store_log_ingest_rejected_total", "reason" => "byte_cap")
             .increment(1);
-        return Err(reject_permanent(
+        return Err(cap_rejection(
             "cap",
             format!(
                 "AppendLog: execution exceeded the {}-byte log ingest cap",
@@ -311,7 +339,7 @@ pub(super) async fn finish_open(
     if prior_chunks >= caps.max_chunks_per_exec {
         metrics::counter!("rio_store_log_ingest_rejected_total", "reason" => "chunk_cap")
             .increment(1);
-        return Err(reject_permanent(
+        return Err(cap_rejection(
             "cap",
             format!(
                 "AppendLog: execution exceeded the {}-chunk cap",

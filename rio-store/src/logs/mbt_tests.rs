@@ -1008,7 +1008,7 @@ impl MbtSystem {
             let mut cursor = tail::LineCursor::new(0);
             let mut served = Vec::new();
             for chunk in &refs {
-                let lines = tail::read_chunk(&self.store, chunk, &[], &mut cursor)
+                let lines = tail::read_chunk(&self.store, None, chunk, &[], &mut cursor)
                     .await
                     .map_err(|s| anyhow::anyhow!("read_chunk({}): {s}", chunk.s3_key))?;
                 served.extend(lines.into_iter().map(|(n, _)| n));

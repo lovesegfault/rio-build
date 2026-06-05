@@ -1804,6 +1804,39 @@ would commit and the read side then materialized as 4.19M allocations ---
 a ~33x resident amplification the byte bound never saw, reachable through
 a wire admission path whose decode cap (256 MiB) dwarfed the chunk it fed.
 
+#r("store.log.loss-event-identity")[
+  The read path's unrecoverable-loss counter is incremented in exactly one
+  module, once per hole identity (execution, object key) per process ---
+  never per read visit --- and only for holes: a manifest row that no
+  longer stands when its object is found missing (the sweep race) MUST be
+  a clean skip, and a divergence every claimed line still serves across
+  (overlong object, covered short) MUST feed the warn-severity divergence
+  family instead. The loss alert pages on any increment; the increment
+  therefore carries the page's meaning.
+]
+The pre-fix read path incremented the page-on-any-increment loss counter
+once per VISIT (N readers of one missing object = N pages), and routed
+served-anyway overlong divergence into the same counter --- operators
+learned to triage "data loss" pages as maybe-nothing, which is how real
+holes go unnoticed.
+
+#r("store.log.cap-reject-class")[
+  Every permanent per-execution AppendLog rejection (byte cap, chunk cap
+  --- mid-stream and during the final drain --- completeness seal,
+  supersession) MUST be constructed by the single gate constructor that
+  stamps FAILED_PRECONDITION plus the x-rio-log-reject class metadata,
+  and RESOURCE_EXHAUSTED MUST appear in the log plane only via the
+  replica-capacity constructor (admission gates: stream cap, byte
+  budget). The two vocabularies are disjoint by construction: per-replica
+  means retry elsewhere, per-execution means stop everywhere.
+]
+bug_068: the mid-stream chunk cap was hand-rolled as bare
+RESOURCE_EXHAUSTED --- per-replica vocabulary for a per-execution fact ---
+so the builder re-dialed at 1 Hz forever, and the final drain's cap arm
+told the builder to "reconnect and replay" with the same effect. The
+classifier on the builder side was correct all along; the server simply
+never spoke the class it listened for.
+
 #r("store.log.ingest-idle-abort")[
   An AppendLog ingest driver whose buffer is empty and whose inbound
   stream has been silent for at least four heartbeat intervals MUST
