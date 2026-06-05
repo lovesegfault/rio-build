@@ -78,8 +78,11 @@ pub struct BuildSpawnContext {
     /// held by `NixStoreFs` (set at FUSE mount) so the JIT `lookup`
     /// callback can reach it.
     pub store_clients: crate::fuse::StoreClients,
+    /// This pod's executor identity, echoed in every report.
     pub executor_id: String,
+    /// Mount point of the FUSE store view builds read inputs from.
     pub fuse_mount_point: PathBuf,
+    /// Base directory for per-build overlayfs upper/work dirs.
     pub overlay_base_dir: PathBuf,
     /// The process-lifetime build-task sink: the spawned build task
     /// sends its `CompletionReport` (and phase edges) here; the pull

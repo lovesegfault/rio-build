@@ -222,7 +222,11 @@ pub enum JitClass {
     /// JIT armed; name IS a registered input. `lookup` MUST block on
     /// fetch and on any failure return EIO (never ENOENT — overlay
     /// would negative-cache it).
-    KnownInput { nar_size: u64 },
+    /// The path is a known build input with this NAR size.
+    KnownInput {
+        /// Size of the input's NAR archive in bytes.
+        nar_size: u64,
+    },
 }
 
 impl Cache {

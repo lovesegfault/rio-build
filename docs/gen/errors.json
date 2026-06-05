@@ -72,24 +72,10 @@
     },
     {
       "enum": "ExecutorError",
-      "name": "BuildFailed",
-      "crate": "rio-builder",
-      "msg": "build failed: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
       "name": "Cancelled",
       "crate": "rio-builder",
       "msg": "build cancelled before cgroup creation",
       "doc": "Cancel flag observed before the per-build cgroup exists. I-166: distinct from the post-cgroup path (cgroup.kill → daemon EOF → `Wire(Io(UnexpectedEof))`) so `is_daemon_transient` doesn't retry it. `spawn_build_task` maps any `Err` with `cancelled=true` to `BuildResultStatus::Cancelled` regardless of variant; this variant just makes the pre-cgroup abort explicit in logs."
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "Cgroup",
-      "crate": "rio-builder",
-      "msg": "cgroup resource tracking failed: {0}",
-      "doc": ""
     },
     {
       "enum": "ExecutorError",
@@ -100,94 +86,10 @@
     },
     {
       "enum": "ExecutorError",
-      "name": "DaemonSetup",
-      "crate": "rio-builder",
-      "msg": "daemon setup failed: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "DaemonSpawn",
-      "crate": "rio-builder",
-      "msg": "daemon spawn failed: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "Grpc",
-      "crate": "rio-builder",
-      "msg": "gRPC error: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "Handshake",
-      "crate": "rio-builder",
-      "msg": "daemon handshake failed: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
       "name": "InvalidDerivation",
       "crate": "rio-builder",
       "msg": "invalid derivation: {0}",
       "doc": "The assignment's `.drv` content is malformed (UTF-8, ATerm parse, BasicDerivation conversion). Deterministic per-derivation: every pod sees the same bytes, so retry-on-another-pod is pointless. Maps to `InputRejected` instead of `InfrastructureFailure`."
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "MetadataFetch",
-      "crate": "rio-builder",
-      "msg": "input metadata fetch failed for {path}: {source}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "NixConf",
-      "crate": "rio-builder",
-      "msg": "failed to write nix.conf: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "Overlay",
-      "crate": "rio-builder",
-      "msg": "overlay setup failed: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "OverlayTaskPanic",
-      "crate": "rio-builder",
-      "msg": "overlay setup task panicked: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "SynthDb",
-      "crate": "rio-builder",
-      "msg": "synthetic DB generation failed: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "Upload",
-      "crate": "rio-builder",
-      "msg": "upload failed: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "Wire",
-      "crate": "rio-builder",
-      "msg": "wire protocol error: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "WrongKind",
-      "crate": "rio-builder",
-      "msg": "wrong executor kind: derivation is_fod={is_fod} but this executor is {executor_kind:?}",
-      "doc": ""
     },
     {
       "enum": "OverlayError",

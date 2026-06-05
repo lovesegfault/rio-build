@@ -49,10 +49,15 @@ struct Entry {
 
 /// Scripted resource outcome for one `(pname, cpu_limit)` probe.
 pub struct ScriptedOutcome {
+    /// Wall-clock build duration in seconds.
     pub wall_secs: f64,
+    /// Peak cgroup memory usage in bytes.
     pub peak_mem: u64,
+    /// Peak concurrent CPU usage in cores.
     pub peak_cpu: f64,
+    /// Total CPU time consumed in seconds.
     pub cpu_seconds: f64,
+    /// Peak scratch-disk usage in bytes, when tracked.
     pub peak_disk: Option<u64>,
 }
 

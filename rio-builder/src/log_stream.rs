@@ -77,7 +77,11 @@ pub enum AddLineResult {
     /// accepting lines). Any already-buffered lines are still in the
     /// batcher — caller should `flush()` them before aborting so the
     /// client sees output right up to the limit.
-    LimitExceeded { reason: String },
+    /// A per-build log limit tripped; `reason` names which.
+    LimitExceeded {
+        /// Human-readable description of the tripped limit.
+        reason: String,
+    },
 }
 
 /// Log batcher that collects log lines, emits `BuildLogBatch` messages,

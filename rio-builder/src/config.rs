@@ -39,6 +39,8 @@ fn executor_kind_ser<S: serde::Serializer>(k: &ExecutorKind, s: S) -> Result<S::
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
+/// Builder runtime configuration: the merged CLI + file + env view
+/// `load()` produces (see the module doc for precedence).
 pub struct Config {
     /// If empty after merge → auto-detect via hostname.
     pub executor_id: String,
@@ -111,6 +113,7 @@ pub struct Config {
     /// Base directory for per-build overlay upper/work layers.
     pub overlay_base_dir: PathBuf,
     #[serde(flatten)]
+    /// Shared service config (telemetry, log format, shutdown grace).
     pub common: rio_common::config::CommonConfig,
     /// HTTP /healthz + /readyz listen address. Builder has no gRPC
     /// server so tonic-health doesn't fit — plain HTTP via axum.
@@ -280,6 +283,8 @@ impl rio_common::server::HasCommonConfig for Config {
     name = "rio-builder",
     about = "Build executor with FUSE store for rio-build"
 )]
+/// Command-line arguments (clap). Every field shadows a `Config` knob;
+/// CLI wins over file/env at merge time.
 pub struct CliArgs {
     /// Executor ID (defaults to hostname)
     #[arg(long)]

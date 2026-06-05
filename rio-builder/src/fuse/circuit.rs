@@ -44,6 +44,7 @@ use fuser::Errno;
 /// tests inject a mock so the state-transition tests don't need
 /// real 30s/720s sleeps.
 pub trait Clock: Send + Sync {
+    /// The current instant on this clock.
     fn now(&self) -> Instant;
 }
 
@@ -136,6 +137,7 @@ impl Default for CircuitBreaker<SystemClock> {
 }
 
 impl<C: Clock> CircuitBreaker<C> {
+    /// Construct with an injected clock (tests drive time manually).
     pub fn with_clock(
         threshold: u32,
         auto_close_after: Duration,
@@ -302,12 +304,6 @@ impl<C: Clock> CircuitBreaker<C> {
         }
     }
 
-    /// Whether the breaker is open RIGHT NOW. Half-open counts as NOT
-    /// open (the probe is allowed). The stream-era P0210 heartbeat was
-    /// the original reporter of this.
-    ///
-    /// Doesn't mutate — the stale `open_since` is cleaned up lazily on
-    /// the next `record(true)`.
     /// Monotonic count of open transitions since process start (both
     /// trip conditions). See the field doc — consumers diff across a
     /// window rather than reading the instantaneous state.
@@ -315,6 +311,12 @@ impl<C: Clock> CircuitBreaker<C> {
         self.trips.load(Ordering::Relaxed)
     }
 
+    /// Whether the breaker is open RIGHT NOW. Half-open counts as NOT
+    /// open (the probe is allowed). The stream-era P0210 heartbeat was
+    /// the original reporter of this.
+    ///
+    /// Doesn't mutate — the stale `open_since` is cleaned up lazily on
+    /// the next `record(true)`.
     pub fn is_open(&self) -> bool {
         self.open
             .lock()

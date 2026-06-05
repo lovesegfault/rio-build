@@ -87,6 +87,7 @@ impl BuildSlot {
             .map(|s| s.drv_path.clone())
     }
 
+    /// Whether a build currently occupies the slot.
     pub fn is_busy(&self) -> bool {
         self.inner.lock().ignore_poison().is_some()
     }

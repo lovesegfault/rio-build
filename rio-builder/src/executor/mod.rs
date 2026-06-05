@@ -70,9 +70,13 @@ const MAX_PARALLEL_FETCHES: usize = 16;
 /// holds `Copy`/cheap-to-copy config that can just be passed by value.
 #[derive(Clone)]
 pub struct ExecutorEnv {
+    /// Mount point of the FUSE store view builds read inputs from.
     pub fuse_mount_point: std::path::PathBuf,
+    /// Base directory for per-build overlayfs upper/work dirs.
     pub overlay_base_dir: std::path::PathBuf,
+    /// This pod's executor identity, echoed in every report.
     pub executor_id: String,
+    /// Per-build log line/byte limits enforced by the stderr loop.
     pub log_limits: LogLimits,
     /// Timeout for the local nix-daemon subprocess build. Used when the
     /// client didn't specify `BuildOptions.build_timeout`. Intentionally
@@ -154,20 +158,28 @@ pub const DEFAULT_DAEMON_TIMEOUT: Duration = Duration::from_secs(7200);
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutorError {
     #[error("overlay setup failed: {0}")]
+    /// Overlayfs setup failed (mount, upper/work dir creation).
     Overlay(#[from] overlay::OverlayError),
     #[error("overlay setup task panicked: {0}")]
+    /// The blocking overlay-setup task panicked.
     OverlayTaskPanic(tokio::task::JoinError),
     #[error("synthetic DB generation failed: {0}")]
+    /// Synthetic Nix store SQLite generation failed.
     SynthDb(#[from] sqlx::Error),
     #[error("failed to write nix.conf: {0}")]
+    /// Writing the per-build nix.conf failed.
     NixConf(#[source] std::io::Error),
     #[error("daemon spawn failed: {0}")]
+    /// Spawning the nix-daemon subprocess failed.
     DaemonSpawn(std::io::Error),
     #[error("daemon handshake failed: {0}")]
+    /// The daemon wire-protocol handshake failed.
     Handshake(#[from] rio_nix::protocol::handshake::HandshakeError),
     #[error("daemon setup failed: {0}")]
+    /// Post-handshake daemon setup (settings exchange) failed.
     DaemonSetup(String),
     #[error("build failed: {0}")]
+    /// The build itself failed (daemon reported failure).
     BuildFailed(String),
     /// The assignment's `.drv` content is malformed (UTF-8, ATerm parse,
     /// BasicDerivation conversion). Deterministic per-derivation: every
@@ -176,14 +188,24 @@ pub enum ExecutorError {
     #[error("invalid derivation: {0}")]
     InvalidDerivation(String),
     #[error("upload failed: {0}")]
+    /// Output upload to the store failed.
     Upload(#[from] upload::UploadError),
     #[error("gRPC error: {0}")]
+    /// A gRPC call failed (store or scheduler).
     Grpc(#[from] tonic::Status),
     #[error("input metadata fetch failed for {path}: {source}")]
-    MetadataFetch { path: String, source: tonic::Status },
+    /// Input path metadata fetch failed.
+    MetadataFetch {
+        /// The store path whose metadata fetch failed.
+        path: String,
+        /// The failing gRPC status.
+        source: tonic::Status,
+    },
     #[error("wire protocol error: {0}")]
+    /// Daemon wire-protocol framing error.
     Wire(#[from] rio_nix::protocol::wire::WireError),
     #[error("cgroup resource tracking failed: {0}")]
+    /// Per-build cgroup resource tracking failed.
     Cgroup(String),
     /// Pod-level cgroup `memory.events` `oom_kill` incremented during
     /// the build. The kernel killed a build process (cc1, ld, …) for
@@ -197,8 +219,11 @@ pub enum ExecutorError {
     #[error(
         "wrong executor kind: derivation is_fod={is_fod} but this executor is {executor_kind:?}"
     )]
+    /// The derivation's FOD-ness does not match this executor kind.
     WrongKind {
+        /// Whether the derivation is fixed-output.
         is_fod: bool,
+        /// The kind this executor was spawned as.
         executor_kind: rio_proto::types::ExecutorKind,
     },
     /// Cancel flag observed before the per-build cgroup exists. I-166:
@@ -358,11 +383,13 @@ pub struct ExecutionResult {
 /// path only.
 #[derive(Debug)]
 pub struct ExecuteOutcome {
+    /// Build outcome: outputs + stats, or the typed failure.
     pub result: Result<ExecutionResult, ExecutorError>,
     /// 0 only for pre-cgroup setup errors (drv parse, WrongKind,
     /// overlay, daemon-spawn). Populated for `CgroupOom` /
     /// post-handshake `Wire` / `Upload` / `BuildFailed`.
     pub peak_memory_bytes: u64,
+    /// Peak concurrent CPU usage (cores) sampled from the cgroup.
     pub peak_cpu_cores: f64,
     /// `None` = no prjquota OR pre-cgroup error. Sampled BEFORE
     /// `build_result?` so an OOM'd build also reports it.

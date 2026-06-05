@@ -24,6 +24,12 @@
 //! +-- Pull loop (runtime/pull.rs: pull -> build -> report -> exit)
 //! ```
 
+// bug_313 class close: doc-theft-by-insertion — a new item inserted
+// directly under an existing doc block steals it, always leaving the
+// VICTIM undocumented. With missing_docs denied, that whole class is a
+// docs-gate red instead of a review hope.
+#![deny(missing_docs)]
+
 pub(crate) mod banner;
 pub mod cgroup;
 pub mod config;
