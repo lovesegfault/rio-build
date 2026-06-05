@@ -1559,6 +1559,31 @@ the discipline is compile-borne, not reviewed-in. Model-level verification:
 mat-133-discarded-outcome / mat-276-dag-absent-cancel calibration pins as
 the falsifiability pair.
 
+#r("sched.materialize.ack-law")[
+  The report intake's answer for one materialization consumption MUST be a
+  pure function of the close write's disposition: settled
+  (Applied/AlreadyResolved) and Fenced closes acknowledge; a Failed close
+  MUST refuse retryably (UNAVAILABLE) so the store's bounded report
+  redelivery re-presents the same outcome --- an acknowledged consumption
+  whose close never became durable is unrepresentable. When a post-close
+  companion write (job resolve, park verdict) fails after a settled close,
+  the claim MUST be released uncharged (claimable-but-unparked dominates
+  wedged-claimed-forever); a fenced companion mutates nothing it no longer
+  owns.
+]
+Both laws are pure kernel functions (`rio-evidence-kernel/src/settle.rs`:
+`consumption_ack`, `companion_follow_up`), CBMC-swept and wired through the
+sealed witness pipeline: `close_for_consumption` is the only constructor of
+the linear `SettledClose` witness, the five settlement companions are the
+only spenders, and the `MatAck` the intake returns is mintable only by those
+companions or the fenced close arm --- an ack with the assignment still open
+does not typecheck. `Fenced ⇒ Ack` is the signed Q20 posture (deposed
+believers ack; the successor's establishment owns the row). The residual:
+a deposed-but-serving replica swallows a report and the successor charges
+'unreported' ~an hour later --- the population is shrunk by the claim nonce
+(#rref("sched.materialize.claim-resume")), and the NACK alternative remains
+a one-line change to the Fenced arm of `consumption_ack`, recorded there.
+
 #r("sched.materialize.conversion-strictness")[
   The parked-job re-evaluation MUST support two independently default-off
   strictness fields on the `[materialization]` config surface ---

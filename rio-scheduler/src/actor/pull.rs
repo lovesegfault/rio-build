@@ -103,6 +103,13 @@ pub enum PullRejection {
     StaleGeneration,
     /// The HMAC-attested intent does not match the requested intent.
     TokenMismatch,
+    /// A consumption close did not become durable (bug_182, the NACK
+    /// law): the report is NOT consumed — the store's redelivery
+    /// re-presents the SAME outcome and the idempotent close retries.
+    /// Retryable (UNAVAILABLE): strictly better than acking a lost
+    /// close and letting the charged 'unreported' establishment settle
+    /// the attempt an hour later.
+    ConsumptionNotDurable,
     /// Database failure while admitting or minting.
     Internal(String),
 }
@@ -118,8 +125,11 @@ impl PullRejection {
         use super::command::RetryClass;
         match self {
             // Leadership-class refusals: valid pulls another replica
-            // serves.
-            Self::NotLeader | Self::StaleGeneration => RetryClass::Retryable,
+            // serves. Non-durable consumption closes: the SAME replica
+            // serves the redelivery once PG recovers.
+            Self::NotLeader | Self::StaleGeneration | Self::ConsumptionNotDurable => {
+                RetryClass::Retryable
+            }
             // Mis-bound token / internal failure: unservable as posed.
             Self::TokenMismatch | Self::Internal(_) => RetryClass::Terminal,
         }
@@ -239,6 +249,7 @@ fn pull_node_status(status: DerivationStatus) -> rio_evidence_kernel::pull::Pull
 impl DagActor {
     /// Handle one `PullAssignment` (the actor turn). Computes the
     /// admission via [`admit_pull`], executes the decision, and replies.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_pull_assignment(
         &mut self,
         intent_id: String,
@@ -946,8 +957,27 @@ impl DagActor {
                             debug!(%exec_id, "duplicate materialization report acknowledged-and-ignored");
                             return Ok(());
                         }
-                        self.consume_materialization_outcome(exec_id, m, outcome)
-                            .await
+                        match outcome.outcome {
+                            // Intake-level arm: no payload means no
+                            // consumption ran — acknowledged without a
+                            // witness (nothing closed, nothing to ack
+                            // lawfully; same family as AckIgnore).
+                            None => {
+                                warn!(%exec_id,
+                                      "materialization outcome with no payload; \
+                                       acknowledged-and-ignored");
+                                Ok(())
+                            }
+                            // The consumption proper: the MatAck
+                            // witness proves an ack-lawful state was
+                            // reached (settled close + companion, or
+                            // fenced); a non-durable close surfaces as
+                            // the retryable NACK.
+                            Some(inner) => self
+                                .consume_materialization_outcome(exec_id, m, inner)
+                                .await
+                                .map(|_ack: super::materialize::MatAck| ()),
+                        }
                     }
                     None => {
                         warn!(%exec_id, "build-report payload for a materialization attempt; ignoring");

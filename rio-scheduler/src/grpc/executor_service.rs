@@ -653,9 +653,13 @@ impl ExecutorService for SchedulerGrpc {
             }
             Err(
                 r @ (crate::actor::PullRejection::NotLeader
-                | crate::actor::PullRejection::StaleGeneration),
+                | crate::actor::PullRejection::StaleGeneration
+                | crate::actor::PullRejection::ConsumptionNotDurable),
             ) => {
-                // Retryable not-leader class (the shared mapping).
+                // Retryable class (the shared mapping).
+                // ConsumptionNotDurable is unreachable from the pull
+                // path (no consumption close runs in a pull) — wired
+                // for exhaustiveness with its retryable siblings.
                 return Err(super::actor_guards::pull_rejection_to_status(&r));
             }
             Err(r @ crate::actor::PullRejection::TokenMismatch) => {
@@ -827,6 +831,19 @@ impl ExecutorService for SchedulerGrpc {
                 r @ (crate::actor::PullRejection::NotLeader
                 | crate::actor::PullRejection::StaleGeneration),
             ) => Err(super::actor_guards::pull_rejection_to_status(&r)),
+            // bug_182: the consumption close did not become durable —
+            // the NACK rides UNAVAILABLE and the store's report
+            // redelivery (600 s) re-presents the SAME outcome. Counted
+            // so a PG brownout's NACK wave is visible.
+            Err(r @ crate::actor::PullRejection::ConsumptionNotDurable) => {
+                metrics::counter!(
+                    "rio_scheduler_pull_rejected_total",
+                    "rpc" => "report_outcome",
+                    "reason" => "consumption_not_durable"
+                )
+                .increment(1);
+                Err(super::actor_guards::pull_rejection_to_status(&r))
+            }
             Err(r @ crate::actor::PullRejection::TokenMismatch) => {
                 metrics::counter!(
                     "rio_scheduler_pull_rejected_total",

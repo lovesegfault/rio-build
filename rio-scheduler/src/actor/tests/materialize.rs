@@ -892,6 +892,119 @@ async fn retry_later_consumption_closes_uncharged_and_defers() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.materialize.ack-law]
+/// bug_182 (the NACK law): a consumption close that cannot become
+/// durable must NACK retryably. Pre-fix, every arm acked
+/// unconditionally — an ack over a lost close kills the store's 600 s
+/// report redelivery, so the attempt settled ~an hour later through
+/// the CHARGED 'unreported' establishment sweep. PG trigger injection
+/// (drop-in-cleanup asserted below) makes the close UPDATE fail: the
+/// intake must answer `Err(ConsumptionNotDurable)` with the attempt
+/// still OPEN and nothing charged; dropping the trigger and
+/// re-delivering the SAME outcome then consumes uncharged (the free
+/// retry the law buys).
+#[tokio::test]
+async fn failed_close_nacks_retryably_then_redelivery_consumes() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("maton-nack-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("maton-nack");
+    n.expected_output_paths = vec![out.clone()];
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    let assignment = match claim_materialization(&handle, "maton-nack", "store-replica-0-w0").await
+    {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+
+    // Trigger injection: every UPDATE on assignments RAISEs — the
+    // consumption close's write fails while everything else (the
+    // already-committed mint) stands.
+    sqlx::query(
+        "CREATE FUNCTION rio_test_fail_assignment_update() RETURNS trigger
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected close failure (bug_182)'; END $$",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER rio_test_fail_close BEFORE UPDATE ON assignments
+         FOR EACH ROW EXECUTE FUNCTION rio_test_fail_assignment_update()",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let retry_later = rio_proto::types::MaterializationOutcome {
+        outcome: Some(
+            rio_proto::types::materialization_outcome::Outcome::RetryLater(
+                rio_proto::types::materialization_outcome::RetryLater {
+                    detail: "upstream rate-limited".into(),
+                    retry_after_secs: 60,
+                    class: "rate_limited".into(),
+                },
+            ),
+        ),
+    };
+    let result =
+        report_materialization_outcome(&handle, exec_id, "maton-nack", retry_later.clone()).await;
+    assert_eq!(
+        result,
+        Err(PullRejection::ConsumptionNotDurable),
+        "a non-durable close must NACK retryably, never ack"
+    );
+    barrier(&handle).await;
+
+    // NOT consumed: the assignment is still open and nothing charged —
+    // the durable state is exactly as before the report.
+    let open: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM assignments WHERE status IN ('pending', 'acknowledged')",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(open, 1, "the NACKed report must leave the attempt open");
+    let charges: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM drv_attempts WHERE event_kind = 'attempt'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(charges, 0, "a NACKed consumption charges nothing");
+
+    // Drop-in-cleanup, asserted: the injection is scoped to exactly
+    // the NACK leg of this test.
+    sqlx::query("DROP TRIGGER rio_test_fail_close ON assignments")
+        .execute(&db.pool)
+        .await?;
+    sqlx::query("DROP FUNCTION rio_test_fail_assignment_update()")
+        .execute(&db.pool)
+        .await?;
+
+    // The store's redelivery (the same outcome, the same exec) now
+    // consumes: closed, still uncharged, job re-armed claimable with
+    // the RetryLater deferral.
+    let result = report_materialization_outcome(&handle, exec_id, "maton-nack", retry_later).await;
+    assert!(result.is_ok(), "redelivery must consume: {result:?}");
+    barrier(&handle).await;
+    let open: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM assignments WHERE status IN ('pending', 'acknowledged')",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(open, 0, "the redelivered report closes the attempt");
+    let charges: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM drv_attempts WHERE event_kind = 'attempt'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(charges, 0, "the transient retry stays uncharged end-to-end");
+    let jobs = sdb(&db.pool)
+        .list_claimable_materialization_jobs(16)
+        .await?;
+    assert_eq!(jobs.len(), 1, "the job re-armed durably, got {jobs:?}");
+    Ok(())
+}
+
 // r[verify sched.materialize.routing+5]
 /// merged_bug_028 (028b, settlement leg / owner Q2): the arm-3
 /// re-probe asks EVERY live tenant and `ConfirmedMissing` is the

@@ -492,6 +492,11 @@ impl AdminService for AdminServiceImpl {
             | Err(crate::actor::PullRejection::StaleGeneration) => {
                 Err(Status::unavailable("not leader (standby replica)"))
             }
+            // Unreachable from the admin resubmit path (no consumption
+            // close runs here), wired for the same retryable class.
+            Err(crate::actor::PullRejection::ConsumptionNotDurable) => {
+                Err(Status::unavailable("consumption close not durable; retry"))
+            }
             Err(crate::actor::PullRejection::TokenMismatch) => {
                 Err(Status::permission_denied("attempt identity mismatch"))
             }

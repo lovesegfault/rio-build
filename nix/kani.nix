@@ -470,6 +470,12 @@ in
     #   - check_project_node_authority_total (merged_bug_210: the
     #     node-axis projection is total and an un-authoritative DAG
     #     never yields a disposition).
-    expectedHarnesses = 21;
+    # 21 → 23: + the settlement-law pair (bug_182/merged_bug_055,
+    # settle.rs):
+    #   - check_consumption_ack_iff_settled_or_fenced (the ack law's
+    #     biconditional — NACK exactly on Failed)
+    #   - check_companion_failed_always_releases (the companion law —
+    #     the wedged-claim ghost unrepresentable through the law).
+    expectedHarnesses = 23;
   };
 }

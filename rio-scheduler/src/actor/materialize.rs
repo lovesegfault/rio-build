@@ -98,27 +98,46 @@ pub(crate) struct JobViewEntry {
 /// believer mutates nothing it no longer owns); `Failed` keeps it for
 /// the next tick's level-triggered retry (tick cadence bounds the
 /// retry; the durable row is the authority either way).
-#[must_use]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum WriteDisposition {
-    /// The durable write applied (rows > 0): the at-most-once edge.
-    Applied,
-    /// Already settled durably by an earlier write (idempotent
-    /// re-entry; not the at-most-once edge).
-    AlreadyResolved,
-    /// The claims-floor fence refused the write (deposed believer).
-    Fenced,
-    /// The write errored (PG unavailable, …) — retried next tick.
-    Failed,
-}
+// The disposition alphabet now lives WITH its settlement laws in the
+// kernel (bug_182/merged_bug_055): `consumption_ack` decides the
+// store-facing answer, `companion_follow_up` decides the claim's fate
+// after a companion write — both CBMC-swept there, wired here.
+pub(crate) use rio_evidence_kernel::settle::{
+    CompanionFollowUp, ConsumptionAck, WriteDisposition, companion_follow_up, consumption_ack,
+};
 
-impl WriteDisposition {
-    /// Whether the durable state is SETTLED (applied now or earlier)
-    /// — the only dispositions that authorize removing a view entry
-    /// or running a companion action.
-    pub(super) fn settled(self) -> bool {
-        matches!(self, Self::Applied | Self::AlreadyResolved)
-    }
+/// Proof that the consumption close for ONE report became durable
+/// (`Applied`/`AlreadyResolved`). Linear and `#[must_use]`: produced
+/// ONLY by [`DagActor::close_for_consumption`], consumed BY VALUE by
+/// exactly the five settled-close companions — an arm that closes and
+/// drops the witness fails `--deny warnings`; an arm that never closes
+/// has no witness to spend and therefore cannot mint a [`MatAck`].
+#[must_use = "a settled close must be spent on exactly one companion (bug_182)"]
+pub(super) struct SettledClose(());
+
+/// Proof that one materialization report was CONSUMED to the point
+/// where acknowledging the store is lawful (`sched.materialize.ack-law`):
+/// either a settled close ran its companion, or the close was fenced
+/// (deposed believer — ack and mutate nothing, the signed Q20 posture).
+/// No other construction site exists, so "ack with the assignment
+/// still open" no longer typechecks.
+#[must_use = "the ack witness is the consumption's return value"]
+pub(super) struct MatAck(());
+
+/// One consumption close's outcome, per the kernel ack law.
+#[must_use]
+pub(super) enum CloseOutcome {
+    /// The close settled durably: spend the witness on a companion.
+    Settled(SettledClose),
+    /// Fenced (deposed believer): acked, nothing further runs here —
+    /// the successor's establishment owns the row (signed Q20).
+    Deferred(MatAck),
+    /// The close write failed: NACK retryably
+    /// ([`super::pull::PullRejection::ConsumptionNotDurable`]) so the
+    /// store's report redelivery retries the SAME outcome instead of
+    /// the charged 'unreported' establishment settling it an hour
+    /// later.
+    NotDurable,
 }
 
 /// Fail-closed availability wrapper around the job view
@@ -965,12 +984,23 @@ impl DagActor {
     /// the consumption transaction — the cross-kind call no longer
     /// typechecks (the witness twin of `close_pull_attempt_uncharged`'s
     /// `&BuildAttempt`).
+    /// Returns the [`MatAck`] witness — constructible only by the five
+    /// settled-close companions and the fenced arm of
+    /// [`Self::close_for_consumption`], so an ack with the assignment
+    /// still open no longer typechecks (bug_182). A close that fails
+    /// to become durable propagates
+    /// [`super::pull::PullRejection::ConsumptionNotDurable`] (the NACK
+    /// law) so the store re-delivers instead of the charged
+    /// 'unreported' establishment settling the row an hour later.
+    /// Takes the INNER outcome: the None-payload intake arm stays at
+    /// the report intake (`Result<(), _>` — no consumption happened,
+    /// no witness to mint).
     pub(super) async fn consume_materialization_outcome(
         &mut self,
         exec_id: Uuid,
         attempt: &crate::db::open_attempts::MatAttempt,
-        outcome: rio_proto::types::MaterializationOutcome,
-    ) -> Result<(), super::pull::PullRejection> {
+        outcome: rio_proto::types::materialization_outcome::Outcome,
+    ) -> Result<MatAck, super::pull::PullRejection> {
         use rio_proto::types::materialization_outcome::Outcome;
         let drv_hash = DrvHash::from(attempt.core.drv_hash.as_str());
         let serving_generation = self.serving_generation();
@@ -1027,63 +1057,89 @@ impl DagActor {
             crate::state::note_wanted_width_saturated(&Uuid::nil());
             warn!(
                 %exec_id, drv_hash = %drv_hash,
-                "no verifiable live-wanted path set; re-arming instead of consuming"
+                "no verifiable live-wanted path set; closing uncharged and deferring"
             );
-            self.release_claim(&drv_hash, Some(&executor)).await;
-            return Ok(());
+            // bug_182 zero-width reshape: this arm used to release the
+            // claim with the assignment still OPEN and ack — the open
+            // attempt then hid the job from every listing (anti-join)
+            // fleet-wide until the establishment sweep. Now it composes
+            // exactly like RetryLater: close UNCHARGED first, then the
+            // release companion with a defer, so a persistent
+            // zero-width condition is re-listable yet cannot hot-loop
+            // claim/close (decision recorded at this arm).
+            return match self
+                .close_for_consumption(exec_id, &drv_hash, None, serving_generation)
+                .await
+            {
+                CloseOutcome::Settled(close) => Ok(self
+                    .companion_release(
+                        &drv_hash,
+                        &executor,
+                        Some(std::time::Duration::from_secs(
+                            RETRY_LATER_DEFAULT_DEFER_SECS,
+                        )),
+                        close,
+                    )
+                    .await),
+                CloseOutcome::Deferred(ack) => Ok(ack),
+                CloseOutcome::NotDurable => Err(super::pull::PullRejection::ConsumptionNotDurable),
+            };
         };
 
-        match outcome.outcome {
-            Some(Outcome::Success(s)) => {
+        match outcome {
+            Outcome::Success(s) => {
                 // Success appends NOTHING to the ledger (design §2.4 —
                 // success is not a fold event). Coverage decides
-                // Complete vs ReArm (the CE-17 class).
-                //
-                // Every companion below gates on the close disposition
-                // (sched.materialize.view-settlement): a Fenced close
-                // means a deposed believer — it mutates nothing it no
-                // longer owns; a Failed close retries via the report's
-                // idempotent re-delivery / the establishment backstop.
-                let close_d = self
-                    .close_materialization_attempt(exec_id, &drv_hash, None, serving_generation)
-                    .await;
-                if !close_d.settled() {
-                    return Ok(());
+                // Complete vs ReArm (the CE-17 class). The close runs
+                // through the ack-law chokepoint: Fenced acks inert
+                // (deposed believer, signed Q20), Failed NACKs.
+                match self
+                    .close_for_consumption(exec_id, &drv_hash, None, serving_generation)
+                    .await
+                {
+                    CloseOutcome::Deferred(ack) => Ok(ack),
+                    CloseOutcome::NotDurable => {
+                        Err(super::pull::PullRejection::ConsumptionNotDurable)
+                    }
+                    CloseOutcome::Settled(close) => {
+                        if success_covers_live_wanted(
+                            &s.ingested_paths,
+                            &s.verified_paths,
+                            &live_wanted_paths,
+                        ) {
+                            // The build-success path: outputs are
+                            // present and verified in the store; one
+                            // chokepoint resolves, settles the view,
+                            // stamps the carrier, and completes for
+                            // live interest.
+                            Ok(self
+                                .complete_materialization_for_live_interest(
+                                    &drv_hash,
+                                    job_id,
+                                    exec_id,
+                                    &executor,
+                                    &carried_paths,
+                                    serving_generation,
+                                    close,
+                                )
+                                .await)
+                        } else {
+                            // Coverage failed — interest grew between
+                            // execution and consumption, or the report
+                            // did not cover the carried realized paths
+                            // (the floating-CA stale-reset shape): the
+                            // job stays pending; the next claim covers
+                            // it. The release companion re-arms
+                            // atomically (re-arm without the reassign
+                            // is the documented wedge).
+                            Ok(self
+                                .companion_release(&drv_hash, &executor, None, close)
+                                .await)
+                        }
+                    }
                 }
-                if success_covers_live_wanted(
-                    &s.ingested_paths,
-                    &s.verified_paths,
-                    &live_wanted_paths,
-                ) {
-                    // The build-success path: outputs are present and
-                    // verified in the store; one chokepoint resolves,
-                    // settles the view, stamps the carrier, and
-                    // completes for live interest.
-                    self.complete_materialization_for_live_interest(
-                        &drv_hash,
-                        job_id,
-                        exec_id,
-                        &carried_paths,
-                        serving_generation,
-                    )
-                    .await;
-                } else {
-                    // Coverage failed — interest grew between execution
-                    // and consumption, or the report did not cover the
-                    // carried realized paths (the floating-CA stale-
-                    // reset shape): the job stays pending; the next
-                    // claim covers it. The node must leave the mint's
-                    // Running state too (the InfraFailure arm's
-                    // posture) — without the reassign the admission
-                    // table answers NotYetReady to EVERY identity (the
-                    // job is pending-unclaimed but the node is held
-                    // Running by closed-attempt bookkeeping) and the
-                    // re-arm is a wedge, not an armed action.
-                    self.release_claim(&drv_hash, Some(&executor)).await;
-                }
-                Ok(())
             }
-            Some(Outcome::Unobtainable(u)) => {
+            Outcome::Unobtainable(u) => {
                 // The charge row: kind=materialization — visible only to
                 // the materialization budget, never to build budgets.
                 let mut row = crate::db::attempts::AttemptRow::new(
@@ -1096,21 +1152,21 @@ impl DagActor {
                 row.executor_id = Some(executor.clone());
                 row.error_msg = (!u.cause.is_empty()).then(|| u.cause.clone());
                 let prior_unobtainable = self.mat_counters(&drv_hash).unobtainable_since_reset;
-                let close_d = self
-                    .close_materialization_attempt(
-                        exec_id,
-                        &drv_hash,
-                        Some(row),
-                        serving_generation,
-                    )
-                    .await;
-                if !close_d.settled() {
-                    // view-settlement gate: a deposed/failed close runs
-                    // no routing — the durable attempt row is still the
-                    // authority and the establishment sweep / re-report
-                    // is the armed action.
-                    return Ok(());
-                }
+                let close = match self
+                    .close_for_consumption(exec_id, &drv_hash, Some(row), serving_generation)
+                    .await
+                {
+                    CloseOutcome::Settled(close) => close,
+                    // view-settlement gate: a deposed close runs no
+                    // routing — ack inert, the successor's sweep owns
+                    // the row (signed Q20).
+                    CloseOutcome::Deferred(ack) => return Ok(ack),
+                    // A failed close NACKs: the store re-delivers the
+                    // SAME outcome and the idempotent close retries.
+                    CloseOutcome::NotDurable => {
+                        return Err(super::pull::PullRejection::ConsumptionNotDurable);
+                    }
+                };
 
                 // 2. The four-arm routing. Arms 0–2 decide without the
                 //    re-probe; the probe is fetched only for arm 3. The
@@ -1178,8 +1234,9 @@ impl DagActor {
                             // indeterminate answer never fail-fasts.
                             // Atomic release (merged_bug_015): the
                             // bare re-arm here was the wedge.
-                            self.release_claim(&drv_hash, Some(&executor)).await;
-                            return Ok(());
+                            return Ok(self
+                                .companion_release(&drv_hash, &executor, None, close)
+                                .await);
                         }
                     }
                 } else {
@@ -1195,8 +1252,9 @@ impl DagActor {
                     reprobe,
                     pruned_origin,
                 });
-                // 3. Execute the routing.
-                match routing {
+                // 3. Execute the routing — every arm spends the
+                //    settled-close witness on exactly one companion.
+                let ack = match routing {
                     UnobtainableRouting::CompleteForLiveInterest => {
                         // The moot arm completes through the SAME
                         // chokepoint as Success — the carrier stamp
@@ -1207,90 +1265,68 @@ impl DagActor {
                             &drv_hash,
                             job_id,
                             exec_id,
+                            &executor,
                             &carried_paths,
                             serving_generation,
+                            close,
                         )
-                        .await;
+                        .await
                     }
                     UnobtainableRouting::ReArm => {
                         // Atomic release (merged_bug_015): re-arm +
                         // requeue in ONE step — the bare re-arm here
                         // held the node Running with no armed action.
-                        self.release_claim(&drv_hash, Some(&executor)).await;
+                        self.companion_release(&drv_hash, &executor, None, close)
+                            .await
                     }
                     UnobtainableRouting::ResolveFromSource => {
-                        let d = match job_id {
-                            Some(job_id) => {
-                                self.resolve_materialization_job(
-                                    job_id,
-                                    Some(exec_id),
-                                    crate::state::JobState::ResolvedFromSource,
-                                    serving_generation,
-                                )
-                                .await
-                            }
-                            None => WriteDisposition::AlreadyResolved,
-                        };
-                        if self.materialization_jobs.remove_settled(&drv_hash, d) {
-                            // The node returns to its dep-derived status
-                            // (the normal Ready path) — requeue it.
-                            self.requeue_after_attempt(
-                                std::slice::from_ref(&drv_hash),
-                                crate::state::AttemptKind::Materialization,
-                                Some(&executor),
-                            )
-                            .await;
-                        }
+                        self.companion_resolve_from_source(
+                            &drv_hash,
+                            job_id,
+                            exec_id,
+                            &executor,
+                            serving_generation,
+                            close,
+                        )
+                        .await
                     }
                     UnobtainableRouting::FailFast => {
-                        let d = match job_id {
-                            Some(job_id) => {
-                                self.resolve_materialization_job(
-                                    job_id,
-                                    Some(exec_id),
-                                    crate::state::JobState::ResolvedUnobtainable,
-                                    serving_generation,
-                                )
-                                .await
-                            }
-                            None => WriteDisposition::AlreadyResolved,
-                        };
-                        if self.materialization_jobs.remove_settled(&drv_hash, d) {
-                            self.fail_fast_pruned_root(
-                                &drv_hash,
-                                "materialization confirmed a live-wanted output missing upstream \
-                                 and not substitutable",
-                            )
-                            .await;
-                        }
+                        self.companion_fail_fast(
+                            &drv_hash,
+                            job_id,
+                            exec_id,
+                            &executor,
+                            serving_generation,
+                            close,
+                        )
+                        .await
                     }
-                }
-                Ok(())
+                };
+                Ok(ack)
             }
-            Some(Outcome::InfraFailure(f)) => {
+            Outcome::InfraFailure(f) => {
                 // The infra charge: counts toward the materialization
                 // budget and toward NOTHING else. Never fail-fasts,
                 // never routes from source (B3). Charge + park verdict
-                // are ONE chokepoint (view-settlement gate, verdict,
-                // and requeue all inside) — no arm hangs on the
-                // disposition here.
-                let _ = self
-                    .charge_materialization_infra(
-                        exec_id,
-                        attempt.core.derivation_id,
-                        &drv_hash,
-                        &executor,
-                        job_id,
-                        crate::state::ReportingParty::Worker,
-                        (!f.detail.is_empty()).then(|| f.detail.clone()),
-                        None,
-                        None,
-                        serving_generation,
-                    )
-                    .await;
-                Ok(())
+                // are ONE chokepoint (close, verdict, and requeue all
+                // inside) — it mints the ack itself and a non-durable
+                // close propagates as the NACK.
+                self.charge_materialization_infra(
+                    exec_id,
+                    attempt.core.derivation_id,
+                    &drv_hash,
+                    &executor,
+                    job_id,
+                    crate::state::ReportingParty::Worker,
+                    (!f.detail.is_empty()).then(|| f.detail.clone()),
+                    None,
+                    None,
+                    serving_generation,
+                )
+                .await
+                .map(|(ack, _settled)| ack)
             }
-            Some(Outcome::RetryLater(r)) => {
+            Outcome::RetryLater(r) => {
                 // merged_bug_178: transient by the substituter's own
                 // contract (raced placeholder slot / upstream 429) —
                 // the attempt proves nothing about upstream content or
@@ -1313,18 +1349,20 @@ impl DagActor {
                     defer_secs = retry_after.as_secs(),
                     "transient materialization failure; closing uncharged and deferring"
                 );
-                let close_d = self
-                    .close_materialization_attempt(exec_id, &drv_hash, None, serving_generation)
-                    .await;
-                if close_d.settled() {
-                    if let Some(entry) = self.materialization_jobs.get_mut(&drv_hash) {
-                        entry.defer_until = Some(std::time::Instant::now() + retry_after);
+                match self
+                    .close_for_consumption(exec_id, &drv_hash, None, serving_generation)
+                    .await
+                {
+                    CloseOutcome::Settled(close) => Ok(self
+                        .companion_release(&drv_hash, &executor, Some(retry_after), close)
+                        .await),
+                    CloseOutcome::Deferred(ack) => Ok(ack),
+                    CloseOutcome::NotDurable => {
+                        Err(super::pull::PullRejection::ConsumptionNotDurable)
                     }
-                    self.release_claim(&drv_hash, Some(&executor)).await;
                 }
-                Ok(())
             }
-            Some(Outcome::Aborted(a)) => {
+            Outcome::Aborted(a) => {
                 // Charge-free close (owner default Q3, 2026-06-03 — AD5
                 // parity for the materialization kind): the worker was
                 // told to stop (SIGTERM during a store rollout/drain),
@@ -1349,17 +1387,18 @@ impl DagActor {
                 // failed close leaves the establishment sweep as the
                 // armed action (the same composition as every other
                 // consumption arm).
-                let close_d = self
-                    .close_materialization_attempt(exec_id, &drv_hash, None, serving_generation)
-                    .await;
-                if close_d.settled() {
-                    self.release_claim(&drv_hash, Some(&executor)).await;
+                match self
+                    .close_for_consumption(exec_id, &drv_hash, None, serving_generation)
+                    .await
+                {
+                    CloseOutcome::Settled(close) => Ok(self
+                        .companion_release(&drv_hash, &executor, None, close)
+                        .await),
+                    CloseOutcome::Deferred(ack) => Ok(ack),
+                    CloseOutcome::NotDurable => {
+                        Err(super::pull::PullRejection::ConsumptionNotDurable)
+                    }
                 }
-                Ok(())
-            }
-            None => {
-                warn!(%exec_id, "materialization outcome with no payload; acknowledged-and-ignored");
-                Ok(())
             }
         }
     }
@@ -1428,6 +1467,11 @@ impl DagActor {
     /// the job durably (and the node is requeued either way: claimable
     /// again / from-source dispatchable per the admission table).
     // r[impl sched.materialize.routing+5]
+    /// Settled-close companion #5 of 5 — it owns its OWN close (the
+    /// charge row rides the close transaction), then runs the park
+    /// verdict. Returns the ack witness plus whether the close
+    /// SETTLED (false = fenced; the establishment caller keys its
+    /// logging on this); a non-durable close propagates as the NACK.
     #[allow(clippy::too_many_arguments)]
     async fn charge_materialization_infra(
         &mut self,
@@ -1441,7 +1485,7 @@ impl DagActor {
         source_node: Option<String>,
         termination_reason: Option<&'static str>,
         serving_generation: crate::db::ServingGeneration,
-    ) -> WriteDisposition {
+    ) -> Result<(MatAck, bool), super::pull::PullRejection> {
         let mut row = crate::db::attempts::AttemptRow::new(
             derivation_id,
             crate::state::OutcomeClass::MaterializationInfra,
@@ -1453,16 +1497,19 @@ impl DagActor {
         row.error_msg = error_detail;
         row.source_node = source_node;
         row.termination_reason = termination_reason.map(Into::into);
-        let close_d = self
-            .close_materialization_attempt(exec_id, drv_hash, Some(row), serving_generation)
-            .await;
-        // The companions gate on the close disposition
-        // (sched.materialize.view-settlement): a deposed believer's
-        // fenced charge runs no verdict and no requeue; a failed close
-        // leaves the establishment sweep as the armed action.
-        if !close_d.settled() {
-            return close_d;
-        }
+        let close = match self
+            .close_for_consumption(exec_id, drv_hash, Some(row), serving_generation)
+            .await
+        {
+            CloseOutcome::Settled(close) => close,
+            // Deposed believer: ack inert — the successor's own sweep
+            // owns this attempt now (signed Q20).
+            CloseOutcome::Deferred(ack) => return Ok((ack, false)),
+            CloseOutcome::NotDurable => {
+                return Err(super::pull::PullRejection::ConsumptionNotDurable);
+            }
+        };
+        let SettledClose(()) = close;
         // The verdict, post-append: park at budget exhaustion, rearm
         // claimable under it. The job_id falls back to the view entry
         // (the establishment path has no report-context job id).
@@ -1484,7 +1531,7 @@ impl DagActor {
             // in ONE step — the node is claimable again immediately).
             self.release_claim(drv_hash, Some(executor)).await;
         }
-        close_d
+        Ok((MatAck(()), true))
     }
 
     /// THE success-for-live-interest completion chokepoint
@@ -1496,14 +1543,22 @@ impl DagActor {
     /// non-destructive guard keeps a known path, so the floating-CA
     /// node re-completes with the realized path instead of the `[""]`
     /// placeholder (GC retention + the client-visible path restored).
+    /// Settled-close companion #1 of 5. Consumes the linear
+    /// [`SettledClose`] witness and mints the [`MatAck`]; a failed
+    /// resolve follows the kernel companion law — release the claim
+    /// uncharged instead of wedging it (merged_bug_055).
+    #[allow(clippy::too_many_arguments)]
     async fn complete_materialization_for_live_interest(
         &mut self,
         drv_hash: &DrvHash,
         job_id: Option<Uuid>,
         exec_id: Uuid,
+        executor: &ExecutorId,
         carried_paths: &[String],
         serving_generation: crate::db::ServingGeneration,
-    ) {
+        close: SettledClose,
+    ) -> MatAck {
+        let SettledClose(()) = close;
         let d = match job_id {
             Some(job_id) => {
                 self.resolve_materialization_job(
@@ -1519,16 +1574,171 @@ impl DagActor {
             // reconciliation, not a decision.
             None => WriteDisposition::AlreadyResolved,
         };
-        if self.materialization_jobs.remove_settled(drv_hash, d) {
-            if !carried_paths.is_empty()
-                && let Some(state) = self.dag.node_mut(drv_hash)
-                && state.output_paths.is_empty()
-            {
-                state.output_paths = carried_paths.to_vec();
+        match companion_follow_up(d) {
+            CompanionFollowUp::Settled => {
+                if self.materialization_jobs.remove_settled(drv_hash, d) {
+                    if !carried_paths.is_empty()
+                        && let Some(state) = self.dag.node_mut(drv_hash)
+                        && state.output_paths.is_empty()
+                    {
+                        state.output_paths = carried_paths.to_vec();
+                    }
+                    self.complete_ready_from_store_batch(std::slice::from_ref(drv_hash))
+                        .await;
+                }
             }
-            self.complete_ready_from_store_batch(std::slice::from_ref(drv_hash))
-                .await;
+            // Deposed believer: mutate nothing the successor owns.
+            CompanionFollowUp::Inert => {}
+            // The resolve write failed: claimable-but-unparked
+            // dominates wedged-claimed-forever — the durable job row
+            // is still pending and the next consumer re-decides.
+            CompanionFollowUp::ReleaseClaimFallback => {
+                warn!(drv_hash = %drv_hash, %exec_id,
+                      "job resolve failed after a settled close; releasing the claim \
+                       uncharged (companion law)");
+                self.release_claim(drv_hash, Some(executor)).await;
+            }
         }
+        MatAck(())
+    }
+
+    /// THE consumption-close chokepoint (bug_182): every report arm
+    /// closes through here and receives the settled-close witness, the
+    /// fenced ack, or the NACK marker — per the kernel ack law
+    /// (`consumption_ack`). No other site constructs [`SettledClose`].
+    async fn close_for_consumption(
+        &mut self,
+        exec_id: Uuid,
+        drv_hash: &DrvHash,
+        charge_row: Option<crate::db::attempts::AttemptRow>,
+        serving_generation: crate::db::ServingGeneration,
+    ) -> CloseOutcome {
+        let d = self
+            .close_materialization_attempt(exec_id, drv_hash, charge_row, serving_generation)
+            .await;
+        match consumption_ack(d) {
+            ConsumptionAck::Ack if d.settled() => CloseOutcome::Settled(SettledClose(())),
+            // Fenced: ack inert (signed Q20 — deposed believers ack;
+            // the successor's establishment owns the row).
+            ConsumptionAck::Ack => CloseOutcome::Deferred(MatAck(())),
+            ConsumptionAck::NackRetryable => CloseOutcome::NotDurable,
+        }
+    }
+
+    /// Settled-close companion #2 of 5: defer (optionally) and release
+    /// the claim atomically — the ReArm / RetryLater / Aborted /
+    /// zero-width / coverage-miss composition.
+    async fn companion_release(
+        &mut self,
+        drv_hash: &DrvHash,
+        executor: &ExecutorId,
+        defer: Option<std::time::Duration>,
+        close: SettledClose,
+    ) -> MatAck {
+        let SettledClose(()) = close;
+        if let Some(d) = defer
+            && let Some(entry) = self.materialization_jobs.get_mut(drv_hash)
+        {
+            entry.defer_until = Some(std::time::Instant::now() + d);
+        }
+        self.release_claim(drv_hash, Some(executor)).await;
+        MatAck(())
+    }
+
+    /// Settled-close companion #3 of 5: resolve the job from source
+    /// and requeue; a failed resolve releases the claim (companion
+    /// law) instead of leaving it wedged.
+    async fn companion_resolve_from_source(
+        &mut self,
+        drv_hash: &DrvHash,
+        job_id: Option<Uuid>,
+        exec_id: Uuid,
+        executor: &ExecutorId,
+        serving_generation: crate::db::ServingGeneration,
+        close: SettledClose,
+    ) -> MatAck {
+        let SettledClose(()) = close;
+        let d = match job_id {
+            Some(job_id) => {
+                self.resolve_materialization_job(
+                    job_id,
+                    Some(exec_id),
+                    crate::state::JobState::ResolvedFromSource,
+                    serving_generation,
+                )
+                .await
+            }
+            None => WriteDisposition::AlreadyResolved,
+        };
+        match companion_follow_up(d) {
+            CompanionFollowUp::Settled => {
+                if self.materialization_jobs.remove_settled(drv_hash, d) {
+                    // The node returns to its dep-derived status
+                    // (the normal Ready path) — requeue it.
+                    self.requeue_after_attempt(
+                        std::slice::from_ref(drv_hash),
+                        crate::state::AttemptKind::Materialization,
+                        Some(executor),
+                    )
+                    .await;
+                }
+            }
+            CompanionFollowUp::Inert => {}
+            CompanionFollowUp::ReleaseClaimFallback => {
+                warn!(drv_hash = %drv_hash, %exec_id,
+                      "from-source resolve failed after a settled close; releasing the \
+                       claim uncharged (companion law)");
+                self.release_claim(drv_hash, Some(executor)).await;
+            }
+        }
+        MatAck(())
+    }
+
+    /// Settled-close companion #4 of 5: resolve the job unobtainable
+    /// and fail-fast the pruned root; a failed resolve releases the
+    /// claim (companion law).
+    async fn companion_fail_fast(
+        &mut self,
+        drv_hash: &DrvHash,
+        job_id: Option<Uuid>,
+        exec_id: Uuid,
+        executor: &ExecutorId,
+        serving_generation: crate::db::ServingGeneration,
+        close: SettledClose,
+    ) -> MatAck {
+        let SettledClose(()) = close;
+        let d = match job_id {
+            Some(job_id) => {
+                self.resolve_materialization_job(
+                    job_id,
+                    Some(exec_id),
+                    crate::state::JobState::ResolvedUnobtainable,
+                    serving_generation,
+                )
+                .await
+            }
+            None => WriteDisposition::AlreadyResolved,
+        };
+        match companion_follow_up(d) {
+            CompanionFollowUp::Settled => {
+                if self.materialization_jobs.remove_settled(drv_hash, d) {
+                    self.fail_fast_pruned_root(
+                        drv_hash,
+                        "materialization confirmed a live-wanted output missing upstream \
+                         and not substitutable",
+                    )
+                    .await;
+                }
+            }
+            CompanionFollowUp::Inert => {}
+            CompanionFollowUp::ReleaseClaimFallback => {
+                warn!(drv_hash = %drv_hash, %exec_id,
+                      "unobtainable resolve failed after a settled close; releasing the \
+                       claim uncharged (companion law)");
+                self.release_claim(drv_hash, Some(executor)).await;
+            }
+        }
+        MatAck(())
     }
 
     /// Close the open materialization attempt (assignment row) and
@@ -1780,15 +1990,31 @@ impl DagActor {
         } else {
             WriteDisposition::Applied
         };
-        if durable.settled()
-            && let Some(entry) = self.materialization_jobs.get_mut(drv_hash)
-        {
-            entry.claimed_by = None;
-            entry.parked_until =
-                Some(std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs));
-            // The dwell clock (migration 083 mirror): this park is the
-            // most recent — re-park restarts the clock by design.
-            entry.parked_at = Some(crate::state::RecoveredInstant::fresh_now());
+        match companion_follow_up(durable) {
+            CompanionFollowUp::Settled => {
+                if let Some(entry) = self.materialization_jobs.get_mut(drv_hash) {
+                    entry.claimed_by = None;
+                    entry.parked_until = Some(
+                        std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs),
+                    );
+                    // The dwell clock (migration 083 mirror): this park
+                    // is the most recent — re-park restarts the clock
+                    // by design.
+                    entry.parked_at = Some(crate::state::RecoveredInstant::fresh_now());
+                }
+            }
+            // Deposed believer: project nothing over rows the
+            // successor owns.
+            CompanionFollowUp::Inert => {}
+            // The park write failed (merged_bug_055): clear the holder
+            // anyway — claimable-but-unparked dominates
+            // wedged-claimed-forever (the attempt is already closed;
+            // a kept holder is exactly the claimed-no-attempt ghost).
+            CompanionFollowUp::ReleaseClaimFallback => {
+                if let Some(entry) = self.materialization_jobs.get_mut(drv_hash) {
+                    entry.claimed_by = None;
+                }
+            }
         }
         // The park's requeue companion (merged_bug_015's park half):
         // the node leaves the mint's Assigned/Running bookkeeping
@@ -1901,10 +2127,11 @@ impl DagActor {
         let drv_hash = DrvHash::from(attempt.drv_hash.as_str());
         let executor = ExecutorId::from(attempt.executor_id.as_str());
         let serving_generation = self.serving_generation();
-        // A deposed/failed close runs no verdict and no requeue — the
-        // successor's own sweep owns this attempt now; a failed close
-        // re-runs next tick (the sweep is idempotent).
-        let close_d = self
+        // A deposed close runs no verdict and no requeue — the
+        // successor's own sweep owns this attempt now; a non-durable
+        // close re-runs next tick (the sweep is idempotent; there is
+        // no store to NACK on this path).
+        match self
             .charge_materialization_infra(
                 attempt.exec_id,
                 attempt.derivation_id,
@@ -1917,9 +2144,11 @@ impl DagActor {
                 Some("unreported"),
                 serving_generation,
             )
-            .await;
-        if !close_d.settled() {
-            return;
+            .await
+        {
+            Ok((_ack, true)) => {}
+            Ok((_ack, false)) => return,
+            Err(_not_durable) => return,
         }
         tracing::info!(
             drv_hash = %drv_hash,

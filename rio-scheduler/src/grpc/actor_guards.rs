@@ -118,6 +118,12 @@ pub(crate) fn pull_rejection_to_status(rejection: &crate::actor::PullRejection) 
         PullRejection::NotLeader | PullRejection::StaleGeneration => {
             Status::unavailable("not leader (standby replica)")
         }
+        // bug_182 (the NACK law): the consumption close did not become
+        // durable — UNAVAILABLE so the store's report redelivery
+        // retries the SAME outcome against this replica.
+        PullRejection::ConsumptionNotDurable => {
+            Status::unavailable("consumption close not durable; re-deliver the report")
+        }
         PullRejection::TokenMismatch => {
             Status::permission_denied("executor token is bound to a different intent")
         }

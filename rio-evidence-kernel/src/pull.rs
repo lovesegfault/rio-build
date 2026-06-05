@@ -969,6 +969,7 @@ mod kinded_tests {
     ///   3. nonce presented, none persisted  → NotYetReady
     ///   4. none presented, one persisted    → NotYetReady (None≠None)
     ///   5. wrong token + matching nonce     → DeliverExisting
+    ///
     /// RED (recorded, pre-fix): leg 1 refused — `left: NotYetReady /
     /// right: DeliverExisting { exec_id: 9 }` — the cell required the
     /// response-borne token alone, which is exactly what a lost
