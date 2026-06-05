@@ -34,30 +34,40 @@ use super::kernel::{AcceptVerdict, accept_verdict};
 /// single line cannot dominate the buffer or a chunk.
 ///
 /// Ported verbatim from the retired scheduler-side ring buffer's
-/// MAX_LINE_LEN; the value is part of
-/// the worker-facing contract (the builder's `LogBatcher` does not
-/// pre-truncate, it relies on the server doing so).
-pub const MAX_LINE_LEN: usize = 64 * 1024;
+/// MAX_LINE_LEN; the value is part of the worker-facing contract and
+/// is owned by the kernel ([`rio_log_kernel::MAX_LINE_CONTENT_BYTES`])
+/// — the builder's `LogBatcher` pre-truncates to the SAME constant
+/// before transmitting (anything past it is discarded here anyway, and
+/// an untruncated multi-MiB line would exceed the log plane's decode
+/// cap); this truncation stays as the enforcement for non-conforming
+/// workers.
+pub const MAX_LINE_LEN: usize = rio_log_kernel::MAX_LINE_CONTENT_BYTES as usize;
 
-/// Per-line memory overhead charged on top of the line's content bytes
-/// in all buffer accounting: the `u64` line-number key (8 bytes) plus
-/// the `Vec<u8>` header (ptr + len + cap = 24 bytes on 64-bit).
+/// Per-line memory overhead charged in all buffer accounting: the
+/// `u64` line-number key (8 bytes) plus the `Vec<u8>` header (ptr +
+/// len + cap = 24 bytes on 64-bit). Without it a stream of 1-byte
+/// lines would hold ~33x its accounted bytes resident before the cut
+/// trigger fired.
 ///
-/// Without this charge a stream of 1-byte lines would hold ~33x its
-/// accounted bytes resident before the cut trigger fired, and could
-/// make us allocate ~33 GiB of headers against a 1 GiB lifetime cap.
-/// The scheduler's ring kept a separate line-COUNT cap alongside its
-/// byte cap for exactly this reason; charging the overhead per line
-/// folds both bounds into one.
-const PER_LINE_OVERHEAD: u64 = 32;
+/// Owned by the kernel ([`rio_log_kernel::PER_LINE_OVERHEAD_BYTES`])
+/// so the THREE buffer axes here (cut trigger, lifetime cap,
+/// `buffer_bytes`) and the cutter's chunk budget
+/// ([`rio_log_kernel::bounded_contiguous_prefix_len`]) charge the SAME
+/// formula — bug_298 was exactly the drift between them: the buffer
+/// axes charged this overhead while the chunk budget charged bare
+/// framing, so one committed chunk could legally pack
+/// `MAX_CHUNK_PAYLOAD_BYTES / 4` near-empty lines for the read path to
+/// materialize.
+const PER_LINE_OVERHEAD: u64 = rio_log_kernel::PER_LINE_OVERHEAD_BYTES;
 
-/// The buffer-accounting size of one (post-truncation) line: content
-/// bytes plus [`PER_LINE_OVERHEAD`]. Used for the cut trigger, the
-/// per-execution lifetime cap, and the incremental `buffer_bytes`
-/// bookkeeping — all three must agree on the formula or the counter
-/// drifts across a drain/restore round trip.
+/// The buffer-accounting size of one (post-truncation) line —
+/// [`rio_log_kernel::charged_line_cost`], the kernel's single byte-axis
+/// formula. Used for the cut trigger, the per-execution lifetime cap,
+/// and the incremental `buffer_bytes` bookkeeping — all three must
+/// agree on the formula or the counter drifts across a drain/restore
+/// round trip.
 fn accounted_len(line: &[u8]) -> u64 {
-    line.len() as u64 + PER_LINE_OVERHEAD
+    rio_log_kernel::charged_line_cost(line.len() as u64)
 }
 
 /// Default for [`IngestConfig::per_exec_byte_cap`]: 1 GiB of accepted
@@ -142,6 +152,13 @@ pub enum AcceptOutcome {
     /// never sends these — the count is the builder's own post-footer
     /// high-water mark from its `CompletionReport`.
     RejectedPastFinal,
+    /// The batch holds more lines than one chunk's charged capacity
+    /// ([`rio_log_kernel::MAX_BATCH_LINES`]) — bug_298's admission
+    /// axis. Dropped whole BEFORE any per-line truncation, accounting,
+    /// or fan-out work (the rejection is the cheap path by design);
+    /// the stream stays open. Honest builders flush at 64 lines, four
+    /// orders of magnitude below the bound.
+    RejectedOversizedBatch,
 }
 
 /// Why [`IngestSession::should_abort`] wants the stream torn down.
@@ -596,6 +613,21 @@ impl IngestSession {
                     "rejected log batch: every line is at or past the recorded final_line_count"
                 );
                 return Ok(AcceptOutcome::RejectedPastFinal);
+            }
+            AcceptVerdict::RejectedOversizedBatch => {
+                metrics::counter!(
+                    "rio_store_log_ingest_rejected_total",
+                    "reason" => "oversized_batch"
+                )
+                .increment(1);
+                tracing::warn!(
+                    exec_id = %self.exec_id,
+                    first_line_number = batch.first_line_number,
+                    lines = batch.lines.len(),
+                    max_batch_lines = rio_log_kernel::MAX_BATCH_LINES,
+                    "rejected log batch: more lines than one chunk's charged capacity"
+                );
+                return Ok(AcceptOutcome::RejectedOversizedBatch);
             }
             AcceptVerdict::Accepted { end } => end,
         };
@@ -1194,6 +1226,38 @@ mod tests {
         ));
     }
 
+    // r[verify store.log.write-read-bound+2]
+    /// bug_298's admission red: pre-fix, a 4,194,304-empty-line batch
+    /// (16 MiB of bare frames, ~134 MiB charged) was `Accepted` and
+    /// buffered whole — the recorded red asserted `RejectedOversizedBatch`
+    /// and got `Accepted { cut_due: true }`. Post-fix it is rejected at
+    /// admission BEFORE any per-line work, the stream stays open (the
+    /// next in-order batch is accepted), and nothing was buffered.
+    #[test]
+    fn oversized_batch_rejected_stream_stays_open() {
+        let mut session = new_session(test_config());
+        let oversized = BuildLogBatch {
+            derivation_path: String::new(),
+            // 4M empty lines: Vec::new() is allocation-free, so the
+            // fixture itself is cheap — the point is the COUNT.
+            lines: vec![Vec::new(); 4_194_304],
+            first_line_number: 0,
+            executor_id: String::new(),
+        };
+        assert!(matches!(
+            session.accept(oversized).unwrap(),
+            AcceptOutcome::RejectedOversizedBatch
+        ));
+        assert_eq!(buffered_line_count(&session), 0, "nothing buffered");
+        // Per-batch semantics: the session is not poisoned and the
+        // high-water mark did not move.
+        assert!(matches!(
+            session.accept(batch(0, 3)).unwrap(),
+            AcceptOutcome::Accepted { .. }
+        ));
+        assert_eq!(buffered_line_count(&session), 3);
+    }
+
     #[test]
     fn enforces_per_exec_byte_cap() {
         let mut session = new_session(IngestConfig {
@@ -1287,7 +1351,7 @@ mod tests {
         assert_eq!(buffered_line_count(&session), 5);
     }
 
-    // r[verify store.log.write-read-bound]
+    // r[verify store.log.write-read-bound+2]
     /// bug_098 (red-first): a contiguous run whose framed payload
     /// exceeds the read path's bound must split across multiple chunks,
     /// each decodable. The recorded red: the unbounded cutter drained

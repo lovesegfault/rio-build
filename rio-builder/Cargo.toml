@@ -24,6 +24,7 @@ test-fixtures = ["dep:toml"]
 
 [dependencies]
 rio-common = { workspace = true }
+rio-log-kernel = { workspace = true }
 rio-nix = { workspace = true }
 rio-proto = { workspace = true }
 schemars = { workspace = true }

@@ -21,6 +21,18 @@ use rio_proto::types::BuildLogBatch;
 /// Maximum lines per batch.
 const MAX_BATCH_LINES: usize = 64;
 
+/// The flush wire-size law (bug_298 done-criterion): the largest batch
+/// this module can emit — `MAX_BATCH_LINES` lines of
+/// `MAX_LINE_CONTENT_BYTES` each, plus a generous 64-byte per-line
+/// protobuf framing margin (tag + length varints are <= 6 bytes) —
+/// must stay under HALF the log plane's decode cap
+/// (`MAX_CHUNK_PAYLOAD_BYTES`), so no honest flush or spool replay can
+/// ever be refused by the store's `max_decoding_message_size`.
+const _: () = assert!(
+    (MAX_BATCH_LINES as u64) * (rio_log_kernel::MAX_LINE_CONTENT_BYTES + 64)
+        <= rio_log_kernel::MAX_CHUNK_PAYLOAD_BYTES / 2
+);
+
 /// Maximum time to wait before flushing a partial batch.
 pub(crate) const BATCH_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -188,6 +200,22 @@ impl LogBatcher {
             self.lines_this_window += 1;
         }
 
+        // --- Pre-truncation to the pipeline's per-line ceiling ---
+        // The store truncates every accepted line to the SAME kernel
+        // constant before buffering, so content past it is guaranteed
+        // discarded server-side: shipping it is pure wire cost, and an
+        // untruncated multi-MiB line (the daemon protocol admits 64 MiB
+        // strings) would exceed the log plane's 16 MiB decode cap and
+        // make an otherwise-honest flush undecodable (bug_298). Slice
+        // BEFORE the size accounting so `total_bytes` charges what
+        // actually ships — the same truncate-then-account order the
+        // store uses.
+        let line = if line.len() as u64 > rio_log_kernel::MAX_LINE_CONTENT_BYTES {
+            line[..rio_log_kernel::MAX_LINE_CONTENT_BYTES as usize].to_vec()
+        } else {
+            line
+        };
+
         // --- Size limit ---
         // Check the PROSPECTIVE total, not the current one. A 100 MiB limit
         // with 99.9 MiB accumulated and a 1 MiB line coming in should reject
@@ -302,6 +330,40 @@ mod tests {
 
     fn mk(limits: LogLimits) -> LogBatcher {
         LogBatcher::new("drv-path".into(), "worker-1".into(), limits, 0)
+    }
+
+    /// bug_298's wire red: pre-fix the batcher shipped lines verbatim
+    /// (the daemon protocol admits 64 MiB strings), so one flush could
+    /// exceed the log plane's 16 MiB decode cap — the recorded red
+    /// asserted the truncated length and got 20,971,520. Post-fix every
+    /// line is pre-truncated to the kernel's per-line ceiling (the same
+    /// constant the store truncates to — content past it was ALWAYS
+    /// discarded server-side), `total_bytes` charges what ships, and
+    /// the worst-case encoded flush sits provably under the decode cap.
+    #[test]
+    fn lines_pre_truncated_to_kernel_ceiling() {
+        use rio_proto::prost::Message as _;
+        let cap = rio_log_kernel::MAX_LINE_CONTENT_BYTES as usize;
+        let mut batcher = mk(LogLimits::UNLIMITED);
+        batcher.add_line(vec![b'x'; 20 * 1024 * 1024]);
+        let batch = batcher.flush();
+        assert_eq!(batch.lines[0].len(), cap, "sliced to the shared ceiling");
+
+        // Worst-case wire flush: MAX_BATCH_LINES ceiling-length lines.
+        let mut batcher = mk(LogLimits::UNLIMITED);
+        let mut full = None;
+        for _ in 0..MAX_BATCH_LINES {
+            if let AddLineResult::BatchReady(b) = batcher.add_line(vec![b'y'; cap + 7]) {
+                full = Some(b);
+            }
+        }
+        let full = full.expect("MAX_BATCH_LINES adds flush exactly once");
+        assert_eq!(full.lines.len(), MAX_BATCH_LINES);
+        let encoded = full.encoded_len() as u64;
+        assert!(
+            encoded <= rio_log_kernel::MAX_CHUNK_PAYLOAD_BYTES / 2,
+            "worst-case flush ({encoded} B) must sit under half the decode cap"
+        );
     }
 
     /// `initial_line` seeds `next_line_number` so the first flush's

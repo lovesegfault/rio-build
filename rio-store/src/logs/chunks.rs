@@ -143,7 +143,7 @@ const LINE_LEN_PREFIX_BYTES: usize = rio_log_kernel::LINE_LEN_PREFIX_BYTES as us
 pub fn compress_lines(lines: &[Vec<u8>]) -> Result<Vec<u8>, LogChunkError> {
     use std::io::Write as _;
     let payload_len: usize = lines.iter().map(|l| l.len() + LINE_LEN_PREFIX_BYTES).sum();
-    // r[impl store.log.write-read-bound]
+    // r[impl store.log.write-read-bound+2]
     // Defense in depth behind the cutter's bounded_contiguous_prefix_len:
     // a chunk this function would frame past the shared payload bound is
     // a chunk decompress_lines will refuse — refuse it HERE, before the
@@ -203,6 +203,20 @@ pub fn decompress_lines(blob: &[u8]) -> Result<Vec<Vec<u8>>, LogChunkError> {
     let mut lines = Vec::new();
     let mut rest: &[u8] = &decoded;
     while !rest.is_empty() {
+        // r[impl store.log.write-read-bound+2]
+        // The absolute line-count backstop (bug_298's read axis). The
+        // byte bound above already implies it — every framed line costs
+        // at least LINE_LEN_PREFIX_BYTES, so a within-bound payload
+        // holds at most MAX_CHUNK_LINES_ABS lines — but the implication
+        // lives in two constants an edit could split; checking the
+        // count directly keeps the allocation bound local and survives
+        // any future re-tuning of the byte bound.
+        if lines.len() as u64 >= rio_log_kernel::MAX_CHUNK_LINES_ABS {
+            return Err(LogChunkError::Codec(std::io::Error::other(format!(
+                "chunk holds more than {} lines (absolute read bound)",
+                rio_log_kernel::MAX_CHUNK_LINES_ABS
+            ))));
+        }
         let Some((prefix, after_prefix)) = rest.split_at_checked(LINE_LEN_PREFIX_BYTES) else {
             return Err(LogChunkError::Codec(std::io::Error::other(format!(
                 "chunk payload ends mid length-prefix ({} trailing bytes)",
@@ -800,6 +814,25 @@ mod tests {
         assert!(!dir.path().parent().unwrap().join("escape.zst").exists());
     }
 
+    // r[verify store.log.write-read-bound+2]
+    /// The absolute line-count backstop's boundary: a payload of
+    /// exactly `MAX_CHUNK_LINES_ABS` empty lines is byte-bound-maximal
+    /// (every line is one bare 4-byte frame, summing to exactly the
+    /// decompression ceiling) and MUST decode — the backstop refuses
+    /// only counts the byte bound already makes unframeable, so no
+    /// grandfathered chunk is ever falsely refused.
+    #[test]
+    fn exactly_abs_line_count_decodes() {
+        let n = rio_log_kernel::MAX_CHUNK_LINES_ABS as usize;
+        // n zero-length frames = n * 4 bytes of payload, zstd of a
+        // 16 MiB zero run is tiny and fast.
+        let payload = vec![0u8; n * LINE_LEN_PREFIX_BYTES];
+        let blob = zstd::stream::encode_all(&payload[..], 0).unwrap();
+        let lines = decompress_lines(&blob).unwrap();
+        assert_eq!(lines.len(), n);
+        assert!(lines.iter().all(|l| l.is_empty()));
+    }
+
     #[test]
     fn key_format_is_stable() {
         // The key format is load-bearing: it is stored verbatim in
@@ -906,7 +939,7 @@ mod tests {
         }
     }
 
-    // r[verify store.log.write-read-bound]
+    // r[verify store.log.write-read-bound+2]
     /// The write-side half of the shared bound: the codec refuses to
     /// FRAME a payload the read path would refuse to decode.
     #[test]

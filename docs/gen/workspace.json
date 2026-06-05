@@ -93,6 +93,7 @@
     "rio-builder": {
       "prod": [
         "rio-common",
+        "rio-log-kernel",
         "rio-nix",
         "rio-proto"
       ],

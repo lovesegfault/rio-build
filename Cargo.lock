@@ -6189,6 +6189,7 @@ dependencies = [
  "prost-types",
  "regex",
  "rio-common",
+ "rio-log-kernel",
  "rio-nix",
  "rio-proto",
  "rio-test-support",

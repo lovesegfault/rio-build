@@ -491,8 +491,17 @@ async fn main() -> anyhow::Result<()> {
                 .max_encoding_message_size(max_msg_size),
         )
         .add_service(
+            // The log plane's decode cap is the KERNEL chunk bound, not
+            // the store-wide max_msg_size knob (bug_298, §5-Q22: 16 MiB
+            // const, no knob): an AppendLog message larger than one
+            // chunk's payload ceiling has no legitimate producer — the
+            // builder flushes at 64 lines / 64 KiB-truncated each — and
+            // every byte tonic decodes here is allocation the admission
+            // gate cannot refuse retroactively. Encoding stays on the
+            // shared knob (TailLog responses are re-chunked to <=256
+            // lines, far below either bound).
             LogServiceServer::new(log_service)
-                .max_decoding_message_size(max_msg_size)
+                .max_decoding_message_size(rio_log_kernel::MAX_CHUNK_PAYLOAD_BYTES as usize)
                 .max_encoding_message_size(max_msg_size),
         )
         .serve_with_shutdown(addr, serve_shutdown.cancelled_owned())

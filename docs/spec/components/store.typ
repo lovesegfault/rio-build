@@ -1776,19 +1776,33 @@ scheduler-owned cross-service state (terminality, report idempotency,
 attempt-kind resolution), and deleting it by age destroyed the kind context
 of still-referenced ledger rows behind the scheduler's back.
 
-#r("store.log.write-read-bound")[
+#r("store.log.write-read-bound+2")[
   The chunk payload ceiling is ONE shared constant consumed by both halves
-  of the codec: the cutter MUST NOT drain a contiguous run whose framed
-  payload exceeds it (an over-bound run drains as multiple chunks), the
-  compressor MUST refuse to frame a payload past it, and the reader MUST
-  refuse to decompress past it. A committed chunk is therefore decodable by
-  construction; a single maximally-truncated line plus its frame prefix
-  always fits (compile-time asserted).
+  of the codec, and it is denominated in CHARGED bytes --- content plus the
+  kernel's per-line overhead plus the frame prefix, the same formula every
+  other byte-denominated bound in the pipeline charges: the cutter MUST NOT
+  drain a contiguous run whose charged payload exceeds the ceiling (an
+  over-bound run drains as multiple chunks), the compressor MUST refuse to
+  frame a payload past it, the reader MUST refuse to decompress past it,
+  the reader MUST refuse a chunk whose manifest row claims more lines than
+  any decodable payload could frame (the absolute line bound,
+  ceiling/prefix-width) BEFORE fetching the object, ingest MUST reject a
+  single batch holding more lines than one chunk's charged capacity at
+  admission (per-batch; the stream stays open), and the log plane's wire
+  decode cap MUST equal the chunk ceiling. A committed chunk is therefore
+  decodable by construction AND its line count is bounded by the same
+  constant that bounds its bytes; a single maximally-truncated line plus
+  its frame prefix always fits (compile-time asserted).
 ]
 The write path used to bound a chunk only by line contiguity while the read
 path enforced a 16 MiB decompression ceiling --- a multi-MiB contiguous run
 committed a chunk the read path then refused, making the tail of that log
-unreadable while the manifest claimed coverage.
+unreadable while the manifest claimed coverage. The first repair shared the
+byte ceiling but charged bare framing, leaving the LINE-COUNT axis open
+(bug_298): sixteen MiB of near-empty lines was 4.19M frames the write side
+would commit and the read side then materialized as 4.19M allocations ---
+a ~33x resident amplification the byte bound never saw, reachable through
+a wire admission path whose decode cap (256 MiB) dwarfed the chunk it fed.
 
 #r("store.log.ingest-idle-abort")[
   An AppendLog ingest driver whose buffer is empty and whose inbound

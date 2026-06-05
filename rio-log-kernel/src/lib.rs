@@ -694,6 +694,14 @@ pub enum AcceptVerdict {
     /// Every line in the batch is at or past the recorded
     /// `final_line_count` ceiling.
     RejectedPastFinal,
+    /// The batch holds more lines than [`MAX_BATCH_LINES`] — more than
+    /// one chunk's charged capacity in a single admission. Per-batch
+    /// (the stream stays open, matching the other `Rejected*`
+    /// semantics): the bound stops the line-count amplification axis
+    /// (millions of near-empty lines in one wire message materializing
+    /// as millions of buffered allocations) before any per-line work,
+    /// without killing an otherwise-honest session.
+    RejectedOversizedBatch,
     /// The batch is accepted. `end` is one past the last accepted line
     /// after clamping to the ceiling: the caller keeps the first
     /// `end - first_line_number` lines and raises its high-water mark
@@ -718,9 +726,12 @@ pub enum AcceptVerdict {
 /// overflow arm as unrepresentable in its bounded line domain):
 ///
 /// 1. overflow — the line numbers must round-trip through `BIGINT`;
-/// 2. monotone floor — the batch must start at or above the high-water
+/// 2. admission size — the batch may not hold more lines than
+///    [`MAX_BATCH_LINES`] (one chunk's charged capacity; the
+///    line-count amplification bound);
+/// 3. monotone floor — the batch must start at or above the high-water
 ///    mark (forward gaps are legal, going backwards is not);
-/// 3. completeness ceiling — a batch starting at or past the recorded
+/// 4. completeness ceiling — a batch starting at or past the recorded
 ///    end is dropped whole; one that straddles it is truncated to
 ///    `[first_line_number, ceiling)`.
 ///
@@ -745,9 +756,14 @@ pub enum AcceptVerdict {
 //       }
 //
 // (`hi` is the batch's exclusive end `lo + count`.) The overflow arm is
-// the one addition: the model's bounded line domain cannot represent an
+// one addition: the model's bounded line domain cannot represent an
 // unrepresentable batch, so its predicate is conditioned on
-// representability — clauses 2-4 carry the same `end <= i64::MAX`
+// representability — the later clauses carry the same `end <= i64::MAX`
+// conjunct. The oversized arm is the other (bug_298's admission axis):
+// the model's `MAX_BATCH_LINES` lives far above its bounded line
+// domain, so its `acceptVerdict` carries the arm with a small bound
+// (`batchLinesBounded` + `CALIB_OVERSIZED_ADMITTED` exercise it); the
+// later clauses carry the matching `line_count <= MAX_BATCH_LINES`
 // conjunct. There is no requires clause: the kernel is total and the
 // worker-supplied inputs are untrusted, so the contract must hold over
 // the full u64 domain. Verified by `check_accept_verdict_contract` in
@@ -763,28 +779,40 @@ pub enum AcceptVerdict {
         }
 }))]
 #[cfg_attr(kani, kani::ensures(|r: &AcceptVerdict| {
-    // RejectedNonMonotone iff representable AND below the high-water
-    // mark (`if (lo < hw) RejectNonMonotone`).
+    // RejectedOversizedBatch iff representable AND over the per-batch
+    // admission bound (one chunk's charged capacity).
+    matches!(r, AcceptVerdict::RejectedOversizedBatch)
+        == (first_line_number
+            .checked_add(line_count)
+            .is_some_and(|end| end <= i64::MAX as u64)
+            && line_count > MAX_BATCH_LINES)
+}))]
+#[cfg_attr(kani, kani::ensures(|r: &AcceptVerdict| {
+    // RejectedNonMonotone iff representable, within the admission
+    // bound, AND below the high-water mark
+    // (`if (lo < hw) RejectNonMonotone`).
     matches!(r, AcceptVerdict::RejectedNonMonotone)
         == (first_line_number
             .checked_add(line_count)
             .is_some_and(|end| end <= i64::MAX as u64)
+            && line_count <= MAX_BATCH_LINES
             && first_line_number < high_water_line)
 }))]
 #[cfg_attr(kani, kani::ensures(|r: &AcceptVerdict| {
-    // RejectedPastFinal iff representable, monotone, AND the batch
-    // starts at or past the known ceiling
+    // RejectedPastFinal iff representable, within the admission bound,
+    // monotone, AND the batch starts at or past the known ceiling
     // (`if (lo >= c.value) RejectPastFinal`).
     matches!(r, AcceptVerdict::RejectedPastFinal)
         == (first_line_number
             .checked_add(line_count)
             .is_some_and(|end| end <= i64::MAX as u64)
+            && line_count <= MAX_BATCH_LINES
             && first_line_number >= high_water_line
             && final_line_count.is_some_and(|c| first_line_number >= c))
 }))]
 #[cfg_attr(kani, kani::ensures(|r: &AcceptVerdict| {
-    // Accepted iff no rejection fires (implied by the three iffs above
-    // over the four-variant enum); the accepted end is the batch's end
+    // Accepted iff no rejection fires (implied by the four iffs above
+    // over the five-variant enum); the accepted end is the batch's end
     // clamped to the ceiling (`Accept(minInt(hi, c.value))` /
     // `Accept(hi)`), so no accepted line is ever at or past the
     // recorded final_line_count (store.log.completeness-gate) and the
@@ -794,6 +822,7 @@ pub enum AcceptVerdict {
             .checked_add(line_count)
             .is_some_and(|batch_end| {
                 batch_end <= i64::MAX as u64
+                    && line_count <= MAX_BATCH_LINES
                     && first_line_number >= high_water_line
                     && final_line_count.is_none_or(|c| first_line_number < c)
                     && *end
@@ -821,14 +850,23 @@ pub fn accept_verdict(
         Some(end) if end <= i64::MAX as u64 => end,
         _ => return AcceptVerdict::RejectedOverflow,
     };
-    // -- Check 2: the monotone floor. A batch starting at or below a
+    // -- Check 2: the per-batch admission bound. One AppendLog message
+    // may not carry more lines than one chunk's charged capacity
+    // ([`MAX_BATCH_LINES`]): past it the batch is rejected before any
+    // per-line allocation, truncation, or fan-out work — the line-count
+    // amplification axis (bug_298) is cut at admission, not at the
+    // lifetime cap after the allocations already happened.
+    if line_count > MAX_BATCH_LINES {
+        return AcceptVerdict::RejectedOversizedBatch;
+    }
+    // -- Check 3: the monotone floor. A batch starting at or below a
     // line number the session already holds or has cut is malformed
     // worker input; renumbering it would corrupt every downstream
     // consumer of the ordering, so it is dropped whole.
     if first_line_number < high_water_line {
         return AcceptVerdict::RejectedNonMonotone;
     }
-    // -- Check 3: the completeness ceiling. Once known, the recorded
+    // -- Check 4: the completeness ceiling. Once known, the recorded
     // final_line_count is one past the last line the build produced:
     // lines numbered at or past it cannot be part of the log.
     match final_line_count {
@@ -907,19 +945,93 @@ pub fn contiguous_prefix_len(line_numbers: impl Iterator<Item = u64>) -> usize {
 pub const LINE_LEN_PREFIX_BYTES: u64 = 4;
 
 /// The chunk payload ceiling shared by the write and read paths: the
-/// cutter never drains a run whose framed payload
-/// (`Σ content + LINE_LEN_PREFIX_BYTES per line`) exceeds this, and the
-/// reader refuses to decompress past it. One constant, one owner — the
-/// write/read bound asymmetry (a committed chunk the read path
-/// rejects) is unrepresentable while both sides consume this value.
+/// cutter never drains a run whose charged payload
+/// ([`charged_line_cost`] + [`LINE_LEN_PREFIX_BYTES`] per line) exceeds
+/// this, and the reader refuses to decompress past it. One constant,
+/// one owner — the write/read bound asymmetry (a committed chunk the
+/// read path rejects) is unrepresentable while both sides consume this
+/// value.
 pub const MAX_CHUNK_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 
-// r[impl store.log.write-read-bound]
+/// Per-line memory overhead charged on top of a line's content bytes
+/// by every byte-denominated bound in the log pipeline: the `u64`
+/// line-number key (8 bytes) plus the `Vec<u8>` header (ptr + len +
+/// cap = 24 bytes on 64-bit).
+///
+/// Without this charge a stream of near-empty lines holds ~33x its
+/// accounted bytes resident before any byte trigger fires — the
+/// line-count amplification axis of bug_298. The kernel owns the
+/// constant so the ingest buffer accounting (cut trigger, lifetime
+/// cap, `buffer_bytes` bookkeeping) and the cutter's chunk budget
+/// ([`bounded_contiguous_prefix_len`]) charge the SAME formula; two
+/// formulas is exactly the write/read asymmetry this module exists to
+/// make unrepresentable.
+pub const PER_LINE_OVERHEAD_BYTES: u64 = 32;
+
+/// The charged size of one (post-truncation) line: content bytes plus
+/// [`PER_LINE_OVERHEAD_BYTES`]. THE byte-axis formula — the ingest
+/// accounting and the cutter budget both consume it, so a bound
+/// denominated in "bytes" can never again be defeated by line count.
+pub const fn charged_line_cost(content_len: u64) -> u64 {
+    content_len.saturating_add(PER_LINE_OVERHEAD_BYTES)
+}
+
+/// The most lines one committed chunk can hold post-fix: an all-empty
+/// run charges `PER_LINE_OVERHEAD_BYTES + LINE_LEN_PREFIX_BYTES` per
+/// line against [`MAX_CHUNK_PAYLOAD_BYTES`], so the cutter's bounded
+/// drain ([`bounded_contiguous_prefix_len`]) tops out here (466,033).
+/// Documentation + test anchor; the bound itself is enforced by the
+/// charge formula, not by counting.
+pub const MAX_CHUNK_LINES: u64 =
+    MAX_CHUNK_PAYLOAD_BYTES / (PER_LINE_OVERHEAD_BYTES + LINE_LEN_PREFIX_BYTES);
+
+/// The absolute read-side line-count backstop for one chunk:
+/// `MAX_CHUNK_PAYLOAD_BYTES / LINE_LEN_PREFIX_BYTES` (4,194,304) — the
+/// most lines any decodable payload could EVER have framed (every
+/// line, even empty, costs its length prefix), i.e. the pre-fix
+/// theoretical ceiling. No legitimately-written chunk, old or new, can
+/// exceed it, so refusing past it (the manifest-row pre-GET check and
+/// the decoder's parse loop) never rejects grandfathered data; a row
+/// claiming more is corrupt by construction and is refused BEFORE the
+/// allocation it requests.
+pub const MAX_CHUNK_LINES_ABS: u64 = MAX_CHUNK_PAYLOAD_BYTES / LINE_LEN_PREFIX_BYTES;
+
+/// The per-line content ceiling for the whole log pipeline: 64 KiB.
+/// The store's ingest truncates every accepted line to this before
+/// buffering (the enforcement for non-conforming workers), and the
+/// builder's `LogBatcher` pre-truncates to the SAME constant before
+/// transmitting — content past it is guaranteed discarded server-side,
+/// so shipping it is pure wire cost, and with the log plane's decode
+/// cap at [`MAX_CHUNK_PAYLOAD_BYTES`] an untruncated multi-MiB line
+/// would make an otherwise-honest flush undecodable (bug_298's
+/// regression edge: the daemon protocol admits 64 MiB strings). One
+/// constant, one owner — `64 lines x (this + frame) ~ 4 MiB << 16 MiB`
+/// is const-asserted by the builder.
+pub const MAX_LINE_CONTENT_BYTES: u64 = 64 * 1024;
+
+/// Per-batch admission bound for `AppendLog`: one batch may not hold
+/// more lines than one chunk's charged capacity ([`MAX_CHUNK_LINES`]).
+/// Enforced by [`accept_verdict`]'s `RejectedOversizedBatch` arm —
+/// per-batch, stream stays open. Honest builders sit orders of
+/// magnitude below this (the builder flushes at 64 lines); the bound
+/// exists so a single wire message cannot materialize millions of
+/// buffered allocations before the byte axes notice.
+pub const MAX_BATCH_LINES: u64 = MAX_CHUNK_LINES;
+
+// r[impl store.log.write-read-bound+2]
 /// The bounded cutter decision: the longest contiguous prefix of
 /// `lines` (`(line_number, content_len)` pairs, contiguity on the
-/// numbers exactly as [`contiguous_prefix_len`]) whose framed payload —
-/// `Σ (content_len + LINE_LEN_PREFIX_BYTES)` — stays at or under
-/// `max_payload`.
+/// numbers exactly as [`contiguous_prefix_len`]) whose CHARGED payload
+/// — `Σ (charged_line_cost(content_len) + LINE_LEN_PREFIX_BYTES)` —
+/// stays at or under `max_payload`.
+///
+/// Charging [`charged_line_cost`] (not bare content) is bug_298's
+/// write-side fix: with bare framing an all-empty run cost 4 bytes per
+/// line, so one chunk could legally hold
+/// `MAX_CHUNK_PAYLOAD_BYTES / 4 = 4,194,304` lines that the read path
+/// then materializes as 4M allocations. Charged, the same run tops out
+/// at [`MAX_CHUNK_LINES`] (466,033) — the chunk's line count is
+/// bounded by the SAME formula every other byte axis uses.
 ///
 /// Returns at least 1 on non-empty input even if the first line alone
 /// exceeds the bound: a single line is always cuttable (the ingest path
@@ -935,13 +1047,14 @@ pub fn bounded_contiguous_prefix_len(
     let Some((mut prev, first_len)) = iter.next() else {
         return 0;
     };
-    let mut framed: u64 = first_len.saturating_add(LINE_LEN_PREFIX_BYTES);
+    let mut framed: u64 = charged_line_cost(first_len).saturating_add(LINE_LEN_PREFIX_BYTES);
     let mut len = 1;
     for (n, content_len) in iter {
         if prev.checked_add(1) != Some(n) {
             break;
         }
-        let next_framed = framed.saturating_add(content_len.saturating_add(LINE_LEN_PREFIX_BYTES));
+        let next_framed = framed
+            .saturating_add(charged_line_cost(content_len).saturating_add(LINE_LEN_PREFIX_BYTES));
         if next_framed > max_payload {
             break;
         }
@@ -1381,7 +1494,7 @@ mod proofs {
         }
     }
 
-    // r[verify store.log.write-read-bound]
+    // r[verify store.log.write-read-bound+2]
     /// [`bounded_contiguous_prefix_len`]'s contract over every input of
     /// up to 4 lines with fully symbolic numbers, sizes, and bound:
     /// (1) the result never exceeds the unbounded contiguous prefix;
@@ -1410,11 +1523,16 @@ mod proofs {
         } else {
             assert!(bounded >= 1);
         }
-        // (3) Within budget, except the singleton escape.
+        // (3) Within budget — the CHARGED budget (bug_298: every line
+        // costs `charged_line_cost` + its frame, so an all-empty run
+        // cannot pack `max_payload / LINE_LEN_PREFIX_BYTES` lines) —
+        // except the singleton escape.
         if bounded > 1 {
             let mut framed: u64 = 0;
             for &(_, content) in &lines[..bounded] {
-                framed = framed.saturating_add(content.saturating_add(LINE_LEN_PREFIX_BYTES));
+                framed = framed.saturating_add(
+                    charged_line_cost(content).saturating_add(LINE_LEN_PREFIX_BYTES),
+                );
             }
             assert!(framed <= max_payload);
         }
@@ -1800,7 +1918,7 @@ mod tests {
         assert_eq!(lens(&[u64::MAX - 1, u64::MAX]), 2);
     }
 
-    // r[verify store.log.write-read-bound]
+    // r[verify store.log.write-read-bound+2]
     #[test]
     fn bounded_prefix_len_table() {
         let f = |v: &[(u64, u64)], cap: u64| bounded_contiguous_prefix_len(v.iter().copied(), cap);
@@ -1814,12 +1932,77 @@ mod tests {
             f(&run, 1000),
             contiguous_prefix_len(run.iter().map(|&(n, _)| n))
         );
-        // The cap splits a contiguous run: 2 lines of framed 14 fit in
-        // 28; the third would make 42 > 28.
-        assert_eq!(f(&run, 28), 2);
+        // The cap splits a contiguous run: 2 lines of charged 46
+        // (10 content + 32 overhead + 4 frame) fit in 92; the third
+        // would make 138 > 92.
+        assert_eq!(f(&run, 92), 2);
         // A number gap still ends the run before the cap does.
         assert_eq!(f(&[(0, 1), (2, 1), (3, 1)], u64::MAX), 1);
         // Exactly at the cap is in-budget.
-        assert_eq!(f(&[(0, 10), (1, 10)], 28), 2);
+        assert_eq!(f(&[(0, 10), (1, 10)], 92), 2);
+    }
+
+    // r[verify store.log.write-read-bound+2]
+    /// bug_298's write-side red: an all-empty contiguous run against
+    /// the production payload bound. Pre-fix (bare `content + 4`
+    /// framing) the cutter admitted all 500,000 lines into one chunk
+    /// (recorded red: `left: 500000, right: 466033`); charged, the
+    /// drain tops out at exactly [`MAX_CHUNK_LINES`] — the read path
+    /// can never again be handed a multi-million-line chunk written by
+    /// our own cutter.
+    #[test]
+    fn empty_line_run_bounded_by_charged_cost() {
+        let bounded =
+            bounded_contiguous_prefix_len((0..500_000u64).map(|n| (n, 0)), MAX_CHUNK_PAYLOAD_BYTES);
+        assert_eq!(bounded as u64, MAX_CHUNK_LINES);
+        // The const family's arithmetic anchors (the docs cite these
+        // numbers; a drive-by constant edit must show up here).
+        assert_eq!(MAX_CHUNK_LINES, 466_033);
+        assert_eq!(MAX_CHUNK_LINES_ABS, 4_194_304);
+        assert_eq!(MAX_BATCH_LINES, MAX_CHUNK_LINES);
+        assert_eq!(charged_line_cost(0), PER_LINE_OVERHEAD_BYTES);
+        assert_eq!(charged_line_cost(u64::MAX), u64::MAX);
+    }
+
+    /// bug_298's admission-axis red: a 4,194,304-empty-line batch (the
+    /// pre-fix theoretical chunk maximum) was `Accepted { end: .. }`
+    /// before the oversized arm existed (recorded red:
+    /// `left: Accepted { end: 4194304 }, right: RejectedOversizedBatch`);
+    /// now it is rejected at admission, before any per-line work, and
+    /// the stream-open semantics match the other per-batch rejections.
+    #[test]
+    fn oversized_batch_rejected_at_admission() {
+        use AcceptVerdict::*;
+        // The exact amplification payload from the finding.
+        assert_eq!(
+            accept_verdict(0, None, 0, 4_194_304),
+            RejectedOversizedBatch
+        );
+        // Boundary: one chunk's charged capacity is admitted...
+        assert_eq!(
+            accept_verdict(0, None, 0, MAX_BATCH_LINES),
+            Accepted {
+                end: MAX_BATCH_LINES
+            }
+        );
+        // ...one more line is not.
+        assert_eq!(
+            accept_verdict(0, None, 0, MAX_BATCH_LINES + 1),
+            RejectedOversizedBatch
+        );
+        // Check order: overflow still wins (unrepresentable end),
+        // oversized wins over the monotone floor and the ceiling.
+        assert_eq!(
+            accept_verdict(0, None, u64::MAX, u64::MAX),
+            RejectedOverflow
+        );
+        assert_eq!(
+            accept_verdict(10, None, 0, MAX_BATCH_LINES + 1),
+            RejectedOversizedBatch
+        );
+        assert_eq!(
+            accept_verdict(0, Some(5), 7, MAX_BATCH_LINES + 1),
+            RejectedOversizedBatch
+        );
     }
 }

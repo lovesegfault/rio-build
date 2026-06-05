@@ -189,6 +189,38 @@ pub async fn read_chunk(
         return Ok(Vec::new());
     }
 
+    // r[impl store.log.write-read-bound+2]
+    // Pre-GET refusal (bug_298's read axis): a manifest row claiming
+    // more lines than ANY decodable payload could frame
+    // (`MAX_CHUNK_LINES_ABS` — every line costs at least its 4-byte
+    // prefix against the 16 MiB payload bound) is corrupt by
+    // construction. Refuse it BEFORE the GET and before the
+    // proportional `Vec` allocations its count requests; typed
+    // permanent (`LOG_UNSERVABLE_METADATA_KEY`) so the reader exit law
+    // stops re-dialing it. No legitimately-written chunk, old or new,
+    // can trip this — the bound is the pre-fix theoretical ceiling,
+    // not the post-fix charged one.
+    if chunk.line_count > rio_log_kernel::MAX_CHUNK_LINES_ABS {
+        error!(
+            s3_key = %chunk.s3_key,
+            exec_id = %chunk.exec_id,
+            manifest_count = chunk.line_count,
+            bound = rio_log_kernel::MAX_CHUNK_LINES_ABS,
+            "TailLog: manifest row claims more lines than any decodable chunk can hold"
+        );
+        let mut status = Status::internal(format!(
+            "TailLog: manifest row claims {} lines, past the {}-line absolute bound              (corrupt row): {}",
+            chunk.line_count,
+            rio_log_kernel::MAX_CHUNK_LINES_ABS,
+            chunk.s3_key
+        ));
+        status.metadata_mut().insert(
+            rio_proto::LOG_UNSERVABLE_METADATA_KEY,
+            tonic::metadata::MetadataValue::from_static("oversized_chunk"),
+        );
+        return Err(status);
+    }
+
     let blob = store.get(&chunk.s3_key).await.map_err(|e| match e {
         LogChunkError::NotFound { key } => {
             // The one condition in this file that means "lines are
@@ -622,6 +654,60 @@ mod tests {
     const DRV_HASH_32: &str = "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm";
     /// A full store path that normalizes to [`DRV_HASH_32`].
     const DRV_PATH: &str = "/nix/store/0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm-hello-2.12.drv";
+
+    // r[verify store.log.write-read-bound+2]
+    /// bug_298's read-axis red: a manifest row claiming more lines than
+    /// any decodable payload could frame. Pre-fix, `read_chunk` went to
+    /// the object store (the recorded red: the error said `missing
+    /// chunk object (data loss)` — the GET happened and misclassified
+    /// the corrupt row as loss, with no unservable metadata); post-fix
+    /// the row is refused BEFORE the GET, typed permanent via
+    /// `LOG_UNSERVABLE_METADATA_KEY` so the reader exit law stops
+    /// re-dialing, and the absence of the object never enters into it.
+    #[tokio::test]
+    async fn oversized_manifest_row_refused_before_get() {
+        // Empty store: if the pre-GET check were missing, the GET would
+        // produce the NotFound/data-loss shape instead.
+        let store = MemoryLogChunkStore::default();
+        let chunk = ChunkRef {
+            exec_id: Uuid::now_v7(),
+            s3_key: "logs/does-not-exist".into(),
+            first_line: 0,
+            line_count: rio_log_kernel::MAX_CHUNK_LINES_ABS + 1,
+        };
+        let mut cursor = LineCursor::new(0);
+        let err = read_chunk(&store, &chunk, &[], &mut cursor)
+            .await
+            .expect_err("a row past the absolute line bound must refuse");
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(
+            err.message().contains("absolute bound"),
+            "refusal names the bound, not data loss: {}",
+            err.message()
+        );
+        assert_eq!(
+            err.metadata()
+                .get(rio_proto::LOG_UNSERVABLE_METADATA_KEY)
+                .and_then(|v| v.to_str().ok()),
+            Some("oversized_chunk"),
+            "typed permanent so the exit law stops re-dialing"
+        );
+        // The boundary itself is NOT refused: exactly ABS lines claimed
+        // proceeds to the (empty) store and surfaces as the loss shape.
+        let boundary = ChunkRef {
+            line_count: rio_log_kernel::MAX_CHUNK_LINES_ABS,
+            ..chunk
+        };
+        let mut cursor = LineCursor::new(0);
+        let err = read_chunk(&store, &boundary, &mut [][..], &mut cursor)
+            .await
+            .expect_err("missing object is still an error, but a GET-shaped one");
+        assert!(
+            err.message().contains("missing chunk object"),
+            "boundary rows pass the pre-GET check: {}",
+            err.message()
+        );
+    }
 
     /// Seed one chunk: the `drv_log_chunks` manifest row AND the
     /// compressed object at the manifest's `s3_key`, from the same

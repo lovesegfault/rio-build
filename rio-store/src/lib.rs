@@ -514,6 +514,9 @@ pub fn describe_metrics() {
          past the execution's recorded end after the completeness seal \
          lands; per-batch, stream stays open, also counted once per \
          straddling batch that is truncated rather than dropped whole), \
+         oversized_batch (more lines in one batch than one chunk's charged \
+         capacity; per-batch, stream stays open, rejected before any \
+         per-line work), \
          byte_cap (per-execution cap, stream-fatal), chunk_cap (the \
          per-execution chunk-count bound refused at admission), or the \
          replica-wide admission gates max_streams / byte_budget (this \

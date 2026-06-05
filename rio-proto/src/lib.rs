@@ -72,6 +72,12 @@ pub mod validated;
 // (Tracey doesn't scan .proto — the documentary annotations live in
 // build_types.proto next to the wire definitions; this marker is the
 // scannable anchor at the Rust point-of-generation.)
+/// Re-export of the prost runtime the generated types are built
+/// against, so downstream crates can reach trait methods on them
+/// (e.g. `Message::encoded_len` for wire-size laws) without pinning
+/// their own `prost` dependency to the matching version.
+pub use prost;
+
 pub mod types {
     tonic::include_proto!("rio.types");
 }

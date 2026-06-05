@@ -1113,7 +1113,8 @@ impl AppendDriver {
                             // `accept`, the stream stays open.
                             Ok(AcceptOutcome::RejectedNonMonotone)
                             | Ok(AcceptOutcome::RejectedOverflow)
-                            | Ok(AcceptOutcome::RejectedPastFinal) => {}
+                            | Ok(AcceptOutcome::RejectedPastFinal)
+                            | Ok(AcceptOutcome::RejectedOversizedBatch) => {}
                             // Stream-fatal (the per-execution byte cap).
                             Err(status) => return LoopExit::Abort(status),
                         }
