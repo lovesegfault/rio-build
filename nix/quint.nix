@@ -6054,6 +6054,40 @@ in
       ];
     };
 
+    # Authorization verdicts: declared-verifier transport law, keyed
+    # no-undeclared-admit, WatchBuild lifecycle-phase independence, and
+    # TailLog request-string independence (bughunt-2 slot 4: bug_237 /
+    # merged_bug_122 / bug_213 / merged_bug_064). Verdicts are
+    # admit/deny only — the resident-phase status asymmetry is the
+    # signed §5-S Q4 residual. Tier-1, exhausts instantly.
+    # r[verify store.authz.declared-verifier]
+    # r[verify sched.tenant.authz+3]
+    # r[verify store.log.tail-ownership]
+    quint-authz = mkQuintCheck {
+      name = "authz";
+      spec = "authz";
+      invariants = [
+        "enforcementFromDeclaredVerifiersOnly"
+        "noUndeclaredAdmitWhenKeyed"
+        "lifecyclePhaseIndependence"
+        "requestStringIndependence"
+      ];
+    };
+
+    # Non-vacuity witness for the two green layer invariants above:
+    # "no keyed declared credential ever admits" MUST be falsified —
+    # the advertised legs (claims on keyed TenantJwt, verified service
+    # token on keyed Service, assignment header on keyed
+    # AssignmentToken) really admit somewhere. An enforcement collapse
+    # into deny-everything would hold the green invariants vacuously;
+    # this turns that into a red check.
+    quint-authz-witness-advertised-leg = mkQuintWitnessCheck {
+      name = "authz-witness-advertised-leg";
+      spec = "authz";
+      main = "authz";
+      witness = "advertisedLegSilent";
+    };
+
     # Open-attempt closure under cancellation: the status outbox + the
     # establishment kernel's charge-free arm (bug_347). Tier-1.
     # r[verify sched.attempt.cancel-close-driven+1]
@@ -6109,6 +6143,40 @@ in
       extraSpecs = [ "gwBuildResync" ];
       step = "calibStep";
       witness = "snapshotOwedNoConsume";
+    };
+    # Authz pre-fix laws frozen (bughunt-2 slot 4) — each falsifies
+    # its paired green invariant.
+    quint-authz-calib-237-foreign-knob = mkQuintWitnessCheck {
+      name = "authz-calib-237-foreign-knob";
+      spec = "calibration/authz-237-foreign-knob";
+      main = "authzCalib237ForeignKnob";
+      extraSpecs = [ "authz" ];
+      step = "calibStep";
+      witness = "enforcementFromDeclaredVerifiersOnly";
+    };
+    quint-authz-calib-122-dead-leg = mkQuintWitnessCheck {
+      name = "authz-calib-122-dead-leg";
+      spec = "calibration/authz-122-dead-leg";
+      main = "authzCalib122DeadLeg";
+      extraSpecs = [ "authz" ];
+      step = "calibStep";
+      witness = "noUndeclaredAdmitWhenKeyed";
+    };
+    quint-authz-calib-213-phase = mkQuintWitnessCheck {
+      name = "authz-calib-213-phase";
+      spec = "calibration/authz-213-phase";
+      main = "authzCalib213Phase";
+      extraSpecs = [ "authz" ];
+      step = "calibStep";
+      witness = "lifecyclePhaseIndependence";
+    };
+    quint-authz-calib-064-string = mkQuintWitnessCheck {
+      name = "authz-calib-064-string";
+      spec = "calibration/authz-064-string";
+      main = "authzCalib064String";
+      extraSpecs = [ "authz" ];
+      step = "calibStep";
+      witness = "requestStringIndependence";
     };
     quint-tailreader-calib-orphan-hotloop = mkQuintWitnessCheck {
       name = "tailreader-calib-orphan-hotloop";
