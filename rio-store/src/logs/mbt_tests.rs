@@ -318,6 +318,10 @@ impl Projection {
 #[serde(tag = "tag", content = "value")]
 enum ModelCount {
     NoCount,
+    /// The assignment-close stamp (sched.db.exec-stamp-on-close):
+    /// status terminal, `final_line_count` NULL — terminal for the
+    /// sweep, countless for the completeness gate.
+    StampedNoCount,
     Count(u64),
 }
 
@@ -542,6 +546,26 @@ impl MbtSystem {
         )
         .bind(exec_id)
         .bind(count)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// `closeExecStamp(e)`: the scheduler's assignment close stamps
+    /// the lifecycle row terminal with NO count
+    /// (sched.db.exec-stamp-on-close — `close_assignments_sql`'s
+    /// stamped CTE, `status IS NULL` guard = first verdict wins). The
+    /// store crate cannot call the scheduler's closer; the mirror
+    /// executes the stamp's effect with the same qual. `'failed'`
+    /// stands for the close family's status — the projection
+    /// distinguishes only NULL / terminal / counted.
+    async fn close_exec_stamp(&mut self, e: u64) -> Result<()> {
+        let exec_id = self.exec(e)?.exec_id;
+        sqlx::query(
+            "UPDATE drv_executions SET status = 'failed', finished_at = now() \
+             WHERE exec_id = $1 AND status IS NULL",
+        )
+        .bind(exec_id)
         .execute(self.pool())
         .await?;
         Ok(())
@@ -916,20 +940,38 @@ impl MbtSystem {
             };
             exec_row_exists.insert(e, exists);
 
-            // -- dbFinalCount: through the store's own accessor, so the
-            // terminal-status filter and the NULL collapse are the
-            // implementation's, not the test's.
-            let count = match exec_id {
-                None => None,
-                Some(id) => gate::sealed_final_line_count(self.pool(), id)
-                    .await
-                    .map_err(|s| anyhow::anyhow!("sealed_final_line_count: {s}"))?,
+            // -- dbFinalCount: the ceiling half through the store's own
+            // accessor (the terminal-status filter and the NULL
+            // collapse are the implementation's, not the test's); the
+            // terminal half through the same EXEC_STATUS_TERMINAL
+            // vocabulary the sweep eligibility reads — a terminal row
+            // with no recorded count is the model's `StampedNoCount`
+            // (the assignment-close stamp).
+            let (terminal, count) = match exec_id {
+                None => (false, None),
+                Some(id) => {
+                    let count = gate::sealed_final_line_count(self.pool(), id)
+                        .await
+                        .map_err(|s| anyhow::anyhow!("sealed_final_line_count: {s}"))?;
+                    let status: Option<String> =
+                        sqlx::query_scalar("SELECT status FROM drv_executions WHERE exec_id = $1")
+                            .bind(id)
+                            .fetch_optional(self.pool())
+                            .await
+                            .context("dbFinalCount status probe")?
+                            .flatten();
+                    let terminal = status
+                        .as_deref()
+                        .is_some_and(|s| rio_migrations::schema::EXEC_STATUS_TERMINAL.contains(&s));
+                    (terminal, count)
+                }
             };
             db_final_count.insert(
                 e,
-                match count {
-                    None => ModelCount::NoCount,
-                    Some(n) => ModelCount::Count(u64::try_from(n).context("negative count")?),
+                match (terminal, count) {
+                    (_, Some(n)) => ModelCount::Count(u64::try_from(n).context("negative count")?),
+                    (true, None) => ModelCount::StampedNoCount,
+                    (false, None) => ModelCount::NoCount,
                 },
             );
 
@@ -1353,7 +1395,11 @@ const SWEEP_COMPLETE_LOG: NamedRun = NamedRun {
         ExecutionExpires(1),
         SweepChunks(1),
         // v2 ownership split: the store pass leaves the lifecycle row;
-        // the scheduler reclaims it once the attempt ledger releases.
+        // the scheduler reclaims it once the attempt ledger releases
+        // AND the artifact conjuncts clear — the builder disconnect
+        // ends the live ingest-session registry row
+        // (store.log.sweep-ownership+1's sixth conjunct).
+        BuilderDisconnects(1),
         LedgerReleases(1),
         GcExecRow(1),
     ],
@@ -1616,6 +1662,10 @@ impl LogServiceDriver {
                 self.rt.block_on(sys.deliver_ack(e))?;
             },
             builderDisconnectsAny(e: u64) => self.sys().builder_disconnects(e)?,
+            closeExecStampAny(e: u64) => {
+                let sys = self.sys.as_mut().expect("init ran");
+                self.rt.block_on(sys.close_exec_stamp(e))?;
+            },
             sessionAbortsAny(e: u64, s: u64) => self.sys().session_aborts(e, s)?,
             // Builder-side: the uploader drops its retransmit buffer.
             // Disclosed loss the store never sees.
