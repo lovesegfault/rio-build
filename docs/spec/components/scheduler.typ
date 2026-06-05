@@ -3815,6 +3815,44 @@ counters (#(refs.metric)("rio_scheduler_lease_rebound_total"),
 #(refs.metric)("rio_scheduler_lease_acquired_total") counts acquire edges
 only.
 
+#r("sched.lease.cancelled-write")[
+  A lease write abandoned by a client-side deadline MUST be treated as
+  possibly committed, never as discarded. The renew composition MUST bound
+  its read and write phases separately, so that a mutating request is only
+  ever transmitted after a completed read and a transmitted request's
+  response is always awaited under its own budget; every mutating act that
+  fails after possible transmission MUST be recorded as an unconfirmed write
+  anchored at the attempt's pre-send clock reading, keeping the OLDEST
+  anchor while unconsumed; and the blind-window clock MUST be stamped from
+  that ledger only by own-commit evidence --- a later completed read
+  observing this replica as holder with a resourceVersion unequal to the
+  previous completed read's --- at the LEDGER's anchor, never the observing
+  read's time. A completed read with an unchanged resourceVersion MUST
+  stamp nothing.
+]
+
+The regime this closes is the mid-band apiserver: reads answer inside their
+budget, writes are too slow to answer but still commit. Pre-fix the single
+composition deadline stamped nothing on expiry, so the leader self-fenced at
+`SELF_FENCE_AFTER` and stayed out --- while its committed-but-cancelled
+renews kept bumping the resourceVersion, re-anchoring every standby's
+observed-record clock (#rref("sched.lease.k8s-lease")) --- an unbounded
+leaderless livelock with the lease perpetually "live" and nobody believing.
+The split phases keep both failure directions honest: a truly blind replica
+fails its READ, transmits nothing, and freezes the rv for stealers (so
+takeover still works); a replica whose writes commit proves it with the rv
+movement its own next read observes, and stays leader. Stamping at the
+ledger's anchor --- minted before the send, so anchor ≤ send ≤ apiserver
+commit --- keeps the NeverDual arithmetic intact: the window the victim
+fences on is never shorter than one anchored at the commit the stealer's
+clock starts from (the `leaderElectionDroppedWrite` regime of
+`docs/spec/models/leaderElection.qnt` is the machine arbiter; its falsify
+twin drops the evidence action and demonstrates the livelock). Read-stamping
+--- restarting the window on a bare completed read with a frozen rv --- is
+the tempting wrong fix: it would let a read-only replica believe forever
+while a healthy peer steals, which is exactly a dual-belief seed; the
+frozen-rv companion test and the model twin pin the refusal.
+
 #r("sched.health.shared-reporter+2")[
   The lease toggle calls `set_not_serving`/`set_serving` on the SAME
   `HealthReporter` the gRPC server was built with (single port). A fresh

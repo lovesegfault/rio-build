@@ -139,6 +139,22 @@ pub const RENEW_INTERVAL: Duration = Duration::from_secs(5);
 /// while still giving 2 attempts before SELF_FENCE_AFTER.
 const RENEW_SLOP: Duration = Duration::from_secs(2);
 
+/// Per-phase budget for the split renew round-trip
+/// (`sched.lease.cancelled-write`): the 3s belt
+/// (`RENEW_INTERVAL − RENEW_SLOP`) tiled into a read phase and a write
+/// phase. Bounding the phases SEPARATELY is load-bearing twice over: a
+/// mutating request is only ever transmitted after a COMPLETED read —
+/// so a truly-blind replica transmits nothing, its rv freezes, and
+/// stealing still works — and a transmitted write always has a full
+/// budget for its response, so "PUT sent but its response window was
+/// eaten by a slow GET" is unrepresentable. Healthy p99 for either
+/// phase is <100ms; 1.5s each is generous.
+const RENEW_PHASE_DEADLINE: Duration = Duration::from_millis(1500);
+const _: () = assert!(
+    RENEW_PHASE_DEADLINE.as_millis() * 2 == RENEW_INTERVAL.as_millis() - RENEW_SLOP.as_millis(),
+    "the two phase budgets must exactly tile the renew belt"
+);
+
 /// The asymmetry margin between the leader's self-fence deadline and the
 /// follower's steal threshold. The two deadlines are anchored at
 /// different moments (the leader stamps `last_successful_renew` when its
@@ -1073,6 +1089,13 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     // straddling SELF_FENCE_AFTER fences at the first post-resume
     // tick). Stamped only with attempt-START anchors; see BlindClock.
     let mut blind = BlindClock::starting_at(RenewAnchor::mint(&fence_now));
+    // r[impl sched.lease.cancelled-write]
+    // The cancelled-write ledger and its evidence cursor: `unconfirmed`
+    // records the oldest transmitted-but-unanswered mutating act;
+    // `last_fetched_rv` is the rv of the last COMPLETED read, the
+    // baseline a later read's rv movement is judged against.
+    let mut unconfirmed: Option<UnconfirmedPut> = None;
+    let mut last_fetched_rv: Option<String> = None;
     let mut interval = tokio::time::interval(RENEW_INTERVAL);
     // Skip: if one renewal is slow (apiserver busy), don't fire
     // twice immediately. SELF_FENCE_AFTER is 11s; we have slack.
@@ -1160,13 +1183,22 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
         // stamped window — the response's arrival time never enters the
         // blind clock (there is no API for it).
         let attempt_anchor = RenewAnchor::mint(&fence_now);
-        match tokio::time::timeout(renew_deadline, election.try_acquire_or_renew()).await {
-            Ok(Ok(result)) => {
+        match election
+            .renew_phased(RENEW_PHASE_DEADLINE, RENEW_PHASE_DEADLINE)
+            .await
+        {
+            election::RenewOutcome::Completed { result, facts } => {
                 // Successful round-trip (apiserver answered). Even
                 // Standby/Conflict restart the blind window — we KNOW
                 // the apiserver state, we just don't hold the lease.
                 // The clock tracks "am I blind", not "am I leader".
                 blind.stamp(attempt_anchor);
+                // A completed round answers the unconfirmed question
+                // wholesale: the fresh stamp supersedes the ledger's
+                // older anchor, and the apiserver state (whoever holds)
+                // is now known — there is nothing left in doubt.
+                unconfirmed = None;
+                last_fetched_rv = facts.map(|f| f.resource_version);
                 // Conflict on renew = someone stole since our GET
                 // → unambiguous lose. Conflict on steal = another
                 // standby raced us → we were never leading. Both
@@ -1401,18 +1433,117 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                     inflight_marks = Some(task);
                 }
             }
-            outcome @ (Ok(Err(_)) | Err(_)) => {
-                // Either apiserver returned an error (Ok(Err)) or
-                // our timeout fired before it answered (Err(Elapsed)).
-                // Both mean: no fresh view of the Lease object.
-                match &outcome {
-                    Ok(Err(e)) => {
+            election::RenewOutcome::FetchedActFailed {
+                facts,
+                put_transmitted,
+                error,
+            } => {
+                match &error {
+                    Some(e) => warn!(
+                        error = %e,
+                        put_transmitted,
+                        "lease act phase failed after a completed read; retrying next tick"
+                    ),
+                    None => warn!(
+                        deadline = ?RENEW_PHASE_DEADLINE,
+                        put_transmitted,
+                        "lease act phase timed out after a completed read; retrying next tick"
+                    ),
+                }
+
+                // r[impl sched.lease.cancelled-write]
+                // Own-commit evidence: the read completed, so we have a
+                // fresh holder/rv view even though the write phase
+                // died. If the lease names US and the rv moved since
+                // our last completed read, some write of OURS committed
+                // (no other writer leaves us as holder while moving the
+                // rv) — consume the ledger and stamp the blind clock at
+                // the LEDGER's anchor (anchor ≤ send ≤ commit; never
+                // the observing read's time). A frozen rv stamps
+                // NOTHING: with no commit there is no evidence, the
+                // window keeps aging, and the fence fires on schedule
+                // (the rv-frozen companion test pins this direction).
+                if let Some(f) = &facts {
+                    if f.holder_is_us
+                        && last_fetched_rv
+                            .as_deref()
+                            .is_some_and(|prev| prev != f.resource_version)
+                        && let Some(led) = unconfirmed.take()
+                    {
+                        blind.stamp(led.anchor);
+                        if !standing.believes() {
+                            // A self-fence inside the mid-band window
+                            // already ran the lose edge; the evidence
+                            // proves the apiserver still (or again)
+                            // names us holder, so re-enter through the
+                            // ordinary acquire edge with the FETCHED
+                            // transition count — the same-count case is
+                            // the documented same-epoch re-acquire
+                            // (generation fetch_max no-op, in-flight
+                            // work survives). The bump-confirmation is
+                            // deliberately NOT run here: confirmation
+                            // stays a completed-round property
+                            // (sched.recovery.bump-confirm), and
+                            // pre-fix this regime fenced outright —
+                            // strictly worse than a gated recovery.
+                            let new_gen = state.on_acquire(f.transitions);
+                            info!(
+                                generation = new_gen,
+                                holder = %cfg.holder_id,
+                                "own-commit evidence (holder=us, rv moved) restored \
+                                 leadership belief after an abandoned write"
+                            );
+                            marks_dirty.mark();
+                            hooks.on_acquire();
+                        }
+                        // Counts as a Leading observation: the read is
+                        // apiserver-authoritative about the hold.
+                        standing.on_observed(true);
+                    }
+                    last_fetched_rv = Some(f.resource_version.clone());
+                } else {
+                    // 404→Create round: no lease was fetched; the next
+                    // read starts a fresh rv baseline.
+                    last_fetched_rv = None;
+                }
+
+                // Record THIS round's transmitted write as in doubt —
+                // kept at the OLDEST anchor: an existing unconsumed
+                // entry is never overwritten (if several writes are in
+                // doubt, the blind window must cover the eldest).
+                if put_transmitted && unconfirmed.is_none() {
+                    unconfirmed = Some(UnconfirmedPut {
+                        anchor: attempt_anchor,
+                    });
+                }
+
+                // The fence still arbitrates: evidence (above) is the
+                // only thing that stamps on this path, so a regime
+                // where writes stop committing fences on the same
+                // schedule as a full outage.
+                if maybe_self_fence(
+                    &state,
+                    &mut standing,
+                    &marks_dirty,
+                    blind.blind_for(fence_now()),
+                ) {
+                    hooks.on_lose();
+                }
+            }
+            election::RenewOutcome::FetchFailed { error } => {
+                // No fresh view of the Lease object at all — and,
+                // because a mutating request is only ever transmitted
+                // after a completed read (renew_phased's phase order),
+                // provably nothing was sent: no ledger entry, the rv
+                // freezes for stealers, and this replica is exactly as
+                // blind as it looks.
+                match &error {
+                    Some(e) => {
                         warn!(error = %e, "lease renew failed (apiserver error); retrying next tick");
                     }
-                    Err(_) => {
-                        warn!(deadline = ?renew_deadline, "lease renew TIMED OUT (apiserver hung?); retrying next tick");
+                    None => {
+                        warn!(deadline = ?RENEW_PHASE_DEADLINE, "lease read phase TIMED OUT (apiserver hung?); retrying next tick");
                     }
-                    Ok(Ok(_)) => unreachable!(),
                 }
                 //
                 // Local self-fence: if SELF_FENCE_AFTER has elapsed
@@ -1692,6 +1823,27 @@ impl BlindClock {
     fn blind_for(&self, now: Duration) -> Duration {
         now.saturating_sub(self.last)
     }
+}
+
+/// Ledger entry for a transmitted-but-unconfirmed lease write
+/// (`sched.lease.cancelled-write`): the act phase failed AFTER a
+/// mutating request may have left this process. "Cancelled" is not
+/// "discarded" — the apiserver may commit the request after our
+/// deadline, and a committed renew/steal bumps the rv every standby's
+/// steal clock keys on. While unconsumed the entry keeps the OLDEST
+/// in-doubt anchor (if several writes are in doubt, the blind window
+/// must cover the eldest); it is consumed ONLY by own-commit evidence
+/// — a later COMPLETED read observing this replica as holder with a
+/// moved rv proves some write of ours committed — and the blind clock
+/// then stamps at THIS entry's anchor, never the observing read's
+/// time: anchor ≤ send ≤ commit, so the stamped window is never
+/// shorter than one anchored at the commit, preserving the NeverDual
+/// separation arithmetic (`FENCE_MARGIN`). A completed read with an
+/// UNCHANGED rv stamps nothing — read-stamping is the regression the
+/// model's falsify twin guards (it would let a read-only replica
+/// believe past every steal).
+struct UnconfirmedPut {
+    anchor: RenewAnchor,
 }
 
 /// Generation-counted dirty flag for the leader-marks reconcile
@@ -3384,6 +3536,222 @@ mod tests {
              marks outage)"
         );
         assert!(!in_flight.load(Ordering::SeqCst));
+    }
+
+    // ---- merged_bug_303: cancelled lease writes are not discarded ----
+
+    /// Test-side apiserver lease body for the parked-request loop
+    /// tests: holder + transitions + rv, the three fields the loop's
+    /// decision and evidence logic read.
+    fn park_lease_json(
+        holder: Option<&str>,
+        transitions: u64,
+        rv: u64,
+    ) -> k8s_openapi::serde_json::Value {
+        json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": "rio-sched",
+                "namespace": "default",
+                "resourceVersion": rv.to_string(),
+            },
+            "spec": {
+                "holderIdentity": holder,
+                "leaseTransitions": transitions,
+                "leaseDurationSeconds": 15,
+            },
+        })
+    }
+
+    /// merged_bug_303 (the mid-band livelock): an apiserver that
+    /// ANSWERS reads promptly but is too slow to answer writes inside
+    /// the belt — while still COMMITTING them — must not depose the
+    /// leader forever. Pre-fix, the single composition deadline
+    /// stamped nothing on Err(Elapsed): the leader self-fenced at 11s
+    /// and stayed out indefinitely, while its committed-but-cancelled
+    /// PUTs kept bumping the rv and re-anchoring every standby's
+    /// steal clock — an unbounded leaderless livelock. Post-fix the
+    /// loop records each transmitted-then-abandoned write as an
+    /// UnconfirmedPut and consumes it with own-commit evidence (a
+    /// completed read observing holder==us with a moved rv), stamping
+    /// the blind clock at the LEDGER's anchor — the leader keeps
+    /// leading exactly because its writes keep committing.
+    // r[verify sched.lease.cancelled-write]
+    #[tokio::test(start_paused = true)]
+    async fn mid_band_committed_writes_keep_the_leader_leading() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Round 1 (healthy): the apiserver answers both phases. The
+        // loop renews a lease it already holds server-side and takes
+        // the acquire edge.
+        let mut rv: u64 = 10;
+        let get = park.next().await;
+        assert!(get.path.contains("/leases/rio-sched"));
+        get.respond_ok(park_lease_json(Some("us"), 3, rv));
+        let put = park.next().await;
+        rv += 1;
+        put.respond_ok(park_lease_json(Some("us"), 3, rv));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        // The init-dirty marks reconcile fires after the first leading
+        // round; answer its own-pod PATCH so the flag settles clean and
+        // no further marks traffic interleaves with the lease rounds.
+        let patch = park.next().await;
+        assert!(patch.path.contains("/pods/us"), "marks reconcile PATCH");
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Mid-band rounds: GET answered promptly; the PUT is never
+        // answered (the write deadline elapses via auto-advance — the
+        // paused clock jumps to the next armed timer whenever every
+        // task is parked) but COMMITS server-side: the next GET serves
+        // the bumped rv. Dropping the parked request models the
+        // response the client never saw. 12 rounds = 60s of sustained
+        // mid-band; the tick cadence stays exactly RENEW_INTERVAL
+        // because the test never advances the clock by hand.
+        for round in 0..12 {
+            let get = park.next().await;
+            assert!(
+                get.path.contains("/leases/rio-sched"),
+                "round {round}: read phase"
+            );
+            get.respond_ok(park_lease_json(Some("us"), 3, rv));
+            let put = park.next().await;
+            rv += 1;
+            drop(put);
+        }
+        settle().await;
+
+        assert!(
+            state.is_leader(),
+            "a leader whose cancelled writes provably COMMIT (holder==us, \
+             rv moving) must keep leading — fencing it forever while its \
+             own PUTs re-anchor every standby's steal clock is the \
+             unbounded leaderless livelock"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            0,
+            "no lose edge may fire while own-commit evidence holds"
+        );
+
+        shutdown.cancel();
+        // Graceful-release leg: answer its GET with a 404 so the loop
+        // exits cleanly (no lease to release).
+        if let Some(req) = park.try_next().await {
+            req.respond_status(404, "NotFound", "gone");
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// The safety companion (sched.lease.cancelled-write's second
+    /// half): when the abandoned writes DON'T commit — the rv the
+    /// reads serve stays frozen — there is no own-commit evidence, the
+    /// blind clock must never be stamped, and the leader must
+    /// self-fence on schedule. A bare completed read with an unchanged
+    /// rv stamps NOTHING (read-stamping is the regression the model's
+    /// falsify twin guards: it would let a read-only replica believe
+    /// past every steal).
+    // r[verify sched.lease.cancelled-write]
+    // r[verify sched.lease.self-fence+2]
+    #[tokio::test(start_paused = true)]
+    async fn rv_frozen_act_failures_still_fence_on_schedule() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Healthy acquire round.
+        let rv: u64 = 10;
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, rv));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, rv + 1));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        // Settle the init-dirty marks reconcile (own-pod PATCH) before
+        // the frozen rounds so the parked queue carries lease traffic
+        // only.
+        let patch = park.next().await;
+        assert!(patch.path.contains("/pods/us"), "marks reconcile PATCH");
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Frozen mid-band: reads answer with an UNMOVED rv (the writes
+        // never commit); writes are abandoned (their deadline elapses
+        // via auto-advance). The blind window grows from the healthy
+        // round's anchor; SELF_FENCE_AFTER is 11s, so the fence fires
+        // by the third frozen round.
+        let mut fenced_at: Option<u32> = None;
+        for round in 0..5u32 {
+            let get = park.next().await;
+            get.respond_ok(park_lease_json(Some("us"), 3, rv + 1));
+            let put = park.next().await;
+            drop(put);
+            settle().await;
+            if fenced_at.is_none() && !state.is_leader() {
+                fenced_at = Some(round);
+            }
+        }
+
+        assert!(
+            !state.is_leader(),
+            "with the rv frozen there is no own-commit evidence: the \
+             leader must fence and stay fenced"
+        );
+        assert!(
+            fenced_at.is_some_and(|r| r <= 2),
+            "the fence must fire within the SELF_FENCE_AFTER schedule \
+             (by the third frozen round), got {fenced_at:?}"
+        );
+        assert!(
+            !hooks.loses.lock().expect("loses lock").is_empty(),
+            "the self-fence runs the lose edge"
+        );
+
+        shutdown.cancel();
+        if let Some(req) = park.try_next().await {
+            req.respond_status(404, "NotFound", "gone");
+        }
+        loop_task.await.expect("lease loop exits");
     }
 
     // ---- Peer sweep: stale leader label on another pod ----

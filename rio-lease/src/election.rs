@@ -91,6 +91,51 @@ pub enum Decision {
     Standby,
 }
 
+/// Facts from a completed GET+decide phase, surfaced to the lease loop
+/// for the own-commit evidence rule (`sched.lease.cancelled-write`).
+/// Facts only, never a capability: the loop cannot touch the lease
+/// through these.
+#[derive(Debug)]
+pub(crate) struct FetchFacts {
+    /// The fetched lease names this replica as holder.
+    pub(crate) holder_is_us: bool,
+    /// `metadata.resourceVersion` of the fetched lease (empty string
+    /// if absent — defensive; apiserver objects always carry one).
+    pub(crate) resource_version: String,
+    /// `spec.leaseTransitions` clamped at 0 (the same clamp the act
+    /// phase's `replace()` applies).
+    pub(crate) transitions: u64,
+}
+
+/// Outcome of one phase-bounded election tick
+/// ([`LeaderElection::renew_phased`]). Classifies WHICH phase failed —
+/// the distinction the cancelled-write ledger keys on.
+#[derive(Debug)]
+pub(crate) enum RenewOutcome {
+    /// Both phases completed: the apiserver answered the full
+    /// round-trip. `facts` is `None` only on the 404→Create path
+    /// (there was no lease to fetch).
+    Completed {
+        result: ElectionResult,
+        facts: Option<FetchFacts>,
+    },
+    /// The read phase completed but the act phase failed or timed
+    /// out. With `put_transmitted`, a mutating request may have left
+    /// this process before the failure — the write may still commit
+    /// server-side ("cancelled" is not "discarded"), which is the
+    /// mint condition for the loop's unconfirmed-write ledger.
+    FetchedActFailed {
+        facts: Option<FetchFacts>,
+        put_transmitted: bool,
+        /// `None` = the phase deadline elapsed; `Some` = the apiserver
+        /// (or transport) answered with an error.
+        error: Option<kube::Error>,
+    },
+    /// The read phase itself failed or timed out: provably blind, and
+    /// provably nothing was transmitted (the act never ran).
+    FetchFailed { error: Option<kube::Error> },
+}
+
 /// The result of [`LeaderElection::fetch_and_decide`]: everything the
 /// act phase needs to finish the round-trip.
 ///
@@ -385,9 +430,91 @@ impl LeaderElection {
     /// handled internally — they're expected racing outcomes, not
     /// errors. The caller retries on `Err` without flipping
     /// `is_leader`; see `run_lease_loop`'s error arm.
+    ///
+    /// Unbounded (no internal deadlines) — for tests and one-shot
+    /// callers. The lease loop uses [`Self::renew_phased`], whose
+    /// per-phase budgets are what make an abandoned write classifiable
+    /// (`sched.lease.cancelled-write`).
     pub async fn try_acquire_or_renew(&mut self) -> Result<ElectionResult, kube::Error> {
         let outcome = self.fetch_and_decide(Instant::now()).await?;
         self.act(outcome).await
+    }
+
+    /// One election tick with SEPARATE read- and write-phase budgets
+    /// (`sched.lease.cancelled-write`): the GET+decide phase runs under
+    /// `fetch_deadline`; only after it completes is a mutating request
+    /// transmitted, under its own `act_deadline`. The split is
+    /// load-bearing twice over: a truly-blind replica (failed read)
+    /// transmits nothing — its rv freezes and stealing works — and a
+    /// transmitted write always gets a full budget for its response, so
+    /// "PUT sent but the response window was eaten by a slow GET" is
+    /// unrepresentable.
+    ///
+    /// Failures are classified into the outcome rather than returned:
+    /// the caller's ledger logic branches on WHICH phase died, and a
+    /// `FetchedActFailed` whose decision was mutating means the write
+    /// may have committed server-side ("cancelled" is not "discarded").
+    /// The returned [`FetchFacts`] are facts, never a capability — the
+    /// caller cannot act on the lease through them, so the GET/PUT
+    /// fusion that prevents TOCTOU bugs is preserved.
+    // r[impl sched.lease.cancelled-write]
+    pub(crate) async fn renew_phased(
+        &mut self,
+        fetch_deadline: Duration,
+        act_deadline: Duration,
+    ) -> RenewOutcome {
+        let outcome =
+            match tokio::time::timeout(fetch_deadline, self.fetch_and_decide(Instant::now())).await
+            {
+                Err(_elapsed) => return RenewOutcome::FetchFailed { error: None },
+                Ok(Err(e)) => return RenewOutcome::FetchFailed { error: Some(e) },
+                Ok(Ok(outcome)) => outcome,
+            };
+
+        let facts = match &outcome {
+            FetchOutcome::Create => None,
+            FetchOutcome::Decided { lease, .. } => Some(FetchFacts {
+                holder_is_us: lease
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.holder_identity.as_deref())
+                    == Some(&*self.holder_id),
+                resource_version: lease.metadata.resource_version.clone().unwrap_or_default(),
+                transitions: lease
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.lease_transitions)
+                    .map_or(0, |t| u64::try_from(t).unwrap_or(0)),
+            }),
+        };
+        // Whether the act phase will transmit a mutating request. The
+        // Standby arm performs no I/O, so its act cannot fail at all;
+        // Create POSTs, Renew/Steal PUT. Conservative on failure: any
+        // mutating act that errors or times out counts as possibly
+        // transmitted — over-recording is safe because the ledger is
+        // only ever consumed by observed own-commit evidence.
+        let mutating = matches!(
+            &outcome,
+            FetchOutcome::Create
+                | FetchOutcome::Decided {
+                    decision: Decision::Renew | Decision::Steal,
+                    ..
+                }
+        );
+
+        match tokio::time::timeout(act_deadline, self.act(outcome)).await {
+            Ok(Ok(result)) => RenewOutcome::Completed { result, facts },
+            Ok(Err(e)) => RenewOutcome::FetchedActFailed {
+                facts,
+                put_transmitted: mutating,
+                error: Some(e),
+            },
+            Err(_elapsed) => RenewOutcome::FetchedActFailed {
+                facts,
+                put_transmitted: mutating,
+                error: None,
+            },
+        }
     }
 
     /// The GET + decide half of [`Self::try_acquire_or_renew`].
@@ -397,9 +524,14 @@ impl LeaderElection {
     /// the apiserver GET and the subsequent PUT into separate actions so
     /// the two-replica CAS race (both GET the same resourceVersion, both
     /// PUT, exactly one wins) is explorable. Production code must only
-    /// ever call the composition — a fetch whose outcome is never acted
-    /// on leaves `observed` updated but the lease untouched, which is a
-    /// state the lease loop never produces.
+    /// ever call a composition ([`Self::try_acquire_or_renew`] or the
+    /// phase-bounded [`Self::renew_phased`]) — both fuse the fetch to an
+    /// act attempt, so a fetch is never deliberately left un-acted-on.
+    /// What a composition CAN produce is an act abandoned mid-flight by
+    /// its phase deadline: the transmitted write may still commit
+    /// server-side, which is exactly what the lease loop's
+    /// unconfirmed-write ledger accounts for
+    /// (`sched.lease.cancelled-write`).
     ///
     /// `now` is the instant `decide()` measures observation staleness
     /// against; the composition passes `Instant::now()`, the model-based
