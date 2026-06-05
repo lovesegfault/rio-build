@@ -290,6 +290,9 @@ describe('createLogStream follow mode', () => {
 describe('authRequired terminal state', () => {
   it('unauthenticated ends the stream terminally, no retry', async () => {
     const { ConnectError, Code } = await import('@connectrpc/connect');
+    // The deny happens at the open — a yield before the throw would
+    // deliver a chunk and defeat the auth-denied premise.
+    // eslint-disable-next-line require-yield
     tailLog.mockImplementation(async function* () {
       throw new ConnectError('tenant token required', Code.Unauthenticated);
     });
@@ -305,6 +308,7 @@ describe('authRequired terminal state', () => {
 
   it('permission-denied is the same terminal cause', async () => {
     const { ConnectError, Code } = await import('@connectrpc/connect');
+    // eslint-disable-next-line require-yield
     tailLog.mockImplementation(async function* () {
       throw new ConnectError('not yours', Code.PermissionDenied);
     });

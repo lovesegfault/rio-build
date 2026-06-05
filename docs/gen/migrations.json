@@ -91,6 +91,7 @@
     "091_chunks_deleted_at",
     "092_manifests_claim_phase",
     "093_live_pins_kind_key",
-    "094_establishment_clusters"
+    "094_establishment_clusters",
+    "095_drop_derivations_tenant_id"
   ]
 }

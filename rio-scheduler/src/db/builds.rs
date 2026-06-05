@@ -352,7 +352,7 @@ impl SchedulerDb {
     /// (post-cleanup or post-failover). `None` when the row is missing
     /// OR not terminal — callers fall back to `NotFound` then.
     ///
-    /// Tenant-bound (bug_213): the caller's [`CallerTenant`] witness is
+    /// Tenant-bound (bug_213): the caller's [`CallerTenant`](crate::grpc::CallerTenant) witness is
     /// part of the query — a foreign tenant's row is ABSENT, so the
     /// caller takes the same `NotFound` as for a build that never
     /// existed (the resident-phase arm keeps `PermissionDenied`: the

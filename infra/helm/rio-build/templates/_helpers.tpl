@@ -65,6 +65,18 @@ Families:
              (private ed25519 seed). Same RIO_JWT__KEY_PATH env var as
              jwtVerify — JwtConfig is a shared type; gateway loads it
              as SigningKey seed, scheduler/store as VerifyingKey.
+  assignHmac .Values.jwt.enabled. SCHEDULER (signs assignment
+             tokens at dispatch) + STORE (verifies them on
+             PutPath/AppendLog). Secret rio-hmac →
+             /etc/rio/assign-hmac/hmac.key, env RIO_HMAC_KEY_PATH.
+             jwt-gated: the boot coherence law (jwt ⇒ service ∧ hmac,
+             r[store.authz.key-coherence]) refuses a store that
+             advertises tenant auth while builder ingest runs keyless
+             — before this family existed NOTHING mounted rio-hmac,
+             so every jwt-enabled deployment was exactly that
+             half-configuration (assignment enforcement silently in
+             dev-mode). Keyless (non-jwt) deployments stay dev-mode
+             by doctrine.
   serviceHmac  always-on. GATEWAY+SCHEDULER+CONTROLLER (signers) +
              STORE+SCHEDULER (verifiers).
              Secret rio-service-hmac → /etc/rio/hmac/service-hmac.key,
@@ -108,6 +120,12 @@ Families:
         "env"  (list
           (dict "name" "POD_NAME" "valueFrom" (dict "fieldRef" (dict "fieldPath" "metadata.name")))
           (dict "name" "LLVM_PROFILE_FILE" "value" "/var/lib/rio/cov/rio-$(POD_NAME)-%p-%m.profraw")))
+      "assignHmac" (dict
+        "on"   $root.Values.jwt.enabled
+        "vol"  "assign-hmac" "path" "/etc/rio/assign-hmac" "ro" true
+        "src"  (dict "secret" (dict "secretName" "rio-hmac"))
+        "env"  (list
+          (dict "name" "RIO_HMAC_KEY_PATH" "value" "/etc/rio/assign-hmac/hmac.key")))
       "serviceHmac" (dict
         "on"   true
         "vol"  "service-hmac" "path" "/etc/rio/hmac" "ro" true
