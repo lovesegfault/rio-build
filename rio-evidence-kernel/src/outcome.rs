@@ -79,34 +79,91 @@ pub fn classify_substitute_failure(class: SubstituteFailureClass) -> FailureDisp
     }
 }
 
-/// The per-tenant settlement re-probe fold (bughunt wave A4,
-/// merged_bug_028 / owner decision Q2 2026-06-03): the consumption
-/// arm-3 re-probe asks every LIVE tenant's upstream view, and
+/// One (tenant, path) cell of the arm-3 re-probe (bug_299): the RAW
+/// membership of one live-wanted path in one tenant's
+/// FindMissingPaths answer. The caller's only job is this mechanical
+/// mapping — no quantifier decision is expressible caller-side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathProbeCell {
+    /// Not in `missing_paths`: present in the store under this
+    /// tenant's visibility.
+    Present,
+    /// Missing locally but a HEAD probe hit an upstream.
+    Substitutable,
+    /// Missing locally and the probe could not classify (429/5xx/
+    /// timeout/deadline). Conservatively obtainable for THIS path
+    /// under THIS tenant.
+    Indeterminate,
+    /// Missing locally, no upstream hit, definitively classified.
+    Missing,
+}
+
+/// One tenant's re-probe row: per-path cells (caller path order) +
+/// whether this tenant's probe could confirm at all (a probe issued
+/// without tenant identity cannot run upstream substitution checks,
+/// so its "missing" is meaningless).
+#[derive(Debug, Clone, Copy)]
+pub struct TenantPathAnswers<'a> {
+    /// Per-path cells, index-aligned with the caller's live-wanted
+    /// path list.
+    pub cells: &'a [PathProbeCell],
+    /// Whether this tenant's answer can confirm absence.
+    pub can_confirm: bool,
+}
+
+/// The per-(tenant, path) settlement re-probe fold (bughunt wave A4,
+/// merged_bug_028 / owner Q2; re-granulated per-path by bug_299):
 /// `ConfirmedMissing` — the verdict that can fail-fast a pruned root
-/// or settle a leaf from-source — requires EVERY tenant to confirm.
-/// One obtainable answer (the path is present, substitutable, or even
-/// indeterminate under that tenant) keeps the job armed: the job
-/// fails only when NO interested tenant can obtain.
+/// or settle a leaf from-source — requires a NON-EMPTY tenant set in
+/// which EVERY tenant can confirm, and SOME path that is `Missing`
+/// under EVERY tenant. The quantifier order is the point: ∃ path ∀
+/// tenant, never ∀ tenant ∃ path. The pre-fix fold consumed one
+/// pre-projected boolean per tenant (each tenant's "∃ path missing
+/// under me"), so complementary coverage — tenant A has X and lacks
+/// Y, tenant B has Y and lacks X — folded to `ConfirmedMissing` and
+/// fail-fasted a job every path of which was obtainable under SOME
+/// tenant.
 ///
-/// An EMPTY answer set folds to `Obtainable` (nothing was confirmed;
-/// the caller's no-live-tenant shape has its own conservative arms).
-/// RPC failures never reach this fold — the caller maps them to its
-/// B3 ReArm before folding (same posture as `route_unobtainable`'s
+/// Conservative rows: an EMPTY tenant set folds to `Obtainable`
+/// (nothing was confirmed; the caller's no-live-tenant shape has its
+/// own arms); ANY tenant that cannot confirm poisons the conjunction
+/// to `Obtainable`; a ragged matrix (caller bug — rows of different
+/// lengths) folds to `Obtainable`, never to a fail-fast. RPC
+/// failures never reach this fold — the caller maps them to its B3
+/// ReArm before folding (same posture as `route_unobtainable`'s
 /// `None` reprobe).
 // r[impl sched.materialize.routing+5]
-pub fn fold_tenant_reprobes(
-    answers: &[crate::routing::ReprobeAnswer],
-) -> crate::routing::ReprobeAnswer {
+// r[impl sched.materialize.reprobe-per-path]
+pub fn fold_path_reprobes(tenants: &[TenantPathAnswers<'_>]) -> crate::routing::ReprobeAnswer {
     use crate::routing::ReprobeAnswer;
-    if !answers.is_empty()
-        && answers
-            .iter()
-            .all(|a| matches!(a, ReprobeAnswer::ConfirmedMissing))
-    {
-        ReprobeAnswer::ConfirmedMissing
-    } else {
-        ReprobeAnswer::Obtainable
+    if tenants.is_empty() {
+        return ReprobeAnswer::Obtainable;
     }
+    let mut i = 0;
+    while i < tenants.len() {
+        if !tenants[i].can_confirm || tenants[i].cells.len() != tenants[0].cells.len() {
+            return ReprobeAnswer::Obtainable;
+        }
+        i += 1;
+    }
+    let n_paths = tenants[0].cells.len();
+    let mut p = 0;
+    while p < n_paths {
+        let mut missing_everywhere = true;
+        let mut t = 0;
+        while t < tenants.len() {
+            if !matches!(tenants[t].cells[p], PathProbeCell::Missing) {
+                missing_everywhere = false;
+                break;
+            }
+            t += 1;
+        }
+        if missing_everywhere {
+            return ReprobeAnswer::ConfirmedMissing;
+        }
+        p += 1;
+    }
+    ReprobeAnswer::Obtainable
 }
 
 /// What the loop body does after recording one classified failure.
@@ -503,22 +560,90 @@ mod tests {
         );
     }
 
-    /// merged_bug_028: ConfirmedMissing is the ALL-tenant conjunction;
-    /// empty never confirms.
+    // r[verify sched.materialize.reprobe-per-path]
+    /// bug_299 red: complementary coverage — A has X (Y missing under
+    /// A), B has Y (X missing under B). Every wanted path is
+    /// obtainable under SOME tenant, so the job must stay armed.
+    /// Recorded red (pre-fix, via the deleted pre-projected-boolean
+    /// fold whose input domain had already lost the path axis):
+    /// `fold_tenant_reprobes(&[ConfirmedMissing, ConfirmedMissing])`
+    /// → `left: ConfirmedMissing` where Obtainable required.
     #[test]
-    fn reprobe_fold_is_all_tenant_conjunction() {
+    fn complementary_coverage_is_obtainable() {
+        use PathProbeCell::*;
         use ReprobeAnswer::*;
-        assert_eq!(fold_tenant_reprobes(&[]), Obtainable);
-        assert_eq!(fold_tenant_reprobes(&[Obtainable]), Obtainable);
-        assert_eq!(fold_tenant_reprobes(&[ConfirmedMissing]), ConfirmedMissing);
+        // Paths [X, Y]. A: X present, Y missing. B: X missing, Y present.
+        let a = [Present, Missing];
+        let b = [Missing, Present];
         assert_eq!(
-            fold_tenant_reprobes(&[ConfirmedMissing, Obtainable]),
-            Obtainable
+            fold_path_reprobes(&[
+                TenantPathAnswers {
+                    cells: &a,
+                    can_confirm: true
+                },
+                TenantPathAnswers {
+                    cells: &b,
+                    can_confirm: true
+                },
+            ]),
+            Obtainable,
+            "complementary coverage must keep the job armed"
         );
+    }
+
+    // r[verify sched.materialize.reprobe-per-path]
+    /// merged_bug_028 + bug_299: ConfirmedMissing requires ∃ path
+    /// missing under EVERY tenant, over a non-empty all-confirming
+    /// set; every conservative row folds Obtainable.
+    #[test]
+    fn reprobe_fold_quantifier_order_and_conservative_rows() {
+        use PathProbeCell::*;
+        use ReprobeAnswer::*;
+        let row = |cells: &'static [PathProbeCell], can_confirm: bool| TenantPathAnswers {
+            cells,
+            can_confirm,
+        };
+        // Empty tenant set never confirms.
+        assert_eq!(fold_path_reprobes(&[]), Obtainable);
+        // Same path missing under EVERY tenant → confirmed.
         assert_eq!(
-            fold_tenant_reprobes(&[ConfirmedMissing, ConfirmedMissing]),
+            fold_path_reprobes(&[
+                row(&[Missing, Present], true),
+                row(&[Missing, Present], true)
+            ]),
             ConfirmedMissing
         );
+        // One tenant sees it substitutable → armed.
+        assert_eq!(
+            fold_path_reprobes(&[
+                row(&[Missing, Present], true),
+                row(&[Substitutable, Present], true)
+            ]),
+            Obtainable
+        );
+        // Indeterminate under one tenant blocks confirmation of that
+        // path (conservative per cell).
+        assert_eq!(
+            fold_path_reprobes(&[row(&[Missing], true), row(&[Indeterminate], true)]),
+            Obtainable
+        );
+        // A tenant that cannot confirm poisons the conjunction.
+        assert_eq!(
+            fold_path_reprobes(&[row(&[Missing], true), row(&[Missing], false)]),
+            Obtainable
+        );
+        // Single confirming tenant, single missing path → confirmed.
+        assert_eq!(
+            fold_path_reprobes(&[row(&[Missing], true)]),
+            ConfirmedMissing
+        );
+        // Ragged matrix (caller bug) folds conservative.
+        assert_eq!(
+            fold_path_reprobes(&[row(&[Missing, Missing], true), row(&[Missing], true)]),
+            Obtainable
+        );
+        // Zero paths → nothing can be missing.
+        assert_eq!(fold_path_reprobes(&[row(&[], true)]), Obtainable);
     }
 }
 
@@ -747,48 +872,118 @@ mod proofs {
         }
     }
 
-    /// merged_bug_028 / owner Q2: `ConfirmedMissing` is the ALL-tenant
-    /// conjunction over a NON-EMPTY answer set — one obtainable tenant
-    /// view (or an empty set) keeps the job armed. Swept over every
-    /// answer vector up to four tenants (bitmask representation; stack
-    /// array — no heap under CBMC).
+    /// K3 (bug_299, superseding merged_bug_028's pre-projected
+    /// harness): the per-(tenant, path) fold's quantifier order over
+    /// the FULL 3×3 cell space (each cell one of 4 variants, 2 bits —
+    /// 2¹⁸ matrices × confirm bits), checked against an independent
+    /// recomputation of `∃ path ∀ tenant Missing` at every width
+    /// (1..=3 tenants; concrete-length calls — symbolic slice lengths
+    /// blow up CBMC's fat-pointer reasoning, observed 19+ CPU-min).
+    /// `kani::cover` pins that the DISAGREEMENT matrix vs the old
+    /// per-tenant projection (`∀ tenant ∃ path`) is reachable — the
+    /// complementary-coverage witness class the old fold fail-fasted.
     #[kani::proof]
-    fn check_confirmed_missing_is_all_tenant_conjunction() {
-        let mask: u8 = kani::any();
-        let mk = |i: usize| {
-            if mask & (1 << i) != 0 {
-                ReprobeAnswer::ConfirmedMissing
-            } else {
-                ReprobeAnswer::Obtainable
-            }
+    fn check_reprobe_quantifier_per_path() {
+        let cell = |bits: u8| match bits & 0b11 {
+            0 => PathProbeCell::Present,
+            1 => PathProbeCell::Substitutable,
+            2 => PathProbeCell::Indeterminate,
+            _ => PathProbeCell::Missing,
         };
-        let arr = [mk(0), mk(1), mk(2), mk(3)];
-        // One concrete-length call per width (0..=4): symbolic slice
-        // lengths make CBMC's fat-pointer + iterator reasoning blow up
-        // (observed: the symbolic-len form ran past 19 CPU-minutes;
-        // this form completes in seconds). The mask still sweeps every
-        // answer VECTOR at each width — 2^4 × 5 widths = the full
-        // bounded space.
-        let confirmed = |i: usize| mask & (1 << i) != 0;
-        assert_eq!(
-            fold_tenant_reprobes(&arr[..0]) == ReprobeAnswer::ConfirmedMissing,
-            false
-        );
-        assert_eq!(
-            fold_tenant_reprobes(&arr[..1]) == ReprobeAnswer::ConfirmedMissing,
-            confirmed(0)
-        );
-        assert_eq!(
-            fold_tenant_reprobes(&arr[..2]) == ReprobeAnswer::ConfirmedMissing,
-            confirmed(0) && confirmed(1)
-        );
-        assert_eq!(
-            fold_tenant_reprobes(&arr[..3]) == ReprobeAnswer::ConfirmedMissing,
-            confirmed(0) && confirmed(1) && confirmed(2)
-        );
-        assert_eq!(
-            fold_tenant_reprobes(&arr[..4]) == ReprobeAnswer::ConfirmedMissing,
-            confirmed(0) && confirmed(1) && confirmed(2) && confirmed(3)
+        let m: [[PathProbeCell; 3]; 3] = [
+            [cell(kani::any()), cell(kani::any()), cell(kani::any())],
+            [cell(kani::any()), cell(kani::any()), cell(kani::any())],
+            [cell(kani::any()), cell(kani::any()), cell(kani::any())],
+        ];
+        let confirm: [bool; 3] = [kani::any(), kani::any(), kani::any()];
+
+        // Width-3 fold (all tenants).
+        let rows = [
+            TenantPathAnswers {
+                cells: &m[0],
+                can_confirm: confirm[0],
+            },
+            TenantPathAnswers {
+                cells: &m[1],
+                can_confirm: confirm[1],
+            },
+            TenantPathAnswers {
+                cells: &m[2],
+                can_confirm: confirm[2],
+            },
+        ];
+        let missing = |t: usize, p: usize| matches!(m[t][p], PathProbeCell::Missing);
+
+        // Independent recomputation per width.
+        let mut w = 1;
+        while w <= 3 {
+            let verdict = fold_path_reprobes(&rows[..w]);
+            let mut all_confirm = true;
+            let mut t = 0;
+            while t < w {
+                if !confirm[t] {
+                    all_confirm = false;
+                }
+                t += 1;
+            }
+            let mut exists_path_forall_tenant = false;
+            let mut p = 0;
+            while p < 3 {
+                let mut everywhere = true;
+                let mut t2 = 0;
+                while t2 < w {
+                    if !missing(t2, p) {
+                        everywhere = false;
+                    }
+                    t2 += 1;
+                }
+                if everywhere {
+                    exists_path_forall_tenant = true;
+                }
+                p += 1;
+            }
+            let want_confirmed = all_confirm && exists_path_forall_tenant;
+            assert_eq!(
+                verdict == ReprobeAnswer::ConfirmedMissing,
+                want_confirmed,
+                "∃ path ∀ tenant, over an all-confirming non-empty set"
+            );
+            w += 1;
+        }
+        // Empty set never confirms.
+        assert!(fold_path_reprobes(&rows[..0]) == ReprobeAnswer::Obtainable);
+
+        // The disagreement witness vs the OLD projection (∀ tenant ∃
+        // path missing) is REACHABLE at width 2 with both confirming:
+        // old says confirmed, new says obtainable — complementary
+        // coverage.
+        let mut forall_tenant_exists_path = true;
+        let mut t3 = 0;
+        while t3 < 2 {
+            let mut any = false;
+            let mut p3 = 0;
+            while p3 < 3 {
+                if missing(t3, p3) {
+                    any = true;
+                }
+                p3 += 1;
+            }
+            if !any {
+                forall_tenant_exists_path = false;
+            }
+            t3 += 1;
+        }
+        let mut exists_forall_2 = false;
+        let mut p4 = 0;
+        while p4 < 3 {
+            if missing(0, p4) && missing(1, p4) {
+                exists_forall_2 = true;
+            }
+            p4 += 1;
+        }
+        kani::cover!(
+            confirm[0] && confirm[1] && forall_tenant_exists_path && !exists_forall_2,
+            "complementary-coverage disagreement matrix reachable"
         );
     }
 }

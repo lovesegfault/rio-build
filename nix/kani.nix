@@ -498,6 +498,16 @@ in
     #     charge > transient > all-clean-miss, idx lane-correctness,
     #     permutation invariance via universally-quantified
     #     transpositions).
+    # 27 → 27 (substitution, bug_299): the pre-projected-boolean
+    # harness check_confirmed_missing_is_all_tenant_conjunction is
+    # DELETED with fold_tenant_reprobes (its input domain — one
+    # boolean per tenant — was the hole: it computes ∀ tenant ∃ path,
+    # not ∃ path ∀ tenant) and replaced one-for-one by
+    # check_reprobe_quantifier_per_path (K3: the full 3×3
+    # per-(tenant,path) cell space vs an independent ∃∀ recomputation
+    # at every width, plus kani::cover of the complementary-coverage
+    # disagreement matrix vs the old projection — 1 of 1 cover
+    # satisfied, 0.6 s).
     expectedHarnesses = 27;
   };
 }

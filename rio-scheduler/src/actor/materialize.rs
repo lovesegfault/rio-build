@@ -2243,31 +2243,38 @@ impl DagActor {
     }
 
     /// The arm-3 FMP re-probe over the live wanted paths — once per
-    /// LIVE TENANT, folded through the kernel's all-tenant conjunction
-    /// (merged_bug_028 / owner Q2: `ConfirmedMissing` — the verdict
-    /// that can fail-fast a pruned root — requires EVERY interested
-    /// tenant to confirm; one obtainable view keeps the job armed).
-    /// `None` = the probe could not answer (no store client / ANY
-    /// tenant's RPC failure / timeout) — the caller maps that to ReArm
-    /// (B3: an indeterminate answer never fail-fasts).
+    /// LIVE TENANT, folded through the kernel's per-(tenant, path)
+    /// quantifier (merged_bug_028 / owner Q2, re-granulated by
+    /// bug_299): `ConfirmedMissing` — the verdict that can fail-fast
+    /// a pruned root — requires SOME path missing under EVERY
+    /// interested tenant (∃ path ∀ tenant). This caller does ONLY
+    /// mechanical membership mapping into raw cells; the quantifier
+    /// decision lives in the kernel, where complementary coverage
+    /// (tenant A has X, tenant B has Y) folds Obtainable. `None` =
+    /// the probe could not answer (no store client / ANY tenant's RPC
+    /// failure / timeout) — the caller maps that to ReArm (B3: an
+    /// indeterminate answer never fail-fasts).
     ///
     /// Without a service signer the store cannot run its upstream
     /// substitution check (no `x-rio-probe-tenant-id`), so a missing
     /// path is indeterminate, never confirmed-missing — the probe then
     /// cannot produce the fail-fast conjunct (B3's conservative
-    /// direction). A node with NO live tenant folds over the empty set
-    /// → `Obtainable` (the kernel's empty-never-confirms row).
+    /// direction; the kernel's can_confirm row). A node with NO live
+    /// tenant folds over the empty set → `Obtainable` (the kernel's
+    /// empty-never-confirms row).
+    // r[impl sched.materialize.reprobe-per-path]
     async fn reprobe_live_wanted_paths(
         &mut self,
         drv_hash: &DrvHash,
         live_wanted: &[String],
     ) -> Option<ReprobeAnswer> {
+        use rio_evidence_kernel::outcome::{PathProbeCell, TenantPathAnswers};
         if live_wanted.is_empty() {
             return Some(ReprobeAnswer::Obtainable);
         }
         let store = self.store_client.clone()?;
         let tenants = self.live_tenants_of(drv_hash);
-        let mut per_tenant: Vec<ReprobeAnswer> = Vec::with_capacity(tenants.len());
+        let mut rows: Vec<(Vec<PathProbeCell>, bool)> = Vec::with_capacity(tenants.len());
         // One AttemptBudget prices the whole reprobe (bug_127, the
         // same law as the dispatch sweep): T tenants share a single
         // grpc_timeout instead of paying it each; an expired budget
@@ -2305,18 +2312,32 @@ impl DagActor {
                 resp.substitutable_paths.into_iter().collect();
             let indeterminate: std::collections::HashSet<String> =
                 resp.indeterminate_paths.into_iter().collect();
-            let obtainable = live_wanted.iter().all(|p| {
-                !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
-            });
-            per_tenant.push(if obtainable || !can_confirm {
-                ReprobeAnswer::Obtainable
-            } else {
-                ReprobeAnswer::ConfirmedMissing
-            });
+            // Mechanical membership mapping — nothing else is
+            // decidable here.
+            let cells: Vec<PathProbeCell> = live_wanted
+                .iter()
+                .map(|p| {
+                    if !missing.contains(p) {
+                        PathProbeCell::Present
+                    } else if substitutable.contains(p) {
+                        PathProbeCell::Substitutable
+                    } else if indeterminate.contains(p) {
+                        PathProbeCell::Indeterminate
+                    } else {
+                        PathProbeCell::Missing
+                    }
+                })
+                .collect();
+            rows.push((cells, can_confirm));
         }
-        Some(rio_evidence_kernel::outcome::fold_tenant_reprobes(
-            &per_tenant,
-        ))
+        let answers: Vec<TenantPathAnswers<'_>> = rows
+            .iter()
+            .map(|(cells, can_confirm)| TenantPathAnswers {
+                cells,
+                can_confirm: *can_confirm,
+            })
+            .collect();
+        Some(rio_evidence_kernel::outcome::fold_path_reprobes(&answers))
     }
 }
 

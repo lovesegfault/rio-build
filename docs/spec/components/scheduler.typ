@@ -1506,6 +1506,28 @@ applied outside a consumption), so a dead upstream can only ever stall nodes
 with no buildable dependency closure; those stay parked, alertable, and
 re-claimable at backoff expiry. (PD-20, discharged in Phase B.)
 
+#r("sched.materialize.reprobe-per-path")[
+  The settlement-arm re-probe's confirmed-missing verdict MUST be computed at
+  per-(tenant, path) granularity with the quantifier order ∃ path ∀ tenant: a
+  fail-fast requires SOME live-wanted path that is missing-and-unsubstitutable
+  -and-determinate under EVERY live interested tenant, over a non-empty tenant
+  set in which every tenant's probe carried confirming identity. The caller
+  MUST pass raw per-path membership cells to the fold --- a per-tenant
+  pre-projection (any boolean computed per tenant before the cross-tenant
+  fold) is not a valid input, since it erases the path axis the quantifier
+  ranges over. Conservative rows MUST fold to obtainable: an empty tenant
+  set, any tenant unable to confirm, any indeterminate cell on the candidate
+  path, and any malformed (ragged) answer matrix.
+]
+The quantifier order is the substance (bug_299): the pre-fix fold consumed one
+pre-projected boolean per tenant --- each tenant's "∃ path missing under me"
+--- which computes ∀ tenant ∃ path. Complementary coverage (tenant A's
+upstreams carry X but not Y, tenant B's carry Y but not X) then folded to
+confirmed-missing and fail-fasted a job every path of which was obtainable
+under SOME tenant --- precisely the owner-Q2 contract the all-tenant
+conjunction was built to protect. The path axis must survive to the fold for
+the conjunction to mean what the routing rule says it means.
+
 #r("sched.materialize.settlement")[
   Every unresolved materialization job MUST have an armed action: a pending
   unparked job is claimable by any store replica; a claimed job settles
