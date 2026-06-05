@@ -1911,16 +1911,20 @@ client's output while the final message advertised a clean cursor past it.
 A drop now costs one recovery pass (a manifest read and possibly chunk
 GETs) instead of lines.
 
-#r("store.log.read-divergence")[
+#r("store.log.read-divergence+1")[
   A chunk's served range and post-visit watermark MUST be bounded by the
   smaller of the manifest row's claim and the object's actual line count,
   and any disagreement between the two MUST be classified and disclosed: a
-  short object (object holds fewer lines than the row claims) is
-  unrecoverable data loss --- served as an error naming the chunk key,
-  never as a silently shorter stream; a long object serves the claimed
-  range only, the unclaimed excess discarded and counted. The manifest
-  claim is the single authoritative bound at every decision point of the
-  read path.
+  long object serves the claimed range only, the unclaimed excess
+  discarded and counted. A short object (object holds fewer lines than
+  the row claims) MUST be decided by COVERAGE, not arm order: when the
+  remaining manifest rows cover the missing span, the clamped lines are
+  served and the covering rows supply the rest; when no row covers it,
+  the read fails as a TYPED-permanent error (the unservable-hole gRPC
+  metadata key) naming the chunk key --- never a silently shorter
+  stream, and never an untyped error a reader re-dials forever. The
+  manifest claim is the single authoritative bound at every decision
+  point of the read path.
 ]
 
 The two divergence directions have different blast radii: an over-length
@@ -1929,8 +1933,14 @@ garbage output that also suppressed the genuine successor lines via the
 advanced watermark; an under-length object was a silent hole presented as
 complete. Both are corruption-grade (the row and object are written from
 the same slice in the same call), so both count toward
-#(refs.metric)("rio_store_log_read_data_loss_total"), but only the short direction is
-unrecoverable and surfaces as an error.
+#(refs.metric)("rio_store_log_read_data_loss_total"). The short direction
+splits by coverage (bug_233): the covered topology (a second session's
+overlapping chunk) is fully servable and was previously wedged behind an
+untyped internal error at the relay's 1 Hz re-dial; the uncovered
+topology is genuine unrecoverable loss, typed so readers stop. The
+seal/read contradiction itself is disclosed, not repaired --- there is no
+in-band repair for a row and object written from one slice that
+disagree.
 
 = PostgreSQL Schema
 <store-schema>

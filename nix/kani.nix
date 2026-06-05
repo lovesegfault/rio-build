@@ -207,8 +207,11 @@ in
     crate = crateBuildKani.members.rio-log-kernel;
     # 5 + check_bounded_prefix_contract (B2: store.log.write-read-bound)
     # + check_tail_next_orphan_always_exits (bughunt2 slot 1:
-    #   merged_bug_130 -- Orphaned exits unconditionally).
-    expectedHarnesses = 11;
+    #   merged_bug_130 -- Orphaned exits unconditionally)
+    # + check_final_claim_contract + check_visit_fanout_batch_contract
+    #   + check_object_coverage_policy (bughunt2 slot 6: served-claim,
+    #   gap-provenance, short-object coverage policy).
+    expectedHarnesses = 14;
   };
 
   # rio-authz-kernel: the store's transport authorization decision

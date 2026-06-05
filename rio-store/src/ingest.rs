@@ -67,6 +67,9 @@ pub const STALE_RECLAIM_STALL_RECLAIM: &str = "stall_reclaim";
 /// hand-enumerated two of the three shipped reasons — the alphabet now
 /// lives here, every emit site references a member, and the parity
 /// test pins this array against the canonical HELP text).
+// Outside tests the array itself is doc-and-registry only (the emit
+// sites use the named members above); the parity test is its consumer.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const STALE_RECLAIM_REASONS: [&str; 3] = [
     STALE_RECLAIM_HEARTBEAT,
     STALE_RECLAIM_STALL_ABORT,

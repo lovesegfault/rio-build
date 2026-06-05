@@ -79,6 +79,15 @@ pub const ASSIGNMENT_TOKEN_HEADER: &str = "x-rio-assignment-token";
 /// status-code mapping. Always ASCII.
 pub const LOG_REJECT_METADATA_KEY: &str = "x-rio-log-reject";
 
+/// gRPC metadata key the store attaches to a `TailLog` read failure
+/// that is PERMANENT for the requested span (bug_233): the manifest
+/// promises lines that no stored object holds and no other manifest
+/// row covers — re-dialing cannot ever serve them. Value names the
+/// shape (`short_object`). Readers (the gateway relay's exit law, the
+/// CLI) treat its presence as `PermanentErr` instead of re-opening at
+/// 1 Hz against an unservable hole. Always ASCII.
+pub const LOG_UNSERVABLE_METADATA_KEY: &str = "x-rio-log-unservable";
+
 /// Service-identity HMAC token. Minted by trusted control-plane callers
 /// (gateway) on `PutPath`; the store verifies it as the HMAC-bypass
 /// condition. See `rio_auth::hmac::ServiceClaims`.

@@ -1494,8 +1494,8 @@ async fn serve_tail(
 
     // -- Phase 1: the manifest (everything already durably chunked).
     let refs = tail::read_manifest_range(&pool, exec_id, since_line).await?;
-    for chunk in &refs {
-        let lines = tail::read_chunk(store.as_ref(), chunk, &mut cursor).await?;
+    for (i, chunk) in refs.iter().enumerate() {
+        let lines = tail::read_chunk(store.as_ref(), chunk, &refs[i + 1..], &mut cursor).await?;
         send_lines(tx, &exec_str, lines, false).await?;
     }
 
@@ -1674,8 +1674,8 @@ async fn serve_tail(
     // cuts the remaining buffer to chunks before the session drops, so
     // the manifest walk below holds everything.
     let refs = tail::read_manifest_range(&pool, exec_id, cursor.next_line()).await?;
-    for chunk in &refs {
-        let lines = tail::read_chunk(store.as_ref(), chunk, &mut cursor).await?;
+    for (i, chunk) in refs.iter().enumerate() {
+        let lines = tail::read_chunk(store.as_ref(), chunk, &refs[i + 1..], &mut cursor).await?;
         recovered |= !lines.is_empty();
         send_lines(tx, &exec_str, lines, false).await?;
     }
@@ -1775,8 +1775,8 @@ async fn backfill_from_views(
     // (b) Everything cut to chunks since the cursor.
     let mut recovered = false;
     let refs = tail::read_manifest_range(pool, exec_id, cursor.next_line()).await?;
-    for chunk in &refs {
-        let lines = tail::read_chunk(store, chunk, cursor).await?;
+    for (i, chunk) in refs.iter().enumerate() {
+        let lines = tail::read_chunk(store, chunk, &refs[i + 1..], cursor).await?;
         recovered |= !lines.is_empty();
         send_lines(tx, exec_str, lines, false).await?;
     }

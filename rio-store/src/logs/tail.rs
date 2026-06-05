@@ -170,10 +170,11 @@ impl LineCursor {
 /// object PUT succeeds): it is surfaced as an `Internal` error naming
 /// the key so the operator can find the hole, never silently skipped —
 /// a silent skip would present a gapped log as complete.
-// r[impl store.log.read-divergence]
+// r[impl store.log.read-divergence+1]
 pub async fn read_chunk(
     store: &dyn LogChunkStore,
     chunk: &ChunkRef,
+    remaining: &[ChunkRef],
     cursor: &mut LineCursor,
 ) -> Result<Vec<(u64, Vec<u8>)>, Status> {
     // A degenerate zero-line chunk (the cutter never writes one, but the
@@ -267,16 +268,44 @@ pub async fn read_chunk(
                 missing_until,
                 "TailLog: chunk object holds fewer lines than its manifest row (data loss)"
             );
-            metrics::counter!(
-                "rio_store_log_read_data_loss_total",
-                "reason" => "short_object"
-            )
-            .increment(1);
-            return Err(Status::internal(format!(
-                "TailLog: chunk object holds fewer lines than its manifest row \
-                 (data loss, lines {missing_from}..{missing_until} missing): {}",
-                chunk.s3_key
-            )));
+            // bug_233: the policy is COVERAGE, not arm ordering. A
+            // missing span some remaining row covers is fully
+            // servable — serve the clamped lines (the visit is
+            // already clamped by construction) and let the covering
+            // rows supply the rest. Only a span NO row covers is a
+            // refusal — and a TYPED-permanent one, so the reader exit
+            // law stops re-dialing an unservable hole instead of
+            // wedging at 1 Hz forever.
+            let rows: Vec<(u64, u64)> = remaining
+                .iter()
+                .map(|r| (r.first_line, r.line_count))
+                .collect();
+            match rio_log_kernel::short_object_policy(missing_from, missing_until, &rows) {
+                rio_log_kernel::ShortObjectPolicy::ServeClamped => {
+                    metrics::counter!(
+                        "rio_store_log_read_data_loss_total",
+                        "reason" => "short_object_covered"
+                    )
+                    .increment(1);
+                }
+                rio_log_kernel::ShortObjectPolicy::UnservableHole => {
+                    metrics::counter!(
+                        "rio_store_log_read_data_loss_total",
+                        "reason" => "short_object"
+                    )
+                    .increment(1);
+                    let mut status = Status::internal(format!(
+                        "TailLog: chunk object holds fewer lines than its manifest row \
+                         (data loss, lines {missing_from}..{missing_until} missing): {}",
+                        chunk.s3_key
+                    ));
+                    status.metadata_mut().insert(
+                        rio_proto::LOG_UNSERVABLE_METADATA_KEY,
+                        tonic::metadata::MetadataValue::from_static("short_object"),
+                    );
+                    return Err(status);
+                }
+            }
         }
         Some(ObjectDivergence::LongObject { excess }) => {
             warn!(
@@ -341,8 +370,8 @@ async fn stream_chunks(
 ) -> Result<Vec<(u64, Vec<u8>)>, Status> {
     let mut cursor = LineCursor::new(since_line);
     let mut out = Vec::new();
-    for chunk in refs {
-        out.extend(read_chunk(store, chunk, &mut cursor).await?);
+    for (i, chunk) in refs.iter().enumerate() {
+        out.extend(read_chunk(store, chunk, &refs[i + 1..], &mut cursor).await?);
     }
     Ok(out)
 }
@@ -771,7 +800,7 @@ mod tests {
     /// are discarded — they would otherwise be served as garbage under
     /// the NEXT chunk's line numbers — and the next chunk's genuine
     /// lines must not be suppressed by an over-advanced watermark.
-    // r[verify store.log.read-divergence]
+    // r[verify store.log.read-divergence+1]
     #[tokio::test]
     async fn over_length_object_clamps_and_preserves_next_chunk() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -802,7 +831,7 @@ mod tests {
     /// An under-length object (holds fewer lines than its manifest row
     /// claims) is data loss with NotFound parity: an `Internal` error
     /// naming the key, never a silently shorter stream.
-    // r[verify store.log.read-divergence]
+    // r[verify store.log.read-divergence+1]
     #[tokio::test]
     async fn short_object_is_data_loss_error() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -954,6 +983,74 @@ mod tests {
             .await
             .unwrap();
         assert!(done.complete(), "served to the seal with full coverage");
+    }
+
+    /// RED (bug_233): a SHORT object whose missing span is covered by
+    /// the remaining manifest rows (a second session's overlapping
+    /// chunk) is fully servable — the walk must serve the clamped
+    /// lines and let the covering row supply the rest, not wedge the
+    /// whole read behind Status::internal.
+    #[tokio::test]
+    async fn short_object_with_covering_row_serves_fully() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let exec = Uuid::now_v7();
+        let sess = Uuid::now_v7();
+        seed_execution(&db.pool, exec, Some("succeeded"), Some(10)).await;
+        // Row A claims [0,10) but its object holds only 5 lines.
+        let content_a = lines("a", 0, 5);
+        let key_a = seed_chunk(&db.pool, &store, exec, sess, 0, 0, &line_refs(&content_a)).await;
+        sqlx::query("UPDATE drv_log_chunks SET line_count = 10 WHERE s3_key = $1")
+            .bind(&key_a)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        // Row B (second session) covers [5,10) with a full object.
+        let sess_b = Uuid::now_v7();
+        let content_b = lines("b", 5, 5);
+        seed_chunk(&db.pool, &store, exec, sess_b, 0, 5, &line_refs(&content_b)).await;
+
+        let refs = read_manifest_range(&db.pool, exec, 0).await.unwrap();
+        let got = stream_chunks(&store, &refs, 0)
+            .await
+            .expect("the overlap topology is fully servable — no wedge");
+        let nums: Vec<u64> = got.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            nums,
+            (0..10).collect::<Vec<u64>>(),
+            "all ten lines, exactly once"
+        );
+    }
+
+    /// bug_233's DR half: a short object whose missing span NO
+    /// remaining row covers is genuine corruption-grade loss — typed
+    /// permanent (`LOG_UNSERVABLE_METADATA_KEY`) so readers stop
+    /// re-dialing it, never silently shortened.
+    #[tokio::test]
+    async fn short_object_without_cover_is_typed_permanent() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let exec = Uuid::now_v7();
+        let sess = Uuid::now_v7();
+        seed_execution(&db.pool, exec, Some("succeeded"), Some(10)).await;
+        let content = lines("a", 0, 5);
+        let key = seed_chunk(&db.pool, &store, exec, sess, 0, 0, &line_refs(&content)).await;
+        sqlx::query("UPDATE drv_log_chunks SET line_count = 10 WHERE s3_key = $1")
+            .bind(&key)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let refs = read_manifest_range(&db.pool, exec, 0).await.unwrap();
+        let err = stream_chunks(&store, &refs, 0)
+            .await
+            .expect_err("an uncovered short object is data loss");
+        assert_eq!(
+            err.metadata()
+                .get(rio_proto::LOG_UNSERVABLE_METADATA_KEY)
+                .map(|v| v.to_str().unwrap_or("")),
+            Some("short_object"),
+            "the loss is TYPED permanent so the reader exit law can stop re-dialing: {err:?}"
+        );
     }
 
     /// Latest-exec resolution: empty exec_id → the newest execution for

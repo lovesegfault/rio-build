@@ -433,7 +433,7 @@ pub struct ObjectVisit {
         }
     }
 }))]
-// r[impl store.log.read-divergence]
+// r[impl store.log.read-divergence+1]
 pub fn visit_object(
     next_line: u64,
     first_line: u64,
@@ -456,6 +456,61 @@ pub fn visit_object(
     ObjectVisit {
         visit: visit_chunk(next_line, first_line, served),
         divergence,
+    }
+}
+
+/// The read-path policy for a SHORT object (one that decompressed to
+/// fewer lines than its manifest row claims) — bug_233. The two cases
+/// have different blast radii and the choice is COVERAGE, not arm
+/// ordering: the wedge class was a fully-servable overlap topology
+/// (a second session's row covering the missing span) refused behind
+/// `Status::internal` forever.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortObjectPolicy {
+    /// Some remaining manifest row covers every missing line: serve
+    /// the clamped lines and keep walking — the covering rows supply
+    /// the rest. Disclosure-only divergence (warn + divergence
+    /// counter), never a refusal.
+    ServeClamped,
+    /// No remaining row covers the missing span: the lines exist
+    /// nowhere — corruption-grade loss. The read fails TYPED-permanent
+    /// (`LOG_UNSERVABLE_METADATA_KEY`) so the reader exit law stops
+    /// re-dialing an unservable hole; the seal/read contradiction for
+    /// genuine corruption is disclosed, not repaired (the manifest row
+    /// and object were written from one slice — disagreement here has
+    /// no in-band repair).
+    UnservableHole,
+}
+
+/// Decide the [`ShortObjectPolicy`] for a missing span
+/// `[missing_from, missing_until)` given the REMAINING manifest rows
+/// (`(first_line, line_count)`, ordered by `first_line` — the manifest
+/// read order). Coverage may be stitched from several overlapping
+/// rows.
+// r[impl store.log.read-divergence+1]
+pub fn short_object_policy(
+    missing_from: u64,
+    missing_until: u64,
+    remaining: &[(u64, u64)],
+) -> ShortObjectPolicy {
+    let mut covered_to = missing_from;
+    for &(first, count) in remaining {
+        if covered_to >= missing_until {
+            break;
+        }
+        let end = first.saturating_add(count);
+        // Ordered input: a row starting past the frontier leaves a
+        // hole no later row can fill (they start even further right).
+        if first > covered_to {
+            break;
+        }
+        covered_to = covered_to.max(end);
+    }
+    if covered_to >= missing_until {
+        ShortObjectPolicy::ServeClamped
+    } else {
+        ShortObjectPolicy::UnservableHole
     }
 }
 
@@ -928,6 +983,60 @@ mod proofs {
         let _ = visit_chunk(next_line, first_line, n_lines);
     }
 
+    /// Verify [`short_object_policy`] over every sorted 3-row manifest
+    /// tail and span (bounded; the function is a left-to-right fold
+    /// with a break, so 3 rows exercise stitch, gap, and exhaustion):
+    /// the verdict is `ServeClamped` iff a step-through cover check —
+    /// written independently as per-line reachability — says every
+    /// missing line is held by some row.
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn check_object_coverage_policy() {
+        const B: u64 = 8; // small domain: positions 0..8
+        let missing_from: u64 = kani::any();
+        let missing_until: u64 = kani::any();
+        kani::assume(missing_from < missing_until && missing_until <= B);
+        let rows: [(u64, u64); 3] = kani::any();
+        kani::assume(rows.iter().all(|&(f, c)| f <= B && c <= B));
+        kani::assume(rows[0].0 <= rows[1].0 && rows[1].0 <= rows[2].0);
+
+        let verdict = short_object_policy(missing_from, missing_until, &rows);
+
+        // Independent oracle: every missing line individually covered,
+        // with rows usable only while the prefix has no gap (the
+        // ordered-walk semantics the policy documents).
+        let mut all_covered = true;
+        let mut line = missing_from;
+        while line < missing_until {
+            let mut hit = false;
+            let mut frontier_ok = true;
+            for &(f, c) in &rows {
+                if !frontier_ok {
+                    break;
+                }
+                if f > line && f > missing_from {
+                    // A row starting past this line cannot help it,
+                    // and ordered input means no later row can either.
+                    frontier_ok = f <= line;
+                }
+                if f <= line && line < f.saturating_add(c) {
+                    hit = true;
+                    break;
+                }
+            }
+            if !hit {
+                all_covered = false;
+                break;
+            }
+            line += 1;
+        }
+        assert_eq!(
+            verdict == ShortObjectPolicy::ServeClamped,
+            all_covered,
+            "policy iff per-line coverage"
+        );
+    }
+
     /// Verify [`visit_fanout_batch`] against its contracts under the
     /// BIGINT precondition: the visit IS the dedup verdict, and the
     /// provenance partition is exact — present iff there is a gap,
@@ -1318,6 +1427,28 @@ mod proofs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn short_object_policy_coverage_stitching() {
+        use ShortObjectPolicy::*;
+        // One covering row.
+        assert_eq!(short_object_policy(5, 10, &[(5, 5)]), ServeClamped);
+        // Stitched from two overlapping rows.
+        assert_eq!(short_object_policy(5, 10, &[(3, 4), (6, 4)]), ServeClamped);
+        // Covering row starts below the span.
+        assert_eq!(short_object_policy(5, 10, &[(0, 12)]), ServeClamped);
+        // Gap in the stitch: [7,8) uncovered.
+        assert_eq!(
+            short_object_policy(5, 10, &[(5, 2), (8, 2)]),
+            UnservableHole
+        );
+        // Nothing at all.
+        assert_eq!(short_object_policy(5, 10, &[]), UnservableHole);
+        // Row past the span can't help (ordered-walk break).
+        assert_eq!(short_object_policy(5, 10, &[(11, 5)]), UnservableHole);
+        // Empty rows are no-ops.
+        assert_eq!(short_object_policy(5, 10, &[(5, 0), (5, 5)]), ServeClamped);
+    }
+
     #[test]
     fn fanout_gap_provenance_partition() {
         // No gap: no provenance.
