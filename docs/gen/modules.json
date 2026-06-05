@@ -583,6 +583,11 @@
       "path": "routing.rs",
       "depth": 0,
       "doc": "The four-arm Unobtainable consumption routing — PURE (no IO, no"
+    },
+    {
+      "path": "settle.rs",
+      "depth": 0,
+      "doc": "The materialization settlement laws (bug_182 + merged_bug_055)."
     }
   ],
   "rio-gateway": [

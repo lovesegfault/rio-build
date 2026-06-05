@@ -8,6 +8,23 @@ use uuid::Uuid;
 
 use crate::state::{BuildState, DerivationStatus, DrvHash, SolvedIntent};
 
+/// Which autoscaler bucket a Ready derivation belongs to — see
+/// [`DagActor::classify_ready_node`] (bug_129: the ONE classifier both
+/// aggregate surfaces read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReadyClass {
+    /// Unresolved CLAIMABLE materialization job: substitution backlog
+    /// (the store trigger's demand), never builder demand.
+    Substituting,
+    /// Unresolved unclaimed job that is not claimable right now
+    /// (parked or deferred): store pacing — counted in NEITHER bucket
+    /// (bug_252; visible via the stalled gauge).
+    ParkedPacing,
+    /// Builder-queue demand: counted in `queued_by_system` on both
+    /// surfaces, whatever the retry-backoff state.
+    Queued,
+}
+
 use super::{
     AdminQuery, AuthBinding, ClusterSnapshot, DagActor, SpawnIntentsRequest, SpawnIntentsSnapshot,
 };
@@ -220,6 +237,32 @@ impl DagActor {
     /// census), and per-executor drain retired with the stream session,
     /// so `draining_executors` is always 0.
     ///
+    /// One Ready-node bucket classification (bug_129): consumed by
+    /// BOTH [`Self::compute_cluster_snapshot`] and
+    /// [`Self::compute_spawn_intents`], so the two RPCs' per-system
+    /// `queued_by_system` aggregates are equal BY CONSTRUCTION. The
+    /// old discipline was paired comments (the PD-7 exclusion was
+    /// mirrored by hand; the bug_282 backoff continue got no snapshot
+    /// twin and the aggregates diverged by exactly the in-backoff
+    /// Ready set). Retry backoff is deliberately NOT a class: it
+    /// suppresses spawn-intent EMISSION only, never demand accounting
+    /// — an in-backoff Ready node is still builder-queue demand on
+    /// both surfaces.
+    // r[impl sched.admin.snapshot-substituting+3]
+    pub(super) fn classify_ready_node(
+        &self,
+        drv_hash: &str,
+        now: std::time::Instant,
+    ) -> ReadyClass {
+        if self.has_claimable_job(drv_hash, now) {
+            ReadyClass::Substituting
+        } else if self.has_pending_unclaimed_job(drv_hash) {
+            ReadyClass::ParkedPacing
+        } else {
+            ReadyClass::Queued
+        }
+    }
+
     /// `as u32` casts: if any collection exceeds 4B entries, truncation
     /// is the LEAST of our problems.
     pub(super) fn compute_cluster_snapshot(&self) -> ClusterSnapshot {
@@ -279,31 +322,28 @@ impl DagActor {
                 }
                 DerivationStatus::Ready => {
                     // r[impl sched.materialize.job+2]
-                    // §2.6: a Ready node carrying an unresolved,
-                    // unclaimed materialization job is substitution
-                    // backlog, not builder-queue backlog — count it in
-                    // the substituting bucket and keep it OUT of
-                    // queued_derivations/queued_by_system so the buckets
-                    // stay disjoint and builder autoscalers don't scale
-                    // on work that will be materialized, not built.
-                    if self.has_claimable_job(drv_hash, bucket_now) {
-                        substituting_derivations += 1;
-                    } else if self.has_pending_unclaimed_job(drv_hash) {
-                        // Parked job (bug_252): pacing, not claimable
-                        // demand — counted in NEITHER bucket so the
-                        // KEDA store trigger drains while the node
-                        // stays out of the builder bucket (it will be
-                        // materialized, not built). Visible via
-                        // rio_scheduler_materialization_stalled.
-                    } else {
-                        // The scalar and the I-107 per-system breakdown
-                        // are counted in the same arm so the sum across
-                        // keys equals the scalar by construction (the
-                        // ready-queue membership the scalar used to read
-                        // was not dequeued by pull mints — the recorded
-                        // over-count).
-                        queued_derivations += 1;
-                        *queued_by_system.entry(s.system.clone()).or_default() += 1;
+                    // §2.6 via THE shared classifier (bug_129): a Ready
+                    // node carrying an unresolved, unclaimed
+                    // materialization job is substitution backlog, not
+                    // builder-queue backlog; a parked/deferred job is
+                    // pacing (bug_252 — NEITHER bucket, visible via
+                    // rio_scheduler_materialization_stalled); everything
+                    // else is builder demand. `compute_spawn_intents`
+                    // reads the SAME classification, so the two
+                    // `queued_by_system` aggregates cannot diverge.
+                    match self.classify_ready_node(drv_hash, bucket_now) {
+                        ReadyClass::Substituting => substituting_derivations += 1,
+                        ReadyClass::ParkedPacing => {}
+                        ReadyClass::Queued => {
+                            // The scalar and the I-107 per-system breakdown
+                            // are counted in the same arm so the sum across
+                            // keys equals the scalar by construction (the
+                            // ready-queue membership the scalar used to read
+                            // was not dequeued by pull mints — the recorded
+                            // over-count).
+                            queued_derivations += 1;
+                            *queued_by_system.entry(s.system.clone()).or_default() += 1;
+                        }
                     }
                 }
                 // Pre-ready: not yet store/builder load. Created has no
@@ -362,10 +402,13 @@ impl DagActor {
     /// [`compute_cluster_snapshot`]; the autoscaler polls every ~10s so
     /// even 10k Ready derivations is sub-ms.
     ///
-    /// `queued_by_system` is populated regardless of the
-    /// kind/feature filters (it's the same population as
-    /// `ClusterSnapshot.queued_by_system`) so the ComponentScaler reads
-    /// a coherent snapshot from the same RPC.
+    /// `queued_by_system` is populated regardless of the kind/feature
+    /// filters and the backoff gate, from the SAME [`ReadyClass`]
+    /// classification as `ClusterSnapshot.queued_by_system` — equal by
+    /// construction (bug_129). The ComponentScaler reads ClusterStatus
+    /// (rio-controller componentscaler/decide.rs), NOT this RPC; the
+    /// field here exists so any consumer of either RPC sees one
+    /// answer.
     ///
     /// [`compute_cluster_snapshot`]: Self::compute_cluster_snapshot
     // pub(crate) for the feature-filter tests (tests/misc.rs) which
@@ -448,33 +491,38 @@ impl DagActor {
                 continue;
             }
             // r[impl sched.materialize.job+2]
-            // PD-7 (Phase B, design §2.3): nodes with an unresolved
-            // materialization job are never spawn-intent candidates —
-            // the controller must not spawn builder pods for work that
-            // will be materialized. Excluded BEFORE the per-system
-            // aggregate so GetSpawnIntents.queued_by_system stays
-            // coherent with ClusterSnapshot.queued_by_system (the §2.6
-            // bucket exclusion's controller-facing twin); retires the
+            // PD-7 (Phase B, design §2.3) via THE shared classifier
+            // (bug_129): nodes with an unresolved materialization job
+            // are never spawn-intent candidates — the controller must
+            // not spawn builder pods for work that will be
+            // materialized — and they stay out of the per-system
+            // aggregate exactly as `compute_cluster_snapshot` keeps
+            // them out of its Ready arm (Substituting and ParkedPacing
+            // are not builder demand on either surface). Retires the
             // CE-59 spawn-intent churn class as a side effect. Claimed
             // jobs' nodes are Assigned/Running and already excluded by
             // the status check above.
-            if self.has_pending_unclaimed_job(drv_hash) {
-                continue;
+            match self.classify_ready_node(drv_hash, spawn_now) {
+                ReadyClass::Substituting | ReadyClass::ParkedPacing => continue,
+                ReadyClass::Queued => {}
             }
+            // Per-system aggregate: counted BEFORE the kind/feature
+            // filters AND before the backoff gate, from the SAME
+            // classification as `ClusterSnapshot.queued_by_system`, so
+            // the two aggregates are equal by construction whichever
+            // RPC a consumer reads.
+            *queued_by_system.entry(state.system.clone()).or_default() += 1;
             // bug_282: a Ready node inside its transient-retry backoff
-            // window is not spawn-intent demand — the kernel's pull
+            // window emits no spawn intent — the kernel's pull
             // admission would refuse the mint anyway (the
             // build_backoff_expired conjunct), so spawning a pod for
             // it just burns a pod-start against a guaranteed
-            // NotYetReady loop until the window lapses.
+            // NotYetReady loop until the window lapses. BELOW the
+            // aggregate (bug_129): backoff suppresses intent EMISSION
+            // only — the node is still queued demand on both surfaces.
             if state.retry.backoff_until.is_some_and(|t| t > spawn_now) {
                 continue;
             }
-            // Per-system aggregate: counted BEFORE the kind/feature
-            // filters so it matches `ClusterSnapshot.queued_by_system`
-            // (the ComponentScaler reads this independent of which
-            // pool asked).
-            *queued_by_system.entry(state.system.clone()).or_default() += 1;
 
             // r[impl sched.admin.spawn-intents.probed-gate+3]
             // A materialization success's consumption promotes

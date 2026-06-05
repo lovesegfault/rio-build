@@ -119,8 +119,11 @@ service AdminService {
   // ADR-023 spawn-intent stream: one SpawnIntent per Ready derivation
   // (FOD and non-FOD alike), pre-filtered server-side by
   // {kind, systems, features}. Replaces the per-class GetSizeClassStatus
-  // — controller pool reconcilers spawn one Job per intent; the
-  // ComponentScaler reads `queued_by_system`.
+  // — controller pool reconcilers spawn one Job per intent. The
+  // ComponentScaler reads ClusterStatus, not this RPC; the
+  // `queued_by_system` here is the SAME per-system population as
+  // `ClusterStatus.queued_by_system` by construction (one shared
+  // Ready-node classifier), so consumers of either RPC see one answer.
   rpc GetSpawnIntents(rio.types.GetSpawnIntentsRequest) returns (rio.types.GetSpawnIntentsResponse);
 
   // Controller reports which SpawnIntents it actually created Jobs for

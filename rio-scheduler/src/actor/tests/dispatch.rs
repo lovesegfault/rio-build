@@ -2358,6 +2358,52 @@ async fn spawn_intents_exclude_backoff_window() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.admin.snapshot-substituting+3]
+/// bug_129: `ClusterStatus.queued_by_system` equals
+/// `GetSpawnIntents.queued_by_system` BY CONSTRUCTION (both surfaces
+/// read the one shared Ready-node classifier), INCLUDING the
+/// in-backoff Ready set — retry backoff suppresses spawn-intent
+/// EMISSION only, never demand accounting. Pre-fix RED (the bug_282
+/// backoff `continue` sat above the spawn-intents aggregate while the
+/// snapshot Ready arm had no backoff check): one in-backoff Ready
+/// node → ClusterStatus said 1, GetSpawnIntents said 0
+/// (`left: Some(1) / right: None`).
+#[tokio::test]
+async fn queued_by_system_equal_across_both_rpcs_under_backoff() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor(db.pool.clone());
+    actor.test_inject_ready("129-backoff", None, "x86_64-linux", false);
+    if let Some(state) = actor.dag.node_mut("129-backoff") {
+        state.retry.backoff_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+
+    let snapshot = actor.compute_cluster_snapshot();
+    let intents = actor.compute_spawn_intents(&Default::default());
+
+    // The aggregates agree per system…
+    assert_eq!(
+        snapshot.queued_by_system.get("x86_64-linux").copied(),
+        Some(1),
+        "an in-backoff Ready node is still builder-queue demand on ClusterStatus"
+    );
+    assert_eq!(
+        intents.queued_by_system.get("x86_64-linux").copied(),
+        Some(1),
+        "GetSpawnIntents counts the SAME demand as ClusterStatus"
+    );
+    // …while the backoff still suppresses the intent (bug_282 kept).
+    assert!(
+        intents.intents.is_empty(),
+        "backoff suppresses intent emission, got {:?}",
+        intents
+            .intents
+            .iter()
+            .map(|i| i.intent_id.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// The sweep-budget law (bug_127), red and green side by side on a
 /// paused clock with 8 hung tenants (every probe future pends
 /// forever):
