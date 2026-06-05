@@ -23,11 +23,17 @@
 // `CycleCommit::{Shadow,Live}` accept nothing else. Here the law is
 // the pair of invariants the calibration twin falsifies.
 //
-// PARAMETER LADDER. MAX_CHUNKS=4 / MAX_MANIFESTS=3 explores every
+// PARAMETER LADDER. MAX_CHUNKS=3 / MAX_MANIFESTS=2 explores every
 // reference shape (unreferenced, singly, multiply, excluded-only
-// referenced) within seconds; the state space is the full cross
-// product of reference maps x exclusion sets x phase — measured at
-// wiring time in the introducing commit's check transcript.
+// referenced); the state space is the cross product of reference maps
+// x exclusion sets x snapshot copies x phase — ~4.2e6 states, TLC
+// minutes. The first wiring used 4/3 AND carried the snapshot map
+// inside `published`, squaring the map dimension into ~1e11+ states:
+// the TLC checks ran 14+ hours without a verdict and wedged a wave
+// gate. Measured runtime at this regime is recorded in the
+// introducing commit; the nix constructors now hard-bound every
+// checker's wall clock so a regression of this class is a RED check,
+// not an eternal gate.
 
 module gcCollectState {
   // --- constants ---------------------------------------------------------
@@ -76,12 +82,17 @@ module gcCollectState {
   var snapExcluded: Set[int]
 
   /// The durable `gc_collect_state` row: the last committed
-  /// observation, plus the snapshot it was derived from (carried so
-  /// the invariant can compare the published counts against the basis
-  /// they were OBLIGED to come from; production carries the same
-  /// pairing implicitly — the row is written inside the snapshot's
-  /// transaction).
-  var published: { live: int, backlog: int, fromRefs: int -> Set[int], committed: bool }
+  /// observation. The snapshot it was derived from is `snapRefs` —
+  /// which the next `snapshot` action overwrites, so the basis
+  /// invariants are guarded on the post-commit window (`phase ==
+  /// PIdle`): between a commit and the next snapshot, `snapRefs` IS
+  /// the basis the row was obliged to come from (production carries
+  /// the same pairing implicitly — the row is written inside the
+  /// snapshot's transaction). Carrying the snapshot INSIDE this record
+  /// instead squares the reachable-state count by the map domain and
+  /// put the TLC checks past any wall clock (the wave's 14-hour wedge;
+  /// see the regime doc).
+  var published: { live: int, backlog: int, committed: bool }
 
   // --- derived -----------------------------------------------------------
 
@@ -110,7 +121,7 @@ module gcCollectState {
     phase' = PIdle,
     snapRefs' = CHUNKS.mapBy(h => Set()),
     snapExcluded' = Set(),
-    published' = { live: 0, backlog: 0, fromRefs: CHUNKS.mapBy(h => Set()), committed: false },
+    published' = { live: 0, backlog: 0, committed: false },
   }
 
   /// A writer moves a reference (upload, path sweep, re-reference)
@@ -166,12 +177,10 @@ module gcCollectState {
       if (CALIB_COMMIT_SIM_BASIS) {
         live: simLive(snapRefs, snapExcluded).size(),
         backlog: simBacklog(snapRefs, snapExcluded).size(),
-        fromRefs: snapRefs,
         committed: true,
       } else {
         live: realLive(snapRefs).size(),
         backlog: realBacklog(snapRefs).size(),
-        fromRefs: snapRefs,
         committed: true,
       },
     refsOf' = refsOf,
@@ -191,19 +200,24 @@ module gcCollectState {
 
   /// The committed live count IS the real mark count over the
   /// snapshot it was derived from — never the exclusion-shrunk
-  /// preview.
+  /// preview. Enforced on the post-commit window (`phase == PIdle`),
+  /// where `snapRefs` still holds the commit's own snapshot; a newly
+  /// opened snapshot (PSnapped) suspends the comparison until its own
+  /// commit rewrites `published`.
   val publishedLiveEqualsRealMark = or {
     not(published.committed),
-    published.live == realLive(published.fromRefs).size(),
+    phase == PSnapped,
+    published.live == realLive(snapRefs).size(),
   }
 
   /// The committed backlog never exceeds the true eligible count over
   /// the same snapshot (the simulated lane can only INFLATE backlog —
   /// an exclusion strips references, making more chunks look
-  /// collectable than are).
+  /// collectable than are). Same post-commit-window guard.
   val backlogLeTrueEligible = or {
     not(published.committed),
-    published.backlog <= realBacklog(published.fromRefs).size(),
+    phase == PSnapped,
+    published.backlog <= realBacklog(snapRefs).size(),
   }
 
   /// A committed observation with a non-empty effective exclusion is
@@ -213,7 +227,8 @@ module gcCollectState {
   /// must VIOLATE in the main regime.)
   val noEffectiveShadowCommit = not(and {
     published.committed,
-    simLive(published.fromRefs, snapExcluded).size() != realLive(published.fromRefs).size(),
+    phase == PIdle,
+    simLive(snapRefs, snapExcluded).size() != realLive(snapRefs).size(),
   })
 }
 
@@ -223,8 +238,8 @@ module gcCollectState {
 // ===========================================================================
 module gcCollectStateMain {
   import gcCollectState(
-    MAX_CHUNKS = 4,
-    MAX_MANIFESTS = 3,
+    MAX_CHUNKS = 3,
+    MAX_MANIFESTS = 2,
     CALIB_COMMIT_SIM_BASIS = false
   ).*
 
@@ -269,8 +284,8 @@ module gcCollectStateMain {
 // ===========================================================================
 module gcCollectStateCalibSimBasis {
   import gcCollectState(
-    MAX_CHUNKS = 4,
-    MAX_MANIFESTS = 3,
+    MAX_CHUNKS = 3,
+    MAX_MANIFESTS = 2,
     CALIB_COMMIT_SIM_BASIS = true
   ).*
 }
