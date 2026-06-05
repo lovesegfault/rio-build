@@ -1,7 +1,7 @@
 //! Cross-tenant: B builds A's drv → separate attribution, shared
 //! result.
 //!
-//! Policy (from `r[sched.tenant.authz+2]` + security.typ): SubmitBuild
+//! Policy (from `r[sched.tenant.authz+3]` + security.typ): SubmitBuild
 //! attributes to `claims.sub`. Derivations are content-addressed and
 //! the store is shared, so B is ALLOWED to build the same drv. The
 //! isolation guarantee is *attribution*, not drv-hash exclusivity:

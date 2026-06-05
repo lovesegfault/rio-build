@@ -31,6 +31,40 @@ use rio_common::tenant::NormalizedName;
 use crate::actor::{ActorCommand, ActorError, ActorHandle, BuildEventReceivers};
 use crate::db::SchedulerDb;
 
+/// The caller's attested tenant identity — the typed witness every
+/// tenant-scoped read of durable build state requires.
+///
+/// Sole producer: [`SchedulerGrpc::require_tenant`] (the
+/// interceptor-reconciling chokepoint: jwt-mode rejection + jti
+/// revocation). A handler path that fetches tenant-scoped rows without
+/// passing through the gate does not typecheck — `bug_213` was exactly
+/// such a path (the `WatchBuild` terminal-row fallback fetched the
+/// settled verdict with no tenant bind, streaming it to foreign
+/// tenants post-cleanup).
+///
+/// `tenant() == None` is the dev-mode posture (no JWT pubkey
+/// configured, no claims attached): tenant-scoped queries bind NULL
+/// and deliberately match every row.
+// r[impl sched.tenant.authz+3]
+#[derive(Debug, Clone)]
+pub(crate) struct CallerTenant {
+    /// `Some((claims.sub, claims.jti))` — attested + revocation-checked.
+    tenant: Option<(Uuid, String)>,
+}
+
+impl CallerTenant {
+    /// The attested tenant id (`claims.sub`); `None` in dev mode.
+    pub(crate) fn tenant(&self) -> Option<Uuid> {
+        self.tenant.as_ref().map(|(sub, _)| *sub)
+    }
+
+    /// The revocation-checked token id, kept for the `builds.jwt_jti`
+    /// audit insert (`r[gw.jwt.issue]`).
+    pub(crate) fn jti(&self) -> Option<&str> {
+        self.tenant.as_ref().map(|(_, jti)| jti.as_str())
+    }
+}
+
 /// Shared scheduler state passed to gRPC handlers.
 #[derive(Clone)]
 pub struct SchedulerGrpc {
@@ -178,7 +212,7 @@ impl SchedulerGrpc {
         s.parse().status_invalid("invalid build_id UUID")
     }
 
-    // r[impl sched.tenant.authz+2]
+    // r[impl sched.tenant.authz+3]
     // r[impl gw.jwt.verify]
     /// Single chokepoint reconciling the permissive interceptor's third
     /// state ("header absent → no Claims attached, request passes") with
@@ -201,10 +235,7 @@ impl SchedulerGrpc {
     /// Hoisted from a SubmitBuild-only inline block: `CancelBuild` /
     /// `WatchBuild` / `QueryBuildStatus` are independent client-facing
     /// ingress points reachable directly with a leaked token.
-    pub(super) async fn require_tenant<T>(
-        &self,
-        req: &Request<T>,
-    ) -> Result<Option<(Uuid, String)>, Status> {
+    pub(super) async fn require_tenant<T>(&self, req: &Request<T>) -> Result<CallerTenant, Status> {
         match req.extensions().get::<rio_auth::jwt::TenantClaims>() {
             Some(claims) => {
                 // Same db-presence gate as tenant resolve. If db is
@@ -223,12 +254,14 @@ impl SchedulerGrpc {
                 {
                     return Err(Status::unauthenticated("token revoked"));
                 }
-                Ok(Some((claims.sub, claims.jti.clone())))
+                Ok(CallerTenant {
+                    tenant: Some((claims.sub, claims.jti.clone())),
+                })
             }
             None if self.jwt_mode => Err(Status::unauthenticated(
                 "SchedulerService requires x-rio-tenant-token in JWT mode",
             )),
-            None => Ok(None),
+            None => Ok(CallerTenant { tenant: None }),
         }
     }
 

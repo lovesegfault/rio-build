@@ -6025,7 +6025,7 @@ in
     # r[verify gw.display.single-map]
     # r[verify gw.resync.loss-signal+1]
     # r[verify sched.pull.kinded-running-surface]
-    # r[verify sched.watch.terminal-from-durable-row]
+    # r[verify sched.watch.terminal-from-durable-row+2]
     # r[verify gw.resync.reattach-budget]
     # r[verify gw.resync.snapshot-owed]
     quint-gw-build-resync = mkQuintCheck {

@@ -42,7 +42,7 @@ impl SchedulerService for SchedulerGrpc {
         self.ensure_leader()?;
         self.check_actor_alive()?;
 
-        // r[impl sched.tenant.authz+2]
+        // r[impl sched.tenant.authz+3]
         // Tenant authorization chokepoint. In JWT mode this rejects
         // token-less calls with UNAUTHENTICATED — the permissive
         // interceptor lets builders (which reach :9001 for
@@ -52,10 +52,8 @@ impl SchedulerService for SchedulerGrpc {
         // authoritative tenant identity below. `jti` is the
         // revocation-checked token id, kept for the `builds.jwt_jti`
         // audit insert (`r[gw.jwt.issue]`).
-        let (caller_tenant, jti) = match self.require_tenant(&request).await? {
-            Some((sub, jti)) => (Some(sub), Some(jti)),
-            None => (None, None),
-        };
+        let caller = self.require_tenant(&request).await?;
+        let (caller_tenant, jti) = (caller.tenant(), caller.jti().map(str::to_owned));
 
         // Also grab the RAW token string for re-inject on downstream
         // store calls (merge-time FindMissingPaths). Claims are the
@@ -278,8 +276,8 @@ impl SchedulerService for SchedulerGrpc {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
-        // r[impl sched.tenant.authz+2]
-        let caller_tenant = self.require_tenant(&request).await?.map(|(sub, _)| sub);
+        // r[impl sched.tenant.authz+3]
+        let caller = self.require_tenant(&request).await?;
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
 
@@ -287,7 +285,7 @@ impl SchedulerService for SchedulerGrpc {
 
         let cmd = ActorCommand::WatchBuild {
             build_id,
-            caller_tenant,
+            caller_tenant: caller.tenant(),
             reply: reply_tx,
         };
 
@@ -298,7 +296,7 @@ impl SchedulerService for SchedulerGrpc {
         // no dedup.
         let (bcast, snapshot) = match self.send_and_await(cmd, reply_rx).await {
             Ok(x) => x,
-            // r[impl sched.watch.terminal-from-durable-row]
+            // r[impl sched.watch.terminal-from-durable-row+2]
             // The actor no longer holds the build (terminal cleanup ran,
             // or this is a fresh post-failover leader that only recovers
             // non-terminal builds). The builds row carries the settled
@@ -311,7 +309,7 @@ impl SchedulerService for SchedulerGrpc {
                     return Err(status);
                 };
                 let Some(row) = db
-                    .get_build_terminal_row(build_id)
+                    .get_build_terminal_row(build_id, &caller)
                     .await
                     .map_err(|e| Status::internal(format!("terminal-row lookup failed: {e}")))?
                 else {
@@ -348,8 +346,8 @@ impl SchedulerService for SchedulerGrpc {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
-        // r[impl sched.tenant.authz+2]
-        let caller_tenant = self.require_tenant(&request).await?.map(|(sub, _)| sub);
+        // r[impl sched.tenant.authz+3]
+        let caller_tenant = self.require_tenant(&request).await?.tenant();
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
 
@@ -373,8 +371,8 @@ impl SchedulerService for SchedulerGrpc {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
-        // r[impl sched.tenant.authz+2]
-        let caller_tenant = self.require_tenant(&request).await?.map(|(sub, _)| sub);
+        // r[impl sched.tenant.authz+3]
+        let caller_tenant = self.require_tenant(&request).await?.tenant();
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
 
@@ -452,7 +450,7 @@ impl SchedulerService for SchedulerGrpc {
 /// (migration 087). Pre-087 terminal rows have NULL payload columns and
 /// degrade to the old empty-payload snapshot — the state itself is
 /// always correct.
-// r[impl sched.watch.terminal-from-durable-row]
+// r[impl sched.watch.terminal-from-durable-row+2]
 fn synthesize_terminal_snapshot(
     build_id: Uuid,
     row: crate::db::BuildTerminalRow,

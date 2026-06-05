@@ -2074,7 +2074,7 @@ async fn display_only_events_route_to_log_ring() {
 /// Some(caller)` is `true` when the lookup is `None`, so a tenant
 /// caller got `PermissionDenied` while an admin caller (`None`) got
 /// `BuildNotFound` for the SAME missing build.
-// r[verify sched.tenant.authz+2]
+// r[verify sched.tenant.authz+3]
 #[tokio::test]
 async fn watch_build_missing_returns_not_found_for_tenant() {
     let db = TestDb::new(&MIGRATOR).await;

@@ -26,7 +26,7 @@
 //! around them. Until then, delta-based assertions are correct under
 //! pool reuse and don't require touching `TenantPool`.
 //!
-//! `r[sched.tenant.authz+2]` covers SchedulerService RPCs (Watch/
+//! `r[sched.tenant.authz+3]` covers SchedulerService RPCs (Watch/
 //! Cancel/QueryStatus reject `PERMISSION_DENIED` on tenant mismatch);
 //! those have no nix-level entry point to probe directly here.
 

@@ -351,19 +351,30 @@ impl SchedulerDb {
     /// Fetch the terminal row of a build the actor no longer holds
     /// (post-cleanup or post-failover). `None` when the row is missing
     /// OR not terminal — callers fall back to `NotFound` then.
-    // r[impl sched.watch.terminal-from-durable-row]
+    ///
+    /// Tenant-bound (bug_213): the caller's [`CallerTenant`] witness is
+    /// part of the query — a foreign tenant's row is ABSENT, so the
+    /// caller takes the same `NotFound` as for a build that never
+    /// existed (the resident-phase arm keeps `PermissionDenied`: the
+    /// spec-pinned status asymmetry). Dev mode (`tenant() == None`)
+    /// binds NULL and matches every row.
+    // r[impl sched.watch.terminal-from-durable-row+2]
+    // r[impl sched.tenant.authz+3]
     pub(crate) async fn get_build_terminal_row(
         &self,
         build_id: Uuid,
+        caller: &crate::grpc::CallerTenant,
     ) -> Result<Option<BuildTerminalRow>, sqlx::Error> {
         sqlx::query_as(
             "SELECT status, error_summary, failed_derivation, failure_status, \
                     cancel_reason, output_paths, \
                     total_drvs, completed_drvs, cached_drvs, failed_drvs \
              FROM builds \
-             WHERE build_id = $1 AND status IN ('succeeded','failed','cancelled')",
+             WHERE build_id = $1 AND status IN ('succeeded','failed','cancelled') \
+               AND ($2::uuid IS NULL OR tenant_id = $2)",
         )
         .bind(build_id)
+        .bind(caller.tenant())
         .fetch_optional(&self.pool)
         .await
     }

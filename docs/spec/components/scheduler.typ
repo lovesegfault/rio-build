@@ -311,7 +311,7 @@ epilogue in the success path).
   gateway PostgreSQL-free --- preserving stateless N-replica HA.
 ]
 
-#r("sched.tenant.authz+2")[
+#r("sched.tenant.authz+3")[
   SchedulerService RPCs (`SubmitBuild`, `WatchBuild`, `QueryBuildStatus`,
   `CancelBuild`) MUST derive tenant identity from the interceptor-attached
   `TenantClaims.sub`, not from any proto body field. When a JWT pubkey is
@@ -324,7 +324,11 @@ epilogue in the success path).
   and applies to all four RPCs, not only SubmitBuild. `WatchBuild`,
   `QueryBuildStatus`, and `CancelBuild` MUST additionally verify the target
   build's `tenant_id` equals `claims.sub` and reject with `PERMISSION_DENIED`
-  on mismatch. `ResolveTenant` is exempt: the gateway calls it during SSH key
+  on mismatch while the actor holds the build. Handlers MUST carry tenant
+  identity only as the typed witness `require_tenant` produces
+  (`CallerTenant`), and every tenant-scoped read of durable build state MUST
+  take that witness — a fetch path that skips the gate does not typecheck.
+  `ResolveTenant` is exempt: the gateway calls it during SSH key
   auth before a JWT exists.
 ]
 
@@ -2174,12 +2178,15 @@ The payload travels as one structure (`SettledBuild`); the failure trio
 or whole-struct-override setters, so partial writes that pair a stale
 culprit with a new summary are unrepresentable.
 
-#r("sched.watch.terminal-from-durable-row")[
+#r("sched.watch.terminal-from-durable-row+2")[
   A `WatchBuild` for a build the actor no longer holds MUST be answered
   from the durable `builds` row when that row records a terminal state: one
   synthesized terminal `BuildSnapshot` carrying the persisted verdict
-  (state, settled counts, outcome payload). `NotFound` is reserved for
-  builds Postgres does not know terminal.
+  (state, settled counts, outcome payload). The durable-row fetch MUST be
+  tenant-bound by the caller's attested identity (dev mode binds none): a
+  foreign tenant's terminal row is absent, so the caller receives the same
+  `NotFound` as for a build Postgres does not know terminal. `NotFound` is
+  reserved for builds Postgres does not know terminal for this caller.
 ]
 The terminal arm of the status UPDATE persists the whole settled payload
 atomically with the status flip (migration 087), so the synthesized

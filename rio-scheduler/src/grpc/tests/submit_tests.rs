@@ -125,7 +125,7 @@ async fn test_submit_build_resolves_known_tenant() {
     assert_eq!(db_tenant, Some(tenant_uuid));
 }
 
-// r[verify sched.tenant.authz+2]
+// r[verify sched.tenant.authz+3]
 /// merged_bug_057: in JWT mode, SchedulerService rejects token-less
 /// calls (the permissive interceptor's third state would otherwise let
 /// a builder reach SubmitBuild/CancelBuild/WatchBuild unauthenticated).
@@ -152,7 +152,7 @@ async fn test_submit_build_jwt_mode_rejects_tokenless() {
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
 }
 
-// r[verify sched.tenant.authz+2]
+// r[verify sched.tenant.authz+3]
 /// merged_bug_057: `claims.sub` is the authoritative tenant identity.
 /// A caller holding tenant-A's claims with body `tenant_name="B"`
 /// MUST be attributed to A, not B.
@@ -189,7 +189,7 @@ async fn test_submit_build_claims_sub_overrides_body_tenant_name() {
     );
 }
 
-// r[verify sched.tenant.authz+2]
+// r[verify sched.tenant.authz+3]
 /// merged_bug_057: cross-tenant Cancel/Watch is rejected with
 /// PERMISSION_DENIED. Submit as A, attempt cancel/watch as B.
 #[tokio::test]
@@ -693,7 +693,7 @@ async fn no_claims_skips_revocation_check() {
 /// cancel the tenant's builds + stream their log output until natural
 /// expiry. Hoisting the lookup into `require_tenant` closes all four.
 // r[verify gw.jwt.verify]
-// r[verify sched.tenant.authz+2]
+// r[verify sched.tenant.authz+3]
 #[tokio::test]
 async fn revoked_jti_rejected_by_cancel_watch_query() {
     let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
@@ -751,7 +751,7 @@ async fn revoked_jti_rejected_by_cancel_watch_query() {
     assert!(s.message().contains("revoked"), "got: {}", s.message());
 }
 
-// r[verify sched.watch.terminal-from-durable-row]
+// r[verify sched.watch.terminal-from-durable-row+2]
 /// merged_bug_323: a WatchBuild AFTER terminal cleanup (or against a
 /// fresh post-failover leader) must answer with the recorded verdict
 /// from the builds row — one synthesized terminal snapshot — never
@@ -827,4 +827,125 @@ async fn watch_build_after_cleanup_serves_durable_terminal_snapshot() {
     // The stream ends after the single message (no live broadcast for a
     // cleaned-up build).
     assert!(stream.next().await.is_none(), "exactly one message");
+}
+
+// r[verify sched.tenant.authz+3]
+// r[verify sched.watch.terminal-from-durable-row+2]
+/// bug_213: the terminal-row fallback must observe the same tenant
+/// authority as the live arm. A foreign tenant watching a build the
+/// actor no longer holds (post-cleanup) must get the ORIGINAL
+/// `NotFound` — the tenant-bound query makes foreign rows absent, so
+/// "exists but foreign" is indistinguishable from "never existed"
+/// (the resident-phase arm keeps `PermissionDenied`: the spec-pinned
+/// status asymmetry). Owner and dev-mode watchers keep the durable-row
+/// answer.
+///
+/// RED (pre-fix): `get_build_terminal_row(build_id)` carried no tenant
+/// bind — tenant B streamed tenant A's settled verdict.
+#[tokio::test]
+async fn test_watch_build_terminal_fallback_tenant_bound() {
+    let (db, grpc, handle, _task) = setup_grpc_with_pool().await;
+    let tenant_a = seed_tenant(&db.pool, "wbtf-a").await;
+    let tenant_b = seed_tenant(&db.pool, "wbtf-b").await;
+    let claims = |sub: uuid::Uuid, jti: &str| rio_auth::jwt::TenantClaims {
+        sub,
+        iat: 0,
+        exp: i64::MAX,
+        jti: jti.into(),
+    };
+
+    // Submit as A.
+    let mut req = Request::new(rio_proto::types::SubmitBuildRequest {
+        nodes: vec![make_node("wbtf-drv")],
+        ..Default::default()
+    });
+    req.extensions_mut().insert(claims(tenant_a, "a"));
+    let resp = grpc.submit_build(req).await.expect("submit as owner");
+    let build_id = resp
+        .metadata()
+        .get(rio_proto::BUILD_ID_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let build_uuid: uuid::Uuid = build_id.parse().unwrap();
+
+    // Cancel as A → terminal.
+    let mut cancel = Request::new(rio_proto::types::CancelBuildRequest {
+        build_id: build_id.clone(),
+        reason: "wbtf".into(),
+    });
+    cancel.extensions_mut().insert(claims(tenant_a, "a"));
+    grpc.cancel_build(cancel).await.expect("owner cancel");
+
+    // Wait for the settled row (the durable verdict the fallback
+    // reads), then evict the build from the actor (the production
+    // cleanup driver, sent directly to bypass the delay).
+    for _ in 0..200 {
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM builds WHERE build_id = $1")
+                .bind(build_uuid)
+                .fetch_optional(&db.pool)
+                .await
+                .unwrap();
+        if status.as_deref() == Some("cancelled") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    handle
+        .send_unchecked(crate::actor::ActorCommand::CleanupTerminalBuild {
+            build_id: build_uuid,
+        })
+        .await
+        .unwrap();
+    // Eviction processed ⇔ the actor answers NotFound to a dev probe.
+    for _ in 0..200 {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        handle
+            .send_unchecked(crate::actor::ActorCommand::QueryBuildStatus {
+                build_id: build_uuid,
+                caller_tenant: None,
+                reply: tx,
+            })
+            .await
+            .unwrap();
+        if matches!(
+            rx.await.unwrap(),
+            Err(crate::actor::ActorError::BuildNotFound(_))
+        ) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Owner keeps the durable-row answer.
+    let mut watch_a = Request::new(rio_proto::types::WatchBuildRequest {
+        build_id: build_id.clone(),
+    });
+    watch_a.extensions_mut().insert(claims(tenant_a, "a"));
+    grpc.watch_build(watch_a)
+        .await
+        .expect("owner must get the synthesized terminal snapshot");
+
+    // Dev-mode (no claims) keeps the durable-row answer.
+    let watch_dev = Request::new(rio_proto::types::WatchBuildRequest {
+        build_id: build_id.clone(),
+    });
+    grpc.watch_build(watch_dev)
+        .await
+        .expect("dev-mode must keep the durable-row answer");
+
+    // Foreign tenant: the original NotFound — absence-shaped.
+    let mut watch_b = Request::new(rio_proto::types::WatchBuildRequest { build_id });
+    watch_b.extensions_mut().insert(claims(tenant_b, "b"));
+    let status = grpc
+        .watch_build(watch_b)
+        .await
+        .expect_err("foreign tenant must not stream the settled verdict");
+    assert_eq!(
+        status.code(),
+        tonic::Code::NotFound,
+        "foreign deny must be the original NotFound, got {status:?}"
+    );
 }
