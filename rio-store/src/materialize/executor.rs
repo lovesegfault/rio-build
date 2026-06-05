@@ -398,10 +398,28 @@ async fn execute_job_inner(
                                     probe_cells.push(TenantAttemptEvidence::CleanMiss);
                                     probe_msgs.push(String::new());
                                 }
-                                MissProbe::Infra(detail) => {
-                                    probe_cells.push(TenantAttemptEvidence::Charge {
-                                        class: SubstituteFailureClass::Fetch,
-                                    });
+                                MissProbe::Failed {
+                                    class,
+                                    retry_after,
+                                    detail,
+                                } => {
+                                    // bug_295: the probe leg rides the
+                                    // SAME truth table as the attempt
+                                    // leg — congruence per CLASS, not
+                                    // per leg (a 429'd probe defers
+                                    // uncharged; a 5xx'd probe charges
+                                    // exactly like a 5xx'd GET).
+                                    match classify_substitute_failure(class) {
+                                        FailureDisposition::RetryUncharged => {
+                                            probe_cells.push(TenantAttemptEvidence::Transient {
+                                                retry_after,
+                                            });
+                                        }
+                                        FailureDisposition::ChargeInfra => {
+                                            probe_cells
+                                                .push(TenantAttemptEvidence::Charge { class });
+                                        }
+                                    }
                                     probe_msgs.push(format!(
                                         "substitution of {path} hit infrastructure trouble: \
                                          {detail}"
@@ -414,11 +432,12 @@ async fn execute_job_inner(
                                 return infra_failure(probe_msgs[idx].clone());
                             }
                             TenantAttemptsVerdict::RetryTransient { idx, max } => {
-                                // Structurally unreachable until the
-                                // probe answers gain the transient
-                                // class axis (bug_295) — written total
-                                // so that landing cannot silently
-                                // change this match's behavior.
+                                // No tenant charged; ≥1 probe was
+                                // rate-limited: close UNCHARGED and
+                                // defer (the probe-leg park-burning
+                                // harm case, bug_295).
+                                info!(path = %path, class = "rate_limited",
+                                      "transient probe failure; reporting retry-later");
                                 return MaterializationOutcome {
                                     outcome: Some(materialization_outcome::Outcome::RetryLater(
                                         materialization_outcome::RetryLater {
@@ -696,22 +715,47 @@ async fn pin_materialized_path(
 /// VERDICT additionally requires confirmation under EVERY interested
 /// tenant plus the caller's [`LocalMiss`] witness (bug_042) — this
 /// per-tenant probe alone never constructs one.
+///
+/// bug_295: a failed probe carries its CLASS, and the caller routes
+/// the disposition through `classify_substitute_failure` — the same
+/// truth table the substitution attempt leg uses. The HEAD and GET
+/// legs are congruent per class: a 429'd probe closes UNCHARGED
+/// (RateLimited → RetryUncharged; pre-fix it was laundered into
+/// `indeterminate` and charged, so a rate-limit wave on the PROBE
+/// burned the park budget the attempt leg was already protecting),
+/// while 5xx/timeout/transport probes stay CHARGED (Fetch →
+/// ChargeInfra — a GET 5xx charges, so a HEAD 5xx must too). The
+/// per-call deadline cut also charges: it is our own budget
+/// infrastructure failing to classify, not upstream politeness
+/// (rationale recorded in the substitution-replacement invariant
+/// map).
 enum MissProbe {
     /// This tenant's upstreams definitively answered "not present".
     Confirmed,
-    /// This tenant's probe could not classify (5xx / timeout / 429 /
-    /// present-but-not-ingested / probe failure) → InfraFailure
-    /// (nothing is confirmed).
-    Infra(String),
+    /// The probe failed with a substitute-failure class; the caller
+    /// folds the classified disposition with every other tenant's.
+    Failed {
+        /// The probe-leg failure class (RateLimited for a terminal
+        /// 429; Fetch for 5xx/timeout/deadline/present-but-not-
+        /// ingested; the error path maps through
+        /// `substitute_error_evidence`).
+        class: SubstituteFailureClass,
+        /// Parsed `Retry-After` advice (RateLimited only).
+        retry_after: Option<std::time::Duration>,
+        /// Human detail for the outcome message.
+        detail: String,
+    },
 }
 
 /// Distinguish confirmed-absent from infrastructure trouble after a
 /// `try_substitute` miss, using the HEAD-probe machinery
-/// ([`Substituter::check_available`]): a path in `indeterminate` could
-/// not be classified (infra); a path in `hits` is present upstream but
-/// substitution did not ingest it (also infra — something is wrong on
-/// our side); a path in neither set is a confirmed miss UNDER THIS
-/// TENANT.
+/// ([`Substituter::check_available`]): a path in `rate_limited` is a
+/// terminal 429 (transient class); a path in `indeterminate` could
+/// not be classified (charging class); a path in `hits` is present
+/// upstream but substitution did not ingest it (also charging —
+/// something is wrong on our side); a path in none of the sets is a
+/// confirmed miss UNDER THIS TENANT.
+// r[impl store.materialize.probe-polarity]
 async fn probe_miss(ctx: &ExecutorContext, tenant_id: Uuid, store_path: &str) -> MissProbe {
     let deadline = tokio::time::Instant::now() + MISS_PROBE_DEADLINE;
     let paths = [store_path.to_string()];
@@ -721,20 +765,39 @@ async fn probe_miss(ctx: &ExecutorContext, tenant_id: Uuid, store_path: &str) ->
         .await
     {
         Ok(result) => {
-            if result.indeterminate.iter().any(|p| p == store_path) {
-                MissProbe::Infra(
-                    "availability probe indeterminate (upstream 5xx/timeout/429)".to_string(),
-                )
+            if let Some((_, retry_after)) =
+                result.rate_limited.iter().find(|(p, _)| p == store_path)
+            {
+                MissProbe::Failed {
+                    class: SubstituteFailureClass::RateLimited,
+                    retry_after: *retry_after,
+                    detail: "availability probe rate-limited (upstream 429)".to_string(),
+                }
+            } else if result.indeterminate.iter().any(|p| p == store_path) {
+                MissProbe::Failed {
+                    class: SubstituteFailureClass::Fetch,
+                    retry_after: None,
+                    detail: "availability probe indeterminate (upstream 5xx/timeout)".to_string(),
+                }
             } else if result.hits.iter().any(|p| p == store_path) {
-                MissProbe::Infra(
-                    "upstream reports the path present but substitution did not ingest it"
+                MissProbe::Failed {
+                    class: SubstituteFailureClass::Fetch,
+                    retry_after: None,
+                    detail: "upstream reports the path present but substitution did not ingest it"
                         .to_string(),
-                )
+                }
             } else {
                 MissProbe::Confirmed
             }
         }
-        Err(e) => MissProbe::Infra(format!("availability probe failed: {e}")),
+        Err(e) => {
+            let (class, retry_after) = crate::substitute::substitute_error_evidence(&e);
+            MissProbe::Failed {
+                class,
+                retry_after,
+                detail: format!("availability probe failed: {e}"),
+            }
+        }
     }
 }
 
@@ -1994,6 +2057,85 @@ mod tests {
         assert!(
             unobtainable.verified_paths.contains(&root),
             "the obtained root rides verified_paths"
+        );
+    }
+
+    // r[verify store.materialize.probe-polarity]
+    /// bug_295 red: an upstream that 404s narinfo GETs but 429s
+    /// narinfo HEADs (method-split rate limiting — real CDNs do this:
+    /// the GET lane is cache-fronted, the HEAD probe lane is
+    /// origin-billed). The attempt leg cleanly misses (GET 404); the
+    /// miss-confirmation HEAD probe is rate-limited with a
+    /// `Retry-After` exceeding the probe budget. Pre-fix the terminal
+    /// 429 was laundered into `indeterminate` → MissProbe::Infra →
+    /// InfraFailure: a PROBE-leg rate-limit wave burned the park
+    /// budget the ATTEMPT leg was already shielding (classification
+    /// congruence per CLASS, §5-Q23). Post-fix the probe answer rides
+    /// the same truth table: 429 → RetryUncharged → RetryLater.
+    ///
+    /// Recorded red (pre-fix): `expected RetryLater, got
+    /// InfraFailure("substitution of … hit infrastructure trouble:
+    /// availability probe indeterminate (upstream 5xx/timeout/429)")`.
+    #[tokio::test]
+    async fn probe_only_rate_limit_defers_uncharged() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-headlimit").await;
+
+        // Method-split upstream: GET → 404 (clean miss), HEAD → 429
+        // with Retry-After far past the probe budget (terminal).
+        let app = axum::Router::new().fallback(axum::routing::any(
+            move |method: axum::http::Method| async move {
+                if method == axum::http::Method::HEAD {
+                    let mut h = axum::http::HeaderMap::new();
+                    h.insert("Retry-After", axum::http::HeaderValue::from_static("300"));
+                    (axum::http::StatusCode::TOO_MANY_REQUESTS, h)
+                } else {
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        axum::http::HeaderMap::new(),
+                    )
+                }
+            },
+        ));
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let upstream = FakeUpstream {
+            url: format!("http://{addr}"),
+            trusted_key: "dummy:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            _task: task,
+        };
+        wire_upstream(&db.pool, tenant, &upstream).await;
+
+        let path = store_path(25, "mat-headlimit");
+        let seeded = seed_job(
+            &db.pool,
+            "mat-headlimit-drv",
+            &[("out", path.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+
+        let ctx = make_ctx(db.pool.clone());
+        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let retry = outcome_retry_later(&outcome).unwrap_or_else(|| {
+            panic!(
+                "expected RetryLater (probe-leg 429 closes uncharged), got {outcome:?} — \
+                 the HEAD rate-limit was charged as infrastructure"
+            )
+        });
+        assert_eq!(
+            retry.class, "rate_limited",
+            "the 429 class rides the report"
+        );
+        assert_eq!(
+            retry.retry_after_secs, 300,
+            "the upstream's Retry-After advice rides the report"
         );
     }
 

@@ -1542,6 +1542,7 @@ impl Substituter {
             return Ok(CheckAvailableResult {
                 hits,
                 indeterminate,
+                rate_limited: Vec::new(),
             });
         }
 
@@ -1631,6 +1632,10 @@ impl Substituter {
 
         // r[impl store.substitute.probe-bounded+4]
         // r[impl store.substitute.probe-429-retry+3]
+        // Last pass's max Retry-After — rides the rate_limited lane so
+        // in-process callers (the executor's miss probe) can surface
+        // the advice (bug_295).
+        let mut last_retry_after: Option<Duration> = None;
         // 429-aware retry loop. Pass 0 covers the full uncached set;
         // each retry pass re-probes only the RateLimited subset after
         // sleeping max(Retry-After) (Fastly's 429 is edge-wide, not
@@ -1696,6 +1701,16 @@ impl Substituter {
                 }
             }
 
+            // Carry the latest advice across breaks: every exit below
+            // (deadline cut, final pass, budget) may leave 429 paths
+            // in `pending`, and the rate_limited lane reports the last
+            // observed Retry-After for all of them (the 429 is
+            // edge-wide, not per-object — same rationale as the
+            // per-pass max sleep).
+            if max_retry_after.is_some() {
+                last_retry_after = max_retry_after;
+            }
+
             if completed < batch_len {
                 // `take_until` stopped yielding after the deadline; the
                 // un-yielded paths are neither hit nor miss for THIS
@@ -1736,7 +1751,7 @@ impl Substituter {
                     remaining_budget = ?remaining,
                     deferred = pending.len(),
                     "check_available: upstream Retry-After exceeds probe budget; \
-                     rate-limited paths returned indeterminate"
+                     rate-limited paths returned in the rate_limited lane"
                 );
                 break;
             }
@@ -1750,15 +1765,22 @@ impl Substituter {
             tokio::time::sleep(sleep).await;
         }
         // Remainder (still 429 after MAX_PASSES, or Retry-After exceeded
-        // budget) → indeterminate: not cached; scheduler optimistically
-        // tries the substitute fetch.
-        indeterminate.extend(pending.into_iter().map(|(p, _)| p));
+        // budget) → the rate_limited lane (bug_295): not cached; the
+        // wire surface still reports it indeterminate (optimistic
+        // substitute fetch), but in-process callers route the 429
+        // class through the truth table so a rate-limit wave closes
+        // UNCHARGED instead of burning the park budget.
+        let rate_limited: Vec<(String, Option<Duration>)> = pending
+            .into_iter()
+            .map(|(p, _)| (p, last_retry_after))
+            .collect();
 
         metrics::histogram!("rio_store_check_available_duration_seconds")
             .record(started.elapsed().as_secs_f64());
         Ok(CheckAvailableResult {
             hits,
             indeterminate,
+            rate_limited,
         })
     }
 }
@@ -1768,13 +1790,23 @@ impl Substituter {
 pub struct CheckAvailableResult {
     /// Paths confirmed available (HEAD 2xx) on at least one upstream.
     pub hits: Vec<String>,
-    /// Paths the probe could NOT classify (every upstream 429/5xx/timed
-    /// out, or the per-call deadline cut the pass short). NOT cached;
-    /// the scheduler MUST treat these optimistically — try the substitute
-    /// fetch (its failure path falls through to build) instead of
-    /// immediately dispatching a builder. A confirmed `Miss` is in
-    /// neither set.
+    /// Paths the probe could NOT classify (upstream 5xx/timeout/
+    /// transport error, or the per-call deadline cut the pass short).
+    /// NOT cached; the scheduler MUST treat these optimistically — try
+    /// the substitute fetch (its failure path falls through to build)
+    /// instead of immediately dispatching a builder. A confirmed
+    /// `Miss` is in neither set.
     pub indeterminate: Vec<String>,
+    // r[impl store.materialize.probe-polarity]
+    /// Paths whose terminal probe state is RATE-LIMITED (429 on every
+    /// pass, or the upstream's `Retry-After` exceeded the call
+    /// budget), with the last observed advice (bug_295). Split out of
+    /// `indeterminate` so in-process callers can route the class
+    /// through the substitute-failure truth table (429 closes
+    /// UNCHARGED; 5xx/timeout charges). The FindMissingPaths wire
+    /// surface merges this back into `indeterminate_paths` — same
+    /// optimistic scheduler treatment, no proto change.
+    pub rate_limited: Vec<(String, Option<Duration>)>,
 }
 
 /// HTTP statuses an upstream binary cache uses to signal "key not
@@ -3480,10 +3512,26 @@ mod tests {
             available.hits.is_empty(),
             "Retry-After > budget → no retry → 0 hits"
         );
+        // bug_295: terminal 429s ride the rate_limited lane (with the
+        // upstream's advice) so in-process callers can defer
+        // UNCHARGED; the wire surface merges them back into
+        // indeterminate_paths at the FMP handler.
         assert_eq!(
-            available.indeterminate.len(),
+            available.rate_limited.len(),
             paths.len(),
-            "rate-limited paths past budget must be reported indeterminate"
+            "rate-limited paths past budget ride the rate_limited lane"
+        );
+        assert!(
+            available
+                .rate_limited
+                .iter()
+                .all(|(_, ra)| *ra == Some(Duration::from_secs(300))),
+            "the upstream's Retry-After advice rides each entry: {:?}",
+            available.rate_limited
+        );
+        assert!(
+            available.indeterminate.is_empty(),
+            "a terminal 429 is NOT indeterminate (5xx/timeout) — the classes split"
         );
         assert!(
             elapsed < Duration::from_secs(5),

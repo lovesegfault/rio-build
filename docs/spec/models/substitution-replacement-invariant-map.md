@@ -2155,3 +2155,44 @@ fencedWrites `0f1ddf484` pattern; the latch set is declared by the
   artifact). All 12 deterministic named runs pass unchanged (8 base
   + 2 failover + 1 adversarial + 1 crash-loop) — exact post-state
   pins through the rewired actions.
+
+## Bughunt-2 fix wave — slot 10 substitution-evidence-folds records (2026-06-05)
+
+### bug_295 DR rider — probe-leg charge polarity (per owner §5-Q23, DEFAULT)
+
+Decision applied: **congruence per CLASS through the one truth table**
+(`classify_substitute_failure`), never per leg.
+
+- **HEAD-429 (terminal: every pass 429'd, or `Retry-After` past the
+  probe budget)** → `RateLimited` → `RetryUncharged`: the job closes
+  uncharged and defers with the upstream's advice riding the report.
+  This was the harm case — the pre-fix probe laundered terminal 429s
+  into `indeterminate`, the executor charged them as `Fetch`
+  infrastructure, and a rate-limit wave on the PROBE leg burned the
+  park budget the ATTEMPT leg's transient lane was already shielding.
+- **HEAD-5xx / transport / timeout-indeterminate** → `Fetch` →
+  `ChargeInfra`, diverging from the report's blanket-transient sketch:
+  a GET 5xx charges, so a HEAD 5xx must too. Anything else opens a
+  polarity seam between two requests to the same upstream for the
+  same object.
+- **Per-call deadline cut (un-probed remainder of a pass)** → stays in
+  `indeterminate` → `ChargeInfra`. Deliberate: the cut is OUR probe
+  budget failing to classify, not upstream politeness — treating it
+  as transient would let a chronically slow upstream defer jobs
+  forever without ever surfacing as infrastructure evidence. The
+  consequence cuts the other way too and is accepted: a persistent
+  429 wall now defers indefinitely (paced by `defer_until`) instead
+  of parking within `max_attempts`; the park ladder loses 429-wall
+  visibility but keeps every real-infrastructure signal.
+- Wire surface unchanged: `CheckAvailableResult.rate_limited` is an
+  in-process lane; the FindMissingPaths handler merges it back into
+  `indeterminate_paths` (same optimistic scheduler treatment, no
+  proto change).
+
+Recorded reds: `probe_only_rate_limit_defers_uncharged` (pre-fix:
+`expected RetryLater … got InfraFailure("… availability probe
+indeterminate (upstream 5xx/timeout/429)")` — the method-split
+404-GET/429-HEAD router); `check_available_429_exceeds_budget`
+re-pinned from the indeterminate lane to the rate_limited lane. The
+existing `upstream_5xx_reports_infra_failure` stays green via the GET
+lane (congruence's other half).

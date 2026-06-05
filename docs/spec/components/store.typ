@@ -1193,6 +1193,28 @@ the headless Service; the executor's poll loop is off the hot path, so the
 documented ClusterIP-plus-retry posture (templates/scheduler.yaml's Service
 comment) is the chosen mechanism here.
 
+#r("store.materialize.probe-polarity")[
+  The miss-confirmation HEAD-probe leg MUST classify its per-tenant
+  failures through the same substitute-failure truth table as the
+  GET/attempt leg --- congruence per CLASS, never per leg. A terminal
+  probe rate-limit (429 on every pass, or `Retry-After` past the call
+  budget) MUST close the job UNCHARGED with the upstream's advice riding
+  the deferral; probe 5xx/timeout/transport failures and the per-call
+  deadline cut MUST stay CHARGED (a GET 5xx charges, so a HEAD 5xx must
+  too). The availability result MUST carry the rate-limited paths as a
+  distinct lane from indeterminate so in-process callers can route the
+  class; the FindMissingPaths wire surface merges the lane back into
+  `indeterminate_paths` unchanged.
+]
+The pre-fix probe laundered terminal 429s into `indeterminate`, which the
+executor charged as infrastructure: a rate-limit wave on the PROBE leg
+burned the park budget that the attempt leg's transient lane was already
+shielding (the park-burning harm case, owner decision §5-Q23). The
+deadline-cut charge is deliberate: the cut is our own probe budget failing
+to classify, not upstream politeness --- treating it as transient would let
+a chronically slow upstream defer jobs forever without ever surfacing as
+infrastructure evidence.
+
 #r("store.materialize.tenant-fold")[
   The executor's per-tenant iteration over a path (both the substitution
   attempt loop and the miss-confirmation probe loop) MUST only accumulate

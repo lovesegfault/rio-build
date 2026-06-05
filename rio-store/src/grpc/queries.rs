@@ -312,7 +312,16 @@ impl StoreServiceImpl {
                     entry + crate::substitute::CHECK_AVAILABLE_DEFAULT_BUDGET,
                 )
                 .await
-                .map(|r| (r.hits, r.indeterminate))
+                .map(|r| {
+                    // bug_295: the rate_limited lane is an in-process
+                    // class split (the executor charges 5xx, defers
+                    // 429); the WIRE surface is unchanged — 429s merge
+                    // back into indeterminate_paths and the scheduler
+                    // keeps its optimistic treatment.
+                    let mut indeterminate = r.indeterminate;
+                    indeterminate.extend(r.rate_limited.into_iter().map(|(p, _)| p));
+                    (r.hits, indeterminate)
+                })
                 .unwrap_or_else(|e| {
                     warn!(error = %e, "check_available failed; reporting all missing as indeterminate");
                     (Vec::new(), missing.clone())
