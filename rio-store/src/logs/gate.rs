@@ -4,8 +4,10 @@
 //! HMAC-verified the assignment token and rejected service-token
 //! callers. Decides whether the stream may write to the execution it
 //! claims: the token must be for this derivation, the claimed
-//! execution must be the derivation's *latest* assignment to *this*
-//! executor, and the execution's log must not already be complete.
+//! execution must be an assignment attempt of this derivation bound
+//! to *this* executor (authority is keyed on the CLAIMED exec —
+//! check 3 below is the single home of that law), and the execution's
+//! log must not already be complete.
 //!
 //! This is the security boundary between untrusted builder pods (which
 //! run arbitrary derivation code) and the log store — the relocation of
@@ -13,12 +15,12 @@
 //! seal that used to live in the scheduler ring buffer's `is_complete`
 //! latch (both deleted with the in-scheduler log path).
 //!
-//! The `builder_id` comparison is a *token-currency* check (is the
-//! attempt this token was minted for still the derivation's live
-//! assignment?), not a *presenter-identity* check: the assignment token
-//! is a bearer credential and `AssignmentClaims::executor_id` is
-//! audit-only attribution (see `rio-auth/src/hmac.rs`) — anyone holding
-//! a current token passes.
+//! The `builder_id` comparison binds the claimed execution to the
+//! executor the token was minted for (the claimed-exec authority
+//! model, check 3), not a *presenter-identity* check: the assignment
+//! token is a bearer credential and `AssignmentClaims::executor_id` is
+//! audit-only attribution (see `rio-auth/src/hmac.rs`) — anyone
+//! holding the token for the claimed attempt passes.
 
 use rio_auth::hmac::AssignmentClaims;
 use rio_common::grpc::StatusExt;
@@ -166,8 +168,8 @@ pub async fn check_append_open(
     // of THIS derivation, assigned to THIS executor, with execution
     // kind `build`.
     //
-    // Authority is keyed on the CLAIMED exec, not on "the derivation's
-    // latest assignment": a newer attempt — most commonly a
+    // Authority is keyed on the CLAIMED exec, not on whichever attempt
+    // is newest for the derivation: a newer attempt — most commonly a
     // materialization mint, which can never legitimately append log
     // lines — used to displace a terminal-but-incomplete build's late
     // replay (merged_bug_101), silently losing the tail of every build
@@ -630,7 +632,7 @@ mod tests {
 
     /// v2 authority: the builder's OWN superseded attempt stays
     /// writable (the late replay is keyed on the claimed exec, not on
-    /// "the derivation's latest assignment"). Containment: exec-keyed
+    /// the derivation's newest attempt). Containment: exec-keyed
     /// chunks + the durable caps + the final_line_count ceiling.
     #[tokio::test]
     async fn admits_own_superseded_execution() {
@@ -662,7 +664,7 @@ mod tests {
 
     // r[verify store.log.read-authority]
     /// The merged_bug_101 regression: a newer materialization mint
-    /// taking the "latest assignment" slot must not displace a
+    /// becoming the derivation's newest attempt must not displace a
     /// terminal-but-incomplete build's late replay.
     #[tokio::test]
     async fn gate_admits_terminal_incomplete_build_after_materialization_mint() {

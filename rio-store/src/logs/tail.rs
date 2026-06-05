@@ -347,9 +347,12 @@ async fn stream_chunks(
 ///
 /// - A non-empty `pinned_exec_id` is used verbatim once it is shown to
 ///   exist (a `drv_executions` lifecycle row *or* at least one manifest
-///   chunk — an execution can have chunks before the scheduler's
-///   lifecycle INSERT lands, and a lifecycle row before its first
-///   chunk). The `derivation` argument is not cross-checked against a
+///   chunk). The write path admits appends only AFTER the lifecycle
+///   row exists — the ordering law is single-homed at `logs/gate.rs`
+///   check 3; cite it rather than restating — so the chunk leg is not
+///   a pre-INSERT window: it is belt-and-braces for lifecycle/artifact
+///   lifetime skew (a reaped lifecycle row whose log artifacts are
+///   still readable). The `derivation` argument is not cross-checked against a
 ///   pinned execution: exec ids are unguessable UUIDv7s and `TailLog`
 ///   is a read-only, route-gated API — the pin *is* the selector.
 /// - An empty `pinned_exec_id` resolves through the `latest_build_exec`

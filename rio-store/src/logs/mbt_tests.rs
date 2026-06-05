@@ -42,7 +42,7 @@
 //!   reads. The driver writes the rows (mirroring the scheduler's
 //!   INSERT/UPDATE); the projection reads them back **through the
 //!   store's own accessors** (`sealed_final_line_count`, the gate's
-//!   latest-assignment lookup), so the seeding and the store's
+//!   claimed-exec lookup), so the seeding and the store's
 //!   interpretation of it are both checked.
 //! - **Builder-side** (`produceLine`, `buildFinishes`, `deliverAck`,
 //!   `uploaderAbandons`, the `producedEnd` / `ackedBelow` / `sentBelow`
@@ -174,7 +174,7 @@ const DRV_HASH_32: &str = "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm";
 /// The one bound builder. The model's writer identity is the execution
 /// index, not the executor (a re-dispatch mints a new exec_id either
 /// way), so every execution is assigned to the same executor and the
-/// gate's latest-assignment rejection is driven purely by the exec_id
+/// gate's claimed-exec rejection is driven purely by the exec_id
 /// mismatch — the same discriminator the model's `e != dispatched`
 /// uses.
 const EXECUTOR: &str = "mbt-builder-0";
@@ -470,8 +470,8 @@ impl MbtSystem {
             .with_context(|| format!("trace references execution {e} before its dispatch"))
     }
 
-    /// `dispatch`: the scheduler mints a new execution, records it as
-    /// the derivation's latest assignment, and INSERTs its lifecycle
+    /// `dispatch`: the scheduler mints a new execution, records its
+    /// assignment row, and INSERTs its lifecycle
     /// row. Mirrors `assign_to_worker`'s assignment write + the
     /// dispatch-time `drv_executions` INSERT. The previous attempt's
     /// assignment is marked failed first (the `assignments_active_uq`

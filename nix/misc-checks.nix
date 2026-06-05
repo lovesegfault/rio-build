@@ -678,6 +678,60 @@ in
         touch $out
       '';
 
+  # bughunt2 slot 4 riders (merged_bug_168 + bug_362): the log-gate
+  # authority model is CLAIMED-EXEC (check 3 at logs/gate.rs) — the
+  # pre-wave "latest assignment" / "live assignment" rule is retired,
+  # and the "chunks before the lifecycle INSERT" ordering claim is
+  # false (append admission requires the drv_executions row to exist,
+  # so chunks can never precede it). Narration restating either
+  # retired concept regressed twice via comment-copy; this lint makes
+  # the phrases unwritable. The ordering law is single-homed at
+  # logs/gate.rs check 3 — cite it instead of restating.
+  # Born RED on the pre-rider tree (7 sites); the rewordings in the
+  # same commit are the green.
+  retired-phrase-lint =
+    pkgs.runCommand "rio-retired-phrase-lint"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-store/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-gateway/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-cli/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-builder/src)
+          ];
+        };
+        nativeBuildInputs = [ pkgs.ripgrep ];
+      }
+      ''
+        set +o pipefail
+        fail=0
+        # The retired assignment-currency vocabulary, scoped to the log
+        # subsystem (the scheduler legitimately reasons about latest
+        # assignments — ITS tables own that question). [^a-zA-Z]{0,3}
+        # catches markup-interposed forms (*latest* assignment).
+        hits=$(rg -n -i '(latest|live)[^a-zA-Z]{0,3}assignment' $src/rio-store/src/logs || true)
+        if [[ -n "$hits" ]]; then
+          echo "FAIL: retired log-authority vocabulary ('latest/live assignment') in" >&2
+          echo "rio-store/src/logs — authority is keyed on the CLAIMED exec; cite" >&2
+          echo "logs/gate.rs check 3 instead of restating the retired rule:" >&2
+          echo "$hits" >&2
+          fail=1
+        fi
+        # The false ordering claim, workspace-wide.
+        hits=$(rg -nU -i "chunks before the[^a-zA-Z]+(scheduler.s[^a-zA-Z]+)?lifecycle INSERT" $src || true)
+        if [[ -n "$hits" ]]; then
+          echo "FAIL: 'chunks before the lifecycle INSERT' is a false ordering claim" >&2
+          echo "(append admission requires the drv_executions row; see logs/gate.rs" >&2
+          echo "check 3, the single home of the ordering law):" >&2
+          echo "$hits" >&2
+          fail=1
+        fi
+        [[ $fail -eq 0 ]]
+        touch $out
+      '';
+
   transport-unary-ban =
     pkgs.runCommand "rio-transport-unary-ban"
       {
