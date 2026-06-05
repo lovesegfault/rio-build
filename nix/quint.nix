@@ -1344,6 +1344,72 @@ in
       extraSpecs = [ "leaderMarks" ];
     };
 
+    # The scheduler's cost-table leadership latch (NEW, bughunt2-wave
+    # slot 8 merged_bug_212): was_leader + poller_tick_prelude + the
+    # observability::LEADER_EDGES cost-latch cells as a protocol — the
+    # standby store, the leading-edge reload (table catches up to the
+    # world before any body runs), the body's persist, the lose cell
+    # on EVERY lose-shaped transition (lost handler AND the rebound's
+    # Compound delivery), and the foreign tenure that evolves the
+    # world exactly when the real lease is not ours (standby, or
+    # inside a rebound's unobserved lose→re-acquire gap). Headline
+    # noStalePersist: no persist ever writes a previous tenure's
+    # table over a foreign-evolved world — the bug_310/merged_bug_212
+    # failure shape. The paired pin is
+    # quint-costlatch-calib-212-acquire-only (the pre-fix acquire-only
+    # rebound delivery skips the lose cell and must falsify).
+    # Measured: exhaustive TLC <1s at the wired constants (transcript
+    # authoritative) — the default 1800s budget is >1800x headroom.
+    # r[verify sched.lease.rebound+3]
+    quint-cost-latch = mkQuintCheck {
+      name = "cost-latch";
+      spec = "costLatch";
+      main = "costLatchBase";
+      invariants = [
+        "boundsOK"
+        "noStalePersist"
+      ];
+    };
+
+    # Non-vacuity witnesses: the body's persist actually runs, and a
+    # foreign tenure actually evolves the world, in the explored
+    # space — the noStalePersist verdict constrains a live
+    # interleaving, not an empty one.
+    quint-cost-latch-witness-persist = mkQuintWitnessCheck {
+      name = "cost-latch-witness-persist";
+      spec = "costLatch";
+      main = "costLatchBase";
+      witness = "noPersist";
+    };
+    quint-cost-latch-witness-foreign = mkQuintWitnessCheck {
+      name = "cost-latch-witness-foreign";
+      spec = "costLatch";
+      main = "costLatchBase";
+      witness = "noForeignPersist";
+    };
+
+    # Deterministic named-run replay (reboundReloadsBeforePersistRun:
+    # rebound with a foreign tenure inside the gap → lose cell →
+    # reload-before-body → fresh persist).
+    quint-cost-latch-runs = mkQuintRunCheck {
+      name = "cost-latch-runs";
+      spec = "costLatch";
+      main = "costLatchBase";
+    };
+
+    # merged_bug_212 pre-fix: ACQUIRE-ONLY rebound delivery — the lose
+    # cell skipped, the latch stays true across the unobserved holder
+    # change, the next leading tick skips the reload and persists the
+    # deposed tenure's table; noStalePersist falls.
+    quint-costlatch-calib-212-acquire-only = mkQuintWitnessCheck {
+      name = "costlatch-calib-212-acquire-only";
+      spec = "calibration/costlatch-212-acquire-only";
+      main = "costlatchCalib212AcquireOnly";
+      witness = "noStalePersist";
+      step = "calibStep";
+      extraSpecs = [ "costLatch" ];
+    };
+
     # ------------------------------------------------------------------
     # rio-store's LogService: the build-log session/chunk/dedup protocol
     # (model C of the log-formal campaign — the successor to the retired
