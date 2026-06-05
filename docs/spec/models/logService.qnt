@@ -353,6 +353,56 @@ module logService {
   /// under it.
   const CALIB_READER_ADVANCE_PAST: bool
 
+  // --- bughunt-2 slot-6 served-stream delta consts ----------------------
+  // (bug_298 / merged_bug_187 / merged_bug_150 / merged_bug_002 /
+  // merged_bug_063's commit-mid-serve seam.) Const-flag pattern: the
+  // four pre-existing base regimes bind every flag false and
+  // MAX_BATCH_LINES = MAX_LINE (the bound can never bite in the
+  // bounded domain), so their state spaces are unchanged — re-measured
+  // byte-identical at introduction.
+
+  /// Enables `appendWorkerGap`: the HONEST uploader's stream skips a
+  /// span (suppression, rate-drop) — the admitted-hole source for the
+  /// served plane, distinct from hostile fabrication.
+  const ENABLE_WORKER_GAP: bool
+  /// Enables `readerWakeOnDrop`: the drop-epoch latch wake — a fan-out
+  /// drop arms `droppedPending`, and the wake back-fills from held
+  /// state (d02563663's watch::Sender latch; "latch, don't pulse").
+  const ENABLE_DROP_WAKE: bool
+  /// Enables the execution axis: `execSwitchDelivery` retags the live
+  /// stream with a new execution (a retry on another worker), and
+  /// `readerDrain` must take the switch arm (merged_bug_002).
+  const ENABLE_EXEC_AXIS: bool
+  /// Per-batch admission bound (`rio_log_kernel::MAX_BATCH_LINES`,
+  /// bug_298): `acceptVerdict` rejects a batch of more lines than
+  /// this, per-batch, stream open. Base regimes bind it to MAX_LINE
+  /// (unreachable); the flood regime binds 1 so the arm bites.
+  const MAX_BATCH_LINES: int
+  /// CALIBRATION: the oversized arm is skipped — an over-bound batch
+  /// is admitted whole (`batchLinesBounded` twin).
+  const CALIB_OVERSIZED_ADMITTED: bool
+  /// CALIBRATION: the drop wake fires WITHOUT the latch — recovery
+  /// runs on admitted holes too, the merged_bug_187 worker
+  /// amplification (`recoveryOnlyOnDrop` twin).
+  const CALIB_RECOVERY_UNGATED: bool
+  /// CALIBRATION: `readerStamp` claims the store's completeness
+  /// verbatim without checking the catch-up actually covered — the
+  /// cursor-blind stamp (merged_bug_063;
+  /// `servedStreamNoSilentLoss` twin over the commit-mid-serve seam).
+  const CALIB_STAMP_SKIPS_CATCHUP: bool
+  /// CALIBRATION: a foreign-execution delivery is drained through the
+  /// OLD cursor — the new numbering's low lines vanish as
+  /// "duplicates" (`noCrossExecRowInterleave` twin, merged_bug_002).
+  const CALIB_EXEC_SPLICE: bool
+  /// CALIBRATION: the drop wake is LOST (the pulse-not-latch failure
+  /// mode) — `readerWakeOnDrop` never fires even armed
+  /// (`servedStreamNoSilentLoss` twin leg two, with the stamp skip).
+  const CALIB_DROP_WAKE_LOST: bool
+  /// CALIBRATION: `readerCatchup` advances the cursor to the mark
+  /// WITHOUT serving the held back-fill (`resumeCursorSound` twin,
+  /// merged_bug_205's finalize-at-gap inverse).
+  const CALIB_RESUME_PAST_GAP: bool
+
   // --- 3. pure helpers --------------------------------------------------
 
   pure def maxInt(a: int, b: int): int = if (a > b) a else b
@@ -497,6 +547,14 @@ module logService {
     nonMonotoneRejected: bool,
     sweptChunks: bool,
     matThenBuildReplayAdmitted: bool,
+    // slot-6 served-stream delta: workerGapAppended (an honest
+    // worker-gap batch landed — the admitted hole is reachable),
+    // oversizedRejected (the bound bit), oversizedAdmitted (only the
+    // CALIB_OVERSIZED_ADMITTED arm can set it; batchLinesBounded is
+    // its negation).
+    workerGapAppended: bool,
+    oversizedRejected: bool,
+    oversizedAdmitted: bool,
   }
 
   /// The reader's terminal observation: the serving session's final
@@ -536,6 +594,32 @@ module logService {
   /// store buffers (witness `noReaderRecovery` pins the repair
   /// reachable).
   var readerRecovered: bool
+
+  // --- slot-6 served-stream delta vars ----------------------------------
+
+  /// The catch-up mark: one past the highest held line at the last
+  /// `readerCatchup`. The stamp's completeness honesty is measured
+  /// against what landed AFTER this mark (commit-mid-serve).
+  var readerManifestMark: int
+  /// Between `readerCatchup` and `readerStamp` (the finalize split's
+  /// intermediate state — core actions interleave here).
+  var readerPendingStamp: bool
+  /// COUNT of recovery (back-fill) events — the m187 "counted
+  /// backfill". `recoveryOnlyOnDrop` pins it to drop provenance.
+  var readerRecoveryEntries: int
+  /// The drop-epoch LATCH (d02563663's watch::Sender): armed by a
+  /// fan-out drop, consumed by `readerWakeOnDrop`. A pulse would be
+  /// lost while the serve loop is parked; the latch survives.
+  var droppedPending: bool
+  /// The execution whose numbering the reader's cursor lives in
+  /// (exec-axis regimes; an abstract 0/1 tag).
+  var readerExec: int
+  /// The execution tag on the live stream's next deliveries.
+  var deliveryExec: int
+  /// Ghost: a foreign-execution row was drained through the old
+  /// cursor and swallowed (only the CALIB_EXEC_SPLICE arm can set it;
+  /// `noCrossExecRowInterleave` = its negation).
+  var execSpliced: bool
 
   // --- 5. derived state -------------------------------------------------
 
@@ -713,9 +797,16 @@ module logService {
   /// The overflow arm (check 0 in the code) is unrepresentable in the
   /// bounded line domain. The accepted batch raises the high water to
   /// its (post-truncation) end.
-  type Verdict = | RejectNonMonotone | RejectPastFinal | Accept(int)
-  pure def acceptVerdict(hw: int, ceiling: CeilingState, lo: int, hi: int): Verdict =
-    if (lo < hw) RejectNonMonotone
+  /// The oversized arm (bug_298, check 2 in the code after the
+  /// unrepresentable overflow): a batch of more than MAX_BATCH_LINES
+  /// lines is rejected whole BEFORE the monotone/ceiling checks —
+  /// per-batch, stream open. `CALIB_OVERSIZED_ADMITTED` skips it (the
+  /// pre-fix admission, `batchLinesBounded`'s twin).
+  type Verdict = | RejectOversized | RejectNonMonotone | RejectPastFinal | Accept(int)
+  pure def acceptVerdictWith(oversizedSkipped: bool, maxBatch: int,
+      hw: int, ceiling: CeilingState, lo: int, hi: int): Verdict =
+    if (hi - lo > maxBatch and not(oversizedSkipped)) RejectOversized
+    else if (lo < hw) RejectNonMonotone
     else
       match ceiling {
         | NoCeiling => Accept(hi)
@@ -723,6 +814,8 @@ module logService {
           if (lo >= c.value) RejectPastFinal
           else Accept(minInt(hi, c.value))
       }
+  def acceptVerdict(hw: int, ceiling: CeilingState, lo: int, hi: int): Verdict =
+    acceptVerdictWith(CALIB_OVERSIZED_ADMITTED, MAX_BATCH_LINES, hw, ceiling, lo, hi)
 
   // --- 7. invariants ----------------------------------------------------
   //
@@ -990,6 +1083,10 @@ module logService {
     pendingFan.forall(n => n >= 0 and n < MAX_LINE),
     pendingFan.size() <= QUEUE_CAP,
     readerServedCount >= readerServed.size(),
+    readerManifestMark >= 0 and readerManifestMark <= MAX_LINE,
+    readerRecoveryEntries >= 0,
+    readerExec >= 0 and readerExec <= 1,
+    deliveryExec >= 0 and deliveryExec <= 1,
   }
 
   // Reader-plane witnesses (expect-violation: each scenario must be
@@ -1001,6 +1098,46 @@ module logService {
   /// Violated when a jump (or the final catch-up) is repaired by
   /// back-filling from the manifest/buffers.
   val noReaderRecovery = not(readerRecovered)
+
+  // --- slot-6 served-stream delta invariants -----------------------------
+
+  /// merged_bug_205's resume law: every HELD line below the reader's
+  /// cursor is served — the cursor never silently crosses a line the
+  /// store could have given it (an un-held below-cursor line is an
+  /// admitted hole, disclosed by the jump/gap row). The
+  /// CALIB_RESUME_PAST_GAP catch-up advances the cursor to the mark
+  /// without serving and falsifies this.
+  val resumeCursorSound = interval(0, readerCursor)
+    .forall(n => or { readerServed.contains(n), not(readerHeld(n)) })
+
+  /// merged_bug_187's provenance gate: counted recovery entries exist
+  /// only when the fan-out actually DROPPED something — admitted
+  /// holes (worker gaps, out-of-order fan) serve across without
+  /// feeding the recovery lane. CALIB_RECOVERY_UNGATED counts every
+  /// back-fill and falsifies this.
+  val recoveryOnlyOnDrop = readerRecoveryEntries > 0 implies fanDropped != Set()
+
+  /// bug_298's admission bound: an over-bound batch is never admitted
+  /// (the ghost's only writer is the CALIB_OVERSIZED_ADMITTED arm —
+  /// the LIVE oversized check makes admission unrepresentable).
+  val batchLinesBounded = not(wit.oversizedAdmitted)
+
+  /// merged_bug_002: a foreign-execution row is never drained through
+  /// the old cursor's numbering (the silent splice/swallow). Only the
+  /// CALIB_EXEC_SPLICE arm can set the ghost; the LIVE switch arm
+  /// resets the cursor first, by construction.
+  val noCrossExecRowInterleave = not(execSpliced)
+
+  // Delta witnesses (expect-violation: reachability pins).
+  /// Violated when an honest worker-gap batch lands (the admitted
+  /// hole is reachable, not vacuously absent).
+  val noWorkerGapAppended = not(wit.workerGapAppended)
+  /// Violated when the oversized arm actually rejects a batch (the
+  /// bound bites in the flood regime).
+  val noOversizedRejected = not(wit.oversizedRejected)
+  /// Violated when the drop wake repairs a dropped span (the latch
+  /// path is reachable; entries imply the wake or the drain counted).
+  val noDropWakeRecovery = not(readerRecoveryEntries > 0)
 
   /// `CompletenessGate` (store.log.completeness-gate's per-append half):
   /// once an ingest session has learned the execution's recorded
@@ -1622,6 +1759,7 @@ module logService {
       // `sessionAborts`' nondeterminism).
       match acceptVerdict(sessHw(e, s), sessCeiling(e, s), lo, hi) {
         | Accept(keptHi) => acceptedTotal.get(e) + (keptHi - lo) <= CAP
+        | RejectOversized => true
         | RejectNonMonotone => true
         | RejectPastFinal => true
       },
@@ -1631,7 +1769,21 @@ module logService {
             sessions' = sessions.put(e,
               sessions.get(e).put(s, sessAfterAccept(sessions.get(e).get(s), lo, keptHi))),
             acceptedTotal' = acceptedTotal.put(e, acceptedTotal.get(e) + (keptHi - lo)),
-            wit' = if (keptHi < hi) { ...wit, pastFinalRejected: true } else wit,
+            wit' = if (hi - lo > MAX_BATCH_LINES)
+                // Only reachable with CALIB_OVERSIZED_ADMITTED (the
+                // live arm rejects first): the admitted over-bound
+                // batch — batchLinesBounded's violation source.
+                { ...wit, oversizedAdmitted: true }
+              else if (keptHi < hi) { ...wit, pastFinalRejected: true }
+              else wit,
+          }
+        | RejectOversized => all {
+            // Per-batch rejection, stream open, nothing buffered —
+            // unreachable for the honest uploader unless the flood
+            // regime shrinks MAX_BATCH_LINES below the line domain.
+            sessions' = sessions,
+            acceptedTotal' = acceptedTotal,
+            wit' = { ...wit, oversizedRejected: true },
           }
         | RejectNonMonotone => all {
             sessions' = sessions,
@@ -1672,6 +1824,75 @@ module logService {
   /// lines past the build's true end") and the source of forward-gapped
   /// manifests. The uploader's cursors are untouched — the fabrication
   /// is the builder process misbehaving alongside its own uploader, and
+  /// The HONEST uploader's stream skips a span (ENABLE_WORKER_GAP):
+  /// rate-limit suppression or batcher drop — the worker-side
+  /// admitted-hole source (merged_bug_187's provenance axis; the
+  /// suppression marker disclosure is out of model). The skipped span
+  /// `[sentBelow, lo)` is never retransmitted; the batch `[lo, hi)`
+  /// lands as a legal forward gap. Distinct from fabrication: these
+  /// are genuine produced lines, so the reader-plane span laws keep
+  /// counting them — only the conservation totality (which suppression
+  /// breaks BY DESIGN) is regime-excluded.
+  action appendWorkerGap(e: int): bool = all {
+    ENABLE_WORKER_GAP,
+    readerUnchanged,
+    e <= dispatched,
+    uploader.get(e) == Uploading,
+    val s = openSessionOf(e)
+    val skipTo = sentBelow.get(e) + 1
+    val hi = producedEnd.get(e)
+    all {
+      s != 0,
+      skipTo < hi,
+      sessHw(e, s) <= skipTo,
+      match acceptVerdict(sessHw(e, s), sessCeiling(e, s), skipTo, hi) {
+        | Accept(keptHi) => acceptedTotal.get(e) + (keptHi - skipTo) <= CAP
+        | RejectOversized => true
+        | RejectNonMonotone => true
+        | RejectPastFinal => true
+      },
+      sentBelow' = sentBelow.put(e, hi),
+      match acceptVerdict(sessHw(e, s), sessCeiling(e, s), skipTo, hi) {
+        | Accept(keptHi) => all {
+            sessions' = sessions.put(e,
+              sessions.get(e).put(s, sessAfterAccept(sessions.get(e).get(s), skipTo, keptHi))),
+            acceptedTotal' = acceptedTotal.put(e, acceptedTotal.get(e) + (keptHi - skipTo)),
+            wit' = { ...wit, workerGapAppended: true },
+          }
+        | RejectOversized => all {
+            sessions' = sessions,
+            acceptedTotal' = acceptedTotal,
+            wit' = { ...wit, oversizedRejected: true },
+          }
+        | RejectNonMonotone => all {
+            sessions' = sessions,
+            acceptedTotal' = acceptedTotal,
+            wit' = wit,
+          }
+        | RejectPastFinal => all {
+            sessions' = sessions,
+            acceptedTotal' = acceptedTotal,
+            wit' = { ...wit, pastFinalRejected: true },
+          }
+      },
+    },
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    assignmentRowLost' = assignmentRowLost,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
+  }
+
   /// its high-water side effect can permanently strand the honest
   /// replay behind the monotone floor (the builder shooting its own
   /// log; the strand is disclosed by the log never completing).
@@ -1692,6 +1913,7 @@ module logService {
       // the cap is an accounting bound, not an honesty check.
       match acceptVerdict(sessHw(e, s), sessCeiling(e, s), lo, hi) {
         | Accept(keptHi) => acceptedTotal.get(e) + (keptHi - lo) <= CAP
+        | RejectOversized => true
         | RejectNonMonotone => true
         | RejectPastFinal => true
       },
@@ -1702,6 +1924,14 @@ module logService {
             fabricated' = fabricated.put(e, fabricated.get(e).union(interval(lo, keptHi))),
             acceptedTotal' = acceptedTotal.put(e, acceptedTotal.get(e) + (keptHi - lo)),
             wit' = if (keptHi < hi) { ...wit, pastFinalRejected: true } else wit,
+          }
+        | RejectOversized => all {
+            // Reachable only when the flood regime shrinks the bound;
+            // the fabricated over-bound batch is dropped whole.
+            sessions' = sessions,
+            fabricated' = fabricated,
+            acceptedTotal' = acceptedTotal,
+            wit' = { ...wit, oversizedRejected: true },
           }
         | RejectNonMonotone => all {
             // Unreachable under the `lo >= hw` precondition; the arm
@@ -2148,6 +2378,13 @@ module logService {
     fanDropped' = fanDropped,
     readerJumpObserved' = readerJumpObserved,
     readerRecovered' = readerRecovered,
+    readerManifestMark' = readerManifestMark,
+    readerPendingStamp' = readerPendingStamp,
+    readerRecoveryEntries' = readerRecoveryEntries,
+    droppedPending' = droppedPending,
+    readerExec' = readerExec,
+    deliveryExec' = deliveryExec,
+    execSpliced' = execSpliced,
   }
 
   /// Frame: the core (non-reader) state untouched — the reader's
@@ -2202,6 +2439,13 @@ module logService {
       fanDropped' = fanDropped,
       readerJumpObserved' = readerJumpObserved,
       readerRecovered' = readerRecovered,
+      readerManifestMark' = readerManifestMark,
+      readerPendingStamp' = readerPendingStamp,
+      readerRecoveryEntries' = readerRecoveryEntries,
+      droppedPending' = droppedPending,
+      readerExec' = readerExec,
+      deliveryExec' = deliveryExec,
+      execSpliced' = execSpliced,
     },
     coreUnchanged,
   }
@@ -2220,12 +2464,16 @@ module logService {
     if (pendingFan.size() < QUEUE_CAP) all {
       pendingFan' = pendingFan.union(Set(n)),
       fanDropped' = fanDropped,
+      droppedPending' = droppedPending,
     } else all {
-      // Full queue: the delivery is dropped. The reader will only
-      // learn of this line through a later jump (or never — which
-      // the invariants make loud at the final stamp).
+      // Full queue: the delivery is dropped — and the drop-epoch
+      // LATCH arms (d02563663's watch::Sender; a pulse here would be
+      // lost exactly when the serve loop is parked mid-send). The
+      // reader learns of this line through the wake's back-fill, a
+      // later jump, or the final catch-up.
       pendingFan' = pendingFan,
       fanDropped' = fanDropped.union(Set(n)),
+      droppedPending' = true,
     },
     readerAttached' = readerAttached,
     readerCursor' = readerCursor,
@@ -2234,6 +2482,12 @@ module logService {
     readerFinal' = readerFinal,
     readerJumpObserved' = readerJumpObserved,
     readerRecovered' = readerRecovered,
+    readerManifestMark' = readerManifestMark,
+    readerPendingStamp' = readerPendingStamp,
+    readerRecoveryEntries' = readerRecoveryEntries,
+    readerExec' = readerExec,
+    deliveryExec' = deliveryExec,
+    execSpliced' = execSpliced,
     coreUnchanged,
   }
 
@@ -2253,72 +2507,266 @@ module logService {
     readerAttached,
     pendingFan != Set(),
     val n = setMin(pendingFan)
+    val execMismatch = ENABLE_EXEC_AXIS and deliveryExec != readerExec
     all {
       pendingFan' = pendingFan.exclude(Set(n)),
-      if (n < readerCursor) all {
+      if (execMismatch and not(CALIB_EXEC_SPLICE)) all {
+        // merged_bug_002, the FIXED switch arm: a delivery from a new
+        // execution resets the cursor to the new numbering plane and
+        // discloses the switch (the execSwitch row); the delivery
+        // itself then serves against the fresh floor (n == 0 serves,
+        // n > 0 is the new plane's own jump).
+        readerExec' = deliveryExec,
+        readerCursor' = n + 1,
+        readerServed' = Set(n),
+        readerServedCount' = readerServedCount + 1,
+        readerJumpObserved' = (readerJumpObserved or n > 0),
+        readerRecovered' = readerRecovered,
+        readerRecoveryEntries' = readerRecoveryEntries,
+        execSpliced' = execSpliced,
+      } else if (execMismatch and CALIB_EXEC_SPLICE) all {
+        // CALIBRATION (pre-fix splice): the foreign delivery drains
+        // through the OLD cursor. Its low line numbers look like
+        // resent duplicates and are SWALLOWED — the silent splice.
+        readerExec' = readerExec,
+        if (n < readerCursor) all {
+          readerCursor' = readerCursor,
+          readerServed' = readerServed,
+          readerServedCount' = readerServedCount,
+          execSpliced' = true,
+        } else all {
+          readerCursor' = n + 1,
+          readerServed' = readerServed.union(Set(n)),
+          readerServedCount' = readerServedCount + 1,
+          execSpliced' = execSpliced,
+        },
+        readerJumpObserved' = readerJumpObserved,
+        readerRecovered' = readerRecovered,
+        readerRecoveryEntries' = readerRecoveryEntries,
+      } else if (n < readerCursor) all {
         // Resent duplicate: the watermark already covers it.
+        readerExec' = readerExec,
         readerCursor' = readerCursor,
         readerServed' = readerServed,
         readerServedCount' = readerServedCount,
         readerJumpObserved' = readerJumpObserved,
         readerRecovered' = readerRecovered,
+        readerRecoveryEntries' = readerRecoveryEntries,
+        execSpliced' = execSpliced,
       } else if (n == readerCursor) all {
+        readerExec' = readerExec,
         readerCursor' = n + 1,
         readerServed' = readerServed.union(Set(n)),
         readerServedCount' = readerServedCount + 1,
         readerJumpObserved' = readerJumpObserved,
         readerRecovered' = readerRecovered,
+        readerRecoveryEntries' = readerRecoveryEntries,
+        execSpliced' = execSpliced,
       } else all {
         // Jump past the cursor: [readerCursor, n) is missing from the
         // live stream.
+        readerExec' = readerExec,
         readerJumpObserved' = true,
+        execSpliced' = execSpliced,
         if (CALIB_READER_ADVANCE_PAST) all {
           // Pre-fix: advance past, serve only the jumped-to line.
           readerCursor' = n + 1,
           readerServed' = readerServed.union(Set(n)),
           readerServedCount' = readerServedCount + 1,
           readerRecovered' = readerRecovered,
+          readerRecoveryEntries' = readerRecoveryEntries,
         } else all {
-          // Fixed: back-fill the held part of the hole first.
+          // Fixed: back-fill the held part of the hole first. The
+          // un-held remainder is provenance-admitted (a worker gap or
+          // a swept span has nothing to back-fill from) — served
+          // across, no entry. The COUNTED recovery (m187) keys on
+          // DROP provenance: only a back-fill that re-serves a line
+          // the fan-out actually dropped increments the counter — a
+          // jump produced by out-of-order fan delivery back-fills
+          // without counting (the code's per-accept broadcast cannot
+          // even produce that order; the model is more adversarial).
+          // CALIB_RECOVERY_UNGATED counts EVERY back-fill — the
+          // pre-fix amplification where admitted holes fed the
+          // recovery lane.
           val backfill = interval(readerCursor, n).filter(m => readerHeld(m))
+          val counted = if (CALIB_RECOVERY_UNGATED) backfill != Set()
+            else backfill.intersect(fanDropped) != Set()
           all {
             readerCursor' = n + 1,
             readerServed' = readerServed.union(backfill).union(Set(n)),
             readerServedCount' = readerServedCount + backfill.size() + 1,
             readerRecovered' = (readerRecovered or backfill != Set()),
+            readerRecoveryEntries' = readerRecoveryEntries
+              + (if (counted) 1 else 0),
           }
         },
       },
       readerAttached' = readerAttached,
       readerFinal' = readerFinal,
       fanDropped' = fanDropped,
+      readerManifestMark' = readerManifestMark,
+      readerPendingStamp' = readerPendingStamp,
+      droppedPending' = droppedPending,
+      deliveryExec' = deliveryExec,
     },
     coreUnchanged,
   }
 
-  /// The serving session ends: the fixed reader catches up from the
-  /// manifest and buffers BEFORE the final stamp (serve_tail's
-  /// pre-`send_final` catch-up); the calibration reader stamps as-is.
-  /// The final carries the store's completeness claim.
-  action readerFinalize = all {
+  /// FIRST HALF of the finalize split (merged_bug_063's
+  /// commit-mid-serve seam): the fixed reader catches up from the
+  /// manifest and buffers (serve_tail's pre-`send_final` catch-up) and
+  /// records the mark it caught up THROUGH. The stamp is a separate
+  /// action — core actions (a cut committing, a line landing) can
+  /// interleave between the two, exactly the window where the
+  /// cursor-blind stamp lied. The calibration readers catch up
+  /// nothing (`CALIB_READER_ADVANCE_PAST`) or advance the cursor
+  /// without serving (`CALIB_RESUME_PAST_GAP`).
+  action readerCatchup = all {
     ENABLE_READER,
     readerAttached,
-    val catchup = if (CALIB_READER_ADVANCE_PAST) Set()
-      else interval(0, MAX_LINE).filter(m => and { readerHeld(m), not(readerServed.contains(m)) })
-    val served2 = readerServed.union(catchup)
-    val cursor2 = if (served2 == Set()) readerCursor
-      else maxInt(readerCursor, served2.fold(0, (a, b) => maxInt(a, b)) + 1)
+    not(readerPendingStamp),
+    val held = interval(0, MAX_LINE).filter(m => readerHeld(m))
+    val catchup = if (CALIB_READER_ADVANCE_PAST or CALIB_RESUME_PAST_GAP) Set()
+      else held.filter(m => not(readerServed.contains(m)))
+    val mark = if (held == Set()) 0 else held.fold(0, (a, b) => maxInt(a, b)) + 1
+    val cursor2 = if (CALIB_RESUME_PAST_GAP) maxInt(readerCursor, mark)
+      else if (readerServed.union(catchup) == Set()) readerCursor
+      else maxInt(readerCursor,
+        readerServed.union(catchup).fold(0, (a, b) => maxInt(a, b)) + 1)
+    val counted = if (CALIB_RECOVERY_UNGATED) catchup != Set()
+      else catchup.intersect(fanDropped) != Set()
     all {
-      readerAttached' = false,
-      readerServed' = served2,
+      readerServed' = readerServed.union(catchup),
       readerServedCount' = readerServedCount + catchup.size(),
       readerCursor' = cursor2,
       readerRecovered' = (readerRecovered or catchup != Set()),
-      readerFinal' = Final({ cursor: cursor2, complete: logIsComplete(1) }),
-      pendingFan' = Set(),
+      readerRecoveryEntries' = readerRecoveryEntries + (if (counted) 1 else 0),
+      readerManifestMark' = mark,
+      readerPendingStamp' = true,
+      readerAttached' = readerAttached,
+      readerFinal' = readerFinal,
+      pendingFan' = pendingFan,
       fanDropped' = fanDropped,
       readerJumpObserved' = readerJumpObserved,
+      droppedPending' = droppedPending,
+      readerExec' = readerExec,
+      deliveryExec' = deliveryExec,
+      execSpliced' = execSpliced,
     },
+    coreUnchanged,
+  }
+
+  /// SECOND HALF: the final message stamps. The FIXED stamp's
+  /// completeness claim is the store's completeness fold AND the
+  /// catch-up coverage re-check (everything held at stamp time is
+  /// served — a line that landed after the mark un-claims
+  /// completeness; the FinalClaim cursor-bind). The
+  /// CALIB_STAMP_SKIPS_CATCHUP stamp claims the store's fold verbatim
+  /// — the pre-fix cursor-blind predicate, honest only by luck.
+  action readerStamp = all {
+    ENABLE_READER,
+    readerAttached,
+    readerPendingStamp,
+    val covered = interval(0, MAX_LINE)
+      .forall(m => readerHeld(m) implies readerServed.contains(m))
+    val complete = if (CALIB_STAMP_SKIPS_CATCHUP) logIsComplete(1)
+      else logIsComplete(1) and covered
+    all {
+      readerAttached' = false,
+      readerPendingStamp' = false,
+      readerFinal' = Final({ cursor: readerCursor, complete: complete }),
+      pendingFan' = Set(),
+      readerServed' = readerServed,
+      readerServedCount' = readerServedCount,
+      readerCursor' = readerCursor,
+      readerRecovered' = readerRecovered,
+      readerRecoveryEntries' = readerRecoveryEntries,
+      readerManifestMark' = readerManifestMark,
+      fanDropped' = fanDropped,
+      readerJumpObserved' = readerJumpObserved,
+      droppedPending' = droppedPending,
+      readerExec' = readerExec,
+      deliveryExec' = deliveryExec,
+      execSpliced' = execSpliced,
+    },
+    coreUnchanged,
+  }
+
+  /// The drop-epoch wake (ENABLE_DROP_WAKE; d02563663's latch): armed
+  /// `droppedPending`, the serve loop back-fills every held dropped
+  /// line at its next select — the burst-end drop serves WITHOUT new
+  /// fan-out output. CALIB_DROP_WAKE_LOST models the lost pulse: the
+  /// action never fires (the latch the code uses cannot lose the
+  /// wake; a Notify could and DID — the flaked predecessor run).
+  action readerWakeOnDrop = all {
+    ENABLE_READER,
+    ENABLE_DROP_WAKE,
+    not(CALIB_DROP_WAKE_LOST),
+    readerAttached,
+    or { droppedPending, CALIB_RECOVERY_UNGATED },
+    val recoverable = fanDropped.filter(m => and {
+      readerHeld(m),
+      not(readerServed.contains(m)),
+    })
+    val ungated = if (CALIB_RECOVERY_UNGATED)
+      interval(0, MAX_LINE).filter(m => and {
+        readerHeld(m), not(readerServed.contains(m)),
+      })
+      else recoverable
+    val served2 = readerServed.union(ungated)
+    all {
+      readerServed' = served2,
+      readerServedCount' = readerServedCount + ungated.size(),
+      // SEALED advance (m205's CursorAdvance law, the same rule the
+      // code's LineCursor enforces): the cursor moves only through
+      // the CONTIGUOUS served prefix — a max-based advance would
+      // cross a held line whose fan-out simply hasn't run yet, the
+      // exact resume-unsoundness resumeCursorSound forbids.
+      readerCursor' = interval(readerCursor, MAX_LINE)
+        .filter(m => not(served2.contains(m)))
+        .fold(MAX_LINE, (a, b) => minInt(a, b)),
+      readerRecovered' = (readerRecovered or ungated != Set()),
+      readerRecoveryEntries' = readerRecoveryEntries
+        + (if (ungated != Set()) 1 else 0),
+      droppedPending' = false,
+      readerAttached' = readerAttached,
+      readerFinal' = readerFinal,
+      pendingFan' = pendingFan,
+      fanDropped' = fanDropped,
+      readerJumpObserved' = readerJumpObserved,
+      readerManifestMark' = readerManifestMark,
+      readerPendingStamp' = readerPendingStamp,
+      readerExec' = readerExec,
+      deliveryExec' = deliveryExec,
+      execSpliced' = execSpliced,
+    },
+    coreUnchanged,
+  }
+
+  /// The live stream retags to a new execution (ENABLE_EXEC_AXIS): a
+  /// retry on another worker whose numbering restarts. Abstract 0/1
+  /// tag toggle; the reader's NEXT drain must take the switch arm.
+  action execSwitchDelivery = all {
+    ENABLE_READER,
+    ENABLE_EXEC_AXIS,
+    readerAttached,
+    deliveryExec == readerExec,
+    deliveryExec' = 1 - deliveryExec,
+    readerAttached' = readerAttached,
+    readerCursor' = readerCursor,
+    readerServed' = readerServed,
+    readerServedCount' = readerServedCount,
+    pendingFan' = pendingFan,
+    readerFinal' = readerFinal,
+    fanDropped' = fanDropped,
+    readerJumpObserved' = readerJumpObserved,
+    readerRecovered' = readerRecovered,
+    readerManifestMark' = readerManifestMark,
+    readerPendingStamp' = readerPendingStamp,
+    readerRecoveryEntries' = readerRecoveryEntries,
+    droppedPending' = droppedPending,
+    readerExec' = readerExec,
+    execSpliced' = execSpliced,
     coreUnchanged,
   }
 
@@ -2350,6 +2798,9 @@ module logService {
       nonMonotoneRejected: false,
       sweptChunks: false,
       matThenBuildReplayAdmitted: false,
+      workerGapAppended: false,
+      oversizedRejected: false,
+      oversizedAdmitted: false,
     },
     readerAttached' = false,
     readerCursor' = 0,
@@ -2360,6 +2811,13 @@ module logService {
     fanDropped' = Set(),
     readerJumpObserved' = false,
     readerRecovered' = false,
+    readerManifestMark' = 0,
+    readerPendingStamp' = false,
+    readerRecoveryEntries' = 0,
+    droppedPending' = false,
+    readerExec' = 0,
+    deliveryExec' = 0,
+    execSpliced' = false,
   }
 
   // --- 9. step ----------------------------------------------------------
@@ -2376,6 +2834,7 @@ module logService {
   action rewriteAssignmentAny = { nondet e = EXECS.oneOf() rewriteAssignment(e) }
   action openRejectedCompleteAny = { nondet e = EXECS.oneOf() openRejectedComplete(e) }
   action appendHonestAny = { nondet e = EXECS.oneOf() appendHonest(e) }
+  action appendWorkerGapAny = { nondet e = EXECS.oneOf() appendWorkerGap(e) }
   action appendFabricatedAny = {
     nondet e = EXECS.oneOf()
     nondet lo = 0.to(MAX_LINE - 1).oneOf()
@@ -2430,7 +2889,11 @@ module logService {
     readerSubscribe,
     fanoutDeliverAny,
     readerDrain,
-    readerFinalize,
+    readerCatchup,
+    readerStamp,
+    readerWakeOnDrop,
+    execSwitchDelivery,
+    appendWorkerGapAny,
   }
 }
 
@@ -2482,6 +2945,16 @@ module logServiceBase {
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
   ).*
 
   // --- deterministic protocol runs --------------------------------------
@@ -2595,6 +3068,16 @@ module logServiceRedispatch {
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
   ).*
 
   /// The superseded writer, v2: execution 1's session is open and
@@ -2673,6 +3156,16 @@ module logServiceResend {
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
   ).*
 
   /// The ambiguous-disconnect overlap: session 1 commits a chunk for
@@ -2737,6 +3230,16 @@ module logServiceSweep {
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
   ).*
 
   /// The TTL sweep deletes a complete log: the manifest and the
@@ -2807,6 +3310,16 @@ module logServiceCalibSessionCaps {
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
   ).*
 }
 
@@ -2836,6 +3349,16 @@ module logServiceCalibGateRow {
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
   ).*
 }
 
@@ -2870,6 +3393,16 @@ module logServiceKindMix {
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
   ).*
 
   /// The displacement scenario, fixed: the build streams and cuts a
@@ -2924,6 +3457,16 @@ module logServiceCalibLatestOnly {
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
   ).*
 }
 
@@ -2954,6 +3497,16 @@ module logServiceCalibLossEscape {
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
   ).*
 }
 
@@ -2984,6 +3537,16 @@ module logServiceCalibSweepAgeOnly {
     ENABLE_READER = false,
     QUEUE_CAP = 0,
     CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
   ).*
 }
 
@@ -3016,6 +3579,16 @@ module logServiceServed {
     ENABLE_READER = true,
     QUEUE_CAP = 1,
     CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
   ).*
 
   /// The repaired-drop happy path, replayable with
@@ -3074,6 +3647,16 @@ module logServiceCalibReaderAdvance {
     ENABLE_READER = true,
     QUEUE_CAP = 1,
     CALIB_READER_ADVANCE_PAST = true,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = true,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
   ).*
 
   /// The recorded pre-fix counterexample, replayable with
@@ -3098,7 +3681,8 @@ module logServiceCalibReaderAdvance {
       .then(readerDrain) //       PRE-FIX: cursor jumps to 3, line 1 spliced
       .then(buildFinishes(1))
       .then(recordFinalLineCount(1))
-      .then(readerFinalize) //    no catch-up; stamps complete over the hole
+      .then(readerCatchup) //    calib: catches up nothing
+      .then(readerStamp) //       blind stamp: complete over the hole
       .expect(all {
         fanDropped == Set(1),
         readerJumpObserved,
@@ -3106,4 +3690,345 @@ module logServiceCalibReaderAdvance {
         readerServed == Set(0, 2),
         readerFinal == Final({ cursor: 3, complete: true }),
       })
+}
+
+
+// =========================================================================
+// SLOT-6 SERVED-STREAM DELTA REGIMES (bughunt-2). Each LIVE regime has
+// its falsify twin (same bindings, one CALIB flag flipped) wired as a
+// quint-log-service-calib-* expect-violation check in nix/quint.nix —
+// a twin that stops violating means the live invariant went vacuous.
+// =========================================================================
+
+// LIVE: the honest worker-gap + drop-wake plane. The uploader can skip
+// spans (suppression — the admitted-hole source), the capacity-1 queue
+// drops under burst, and the drop-epoch LATCH wakes the serve loop to
+// back-fill. The conservation-totality invariants are deliberately
+// absent: suppression breaks produced→served totality BY DESIGN (the
+// disclosure is the suppression marker, out of model); the reader-plane
+// laws are what hold. RECONNECT IS OFF in this regime: the model's
+// replay resets sentBelow to ackedBelow, which would resurrect a
+// suppressed line the code's batcher dropped from its retransmit
+// buffer permanently — suppression permanence is the rio-builder
+// proptest's pin (suppression_never_skips_numbers), not this plane's;
+// the reconnect x served-stream interleavings stay verified in
+// logServiceServed.
+module logServiceWorkerGap {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 2,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = false,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = true,
+    QUEUE_CAP = 1,
+    CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = true,
+    ENABLE_DROP_WAKE = true,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
+  ).*
+}
+
+// TWIN of logServiceWorkerGap: the wake is LOST (pulse-not-latch) and
+// the stamp is blind — a burst-end drop becomes a hole a complete
+// stamp crosses. servedStreamNoSilentLoss MUST falsify.
+module logServiceCalibDropWakeLost {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 2,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = false,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = true,
+    QUEUE_CAP = 1,
+    CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = true,
+    ENABLE_DROP_WAKE = true,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = true,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = true,
+    CALIB_RESUME_PAST_GAP = false,
+  ).*
+}
+
+// TWIN: the finalize split's commit-mid-serve seam alone — catch-up
+// runs honestly, a cut commits BETWEEN catch-up and stamp, and the
+// blind stamp claims the store's fold without the coverage re-check.
+// servedStreamNoSilentLoss MUST falsify (merged_bug_063's shape).
+module logServiceCalibStampSkips {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 2,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = true,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = true,
+    QUEUE_CAP = 1,
+    CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = true,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
+  ).*
+}
+
+// TWIN: recovery counted without drop provenance — out-of-order fan
+// delivery makes the drain back-fill held-but-never-dropped lines, and
+// the ungated counter bills them to the recovery lane (merged_bug_187's
+// worker amplification). recoveryOnlyOnDrop MUST falsify. QUEUE_CAP=2
+// so the jump can happen with NO drop at all.
+module logServiceCalibRecoveryUngated {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 2,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = true,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = true,
+    QUEUE_CAP = 2,
+    CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = true,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
+  ).*
+}
+
+// TWIN: the resume cursor crosses a held-unserved line — the catch-up
+// advances to the mark without serving the back-fill (merged_bug_205's
+// finalize-at-gap inverse). resumeCursorSound MUST falsify.
+module logServiceCalibResumePastGap {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 2,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = true,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = true,
+    QUEUE_CAP = 1,
+    CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = true,
+  ).*
+}
+
+// LIVE: the execution axis. The live stream can retag to a new
+// execution (a retry on another worker, numbering restarted); the
+// reader's drain takes the switch arm — explicit disclosure, cursor
+// reset, never a silent swallow.
+module logServiceExecAxis {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 2,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = true,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = true,
+    QUEUE_CAP = 2,
+    CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = true,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
+  ).*
+}
+
+// TWIN of logServiceExecAxis: the splice — a foreign-execution row
+// drains through the OLD cursor and its low numbering vanishes as a
+// "duplicate" (merged_bug_002's exact swallow).
+// noCrossExecRowInterleave MUST falsify.
+module logServiceCalibExecSplice {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 2,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = true,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = true,
+    QUEUE_CAP = 2,
+    CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = true,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = true,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
+  ).*
+}
+
+// LIVE: the admission-bound (flood) regime. MAX_BATCH_LINES shrinks to
+// 1 so a two-line honest batch hits the oversized arm — per-batch
+// reject, stream open, nothing buffered. The reader plane is off (an
+// ingest-plane probe); the conservation totality is deliberately
+// absent (a rejected batch's lines are wire-dropped by construction —
+// the real builder's flush bound sits orders below the cap, pinned by
+// the rio-builder const-assert).
+module logServiceFlood {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 1,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = false,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 1,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
+  ).*
+}
+
+// TWIN of logServiceFlood: the oversized arm is skipped — the
+// over-bound batch is ADMITTED whole. batchLinesBounded MUST falsify.
+module logServiceCalibOversized {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 1,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = false,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 1,
+    CALIB_OVERSIZED_ADMITTED = true,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
+  ).*
 }

@@ -1666,6 +1666,15 @@ in
         "servedStreamNoSilentLoss"
         "servedStreamSpanExact"
         "readerBoundsOK"
+        # resumeCursorSound is deliberately NOT bound here: under
+        # RECONNECT a disclosed-gap span can re-materialize below the
+        # cursor via the honest replay (the disclosure already covered
+        # it — the gateway's accepted_gap_floor story). The law's home
+        # is the single-session worker-gap plane, where apalache holds
+        # it; its twin (calib-resume-past-gap) still falsifies.
+        "recoveryOnlyOnDrop"
+        "batchLinesBounded"
+        "noCrossExecRowInterleave"
       ];
     };
 
@@ -1704,6 +1713,129 @@ in
       spec = "logService";
       main = "logServiceServed";
       witness = "noReaderRecovery";
+    };
+
+    # ------------------------------------------------------------------
+    # bughunt-2 slot 6: the served-stream delta planes. Three LIVE
+    # regimes (worker-gap/drop-wake, exec axis, admission flood), each
+    # invariant carrying its falsify twin below — a twin that stops
+    # violating means the live law went vacuous. The four pre-existing
+    # base regimes bind every delta flag false and MAX_BATCH_LINES =
+    # MAX_LINE (the oversized arm provably dead in the bounded domain);
+    # re-measured at introduction.
+    # r[verify store.log.gap-provenance]
+    # r[verify store.log.served-claim]
+    quint-log-service-worker-gap = mkQuintCheck {
+      name = "log-service-worker-gap";
+      spec = "logService";
+      main = "logServiceWorkerGap";
+      invariants = [
+        "boundsOK"
+        "readerBoundsOK"
+        "servedStreamSpanExact"
+        "servedStreamNoSilentLoss"
+        "resumeCursorSound"
+        "recoveryOnlyOnDrop"
+        "batchLinesBounded"
+        "noCrossExecRowInterleave"
+      ];
+    };
+
+    # The execution axis: a retried build's new numbering is disclosed
+    # (explicit switch, cursor reset), never silently spliced or
+    # swallowed (merged_bug_002 — kernel visit_chunk_keyed / the
+    # dashboard's keyed mirror).
+    quint-log-service-exec-axis = mkQuintCheck {
+      name = "log-service-exec-axis";
+      spec = "logService";
+      main = "logServiceExecAxis";
+      invariants = [
+        "boundsOK"
+        "readerBoundsOK"
+        "noCrossExecRowInterleave"
+      ];
+    };
+
+    # The admission bound (bug_298): MAX_BATCH_LINES shrinks to 1 so
+    # the oversized arm bites — per-batch reject, stream open.
+    # r[verify store.log.write-read-bound+2]
+    quint-log-service-flood = mkQuintCheck {
+      name = "log-service-flood";
+      spec = "logService";
+      main = "logServiceFlood";
+      invariants = [
+        "boundsOK"
+        "batchLinesBounded"
+      ];
+    };
+
+    # The slot-6 delta also extends the SERVED regime's bound set with
+    # the four new laws (they hold there with every delta flag off —
+    # the structural arms alone enforce them).
+
+    # --- falsify twins (expect-violation) -------------------------------
+    quint-log-service-calib-oversized = mkQuintWitnessCheck {
+      name = "log-service-calib-oversized";
+      spec = "logService";
+      main = "logServiceCalibOversized";
+      witness = "batchLinesBounded";
+    };
+
+    quint-log-service-calib-recovery-ungated = mkQuintWitnessCheck {
+      name = "log-service-calib-recovery-ungated";
+      spec = "logService";
+      main = "logServiceCalibRecoveryUngated";
+      witness = "recoveryOnlyOnDrop";
+    };
+
+    quint-log-service-calib-stamp-skips = mkQuintWitnessCheck {
+      name = "log-service-calib-stamp-skips";
+      spec = "logService";
+      main = "logServiceCalibStampSkips";
+      witness = "servedStreamNoSilentLoss";
+    };
+
+    quint-log-service-calib-exec-splice = mkQuintWitnessCheck {
+      name = "log-service-calib-exec-splice";
+      spec = "logService";
+      main = "logServiceCalibExecSplice";
+      witness = "noCrossExecRowInterleave";
+    };
+
+    quint-log-service-calib-drop-wake-lost = mkQuintWitnessCheck {
+      name = "log-service-calib-drop-wake-lost";
+      spec = "logService";
+      main = "logServiceCalibDropWakeLost";
+      witness = "servedStreamNoSilentLoss";
+    };
+
+    quint-log-service-calib-resume-past-gap = mkQuintWitnessCheck {
+      name = "log-service-calib-resume-past-gap";
+      spec = "logService";
+      main = "logServiceCalibResumePastGap";
+      witness = "resumeCursorSound";
+    };
+
+    # --- reachability witnesses (expect-violation) -----------------------
+    quint-log-service-witness-worker-gap = mkQuintWitnessCheck {
+      name = "log-service-witness-worker-gap";
+      spec = "logService";
+      main = "logServiceWorkerGap";
+      witness = "noWorkerGapAppended";
+    };
+
+    quint-log-service-witness-oversized-rejected = mkQuintWitnessCheck {
+      name = "log-service-witness-oversized-rejected";
+      spec = "logService";
+      main = "logServiceFlood";
+      witness = "noOversizedRejected";
+    };
+
+    quint-log-service-witness-drop-wake = mkQuintWitnessCheck {
+      name = "log-service-witness-drop-wake";
+      spec = "logService";
+      main = "logServiceWorkerGap";
+      witness = "noDropWakeRecovery";
     };
 
     # ------------------------------------------------------------------
