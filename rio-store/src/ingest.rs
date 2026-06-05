@@ -56,12 +56,28 @@ pub enum PlaceholderClaim {
 /// PutPath hot path vs the substitution hot path are tracked
 /// separately because they indicate different upstream-health
 /// problems).
+/// The death-DELETE + re-insert arm of stale reclaim (dead owner).
+pub const STALE_RECLAIM_HEARTBEAT: &str = "heartbeat";
+/// The owner aborted its own wedged download and released in place.
+pub const STALE_RECLAIM_STALL_ABORT: &str = "stall_abort";
+/// A competing claimant took over a frozen mid-download claim in place.
+pub const STALE_RECLAIM_STALL_RECLAIM: &str = "stall_reclaim";
+/// The COMPLETE `reason` label alphabet for
+/// [`IngestHooks::stale_reclaimed_metric`] (bug_265: the field doc
+/// hand-enumerated two of the three shipped reasons — the alphabet now
+/// lives here, every emit site references a member, and the parity
+/// test pins this array against the canonical HELP text).
+pub const STALE_RECLAIM_REASONS: [&str; 3] = [
+    STALE_RECLAIM_HEARTBEAT,
+    STALE_RECLAIM_STALL_ABORT,
+    STALE_RECLAIM_STALL_RECLAIM,
+];
+
 #[derive(Clone, Copy)]
 pub struct IngestHooks {
     /// `metrics::counter!` name incremented when a stale `'uploading'`
-    /// placeholder is reaped on the hot path (labeled by reason:
-    /// `heartbeat` for the death-DELETE arm, `stall_reclaim` for the
-    /// download-stalled in-place takeover). e.g.
+    /// placeholder is reaped on the hot path, labeled by `reason` —
+    /// the alphabet is [`STALE_RECLAIM_REASONS`], nothing else. e.g.
     /// `rio_store_putpath_stale_reclaimed_total`.
     pub stale_reclaimed_metric: &'static str,
     /// Prefix for `warn!`/`debug!` log lines (e.g. `"PutPath"`,
@@ -179,7 +195,7 @@ pub async fn claim_placeholder(
                     threshold = ?SUBSTITUTE_STALE_THRESHOLD,
                     "{}: stale 'uploading' placeholder — reclaimed", hooks.ctx_label,
                 );
-                metrics::counter!(hooks.stale_reclaimed_metric, "reason" => "heartbeat")
+                metrics::counter!(hooks.stale_reclaimed_metric, "reason" => STALE_RECLAIM_HEARTBEAT)
                     .increment(1);
                 // Propagate (?) — after reap_one Ok(true) the
                 // placeholder is gone; collapsing Err into the
@@ -219,7 +235,7 @@ pub async fn claim_placeholder(
                 "{}: download-stalled placeholder — taken over in place (strike recorded)",
                 hooks.ctx_label,
             );
-            metrics::counter!(hooks.stale_reclaimed_metric, "reason" => "stall_reclaim")
+            metrics::counter!(hooks.stale_reclaimed_metric, "reason" => STALE_RECLAIM_STALL_RECLAIM)
                 .increment(1);
         }
     }
@@ -539,6 +555,31 @@ pub async fn abort_placeholder(pool: &PgPool, store_path_hash: &[u8], claim: Uui
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bug_265 parity: the const alphabet IS the label alphabet — every
+    /// member appears in the canonical HELP text of both metric
+    /// families (lib.rs describe_counter, which docs/gen/metrics.json
+    /// is generated from), and the array is duplicate-free. The emit
+    /// sites reference the named members, so reachable-reason
+    /// membership is structural.
+    #[test]
+    fn stale_reclaim_reason_alphabet_matches_help() {
+        let lib = include_str!("lib.rs");
+        let sub_help_start = lib
+            .find("rio_store_substitute_stale_reclaimed_total")
+            .expect("substitute HELP present");
+        let help = &lib[sub_help_start..sub_help_start + 700];
+        for reason in STALE_RECLAIM_REASONS {
+            assert!(
+                help.contains(reason),
+                "substitute stale-reclaim HELP must name reason '{reason}'"
+            );
+        }
+        let mut sorted = STALE_RECLAIM_REASONS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), STALE_RECLAIM_REASONS.len(), "no duplicates");
+    }
     use std::time::Duration;
 
     use rio_test_support::TestDb;

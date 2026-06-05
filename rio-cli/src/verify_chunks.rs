@@ -9,7 +9,6 @@
 //! (`uploaded_at` set, not deleted) but the backend's HeadObject 404s.
 //! The I-007 prefix-normalize fix stranded 3465 objects this way.
 
-use anyhow::anyhow;
 use rio_proto::types::VerifyChunksRequest;
 
 use crate::{RPC_TIMEOUT, StoreAdminClient};
@@ -33,37 +32,35 @@ pub(crate) async fn run(client: &mut StoreAdminClient, a: Args) -> anyhow::Resul
     .await?
     .into_inner();
 
-    let mut saw_done = false;
-    while let Some(p) = stream
-        .message()
-        .await
-        .map_err(|s| anyhow!("VerifyChunks: stream: {} ({:?})", s.message(), s.code()))?
-    {
-        // Missing hashes to stdout (per-batch, no buffering — large
-        // stores can have a long tail). Hex-encoded BLAKE3, one per
-        // line. The operator pipes this into S3 spot-checks or a
-        // recovery script.
-        for h in &p.missing_hashes {
-            println!("{}", hex::encode(h));
-        }
-        // Progress to stderr. Separate stream so `verify-chunks |
-        // tee missing.txt` captures stdout while progress scrolls
-        // past on stderr.
-        if p.done {
-            eprintln!(
-                "verify-chunks: done — scanned {}, missing {}",
-                p.scanned, p.missing
-            );
-            saw_done = true;
-        } else {
-            eprintln!("  scanned={} missing={}", p.scanned, p.missing);
-        }
-    }
-    if !saw_done {
-        eprintln!(
-            "warning: verify-chunks stream closed without done — \
-             store disconnected mid-scan"
-        );
-    }
-    Ok(())
+    // The drain law (bug_141): an audit stream that closes without the
+    // `done` sentinel was TRUNCATED — that must be a nonzero exit, not
+    // a warning. A partial missing-hash list that exits 0 reads as "the
+    // rest of the store is clean", and the operator acts on absence.
+    crate::stream_util::drain_until_done(
+        "VerifyChunks",
+        &mut stream,
+        |p| {
+            // Missing hashes to stdout (per-batch, no buffering — large
+            // stores can have a long tail). Hex-encoded BLAKE3, one per
+            // line. The operator pipes this into S3 spot-checks or a
+            // recovery script.
+            for h in &p.missing_hashes {
+                println!("{}", hex::encode(h));
+            }
+            // Progress to stderr. Separate stream so `verify-chunks |
+            // tee missing.txt` captures stdout while progress scrolls
+            // past on stderr.
+            if p.done {
+                eprintln!(
+                    "verify-chunks: done — scanned {}, missing {}",
+                    p.scanned, p.missing
+                );
+            } else {
+                eprintln!("  scanned={} missing={}", p.scanned, p.missing);
+            }
+            Ok(())
+        },
+        |p| p.done,
+    )
+    .await
 }

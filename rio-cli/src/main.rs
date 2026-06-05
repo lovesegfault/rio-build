@@ -59,6 +59,7 @@ mod poison;
 mod pool;
 mod sla;
 mod status;
+mod stream_util;
 mod tenants;
 mod upstream;
 mod verify_chunks;

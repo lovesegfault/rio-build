@@ -74,10 +74,13 @@ pub(crate) async fn run(client: &mut AdminClient, a: Args) -> anyhow::Result<()>
         }
         last = Some(p);
     }
-    // If the stream closed without an `is_complete` frame,
-    // surface that — scheduler shutdown or store disconnect
-    // mid-sweep. Not an error (the sweep may have completed
-    // store-side; we just don't know), but worth flagging.
+    // DOCUMENTED EXCEPTION to the stream_util::drain_until_done law
+    // (bug_141): a stream that closed without `is_complete` is
+    // surfaced on stderr but stays exit-0 — the sweep may have
+    // completed store-side after the progress relay died, so the exit
+    // status cannot honestly assert either outcome, and TriggerGC is
+    // idempotently re-runnable. verify-chunks (an audit whose ABSENCE
+    // of output is acted on) converts instead.
     if !last.map(|p| p.is_complete).unwrap_or(false) {
         eprintln!(
             "warning: GC stream closed without is_complete — \

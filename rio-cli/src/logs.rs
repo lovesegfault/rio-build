@@ -115,6 +115,11 @@ pub(crate) async fn run(client: &mut LogsClient, a: Args) -> anyhow::Result<()> 
         emit_chunk(&mut out, &mut cursor, &mut gap_seen, &chunk)?;
     }
     out.flush()?;
+    // DOCUMENTED EXCEPTION to stream_util::drain_until_done (bug_141):
+    // an incomplete LOG is a rendered state with user-facing semantics
+    // (build still running / cancelled / flush pending), not a command
+    // failure — `rio-cli logs` stays exit-0 with the disclosure on
+    // stderr so pipelines get whatever lines exist.
     // Interior gaps and a truncated tail are different failure shapes:
     // the marker lines above name the former; the note here says which
     // applies so a clean-looking log is never silently partial.

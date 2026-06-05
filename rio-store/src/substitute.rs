@@ -1148,7 +1148,7 @@ impl Substituter {
                         if released {
                             metrics::counter!(
                                 SUBSTITUTE_HOOKS.stale_reclaimed_metric,
-                                "reason" => "stall_abort"
+                                "reason" => crate::ingest::STALE_RECLAIM_STALL_ABORT
                             )
                             .increment(1);
                         }
