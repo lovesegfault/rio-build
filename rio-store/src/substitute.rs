@@ -267,6 +267,36 @@ impl From<metadata::MetadataError> for SubstituteError {
     }
 }
 
+/// The ONE exhaustive `SubstituteError` → (kernel class, duration
+/// advice) hop (merged_bug_178 + merged_bug_044): the substitute
+/// loop's evidence recording and the materialization executor's
+/// failure classification both route through this match — NO
+/// catch-all, so adding a `SubstituteError` variant breaks this
+/// build together with the kernel's class-keyed routing. The advice
+/// channel carries the class's duration evidence (stall window /
+/// parsed `Retry-After`); classes without one yield `None`
+/// exhaustively, so a future advice-carrying variant must name
+/// itself here.
+pub(crate) fn substitute_error_evidence(
+    e: &SubstituteError,
+) -> (
+    rio_evidence_kernel::outcome::SubstituteFailureClass,
+    Option<Duration>,
+) {
+    use rio_evidence_kernel::outcome::SubstituteFailureClass as C;
+    match e {
+        SubstituteError::Raced => (C::Raced, None),
+        SubstituteError::RateLimited { retry_after } => (C::RateLimited, *retry_after),
+        SubstituteError::Stalled { window } => (C::Stalled, Some(*window)),
+        SubstituteError::Admission(_) => (C::AdmissionSaturated, None),
+        SubstituteError::Fetch(_) | SubstituteError::NarInfo(_) => (C::Fetch, None),
+        SubstituteError::HashMismatch { .. }
+        | SubstituteError::SizeMismatch { .. }
+        | SubstituteError::TooLarge { .. } => (C::Integrity, None),
+        SubstituteError::Ingest(_) => (C::Ingest, None),
+    }
+}
+
 /// Result of probing one upstream for one path. Disambiguates the three
 /// "no PathInfo" outcomes that `Option<ValidatedPathInfo>` collapsed:
 /// `Miss` (try next upstream), `Raced` (another uploader holds the
@@ -660,12 +690,19 @@ impl Substituter {
                 // as upstream failure. Admission and Stalled each have
                 // their own dedicated counter
                 // (stale_reclaimed_total{reason="stall_abort"}).
+                // `Fetch` is skipped too (merged_bug_044): the only
+                // Fetch that escapes `do_substitute` is the fold's
+                // all-errored verdict, and every contributing upstream
+                // error was already counted per-upstream inside the
+                // loop — counting the escape again would double-bill
+                // one failed iteration.
                 if !matches!(
                     *e,
                     SubstituteError::Raced
                         | SubstituteError::RateLimited { .. }
                         | SubstituteError::Admission(_)
                         | SubstituteError::Stalled { .. }
+                        | SubstituteError::Fetch(_)
                 ) {
                     metrics::counter!(
                         "rio_store_substitute_total",
@@ -716,17 +753,16 @@ impl Substituter {
 
         let start = Instant::now();
         let tenant_label = tenant_id.to_string();
-        // Track 429 across the iteration: only fail with `RateLimited`
-        // if NO upstream had the path. This mirrors the HEAD-probe
-        // semantics (`probe_one`): a tenant with [rate-limited-A,
-        // healthy-B] configured should hit B, not propagate A's 429.
-        let mut any_429: Option<Option<Duration>> = None;
-        // Track stalls the same way (bug_081): a stall on upstream A is
-        // A-local — its strike is already durably recorded by the
-        // in-place release, so the loop fails over to B instead of
-        // aborting the whole attempt. The post-loop fold surfaces the
-        // stall only when nothing served.
-        let mut any_stall: Option<Duration> = None;
+        // Evidence cells for the post-loop fold (bug_081 +
+        // merged_bug_044): every `Err` arm routes through the kernel's
+        // ONE `record` chokepoint, so a continue that loses failure
+        // evidence is no longer writable here. 429s and stalls keep
+        // their max-across-upstreams semantics (a tenant with
+        // [rate-limited-A, healthy-B] hits B; a stall on A fails over
+        // with its strike already durably recorded); generic errors
+        // set the error cell so an all-errored iteration can never
+        // fold to a cacheable clean miss.
+        let mut cells = rio_evidence_kernel::outcome::SubstituteLoopCells::new();
         for upstream in &upstreams {
             match self
                 .try_upstream(http, tenant_id, upstream, store_path, &hash_part, progress)
@@ -763,63 +799,65 @@ impl Substituter {
                     debug!(upstream = %upstream.url, "concurrent uploader, stopping");
                     return Err(SubstituteError::Raced);
                 }
-                Err(SubstituteError::Stalled { window }) => {
-                    // r[impl store.substitute.stall-abort+2]
-                    // Owner-side stall abort: the claim was released in
-                    // place with the strike durably recorded — the
-                    // stall is THIS upstream's failure, so CONTINUE to
-                    // the next (mirroring the 429 failover; bug_081).
-                    // The post-loop fold surfaces `Stalled` to every
-                    // coalesced waiter only if no later upstream
-                    // serves the path (moka does not cache the Err);
-                    // failing over loses no evidence and a healthy
-                    // second upstream turns the attempt into a hit.
-                    warn!(upstream = %upstream.url, "download stalled, trying next");
-                    any_stall = Some(match any_stall {
-                        Some(prev) => prev.max(window),
-                        None => window,
-                    });
-                }
-                Err(SubstituteError::RateLimited { retry_after }) => {
-                    // Upstream 429'd the narinfo or NAR GET. CONTINUE
-                    // to the next upstream — only return `RateLimited`
-                    // after the loop if no other upstream had it. moka
-                    // will not cache the eventual `Err`, and the
-                    // admission permit drops on return so the wait
-                    // happens caller-side
-                    // (r[store.substitute.probe-429-retry+3]).
-                    debug!(upstream = %upstream.url, ?retry_after,
-                           "upstream 429, trying next");
-                    // Max across upstreams that 429'd (matches probe_one).
-                    any_429 = Some(match any_429.flatten() {
-                        Some(prev) => Some(prev.max(retry_after.unwrap_or_default())),
-                        None => retry_after,
-                    });
-                }
                 Err(e) => {
-                    // This upstream failed (down, hash mismatch, parse
-                    // error). Log and try the next one — a single bad
-                    // upstream shouldn't block substitution entirely.
-                    // The integrity metric is emitted HERE (where the
-                    // error is observable) — per-upstream errors never
-                    // reach `grpc/mod.rs`.
-                    if matches!(
-                        e,
-                        SubstituteError::HashMismatch { .. } | SubstituteError::SizeMismatch { .. }
-                    ) {
-                        metrics::counter!(
-                            "rio_store_substitute_integrity_failures_total",
-                            "tenant" => tenant_label.clone()
-                        )
-                        .increment(1);
+                    // This upstream failed. Class-keyed logging and
+                    // metrics are cosmetic; the EVIDENCE goes through
+                    // the kernel cells' one `record` chokepoint below,
+                    // so this arm cannot continue while losing the
+                    // failure (merged_bug_044 — the pre-fix catch-all
+                    // recorded nothing, making an all-errored
+                    // iteration fold to a CACHED clean miss).
+                    match &e {
+                        SubstituteError::Stalled { .. } => {
+                            // r[impl store.substitute.stall-abort+2]
+                            // Owner-side stall abort: the claim was
+                            // released in place with the strike durably
+                            // recorded — the stall is THIS upstream's
+                            // failure, so fail over (bug_081). The fold
+                            // surfaces `Stalled` only if nothing serves.
+                            warn!(upstream = %upstream.url, "download stalled, trying next");
+                        }
+                        SubstituteError::RateLimited { retry_after } => {
+                            // 429 → fail over; the fold returns
+                            // `RateLimited` (uncached) only if no other
+                            // upstream had it
+                            // (r[store.substitute.probe-429-retry+3]).
+                            debug!(upstream = %upstream.url, ?retry_after,
+                                   "upstream 429, trying next");
+                        }
+                        other => {
+                            // Down / hash mismatch / parse error. The
+                            // integrity metric is emitted HERE (where
+                            // the error is observable) — per-upstream
+                            // errors never reach `grpc/mod.rs`.
+                            if matches!(
+                                other,
+                                SubstituteError::HashMismatch { .. }
+                                    | SubstituteError::SizeMismatch { .. }
+                            ) {
+                                metrics::counter!(
+                                    "rio_store_substitute_integrity_failures_total",
+                                    "tenant" => tenant_label.clone()
+                                )
+                                .increment(1);
+                            }
+                            warn!(upstream = %upstream.url, error = %other,
+                                  "upstream fetch failed, trying next");
+                            metrics::counter!(
+                                "rio_store_substitute_total",
+                                "result" => "error",
+                                "tenant" => tenant_label.clone()
+                            )
+                            .increment(1);
+                        }
                     }
-                    warn!(upstream = %upstream.url, error = %e, "upstream fetch failed, trying next");
-                    metrics::counter!(
-                        "rio_store_substitute_total",
-                        "result" => "error",
-                        "tenant" => tenant_label.clone()
-                    )
-                    .increment(1);
+                    let (class, advice) = substitute_error_evidence(&e);
+                    match cells.record(class, advice) {
+                        rio_evidence_kernel::outcome::LoopControl::AbortRaced => {
+                            return Err(SubstituteError::Raced);
+                        }
+                        rio_evidence_kernel::outcome::LoopControl::Continue => {}
+                    }
                 }
             }
         }
@@ -828,14 +866,22 @@ impl Substituter {
         // attempt outcome from the recorded evidence: a stall
         // dominates (its strike must reach the executor's
         // classification), then 429 (uncached so a retry re-asks),
-        // then a cacheable clean miss — only when every upstream gave
-        // a definitive verdict.
-        match rio_evidence_kernel::outcome::fold_substitute_loop(any_stall, any_429) {
+        // then `Errored` (≥1 upstream broke — surfaced as an UNCACHED
+        // `Fetch` error so the next attempt re-asks instead of
+        // trusting a poisoned miss), then the cacheable clean miss —
+        // only when every upstream answered hit-or-404.
+        match rio_evidence_kernel::outcome::fold_substitute_loop(cells) {
             rio_evidence_kernel::outcome::SubstituteLoopVerdict::Stalled { window } => {
                 Err(SubstituteError::Stalled { window })
             }
             rio_evidence_kernel::outcome::SubstituteLoopVerdict::RateLimited { retry_after } => {
                 Err(SubstituteError::RateLimited { retry_after })
+            }
+            rio_evidence_kernel::outcome::SubstituteLoopVerdict::Errored => {
+                Err(SubstituteError::Fetch(format!(
+                    "no upstream served {store_path} and at least one errored — \
+                     not a definitive miss"
+                )))
             }
             rio_evidence_kernel::outcome::SubstituteLoopVerdict::CleanMiss => Ok(None),
         }
@@ -2567,8 +2613,16 @@ mod tests {
 
         let rec = CountingRecorder::default();
         let _g = metrics::set_default_local_recorder(&rec);
-        let got = sub.try_substitute(tid, &other).await.unwrap();
-        assert!(got.is_none());
+        // merged_bug_044: B errored, so the iteration is NOT a clean
+        // miss — the fold surfaces an uncached Err(Fetch) (pre-fix
+        // this was a cacheable Ok(None)). The per-tenant labels below
+        // are what this test pins; the verdict flip is pinned by the
+        // dedicated all-errored battery.
+        let got = sub.try_substitute(tid, &other).await;
+        assert!(
+            matches!(got, Err(SubstituteError::Fetch(_))),
+            "404+500 mix must be Err(Fetch), got {got:?}"
+        );
 
         let miss = format!("rio_store_substitute_total{{result=miss,tenant={tid}}}");
         let err = format!("rio_store_substitute_total{{result=error,tenant={tid}}}");
@@ -2590,6 +2644,100 @@ mod tests {
             !rec.all_keys().iter().any(|k| k.contains("upstream=")),
             "no upstream= label; keys={:?}",
             rec.all_keys()
+        );
+    }
+
+    /// merged_bug_044 red (044-a): ONE upstream, every narinfo GET
+    /// 500s. The pre-fix loop's catch-all `Err(e)` arm recorded NO
+    /// evidence, so the post-loop fold saw `(None, None)` →
+    /// `CleanMiss` → `Ok(None)` — an all-errored iteration was
+    /// indistinguishable from a definitive all-404 miss. The kernel
+    /// cells make the error axis evidence by construction: the fold
+    /// yields `Errored` and the caller returns `Err(Fetch)` (gRPC
+    /// `unavailable` — retryable), never a cacheable miss.
+    ///
+    /// Recorded red (pre-fix): `got Ok(None)` where `Err(Fetch)`
+    /// expected.
+    #[tokio::test]
+    async fn substitute_all_errored_is_err_not_clean_miss() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-all-err").await;
+        let b = spawn_500_upstream().await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &b.url,
+            50,
+            &["dummy:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()],
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let path = format!(
+            "/nix/store/{}-all-errored",
+            rio_test_support::fixtures::rand_store_hash()
+        );
+        let sub = test_substituter(db.pool.clone());
+        let got = sub.try_substitute(tid, &path).await;
+        assert!(
+            matches!(got, Err(SubstituteError::Fetch(_))),
+            "all-errored iteration must be Err(Fetch), got {got:?}"
+        );
+    }
+
+    /// merged_bug_044 red (044-b, cache poisoning): the all-errored
+    /// `Ok(None)` was CACHED by the moka definitive-miss slot — every
+    /// `(tenant, path)` probed during a 30 s upstream outage stayed
+    /// "missing" for the full TTL even after recovery, silently
+    /// degrading to build-from-source. `Err` is never cached: the
+    /// next call re-runs the iteration and hits the recovered (here:
+    /// newly configured, higher-priority) upstream.
+    ///
+    /// Recorded red (pre-fix): second call returned the poisoned
+    /// cached `None` instead of the served path.
+    #[tokio::test]
+    async fn substitute_all_errored_not_cached_as_definitive_miss() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-poison").await;
+        let (path, nar) = make_path();
+        // Phase 1: only a 500ing upstream configured.
+        let b = spawn_500_upstream().await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &b.url,
+            50,
+            &["dummy:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()],
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+        let sub = test_substituter(db.pool.clone());
+        let first = sub.try_substitute(tid, &path).await;
+        assert!(
+            matches!(first, Err(SubstituteError::Fetch(_))),
+            "phase-1 all-errored must be Err(Fetch), got {first:?}"
+        );
+
+        // Phase 2: a healthy upstream appears at higher priority. The
+        // Err above must NOT have populated the (tenant, path) slot —
+        // this call re-runs the iteration and serves.
+        let a = spawn_fake_upstream(&path, nar, "cache.poison-a").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &a.url,
+            10,
+            std::slice::from_ref(&a.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+        let second = sub.try_substitute(tid, &path).await.unwrap();
+        assert!(
+            second.is_some(),
+            "recovered upstream must serve — a cached all-errored miss poisons the slot"
         );
     }
 
@@ -3030,28 +3178,45 @@ mod tests {
     }
 
     proptest::proptest! {
-        /// bug_081 failover-totality: for ANY combination of recorded
-        /// stall/429 evidence the post-loop fold is total and honors
-        /// the precedence Stalled > RateLimited > CleanMiss — the
-        /// failover loop can never fall through without a verdict, and
-        /// recorded charging evidence is never shadowed by back-off
-        /// advice.
+        /// bug_081 + merged_bug_044 failover-totality: for ANY
+        /// recorded evidence sequence the post-loop fold is total and
+        /// honors the precedence Stalled > RateLimited > Errored >
+        /// CleanMiss — the failover loop can never fall through
+        /// without a verdict, recorded charging evidence is never
+        /// shadowed by back-off advice, and an iteration with ANY
+        /// errored upstream can never fold to the cacheable miss.
         #[test]
         fn prop_substitute_loop_fold_total(
             stall_secs in proptest::option::of(0u64..1_000_000),
             had_429 in proptest::bool::ANY,
             retry_secs in proptest::option::of(0u64..1_000_000),
+            errored in proptest::bool::ANY,
         ) {
-            use rio_evidence_kernel::outcome::{SubstituteLoopVerdict, fold_substitute_loop};
+            use rio_evidence_kernel::outcome::{
+                SubstituteFailureClass, SubstituteLoopCells, SubstituteLoopVerdict,
+                fold_substitute_loop,
+            };
             let any_stall = stall_secs.map(Duration::from_secs);
             let any_429 = had_429.then(|| retry_secs.map(Duration::from_secs));
-            let got = fold_substitute_loop(any_stall, any_429);
-            match (any_stall, any_429) {
-                (Some(w), _) => proptest::prop_assert_eq!(
+            let mut cells = SubstituteLoopCells::new();
+            if let Some(w) = any_stall {
+                let _ = cells.record(SubstituteFailureClass::Stalled, Some(w));
+            }
+            if let Some(ra) = any_429 {
+                let _ = cells.record(SubstituteFailureClass::RateLimited, ra);
+            }
+            if errored {
+                let _ = cells.record(SubstituteFailureClass::Fetch, None);
+            }
+            let got = fold_substitute_loop(cells);
+            match (any_stall, any_429, errored) {
+                (Some(w), _, _) => proptest::prop_assert_eq!(
                     got, SubstituteLoopVerdict::Stalled { window: w }),
-                (None, Some(ra)) => proptest::prop_assert_eq!(
+                (None, Some(ra), _) => proptest::prop_assert_eq!(
                     got, SubstituteLoopVerdict::RateLimited { retry_after: ra }),
-                (None, None) => proptest::prop_assert_eq!(
+                (None, None, true) => proptest::prop_assert_eq!(
+                    got, SubstituteLoopVerdict::Errored),
+                (None, None, false) => proptest::prop_assert_eq!(
                     got, SubstituteLoopVerdict::CleanMiss),
             }
         }
@@ -4198,11 +4363,17 @@ mod tests {
         insert_flex(&db.pool, tid, &fake, 50).await;
 
         let sub = test_substituter(db.pool.clone());
-        // Single upstream → its NarInfo error escapes the loop unswallowed?
-        // No: per-upstream errors are try-next; with one upstream that's
-        // a miss. Assert the miss AND that nothing was ingested.
-        let got = sub.try_substitute(tid, &path_b).await.unwrap();
-        assert!(got.is_none(), "identity mismatch → miss, got {got:?}");
+        // The identity reject is a NarInfo (class=Fetch) error: the
+        // upstream served GARBAGE, which since merged_bug_044 is
+        // recorded evidence — the iteration folds to `Errored` and
+        // surfaces an UNCACHED Err(Fetch), never a cacheable
+        // definitive miss. Assert the error AND that nothing was
+        // ingested.
+        let got = sub.try_substitute(tid, &path_b).await;
+        assert!(
+            matches!(got, Err(SubstituteError::Fetch(_))),
+            "identity mismatch → uncached Err(Fetch), got {got:?}"
+        );
         assert_eq!(
             fake.nar_hits.load(Ordering::SeqCst),
             0,
@@ -4673,10 +4844,15 @@ mod tests {
         let sub = test_substituter(db.pool.clone());
         let rec = CountingRecorder::default();
         let _g = metrics::set_default_local_recorder(&rec);
-        let got = sub.try_substitute(tid, &path).await.unwrap();
+        let got = sub.try_substitute(tid, &path).await;
 
-        // Per-upstream error swallowed → miss (one upstream).
-        assert!(got.is_none(), "size mismatch → miss; got {got:?}");
+        // Integrity garbage is recorded evidence (merged_bug_044):
+        // the iteration folds to `Errored` → uncached Err(Fetch),
+        // never a cacheable definitive miss.
+        assert!(
+            matches!(got, Err(SubstituteError::Fetch(_))),
+            "size mismatch → uncached Err(Fetch); got {got:?}"
+        );
         // NAR was fetched (size check happens AFTER download).
         assert_eq!(fake.nar_hits.load(Ordering::SeqCst), 1, "NAR fetched");
         // Nothing persisted.

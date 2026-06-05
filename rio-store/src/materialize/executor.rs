@@ -17,9 +17,7 @@ use sqlx::PgPool;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use rio_evidence_kernel::outcome::{
-    FailureDisposition, SubstituteFailureClass, classify_substitute_failure,
-};
+use rio_evidence_kernel::outcome::{FailureDisposition, classify_substitute_failure};
 use rio_proto::types::{MaterializationOutcome, materialization_outcome};
 
 use crate::substitute::{SubstituteError, Substituter};
@@ -293,7 +291,7 @@ async fn execute_job_inner(
                         // the kernel truth table — no catch-all (a
                         // future SubstituteError variant fails this
                         // match AND the class table).
-                        let class = substitute_failure_class(&e);
+                        let class = crate::substitute::substitute_error_evidence(&e).0;
                         match classify_substitute_failure(class) {
                             FailureDisposition::RetryUncharged => {
                                 let (label, retry_after_secs) = match &e {
@@ -485,23 +483,6 @@ async fn probe_local(
     match crate::metadata::query_path_info(&ctx.pool, store_path).await? {
         Some(info) => Ok(LocalPresence::Present(Box::new(info))),
         None => Ok(LocalPresence::Absent(LocalMiss(()))),
-    }
-}
-
-/// Exhaustive `SubstituteError` → kernel class mapping
-/// (merged_bug_178): NO catch-all — adding a variant breaks this
-/// build and the kernel table together.
-fn substitute_failure_class(e: &SubstituteError) -> SubstituteFailureClass {
-    match e {
-        SubstituteError::Raced => SubstituteFailureClass::Raced,
-        SubstituteError::RateLimited { .. } => SubstituteFailureClass::RateLimited,
-        SubstituteError::Stalled { .. } => SubstituteFailureClass::Stalled,
-        SubstituteError::Admission(_) => SubstituteFailureClass::AdmissionSaturated,
-        SubstituteError::Fetch(_) | SubstituteError::NarInfo(_) => SubstituteFailureClass::Fetch,
-        SubstituteError::HashMismatch { .. }
-        | SubstituteError::SizeMismatch { .. }
-        | SubstituteError::TooLarge { .. } => SubstituteFailureClass::Integrity,
-        SubstituteError::Ingest(_) => SubstituteFailureClass::Ingest,
     }
 }
 

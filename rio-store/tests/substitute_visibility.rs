@@ -212,25 +212,33 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
     // r[verify store.substitute.find-missing-gated]
     // Pre-fix: only QueryPathInfo was gated; the other five leaked.
     switch.set(Some(tid_c));
+    // QueryPathInfo / GetPath fall through to LIVE substitution when
+    // the local row is gate-hidden — and C's only upstream is an
+    // unresolvable host. Since merged_bug_044 an all-errored
+    // iteration is `Unavailable` (retryable), NOT `NotFound`: an
+    // unreachable upstream cannot CONFIRM the path is missing, and a
+    // false NotFound here is exactly the cached-poisoned-miss class.
+    // The gate semantics this test pins are intact either way: the
+    // K1-signed row's data never reaches C.
     let err = client
         .query_path_info(req())
         .await
-        .expect_err("tenant C doesn't trust K1 → NotFound");
+        .expect_err("tenant C doesn't trust K1 → gate-hidden");
     assert_eq!(
         err.code(),
-        tonic::Code::NotFound,
-        "expected NotFound, got {err:?}"
+        tonic::Code::Unavailable,
+        "gate-hidden + dead upstream → Unavailable (cannot confirm missing), got {err:?}"
     );
 
-    // GetPath: same gate as QueryPathInfo.
+    // GetPath: same gate, same substitute fallthrough.
     let err = client
         .get_path(GetPathRequest {
             store_path: path.clone(),
             manifest_hint: None,
         })
         .await
-        .expect_err("GetPath: C doesn't trust K1 → NotFound");
-    assert_eq!(err.code(), tonic::Code::NotFound, "GetPath: {err:?}");
+        .expect_err("GetPath: C doesn't trust K1 → gate-hidden");
+    assert_eq!(err.code(), tonic::Code::Unavailable, "GetPath: {err:?}");
 
     // QueryPathFromHashPart: same gate, no substitute fallback.
     let hash_part = path

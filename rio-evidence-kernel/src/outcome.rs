@@ -109,11 +109,90 @@ pub fn fold_tenant_reprobes(
     }
 }
 
+/// What the loop body does after recording one classified failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "AbortRaced must stop the iteration — ignoring it races the placeholder slot"]
+pub enum LoopControl {
+    /// Keep iterating: the failure was upstream-local and is now
+    /// recorded evidence; a later upstream may still serve.
+    Continue,
+    /// Stop: another uploader holds the placeholder slot; remaining
+    /// upstreams would race the same slot.
+    AbortRaced,
+}
+
+/// The per-iteration evidence cells of one `do_substitute` upstream
+/// loop (merged_bug_044, completing bug_081's fold). Fields are
+/// PRIVATE and the ONE writer is [`SubstituteLoopCells::record`],
+/// keyed on the already-exhaustive [`SubstituteFailureClass`]: a
+/// future `SubstituteError` variant breaks the caller's error→class
+/// hop and this routing together at compile time, and a loop arm
+/// cannot reach the fold with unrecorded failure evidence — the
+/// pre-fix catch-all `Err(e) => continue` (which made an all-errored
+/// iteration indistinguishable from an all-404 clean miss) is no
+/// longer expressible through this API.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SubstituteLoopCells {
+    any_stall: Option<core::time::Duration>,
+    any_429: Option<Option<core::time::Duration>>,
+    any_errored: bool,
+}
+
+impl SubstituteLoopCells {
+    /// Empty cells: no failure observed yet.
+    pub const fn new() -> Self {
+        Self {
+            any_stall: None,
+            any_429: None,
+            any_errored: false,
+        }
+    }
+
+    /// THE recording chokepoint — total over the class alphabet (no
+    /// catch-all). `advice` is the class's duration evidence: the
+    /// stall window for `Stalled`, the parsed `Retry-After` for
+    /// `RateLimited` (`None` = 429 without advice); the remaining
+    /// classes carry none and ignore it. Stall windows and
+    /// retry-afters keep the MAX across upstreams (matching the
+    /// probe semantics).
+    pub fn record(
+        &mut self,
+        class: SubstituteFailureClass,
+        advice: Option<core::time::Duration>,
+    ) -> LoopControl {
+        match class {
+            SubstituteFailureClass::Raced => return LoopControl::AbortRaced,
+            SubstituteFailureClass::Stalled => {
+                let window = advice.unwrap_or_default();
+                self.any_stall = Some(match self.any_stall {
+                    Some(prev) => prev.max(window),
+                    None => window,
+                });
+            }
+            SubstituteFailureClass::RateLimited => {
+                self.any_429 = Some(match (self.any_429.flatten(), advice) {
+                    (Some(prev), Some(ra)) => Some(prev.max(ra)),
+                    (Some(prev), None) => Some(prev),
+                    (None, ra) => ra,
+                });
+            }
+            SubstituteFailureClass::AdmissionSaturated
+            | SubstituteFailureClass::Fetch
+            | SubstituteFailureClass::Integrity
+            | SubstituteFailureClass::Ingest => self.any_errored = true,
+        }
+        LoopControl::Continue
+    }
+}
+
 /// The post-loop verdict of one `do_substitute` upstream iteration that
-/// produced no hit (bughunt wave A4, bug_081).
+/// produced no hit (bughunt wave A4, bug_081 + merged_bug_044).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubstituteLoopVerdict {
-    /// Every upstream gave a definitive miss — cacheable.
+    /// Every upstream answered hit-or-404 — the cacheable definitive
+    /// miss. With the error axis recorded (merged_bug_044) this
+    /// contract is established for the first time: an iteration where
+    /// any upstream ERRORED folds to [`Self::Errored`], never here.
     CleanMiss,
     /// ≥1 upstream stalled (and none served). The stall dominates a
     /// concurrent 429: its strike is already durably recorded and the
@@ -130,24 +209,30 @@ pub enum SubstituteLoopVerdict {
         /// Max parsed `Retry-After` across the 429ing upstreams.
         retry_after: Option<core::time::Duration>,
     },
+    /// ≥1 upstream errored (fetch/TLS/parse/integrity/ingest/
+    /// admission) and none served, stalled, or 429'd. NOT a
+    /// definitive miss: the caller must surface an UNCACHED error so
+    /// the next attempt re-asks — caching this as a miss poisons the
+    /// `(tenant, path)` slot for the TTL window (merged_bug_044).
+    Errored,
 }
 
-/// bug_081's pure post-loop fold: a stall on ONE upstream is an
-/// upstream-local failure — the loop records it and fails over
-/// (mirroring the 429 arm); only after every upstream has been tried
-/// does the recorded evidence pick the attempt outcome. Total over
-/// both observation axes; precedence `Stalled > RateLimited >
-/// CleanMiss` (charging evidence outranks back-off advice outranks a
-/// cacheable miss).
+/// bug_081's pure post-loop fold over merged_bug_044's evidence
+/// cells: a failure on ONE upstream is upstream-local — the loop
+/// records it and fails over; only after every upstream has been
+/// tried does the recorded evidence pick the attempt outcome. Total
+/// over all three observation axes; precedence `Stalled >
+/// RateLimited > Errored > CleanMiss` (charging evidence outranks
+/// back-off advice outranks "something broke, don't cache" outranks
+/// a cacheable miss).
 // r[impl store.substitute.stall-abort+2]
-pub fn fold_substitute_loop(
-    any_stall: Option<core::time::Duration>,
-    any_429: Option<Option<core::time::Duration>>,
-) -> SubstituteLoopVerdict {
-    match (any_stall, any_429) {
-        (Some(window), _) => SubstituteLoopVerdict::Stalled { window },
-        (None, Some(retry_after)) => SubstituteLoopVerdict::RateLimited { retry_after },
-        (None, None) => SubstituteLoopVerdict::CleanMiss,
+// r[impl store.substitute.loop-evidence-total]
+pub fn fold_substitute_loop(cells: SubstituteLoopCells) -> SubstituteLoopVerdict {
+    match (cells.any_stall, cells.any_429, cells.any_errored) {
+        (Some(window), _, _) => SubstituteLoopVerdict::Stalled { window },
+        (None, Some(retry_after), _) => SubstituteLoopVerdict::RateLimited { retry_after },
+        (None, None, true) => SubstituteLoopVerdict::Errored,
+        (None, None, false) => SubstituteLoopVerdict::CleanMiss,
     }
 }
 
@@ -156,31 +241,97 @@ mod tests {
     use super::*;
     use crate::routing::ReprobeAnswer;
 
-    /// bug_081: the post-loop fold's precedence, all four cells.
+    /// bug_081 + merged_bug_044: the post-loop fold's precedence over
+    /// the recorded cells, including the error axis the pre-fix
+    /// 2-axis fold could not represent.
     #[test]
     fn substitute_loop_fold_precedence() {
         use core::time::Duration;
+        let empty = SubstituteLoopCells::new();
         assert_eq!(
-            fold_substitute_loop(None, None),
+            fold_substitute_loop(empty),
             SubstituteLoopVerdict::CleanMiss
         );
+
+        let mut just_429 = SubstituteLoopCells::new();
         assert_eq!(
-            fold_substitute_loop(None, Some(Some(Duration::from_secs(7)))),
+            just_429.record(
+                SubstituteFailureClass::RateLimited,
+                Some(Duration::from_secs(7))
+            ),
+            LoopControl::Continue
+        );
+        assert_eq!(
+            fold_substitute_loop(just_429),
             SubstituteLoopVerdict::RateLimited {
                 retry_after: Some(Duration::from_secs(7))
             }
         );
+
+        let mut just_stall = SubstituteLoopCells::new();
+        let _ = just_stall.record(
+            SubstituteFailureClass::Stalled,
+            Some(Duration::from_secs(180)),
+        );
         assert_eq!(
-            fold_substitute_loop(Some(Duration::from_secs(180)), None),
+            fold_substitute_loop(just_stall),
             SubstituteLoopVerdict::Stalled {
                 window: Duration::from_secs(180)
             }
         );
-        // Both observed → the stall dominates.
+
+        // merged_bug_044: the all-errored iteration is NOT a clean
+        // miss — one recorded error flips the verdict off the
+        // cacheable lane.
+        let mut just_err = SubstituteLoopCells::new();
+        let _ = just_err.record(SubstituteFailureClass::Fetch, None);
         assert_eq!(
-            fold_substitute_loop(Some(Duration::from_secs(180)), Some(None)),
+            fold_substitute_loop(just_err),
+            SubstituteLoopVerdict::Errored
+        );
+
+        // Full precedence: stall > 429 > errored.
+        let mut all = SubstituteLoopCells::new();
+        let _ = all.record(SubstituteFailureClass::Ingest, None);
+        let _ = all.record(SubstituteFailureClass::RateLimited, None);
+        let _ = all.record(
+            SubstituteFailureClass::Stalled,
+            Some(Duration::from_secs(180)),
+        );
+        assert_eq!(
+            fold_substitute_loop(all),
             SubstituteLoopVerdict::Stalled {
                 window: Duration::from_secs(180)
+            }
+        );
+
+        // Raced aborts and records nothing.
+        let mut raced = SubstituteLoopCells::new();
+        assert_eq!(
+            raced.record(SubstituteFailureClass::Raced, None),
+            LoopControl::AbortRaced
+        );
+        assert_eq!(
+            fold_substitute_loop(raced),
+            SubstituteLoopVerdict::CleanMiss
+        );
+
+        // Max semantics across upstreams on both advice channels.
+        let mut maxed = SubstituteLoopCells::new();
+        let _ = maxed.record(
+            SubstituteFailureClass::RateLimited,
+            Some(Duration::from_secs(3)),
+        );
+        let _ = maxed.record(
+            SubstituteFailureClass::RateLimited,
+            Some(Duration::from_secs(9)),
+        );
+        // A bare 429 after an advised one must not erase the advice.
+        let _ = maxed.record(SubstituteFailureClass::RateLimited, None);
+        assert_eq!(
+            fold_substitute_loop(maxed),
+            SubstituteLoopVerdict::RateLimited {
+                retry_after: Some(Duration::from_secs(9))
             }
         );
     }
@@ -249,33 +400,123 @@ mod proofs {
             SubstituteFailureClass::Raced | SubstituteFailureClass::RateLimited
         );
         assert_eq!(disposition == FailureDisposition::RetryUncharged, transient);
-        // bug_081's loop fold rides the same table: Stalled dominates
-        // RateLimited dominates CleanMiss, total over both axes.
-        let any_stall = if kani::any() {
-            Some(core::time::Duration::from_secs(kani::any::<u32>() as u64))
-        } else {
-            None
+    }
+
+    /// K1 (merged_bug_044): the loop cells are total over the class
+    /// alphabet and the fold's precedence is `Stalled > RateLimited >
+    /// Errored > CleanMiss`. Swept over every 2-record class sequence
+    /// with symbolic advice: record routing (Raced aborts and writes
+    /// nothing; Stalled/RateLimited keep MAX advice; the four error
+    /// classes set the error cell), then the fold verdict is checked
+    /// against an independent recomputation from the recorded
+    /// sequence. The `(no stall, no 429, errored)` cell — the one the
+    /// pre-fix 2-axis fold could not represent — is reachable here
+    /// and must yield `Errored`, never `CleanMiss`.
+    #[kani::proof]
+    fn check_substitute_loop_cells_total() {
+        let pick = |sel: u8| match sel {
+            0 => SubstituteFailureClass::Raced,
+            1 => SubstituteFailureClass::RateLimited,
+            2 => SubstituteFailureClass::Stalled,
+            3 => SubstituteFailureClass::AdmissionSaturated,
+            4 => SubstituteFailureClass::Fetch,
+            5 => SubstituteFailureClass::Integrity,
+            _ => SubstituteFailureClass::Ingest,
         };
-        let any_429 = if kani::any() {
-            Some(if kani::any() {
-                Some(core::time::Duration::from_secs(kani::any::<u32>() as u64))
+        let advice_of = |has: bool, secs: u32| {
+            if has {
+                Some(core::time::Duration::from_secs(secs as u64))
             } else {
                 None
-            })
-        } else {
-            None
+            }
         };
-        let verdict = fold_substitute_loop(any_stall, any_429);
-        match (any_stall, any_429) {
-            (Some(w), _) => assert_eq!(verdict, SubstituteLoopVerdict::Stalled { window: w }),
-            (None, Some(ra)) => {
+        let classes = [pick(kani::any()), pick(kani::any())];
+        let advices = [
+            advice_of(kani::any(), kani::any()),
+            advice_of(kani::any(), kani::any()),
+        ];
+
+        let mut cells = SubstituteLoopCells::new();
+        // Independent shadow of what record() must accumulate.
+        let mut want_stall: Option<core::time::Duration> = None;
+        let mut want_429: Option<Option<core::time::Duration>> = None;
+        let mut want_err = false;
+        let mut aborted = false;
+        let mut i = 0;
+        while i < classes.len() {
+            let control = cells.record(classes[i], advices[i]);
+            match classes[i] {
+                SubstituteFailureClass::Raced => {
+                    assert_eq!(control, LoopControl::AbortRaced);
+                    aborted = true;
+                    // The real loop returns here; later records don't
+                    // happen. Stop the shadow too.
+                    break;
+                }
+                SubstituteFailureClass::Stalled => {
+                    assert_eq!(control, LoopControl::Continue);
+                    let w = advices[i].unwrap_or_default();
+                    want_stall = Some(match want_stall {
+                        Some(prev) => {
+                            if prev > w {
+                                prev
+                            } else {
+                                w
+                            }
+                        }
+                        None => w,
+                    });
+                }
+                SubstituteFailureClass::RateLimited => {
+                    assert_eq!(control, LoopControl::Continue);
+                    want_429 = Some(match (want_429.and_then(|x| x), advices[i]) {
+                        (Some(prev), Some(ra)) => Some(if prev > ra { prev } else { ra }),
+                        (Some(prev), None) => Some(prev),
+                        (None, ra) => ra,
+                    });
+                }
+                SubstituteFailureClass::AdmissionSaturated
+                | SubstituteFailureClass::Fetch
+                | SubstituteFailureClass::Integrity
+                | SubstituteFailureClass::Ingest => {
+                    assert_eq!(control, LoopControl::Continue);
+                    want_err = true;
+                }
+            }
+            i += 1;
+        }
+        let _ = aborted;
+
+        let verdict = fold_substitute_loop(cells);
+        match (want_stall, want_429, want_err) {
+            (Some(w), _, _) => assert_eq!(verdict, SubstituteLoopVerdict::Stalled { window: w }),
+            (None, Some(ra), _) => {
                 assert_eq!(
                     verdict,
                     SubstituteLoopVerdict::RateLimited { retry_after: ra }
                 )
             }
-            (None, None) => assert_eq!(verdict, SubstituteLoopVerdict::CleanMiss),
+            (None, None, true) => assert_eq!(verdict, SubstituteLoopVerdict::Errored),
+            (None, None, false) => assert_eq!(verdict, SubstituteLoopVerdict::CleanMiss),
         }
+    }
+
+    /// K1 falsify twin (merged_bug_044): the pre-fix 2-axis
+    /// projection — drop the error cell, fold only `(any_stall,
+    /// any_429)` — CANNOT agree with the 3-axis fold. The witness
+    /// cell is exactly `(None, None, errored)`: the projection says
+    /// `CleanMiss` (cacheable), the fold says `Errored` (uncached).
+    /// `should_panic` pins that the disagreement is REAL — if a
+    /// refactor ever collapses `Errored` back into `CleanMiss`, this
+    /// twin stops panicking and the harness count check flags it.
+    #[kani::proof]
+    #[kani::should_panic]
+    fn check_substitute_cells_errored_axis_required() {
+        let mut cells = SubstituteLoopCells::new();
+        let _ = cells.record(SubstituteFailureClass::Fetch, None);
+        // The old projection had no error axis: (None, None) → CleanMiss.
+        let projected = SubstituteLoopVerdict::CleanMiss;
+        assert_eq!(fold_substitute_loop(cells), projected);
     }
 
     /// merged_bug_028 / owner Q2: `ConfirmedMissing` is the ALL-tenant
