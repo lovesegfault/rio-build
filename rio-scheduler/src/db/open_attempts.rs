@@ -223,10 +223,12 @@ impl SchedulerDb {
         executor_id: &str,
         generation: i64,
         exec_id: Uuid,
+        claim_nonce: Option<Uuid>,
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
-            "INSERT INTO assignments (derivation_id, builder_id, generation, status, exec_id) \
-             VALUES ($1, $2, $3, 'pending', $4) \
+            "INSERT INTO assignments (derivation_id, builder_id, generation, status, exec_id, \
+                                      claim_nonce) \
+             VALUES ($1, $2, $3, 'pending', $4, $5) \
              ON CONFLICT (derivation_id) WHERE status IN ('pending', 'acknowledged') \
              DO UPDATE SET \
                  builder_id = EXCLUDED.builder_id, \
@@ -234,13 +236,15 @@ impl SchedulerDb {
                  status = 'pending', \
                  assigned_at = now(), \
                  completed_at = NULL, \
-                 exec_id = EXCLUDED.exec_id \
+                 exec_id = EXCLUDED.exec_id, \
+                 claim_nonce = EXCLUDED.claim_nonce \
              WHERE assignments.generation <= EXCLUDED.generation",
         )
         .bind(derivation_id)
         .bind(executor_id)
         .bind(generation)
         .bind(exec_id)
+        .bind(claim_nonce)
         .execute(&mut *conn)
         .await?;
         Ok(result.rows_affected())
@@ -271,6 +275,7 @@ impl SchedulerDb {
         source_node: Option<&str>,
         deadline_secs: Option<f64>,
         attempt_kind: crate::state::AttemptKind,
+        claim_nonce: Option<Uuid>,
     ) -> Result<super::FencedOutcome, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
             super::FencedBegin::Fenced { .. } => return Ok(super::FencedOutcome::Fenced),
@@ -282,6 +287,7 @@ impl SchedulerDb {
             executor_id.as_str(),
             serving_generation.as_i64(),
             exec_id,
+            claim_nonce,
         )
         .await?;
         if upserted == 0 {

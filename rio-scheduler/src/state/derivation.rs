@@ -1105,6 +1105,14 @@ pub struct DerivationState {
     /// substitution display, and the running-count aggregates exclude
     /// materialization-claimed nodes (owner decision Q10, bug_144).
     pub open_attempt_kind: Option<AttemptKind>,
+    /// bug_251 (rule-4b): the open attempt's persisted claim nonce
+    /// (`assignments.claim_nonce` mirror) — the lost-response resume
+    /// credential the kernel's re-delivery cell compares. Set with
+    /// `exec_id` at the mint bookkeeping, cleared in lockstep with it
+    /// at every clear site, recovered off the same assignments join
+    /// (`load_nonterminal_derivations`), so a reset drv's leaked row
+    /// can no more re-stamp this than it can `exec_id`.
+    pub claim_nonce: Option<Uuid>,
     /// Scheduling hints (estimator outputs, resource_floor, critical-path priority).
     pub sched: SchedHint,
     /// ATerm-serialized .drv content, inlined by the gateway for
@@ -1285,6 +1293,7 @@ impl DerivationState {
             assigned_executor: None,
             exec_id: None,
             open_attempt_kind: None,
+            claim_nonce: None,
             // est_duration/priority: placeholders — merge.rs sets them
             // via critical_path::compute_initial right after
             // try_from_node (SLA cache not in scope here). 0.0 is a
@@ -1378,6 +1387,10 @@ impl DerivationState {
                 .attempt_kind
                 .as_deref()
                 .and_then(|k| k.parse::<AttemptKind>().ok()),
+            // rule-4b: rides the same active-assignment join as
+            // exec_id, so the reset-preservation contract holds for
+            // the nonce too.
+            claim_nonce: row.claim_nonce,
             sched: SchedHint {
                 // M_044: persisted reactive floor. PG bigint → i64;
                 // negatives (impossible by DEFAULT 0 + only-ever-doubled
@@ -1476,6 +1489,7 @@ impl DerivationState {
             assigned_executor: None,
             exec_id: None,
             open_attempt_kind: None,
+            claim_nonce: None,
             sched: SchedHint::default(),
             drv_content: Vec::new(),
             input_srcs: Vec::new(),
@@ -1688,6 +1702,7 @@ impl DerivationState {
         if from.is_terminal() && !to.is_terminal() {
             self.exec_id = None;
             self.open_attempt_kind = None;
+            self.claim_nonce = None;
         }
 
         from
@@ -1719,6 +1734,7 @@ impl DerivationState {
         self.assigned_executor = None;
         self.exec_id = None;
         self.open_attempt_kind = None;
+        self.claim_nonce = None;
         Ok(())
     }
 
@@ -1776,6 +1792,7 @@ impl DerivationState {
         self.assigned_executor = None;
         self.exec_id = None;
         self.open_attempt_kind = None;
+        self.claim_nonce = None;
         Ok(target)
     }
 
@@ -2717,6 +2734,7 @@ mod tests {
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,
             exec_id: None,
+            claim_nonce: None,
             attempt_kind: None,
         };
         let state = DerivationState::from_recovery_row(row, DerivationStatus::Queued).unwrap();

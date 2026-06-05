@@ -1101,6 +1101,7 @@ async fn unresolved_job_view_ignores_build_kind_assignments() -> anyhow::Result<
             None,
             None,
             crate::state::AttemptKind::Build,
+            None,
         )
         .await?;
     assert!(
@@ -1137,6 +1138,7 @@ async fn unresolved_job_view_ignores_build_kind_assignments() -> anyhow::Result<
             None,
             None,
             crate::state::AttemptKind::Materialization,
+            None,
         )
         .await?;
     assert!(matches!(minted, FencedOutcome::Applied(_)));

@@ -16,6 +16,7 @@ async fn pull_deliver(handle: &ActorHandle, intent: &str) -> rio_proto::types::W
             kind: rio_evidence_kernel::pull::PullKind::Build,
             executor_instance: None,
             resume_exec_id: None,
+            claim_nonce: None,
             reply,
         })
         .await
@@ -465,6 +466,7 @@ async fn establishment_mat_arm_charges_with_failing_probe() -> TestResult {
             auth_intent: Some("est-e".into()),
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-test-0".into()),
+            claim_nonce: None,
             reply,
             resume_exec_id: None,
         })

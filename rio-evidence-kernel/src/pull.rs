@@ -219,6 +219,8 @@ mod tests {
                 kind: PullKind::Build,
                 job: JobView::None,
                 resume_exec_id: None,
+                presented_nonce: None,
+                attempt_nonce: None,
             },
         )
     }
@@ -374,6 +376,8 @@ mod proofs {
                 kind: PullKind::Build,
                 job: JobView::None,
                 resume_exec_id: None,
+                presented_nonce: None,
+                attempt_nonce: None,
             },
         )
     }
@@ -562,6 +566,46 @@ pub struct MaterializationInputs<ExecId> {
     /// Build-kind re-delivery is
     /// untouched (lost-ack resume keeps working tokenlessly).
     pub resume_exec_id: Option<ExecId>,
+    /// bug_251 (rule-4b, SIGNED 2026-06-04 — the wave signature packet;
+    /// status at the executor-invariant-map.md rule-4 anchor): the
+    /// client-chosen claim nonce PRESENTED on this pull
+    /// (`PullAssignmentRequest.claim_nonce`, parsed at the gRPC
+    /// boundary; u128 = the UUID's scalar form). The credential that
+    /// SURVIVES response loss: minted store-side BEFORE the pull and
+    /// persisted with the assignment at mint, so a worker whose
+    /// original response (and the exec_id resume token it carried)
+    /// never arrived can still prove it opened the attempt.
+    pub presented_nonce: Option<u128>,
+    /// The open attempt's PERSISTED claim nonce
+    /// (`assignments.claim_nonce`, mirrored into the node state at
+    /// mint and re-hydrated at recovery). `None` for attempts minted
+    /// nonceless (old stores, build pulls): the nonce leg then never
+    /// matches — `None == None` is NOT a credential (the
+    /// Option-equality trap; see [`redelivery_credential_ok`]).
+    pub attempt_nonce: Option<u128>,
+}
+
+// r[impl sched.materialize.claim-resume]
+/// The rule-4b re-delivery credential (SIGNED 2026-06-04; the record
+/// lives at the executor-invariant-map.md rule-4 anchor):
+/// materialization re-delivery requires `held_by_puller` AND
+/// (`resume_exec_id` match OR persisted `claim_nonce` match) —
+/// credential-less same-identity re-pulls remain `NotYetReady`.
+///
+/// The nonce leg requires BOTH sides present: `None` never matches
+/// `None`. A puller presenting nothing gains nothing from an attempt
+/// that persisted nothing — the Option-equality trap is the exact
+/// fumble this single fn exists to make unrepeatable; every future
+/// arm goes through it or fails review. Pinned by
+/// `check_materialization_redelivery_requires_credential`.
+pub fn redelivery_credential_ok<ExecId: PartialEq>(
+    presented_resume: Option<&ExecId>,
+    attempt_exec_id: &ExecId,
+    presented_nonce: Option<u128>,
+    attempt_nonce: Option<u128>,
+) -> bool {
+    presented_resume == Some(attempt_exec_id)
+        || (presented_nonce.is_some() && presented_nonce == attempt_nonce)
 }
 
 // r[impl sched.materialize.job+2]
@@ -586,8 +630,9 @@ pub struct MaterializationInputs<ExecId> {
 ///                             node terminal → Gone; else NotYetReady
 ///     job Pending{parked:t} → NotYetReady (backoff unexpired)
 ///     job Claimed{held:t}   → DeliverExisting (re-delivery to the same
-///                             replica — needs the open attempt's exec id,
-///                             so this arm consumes request.open_attempt)
+///                             replica — requires the rule-4b credential:
+///                             resume token ∨ persisted claim nonce; the
+///                             arm consumes request.open_attempt)
 ///     job Claimed{held:f}   → NotYetReady (the one-winner arbiter, BC-1)
 pub fn admit_pull<IntentId, ExecutorIdent, ExecId>(
     request: PullRequest<'_, IntentId, ExecutorIdent, ExecId>,
@@ -708,20 +753,32 @@ where
                 PullAdmission::RejectToken => PullAdmission::RejectToken,
                 PullAdmission::RejectStaleGeneration => PullAdmission::RejectStaleGeneration,
                 PullAdmission::Gone => PullAdmission::Gone,
-                // merged_bug_158: the DELIVERY cell additionally
-                // requires the resume token — identity agreement alone
-                // is forgeable (a sanitize-fold collision or a
-                // restarted pod re-pulls under the same composite
-                // identity without ever having held the attempt). The
-                // token is the open attempt's own exec id, known only
-                // to the puller the original WorkAssignment answered.
-                // Tokenless/mismatched same-identity re-pulls answer
-                // NotYetReady and settle through the establishment
-                // window (the T-0e.6 rule-4 amendment — status at the
-                // executor-invariant-map.md rule-4 anchor). Pinned by
-                // `check_materialization_redelivery_requires_resume_token`.
+                // merged_bug_158 + bug_251 (rule-4b): the DELIVERY
+                // cell additionally requires the re-delivery
+                // CREDENTIAL — identity agreement alone is forgeable
+                // (a sanitize-fold collision or a restarted pod
+                // re-pulls under the same composite identity without
+                // ever having held the attempt). Two credentials prove
+                // holdership: the resume token (the open attempt's own
+                // exec id, known only to the puller the original
+                // WorkAssignment answered) OR the persisted claim
+                // nonce (minted client-side BEFORE the pull, so it
+                // survives the lost-response window the token cannot —
+                // the one failure mode re-delivery exists for).
+                // Credential-less/mismatched same-identity re-pulls
+                // answer NotYetReady and settle through the
+                // establishment window (the T-0e.6 rule-4 amendment —
+                // status at the executor-invariant-map.md rule-4
+                // anchor). Pinned by
+                // `check_materialization_redelivery_requires_credential`.
                 PullAdmission::DeliverExisting { exec_id }
-                    if held_by_puller && mat.resume_exec_id.as_ref() == Some(&exec_id) =>
+                    if held_by_puller
+                        && redelivery_credential_ok(
+                            mat.resume_exec_id.as_ref(),
+                            &exec_id,
+                            mat.presented_nonce,
+                            mat.attempt_nonce,
+                        ) =>
                 {
                     PullAdmission::DeliverExisting { exec_id }
                 }
@@ -783,6 +840,8 @@ mod kinded_tests {
                 kind: PullKind::Build,
                 job,
                 resume_exec_id: None,
+                presented_nonce: None,
+                attempt_nonce: None,
             };
             // Ready (deliverable as-built) → refused.
             assert_eq!(
@@ -832,6 +891,8 @@ mod kinded_tests {
                 held_by_puller: true,
             },
             resume_exec_id: resume,
+            presented_nonce: None,
+            attempt_nonce: None,
         };
         // Fresh claim (no token): refused.
         assert_eq!(
@@ -869,10 +930,115 @@ mod kinded_tests {
                         held_by_puller: false,
                     },
                     resume_exec_id: Some(9),
+                    presented_nonce: None,
+                    attempt_nonce: None,
                 }
             ),
             PullAdmission::NotYetReady,
             "BC-1: the view projection still arbitrates"
+        );
+        // rule-4b: NONCE agreement never overrides identity
+        // disagreement either — the credential proves holdership of
+        // the attempt, not ownership of the arbitration.
+        assert_eq!(
+            admit_pull(
+                request(Some(S::Assigned), Some((&me, 9)), &me),
+                MaterializationInputs {
+                    kind: PullKind::Materialization,
+                    job: JobView::Claimed {
+                        held_by_puller: false,
+                    },
+                    resume_exec_id: None,
+                    presented_nonce: Some(42),
+                    attempt_nonce: Some(42),
+                }
+            ),
+            PullAdmission::NotYetReady,
+            "BC-1 dominates the nonce leg too"
+        );
+    }
+
+    // r[verify sched.materialize.claim-resume]
+    /// bug_251 (rule-4b, SIGNED): the claim nonce is the credential
+    /// that SURVIVES response loss. A puller whose original response
+    /// never arrived holds no exec_id token — but it minted and
+    /// persisted a nonce with the claim, and presenting THAT nonce
+    /// resumes the attempt. Every leg of the disjunction:
+    ///   1. nonce match, no token            → DeliverExisting
+    ///   2. nonce mismatch, no token         → NotYetReady
+    ///   3. nonce presented, none persisted  → NotYetReady
+    ///   4. none presented, one persisted    → NotYetReady (None≠None)
+    ///   5. wrong token + matching nonce     → DeliverExisting
+    /// RED (recorded, pre-fix): leg 1 refused — `left: NotYetReady /
+    /// right: DeliverExisting { exec_id: 9 }` — the cell required the
+    /// response-borne token alone, which is exactly what a lost
+    /// response destroys.
+    #[test]
+    fn lost_response_nonce_resumes_claim() {
+        use PullNodeStatus as S;
+        let me = 1u8;
+        let mat = |presented, attempt| MaterializationInputs {
+            kind: PullKind::Materialization,
+            job: JobView::Claimed {
+                held_by_puller: true,
+            },
+            resume_exec_id: None,
+            presented_nonce: presented,
+            attempt_nonce: attempt,
+        };
+        // 1. The lost-response resume: persisted nonce match → re-delivery.
+        assert_eq!(
+            admit_pull(
+                request(Some(S::Running), Some((&me, 9)), &me),
+                mat(Some(42), Some(42))
+            ),
+            PullAdmission::DeliverExisting { exec_id: 9 },
+            "the nonce survives response loss and resumes the attempt"
+        );
+        // 2. Mismatched nonce: refused.
+        assert_eq!(
+            admit_pull(
+                request(Some(S::Running), Some((&me, 9)), &me),
+                mat(Some(42), Some(43))
+            ),
+            PullAdmission::NotYetReady
+        );
+        // 3. Nonce presented but the attempt persisted none (old
+        //    scheduler / build-minted row): refused.
+        assert_eq!(
+            admit_pull(
+                request(Some(S::Running), Some((&me, 9)), &me),
+                mat(Some(42), None)
+            ),
+            PullAdmission::NotYetReady
+        );
+        // 4. The Option-equality trap: nothing presented, nothing
+        //    persisted — None==None must NOT be a credential.
+        assert_eq!(
+            admit_pull(
+                request(Some(S::Running), Some((&me, 9)), &me),
+                mat(None, None)
+            ),
+            PullAdmission::NotYetReady,
+            "credential-less same-identity re-pulls remain NotYetReady"
+        );
+        // 5. The disjunction: a WRONG resume token alongside a
+        //    matching nonce still resumes (either credential proves
+        //    holdership; the worker may have recorded both).
+        assert_eq!(
+            admit_pull(
+                request(Some(S::Running), Some((&me, 9)), &me),
+                MaterializationInputs {
+                    kind: PullKind::Materialization,
+                    job: JobView::Claimed {
+                        held_by_puller: true,
+                    },
+                    resume_exec_id: Some(7),
+                    presented_nonce: Some(42),
+                    attempt_nonce: Some(42),
+                }
+            ),
+            PullAdmission::DeliverExisting { exec_id: 9 }
         );
     }
 
@@ -891,6 +1057,8 @@ mod kinded_tests {
             kind: PullKind::Materialization,
             job,
             resume_exec_id: None,
+            presented_nonce: None,
+            attempt_nonce: None,
         };
         // No job → Gone (nothing to materialize).
         assert_eq!(
@@ -958,6 +1126,8 @@ mod kinded_tests {
                     kind: PullKind::Build,
                     job: JobView::Pending { parked: false },
                     resume_exec_id: None,
+                    presented_nonce: None,
+                    attempt_nonce: None,
                 }
             ),
             PullAdmission::NotYetReady
@@ -1002,6 +1172,8 @@ mod kinded_tests {
                         held_by_puller: true
                     },
                     resume_exec_id: Some(9),
+                    presented_nonce: None,
+                    attempt_nonce: None,
                 }
             ),
             PullAdmission::DeliverExisting { exec_id: 9 }
@@ -1099,6 +1271,8 @@ mod kinded_tests {
                 kind: PullKind::Build,
                 job: JobView::None,
                 resume_exec_id: None,
+                presented_nonce: None,
+                attempt_nonce: None,
             },
         );
         assert_eq!(build, PullAdmission::DeliverNew);
@@ -1110,6 +1284,8 @@ mod kinded_tests {
                 kind: PullKind::Materialization,
                 job: JobView::None,
                 resume_exec_id: None,
+                presented_nonce: None,
+                attempt_nonce: None,
             },
         );
         assert_ne!(
@@ -1125,6 +1301,8 @@ mod kinded_tests {
                 kind: PullKind::Build,
                 job: JobView::Pending { parked: false },
                 resume_exec_id: None,
+                presented_nonce: None,
+                attempt_nonce: None,
             },
         );
         assert_eq!(got, PullAdmission::NotYetReady);
@@ -1243,6 +1421,12 @@ mod kinded_proofs {
         }
     }
 
+    /// Symbolic claim nonce (the u128 credential scalar): absent or
+    /// arbitrary. EQ-only downstream, so no bound is needed.
+    fn any_nonce() -> Option<u128> {
+        if kani::any() { Some(kani::any()) } else { None }
+    }
+
     fn run_kinded(inputs: &Inputs, mat: MaterializationInputs<u8>) -> PullAdmission<u8> {
         admit_pull(
             PullRequest {
@@ -1277,6 +1461,8 @@ mod kinded_proofs {
                 // Widened domain (158): the build arms must hold for
                 // every token value — the field is materialization-only.
                 resume_exec_id: any_resume(),
+                presented_nonce: None,
+                attempt_nonce: None,
             },
         );
 
@@ -1328,6 +1514,8 @@ mod kinded_proofs {
                 kind: PullKind::Build,
                 job: JobView::None,
                 resume_exec_id: None,
+                presented_nonce: None,
+                attempt_nonce: None,
             },
         );
 
@@ -1342,16 +1530,20 @@ mod kinded_proofs {
         let inputs = any_inputs();
         let job = any_job_view();
         let mat_resume = any_resume();
+        let presented = any_nonce();
+        let attempt = any_nonce();
 
         let decision = run_kinded(
             &inputs,
             MaterializationInputs {
                 kind: PullKind::Materialization,
                 job,
-                // Widened domain (158): one-winner holds for every
-                // token value; the DeliverExisting branch additionally
-                // proves the token matched.
+                // Widened domain (158, then rule-4b): one-winner holds
+                // for every credential value; the DeliverExisting
+                // branch additionally proves a credential matched.
                 resume_exec_id: mat_resume,
+                presented_nonce: presented,
+                attempt_nonce: attempt,
             },
         );
 
@@ -1394,11 +1586,14 @@ mod kinded_proofs {
                     }
                     None => unreachable!("DeliverExisting requires an open attempt"),
                 }
-                // 158: a materialization re-delivery REQUIRES the
-                // matching resume token (build-kind re-delivery is
-                // tokenless by contract — this harness is the
+                // 158 + rule-4b: a materialization re-delivery
+                // REQUIRES a matching credential — resume token OR
+                // persisted claim nonce (build-kind re-delivery is
+                // credential-less by contract — this harness is the
                 // materialization arm).
-                assert_eq!(mat_resume, Some(exec_id));
+                assert!(
+                    mat_resume == Some(exec_id) || (presented.is_some() && presented == attempt)
+                );
                 // And it never escapes the identity/fence gates.
                 assert!(!inputs.auth.is_some_and(|a| a != inputs.intent));
                 assert!(
@@ -1427,18 +1622,26 @@ mod kinded_proofs {
     }
 
     // r[verify sched.materialize.job+2]
-    /// merged_bug_158: over the full kinded domain, a materialization
-    /// re-delivery is produced ONLY when the resume token matches the
-    /// open attempt's exec id — tokenless and mismatched same-identity
-    /// re-pulls are refused (NotYetReady; the establishment window
-    /// settles the attempt). The contrapositive of the one-winner
-    /// branch assertion, stated as its own pin so the gating conjunct
-    /// cannot be weakened without a named proof failing.
+    // r[verify sched.materialize.claim-resume]
+    /// bug_251 (rule-4b, SIGNED 2026-06-04): over the full kinded
+    /// domain, a materialization re-delivery is produced ONLY under
+    /// the credential disjunction — the resume token matches the open
+    /// attempt's exec id, OR the presented claim nonce matches the
+    /// attempt's persisted nonce with BOTH sides present. Credential-
+    /// less and mismatched same-identity re-pulls are refused
+    /// (NotYetReady; the establishment window settles the attempt),
+    /// and None==None never satisfies the nonce leg. REPLACES (widens)
+    /// `check_materialization_redelivery_requires_resume_token` over
+    /// the (resume ∨ nonce) domain — merged_bug_158's refusal
+    /// direction is the mat_resume.is_none() ∧ nonce-less slice of
+    /// this proof, preserved verbatim.
     #[kani::proof]
-    fn check_materialization_redelivery_requires_resume_token() {
+    fn check_materialization_redelivery_requires_credential() {
         let inputs = any_inputs();
         let job = any_job_view();
         let mat_resume = any_resume();
+        let presented = any_nonce();
+        let attempt = any_nonce();
 
         let decision = run_kinded(
             &inputs,
@@ -1446,11 +1649,14 @@ mod kinded_proofs {
                 kind: PullKind::Materialization,
                 job,
                 resume_exec_id: mat_resume,
+                presented_nonce: presented,
+                attempt_nonce: attempt,
             },
         );
 
+        let nonce_match = presented.is_some() && presented == attempt;
         if let PullAdmission::DeliverExisting { exec_id } = decision {
-            assert_eq!(mat_resume, Some(exec_id));
+            assert!(mat_resume == Some(exec_id) || nonce_match);
             assert!(matches!(
                 job,
                 JobView::Claimed {
@@ -1458,9 +1664,9 @@ mod kinded_proofs {
                 }
             ));
         }
-        // And the refusal direction: with NO token, no re-delivery
-        // exists anywhere in the materialization table.
-        if mat_resume.is_none() {
+        // The refusal direction: with NO credential of either kind,
+        // no re-delivery exists anywhere in the materialization table.
+        if mat_resume.is_none() && !nonce_match {
             assert!(!matches!(decision, PullAdmission::DeliverExisting { .. }));
         }
     }
@@ -1491,6 +1697,8 @@ mod kinded_proofs {
                 kind,
                 job,
                 resume_exec_id: any_resume(),
+                presented_nonce: None,
+                attempt_nonce: None,
             },
         );
 

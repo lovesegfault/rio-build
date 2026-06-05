@@ -7,11 +7,12 @@
 //! scripted mock with no wire and no scheduler.
 // r[impl store.materialize.executor+5]
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use rio_common::grpc::DEFAULT_GRPC_TIMEOUT;
 use rio_common::transport::{AttemptBudget, BoundedOutcome, SIGTERM_FINAL_ATTEMPT, bounded};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use rio_proto::types::{
@@ -88,6 +89,146 @@ pub struct ClaimedJob {
     pub drv_path: String,
 }
 
+// r[impl sched.materialize.claim-resume]
+/// bug_251 (rule-4b, SIGNED 2026-06-04) — the bounded per-worker
+/// resume ledger, the client half of the lost-response credential.
+///
+/// One entry per claim attempt whose ANSWER never arrived (timeout /
+/// transport error): the v4 nonce was minted BEFORE the pull rode the
+/// wire, so the scheduler may have committed an attempt that persisted
+/// it (`assignments.claim_nonce`, migration 096) while the response —
+/// and the `exec_id` resume token it carried — died in flight. A
+/// minted attempt leaves the claimable listing (it is open, held by
+/// THIS replica), so re-listing can never find it again: the next
+/// pass instead issues DIRECT resume pulls for ledger entries,
+/// presenting the nonce; the kernel's credential disjunction
+/// re-delivers and the worker recovers the assignment.
+///
+/// Entries leave on every ANSWERED outcome (Assignment — we hold the
+/// job; Gone — resolved/absent, authoritative) and on capacity
+/// eviction (oldest first). `NotYetReady` KEEPS the entry: the job
+/// may be parked, raced to another replica (their resolution answers
+/// Gone later), or our own attempt seen through a mid-recovery stale
+/// view — the retry costs one bounded RPC per pass. An evicted or
+/// process-lost entry settles through the charged establishment
+/// window — the SIGNED residual (rule-4b): real crashes still pay,
+/// lost responses no longer do.
+#[derive(Default)]
+pub struct ResumeLedger {
+    entries: VecDeque<ResumeEntry>,
+}
+
+/// One unanswered claim: everything the resume pull and the recovered
+/// [`ClaimedJob`] need from the original listing descriptor, plus the
+/// minted nonce.
+#[derive(Clone)]
+struct ResumeEntry {
+    job_id: Uuid,
+    drv_hash: String,
+    tenant_hint: Option<Uuid>,
+    origin: String,
+    nonce: Uuid,
+}
+
+/// Ledger capacity. Eviction is loud and settles via the
+/// establishment window; 32 unanswered claims on ONE worker already
+/// signals a scheduler-side outage the establishment sweep owns.
+const RESUME_LEDGER_CAP: usize = 32;
+
+impl ResumeLedger {
+    /// Record a claim attempt BEFORE its pull rides the wire (upsert
+    /// by job: a re-claim re-mints, and exactly one nonce per job is
+    /// ever live on this worker).
+    fn note_pull(&mut self, entry: ResumeEntry) {
+        self.entries.retain(|e| e.job_id != entry.job_id);
+        if self.entries.len() >= RESUME_LEDGER_CAP {
+            if let Some(evicted) = self.entries.pop_front() {
+                warn!(drv_hash = %evicted.drv_hash, job_id = %evicted.job_id,
+                      "resume ledger full; evicted entry settles via the establishment window");
+            }
+        }
+        self.entries.push_back(entry);
+    }
+
+    /// An ANSWERED outcome for the job — drop its entry.
+    fn resolve(&mut self, job_id: Uuid) {
+        self.entries.retain(|e| e.job_id != job_id);
+    }
+
+    /// Snapshot for the resume pass (entries are a handful of small
+    /// strings; the pass mutates the ledger per answer).
+    fn snapshot(&self) -> Vec<ResumeEntry> {
+        self.entries.iter().cloned().collect()
+    }
+
+    /// Test/diagnostic visibility: unanswered claims currently held.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True when no unanswered claim is outstanding.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// One claim attempt's wire verdict — shared by the listing pass and
+/// the resume pass so the two cannot drift on outcome semantics.
+enum PullAnswer {
+    Deliver(rio_proto::types::WorkAssignment),
+    /// Answered: the job is resolved/absent — authoritative stop.
+    Gone,
+    /// Answered: refused for now (race lost, parked, not ready).
+    NotYetReady,
+    /// SIGTERM raced the pull — end the pass.
+    Shutdown,
+    /// The answer never arrived (timeout / transport error): a mint
+    /// may have committed server-side — exactly the window the
+    /// resume ledger exists for.
+    Unanswered,
+}
+
+/// Issue one bounded `PullAssignment` and classify the outcome.
+async fn pull_once<T: MaterializeTransport>(
+    transport: &mut T,
+    shutdown: &rio_common::signal::Token,
+    req: PullAssignmentRequest,
+    drv_hash: &str,
+) -> PullAnswer {
+    match bounded(shutdown, DEFAULT_GRPC_TIMEOUT, transport.pull(req)).await {
+        BoundedOutcome::Shutdown => PullAnswer::Shutdown,
+        BoundedOutcome::TimedOut { after } => {
+            // bug_251: a minted attempt leaves the claimable listing,
+            // so "the next poll re-lists" was FALSE for the timeout
+            // case — the nonce in the resume ledger is what recovers
+            // it now.
+            warn!(drv_hash = %drv_hash, after_secs = after.as_secs(),
+                  "materialization claim unanswered; nonce recorded — the next pass \
+                   resumes it directly");
+            transport.note_timeout();
+            PullAnswer::Unanswered
+        }
+        BoundedOutcome::Resolved(Ok(resp)) => match resp.outcome {
+            Some(pull_assignment_response::Outcome::Assignment(assignment)) => {
+                PullAnswer::Deliver(assignment)
+            }
+            Some(pull_assignment_response::Outcome::Gone(_)) => PullAnswer::Gone,
+            Some(pull_assignment_response::Outcome::NotYetReady(_)) | None => {
+                debug!(drv_hash = %drv_hash,
+                       "materialization claim not delivered (race lost / not ready)");
+                PullAnswer::NotYetReady
+            }
+        },
+        BoundedOutcome::Resolved(Err(status)) => {
+            warn!(drv_hash = %drv_hash,
+                  code = ?status.code(), msg = status.message(),
+                  "materialization claim RPC failed; nonce recorded — the next pass \
+                   resumes it directly");
+            PullAnswer::Unanswered
+        }
+    }
+}
+
 /// One poll→claim pass: list claimable jobs, then attempt to claim up
 /// to `available_slots` of them via
 /// `PullAssignment(kind=MATERIALIZATION, executor_instance=<pod>)`.
@@ -103,10 +244,56 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     transport: &mut T,
     executor_instance: &str,
     available_slots: usize,
+    ledger: &mut ResumeLedger,
     shutdown: &rio_common::signal::Token,
 ) -> Vec<ClaimedJob> {
     if available_slots == 0 {
         return Vec::new();
+    }
+    let mut claimed = Vec::new();
+
+    // bug_251: the RESUME pass runs FIRST — unanswered claims from
+    // prior passes are existing obligations (the scheduler may hold an
+    // open attempt minted for this replica that no listing will ever
+    // show again). Each resume pull presents the persisted nonce; the
+    // kernel's credential disjunction re-delivers.
+    for entry in ledger.snapshot() {
+        if claimed.len() >= available_slots {
+            break;
+        }
+        let req = PullAssignmentRequest {
+            executor_token: String::new(),
+            intent_id: entry.drv_hash.clone(),
+            kind: rio_proto::types::AttemptKind::Materialization.into(),
+            executor_instance: executor_instance.to_string(),
+            // The resume credential: the original response never
+            // arrived, so no exec_id token exists — the nonce IS the
+            // proof of holdership (rule-4b).
+            resume_exec_id: String::new(),
+            claim_nonce: entry.nonce.to_string(),
+        };
+        match pull_once(transport, shutdown, req, &entry.drv_hash).await {
+            PullAnswer::Shutdown => return claimed,
+            PullAnswer::Deliver(assignment) => {
+                info!(drv_hash = %entry.drv_hash, exec_id = %assignment.exec_id,
+                      "lost-response claim resumed via nonce (rule-4b)");
+                ledger.resolve(entry.job_id);
+                claimed.push(ClaimedJob {
+                    job_id: entry.job_id,
+                    drv_hash: entry.drv_hash,
+                    tenant_hint: entry.tenant_hint,
+                    origin: entry.origin,
+                    exec_id: assignment.exec_id,
+                    drv_path: assignment.drv_path,
+                });
+            }
+            // Authoritative: the job resolved without us.
+            PullAnswer::Gone => ledger.resolve(entry.job_id),
+            // Parked / raced / stale view: keep — one bounded RPC per
+            // pass until Gone or delivery; capacity bounds the total.
+            PullAnswer::NotYetReady => {}
+            PullAnswer::Unanswered => {}
+        }
     }
     // bug_385: the listing window is DECOUPLED from the claim budget.
     // With limit == slots, a refused head — raced to another replica,
@@ -154,7 +341,6 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         }
     };
 
-    let mut claimed = Vec::new();
     for descriptor in listed {
         // The claim budget: stop once `available_slots` claims
         // SUCCEEDED — refusals (Gone/NotYetReady/timeout) do not
@@ -182,6 +368,20 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
                 continue;
             }
         };
+        // bug_251 (rule-4b): mint the claim nonce and record it in the
+        // resume ledger BEFORE the pull rides the wire. If the answer
+        // never arrives, the scheduler may still have committed the
+        // mint WITH this nonce persisted (`assignments.claim_nonce`) —
+        // the ledger entry is then the credential that recovers the
+        // attempt on the next pass.
+        let nonce = Uuid::new_v4();
+        ledger.note_pull(ResumeEntry {
+            job_id,
+            drv_hash: descriptor.drv_hash.clone(),
+            tenant_hint: Uuid::parse_str(&descriptor.tenant_id).ok(),
+            origin: descriptor.origin.clone(),
+            nonce,
+        });
         let req = PullAssignmentRequest {
             // No executor token: the store's credential is the
             // service token in metadata (the kind-attested credential).
@@ -192,49 +392,39 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             kind: rio_proto::types::AttemptKind::Materialization.into(),
             executor_instance: executor_instance.to_string(),
             // Fresh claims NEVER carry a resume token (merged_bug_158:
-            // re-delivery of a Claimed attempt requires the original
-            // exec_id, so a colliding identity cannot steal it). A
-            // crashed-and-restarted worker has no exec id either: its
-            // tokenless re-pull answers NotYetReady and the attempt
-            // settles through the establishment window (the T-0e.6
-            // rule-4 amendment — status at the executor-invariant-map.md
-            // rule-4 anchor).
+            // re-delivery of a Claimed attempt requires a credential,
+            // so a colliding identity cannot steal it). A
+            // crashed-and-restarted worker has neither exec id nor
+            // ledger: its credential-less re-pull answers NotYetReady
+            // and the attempt settles through the establishment
+            // window (the T-0e.6 rule-4 amendment — status at the
+            // executor-invariant-map.md rule-4 anchor).
             resume_exec_id: String::new(),
+            claim_nonce: nonce.to_string(),
         };
-        match bounded(shutdown, DEFAULT_GRPC_TIMEOUT, transport.pull(req)).await {
+        match pull_once(transport, shutdown, req, &descriptor.drv_hash).await {
             // SIGTERM mid-pass: return what was already claimed so the
             // caller can abort/report those attempts under the grace.
-            BoundedOutcome::Shutdown => return claimed,
-            BoundedOutcome::TimedOut { after } => {
-                warn!(drv_hash = %descriptor.drv_hash, after_secs = after.as_secs(),
-                      "materialization claim unanswered; skipping (next poll re-lists)");
-                transport.note_timeout();
+            PullAnswer::Shutdown => return claimed,
+            PullAnswer::Deliver(assignment) => {
+                ledger.resolve(job_id);
+                claimed.push(ClaimedJob {
+                    job_id,
+                    drv_hash: descriptor.drv_hash,
+                    tenant_hint: Uuid::parse_str(&descriptor.tenant_id).ok(),
+                    origin: descriptor.origin,
+                    exec_id: assignment.exec_id,
+                    drv_path: assignment.drv_path,
+                });
             }
-            BoundedOutcome::Resolved(Ok(resp)) => match resp.outcome {
-                Some(pull_assignment_response::Outcome::Assignment(assignment)) => {
-                    claimed.push(ClaimedJob {
-                        job_id,
-                        drv_hash: descriptor.drv_hash,
-                        tenant_hint: Uuid::parse_str(&descriptor.tenant_id).ok(),
-                        origin: descriptor.origin,
-                        exec_id: assignment.exec_id,
-                        drv_path: assignment.drv_path,
-                    });
-                }
-                // Lost the race (another replica holds the attempt) or
-                // the job resolved between list and claim: normal.
-                Some(pull_assignment_response::Outcome::NotYetReady(_))
-                | Some(pull_assignment_response::Outcome::Gone(_))
-                | None => {
-                    debug!(drv_hash = %descriptor.drv_hash,
-                           "materialization claim not delivered (race lost / job resolved)");
-                }
-            },
-            BoundedOutcome::Resolved(Err(status)) => {
-                warn!(drv_hash = %descriptor.drv_hash,
-                      code = ?status.code(), msg = status.message(),
-                      "materialization claim RPC failed; skipping (next poll re-lists)");
-            }
+            // ANSWERED refusals on a FRESH claim: the scheduler did
+            // not mint for us — drop the nonce (unlike the resume
+            // pass, where NotYetReady may shadow our own held
+            // attempt through a stale view).
+            PullAnswer::Gone | PullAnswer::NotYetReady => ledger.resolve(job_id),
+            // The answer never arrived: the entry STAYS — the next
+            // pass resumes it directly with the nonce.
+            PullAnswer::Unanswered => {}
         }
     }
     claimed
@@ -578,6 +768,10 @@ mod tests {
         report_calls: u32,
         seen_pull_requests: Vec<PullAssignmentRequest>,
         seen_list_limits: Vec<u32>,
+        /// bug_251: hang the next N pulls (request recorded, future
+        /// never resolves) — with `start_paused` tokio time the
+        /// bounded await elapses instantly, modeling a lost response.
+        hang_next_pulls: u32,
     }
 
     impl MockTransport {
@@ -595,6 +789,7 @@ mod tests {
                 report_calls: 0,
                 seen_pull_requests: Vec::new(),
                 seen_list_limits: Vec::new(),
+                hang_next_pulls: 0,
             }
         }
     }
@@ -619,6 +814,13 @@ mod tests {
         ) -> Result<PullAssignmentResponse, tonic::Status> {
             self.pull_calls += 1;
             self.seen_pull_requests.push(req);
+            if self.hang_next_pulls > 0 {
+                self.hang_next_pulls -= 1;
+                // Lost response: the request reached the wire (it is
+                // recorded above — the scheduler may act on it) but
+                // no answer ever returns.
+                std::future::pending::<()>().await;
+            }
             match self.pulls.len() {
                 0 => Err(tonic::Status::unavailable("script exhausted")),
                 1 => self.pulls[0].clone(),
@@ -708,7 +910,14 @@ mod tests {
             ],
             vec![],
         );
-        let claimed = poll_and_claim(&mut t, "store-replica-0", 8, &token()).await;
+        let claimed = poll_and_claim(
+            &mut t,
+            "store-replica-0",
+            8,
+            &mut ResumeLedger::default(),
+            &token(),
+        )
+        .await;
         assert_eq!(claimed.len(), 2, "both listed jobs are claimed");
         assert_eq!(claimed[0].drv_hash, d1.drv_hash);
         assert_eq!(claimed[0].exec_id, "exec-1");
@@ -744,7 +953,14 @@ mod tests {
         );
         // Budget 1: the head refuses, the younger job must fill the
         // slot in the same pass.
-        let claimed = poll_and_claim(&mut t, "store-replica-0", 1, &token()).await;
+        let claimed = poll_and_claim(
+            &mut t,
+            "store-replica-0",
+            1,
+            &mut ResumeLedger::default(),
+            &token(),
+        )
+        .await;
         assert_eq!(
             claimed.len(),
             1,
@@ -779,7 +995,14 @@ mod tests {
             ],
             vec![],
         );
-        let claimed = poll_and_claim(&mut t, "store-replica-0", 2, &token()).await;
+        let claimed = poll_and_claim(
+            &mut t,
+            "store-replica-0",
+            2,
+            &mut ResumeLedger::default(),
+            &token(),
+        )
+        .await;
         assert_eq!(claimed.len(), 2, "the budget caps successful claims");
         assert_eq!(t.pull_calls, 2, "no claim attempted past the budget");
     }
@@ -798,7 +1021,14 @@ mod tests {
             vec![Ok(deliver("exec-9", "/nix/store/zzz-bad.drv"))],
             vec![],
         );
-        let claimed = poll_and_claim(&mut t, "store-replica-0", 8, &token()).await;
+        let claimed = poll_and_claim(
+            &mut t,
+            "store-replica-0",
+            8,
+            &mut ResumeLedger::default(),
+            &token(),
+        )
+        .await;
         assert!(
             claimed.is_empty(),
             "a malformed job_id must refuse the claim (pre-fix RED: claimed with job_id=None)"
@@ -823,7 +1053,14 @@ mod tests {
             ],
             vec![],
         );
-        let claimed = poll_and_claim(&mut t, "store-replica-0", 8, &token()).await;
+        let claimed = poll_and_claim(
+            &mut t,
+            "store-replica-0",
+            8,
+            &mut ResumeLedger::default(),
+            &token(),
+        )
+        .await;
         assert_eq!(
             claimed.len(),
             1,
@@ -845,7 +1082,14 @@ mod tests {
             vec![Ok(deliver("exec-x", "/nix/store/xxx.drv"))],
             vec![],
         );
-        let claimed = poll_and_claim(&mut t, "store-replica-0", 2, &token()).await;
+        let claimed = poll_and_claim(
+            &mut t,
+            "store-replica-0",
+            2,
+            &mut ResumeLedger::default(),
+            &token(),
+        )
+        .await;
         assert_eq!(claimed.len(), 2);
         assert_eq!(
             t.pull_calls, 2,
@@ -854,7 +1098,14 @@ mod tests {
 
         // Zero slots → no RPCs at all.
         let mut idle = MockTransport::new(vec![], vec![], vec![]);
-        let claimed = poll_and_claim(&mut idle, "store-replica-0", 0, &token()).await;
+        let claimed = poll_and_claim(
+            &mut idle,
+            "store-replica-0",
+            0,
+            &mut ResumeLedger::default(),
+            &token(),
+        )
+        .await;
         assert!(claimed.is_empty());
         assert_eq!(idle.list_calls, 0, "zero slots never even lists");
     }
@@ -872,7 +1123,14 @@ mod tests {
             vec![Ok(deliver("exec-1", "/nix/store/aaa.drv"))],
             vec![],
         );
-        let _ = poll_and_claim(&mut t, "store-replica-7", 8, &token()).await;
+        let _ = poll_and_claim(
+            &mut t,
+            "store-replica-7",
+            8,
+            &mut ResumeLedger::default(),
+            &token(),
+        )
+        .await;
         assert_eq!(t.seen_pull_requests.len(), 2);
         for (req, descriptor) in t.seen_pull_requests.iter().zip([&d1, &d2]) {
             assert_eq!(
@@ -1104,7 +1362,14 @@ mod tests {
             ),
             shutdown: shutdown.clone(),
         };
-        let claimed = poll_and_claim(&mut t, "store-replica-0", 8, &shutdown).await;
+        let claimed = poll_and_claim(
+            &mut t,
+            "store-replica-0",
+            8,
+            &mut ResumeLedger::default(),
+            &shutdown,
+        )
+        .await;
         assert_eq!(claimed.len(), 1, "the won claim is returned");
         assert_eq!(
             t.inner.pull_calls, 1,
@@ -1272,7 +1537,14 @@ mod tests {
 
         // The executor's connection gets pinned to the standby: the
         // poll pass comes back empty (UNAVAILABLE answers).
-        let claimed = poll_and_claim(&mut transport, "store-replica-0", 1, &token()).await;
+        let claimed = poll_and_claim(
+            &mut transport,
+            "store-replica-0",
+            1,
+            &mut ResumeLedger::default(),
+            &token(),
+        )
+        .await;
         assert!(
             claimed.is_empty(),
             "the standby answers UNAVAILABLE — nothing claimable on this pass"
@@ -1289,7 +1561,14 @@ mod tests {
         // empty.
         let mut claimed = Vec::new();
         for _ in 0..5 {
-            claimed = poll_and_claim(&mut transport, "store-replica-0", 1, &token()).await;
+            claimed = poll_and_claim(
+                &mut transport,
+                "store-replica-0",
+                1,
+                &mut ResumeLedger::default(),
+                &token(),
+            )
+            .await;
             if !claimed.is_empty() {
                 break;
             }
@@ -1321,7 +1600,14 @@ mod tests {
                 .unwrap();
 
         // Pin the connection to the standby with one failing pass.
-        let _ = poll_and_claim(&mut transport, "store-replica-0", 1, &token()).await;
+        let _ = poll_and_claim(
+            &mut transport,
+            "store-replica-0",
+            1,
+            &mut ResumeLedger::default(),
+            &token(),
+        )
+        .await;
         // The rollout completes mid-execution.
         *backend.lock().unwrap() = leader_addr;
 
@@ -1397,5 +1683,103 @@ mod tests {
             "the progress relay must converge on the leader after a rollout \
              (abandon-on-UNAVAILABLE redial)"
         );
+    }
+
+    /// bug_251 (rule-4b): timeout-then-resume — a lost-response claim
+    /// is recovered by a DIRECT nonce-presenting resume pull on the
+    /// next pass, never by re-listing (a minted attempt leaves the
+    /// claimable listing forever; the pre-fix TimedOut log said "next
+    /// poll re-lists", documenting a recovery path that did not
+    /// exist). RED (recorded, kernel pin): the nonce-match leg
+    /// refused pre-fix — `left: NotYetReady / right: DeliverExisting
+    /// { exec_id: 9 }` (`lost_response_nonce_resumes_claim`); this
+    /// test pins the client half end-to-end.
+    // r[verify sched.materialize.claim-resume]
+    #[tokio::test(start_paused = true)]
+    async fn timeout_then_resume_recovers_lost_response() {
+        let d = descriptor(1);
+        let job_id = d.job_id.clone();
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![d])), Ok(listing(vec![]))],
+            vec![Ok(deliver("exec-resume", "/nix/store/resume-x.drv"))],
+            vec![],
+        );
+        t.hang_next_pulls = 1;
+        let mut ledger = ResumeLedger::default();
+
+        // Pass 1: the pull's answer never arrives — the claim is
+        // recorded, nothing delivered.
+        let claimed = poll_and_claim(&mut t, "store-replica-0", 1, &mut ledger, &token()).await;
+        assert!(claimed.is_empty());
+        assert_eq!(
+            ledger.len(),
+            1,
+            "the unanswered claim is held in the ledger"
+        );
+        let nonce_1 = t.seen_pull_requests[0].claim_nonce.clone();
+        assert!(
+            !nonce_1.is_empty(),
+            "the nonce rides the FIRST pull — minted before the wire, not after the loss"
+        );
+
+        // Pass 2: the job no longer lists (the attempt is open,
+        // held by us, server-side); the resume pull presents the
+        // SAME nonce and recovers the assignment.
+        let claimed = poll_and_claim(&mut t, "store-replica-0", 1, &mut ledger, &token()).await;
+        assert_eq!(claimed.len(), 1, "the lost-response claim is recovered");
+        assert_eq!(claimed[0].exec_id, "exec-resume");
+        assert_eq!(claimed[0].job_id.to_string(), job_id);
+        assert!(ledger.is_empty(), "delivery resolves the ledger entry");
+        let resume_req = t.seen_pull_requests.last().expect("resume pull recorded");
+        assert_eq!(
+            resume_req.claim_nonce, nonce_1,
+            "the resume presents the SAME nonce the mint persisted"
+        );
+        assert!(
+            resume_req.resume_exec_id.is_empty(),
+            "no exec_id token exists — the response that carried it was lost"
+        );
+    }
+
+    /// bug_251: answered outcomes resolve ledger entries — Gone is
+    /// authoritative on the resume pass; NotYetReady keeps the entry
+    /// (parked / raced / stale view — one bounded RPC per pass); the
+    /// capacity bound evicts oldest-first.
+    #[tokio::test(start_paused = true)]
+    async fn resume_ledger_lifecycle() {
+        let d = descriptor(2);
+        let mut t = MockTransport::new(
+            vec![
+                Ok(listing(vec![d])),
+                Ok(listing(vec![])),
+                Ok(listing(vec![])),
+            ],
+            vec![Ok(not_yet_ready()), Ok(gone())],
+            vec![],
+        );
+        t.hang_next_pulls = 1;
+        let mut ledger = ResumeLedger::default();
+        // Pass 1: unanswered — entry held.
+        let _ = poll_and_claim(&mut t, "store-replica-0", 1, &mut ledger, &token()).await;
+        assert_eq!(ledger.len(), 1);
+        // Pass 2: resume answered NotYetReady — entry KEPT.
+        let _ = poll_and_claim(&mut t, "store-replica-0", 1, &mut ledger, &token()).await;
+        assert_eq!(ledger.len(), 1, "NotYetReady keeps the resume obligation");
+        // Pass 3: resume answered Gone — entry dropped.
+        let _ = poll_and_claim(&mut t, "store-replica-0", 1, &mut ledger, &token()).await;
+        assert!(ledger.is_empty(), "Gone is authoritative");
+
+        // Capacity: the 33rd entry evicts the oldest.
+        let mut full = ResumeLedger::default();
+        for i in 0..(RESUME_LEDGER_CAP + 1) {
+            full.note_pull(ResumeEntry {
+                job_id: Uuid::now_v7(),
+                drv_hash: format!("drv-cap-{i}"),
+                tenant_hint: None,
+                origin: "cache_opportunity".into(),
+                nonce: Uuid::new_v4(),
+            });
+        }
+        assert_eq!(full.len(), RESUME_LEDGER_CAP);
     }
 }

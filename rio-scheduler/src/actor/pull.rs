@@ -163,6 +163,13 @@ pub(crate) struct PullInputs<'a> {
     /// (`PullAssignmentRequest.resume_exec_id`, parsed at the gRPC
     /// boundary; unparseable ⇒ `None` = deny-by-default fresh claim).
     pub resume_exec_id: Option<Uuid>,
+    /// bug_251 (rule-4b): the claim nonce PRESENTED on this pull
+    /// (`PullAssignmentRequest.claim_nonce`) — the lost-response
+    /// resume credential.
+    pub presented_nonce: Option<Uuid>,
+    /// The open attempt's PERSISTED claim nonce (the node mirror of
+    /// `assignments.claim_nonce`; hydrated at mint and at recovery).
+    pub attempt_nonce: Option<Uuid>,
 }
 
 // r[impl sched.executor.pull-gone]
@@ -198,6 +205,11 @@ pub(crate) fn admit_pull(inputs: &PullInputs<'_>) -> PullDecision {
             kind: inputs.pull_kind,
             job: inputs.job_view,
             resume_exec_id: inputs.resume_exec_id,
+            // The kernel's credential scalar is the UUID's u128 form
+            // (type-distinct from ExecId, so a nonce can never be
+            // compared against an exec id by accident).
+            presented_nonce: inputs.presented_nonce.map(|n| n.as_u128()),
+            attempt_nonce: inputs.attempt_nonce.map(|n| n.as_u128()),
         },
     )
 }
@@ -234,6 +246,7 @@ impl DagActor {
         kind: rio_evidence_kernel::pull::PullKind,
         executor_instance: Option<String>,
         resume_exec_id: Option<Uuid>,
+        claim_nonce: Option<Uuid>,
         reply: oneshot::Sender<Result<PullOutcome, PullRejection>>,
     ) {
         let result = self
@@ -243,6 +256,7 @@ impl DagActor {
                 kind,
                 executor_instance.as_deref(),
                 resume_exec_id,
+                claim_nonce,
             )
             .await;
         let _ = reply.send(result);
@@ -256,6 +270,7 @@ impl DagActor {
         kind: rio_evidence_kernel::pull::PullKind,
         executor_instance: Option<&str>,
         resume_exec_id: Option<Uuid>,
+        claim_nonce: Option<Uuid>,
     ) -> Result<PullOutcome, PullRejection> {
         // Standby replicas answer nothing (the gRPC layer already
         // gates; this closes the in-flight-deposed window).
@@ -290,25 +305,31 @@ impl DagActor {
             _ => ExecutorId::from(intent_id),
         };
 
-        let (status, open_attempt, build_backoff_expired) = match self.dag.node(&drv_hash) {
-            None => (None, None, true),
-            Some(state) => (
-                Some(state.status()),
-                state
-                    .assigned_executor
-                    .as_ref()
-                    .zip(state.exec_id)
-                    .map(|(executor, exec_id)| (executor.clone(), exec_id)),
-                // bug_282: the transient-retry backoff produced by
-                // handle_transient_failure, finally consumed — the
-                // kernel's (Build, None) arm holds the fresh mint
-                // until the window lapses.
-                state
-                    .retry
-                    .backoff_until
-                    .is_none_or(|t| t <= std::time::Instant::now()),
-            ),
-        };
+        let (status, open_attempt, attempt_nonce, build_backoff_expired) =
+            match self.dag.node(&drv_hash) {
+                None => (None, None, None, true),
+                Some(state) => (
+                    Some(state.status()),
+                    state
+                        .assigned_executor
+                        .as_ref()
+                        .zip(state.exec_id)
+                        .map(|(executor, exec_id)| (executor.clone(), exec_id)),
+                    // The open attempt's persisted claim nonce (rule-4b):
+                    // meaningful only alongside exec_id (set at mint,
+                    // cleared in lockstep, recovered off the same
+                    // assignments join).
+                    state.claim_nonce,
+                    // bug_282: the transient-retry backoff produced by
+                    // handle_transient_failure, finally consumed — the
+                    // kernel's (Build, None) arm holds the fresh mint
+                    // until the window lapses.
+                    state
+                        .retry
+                        .backoff_until
+                        .is_none_or(|t| t <= std::time::Instant::now()),
+                ),
+            };
         let decision = admit_pull(&PullInputs {
             intent_id,
             auth_intent,
@@ -323,6 +344,8 @@ impl DagActor {
             // (Unavailable projects Pending{parked:true} — fail-closed).
             job_view: self.materialization_job_view(&drv_hash, &pulling_identity),
             resume_exec_id,
+            presented_nonce: claim_nonce,
+            attempt_nonce,
         });
 
         // merged_bug_246, the Gone half of the fail-closed posture: a
@@ -396,8 +419,14 @@ impl DagActor {
                 Ok(PullOutcome::Deliver(Box::new(assignment)))
             }
             PullDecision::DeliverNew => {
-                self.mint_and_deliver(&drv_hash, &pulling_identity, serving_generation, kind)
-                    .await
+                self.mint_and_deliver(
+                    &drv_hash,
+                    &pulling_identity,
+                    serving_generation,
+                    kind,
+                    claim_nonce,
+                )
+                .await
             }
         }
     }
@@ -414,6 +443,7 @@ impl DagActor {
         pulling_identity: &ExecutorId,
         serving_generation: crate::db::ServingGeneration,
         kind: rio_evidence_kernel::pull::PullKind,
+        claim_nonce: Option<Uuid>,
     ) -> Result<PullOutcome, PullRejection> {
         let Some(db_id) = self.dag.node(drv_hash).and_then(|s| s.db_id) else {
             // Merged but not yet persisted — deliverable on a later
@@ -523,6 +553,10 @@ impl DagActor {
                 profile.source_node.as_deref(),
                 profile.deadline_secs,
                 profile.attempt_kind,
+                // rule-4b: persist the presented claim nonce with the
+                // assignment — the lost-response credential. None for
+                // build pulls and nonceless (old-store) claims.
+                claim_nonce,
             )
             .await
             .map_err(|e| PullRejection::Internal(format!("pull mint transaction failed: {e}")))?;
@@ -592,6 +626,9 @@ impl DagActor {
             state.retry.backoff_until = None;
             state.assigned_executor = Some(pulling_identity.clone());
             state.exec_id = Some(exec_id);
+            // rule-4b: mirror the persisted nonce (cleared in lockstep
+            // with exec_id at every clear site).
+            state.claim_nonce = claim_nonce;
             // r[impl sched.pull.kinded-running-surface]
             // Captured at the single mint site for BOTH work classes,
             // cleared in lockstep with exec_id (bug_144).
@@ -676,6 +713,8 @@ mod kernel_tests {
             job_view: rio_evidence_kernel::pull::JobView::None,
             build_backoff_expired: true,
             resume_exec_id: None,
+            presented_nonce: None,
+            attempt_nonce: None,
         }
     }
 

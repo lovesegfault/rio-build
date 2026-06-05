@@ -480,6 +480,20 @@ message PullAssignmentRequest {
   // Deploy order: scheduler before store (old schedulers ignore it —
   // delivery stays gated scheduler-side either way).
   string resume_exec_id = 5;
+  // NEW (additive, bughunt2 — bug_251 / rule-4b, SIGNED 2026-06-04 at
+  // the executor-invariant-map.md rule-4 anchor): the client-chosen
+  // claim nonce, the resume credential that SURVIVES response loss.
+  // Minted v4 by the store worker BEFORE the pull and persisted
+  // scheduler-side with the assignment at mint (096), so a worker
+  // whose original response (and the exec_id token it carried) never
+  // arrived can still prove it opened the attempt: re-delivery
+  // requires held_by_puller AND (resume_exec_id match OR persisted
+  // claim_nonce match). Empty == absent; credential-less same-identity
+  // re-pulls remain NotYetReady and settle via the establishment
+  // window. Build pulls ignore it. Deploy order: scheduler before
+  // store (an old scheduler never persists it — the store's resume
+  // degrades to the establishment window, the pre-field behavior).
+  string claim_nonce = 6;
 }
 
 // The drv is no longer wanted (cancelled, substituted, completed,

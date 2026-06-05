@@ -591,6 +591,7 @@ async fn flag_on_infra_failure_charges_and_rearms() -> TestResult {
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-0".into()),
             resume_exec_id: None,
+            claim_nonce: None,
             reply,
         })
         .await
@@ -695,6 +696,7 @@ async fn aborted_outcome_closes_attempt_uncharged() -> TestResult {
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-0-w0".into()),
             resume_exec_id: None,
+            claim_nonce: None,
             reply,
         })
         .await
@@ -758,6 +760,7 @@ async fn aborted_outcome_closes_attempt_uncharged() -> TestResult {
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-1-w0".into()),
             resume_exec_id: None,
+            claim_nonce: None,
             reply,
         })
         .await
@@ -797,6 +800,7 @@ async fn retry_later_consumption_closes_uncharged_and_defers() -> TestResult {
             auth_intent: Some("maton-retry".into()),
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-0-w0".into()),
+            claim_nonce: None,
             reply,
             resume_exec_id: None,
         })
@@ -866,6 +870,7 @@ async fn retry_later_consumption_closes_uncharged_and_defers() -> TestResult {
             auth_intent: Some("maton-retry".into()),
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-1-w0".into()),
+            claim_nonce: None,
             reply,
             resume_exec_id: None,
         })
@@ -1035,6 +1040,7 @@ async fn establishment_writes_materialization_infra_never_adopts() -> TestResult
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-0".into()),
             resume_exec_id: None,
+            claim_nonce: None,
             reply,
         })
         .await
@@ -1112,6 +1118,7 @@ async fn cancellation_closes_open_attempt_charge_free() -> TestResult {
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-0".into()),
             resume_exec_id: None,
+            claim_nonce: None,
             reply,
         })
         .await
@@ -1220,6 +1227,7 @@ async fn claim_materialization(
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some(instance.into()),
             resume_exec_id: None,
+            claim_nonce: None,
             reply,
         })
         .await
@@ -1242,6 +1250,32 @@ async fn resume_materialization(
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some(instance.into()),
             resume_exec_id: Some(exec_id),
+            claim_nonce: None,
+            reply,
+        })
+        .await
+        .expect("actor alive")
+}
+
+/// [`claim_materialization`] carrying the bug_251 claim nonce: the
+/// fresh-claim shape whose mint PERSISTS the nonce (the lost-response
+/// credential, `assignments.claim_nonce`), and — presented tokenless —
+/// the credential-only re-pull shape a worker uses when the original
+/// response never arrived.
+async fn claim_materialization_with_nonce(
+    handle: &ActorHandle,
+    drv: &str,
+    instance: &str,
+    nonce: Uuid,
+) -> Result<PullOutcome, PullRejection> {
+    handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: drv.into(),
+            auth_intent: Some(drv.into()),
+            kind: rio_evidence_kernel::pull::PullKind::Materialization,
+            executor_instance: Some(instance.into()),
+            resume_exec_id: None,
+            claim_nonce: Some(nonce),
             reply,
         })
         .await
@@ -3867,6 +3901,7 @@ async fn flag_on_every_job_state_has_armed_action() -> TestResult {
 // ── T-4.3 (Phase B): recovery job-view rebuild + reap-survivor armament ──
 
 // r[verify sched.materialize.job+2]
+// r[verify sched.materialize.claim-resume]
 /// T-4.3 step 2 (red-first): materialization jobs survive leader
 /// failover AS ARMED ACTIONS — the new leader's recovery rebuilds the
 /// in-memory job view from PG, so pull admission answers correctly from
@@ -3894,6 +3929,10 @@ async fn flag_on_recovery_rebuilds_job_view_and_jobs_survive() -> TestResult {
 
     // ── Phase 1: a flag-on leader creates jobs in three states ──
     let claimed_exec: Uuid;
+    // bug_251: the nonce minted by the "store" for the rcv-claimed
+    // claim — survives the failover client-side (the worker process
+    // outlives the scheduler) and resumes the attempt tokenlessly.
+    let claimed_nonce = Uuid::new_v4();
     {
         let (handle, task) =
             setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |cfg, _| {
@@ -3927,7 +3966,18 @@ async fn flag_on_recovery_rebuilds_job_view_and_jobs_survive() -> TestResult {
         nb.expected_output_paths = vec![out_b.clone()];
         merge_dag(&handle, Uuid::new_v4(), vec![nb], vec![], false).await?;
         barrier(&handle).await;
-        let assignment = match claim_materialization(&handle, "rcv-claimed", "store-test-0").await {
+        // bug_251 (rule-4b): the claim carries a client-chosen nonce —
+        // the mint persists it (`assignments.claim_nonce`, 096) and
+        // the post-failover assertions below prove the nonce leg of
+        // the credential disjunction survives recovery.
+        let assignment = match claim_materialization_with_nonce(
+            &handle,
+            "rcv-claimed",
+            "store-test-0",
+            claimed_nonce,
+        )
+        .await
+        {
             Ok(PullOutcome::Deliver(a)) => *a,
             other => panic!("phase 1 claim must deliver, got {other:?}"),
         };
@@ -4011,8 +4061,38 @@ async fn flag_on_recovery_rebuilds_job_view_and_jobs_survive() -> TestResult {
     let tokenless = claim_materialization(&handle, "rcv-claimed", "store-test-0").await;
     assert!(
         matches!(tokenless, Ok(PullOutcome::NotYetReady { .. })),
-        "a tokenless same-identity re-pull must NOT re-deliver (158), got {tokenless:?}"
+        "a CREDENTIAL-LESS same-identity re-pull must NOT re-deliver \
+         (158 + rule-4b: identity agreement alone is forgeable), got {tokenless:?}"
     );
+    // rule-4b credential rows (bug_251):
+    //   wrong nonce  → NotYetReady (a guessed/stale nonce is no credential);
+    //   right nonce  → DeliverExisting, SAME exec — the nonce was
+    //                  persisted by the OLD leader's mint and rehydrated
+    //                  by the NEW leader's recovery (the end-to-end
+    //                  persistence pin for migration 096).
+    let wrong_nonce =
+        claim_materialization_with_nonce(&handle, "rcv-claimed", "store-test-0", Uuid::new_v4())
+            .await;
+    assert!(
+        matches!(wrong_nonce, Ok(PullOutcome::NotYetReady { .. })),
+        "a mismatched nonce must NOT re-deliver, got {wrong_nonce:?}"
+    );
+    match claim_materialization_with_nonce(&handle, "rcv-claimed", "store-test-0", claimed_nonce)
+        .await
+    {
+        Ok(PullOutcome::Deliver(a)) => {
+            let re_exec: Uuid = a.exec_id.parse()?;
+            assert_eq!(
+                re_exec, claimed_exec,
+                "the nonce-presenting tokenless re-pull must re-deliver the SAME \
+                 open attempt across failover (mint persisted + recovery rehydrated)"
+            );
+        }
+        other => panic!(
+            "the holder's nonce re-pull must re-deliver across failover \
+             (the lost-response credential), got {other:?}"
+        ),
+    }
     let reclaim =
         resume_materialization(&handle, "rcv-claimed", "store-test-0", claimed_exec).await;
     match reclaim {

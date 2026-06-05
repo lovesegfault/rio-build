@@ -3250,6 +3250,7 @@ async fn failed_recovery_ticks_never_close_predecessor_attempts() -> TestResult 
                 kind: rio_evidence_kernel::pull::PullKind::Build,
                 executor_instance: None,
                 resume_exec_id: None,
+                claim_nonce: None,
                 reply,
             })
             .await

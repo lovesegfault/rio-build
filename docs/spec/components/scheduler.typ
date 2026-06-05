@@ -1407,6 +1407,30 @@ is the successor of the walk-era must-substitute pull interlock (kind-aware:
 materialization-kind claims are the one exception,
 #rref("sched.state.machine")).
 
+#r("sched.materialize.claim-resume")[
+  Re-delivery of an open materialization attempt MUST require that the
+  pulling identity holds the attempt AND that the pull presents a matching
+  re-delivery credential --- the original delivery's exec id
+  (`resume_exec_id`) OR the claim's persisted nonce
+  (`PullAssignmentRequest.claim_nonce` matching `assignments.claim_nonce`)
+  --- where an absent credential matches nothing (absent-presented against
+  absent-persisted MUST refuse); the nonce MUST be minted client-side
+  before the pull is sent, persisted with the assignment at mint, and
+  recovered across leader failover; credential-less or mismatched
+  same-identity re-pulls MUST be answered NotYetReady and settle through
+  the establishment window.
+]
+The rule-4b amendment (executor-invariant-map.md rule-4 anchor, SIGNED
+2026-06-04): the exec-id resume token travels only on the RESPONSE, so the one
+failure mode re-delivery exists for --- the lost response --- was exactly the
+case the token could never cover (bug_251). The client-chosen nonce closes it:
+minted BEFORE the pull, it survives response loss by construction; the store
+worker's bounded resume ledger re-pulls directly (a minted attempt leaves the
+claimable listing forever, so re-listing can never recover it). Crashed
+workers (ledger lost with the process) still settle through the charged
+establishment window --- the signed residual, now reachable only by real
+crashes. Build-kind re-delivery stays credential-less (as-built).
+
 #r("sched.materialize.routing+5")[
   A materialization outcome MUST be consumed in exactly one fenced transaction
   keyed by its exec_id, and that transaction MUST re-read live interest and the

@@ -3631,6 +3631,7 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
             rio_evidence_kernel::pull::PullKind::Build,
             None,
             None,
+            None,
             tx,
         )
         .await;
@@ -3657,6 +3658,7 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
             "ice-pull-a".into(),
             Some("ice-pull-a".into()),
             rio_evidence_kernel::pull::PullKind::Build,
+            None,
             None,
             None,
             tx,

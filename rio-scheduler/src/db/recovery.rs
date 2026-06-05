@@ -115,6 +115,7 @@ impl SchedulerDb {
                    d.is_fixed_output, d.is_ca,
                    d.floor_mem_bytes, d.floor_disk_bytes, d.floor_deadline_secs,
                    a.exec_id,
+                   a.claim_nonce,
                    e.attempt_kind
             FROM derivations d
             LEFT JOIN assignments a ON a.derivation_id = d.derivation_id

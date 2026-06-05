@@ -611,6 +611,16 @@ impl ExecutorService for SchedulerGrpc {
             }
             rio_evidence_kernel::pull::PullKind::Build => None,
         };
+        // bug_251 (rule-4b): the claim nonce — same parse-don't-
+        // validate posture as the resume token (malformed == absent,
+        // deny-by-default, no probe oracle). Build pulls never carry
+        // one.
+        let claim_nonce = match kind {
+            rio_evidence_kernel::pull::PullKind::Materialization => (!req.claim_nonce.is_empty())
+                .then(|| req.claim_nonce.parse::<uuid::Uuid>().ok())
+                .flatten(),
+            rio_evidence_kernel::pull::PullKind::Build => None,
+        };
 
         // send_unchecked: a dropped pull would park the pod for a full
         // backoff interval; the pod retries anyway, so backpressure
@@ -623,6 +633,7 @@ impl ExecutorService for SchedulerGrpc {
                 kind,
                 executor_instance,
                 resume_exec_id,
+                claim_nonce,
                 reply: reply_tx,
             })
             .await

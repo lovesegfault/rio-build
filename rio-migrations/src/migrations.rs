@@ -2206,6 +2206,28 @@ pub const M_094: () = ();
 /// cannot grow back in fixtures either.
 pub const M_095: () = ();
 
+/// `096_assignments_claim_nonce.sql` — bug_251 (rule-4b, SIGNED
+/// 2026-06-04 at the executor-invariant-map.md rule-4 anchor).
+///
+/// `assignments.claim_nonce UUID NULL`: the client-chosen claim nonce,
+/// the materialization resume credential that SURVIVES response loss.
+/// The store worker mints a v4 BEFORE each `PullAssignment` and the
+/// scheduler persists it with the assignment row at mint
+/// (`mint_assignment_upsert_in_tx`); the kernel's re-delivery cell
+/// then accepts `resume_exec_id` match OR persisted-nonce match —
+/// the exec_id token travels only on the RESPONSE, so the one failure
+/// mode re-delivery exists for (the lost response) was exactly the
+/// case the token could never cover.
+///
+/// NULL = nonceless claim (old store, build pull): the kernel's nonce
+/// leg never matches NULL (None==None is not a credential), so
+/// pre-096 rows and rolling deployments degrade to the establishment
+/// window — the pre-nonce behavior, never a wedge. Recovery hydrates
+/// the nonce off the same guarded assignments join as `exec_id`
+/// (`load_nonterminal_derivations`), so failover preserves both the
+/// credential and the reset-clear contract.
+pub const M_096: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

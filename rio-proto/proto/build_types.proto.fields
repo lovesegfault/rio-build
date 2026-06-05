@@ -89,6 +89,7 @@ string build_id = 1;
 string build_id = 1;
 string cancel_reason = 15;
 string cause = 3;
+string claim_nonce = 6;
 string class = 3;
 string derivation_path = 1;
 string derivation_path = 1;

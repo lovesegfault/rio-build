@@ -96,6 +96,7 @@ async fn fenced_tx_drop_rolls_back() -> anyhow::Result<()> {
             None,
             None,
             AttemptKind::Build,
+            None,
         )
         .await?;
     assert!(outcome.settled());
@@ -197,6 +198,7 @@ async fn mint_statement_guard_blocks_generation_regression() -> anyhow::Result<(
             None,
             None,
             AttemptKind::Build,
+            None,
         )
         .await?;
     assert!(minted.settled());
@@ -211,6 +213,7 @@ async fn mint_statement_guard_blocks_generation_regression() -> anyhow::Result<(
         "w-deposed",
         4,
         deposed_exec,
+        None,
     )
     .await?;
     assert_eq!(
@@ -250,6 +253,7 @@ async fn mint_same_generation_remint_applies() -> anyhow::Result<()> {
             None,
             None,
             AttemptKind::Build,
+            None,
         )
         .await?;
     assert!(outcome.settled());
@@ -265,6 +269,7 @@ async fn mint_same_generation_remint_applies() -> anyhow::Result<()> {
             None,
             None,
             AttemptKind::Build,
+            None,
         )
         .await?;
     assert!(outcome.settled(), "equal-generation re-mint must apply");

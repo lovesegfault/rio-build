@@ -2710,6 +2710,58 @@ semantics; the wire-delta table is complete (second-lander A4:
 behavior change for tokenless senders is accepted as the contract's
 own term.
 
+**Rule-4b amendment — the claim-nonce credential (bughunt2 wave,
+bug_251; recorded at this single anchor):** rule 4's re-delivery
+clause is amended from "re-delivers to the same composite identity
+PRESENTING the original exec_id resume token" to the credential
+disjunction:
+
+> materialization re-delivery requires `held_by_puller` ∧
+> (`resume_exec_id` match ∨ persisted `claim_nonce` match);
+> credential-less same-identity re-pulls remain `NotYetReady`.
+
+The wire delta is `PullAssignmentRequest.claim_nonce = 6`
+(client-chosen v4, minted BEFORE the pull rides the wire, persisted
+at mint — `assignments.claim_nonce`, migration 096 — and recovered
+across failover by the recovery join). Rationale: the resume token
+travels only on the RESPONSE, so the one failure mode re-delivery
+exists for (the lost response) is exactly where no client can hold
+the token; the nonce survives the loss by construction. The
+establishment-window settlement remains the posture for
+credential-less senders — now reachable only by real crashes
+(process-lost ledger), not by every lost response. The nonce leg
+matches only with BOTH sides present (absent-vs-absent refuses — the
+Option-equality trap is centralized in the kernel's
+`redelivery_credential_ok`).
+
+**Owner counter-signature for the rule-4b amendment: SIGNED
+2026-06-04 (the §5-S R14 signature packet, collected in-conversation
+before any bughunt2 worktree branched; transcribed here by the
+materialize-disposition-coherence workstream per R14 — that round's
+directive is the recorded authorization).**
+Pinned: `check_materialization_redelivery_requires_credential`
+(REPLACES — widens — `check_materialization_redelivery_requires_resume_token`
+over the (resume ∨ nonce) domain; CBMC, both directions, the
+credential-less refusal preserved as the nonce-less slice) + the
+widened `check_kinded_one_winner_arbitration` (the DeliverExisting
+branch now proves a credential matched), the kinded unit table
+(`lost_response_nonce_resumes_claim`: nonce-match delivers;
+mismatched, half-present, and None-vs-None all refuse; the
+disjunction delivers past a wrong token;
+`colliding_identity_fresh_claim_gets_not_yet_ready` extended — nonce
+agreement never overrides the one-winner refusal), the failover
+re-delivery test
+(`flag_on_recovery_rebuilds_job_view_and_jobs_survive`: wrong-nonce
+refused; right-nonce tokenless re-pull re-delivers the SAME attempt
+across failover — the migration-096 persistence pin; the
+credential-less refusal stays pinned), the store client battery
+(`timeout_then_resume_recovers_lost_response`,
+`resume_ledger_lifecycle`), and the `mat-158-colliding-identity`
+calibration (header re-pointed to the credential rule;
+`atMostOneClaimWinner` still falsifies — identity agreement alone
+remains forgeable, which is exactly what the credential gate
+refuses).
+
 ### The go/no-go evaluation (T-0e.7)
 
 Every design §6 no-go condition (nine bullets) plus the plan's

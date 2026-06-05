@@ -1041,6 +1041,7 @@ pub(crate) async fn try_pull_attempt(
             kind: rio_evidence_kernel::pull::PullKind::Build,
             executor_instance: None,
             resume_exec_id: None,
+            claim_nonce: None,
             reply,
         })
         .await

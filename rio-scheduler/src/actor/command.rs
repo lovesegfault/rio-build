@@ -145,6 +145,13 @@ pub enum ActorCommand {
         /// boundary (unparseable ⇒ `None` = deny-by-default fresh
         /// claim). Always `None` for build pulls.
         resume_exec_id: Option<uuid::Uuid>,
+        /// bug_251 (rule-4b): the client-chosen claim nonce
+        /// (`PullAssignmentRequest.claim_nonce`), parsed at the gRPC
+        /// boundary (unparseable ⇒ `None` = deny-by-default). The
+        /// credential that survives response loss — persisted with
+        /// the assignment at mint, compared by the kernel's
+        /// re-delivery cell. Always `None` for build pulls.
+        claim_nonce: Option<uuid::Uuid>,
         reply: oneshot::Sender<Result<super::pull::PullOutcome, super::pull::PullRejection>>,
     },
 

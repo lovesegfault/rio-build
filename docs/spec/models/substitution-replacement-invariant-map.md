@@ -1911,9 +1911,11 @@ conjunct `held_by_puller && resume_exec_id == open_attempt.exec_id`
 (rio-evidence-kernel/src/pull.rs, the `(Materialization, Claimed)` arm).
 The refusal catch-alls above are byte-unchanged — the gate narrows only
 the delivery cell, exactly as this entry's pointer scoped it. Pinned by
-`check_materialization_redelivery_requires_resume_token` (both
-directions: a delivery implies a matching token; no token ⇒ no
-re-delivery anywhere in the materialization table) and the widened
+`check_materialization_redelivery_requires_credential` (both
+directions: a delivery implies a matching credential; no credential ⇒
+no re-delivery anywhere in the materialization table — the bughunt2
+rule-4b widening of the original resume-token harness, whose
+refusal direction survives as the credential-less slice) and the widened
 `check_kinded_one_winner_arbitration` (the DeliverExisting branch now
 also proves the token matched); the kinded unit table re-pinned the
 tokenless contract change (`colliding_identity_fresh_claim_gets_not_yet_ready`,

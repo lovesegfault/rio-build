@@ -7,11 +7,14 @@
 // pre-B2 `{pod}` template collision, or any HMAC-identity reuse) both
 // held the same open materialization attempt: the kernel answered
 // DeliverExisting to the second poller because identity agreement was
-// the only gate. The production fix is the resume token: re-delivery
-// requires the original exec_id (rio-evidence-kernel
-// check_materialization_redelivery_requires_resume_token; the T-0e.6
-// rule-4 amendment — status at the executor-invariant-map.md rule-4
-// anchor, the single record).
+// the only gate. The production fix is the re-delivery CREDENTIAL
+// (rule-4b): re-delivery requires the original exec_id resume token
+// OR the persisted claim nonce (rio-evidence-kernel
+// check_materialization_redelivery_requires_credential; the T-0e.6
+// rule-4 amendment + the rule-4b extension — status at the
+// executor-invariant-map.md rule-4 anchor, the single record). A
+// colliding identity holds NEITHER credential — the falsification
+// below is unchanged.
 //
 // PRE-FIX behavior modeled: calibCollidingRedeliver admits a second
 // poller onto the open attempt on identity match alone — after the

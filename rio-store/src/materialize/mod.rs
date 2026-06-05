@@ -170,6 +170,11 @@ async fn claim_loop<T>(
     T: client::MaterializeTransport + Clone + Send + Sync + 'static,
 {
     info!(worker, instance = %instance, "materialization claim loop started");
+    // bug_251 (rule-4b): the per-worker resume ledger — unanswered
+    // claims carry their minted nonce across passes so a lost
+    // response is recovered by a direct resume pull, not abandoned
+    // to the charged establishment window.
+    let mut ledger = client::ResumeLedger::default();
     loop {
         if shutdown.is_cancelled() {
             return;
@@ -177,7 +182,8 @@ async fn claim_loop<T>(
         // Each worker claims at most one job per pass — concurrency is
         // the worker count, and the scheduler's one-winner arbitration
         // (per-replica composite identity) handles claim races.
-        let claimed = client::poll_and_claim(&mut transport, &instance, 1, &shutdown).await;
+        let claimed =
+            client::poll_and_claim(&mut transport, &instance, 1, &mut ledger, &shutdown).await;
         for job in claimed {
             info!(
                 worker,

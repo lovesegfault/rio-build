@@ -1346,6 +1346,7 @@ impl DagActor {
                     kind,
                     executor_instance,
                     resume_exec_id,
+                    claim_nonce,
                     reply,
                 } => {
                     // r[sched.lease.standby-drops-writes+3]: the handler
@@ -1357,6 +1358,7 @@ impl DagActor {
                         kind,
                         executor_instance,
                         resume_exec_id,
+                        claim_nonce,
                         reply,
                     )
                     .await;

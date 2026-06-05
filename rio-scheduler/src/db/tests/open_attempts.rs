@@ -194,6 +194,7 @@ async fn mint_persists_dispatched_deadline_and_view_returns_it() -> anyhow::Resu
             Some(1234.0),
             // Mechanical flag-off default (carve-out 1c): build kind.
             crate::state::AttemptKind::Build,
+            None,
         )
         .await?;
     assert!(
