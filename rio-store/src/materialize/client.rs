@@ -197,7 +197,8 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             // crashed-and-restarted worker has no exec id either: its
             // tokenless re-pull answers NotYetReady and the attempt
             // settles through the establishment window (the T-0e.6
-            // rule-4 amendment, PENDING owner counter-signature).
+            // rule-4 amendment — status at the executor-invariant-map.md
+            // rule-4 anchor).
             resume_exec_id: String::new(),
         };
         match bounded(shutdown, DEFAULT_GRPC_TIMEOUT, transport.pull(req)).await {

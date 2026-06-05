@@ -557,8 +557,9 @@ pub struct MaterializationInputs<ExecId> {
     /// cannot resume an attempt it did not open, because it cannot
     /// know the exec id). Tokenless same-identity re-pulls answer
     /// `NotYetReady` and settle through the establishment window —
-    /// the T-0e.6 rule-4 amendment (executor-invariant-map.md),
-    /// PENDING owner counter-signature. Build-kind re-delivery is
+    /// the T-0e.6 rule-4 amendment (status at the
+    /// executor-invariant-map.md rule-4 anchor, the single record).
+    /// Build-kind re-delivery is
     /// untouched (lost-ack resume keeps working tokenlessly).
     pub resume_exec_id: Option<ExecId>,
 }
@@ -716,8 +717,8 @@ where
                 // to the puller the original WorkAssignment answered.
                 // Tokenless/mismatched same-identity re-pulls answer
                 // NotYetReady and settle through the establishment
-                // window (the T-0e.6 rule-4 amendment, PENDING owner
-                // counter-signature). Pinned by
+                // window (the T-0e.6 rule-4 amendment — status at the
+                // executor-invariant-map.md rule-4 anchor). Pinned by
                 // `check_materialization_redelivery_requires_resume_token`.
                 PullAdmission::DeliverExisting { exec_id }
                     if held_by_puller && mat.resume_exec_id.as_ref() == Some(&exec_id) =>

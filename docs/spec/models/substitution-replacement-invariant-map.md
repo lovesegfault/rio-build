@@ -651,8 +651,8 @@ stop-condition-2 candidate (notes finding 11); the orchestrator ruled the
 mark discriminator IS the §2.4 intent (the stricter flag-on behavior was a
 plan-text artifact, not a design decision); implemented + spec-bumped in
 `c952e5a51`; T-3.1 re-verified green in both branches post-fix. The ruling
-record rides this map **pending owner counter-signature** (the design
-§10/§2.4 text is owner-controlled).
+record rides this map — **counter-signed below, 2026-06-01** (the
+design §10/§2.4 text is owner-controlled).
 
 > **Counter-signed: owner, 2026-06-01 (round-2 final decision gate).**
 > The mark-discriminator ruling stands as written — no overrule; the B2
@@ -1919,8 +1919,8 @@ also proves the token matched); the kinded unit table re-pinned the
 tokenless contract change (`colliding_identity_fresh_claim_gets_not_yet_ready`,
 plus the failover re-delivery test now presenting the token). The
 canonical contract record is the T-0e.6 addendum extension's rule-4
-amendment (executor-invariant-map.md, PENDING owner counter-signature
-per §4.4 item 7).
+amendment (executor-invariant-map.md — the single status anchor, per
+§4.4 item 7).
 
 *Model leg landed (2026-06-03, B1-s2 commit 4):* the pre-fix admission
 is preserved as the `mat-158-colliding-identity` calibration

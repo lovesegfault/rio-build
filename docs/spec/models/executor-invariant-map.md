@@ -2678,9 +2678,9 @@ Wire deltas (B1):
 | `MaterializationOutcome.Aborted` | `Aborted aborted = 5` (oneof) | SIGTERM mid-walk: the worker aborts the walk by drop and reports once under the termination grace. Settlement: charge-free close (owner Q3 default, 2026-06-03) — the attempt closes with NO `materialization_infra` row, the claim is released through `release_claim`, and the job returns to pending claimable (AD5 parity for the materialization kind: routine store rollouts stop burning the park budget). Skew: an old scheduler decodes the unknown oneof arm as unset and rejects the report shape it cannot settle; the attempt then settles via the establishment window — degraded to the pre-field behavior, never wedged |
 | `PullAssignmentRequest.resume_exec_id` | `string resume_exec_id = 5` | The materialization re-delivery resume token: the exec id the puller's original delivery carried, presented as proof it holds the open attempt. Fresh claims send empty; build pulls ignore the field entirely (build re-delivery stays tokenless, as frozen). Skew: an old store replica never sets it — its same-identity re-pulls answer `NotYetReady` and settle via the establishment window (the rule-4 amendment's posture; fail-safe, see below) |
 
-**Rule-4 amendment (PENDING owner counter-signature — §4.4 item 7,
-the follow-up-ledger row-4 / 2026-06-02 batch procedure; never
-fabricated):** rule 4's re-delivery clause is amended from "the
+**Rule-4 amendment (status: the counter-signature block below is the
+single record — §4.4 item 7, the follow-up-ledger row-4 / 2026-06-02
+batch procedure; never fabricated):** rule 4's re-delivery clause is amended from "the
 kernel's open-attempt arm re-delivers to the same composite identity"
 to "re-delivers to the same composite identity PRESENTING the original
 exec_id resume token (`resume_exec_id`)". Tokenless or mismatched

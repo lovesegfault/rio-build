@@ -882,6 +882,80 @@ in
         touch $out
       '';
 
+  amendment-status-coherence =
+    pkgs.runCommand "rio-amendment-status-coherence"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            ../docs/spec
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-store/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-evidence-kernel/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-gateway/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-builder/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-cli/src)
+          ];
+        };
+        nativeBuildInputs = [ pkgs.ripgrep ];
+      }
+      ''
+        set +o pipefail
+        # bug_109: amendment status lives at exactly ONE anchor (the
+        # counter-signature record at the executor-invariant-map.md
+        # rule-4 block); every other site POINTS there instead of
+        # restating the state. Both halves run against planted red and
+        # green fixtures below before the real tree is scanned.
+        scan() {
+          local dir=$1 fail=0 hits pending signed both
+          # (1) Zero stale status restatements. MULTILINE-tolerant
+          # (rg -U): the wave sweep found a live site whose phrase
+          # wrapped across a comment-line boundary and was invisible
+          # to single-line grep. The interposed class tolerates
+          # comment leaders between the words.
+          hits=$(rg -nU -i 'pending[[:space:]/*#-]+owner[[:space:]/*#-]+counter-signature' "$dir" || true)
+          if [[ -n "$hits" ]]; then
+            echo "FAIL: stale 'PENDING owner counter-signature' restatement —" >&2
+            echo "amendment status lives only at the executor-invariant-map.md" >&2
+            echo "rule-4 anchor; point there instead of restating the state:" >&2
+            echo "$hits" >&2
+            fail=1
+          fi
+          # (2) Coherence: one amendment id carrying BOTH a PENDING
+          # marker and a SIGNED counter-signature record is
+          # self-contradictory — one of the two is stale.
+          pending=$(rg -oNU -i '(rule-[a-z0-9]+)[[:space:]]+amendment[[:space:]]*\((PENDING|AWAITING)' "$dir" -r '$1' | tr '[:upper:]' '[:lower:]' | sort -u || true)
+          signed=$(rg -oNU -i 'counter-signature[[:space:]]+for[[:space:]]+the[[:space:]]+(rule-[a-z0-9]+)[[:space:]]+amendment:[[:space:]]+SIGNED' "$dir" -r '$1' | tr '[:upper:]' '[:lower:]' | sort -u || true)
+          both=$(comm -12 <(echo "$pending") <(echo "$signed") | sed '/^$/d')
+          if [[ -n "$both" ]]; then
+            echo "FAIL: amendment id(s) recorded BOTH pending and signed:" >&2
+            echo "$both" >&2
+            echo "(sweep the stale marker; the signature block is the record)" >&2
+            fail=1
+          fi
+          [[ $fail -eq 0 ]]
+        }
+        # Self-test: the planted red must FAIL (both halves trip), the
+        # clean fixture must PASS — only then is the scanner trusted.
+        mkdir -p "$TMPDIR/red" "$TMPDIR/green"
+        {
+          echo 'The Rule-9 amendment (PENDING'
+          echo 'owner counter-signature) is recorded here.'
+          echo 'Owner counter-signature for the rule-9 amendment: SIGNED 2026-01-01.'
+        } > "$TMPDIR/red/doc.md"
+        {
+          echo 'The rule-9 amendment — status at the single anchor.'
+          echo 'Owner counter-signature for the rule-9 amendment: SIGNED 2026-01-01.'
+        } > "$TMPDIR/green/doc.md"
+        if scan "$TMPDIR/red" 2>/dev/null; then
+          echo "SELF-TEST FAIL: the planted-red fixture passed" >&2
+          exit 1
+        fi
+        scan "$TMPDIR/green" || { echo "SELF-TEST FAIL: the clean fixture failed" >&2; exit 1; }
+        scan "$src"
+        touch $out
+      '';
+
   transport-unary-ban =
     pkgs.runCommand "rio-transport-unary-ban"
       {

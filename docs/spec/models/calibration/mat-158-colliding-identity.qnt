@@ -10,7 +10,8 @@
 // the only gate. The production fix is the resume token: re-delivery
 // requires the original exec_id (rio-evidence-kernel
 // check_materialization_redelivery_requires_resume_token; the T-0e.6
-// rule-4 amendment, PENDING owner counter-signature).
+// rule-4 amendment — status at the executor-invariant-map.md rule-4
+// anchor, the single record).
 //
 // PRE-FIX behavior modeled: calibCollidingRedeliver admits a second
 // poller onto the open attempt on identity match alone — after the
