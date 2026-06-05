@@ -482,6 +482,22 @@ in
     # (assignment active ∧ not yet classified), so the materialization
     # arm's deleted hand gate (which ignored `assignment_active`)
     # cannot be reintroduced without this proof going red.
-    expectedHarnesses = 24;
+    # 24 → 27: + the substitution evidence-fold trio (merged_bug_044 /
+    # merged_bug_133, outcome.rs; check_substitute_failure_truth_table
+    # narrows to the classification table — its old 2-axis loop-fold
+    # half is superseded by the cells form):
+    #   - check_substitute_loop_cells_total (K1: record routing +
+    #     Stalled > RateLimited > Errored > CleanMiss precedence vs an
+    #     independent shadow over symbolic 2-record sequences)
+    #   - check_substitute_cells_errored_axis_required (K1 falsify
+    #     twin, should_panic: the pre-fix 2-axis projection cannot
+    #     represent the (no-stall, no-429, errored) cell — if Errored
+    #     ever collapses back into CleanMiss this twin stops panicking
+    #     and the count check flags it)
+    #   - check_fold_tenant_attempts_permutation_and_precedence (K2:
+    #     charge > transient > all-clean-miss, idx lane-correctness,
+    #     permutation invariance via universally-quantified
+    #     transpositions).
+    expectedHarnesses = 27;
   };
 }

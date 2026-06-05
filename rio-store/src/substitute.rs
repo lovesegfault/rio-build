@@ -2647,6 +2647,7 @@ mod tests {
         );
     }
 
+    // r[verify store.substitute.loop-evidence-total]
     /// merged_bug_044 red (044-a): ONE upstream, every narinfo GET
     /// 500s. The pre-fix loop's catch-all `Err(e)` arm recorded NO
     /// evidence, so the post-loop fold saw `(None, None)` →

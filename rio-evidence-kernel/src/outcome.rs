@@ -236,6 +236,101 @@ pub fn fold_substitute_loop(cells: SubstituteLoopCells) -> SubstituteLoopVerdict
     }
 }
 
+/// One consulted tenant's recorded attempt evidence (merged_bug_133,
+/// mirroring [`SubstituteLoopCells`] one level up: per-tenant instead
+/// of per-upstream). The executor's tenant loop ONLY pushes cells —
+/// a hit breaks, everything else is recorded and folded after EVERY
+/// tenant has been consulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenantAttemptEvidence {
+    /// The tenant's attempt failed with a charging class
+    /// (stall/capacity/fetch/integrity/ingest) — the charge ladder
+    /// must see it if nothing serves.
+    Charge {
+        /// The charging class, for the caller's detail message.
+        class: SubstituteFailureClass,
+    },
+    /// Transient by the substituter's own contract (raced / 429) —
+    /// an uncharged retry may serve.
+    Transient {
+        /// Parsed `Retry-After` advice, if any.
+        retry_after: Option<core::time::Duration>,
+    },
+    /// Clean miss under this tenant's upstream view (every upstream
+    /// answered hit-or-404).
+    CleanMiss,
+}
+
+/// The post-loop verdict over every consulted tenant's evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenantAttemptsVerdict {
+    /// ≥1 tenant produced charging evidence and none served. `idx` is
+    /// the FIRST charging cell (the caller's detail message names it).
+    ChargeInfra {
+        /// Index of the first `Charge` cell.
+        idx: usize,
+    },
+    /// No charging evidence; ≥1 transient. The job closes UNCHARGED
+    /// and defers — a 429/raced wave must never park a healthy job.
+    RetryTransient {
+        /// Index of the transient cell with the LARGEST advice (ties
+        /// → first), so the caller's label/detail match `max`.
+        idx: usize,
+        /// Largest `Retry-After` advice across the transient cells.
+        max: Option<core::time::Duration>,
+    },
+    /// Every consulted tenant cleanly missed (vacuously true for an
+    /// empty set — the caller's no-tenant shape has its own arms).
+    AllCleanMiss,
+}
+
+/// merged_bug_133's pure post-loop fold: ALL failure dispositions
+/// exit at the fold, after every tenant has been consulted —
+/// restoring owner-Q2 ("a job fails only when NO interested tenant
+/// can obtain"); the deterministic resolve order can no longer
+/// starve later tenants of their chance to serve. Precedence
+/// `ChargeInfra > RetryTransient > AllCleanMiss`: charging evidence
+/// (recorded strikes, capacity, integrity) outranks back-off advice
+/// (matching [`fold_substitute_loop`]'s ordering one level down),
+/// and the miss lane requires a clean miss under EVERY tenant.
+// r[impl store.materialize.tenant-fold]
+pub fn fold_tenant_attempts(cells: &[TenantAttemptEvidence]) -> TenantAttemptsVerdict {
+    let mut first_charge: Option<usize> = None;
+    let mut best_transient: Option<(usize, Option<core::time::Duration>)> = None;
+    let mut i = 0;
+    while i < cells.len() {
+        match cells[i] {
+            TenantAttemptEvidence::Charge { .. } => {
+                if first_charge.is_none() {
+                    first_charge = Some(i);
+                }
+            }
+            TenantAttemptEvidence::Transient { retry_after } => {
+                best_transient = Some(match best_transient {
+                    Some((pi, prev)) => {
+                        // Keep the cell with the larger advice; a
+                        // bare transient never displaces an advised
+                        // one, ties keep the earlier cell.
+                        match (prev, retry_after) {
+                            (None, Some(_)) => (i, retry_after),
+                            (Some(p), Some(r)) if r > p => (i, retry_after),
+                            _ => (pi, prev),
+                        }
+                    }
+                    None => (i, retry_after),
+                });
+            }
+            TenantAttemptEvidence::CleanMiss => {}
+        }
+        i += 1;
+    }
+    match (first_charge, best_transient) {
+        (Some(idx), _) => TenantAttemptsVerdict::ChargeInfra { idx },
+        (None, Some((idx, max))) => TenantAttemptsVerdict::RetryTransient { idx, max },
+        (None, None) => TenantAttemptsVerdict::AllCleanMiss,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +447,60 @@ mod tests {
         ] {
             assert_eq!(classify_substitute_failure(class), want, "{class:?}");
         }
+    }
+
+    // r[verify store.materialize.tenant-fold]
+    /// merged_bug_133: the tenant fold's precedence (charge >
+    /// transient > all-clean-miss), idx selection, and max-advice
+    /// semantics.
+    #[test]
+    fn tenant_attempts_fold_precedence_and_advice() {
+        use TenantAttemptEvidence as E;
+        use TenantAttemptsVerdict as V;
+        use core::time::Duration;
+
+        assert_eq!(fold_tenant_attempts(&[]), V::AllCleanMiss);
+        assert_eq!(
+            fold_tenant_attempts(&[E::CleanMiss, E::CleanMiss]),
+            V::AllCleanMiss
+        );
+        // Charge outranks transient regardless of order; idx = FIRST
+        // charge.
+        assert_eq!(
+            fold_tenant_attempts(&[
+                E::Transient { retry_after: None },
+                E::Charge {
+                    class: SubstituteFailureClass::Stalled
+                },
+                E::Charge {
+                    class: SubstituteFailureClass::Fetch
+                },
+            ]),
+            V::ChargeInfra { idx: 1 }
+        );
+        // Transient lane: idx rides the LARGEST advice; a bare
+        // transient never displaces an advised one; max is the
+        // largest advice.
+        assert_eq!(
+            fold_tenant_attempts(&[
+                E::Transient {
+                    retry_after: Some(Duration::from_secs(3))
+                },
+                E::CleanMiss,
+                E::Transient {
+                    retry_after: Some(Duration::from_secs(9))
+                },
+                E::Transient { retry_after: None },
+            ]),
+            V::RetryTransient {
+                idx: 2,
+                max: Some(Duration::from_secs(9))
+            }
+        );
+        assert_eq!(
+            fold_tenant_attempts(&[E::Transient { retry_after: None }, E::CleanMiss]),
+            V::RetryTransient { idx: 0, max: None }
+        );
     }
 
     /// merged_bug_028: ConfirmedMissing is the ALL-tenant conjunction;
@@ -517,6 +666,85 @@ mod proofs {
         // The old projection had no error axis: (None, None) → CleanMiss.
         let projected = SubstituteLoopVerdict::CleanMiss;
         assert_eq!(fold_substitute_loop(cells), projected);
+    }
+
+    /// K2 (merged_bug_133): `fold_tenant_attempts` charge-precedence
+    /// and permutation invariance, swept over every 3-cell vector
+    /// with symbolic transient advice. Permutation invariance is
+    /// proven via an arbitrary transposition: transpositions generate
+    /// the symmetric group, and the cell contents are universally
+    /// quantified, so swap-invariance at every (i, j) implies
+    /// invariance under every permutation. The verdict CLASS and the
+    /// max advice are the invariants (`idx` deliberately is not — it
+    /// names a cell in the given order for the caller's message).
+    #[kani::proof]
+    fn check_fold_tenant_attempts_permutation_and_precedence() {
+        let mk = |sel: u8, has_advice: bool, secs: u8| match sel % 3 {
+            0 => TenantAttemptEvidence::Charge {
+                // The verdict is class-blind by construction; one
+                // charging class stands for all (the class only rides
+                // into the caller's detail message).
+                class: SubstituteFailureClass::Fetch,
+            },
+            1 => TenantAttemptEvidence::Transient {
+                retry_after: if has_advice {
+                    Some(core::time::Duration::from_secs(secs as u64))
+                } else {
+                    None
+                },
+            },
+            _ => TenantAttemptEvidence::CleanMiss,
+        };
+        let a = [
+            mk(kani::any(), kani::any(), kani::any()),
+            mk(kani::any(), kani::any(), kani::any()),
+            mk(kani::any(), kani::any(), kani::any()),
+        ];
+        let i: usize = kani::any();
+        let j: usize = kani::any();
+        kani::assume(i < 3 && j < 3);
+        let mut b = a;
+        b.swap(i, j);
+
+        let va = fold_tenant_attempts(&a);
+        let vb = fold_tenant_attempts(&b);
+        match (va, vb) {
+            (
+                TenantAttemptsVerdict::ChargeInfra { .. },
+                TenantAttemptsVerdict::ChargeInfra { .. },
+            ) => {}
+            (
+                TenantAttemptsVerdict::RetryTransient { max: ma, .. },
+                TenantAttemptsVerdict::RetryTransient { max: mb, .. },
+            ) => assert_eq!(ma, mb),
+            (TenantAttemptsVerdict::AllCleanMiss, TenantAttemptsVerdict::AllCleanMiss) => {}
+            _ => panic!("verdict class must be permutation-invariant"),
+        }
+
+        // Charge-precedence + lane totality against an independent
+        // scan of the cells.
+        let mut any_charge = false;
+        let mut any_transient = false;
+        let mut k = 0;
+        while k < a.len() {
+            match a[k] {
+                TenantAttemptEvidence::Charge { .. } => any_charge = true,
+                TenantAttemptEvidence::Transient { .. } => any_transient = true,
+                TenantAttemptEvidence::CleanMiss => {}
+            }
+            k += 1;
+        }
+        match va {
+            TenantAttemptsVerdict::ChargeInfra { idx } => {
+                assert!(any_charge);
+                assert!(matches!(a[idx], TenantAttemptEvidence::Charge { .. }));
+            }
+            TenantAttemptsVerdict::RetryTransient { idx, .. } => {
+                assert!(!any_charge && any_transient);
+                assert!(matches!(a[idx], TenantAttemptEvidence::Transient { .. }));
+            }
+            TenantAttemptsVerdict::AllCleanMiss => assert!(!any_charge && !any_transient),
+        }
     }
 
     /// merged_bug_028 / owner Q2: `ConfirmedMissing` is the ALL-tenant

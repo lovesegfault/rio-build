@@ -1063,6 +1063,25 @@ local NAR-bytes budget is exempt as durable data --- the owner stamps
 `'persisting'` before the persist), and the takeover predicate strikes only
 `'downloading'` claims: backpressure is not an upstream stall.
 
+#r("store.substitute.loop-evidence-total")[
+  Every non-hit arm of the per-upstream substitution loop MUST record its
+  failure as fold evidence keyed on the total failure-class alphabet --- no
+  loop arm may continue past an upstream failure without recording it --- and
+  the post-loop verdict MUST be a pure fold over the recorded cells with
+  precedence stall > rate-limit > errored > clean-miss. The cacheable
+  definitive-miss verdict (`Ok(None)`, which the in-process cache stores for
+  its TTL) MUST be reachable only when EVERY consulted upstream answered
+  hit-or-404; an iteration in which any upstream errored (connect/TLS/5xx,
+  served garbage, integrity or ingest failure) MUST surface an uncached
+  retryable error instead.
+]
+The pre-fix loop's catch-all error arm recorded nothing, so an all-errored
+iteration folded to the same cacheable clean miss as an all-404 one: a 30 s
+upstream outage poisoned every (tenant, path) probed during it for the full
+cache TTL, silently degrading those paths to build-from-source (the
+2026-05-23 incident class). Recording the error axis makes the clean-miss
+cache contract real for the first time.
+
 #r("store.substitute.stale-reclaim+3")[
   When a claim attempt finds an existing `'uploading'` placeholder for the
   requested path, `claim_placeholder` MUST apply three takeover arms in
@@ -1173,6 +1192,23 @@ builders avoid the same hazard with the health-probing balanced channel over
 the headless Service; the executor's poll loop is off the hot path, so the
 documented ClusterIP-plus-retry posture (templates/scheduler.yaml's Service
 comment) is the chosen mechanism here.
+
+#r("store.materialize.tenant-fold")[
+  The executor's per-tenant iteration over a path (both the substitution
+  attempt loop and the miss-confirmation probe loop) MUST only accumulate
+  per-tenant evidence cells --- a serving hit may break the iteration, but
+  every failure disposition MUST exit through a pure post-loop fold evaluated
+  only after EVERY resolved tenant has been consulted, with precedence
+  charge > transient > all-clean-miss. No tenant-axis loop may return a
+  job-level outcome from inside its body.
+]
+This is the structural form of the owner-Q2 contract ("a job fails only when
+NO interested tenant can obtain"): the tenant resolve order is deterministic
+(creating-build hint first), so a pre-fold in-loop return on a charging
+failure starved every later tenant of its chance to serve --- a dead first
+tenant turned an obtainable path into InfraFailure. Charging evidence still
+outranks back-off advice at the fold (matching the per-upstream loop's
+ordering one level down), and the transient lane still closes uncharged.
 
 = Two-Phase Garbage Collection
 

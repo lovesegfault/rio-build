@@ -17,7 +17,10 @@ use sqlx::PgPool;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use rio_evidence_kernel::outcome::{FailureDisposition, classify_substitute_failure};
+use rio_evidence_kernel::outcome::{
+    FailureDisposition, SubstituteFailureClass, TenantAttemptEvidence, TenantAttemptsVerdict,
+    classify_substitute_failure, fold_tenant_attempts,
+};
 use rio_proto::types::{MaterializationOutcome, materialization_outcome};
 
 use crate::substitute::{SubstituteError, Substituter};
@@ -261,16 +264,20 @@ async fn execute_job_inner(
                     );
                 }
             };
-            // merged_bug_028 / owner Q2: try EVERY interested tenant's
-            // upstream view until one serves the path. The per-tenant
-            // fold is conservative in this order: any Hit wins; any
-            // charging-class failure is InfraFailure immediately
-            // (stall/capacity evidence outranks politeness); any
-            // transient (raced/429) defers the whole walk only after
-            // no remaining tenant hit; a miss verdict requires a CLEAN
-            // miss under every tenant (and then confirmation below).
+            // merged_bug_028 / owner Q2 + merged_bug_133: try EVERY
+            // interested tenant's upstream view until one serves the
+            // path. The loop body ONLY pushes evidence cells (a hit
+            // breaks) — ALL failure dispositions exit at the kernel
+            // fold below, after every tenant has been consulted, so
+            // the deterministic resolve order can never starve a
+            // later tenant of its chance to serve (pre-fix: tenant
+            // A's charging failure aborted the walk before serving
+            // tenant B was tried).
             let mut hit: Option<Box<rio_proto::validated::ValidatedPathInfo>> = None;
-            let mut transient: Option<(&'static str, u64, String)> = None;
+            let mut cells: Vec<TenantAttemptEvidence> = Vec::with_capacity(tenants.len());
+            // Per-cell (label, detail) for the outcome message,
+            // index-aligned with `cells`.
+            let mut cell_msgs: Vec<(&'static str, String)> = Vec::with_capacity(tenants.len());
             for &tenant_id in &tenants {
                 match ctx
                     .substituter
@@ -284,7 +291,8 @@ async fn execute_job_inner(
                     Ok(None) => {
                         // Clean miss under this tenant; the next tenant
                         // may still serve it.
-                        continue;
+                        cells.push(TenantAttemptEvidence::CleanMiss);
+                        cell_msgs.push(("", String::new()));
                     }
                     Err(e) => {
                         // merged_bug_178: total classification through
@@ -294,27 +302,20 @@ async fn execute_job_inner(
                         let class = crate::substitute::substitute_error_evidence(&e).0;
                         match classify_substitute_failure(class) {
                             FailureDisposition::RetryUncharged => {
-                                let (label, retry_after_secs) = match &e {
-                                    SubstituteError::RateLimited { retry_after } => (
-                                        "rate_limited",
-                                        retry_after.map(|d| d.as_secs()).unwrap_or(0),
-                                    ),
-                                    _ => ("raced", 0),
+                                let (label, retry_after) = match &e {
+                                    SubstituteError::RateLimited { retry_after } => {
+                                        ("rate_limited", *retry_after)
+                                    }
+                                    _ => ("raced", None),
                                 };
-                                let prev = transient.take();
-                                transient = Some(match prev {
-                                    Some(p) if p.1 >= retry_after_secs => p,
-                                    _ => (
-                                        label,
-                                        retry_after_secs,
-                                        format!("substitution of {path}: {e}"),
-                                    ),
-                                });
-                                continue;
+                                cells.push(TenantAttemptEvidence::Transient { retry_after });
+                                cell_msgs.push((label, format!("substitution of {path}: {e}")));
                             }
                             FailureDisposition::ChargeInfra => {
-                                return infra_failure(format!(
-                                    "substitution of {path} failed ({class:?}): {e}"
+                                cells.push(TenantAttemptEvidence::Charge { class });
+                                cell_msgs.push((
+                                    "",
+                                    format!("substitution of {path} failed ({class:?}): {e}"),
                                 ));
                             }
                         }
@@ -351,50 +352,94 @@ async fn execute_job_inner(
                         }
                     }
                 }
-                None if transient.is_some() => {
-                    // No tenant hit and at least one was transient:
-                    // RetryLater so the scheduler closes UNCHARGED and
-                    // defers (a 429 wave must never park a healthy
-                    // job). The largest Retry-After across tenants
-                    // rides the report.
-                    let (label, retry_after_secs, detail) = transient.expect("checked is_some");
-                    info!(path = %path, class = label,
-                          "transient substitute failure; reporting retry-later");
-                    return MaterializationOutcome {
-                        outcome: Some(materialization_outcome::Outcome::RetryLater(
-                            materialization_outcome::RetryLater {
-                                detail,
-                                retry_after_secs,
-                                class: label.to_string(),
-                            },
-                        )),
-                    };
-                }
-                None => {
-                    // Every tenant cleanly missed. The miss verdict
-                    // additionally requires the HEAD-probe to confirm
-                    // absence under EVERY tenant (merged_bug_028: any
-                    // indeterminate or probe trouble → infra; the
-                    // local-miss witness from above completes the
-                    // proof — bug_042).
-                    for &tenant_id in &tenants {
-                        match probe_miss(ctx, tenant_id, &path).await {
-                            MissProbe::Confirmed => {}
-                            MissProbe::Infra(detail) => {
-                                return infra_failure(format!(
-                                    "substitution of {path} hit infrastructure trouble: {detail}"
-                                ));
+                None => match fold_tenant_attempts(&cells) {
+                    TenantAttemptsVerdict::ChargeInfra { idx } => {
+                        // ≥1 tenant produced charging evidence and no
+                        // tenant served: the charge ladder (and park
+                        // budget) must see it. The detail names the
+                        // first charging tenant's failure.
+                        return infra_failure(cell_msgs[idx].1.clone());
+                    }
+                    TenantAttemptsVerdict::RetryTransient { idx, max } => {
+                        // No charge; ≥1 transient: RetryLater so the
+                        // scheduler closes UNCHARGED and defers (a 429
+                        // wave must never park a healthy job). The
+                        // largest Retry-After across tenants rides the
+                        // report.
+                        let (label, detail) = &cell_msgs[idx];
+                        info!(path = %path, class = label,
+                              "transient substitute failure; reporting retry-later");
+                        return MaterializationOutcome {
+                            outcome: Some(materialization_outcome::Outcome::RetryLater(
+                                materialization_outcome::RetryLater {
+                                    detail: detail.clone(),
+                                    retry_after_secs: max.map(|d| d.as_secs()).unwrap_or(0),
+                                    class: (*label).to_string(),
+                                },
+                            )),
+                        };
+                    }
+                    TenantAttemptsVerdict::AllCleanMiss => {
+                        // Every tenant cleanly missed. The miss verdict
+                        // additionally requires the HEAD-probe to
+                        // confirm absence under EVERY tenant
+                        // (merged_bug_028: any indeterminate or probe
+                        // trouble → infra; the local-miss witness from
+                        // above completes the proof — bug_042). The
+                        // probe loop rides the SAME cells + fold — no
+                        // in-loop returns on any tenant axis
+                        // (merged_bug_133).
+                        let mut probe_cells: Vec<TenantAttemptEvidence> =
+                            Vec::with_capacity(tenants.len());
+                        let mut probe_msgs: Vec<String> = Vec::with_capacity(tenants.len());
+                        for &tenant_id in &tenants {
+                            match probe_miss(ctx, tenant_id, &path).await {
+                                MissProbe::Confirmed => {
+                                    probe_cells.push(TenantAttemptEvidence::CleanMiss);
+                                    probe_msgs.push(String::new());
+                                }
+                                MissProbe::Infra(detail) => {
+                                    probe_cells.push(TenantAttemptEvidence::Charge {
+                                        class: SubstituteFailureClass::Fetch,
+                                    });
+                                    probe_msgs.push(format!(
+                                        "substitution of {path} hit infrastructure trouble: \
+                                         {detail}"
+                                    ));
+                                }
                             }
                         }
+                        match fold_tenant_attempts(&probe_cells) {
+                            TenantAttemptsVerdict::ChargeInfra { idx } => {
+                                return infra_failure(probe_msgs[idx].clone());
+                            }
+                            TenantAttemptsVerdict::RetryTransient { idx, max } => {
+                                // Structurally unreachable until the
+                                // probe answers gain the transient
+                                // class axis (bug_295) — written total
+                                // so that landing cannot silently
+                                // change this match's behavior.
+                                return MaterializationOutcome {
+                                    outcome: Some(materialization_outcome::Outcome::RetryLater(
+                                        materialization_outcome::RetryLater {
+                                            detail: probe_msgs[idx].clone(),
+                                            retry_after_secs: max.map(|d| d.as_secs()).unwrap_or(0),
+                                            class: "rate_limited".to_string(),
+                                        },
+                                    )),
+                                };
+                            }
+                            TenantAttemptsVerdict::AllCleanMiss => {}
+                        }
+                        let _witness: LocalMiss = local_witness;
+                        debug!(path = %path, cell = ?cell, tenants = tenants.len(),
+                               "path confirmed absent under every interested tenant (and locally)");
+                        match cell {
+                            PathCell::Wanted => missing_wanted.push(path.clone()),
+                            PathCell::Reference => missing_references.push(path.clone()),
+                        }
                     }
-                    let _witness: LocalMiss = local_witness;
-                    debug!(path = %path, cell = ?cell, tenants = tenants.len(),
-                           "path confirmed absent under every interested tenant (and locally)");
-                    match cell {
-                        PathCell::Wanted => missing_wanted.push(path.clone()),
-                        PathCell::Reference => missing_references.push(path.clone()),
-                    }
-                }
+                },
             }
         }
     }
@@ -1327,6 +1372,86 @@ mod tests {
             success.ingested_paths.len() + success.verified_paths.len(),
             1,
             "the wanted path was fetched under the live tenant"
+        );
+    }
+
+    // r[verify store.materialize.tenant-fold]
+    /// merged_bug_133 red: the recorded (hint) tenant's upstream is
+    /// DEAD (every request 500s → charging class), a SECOND
+    /// interested tenant's upstream SERVES the path. The hint tenant
+    /// sorts first (deterministic resolve order), and the pre-fix
+    /// in-loop `ChargeInfra => return infra_failure(...)` aborted the
+    /// walk before the serving tenant was ever consulted — violating
+    /// owner-Q2 ("a job fails only when NO interested tenant can
+    /// obtain"). With the per-tenant evidence cells all failure
+    /// dispositions move to the post-loop fold: B serves → Success.
+    ///
+    /// Recorded red (pre-fix): `expected Success via the second
+    /// tenant, got InfraFailure("substitution of … failed (Fetch)")`.
+    #[tokio::test]
+    async fn dead_first_tenant_then_serving_second_succeeds() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let dead_tenant = seed_tenant(&db.pool, "mat-dead-a").await;
+        let serving_tenant = seed_tenant(&db.pool, "mat-serve-b").await;
+
+        let path = store_path(7, "mat-dead-then-serve");
+        let (nar, _) = rio_test_support::fixtures::make_nar(b"served by tenant B");
+        // Tenant A (the job hint → consulted FIRST): all-500 upstream
+        // → all-errored iteration → charging class.
+        let dead = spawn_status_upstream(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
+        wire_upstream(&db.pool, dead_tenant, &dead).await;
+        // Tenant B: serves the path.
+        let upstream =
+            spawn_multi_upstream(vec![(path.clone(), nar, vec![])], "cache.deadab").await;
+        wire_upstream(&db.pool, serving_tenant, &upstream).await;
+
+        // Creating build (ACTIVE) carries the dead tenant → live
+        // interest AND the hint. A second live build carries the
+        // serving tenant.
+        let seeded = seed_job(
+            &db.pool,
+            "mat-dead-then-serve-drv",
+            &[("out", path.as_str())],
+            Some(dead_tenant),
+            Some(dead_tenant),
+            &[],
+        )
+        .await;
+        let live_build = Uuid::new_v4();
+        sqlx::query("INSERT INTO builds (build_id, tenant_id, status) VALUES ($1, $2, 'active')")
+            .bind(live_build)
+            .bind(serving_tenant)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(live_build)
+            .bind(seeded.derivation_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO build_wanted_outputs (build_id, derivation_id, wanted_output_names) \
+             VALUES ($1, $2, '{}')",
+        )
+        .bind(live_build)
+        .bind(seeded.derivation_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let ctx = make_ctx(db.pool.clone());
+        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let success = outcome_success(&outcome).unwrap_or_else(|| {
+            panic!(
+                "expected Success via the second (serving) tenant, got {outcome:?} — \
+                 the first tenant's charging failure starved the iteration"
+            )
+        });
+        assert_eq!(
+            success.ingested_paths.len(),
+            1,
+            "the wanted path was ingested under the serving tenant"
         );
     }
 
