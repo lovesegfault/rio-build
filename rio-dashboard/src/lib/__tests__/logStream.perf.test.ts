@@ -1,4 +1,4 @@
-// r[verify dash.stream.log-tail+3]
+// r[verify dash.stream.log-tail+4]
 // Structural perf guard: the prior spread-reassign
 // (`lines = [...lines, ...decoded]`) copied the entire existing array
 // per chunk — O(n²) total for n lines. For 20K lines in 100-line chunks
@@ -27,9 +27,13 @@ import { createLogStream } from '../logStream.svelte';
 // so we loop many rounds; the flush cost itself is linear and folds
 // into the baseline.
 async function flush(rounds: number): Promise<void> {
-  for (let i = 0; i < rounds; i++) {
-    await Promise.resolve();
-    await Promise.resolve();
+  // Macrotask rounds — depth-decoupled (see logStream.test.ts). One
+  // setTimeout(0) hop drains the ENTIRE ready microtask chain (the
+  // stream loop awaits only promises between chunks), so a handful of
+  // hops covers any chunk count; more would just bill ~1ms-clamped
+  // timer waits to the perf measurement.
+  for (let i = 0; i < Math.min(rounds, 6); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
   }
 }
 
@@ -130,7 +134,7 @@ describe('createLogStream perf', () => {
     expect(s.rows.length).toBe(40_000);
   });
 
-  // r[verify dash.stream.log-tail+3]
+  // r[verify dash.stream.log-tail+4]
   // rev-p392 correctness: single giant chunk is bounded correctly.
   // Pre-fix a 70K-line chunk left lines at 60K (splice removed fixed
   // DROP_LINES, didn't re-check). Post-fix it's capped at

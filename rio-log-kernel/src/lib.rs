@@ -268,6 +268,48 @@ pub fn visit_chunk(next_line: u64, first_line: u64, n_lines: u64) -> ChunkVisit 
     }
 }
 
+/// One keyed chunk visit: the execution axis decided BEFORE the line
+/// axis (merged_bug_002). A `TailLog` subscription that follows a
+/// derivation can observe chunks from a NEW execution (a retry on
+/// another worker) whose line numbers restart at zero — fed straight
+/// into [`visit_chunk`], the restart is indistinguishable from a
+/// duplicate (`Skip`) or a backwards walk, and the consumer silently
+/// splices two different builds' logs into one numbering.
+///
+/// The enum forces every keyed consumer to write the switch arm: a
+/// caller that matches on `KeyedVisit` cannot compile without deciding
+/// what an execution switch does to its cursor (reset), its UI (the
+/// disclosure row), and its dedup floor. Mirrored byte-for-byte in the
+/// dashboard's `lineCursor.ts::visitChunkKeyed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyedVisit {
+    /// The chunk belongs to a different execution than the cursor's:
+    /// the consumer must reset its cursor to the chunk's view (visit
+    /// the SAME chunk again against a zero floor after switching) and
+    /// disclose the switch. No lines are classified by this verdict.
+    ExecSwitch,
+    /// Same execution: the plain line-axis verdict.
+    Visit(ChunkVisit),
+}
+
+// r[impl store.log.session-keyed]
+/// [`visit_chunk`] with the execution axis in front: `keys_match` is
+/// the caller's `current_exec == chunk_exec` (payload-free — the
+/// kernel never sees the key representation, only the comparison).
+/// `keys_match == false` is an [`KeyedVisit::ExecSwitch`]; the caller
+/// resets its cursor and re-visits.
+pub fn visit_chunk_keyed(
+    keys_match: bool,
+    next_line: u64,
+    first_line: u64,
+    n_lines: u64,
+) -> KeyedVisit {
+    if !keys_match {
+        return KeyedVisit::ExecSwitch;
+    }
+    KeyedVisit::Visit(visit_chunk(next_line, first_line, n_lines))
+}
+
 /// Why one connected `TailLog` stream stopped yielding messages, as
 /// the relay's loop observed it. The conflations this enum forbids are
 /// the merged_bug_076 class: an `Err` is always
@@ -295,6 +337,15 @@ pub enum TailStopCause {
     /// mirror is deliberately NOT extended (a browser stream owns its
     /// consumer in the same task; orphanhood is unrepresentable there).
     Orphaned,
+    /// The stream died with a TYPED-permanent unservable error — the
+    /// store stamped `x-rio-log-unservable` on the status (a manifest
+    /// hole no row covers, a corrupt oversized row): every future open
+    /// will refuse identically, so re-dialing is the merged_bug_164
+    /// 1 Hz wedge. The law exits unconditionally. Mirrored in the
+    /// dashboard's TS `tailNext` as `'permanentErr'` (unlike
+    /// `Orphaned`, a browser consumer CAN observe this — it arrives in
+    /// the stream error's metadata).
+    PermanentErr,
 }
 
 /// The verdict of [`tail_next`].
@@ -311,14 +362,15 @@ pub enum TailNext {
 /// The relay's exit-decision kernel: may a `TailLog` subscription stop
 /// re-opening?
 ///
-/// The law (merged_bug_076, merged_bug_130): **Exit iff the grace
-/// budget is spent, or the relay is orphaned (no consumer remains), or
-/// the stream ended naturally with the derivation terminal and the
-/// served log complete.** Every other shape re-opens — a transport
-/// error after terminal, an open failure at terminal, a natural end
-/// with an incomplete served log, a gap awaiting its second chance:
-/// all of these have lines that may still be servable and budget to
-/// fetch them with. "Give up with grace unspent and the log
+/// The law (merged_bug_076, merged_bug_130, merged_bug_164): **Exit
+/// iff the grace budget is spent, or the relay is orphaned (no
+/// consumer remains), or the failure is typed-permanent (the store
+/// said no open can ever serve this), or the stream ended naturally
+/// with the derivation terminal and the served log complete.** Every
+/// other shape re-opens — a transport error after terminal, an open
+/// failure at terminal, a natural end with an incomplete served log, a
+/// gap awaiting its second chance: all of these have lines that may
+/// still be servable and budget to fetch them with. "Give up with grace unspent and the log
 /// incomplete" is unrepresentable by this function — and so is "keep
 /// opening streams nobody reads": an orphaned relay has no consumer to
 /// lose lines for, so exiting loses nothing and re-opening burns a
@@ -329,7 +381,7 @@ pub enum TailNext {
 /// passed" (false whenever the deadline is not yet armed);
 /// `served_complete` is the most recent final message's `is_complete`
 /// — the store's own claim that everything durable was served.
-// r[impl store.log.tail-grace-drain+1]
+// r[impl store.log.tail-grace-drain+2]
 pub fn tail_next(
     cause: TailStopCause,
     terminal: bool,
@@ -340,7 +392,7 @@ pub fn tail_next(
         return TailNext::Exit;
     }
     match cause {
-        TailStopCause::Orphaned => TailNext::Exit,
+        TailStopCause::Orphaned | TailStopCause::PermanentErr => TailNext::Exit,
         TailStopCause::NaturalEnd if terminal && served_complete => TailNext::Exit,
         TailStopCause::NaturalEnd
         | TailStopCause::TransportErr
@@ -1228,36 +1280,46 @@ mod proofs {
 
     /// [`tail_next`] never exits prematurely: with grace budget
     /// remaining and the served log not complete, the verdict is
-    /// Reopen for EVERY non-orphan cause/terminal combination — the
+    /// Reopen for EVERY retryable cause/terminal combination — the
     /// three premature-exit shapes of merged_bug_076 (Err conflated to
     /// drained, open-failure at terminal, natural end with an
     /// incomplete log) are unrepresentable. `Orphaned` is exempt by
     /// design: with no consumer left there are no lines to lose, so
     /// its exit is not premature (merged_bug_130 — the proof below
-    /// pins it as an unconditional exit). Exhaustive over the
-    /// 5x2x2 input domain.
+    /// pins it as an unconditional exit). `PermanentErr` is exempt the
+    /// other way around (merged_bug_164): the store typed the refusal
+    /// as forever, so there are no servable lines to wait for and
+    /// re-dialing is the 1 Hz wedge. Exhaustive over the 6x2x2 input
+    /// domain.
     #[kani::proof]
     fn check_tail_next_no_premature_exit() {
         let cause: u8 = kani::any();
-        kani::assume(cause < 5);
+        kani::assume(cause < 6);
         let cause = match cause {
             0 => TailStopCause::NaturalEnd,
             1 => TailStopCause::TransportErr,
             2 => TailStopCause::OpenFailed,
             3 => TailStopCause::GapObserved,
-            _ => TailStopCause::Orphaned,
+            4 => TailStopCause::Orphaned,
+            _ => TailStopCause::PermanentErr,
         };
+        let unconditional_exit =
+            matches!(cause, TailStopCause::Orphaned | TailStopCause::PermanentErr);
         let terminal: bool = kani::any();
         let served_complete: bool = kani::any();
         // Grace unspent + log not served-complete + a consumer still
-        // listening => never Exit.
-        if !served_complete && cause != TailStopCause::Orphaned {
+        // listening + the store has not said never => never Exit.
+        if !served_complete && !unconditional_exit {
             assert!(tail_next(cause, terminal, false, served_complete) == TailNext::Reopen);
         }
-        // Grace unspent + not a natural end + not orphaned => never
+        // Grace unspent + not a natural end + retryable => never
         // Exit, even when complete (an erred stream gets its retry).
-        if cause != TailStopCause::NaturalEnd && cause != TailStopCause::Orphaned {
+        if cause != TailStopCause::NaturalEnd && !unconditional_exit {
             assert!(tail_next(cause, terminal, false, served_complete) == TailNext::Reopen);
+        }
+        // The two unconditional exits ARE unconditional.
+        if unconditional_exit {
+            assert!(tail_next(cause, terminal, false, served_complete) == TailNext::Exit);
         }
     }
 
@@ -1269,13 +1331,14 @@ mod proofs {
     #[kani::proof]
     fn check_tail_next_grace_exit() {
         let cause: u8 = kani::any();
-        kani::assume(cause < 5);
+        kani::assume(cause < 6);
         let cause = match cause {
             0 => TailStopCause::NaturalEnd,
             1 => TailStopCause::TransportErr,
             2 => TailStopCause::OpenFailed,
             3 => TailStopCause::GapObserved,
-            _ => TailStopCause::Orphaned,
+            4 => TailStopCause::Orphaned,
+            _ => TailStopCause::PermanentErr,
         };
         let terminal: bool = kani::any();
         let served_complete: bool = kani::any();
@@ -1283,7 +1346,12 @@ mod proofs {
         // The early-exit cell, exactly.
         let early = tail_next(cause, terminal, false, served_complete) == TailNext::Exit;
         let natural_drained = cause == TailStopCause::NaturalEnd && terminal && served_complete;
-        assert!(early == (natural_drained || cause == TailStopCause::Orphaned));
+        assert!(
+            early
+                == (natural_drained
+                    || cause == TailStopCause::Orphaned
+                    || cause == TailStopCause::PermanentErr)
+        );
     }
 
     /// `Orphaned` always exits: with the consumer-side lifecycle
@@ -1725,23 +1793,37 @@ mod tests {
         }
     }
 
-    /// The full tail_next decision table: 5 causes x terminal x
-    /// grace_expired x served_complete = 40 rows. Exit cells: every
-    /// grace_expired row, every Orphaned row, plus exactly
+    /// The full tail_next decision table: 6 causes x terminal x
+    /// grace_expired x served_complete = 48 rows. Exit cells: every
+    /// grace_expired row, every Orphaned row, every PermanentErr row
+    /// (recorded red for the variant's introduction: the 8
+    /// PermanentErr rows did not exist — the pre-fix law had no
+    /// vocabulary for "the store says never", so a typed-permanent
+    /// refusal re-dialed at 1 Hz until grace), plus exactly
     /// (NaturalEnd, terminal, !grace_expired, served_complete).
-    // r[verify store.log.tail-grace-drain+1]
+    // r[verify store.log.tail-grace-drain+2]
     #[test]
     fn tail_next_decision_table() {
         use TailNext::*;
         use TailStopCause::*;
-        let causes = [NaturalEnd, TransportErr, OpenFailed, GapObserved, Orphaned];
+        let causes = [
+            NaturalEnd,
+            TransportErr,
+            OpenFailed,
+            GapObserved,
+            Orphaned,
+            PermanentErr,
+        ];
+        let mut rows = 0;
         for cause in causes {
             for terminal in [false, true] {
                 for grace_expired in [false, true] {
                     for served_complete in [false, true] {
+                        rows += 1;
                         let got = tail_next(cause, terminal, grace_expired, served_complete);
                         let want = if grace_expired
                             || cause == Orphaned
+                            || cause == PermanentErr
                             || (cause == NaturalEnd && terminal && served_complete)
                         {
                             Exit
@@ -1756,6 +1838,7 @@ mod tests {
                 }
             }
         }
+        assert_eq!(rows, 48, "the R5 composed table: 6 causes x 2^3");
     }
 
     /// The clamp + classification table: `(cursor, first, manifest,

@@ -199,6 +199,12 @@
            row, never a seamless splice. Fixed .line height keeps the
            virtualization spacer math exact. -->
       <pre class="line gap" data-testid="log-gap">— lines {row.from}–{row.until - 1n} missing (durable log gap) —</pre>
+    {:else if row.kind === 'execSwitch'}
+      <!-- The build was retried on another worker: the numbering
+           restarted at zero (merged_bug_002). Disclosed, never a
+           seamless splice of two executions' logs. Same fixed .line
+           height for the spacer math. -->
+      <pre class="line gap" data-testid="log-exec-switch">— execution switched ({row.text}); line numbering restarts —</pre>
     {:else}
       <pre class="line" title={row.text}>{row.text}</pre>
     {/if}

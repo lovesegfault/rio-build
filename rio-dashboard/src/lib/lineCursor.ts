@@ -90,18 +90,32 @@ export function visitChunk(
 /// 2026-06-04). The gateway relay never sees this shape as a relay
 /// decision — it forwards the watching caller's own token, so an auth
 /// failure there is the caller's grpc status, not a reconnect verdict.
-export type TailStopCause = 'naturalEnd' | 'transportErr' | 'openFailed' | 'authRequired';
+/// `permanentErr` mirrors the kernel's `TailStopCause::PermanentErr`
+/// (merged_bug_164's reader half): the store stamped the failure as
+/// unservable-forever (`x-rio-log-unservable` trailer — an uncovered
+/// manifest hole, a corrupt oversized row). Every future open refuses
+/// identically; re-dialing was the 1 Hz wedge. The kernel's `Orphaned`
+/// is deliberately NOT mirrored (a browser stream owns its consumer in
+/// the same task; orphanhood is unrepresentable here).
+export type TailStopCause =
+  | 'naturalEnd'
+  | 'transportErr'
+  | 'openFailed'
+  | 'authRequired'
+  | 'permanentErr';
 
 export type TailVerdict = 'reopen' | 'exit';
 
 /// The relay exit law, mirrored from `rio_log_kernel::tail_next`:
 /// **exit iff the grace budget is spent, the stream ended naturally
-/// with the derivation terminal and the served log complete, or the
-/// store demanded credentials (`authRequired`).** Every other shape
-/// re-opens. "Give up with grace unspent and the log incomplete" is
-/// unrepresentable — except by the store's own deny, which no amount
-/// of reconnecting heals (r[impl store.log.consumer-registry]: the
-/// terminal auth state is the KeylessOnly posture's mandated surface).
+/// with the derivation terminal and the served log complete, the store
+/// demanded credentials (`authRequired`), or the store typed the
+/// failure permanent (`permanentErr`).** Every other shape re-opens.
+/// "Give up with grace unspent and the log incomplete" is
+/// unrepresentable — except by the store's own deny or its own
+/// "never", neither of which any amount of reconnecting heals
+/// (r[impl store.log.consumer-registry]: the terminal auth state is
+/// the KeylessOnly posture's mandated surface).
 export function tailNext(
   cause: TailStopCause,
   terminal: boolean,
@@ -116,10 +130,40 @@ export function tailNext(
     case 'openFailed':
       return 'reopen';
     case 'authRequired':
+    case 'permanentErr':
       return 'exit';
     default:
       return assertNever(cause);
   }
+}
+
+/// One keyed visit verdict, mirroring the kernel's `KeyedVisit`
+/// (merged_bug_002): the execution axis decided BEFORE the line axis.
+/// A consumer that follows a derivation can observe chunks from a NEW
+/// execution (a retry on another worker) whose numbering restarts at
+/// zero — fed straight into `visitChunk` the restart is
+/// indistinguishable from a duplicate (`skip`), and the stream
+/// silently swallows the new build's lines. Matching on this type
+/// forces the switch arm: reset the cursor, disclose the switch, then
+/// re-visit the SAME chunk against the fresh floor.
+export type KeyedVisit =
+  | { kind: 'execSwitch' }
+  | { kind: 'visit'; visit: ChunkVisit };
+
+/// `visitChunk` with the execution axis in front — `keysMatch` is the
+/// caller's `lastExecId === chunk.execId` comparison (an empty
+/// chunk-side id matches anything: pre-exec-stamping servers). Mirrors
+/// `rio_log_kernel::visit_chunk_keyed` exactly.
+export function visitChunkKeyed(
+  keysMatch: boolean,
+  nextLine: bigint,
+  firstLine: bigint,
+  nLines: bigint,
+): KeyedVisit {
+  if (!keysMatch) {
+    return { kind: 'execSwitch' };
+  }
+  return { kind: 'visit', visit: visitChunk(nextLine, firstLine, nLines) };
 }
 
 /// Exhaustiveness backstop: a new `ChunkVisit`/`TailStopCause` variant

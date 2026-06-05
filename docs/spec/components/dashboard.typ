@@ -214,12 +214,23 @@ stack can't give you.
   nodes (`GetBuildGraphResponse.truncated`).
 ]
 
-#r("dash.stream.log-tail+3")[
+#r("dash.stream.log-tail+4")[
   `LogService.TailLog` server-stream consumption MUST use
   `TextDecoder('utf-8', {fatal: false})` --- build output can contain non-UTF-8
   bytes (compiler locale garbage). Lossy decode to `U+FFFD`, never throw. nginx
   `proxy_buffering off` is required or the stream buffers entirely before
-  reaching the browser.
+  reaching the browser. The follow loop MUST drive the stream iterator
+  manually, racing each pending message against a one-second terminality
+  tick, so the armed-once grace clock runs and finalizes MID-STREAM
+  through the same exit law as every stream end (a never-ending quiet
+  stream on a terminal build must not hold the tab in "streaming"
+  forever); each attempt carries its own abort controller chained to the
+  consumer's. Chunks MUST be visited through the execution-keyed step:
+  a chunk from a different execution than the cursor's is an explicit
+  execution-switch row and a cursor reset --- never a silent swallow as
+  a "duplicate" of the old numbering, never a seamless splice. A status
+  the store typed permanently unservable exits terminally (no re-dial)
+  and surfaces the incomplete banner.
 ]
 
 #r("dash.stream.idle-timeout+3")[

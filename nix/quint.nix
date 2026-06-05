@@ -1649,7 +1649,7 @@ in
     # The four pre-existing log-service regimes bind ENABLE_READER =
     # false and were re-measured BYTE-IDENTICAL at the introduction.
     # r[verify store.log.tail-fanout-recovery]
-    # r[verify store.log.tail-grace-drain]
+    # r[verify store.log.tail-grace-drain+2]
     quint-log-service-served = mkQuintCheck {
       name = "log-service-served";
       spec = "logService";

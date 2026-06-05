@@ -294,16 +294,37 @@ enum DriveEnd {
     /// The stream stopped; `tail_next(cause, ..)` decides what happens.
     Ended(TailStopCause),
     /// The stream jumped past the relay floor and the gap has not had
-    /// its one re-open chance yet. Nothing was relayed or advanced;
-    /// the caller re-opens at `gap_from` (== the unchanged floor).
-    Gap { gap_from: u64 },
+    /// its one re-open chance yet. The sliced lines are WITHHELD in
+    /// the caller's [`PendingGap`] (merged_bug_150: dropping them made
+    /// "exit at the grace edge" silently lose fetched lines); nothing
+    /// was relayed or advanced; the caller re-opens at the unchanged
+    /// floor.
+    Gap,
     /// The output channel's receiver is gone — the build's event loop
     /// has exited. Nothing left to relay to.
     OutputClosed,
 }
 
+/// A forward jump awaiting its one re-open chance, WITH the lines that
+/// arrived past it (merged_bug_150). The pre-fix shape kept only
+/// `gap_from` and dropped the chunk — so any exit between the first
+/// sighting and the second (grace edge, orphan, terminal-complete)
+/// lost both the fetched lines AND the marker. Holding the sliced
+/// chunk makes the exit flush total: [`accept_and_disclose`] is the
+/// only way out of this state, and every `run_tail` exit path runs it.
+struct PendingGap {
+    /// First missing line (== the relay floor at sighting time).
+    gap_from: u64,
+    /// One past the last missing line (the withheld chunk's first).
+    gap_until: u64,
+    /// The already-sliced lines past the gap, ready to relay.
+    withheld: TaggedLogChunk,
+    /// The relay watermark to adopt once the withheld lines flush.
+    next_line: u64,
+}
+
 // r[impl store.log.tail-reconnect]
-// r[impl store.log.tail-grace-drain+1]
+// r[impl store.log.tail-grace-drain+2]
 /// One subscription's lifetime: open → drive → (backoff → re-open)*,
 /// with the exit decision delegated to the kernel's [`tail_next`] law:
 /// exit only when the post-terminal grace expired, the relay is
@@ -338,8 +359,10 @@ async fn run_tail(
     // re-open chance: the same `gap_from` seen again means the hole is
     // durable (the store re-served the same split) and is accepted
     // with an inline marker. Each distinct gap_from is retried exactly
-    // once — the loop cannot ping-pong on one hole.
-    let mut pending_gap: Option<u64> = None;
+    // once — the loop cannot ping-pong on one hole. The lines that
+    // arrived past the jump ride along (merged_bug_150) so EVERY exit
+    // path can flush them with the disclosure.
+    let mut pending_gap: Option<PendingGap> = None;
     // Gaps at line numbers below this have already been disclosed with
     // a marker; never re-mark them.
     let mut accepted_gap_floor: Option<u64> = None;
@@ -369,6 +392,17 @@ async fn run_tail(
             );
             debug_assert_eq!(verdict, TailNext::Exit);
             debug!("log tail orphaned (subscription set gone); exiting");
+            // Orphan exit still flushes (merged_bug_150): the send
+            // fails harmlessly if the consumer is truly gone, but an
+            // orphaned WATCH with a live OUTPUT channel must not eat
+            // the withheld lines.
+            flush_pending_gap(
+                &mut pending_gap,
+                &out_tx,
+                &mut last_relayed,
+                &mut accepted_gap_floor,
+            )
+            .await;
             return;
         }
         arm_grace(&mut grace_deadline, &drain, config.terminal_grace);
@@ -405,6 +439,7 @@ async fn run_tail(
                 match drive_stream(
                     resp.into_inner(),
                     &derivation_path,
+                    &exec_id,
                     &out_tx,
                     &mut drain,
                     &mut last_relayed,
@@ -413,18 +448,20 @@ async fn run_tail(
                     &mut pending_gap,
                     &mut accepted_gap_floor,
                     config.terminal_grace,
+                    config.reconnect_backoff,
                 )
                 .await
                 {
                     DriveEnd::OutputClosed => return,
                     DriveEnd::Ended(cause) => cause,
-                    DriveEnd::Gap { gap_from } => {
-                        // Remember the jump; the very next stream gets
-                        // one chance to serve the missing span before
-                        // the gap is accepted and disclosed.
-                        pending_gap = Some(gap_from);
+                    DriveEnd::Gap => {
+                        // The jump (and its withheld lines) is already
+                        // recorded in `pending_gap`; the very next
+                        // stream gets one chance to serve the missing
+                        // span before the gap is accepted and
+                        // disclosed.
                         debug!(
-                            gap_from,
+                            gap_from = pending_gap.as_ref().map_or(0, |p| p.gap_from),
                             "TailLog stream jumped past the relay floor; re-opening at the gap"
                         );
                         TailStopCause::GapObserved
@@ -503,6 +540,18 @@ async fn run_tail(
                     ?cause,
                     terminal, grace_expired, served_complete, "log tail finished"
                 );
+                // THE single exit flush (merged_bug_150): a gap still
+                // pending at exit time never got its second chance —
+                // accept it now, marker plus withheld lines, through
+                // the same path the in-stream accept uses. Exiting
+                // with fetched-but-undisclosed lines is unrepresentable.
+                flush_pending_gap(
+                    &mut pending_gap,
+                    &out_tx,
+                    &mut last_relayed,
+                    &mut accepted_gap_floor,
+                )
+                .await;
                 return;
             }
             TailNext::Reopen => {
@@ -530,9 +579,12 @@ fn reconnect_reason(cause: TailStopCause) -> &'static str {
         TailStopCause::NaturalEnd | TailStopCause::TransportErr => "stream_ended",
         TailStopCause::OpenFailed => "open_failed",
         TailStopCause::GapObserved => "gap_observed",
-        // Orphaned never reaches a Reopen verdict: the law exits on it
-        // unconditionally (kani: check_tail_next_orphan_always_exits).
-        TailStopCause::Orphaned => unreachable!("Orphaned never reopens (kernel law)"),
+        // Orphaned/PermanentErr never reach a Reopen verdict: the law
+        // exits on them unconditionally (kani:
+        // check_tail_next_no_premature_exit pins both).
+        TailStopCause::Orphaned | TailStopCause::PermanentErr => {
+            unreachable!("unconditional exits never reopen (kernel law)")
+        }
     }
 }
 
@@ -594,22 +646,41 @@ async fn backoff_capped(
     clippy::too_many_arguments,
     reason = "the subscription's cursor state lives in run_tail; one drive borrows it all"
 )]
+#[allow(clippy::too_many_arguments)]
 async fn drive_stream(
     mut stream: tonic::Streaming<TailLogChunk>,
     derivation_path: &str,
+    pinned_exec: &str,
     out_tx: &mpsc::Sender<TaggedLogChunk>,
     drain: &mut watch::Receiver<bool>,
     last_relayed: &mut Option<u64>,
     served_complete: &mut bool,
     grace_deadline: &mut Option<Instant>,
-    pending_gap: &mut Option<u64>,
+    pending_gap: &mut Option<PendingGap>,
     accepted_gap_floor: &mut Option<u64>,
     terminal_grace: Duration,
+    reconnect_backoff: Duration,
 ) -> DriveEnd {
     loop {
         tokio::select! {
             msg = stream.message() => match msg {
                 Ok(Some(chunk)) => {
+                    // merged_bug_002 defensive check: this relay PINNED
+                    // an execution in its request, so every chunk must
+                    // carry it. A foreign exec_id here is a store bug
+                    // (the keyed splice belongs to consumers that
+                    // follow a derivation across executions — the
+                    // dashboard — via the kernel's visit_chunk_keyed);
+                    // relaying it would splice another build's lines
+                    // into this one's numbering. Skip loudly.
+                    if !chunk.exec_id.is_empty() && chunk.exec_id != pinned_exec {
+                        warn!(
+                            got = %chunk.exec_id,
+                            pinned = %pinned_exec,
+                            "TailLog chunk from a foreign execution on a pinned stream; skipped"
+                        );
+                        continue;
+                    }
                     // The completeness claim rides every message; the
                     // value at stream end is the final message's — the
                     // one `tail_next` needs. Recorded BEFORE the empty
@@ -620,6 +691,17 @@ async fn drive_stream(
                     match visit_chunk(floor, first, chunk.lines.len() as u64) {
                         ChunkVisit::Skip { .. } => {}
                         ChunkVisit::Serve { yield_from, yield_until, next_line } => {
+                            // A pending gap whose first missing line is
+                            // now BELOW the relay floor has healed: the
+                            // re-open served the span, so the withheld
+                            // copy is stale — flushing it later would
+                            // disclose a hole that no longer exists and
+                            // duplicate its lines (the composed-drive
+                            // property test caught exactly that). Void
+                            // it; a residual hole re-records fresh.
+                            if pending_gap.as_ref().is_some_and(|p| next_line > p.gap_from) {
+                                *pending_gap = None;
+                            }
                             let tagged =
                                 slice_chunk(chunk, derivation_path, yield_from, yield_until);
                             *last_relayed = Some(next_line.saturating_sub(1));
@@ -642,52 +724,77 @@ async fn drive_stream(
                             yield_until,
                             next_line,
                         } => {
-                            if *pending_gap == Some(gap_from) {
-                                // The gap survived its one re-open
-                                // chance: the store re-served the same
-                                // split, so the hole is durable.
-                                // Disclose it inline (owner decision
-                                // Q8: the marker enters client-visible
-                                // build output) and move on.
-                                *pending_gap = None;
-                                if accepted_gap_floor.is_none_or(|f| gap_from >= f) {
-                                    *accepted_gap_floor = Some(gap_until);
-                                    let marker = gap_marker(gap_from, gap_until);
-                                    if out_tx
-                                        .send(TaggedLogChunk {
-                                            derivation_path: derivation_path.to_string(),
-                                            first_line_number: gap_from,
-                                            lines: vec![marker],
-                                        })
-                                        .await
-                                        .is_err()
-                                    {
-                                        return DriveEnd::OutputClosed;
-                                    }
-                                }
-                                let tagged = slice_chunk(
-                                    chunk,
-                                    derivation_path,
-                                    yield_from,
-                                    yield_until,
-                                );
-                                *last_relayed = Some(next_line.saturating_sub(1));
-                                if out_tx.send(tagged).await.is_err() {
+                            let withheld =
+                                slice_chunk(chunk, derivation_path, yield_from, yield_until);
+                            let fresh = PendingGap {
+                                gap_from,
+                                gap_until,
+                                withheld,
+                                next_line,
+                            };
+                            let second_sighting =
+                                pending_gap.as_ref().is_some_and(|p| p.gap_from == gap_from);
+                            // Budget-aware first sighting
+                            // (merged_bug_150): withholding only pays
+                            // off if there is grace left for the
+                            // re-open chance to actually happen. At
+                            // the edge — remaining grace at or under
+                            // one backoff — accept immediately.
+                            let no_budget_for_retry = grace_deadline.is_some_and(|d| {
+                                d.saturating_duration_since(Instant::now()) <= reconnect_backoff
+                            });
+                            if second_sighting || no_budget_for_retry {
+                                // Durable hole (the store re-served the
+                                // same split) or no budget to find out:
+                                // accept and disclose inline (owner
+                                // decision Q8: the marker enters
+                                // client-visible build output).
+                                *pending_gap = Some(fresh);
+                                if !flush_pending_gap(
+                                    pending_gap,
+                                    out_tx,
+                                    last_relayed,
+                                    accepted_gap_floor,
+                                )
+                                .await
+                                {
                                     return DriveEnd::OutputClosed;
                                 }
                             } else {
-                                // First sighting of this jump: do NOT
-                                // relay or advance — give the store one
-                                // re-open at the gap to serve the span
-                                // (a transient: mid-flight cut, replica
-                                // version skew, racing manifest read).
-                                return DriveEnd::Gap { gap_from };
+                                // First sighting with budget: WITHHOLD
+                                // the sliced lines and give the store
+                                // one re-open at the gap to serve the
+                                // span (a transient: mid-flight cut,
+                                // replica version skew, racing
+                                // manifest read). The withheld copy
+                                // makes every later exit total.
+                                *pending_gap = Some(fresh);
+                                return DriveEnd::Gap;
                             }
                         }
                     }
                 }
                 Ok(None) => return DriveEnd::Ended(TailStopCause::NaturalEnd),
                 Err(status) => {
+                    // merged_bug_164's reader half: a status the store
+                    // typed as unservable-forever
+                    // (x-rio-log-unservable: a hole no manifest row
+                    // covers, a corrupt oversized row) will refuse
+                    // identically on every future open — re-dialing it
+                    // at the backoff cadence was the 1 Hz wedge the
+                    // exit law now forbids.
+                    if status
+                        .metadata()
+                        .get(rio_proto::LOG_UNSERVABLE_METADATA_KEY)
+                        .is_some()
+                    {
+                        warn!(
+                            code = ?status.code(),
+                            msg = %status.message(),
+                            "TailLog stream refused as permanently unservable; not retrying"
+                        );
+                        return DriveEnd::Ended(TailStopCause::PermanentErr);
+                    }
                     debug!(code = ?status.code(), "TailLog stream error");
                     return DriveEnd::Ended(TailStopCause::TransportErr);
                 }
@@ -717,6 +824,48 @@ async fn drive_stream(
             }
         }
     }
+}
+
+/// THE accept-and-disclose path (merged_bug_150): marker (floor-gated,
+/// never repeated for a span) then the withheld lines, advancing the
+/// relay watermark. Every consumer of a pending gap — the in-stream
+/// second sighting, the budget-edge immediate accept, and BOTH
+/// `run_tail` exit paths — flushes through here, so "exit with
+/// fetched-but-undisclosed lines" is not a state the loop can be in.
+/// Returns false iff the output channel is closed (nothing left to
+/// disclose to).
+async fn flush_pending_gap(
+    pending_gap: &mut Option<PendingGap>,
+    out_tx: &mpsc::Sender<TaggedLogChunk>,
+    last_relayed: &mut Option<u64>,
+    accepted_gap_floor: &mut Option<u64>,
+) -> bool {
+    let Some(pending) = pending_gap.take() else {
+        return true;
+    };
+    if accepted_gap_floor.is_none_or(|f| pending.gap_from >= f) {
+        *accepted_gap_floor = Some(pending.gap_until);
+        let marker = gap_marker(pending.gap_from, pending.gap_until);
+        if out_tx
+            .send(TaggedLogChunk {
+                derivation_path: pending.withheld.derivation_path.clone(),
+                first_line_number: pending.gap_from,
+                lines: vec![marker],
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    let advanced = pending.next_line.saturating_sub(1);
+    if !pending.withheld.lines.is_empty() {
+        if out_tx.send(pending.withheld).await.is_err() {
+            return false;
+        }
+        *last_relayed = Some(advanced);
+    }
+    true
 }
 
 /// The synthesized disclosure for an accepted durable gap (owner
@@ -786,6 +935,10 @@ mod tests {
         /// End the stream with an in-stream error (a store replica
         /// dying mid-serve / a proxy reset).
         Error(tonic::Code),
+        /// End the stream with a TYPED-permanent unservable error (the
+        /// store's `x-rio-log-unservable` metadata: an uncovered hole,
+        /// a corrupt oversized row).
+        ErrorUnservable,
     }
 
     /// One scripted `tail_log` response.
@@ -937,6 +1090,15 @@ mod tests {
                         let _ = tx
                             .send(Err(Status::new(code, "scripted stream error")))
                             .await;
+                    }
+                    SessionEnd::ErrorUnservable => {
+                        let mut status =
+                            Status::internal("scripted: chunk is permanently unservable");
+                        status.metadata_mut().insert(
+                            rio_proto::LOG_UNSERVABLE_METADATA_KEY,
+                            tonic::metadata::MetadataValue::from_static("short_object"),
+                        );
+                        let _ = tx.send(Err(status)).await;
                     }
                 }
             });
@@ -1238,7 +1400,7 @@ mod tests {
         h.set.abort_all();
     }
 
-    // r[verify store.log.tail-grace-drain+1]
+    // r[verify store.log.tail-grace-drain+2]
     /// merged_bug_194's dedicated gateway twin: a store that ACCEPTS
     /// the TCP connection but never answers `TailLog` (the open future
     /// itself hangs) must not park the relay past the drain deadline.
@@ -1315,7 +1477,7 @@ mod tests {
         assert!(set.tasks.is_empty(), "no task spawned");
     }
 
-    // r[verify store.log.tail-grace-drain+1]
+    // r[verify store.log.tail-grace-drain+2]
     /// A transport error after the terminal signal does not end the
     /// subscription while grace budget remains — the final lines may be
     /// on a replica that is restarting right now.
@@ -1394,7 +1556,7 @@ mod tests {
         h.set.abort_all();
     }
 
-    // r[verify store.log.tail-grace-drain+1]
+    // r[verify store.log.tail-grace-drain+2]
     /// A natural stream end after terminal with the store NOT claiming
     /// completeness re-opens (the served log is incomplete and there is
     /// budget left); the re-opened stream's complete final exits it.
@@ -1471,7 +1633,181 @@ mod tests {
         h.set.abort_all();
     }
 
-    // r[verify store.log.tail-grace-drain+1]
+    // r[verify store.log.tail-grace-drain+2]
+    /// merged_bug_150's recorded red: a forward jump sighted at the
+    /// grace edge — no budget for the one re-open chance — used to
+    /// DROP the fetched lines and exit without a marker (the pre-fix
+    /// run timed out waiting for line 100: neither the withheld lines
+    /// nor the disclosure ever reached the output). Now the
+    /// budget-aware first sighting accepts immediately: marker plus
+    /// the withheld lines flush through the same accept_and_disclose
+    /// path every other exit uses, on the ONE open (no re-open burned
+    /// against a budget that cannot fund it).
+    #[tokio::test]
+    async fn gap_at_grace_edge_flushes_withheld_lines() {
+        let mut h = harness_with(LogTailConfig {
+            reconnect_backoff: Duration::from_millis(50),
+            terminal_grace: Duration::from_millis(150),
+            open_bound: Duration::from_millis(100),
+        })
+        .await;
+        // One stream serves the prefix and the jump, then closes. The
+        // store NEVER re-serves the missing span (every later open is
+        // the mock's exhausted-scripts empty close), so the ONLY way
+        // lines 100.. and the marker reach the output is the exit
+        // flush of the withheld copy.
+        h.mock
+            .push_script(vec![chunk(0, 5), chunk(100, 5)], SessionEnd::Close);
+        h.set.on_started(DRV, EXEC_A);
+
+        // The prefix relays before the sighting withholds.
+        let prefix = recv_lines(&mut h.out_rx, 5).await;
+        assert_eq!(prefix[4].0, 4, "prefix intact");
+
+        // NOW the derivation goes terminal: the grace clock starts,
+        // empty closes burn it down, and the exit fires with the gap
+        // still pending — its one re-open chance never served the span.
+        h.set.on_terminal(DRV);
+
+        let rest = recv_lines(&mut h.out_rx, 6).await;
+        assert_eq!(
+            rest[0],
+            (
+                5,
+                "*** rio: lines 5-99 missing (durable log gap) ***".to_string()
+            ),
+            "the exit flush discloses the gap"
+        );
+        assert_eq!(rest[1].0, 100, "the withheld lines flushed at exit");
+        assert_eq!(rest[5].0, 104);
+        h.set.abort_all();
+    }
+
+    /// merged_bug_164's reader half (recorded red: pre-fix the relay
+    /// re-dialed the unservable stream once per backoff until grace —
+    /// the request count climbed past 1 while the law had no
+    /// PermanentErr vocabulary). A status carrying
+    /// `x-rio-log-unservable` exits after ONE open, immediately,
+    /// relaying what arrived before the refusal.
+    #[tokio::test]
+    async fn unservable_stream_exits_without_redial() {
+        let mut h = harness().await;
+        h.mock
+            .push_script(vec![chunk(0, 3)], SessionEnd::ErrorUnservable);
+        h.set.on_started(DRV, EXEC_A);
+
+        let lines = recv_lines(&mut h.out_rx, 3).await;
+        assert_eq!(lines[2].0, 2, "lines before the refusal relay");
+        // Give a would-be re-dial loop several backoffs to show itself.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            h.mock.request_count(),
+            1,
+            "a typed-permanent refusal is never re-dialed"
+        );
+        h.set.abort_all();
+    }
+
+    /// merged_bug_002's gateway leg: this relay pins ONE execution; a
+    /// chunk tagged with a different exec_id is a store bug and must
+    /// be skipped (relaying it would splice a different build's
+    /// numbering into this stream), without disturbing the pinned
+    /// stream's dedup floor.
+    #[tokio::test]
+    async fn foreign_exec_chunk_skipped() {
+        let mut h = harness().await;
+        let mut foreign = chunk(10, 3);
+        foreign.exec_id = EXEC_B.to_string();
+        h.mock
+            .push_script(vec![chunk(0, 2), foreign, chunk(2, 2)], SessionEnd::Hold);
+        h.set.on_started(DRV, EXEC_A);
+
+        let lines = recv_lines(&mut h.out_rx, 4).await;
+        assert_eq!(
+            lines.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "the foreign-exec chunk is skipped, not spliced"
+        );
+        h.set.abort_all();
+    }
+
+    /// merged_bug_150's composed-drive property over a bounded grid
+    /// (gap position x budget regime x whether the store ever re-serves
+    /// the span): EVERY line the store served above the relay floor is
+    /// either relayed or covered by a disclosed gap-marker span —
+    /// "silently discarded" is not an outcome any cell can produce.
+    #[tokio::test]
+    async fn composed_drive_never_silently_discards() {
+        for gap_at in [1u64, 7, 31] {
+            for (backoff_ms, grace_ms) in [(400u64, 150u64), (50, 800)] {
+                for reserves in [false, true] {
+                    let mut h = harness_with(LogTailConfig {
+                        reconnect_backoff: Duration::from_millis(backoff_ms),
+                        terminal_grace: Duration::from_millis(grace_ms),
+                        open_bound: Duration::from_millis(100),
+                    })
+                    .await;
+                    let tail = chunk(100, 2);
+                    h.mock
+                        .push_script(vec![chunk(0, gap_at as usize), tail], SessionEnd::Hold);
+                    if reserves {
+                        // The re-open serves the missing span, then the
+                        // tail again.
+                        h.mock.push_script(
+                            vec![chunk(gap_at, (100 - gap_at) as usize), chunk(100, 2)],
+                            SessionEnd::Hold,
+                        );
+                    } else {
+                        h.mock.push_script(vec![chunk(100, 2)], SessionEnd::Hold);
+                    }
+                    h.set.on_started(DRV, EXEC_A);
+                    // Terminal after the prefix has had a moment to
+                    // relay: the grace clock starts somewhere between
+                    // the sighting and the later opens — WHICH accept
+                    // path runs (second sighting, budget edge, exit
+                    // flush) varies by cell and scheduling; the
+                    // property must hold on all of them.
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    h.set.on_terminal(DRV);
+
+                    // Drain until quiet: the set keeps a sender
+                    // clone, so the channel never closes — a full
+                    // second past every cell's grace+backoff horizon
+                    // with no output means the relay is done.
+                    let mut got: Vec<(u64, String)> = Vec::new();
+                    while let Ok(Some(tagged)) =
+                        tokio::time::timeout(Duration::from_secs(1), h.out_rx.recv()).await
+                    {
+                        for (i, line) in tagged.lines.iter().enumerate() {
+                            got.push((
+                                tagged.first_line_number + i as u64,
+                                String::from_utf8(line.clone()).unwrap(),
+                            ));
+                        }
+                    }
+                    // The property: lines 0..gap_at always relay;
+                    // 100..102 relay (withheld or fresh); the span
+                    // between is either RELAYED (reserves && budget) or
+                    // covered by a marker row at gap_at.
+                    let nums: Vec<u64> = got.iter().map(|(n, _)| *n).collect();
+                    for want in (0..gap_at).chain([100, 101]) {
+                        assert!(
+                            nums.contains(&want)
+                                || got.iter().any(|(n, l)| *n <= want && l.contains("missing")),
+                            "cell(gap_at={gap_at}, backoff={backoff_ms}, grace={grace_ms}, \
+                             reserves={reserves}): line {want} neither relayed nor covered \
+                             by a disclosure (got {nums:?})"
+                        );
+                    }
+                    let served_span = nums.windows(2).all(|w| w[1] >= w[0]);
+                    assert!(served_span, "relay order is monotone: {nums:?}");
+                    h.set.abort_all();
+                }
+            }
+        }
+    }
+
+    // r[verify store.log.tail-grace-drain+2]
     /// An orphaned relay — the drain sender gone without an abort —
     /// exits via the kernel law instead of hot-looping stream opens
     /// (merged_bug_130). Pre-fix the dead watch channel turned every

@@ -26,9 +26,15 @@
 import { Code, ConnectError } from '@connectrpc/connect';
 
 import { logs } from '../api/logs';
-import { ReopenPacer, assertNever, tailNext, visitChunk, type TailStopCause } from './lineCursor';
+import {
+  ReopenPacer,
+  assertNever,
+  tailNext,
+  visitChunkKeyed,
+  type TailStopCause,
+} from './lineCursor';
 
-// r[impl dash.stream.log-tail+3]
+// r[impl dash.stream.log-tail+4]
 // r[impl dash.log.cap]
 // r[impl dash.log.virtualize]
 // (Virtualization itself lives in LogViewer.svelte — windowed slice over
@@ -61,18 +67,29 @@ const DROP_ROWS = 10_000;
 // log incomplete if the store never stamped completion.
 const GRACE_MS = 5_000;
 
+// merged_bug_254: how often an OPEN, quiet stream re-checks
+// terminality. The pre-fix `for await` parked the loop inside the
+// iterator with no way to observe a terminal flip until the stream
+// ended — a never-ending quiet stream on a terminal build kept the tab
+// in "streaming" forever. The manually-driven iterator races each
+// next() against this tick so the grace clock arms and fires
+// mid-stream, finalizing through the SAME tail_next path every other
+// exit uses.
+const TERMINAL_TICK_MS = 1_000;
+
 // One rendered row. MONOMORPHIC ON PURPOSE: every row carries all four
 // fields (text empty for gaps, range zero for lines) so the rows array
 // holds a single V8 hidden class — the virtualized viewer iterates this
 // array on every scroll frame and a polymorphic shape would deopt the
 // slice loop. Discriminate on `kind`.
 export type LogRow = {
-  kind: 'line' | 'gap';
-  /** The decoded line; `''` for gap rows. */
+  kind: 'line' | 'gap' | 'execSwitch';
+  /** The decoded line; `''` for gap rows; the NEW execution id for
+   * execSwitch rows (merged_bug_002 — the numbering restarted). */
   text: string;
-  /** First missing line of a gap row; `0n` for line rows. */
+  /** First missing line of a gap row; `0n` for line/execSwitch rows. */
   from: bigint;
-  /** One past the last missing line of a gap row; `0n` for line rows. */
+  /** One past the last missing line of a gap row; `0n` otherwise. */
   until: bigint;
 };
 
@@ -99,6 +116,10 @@ function lineRow(text: string): LogRow {
 
 function gapRow(from: bigint, until: bigint): LogRow {
   return { kind: 'gap', text: '', from, until };
+}
+
+function execSwitchRow(newExecId: string): LogRow {
+  return { kind: 'execSwitch', text: newExecId, from: 0n, until: 0n };
 }
 
 /** setTimeout that resolves early (and cleans up) on abort. */
@@ -179,14 +200,31 @@ export function createLogStream(
     let lastErr: Error | null = null;
     let everReceived = false;
 
+    // The execution whose numbering the cursor lives in. Empty until
+    // the first exec-stamped chunk; a later chunk from a DIFFERENT
+    // execution is a retry on another worker whose numbering restarted
+    // at zero (merged_bug_002) — the keyed visit forces the switch arm
+    // below instead of silently swallowing the new build's lines as
+    // "duplicates".
+    let lastExecId = '';
+
     // r[impl dash.stream.idle-timeout+3]
     // The reconnect loop has NO idle timer of its own: while a stream
     // is open we only await the next message — an hour of builder
     // silence holds the stream open (the infra chain is provisioned for
-    // it; see the rule). The loop acts solely on stream end/error.
+    // it; see the rule). The 1 s tick below observes TERMINALITY, not
+    // idleness: it never closes a stream on silence alone, it lets the
+    // armed-once grace clock run mid-stream (merged_bug_254).
     for (;;) {
       let cause: TailStopCause;
       let receivedThisAttempt = false;
+      // Per-attempt controller (merged_bug_254): the mid-stream grace
+      // cutoff cancels THIS attempt's fetch without touching the
+      // master; destroy() aborts the master which chains here.
+      const attempt = new AbortController();
+      const chainAbort = () => attempt.abort();
+      ctrl.signal.addEventListener('abort', chainAbort, { once: true });
+      let graceCutoff = false;
       try {
         const stream = logs.tailLog(
           {
@@ -195,54 +233,146 @@ export function createLogStream(
             sinceLine: cursor,
             follow: true,
           },
-          { signal: ctrl.signal },
+          { signal: attempt.signal },
         );
-        for await (const chunk of stream) {
+        // Manually-driven iterator: each pending next() is raced
+        // against the terminal tick. The SAME next() promise is reused
+        // across lost races (an async iterator must never have two
+        // concurrent next() calls in flight).
+        type TailChunk = {
+          execId: string;
+          lines: Uint8Array[];
+          firstLineNumber: bigint;
+          isComplete: boolean;
+        };
+        const it: AsyncIterator<TailChunk> = stream[Symbol.asyncIterator]();
+        // The abort edge joins every race: a mock or proxy stream that
+        // ignores its signal must not be able to hold the loop hostage
+        // — destroy() and the grace cutoff resolve this promise even
+        // when the transport never rejects.
+        const abortEdge = new Promise<{ kind: 'abort' }>((resolve) => {
+          attempt.signal.addEventListener('abort', () => resolve({ kind: 'abort' }), {
+            once: true,
+          });
+        });
+        // Wrapped ONCE and reused across lost races: an async iterator
+        // must never have two concurrent next() calls in flight, and
+        // re-wrapping per race would deepen the microtask chain.
+        let pendingNext: Promise<{
+          kind: 'msg';
+          r: IteratorResult<TailChunk>;
+        }> | null = null;
+        stream_loop: for (;;) {
+          const nextMsg = (pendingNext ??= it
+            .next()
+            .then((r) => ({ kind: 'msg' as const, r })));
+          const tickCtrl = new AbortController();
+          const winner = await Promise.race([
+            nextMsg,
+            abortEdge,
+            sleep(TERMINAL_TICK_MS, tickCtrl.signal).then(() => ({
+              kind: 'tick' as const,
+            })),
+          ]);
+          tickCtrl.abort();
+          if (winner.kind === 'abort') {
+            // Master destroy or grace cutoff; the shared post-stream
+            // path sorts out which.
+            break;
+          }
+          if (winner.kind === 'tick') {
+            // Observe terminality mid-stream: arm the grace clock the
+            // first time the closure says terminal, and once the
+            // armed deadline passes, cut THIS attempt — the exit
+            // decision itself happens on the shared tail_next path
+            // below, same as every other stream end.
+            if (isTerminal() && graceDeadline === null) {
+              graceDeadline = Date.now() + GRACE_MS;
+            }
+            if (graceDeadline !== null && Date.now() >= graceDeadline) {
+              graceCutoff = true;
+              attempt.abort();
+              break stream_loop;
+            }
+            continue;
+          }
+          const { r } = winner;
+          pendingNext = null;
+          if (r.done) {
+            break;
+          }
+          const chunk = r.value;
           receivedThisAttempt = true;
           everReceived = true;
           servedComplete = chunk.isComplete;
-          const visit = visitChunk(
-            cursor,
-            chunk.firstLineNumber,
-            BigInt(chunk.lines.length),
-          );
-          // r[impl dash.stream.reopen-pacing]
-          // The pacer sees the VERDICT, not the receipt: a keep-alive
-          // or fully-resent chunk (skip) is not progress and must not
-          // reset the re-open ladder (merged_bug_054's flat 4 Hz poll).
-          pacer.noteVisit(visit);
-          switch (visit.kind) {
-            case 'skip':
-              // Zero-line keep-alive/final, or a fully-resent chunk:
-              // nothing new, watermark untouched.
-              break;
-            case 'serve': {
-              // Slice off the resent prefix (lines below the
-              // watermark): yieldFrom is absolute, the buffer index is
-              // chunk-relative. The offset fits in a number — chunk
-              // sizes are bounded by the 16MiB codec ceiling.
-              const offset = Number(visit.yieldFrom - chunk.firstLineNumber);
-              for (let i = offset; i < chunk.lines.length; i++) {
-                push(lineRow(decoder.decode(chunk.lines[i])));
-              }
-              cursor = visit.nextLine;
-              break;
+          // The execution axis FIRST (merged_bug_002): an empty
+          // chunk-side id matches anything (pre-exec-stamping
+          // servers), and the first stamped id adopts silently.
+          let keysMatch =
+            chunk.execId === '' || lastExecId === '' || chunk.execId === lastExecId;
+          if (lastExecId === '' && chunk.execId !== '') {
+            lastExecId = chunk.execId;
+          }
+          // The keyed visit may demand a re-visit of the SAME chunk
+          // after the switch arm resets the floor.
+          keyed_visit: for (;;) {
+            const keyed = visitChunkKeyed(
+              keysMatch,
+              cursor,
+              chunk.firstLineNumber,
+              BigInt(chunk.lines.length),
+            );
+            if (keyed.kind === 'execSwitch') {
+              // A retry on another worker: numbering restarted. An
+              // explicit switch row — never a seamless splice or a
+              // silent swallow — then the cursor lives in the new
+              // execution's numbering.
+              push(execSwitchRow(chunk.execId));
+              cursor = 0n;
+              lastExecId = chunk.execId;
+              keysMatch = true;
+              continue keyed_visit;
             }
-            case 'gapThenServe': {
-              // A span the store could not serve (dropped fan-out
-              // batch, hand-deleted chunk, swept manifest rows): an
-              // explicit gap row, then the chunk's lines. Never a
-              // seamless splice.
-              gapCount += 1;
-              push(gapRow(visit.gapFrom, visit.gapUntil));
-              for (let i = 0; i < chunk.lines.length; i++) {
-                push(lineRow(decoder.decode(chunk.lines[i])));
+            const visit = keyed.visit;
+            // r[impl dash.stream.reopen-pacing]
+            // The pacer sees the VERDICT, not the receipt: a keep-alive
+            // or fully-resent chunk (skip) is not progress and must not
+            // reset the re-open ladder (merged_bug_054's flat 4 Hz poll).
+            pacer.noteVisit(visit);
+            switch (visit.kind) {
+              case 'skip':
+                // Zero-line keep-alive/final, or a fully-resent chunk:
+                // nothing new, watermark untouched.
+                break;
+              case 'serve': {
+                // Slice off the resent prefix (lines below the
+                // watermark): yieldFrom is absolute, the buffer index is
+                // chunk-relative. The offset fits in a number — chunk
+                // sizes are bounded by the 16MiB codec ceiling.
+                const offset = Number(visit.yieldFrom - chunk.firstLineNumber);
+                for (let i = offset; i < chunk.lines.length; i++) {
+                  push(lineRow(decoder.decode(chunk.lines[i])));
+                }
+                cursor = visit.nextLine;
+                break;
               }
-              cursor = visit.nextLine;
-              break;
+              case 'gapThenServe': {
+                // A span the store could not serve (dropped fan-out
+                // batch, hand-deleted chunk, swept manifest rows): an
+                // explicit gap row, then the chunk's lines. Never a
+                // seamless splice.
+                gapCount += 1;
+                push(gapRow(visit.gapFrom, visit.gapUntil));
+                for (let i = 0; i < chunk.lines.length; i++) {
+                  push(lineRow(decoder.decode(chunk.lines[i])));
+                }
+                cursor = visit.nextLine;
+                break;
+              }
+              default:
+                assertNever(visit);
             }
-            default:
-              assertNever(visit);
+            break;
           }
           applyCap();
           if (chunk.isComplete) {
@@ -254,32 +384,61 @@ export function createLogStream(
             return;
           }
         }
+        if (ctrl.signal.aborted) {
+          // destroy() while the transport stayed silent (signal-deaf
+          // mocks, an already-buffered stream): same exit as the
+          // rejected-transport path below.
+          done = true;
+          return;
+        }
+        // A grace cutoff that broke the loop without a transport throw
+        // (signal-deaf mock) still decides on the shared path below
+        // with graceExpired=true.
         cause = 'naturalEnd';
       } catch (e) {
-        // Swallow AbortError: that's our own destroy() firing.
+        // Swallow AbortError: our own destroy() (master) or the
+        // mid-stream grace cutoff (attempt) firing.
         if (ctrl.signal.aborted) {
           done = true;
           return;
         }
-        lastErr = e instanceof Error ? e : new Error(String(e));
-        const code = ConnectError.from(e).code;
-        if (code === Code.Unauthenticated || code === Code.PermissionDenied) {
-          // The store demanded credentials. The dashboard is
-          // registry-declared KeylessOnly (merged_bug_108, owner
-          // decision Q1 2026-06-04) — terminal, never retried: an auth
-          // deny does not heal by reconnecting, and the pre-fix
-          // `openFailed` classification polled the store forever.
-          cause = 'authRequired';
-        } else if (!everReceived && code === Code.NotFound) {
-          // The execution/manifest may simply not exist yet (the build
-          // was just dispatched; the first chunk is still in flight to
-          // the store). Mirrors the gateway relay's NotFound-retryable
-          // open. Bounded by backoff + unmount destroy(), and by the
-          // grace window once terminal.
-          cause = 'openFailed';
+        if (graceCutoff) {
+          // The grace clock cut a quiet open stream: decide on the
+          // SAME path as a natural end — tail_next sees
+          // graceExpired=true and exits, flagging incompleteness
+          // exactly like every other exit (merged_bug_254).
+          cause = 'naturalEnd';
         } else {
-          cause = receivedThisAttempt ? 'transportErr' : 'openFailed';
+          lastErr = e instanceof Error ? e : new Error(String(e));
+          const connectErr = ConnectError.from(e);
+          const code = connectErr.code;
+          if (code === Code.Unauthenticated || code === Code.PermissionDenied) {
+            // The store demanded credentials. The dashboard is
+            // registry-declared KeylessOnly (merged_bug_108, owner
+            // decision Q1 2026-06-04) — terminal, never retried: an auth
+            // deny does not heal by reconnecting, and the pre-fix
+            // `openFailed` classification polled the store forever.
+            cause = 'authRequired';
+          } else if (connectErr.metadata.get('x-rio-log-unservable') !== null) {
+            // merged_bug_164's reader half: the store typed this
+            // failure as unservable-forever (an uncovered manifest
+            // hole, a corrupt row). Every future open refuses
+            // identically — the pre-fix loop re-dialed it once per
+            // pacer delay until grace.
+            cause = 'permanentErr';
+          } else if (!everReceived && code === Code.NotFound) {
+            // The execution/manifest may simply not exist yet (the build
+            // was just dispatched; the first chunk is still in flight to
+            // the store). Mirrors the gateway relay's NotFound-retryable
+            // open. Bounded by backoff + unmount destroy(), and by the
+            // grace window once terminal.
+            cause = 'openFailed';
+          } else {
+            cause = receivedThisAttempt ? 'transportErr' : 'openFailed';
+          }
         }
+      } finally {
+        ctrl.signal.removeEventListener('abort', chainAbort);
       }
       const terminal = isTerminal();
       if (terminal && graceDeadline === null) {
@@ -298,6 +457,11 @@ export function createLogStream(
           // The terminal auth-required surface: the viewer renders the
           // sign-in notice, not the incomplete-log banner heuristics.
           authRequired = true;
+          err = lastErr;
+        } else if (cause === 'permanentErr') {
+          // A typed-permanent hole: the incomplete banner tells the
+          // truth (some lines can never be served) and the error rides
+          // along for the detail line.
           err = lastErr;
         } else if (!servedComplete && rows.length === 0 && lastErr !== null) {
           err = lastErr;

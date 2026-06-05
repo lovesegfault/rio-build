@@ -1,4 +1,4 @@
-// r[verify dash.stream.log-tail+3]
+// r[verify dash.stream.log-tail+4]
 // Runes-in-module store driven by a mocked async-generator RPC. The
 // `.svelte.ts` compile pass means `$state` inside createLogStream works
 // under vitest too (the Svelte vite plugin handles the transform).
@@ -6,7 +6,9 @@
 // Reading the returned getters bare — outside a component — works
 // because we're not testing reactivity tracking, just the value
 // progression as the generator drains. Each yield lands on the next
-// microtask, so `await Promise.resolve()` steps the for-await one chunk.
+// microtask; the manually-driven iterator (merged_bug_254) adds a race
+// and a tick per message, so each chunk costs a few more turns than the
+// old for-await — flush() budgets generously.
 //
 // The follow/reconnect/gap battery lives in logStream.follow.test.ts
 // (fake timers); this file pins the timer-free basics: accumulation,
@@ -25,10 +27,13 @@ import { createLogStream } from '../logStream.svelte';
 // it and the arithmetic is easy to botch inline (consol-mc185: the
 // tick/Promise boilerplate is copy-pasted across five test files — a
 // shared flushSvelte() helper is queued, this is the local first step).
-async function flush(rounds = 1): Promise<void> {
+async function flush(rounds = 2): Promise<void> {
+  // Macrotask rounds: each setTimeout(0) hop lets the ENTIRE pending
+  // microtask chain drain (the manually-driven iterator races a tick
+  // per message, so its chains are deeper than the old for-await's —
+  // counting microtasks made the budget depth-coupled).
   for (let i = 0; i < rounds; i++) {
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
   }
 }
 

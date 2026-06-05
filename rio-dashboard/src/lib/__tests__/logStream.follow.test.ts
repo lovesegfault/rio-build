@@ -5,6 +5,7 @@
 // tail_next law (isComplete immediately; otherwise terminal + armed-once
 // grace). Uses fake timers — the reconnect loop sleeps through
 // setTimeout and reads Date.now(), both faked.
+import { Code, ConnectError } from '@connectrpc/connect';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { tailLog } = vi.hoisted(() => ({ tailLog: vi.fn() }));
@@ -28,7 +29,7 @@ function chunk(
   };
 }
 
-async function flush(rounds = 4): Promise<void> {
+async function flush(rounds = 12): Promise<void> {
   for (let i = 0; i < rounds; i++) {
     await Promise.resolve();
     await Promise.resolve();
@@ -45,6 +46,90 @@ afterEach(() => {
 });
 
 describe('createLogStream follow mode', () => {
+  // r[verify dash.stream.log-tail+4]
+  /// merged_bug_254's recorded red: a NEVER-ENDING quiet stream on a
+  /// terminal build. The pre-fix `for await` parked inside the
+  /// iterator — `done` stayed false forever (the red observed exactly
+  /// that after advancing the clock past every budget). The
+  /// manually-driven iterator's 1 s tick arms the grace clock
+  /// mid-stream and finalizes through the same tail_next path.
+  it('never_ending_stream_finalizes_at_grace: terminal + quiet open stream exits', async () => {
+    tailLog.mockImplementation(async function* () {
+      yield chunk(['l0', 'l1']);
+      // The stream stays open forever and ignores its signal.
+      await new Promise(() => {});
+    });
+    const s = createLogStream('/nix/store/x.drv', '', { isTerminal: () => true });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(s.rows.length).toBe(2);
+    expect(s.done).toBe(false);
+    // Tick 1: observes terminal, arms the 5 s grace. Then ride past it.
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(s.done).toBe(true);
+    expect(s.incomplete).toBe(true);
+    s.destroy();
+  });
+
+  // r[verify dash.stream.log-tail+4]
+  /// merged_bug_002's recorded red: a retry on another worker restarts
+  /// numbering at zero. Pre-fix the new execution's chunk was
+  /// indistinguishable from a resent duplicate (`skip`) — the red
+  /// observed rows ['a0','a1'] with the b-lines silently swallowed and
+  /// no disclosure. The keyed visit forces the switch arm: an explicit
+  /// execSwitch row, cursor reset, then the new execution's lines.
+  it('exec_switch_disclosed_not_spliced: a new execution resets the cursor with a marked row', async () => {
+    tailLog.mockImplementation(async function* () {
+      yield { ...chunk(['a0', 'a1']), execId: 'exec-a' };
+      yield { ...chunk(['b0', 'b1'], { isComplete: true }), execId: 'exec-b' };
+    });
+    const s = createLogStream('/nix/store/x.drv');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(s.rows.map((r) => r.kind)).toEqual([
+      'line',
+      'line',
+      'execSwitch',
+      'line',
+      'line',
+    ]);
+    expect(s.rows[2].text).toBe('exec-b');
+    expect(s.rows.filter((r) => r.kind === 'line').map((r) => r.text)).toEqual([
+      'a0',
+      'a1',
+      'b0',
+      'b1',
+    ]);
+    expect(s.done).toBe(true);
+    s.destroy();
+  });
+
+  // r[verify dash.stream.log-tail+4]
+  /// merged_bug_164's reader half (recorded red: pre-fix the
+  /// `x-rio-log-unservable` refusal classified as transportErr and the
+  /// loop re-dialed — tailLog call count climbed past 1). A
+  /// typed-permanent refusal exits after ONE open: re-dialing cannot
+  /// heal what the store typed as forever.
+  it('permanent_unservable_exits_terminally: x-rio-log-unservable is never re-dialed', async () => {
+    tailLog.mockImplementation(async function* () {
+      yield chunk(['l0']);
+      throw new ConnectError(
+        'chunk is permanently unservable',
+        Code.Internal,
+        new Headers({ 'x-rio-log-unservable': 'short_object' }),
+      );
+    });
+    const s = createLogStream('/nix/store/x.drv');
+    await vi.advanceTimersByTimeAsync(10);
+    // Ride well past several pacer delays: a re-dialing loop would
+    // re-open within ~250-2000 ms.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(tailLog).toHaveBeenCalledTimes(1);
+    expect(s.done).toBe(true);
+    expect(s.incomplete).toBe(true);
+    expect(s.err).not.toBeNull();
+    s.destroy();
+  });
+
   // r[verify dash.stream.idle-timeout+3]
   // (No idle timer of our own on an open stream: the loop only acts on
   // stream end/error — asserted here by the request shape and the

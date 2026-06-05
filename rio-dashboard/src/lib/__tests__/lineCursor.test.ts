@@ -14,6 +14,7 @@ import {
   REOPEN_BASE_MS,
   REOPEN_MAX_MS,
   tailNext,
+  visitChunkKeyed,
   visitChunk,
   type ChunkVisit,
   type TailStopCause,
@@ -149,6 +150,44 @@ describe('tailNext', () => {
           ).toBe('exit');
         }
       }
+    }
+  });
+
+  // r[verify dash.stream.log-tail+4]
+  it('permanentErr exits every cell — the store said never, retry cannot heal it', () => {
+    for (const terminal of [false, true]) {
+      for (const graceExpired of [false, true]) {
+        for (const servedComplete of [false, true]) {
+          expect(
+            tailNext('permanentErr', terminal, graceExpired, servedComplete),
+            `tailNext(permanentErr, ${terminal}, ${graceExpired}, ${servedComplete})`,
+          ).toBe('exit');
+        }
+      }
+    }
+  });
+});
+
+describe('visitChunkKeyed', () => {
+  // Mirrors rio-log-kernel::visit_chunk_keyed: the execution axis is
+  // decided BEFORE the line axis, and a matched key delegates verbatim.
+  it('keys mismatch => execSwitch, no line verdict', () => {
+    expect(visitChunkKeyed(false, 5n, 0n, 3n)).toEqual({ kind: 'execSwitch' });
+    // Even a chunk that would be a clean serve under the cursor.
+    expect(visitChunkKeyed(false, 0n, 0n, 3n)).toEqual({ kind: 'execSwitch' });
+  });
+
+  it('keys match => exactly visitChunk, wrapped', () => {
+    for (const [cursor, first, n] of [
+      [0n, 0n, 3n],
+      [5n, 0n, 3n],
+      [2n, 10n, 4n],
+      [0n, 0n, 0n],
+    ] as const) {
+      expect(visitChunkKeyed(true, cursor, first, n)).toEqual({
+        kind: 'visit',
+        visit: visitChunk(cursor, first, n),
+      });
     }
   });
 });

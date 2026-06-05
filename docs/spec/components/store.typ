@@ -1906,22 +1906,29 @@ stored-to-live seam. A `TailLog` reaching a replica that does not hold the
 execution's ingest session is proxied one hop to the owner; on proxy failure
 it degrades to the manifest-only view rather than erroring.
 
-#r("store.log.tail-grace-drain+1")[
+#r("store.log.tail-grace-drain+2")[
   A live-tail relay MUST NOT stop re-subscribing while it still has grace
   budget and the served log is not complete. The exit decision is one total
   function over (stop cause, terminal, grace expired, served complete):
   exit exactly when the post-terminal grace has expired, or when the relay
   is orphaned (its consumer-side lifecycle channel is gone --- no reader
-  remains and no signal can ever arrive), or when the stream ended
-  naturally with the execution terminal and the store's final message
-  claiming the served log complete. Transport errors and open failures
-  after terminal re-open within the remaining grace; the post-terminal
-  grace deadline is armed exactly once per subscription. A forward jump in
-  the served stream is re-opened at the gap exactly once before being
-  accepted and disclosed inline. An orphaned relay MUST NOT open another
-  stream --- its exit is unconditional --- and relay ownership MUST be
-  drop-safe: dropping the owning subscription set aborts every relay, so
-  no drop path can leave one running unowned.
+  remains and no signal can ever arrive), or when the failure is
+  typed-permanent (the store stamped the status unservable-forever ---
+  every future open refuses identically, so re-dialing is a wedge, not a
+  recovery), or when the stream ended naturally with the execution
+  terminal and the store's final message claiming the served log complete.
+  Transport errors and open failures after terminal re-open within the
+  remaining grace; the post-terminal grace deadline is armed exactly once
+  per subscription. A forward jump in the served stream is re-opened at
+  the gap exactly once before being accepted and disclosed inline, the
+  lines that arrived past the jump are WITHHELD with the pending gap (not
+  dropped), every exit path flushes a still-pending gap --- marker plus
+  withheld lines --- through the single accept-and-disclose path, and a
+  first sighting whose remaining grace cannot fund the re-open chance is
+  accepted immediately. An orphaned relay MUST NOT open another stream ---
+  its exit is unconditional --- and relay ownership MUST be drop-safe:
+  dropping the owning subscription set aborts every relay, so no drop path
+  can leave one running unowned.
 ]
 
 The conflations this rule forbids each lost final lines in production
