@@ -14,8 +14,10 @@
 //!    contribution above a [`LineCursor`] watermark — the unit the
 //!    `TailLog` handler streams (for follow and non-follow reads
 //!    alike), one chunk resident at a time.
-//! 3. [`resolve_exec`] turns a `TailLogRequest`'s `(derivation,
-//!    exec_id)` pair into the execution to read.
+//! 3. [`authorize_tail`] turns a `TailLogRequest`'s `(derivation,
+//!    exec_id)` pair plus the verified tenant (if any) into the
+//!    [`OwnedExec`] the serve layer requires — resolution and
+//!    build-membership ownership in one gate.
 //!
 //! The completeness predicate (`TailLogChunk.is_complete`) is
 //! `super::gate::log_is_complete` — the same function that seals the
@@ -368,8 +370,12 @@ async fn stream_chunks(
 /// or it expired) — because they have different audiences: the first is
 /// a dashboard deep-link gone stale, the second is `rio-cli logs` for a
 /// derivation that never built.
+///
+/// Private: callers go through [`authorize_tail`], the sole
+/// [`OwnedExec`] producer — resolution without the ownership gate is
+/// unreachable from outside this module.
 // r[impl obs.log.exec-keyed+2]
-pub async fn resolve_exec(
+async fn resolve_exec(
     pool: &PgPool,
     derivation: &str,
     pinned_exec_id: &str,
@@ -425,64 +431,145 @@ pub async fn resolve_exec(
     })
 }
 
-/// Does `tenant` own the derivation whose log `exec_id` carries?
+/// An execution the caller is authorized to read the log of.
 ///
-/// Primary: the execution's `assignments` row joins to its
-/// `derivations` row (`derivations.tenant_id`). Fallback (assignment
-/// swept or never recorded): match the derivation row whose DAG key
-/// has the request derivation's 32-char log-hash prefix. A derivation
-/// row with `tenant_id IS NULL` matches neither arm — fail closed.
+/// Sole producer: [`authorize_tail`] — resolution and tenant ownership
+/// fold into one gate, so a serve path that skips authorization does
+/// not compile (`serve_tail` and the live-buffer lookup take this type,
+/// never a raw [`Uuid`]).
+#[derive(Debug, Clone, Copy)]
+pub struct OwnedExec(Uuid);
+
+impl OwnedExec {
+    /// The authorized execution id.
+    pub fn id(&self) -> Uuid {
+        self.0
+    }
+
+    /// Test-only constructor for serve-layer unit tests that exercise
+    /// chunk reading below the authorization gate. Production code has
+    /// exactly one producer: [`authorize_tail`].
+    #[cfg(test)]
+    pub fn for_tests(exec_id: Uuid) -> Self {
+        Self(exec_id)
+    }
+}
+
+/// Resolve AND authorize a `TailLog` request: the sole [`OwnedExec`]
+/// producer.
 ///
-/// Runtime queries over scheduler-owned tables; the columns are pinned
-/// by the `STORE_READS` cross-service contract.
-pub async fn tenant_owns_exec(
+/// Ownership is **build-membership** over the production-written chain
+/// `assignments → build_derivations → builds.tenant_id` (§5-S Q2,
+/// 2026-06-04: any tenant whose build contains the content-addressed
+/// derivation may read its execution logs; this amends round-1's
+/// "derivation ownership" wording — the service-bypass prohibition is
+/// unchanged). `derivations.tenant_id` was never production-written
+/// (migration 095 census) and is read by NOTHING anymore.
+///
+/// Swept-assignment arm: the execution's own `drv_executions.drv_hash`
+/// (server data, 32-char nixbase32) prefix-matches its `derivations`
+/// row, then the same build-membership chain. The caller's request
+/// string appears in **no ownership predicate** — a verbatim-own-drv +
+/// foreign-pin request can no longer launder ownership through the
+/// resolver's fallback (merged_bug_064-a).
+///
+/// Deny-with-claims is **absence-shaped**: the same `NotFound` text the
+/// resolution arm produces for a row that does not exist (foreign ≡
+/// never-built; the cross-tenant existence oracle of distinguishable
+/// `PermissionDenied` is gone — merged_bug_064-c). `tenant == None`
+/// (no JWT pubkey configured: the dev/VM posture) keeps the
+/// distinguishable resolution errors.
+///
+/// Runtime queries over scheduler-owned tables; columns pinned by the
+/// `STORE_READS` cross-service contract.
+// r[impl store.log.tail-ownership]
+pub async fn authorize_tail(
     pool: &PgPool,
-    exec_id: Uuid,
     derivation: &str,
-    tenant: Uuid,
-) -> Result<bool, Status> {
+    pinned_exec_id: &str,
+    tenant: Option<Uuid>,
+) -> Result<OwnedExec, Status> {
+    let exec_id = resolve_exec(pool, derivation, pinned_exec_id).await?;
+    let Some(tenant) = tenant else {
+        return Ok(OwnedExec(exec_id));
+    };
+
+    // Primary: the execution's assignment row → its build(s) → tenant.
     let owned: bool = sqlx::query_scalar(
         "SELECT EXISTS( \
              SELECT 1 FROM assignments a \
-             JOIN derivations d USING (derivation_id) \
-             WHERE a.exec_id = $1 AND d.tenant_id = $2)",
+             JOIN build_derivations bd USING (derivation_id) \
+             JOIN builds b USING (build_id) \
+             WHERE a.exec_id = $1 AND b.tenant_id = $2)",
     )
     .bind(exec_id)
     .bind(tenant)
     .fetch_one(pool)
     .await
     .status_internal("TailLog: ownership lookup")?;
+    let owned = if owned {
+        true
+    } else {
+        // Swept-assignment arm: key on the execution's OWN recorded
+        // drv_hash (server data — no LIKE-metacharacter exposure, the
+        // 32-char nixbase32 alphabet has no `%`/`_`), never on the
+        // caller's request string.
+        sqlx::query_scalar(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM drv_executions e \
+                 JOIN derivations d ON d.drv_hash LIKE e.drv_hash || '%' \
+                 JOIN build_derivations bd USING (derivation_id) \
+                 JOIN builds b USING (build_id) \
+                 WHERE e.exec_id = $1 AND b.tenant_id = $2)",
+        )
+        .bind(exec_id)
+        .bind(tenant)
+        .fetch_one(pool)
+        .await
+        .status_internal("TailLog: ownership fallback lookup")?
+    };
     if owned {
-        return Ok(true);
+        return Ok(OwnedExec(exec_id));
     }
-    if derivation.is_empty() {
-        return Ok(false);
-    }
-    // The hash flows into a LIKE prefix pattern. Validate BEFORE the
-    // query, exactly like the QueryPathFromHashPart precedent
-    // (grpc/queries.rs): `drv_log_hash` passes unparseable input
-    // through verbatim, so an attacker-supplied `%`/`_` would
-    // otherwise satisfy the prefix predicate against ANY derivation
-    // their tenant owns — and ownership here authorizes a PINNED
-    // (possibly foreign) exec_id. nixbase32 decode checks length AND
-    // charset (no `%`/`_` in the alphabet); failure takes the same
-    // not-owned path as any other mismatch (indistinguishable).
-    let hash = drv_log_hash(derivation);
-    if hash.len() != rio_nix::store_path::HASH_CHARS
-        || rio_nix::store_path::nixbase32::decode(&hash).is_err()
-    {
-        return Ok(false);
-    }
-    sqlx::query_scalar(
-        "SELECT EXISTS( \
-             SELECT 1 FROM derivations \
-             WHERE tenant_id = $2 AND drv_hash LIKE $1 || '%')",
+    // Absence-shaped deny: byte-identical to the resolution arm's
+    // missing-row error so foreign and nonexistent are
+    // indistinguishable to an authenticated caller.
+    Err(if pinned_exec_id.is_empty() {
+        Status::not_found(format!(
+            "no executions recorded for derivation {}",
+            drv_log_hash(derivation)
+        ))
+    } else {
+        Status::not_found(format!("no log recorded for execution {exec_id}"))
+    })
+}
+
+/// Test fixture: the PRODUCTION ownership shape — a `builds` row owned
+/// by `tenant`, linked to `derivation_id` via `build_derivations`.
+/// `derivations.tenant_id` was never production-written and is dropped
+/// by migration 095; the `authz-fixture-policy` misc-check bans test
+/// writes to it so fixtures cannot drift back to the dead shape
+/// (merged_bug_064-b vacuity class).
+#[cfg(test)]
+pub(crate) async fn seed_production_ownership(
+    pool: &PgPool,
+    tenant: Uuid,
+    derivation_id: Uuid,
+) -> Uuid {
+    let build_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO builds (tenant_id, status) VALUES ($1, 'active') RETURNING build_id",
     )
-    .bind(&hash)
     .bind(tenant)
     .fetch_one(pool)
     .await
-    .status_internal("TailLog: ownership fallback lookup")
+    .unwrap();
+    sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+        .bind(build_id)
+        .bind(derivation_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    build_id
 }
 
 #[cfg(test)]

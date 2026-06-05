@@ -1556,12 +1556,41 @@ handler — `TailLog` required nothing and was indistinguishable from a
 missing check, leaving build-log content readable by any pod that could
 reach the port (untrusted builders included). The class table makes the
 demand explicit per method, the layer rejects any method added without a
-declared class, and ownership is checked in the handler against the
-verified claims (assignments→derivations join, drv-hash-prefix fallback,
-tenant-less rows fail closed). Enforcement is enforce-when-configured so
+declared class, and ownership is checked in the handler per the tail
+ownership rule below. Enforcement is enforce-when-configured so
 keyless dev/VM deployments keep working. Builder/fetcher network policy
 additionally pins an L7 allow-list that omits `TailLog` — an untrusted
 build cannot reach the method even with a stolen token.
+
+#r("store.log.tail-ownership")[
+  `TailLog` ownership MUST be build-membership over production-written
+  rows: a verified tenant may read an execution's log iff one of its
+  builds contains the execution's derivation
+  (`assignments`→`build_derivations`→`builds.tenant_id`, with a
+  swept-assignment arm keyed on the execution's own recorded
+  `drv_executions.drv_hash` — never the request string, which MUST
+  appear in no ownership predicate). Resolution and ownership MUST fold
+  into a single authorization gate whose typed witness the serve layer
+  requires, and deny-with-claims MUST be absence-shaped: byte-identical
+  to the error for an execution that does not exist.
+]
+
+Ownership previously keyed on `derivations.tenant_id` — a column no
+production write path ever populated (dropped by migration 095), so the
+gate was constant-false and the test fixtures that stamped the column
+proved a vacuous truth; the swept-assignment fallback additionally matched
+the *caller's request string* against derivations the caller already
+owned, authorizing a pinned foreign execution (own-drv + foreign-pin).
+Build-membership over `builds.tenant_id` is the production-populated
+chain (owner decision 2026-06-04: any tenant whose build contains the
+content-addressed derivation may read its execution logs — amends the
+earlier "derivation ownership" wording; the no-service-bypass posture is
+unchanged). Absence-shaped denial kills the cross-tenant existence
+oracle of a distinguishable permission error; a retention-swept
+execution therefore denies even an authenticated pin (accepted
+narrowing). Keyless deployments (`tenant = None`) keep the
+distinguishable resolution errors — there is no claims-bearing caller to
+oracle.
 
 #r("store.authz.declared-verifier")[
   A credential class's transport verdict MUST be derived only from the

@@ -20,9 +20,10 @@
 //! authorized per-stream. `TailLog` is **tenant-authenticated**: the
 //! per-method credential layer ([`crate::authz`]) requires a verified
 //! tenant token whenever a JWT pubkey is configured, and the handler
-//! additionally checks that the claims' tenant OWNS the requested
-//! derivation (assignments→derivations join, drv-hash-prefix fallback,
-//! tenant-less rows fail closed — see [`tail::tenant_owns_exec`]). The
+//! additionally requires build-membership ownership of the requested
+//! execution (assignments→build_derivations→builds.tenant_id, with a
+//! swept-assignment arm keyed on the execution's own recorded hash;
+//! deny is absence-shaped — see [`tail::authorize_tail`]). The
 //! gateway relay forwards the watching caller's session token; the
 //! dashboard sends its tenant session token over gRPC-Web; `rio-cli
 //! logs` sends `--tenant-token`/`RIO_TENANT_TOKEN`. Builder/fetcher
@@ -653,29 +654,20 @@ impl LogServiceImpl {
         tenant: Option<Uuid>,
         tenant_token: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     ) -> ReceiverStream<Result<TailLogChunk, Status>> {
-        // Resolve the execution. NotFound here is the common "no such
-        // log" case and must reach grpc-web clients in-body.
-        let exec_id = match tail::resolve_exec(&self.pool, &req.derivation, &req.exec_id).await {
-            Ok(id) => id,
-            Err(status) => return err_stream(status),
-        };
-
-        // Ownership: a verified tenant may only read logs of
-        // derivations it owns (bug_290; owner decision Q4 — no
+        // Resolve AND authorize in one gate (the sole OwnedExec
+        // producer): a verified tenant may only read logs of builds it
+        // is a member-owner of (bug_290 / §5-S Q2 build-membership; no
         // service-token bypass). Enforce-when-presented mirrors the
-        // authz layer: when no pubkey is configured no claims exist
-        // and the deployment is in the dev/VM posture.
-        if let Some(tenant) = tenant {
-            match tail::tenant_owns_exec(&self.pool, exec_id, &req.derivation, tenant).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    return err_stream(Status::permission_denied(
-                        "derivation is not owned by the caller's tenant",
-                    ));
-                }
+        // authz layer: when no pubkey is configured no claims exist and
+        // the deployment is in the dev/VM posture. Deny-with-claims is
+        // absence-shaped NotFound (merged_bug_064-c) and must reach
+        // grpc-web clients in-body, same as the plain missing-row case.
+        let owned =
+            match tail::authorize_tail(&self.pool, &req.derivation, &req.exec_id, tenant).await {
+                Ok(owned) => owned,
                 Err(status) => return err_stream(status),
-            }
-        }
+            };
+        let exec_id = owned.id();
 
         // Find the live ingest buffer, if any. Only a LOCAL session can
         // be subscribed to; a session on another replica is relayed by
@@ -777,7 +769,7 @@ impl LogServiceImpl {
         let since_line = req.since_line;
         tokio::spawn(async move {
             let had_subscription = subscription.is_some();
-            let r = serve_tail(pool, store, exec_id, since_line, follow, subscription, &tx).await;
+            let r = serve_tail(pool, store, owned, since_line, follow, subscription, &tx).await;
             if had_subscription && follow {
                 metrics::gauge!("rio_store_log_tail_subscribers").decrement(1.0);
             }
@@ -1473,12 +1465,16 @@ type LiveSubscription = Option<(
 async fn serve_tail(
     pool: PgPool,
     store: Arc<dyn LogChunkStore>,
-    exec_id: Uuid,
+    owned: tail::OwnedExec,
     since_line: u64,
     follow: bool,
     subscription: LiveSubscription,
     tx: &mpsc::Sender<Result<TailLogChunk, Status>>,
 ) -> Result<(), Status> {
+    // The serve layer takes the authorization witness, never a raw
+    // Uuid: a future serve path that skips `authorize_tail` does not
+    // compile (merged_bug_064 chokepoint).
+    let exec_id = owned.id();
     let mut cursor = LineCursor::new(since_line);
     let exec_str = exec_id.to_string();
 
@@ -1874,27 +1870,50 @@ mod tests {
         stream.next().await
     }
 
+    /// The derivation_id `seed_assignment` upserted for [`DRV`].
+    async fn derivation_id_of(pool: &PgPool) -> Uuid {
+        sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+            .bind(DRV)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Foreign tenant ⇒ absence-shaped NotFound: byte-identical to the
+    /// missing-execution error, so an authenticated caller cannot
+    /// distinguish "exists but foreign" from "never existed"
+    /// (merged_bug_064-c — the old distinguishable PermissionDenied was
+    /// a cross-tenant existence oracle).
+    ///
+    /// RED (pre-fix, production-shaped seeding): the OLD gate keyed on
+    /// never-written `derivations.tenant_id`, denying via
+    /// PermissionDenied — distinguishable from absent.
     // r[verify store.log.method-credential+2]
+    // r[verify store.log.tail-ownership]
     #[tokio::test]
-    async fn taillog_foreign_tenant_rejected() {
+    async fn taillog_foreign_tenant_gets_absence_shaped_notfound() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let chunk_store = Arc::new(MemoryLogChunkStore::default());
         let exec = seed_assignment(&db.pool, "builder-own").await;
         let owner = seed_tenant(&db.pool, "tenant-owner").await;
-        sqlx::query("UPDATE derivations SET tenant_id = $1 WHERE drv_hash = $2")
-            .bind(owner)
-            .bind(DRV)
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        tail::seed_production_ownership(&db.pool, owner, derivation_id_of(&db.pool).await).await;
         let foreign = seed_tenant(&db.pool, "tenant-foreign").await;
         let svc = LogServiceImpl::new(db.pool.clone(), chunk_store, "test-pod".to_string());
         match tail_first_item(&svc, exec, Some(tenant_claims(foreign))).await {
-            Some(Err(status)) => assert_eq!(
-                status.code(),
-                tonic::Code::PermissionDenied,
-                "foreign tenant must get PERMISSION_DENIED, got {status:?}"
-            ),
+            Some(Err(status)) => {
+                assert_eq!(
+                    status.code(),
+                    tonic::Code::NotFound,
+                    "foreign tenant must get the absence-shaped NOT_FOUND, got {status:?}"
+                );
+                // Oracle closure: the deny text equals the genuinely-
+                // absent text for the same pinned id.
+                assert_eq!(
+                    status.message(),
+                    format!("no log recorded for execution {exec}"),
+                    "foreign deny must be byte-identical to the absent-row error"
+                );
+            }
             other => panic!(
                 "a verified-but-foreign tenant read the log (got {other:?}); \
                  ownership must be enforced"
@@ -1902,62 +1921,93 @@ mod tests {
         }
     }
 
+    /// The owning tenant is admitted via the PRODUCTION-written chain
+    /// (assignments→build_derivations→builds.tenant_id).
+    ///
+    /// RED (pre-fix): under production-shaped seeding the OLD gate read
+    /// `derivations.tenant_id` — never written ⇒ ownership was
+    /// constant-FALSE and the OWNER was denied (merged_bug_064-b: the
+    /// legacy fixtures wrote the dead column, so the suite proved a
+    /// vacuous truth).
     // r[verify store.log.method-credential+2]
+    // r[verify store.log.tail-ownership]
     #[tokio::test]
-    async fn taillog_owner_admitted() {
+    async fn taillog_owner_admitted_under_production_seeding() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let chunk_store = Arc::new(MemoryLogChunkStore::default());
         let exec = seed_assignment(&db.pool, "builder-own2").await;
         let owner = seed_tenant(&db.pool, "tenant-owner2").await;
-        sqlx::query("UPDATE derivations SET tenant_id = $1 WHERE drv_hash = $2")
-            .bind(owner)
-            .bind(DRV)
+        tail::seed_production_ownership(&db.pool, owner, derivation_id_of(&db.pool).await).await;
+        let svc = LogServiceImpl::new(db.pool.clone(), chunk_store, "test-pod".to_string());
+        if let Some(Err(status)) = tail_first_item(&svc, exec, Some(tenant_claims(owner))).await {
+            panic!("the owning tenant must be admitted, got {status:?}");
+        }
+    }
+
+    /// Swept-assignment arm: assignment row gone (retention), ownership
+    /// still resolves through drv_executions⨝derivations (the
+    /// execution's OWN recorded hash) → build membership.
+    // r[verify store.log.method-credential+2]
+    // r[verify store.log.tail-ownership]
+    #[tokio::test]
+    async fn taillog_owner_admitted_via_swept_assignment_arm() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let chunk_store = Arc::new(MemoryLogChunkStore::default());
+        let exec = seed_assignment(&db.pool, "builder-swept").await;
+        let owner = seed_tenant(&db.pool, "tenant-swept").await;
+        tail::seed_production_ownership(&db.pool, owner, derivation_id_of(&db.pool).await).await;
+        sqlx::query("DELETE FROM assignments WHERE exec_id = $1")
+            .bind(exec)
             .execute(&db.pool)
             .await
             .unwrap();
         let svc = LogServiceImpl::new(db.pool.clone(), chunk_store, "test-pod".to_string());
         if let Some(Err(status)) = tail_first_item(&svc, exec, Some(tenant_claims(owner))).await {
-            assert_ne!(
-                status.code(),
-                tonic::Code::PermissionDenied,
-                "the owning tenant must be admitted"
-            );
+            panic!("swept-assignment owner must be admitted, got {status:?}");
         }
     }
 
-    /// LIKE-injection guard: a wildcard "derivation" must not satisfy
-    /// the ownership fallback (cross-tenant read: pin a foreign exec,
-    /// bind `%` so the prefix predicate matches ANY derivation the
-    /// caller's own tenant has).
+    /// merged_bug_064-a (the IDOR): request the caller's OWN derivation
+    /// verbatim while pinning a FOREIGN exec_id. The request string is
+    /// in NO ownership predicate, so owning some unrelated derivation
+    /// authorizes nothing about the pinned execution.
+    ///
+    /// RED (pre-fix): the old fallback matched the REQUEST string's
+    /// hash prefix against any derivation the caller's tenant owned —
+    /// own-drv + foreign-pin streamed the foreign log.
     // r[verify store.log.method-credential+2]
+    // r[verify store.log.tail-ownership]
     #[tokio::test]
-    async fn taillog_wildcard_derivation_rejected() {
+    async fn taillog_foreign_pin_with_own_derivation_rejected() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let chunk_store = Arc::new(MemoryLogChunkStore::default());
-        // Foreign tenant owns the execution's derivation.
+        // Foreign tenant's execution of DRV.
         let exec = seed_assignment(&db.pool, "builder-own4").await;
         let owner = seed_tenant(&db.pool, "tenant-owner4").await;
-        sqlx::query("UPDATE derivations SET tenant_id = $1 WHERE drv_hash = $2")
-            .bind(owner)
-            .bind(DRV)
-            .execute(&db.pool)
-            .await
-            .unwrap();
-        // The attacker tenant owns SOME unrelated derivation.
+        tail::seed_production_ownership(&db.pool, owner, derivation_id_of(&db.pool).await).await;
+        // The attacker tenant legitimately owns an UNRELATED derivation.
         let attacker = seed_tenant(&db.pool, "tenant-attacker").await;
-        sqlx::query(
-            "INSERT INTO derivations (drv_hash, drv_path, system, status, tenant_id) \
+        let attacker_drv: Uuid = sqlx::query_scalar(
+            "INSERT INTO derivations (drv_hash, drv_path, system, status) \
              VALUES ('zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-other.drv', '/nix/store/zz-other.drv', \
-                     'x86_64-linux', 'assigned', $1)",
+                     'x86_64-linux', 'assigned') \
+             RETURNING derivation_id",
         )
-        .bind(attacker)
-        .execute(&db.pool)
+        .fetch_one(&db.pool)
         .await
         .unwrap();
+        tail::seed_production_ownership(&db.pool, attacker, attacker_drv).await;
         let svc = LogServiceImpl::new(db.pool.clone(), chunk_store, "test-pod".to_string());
-        for wildcard in ["%", "_", "zz%"] {
+        // Verbatim own derivation + wildcards: every shape must take
+        // the absence-shaped deny — the string reaches no predicate.
+        for derivation in [
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-other.drv",
+            "%",
+            "_",
+            "zz%",
+        ] {
             let mut request = Request::new(TailLogRequest {
-                derivation: wildcard.to_string(),
+                derivation: derivation.to_string(),
                 exec_id: exec.to_string(),
                 since_line: 0,
                 follow: false,
@@ -1968,28 +2018,29 @@ mod tests {
             match stream.next().await {
                 Some(Err(status)) => assert_eq!(
                     status.code(),
-                    tonic::Code::PermissionDenied,
-                    "wildcard {wildcard:?} must be rejected, got {status:?}"
+                    tonic::Code::NotFound,
+                    "derivation {derivation:?} must take the absence-shaped deny, got {status:?}"
                 ),
                 other => panic!(
-                    "wildcard {wildcard:?} satisfied the ownership fallback \
+                    "derivation {derivation:?} laundered ownership of a foreign pin \
                      (cross-tenant read); got {other:?}"
                 ),
             }
         }
     }
 
-    /// Tenant-less derivation row + verified claims => fail closed.
+    /// Execution with no owning build (no builds row at all) + verified
+    /// claims ⇒ fail closed, absence-shaped.
     #[tokio::test]
-    async fn taillog_tenantless_derivation_fails_closed() {
+    async fn taillog_buildless_execution_fails_closed() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let chunk_store = Arc::new(MemoryLogChunkStore::default());
         let exec = seed_assignment(&db.pool, "builder-own3").await;
         let any = seed_tenant(&db.pool, "tenant-any").await;
         let svc = LogServiceImpl::new(db.pool.clone(), chunk_store, "test-pod".to_string());
         match tail_first_item(&svc, exec, Some(tenant_claims(any))).await {
-            Some(Err(status)) => assert_eq!(status.code(), tonic::Code::PermissionDenied),
-            other => panic!("tenant-less derivation must fail closed, got {other:?}"),
+            Some(Err(status)) => assert_eq!(status.code(), tonic::Code::NotFound),
+            other => panic!("build-less execution must fail closed, got {other:?}"),
         }
     }
 
