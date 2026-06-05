@@ -1621,7 +1621,7 @@ in
 
     # An abandonment actually fires the disclosure counter — the
     # counted arm of the loss lattice is exercised.
-    # r[verify builder.log.loss-disclosure]
+    # r[verify builder.log.loss-disclosure+2]
     quint-log-service-witness-loss-counted = mkQuintWitnessCheck {
       name = "log-service-witness-loss-counted";
       spec = "logService";

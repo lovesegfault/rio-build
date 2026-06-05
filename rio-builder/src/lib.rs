@@ -251,7 +251,9 @@ pub fn describe_metrics() {
          hit — store unavailable too long), superseded (the execution \
          was re-dispatched; this attempt's tail is gone), cap_exhausted \
          (per-execution log cap; overflow is discarded by design but \
-         still disclosed), panic (the upload task died mid-flight). \
+         still disclosed), panic (the upload task died mid-flight), \
+         uploader_dead (lines produced after the upload task died — \
+         counted by the producer-side ledger, never silently dropped). \
          Each increment is durable log loss for one build — the lines \
          exist nowhere. A zero-loss abandon (the store already holds \
          the complete log) does NOT count. Alert on any increase."

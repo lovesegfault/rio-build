@@ -612,7 +612,7 @@ requirement and the display-only / no-pod-identity rationale live in
   to `0` means unlimited.
 ]
 
-#r("builder.log.loss-disclosure")[
+#r("builder.log.loss-disclosure+2")[
   Every log-upload abandonment MUST be disclosed through one chokepoint that
   derives the loss from the abandonment reason: an upload that ends with
   un-acked lines increments
@@ -622,13 +622,21 @@ requirement and the display-only / no-pod-identity rationale live in
   log. A permanent store rejection arriving mid-stream MUST terminate the
   session loop (no reconnect can succeed against it), and a panic in the
   upload task MUST disclose its un-acked lines during unwind, independent of
-  whether any caller awaits the task.
+  whether any caller awaits the task. Lines produced AFTER the upload task
+  has died MUST route through the same chokepoint (reason `uploader_dead`):
+  the producer-side sink MUST make an uncounted discard unrepresentable ---
+  once the upload channel is gone, the only way to drop a batch is the
+  ledger method whose teardown discloses the accumulated total.
 ]
 The reason vocabulary is the `x-rio-log-reject` metadata class the store
 attaches to permanent rejections (`cap`/`complete`/`superseded`) plus the
-builder-local `deadline_expired` and `panic`; bare-code fallbacks
-(`FAILED_PRECONDITION` → complete, `PERMISSION_DENIED` → superseded) keep the
-mapping total against pre-metadata stores.
+builder-local `deadline_expired`, `panic`, and `uploader_dead`; bare-code
+fallbacks (`FAILED_PRECONDITION` → complete, `PERMISSION_DENIED` →
+superseded) keep the mapping total against pre-metadata stores. The
+producer-side ledger is disjoint from the upload task's own unwind guard by
+construction: the guard covers lines the uploader ACCEPTED, the ledger only
+lines the closed channel REFUSED (the bounced batch that detected the death
+seeds it), so the two surfaces partition the loss exactly.
 
 = Overlay Store Architecture
 

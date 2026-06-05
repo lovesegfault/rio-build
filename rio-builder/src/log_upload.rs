@@ -138,6 +138,12 @@ pub enum AbandonReason {
     /// during unwind, so even a never-awaited detached task
     /// discloses).
     Panicked,
+    /// Producer-side discard: the stderr loop produced lines AFTER the
+    /// uploader task died (its input channel closed under it). Those
+    /// lines never entered the uploader's buffer, so no other reason
+    /// can ever cover them; the stderr loop's `DiscardLedger` routes
+    /// their total through the chokepoint at loop teardown (bug_241).
+    UploaderDead,
 }
 
 impl AbandonReason {
@@ -150,6 +156,7 @@ impl AbandonReason {
             Self::Superseded => "superseded",
             Self::CapExhausted => "cap_exhausted",
             Self::Panicked => "panic",
+            Self::UploaderDead => "uploader_dead",
         }
     }
 }
@@ -163,11 +170,12 @@ fn lost_lines(reason: AbandonReason, unacked: u64) -> u64 {
         AbandonReason::DeadlineExpired
         | AbandonReason::Superseded
         | AbandonReason::CapExhausted
-        | AbandonReason::Panicked => unacked,
+        | AbandonReason::Panicked
+        | AbandonReason::UploaderDead => unacked,
     }
 }
 
-// r[impl builder.log.loss-disclosure]
+// r[impl builder.log.loss-disclosure+2]
 /// THE single disclosure site: the only place
 /// `rio_builder_log_drain_abandoned_total` is incremented.
 /// Counter ⟺ `lost_lines > 0`, by construction — a zero-loss abandon
@@ -194,6 +202,17 @@ fn disclose(reason: AbandonReason, unacked_lines: u64, last_acked_line: Option<u
         "log upload abandoned with un-acked lines: those lines were \
          never durably stored and will be missing from the build log"
     );
+}
+
+// r[impl builder.log.loss-disclosure+2]
+/// Producer-side entry (bug_241): the stderr loop's post-uploader-death
+/// discard total, routed through THE single `disclose` chokepoint as
+/// `reason="uploader_dead"`. The counting stays at one site; the
+/// per-reason breakdown stays honest; a zero total is the ordinary
+/// zero-loss debug arm. `last_acked_line` is `None` by construction —
+/// these lines never reached the uploader, so no ack can cover them.
+pub(crate) fn disclose_uploader_dead(discarded_lines: u64) {
+    disclose(AbandonReason::UploaderDead, discarded_lines, None);
 }
 
 /// Drop-guard that discloses a panic-shaped loss. Armed before the
@@ -1561,7 +1580,7 @@ mod tests {
     //    builder.log.loss-disclosure)
     // ------------------------------------------------------------------
 
-    // r[verify builder.log.loss-disclosure]
+    // r[verify builder.log.loss-disclosure+2]
     /// merged_bug_360 (red-first): PERMISSION_DENIED with un-acked lines
     /// is durable loss — the superseding attempt produces ITS OWN log,
     /// not these lines. Pre-fix, `rejected: true` suppressed the
@@ -1601,7 +1620,7 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure]
+    // r[verify builder.log.loss-disclosure+2]
     /// merged_bug_360 (red-first): a panic in the upload task must
     /// disclose the un-acked lines. Pre-fix the counter fired only at
     /// `run()`'s normal exit, which a panicking task never reaches —
@@ -1657,7 +1676,7 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure]
+    // r[verify builder.log.loss-disclosure+2]
     /// bug_248 (red-first): a permanent rejection arriving MID-STREAM
     /// (the cap tripping while the stream is open) must stop the
     /// session loop — pre-fix it was classified Reconnect and the
@@ -1707,7 +1726,7 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure]
+    // r[verify builder.log.loss-disclosure+2]
     /// Polarity guard: a `complete` rejection (the store provably holds
     /// the full `[0, final)` log) is the ONE zero-loss abandon — no
     /// counter, under any reason label.

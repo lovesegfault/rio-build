@@ -157,6 +157,52 @@ const MAX_BUILD_STDERR_MESSAGES: u64 = 10_000_000;
 /// without reading `BuildResult`. `Err(e)` = wire error, propagate.
 type LoopOutcome = Result<Option<BuildResult>, wire::WireError>;
 
+/// The stderr loop's log data-plane: an open channel to the uploader,
+/// or — after the uploader dies — the discard ledger. The enum is the
+/// chokepoint (bug_241): there is no third state and no uncounted
+/// path; dropping a batch REQUIRES calling the ledger method.
+enum UploadSink<'a> {
+    /// Uploader alive: batches go to its input channel.
+    Open(&'a mpsc::Sender<rio_proto::types::BuildLogBatch>),
+    /// Uploader dead: batches are counted into the ledger, disclosed
+    /// at teardown.
+    Lost(DiscardLedger),
+}
+
+/// Producer-side discard ledger for the post-uploader-death window
+/// (bug_241). Disjoint from the uploader's `LossGuard` by
+/// construction: the guard covers lines the uploader ACCEPTED at panic
+/// time; this ledger counts only lines the channel REFUSED — the
+/// bounced batch that detected the death seeds it, and everything
+/// produced afterwards accrues. Drop-armed: loop exit (normal or
+/// unwind) routes the accumulated total through `log_upload`'s single
+/// `disclose()` chokepoint as `reason="uploader_dead"`. The Drop body
+/// is sync and panic-free (counter + log only); a zero total is the
+/// chokepoint's ordinary zero-loss debug arm.
+struct DiscardLedger {
+    discarded_lines: u64,
+}
+
+impl DiscardLedger {
+    fn new() -> Self {
+        Self { discarded_lines: 0 }
+    }
+
+    /// THE discard path: count the batch. Returning from the dead-sink
+    /// send IS this method — an uncounted discard does not typecheck.
+    fn discard(&mut self, batch: rio_proto::types::BuildLogBatch) {
+        self.discarded_lines = self
+            .discarded_lines
+            .saturating_add(batch.lines.len() as u64);
+    }
+}
+
+impl Drop for DiscardLedger {
+    fn drop(&mut self) {
+        crate::log_upload::disclose_uploader_dead(self.discarded_lines);
+    }
+}
+
 /// Per-message dispatch state for [`read_build_stderr_loop`]'s `select!`.
 ///
 /// Holds the batcher + log channel + book-keeping that every match arm
@@ -173,21 +219,21 @@ struct StderrLoop<'a> {
     /// build's completion is gone (it can't be reported either), so
     /// phase-send failure still aborts the loop.
     log_tx: &'a mpsc::Sender<BuildTaskMessage>,
-    /// Data-plane channel to the per-build [`crate::log_upload::LogUploader`]
-    /// (which streams to rio-store's `AppendLog`). Bounded (256) as
-    /// ordinary queue slack between the loop and the uploader task. Store
-    /// slowness does NOT backpressure this channel — the uploader absorbs
-    /// it into its in-memory retransmit buffer (see `log_upload.rs`'s
-    /// module doc for the real memory bound: the per-build log-size cap
-    /// plus per-line overhead, inside the pod's memory limit). Closure
-    /// means the uploader task exited (it only does so by panicking while
-    /// input is open) — the build continues and discards log output rather
-    /// than failing, per "a build is never failed because its log could
-    /// not be persisted".
-    upload_tx: &'a mpsc::Sender<rio_proto::types::BuildLogBatch>,
-    /// Set after the first failed send to `upload_tx` so the
-    /// degraded-to-discarding warning fires once, not per batch.
-    upload_lost: bool,
+    /// Data-plane sink to the per-build
+    /// [`crate::log_upload::LogUploader`] (which streams to rio-store's
+    /// `AppendLog`). While `Open`, a bounded (256) channel as ordinary
+    /// queue slack between the loop and the uploader task; store
+    /// slowness does NOT backpressure it — the uploader absorbs it into
+    /// its in-memory retransmit buffer (see `log_upload.rs`'s module
+    /// doc for the real memory bound). Channel closure means the
+    /// uploader task exited (it only does so by panicking while input
+    /// is open): the sink flips to `Lost(DiscardLedger)` — the build
+    /// continues, per "a build is never failed because its log could
+    /// not be persisted", and every further batch is COUNTED by the
+    /// ledger, whose teardown discloses the total through the loss
+    /// chokepoint (bug_241: the pre-ledger early-return discarded the
+    /// post-death lines with zero disclosure).
+    upload: UploadSink<'a>,
     /// Count of STDERR messages seen so far; bounded by
     /// [`MAX_BUILD_STDERR_MESSAGES`].
     msg_count: u64,
@@ -209,29 +255,39 @@ impl<'a> StderrLoop<'a> {
         Self {
             batcher,
             log_tx,
-            upload_tx,
-            upload_lost: false,
+            upload: UploadSink::Open(upload_tx),
             msg_count: 0,
             last_output: Instant::now(),
             silence,
         }
     }
 
+    // r[impl builder.log.loss-disclosure+2]
     /// Send a log batch to the per-build uploader. Never aborts the
     /// loop: a closed upload channel means the uploader task panicked,
     /// and a build is never failed because its log could not be
-    /// persisted — degrade to discarding output and warn once.
+    /// persisted — degrade to COUNTED discarding (the only discard
+    /// path is the ledger method, so an undisclosed producer-side drop
+    /// is unrepresentable) and warn once on the flip.
     async fn send_log_batch(&mut self, batch: rio_proto::types::BuildLogBatch) {
-        if self.upload_lost {
-            return;
-        }
-        if self.upload_tx.send(batch).await.is_err() {
-            self.upload_lost = true;
-            tracing::warn!(
-                drv_path = %self.batcher.drv_path(),
-                "log upload channel closed (uploader task died); \
-                 discarding further log output for this build"
-            );
+        match &mut self.upload {
+            UploadSink::Open(tx) => {
+                if let Err(bounced) = tx.send(batch).await {
+                    tracing::warn!(
+                        drv_path = %self.batcher.drv_path(),
+                        "log upload channel closed (uploader task died); \
+                         counting and discarding further log output for \
+                         this build"
+                    );
+                    let mut ledger = DiscardLedger::new();
+                    // The bounced batch is the first refused payload —
+                    // it never entered the channel, so the uploader's
+                    // own accounting can never cover it.
+                    ledger.discard(bounced.0);
+                    self.upload = UploadSink::Lost(ledger);
+                }
+            }
+            UploadSink::Lost(ledger) => ledger.discard(batch),
         }
     }
 
@@ -622,6 +678,67 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Current-thread block_on for recorder-scoped async bodies (the
+    /// metrics local-recorder guard is sync; nothing here uses timers).
+    fn futures_executor_block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(fut)
+    }
+
+    // r[verify builder.log.loss-disclosure+2]
+    /// bug_241: lines produced AFTER the uploader dies must be
+    /// disclosed through the loss chokepoint, not silently discarded.
+    /// The pre-fix `upload_lost` early-return was one step upstream of
+    /// disclose(): the bounced batch and everything after it vanished
+    /// with zero counter increments, while the spec rule's "every
+    /// abandonment is disclosed" claim read as satisfied because the
+    /// UPLOADER's own lifecycle was covered.
+    #[test]
+    fn uploader_death_discard_is_disclosed() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let batch = |first: u64, n: usize| rio_proto::types::BuildLogBatch {
+            derivation_path: "/nix/store/x-d.drv".into(),
+            executor_id: "exec-1".into(),
+            lines: (0..n).map(|i| format!("l{i}").into_bytes()).collect(),
+            first_line_number: first,
+        };
+
+        let recorder = CountingRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            futures_executor_block_on(async {
+                let (log_tx, _log_rx) = mpsc::channel::<BuildTaskMessage>(8);
+                let (upload_tx, upload_rx) = mpsc::channel::<rio_proto::types::BuildLogBatch>(8);
+                // The uploader task died: its receiver is gone.
+                drop(upload_rx);
+                let batcher = LogBatcher::new(
+                    "/nix/store/x-d.drv".into(),
+                    "exec-1".into(),
+                    crate::log_stream::LogLimits::UNLIMITED,
+                    0,
+                );
+                let mut sl = StderrLoop::new(batcher, &log_tx, &upload_tx, Duration::from_secs(60));
+                // The bounced batch (detects the death) and two more
+                // produced afterwards: 3 + 2 + 4 = 9 discarded lines.
+                sl.send_log_batch(batch(0, 3)).await;
+                sl.send_log_batch(batch(3, 2)).await;
+                sl.send_log_batch(batch(5, 4)).await;
+                // Loop teardown (normal exit or unwind) settles the
+                // ledger.
+                drop(sl);
+            });
+        });
+
+        assert_eq!(
+            recorder.get("rio_builder_log_drain_abandoned_total{reason=uploader_dead}"),
+            1,
+            "the post-uploader-death discard must be disclosed through \
+             the single chokepoint (one abandonment event for this build)"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // read_build_stderr_loop — pure async, no daemon process needed
