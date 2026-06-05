@@ -68,7 +68,11 @@ module matCalibDedupRemoved {
     all {
       jobs' = jobs.put(d, SomeJob({ ...freshJob, origin: origin, tenant: tenant })),
       view' = view.put(d, VPending(false)),
-      dupJob' = if (hasUnresolvedJob(d)) dupJob.put(d, true) else dupJob,
+      // THE BUG: the dropped unique-index decision, routed through
+      // the LIVE dedup seat (R10/P5: the seat computes the
+      // widened-slot truth; this override perturbs the decision only
+      // — and drops createJob's no-unresolved-job guard).
+      dedupSlotApply(d, false),
       topdownPruned' = if (origin == OPruned) topdownPruned.put(d, true) else topdownPruned,
       nodeStatus' = if (origin == OStaleReset or origin == OReprobe)
         nodeStatus.put(d, NQueued)

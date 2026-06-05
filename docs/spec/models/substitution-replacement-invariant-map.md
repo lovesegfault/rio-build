@@ -2101,3 +2101,57 @@ across all five regimes:
    deferring would idle the attempt forever with zero operator
    signal; the charge surfaces it on the crash ledger where the
    existing alerting looks.
+
+### R10 oracle-seat hoists (bughunt-2 fix wave, slot 9 — landed with this commit)
+
+The quint-policy census (R10 relay, wave-log 2026-06-04) found the six
+materializationJob ghost latches **P4-writerless** — only calibration
+overrides assigned them, so a regression introduced in a live action
+could never trip its own invariant — and `failoverPreservesJobs`
+**P1-untwinned in all seven regimes** that check it. Repair per the
+fencedWrites `0f1ddf484` pattern; the latch set is declared by the
+`// quint-policy-latches:` header directive (P5 domain).
+
+- **Six oracle-seated apply sub-actions** (model §8a) now compute the
+  latches LIVE from the caller's decision + the pre-state; live
+  actions and calibrations route through the SAME seats — only the
+  decision differs, and no calibration assigns a declared latch
+  (P5):
+  | Seat | Latch | Live caller (lawful decision) | Calibration (perturbed decision) |
+  |---|---|---|---|
+  | `releaseStatusApply(d, toReady)` | `requeueReadyJustifiedAll` | `reportInfra` (false — conservative NQueued restore); `workerAborted` (origin-restore) | `mat-318-requeue-forces-ready` (forced true) |
+  | `abortSettleApply(d, charges)` | `abortChargeFree` (+ the charge shape: per-job window, park verdict, ledger row, `budgetSoundAll` conjunct) | `workerAborted` (false — the Aborted intake's charge-free close) | `mat-189-abort-charges` (true) |
+  | `consumeSettleApply(d, usedUnion)` | `covLiveOnlyAll` (+ `covAtResolveAll`, `noVacuousCoverageAll`, the settlement writes) | `consumeSuccess` (the live §6 join) | `mat-f4-dead-union` (the dead-inclusive stored union) |
+  | `staleWriteApply(d, fenceHonored)` | `staleJobWriteApplied` (+ the discard probe) | `staleTenureWriteDiscarded` (true — fence honored, write discarded) | `mat-f11-unfenced-resolve` (false — the write applies) |
+  | `dedupSlotApply(d, dedupHonored)` | `dupJob` | `createJob` (true; its no-unresolved-job guard keeps the oracle quiet) | `mat-dedup-removed` (false, guard dropped) |
+  | `failoverRowsApply(dropsRows)` | `failoverDroppedJobs` | `failover` (false — jobs are PG rows) | `mat-failover-drops-rows` (true) — NEW |
+- **NEW twin `mat-failover-drops-rows`** (wired
+  `quint-materialization-calib-failover-drops-rows`):
+  `failoverPreservesJobs`' first falsifier — clears the P1×7 census
+  finding. No production defect transferred (the drop is a
+  hypothetical); the twin exists so a regression in the live
+  failover's row handling becomes visible.
+- **TLC verdicts post-hoist** (all six falsifications re-run, hazard
+  (www) reachability discipline — each violation REQUIRES reaching
+  its seat with the perturbed decision): 318 2.6 s (553 distinct at
+  termination), 189 2.9 s (384), f4 3.2 s (1,483), f11 2.6 s
+  (1,091), dedup 3.7 s (1,490), failover-drops-rows 3.7 s (1,603) —
+  all `[violation]`. Baselines per the P3 pairing instrument (the
+  exhaustive TLC conjunctions do not converge at these scopes — the
+  measurement record above): as-built `step` at each calib scope,
+  simulator 400 K x 15, all six `[ok]`; the live-regime sim-holds
+  checks remain the gate-wired baseline.
+- **Value-identity of the live rewiring, proven by COMPLETE
+  exploration** (not falsification counts — a violation-terminated
+  TLC run's generated/distinct totals are parallel-worker
+  race-dependent and are NOT an identity signal; only a
+  drained-queue exploration's are): a temporary micro-scope module
+  (1 build/drv/output/replica, MAT_BUDGET 1, MAX_EXECS 2) explored
+  complete pre/post — base alphabet **9,867,105 generated /
+  23,244 distinct, exactly equal**; widened (ENABLE_FAILOVER +
+  ENABLE_STALE_TENURE + ENABLE_WORKER_ABORTED, MAX_GEN 1 — every
+  seat caller live) **84,112,481 generated / 163,644 distinct,
+  exactly equal**; the depth line jittered +-1 (the known TLC
+  artifact). All 12 deterministic named runs pass unchanged (8 base
+  + 2 failover + 1 adversarial + 1 crash-loop) — exact post-state
+  pins through the rewired actions.

@@ -46,13 +46,11 @@ module matCalibF11UnfencedResolve {
     ENABLE_STALE_TENURE,
     leaseGen > 0,
     hasUnresolvedJob(d),
-    jobs' = jobs.put(d, match jobs.get(d) {
-      | NoJob => NoJob
-      | SomeJob(j) => SomeJob({ ...j, state: JResolvedFromSource, parked: false })
-    }),
-    view' = view.put(d, VNone),
-    staleJobWriteApplied' = true,
-    staleWriteDiscarded' = staleWriteDiscarded,
+    // THE BUG: the dishonored fence, routed through the LIVE
+    // stale-write seat (R10/P5: the seat applies the write and
+    // computes the latch from the tenure pre-state; this override
+    // perturbs the fence decision only).
+    staleWriteApply(d, false),
     attempts' = attempts, nodeStatus' = nodeStatus,
     dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
     leaseGen' = leaseGen, channelStale' = channelStale,

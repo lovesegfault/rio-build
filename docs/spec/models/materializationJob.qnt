@@ -1,4 +1,5 @@
 // -*- mode: Bluespec; -*-
+// quint-policy-latches: covLiveOnlyAll, failoverDroppedJobs, staleJobWriteApplied, dupJob, requeueReadyJustifiedAll, abortChargeFree
 //
 // Substitution-replacement model (Phase C-prime, re-targeted to the
 // post-deletion system at Phase D-prime T-D7.2): the store-owned
@@ -333,7 +334,9 @@ module materializationJob {
   var jobs: str -> JobOpt
   /// GHOST (the C-prime slot widening): a second unresolved job row
   /// was created for the drv. Unreachable as built (the creation guard
-  /// is the partial-unique index); the dedup-removed override latches it.
+  /// is the partial-unique index). R10: computed live by the
+  /// dedupSlotApply seat; the dedup-removed calibration perturbs the
+  /// decision only.
   var dupJob: str -> bool
   /// The in-memory job view (delta 5) — the kernel admission's input.
   var view: str -> ViewState
@@ -402,7 +405,9 @@ module materializationJob {
   /// stale-tenure regime's probe).
   var staleWriteDiscarded: bool
   /// GHOST (F11): a stale-generation job write APPLIED. Unreachable as
-  /// built (the fence discards); the unfenced-resolve override latches.
+  /// built (the fence discards). R10: computed live by the
+  /// staleWriteApply seat; the unfenced-resolve calibration perturbs
+  /// the fence decision only.
   var staleJobWriteApplied: bool
   /// GHOST (A1, merged_bug_276): a materialization-infra charge landed
   /// on a drv whose job was ALREADY cancelled (or gone) — the
@@ -420,8 +425,10 @@ module materializationJob {
   var claimAfterFailover: bool
   /// GHOST (delta 5 / A10): a failover dropped durable job rows.
   /// Constant-false as built (jobs are PG rows); the view-drop
-  /// override targets the VIEW instead, and a hypothetical
-  /// row-dropping override would latch this.
+  /// override targets the VIEW instead. R10: computed live by the
+  /// failoverRowsApply seat; the mat-failover-drops-rows calibration
+  /// perturbs the durability decision and is failoverPreservesJobs'
+  /// falsifier.
   var failoverDroppedJobs: bool
 
   /// Build liveness (the interest join's left side).
@@ -462,7 +469,8 @@ module materializationJob {
   /// CE-17 class; survives benign post-resolution GC).
   var covAtResolveAll: bool
   /// Every consumption coverage decision ranged over the LIVE-only
-  /// wanted union (the C5/B4 successor).
+  /// wanted union (the C5/B4 successor). R10: computed live by the
+  /// consumeSettleApply seat from the caller's decision set.
   var covLiveOnlyAll: bool
   /// Every job creation left the job tenant-resolvable: >=1 live build
   /// with wanted rows at creation commit (delta 2b — the B4 backfill).
@@ -479,7 +487,9 @@ module materializationJob {
   /// at claim time). Constant-true under the as-built edges — every
   /// main-model release restores NQueued (the conservative arm of
   /// validate_transition_for_release); the mat-318 calibration's
-  /// forced-Ready requeue reaches the violation.
+  /// forced-Ready requeue reaches the violation. R10: computed live
+  /// by the releaseStatusApply seat from the caller's status
+  /// decision.
   var requeueReadyJustifiedAll: bool
   /// CARRIER IMAGE (bughunt wave, A3/257+055): the stale-reset job
   /// carries the realized output paths captured AT CREATION
@@ -508,7 +518,8 @@ module materializationJob {
   /// 085 window. Constant-true under the as-built workerAborted; the
   /// mat-189-abort-charges calibration re-introduces the pre-fix
   /// class-blind flatten (Err -> infra_failure) and reaches the
-  /// violation.
+  /// violation. R10: computed live by the abortSettleApply seat from
+  /// the caller's charge decision.
   var abortChargeFree: bool
 
   /// A4: the view-only deferral (RetryLater) — pull admission reads it
@@ -1141,6 +1152,160 @@ module materializationJob {
     execsMinted' = execsMinted,
   }
 
+  // --- 8a. oracle-seated apply sub-actions (bughunt-2 R10) -------------------
+  //
+  // The six declared latches (header directive) are computed HERE, in
+  // shared parameterized seats the live actions and the calibration
+  // overrides BOTH route through — only the caller's DECISION differs
+  // (the fencedWrites 0f1ddf484 repair pattern). A regression in a
+  // live action now trips its own invariant instead of leaving a
+  // writerless ghost; a calibration perturbs a decision, never a
+  // latch (quint-policy P5).
+
+  /// Release-status seat (A2/318): the re-arm after a closed
+  /// materialization attempt. `toReady` is the CALLER's status
+  /// decision (production: reset_after_attempt's deps_completed
+  /// input); the justification truth — a Ready-setting release had a
+  /// Ready-origin claim — is computed here from the claimOrigin
+  /// witness. Live callers: reportInfra (always false — the
+  /// conservative NQueued restore) and workerAborted (origin-restore:
+  /// true exactly when the claim originated Ready). The mat-318
+  /// calibration passes the forced true.
+  action releaseStatusApply(d: str, toReady: bool): bool = all {
+    nodeStatus' = nodeStatus.put(d, if (toReady) NReady else NQueued),
+    requeueReadyJustifiedAll' = and {
+      requeueReadyJustifiedAll,
+      toReady implies (claimOrigin.get(d) == NReady),
+    },
+  }
+
+  /// Abort-settlement seat (B1/189): the SIGTERM-aborted close.
+  /// `charges` is the CALLER's intake decision (production: the
+  /// Aborted wire variant routes through release_claim charge-free;
+  /// the pre-fix class-blind Err arm charged). The charge shape — the
+  /// per-job window bump, the park verdict, the ledger row — and the
+  /// abort-charge-free truth are computed here. Live caller:
+  /// workerAborted (false). The mat-189 calibration passes true.
+  action abortSettleApply(d: str, charges: bool): bool = all {
+    val newCount = match jobs.get(d) {
+      | NoJob => 0
+      | SomeJob(j) => if (charges) j.matInfraCount + 1 else j.matInfraCount
+    }
+    val parks = and { charges, newCount >= MAT_BUDGET }
+    all {
+      jobs' = jobs.put(d, match jobs.get(d) {
+        | NoJob => NoJob
+        | SomeJob(j) => SomeJob({ ...j,
+            state: JPending,
+            parked: if (charges) parks else j.parked,
+            matInfraCount: newCount })
+      }),
+      view' = view.put(d, VPending(if (charges) parks else false)),
+      matInfraLedger' = if (charges)
+        matInfraLedger.put(d, matInfraLedger.get(d) + 1)
+      else matInfraLedger,
+      budgetSoundAll' = and {
+        budgetSoundAll,
+        charges implies (parks == (newCount >= MAT_BUDGET)),
+      },
+      abortChargeFree' = and { abortChargeFree, not(charges) },
+    },
+  }
+
+  /// Success-consumption settlement seat (C5/B4 + CE-17): the
+  /// coverage decision's input set is the CALLER's choice —
+  /// production reads the live §6 join; the pre-fix read was the
+  /// dead-inclusive stored union (the mat-f4 calibration's decision).
+  /// Both coverage latches and the vacuity latch are computed here
+  /// from the pre-state.
+  action consumeSettleApply(d: str, usedUnion: Set[str]): bool = all {
+    val covered = usedUnion.forall(o => present.get((d, o)))
+    val execId = match attempts.get(d) { | NoAttempt => 0 | OpenAttempt(a) => a.execId }
+    all {
+      jobs' = jobs.put(d, match jobs.get(d) {
+        | NoJob => NoJob
+        | SomeJob(j) => SomeJob({ ...j,
+            state: if (covered) JResolvedSuccess else JPending,
+            resolutionExec: if (covered) execId else j.resolutionExec })
+      }),
+      view' = if (covered) view.put(d, VNone) else view.put(d, VPending(false)),
+      nodeStatus' = if (covered) nodeStatus.put(d, NCompleted) else nodeStatus.put(d, NQueued),
+      attempts' = attempts.put(d, NoAttempt),
+      // delta 1 clear-mirror: success resolution consumes the mark.
+      topdownPruned' = if (covered) topdownPruned.put(d, false) else topdownPruned,
+      // CE-17 latch: coverage held over the LIVE union at the decision
+      // (identical to the decision itself when the caller passes the
+      // live join; the dead-union decision diverges exactly when a
+      // dead build's row covers what the live join does not).
+      covAtResolveAll' = and {
+        covAtResolveAll,
+        covered implies liveWantedCovered(d),
+      },
+      // C5/B4 latch: the decision set WAS the live join.
+      covLiveOnlyAll' = and {
+        covLiveOnlyAll,
+        usedUnion == liveWanted(d),
+      },
+      // A4 latch: the covered completion carried real width or real
+      // evidence.
+      noVacuousCoverageAll' = and {
+        noVacuousCoverageAll,
+        covered implies or {
+          liveWanted(d) != Set(),
+          OUTPUTS.exists(o => ingested.get((d, o)) or present.get((d, o))),
+        },
+      },
+    },
+  }
+
+  /// Stale-tenure job-write seat (F11): `fenceHonored` is the
+  /// CALLER's fence decision (production: the claims-floor fence
+  /// covers job-table writes uniformly). Honored => the write is
+  /// DISCARDED (the staleWriteDiscarded probe records the visit);
+  /// dishonored => the write APPLIES and the stale-apply truth is
+  /// computed here from the tenure pre-state. Live caller:
+  /// staleTenureWriteDiscarded (true). The mat-f11 calibration passes
+  /// false.
+  action staleWriteApply(d: str, fenceHonored: bool): bool = all {
+    jobs' = if (fenceHonored) jobs else jobs.put(d, match jobs.get(d) {
+      | NoJob => NoJob
+      | SomeJob(j) => SomeJob({ ...j, state: JResolvedFromSource, parked: false })
+    }),
+    view' = if (fenceHonored) view else view.put(d, VNone),
+    staleWriteDiscarded' = if (fenceHonored) true else staleWriteDiscarded,
+    staleJobWriteApplied' = or {
+      staleJobWriteApplied,
+      and { not(fenceHonored), leaseGen > 0 },
+    },
+  }
+
+  /// Creation dedup-slot seat (C-prime slot widening): `dedupHonored`
+  /// is the CALLER's index decision (production: the partial-unique
+  /// index refuses a second unresolved row). The widened-slot truth is
+  /// computed here from the pre-state. Live caller: createJob (true —
+  /// and its no-unresolved-job guard keeps the oracle quiet). The
+  /// mat-dedup-removed calibration passes false with the guard
+  /// dropped.
+  action dedupSlotApply(d: str, dedupHonored: bool): bool = all {
+    dupJob' = if (and { not(dedupHonored), hasUnresolvedJob(d) })
+      dupJob.put(d, true)
+    else dupJob,
+  }
+
+  /// Failover row-durability seat (delta 5 / A10): `dropsRows` is the
+  /// CALLER's durability decision (production: jobs are PG rows — a
+  /// failover cannot drop them). The drop truth is computed here from
+  /// the pre-state's pending population. Live caller: failover
+  /// (false). The mat-failover-drops-rows calibration passes true —
+  /// failoverPreservesJobs' first falsifier.
+  action failoverRowsApply(dropsRows: bool): bool = all {
+    jobs' = if (dropsRows) DRVS.mapBy(d => NoJob) else jobs,
+    failoverDroppedJobs' = or {
+      failoverDroppedJobs,
+      and { dropsRows, DRVS.exists(d => hasUnresolvedJob(d)) },
+    },
+  }
+
   // --- 8. actions ----------------------------------------------------------------
 
   /// §6: a build's merge writes (or REWRITES — the as-built upsert,
@@ -1233,7 +1398,12 @@ module materializationJob {
     all {
       jobs' = jobs.put(d, SomeJob({ ...freshJob, origin: origin, tenant: tenant })),
       view' = view.put(d, VPending(false)),
-      dupJob' = dupJob,
+      // R10: the widened-slot oracle routes through the dedup seat —
+      // the as-built decision honors the partial-unique index (and
+      // the no-unresolved-job guard above keeps the oracle quiet);
+      // the mat-dedup-removed calibration passes dedupHonored=false
+      // with the guard dropped.
+      dedupSlotApply(d, true),
       topdownPruned' = if (origin == OPruned) topdownPruned.put(d, true) else topdownPruned,
       nodeStatus' = if (origin == OStaleReset or origin == OReprobe)
         nodeStatus.put(d, NQueued)
@@ -1425,36 +1595,13 @@ module materializationJob {
       liveWanted(d) != Set(),
       OUTPUTS.exists(o => ingested.get((d, o)) or present.get((d, o))),
     },
-    val covered = liveWantedCovered(d)
-    val execId = match attempts.get(d) { | NoAttempt => 0 | OpenAttempt(a) => a.execId }
-    all {
-      jobs' = jobs.put(d, match jobs.get(d) {
-        | NoJob => NoJob
-        | SomeJob(j) => SomeJob({ ...j,
-            state: if (covered) JResolvedSuccess else JPending,
-            resolutionExec: if (covered) execId else j.resolutionExec })
-      }),
-      view' = if (covered) view.put(d, VNone) else view.put(d, VPending(false)),
-      nodeStatus' = if (covered) nodeStatus.put(d, NCompleted) else nodeStatus.put(d, NQueued),
-      attempts' = attempts.put(d, NoAttempt),
-      // delta 1 clear-mirror: success resolution consumes the mark.
-      topdownPruned' = if (covered) topdownPruned.put(d, false) else topdownPruned,
-      // CE-17 latch: coverage held at the decision (covered arm), and
-      // the decision ranged over the live-only union (structural).
-      covAtResolveAll' = and { covAtResolveAll, covered implies covered },
-      covLiveOnlyAll' = covLiveOnlyAll,
-      // A4 latch: the covered completion carried real width or real
-      // evidence (the guard above is the as-built fact; the
-      // mat-a4-vacuous-success override drops the guard and this latch
-      // records the vacuous completion).
-      noVacuousCoverageAll' = and {
-        noVacuousCoverageAll,
-        covered implies or {
-          liveWanted(d) != Set(),
-          OUTPUTS.exists(o => ingested.get((d, o)) or present.get((d, o))),
-        },
-      },
-    },
+    // R10: the settlement (job/view/status/mark + all three coverage
+    // latches) is the seat's; the as-built decision set is the live
+    // §6 join. The mat-f4 calibration routes the dead-inclusive
+    // stored union through the same seat (its decision is the only
+    // difference); mat-a4-vacuous-success keeps its own guard-dropped
+    // replica (its subject latch has this live writer).
+    consumeSettleApply(d, liveWanted(d)),
     deferUntil' = deferUntil, transientChargeFreeAll' = transientChargeFreeAll,
     closureCompleteAll' = closureCompleteAll, everContrib' = everContrib,
     leafReevalReleased' = leafReevalReleased,
@@ -1648,7 +1795,12 @@ module materializationJob {
       abortChargeFree' = abortChargeFree,
     },
     attempts' = attempts.put(d, NoAttempt),
-    nodeStatus' = nodeStatus.put(d, NQueued),
+    // R10: the re-arm status + the A2/318 release latch route through
+    // the seat — the as-built decision is the conservative NQueued
+    // restore (validate_transition_for_release's no-upgrade arm). The
+    // mat-318 calibration routes the forced Ready through the same
+    // seat.
+    releaseStatusApply(d, false),
     matInfraLedger' = matInfraLedger.put(d, matInfraLedger.get(d) + 1),
     dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, envUnchanged,
@@ -1659,7 +1811,7 @@ module materializationJob {
     tenureUnchanged,
     // ghostsUnchanged expanded: this charge edge writes the
     // budget-soundness latch (A3/067 — park applied iff the per-job
-    // window reached the budget).
+    // window reached the budget) and seats the release latch above.
     failFastCount' = failFastCount,
     ffJustifiedAll' = ffJustifiedAll, fsJustifiedAll' = fsJustifiedAll,
     fsReportSoundAll' = fsReportSoundAll, covAtResolveAll' = covAtResolveAll,
@@ -1667,7 +1819,6 @@ module materializationJob {
     creationResolvableAll' = creationResolvableAll,
     chargedAfterCancel' = chargedAfterCancel,
     claimOrigin' = claimOrigin,
-    requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
     carried' = carried,
     a4Unchanged,
   }
@@ -1915,17 +2066,36 @@ module materializationJob {
       | OpenAttempt(a) => a.kind == KMaterialization
     },
     match jobs.get(d) { | NoJob => false | SomeJob(j) => j.state == JClaimed },
-    jobs' = jobs.put(d, match jobs.get(d) {
-      | NoJob => NoJob
-      | SomeJob(j) => SomeJob({ ...j, state: JPending })
-    }),
-    view' = view.put(d, VPending(false)),
+    // R10: the charge-free close routes through the abort-settlement
+    // seat (charges=false — the Aborted intake's release_claim path;
+    // the mat-189 calibration routes charges=true through the same
+    // seat) and the origin-restore routes through the release seat
+    // (toReady exactly when the claim originated Ready — the A2/318
+    // contract over the claimOrigin witness).
+    abortSettleApply(d, false),
+    releaseStatusApply(d, claimOrigin.get(d) == NReady),
     attempts' = attempts.put(d, NoAttempt),
-    nodeStatus' = nodeStatus.put(d, claimOrigin.get(d)),
     topdownPruned' = topdownPruned,
     dupJob' = dupJob, execsMinted' = execsMinted,
-    relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
-    tenureUnchanged, ghostsUnchanged, a4Unchanged,
+    relUnchanged, storeUnchanged, envUnchanged,
+    // ledgerUnchanged expanded: the abort seat owns matInfraLedger
+    // (identity at charges=false).
+    matUnobtainableLedger' = matUnobtainableLedger,
+    buildCrashLedger' = buildCrashLedger,
+    establishCount' = establishCount, buildCrashEstablished' = buildCrashEstablished,
+    unobChargeBacked' = unobChargeBacked,
+    tenureUnchanged,
+    // ghostsUnchanged expanded: the seats own the release latch, the
+    // budget latch and the abort latch.
+    failFastCount' = failFastCount,
+    ffJustifiedAll' = ffJustifiedAll, fsJustifiedAll' = fsJustifiedAll,
+    fsReportSoundAll' = fsReportSoundAll, covAtResolveAll' = covAtResolveAll,
+    covLiveOnlyAll' = covLiveOnlyAll,
+    creationResolvableAll' = creationResolvableAll,
+    chargedAfterCancel' = chargedAfterCancel,
+    claimOrigin' = claimOrigin,
+    carried' = carried,
+    a4Unchanged,
   }
 
   /// Delta 3 arm 1: the per-tick park RE-EVALUATION
@@ -2095,10 +2265,12 @@ module materializationJob {
     view' = DRVS.mapBy(d => projView(jobs.get(d), attempts.get(d))),
     channelStale' = REPLICAS.mapBy(r => true),
     failedOver' = true,
-    // the pre/post ghost: durable rows are untouched (the frame); a
-    // row-dropping override would compute and latch a difference here.
-    failoverDroppedJobs' = failoverDroppedJobs,
-    jobs' = jobs, dupJob' = dupJob, attempts' = attempts,
+    // R10: row durability routes through the seat — the as-built
+    // decision is dropsRows=false (jobs are PG rows; the failover
+    // cannot touch them). The mat-failover-drops-rows calibration
+    // passes true and is failoverPreservesJobs' falsifier.
+    failoverRowsApply(false),
+    dupJob' = dupJob, attempts' = attempts,
     nodeStatus' = nodeStatus, topdownPruned' = topdownPruned,
     execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
@@ -2137,12 +2309,21 @@ module materializationJob {
     leaseGen > 0,
     hasUnresolvedJob(d),
     not(staleWriteDiscarded),
-    staleWriteDiscarded' = true,
-    leaseGen' = leaseGen, staleJobWriteApplied' = staleJobWriteApplied,
+    // R10: the fence decision routes through the seat — the as-built
+    // decision honors the claims-floor fence (the write is discarded;
+    // only the probe ghost records the visit). The mat-f11
+    // calibration routes fenceHonored=false through the same seat and
+    // the write applies.
+    staleWriteApply(d, true),
+    leaseGen' = leaseGen,
     channelStale' = channelStale, failedOver' = failedOver,
     claimAfterFailover' = claimAfterFailover,
     failoverDroppedJobs' = failoverDroppedJobs,
-    jobCoreUnchanged, relUnchanged, storeUnchanged, ledgerUnchanged,
+    // jobCoreUnchanged expanded: the seat owns jobs and view
+    // (identity at fenceHonored=true).
+    dupJob' = dupJob, attempts' = attempts, nodeStatus' = nodeStatus,
+    topdownPruned' = topdownPruned, execsMinted' = execsMinted,
+    relUnchanged, storeUnchanged, ledgerUnchanged,
     envUnchanged, ghostsUnchanged, a4Unchanged,
   }
 

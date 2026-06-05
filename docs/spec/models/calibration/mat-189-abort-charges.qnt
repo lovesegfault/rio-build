@@ -57,21 +57,14 @@ module matCalibAbortCharges {
       | NoJob => false
       | SomeJob(j) => j.state == JClaimed and j.matInfraCount < MAT_BUDGET + 2
     },
-    val newCount = match jobs.get(d) { | NoJob => 0 | SomeJob(j) => j.matInfraCount + 1 }
-    val parks = newCount >= MAT_BUDGET
-    all {
-      jobs' = jobs.put(d, match jobs.get(d) {
-        | NoJob => NoJob
-        | SomeJob(j) => SomeJob({ ...j, state: JPending, parked: parks, matInfraCount: newCount })
-      }),
-      view' = view.put(d, VPending(parks)),
-      budgetSoundAll' = and { budgetSoundAll, parks == (newCount >= MAT_BUDGET) },
-      // THE BUG: the abort drew the budget.
-      abortChargeFree' = false,
-    },
+    // THE BUG: the abort drew the budget — the charging decision,
+    // routed through the LIVE abort-settlement seat (R10/P5: the
+    // seat computes the charge shape and the abort latch; this
+    // override perturbs the decision only) and the conservative
+    // release through the live release seat.
+    abortSettleApply(d, true),
+    releaseStatusApply(d, false),
     attempts' = attempts.put(d, NoAttempt),
-    nodeStatus' = nodeStatus.put(d, NQueued),
-    matInfraLedger' = matInfraLedger.put(d, matInfraLedger.get(d) + 1),
     dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, envUnchanged,
     matUnobtainableLedger' = matUnobtainableLedger,
@@ -86,7 +79,6 @@ module matCalibAbortCharges {
     creationResolvableAll' = creationResolvableAll,
     chargedAfterCancel' = chargedAfterCancel,
     claimOrigin' = claimOrigin,
-    requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
     carried' = carried,
     a4Unchanged,
   }

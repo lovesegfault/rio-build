@@ -60,24 +60,11 @@ module matCalibF4DeadUnion {
       | OpenAttempt(a) => a.kind == KMaterialization and not(channelStale.get(a.instance))
     },
     match jobs.get(d) { | NoJob => false | SomeJob(j) => j.state == JClaimed },
-    val usedUnion = storedUnion(d)
-    val covered = usedUnion.forall(o => present.get((d, o)))
-    val execId = match attempts.get(d) { | NoAttempt => 0 | OpenAttempt(a) => a.execId }
-    all {
-      jobs' = jobs.put(d, match jobs.get(d) {
-        | NoJob => NoJob
-        | SomeJob(j) => SomeJob({ ...j,
-            state: if (covered) JResolvedSuccess else JPending,
-            resolutionExec: if (covered) execId else j.resolutionExec })
-      }),
-      view' = if (covered) view.put(d, VNone) else view.put(d, VPending(false)),
-      nodeStatus' = if (covered) nodeStatus.put(d, NCompleted) else nodeStatus.put(d, NQueued),
-      attempts' = attempts.put(d, NoAttempt),
-      topdownPruned' = if (covered) topdownPruned.put(d, false) else topdownPruned,
-      covAtResolveAll' = and { covAtResolveAll, covered implies liveWantedCovered(d) },
-      // production oracle: the decision set must be the live join.
-      covLiveOnlyAll' = and { covLiveOnlyAll, usedUnion == liveWanted(d) },
-    },
+    // THE BUG: the dead-inclusive stored union as the coverage
+    // decision set, routed through the LIVE settlement seat (R10/P5:
+    // the seat computes both coverage latches from the decision set;
+    // this override perturbs the decision only).
+    consumeSettleApply(d, storedUnion(d)),
     dupJob' = dupJob, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
     tenureUnchanged,
@@ -91,7 +78,13 @@ module matCalibF4DeadUnion {
     budgetSoundAll' = budgetSoundAll,
     abortChargeFree' = abortChargeFree,
     requeueReadyJustifiedAll' = requeueReadyJustifiedAll,
-    a4Unchanged,
+    // a4Unchanged expanded: the settlement seat owns the vacuity
+    // latch.
+    deferUntil' = deferUntil,
+    transientChargeFreeAll' = transientChargeFreeAll,
+    closureCompleteAll' = closureCompleteAll,
+    everContrib' = everContrib,
+    leafReevalReleased' = leafReevalReleased,
   }
 
   action calibStep = {

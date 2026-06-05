@@ -4832,6 +4832,20 @@ in
       step = "calibStep";
       witness = "unresolvedJobAlwaysArmed";
     };
+    # R10 (bughunt-2): the row-durability hypothetical — a failover
+    # drops unresolved job rows through the live failoverRowsApply
+    # seat (dropsRows=true). failoverPreservesJobs' first falsifier
+    # (P1: the invariant was untwinned in all seven regimes checking
+    # it). Measured 3.7s TLC; the default wall-clock budget carries
+    # two orders of headroom.
+    quint-materialization-calib-failover-drops-rows = mkQuintWitnessCheck {
+      name = "materialization-calib-failover-drops-rows";
+      spec = "calibration/mat-failover-drops-rows";
+      main = "matCalibFailoverDropsRows";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "failoverPreservesJobs";
+    };
     # B5(a): the dedup re-feed overwrites armament state (park/holder).
     quint-materialization-calib-b5a-refeed-overwrite = mkQuintWitnessCheck {
       name = "materialization-calib-b5a-refeed-overwrite";

@@ -68,13 +68,10 @@ module matCalib318RequeueForcesReady {
       view' = view.put(d, VPending(parks)),
     },
     attempts' = attempts.put(d, NoAttempt),
-    // THE BUG: forced Ready — the latch records the unjustified
-    // upgrade when the claim came from NQueued.
-    nodeStatus' = nodeStatus.put(d, NReady),
-    requeueReadyJustifiedAll' = and {
-      requeueReadyJustifiedAll,
-      claimOrigin.get(d) == NReady,
-    },
+    // THE BUG: the forced-Ready decision, routed through the LIVE
+    // release seat (R10/P5: the seat computes the latch from the
+    // claimOrigin witness; this override perturbs the decision only).
+    releaseStatusApply(d, true),
     matInfraLedger' = matInfraLedger.put(d, matInfraLedger.get(d) + 1),
     dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, envUnchanged,
