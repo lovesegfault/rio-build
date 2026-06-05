@@ -15,7 +15,7 @@ use super::TF_DIR;
 use crate::config::XtaskConfig;
 use crate::k8s::client as kube;
 use crate::k8s::provider::DeployOpts;
-use crate::k8s::{NS, ensure_namespaces, shared, status};
+use crate::k8s::{MIGRATE_JOB_LABEL, NS, ensure_namespaces, shared, status};
 use crate::{git, helm, tofu, ui};
 
 /// `pools[]` (helm list — replaced wholesale, hence one const).
@@ -90,10 +90,8 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     let store_arn = tf.get("store_iam_role_arn")?;
     let scheduler_arn = tf.get("scheduler_iam_role_arn")?;
     let bootstrap_arn = tf.get("bootstrap_iam_role_arn")?;
-    // Optional: tfstate from before the controller IRSA module
-    // (rds-db:connect for IAM-mode postgres) just skips the annotation
-    // — password-mode controller needs no AWS access.
-    let controller_arn = tf.get_opt("controller_iam_role_arn");
+    let pg_mode =
+        resolve_pg_deploy_mode(tf.get_opt("controller_iam_role_arn"), opts.pg_password_mode)?;
     let db_arn = tf.get("db_secret_arn")?;
     let db_host = tf.get("db_endpoint")?;
     let vpc_ipv6_cidr = tf.get("vpc_ipv6_cidr_block")?;
@@ -278,6 +276,13 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // 14×20=280 can still burst-saturate — TODO(P-new): bump
             // Aurora min_capacity OR cap componentScaler.store.max
             // against (rds_max_conns / pgMaxConnections).
+            // IAM-auth watch item: RDS caps NEW IAM connections at
+            // ~200/s cluster-wide; idle_timeout=60s churn regrows well
+            // under that at this scale. Tripwire =
+            // rio_pg_iam_mint_failures_total; if it fires, front
+            // Aurora with RDS Proxy (app keeps IAM, proxy holds the
+            // warm pool — ceiling becomes irrelevant). See
+            // rio-store/src/main.rs init_db_pool.
             .set("store.pgMaxConnections", "20")
             // I-147/I-150: production-scale resources. values.yaml defaults
             // stay small so VM-test k3s (2-node QEMU) can schedule; EKS
@@ -319,11 +324,19 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // rio-migrate is a plain Job, not a hook — it applies and
             // runs on every deploy regardless of this flag.
             .no_hooks(no_hooks);
-        if let Some(arn) = &controller_arn {
-            helm_cmd = helm_cmd.set(
-                r"controller.serviceAccount.annotations.eks\.amazonaws\.com/role-arn",
-                arn,
-            );
+        if let PgDeployMode::Iam { controller_arn } = &pg_mode {
+            // RDS IAM auth by default: the rio-migrate Job runs as
+            // the master and provisions the rio_app role + grants
+            // (ensure_roles) before app pods (re)start, so even a
+            // fresh cluster deploys directly in iam mode — no
+            // password-first transitional deploy. Chart default stays
+            // `password` for k3s/dev where there is no Aurora.
+            helm_cmd = helm_cmd
+                .set(
+                    r"controller.serviceAccount.annotations.eks\.amazonaws\.com/role-arn",
+                    controller_arn,
+                )
+                .set("postgres.authMode", "iam");
         }
         let r = helm_cmd.run().await;
         progress.abort();
@@ -370,6 +383,44 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     Ok(())
 }
 
+/// How the deploy configures postgres auth, decided from tfstate +
+/// the --pg-password-mode escape flag.
+#[derive(Debug, PartialEq, Eq)]
+enum PgDeployMode {
+    /// rds-db:connect IRSA infra present: set postgres.authMode=iam
+    /// and annotate the controller SA with its role.
+    Iam { controller_arn: String },
+    /// Explicitly requested via --pg-password-mode: keep the chart's
+    /// password default and skip the controller annotation entirely —
+    /// a password-mode controller needs no AWS access, and annotating
+    /// it anyway would grant an unused credential path.
+    Password,
+}
+
+/// IAM-mode postgres is the default; a tfstate predating the
+/// controller IRSA module (no `controller_iam_role_arn` output) is a
+/// HARD error, not a silent password fallback — falling back would
+/// re-open the master-rotation outage class while reporting success.
+/// The escape hatch for genuinely-old environments is the explicit
+/// flag. Pure (tfstate output pre-fetched, no helm wiring) so the
+/// decision table is unit-testable; only the thin call site shells.
+fn resolve_pg_deploy_mode(
+    controller_iam_role_arn: Option<String>,
+    pg_password_mode: bool,
+) -> Result<PgDeployMode> {
+    if pg_password_mode {
+        return Ok(PgDeployMode::Password);
+    }
+    match controller_iam_role_arn {
+        Some(controller_arn) => Ok(PgDeployMode::Iam { controller_arn }),
+        None => anyhow::bail!(
+            "tfstate has no controller_iam_role_arn (predates the IAM-auth \
+             infra); run `tofu apply` — or pass --pg-password-mode to \
+             deploy without IAM postgres auth"
+        ),
+    }
+}
+
 /// On deploy failure: dump migrate-Job status + last rio-migrate pod
 /// log tail. Best-effort — every command error is swallowed (we are
 /// already on the error path).
@@ -377,13 +428,13 @@ fn print_migrate_diagnostics() {
     let Ok(sh) = crate::sh::shell() else { return };
     if let Ok(jobs) = crate::sh::read(crate::sh::cmd!(
         sh,
-        "kubectl -n {NS} get jobs -l app.kubernetes.io/name=rio-migrate -o wide"
+        "kubectl -n {NS} get jobs -l {MIGRATE_JOB_LABEL} -o wide"
     )) {
         warn!("rio-migrate Jobs:\n{jobs}");
     }
     if let Ok(logs) = crate::sh::read(crate::sh::cmd!(
         sh,
-        "kubectl -n {NS} logs -l app.kubernetes.io/name=rio-migrate --tail=30 --prefix --ignore-errors"
+        "kubectl -n {NS} logs -l {MIGRATE_JOB_LABEL} --tail=30 --prefix --ignore-errors"
     )) {
         warn!("rio-migrate pod logs (tail):\n{logs}");
     }
@@ -570,5 +621,54 @@ async fn ec2nodeclass_resolved_amis(
             );
             std::collections::HashSet::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod pg_deploy_mode_tests {
+    use super::*;
+
+    #[test]
+    fn iam_when_irsa_infra_present() {
+        assert_eq!(
+            resolve_pg_deploy_mode(Some("arn:aws:iam::1:role/ctrl".into()), false).unwrap(),
+            PgDeployMode::Iam {
+                controller_arn: "arn:aws:iam::1:role/ctrl".into()
+            }
+        );
+    }
+
+    /// The escape flag wins even when the infra exists — an operator
+    /// debugging IAM auth must be able to force password mode, and
+    /// password mode must not annotate the controller (no AWS access
+    /// needed, no unused credential path).
+    #[test]
+    fn flag_forces_password_even_with_infra_present() {
+        assert_eq!(
+            resolve_pg_deploy_mode(Some("arn:aws:iam::1:role/ctrl".into()), true).unwrap(),
+            PgDeployMode::Password
+        );
+    }
+
+    #[test]
+    fn flag_allows_pre_iam_tfstate() {
+        assert_eq!(
+            resolve_pg_deploy_mode(None, true).unwrap(),
+            PgDeployMode::Password
+        );
+    }
+
+    /// The load-bearing case: pre-IAM tfstate without the flag must
+    /// HARD-fail naming both remedies — a silent password fallback
+    /// would re-open the master-rotation outage class while the
+    /// deploy reports success.
+    #[test]
+    fn pre_iam_tfstate_without_flag_is_hard_error_naming_both_remedies() {
+        let err = resolve_pg_deploy_mode(None, false).unwrap_err().to_string();
+        assert!(err.contains("tofu apply"), "must point at the fix: {err}");
+        assert!(
+            err.contains("--pg-password-mode"),
+            "must point at the escape hatch: {err}"
+        );
     }
 }
