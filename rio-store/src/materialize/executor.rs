@@ -80,10 +80,13 @@ pub async fn execute_job(ctx: &ExecutorContext, claimed: &ClaimedJob) -> Materia
 /// per ingested/verified path with CUMULATIVE byte counts across the
 /// job's whole closure walk (the sum of processed paths' NAR sizes so
 /// far). Monotone non-decreasing in `bytes_done`, and
-/// `bytes_done <= bytes_expected` at every call; the final call covers
-/// the whole closure. Display-only and droppable: the callback must be
-/// cheap and non-blocking (it runs on the walk); the caller forwards it
-/// to `ReportMaterializationProgress` fire-and-forget.
+/// `bytes_done <= bytes_expected` at every call — ENFORCED by
+/// [`MonotoneProgress`], the only constructor of emission sites
+/// (bug_159: within-path retry resets used to regress the counter);
+/// the final call covers the whole closure. Display-only and
+/// droppable: the callback must be cheap and non-blocking (it runs on
+/// the walk); the caller forwards it to
+/// `ReportMaterializationProgress` fire-and-forget.
 // r[impl store.materialize.executor+5]
 // r[impl obs.metric.store]
 pub async fn execute_job_with_progress(
@@ -143,6 +146,80 @@ pub(crate) fn outcome_label(outcome: Option<&materialization_outcome::Outcome>) 
     }
 }
 
+/// The pure clamp law behind [`MonotoneProgress`] (bug_159): given
+/// the previous job-level high-water mark and an absolute candidate
+/// report, the emitted pair is `done = max(high_water, done)`,
+/// `expected = max(expected, done)` — emitted `done` never regresses
+/// and `done <= expected` holds at every call, over ARBITRARY
+/// candidate sequences (within-path retry resets are just smaller
+/// candidates). Proptest-swept below.
+fn clamp_progress(high_water: u64, done: u64, expected: u64) -> (u64, u64) {
+    let emit_done = high_water.max(done);
+    let emit_expected = expected.max(emit_done);
+    (emit_done, emit_expected)
+}
+
+/// bug_159: the job-level monotone progress adapter — the ONLY
+/// constructor of per-path progress callbacks (the raw job callback is
+/// moved in and private, so an unclamped emission site is
+/// unwritable). Owns the job's high-water mark and routes EVERY
+/// emission (per-path streaming, path-completed ticks) through
+/// [`clamp_progress`].
+///
+/// Why: the documented contract on [`execute_job_with_progress`] is
+/// "monotone non-decreasing in `bytes_done`, `bytes_done <=
+/// bytes_expected` at every call" — but the per-fetch byte counter is
+/// local to each `fetch_nar` attempt, so a stall failover to the next
+/// upstream (substitute.rs "download stalled, trying next") or a
+/// per-tenant retry restarted `done` at 0 and the pre-fix adapter
+/// forwarded `base + done` raw: `bytes_done` regressed below an
+/// already-reported value. Monotonicity now lives at the type that
+/// owns the contract, not as discipline at each call site.
+// r[impl store.materialize.progress-monotone]
+struct MonotoneProgress<F: Fn(u64, u64, &str) + Send + Sync + 'static> {
+    on_progress: std::sync::Arc<F>,
+    /// Job-level emitted-`done` high-water mark. Atomic because the
+    /// per-path callbacks are `Fn + Send + Sync` by the substituter's
+    /// callback contract; `fetch_max` keeps clamp-and-store one
+    /// operation.
+    high_water: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<F: Fn(u64, u64, &str) + Send + Sync + 'static> MonotoneProgress<F> {
+    fn new(on_progress: F) -> Self {
+        MonotoneProgress {
+            on_progress: std::sync::Arc::new(on_progress),
+            high_water: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Clamp an ABSOLUTE candidate report and emit it.
+    fn emit(&self, done: u64, expected: u64, uri: &str) {
+        let prev = self
+            .high_water
+            .fetch_max(done, std::sync::atomic::Ordering::SeqCst);
+        let (d, e) = clamp_progress(prev, done, expected);
+        (self.on_progress)(d, e, uri);
+    }
+
+    /// The per-path callback for a path starting at cumulative `base`
+    /// bytes (merged_bug_195: `done`/`expected` arrive RELATIVE to the
+    /// in-flight path). The only way to build one.
+    fn per_path(&self, base: u64) -> impl Fn(u64, u64, &str) + Send + Sync + 'static {
+        let this = MonotoneProgress {
+            on_progress: std::sync::Arc::clone(&self.on_progress),
+            high_water: std::sync::Arc::clone(&self.high_water),
+        };
+        move |done: u64, expected: u64, uri: &str| {
+            this.emit(
+                base.saturating_add(done),
+                base.saturating_add(expected),
+                uri,
+            );
+        }
+    }
+}
+
 /// The walk body behind [`execute_job_with_progress`] (split so the
 /// outcome counter has a single increment site over every return path).
 async fn execute_job_inner(
@@ -150,10 +227,11 @@ async fn execute_job_inner(
     claimed: &ClaimedJob,
     on_progress: impl Fn(u64, u64, &str) + Send + Sync + 'static,
 ) -> MaterializationOutcome {
-    // `SubstProgressFn` is `dyn Fn + 'static` (type-alias default
-    // lifetime), so the per-path adapters below must OWN their handle
-    // to the job-level callback — one Arc, cloned per path.
-    let on_progress = std::sync::Arc::new(on_progress);
+    // bug_159: every emission goes through the monotone adapter — the
+    // raw callback is moved in, so an unclamped site is unwritable.
+    // (`SubstProgressFn` is `dyn Fn + 'static`, so the per-path
+    // closures own Arc handles, cloned per path.)
+    let progress = MonotoneProgress::new(on_progress);
     // ── 1. Tenant re-resolution (AS-4, live-interest-first; PLURAL
     //    per merged_bug_028 / owner Q2: any interested tenant's
     //    upstreams may serve, the job fails only when none can) ──────
@@ -271,7 +349,7 @@ async fn execute_job_inner(
                     }
                     verified.push(path.clone());
                     completed_bytes = completed_bytes.saturating_add(info.nar_size);
-                    on_progress(completed_bytes, completed_bytes, "");
+                    progress.emit(completed_bytes, completed_bytes, "");
                     for reference in &info.references {
                         let r = reference.as_str().to_string();
                         if r != path && !visited.contains(&r) {
@@ -290,17 +368,12 @@ async fn execute_job_inner(
             // body fetch — `expected` = completed + the declared
             // NarSize (known before the body), `done` = completed +
             // streamed-so-far, `uri` = the serving upstream.
-            let base = completed_bytes;
-            let per_path_progress = {
-                let on_progress = on_progress.clone();
-                move |done: u64, expected: u64, uri: &str| {
-                    on_progress(
-                        base.saturating_add(done),
-                        base.saturating_add(expected),
-                        uri,
-                    );
-                }
-            };
+            // bug_159: minted by the adapter — the only constructor of
+            // per-path callbacks; a stall-failover counter reset
+            // (substitute.rs retries the next upstream with a fresh
+            // byte counter) clamps at the job high-water instead of
+            // regressing below an already-reported value.
+            let per_path_progress = progress.per_path(completed_bytes);
             // merged_bug_028 / owner Q2 + merged_bug_133: try EVERY
             // interested tenant's upstream view until one serves the
             // path. The loop body ONLY pushes evidence cells (a hit
@@ -379,7 +452,7 @@ async fn execute_job_inner(
                     // gateway omits the "from <uri>" suffix when the
                     // field is empty.
                     completed_bytes = completed_bytes.saturating_add(path_info.nar_size);
-                    on_progress(completed_bytes, completed_bytes, "");
+                    progress.emit(completed_bytes, completed_bytes, "");
                     // Extend the frontier with the narinfo references —
                     // the closure-completeness obligation.
                     for reference in &path_info.references {
@@ -2603,6 +2676,68 @@ mod tests {
             outcome_infra(&outcome).is_some(),
             "an unconfirmable tenant view must report infra, got {outcome:?}"
         );
+    }
+
+    // ── bug_159: monotone progress ────────────────────────────────────
+
+    // r[verify store.materialize.progress-monotone]
+    /// bug_159: the stall-failover regression trace. Path A completes
+    /// at 100 cumulative; path B (base 100) streams to 120 relative,
+    /// the download stalls, and the failover attempt restarts the
+    /// per-fetch counter at 0 — the pre-fix adapter forwarded
+    /// base+done raw and bytes_done regressed below the
+    /// already-reported value. RED (strawman: clamp bypassed, raw
+    /// forward): the emitted sequence carried (110, 210) after
+    /// (220, 300) — assert_eq! sequence mismatch at the reset event.
+    #[test]
+    fn monotone_progress_clamps_stall_failover_resets() {
+        use std::sync::{Arc, Mutex};
+        let got: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
+        let sink = Arc::clone(&got);
+        let progress = MonotoneProgress::new(move |d: u64, e: u64, _u: &str| {
+            sink.lock().unwrap().push((d, e));
+        });
+
+        progress.emit(100, 100, ""); // path A fully processed
+        let cb = progress.per_path(100); // path B starts at base=100
+        cb(120, 200, "u1"); // attempt 1 streams 120 of 200
+        cb(10, 200, "u2"); // stall failover: counter RESET to 10
+        cb(180, 200, "u2"); // attempt 2 catches up past the mark
+        progress.emit(300, 300, ""); // path B fully processed
+
+        let events = got.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![(100, 100), (220, 300), (220, 300), (280, 300), (300, 300)],
+            "reset clamps at the high-water; catch-up resumes"
+        );
+        let mut last = 0u64;
+        for (d, e) in events {
+            assert!(d >= last, "emitted done regressed: {d} after {last}");
+            assert!(d <= e, "done {d} > expected {e}");
+            last = d;
+        }
+    }
+
+    proptest::proptest! {
+        // r[verify store.materialize.progress-monotone]
+        /// The pure clamp law over ARBITRARY candidate sequences
+        /// (within-path resets are just smaller candidates): emitted
+        /// done is non-decreasing and done <= expected at every step.
+        #[test]
+        fn clamp_progress_monotone_over_arbitrary_traces(
+            events in proptest::collection::vec((0u64..1_000_000, 0u64..1_000_000), 1..100)
+        ) {
+            let mut hw = 0u64;
+            let mut last = 0u64;
+            for (done, expected) in events {
+                let (d, e) = clamp_progress(hw, done, expected);
+                hw = hw.max(d);
+                proptest::prop_assert!(d >= last, "regressed: {} after {}", d, last);
+                proptest::prop_assert!(d <= e, "done {} > expected {}", d, e);
+                last = d;
+            }
+        }
     }
 
     // ── bug_244: outcome-label alphabet drift gate ────────────────────

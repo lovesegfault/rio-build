@@ -1232,6 +1232,23 @@ tenant turned an obtainable path into InfraFailure. Charging evidence still
 outranks back-off advice at the fold (matching the per-upstream loop's
 ordering one level down), and the transient lane still closes uncharged.
 
+#r("store.materialize.progress-monotone")[
+  Every materialization progress emission MUST route through a
+  job-level monotone adapter that owns the high-water mark and is the
+  ONLY constructor of per-path progress callbacks: emitted
+  `bytes_done` MUST be non-decreasing across the job and
+  `bytes_done <= bytes_expected` MUST hold at every call, for every
+  candidate sequence including within-path retry resets.
+]
+The per-fetch byte counter is local to each download attempt, so a stall
+failover to the next upstream (or a per-tenant retry) restarts it at
+zero; the pre-fix per-path adapter forwarded `base + done` raw and the
+documented monotone contract was violated on exactly the traces the
+stall-failover machinery exists to produce. The clamp law is a pure
+function (`done' = max(high_water, done)`, `expected' = max(expected,
+done')`), proptest-swept over arbitrary candidate traces; the adapter
+moves the raw callback in, so an unclamped emission site is unwritable.
+
 #r("store.materialize.worker-identity")[
   The executor's per-worker wire identity MUST be carried by a
   validated DNS-1123 label type whose sanitizer budgets the worker
