@@ -31,9 +31,10 @@ pub(crate) struct Args {
     exec_id: Option<String>,
     /// Tenant session token (JWT) presented to the store. Required
     /// when the store has a JWT pubkey configured: `TailLog` is
-    /// tenant-authenticated and ownership-checked (the gateway and
-    /// dashboard send their session tokens automatically; direct CLI
-    /// reads supply one here).
+    /// tenant-authenticated and ownership-checked (the gateway relays
+    /// the watching caller's token automatically; the dashboard is
+    /// registry-declared keyless and shows a sign-in-required notice
+    /// instead; direct CLI reads supply one here).
     #[arg(long, env = "RIO_TENANT_TOKEN")]
     tenant_token: Option<String>,
 }

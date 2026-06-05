@@ -83,15 +83,25 @@ export function visitChunk(
 /// `gapObserved` cause (the gateway's reopen-once-at-gap discipline):
 /// it talks to the store directly and renders the gap row inline
 /// instead — `visitChunk`'s `gapThenServe` IS its disclosure.
-export type TailStopCause = 'naturalEnd' | 'transportErr' | 'openFailed';
+///
+/// `authRequired` is likewise dashboard-only (no kernel mirror): the
+/// store demanded credentials the registry-declared-KeylessOnly
+/// dashboard does not hold (merged_bug_108, owner decision Q1
+/// 2026-06-04). The gateway relay never sees this shape as a relay
+/// decision — it forwards the watching caller's own token, so an auth
+/// failure there is the caller's grpc status, not a reconnect verdict.
+export type TailStopCause = 'naturalEnd' | 'transportErr' | 'openFailed' | 'authRequired';
 
 export type TailVerdict = 'reopen' | 'exit';
 
 /// The relay exit law, mirrored from `rio_log_kernel::tail_next`:
-/// **exit iff the grace budget is spent, or the stream ended naturally
-/// with the derivation terminal and the served log complete.** Every
-/// other shape re-opens. "Give up with grace unspent and the log
-/// incomplete" is unrepresentable.
+/// **exit iff the grace budget is spent, the stream ended naturally
+/// with the derivation terminal and the served log complete, or the
+/// store demanded credentials (`authRequired`).** Every other shape
+/// re-opens. "Give up with grace unspent and the log incomplete" is
+/// unrepresentable — except by the store's own deny, which no amount
+/// of reconnecting heals (r[impl store.log.consumer-registry]: the
+/// terminal auth state is the KeylessOnly posture's mandated surface).
 export function tailNext(
   cause: TailStopCause,
   terminal: boolean,
@@ -105,6 +115,8 @@ export function tailNext(
     case 'transportErr':
     case 'openFailed':
       return 'reopen';
+    case 'authRequired':
+      return 'exit';
     default:
       return assertNever(cause);
   }

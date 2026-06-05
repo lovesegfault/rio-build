@@ -16,18 +16,39 @@
 use http::{HeaderName, Method};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+/// Credential headers a browser-resident caller may need to attach to
+/// gRPC-Web requests (merged_bug_108). The CORS `allow_headers` list is
+/// DERIVED from this set — a credential header added here is allowed
+/// in the same edit, so "the SPA holds a token the preflight refuses
+/// to let it send" is no longer writable. Today: the tenant session
+/// token (`TailLog`/`TenantQuota` are tenant-authenticated; the
+/// dashboard itself is registry-declared KeylessOnly, so this entry is
+/// the enabling work for any later-funded dashboard credential, not a
+/// live send).
+// r[impl store.log.consumer-registry]
+pub const BROWSER_CREDENTIAL_HEADERS: &[&str] = &[crate::grpc::TENANT_TOKEN_HEADER];
+
 /// Build the dashboard CORS layer from a comma-separated origin list
 /// (helm renders `dashboard.cors.allowOrigins | join ","` into both
 /// services' env).
 pub fn dashboard_cors_layer(cors_allow_origins: &str) -> CorsLayer {
+    // Transport headers connect-web always sends, plus the derived
+    // browser-credential set.
+    let allow = [
+        HeaderName::from_static("content-type"),
+        HeaderName::from_static("x-grpc-web"),
+        HeaderName::from_static("x-user-agent"),
+    ]
+    .into_iter()
+    .chain(
+        BROWSER_CREDENTIAL_HEADERS
+            .iter()
+            .map(|h| HeaderName::from_static(h)),
+    );
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(parse_cors_origins(cors_allow_origins)))
         .allow_methods([Method::POST, Method::OPTIONS])
-        .allow_headers([
-            HeaderName::from_static("content-type"),
-            HeaderName::from_static("x-grpc-web"),
-            HeaderName::from_static("x-user-agent"),
-        ])
+        .allow_headers(allow.collect::<Vec<_>>())
         .expose_headers([
             HeaderName::from_static("grpc-status"),
             HeaderName::from_static("grpc-message"),
@@ -58,6 +79,50 @@ pub fn parse_cors_origins(raw: &str) -> Vec<http::HeaderValue> {
 mod tests {
     use super::*;
     use http::HeaderValue;
+
+    /// The real browser handshake (merged_bug_108): an OPTIONS
+    /// preflight asking to send the tenant session token must be
+    /// granted — `allow_headers` is DERIVED from
+    /// [`BROWSER_CREDENTIAL_HEADERS`], so adding a browser credential
+    /// header cannot silently miss the CORS contract again.
+    ///
+    /// RED (pre-fix): `access-control-allow-headers` listed only
+    /// content-type/x-grpc-web/x-user-agent — the browser refused to
+    /// send `x-rio-tenant-token`, so a credentialed dashboard could
+    /// never have worked even with a token in hand.
+    // r[verify store.log.consumer-registry]
+    #[tokio::test]
+    async fn preflight_grants_tenant_token_header() {
+        use tower::{Layer, ServiceExt};
+        let layer = dashboard_cors_layer("http://dash.example");
+        let svc = layer.layer(tower::service_fn(
+            |_req: http::Request<axum::body::Body>| async {
+                Ok::<_, std::convert::Infallible>(http::Response::new(axum::body::Body::empty()))
+            },
+        ));
+        let req = http::Request::builder()
+            .method(http::Method::OPTIONS)
+            .uri("/rio.store.LogService/TailLog")
+            .header("origin", "http://dash.example")
+            .header("access-control-request-method", "POST")
+            .header(
+                "access-control-request-headers",
+                crate::grpc::TENANT_TOKEN_HEADER,
+            )
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = svc.oneshot(req).await.unwrap();
+        let allowed = resp
+            .headers()
+            .get("access-control-allow-headers")
+            .map(|v| v.to_str().unwrap_or("").to_ascii_lowercase())
+            .unwrap_or_default();
+        assert!(
+            allowed.contains(crate::grpc::TENANT_TOKEN_HEADER),
+            "preflight must allow {}; got allow-headers={allowed:?}",
+            crate::grpc::TENANT_TOKEN_HEADER
+        );
+    }
 
     /// Moved verbatim from rio-scheduler (the contract's previous
     /// home) when the layer was single-sourced.

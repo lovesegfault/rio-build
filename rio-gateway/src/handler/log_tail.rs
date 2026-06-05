@@ -380,7 +380,8 @@ async fn run_tail(
             follow: true,
         });
         // Forward the watching caller's tenant token — the store
-        // verifies it and checks derivation ownership (bug_290).
+        // verifies it and checks build-membership ownership
+        // (bug_290; store.log.tail-ownership).
         if let Some(token) = jwt_token.as_deref()
             && let Ok(value) = token.parse()
         {

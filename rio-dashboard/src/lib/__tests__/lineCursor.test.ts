@@ -137,6 +137,20 @@ describe('tailNext', () => {
       }
     }
   });
+
+  // r[verify store.log.consumer-registry]
+  it('authRequired exits every cell — auth deny does not heal by retry', () => {
+    for (const terminal of [false, true]) {
+      for (const graceExpired of [false, true]) {
+        for (const servedComplete of [false, true]) {
+          expect(
+            tailNext('authRequired', terminal, graceExpired, servedComplete),
+            `tailNext(authRequired, ${terminal}, ${graceExpired}, ${servedComplete})`,
+          ).toBe('exit');
+        }
+      }
+    }
+  });
 });
 
 // r[verify dash.stream.reopen-pacing]

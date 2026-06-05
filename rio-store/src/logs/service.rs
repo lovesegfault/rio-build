@@ -25,7 +25,9 @@
 //! swept-assignment arm keyed on the execution's own recorded hash;
 //! deny is absence-shaped — see [`tail::authorize_tail`]). The
 //! gateway relay forwards the watching caller's session token; the
-//! dashboard sends its tenant session token over gRPC-Web; `rio-cli
+//! dashboard is registry-declared KeylessOnly (owner decision Q1,
+//! 2026-06-04 — its Logs tab surfaces the terminal `authRequired`
+//! state in jwt-enabled deployments); `rio-cli
 //! logs` sends `--tenant-token`/`RIO_TENANT_TOKEN`. Builder/fetcher
 //! network policy pins an L7 allow-list that excludes `TailLog`, so an
 //! untrusted build cannot even reach the method. (The pre-authz

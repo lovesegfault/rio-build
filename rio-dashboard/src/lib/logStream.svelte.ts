@@ -86,6 +86,10 @@ export type LogStream = {
   /** Interior gaps observed (gap rows pushed). Drives the banner split:
    * interior gaps vs missing tail are different failure stories. */
   readonly gapCount: number;
+  /** The store demanded credentials the KeylessOnly dashboard does not
+   * hold (terminal — never retried). The viewer renders the
+   * sign-in-required notice instead of the incomplete-log banner. */
+  readonly authRequired: boolean;
   destroy: () => void;
 };
 
@@ -136,6 +140,7 @@ export function createLogStream(
   let droppedLines = $state(0);
   let incomplete = $state(false);
   let gapCount = $state(0);
+  let authRequired = $state(false);
   const isTerminal = opts?.isTerminal ?? (() => false);
   const ctrl = new AbortController();
 
@@ -258,7 +263,14 @@ export function createLogStream(
         }
         lastErr = e instanceof Error ? e : new Error(String(e));
         const code = ConnectError.from(e).code;
-        if (!everReceived && code === Code.NotFound) {
+        if (code === Code.Unauthenticated || code === Code.PermissionDenied) {
+          // The store demanded credentials. The dashboard is
+          // registry-declared KeylessOnly (merged_bug_108, owner
+          // decision Q1 2026-06-04) — terminal, never retried: an auth
+          // deny does not heal by reconnecting, and the pre-fix
+          // `openFailed` classification polled the store forever.
+          cause = 'authRequired';
+        } else if (!everReceived && code === Code.NotFound) {
           // The execution/manifest may simply not exist yet (the build
           // was just dispatched; the first chunk is still in flight to
           // the store). Mirrors the gateway relay's NotFound-retryable
@@ -282,7 +294,12 @@ export function createLogStream(
         // ended cleanly. A hard-down store with nothing rendered also
         // surfaces the last transport error.
         incomplete = !servedComplete;
-        if (!servedComplete && rows.length === 0 && lastErr !== null) {
+        if (cause === 'authRequired') {
+          // The terminal auth-required surface: the viewer renders the
+          // sign-in notice, not the incomplete-log banner heuristics.
+          authRequired = true;
+          err = lastErr;
+        } else if (!servedComplete && rows.length === 0 && lastErr !== null) {
           err = lastErr;
         }
         done = true;
@@ -324,6 +341,9 @@ export function createLogStream(
     },
     get gapCount() {
       return gapCount;
+    },
+    get authRequired() {
+      return authRequired;
     },
     destroy: () => ctrl.abort(),
   };

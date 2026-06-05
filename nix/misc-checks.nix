@@ -678,6 +678,52 @@ in
         touch $out
       '';
 
+  # bughunt2 slot 4 (merged_bug_108): the consumer registry
+  # (rio-store/src/authz.rs METHOD_CONSUMERS) declares every production
+  # surface of the tenant-authenticated store methods with a grep
+  # anchor. This check pins the anchors against the real files — a
+  # renamed or deleted consumer breaks here instead of silently
+  # rotting the registry. Pairing is positional (anchor_file then
+  # anchor_symbol per struct literal, enforced by a count equality).
+  consumer-registry-anchors =
+    pkgs.runCommand "rio-consumer-registry-anchors"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            ../rio-store/src/authz.rs
+            ../rio-gateway/src/handler/log_tail.rs
+            ../rio-gateway/src/quota.rs
+            ../rio-cli/src/logs.rs
+            ../rio-dashboard/src/lib/logStream.svelte.ts
+          ];
+        };
+        nativeBuildInputs = [ pkgs.ripgrep ];
+      }
+      ''
+        set +o pipefail
+        reg=$src/rio-store/src/authz.rs
+        mapfile -t files < <(rg -o 'anchor_file: "([^"]+)"' -r '$1' "$reg")
+        mapfile -t symbols < <(rg -o 'anchor_symbol: "([^"]+)"' -r '$1' "$reg")
+        if [[ ''${#files[@]} -lt 4 || ''${#files[@]} -ne ''${#symbols[@]} ]]; then
+          echo "FAIL: registry parse drift (''${#files[@]} files vs ''${#symbols[@]} symbols)" >&2
+          exit 1
+        fi
+        fail=0
+        for i in "''${!files[@]}"; do
+          f=''${files[$i]}; sym=''${symbols[$i]}
+          if [[ ! -f "$src/$f" ]]; then
+            echo "FAIL: METHOD_CONSUMERS anchor_file $f does not exist" >&2
+            fail=1
+          elif ! rg -q -F "$sym" "$src/$f"; then
+            echo "FAIL: anchor symbol $sym not found in $f (consumer moved/renamed?)" >&2
+            fail=1
+          fi
+        done
+        [[ $fail -eq 0 ]]
+        touch $out
+      '';
+
   # bughunt2 slot 4 (merged_bug_064): derivations.tenant_id was never
   # production-written (migration 095 census, M_095) and is DROPPED;
   # ownership is build-membership over builds.tenant_id

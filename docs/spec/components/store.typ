@@ -1592,6 +1592,30 @@ narrowing). Keyless deployments (`tenant = None`) keep the
 distinguishable resolution errors — there is no claims-bearing caller to
 oracle.
 
+#r("store.log.consumer-registry")[
+  Every production consumer surface of the store's tenant-authenticated
+  log/quota methods MUST be declared in the consumer registry
+  (`METHOD_CONSUMERS`) with its credential source and a greppable code
+  anchor. A keyless surface MUST carry an explicit dated owner-decision
+  rationale, and MUST surface a terminal auth-required state instead of
+  retrying when the store demands credentials. Browser-sent credential
+  headers MUST be derived into the CORS `allow_headers` list from the
+  single shared `BROWSER_CREDENTIAL_HEADERS` set.
+]
+
+Strict `TailLog` made three consumer surfaces' credential posture
+load-bearing, but nothing declared what each surface sends: the
+dashboard silently broke in jwt-enabled deployments (and retried the
+store forever on every deny), and the CORS layer did not even allow the
+tenant-token header a credentialed browser caller would need — two
+halves of the same undeclared-consumer failure. The registry makes the
+posture reviewable (the dashboard's KeylessOnly row cites owner decision
+Q1, 2026-06-04 — the Logs tab stays keyless until a dashboard credential
+is funded under its own decision; the `authRequired` terminal stream
+state is the declared surface of that break), the anchors make registry
+rot a CI failure, and the header derivation makes "SPA holds a token the
+preflight refuses" unwritable.
+
 #r("store.authz.declared-verifier")[
   A credential class's transport verdict MUST be derived only from the
   verifier family the class declares: the verdict arms receive single-knob

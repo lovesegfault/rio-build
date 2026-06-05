@@ -243,10 +243,100 @@ pub const METHOD_CREDENTIALS: &[(&str, CredentialClass)] = &[
         CredentialClass::AssignmentToken,
     ),
     // TailLog: tenant reads only (owner decision, bug_290). The
-    // handler additionally checks derivation OWNERSHIP against the
-    // verified claims — this row pins that an unauthenticated caller
-    // never reaches that handler when JWT is configured.
+    // handler additionally requires build-membership OWNERSHIP of the
+    // requested execution (store.log.tail-ownership; authorize_tail)
+    // — this row pins that an unauthenticated caller never reaches
+    // that handler when JWT is configured.
     ("/rio.store.LogService/TailLog", CredentialClass::TenantJwt),
+];
+
+/// Which production surface consumes a tenant-authenticated store
+/// method (merged_bug_108).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConsumerSurface {
+    Gateway,
+    Cli,
+    Dashboard,
+}
+
+/// How that surface obtains the credential the method's class demands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredSource {
+    /// Relays the calling tenant's own JWT (the gateway pattern: the
+    /// watching/submitting caller's token travels with the request).
+    CallerJwtRelay,
+    /// Operator-supplied tenant token (CLI flag / env var).
+    TenantTokenFlag,
+    /// Sends no credential. MUST carry the owner-decision rationale —
+    /// a keyless surface against a keyed method is a broken surface in
+    /// every jwt-enabled deployment, and that breakage must be a
+    /// signed, declared posture (not an accident discovered in prod).
+    KeylessOnly { rationale: &'static str },
+}
+
+/// One declared consumer of a tenant-authenticated store method.
+pub struct MethodConsumer {
+    /// Method name (the `METHOD_CREDENTIALS` path suffix).
+    pub method: &'static str,
+    pub surface: ConsumerSurface,
+    pub cred_source: CredSource,
+    /// Workspace-relative file the consumer lives in. The
+    /// `consumer-registry-anchors` misc-check greps `anchor_symbol`
+    /// in this file — a renamed/removed consumer breaks the check, so
+    /// the registry cannot silently rot.
+    pub anchor_file: &'static str,
+    pub anchor_symbol: &'static str,
+}
+
+/// The consumer registry: every production surface that calls a
+/// tenant-authenticated LogService/StoreService method, with its
+/// credential source declared. Tests pin the registry laws (KeylessOnly
+/// requires a rationale; rows unique; the dashboard's Logs tab stays
+/// KeylessOnly per owner decision Q1, 2026-06-04); the
+/// `consumer-registry-anchors` misc-check pins the anchors against the
+/// real files.
+// r[impl store.log.consumer-registry]
+pub const METHOD_CONSUMERS: &[MethodConsumer] = &[
+    MethodConsumer {
+        method: "TailLog",
+        surface: ConsumerSurface::Gateway,
+        cred_source: CredSource::CallerJwtRelay,
+        // Forwards the watching caller's tenant token on the relayed
+        // TailLog open.
+        anchor_file: "rio-gateway/src/handler/log_tail.rs",
+        anchor_symbol: "TENANT_TOKEN_HEADER",
+    },
+    MethodConsumer {
+        method: "TailLog",
+        surface: ConsumerSurface::Cli,
+        cred_source: CredSource::TenantTokenFlag,
+        anchor_file: "rio-cli/src/logs.rs",
+        anchor_symbol: "RIO_TENANT_TOKEN",
+    },
+    MethodConsumer {
+        method: "TailLog",
+        surface: ConsumerSurface::Dashboard,
+        cred_source: CredSource::KeylessOnly {
+            rationale: "owner decision Q1 (2026-06-04), extending bug_290 \
+                 (tenant JWT + ownership, no service bypass): no dashboard \
+                 credential is funded this wave, so the Logs tab breaks in \
+                 every jwt-enabled deployment — declared here, surfaced as \
+                 the terminal authRequired stream state (no retry). A \
+                 session-token exchange would restore only a per-tenant \
+                 view; the cross-tenant operator surface needs \
+                 operator-scope claims under its own owner decision.",
+        },
+        anchor_file: "rio-dashboard/src/lib/logStream.svelte.ts",
+        anchor_symbol: "authRequired",
+    },
+    MethodConsumer {
+        method: "TenantQuota",
+        surface: ConsumerSurface::Gateway,
+        cred_source: CredSource::CallerJwtRelay,
+        // Forwards the submitting tenant's JWT on the quota probe.
+        anchor_file: "rio-gateway/src/quota.rs",
+        anchor_symbol: "with_jwt",
+    },
 ];
 
 /// Class lookup by full gRPC path (`/package.Service/Method`).
@@ -474,6 +564,65 @@ mod tests {
     }
 
     const SVC_KEY: &[u8] = b"authz-service-token-test-key-32b";
+
+    /// Registry laws (merged_bug_108): keyless surfaces carry a dated
+    /// owner-decision rationale; (method, surface) rows are unique;
+    /// every registered method is a declared METHOD_CREDENTIALS row.
+    // r[verify store.log.consumer-registry]
+    #[test]
+    fn consumer_registry_laws() {
+        let mut seen = std::collections::HashSet::new();
+        for c in METHOD_CONSUMERS {
+            assert!(
+                seen.insert((c.method, c.surface)),
+                "duplicate consumer row: {} / {:?}",
+                c.method,
+                c.surface
+            );
+            if let CredSource::KeylessOnly { rationale } = c.cred_source {
+                assert!(
+                    rationale.contains("owner decision") && rationale.contains("20"),
+                    "KeylessOnly row {}/{:?} must cite a dated owner decision",
+                    c.method,
+                    c.surface
+                );
+            }
+            assert!(
+                METHOD_CREDENTIALS
+                    .iter()
+                    .any(|(path, _)| path.ends_with(&format!("/{}", c.method))),
+                "consumer row {} names a method with no METHOD_CREDENTIALS row",
+                c.method
+            );
+            assert!(
+                !c.anchor_file.is_empty() && !c.anchor_symbol.is_empty(),
+                "consumer row {}/{:?} must carry a grep anchor",
+                c.method,
+                c.surface
+            );
+        }
+    }
+
+    /// Owner decision Q1 pinned: the dashboard TailLog surface stays
+    /// KeylessOnly with the terminal authRequired anchor — flipping it
+    /// to a credentialed source is a NEW owner decision and must edit
+    /// this test knowingly.
+    // r[verify store.log.consumer-registry]
+    #[test]
+    fn dashboard_taillog_stays_keyless_only() {
+        let row = METHOD_CONSUMERS
+            .iter()
+            .find(|c| c.method == "TailLog" && c.surface == ConsumerSurface::Dashboard)
+            .expect("the dashboard TailLog consumer must be registry-declared");
+        assert!(
+            matches!(row.cred_source, CredSource::KeylessOnly { .. }),
+            "dashboard TailLog is KeylessOnly per owner decision Q1 (2026-06-04)"
+        );
+        assert_eq!(
+            row.anchor_symbol, "authRequired",
+            "the declared surface for the keyless break is the terminal authRequired state"
+        );
+    }
 
     fn svc(jwt: bool, hmac: bool) -> AuthzService<EchoOk> {
         svc_with_verifier(

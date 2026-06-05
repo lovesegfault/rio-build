@@ -275,3 +275,44 @@ describe('createLogStream follow mode', () => {
   });
 
 });
+
+// r[verify store.log.consumer-registry]
+// merged_bug_108: the dashboard is registry-declared KeylessOnly (owner
+// decision Q1, 2026-06-04, extending bug_290: tenant JWT + ownership,
+// no service bypass — and no dashboard credential funded this wave).
+// When the store demands credentials (jwt-enabled deployment), the
+// stream MUST end in the terminal `authRequired` state — no retry
+// ladder: an auth failure does not heal by reconnecting, and the
+// pre-fix loop classified it `openFailed` and polled the store forever.
+//
+// RED (pre-fix): `done` stayed false through the whole ladder (the
+// loop re-opened on Unauthenticated exactly like a transient).
+describe('authRequired terminal state', () => {
+  it('unauthenticated ends the stream terminally, no retry', async () => {
+    const { ConnectError, Code } = await import('@connectrpc/connect');
+    tailLog.mockImplementation(async function* () {
+      throw new ConnectError('tenant token required', Code.Unauthenticated);
+    });
+    const s = createLogStream('/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv');
+    await flush(2);
+    expect(s.done).toBe(true);
+    expect(s.authRequired).toBe(true);
+    expect(s.err).not.toBeNull();
+    // No second open: the first verdict is terminal.
+    expect(tailLog).toHaveBeenCalledTimes(1);
+    s.destroy();
+  });
+
+  it('permission-denied is the same terminal cause', async () => {
+    const { ConnectError, Code } = await import('@connectrpc/connect');
+    tailLog.mockImplementation(async function* () {
+      throw new ConnectError('not yours', Code.PermissionDenied);
+    });
+    const s = createLogStream('/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv');
+    await flush(2);
+    expect(s.done).toBe(true);
+    expect(s.authRequired).toBe(true);
+    expect(tailLog).toHaveBeenCalledTimes(1);
+    s.destroy();
+  });
+});
