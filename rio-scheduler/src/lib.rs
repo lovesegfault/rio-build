@@ -290,13 +290,18 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_pull_rejected_total",
-        "Pull-mode unaries rejected for identity reasons (labels: rpc = \
+        "Pull-mode unaries rejected (labels: rpc = \
          pull_assignment|report_outcome, reason = unauthenticated|token_mismatch|\
          kind_unauthorized — the executor token verified but its kind is not \
-         allowed to take this attempt kind). \
-         A sustained rate means a pod fleet holds mis-bound/expired executor \
-         tokens or an HMAC rotation skew — the rejected pods exit nonzero and \
-         their logs are ephemeral, so this counter is the alertable trace."
+         allowed to take this attempt kind; consumption_not_durable — the \
+         report's consumption close failed to commit durably, the NACK rides \
+         UNAVAILABLE and the store's report redelivery re-presents the SAME \
+         outcome, so a sustained rate here is a PG brownout trace, not an \
+         identity fault). \
+         A sustained rate on the identity reasons means a pod fleet holds \
+         mis-bound/expired executor tokens or an HMAC rotation skew — the \
+         rejected pods exit nonzero and their logs are ephemeral, so this \
+         counter is the alertable trace."
     );
     describe_counter!(
         "rio_scheduler_pull_establishments_total",

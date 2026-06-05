@@ -242,7 +242,8 @@ const LIST_FAILURE_WARN_THRESHOLD: u32 = 3;
 ///
 /// The per-pass failure logs stay at `debug!` (an empty poll pass is
 /// routine); this latch owns the ESCALATION: when failures become
-/// consecutive past [`LIST_FAILURE_WARN_THRESHOLD`] it emits ONE
+/// consecutive past `LIST_FAILURE_WARN_THRESHOLD` (private const,
+/// currently 3) it emits ONE
 /// `warn!`, then stays silent until a success resets it (recovery is
 /// logged at `info!`), so a dead edge surfaces above debug without a
 /// warn-per-pass flood.
