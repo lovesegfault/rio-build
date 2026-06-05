@@ -2020,7 +2020,8 @@ pub use rio_common::wanted_outputs::{
 /// SATURATES the union to maximal width. Never a narrower
 /// stale snapshot, never a vacuous set; divergence from the exact union is strictly in
 /// the widening direction. The degradation is observable:
-/// [`note_wanted_width_saturated`] (counter + rate-limited warn).
+/// [`note_width_event`]'s `SaturatedToDeclared` arm (counter +
+/// rate-limited warn).
 ///
 /// Returns `None` only when the node has zero live interested builds
 /// (all terminal, missing from `builds`, or an empty interest set —
@@ -2058,7 +2059,9 @@ pub fn effective_wanted(
         // (MAXIMAL width — never under-counted, never the stored
         // union). Observable via counter + rate-limited warn.
         let Some(contribution) = state.wanted_by_build.get(build_id) else {
-            note_wanted_width_saturated(build_id);
+            note_width_event(WidthEvent::SaturatedToDeclared {
+                build_id: *build_id,
+            });
             return Some(Vec::new());
         };
         match &mut effective {
@@ -2069,30 +2072,79 @@ pub fn effective_wanted(
     effective
 }
 
-/// DQ-2 observability: the conservative-absent arm fired — a live
-/// build's wanted contributions are unknown and the effective width
-/// degraded to all-declared. Counter always; warn rate-limited (the
-/// arm can fire per classification pass).
-pub fn note_wanted_width_saturated(build_id: &Uuid) {
-    metrics::counter!("rio_scheduler_wanted_width_saturated_total").increment(1);
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static LAST_WARN_EPOCH: AtomicI64 = AtomicI64::new(0);
+/// The two width-observability event classes (bug_282). The event
+/// carries exactly the identity its class declares, so a wrong-class
+/// increment — the bug_282 shape: the zero-width re-arm counting
+/// itself as "saturated to all-declared" under a nil build id — is
+/// unrepresentable at the type.
+#[derive(Debug)]
+pub enum WidthEvent {
+    /// DQ-2: the conservative-absent arm fired — a live build's wanted
+    /// contributions are unknown and the effective width degraded to
+    /// ALL-DECLARED (maximal).
+    SaturatedToDeclared {
+        /// The live interested build whose contribution is unknown.
+        build_id: Uuid,
+    },
+    /// merged_bug_194 witness: a materialization re-arm found NO
+    /// verifiable wanted set (width ZERO — empty set or empty-string
+    /// paths), the opposite end of the width axis.
+    NoVerifiableSet {
+        /// The reporting attempt's exec id (no build is implicated —
+        /// the condition is per-attempt).
+        exec_id: Uuid,
+    },
+}
+
+/// Once-per-10s warn latch; each [`WidthEvent`] variant owns its OWN
+/// latch (bug_282: the old single latch was shared across callers, so
+/// the wrong-class caller suppressed the genuine DQ-2 warn — and its
+/// real build id — in the same window).
+fn width_warn_due(latch: &std::sync::atomic::AtomicI64) -> bool {
+    use std::sync::atomic::Ordering;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let last = LAST_WARN_EPOCH.load(Ordering::Relaxed);
-    if now - last >= 10
-        && LAST_WARN_EPOCH
+    let last = latch.load(Ordering::Relaxed);
+    now - last >= 10
+        && latch
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
-    {
-        tracing::warn!(
-            build_id = %build_id,
-            "wanted contributions unknown for live build; degrading to \
-             all-declared width (rate-limited; see \
-             rio_scheduler_wanted_width_saturated_total)"
-        );
+}
+
+/// THE width-observability chokepoint (bug_282): per-variant counters
+/// and per-variant rate-limited warns. Counter always; warn
+/// rate-limited (either arm can fire per classification pass).
+// r[impl obs.metric.scheduler]
+pub fn note_width_event(event: WidthEvent) {
+    use std::sync::atomic::AtomicI64;
+    match event {
+        WidthEvent::SaturatedToDeclared { build_id } => {
+            metrics::counter!("rio_scheduler_wanted_width_saturated_total").increment(1);
+            static LAST_WARN_EPOCH: AtomicI64 = AtomicI64::new(0);
+            if width_warn_due(&LAST_WARN_EPOCH) {
+                tracing::warn!(
+                    build_id = %build_id,
+                    "wanted contributions unknown for live build; degrading to \
+                     all-declared width (rate-limited; see \
+                     rio_scheduler_wanted_width_saturated_total)"
+                );
+            }
+        }
+        WidthEvent::NoVerifiableSet { exec_id } => {
+            metrics::counter!("rio_scheduler_materialization_no_verifiable_wanted_total")
+                .increment(1);
+            static LAST_WARN_EPOCH: AtomicI64 = AtomicI64::new(0);
+            if width_warn_due(&LAST_WARN_EPOCH) {
+                tracing::warn!(
+                    exec_id = %exec_id,
+                    "materialization re-arm found no verifiable wanted set \
+                     (rate-limited; see \
+                     rio_scheduler_materialization_no_verifiable_wanted_total)"
+                );
+            }
+        }
     }
 }
 

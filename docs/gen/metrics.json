@@ -115,6 +115,7 @@
     "rio_scheduler_materialization_jobs_gc_total",
     "rio_scheduler_materialization_jobs_origin_upgraded_total",
     "rio_scheduler_materialization_jobs_resolved_total",
+    "rio_scheduler_materialization_no_verifiable_wanted_total",
     "rio_scheduler_materialization_stalled",
     "rio_scheduler_materialization_view_node_skew_total",
     "rio_scheduler_merge_phase_seconds",
@@ -811,6 +812,11 @@
         "name": "rio_scheduler_materialization_jobs_resolved_total",
         "kind": "counter",
         "help": "Materialization jobs terminally resolved, labeled by outcome (success|from_source|unobtainable|cancelled|obsolete). At-most-once per job (re-resolution no-ops never double-count). success = the wanted set was materialized from upstream; from_source = the job released the node to normal from-source dispatch (durable Vouched/Pending evidence or the PD-20 park re-evaluation); unobtainable = the fail-fast settlement; cancelled = zero live interest remained. A high infra-failure or unobtainable rate is the upstream-health signal."
+      },
+      {
+        "name": "rio_scheduler_materialization_no_verifiable_wanted_total",
+        "kind": "counter",
+        "help": "A materialization re-arm found NO verifiable wanted path set (width ZERO — empty set or empty-string placeholder paths, even after the realized-path carrier union), so the consumption closed uncharged and deferred instead of verifying vacuously. The opposite end of the width axis from ..._wanted_width_saturated_total (bug_282: the two event classes share one typed chokepoint and never one counter)."
       },
       {
         "name": "rio_scheduler_materialization_stalled",

@@ -2347,3 +2347,67 @@ fn claimability_precedence_grid() {
     e.test_set_defer_until(Some(past));
     assert_eq!(e.claimability(now), Claimability::ClaimableNow);
 }
+
+// r[verify obs.metric.scheduler]
+/// bug_282: the width-observability chokepoint routes each event class
+/// to ITS OWN counter (and its own warn latch). Pre-fix RED: the
+/// zero-width materialization re-arm called the saturation noter with
+/// a nil build id — the WRONG counter moved
+/// (`rio_scheduler_wanted_width_saturated_total: 1` for a
+/// no-verifiable-set event, captured below via the strawman) and the
+/// single shared latch let that call suppress a genuine DQ-2 warn (and
+/// its real build id) in the same 10s window. The typed `WidthEvent`
+/// makes the wrong-class increment unrepresentable.
+#[test]
+fn width_events_route_to_their_own_counters() {
+    use crate::sla::metrics::counter_map;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    {
+        let _g = metrics::set_default_local_recorder(&rec);
+        crate::state::note_width_event(crate::state::WidthEvent::NoVerifiableSet {
+            exec_id: Uuid::new_v4(),
+        });
+    }
+    let counters = counter_map(&snap);
+    assert_eq!(
+        counters
+            .get("rio_scheduler_materialization_no_verifiable_wanted_total")
+            .copied(),
+        Some(1),
+        "the zero-width event moves ITS counter"
+    );
+    assert_eq!(
+        counters
+            .get("rio_scheduler_wanted_width_saturated_total")
+            .copied(),
+        None,
+        "the zero-width event must NOT move the DQ-2 saturation counter"
+    );
+
+    {
+        let _g = metrics::set_default_local_recorder(&rec);
+        crate::state::note_width_event(crate::state::WidthEvent::SaturatedToDeclared {
+            build_id: Uuid::new_v4(),
+        });
+    }
+    let counters = counter_map(&snap);
+    assert_eq!(
+        counters
+            .get("rio_scheduler_wanted_width_saturated_total")
+            .copied(),
+        Some(1),
+        "the saturation event moves the DQ-2 counter"
+    );
+    assert_eq!(
+        counters
+            .get("rio_scheduler_materialization_no_verifiable_wanted_total")
+            .copied()
+            .unwrap_or(0),
+        0,
+        "…and leaves the zero-width counter untouched (snapshots drain — \
+         this is the delta since the first read)"
+    );
+}

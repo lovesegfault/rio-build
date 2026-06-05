@@ -332,6 +332,16 @@ pub fn describe_metrics() {
          narrow set). Sustained increments mean pre-relation builds are \
          still live; the population shrinks to zero as they terminate."
     );
+    describe_counter!(
+        "rio_scheduler_materialization_no_verifiable_wanted_total",
+        "A materialization re-arm found NO verifiable wanted path set \
+         (width ZERO — empty set or empty-string placeholder paths, even \
+         after the realized-path carrier union), so the consumption \
+         closed uncharged and deferred instead of verifying vacuously. \
+         The opposite end of the width axis from \
+         ..._wanted_width_saturated_total (bug_282: the two event \
+         classes share one typed chokepoint and never one counter)."
+    );
     describe_gauge!(
         "rio_scheduler_substituting_derivations",
         "Derivations carrying a CLAIMABLE materialization job (unclaimed AND not \

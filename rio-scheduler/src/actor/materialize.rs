@@ -1239,7 +1239,10 @@ impl DagActor {
         // mint's Running state (the ReArm posture; the next claim or
         // the zero-interest closer settles it).
         let Some(live_wanted_paths) = LiveWanted::new(wanted_union) else {
-            crate::state::note_wanted_width_saturated(&Uuid::nil());
+            // bug_282: this is the width-ZERO event class — its own
+            // counter and warn latch; it can no longer masquerade as
+            // (or suppress the warn of) the DQ-2 saturation event.
+            crate::state::note_width_event(crate::state::WidthEvent::NoVerifiableSet { exec_id });
             warn!(
                 %exec_id, drv_hash = %drv_hash,
                 "no verifiable live-wanted path set; closing uncharged and deferring"

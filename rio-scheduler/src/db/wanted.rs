@@ -138,7 +138,9 @@ impl SchedulerDb {
         for (build_id, names, saturated_default) in rows {
             if names.is_empty() {
                 if saturated_default {
-                    crate::state::note_wanted_width_saturated(&build_id);
+                    crate::state::note_width_event(crate::state::WidthEvent::SaturatedToDeclared {
+                        build_id,
+                    });
                 }
                 return Ok(Some(Vec::new()));
             }
