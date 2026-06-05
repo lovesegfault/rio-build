@@ -34,6 +34,7 @@ use rio_common::grpc::StatusExt;
 
 use crate::metadata::{self, ManifestKind};
 
+use super::sign;
 use super::{StoreServiceImpl, metadata_status, validate_store_path};
 
 pub(super) type GetPathStream = ReceiverStream<Result<GetPathResponse, Status>>;
@@ -96,7 +97,14 @@ async fn stream_bytes(
 fn hint_into_manifest(
     store_path: &str,
     hint: ManifestHint,
-) -> Result<Option<(rio_proto::validated::ValidatedPathInfo, ManifestKind)>, Status> {
+) -> Result<
+    Option<(
+        rio_proto::validated::ValidatedPathInfo,
+        ManifestKind,
+        sign::CapabilityHint,
+    )>,
+    Status,
+> {
     let Some(raw_info) = hint.info else {
         return Ok(None);
     };
@@ -152,7 +160,13 @@ fn hint_into_manifest(
             .collect::<Result<_, _>>()?;
         ManifestKind::Chunked(entries)
     };
-    Ok(Some((info, manifest)))
+    // The sole CapabilityHint mint: a validated, path-matching
+    // presented hint (chunk hashes as capability tokens, I-110c).
+    Ok(Some((
+        info,
+        manifest,
+        sign::CapabilityHint::from_presented_hint(),
+    )))
 }
 
 impl StoreServiceImpl {
@@ -182,9 +196,11 @@ impl StoreServiceImpl {
         // `reject_end_user_tenant`: end-user tenants can't obtain
         // chunk hashes for paths the gate would hide.
         if let Some(hint) = req.manifest_hint
-            && let Some((info, manifest)) = hint_into_manifest(&req.store_path, hint)?
+            && let Some((info, manifest, capability)) = hint_into_manifest(&req.store_path, hint)?
         {
-            return self.stream_path(info, manifest).await;
+            return self
+                .stream_path(sign::ServeAuthority::Hint(capability), info, manifest)
+                .await;
         }
 
         // Step 1: narinfo + manifest.
@@ -198,31 +214,39 @@ impl StoreServiceImpl {
             .await
             .map_err(|e| metadata_status("GetPath: query_path_info", e))?;
         let local_hit = local.is_some();
-        let info = match local {
+        let (info, vis) = match local {
             Some(i) => {
                 // r[impl store.substitute.tenant-sig-visibility+2]
                 // Same gate as QueryPathInfo: hide-as-NotFound on
                 // failure, fall through to try_substitute_on_miss
                 // (the requesting tenant's upstreams may also have
                 // it, which would append a trusted sig).
-                if self.sig_visibility_gate(tenant_id, &i).await? {
-                    i
-                } else if let Some(sub) = self
-                    .try_substitute_on_miss(tenant_id, &req.store_path)
-                    .await?
-                {
-                    sub
-                } else {
-                    return Err(Status::not_found(format!(
-                        "path not found: {}",
-                        req.store_path
-                    )));
+                match self.sig_visibility_gate(tenant_id, &i).await? {
+                    Some(vis) => (i, vis),
+                    None => {
+                        if let Some(sub) = self
+                            .try_substitute_on_miss(tenant_id, &req.store_path)
+                            .await?
+                        {
+                            (sub, sign::PathVisible::substituted_for_tenant())
+                        } else {
+                            return Err(Status::not_found(format!(
+                                "path not found: {}",
+                                req.store_path
+                            )));
+                        }
+                    }
                 }
             }
-            None => self
-                .try_substitute_on_miss(tenant_id, &req.store_path)
-                .await?
-                .ok_or_else(|| Status::not_found(format!("path not found: {}", req.store_path)))?,
+            None => {
+                let sub = self
+                    .try_substitute_on_miss(tenant_id, &req.store_path)
+                    .await?
+                    .ok_or_else(|| {
+                        Status::not_found(format!("path not found: {}", req.store_path))
+                    })?;
+                (sub, sign::PathVisible::substituted_for_tenant())
+            }
         };
         let lookup_elapsed = lookup_start.elapsed();
         if lookup_elapsed > std::time::Duration::from_secs(1) {
@@ -244,7 +268,8 @@ impl StoreServiceImpl {
                 Status::not_found(format!("manifest not found for: {}", req.store_path))
             })?;
 
-        self.stream_path(info, manifest).await
+        self.stream_path(sign::ServeAuthority::Visible(vis), info, manifest)
+            .await
     }
 
     /// Steps 2-4 of GetPath: pre-flight size/backend check, spawn the
@@ -252,6 +277,7 @@ impl StoreServiceImpl {
     /// I-110c manifest-hint fast path and the PG-lookup path share it.
     async fn stream_path(
         &self,
+        _authority: sign::ServeAuthority,
         info: rio_proto::validated::ValidatedPathInfo,
         manifest: ManifestKind,
     ) -> Result<Response<GetPathStream>, Status> {

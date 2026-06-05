@@ -62,12 +62,55 @@ pub(in crate::grpc) enum NarPersist {
     ChunkedStaged,
 }
 
-/// Auth context for PutPath / PutPathBatch: HMAC assignment claims
+/// The ingest write authority — produced ONLY by
+/// [`StoreServiceImpl::verify_assignment_token`]. The tri-state makes
+/// the gate's divergent service-caller policy explicit at every
+/// consumer: PutPath* accept `ServiceBypass` (the gateway/scheduler
+/// upload path); `AppendHwPerfSample` rejects it with a visible match
+/// arm. The pre-witness `Option<AssignmentClaims>` collapsed
+/// dev-mode and service-bypass into one ambiguous `None` that
+/// consumers had to disambiguate by re-probing verifier knobs.
+pub(in crate::grpc) enum IngestAuthority {
+    /// HMAC-verified builder assignment token (path allowlist rides
+    /// in the claims).
+    Builder(rio_auth::hmac::AssignmentClaims),
+    /// Allowlisted, VERIFIED service caller (no per-build token).
+    ServiceBypass {
+        /// The verified `ServiceClaims.caller`.
+        #[allow(dead_code)] // named for tracing/debug; policy is the variant
+        caller: String,
+    },
+    /// No HMAC verifier configured (dev mode) — accept all.
+    DevMode,
+}
+
+impl IngestAuthority {
+    /// The builder's claims when (and only when) the authority is a
+    /// verified assignment token — the path-allowlist consumers'
+    /// view (`validate_put_metadata`, `ingest_nar_stream`).
+    pub(in crate::grpc) fn builder_claims(&self) -> Option<&rio_auth::hmac::AssignmentClaims> {
+        match self {
+            IngestAuthority::Builder(c) => Some(c),
+            IngestAuthority::ServiceBypass { .. } | IngestAuthority::DevMode => None,
+        }
+    }
+}
+
+/// Auth context for PutPath / PutPathBatch: the typed ingest authority
 /// (path allowlist) + JWT tenant id (signing-key selection). Both
 /// extracted from request metadata BEFORE `into_inner()` consumes it.
+/// Constructible only via [`StoreServiceImpl::authorize`] — a put
+/// path that skips the token gate does not compile.
 pub(in crate::grpc) struct PutAuth {
-    pub hmac_claims: Option<rio_auth::hmac::AssignmentClaims>,
+    pub authority: IngestAuthority,
     pub tenant_id: Option<uuid::Uuid>,
+}
+
+impl PutAuth {
+    /// See [`IngestAuthority::builder_claims`].
+    pub(in crate::grpc) fn builder_claims(&self) -> Option<&rio_auth::hmac::AssignmentClaims> {
+        self.authority.builder_claims()
+    }
 }
 
 /// Validate a raw PathInfo message for PutPath/PutPathBatch.
@@ -368,13 +411,13 @@ impl StoreServiceImpl {
     /// see [`StoreServiceImpl::verify_assignment_token`]) — all
     /// cluster-key-correct.
     pub(in crate::grpc) fn authorize<T>(&self, request: &Request<T>) -> Result<PutAuth, Status> {
-        let hmac_claims = self.verify_assignment_token(request)?;
+        let authority = self.verify_assignment_token(request)?;
         let tenant_id = request
             .extensions()
             .get::<rio_auth::jwt::TenantClaims>()
             .map(|c| c.sub);
         Ok(PutAuth {
-            hmac_claims,
+            authority,
             tenant_id,
         })
     }

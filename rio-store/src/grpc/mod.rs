@@ -283,6 +283,30 @@ pub const DEFAULT_CHUNK_PREFETCH_K: usize = 64;
 /// comfortably on 64-bit.
 const DEFAULT_NAR_BUDGET: usize = (8 * MAX_NAR_SIZE) as usize;
 
+/// Witness: this request is NOT an end-user tenant session — the
+/// deny-tenants polarity check passed (`reject_end_user_tenant`).
+/// The builder-internal batch data fetches REQUIRE one, so the
+/// deliberate sig-visibility gate-skip on those RPCs cannot become a
+/// tenant-side bypass by arm deletion: a batch handler without the
+/// check does not compile.
+#[must_use]
+pub(crate) struct EndUserRejected(());
+
+/// Witness for scheduler-managed realisation writes: a VERIFIED
+/// allowlisted service caller, or dev mode (no service verifier
+/// configured). Sole producer: `require_service_caller`.
+#[must_use]
+pub(crate) enum ServiceCallerOk {
+    /// HMAC-verified `x-rio-service-token` from an allowlisted caller.
+    Verified {
+        /// The verified `ServiceClaims.caller`.
+        #[allow(dead_code)] // named for tracing/debug; policy is the variant
+        caller: String,
+    },
+    /// No service verifier configured (dev mode) — accept.
+    DevMode,
+}
+
 impl StoreServiceImpl {
     /// Create a new StoreService with inline-only storage (no chunking).
     ///
@@ -494,7 +518,7 @@ impl StoreServiceImpl {
         &self,
         request: &Request<T>,
         rpc: &'static str,
-    ) -> Result<(), Status> {
+    ) -> Result<EndUserRejected, Status> {
         if request
             .extensions()
             .get::<rio_auth::jwt::TenantClaims>()
@@ -504,7 +528,27 @@ impl StoreServiceImpl {
                 "{rpc} is builder-internal; use the per-path RPC for tenant-scoped reads"
             )));
         }
-        Ok(())
+        Ok(EndUserRejected(()))
+    }
+
+    /// Witness-producing service-caller gate for scheduler-managed
+    /// write RPCs (`RegisterRealisation`). Dev-mode (`service_verifier
+    /// = None`) passes through as its own variant, matching the
+    /// `hmac_verifier=None` semantics elsewhere — production always
+    /// configures both (and boot key-coherence refuses the half-keyed
+    /// JWT states).
+    fn require_service_caller<T>(
+        &self,
+        request: &Request<T>,
+        denial: &'static str,
+    ) -> Result<ServiceCallerOk, Status> {
+        if self.service_verifier.is_none() {
+            return Ok(ServiceCallerOk::DevMode);
+        }
+        match self.verified_service_caller(request) {
+            Some(caller) => Ok(ServiceCallerOk::Verified { caller }),
+            None => Err(Status::permission_denied(denial)),
+        }
     }
 
     // r[impl store.substitute.upstream]
@@ -733,10 +777,15 @@ impl StoreService for StoreServiceImpl {
         request: Request<AppendHwPerfSampleRequest>,
     ) -> Result<Response<()>, Status> {
         let (pod_id, tenant) = match self.verify_assignment_token(&request)? {
-            Some(claims) => (claims.executor_id, claims.tenant),
+            put_path::IngestAuthority::Builder(claims) => (claims.executor_id, claims.tenant),
             // Dev mode (no HMAC verifier): body pod_id, NULL tenant.
-            None if self.hmac_verifier.is_none() => (request.get_ref().pod_id.clone(), None),
-            None => {
+            put_path::IngestAuthority::DevMode => (request.get_ref().pod_id.clone(), None),
+            // The divergent service-caller policy, as a VISIBLE arm:
+            // PutPath* admit the bypass (gateway/scheduler uploads);
+            // this RPC's one-rank-in-a-median defense requires pod_id
+            // from a scheduler-signed assignment token, so service
+            // callers are rejected outright.
+            put_path::IngestAuthority::ServiceBypass { .. } => {
                 metrics::counter!("rio_store_hmac_rejected_total",
                                   "reason" => "service_caller_not_permitted")
                 .increment(1);

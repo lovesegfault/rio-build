@@ -96,7 +96,7 @@ impl StoreServiceImpl {
 
         // --- Phase 1: drain the stream, route by output_index ---
         let (mut outputs, _held_permits) = self
-            .drain_batch_stream(&mut stream, auth.hmac_claims.as_ref())
+            .drain_batch_stream(&mut stream, auth.builder_claims())
             .await?;
         if outputs.is_empty() {
             return Err(Status::invalid_argument("PutPathBatch: empty stream"));
@@ -144,7 +144,7 @@ impl StoreServiceImpl {
                 bail!(e);
             }
             // r[impl sec.authz.ca-path-derived+2]
-            if let Err(e) = verify_ca_store_path(info, auth.hmac_claims.as_ref(), &ctx) {
+            if let Err(e) = verify_ca_store_path(info, auth.builder_claims(), &ctx) {
                 bail!(e);
             }
 

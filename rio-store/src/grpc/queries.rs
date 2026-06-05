@@ -21,9 +21,77 @@ use rio_common::tenant::NormalizedName;
 use crate::metadata::{self, ManifestKind};
 use crate::realisations;
 
-use super::{StoreServiceImpl, metadata_status, validate_store_path};
+use super::sign::{self, PathVisible};
+use super::{
+    EndUserRejected, ServiceCallerOk, StoreServiceImpl, metadata_status, validate_store_path,
+};
+
+/// The narinfo reply step: a [`PathVisible`] witness is REQUIRED to
+/// surface path metadata to the caller — a read arm that skips the
+/// sig-visibility gate (or the substitution mint) does not compile.
+fn visible_narinfo(_vis: PathVisible, info: rio_proto::validated::ValidatedPathInfo) -> PathInfo {
+    info.into()
+}
 
 impl StoreServiceImpl {
+    /// The AddSignatures write step: gate witness required — appending
+    /// sigs to a gate-hidden path (existence probe / junk-sig DoS) is
+    /// not expressible.
+    async fn append_signatures_visible(
+        &self,
+        _vis: PathVisible,
+        store_path: &str,
+        signatures: &[String],
+    ) -> Result<u64, Status> {
+        metadata::append_signatures(&self.pool, store_path, signatures)
+            .await
+            .map_err(|e| metadata_status("AddSignatures: append_signatures", e))
+    }
+
+    /// `BatchQueryPathInfo`'s data fetch: the [`EndUserRejected`]
+    /// witness is REQUIRED — the deliberate sig-visibility gate-skip
+    /// on this builder-internal RPC is safe only because end-user
+    /// tenants are rejected first, and this signature makes deleting
+    /// that check a compile error.
+    async fn builder_internal_path_info_batch(
+        &self,
+        _builder_internal: EndUserRejected,
+        store_paths: &[String],
+    ) -> Result<Vec<(String, Option<rio_proto::validated::ValidatedPathInfo>)>, Status> {
+        metadata::query_path_info_batch(&self.pool, store_paths)
+            .await
+            .map_err(|e| metadata_status("BatchQueryPathInfo: query_path_info_batch", e))
+    }
+
+    /// `BatchGetManifest`'s data fetch — same witness requirement as
+    /// [`Self::builder_internal_path_info_batch`].
+    async fn builder_internal_manifest_batch(
+        &self,
+        _builder_internal: EndUserRejected,
+        store_paths: &[String],
+    ) -> Result<
+        Vec<(
+            String,
+            Option<(rio_proto::validated::ValidatedPathInfo, ManifestKind)>,
+        )>,
+        Status,
+    > {
+        metadata::get_manifest_batch(&self.pool, store_paths)
+            .await
+            .map_err(|e| metadata_status("BatchGetManifest: get_manifest_batch", e))
+    }
+
+    /// The realisation write step: a [`ServiceCallerOk`] witness is
+    /// REQUIRED — realisations are scheduler-managed, and a write arm
+    /// that skips the service-caller gate does not compile.
+    async fn insert_realisation_as_service(
+        &self,
+        _write_auth: ServiceCallerOk,
+        r: &realisations::Realisation,
+    ) -> Result<bool, crate::metadata::MetadataError> {
+        realisations::insert(&self.pool, r).await
+    }
+
     /// DoS bound + per-path format check shared by the batch read RPCs.
     /// Rejects the whole batch on any malformed path (client bug indicator).
     fn validate_path_batch(&self, paths: &[String]) -> Result<(), Status> {
@@ -57,43 +125,46 @@ impl StoreServiceImpl {
             .await
             .map_err(|e| metadata_status("QueryPathInfo: query_path_info", e))?;
 
-        let info = match local {
+        let (info, vis) = match local {
             Some(i) => {
                 // r[impl store.substitute.tenant-sig-visibility+2]
                 // Local hit — but is it visible to THIS tenant? A path
                 // substituted by tenant A with sig_mode=keep is
                 // invisible to tenant B unless B trusts A's upstream
                 // key. Hide-as-NotFound on gate failure.
-                if !self.sig_visibility_gate(tenant_id, &i).await? {
-                    // Gate failed — but B's upstreams may ALSO have
-                    // this path. Try substituting (which will
-                    // append B-trusted sigs to the existing row).
-                    if let Some(sub) = self
-                        .try_substitute_on_miss(tenant_id, &req.store_path)
-                        .await?
-                    {
-                        sub
-                    } else {
-                        return Err(Status::not_found(format!(
-                            "path not found: {}",
-                            req.store_path
-                        )));
+                match self.sig_visibility_gate(tenant_id, &i).await? {
+                    Some(vis) => (i, vis),
+                    None => {
+                        // Gate failed — but B's upstreams may ALSO have
+                        // this path. Try substituting (which will
+                        // append B-trusted sigs to the existing row).
+                        if let Some(sub) = self
+                            .try_substitute_on_miss(tenant_id, &req.store_path)
+                            .await?
+                        {
+                            (sub, sign::PathVisible::substituted_for_tenant())
+                        } else {
+                            return Err(Status::not_found(format!(
+                                "path not found: {}",
+                                req.store_path
+                            )));
+                        }
                     }
-                } else {
-                    i
                 }
             }
             None => {
                 // Local miss — try upstream substitution.
-                self.try_substitute_on_miss(tenant_id, &req.store_path)
+                let sub = self
+                    .try_substitute_on_miss(tenant_id, &req.store_path)
                     .await?
                     .ok_or_else(|| {
                         Status::not_found(format!("path not found: {}", req.store_path))
-                    })?
+                    })?;
+                (sub, sign::PathVisible::substituted_for_tenant())
             }
         };
 
-        Ok(Response::new(info.into()))
+        Ok(Response::new(visible_narinfo(vis, info)))
     }
 
     /// Batch query metadata for many paths in one PG round-trip.
@@ -110,16 +181,16 @@ impl StoreServiceImpl {
         request: Request<BatchQueryPathInfoRequest>,
     ) -> Result<Response<BatchQueryPathInfoResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        self.reject_end_user_tenant(&request, "BatchQueryPathInfo")?;
+        let builder_internal = self.reject_end_user_tenant(&request, "BatchQueryPathInfo")?;
         let req = request.into_inner();
 
         self.validate_path_batch(&req.store_paths)?;
 
         let n_paths = req.store_paths.len();
         let start = std::time::Instant::now();
-        let entries = metadata::query_path_info_batch(&self.pool, &req.store_paths)
-            .await
-            .map_err(|e| metadata_status("BatchQueryPathInfo: query_path_info_batch", e))?
+        let entries = self
+            .builder_internal_path_info_batch(builder_internal, &req.store_paths)
+            .await?
             .into_iter()
             .map(|(store_path, info)| PathInfoEntry {
                 store_path,
@@ -142,14 +213,14 @@ impl StoreServiceImpl {
         request: Request<BatchGetManifestRequest>,
     ) -> Result<Response<BatchGetManifestResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        self.reject_end_user_tenant(&request, "BatchGetManifest")?;
+        let builder_internal = self.reject_end_user_tenant(&request, "BatchGetManifest")?;
         let req = request.into_inner();
 
         self.validate_path_batch(&req.store_paths)?;
 
-        let entries = metadata::get_manifest_batch(&self.pool, &req.store_paths)
-            .await
-            .map_err(|e| metadata_status("BatchGetManifest: get_manifest_batch", e))?
+        let entries = self
+            .builder_internal_manifest_batch(builder_internal, &req.store_paths)
+            .await?
             .into_iter()
             .map(|(store_path, found)| {
                 let hint = found.map(|(info, kind)| {
@@ -313,14 +384,14 @@ impl StoreServiceImpl {
         // Same gate as QueryPathInfo. Hash-part lookup is local-only
         // (no upstream knows our hash space), so on gate failure
         // there's no try_substitute_on_miss fallback — just NotFound.
-        if !self.sig_visibility_gate(tenant_id, &info).await? {
+        let Some(vis) = self.sig_visibility_gate(tenant_id, &info).await? else {
             return Err(Status::not_found(format!(
                 "no path with hash part: {}",
                 req.hash_part
             )));
-        }
+        };
 
-        Ok(Response::new(info.into()))
+        Ok(Response::new(visible_narinfo(vis, info)))
     }
 
     /// Append signatures to an existing store path.
@@ -356,12 +427,12 @@ impl StoreServiceImpl {
             .await
             .map_err(|e| metadata_status("AddSignatures: query_path_info", e))?
             .ok_or_else(|| Status::not_found(format!("path not found: {}", req.store_path)))?;
-        if !self.sig_visibility_gate(tenant_id, &info).await? {
+        let Some(vis) = self.sig_visibility_gate(tenant_id, &info).await? else {
             return Err(Status::not_found(format!(
                 "path not found: {}",
                 req.store_path
             )));
-        }
+        };
 
         // Empty sigs list: no-op. Don't hit PG for nothing. Not an error —
         // `nix store sign` with no configured keys can legitimately produce
@@ -370,9 +441,9 @@ impl StoreServiceImpl {
             return Ok(Response::new(AddSignaturesResponse {}));
         }
 
-        let rows = metadata::append_signatures(&self.pool, &req.store_path, &req.signatures)
-            .await
-            .map_err(|e| metadata_status("AddSignatures: append_signatures", e))?;
+        let rows = self
+            .append_signatures_visible(vis, &req.store_path, &req.signatures)
+            .await?;
 
         if rows == 0 {
             return Err(Status::not_found(format!(
@@ -401,15 +472,14 @@ impl StoreServiceImpl {
         request: Request<RegisterRealisationRequest>,
     ) -> Result<Response<RegisterRealisationResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        // Dev-mode pass-through (`service_verifier=None`) matches the
-        // `hmac_verifier=None` semantics elsewhere — production always
-        // configures both.
-        if self.service_verifier.is_some() && self.verified_service_caller(&request).is_none() {
-            return Err(Status::permission_denied(
-                "RegisterRealisation requires a service token; \
-                 realisations are scheduler-managed",
-            ));
-        }
+        // Witness-producing gate: dev-mode pass-through
+        // (`service_verifier=None`) matches the `hmac_verifier=None`
+        // semantics elsewhere — production always configures both.
+        let write_auth = self.require_service_caller(
+            &request,
+            "RegisterRealisation requires a service token; \
+             realisations are scheduler-managed",
+        )?;
         let proto = request
             .into_inner()
             .realisation
@@ -463,19 +533,21 @@ impl StoreServiceImpl {
             signatures: proto.signatures,
         };
 
-        realisations::insert(&self.pool, &r).await.map_err(|e| {
-            if matches!(
-                e,
-                crate::metadata::MetadataError::RealisationConflict { .. }
-            ) {
-                // Loud: this is either a determinism bug or attempted
-                // poison. WARN both paths so it surfaces in alerts.
-                warn!(error = %e, "realisation conflict");
-                Status::already_exists(e.to_string())
-            } else {
-                metadata_status("RegisterRealisation: insert", e)
-            }
-        })?;
+        self.insert_realisation_as_service(write_auth, &r)
+            .await
+            .map_err(|e| {
+                if matches!(
+                    e,
+                    crate::metadata::MetadataError::RealisationConflict { .. }
+                ) {
+                    // Loud: this is either a determinism bug or attempted
+                    // poison. WARN both paths so it surfaces in alerts.
+                    warn!(error = %e, "realisation conflict");
+                    Status::already_exists(e.to_string())
+                } else {
+                    metadata_status("RegisterRealisation: insert", e)
+                }
+            })?;
 
         Ok(Response::new(RegisterRealisationResponse {}))
     }
@@ -537,6 +609,13 @@ impl StoreServiceImpl {
         request: Request<TenantQuotaRequest>,
     ) -> Result<Response<TenantQuotaResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // Caller identity BEFORE into_inner consumes the extensions.
+        // The layer's TenantJwt class guarantees claims are present
+        // whenever a JWT pubkey is configured; None here = dual-mode.
+        let caller = request
+            .extensions()
+            .get::<rio_auth::jwt::TenantClaims>()
+            .map(|c| c.sub);
         let req = request.into_inner();
 
         // Invalid name is a gateway bug here — the quota gate
@@ -550,6 +629,28 @@ impl StoreServiceImpl {
                 "tenant_name invalid: {e} (gateway should gate single-tenant mode before calling)"
             ))
         })?;
+
+        // Handler ownership (merged_bug_122): the named tenant must BE
+        // the verified caller. The mismatch deny is byte-identical to
+        // the no-such-tenant deny (absence-shaped), so a foreign
+        // tenant name's existence cannot be probed through this RPC.
+        // No-claims callers (dual-mode/dev, or scheduler probes that
+        // never reach here) pass through unchanged.
+        let owner: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT tenant_id FROM tenants WHERE tenant_name = $1")
+                .bind(name.as_str())
+                .fetch_optional(&self.pool)
+                .await
+                .status_internal("TenantQuota: tenant lookup")?;
+        match (owner, caller) {
+            (None, _) => {
+                return Err(Status::not_found(format!("unknown tenant: {name}")));
+            }
+            (Some(owner_id), Some(sub)) if owner_id != sub => {
+                return Err(Status::not_found(format!("unknown tenant: {name}")));
+            }
+            _ => {}
+        }
 
         let quota = crate::gc::tenant::tenant_quota_by_name(&self.pool, &name)
             .await
@@ -566,5 +667,73 @@ impl StoreServiceImpl {
             used_bytes: used.max(0) as u64,
             limit_bytes: limit.map(|l| l.max(0) as u64),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::seed_tenant;
+    use rio_test_support::TestDb;
+
+    fn claims(sub: uuid::Uuid) -> rio_auth::jwt::TenantClaims {
+        rio_auth::jwt::TenantClaims {
+            sub,
+            iat: 0,
+            exp: i64::MAX,
+            jti: String::from("quota-test-jti"),
+        }
+    }
+
+    fn quota_req(name: &str, with_claims: Option<uuid::Uuid>) -> Request<TenantQuotaRequest> {
+        let mut r = Request::new(TenantQuotaRequest {
+            tenant_name: name.to_string(),
+        });
+        if let Some(sub) = with_claims {
+            r.extensions_mut().insert(claims(sub));
+        }
+        r
+    }
+
+    /// 122's handler red (recorded pre-fix): tenant B's verified
+    /// claims naming tenant A returned A's QUOTA (cross-tenant read).
+    /// Post-fix: claims.sub must match the named tenant's row;
+    /// mismatch is the ABSENCE-shaped `unknown tenant: {name}` —
+    /// byte-identical to the no-such-tenant deny, so existence of a
+    /// foreign tenant name cannot be probed (enumeration oracle dead).
+    /// No-claims callers pass through (dual-mode preserved).
+    // r[verify store.log.method-credential+2]
+    #[tokio::test]
+    async fn tenant_quota_foreign_claims_get_absence_shaped_deny() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreServiceImpl::new(db.pool.clone());
+        let tid_a = seed_tenant(&db.pool, "quota-owner").await;
+        let tid_b = seed_tenant(&db.pool, "quota-foreign").await;
+
+        // Foreign claims: B asks for A's quota -> absence-shaped deny.
+        let err = svc
+            .tenant_quota_impl(quota_req("quota-owner", Some(tid_b)))
+            .await
+            .expect_err("foreign claims must not read another tenant's quota");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert_eq!(err.message(), "unknown tenant: quota-owner");
+
+        // The deny is byte-identical to the genuinely-absent deny.
+        let absent = svc
+            .tenant_quota_impl(quota_req("quota-no-such", Some(tid_b)))
+            .await
+            .expect_err("absent tenant is NotFound");
+        assert_eq!(absent.code(), tonic::Code::NotFound);
+        assert_eq!(absent.message(), "unknown tenant: quota-no-such");
+
+        // Own claims pass.
+        svc.tenant_quota_impl(quota_req("quota-owner", Some(tid_a)))
+            .await
+            .expect("own claims read own quota");
+
+        // No claims (dual-mode/dev) pass through unchanged.
+        svc.tenant_quota_impl(quota_req("quota-owner", None))
+            .await
+            .expect("anonymous dual-mode passthrough preserved");
     }
 }

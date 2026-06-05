@@ -22,6 +22,76 @@ use crate::metadata::{self};
 
 use super::{StoreServiceImpl, metadata_status};
 
+/// Witness: this narinfo passed the tenant sig-visibility policy for
+/// THIS request. Produced ONLY by
+/// [`StoreServiceImpl::sig_visibility_gate`]'s visible verdict or
+/// [`PathVisible::substituted_for_tenant`] (a path fetched through
+/// the requesting tenant's own upstreams). The narinfo serve/write
+/// steps require one (`visible_narinfo`, `append_signatures_visible`,
+/// [`ServeAuthority`]) — a tenant-facing read path that skips the
+/// gate does not compile.
+#[must_use]
+#[derive(Debug)]
+pub(in crate::grpc) struct PathVisible(());
+
+impl PathVisible {
+    /// Sole non-gate mint: substitution fetched the path via the
+    /// REQUESTING tenant's own upstreams (`try_substitute_on_miss`),
+    /// so visibility holds by construction (the fetch appended sigs
+    /// the tenant trusts).
+    pub(in crate::grpc) fn substituted_for_tenant() -> Self {
+        PathVisible(())
+    }
+}
+
+/// Witness: GetPath's manifest-hint fast path — the caller PRESENTED
+/// the manifest (BLAKE3 chunk hashes as capability tokens, I-110c),
+/// so the serve step is hint-authorized without the visibility gate.
+/// Sole mint: `hint_into_manifest`'s validated-hint return. The
+/// chokepoint protecting this path is `BatchGetManifest`'s
+/// end-user-rejection: tenants cannot obtain chunk hashes for paths
+/// the gate would hide.
+#[must_use]
+#[derive(Debug)]
+pub(in crate::grpc) struct CapabilityHint(());
+
+impl CapabilityHint {
+    /// Sole mint: a validated, path-matching presented manifest hint.
+    pub(in crate::grpc) fn from_presented_hint() -> Self {
+        CapabilityHint(())
+    }
+}
+
+/// The two authorities under which GetPath may stream bytes.
+/// `stream_path` requires one — a new GetPath arm without a recorded
+/// authority does not compile.
+pub(in crate::grpc) enum ServeAuthority {
+    /// Passed the sig-visibility gate (or tenant-trust substitution).
+    Visible(PathVisible),
+    /// Presented manifest hint (capability tokens).
+    Hint(CapabilityHint),
+}
+
+/// The gate-passing subset of a `FindMissingPaths` batch — sole
+/// producer [`StoreServiceImpl::sig_visibility_gate_batch`]. The
+/// missing-fold consults membership through this type only, so the
+/// fold is structurally downstream of the gate.
+#[must_use]
+pub(in crate::grpc) struct VisibleSet {
+    set: HashSet<String>,
+}
+
+impl VisibleSet {
+    pub(in crate::grpc) fn contains(&self, path: &str) -> bool {
+        self.set.contains(path)
+    }
+
+    #[cfg(test)]
+    pub(in crate::grpc) fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
 impl StoreServiceImpl {
     // r[impl store.substitute.tenant-sig-visibility+2]
     /// Cross-tenant sig-visibility gate. A substituted path (one that
@@ -55,9 +125,9 @@ impl StoreServiceImpl {
         &self,
         tenant_id: Option<uuid::Uuid>,
         info: &ValidatedPathInfo,
-    ) -> Result<bool, Status> {
+    ) -> Result<Option<PathVisible>, Status> {
         let Some(tid) = tenant_id else {
-            return Ok(true); // anonymous → unfiltered
+            return Ok(Some(PathVisible(()))); // anonymous → unfiltered
         };
         // r[impl gw.jwt.anon-drv-lookup]
         // .drv files are build INPUTS, not tenant-owned outputs — exempt
@@ -68,7 +138,7 @@ impl StoreServiceImpl {
         // with zero `path_tenants` rows falls through to sig-verify and
         // is reported invisible (no upstream sigs on .drvs).
         if info.store_path.is_derivation() {
-            return Ok(true);
+            return Ok(Some(PathVisible(())));
         }
 
         let path_hash = info.store_path.sha256_digest();
@@ -89,7 +159,7 @@ impl StoreServiceImpl {
         .status_internal("sig_visibility_gate: path_tenants")?;
 
         if owned {
-            return Ok(true);
+            return Ok(Some(PathVisible(())));
         }
         if any_built {
             // I-217: built by ANOTHER tenant only. Previously this
@@ -99,7 +169,7 @@ impl StoreServiceImpl {
             // are still shared (dedup) — only narinfo visibility is
             // gated, so B building the SAME drv later gets its own
             // `path_tenants` row and becomes `owned`.
-            return Ok(false);
+            return Ok(None);
         }
 
         // Zero path_tenants rows → substitution-only OR freshly-PutPath
@@ -114,7 +184,7 @@ impl StoreServiceImpl {
             // → any substituted path is invisible. With a signer the
             // cluster key was pushed above, so this is the no-signer
             // edge only.
-            return Ok(false);
+            return Ok(None);
         }
 
         let fp = rio_nix::narinfo::fingerprint(
@@ -127,7 +197,11 @@ impl StoreServiceImpl {
                 .map(|r| r.to_string())
                 .collect::<Vec<_>>(),
         );
-        Ok(crate::signing::any_sig_trusted(&info.signatures, &trusted, &fp).is_some())
+        Ok(
+            crate::signing::any_sig_trusted(&info.signatures, &trusted, &fp)
+                .is_some()
+                .then_some(PathVisible(())),
+        )
     }
 
     // r[impl store.substitute.tenant-sig-visibility+2]
@@ -187,10 +261,12 @@ impl StoreServiceImpl {
         &self,
         tenant_id: Option<uuid::Uuid>,
         present: &[String],
-    ) -> Result<HashSet<String>, Status> {
+    ) -> Result<VisibleSet, Status> {
         // Anonymous → unfiltered (r[store.tenant.narinfo-filter]).
         if tenant_id.is_none() || present.is_empty() {
-            return Ok(present.iter().cloned().collect());
+            return Ok(VisibleSet {
+                set: present.iter().cloned().collect(),
+            });
         }
         let tid = tenant_id.unwrap();
 
@@ -247,7 +323,7 @@ impl StoreServiceImpl {
             }
         }
         if subst_only.is_empty() {
-            return Ok(visible);
+            return Ok(VisibleSet { set: visible });
         }
 
         // Substitution-only subset: fetch (path, signatures, nar_hash,
@@ -256,7 +332,7 @@ impl StoreServiceImpl {
         let trusted = self.tenant_trusted_set(tid).await?;
         if trusted.is_empty() {
             // Tenant trusts nothing → all substitution-only paths hidden.
-            return Ok(visible);
+            return Ok(VisibleSet { set: visible });
         }
 
         // narinfo carries everything fingerprint() needs. One ANY()
@@ -295,7 +371,7 @@ impl StoreServiceImpl {
                 visible.insert(r.store_path);
             }
         }
-        Ok(visible)
+        Ok(VisibleSet { set: visible })
     }
 
     /// Sync signing given a pre-resolved `Signer`. No DB hit.
@@ -613,26 +689,38 @@ mod tests {
 
         // A: trusts K (the substituting tenant) → sig verifies → visible.
         assert!(
-            svc.sig_visibility_gate(Some(tid_a), &stored).await.unwrap(),
+            svc.sig_visibility_gate(Some(tid_a), &stored)
+                .await
+                .unwrap()
+                .is_some(),
             "tenant A trusts K → visible"
         );
 
         // B: trusts K → sig verifies → visible.
         assert!(
-            svc.sig_visibility_gate(Some(tid_b), &stored).await.unwrap(),
+            svc.sig_visibility_gate(Some(tid_b), &stored)
+                .await
+                .unwrap()
+                .is_some(),
             "tenant B trusts K → visible"
         );
 
         // C: doesn't trust K → hidden.
         assert!(
-            !svc.sig_visibility_gate(Some(tid_c), &stored).await.unwrap(),
+            svc.sig_visibility_gate(Some(tid_c), &stored)
+                .await
+                .unwrap()
+                .is_none(),
             "tenant C doesn't trust K → NotFound"
         );
 
         // Anonymous → passes through (unfiltered per
         // r[store.tenant.narinfo-filter]).
         assert!(
-            svc.sig_visibility_gate(None, &stored).await.unwrap(),
+            svc.sig_visibility_gate(None, &stored)
+                .await
+                .unwrap()
+                .is_some(),
             "anonymous → unfiltered"
         );
 
@@ -648,11 +736,17 @@ mod tests {
             .unwrap();
 
         assert!(
-            svc.sig_visibility_gate(Some(tid_a), &stored).await.unwrap(),
+            svc.sig_visibility_gate(Some(tid_a), &stored)
+                .await
+                .unwrap()
+                .is_some(),
             "A owns the path → visible to A"
         );
         assert!(
-            !svc.sig_visibility_gate(Some(tid_c), &stored).await.unwrap(),
+            svc.sig_visibility_gate(Some(tid_c), &stored)
+                .await
+                .unwrap()
+                .is_none(),
             "I-217: A built it, C didn't → HIDDEN from C (was leak pre-fix)"
         );
         // B also doesn't own it but trusts K (the sig). With any_built
@@ -660,7 +754,10 @@ mod tests {
         // full stop), B is also hidden — correct: a substituted-then-
         // built path is now tenant-owned, not "still public via sig".
         assert!(
-            !svc.sig_visibility_gate(Some(tid_b), &stored).await.unwrap(),
+            svc.sig_visibility_gate(Some(tid_b), &stored)
+                .await
+                .unwrap()
+                .is_none(),
             "I-217: built-by-another takes precedence over sig-trust"
         );
     }
@@ -708,15 +805,24 @@ mod tests {
             .unwrap();
 
         assert!(
-            svc.sig_visibility_gate(Some(tid_a), &stored).await.unwrap(),
+            svc.sig_visibility_gate(Some(tid_a), &stored)
+                .await
+                .unwrap()
+                .is_some(),
             "A owns it → visible to A (substituter=None)"
         );
         assert!(
-            !svc.sig_visibility_gate(Some(tid_b), &stored).await.unwrap(),
+            svc.sig_visibility_gate(Some(tid_b), &stored)
+                .await
+                .unwrap()
+                .is_none(),
             "I-217: B does NOT own it → hidden (substituter=None must not bypass)"
         );
         assert!(
-            svc.sig_visibility_gate(None, &stored).await.unwrap(),
+            svc.sig_visibility_gate(None, &stored)
+                .await
+                .unwrap()
+                .is_some(),
             "anonymous → unfiltered (spec carve-out)"
         );
 
@@ -800,7 +906,10 @@ mod tests {
 
         // THE assertion: tenant sees its own tenant-key-signed path.
         assert!(
-            svc.sig_visibility_gate(Some(tid), &stored).await.unwrap(),
+            svc.sig_visibility_gate(Some(tid), &stored)
+                .await
+                .unwrap()
+                .is_some(),
             "tenant MUST see paths signed by its own tenant_keys pubkey \
              during the path_tenants count=0 window"
         );
@@ -809,9 +918,10 @@ mod tests {
         // tenant_keys, doesn't trust this key) → hidden.
         let tid_other = seed_tenant(&db.pool, "own-key-other").await;
         assert!(
-            !svc.sig_visibility_gate(Some(tid_other), &stored)
+            svc.sig_visibility_gate(Some(tid_other), &stored)
                 .await
-                .unwrap(),
+                .unwrap()
+                .is_none(),
             "other tenant doesn't trust this tenant's key → hidden"
         );
     }
@@ -882,11 +992,17 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            svc.sig_visibility_gate(Some(tid), &drv_info).await.unwrap(),
+            svc.sig_visibility_gate(Some(tid), &drv_info)
+                .await
+                .unwrap()
+                .is_some(),
             ".drv with no path_tenants/sigs must be visible (build input, not tenant output)"
         );
         assert!(
-            !svc.sig_visibility_gate(Some(tid), &out_info).await.unwrap(),
+            svc.sig_visibility_gate(Some(tid), &out_info)
+                .await
+                .unwrap()
+                .is_none(),
             "non-.drv with no path_tenants/sigs must be hidden (substitution-only, untrusted)"
         );
 
@@ -994,7 +1110,7 @@ mod tests {
                 let single = svc.sig_visibility_gate(Some(tid), &info).await.unwrap();
                 assert_eq!(
                     batch.contains(p),
-                    single,
+                    single.is_some(),
                     "tenant {name}: batch/single disagree for {p}"
                 );
             }
@@ -1106,7 +1222,8 @@ mod tests {
         assert!(
             svc.sig_visibility_gate(Some(tid_other), &stored)
                 .await
-                .unwrap(),
+                .unwrap()
+                .is_some(),
             "path signed under old cluster key A MUST stay visible after \
              rotation to B when A is in prior_cluster — this is the \
              CASCADE-survival property"
@@ -1121,10 +1238,11 @@ mod tests {
             .with_substituter(sub)
             .with_signer(ts_no_history);
         assert!(
-            !svc_no_history
+            svc_no_history
                 .sig_visibility_gate(Some(tid_other), &stored)
                 .await
-                .unwrap(),
+                .unwrap()
+                .is_none(),
             "negative control: WITHOUT prior_cluster, old-key path MUST \
              be invisible (this is the bug P0521 fixes)"
         );

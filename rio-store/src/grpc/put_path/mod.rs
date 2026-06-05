@@ -26,7 +26,8 @@ use super::{StoreServiceImpl, putpath_metadata_status};
 
 pub(super) mod common;
 pub(super) use common::{
-    PlaceholderClaim, apply_trailer, validate_put_metadata, verify_ca_store_path, verify_nar,
+    IngestAuthority, PlaceholderClaim, apply_trailer, validate_put_metadata, verify_ca_store_path,
+    verify_nar,
 };
 
 /// Drain remaining messages from a streaming request.
@@ -52,25 +53,27 @@ async fn drain_stream(stream: &mut Streaming<PutPathRequest>) {
 }
 
 impl StoreServiceImpl {
-    /// HMAC assignment-token gate. Returns:
-    /// - `Ok(Some(claims))` — valid `x-rio-assignment-token`; caller
+    /// HMAC assignment-token gate — the SOLE producer of
+    /// [`IngestAuthority`] (callers must NOT restate the admit
+    /// reasons; cite this fn instead — R7-m001 found 5 divergent
+    /// restatements):
+    /// - `Builder(claims)` — valid `x-rio-assignment-token`; caller
     ///   checks the requested path ∈ `claims.expected_outputs`.
-    /// - `Ok(None)` — TWO distinct reasons (callers must NOT restate;
-    ///   cite this fn instead — R7-m001 found 5 divergent restatements):
-    ///     1. **dev-mode**: `hmac_verifier` unset → accept all.
-    ///     2. **service-token bypass**: valid `x-rio-service-token`
-    ///        whose `caller` ∈ `service_bypass_callers`
-    ///        (gateway/scheduler) → no per-build assignment token
-    ///        required.
+    /// - `ServiceBypass{caller}` — valid `x-rio-service-token` whose
+    ///   `caller` ∈ `service_bypass_callers` (gateway/scheduler) → no
+    ///   per-build assignment token required. PutPath* accept this;
+    ///   AppendHwPerfSample REJECTS it (the divergent policy is a
+    ///   visible match arm at each consumer, not an ambiguous None).
+    /// - `DevMode` — `hmac_verifier` unset → accept all.
     /// - `Err(PERMISSION_DENIED)` — token missing/invalid/expired, or
     ///   service-token caller not allowlisted.
     pub(super) fn verify_assignment_token<T>(
         &self,
         request: &Request<T>,
-    ) -> Result<Option<rio_auth::hmac::AssignmentClaims>, Status> {
+    ) -> Result<IngestAuthority, Status> {
         let Some(verifier) = &self.hmac_verifier else {
             // Verifier not configured = dev mode, accept all.
-            return Ok(None);
+            return Ok(IngestAuthority::DevMode);
         };
 
         // Service-token bypass (transport-agnostic — works over
@@ -91,10 +94,12 @@ impl StoreServiceImpl {
                 {
                     metrics::counter!(
                         "rio_store_service_token_accepted_total",
-                        "caller" => claims.caller,
+                        "caller" => claims.caller.clone(),
                     )
                     .increment(1);
-                    return Ok(None);
+                    return Ok(IngestAuthority::ServiceBypass {
+                        caller: claims.caller,
+                    });
                 }
                 Ok(claims) => {
                     metrics::counter!("rio_store_hmac_rejected_total",
@@ -120,12 +125,15 @@ impl StoreServiceImpl {
             .and_then(|v| v.to_str().ok());
 
         match token {
-            Some(t) => verifier.verify(t).map(Some).map_err(|e| {
-                warn!(error = %e, "PutPath: assignment token verification failed");
-                metrics::counter!("rio_store_hmac_rejected_total", "reason" => "invalid_token")
-                    .increment(1);
-                Status::permission_denied(format!("assignment token: {e}"))
-            }),
+            Some(t) => verifier
+                .verify(t)
+                .map(IngestAuthority::Builder)
+                .map_err(|e| {
+                    warn!(error = %e, "PutPath: assignment token verification failed");
+                    metrics::counter!("rio_store_hmac_rejected_total", "reason" => "invalid_token")
+                        .increment(1);
+                    Status::permission_denied(format!("assignment token: {e}"))
+                }),
             None => {
                 metrics::counter!("rio_store_hmac_rejected_total", "reason" => "missing_token")
                     .increment(1);
@@ -152,7 +160,7 @@ impl StoreServiceImpl {
         let mut stream = request.into_inner();
 
         let raw_info = common::read_first_metadata(&mut stream).await?;
-        let mut info = validate_put_metadata(raw_info, auth.hmac_claims.as_ref(), "PutPath")?;
+        let mut info = validate_put_metadata(raw_info, auth.builder_claims(), "PutPath")?;
         // Server-derived in validate_put_metadata (step 7) — never the
         // wire value. r[sec.boundary.grpc-hmac].
         let store_path_hash = info.store_path_hash.clone();
@@ -172,7 +180,7 @@ impl StoreServiceImpl {
         // IA → claim BEFORE ingest (path is HMAC-bound); CA → claim
         // AFTER ingest (path is now content-bound). Matches
         // PutPathBatch's verify-then-claim ordering.
-        let is_ca_caller = auth.hmac_claims.as_ref().is_some_and(|c| c.is_ca);
+        let is_ca_caller = auth.builder_claims().is_some_and(|c| c.is_ca);
 
         let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
         let (mut claim, mut placeholder_guard) = if is_ca_caller {
@@ -198,7 +206,7 @@ impl StoreServiceImpl {
         };
 
         let (nar_data, _held_permits) = match self
-            .ingest_nar_stream(&mut stream, &mut info, auth.hmac_claims.as_ref())
+            .ingest_nar_stream(&mut stream, &mut info, auth.builder_claims())
             .await
         {
             Ok(x) => x,
