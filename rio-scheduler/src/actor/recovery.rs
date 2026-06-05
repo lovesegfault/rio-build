@@ -1066,7 +1066,8 @@ impl DagActor {
     /// Handle `LeaderRebound`: a holder change observed late on a
     /// still-leading round (`sched.lease.rebound`). The rebound is a
     /// compressed lose→acquire pair whose standby interval was never
-    /// locally observed, so it runs the [`LeaderEdge`] table's
+    /// locally observed, so it runs the
+    /// [`LeaderEdge`](crate::observability::LeaderEdge) table's
     /// **Compound** members' lose cells first — the cost latch's
     /// false-store (the foreign term may have persisted its own
     /// prices; the next housekeeping tick must reload before it

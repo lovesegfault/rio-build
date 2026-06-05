@@ -432,7 +432,7 @@ impl LeaderElection {
     /// `is_leader`; see `run_lease_loop`'s error arm.
     ///
     /// Unbounded (no internal deadlines) — for tests and one-shot
-    /// callers. The lease loop uses [`Self::renew_phased`], whose
+    /// callers. The lease loop uses `Self::renew_phased` (private), whose
     /// per-phase budgets are what make an abandoned write classifiable
     /// (`sched.lease.cancelled-write`).
     pub async fn try_acquire_or_renew(&mut self) -> Result<ElectionResult, kube::Error> {
