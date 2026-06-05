@@ -429,6 +429,67 @@ pub fn visit_object(
     }
 }
 
+/// A served-stream completeness claim: the ONLY way to say
+/// `is_complete = true` on a `TailLog` final message. Private fields —
+/// constructible solely through [`final_claim`], which correlates the
+/// claim with the SERVED cursor, not just the durable state
+/// (merged_bug_063: a seal + manifest commit landing mid-serve made
+/// the old uncorrelated predicate stamp `complete = true` on a stream
+/// that had served half the lines; the reconnect heal never fired).
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FinalClaim {
+    complete: bool,
+    cursor_next: u64,
+}
+
+impl FinalClaim {
+    /// Did the served stream deliver everything the sealed witness
+    /// recorded? `true` only when the sealed final line count exists,
+    /// the manifest covers it contiguously, AND the served cursor has
+    /// reached it.
+    pub fn complete(&self) -> bool {
+        self.complete
+    }
+
+    /// The served watermark this claim was minted against — the
+    /// `next_line` the final message advertises for the reconnect
+    /// contract.
+    pub fn cursor_next(&self) -> u64 {
+        self.cursor_next
+    }
+}
+
+/// Mint the final-message completeness claim
+/// (`docs/spec/models/logService.qnt::readerStamp`):
+/// **complete ⇔ sealed = Some(n) ∧ cursor_next ≥ n ∧
+/// manifest_covers_sealed.**
+///
+/// `sealed_final_line_count` is the lifecycle row's recorded end (only
+/// when terminal); `manifest_covers_sealed` is the contiguity fold up
+/// to that count; `cursor_next` is the watermark actually served to
+/// THIS reader. A mid-serve commit+seal yields `complete = false` and
+/// the client's reconnect contract heals the difference.
+#[cfg_attr(kani, kani::ensures(|r: &FinalClaim| {
+    r.cursor_next == cursor_next
+        && (r.complete
+            == matches!(sealed_final_line_count,
+                        Some(n) if cursor_next >= n && manifest_covers_sealed))
+}))]
+// r[impl store.log.served-claim]
+pub fn final_claim(
+    cursor_next: u64,
+    sealed_final_line_count: Option<u64>,
+    manifest_covers_sealed: bool,
+) -> FinalClaim {
+    let complete = matches!(sealed_final_line_count,
+                            Some(n) if cursor_next >= n && manifest_covers_sealed);
+    FinalClaim {
+        complete,
+        cursor_next,
+    }
+}
+
 /// The verdict of [`accept_verdict`] for one non-empty `AppendLog`
 /// batch. The three `Rejected*` variants map one-to-one onto the
 /// rejection variants of rio-store's `logs::ingest::AcceptOutcome`;
@@ -732,6 +793,18 @@ mod proofs {
         let first_line: u64 = kani::any();
         let n_lines: u64 = kani::any();
         let _ = visit_chunk(next_line, first_line, n_lines);
+    }
+
+    /// Verify [`final_claim`] against its ensures contract over the
+    /// full `(u64, Option<u64>, bool)` domain: complete ⇔ sealed
+    /// Some(n) ∧ cursor ≥ n ∧ covers, and the advertised cursor is the
+    /// input cursor. No loops, no allocation — exhaustive.
+    #[kani::proof_for_contract(final_claim)]
+    fn check_final_claim_contract() {
+        let cursor_next: u64 = kani::any();
+        let sealed: Option<u64> = kani::any();
+        let covers: bool = kani::any();
+        let _ = final_claim(cursor_next, sealed, covers);
     }
 
     /// Verify [`accept_verdict`] against its `kani::ensures` contracts
@@ -1098,6 +1171,23 @@ mod proofs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn final_claim_law() {
+        // complete ⇔ sealed ∧ cursor ≥ sealed ∧ covers
+        assert!(!final_claim(10, Some(20), true).complete(), "mid-serve");
+        assert!(
+            !final_claim(20, Some(20), false).complete(),
+            "gapped manifest"
+        );
+        assert!(!final_claim(20, None, true).complete(), "unsealed");
+        assert!(final_claim(20, Some(20), true).complete());
+        assert!(
+            final_claim(25, Some(20), true).complete(),
+            "served past seal"
+        );
+        assert_eq!(final_claim(7, None, false).cursor_next(), 7);
+    }
+
     use super::*;
 
     /// One visit step per row: `(cursor, first, n) -> expected

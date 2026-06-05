@@ -20,7 +20,7 @@
 //!    build-membership ownership in one gate.
 //!
 //! The completeness predicate (`TailLogChunk.is_complete`) is
-//! `super::gate::log_is_complete` — the same function that seals the
+//! `super::gate::final_claim_for` — the same facts that seal the
 //! write path. It is deliberately not reimplemented here.
 //!
 //! No gRPC, no live-tail subscription, no cross-replica proxy — those
@@ -908,6 +908,49 @@ mod tests {
                 "{why}"
             );
         }
+    }
+
+    /// RED (merged_bug_063): a final message stamped mid-serve — the
+    /// reader's cursor at 10 while the seal+manifest committed to 20 —
+    /// must NOT claim the served stream complete. Today the predicate
+    /// is cursor-blind.
+    #[tokio::test]
+    async fn mid_serve_final_is_not_complete() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let exec = Uuid::now_v7();
+        let sess = Uuid::now_v7();
+        seed_execution(&db.pool, exec, Some("succeeded"), Some(20)).await;
+        for (seq, first) in [(0u32, 0u64), (1, 10)] {
+            let content = lines("x", first, 10);
+            seed_chunk(
+                &db.pool,
+                &store,
+                exec,
+                sess,
+                seq,
+                first,
+                &line_refs(&content),
+            )
+            .await;
+        }
+        // The serve cursor sits at 10: the commit+seal landed mid-serve.
+        // The kernel claim is cursor-correlated — complete=false here,
+        // complete=true only once the reader has been served to 20.
+        // (The old cursor-blind `log_is_complete` returned true at
+        // cursor 10 — the recorded red.)
+        let mid = crate::logs::gate::final_claim_for(&db.pool, exec, 10)
+            .await
+            .unwrap();
+        assert!(
+            !mid.complete(),
+            "a final stamped with the cursor at 10 (< sealed 20) must not claim complete"
+        );
+        assert_eq!(mid.cursor_next(), 10);
+        let done = crate::logs::gate::final_claim_for(&db.pool, exec, 20)
+            .await
+            .unwrap();
+        assert!(done.complete(), "served to the seal with full coverage");
     }
 
     /// Latest-exec resolution: empty exec_id → the newest execution for

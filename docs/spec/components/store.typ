@@ -1648,6 +1648,19 @@ helm default (both HMAC keys, no JWT), and the fully-keyed production
 posture all keep booting — dual-mode is permanent doctrine; half-keyed
 authentication is not a mode.
 
+#r("store.log.served-claim")[
+  A `TailLog` final message's `is_complete` MUST be minted as a
+  served-stream claim correlated with the reader's served cursor:
+  `complete` if and only if the execution's sealed `final_line_count`
+  exists, the manifest covers it contiguously, and the served watermark
+  has reached it. A completeness predicate computed from durable state
+  alone MUST NOT stamp a final message.
+]
+A seal and its covering cut can commit mid-serve; the uncorrelated
+predicate then advertises a complete stream to a reader that was served
+half of it, and the reconnect heal never fires (merged_bug_063). The
+kernel's `final_claim` is the only constructor of the claim.
+
 #r("store.log.completeness-gate")[
   An execution's log is complete when its lifecycle row is terminal, its
   builder-reported `final_line_count` is known, and its chunk manifest

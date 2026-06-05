@@ -340,11 +340,40 @@ pub(super) async fn finish_open(
 /// backs `TailLogChunk.is_complete` — `pub(super)` so the TailLog read
 /// path imports this exact function instead of growing a second copy
 /// that could diverge from the seal.
+/// DEMOTED (merged_bug_063): cursor-blind — kept only as the test
+/// oracle for the durable half of the predicate. The serve path mints
+/// [`final_claim_for`] instead; a `TailLog` final message cannot be
+/// stamped from this function (`send_final` takes the kernel claim).
+#[cfg(test)]
 pub(super) async fn log_is_complete(pool: &PgPool, exec_id: Uuid) -> Result<bool, Status> {
     match sealed_final_line_count(pool, exec_id).await? {
         Some(final_line_count) => manifest_covers(pool, exec_id, final_line_count).await,
         None => Ok(false),
     }
+}
+
+/// The serve path's ONLY completeness source: fetch the sealed witness
+/// and the manifest fold, then mint the kernel [`FinalClaim`]
+/// correlated with the SERVED cursor. The cursor-blind
+/// [`log_is_complete`] above is demoted to the ingest/test side — a
+/// `TailLog` final message cannot be stamped from it (merged_bug_063:
+/// `send_final` takes the claim, not a bool).
+// r[impl store.log.served-claim]
+pub(super) async fn final_claim_for(
+    pool: &PgPool,
+    exec_id: Uuid,
+    cursor_next: u64,
+) -> Result<rio_log_kernel::FinalClaim, Status> {
+    let sealed = sealed_final_line_count(pool, exec_id).await?;
+    let covers = match sealed {
+        Some(n) => manifest_covers(pool, exec_id, n).await?,
+        None => false,
+    };
+    Ok(rio_log_kernel::final_claim(
+        cursor_next,
+        sealed.map(|n| n as u64),
+        covers,
+    ))
 }
 
 // r[impl store.log.completeness-gate]

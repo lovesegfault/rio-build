@@ -1493,8 +1493,8 @@ async fn serve_tail(
         // History-only. The final (possibly empty) message carries the
         // computed completeness so the CLI/dashboard can render their
         // "(log incomplete)" notice.
-        let is_complete = gate::log_is_complete(&pool, exec_id).await?;
-        send_final(tx, &exec_str, cursor.next_line(), is_complete).await?;
+        let claim = gate::final_claim_for(&pool, exec_id, cursor.next_line()).await?;
+        send_final(tx, &exec_str, claim).await?;
         return Ok(());
     };
 
@@ -1513,8 +1513,8 @@ async fn serve_tail(
     }
 
     if !follow {
-        let is_complete = gate::log_is_complete(&pool, exec_id).await?;
-        send_final(tx, &exec_str, cursor.next_line(), is_complete).await?;
+        let claim = gate::final_claim_for(&pool, exec_id, cursor.next_line()).await?;
+        send_final(tx, &exec_str, claim).await?;
         return Ok(());
     }
 
@@ -1624,39 +1624,27 @@ async fn serve_tail(
     // drop on the LAST batches must not become a missing tail the
     // final message advertises past.
     let mut recovered = false;
-    // Snapshot FIRST, manifest second — the same coverage-contract
-    // ordering as the in-stream backfill above (a cut committing
-    // between a manifest-first read and the snapshot would hide its
-    // lines from both views).
-    let snap: Vec<(u64, Vec<u8>)> = match shared.upgrade() {
-        Some(shared) => lock_shared(&shared).snapshot(),
-        None => Vec::new(),
-    };
+    // INVARIANT (merged_bug_063 dead-arm deletion): `rx.recv()`
+    // returned `None` ⇔ every `IngestShared` `Arc` was dropped ⇔ the
+    // `Weak` cannot upgrade — the post-session "snapshot" half of this
+    // catch-up was provably empty on every execution. The final drain
+    // cuts the remaining buffer to chunks before the session drops, so
+    // the manifest walk below holds everything.
     let refs = tail::read_manifest_range(&pool, exec_id, cursor.next_line()).await?;
     for chunk in &refs {
         let lines = tail::read_chunk(store.as_ref(), chunk, &mut cursor).await?;
         recovered |= !lines.is_empty();
         send_lines(tx, &exec_str, lines, false).await?;
     }
-    let snap: Vec<(u64, Vec<u8>)> = snap
-        .into_iter()
-        .filter(|(n, _)| *n >= cursor.next_line())
-        .collect();
-    if !snap.is_empty() {
-        let end = snap.last().map(|(n, _)| *n);
-        recovered = true;
-        send_lines(tx, &exec_str, snap, false).await?;
-        if let Some(end) = end {
-            cursor.advance_to(end + 1);
-        }
-    }
     if recovered {
         metrics::counter!("rio_store_log_tail_fanout_recovered_total").increment(1);
     }
     // Tell the reader where things stand; the client's reconnect
-    // contract takes it from here.
-    let is_complete = gate::log_is_complete(&pool, exec_id).await?;
-    send_final(tx, &exec_str, cursor.next_line(), is_complete).await?;
+    // contract takes it from here. The claim is minted against the
+    // SERVED cursor — a seal+cut that committed mid-serve yields
+    // complete=false and the reconnect heals.
+    let claim = gate::final_claim_for(&pool, exec_id, cursor.next_line()).await?;
+    send_final(tx, &exec_str, claim).await?;
     Ok(())
 }
 
@@ -1707,15 +1695,14 @@ async fn send_lines(
 async fn send_final(
     tx: &mpsc::Sender<Result<TailLogChunk, Status>>,
     exec_id: &str,
-    next_line: u64,
-    is_complete: bool,
+    claim: rio_log_kernel::FinalClaim,
 ) -> Result<(), Status> {
     let _ = tx
         .send(Ok(TailLogChunk {
             exec_id: exec_id.to_string(),
             lines: Vec::new(),
-            first_line_number: next_line,
-            is_complete,
+            first_line_number: claim.cursor_next(),
+            is_complete: claim.complete(),
         }))
         .await;
     Ok(())
