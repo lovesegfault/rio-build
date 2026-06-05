@@ -432,10 +432,75 @@ fn pg_host_port(url: &str) -> Result<(String, u16)> {
     Ok((host.to_owned(), port.parse().context("PG URL bad port")?))
 }
 
+/// Rewrite the URL's host to the local tunnel endpoint AND downgrade
+/// its TLS posture to `sslmode=require`, dropping `sslrootcert`.
+/// verify-full through a localhost tunnel is structurally impossible
+/// (the server cert's SAN names the RDS endpoint, not `localhost`)
+/// and the bundle path in the URL is a pod mount path that does not
+/// exist on the operator machine. `require` (encrypt, don't verify)
+/// is the correct tunnel posture: the threat model for an
+/// operator-laptop port-forward differs from in-VPC pods, and the
+/// credential is the master password either way.
 fn rewrite_pg_host(url: &str, new_host_port: &str) -> String {
     let (pre, post) = url.split_once('@').expect("validated by pg_host_port");
     let (_, db) = post.split_once('/').unwrap_or((post, ""));
-    format!("{pre}@{new_host_port}/{db}")
+    let (path, query) = db.split_once('?').unwrap_or((db, ""));
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|p| !p.is_empty() && !p.starts_with("sslmode=") && !p.starts_with("sslrootcert="))
+        .collect();
+    let mut q = kept.join("&");
+    if query.contains("sslmode=") {
+        if !q.is_empty() {
+            q.push('&');
+        }
+        q.push_str("sslmode=require");
+    }
+    if q.is_empty() {
+        format!("{pre}@{new_host_port}/{path}")
+    } else {
+        format!("{pre}@{new_host_port}/{path}?{q}")
+    }
+}
+
+#[cfg(test)]
+mod rewrite_tests {
+    use super::rewrite_pg_host;
+
+    /// The ESO-templated Aurora URL carries verify-full + a pod-mount
+    /// sslrootcert path; both must be replaced for the tunnel or the
+    /// connect fails twice over (missing bundle file, SAN mismatch
+    /// against localhost).
+    #[test]
+    fn verify_full_url_downgrades_to_require_for_tunnel() {
+        let url = "postgres://rio:p%40ss@rio-pg.cluster-x.rds.amazonaws.com:5432/rio\
+                   ?sslmode=verify-full&sslrootcert=/etc/rio/rds-ca/global-bundle.pem";
+        let got = rewrite_pg_host(url, "localhost:15432");
+        assert_eq!(
+            got,
+            "postgres://rio:p%40ss@localhost:15432/rio?sslmode=require"
+        );
+    }
+
+    /// k3s bitnami URLs have no ssl params — pass through untouched.
+    #[test]
+    fn plain_url_keeps_no_query() {
+        let url = "postgres://rio:secret@rio-postgresql:5432/rio";
+        assert_eq!(
+            rewrite_pg_host(url, "localhost:6000"),
+            "postgres://rio:secret@localhost:6000/rio"
+        );
+    }
+
+    /// Unrelated query params survive the rewrite.
+    #[test]
+    fn unrelated_params_survive() {
+        let url = "postgres://u:p@h:5432/db?application_name=qa&sslmode=verify-full";
+        assert_eq!(
+            rewrite_pg_host(url, "localhost:7000"),
+            "postgres://u:p@localhost:7000/db?application_name=qa&sslmode=require"
+        );
+    }
 }
 
 // ─── ephemeral tenants ─────────────────────────────────────────────────

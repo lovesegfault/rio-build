@@ -38,6 +38,13 @@ pub struct DeployOpts {
     /// builds started immediately after `up` get evicted mid-run as
     /// the rollout proceeds.
     pub wait_drift: bool,
+    /// Deploy with postgres.authMode=password instead of the iam
+    /// default (EKS). Escape hatch for tfstate predating the IAM-auth
+    /// infra (controller IRSA role / rds-db:connect): without the
+    /// flag such a state is a HARD error, never a silent fallback —
+    /// password mode re-opens the master-rotation outage class while
+    /// reporting success.
+    pub pg_password_mode: bool,
     /// Source CIDRs allowed to reach the gateway NLB. Non-empty flips
     /// the NLB to `internet-facing` and sets
     /// `spec.loadBalancerSourceRanges`; empty (default) keeps it
