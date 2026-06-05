@@ -2146,6 +2146,48 @@ pub const M_093: () = ();
 ///   raw `drv_*` queries in runbooks).
 pub const M_094: () = ();
 
+/// `migrations/095_drop_derivations_tenant_id.sql`
+///
+/// Drops the never-production-written `derivations.tenant_id`
+/// (bughunt-2 wave, merged_bug_064; owner decision Q2, 2026-06-04).
+/// `TailLog` ownership keyed on this column was constant-false in
+/// production, and the test fixtures that stamped it proved a vacuous
+/// truth; ownership is now **build-membership** over the
+/// production-written `builds.tenant_id` chain
+/// (`assignments`→`build_derivations`→`builds`, swept-assignment arm
+/// via `drv_executions`⨝`derivations` on the execution's own recorded
+/// hash) — see `store.log.tail-ownership` and
+/// `rio_store::logs::tail::authorize_tail`.
+///
+/// Never-written census (re-run at the slot-4 candidate tip,
+/// 4a9d9b535, 2026-06-04 — the evidence standard the Q2 signature
+/// attests over):
+/// - The sole production INSERT into `derivations`
+///   (`batch_upsert_derivations`, rio-scheduler/src/db/batch.rs:105)
+///   omits the column from its column list.
+/// - `git log --all -S 'UPDATE derivations SET tenant_id'
+///   --pickaxe-regex -- '*.rs'` → exactly a57034dd8 (branch-local,
+///   `#[cfg(test)]` fixtures only) and the slot-4 commit REMOVING
+///   those fixtures; `origin/main` history has zero writers.
+/// - `.sqlx/` prepared queries and non-Rust sources carry no writer.
+/// - Structural anchor: checksum-frozen `009_phase4.sql:29`
+///   force-nulls the column before this migration can ever run, and
+///   `derivations_tenant_fk` (ON DELETE SET NULL) bounded even manual
+///   writes.
+/// - Zero production reads remain at the candidate tip (the last
+///   reader was the constant-false tail gate this wave re-keyed).
+/// - The one non-tree residual — no environment carries out-of-band
+///   manual writes to the column — is the owner attestation in the
+///   §5-S Q2 signature (2026-06-04).
+///
+/// `DROP COLUMN` cascade-drops `derivations_tenant_fk` and the partial
+/// index `derivations_tenant_idx` (009). Irreversible without a new
+/// migration by design; the `authz-fixture-policy` misc-check bans
+/// `INSERT`/`UPDATE` writes naming `derivations`…`tenant_id`
+/// workspace-wide (allowlist: rio-migrations/) so the dead shape
+/// cannot grow back in fixtures either.
+pub const M_095: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

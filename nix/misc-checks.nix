@@ -678,6 +678,61 @@ in
         touch $out
       '';
 
+  # bughunt2 slot 4 (merged_bug_064): derivations.tenant_id was never
+  # production-written (migration 095 census, M_095) and is DROPPED;
+  # ownership is build-membership over builds.tenant_id
+  # (store.log.tail-ownership). The vacuity failure mode was test
+  # fixtures stamping the dead column so ownership suites proved a
+  # truth production never exercised. This lint makes the dead fixture
+  # shape unwritable workspace-wide (allowlist: rio-migrations/, which
+  # legitimately mentions the column in frozen history). Its born-red
+  # baseline IS the census: at the pre-rewrite tree (372c7719e) it
+  # fires on the four legacy logs/service.rs fixture writes.
+  authz-fixture-policy =
+    pkgs.runCommand "rio-authz-fixture-policy"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-store)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-gateway)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-cli)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-builder)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-controller)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-common)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-test-support)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../xtask)
+          ];
+        };
+        nativeBuildInputs = [ pkgs.ripgrep ];
+      }
+      ''
+        set +o pipefail
+        fail=0
+        # INSERT column lists naming the dropped column (multiline:
+        # SQL string literals wrap; the column list ends at ')').
+        hits=$(rg -nU 'INSERT INTO derivations\s*\([^)]*tenant_id' $src || true)
+        if [[ -n "$hits" ]]; then
+          echo "FAIL: fixture INSERTs derivations.tenant_id — the column was never" >&2
+          echo "production-written and is dropped (migration 095, M_095). Ownership" >&2
+          echo "fixtures use the production shape: seed_production_ownership" >&2
+          echo "(builds.tenant_id + build_derivations), per store.log.tail-ownership:" >&2
+          echo "$hits" >&2
+          fail=1
+        fi
+        # UPDATE ... SET targeting the dropped column.
+        hits=$(rg -nU 'UPDATE derivations\s+SET[^"]{0,300}tenant_id' $src || true)
+        if [[ -n "$hits" ]]; then
+          echo "FAIL: fixture UPDATEs derivations.tenant_id (dropped by migration 095" >&2
+          echo "— see M_095); use seed_production_ownership instead:" >&2
+          echo "$hits" >&2
+          fail=1
+        fi
+        [[ $fail -eq 0 ]]
+        touch $out
+      '';
+
   # bughunt2 slot 4 riders (merged_bug_168 + bug_362): the log-gate
   # authority model is CLAIMED-EXEC (check 3 at logs/gate.rs) — the
   # pre-wave "latest assignment" / "live assignment" rule is retired,

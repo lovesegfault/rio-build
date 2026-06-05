@@ -238,6 +238,7 @@ fn migration_checksums_frozen() {
         (92, "a015e5b79a7fbb8d5ce18de91fe8052f8103a067f1d4a59922e8edc17b8c1474146c2ddd1058cd172da7e5539ad36dba"),
         (93, "aaeaf06e1fed0b64593e28ddd3f31ecf5214c14f8c826a34d91495c23246277a33aa1c017163a914c9ba3beabb651100"),
         (94, "cf331bf43708600be422b7d2bdbb30366cf8688920a2cd65894f911795ebc978c2dc7909f2254903c55a148cd9aab744"),
+        (95, "d97a2280a397223fff4e1214cca423083797a8f6e8ad6f8b006ed456c06d175ac17c4e9eb37b49c62abc46994c83075b"),
     ];
 
     let pinned: std::collections::HashMap<i64, &str> = PINNED.iter().copied().collect();
@@ -330,10 +331,16 @@ async fn cross_service_schema_contract() {
         ("assignments", "derivation_id",  "uuid"),
         ("derivations", "derivation_id",  "uuid"),
         ("derivations", "drv_hash",       "text"),
-        // logs (authz): TailLog ownership — the handler joins the
-        // exec's assignment to its derivation row and compares the
-        // owner tenant against the verified claims.
-        ("derivations", "tenant_id",      "uuid"),
+        // logs (authz): TailLog ownership is build-membership
+        // (store.log.tail-ownership) — authorize_tail joins the exec's
+        // assignment (or, swept, its drv_executions hash ⨝ derivations)
+        // through build_derivations to builds.tenant_id and compares
+        // against the verified claims. derivations.tenant_id was
+        // never production-written and is dropped by migration 095.
+        ("build_derivations", "build_id",      "uuid"),
+        ("build_derivations", "derivation_id", "uuid"),
+        ("builds", "build_id",  "uuid"),
+        ("builds", "tenant_id", "uuid"),
         // logs (063): latest-exec resolution + the completeness
         // predicate. drv_executions is scheduler-WRITTEN, store-READ.
         ("drv_executions", "exec_id",          "uuid"),
