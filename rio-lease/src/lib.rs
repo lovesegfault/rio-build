@@ -1036,12 +1036,16 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     //   - every acquire/lose transition, including the self-fence
     //     (which cannot patch — the apiserver is unreachable — so the
     //     flag IS the deferred debt the old `owe_cost_clear` carried).
-    //   - implicitly kept set by a failed or stale PATCH: the spawned
-    //     task clears it only when a patch succeeds AND the polarity it
-    //     wrote still matches the pod's leadership.
+    //   - implicitly kept set by a failed PATCH: the spawned task
+    //     clears only THROUGH the mark snapshot the loop took at its
+    //     spawn ([`DirtyGen::clear_through`]), so a failure simply
+    //     never clears — and any dirtying event that lands after the
+    //     snapshot (a transition, a rebound, a verify divergence)
+    //     survives the clear by arithmetic, with no per-edge ordering
+    //     premise.
     // Arc: the detached patch task owns a clone and clears it on
     // success.
-    let marks_dirty = Arc::new(AtomicBool::new(true));
+    let marks_dirty = Arc::new(DirtyGen::new_dirty());
     // Single-flight slot for the marks PATCH task: owned by the loop
     // (which takes it before spawning) plus the one in-flight task,
     // which releases it on completion via a Drop guard whose release
@@ -1131,7 +1135,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
             }
             state.on_lose();
             hooks.on_lose();
-            marks_dirty.store(true, Ordering::SeqCst);
+            marks_dirty.mark();
             continue;
         }
 
@@ -1203,7 +1207,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         // longer match this pod — the reconcile arm
                         // after the edge match patches them this same
                         // tick.
-                        marks_dirty.store(true, Ordering::SeqCst);
+                        marks_dirty.mark();
 
                         // r[impl sched.lease.non-blocking-acquire+2]
                         // Fire the per-component on-acquire hook
@@ -1255,7 +1259,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         // Trailers-Only Unavailable otherwise). The
                         // reconcile arm after the edge match patches
                         // this tick.
-                        marks_dirty.store(true, Ordering::SeqCst);
+                        marks_dirty.mark();
                     }
                     (Some(transitions), true) => {
                         // ---- Still leading ----
@@ -1305,7 +1309,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             // The rebound re-dirty: a guaranteed-
                             // foreign-sweep falsifier handled at its
                             // edge; the verify pass bounds the rest.
-                            marks_dirty.store(true, Ordering::SeqCst);
+                            marks_dirty.mark();
                             let new_gen = state.on_rebound(transitions);
                             warn!(
                                 recorded,
@@ -1358,7 +1362,6 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                     now_leading,
                     &marks_dirty,
                     &marks_patch_in_flight,
-                    state.is_leader_arc(),
                     renew_deadline,
                 ) {
                     inflight_marks = Some(task);
@@ -1383,7 +1386,6 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         &cfg,
                         &marks_dirty,
                         &marks_patch_in_flight,
-                        state.is_leader_arc(),
                         renew_deadline,
                     )
                 {
@@ -1683,6 +1685,135 @@ impl BlindClock {
     }
 }
 
+/// Generation-counted dirty flag for the leader-marks reconcile
+/// (bug_181's structural close — replaces the `AtomicBool` whose clear
+/// could clobber a concurrent re-dirty).
+///
+/// Two monotone counters: `marked` bumps on every dirtying event,
+/// `cleared` advances only *through a snapshot the clearing task took
+/// at spawn*. Dirty ⇔ `marked > cleared`. A mark that lands after a
+/// task's snapshot is `> snap ≥ cleared` and therefore survives that
+/// task's clear **by arithmetic** — there is no per-edge ordering
+/// premise ("every edge writes `is_leader` before the flag") to
+/// maintain, document, or violate. The rebound edge — which by design
+/// never writes `is_leader` — was exactly the dirtying site the old
+/// premise missed; any future site (a new edge, a verify pass, an
+/// actor) is race-proof the moment it calls [`mark`](Self::mark).
+///
+/// The count-coincidence ABA of the bool (clear erases an unseen mark)
+/// is unrepresentable: `clear_through` is `fetch_max`, so clears never
+/// regress, and a clear can only settle marks that existed at its own
+/// snapshot.
+pub(crate) struct DirtyGen {
+    /// Total dirtying events. Starts at 1 (construction is the first
+    /// dirtying event: a fresh loop owes one reconcile — see the
+    /// init-dirty comment in `run_lease_loop_with_client`).
+    marked: AtomicU64,
+    /// Highest settled mark. `cleared ≤ marked` always (clears go
+    /// through snapshots of `marked`).
+    cleared: AtomicU64,
+}
+
+impl DirtyGen {
+    /// Construct in the dirty state (one un-cleared mark): the loop
+    /// always owes its first reconcile.
+    fn new_dirty() -> Self {
+        Self {
+            marked: AtomicU64::new(1),
+            cleared: AtomicU64::new(0),
+        }
+    }
+
+    /// Construct in the clean state. Test-only: production reaches
+    /// clean exclusively through a completed reconcile's
+    /// [`clear_through`](Self::clear_through).
+    #[cfg(any(test, kani))]
+    fn new_clean() -> Self {
+        Self {
+            marked: AtomicU64::new(0),
+            cleared: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a dirtying event — any site, any task, any time. The
+    /// mark survives every clear whose snapshot predates it.
+    fn mark(&self) {
+        self.marked.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Snapshot the mark counter for a clear-through. Taken by the
+    /// loop at task spawn (before the task's round-trip), so the clear
+    /// can settle exactly the marks the task's patch could have
+    /// reflected.
+    fn snapshot(&self) -> u64 {
+        self.marked.load(Ordering::SeqCst)
+    }
+
+    /// Are there unsettled marks?
+    fn is_dirty(&self) -> bool {
+        self.marked.load(Ordering::SeqCst) > self.cleared.load(Ordering::SeqCst)
+    }
+
+    /// Settle every mark up to `snap` (a value from
+    /// [`snapshot`](Self::snapshot)). `fetch_max`: concurrent or
+    /// out-of-order clears never regress the settled watermark, and a
+    /// mark later than `snap` stays dirty by arithmetic.
+    fn clear_through(&self, snap: u64) {
+        self.cleared.fetch_max(snap, Ordering::SeqCst);
+    }
+}
+
+/// The DirtyGen algebra under CBMC: over every bounded interleaving of
+/// marks and snapshot/clear pairs, a mark that lands after a snapshot
+/// is never settled by that snapshot's clear. Joins the `decide_pure` /
+/// `LeaseStanding` pattern: no loops in the functions under proof,
+/// bounded driver loop. (rio-lease has no `expectedHarnesses` pin —
+/// the kani driver's "Complete - N" line is the count of record.)
+#[cfg(kani)]
+mod dirty_gen_proofs {
+    use super::DirtyGen;
+
+    const MAX_EVENTS: usize = 8;
+
+    /// r[verify sched.lease.rebound+2]
+    /// For every event sequence (mark / snapshot / clear-through-last-
+    /// snapshot), after any clear: if a mark happened after the
+    /// snapshot that clear used, the flag is still dirty.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn dirty_gen_mark_after_snapshot_never_cleared() {
+        // 0 = mark, 1 = take snapshot, 2 = clear through the last
+        // taken snapshot (no-op when none taken yet).
+        let events: [u8; MAX_EVENTS] = kani::any();
+        let dg = DirtyGen::new_clean();
+        let mut snap: Option<u64> = None;
+        let mut marked_since_snap = false;
+        let mut i = 0;
+        while i < MAX_EVENTS {
+            match events[i] % 3 {
+                0 => {
+                    dg.mark();
+                    marked_since_snap = true;
+                }
+                1 => {
+                    snap = Some(dg.snapshot());
+                    marked_since_snap = false;
+                }
+                _ => {
+                    if let Some(s) = snap {
+                        dg.clear_through(s);
+                        assert!(
+                            !marked_since_snap || dg.is_dirty(),
+                            "a mark after the snapshot must survive the clear"
+                        );
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
 /// Local self-fence: if we believed we were leading but haven't
 /// had a successful apiserver round-trip in over [`SELF_FENCE_AFTER`],
 /// flip `is_leader=false` locally. SELF_FENCE_AFTER is 2×FENCE_MARGIN
@@ -1706,7 +1837,7 @@ impl BlindClock {
 fn maybe_self_fence(
     state: &LeaderState,
     standing: &mut LeaseStanding,
-    marks_dirty: &AtomicBool,
+    marks_dirty: &DirtyGen,
     blind_for: Duration,
 ) -> bool {
     if standing.believes() && blind_for > SELF_FENCE_AFTER {
@@ -1730,7 +1861,7 @@ fn maybe_self_fence(
         // reconcile still matters: in a symmetric partition there is no
         // reachable holder to sweep us, and our own first reachable
         // round-trip is what clears the marks (and the cost tie) then.
-        marks_dirty.store(true, Ordering::SeqCst);
+        marks_dirty.mark();
         true
     } else {
         false
@@ -1806,16 +1937,21 @@ fn leader_marks_patch(
 /// ([`maybe_spawn_leader_marks`]) spawns this while `marks_dirty` is
 /// set AND no other marks PATCH is in flight — at most one is in
 /// flight at a time, and dirtiness persists across the ticks the
-/// single-flight guard skips. The task clears `marks_dirty` ONLY when
-/// the PATCH succeeds AND the polarity it wrote (`leading`) still
-/// matches the pod's current leadership (re-checked once more after
-/// the clear); a failed or timed-out patch leaves the flag set, and a
-/// patch of a since-stale polarity re-marks it dirty. Either way the
-/// first tick after the slot frees retries with the then-current state
-/// instead of leaving the marks wrong until the next leadership
-/// transition — the label is load-bearing for the dashboard data path
-/// (leader-only Service), so "wrong until the next transition" would
-/// be an unbounded outage, not a cosmetic blip.
+/// single-flight guard skips. On success the task clears the marks
+/// only THROUGH the [`DirtyGen`] snapshot the caller took at spawn:
+/// any dirtying event that lands after the snapshot — a transition
+/// edge, a rebound (which by design never writes `is_leader`), a
+/// verify divergence — stays dirty **by arithmetic**, so no polarity
+/// re-check or per-edge store-ordering premise exists to get wrong
+/// (bug_181: the old bool's clear clobbered a concurrent rebound
+/// re-dirty exactly because the rebound edge has no `is_leader` write
+/// for a re-check to observe). A failed or timed-out patch clears
+/// nothing. Either way the first tick after the slot frees retries
+/// with the then-current state instead of leaving the marks wrong
+/// until the next leadership transition — the label is load-bearing
+/// for the dashboard data path (leader-only Service), so "wrong until
+/// the next transition" would be an unbounded outage, not a cosmetic
+/// blip.
 ///
 /// `tokio::spawn` because the lease loop MUST NOT block. A slow
 /// apiserver PATCH would stall the renew tick — the blocked loop can
@@ -1834,9 +1970,9 @@ fn spawn_patch_leader_marks(
     client: kube::Client,
     cfg: &LeaseConfig,
     leading: bool,
-    marks_dirty: Arc<AtomicBool>,
+    marks_dirty: Arc<DirtyGen>,
+    marks_snapshot: u64,
     patch_in_flight: Arc<AtomicBool>,
-    is_leader: Arc<AtomicBool>,
     patch_timeout: Duration,
 ) -> tokio::task::JoinHandle<()> {
     let namespace = cfg.namespace.clone();
@@ -1893,27 +2029,17 @@ fn spawn_patch_leader_marks(
                     _ => true,
                 };
                 // Single-flight makes the apiserver's last-applied
-                // marks the ones THIS task wrote, so a successful patch
-                // whose polarity still matches the desire is safe to
-                // clear on once the sweep also landed; a since-stale
-                // polarity (or an incomplete sweep) forces another
-                // reconcile instead. The re-check after the clear
-                // covers the one remaining race: an acquire/lose/
-                // self-fence edge whose `marks_dirty.store(true)` lands
-                // between the polarity comparison and the
-                // `store(false)` would be clobbered — re-reading the
-                // desire and re-dirtying recovers it (every edge writes
-                // `is_leader` before `marks_dirty`, both SeqCst, so a
-                // desire change that beat the clear is visible to the
-                // re-check; one that lands after it wins by program
-                // order).
-                if sweep_ok && is_leader.load(Ordering::SeqCst) == leading {
-                    marks_dirty.store(false, Ordering::SeqCst);
-                    if is_leader.load(Ordering::SeqCst) != leading {
-                        marks_dirty.store(true, Ordering::SeqCst);
-                    }
-                } else {
-                    marks_dirty.store(true, Ordering::SeqCst);
+                // marks the ones THIS task wrote; a clean own patch +
+                // sweep settles exactly the marks that existed at the
+                // caller's spawn snapshot. Any dirtying event that
+                // landed after the snapshot — a transition edge, a
+                // rebound (no `is_leader` write to observe), a verify
+                // divergence — is `> marks_snapshot` and stays dirty by
+                // arithmetic; an incomplete sweep simply clears
+                // nothing, so the next round-trip retries the whole
+                // reconcile.
+                if sweep_ok {
+                    marks_dirty.clear_through(marks_snapshot);
                 }
             }
             Ok(Err(e)) => {
@@ -2011,16 +2137,15 @@ fn marks_match(
 /// captured at spawn, and on divergence re-dirty the marks + warn —
 /// the repair itself reuses the level-triggered reconcile on the next
 /// round-trip. A GET failure changes nothing (the next verify interval
-/// retries); a polarity gone stale mid-flight is caught by the same
-/// post-clear re-check discipline the reconcile uses — here the
-/// comparison simply re-runs against the captured polarity, and a
-/// wrong-capture verdict at worst re-dirties, which is always safe
-/// (one no-op PATCH).
+/// retries); a polarity gone stale mid-flight at worst re-dirties
+/// ([`DirtyGen::mark`]), which is always safe (one no-op PATCH) — and
+/// a mark is never erased by a concurrent reconcile's clear (the
+/// clear-through arithmetic), so the verify's verdict cannot be lost.
 fn spawn_verify_leader_marks(
     client: kube::Client,
     cfg: &LeaseConfig,
     leading: bool,
-    marks_dirty: Arc<AtomicBool>,
+    marks_dirty: Arc<DirtyGen>,
     patch_in_flight: Arc<AtomicBool>,
     call_timeout: Duration,
 ) -> tokio::task::JoinHandle<()> {
@@ -2046,7 +2171,7 @@ fn spawn_verify_leader_marks(
                         "leader-marks verify found divergence (external strip/foreign \
                          sweep?); re-dirtying for the next reconcile"
                     );
-                    marks_dirty.store(true, Ordering::SeqCst);
+                    marks_dirty.mark();
                 }
             }
             Ok(Err(e)) => {
@@ -2073,12 +2198,11 @@ fn spawn_verify_leader_marks(
 fn maybe_spawn_verify_leader_marks(
     client: &kube::Client,
     cfg: &LeaseConfig,
-    marks_dirty: &Arc<AtomicBool>,
+    marks_dirty: &Arc<DirtyGen>,
     patch_in_flight: &Arc<AtomicBool>,
-    _is_leader: Arc<AtomicBool>,
     call_timeout: Duration,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if !marks_dirty.load(Ordering::SeqCst) && !patch_in_flight.swap(true, Ordering::SeqCst) {
+    if !marks_dirty.is_dirty() && !patch_in_flight.swap(true, Ordering::SeqCst) {
         Some(spawn_verify_leader_marks(
             client.clone(),
             cfg,
@@ -2243,21 +2367,25 @@ pub(crate) fn maybe_spawn_leader_marks(
     client: &kube::Client,
     cfg: &LeaseConfig,
     leading: bool,
-    marks_dirty: &Arc<AtomicBool>,
+    marks_dirty: &Arc<DirtyGen>,
     patch_in_flight: &Arc<AtomicBool>,
-    is_leader: Arc<AtomicBool>,
     patch_timeout: Duration,
 ) -> Option<tokio::task::JoinHandle<()>> {
     // Short-circuit keeps the swap (which takes the slot) from firing
     // on non-dirty ticks.
-    if marks_dirty.load(Ordering::SeqCst) && !patch_in_flight.swap(true, Ordering::SeqCst) {
+    if marks_dirty.is_dirty() && !patch_in_flight.swap(true, Ordering::SeqCst) {
+        // The clear-through snapshot: taken AFTER the slot is held and
+        // BEFORE the task runs, so the spawned task can settle exactly
+        // the marks its patch could have reflected — anything later
+        // survives its clear by arithmetic.
+        let marks_snapshot = marks_dirty.snapshot();
         Some(spawn_patch_leader_marks(
             client.clone(),
             cfg,
             leading,
             Arc::clone(marks_dirty),
+            marks_snapshot,
             Arc::clone(patch_in_flight),
-            is_leader,
             patch_timeout,
         ))
     } else {
@@ -2706,7 +2834,7 @@ mod tests {
 
         let mut standing = LeaseStanding::new();
         standing.on_observed(true);
-        let marks_dirty = AtomicBool::new(false);
+        let marks_dirty = DirtyGen::new_clean();
         // 20s blind > SELF_FENCE_AFTER (11s). The predicate is clock-free
         // (takes the blind duration directly) since the boottime move.
         let blind_for = Duration::from_secs(20);
@@ -2745,7 +2873,7 @@ mod tests {
 
         let mut standing = LeaseStanding::new();
         standing.on_observed(true);
-        let marks_dirty = AtomicBool::new(false);
+        let marks_dirty = DirtyGen::new_clean();
         // 10s blind < SELF_FENCE_AFTER (11s). Two failed ticks, lease
         // still validly held as far as we know.
         let blind_for = Duration::from_secs(10);
@@ -2773,7 +2901,7 @@ mod tests {
 
         let mut standing = LeaseStanding::new();
         standing.on_observed(true);
-        let marks_dirty = AtomicBool::new(false);
+        let marks_dirty = DirtyGen::new_clean();
 
         let fired = maybe_self_fence(&state, &mut standing, &marks_dirty, SELF_FENCE_AFTER);
 
@@ -2795,7 +2923,7 @@ mod tests {
         // is_leader already false, recovery_complete already false.
 
         let mut standing = LeaseStanding::new();
-        let marks_dirty = AtomicBool::new(false);
+        let marks_dirty = DirtyGen::new_clean();
         let blind_for = Duration::from_secs(20);
 
         let fired = maybe_self_fence(&state, &mut standing, &marks_dirty, blind_for);
@@ -2825,13 +2953,13 @@ mod tests {
 
         let mut standing = LeaseStanding::new();
         standing.on_observed(true);
-        let marks_dirty = AtomicBool::new(false);
+        let marks_dirty = DirtyGen::new_clean();
         let blind_for = Duration::from_secs(20);
 
         let fired = maybe_self_fence(&state, &mut standing, &marks_dirty, blind_for);
         assert!(fired);
         assert!(
-            marks_dirty.load(Ordering::SeqCst),
+            marks_dirty.is_dirty(),
             "self-fence must mark the pod's leader marks dirty (apiserver unreachable \
              now, so the lease loop reconciles them on the next reachable round-trip)"
         );
@@ -2840,7 +2968,7 @@ mod tests {
         // led has no marks to reconcile).
         let standby = LeaderState::pending(Arc::new(AtomicU64::new(1)));
         let mut standing = LeaseStanding::new();
-        let marks_dirty = AtomicBool::new(false);
+        let marks_dirty = DirtyGen::new_clean();
         let fired = maybe_self_fence(
             &standby,
             &mut standing,
@@ -2848,10 +2976,7 @@ mod tests {
             Duration::from_secs(20),
         );
         assert!(!fired);
-        assert!(
-            !marks_dirty.load(Ordering::SeqCst),
-            "no-fire → flag untouched"
-        );
+        assert!(!marks_dirty.is_dirty(), "no-fire → flag untouched");
     }
 
     // ---- Leader-marks patch body (deletion-cost + leader label) ----
@@ -2997,7 +3122,7 @@ mod tests {
     async fn marks_reconcile_single_flight_couples_flag_to_stored_polarity() {
         let (client, mut park) = RequestPark::new();
         let cfg = marks_test_cfg();
-        let marks_dirty = Arc::new(AtomicBool::new(true));
+        let marks_dirty = Arc::new(DirtyGen::new_dirty());
         let in_flight = Arc::new(AtomicBool::new(false));
         let is_leader = Arc::new(AtomicBool::new(true));
         // Generous bound: nothing in this schedule relies on the
@@ -3010,16 +3135,9 @@ mod tests {
 
         // Leader + dirty → task A (leader polarity) spawns; its PATCH
         // parks at the mock.
-        let handle_a = maybe_spawn_leader_marks(
-            &client,
-            &cfg,
-            true,
-            &marks_dirty,
-            &in_flight,
-            Arc::clone(&is_leader),
-            patch_timeout,
-        )
-        .expect("dirty + free slot must spawn");
+        let handle_a =
+            maybe_spawn_leader_marks(&client, &cfg, true, &marks_dirty, &in_flight, patch_timeout)
+                .expect("dirty + free slot must spawn");
         let req_a = park.next().await;
         assert!(
             req_a.path.contains("/pods/us"),
@@ -3029,7 +3147,7 @@ mod tests {
 
         // Lose edge while A is still in flight: desire flips, dirty set.
         is_leader.store(false, Ordering::SeqCst);
-        marks_dirty.store(true, Ordering::SeqCst);
+        marks_dirty.mark();
 
         // Single-flight: the opposite-polarity drive is skipped while A
         // holds the slot — a concurrent pair of patches is exactly what
@@ -3042,7 +3160,6 @@ mod tests {
                 false,
                 &marks_dirty,
                 &in_flight,
-                Arc::clone(&is_leader),
                 patch_timeout,
             )
             .is_none(),
@@ -3089,7 +3206,7 @@ mod tests {
         }));
         handle_a.await.expect("patch task A");
         assert!(
-            marks_dirty.load(Ordering::SeqCst),
+            marks_dirty.is_dirty(),
             "stale-polarity completion must leave the marks dirty"
         );
         assert!(
@@ -3104,7 +3221,6 @@ mod tests {
             false,
             &marks_dirty,
             &in_flight,
-            Arc::clone(&is_leader),
             patch_timeout,
         )
         .expect("dirty + freed slot must spawn the retry");
@@ -3117,7 +3233,7 @@ mod tests {
         // patch in flight ⇒ the apiserver's last-applied polarity equals
         // the pod's leadership. Exactly two PATCHes total (A + retry).
         assert!(
-            !marks_dirty.load(Ordering::SeqCst),
+            !marks_dirty.is_dirty(),
             "converged reconcile clears the flag"
         );
         assert!(!in_flight.load(Ordering::SeqCst));
@@ -3145,46 +3261,27 @@ mod tests {
     async fn marks_patch_failure_releases_slot_and_keeps_dirty() {
         let (client, mut park) = RequestPark::new();
         let cfg = marks_test_cfg();
-        let marks_dirty = Arc::new(AtomicBool::new(true));
+        let marks_dirty = Arc::new(DirtyGen::new_dirty());
         let in_flight = Arc::new(AtomicBool::new(false));
-        let is_leader = Arc::new(AtomicBool::new(true));
         let patch_timeout = Duration::from_secs(60);
 
-        let handle = maybe_spawn_leader_marks(
-            &client,
-            &cfg,
-            true,
-            &marks_dirty,
-            &in_flight,
-            Arc::clone(&is_leader),
-            patch_timeout,
-        )
-        .expect("dirty + free slot must spawn");
+        let handle =
+            maybe_spawn_leader_marks(&client, &cfg, true, &marks_dirty, &in_flight, patch_timeout)
+                .expect("dirty + free slot must spawn");
         park.next()
             .await
             .respond_status(403, "Forbidden", "rbac: missing patch on pods");
         handle.await.expect("patch task");
 
-        assert!(
-            marks_dirty.load(Ordering::SeqCst),
-            "failed patch keeps the marks dirty"
-        );
+        assert!(marks_dirty.is_dirty(), "failed patch keeps the marks dirty");
         assert!(
             !in_flight.load(Ordering::SeqCst),
             "failed patch releases the slot"
         );
         // The freed slot is genuinely usable: the next drive spawns.
         assert!(
-            maybe_spawn_leader_marks(
-                &client,
-                &cfg,
-                true,
-                &marks_dirty,
-                &in_flight,
-                Arc::clone(&is_leader),
-                patch_timeout,
-            )
-            .is_some(),
+            maybe_spawn_leader_marks(&client, &cfg, true, &marks_dirty, &in_flight, patch_timeout,)
+                .is_some(),
             "retry after a failure must be able to take the slot"
         );
     }
@@ -3197,22 +3294,14 @@ mod tests {
     async fn marks_patch_timeout_releases_slot_and_keeps_dirty() {
         let (client, mut park) = RequestPark::new();
         let cfg = marks_test_cfg();
-        let marks_dirty = Arc::new(AtomicBool::new(true));
+        let marks_dirty = Arc::new(DirtyGen::new_dirty());
         let in_flight = Arc::new(AtomicBool::new(false));
-        let is_leader = Arc::new(AtomicBool::new(true));
         // Same bound the loop passes: its renew deadline.
         let patch_timeout = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
 
-        let handle = maybe_spawn_leader_marks(
-            &client,
-            &cfg,
-            true,
-            &marks_dirty,
-            &in_flight,
-            Arc::clone(&is_leader),
-            patch_timeout,
-        )
-        .expect("dirty + free slot must spawn");
+        let handle =
+            maybe_spawn_leader_marks(&client, &cfg, true, &marks_dirty, &in_flight, patch_timeout)
+                .expect("dirty + free slot must spawn");
         // Park the request and never answer it; the call must end via
         // its own timeout once the (paused) clock passes the bound.
         let parked = park.next().await;
@@ -3220,7 +3309,7 @@ mod tests {
         handle.await.expect("patch task ends via its timeout");
 
         assert!(
-            marks_dirty.load(Ordering::SeqCst),
+            marks_dirty.is_dirty(),
             "timed-out patch keeps the marks dirty"
         );
         assert!(
@@ -3228,19 +3317,64 @@ mod tests {
             "timed-out patch releases the slot"
         );
         assert!(
-            maybe_spawn_leader_marks(
-                &client,
-                &cfg,
-                true,
-                &marks_dirty,
-                &in_flight,
-                Arc::clone(&is_leader),
-                patch_timeout,
-            )
-            .is_some(),
+            maybe_spawn_leader_marks(&client, &cfg, true, &marks_dirty, &in_flight, patch_timeout,)
+                .is_some(),
             "retry after a timeout must be able to take the slot"
         );
         drop(parked);
+    }
+
+    /// bug_181 red: a rebound's re-dirty landing while a reconcile is
+    /// in flight must survive that reconcile's clear. The rebound edge
+    /// dirties the marks WITHOUT writing `is_leader` (by design —
+    /// pinned by `on_rebound_records_count_and_reruns_recovery`), so a
+    /// completion-side polarity re-check premised on "every edge writes
+    /// `is_leader` before the dirty flag" cannot see it: the in-flight
+    /// task's clear erases the rebound's mark even though the foreign
+    /// term's reconcile provably swept our stored marks. The dirtying
+    /// site this test stands in for is the rebound arm's re-dirty in
+    /// `run_lease_loop_with_client` (the `transitions != recorded`
+    /// branch).
+    // r[verify sched.lease.rebound+2]
+    // r[verify sched.lease.deletion-cost+3]
+    #[tokio::test]
+    async fn rebound_redirty_survives_inflight_reconcile_clear() {
+        let (client, mut park) = RequestPark::new();
+        // No leader label configured → no peer-sweep legs; the own-pod
+        // PATCH is the only request.
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let marks_dirty = Arc::new(DirtyGen::new_dirty());
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let patch_timeout = Duration::from_secs(60);
+
+        // Leader + dirty → reconcile spawns; its PATCH parks.
+        let handle =
+            maybe_spawn_leader_marks(&client, &cfg, true, &marks_dirty, &in_flight, patch_timeout)
+                .expect("dirty + free slot must spawn");
+        let req = park.next().await;
+        assert!(req.path.contains("/pods/us"));
+
+        // The rebound re-dirty lands while the PATCH is in flight.
+        // is_leader is NOT written — that is the rebound's contract.
+        marks_dirty.mark();
+
+        // The task completes successfully and runs its clear decision.
+        req.respond_ok(pod_ok("us"));
+        handle.await.expect("patch task");
+
+        assert!(
+            marks_dirty.is_dirty(),
+            "a rebound re-dirty landing mid-reconcile must survive the \
+             completing task's clear (the foreign term's sweep stripped \
+             our stored marks; a clean flag here is an unbounded stale-\
+             marks outage)"
+        );
+        assert!(!in_flight.load(Ordering::SeqCst));
     }
 
     // ---- Peer sweep: stale leader label on another pod ----
@@ -3363,9 +3497,8 @@ mod tests {
     async fn leading_reconcile_sweeps_stale_peer_label() {
         let (client, verifier) = ApiServerVerifier::new();
         let cfg = marks_test_cfg();
-        let marks_dirty = Arc::new(AtomicBool::new(true));
+        let marks_dirty = Arc::new(DirtyGen::new_dirty());
         let in_flight = Arc::new(AtomicBool::new(false));
-        let is_leader = Arc::new(AtomicBool::new(true));
 
         let guard = verifier.run(vec![
             Scenario::ok(Method::PATCH, "/pods/us", pod_ok("us").to_string()),
@@ -3405,7 +3538,6 @@ mod tests {
             true,
             &marks_dirty,
             &in_flight,
-            Arc::clone(&is_leader),
             Duration::from_secs(60),
         )
         .expect("dirty + free slot must spawn");
@@ -3413,7 +3545,7 @@ mod tests {
         guard.verified().await;
 
         assert!(
-            !marks_dirty.load(Ordering::SeqCst),
+            !marks_dirty.is_dirty(),
             "own patch + sweep all landed → flag clears"
         );
         assert!(!in_flight.load(Ordering::SeqCst), "slot released");
@@ -3426,9 +3558,8 @@ mod tests {
     async fn failed_peer_sweep_keeps_marks_dirty() {
         let (client, verifier) = ApiServerVerifier::new();
         let cfg = marks_test_cfg();
-        let marks_dirty = Arc::new(AtomicBool::new(true));
+        let marks_dirty = Arc::new(DirtyGen::new_dirty());
         let in_flight = Arc::new(AtomicBool::new(false));
-        let is_leader = Arc::new(AtomicBool::new(true));
 
         let guard = verifier.run(vec![
             Scenario::ok(Method::PATCH, "/pods/us", pod_ok("us").to_string()),
@@ -3467,7 +3598,6 @@ mod tests {
             true,
             &marks_dirty,
             &in_flight,
-            Arc::clone(&is_leader),
             Duration::from_secs(60),
         )
         .expect("dirty + free slot must spawn");
@@ -3475,7 +3605,7 @@ mod tests {
         guard.verified().await;
 
         assert!(
-            marks_dirty.load(Ordering::SeqCst),
+            marks_dirty.is_dirty(),
             "incomplete sweep must keep the marks dirty"
         );
         assert!(
@@ -3894,9 +4024,8 @@ mod tests {
     async fn peer_sweep_spares_current_lease_holder() {
         let (client, verifier) = ApiServerVerifier::new();
         let cfg = marks_test_cfg();
-        let marks_dirty = Arc::new(AtomicBool::new(true));
+        let marks_dirty = Arc::new(DirtyGen::new_dirty());
         let in_flight = Arc::new(AtomicBool::new(false));
-        let is_leader = Arc::new(AtomicBool::new(true));
 
         let guard = verifier.run(vec![
             Scenario::ok(Method::PATCH, "/pods/us", pod_ok("us").to_string()),
@@ -3935,7 +4064,6 @@ mod tests {
             true,
             &marks_dirty,
             &in_flight,
-            Arc::clone(&is_leader),
             Duration::from_secs(60),
         )
         .expect("dirty + free slot must spawn");
@@ -3943,7 +4071,7 @@ mod tests {
         guard.verified().await;
 
         assert!(
-            !marks_dirty.load(Ordering::SeqCst),
+            !marks_dirty.is_dirty(),
             "own patch + holder-aware sweep all landed → flag clears"
         );
     }
@@ -4033,9 +4161,8 @@ mod tests {
         mock.seed_pod("us", pod_ok("us"));
         mock.set_behavior(MockBehavior::Park);
         let cfg = marks_test_cfg();
-        let marks_dirty = Arc::new(AtomicBool::new(true));
+        let marks_dirty = Arc::new(DirtyGen::new_dirty());
         let in_flight = Arc::new(AtomicBool::new(false));
-        let is_leader = Arc::new(AtomicBool::new(true));
 
         let handle = maybe_spawn_leader_marks(
             &client,
@@ -4043,7 +4170,6 @@ mod tests {
             true,
             &marks_dirty,
             &in_flight,
-            Arc::clone(&is_leader),
             Duration::from_secs(600), // far beyond the test: abort, not timeout, ends it
         )
         .expect("dirty + free slot must spawn");
@@ -4068,7 +4194,7 @@ mod tests {
              future reconcile of a (hypothetical) successor user of the Arcs"
         );
         assert!(
-            marks_dirty.load(Ordering::SeqCst),
+            marks_dirty.is_dirty(),
             "an aborted reconcile proved nothing — the marks stay dirty"
         );
         let sweep_issued = mock

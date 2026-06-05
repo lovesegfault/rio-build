@@ -436,7 +436,7 @@ impl MbtSystem {
         // directly, so the driver maps the model's tick delta straight
         // through — no synthetic-instant fabrication.
         let blind_for = TICK * u32::try_from(h.ticks - h.fence_tick).expect("tick delta fits u32");
-        let marks_dirty = std::sync::atomic::AtomicBool::new(false);
+        let marks_dirty = crate::DirtyGen::new_clean();
         let fired = maybe_self_fence(&h.state, &mut h.standing, &marks_dirty, blind_for);
         // The model's selfFence precondition is `leading[n] ∧ deadline
         // passed`; the tick mapping guarantees the implementation agrees
