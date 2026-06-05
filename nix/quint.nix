@@ -1214,24 +1214,35 @@ in
       main = "leaderElectionShutdown";
     };
 
-    # The leader-marks reconciliation model (NEW, bughunt-wave F1
-    # merged_bug_138): the deletion-cost/label machinery as a
-    # level-triggered protocol — edge writers, the single-flight
-    # reconcile, the holder-aware sweep (captured-holder skip), the
-    # external falsifier (a strip no edge writer sees), and the
-    # bounded-cadence verify pass. Headline marksDivergenceBounded:
-    # OUR pod's marks divergence is discovered (dirty/in-flight) or
-    # younger than the verify cadence — the contract
-    # sched.lease.marks-verify states. The wrongSince stamp is one
-    # derived helper applied in EVERY action (no enumerated writer
+    # The leader-marks reconciliation model (bughunt-wave F1
+    # merged_bug_138; DirtyGen rework bughunt2-wave slot 8 bug_181):
+    # the deletion-cost/label machinery as a level-triggered protocol —
+    # edge writers that MARK a generation counter, the single-flight
+    # reconcile split into its API-write and flag-clear phases, the
+    # holder-aware sweep (captured-holder skip), the external falsifier
+    # (a strip no edge writer sees), the rebound dirtying site
+    # (merged_bug_212's hook — the "future writer" class the
+    # generation arithmetic absorbs), and the bounded-cadence verify
+    # pass. Headlines: marksDivergenceBounded (cause-tagged — OUR
+    # pod's divergence is discovered, or strip-caused and younger than
+    # the verify cadence plus the task-parking deadline; edge- and
+    # stale-write-caused divergence carries NO age window because the
+    # edge marked in the same transition) and notClobbered (no clear
+    # erases a post-snapshot mark — the DirtyGen clear-through
+    # arithmetic itself). The wrongSince/wrongCause stamps are single
+    # derived helpers applied in EVERY action (no enumerated writer
     # list), which is what keeps the green verdict non-vacuous; the
-    # paired pin is quint-lease-calib-138-edge-only (the verify pass
-    # removed must falsify). The holder-aware sweep half is encoded
-    # structurally (reconcileComplete) and pinned at the production
+    # paired pins are quint-lease-calib-138-edge-only (verify pass
+    # removed must falsify the bound) and
+    # quint-lease-calib-181-bool-clear (bool clear-all restored must
+    # falsify notClobbered). The holder-aware sweep half is encoded
+    # structurally (reconcilePatched) and pinned at the production
     # level by peer_sweep_spares_current_lease_holder — see the model
     # comment for why a model invariant there would be decorative
     # (the spawn-to-complete TOCTOU is a real, verify-bounded
-    # residual).
+    # residual). Measured: exhaustive TLC ~4s at the wired constants
+    # (transcript is authoritative) — the default 1800s budget is
+    # ~450x headroom.
     # r[verify sched.lease.marks-verify]
     # r[verify sched.lease.deletion-cost+3]
     quint-leader-marks = mkQuintCheck {
@@ -1241,6 +1252,7 @@ in
       invariants = [
         "boundsOK"
         "marksDivergenceBounded"
+        "notClobbered"
       ];
     };
 
@@ -1253,8 +1265,21 @@ in
       witness = "noStrip";
     };
 
-    # Deterministic named-run replay (verifyConvergesRun: strip →
-    # cadence-forced verify → re-discovery → re-assert).
+    # Non-vacuity witness: the rebound dirtying site actually fires in
+    # the explored space — the notClobbered verdict covers the
+    # post-212 writer set, not just the original edges.
+    quint-leader-marks-witness-rebound = mkQuintWitnessCheck {
+      name = "leader-marks-witness-rebound";
+      spec = "leaderMarks";
+      main = "leaderMarksBase";
+      witness = "noRebound";
+    };
+
+    # Deterministic named-run replays (verifyConvergesRun: strip →
+    # cadence-forced verify → re-discovery → re-assert;
+    # clearKeepsPostSnapMarkRun: a rebound marks between the API write
+    # and the clear, and the clear-through arithmetic keeps the loop
+    # dirty — the DirtyGen save, end to end).
     quint-leader-marks-runs = mkQuintRunCheck {
       name = "leader-marks-runs";
       spec = "leaderMarks";
@@ -1299,6 +1324,22 @@ in
       spec = "calibration/lease-138-edge-only";
       main = "leaseCalib138EdgeOnly";
       witness = "marksDivergenceBounded";
+      step = "calibStep";
+      extraSpecs = [ "leaderMarks" ];
+    };
+
+    # bug_181 pre-fix (bughunt2-wave slot 8): BOOL dirty flag — the
+    # reconcile success path's store(false) clears EVERY dirtying
+    # event regardless of when it landed. A mark between the spawn
+    # snapshot and the clear (a leadership edge, the rebound hook) is
+    # erased — the parked-PATCH clobber of the bug_181 red;
+    # notClobbered falls. The DirtyGen clear-through arithmetic is
+    # exactly what this pin guards.
+    quint-lease-calib-181-bool-clear = mkQuintWitnessCheck {
+      name = "lease-calib-181-bool-clear";
+      spec = "calibration/lease-181-bool-clear";
+      main = "leaseCalib181BoolClear";
+      witness = "notClobbered";
       step = "calibStep";
       extraSpecs = [ "leaderMarks" ];
     };
