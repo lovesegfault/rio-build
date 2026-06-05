@@ -108,7 +108,8 @@ postgres:
   # iam_database_authentication_enabled + rds-db:connect on the
   # store/scheduler/controller IRSA roles.
   # Safe on a FRESH cluster: the rio-migrate Job (migrate-job.yaml)
-  # always runs as the master before any app pod connects as rio_app.
+  # always runs as the master and provisions the rio_app role + grants
+  # (rio_migrations::ensure_roles) before any app pod connects as it.
   # xtask sets iam on every EKS deploy; the chart default stays
   # password for k3s/dev.
   #
