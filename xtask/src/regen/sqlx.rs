@@ -52,31 +52,28 @@ pub async fn run() -> Result<()> {
     })
     .await?;
 
-    // --check first: exits 0 if cache is current. Non-zero → regenerate.
+    // The full prepare runs UNCONDITIONALLY (bughunt-2 merged_bug_293
+    // residual): `--check` verifies only the source→cache direction —
+    // measured passing in 101s with a planted orphan .sqlx entry
+    // present — so a --check fast-path silently preserves orphaned
+    // cache files. The full workspace prepare rewrites the EXACT live
+    // query set (sweeping orphans), making this regenerator the strict
+    // both-directions set-equality vehicle by construction; a
+    // no-change run rewrites identical bytes, so umbrella idempotence
+    // is unaffected. Text-matching orphan detection stays banned as
+    // unsound (Rust adjacent-string-literal concatenation defeats any
+    // normalization short of literal parsing — 8/10 false positives
+    // measured).
     //
     // `cargo sqlx prepare --workspace` internally does `cargo rustc -p
-    // <crate>` per member — per-package feature resolution, unavoidable.
-    // The --check fast-path avoids the rebuild in the common case.
+    // <crate>` per member — per-package feature resolution, unavoidable;
+    // the isolated CARGO_TARGET_DIR keeps repeat runs warm.
     //
     // `-- --all-targets`: forwarded to the inner `cargo rustc` so
     // `#[cfg(test)]` queries are cached too. The cross-service
     // `LivePin` contract anchor (rio-store gc tests) lives under
     // cfg(test) — without this, regen succeeds but `cargo test`
     // fails on "no cached data for this query".
-    let current = ui::step("cargo sqlx prepare --check", || async {
-        Ok(sh::run(cmd!(
-            sh,
-            "cargo sqlx prepare --workspace --check -- --all-targets"
-        ))
-        .await
-        .is_ok())
-    })
-    .await?;
-    if current {
-        tracing::debug!("sqlx cache already current");
-        return Ok(());
-    }
-
     ui::step("cargo sqlx prepare --workspace", || {
         sh::run(cmd!(sh, "cargo sqlx prepare --workspace -- --all-targets"))
     })
