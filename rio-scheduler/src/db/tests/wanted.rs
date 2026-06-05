@@ -566,3 +566,139 @@ async fn record_wanted_upsert_unions_not_replaces() -> anyhow::Result<()> {
     assert_eq!(rows[0].1, Vec::<String>::new(), "empty saturates the union");
     Ok(())
 }
+
+// r[verify sched.materialize.job+2]
+/// merged_bug_059 class pin: the stored row equals the kernel fold
+/// (`rio_common::wanted_outputs::union_wanted_saturating`) over
+/// ARBITRARY contribution sequences — the falsify-twin of any
+/// "last-write-wins" reading of the upsert (the header that claimed
+/// exactly that is synced in this commit). 64 deterministic LCG-seeded
+/// sequences over distinct-name subsets of {a, b, c} plus the '{}'
+/// (= all declared) sentinel; the SQL row is checked against the
+/// kernel fold after EVERY step, so a divergence names its full
+/// sequence.
+#[tokio::test]
+async fn record_wanted_sql_equals_kernel_union_fold() -> anyhow::Result<()> {
+    let (test_db, db) = setup().await;
+    let mut state: u64 = 0x0059_1176;
+    let mut next = move |bound: usize| -> usize {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 33) as usize) % bound
+    };
+    const ALPHABET: [&str; 3] = ["a", "b", "c"];
+    for case in 0..64 {
+        let d = insert_test_derivation(&db, &format!("wanted-prop-{case}")).await?;
+        let b = insert_test_build(&db).await?;
+        let len = 1 + next(5);
+        let mut fold: Option<Vec<String>> = None;
+        let mut seq: Vec<Vec<String>> = Vec::new();
+        for _ in 0..len {
+            // A contribution is either the '{}' sentinel or a
+            // DISTINCT-name subset of the alphabet in mask order
+            // (production contributions are distinct by construction).
+            let contribution: Vec<String> = match next(5) {
+                0 => Vec::new(),
+                _ => {
+                    let mask = 1 + next(7);
+                    ALPHABET
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| mask & (1 << i) != 0)
+                        .map(|(_, n)| n.to_string())
+                        .collect()
+                }
+            };
+            seq.push(contribution.clone());
+            let outcome = db
+                .record_wanted_fenced(
+                    ServingGeneration::stamp_from_claim(1),
+                    &[WantedRow {
+                        build_id: b,
+                        derivation_id: d,
+                        wanted_output_names: &contribution,
+                    }],
+                )
+                .await?;
+            assert!(outcome.settled());
+            match &mut fold {
+                None => fold = Some(contribution.clone()),
+                Some(acc) => {
+                    rio_common::wanted_outputs::union_wanted_saturating(acc, &contribution);
+                }
+            }
+            let rows = raw_rows(&test_db.pool, d).await?;
+            assert_eq!(
+                rows.len(),
+                1,
+                "case {case}: exactly one row per (build, drv)"
+            );
+            assert_eq!(
+                &rows[0].1,
+                fold.as_ref().expect("fold seeded"),
+                "case {case}: stored row diverged from the kernel fold after {seq:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+// r[verify sched.materialize.job+2]
+/// merged_bug_059 (3): the DQ-2 saturation note is a function of the
+/// row SET, not of PG heap order. An explicit '{}' row (b1, inserted
+/// FIRST so the old early-return hit it first) coexists with a legacy
+/// defaulted row (b2, build_derivations member with no wanted row):
+/// the union saturates either way, and the saturation note MUST fire
+/// for the defaulted row regardless of which row the scan sees first.
+/// Pre-fix RED (strawman: return-at-first-empty restored): the
+/// counter stayed at zero — `left: 0 / right: 1`.
+#[tokio::test]
+async fn saturation_note_is_order_independent() -> anyhow::Result<()> {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let (test_db, db) = setup().await;
+    let d1 = insert_test_derivation(&db, "wanted-order-d1").await?;
+    let b1 = insert_test_build(&db).await?;
+    let b2 = insert_test_build(&db).await?;
+
+    // b1: EXPLICIT '{}' (all-declared) contribution — inserted first.
+    let outcome = db
+        .record_wanted_fenced(
+            ServingGeneration::stamp_from_claim(1),
+            &[WantedRow {
+                build_id: b1,
+                derivation_id: d1,
+                wanted_output_names: &[],
+            }],
+        )
+        .await?;
+    assert!(outcome.settled());
+    // Both builds are live members; b2 has NO wanted row (the legacy
+    // defaulted shape — `saturated_default` in the 086 view).
+    for b in [b1, b2] {
+        sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(b)
+            .bind(d1)
+            .execute(&test_db.pool)
+            .await?;
+    }
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let union = {
+        let _g = metrics::set_default_local_recorder(&rec);
+        db.effective_wanted_union(d1).await?
+    };
+    assert_eq!(union, Some(Vec::new()), "the union saturates");
+    let counters = crate::sla::metrics::counter_map(&snap);
+    assert_eq!(
+        counters
+            .get("rio_scheduler_wanted_width_saturated_total")
+            .copied()
+            .unwrap_or(0),
+        1,
+        "the defaulted row's saturation is noted regardless of row order"
+    );
+    Ok(())
+}

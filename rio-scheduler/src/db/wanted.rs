@@ -28,12 +28,16 @@ pub(crate) struct WantedRow<'a> {
 }
 
 impl SchedulerDb {
-    /// Record/replace builds' wanted contributions for a batch of
+    /// Record builds' wanted contributions for a batch of
     /// derivations, inside the caller's transaction (the merge tx).
-    /// `ON CONFLICT (build_id, derivation_id) DO UPDATE` —
-    /// last-write-wins per build; never touches another build's rows
-    /// (PK isolation). The caller's transaction carries the merge
-    /// fence; this helper adds no second floor read (one fence per
+    /// `ON CONFLICT (build_id, derivation_id) DO UPDATE` is the
+    /// SATURATING UNION (merged_bug_176/059 — NOT last-write-wins: a
+    /// narrower re-record must never shrink demand; either side '{}'
+    /// saturates to all-declared; the stored row equals the kernel's
+    /// `union_wanted_saturating` fold, pinned by the db/tests/wanted
+    /// sequence battery). Never touches another build's rows (PK
+    /// isolation). The caller's transaction carries the merge fence;
+    /// this helper adds no second floor read (one fence per
     /// transaction — the merge-tx discipline from Phase-1 Wave 3).
     pub(crate) async fn record_wanted_in_tx(
         tx: &mut PgConnection,
@@ -87,9 +91,12 @@ impl SchedulerDb {
     /// Returns [`FencedOutcome::Fenced`] (nothing written) when
     /// `serving_generation` is below the durable claims floor.
     /// Test-battery form (merged_bug_284 sweep): production wanted
-    /// writes flow through the merge transaction's union upsert
-    /// (`batch.rs`, union-on-conflict); this fenced singular IS the
-    /// relation's specification and db/tests/wanted.rs pins it.
+    /// writes flow through [`Self::record_wanted_in_tx`] ABOVE (the
+    /// union upsert in THIS file, called from the merge transaction —
+    /// db/batch.rs explicitly disclaims owning wanted rows); this
+    /// fenced singular IS the relation's specification and
+    /// db/tests/wanted.rs pins it (merged_bug_059: the old pointer
+    /// sent sibling sweeps to audit the wrong file).
     #[cfg(test)]
     pub(crate) async fn record_wanted_fenced(
         &self,
@@ -134,7 +141,13 @@ impl SchedulerDb {
             return Ok(None);
         }
         // Saturating union: any '{}' contribution saturates to "all".
+        // merged_bug_059: ALL rows are scanned before the saturated
+        // answer is returned, so the DQ-2 saturation note is a
+        // function of the row SET, not of unspecified PG heap order —
+        // every legacy defaulted row is noted even when an explicit
+        // '{}' row happens to be fetched first.
         let mut union: Vec<String> = Vec::new();
+        let mut saturated = false;
         for (build_id, names, saturated_default) in rows {
             if names.is_empty() {
                 if saturated_default {
@@ -142,13 +155,19 @@ impl SchedulerDb {
                         build_id,
                     });
                 }
-                return Ok(Some(Vec::new()));
+                saturated = true;
+                continue;
             }
-            for n in names {
-                if !union.contains(&n) {
-                    union.push(n);
+            if !saturated {
+                for n in names {
+                    if !union.contains(&n) {
+                        union.push(n);
+                    }
                 }
             }
+        }
+        if saturated {
+            return Ok(Some(Vec::new()));
         }
         Ok(Some(union))
     }
