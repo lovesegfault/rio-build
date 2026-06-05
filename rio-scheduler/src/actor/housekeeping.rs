@@ -820,39 +820,109 @@ impl DagActor {
         crate::observability::LeaderGauge::OpenAttempts.set(opens.build.len() as f64);
         crate::observability::LeaderGauge::OpenMaterializationAttempts
             .set(opens.materialization.len() as f64);
-        // Skew tripwire (merged_bug_307 rider): a pending-unclaimed
-        // view entry whose node is still Assigned/Running with NO open
-        // materialization assignment is the released-claim wedge shape
-        // — `release_claim` should have requeued the node in the same
-        // step that dropped the claim. Counted (and fatal under debug
-        // builds) so a re-introduced split release is observable
-        // instead of a silent NotYetReady-forever.
-        {
+        // Skew tripwires over the SAME snapshot, both polarities
+        // (merged_bug_307 rider + merged_bug_055 C — the
+        // `claimed_by.is_some() ⇒ continue` blinder is gone):
+        //
+        // polarity=split_release — a pending-unclaimed view entry
+        // whose node is still Assigned/Running with NO open
+        // materialization assignment: `release_claim` should have
+        // requeued the node in the same step that dropped the claim.
+        // Counted (and fatal under debug builds) so a re-introduced
+        // split release is observable instead of a silent
+        // NotYetReady-forever.
+        //
+        // polarity=claimed_no_attempt — the INVERSE ghost: a view
+        // entry still CLAIMED while no open materialization assignment
+        // exists (the attempt closed without its companion clearing
+        // the holder — any future bypass of the sealed witness
+        // pipeline, a crash between close-commit and view update, a
+        // failed companion before the release fallback existed). The
+        // listing's claimed-filter hides such a job from every replica
+        // forever. LEVEL-TRIGGERED REPAIR, not just a counter: release
+        // the claim uncharged through the same atomic
+        // release+requeue path the consumption companions use — the
+        // whole ghost family self-heals here regardless of producer.
+        // Two-strike structural guard (see `claimed_unbacked_strike`):
+        // a claim minted between the rows snapshot and this iteration
+        // gets one full sweep to appear before it can be called a
+        // ghost. No debug_assert on this polarity BY DECISION: the
+        // ghost is a repairable runtime condition with live producers
+        // (crash windows), not a pure code-regression shape — a fatal
+        // assert would make the self-healing lane untestable and turn
+        // recoverable skew into debug-build crashes.
+        let ghosts: Vec<(crate::state::DrvHash, crate::state::ExecutorId)> = {
             use crate::state::DerivationStatus::{Assigned, Running};
             let mat_open: std::collections::HashSet<&str> = opens
                 .materialization
                 .iter()
                 .map(|a| a.drv_hash.as_str())
                 .collect();
+            let mut ghosts = Vec::new();
+            let mut first_strikes: Vec<crate::state::DrvHash> = Vec::new();
+            let mut cleared_strikes: Vec<crate::state::DrvHash> = Vec::new();
             for (drv_hash, entry) in self.materialization_jobs.iter() {
-                if entry.claimed_by.is_some() {
-                    continue;
-                }
-                let wedged = self
-                    .dag
-                    .node(drv_hash.as_str())
-                    .is_some_and(|s| matches!(s.status(), Assigned | Running))
-                    && !mat_open.contains(drv_hash.as_str());
-                if wedged {
-                    metrics::counter!("rio_scheduler_materialization_view_node_skew_total")
-                        .increment(1);
-                    debug_assert!(
-                        false,
-                        "pending-unclaimed materialization job for {drv_hash} with node \
-                         Assigned/Running and no open assignment (split-release wedge)"
-                    );
+                match &entry.claimed_by {
+                    Some(holder) => {
+                        if mat_open.contains(drv_hash.as_str()) {
+                            // Backed claim: reset any stale strike.
+                            if entry.claimed_unbacked_strike {
+                                cleared_strikes.push(drv_hash.clone());
+                            }
+                        } else if entry.claimed_unbacked_strike {
+                            // Second consecutive unbacked observation:
+                            // the claimed-no-attempt ghost.
+                            ghosts.push((drv_hash.clone(), holder.clone()));
+                        } else {
+                            first_strikes.push(drv_hash.clone());
+                        }
+                    }
+                    None => {
+                        let wedged = self
+                            .dag
+                            .node(drv_hash.as_str())
+                            .is_some_and(|s| matches!(s.status(), Assigned | Running))
+                            && !mat_open.contains(drv_hash.as_str());
+                        if wedged {
+                            metrics::counter!(
+                                "rio_scheduler_materialization_view_node_skew_total",
+                                "polarity" => "split_release"
+                            )
+                            .increment(1);
+                            debug_assert!(
+                                false,
+                                "pending-unclaimed materialization job for {drv_hash} with \
+                                 node Assigned/Running and no open assignment \
+                                 (split-release wedge)"
+                            );
+                        }
+                    }
                 }
             }
+            for drv_hash in first_strikes {
+                if let Some(entry) = self.materialization_jobs.get_mut(&drv_hash) {
+                    entry.claimed_unbacked_strike = true;
+                }
+            }
+            for drv_hash in cleared_strikes {
+                if let Some(entry) = self.materialization_jobs.get_mut(&drv_hash) {
+                    entry.claimed_unbacked_strike = false;
+                }
+            }
+            ghosts
+        };
+        for (drv_hash, holder) in ghosts {
+            metrics::counter!(
+                "rio_scheduler_materialization_view_node_skew_total",
+                "polarity" => "claimed_no_attempt"
+            )
+            .increment(1);
+            warn!(
+                drv_hash = %drv_hash, holder = %holder,
+                "claimed-no-attempt ghost (two sweeps unbacked): releasing the claim \
+                 uncharged — the job returns to the listing"
+            );
+            self.release_claim(&drv_hash, Some(&holder)).await;
         }
         if opens.build.is_empty() && opens.materialization.is_empty() {
             return;
@@ -1049,11 +1119,28 @@ impl DagActor {
                     )
                     .await
                 {
-                    Ok(o) if o.settled() => info!(
-                        drv_hash = %attempt.drv_hash, exec_id = %attempt.exec_id,
-                        node = ?node,
-                        "establishment sweep: cancelled/settled/absent node; assignment closed charge-free"
-                    ),
+                    Ok(o) if o.settled() => {
+                        info!(
+                            drv_hash = %attempt.drv_hash, exec_id = %attempt.exec_id,
+                            node = ?node,
+                            "establishment sweep: cancelled/settled/absent node; assignment closed charge-free"
+                        );
+                        // merged_bug_055 C, producer 3 fixed directly:
+                        // a settled charge-free close of a
+                        // MATERIALIZATION-kind attempt must clear the
+                        // view holder in the same step — otherwise the
+                        // entry stays claimed with its attempt closed
+                        // (the claimed-no-attempt ghost the two-strike
+                        // tripwire above would otherwise repair two
+                        // sweeps later).
+                        if kind == rio_evidence_kernel::pull::PullKind::Materialization
+                            && let Some(entry) =
+                                self.materialization_jobs.get_mut(attempt.drv_hash.as_str())
+                        {
+                            entry.claimed_by = None;
+                            entry.claimed_unbacked_strike = false;
+                        }
+                    }
                     Ok(_) => {
                         self.note_fenced_evidence_write("establishment charge-free close");
                     }

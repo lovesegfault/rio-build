@@ -1005,6 +1005,84 @@ async fn failed_close_nacks_retryably_then_redelivery_consumes() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.materialize.ack-law]
+/// merged_bug_055 C (the inverse tripwire): a view entry still CLAIMED
+/// while its open assignment is gone — seeded here by closing the
+/// assignment out-of-band, the crash-window / pipeline-bypass shape —
+/// is the claimed-no-attempt ghost: the listing's claimed-filter hides
+/// the job from every replica and, with the attempt closed, even the
+/// establishment sweep (which lists OPEN attempts) never touches it.
+/// Pre-fix the sweep's `claimed_by.is_some() ⇒ continue` blinder
+/// skipped it forever (the red: a fresh claim still NotYetReady after
+/// two sweeps). The two-strike repair releases the claim uncharged on
+/// the second consecutive unbacked observation: strike on tick 1,
+/// repair on tick 2, re-claimable immediately after.
+#[tokio::test]
+async fn claimed_no_attempt_ghost_repaired_after_two_sweeps() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("maton-ghost-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("maton-ghost");
+    n.expected_output_paths = vec![out.clone()];
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    let assignment = match claim_materialization(&handle, "maton-ghost", "store-replica-0-w0").await
+    {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("claim must deliver, got {other:?}"),
+    };
+    let _exec_id: Uuid = assignment.exec_id.parse()?;
+
+    // Seed the ghost: close the assignment OUT-OF-BAND (no companion
+    // ran, no view update — the crash window between close-commit and
+    // view mutation, or any future bypass of the witness pipeline).
+    let closed = sqlx::query(
+        "UPDATE assignments SET status = 'completed', completed_at = now()
+         WHERE status IN ('pending', 'acknowledged')",
+    )
+    .execute(&db.pool)
+    .await?
+    .rows_affected();
+    assert_eq!(closed, 1, "the seed closes exactly the open assignment");
+
+    // Sweep 1: first unbacked observation — strike recorded, claim
+    // still held (the one-sweep insurance against the snapshot race).
+    tick(&handle).await?;
+    let refused = claim_materialization(&handle, "maton-ghost", "store-replica-1-w0").await;
+    assert!(
+        matches!(refused, Ok(PullOutcome::NotYetReady { .. })),
+        "one unbacked sweep must NOT yet repair (snapshot-race insurance), got {refused:?}"
+    );
+
+    // Sweep 2: second consecutive unbacked observation — the ghost is
+    // repaired (claim released uncharged, job re-listable).
+    tick(&handle).await?;
+    let jobs = list_materialization_jobs(&handle, 16).await;
+    assert_eq!(
+        jobs.len(),
+        1,
+        "the repaired job is listed again, got {jobs:?}"
+    );
+    let redelivered = claim_materialization(&handle, "maton-ghost", "store-replica-1-w0").await;
+    assert!(
+        matches!(redelivered, Ok(PullOutcome::Deliver(_))),
+        "after the repair a fresh identity must claim (pre-fix red: NotYetReady \
+         forever — the blinder skipped claimed entries and establishment only \
+         lists OPEN attempts), got {redelivered:?}"
+    );
+
+    // The repair is UNCHARGED: zero ledger rows of any class.
+    let charges: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM drv_attempts WHERE event_kind = 'attempt'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(charges, 0, "the ghost repair charges nothing");
+    Ok(())
+}
+
 // r[verify sched.materialize.routing+5]
 /// merged_bug_028 (028b, settlement leg / owner Q2): the arm-3
 /// re-probe asks EVERY live tenant and `ConfirmedMissing` is the

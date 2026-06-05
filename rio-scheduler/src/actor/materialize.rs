@@ -62,6 +62,20 @@ pub(crate) struct JobViewEntry {
     pub parked_until: Option<std::time::Instant>,
     /// `Some(identity)` while an open materialization attempt exists.
     pub claimed_by: Option<ExecutorId>,
+    /// Ghost-strike flag (merged_bug_055 C, the inverse tripwire): set
+    /// when a housekeeping sweep observed this entry CLAIMED with no
+    /// open materialization assignment in the same snapshot; a SECOND
+    /// consecutive such observation is the claimed-no-attempt ghost
+    /// and triggers the uncharged release repair. Cleared whenever the
+    /// claim is observed backed or re-minted. This is the one-sweep
+    /// insurance the spec sketched as a `claimed_at` age guard, made
+    /// structural (clock-free): a claim minted between the sweep's
+    /// row snapshot and the view iteration gets one full sweep to
+    /// appear in the next snapshot before it can ever be called a
+    /// ghost. In-memory only (never recovered as set — recovery
+    /// rebuilds from rows, so a recovered claim starts at zero
+    /// strikes by construction).
+    pub claimed_unbacked_strike: bool,
     /// Realized-path carrier (migration 082, the floating-CA
     /// stale-reset lane) — display copy for the claim-intake
     /// SUBSTITUTING event; the executor and the consumption coverage
@@ -593,6 +607,7 @@ impl DagActor {
                 .filter(|secs| *secs > 0.0)
                 .map(|secs| std::time::Instant::now() + std::time::Duration::from_secs_f64(secs)),
             claimed_by: row.claimed_by.map(crate::state::ExecutorId::from),
+            claimed_unbacked_strike: false,
             carried_realized_paths: row.carried_realized_paths,
             parked_at: row
                 .park_began_secs_ago
@@ -637,6 +652,7 @@ impl DagActor {
                         job_id,
                         parked_until: None,
                         claimed_by: None,
+                        claimed_unbacked_strike: false,
                         carried_realized_paths: None,
                         parked_at: None,
                         defer_until: None,
@@ -796,6 +812,8 @@ impl DagActor {
     pub(super) fn note_materialization_claimed(&mut self, drv_hash: &DrvHash, holder: &ExecutorId) {
         if let Some(entry) = self.materialization_jobs.get_mut(drv_hash) {
             entry.claimed_by = Some(holder.clone());
+            // A fresh mint resets the ghost strike (merged_bug_055 C).
+            entry.claimed_unbacked_strike = false;
         }
         // T-6.2 lifecycle counter: one increment per delivered claim
         // (the open attempt's mint committed — this is called only on
