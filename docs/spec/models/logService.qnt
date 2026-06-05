@@ -423,6 +423,25 @@ module logService {
   /// WITHOUT serving the held back-fill (`resumeCursorSound` twin,
   /// merged_bug_205's finalize-at-gap inverse).
   const CALIB_RESUME_PAST_GAP: bool
+  /// Enables the PRODUCER plane (bughunt2-wave slot 8, bug_241): the
+  /// uploader can die EARLY (uploaderDies -- panic/abort while the
+  /// build still produces; the channel closes, subsequent sends
+  /// bounce), the channel-refusal watermark (refusedFrom) is stamped,
+  /// and the build-exit Drop discloses every refused line through the
+  /// DiscardLedger (producerCountedBelow advances at buildFinishes).
+  /// Mirrors rio-builder/src/log_upload.rs UploadSink{Open,Lost}:
+  /// the ONLY path that drops a batch is the ledger method, and Drop
+  /// routes through disclose() as uploader_dead. False in every
+  /// pre-existing regime: all three new coordinates freeze and the
+  /// state spaces stay byte-identical (re-measured at the introducing
+  /// commit).
+  const ENABLE_PRODUCER_PLANE: bool
+  /// Calibration: the pre-fix producer -- the build-exit Drop does
+  /// NOT disclose (no DiscardLedger; the bounced batches simply
+  /// vanish). producerLossCounted falsifies under it -- the bug_241
+  /// red (zero counter increments on post-death discards) as a model
+  /// violation.
+  const CALIB_PRODUCER_BLIND: bool
 
   // --- 3. pure helpers --------------------------------------------------
 
@@ -519,6 +538,20 @@ module logService {
 
   /// Per execution: the uploader's lifecycle.
   var uploader: int -> Uploader
+  /// Per execution: the channel-refusal watermark -- one past the
+  /// highest line the uploader ever accepted; -1 while the uploader
+  /// lives (or died never having refused). Stamped by uploaderDies at
+  /// the death instant: every line produced past it bounces off the
+  /// closed channel into the DiscardLedger. Frozen -1 outside the
+  /// producer plane.
+  var refusedFrom: int -> int
+  /// Per execution: one past the highest produced line the producer
+  /// ledger has DISCLOSED as refused (the Drop's disclose(uploader_dead)
+  /// at build exit); 0 = nothing disclosed. Covers [refusedFrom, .)
+  /// when a refusal exists -- disjoint by construction from the
+  /// drain-deadline counter, which owns [ackedBelow, refusedFrom).
+  /// Frozen 0 outside the producer plane.
+  var producerCountedBelow: int -> int
   /// Per execution: one past the highest line covered by an ack the
   /// builder has received (`UploadTask::last_acked_line + 1`). Monotone.
   /// The retransmit buffer is `[ackedBelow, producedEnd)` while
@@ -1004,6 +1037,31 @@ module logService {
           delivered(e).forall(n => storeBufHolds(e, n) or manifestHolds(e, n))
     })
 
+  /// `builder.log.loss-disclosure` at the PRODUCER plane
+  /// (bughunt2-wave slot 8, bug_241): every line the build produced
+  /// past the channel-refusal watermark is disclosed by the time the
+  /// build exits -- the UploadSink Drop's disclose(uploader_dead) over
+  /// the DiscardLedger. The first conjunct is the disjointness half
+  /// (the ledger never counts lines the uploader accepted; those are
+  /// the drain-deadline counter's), the second is monotone sanity,
+  /// the third is the headline. CALIB_PRODUCER_BLIND (the pre-fix
+  /// Drop, no disclosure) falsifies the third.
+  val producerLossCounted = EXECS.forall(e => and {
+    refusedFrom.get(e) == -1 implies producerCountedBelow.get(e) == 0,
+    producerCountedBelow.get(e) <= producedEnd.get(e),
+    (buildFinished.get(e) and refusedFrom.get(e) != -1) implies
+      producerCountedBelow.get(e) == producedEnd.get(e),
+  })
+
+  /// Witness (expect-violation in the producer regime): lines are
+  /// actually REFUSED in the explored space -- an uploader dies and
+  /// the build produces past the watermark; the producerLossCounted
+  /// verdict is about a space where the ledger has work to do.
+  val noRefusedLines = EXECS.forall(e => or {
+    refusedFrom.get(e) == -1,
+    producedEnd.get(e) <= refusedFrom.get(e),
+  })
+
   /// `store.log.sweep-ownership` (bughunt-wave B2 item 8,
   /// merged_bug_086): a deleted lifecycle row implies the execution
   /// was sweep-eligible — terminal, attempt-ledger-unreferenced, and
@@ -1375,6 +1433,8 @@ module logService {
   //          rio-scheduler/src/db/executions.rs (the dispatch INSERT).
   action dispatch = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     dispatched < MAX_EXECS,
     EXECS.filter(e => e <= dispatched and execKind.get(e) == KBuild).size() < MAX_BUILD_EXECS,
     dispatched' = dispatched + 1,
@@ -1410,6 +1470,8 @@ module logService {
   //          observed by gate.rs as a newer assignments row.
   action dispatchMaterialization = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     ENABLE_MAT_DISPATCH,
     dispatched < MAX_EXECS,
     dispatched' = dispatched + 1,
@@ -1442,6 +1504,8 @@ module logService {
   //          sweep.rs's eligibility SELECT as zero referencing rows.
   action ledgerReleases(e: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     ENABLE_SWEEP,
     e <= dispatched,
     ledgerReferenced.get(e),
@@ -1473,6 +1537,8 @@ module logService {
   //          log_upload.rs::UploadTask::accept (the buffer push).
   action produceLine(e: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     e <= dispatched,
     execKind.get(e) == KBuild,
     not(buildFinished.get(e)),
@@ -1505,10 +1571,21 @@ module logService {
   //          completion report) + log_upload.rs::accept(None).
   action buildFinishes(e: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
     e <= dispatched,
     execKind.get(e) == KBuild,
     not(buildFinished.get(e)),
     buildFinished' = buildFinished.put(e, true),
+    // The build-exit Drop (UploadSink::Lost): disclose every refused
+    // line through the DiscardLedger -- unless the calibration
+    // restores the pre-fix silent Drop.
+    producerCountedBelow' = producerCountedBelow.put(e,
+      if (and {
+        ENABLE_PRODUCER_PLANE,
+        not(CALIB_PRODUCER_BLIND),
+        refusedFrom.get(e) != -1,
+      }) producedEnd.get(e)
+      else producerCountedBelow.get(e)),
     dispatched' = dispatched,
     producedEnd' = producedEnd,
     dbFinalCount' = dbFinalCount,
@@ -1543,6 +1620,8 @@ module logService {
   //          (terminal_log_epilogue's `try_from(...).filter(> 0)`).
   action recordFinalLineCount(e: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     e <= dispatched,
     buildFinished.get(e),
     execRowExists.get(e),
@@ -1625,6 +1704,8 @@ module logService {
   //          log_upload.rs::UploadTask::open / drive's `sent = 0`.
   action openSession(e: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     openAdmitted(e),
     uploader.get(e) == Uploading,
     // One AppendLog stream per uploader: the previous session must have
@@ -1690,6 +1771,8 @@ module logService {
   //          log_upload.rs::reject_permanently.
   action openRejectedSuperseded(e: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     e <= dispatched,
     execKind.get(e) == KBuild,
     assignmentRowLost.get(e),
@@ -1729,6 +1812,8 @@ module logService {
   //          gate.rs::check_append_open as fetch_optional == None.
   action rewriteAssignment(e: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     e <= dispatched,
     e != dispatched,
     not(assignmentRowLost.get(e)),
@@ -1762,6 +1847,8 @@ module logService {
   //          log_upload.rs::reject_permanently.
   action openRejectedComplete(e: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     e <= dispatched,
     e == dispatched,
     execKind.get(e) == KBuild,
@@ -1821,6 +1908,8 @@ module logService {
   //          ingest.rs::IngestSession::accept.
   action appendHonest(e: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     e <= dispatched,
     uploader.get(e) == Uploading,
     val s = openSessionOf(e)
@@ -1913,6 +2002,8 @@ module logService {
   action appendWorkerGap(e: int): bool = all {
     ENABLE_WORKER_GAP,
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     e <= dispatched,
     uploader.get(e) == Uploading,
     val s = openSessionOf(e)
@@ -1978,6 +2069,8 @@ module logService {
   //          LogBatcher.
   action appendFabricated(e: int, lo: int, hi: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     ENABLE_FABRICATION,
     e <= dispatched,
     lo < hi,
@@ -2056,6 +2149,8 @@ module logService {
   //          ingest.rs::set_final_line_count.
   action refreshCeiling(e: int, s: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     e <= dispatched,
     sessIsOpen(e, s),
     sessCeiling(e, s) == NoCeiling,
@@ -2116,6 +2211,8 @@ module logService {
   //          service.rs::do_cut / drain.
   action cutChunk(e: int, s: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     e <= dispatched,
     hasSession(e, s),
     sessBuf(e, s) != Set(),
@@ -2165,6 +2262,8 @@ module logService {
   //          log_upload.rs::trim.
   action deliverAck(e: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     e <= dispatched,
     uploader.get(e) == Uploading,
     val s = openSessionOf(e)
@@ -2212,6 +2311,8 @@ module logService {
   //          AppendDriver::run (the drain arm).
   action builderDisconnects(e: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     e <= dispatched,
     val s = openSessionOf(e)
     all {
@@ -2253,6 +2354,8 @@ module logService {
   //          deregistration scopeguard drops IngestShared).
   action sessionAborts(e: int, s: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     e <= dispatched,
     hasSession(e, s),
     // An inert detached session (empty buffer) aborting is a no-op
@@ -2290,8 +2393,53 @@ module logService {
   /// error log, and the execution's log never reads complete (the
   /// manifest cannot cover the abandoned tail).
   // Mirrors: log_upload.rs::run_inner (DeadlineExpired -> abandoned()).
+  /// The EARLY uploader death (bughunt2-wave slot 8, bug_241): the
+  /// upload task panics/aborts while the build still produces. The
+  /// channel closes -- the refusal watermark is stamped at the
+  /// current produced end, and every line produced from here on
+  /// bounces into the DiscardLedger (disclosed at the build-exit
+  /// Drop; see buildFinishes). The un-acked range the uploader had
+  /// already accepted, [ackedBelow, refusedFrom), is the death
+  /// path's own disclosure -- counted: true, exactly the drain arm's
+  /// accounting (production: the SendError-bounced batch seeds the
+  /// ledger and the LossGuard discloses the buffered range).
+  /// Producer-plane only.
+  // Mirrors: rio-builder/src/log_upload.rs (UploadSink::Lost +
+  //          DiscardLedger seed on SendError).
+  action uploaderDies(e: int): bool = all {
+    readerUnchanged,
+    ENABLE_PRODUCER_PLANE,
+    e <= dispatched,
+    execKind.get(e) == KBuild,
+    uploader.get(e) == Uploading,
+    not(buildFinished.get(e)),
+    uploader' = uploader.put(e, Abandoned({ counted: true })),
+    refusedFrom' = refusedFrom.put(e, producedEnd.get(e)),
+    producerCountedBelow' = producerCountedBelow,
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessions' = sessions,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    wit' = wit,
+    assignmentRowLost' = assignmentRowLost,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
+    acceptedTotal' = acceptedTotal,
+  }
+
   action uploaderAbandons(e: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     e <= dispatched,
     execKind.get(e) == KBuild,
     uploader.get(e) == Uploading,
@@ -2326,6 +2474,8 @@ module logService {
   /// log_retention_days`. Environment action; monotone.
   action executionExpires(e: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     ENABLE_SWEEP,
     e <= dispatched,
     not(expired.get(e)),
@@ -2368,6 +2518,8 @@ module logService {
   //          delete_batch; the registry DELETE is unmodeled hygiene).
   action sweepChunks(e: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     ENABLE_SWEEP,
     e <= dispatched,
     expired.get(e),
@@ -2412,6 +2564,8 @@ module logService {
   //          rio_retry_kernel::exec_row_sweep_eligible.
   action gcExecRow(e: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     ENABLE_SWEEP,
     e <= dispatched,
     execRowSweepEligible(e),
@@ -2453,6 +2607,8 @@ module logService {
   //          (the stamped CTE arm; status IS NULL guard).
   action closeExecStamp(e: int): bool = all {
     readerUnchanged,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     e <= dispatched,
     execRowExists.get(e),
     dbFinalCount.get(e) == NoCount,
@@ -2513,6 +2669,8 @@ module logService {
   /// actions are read-only over the log state.
   action coreUnchanged = all {
     dispatched' = dispatched,
+    refusedFrom' = refusedFrom,
+    producerCountedBelow' = producerCountedBelow,
     producedEnd' = producedEnd,
     buildFinished' = buildFinished,
     dbFinalCount' = dbFinalCount,
@@ -2917,6 +3075,8 @@ module logService {
     execKind' = EXECS.mapBy(e => KBuild),
     ledgerReferenced' = EXECS.mapBy(e => true),
     uploader' = EXECS.mapBy(e => Uploading),
+    refusedFrom' = EXECS.mapBy(e => -1),
+    producerCountedBelow' = EXECS.mapBy(e => 0),
     ackedBelow' = EXECS.mapBy(e => 0),
     sentBelow' = EXECS.mapBy(e => 0),
     sessions' = EXECS.mapBy(e => SESSION_IDS.mapBy(s => NoSession)),
@@ -2992,6 +3152,7 @@ module logService {
     sessionAborts(e, s)
   }
   action uploaderAbandonsAny = { nondet e = EXECS.oneOf() uploaderAbandons(e) }
+  action uploaderDiesAny = { nondet e = EXECS.oneOf() uploaderDies(e) }
   action executionExpiresAny = { nondet e = EXECS.oneOf() executionExpires(e) }
   action sweepChunksAny = { nondet e = EXECS.oneOf() sweepChunks(e) }
   action gcExecRowAny = { nondet e = EXECS.oneOf() gcExecRow(e) }
@@ -3016,6 +3177,10 @@ module logService {
     builderDisconnectsAny,
     sessionAbortsAny,
     uploaderAbandonsAny,
+    // Producer-plane (disabled at ENABLE_PRODUCER_PLANE = false; the
+    // pre-existing regimes' state spaces re-measured byte-identical
+    // at the introducing commit).
+    uploaderDiesAny,
     executionExpiresAny,
     sweepChunksAny,
     gcExecRowAny,
@@ -3092,6 +3257,8 @@ module logServiceBase {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 
   // --- deterministic protocol runs --------------------------------------
@@ -3217,6 +3384,8 @@ module logServiceRedispatch {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 
   /// The superseded writer, v2: execution 1's session is open and
@@ -3307,6 +3476,8 @@ module logServiceResend {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 
   /// The ambiguous-disconnect overlap: session 1 commits a chunk for
@@ -3386,6 +3557,8 @@ module logServiceSweep {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 
   /// The TTL sweep deletes a complete log: the manifest and the
@@ -3493,6 +3666,8 @@ module logServiceCalibSessionCaps {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 }
 
@@ -3534,6 +3709,8 @@ module logServiceCalibGateRow {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 }
 
@@ -3580,6 +3757,8 @@ module logServiceKindMix {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 
   /// The displacement scenario, fixed: the build streams and cuts a
@@ -3646,6 +3825,8 @@ module logServiceCalibLatestOnly {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 }
 
@@ -3688,6 +3869,8 @@ module logServiceCalibLossEscape {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 }
 
@@ -3730,6 +3913,8 @@ module logServiceCalibSweepAgeOnly {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 }
 
@@ -3774,6 +3959,8 @@ module logServiceServed {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 
   /// The repaired-drop happy path, replayable with
@@ -3844,6 +4031,8 @@ module logServiceCalibReaderAdvance {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 
   /// The recorded pre-fix counterexample, replayable with
@@ -3931,6 +4120,8 @@ module logServiceWorkerGap {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 }
 
@@ -3968,6 +4159,8 @@ module logServiceCalibDropWakeLost {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = true,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 }
 
@@ -4006,6 +4199,8 @@ module logServiceCalibStampSkips {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 }
 
@@ -4045,6 +4240,8 @@ module logServiceCalibRecoveryUngated {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 }
 
@@ -4082,6 +4279,8 @@ module logServiceCalibResumePastGap {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = true,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 }
 
@@ -4120,6 +4319,8 @@ module logServiceExecAxis {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 }
 
@@ -4158,6 +4359,8 @@ module logServiceCalibExecSplice {
     CALIB_EXEC_SPLICE = true,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 }
 
@@ -4199,6 +4402,8 @@ module logServiceFlood {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 }
 
@@ -4235,6 +4440,8 @@ module logServiceCalibOversized {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 }
 
@@ -4276,6 +4483,8 @@ module logServiceCalibGcRowIgnoresArtifacts {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 }
 
@@ -4317,6 +4526,8 @@ module logServiceCalibCloseNoStamp {
     CALIB_EXEC_SPLICE = false,
     CALIB_DROP_WAKE_LOST = false,
     CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = false,
+    CALIB_PRODUCER_BLIND = false,
   ).*
 
   /// The immortality, step by step: closed (no stamp), expired,
@@ -4334,4 +4545,115 @@ module logServiceCalibCloseNoStamp {
         execRowExists.get(1),
         not(execRowSweepEligible(1)),
       })
+}
+
+// =========================================================================
+// THE PRODUCER REGIME (bughunt2-wave slot 8, bug_241): the base
+// lifecycle plus the early uploader death. The adversarial schedule is
+// the death racing production: lines produced past the refusal
+// watermark exist only in the DiscardLedger's accounting, and the
+// build-exit Drop must disclose every one of them
+// (producerLossCounted). ingestLossCounted is co-verified: the death
+// path's own un-acked disclosure (counted: true) must keep the ingest
+// plane's law intact. Constants are the base regime's; only the plane
+// toggles.
+// =========================================================================
+module logServiceProducerLoss {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 1,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = true,
+    ENABLE_RECONNECT = false,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = true,
+    CALIB_PRODUCER_BLIND = false,
+  ).*
+
+  /// The bug_241 narrative, end to end: the uploader dies mid-build,
+  /// the build keeps producing (the refused lines), and the exit Drop
+  /// discloses exactly the refused range while the death's own
+  /// disclosure covered the accepted-but-un-acked range.
+  run producerDeathDisclosedRun =
+    init
+      .then(dispatch)
+      .then(produceLine(1))
+      .then(uploaderDies(1))
+      .then(produceLine(1))
+      .then(produceLine(1))
+      .then(buildFinishes(1))
+      .expect(all {
+        refusedFrom.get(1) == 1,
+        producedEnd.get(1) == 3,
+        producerCountedBelow.get(1) == 3,
+        uploader.get(1) == Abandoned({ counted: true }),
+      })
+}
+
+// =========================================================================
+// bug_241 pre-fix calibration: the producer-blind world -- the
+// build-exit Drop does NOT disclose (no DiscardLedger; the bounced
+// batches vanish, the production red's zero counter increments).
+// producerLossCounted falsifies. This pin is the non-vacuity evidence
+// for logServiceProducerLoss: if it ever stops falsifying, the model
+// has drifted away from the silent-discard class UploadSink::Lost
+// exists to make unrepresentable.
+// =========================================================================
+module logServiceCalibProducerBlind {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 1,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = true,
+    ENABLE_RECONNECT = false,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+    CALIB_GC_ROW_IGNORE_ARTIFACTS = false,
+    CALIB_CLOSE_NO_STAMP = false,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
+    ENABLE_WORKER_GAP = false,
+    ENABLE_DROP_WAKE = false,
+    ENABLE_EXEC_AXIS = false,
+    MAX_BATCH_LINES = 3,
+    CALIB_OVERSIZED_ADMITTED = false,
+    CALIB_RECOVERY_UNGATED = false,
+    CALIB_STAMP_SKIPS_CATCHUP = false,
+    CALIB_EXEC_SPLICE = false,
+    CALIB_DROP_WAKE_LOST = false,
+    CALIB_RESUME_PAST_GAP = false,
+    ENABLE_PRODUCER_PLANE = true,
+    CALIB_PRODUCER_BLIND = true,
+  ).*
 }

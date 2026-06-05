@@ -1613,6 +1613,67 @@ in
       ];
     };
 
+    # The PRODUCER plane (NEW, bughunt2-wave slot 8, bug_241): the
+    # early uploader death (panic/abort while the build still
+    # produces) stamps the channel-refusal watermark, the build keeps
+    # producing into the closed channel, and the build-exit Drop must
+    # disclose every refused line through the DiscardLedger
+    # (UploadSink{Open,Lost} -- the only path that drops a batch is
+    # the ledger method). Headline producerLossCounted: disjointness
+    # from the drain-deadline counter (the ledger never counts
+    # accepted lines), monotone sanity, and disclosure-complete at
+    # build exit. The base lifecycle laws are co-verified -- the death
+    # path's own un-acked disclosure must keep the ingest plane
+    # intact. The paired pin is
+    # quint-log-service-calib-producer-blind (the pre-fix silent Drop
+    # must falsify). Measured: exhaustive TLC ~3s / ~53k distinct
+    # states (transcript authoritative) -- the default 1800s budget
+    # is ~600x headroom.
+    # r[verify builder.log.loss-disclosure+2]
+    quint-log-service-producer = mkQuintCheck {
+      name = "log-service-producer";
+      spec = "logService";
+      main = "logServiceProducerLoss";
+      invariants = [
+        "boundsOK"
+        "producerLossCounted"
+        "ingestLossCounted"
+        "noSilentLineLoss"
+        "servedSpanExact"
+        "completeLogServesAllProduced"
+        "completenessGate"
+      ];
+    };
+
+    # Non-vacuity witness: lines are actually refused in the explored
+    # space (an uploader dies and the build produces past the
+    # watermark) -- the producerLossCounted verdict has work to do.
+    quint-log-service-witness-refused = mkQuintWitnessCheck {
+      name = "log-service-witness-refused";
+      spec = "logService";
+      main = "logServiceProducerLoss";
+      witness = "noRefusedLines";
+    };
+
+    # Deterministic named-run replay (producerDeathDisclosedRun: die
+    # mid-build, produce refused lines, exit-Drop discloses exactly
+    # the refused range).
+    quint-log-service-runs-producer = mkQuintRunCheck {
+      name = "log-service-runs-producer";
+      spec = "logService";
+      main = "logServiceProducerLoss";
+    };
+
+    # bug_241 pre-fix: the producer-blind world -- the build-exit Drop
+    # does not disclose; the bounced batches vanish (the production
+    # red's zero counter increments); producerLossCounted falls.
+    quint-log-service-calib-producer-blind = mkQuintWitnessCheck {
+      name = "log-service-calib-producer-blind";
+      spec = "logService";
+      main = "logServiceCalibProducerBlind";
+      witness = "producerLossCounted";
+    };
+
     # Non-vacuity witnesses for the LogService regimes. Each check
     # passes only when the checker violates its witness — machine-checked
     # evidence that the scenario a regime's headline invariant constrains
