@@ -266,7 +266,9 @@ pub enum DrainStatus {
     /// proceed with its `CompletionReport` — a build is never failed or
     /// delayed because its log could not be persisted yet.
     Detached {
+        /// The last line the store acknowledged before detach.
         last_acked_line: Option<u64>,
+        /// Lines still un-acked at detach (above the watermark).
         unacked_lines: u64,
     },
     /// The upload ended with lines still un-acked. Whether that is loss
@@ -274,8 +276,12 @@ pub enum DrainStatus {
     /// (see `lost_lines`); the disclosure itself happened at the
     /// task's single `disclose` site before this status was returned.
     Abandoned {
+        /// The last line the store acknowledged before the abandon.
         last_acked_line: Option<u64>,
+        /// Un-acked lines at abandonment (above the watermark);
+        /// whether they are LOSS is `reason`'s call (`lost_lines`).
         unacked_lines: u64,
+        /// Why the upload ended un-acked; decides the loss verdict.
         reason: AbandonReason,
     },
 }
@@ -787,7 +793,12 @@ impl UploadTask {
     }
 
     /// Pop every buffered frame whose last line is covered by
-    /// `durable_through_line`. Returns the number of frames popped.
+    /// `durable_through_line`, and advance the ack watermark to it
+    /// REGARDLESS of whether a whole frame popped (bug_144: the store
+    /// acks lines, the buffer holds frames — a mid-frame ack is
+    /// routine whenever a frame's payload straddles a chunk cut, and
+    /// the watermark is the truth the disclosure surfaces report
+    /// against). Returns the number of frames popped.
     fn trim(&mut self, durable_through_line: u64) -> usize {
         let mut popped = 0;
         while let Some(front) = self.buffer.front() {
@@ -812,14 +823,46 @@ impl UploadTask {
             self.buffer.pop_front();
             popped += 1;
         }
-        if popped > 0 {
-            self.last_acked_line = Some(
-                self.last_acked_line
-                    .map_or(durable_through_line, |l| l.max(durable_through_line)),
-            );
+        // The watermark advance is deliberately OUTSIDE the popped
+        // check: an ack that lands inside the front frame pops nothing
+        // but still proves durability through its line. Monotone
+        // (acks never regress; the guard is defensive).
+        let advanced = match self.last_acked_line {
+            Some(prev) if prev >= durable_through_line => false,
+            _ => {
+                self.last_acked_line = Some(durable_through_line);
+                true
+            }
+        };
+        if popped > 0 || advanced {
             self.publish(false);
         }
         popped
+    }
+
+    /// Lines of the FRONT buffered frame already covered by the ack
+    /// watermark (a mid-frame ack landed inside it). Durably stored —
+    /// memory the trim cannot reclaim yet (frames pop whole), but NOT
+    /// loss.
+    fn covered_front_prefix(&self) -> u64 {
+        match (self.buffer.front(), self.last_acked_line) {
+            (Some(front), Some(law)) if law >= front.first_line_number => {
+                (law - front.first_line_number + 1).min(front.lines.len() as u64)
+            }
+            _ => 0,
+        }
+    }
+
+    // r[impl builder.log.loss-disclosure+2]
+    /// Buffered lines strictly above the ack watermark — the
+    /// DISCLOSURE view of the un-acked count (bug_144). Derived at
+    /// every disclosure surface rather than cached, so it stays
+    /// correct under ANY ack granularity the store adopts; the cached
+    /// `unacked_lines` keeps its frame-granular Σ-over-buffer meaning
+    /// for memory accounting.
+    fn unacked_above_watermark(&self) -> u64 {
+        self.unacked_lines
+            .saturating_sub(self.covered_front_prefix())
     }
 
     /// The store will never accept this stream. Drop the buffer and keep
@@ -831,6 +874,11 @@ impl UploadTask {
     /// the single `disclose` site (CompleteLog: no — the store
     /// provably holds the finished log; Superseded/CapExhausted: yes).
     async fn reject_permanently(&mut self, reason: AbandonReason) -> DrainStatus {
+        // A mid-frame ack's covered prefix is durable, not lost
+        // (bug_144): deduct it as the buffer is dropped, so the
+        // running count — and the Abandoned status built from it —
+        // reports only lines above the watermark.
+        self.unacked_lines = self.unacked_above_watermark();
         self.buffer.clear();
         // `unacked_lines` deliberately keeps counting: the Abandoned status
         // reports how many lines were discarded.
@@ -855,7 +903,7 @@ impl UploadTask {
         DrainStatus::Abandoned {
             reason: AbandonReason::DeadlineExpired,
             last_acked_line: self.last_acked_line,
-            unacked_lines: self.unacked_lines,
+            unacked_lines: self.unacked_above_watermark(),
         }
     }
 
@@ -877,7 +925,11 @@ impl UploadTask {
     fn publish(&self, done: bool) {
         self.progress.send_replace(Progress {
             last_acked_line: self.last_acked_line,
-            unacked_lines: self.unacked_lines,
+            // The disclosure view (bug_144): the LossGuard's panic
+            // disclosure and finish()'s Detached reporting read this
+            // watch, so they must see lines-above-watermark, not the
+            // frame-granular memory count.
+            unacked_lines: self.unacked_above_watermark(),
             done,
         });
     }
@@ -1208,6 +1260,13 @@ mod tests {
         mock: MockLogService,
         uploader: LogUploader,
         _server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Harness {
+        /// Snapshot of the uploader's progress watch.
+        fn uploader_progress(&self) -> super::Progress {
+            *self.uploader.progress().borrow()
+        }
     }
 
     /// Test-scale timings: a 50 ms reconnect backoff and a 400 ms drain
@@ -1573,6 +1632,62 @@ mod tests {
             ),
             "a bare FAILED_PRECONDITION rejection reports CompleteLog, got {status:?}"
         );
+    }
+
+    // r[verify builder.log.loss-disclosure+2]
+    /// bug_144: a mid-frame ack — the store's line-granular
+    /// `durable_through_line` landing INSIDE a buffered frame — must
+    /// advance the watermark and shrink the disclosed loss to the
+    /// lines strictly above it. Pre-fix both were frame-granular: the
+    /// watermark only advanced when a whole frame popped, so an ack
+    /// covering 54 of a 64-line frame reported last_acked=None and 64
+    /// lines "lost" even though the store durably holds 54 of them.
+    /// The shared write/read chunk bound (bug_098) is what made
+    /// mid-frame acks routine: a frame whose payload straddles the
+    /// chunk cut gets acked at the cut line, not the frame end.
+    #[tokio::test]
+    async fn mid_frame_ack_advances_watermark_and_shrinks_disclosed_loss() {
+        let h = harness().await;
+        let tx = h.uploader.sender();
+        // One 64-line frame [0, 64).
+        tx.send(batch(0, 64)).await.unwrap();
+        wait_for("the frame to reach the store", || {
+            h.mock.session_count() == 1 && h.mock.session(0).message_count() >= 2
+        })
+        .await;
+
+        // The store commits a chunk cut at line 53: lines 0..=53 (54
+        // lines) are durable; 10 are not.
+        h.mock.session(0).ack(53).await;
+        wait_for("the mid-frame ack to land in the progress watch", || {
+            h.uploader_progress().last_acked_line == Some(53)
+        })
+        .await;
+        let p = h.uploader_progress();
+        assert_eq!(
+            p.last_acked_line,
+            Some(53),
+            "a mid-frame ack advances the watermark (the store DID \
+             durably commit through line 53)"
+        );
+        assert_eq!(
+            p.unacked_lines, 10,
+            "disclosed un-acked lines are those strictly above the \
+             watermark, not the whole straddling frame"
+        );
+
+        drop(tx);
+        let status = h.uploader.finish(Duration::from_millis(100)).await;
+        match status {
+            DrainStatus::Detached {
+                last_acked_line,
+                unacked_lines,
+            } => {
+                assert_eq!(last_acked_line, Some(53));
+                assert_eq!(unacked_lines, 10);
+            }
+            other => panic!("expected Detached with a partial tail, got {other:?}"),
+        }
     }
 
     // ------------------------------------------------------------------
