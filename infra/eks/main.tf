@@ -462,7 +462,7 @@ module "rio_store_irsa" {
 }
 
 # RDS IAM database auth: lets a pod mint 15-minute PG auth tokens for
-# DB user rio_app (migration 065 creates the role; rio_common::pg_iam
+# DB user rio_app (the migrate runner's ensure_roles pass creates the role; rio_common::pg_iam
 # does the SigV4 presign). ONE shared policy for store/scheduler/
 # controller — all three connect to the same cluster as the same DB
 # user, so per-service copies would be three identical documents.

@@ -133,11 +133,14 @@ resource "aws_rds_cluster" "rio" {
 
   # RDS IAM database authentication: pods mint 15-minute SigV4 tokens
   # from their IRSA roles (rds-db:connect — main.tf rio_rds_connect)
-  # and connect as DB user rio_app (migration 065 creates it with
-  # rds_iam membership) — no static credential to rotate out from
-  # under a running pod. Enabling this flag is a no-op for
-  # password-mode clients; helm postgres.authMode is the actual
-  # switch.
+  # and connect as DB user rio_app (the migrate runner's ensure_roles
+  # pass creates it with rds_iam membership) — no static credential to
+  # rotate out from under a running pod. NOT a free flip for
+  # password-mode clients: with this flag on, RDS PAM rejects password
+  # auth for any role that holds rds_iam directly OR BY INHERITANCE —
+  # which is why ensure_roles never grants rio_app (a member of
+  # rds_iam) to the master, and detaches any legacy membership it
+  # finds. helm postgres.authMode is the client-side switch.
   iam_database_authentication_enabled = true
 
   db_subnet_group_name   = aws_db_subnet_group.rio.name

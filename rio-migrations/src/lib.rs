@@ -25,6 +25,7 @@ pub fn migrator() -> sqlx::migrate::Migrator {
     sqlx::migrate!("./migrations")
 }
 
+pub mod ensure_roles;
 pub mod migrate;
 pub mod migrations;
 pub mod retention;

@@ -1,14 +1,17 @@
 //! Shared sqlx migration runner — try-then-wait advisory lock.
 //!
-//! rio-store and rio-scheduler both run the same `rio-migrations`
-//! migration set against the same Postgres database. Both MUST
-//! serialize via the same lock and the same non-blocking strategy:
-//! sqlx's default blocking `pg_advisory_lock` deadlocks against
-//! `CREATE INDEX CONCURRENTLY` (migrations 011, 022) when ≥2 replicas
-//! start together (I-194), and sqlx's default lock key is a hash of
-//! the database name — so two services calling raw `Migrator::run`
-//! against the same DB would mutually exclude, but a service using
-//! [`run`] and one using raw `Migrator::run` would NOT.
+//! Production migrations run in exactly one place — `rio-store
+//! migrate` ([`run_with_roles`]); app startup only verifies via
+//! [`assert_current`]. The lock still matters: concurrent runner
+//! invocations (old-tag/new-tag migrate Jobs racing during an
+//! upgrade, a runner racing a legacy in-pod migrator during
+//! mid-upgrade skew) MUST serialize via the same key and the same
+//! non-blocking strategy: sqlx's default blocking `pg_advisory_lock`
+//! deadlocks against `CREATE INDEX CONCURRENTLY` (migrations 011,
+//! 022) when two runners start together (I-194), and sqlx's default
+//! lock key is a hash of the database name — so two callers of raw
+//! `Migrator::run` against the same DB would mutually exclude, but a
+//! caller using [`run`] and one using raw `Migrator::run` would NOT.
 
 use std::time::Duration;
 
@@ -65,10 +68,45 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// `Migrator` is not `Clone`. Callers pass [`crate::migrator()`]
 /// to get a fresh owned value.
 pub async fn run(pool: &PgPool, mut migrator: Migrator) -> Result<(), MigrateError> {
-    // Dedicated lock connection, detached so dropping it closes the
-    // socket (releasing the session lock) on ANY exit path. NOT the
-    // connection that runs migrations — `migrator.run(pool)`
-    // acquires its own from the pool.
+    let mut lock_conn = acquire_lock(pool).await?;
+    apply(pool, &mut migrator).await?;
+    release_lock(&mut lock_conn).await;
+    Ok(())
+}
+
+/// [`run`] plus [`crate::ensure_roles::ensure_roles`], BOTH under the
+/// same advisory-lock hold. This is the production entry point
+/// (`rio-store migrate`).
+///
+/// The role pass MUST run before the unlock: the migrate Job design
+/// deliberately allows concurrent old-tag/new-tag runner invocations,
+/// and role DDL is CLUSTER-wide — two unserialized ensure_roles
+/// passes would race on pg_authid (`tuple concurrently updated`,
+/// duplicate CREATE ROLE), and one run's defensive REASSIGN+REVOKE
+/// detach could interleave with another run's grants, re-opening a
+/// transient ACL-strip window. Serialized, the "grants re-asserted
+/// every run" recurrence-proof holds. (PG advisory locks are
+/// server-wide, not per-database, so this also serializes role DDL
+/// across the shared-PG-server llvm-cov test topology.)
+pub async fn run_with_roles(pool: &PgPool, mut migrator: Migrator) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let mut lock_conn = acquire_lock(pool).await?;
+    apply(pool, &mut migrator)
+        .await
+        .context("applying migrations")?;
+    crate::ensure_roles::ensure_roles(&mut lock_conn)
+        .await
+        .context("ensure_roles (rio_app role/grants reconciliation)")?;
+    release_lock(&mut lock_conn).await;
+    Ok(())
+}
+
+/// Acquire `MIGRATE_LOCK_ID` on a dedicated connection, detached so
+/// dropping it closes the socket (releasing the session lock) on ANY
+/// exit path (`?`, panic, cancel). NOT the connection that runs
+/// migrations — `migrator.run(pool)` acquires its own from the pool.
+async fn acquire_lock(pool: &PgPool) -> Result<sqlx::postgres::PgConnection, MigrateError> {
     let mut lock_conn = pool.acquire().await?.detach();
 
     let mut waited = false;
@@ -81,28 +119,49 @@ pub async fn run(pool: &PgPool, mut migrator: Migrator) -> Result<(), MigrateErr
             break;
         }
         if !waited {
-            info!("another replica is migrating; polling advisory lock");
+            info!("another runner is migrating; polling advisory lock");
             waited = true;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+    Ok(lock_conn)
+}
 
-    // Leader (or follower that woke after leader released). sqlx's
-    // own lock OFF — MIGRATE_LOCK_ID serializes instead. lock_conn
-    // is now idle (SELECT completed → no vxid held), so the
-    // migrator's CIC won't wait on it.
+/// Run the migrator with sqlx's own lock OFF (`MIGRATE_LOCK_ID`
+/// serializes instead; the caller holds it — its lock connection is
+/// idle, so the migrator's CIC won't wait on it).
+///
+/// `ignore_missing`: applied-but-not-embedded versions are accepted.
+/// Two callers depend on this:
+/// - the documented binary-rollback path (deploy the previous binary
+///   against a newer schema — without the flag, sqlx's
+///   `validate_applied_migrations` fails `VersionMissing`);
+/// - the un-embedding of the retired role migrations (069/070 on the
+///   deployed lineage): their applied rows stay in
+///   `_sqlx_migrations` as inert history. Reverting this flag would
+///   brick those deploys with `VersionMissing(69)`.
+///
+/// Checksum protection is unaffected — `VersionMismatch` on content
+/// drift of EMBEDDED versions still fails, and the CI freeze test
+/// pins content. Residual hard-fail: sqlx's dirty check aborts on ANY
+/// `success=false` row (embedded or not) BEFORE validation; an
+/// un-embedded failed row can never be re-applied, so the remedy is a
+/// manual row delete (see deployment.typ rollback notes).
+async fn apply(pool: &PgPool, migrator: &mut Migrator) -> Result<(), MigrateError> {
     migrator.set_locking(false);
+    migrator.set_ignore_missing(true);
     migrator.run(pool).await?;
-    debug!(waited, "migrations applied");
+    debug!("migrations applied");
+    Ok(())
+}
 
-    // Polite explicit unlock; failure is harmless (lock_conn drops
-    // next, closing the socket → PG releases the session lock).
+/// Polite explicit unlock; failure is harmless (the connection drops
+/// soon after, closing the socket → PG releases the session lock).
+async fn release_lock(lock_conn: &mut sqlx::postgres::PgConnection) {
     let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(MIGRATE_LOCK_ID)
-        .execute(&mut lock_conn)
+        .execute(lock_conn)
         .await;
-
-    Ok(())
 }
 
 /// Verify every embedded migration has been applied, without running
@@ -114,12 +173,14 @@ pub async fn run(pool: &PgPool, mut migrator: Migrator) -> Result<(), MigrateErr
 /// with "relation does not exist" mid-request.
 ///
 /// Only `embedded ⊆ applied` is checked. Applied-but-not-embedded
-/// versions are EXPECTED during a rolling upgrade: the migrate Job
-/// lands the newer schema first, then old-binary replicas may still restart
+/// versions are EXPECTED during a rolling upgrade: the pre-upgrade
+/// hook migrates first, then old-binary replicas may still restart
 /// against the newer schema (migrations are forward-compatible by
 /// policy — see `docs/spec/system/deployment.typ`). Checksums are
 /// not compared either; `migration_checksums_frozen` pins them at CI
-/// time and [`run`] rejects mismatches at apply time.
+/// time and [`run`] rejects mismatches at apply time — for EMBEDDED
+/// versions only: with `ignore_missing` on, applied-but-not-embedded
+/// rows are skipped entirely (no checksum to compare against).
 // r[impl store.db.schema-current+2]
 pub async fn assert_current(pool: &PgPool) -> anyhow::Result<()> {
     const RUNNER_HINT: &str = "run `rio-store migrate` (helm: the rio-migrate Job, \

@@ -586,7 +586,11 @@ async fn pg_preflight() -> anyhow::Result<()> {
 /// ExecStart of the NixOS `rio-migrate` systemd oneshot — migrations
 /// run out-of-band, BEFORE any app pod/service starts, and always as
 /// the database master — schema DDL never depends on the credentials
-/// or privileges of whatever auth mode the app pods use.
+/// or privileges of whatever auth mode the app pods use. The same
+/// run reconciles the `rio_app` role and its grants
+/// (`rio_migrations::ensure_roles`), so a fresh cluster deploys
+/// directly in `postgres.authMode=iam`: the role exists before any
+/// pod connects as it.
 ///
 /// Reads `RIO_DATABASE_URL` directly instead of loading the full
 /// store `Config` — the Job sets exactly this one variable, and the
@@ -641,7 +645,7 @@ async fn run_migrate() -> anyhow::Result<()> {
             {
                 // Shared classifier, BOUNDED variant: reachability
                 // errors, PG lifecycle FATALs (57P03 during bitnami
-                // initdb burned a backoffLimit pod with an
+                // initdb burned a backoffLimit pod with the old
                 // Io|PoolTimedOut-only filter), resource pressure,
                 // and 3D000 (database not created yet — bitnami init
                 // window). Permanent errors (auth, bad SQL) still
@@ -662,6 +666,9 @@ async fn run_migrate() -> anyhow::Result<()> {
         }
     };
 
+    // Migrations + the rio_app role/grant reconciliation, both under
+    // one advisory-lock hold (see migrate::run_with_roles for why the
+    // role pass must not run unserialized).
     tokio::select! {
         biased;
         _ = shutdown.cancelled() => {
@@ -671,8 +678,8 @@ async fn run_migrate() -> anyhow::Result<()> {
                  idempotently"
             );
         }
-        r = rio_migrations::migrate::run(&pool, rio_migrations::migrator()) => {
-            r.inspect_err(|e| error!(error = %e, "database migrations failed"))?;
+        r = rio_migrations::migrate::run_with_roles(&pool, rio_migrations::migrator()) => {
+            r.inspect_err(|e| error!(error = format!("{e:#}"), "database migrations failed"))?;
         }
     }
     info!("database migrations applied");
