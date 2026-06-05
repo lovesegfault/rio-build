@@ -747,6 +747,11 @@
   ],
   "rio-migrations": [
     {
+      "path": "ensure_roles.rs",
+      "depth": 0,
+      "doc": "Runner-owned role and grant management for `rio_app`."
+    },
+    {
       "path": "lib.rs",
       "depth": 0,
       "doc": "Single source of truth for database migrations."

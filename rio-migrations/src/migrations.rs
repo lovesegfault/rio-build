@@ -27,10 +27,27 @@
 //! frozen at whatever path was current when the migration shipped.
 //!
 //! The try-then-wait advisory-lock runner that applies these lives in
-//! `rio_migrations::migrate::run` — both rio-store and rio-scheduler run
-//! the SAME migration set against the SAME database under the same
-//! lock key (`rio_migrations::migrate::MIGRATE_LOCK_ID`), so the runner is
-//! shared, not crate-local.
+//! `rio_migrations::migrate` (`run_with_roles`, called by `rio-store
+//! migrate`); app services only verify via `assert_current`. Role and
+//! grant management is deliberately NOT in this migration set — see
+//! `src/ensure_roles.rs` for why frozen SQL is the wrong home for
+//! desired-state reconciliation.
+//!
+//! **NUMBERING POLICY:** migration numbers are allocated by the
+//! branch that deploys to a persistent DB. A stacked branch's
+//! migrations are review artifacts; whichever branch integrates
+//! second renumbers ONLY migrations that no persistent DB has
+//! applied, adopting the deployed branch's files byte-identically.
+//! Numbers a persistent DB has recorded are never reused — see the
+//! burned-numbers note after `M_064` below. With
+//! `ignore_missing(true)` permanently on in the runner
+//! (`migrate.rs`), sqlx no longer errors on an orphaned applied row:
+//! accidentally RENUMBERING an already-applied migration (same
+//! content, new version) would silently RE-APPLY its SQL on the
+//! persistent DB instead of failing `VersionMissing`. The reverse
+//! check in `migration_checksums_frozen` ("PINNED lists migration v
+//! but migrations/ has no such file") is now the ONLY guard against
+//! that — do not weaken it.
 
 #![allow(dead_code)] // M_NNN doc-consts; never referenced, only `cargo doc`'d
 
@@ -1234,6 +1251,23 @@ pub const M_067: () = ();
 /// index had zero readers while still being maintained on every
 /// `manifests` UPDATE.
 pub const M_068: () = ();
+
+// BURNED NUMBERS — 069 and 070 (next free migration: 071):
+//
+// - 069/070 were rio_app role/grant migrations that ARE applied on
+//   the persistent DB (recorded rows in `_sqlx_migrations`) and were
+//   then retired: role/grant management moved out of the frozen
+//   migration set into the runner's `ensure_roles` pass
+//   (src/ensure_roles.rs — see its module docs for the two live
+//   incidents that forced the move). Their applied rows stay as
+//   harmless history.
+//
+//   UNLIKE the M_055 gap above — a never-applied number that sqlx
+//   tolerates WITHOUT ignore_missing because no `_sqlx_migrations`
+//   row exists anywhere — 069/070 ARE applied rows: un-embedding
+//   them is safe ONLY because the runner sets `ignore_missing(true)`
+//   (migrate.rs). Reverting that flag would brick deploys against
+//   the persistent DB with `VersionMissing(69)`.
 
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,

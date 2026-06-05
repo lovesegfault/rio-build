@@ -278,6 +278,15 @@ fn migration_checksums_frozen() {
         (66, "0653a6722448389c273f9e2deff130a328c3a278265d294e7a69f42838656104a1d4c7a3b7d07ca0971752939b2d4dd0"),
         (67, "18b1c7c542fbfca71731766b5dbf60060860a43534462baa39ca570a0f14b34f006e0d60153daa5367f0129f55c9b78a"),
         (68, "09098d0cdeddce25a3b834402c2a4257a5577871a9d485be64b29bacf185cc39630d23c329d2e460c6d1e6dacba063fe"),
+        // 069/070 are BURNED (see rio-migrations/src/migrations.rs,
+        // "BURNED NUMBERS"): they were role migrations that ARE
+        // applied rows on the persistent DB, retired in favor of the
+        // runner's ensure_roles pass. Their rows stay inert ONLY
+        // because the runner sets ignore_missing(true) — and with
+        // that flag on, the reverse check below ("PINNED lists
+        // migration v but migrations/ has no such file") is the ONLY
+        // guard against renumbering an applied migration into a
+        // silent re-apply. Next free migration number: 071.
     ];
 
     let pinned: std::collections::HashMap<i64, &str> = PINNED.iter().copied().collect();
@@ -450,4 +459,307 @@ async fn migration_048_recounts_skipped_as_completed() {
     // b2 active → guard skipped it: seeded undercount preserved (live
     // path owns active builds; 048 must not race it).
     assert_eq!(row(b2).fetch_one(&db.pool).await.unwrap(), (2, 2));
+}
+
+/// Shared grant assertions for the ensure_roles tests: `rio_app`
+/// holds full DML on EVERY public table AND sequence, plus default
+/// privileges for both object kinds. Idempotent-STATE assertions
+/// only — never "role did not exist before": under llvm-cov `cargo
+/// test` the PG server is process-shared and `rio_app` is
+/// cluster-wide, so a sibling test may have created it already.
+async fn assert_rio_app_grants(pool: &sqlx::PgPool) {
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT c.relname FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert!(!tables.is_empty(), "migrated DB must have public tables");
+    for t in &tables {
+        let ok: bool = sqlx::query_scalar(
+            "SELECT has_table_privilege('rio_app', format('%I.%I', 'public', $1::text), \
+             'SELECT,INSERT,UPDATE,DELETE')",
+        )
+        .bind(t)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(ok, "rio_app lacks DML on table {t}");
+    }
+
+    let sequences: Vec<String> = sqlx::query_scalar(
+        "SELECT c.relname FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'public' AND c.relkind = 'S'",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    for sq in &sequences {
+        let ok: bool = sqlx::query_scalar(
+            "SELECT has_sequence_privilege('rio_app', format('%I.%I', 'public', $1::text), \
+             'USAGE,SELECT,UPDATE')",
+        )
+        .bind(sq)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(ok, "rio_app lacks privileges on sequence {sq}");
+    }
+
+    // Default privileges registered for BOTH object kinds ('r' tables,
+    // 'S' sequences) — a tables-only default leaves serial/identity
+    // sequences permission-denied on the first post-migration insert.
+    for objtype in ["r", "S"] {
+        let ok: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_default_acl d \
+             JOIN pg_namespace n ON n.oid = d.defaclnamespace \
+             WHERE n.nspname = 'public' AND d.defaclobjtype = $1::\"char\" \
+               AND array_to_string(d.defaclacl, ',') LIKE '%rio_app%')",
+        )
+        .bind(objtype)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(ok, "no default privileges for rio_app on objtype {objtype}");
+    }
+}
+
+/// ensure_roles creates `rio_app` with full grants and is idempotent
+/// (the second run must change nothing and fail nothing). Exercised
+/// through the lock-holding combined entry point — production never
+/// calls ensure_roles bare, and the advisory lock is what serializes
+/// the cluster-wide role DDL under the shared-server test topology.
+/// Also pins the superuser-runner behavior: on non-RDS (no rds_iam
+/// role) the role+grants ARE created — intentional, not accidental.
+// r[verify store.db.ensure-roles]
+#[tokio::test]
+async fn ensure_roles_creates_and_is_idempotent() {
+    let db = rio_test_support::TestDb::new(&MIGRATOR).await;
+
+    rio_migrations::migrate::run_with_roles(&db.pool, rio_migrations::migrator())
+        .await
+        .expect("first run_with_roles");
+    assert_rio_app_grants(&db.pool).await;
+
+    // Idempotent: second pass over the converged state.
+    rio_migrations::migrate::run_with_roles(&db.pool, rio_migrations::migrator())
+        .await
+        .expect("second run_with_roles must be a clean no-op");
+    assert_rio_app_grants(&db.pool).await;
+
+    let login: bool =
+        sqlx::query_scalar("SELECT rolcanlogin FROM pg_roles WHERE rolname = 'rio_app'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(login, "rio_app must have LOGIN");
+}
+
+/// Regression for the live REASSIGN ACL-strip incident: replay the
+/// retired role migrations' bodies (069 ownership transfer + 070
+/// REASSIGN-detach — kept as fixtures; PG >= 16 required for their
+/// pg_has_role(..., 'SET')), confirm the strip occurred, then assert
+/// ensure_roles re-grants everything on tables AND sequences.
+// r[verify store.db.ensure-roles]
+#[tokio::test]
+async fn ensure_roles_regrants_after_legacy_acl_strip() {
+    let db = rio_test_support::TestDb::new(&MIGRATOR).await;
+
+    sqlx::raw_sql(include_str!("fixtures/legacy_069_rio_app_role.sql"))
+        .execute(&db.pool)
+        .await
+        .expect("replay legacy 069");
+    sqlx::raw_sql(include_str!(
+        "fixtures/legacy_070_master_detach_rio_app.sql"
+    ))
+    .execute(&db.pool)
+    .await
+    .expect("replay legacy 070");
+
+    // Precondition: the replayed REASSIGN really stripped rio_app's
+    // privileges (the live symptom was `permission denied for table
+    // _sqlx_migrations` in every app pod). Without this assert the
+    // test would pass vacuously if PG's REASSIGN semantics changed.
+    let stripped: bool = sqlx::query_scalar(
+        "SELECT NOT has_table_privilege('rio_app', '_sqlx_migrations', 'SELECT')",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        stripped,
+        "fixture replay did not reproduce the ACL strip — fixture or PG semantics drifted"
+    );
+
+    rio_migrations::migrate::run_with_roles(&db.pool, rio_migrations::migrator())
+        .await
+        .expect("run_with_roles over the stripped database");
+    assert_rio_app_grants(&db.pool).await;
+}
+
+/// The k3s contract: an unprivileged runner (bitnami app user — no
+/// CREATEROLE) must degrade to a WARNING, not a failure. A bare
+/// CREATE ROLE here once crash-looped every store/scheduler pod on
+/// k3s. Called bare (not via run_with_roles): the migrator cannot run
+/// as this user at all, and the unprivileged path performs no DDL —
+/// nothing to serialize.
+#[tokio::test]
+async fn ensure_roles_unprivileged_user_degrades_to_warning() {
+    use sqlx::ConnectOptions as _;
+
+    let db = rio_test_support::TestDb::new(&MIGRATOR).await;
+
+    // Unique name: roles are cluster-wide and the llvm-cov topology
+    // shares one server across tests.
+    let role = format!(
+        "rio_test_limited_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE ROLE \"{role}\" WITH LOGIN"
+    )))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let opts = (*db.pool.connect_options()).clone().username(&role);
+    let mut conn = opts.connect().await.expect("connect as limited role");
+    rio_migrations::ensure_roles::ensure_roles(&mut conn)
+        .await
+        .expect("unprivileged ensure_roles must warn, not fail");
+    drop(conn);
+
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE \"{role}\"")))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+}
+
+/// Rollback / un-embedding regression: `migrate::run` and
+/// `assert_current` both tolerate an applied row whose version is not
+/// in the embedded set. This is the documented binary-rollback path
+/// (previous binary against a newer schema) AND what keeps the
+/// retired role migrations' applied rows (069/070 on the persistent
+/// DB) inert. Without `ignore_missing(true)` sqlx fails
+/// `VersionMissing` before applying anything.
+#[tokio::test]
+async fn migrate_run_tolerates_applied_but_not_embedded_rows() {
+    let db = rio_test_support::TestDb::new(&MIGRATOR).await;
+
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations \
+         (version, description, installed_on, success, checksum, execution_time) \
+         VALUES (9999, 'from-a-newer-binary', now(), true, '\\x00'::bytea, 0)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    rio_migrations::migrate::run(&db.pool, rio_migrations::migrator())
+        .await
+        .expect("run must ignore the un-embedded applied row");
+    rio_migrations::migrate::assert_current(&db.pool)
+        .await
+        .expect("assert_current accepts applied-but-not-embedded");
+}
+
+/// The rds_iam branch: where the role exists (RDS/Aurora — simulated
+/// here by creating it), ensure_roles must grant it to rio_app. That
+/// membership is the entire IAM-auth switch — without it RDS PAM
+/// rejects rio_app's token and every app pod fails auth.
+#[tokio::test]
+async fn ensure_roles_grants_rds_iam_membership_where_role_exists() {
+    let db = rio_test_support::TestDb::new(&MIGRATOR).await;
+
+    // Cluster-wide role; IF NOT EXISTS shape because the llvm-cov
+    // topology shares one server across tests. NOLOGIN like the real
+    // rds_iam. Never dropped — other tests' ensure_roles passes then
+    // take the grant path too, which is idempotent.
+    sqlx::raw_sql(
+        "DO $$ BEGIN \
+           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rds_iam') THEN \
+             CREATE ROLE rds_iam NOLOGIN; \
+           END IF; \
+         END $$",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    rio_migrations::migrate::run_with_roles(&db.pool, rio_migrations::migrator())
+        .await
+        .expect("run_with_roles with rds_iam present");
+
+    let member: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+           SELECT 1 FROM pg_auth_members m
+           JOIN pg_roles g ON g.oid = m.roleid
+           JOIN pg_roles mem ON mem.oid = m.member
+           WHERE g.rolname = 'rds_iam' AND mem.rolname = 'rio_app')",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        member,
+        "ensure_roles must grant rds_iam to rio_app where the role exists"
+    );
+}
+
+/// The defensive-detach branch: a legacy database where the runner's
+/// user holds an INHERITING rio_app membership (the incident-1 shape —
+/// inherited rds_iam made RDS PAM reject the master's password). The
+/// ACL-strip replay test does NOT reach this branch (its superuser
+/// replay short-circuits the legacy grant), so pin it directly:
+/// ensure_roles must REASSIGN+REVOKE the membership and re-assert
+/// grants in the same run.
+// r[verify store.db.ensure-roles]
+#[tokio::test]
+async fn ensure_roles_detaches_inheriting_master_membership() {
+    let db = rio_test_support::TestDb::new(&MIGRATOR).await;
+
+    // First pass creates rio_app + grants.
+    rio_migrations::migrate::run_with_roles(&db.pool, rio_migrations::migrator())
+        .await
+        .expect("initial run_with_roles");
+
+    // Reproduce the legacy grant (explicit, INHERIT — the default).
+    sqlx::query("GRANT rio_app TO CURRENT_USER")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let inheriting = "SELECT EXISTS (
+           SELECT 1 FROM pg_auth_members m
+           JOIN pg_roles g ON g.oid = m.roleid
+           JOIN pg_roles mem ON mem.oid = m.member
+           WHERE g.rolname = 'rio_app' AND mem.rolname = current_user
+             AND m.inherit_option)";
+    let before: bool = sqlx::query_scalar(inheriting)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(before, "test setup must create an inheriting membership");
+
+    rio_migrations::migrate::run_with_roles(&db.pool, rio_migrations::migrator())
+        .await
+        .expect("run_with_roles over the legacy membership");
+
+    let after: bool = sqlx::query_scalar(inheriting)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        !after,
+        "ensure_roles must detach the inheriting master membership (RDS PAM \
+         treats inherited rds_iam as IAM-only and rejects the password)"
+    );
+    // The detach's REASSIGN rewrites owner ACLs — the same run must
+    // have re-asserted every grant.
+    assert_rio_app_grants(&db.pool).await;
 }

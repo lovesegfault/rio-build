@@ -1299,6 +1299,27 @@ Running migrations out-of-band, always as the database master, decouples
 schema DDL from app-pod credentials: `postgres.authMode=iam` pods never
 need DDL-capable database privileges.
 
+#r("store.db.ensure-roles")[
+  Every migrate run MUST re-assert the `rio_app` role, its `rds_iam`
+  membership (where that role exists), and its full table/sequence/default
+  privileges (`rio_migrations::ensure_roles`), under the same advisory-lock
+  hold as the migrations themselves; role and grant management MUST NOT
+  ship as checksum-frozen migrations. Where the connected user lacks the
+  required privileges (k3s migrates as the bitnami app user, which has no
+  CREATEROLE), the pass MUST degrade to a warning, not a failure.
+]
+
+Roles and grants are desired state — cluster-wide, environment-dependent
+(`rds_iam` exists only on RDS), and subject to drift from manual incident
+recovery — not schema history. Two live incidents motivated the move out
+of frozen SQL: a role migration's `GRANT rio_app TO <master>` made the
+master inherit `rds_iam` and RDS PAM rejected its password (locking out
+the migration runner itself), and the frozen follow-up's
+`REASSIGN OWNED BY rio_app` rewrote owner-ACL entries and stripped all of
+rio_app's privileges while the migrate Job reported success. Re-asserting
+grants on every run makes both classes self-healing; the advisory lock
+serializes the cluster-wide role DDL across concurrent runner invocations.
+
 #r("store.db.pool-idle-timeout")[
   The PostgreSQL connection pool MUST set `idle_timeout` (60s) and
   `min_connections` (2). Aurora Serverless v2 scales `max_connections` with ACU
