@@ -1214,6 +1214,63 @@ in
       main = "leaderElectionShutdown";
     };
 
+    # The dropped-write (mid-band) fault regime (NEW, bughunt2-wave
+    # slot 8 merged_bug_303): every renew round's fetch completes, no
+    # act's response ever arrives, transmitted PUTs still COMMIT
+    # (renewSendDropped), and the own-commit evidence rule
+    # (fetchObservesOwnCommit) is the only thing that can re-anchor
+    # the holder's belief -- consuming the UnconfirmedPut ledger and
+    # stamping the blind clock at the LEDGER's anchor, never the
+    # read's time. Asymmetric-TTL constants, so neverDual is checked
+    # here as the SOUNDNESS ARBITER of the evidence design: stamping
+    # at the anchor must never let a blind victim's belief outlive a
+    # healthy thief's steal deadline. blindHolderBounded is the
+    # headline liveness-as-safety claim: a fenced holder with
+    # observable own-commit evidence re-believes within the forcing
+    # cap's window (BLIND_HOLDER_BOUND = 8 global ticks,
+    # boundary-measured: 7 violates, 8 holds -- see the module
+    # comment). The paired pin is quint-lease-calib-303-blind-timeout
+    # (the evidence rule removed in its three pieces must falsify).
+    # Measured: exhaustive TLC ~6s / ~619k distinct states at the
+    # wired constants -- the default 1800s budget is ~300x headroom.
+    # r[verify sched.lease.cancelled-write]
+    quint-leader-election-dropped-write = mkQuintCheck {
+      name = "leader-election-dropped-write";
+      spec = "leaderElection";
+      main = "leaderElectionDroppedWrite";
+      step = "midBandStep";
+      invariants = [
+        "boundsOK"
+        "clockSkewBound"
+        "atMostOneCASWinner"
+        "loopInterval"
+        "boundedDualLeadership"
+        "staleLeaderHasStaleGeneration"
+        "neverDual"
+        "blindHolderBounded"
+      ];
+    };
+
+    # Non-vacuity witness: a transmitted write actually drops in the
+    # explored space -- the neverDual and blindHolderBounded verdicts
+    # above are about a space where the fault bites.
+    quint-leader-election-witness-dropped-commit = mkQuintWitnessCheck {
+      name = "leader-election-witness-dropped-commit";
+      spec = "leaderElection";
+      main = "leaderElectionDroppedWrite";
+      witness = "noDroppedCommit";
+      step = "midBandStep";
+    };
+
+    # Deterministic named-run replay (livelockBrokenRun: two dropped
+    # writes, belief sustained on own-commit evidence alone, each
+    # stamp at the ledger anchor, no leaderless window, no dual).
+    quint-leader-election-runs-dropped-write = mkQuintRunCheck {
+      name = "leader-election-runs-dropped-write";
+      spec = "leaderElection";
+      main = "leaderElectionDroppedWrite";
+    };
+
     # The leader-marks reconciliation model (bughunt-wave F1
     # merged_bug_138; DirtyGen rework bughunt2-wave slot 8 bug_181):
     # the deletion-cost/label machinery as a level-triggered protocol —
@@ -1312,6 +1369,23 @@ in
       spec = "calibration/lease-387-belief-gate";
       main = "leaseCalib387BeliefGate";
       witness = "gracefulHandover";
+      step = "calibStep";
+      extraSpecs = [ "leaderElection" ];
+    };
+
+    # merged_bug_303 pre-fix (bughunt2-wave slot 8): BLIND TIMEOUT --
+    # no evidence rule (no consumption, no anchor stamp, no forcing
+    # cap, the pre-fix GET): a fenced holder whose committed writes
+    # keep bumping the rv can never re-anchor its belief and the
+    # blind-holder window stretches to the trace horizon;
+    # blindHolderBounded falls. One cycle of the unbounded leaderless
+    # livelock the phased renew + UnconfirmedPut ledger exist to
+    # break.
+    quint-lease-calib-303-blind-timeout = mkQuintWitnessCheck {
+      name = "lease-calib-303-blind-timeout";
+      spec = "calibration/lease-303-blind-timeout";
+      main = "leaseCalib303BlindTimeout";
+      witness = "blindHolderBounded";
       step = "calibStep";
       extraSpecs = [ "leaderElection" ];
     };

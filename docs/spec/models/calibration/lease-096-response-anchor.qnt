@@ -41,7 +41,9 @@ module leaseCalib096ResponseAnchor {
     MAX_CLAIM_FAILURES = 0,
     MAX_RESTORES = 0,
     MAX_SUSPENDS = 1,
-    MAX_SHUTDOWNS = 0
+    MAX_SHUTDOWNS = 0,
+    MAX_DROPS = 0,
+    BLIND_HOLDER_BOUND = 0
   ).* from "../leaderElection"
 
   /// PRE-FIX read: stamps the fence at the READ instant — the
@@ -66,6 +68,13 @@ module leaseCalib096ResponseAnchor {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     fenceThenExit' = fenceThenExit,
+    // New-var frames mirroring the live renewReadOk (the parked read
+    // arriving is a completed round; suspend and dropped-write are
+    // never co-enabled, and MAX_DROPS = 0 here freezes all four).
+    unconfirmed' = unconfirmed.put(n, NoUnconf),
+    lastFetchedRv' = lastFetchedRv,
+    drops' = drops,
+    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed.put(n, NoUnconf), lastFetchedRv, blindHolderFor, false),
   }
 
   action calibRenewReadOkAny = {

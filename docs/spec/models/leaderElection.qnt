@@ -225,6 +225,12 @@ module leaderElection {
   /// clock — what production's RenewAnchor captures before the await.
   /// Only the suspend fault (MAX_SUSPENDS > 0) ever creates one.
   type PendingState = | NoPending | PendingRead({ anchor: int })
+  /// The cancelled-write ledger entry (production UnconfirmedPut,
+  /// rio-lease/src/lib.rs): a transmitted-but-unconfirmed lease
+  /// write, kept at the OLDEST anchor until own-commit evidence (or a
+  /// completed round, wholesale) consumes it. anchor is the attempt
+  /// instant on the node's clock -- anchor <= send <= commit.
+  type UnconfState = | NoUnconf | Unconf({ anchor: int })
 
   // --- 2. constants (const = overridable per fault regime) --------------
   const NODES: Set[Node]
@@ -274,6 +280,23 @@ module leaderElection {
   /// (bug_387): the release fires iff the node HELD the lease
   /// unsuperseded, regardless of the belief the self-fence cleared.
   const MAX_SHUTDOWNS: int
+  /// Dropped writes per trace (0 = disabled): a renew-shaped PUT that
+  /// COMMITS at the apiserver while the renew composition fails after
+  /// transmission -- the mid-band act deadline of merged_bug_303 (the
+  /// fetch fits the phase budget, the act's response does not). The
+  /// loop is NOT parked (contrast MAX_SUSPENDS): the round resolves
+  /// as an error, no clock is stamped, belief is untouched (decay is
+  /// selfFence's job), and the committed write sits in the
+  /// UnconfirmedPut ledger until own-commit evidence consumes it.
+  /// Distinct from MAX_SUSPENDS' split renew: there the response
+  /// arrives late (renewReadOk); here it never arrives at all.
+  const MAX_DROPS: int
+  /// The blind-holder-window bound (global ticks) blindHolderBounded
+  /// asserts in dropped-write regimes; bind 0 wherever MAX_DROPS = 0
+  /// (the ghost is frozen there). The value is a calibrated
+  /// measurement -- see the introducing commit and the droppedWrite
+  /// module comment.
+  const BLIND_HOLDER_BOUND: int
 
   /// acquiredAt sentinel: "never acquired" (the TLA+ acquiredAt[n] =
   /// NULL). -1 can never equal a real rv (>= 0), mirroring a model
@@ -375,6 +398,30 @@ module leaderElection {
   /// at the apiserver but no longer believed (post-self-fence) — the
   /// fence-then-SIGTERM shape. Read by the noFenceThenExit witness.
   var fenceThenExit: bool
+  /// Per-node cancelled-write ledger (in-memory: a crash loses it --
+  /// which is exactly why evidence can never fire post-crash at a
+  /// reset generation). Frozen all-NoUnconf at MAX_DROPS = 0.
+  var unconfirmed: Node -> UnconfState
+  /// Per-node evidence cursor: the rv of the last COMPLETED fetch
+  /// (production last_fetched_rv; -1 = none). Updates are gated on
+  /// MAX_DROPS > 0 so the four pre-existing regimes' state spaces
+  /// stay byte-identical (re-measured at the introducing commit).
+  var lastFetchedRv: Node -> int
+  /// Ghost: global ticks accumulated while SOME alive node is the
+  /// EVIDENCE-STARVED BLIND HOLDER -- the lease names it, it has
+  /// stopped believing (fenced), and own-commit evidence of its
+  /// transmitted write is OBSERVABLE (entry pending, rv moved past
+  /// its cursor) yet unobserved. This is merged_bug_303's failure
+  /// window stated as safety: pre-fix it never closes (the livelock,
+  /// one cycle of it); with the evidence rule the forcing cap closes
+  /// it within one poll. Deliberately NOT "no believer exists":
+  /// global leaderlessness is a liveness property the model's
+  /// candidates are not poll-forced to close (a standby's steal is
+  /// never obligatory), and asserting it as state would be vacuous
+  /// or false. Frozen 0 at MAX_DROPS = 0.
+  var blindHolderFor: int
+  /// Dropped writes so far.
+  var drops: int
 
   // --- 4. accessor / guard helpers --------------------------------------
   // The TLA+ reads snap[n].rv directly after guarding snap[n] /= NULL;
@@ -391,6 +438,35 @@ module leaderElection {
   def obsSinceOf(n: Node): int = match obs.get(n) { | NoObs => -1 | Observed(o) => o.since }
   def hasPending(n: Node): bool = pending.get(n) != NoPending
   def anchorOf(n: Node): int = match pending.get(n) { | NoPending => -1 | PendingRead(p) => p.anchor }
+  def unconfAnchorOf(n: Node): int = match unconfirmed.get(n) { | NoUnconf => -1 | Unconf(u) => u.anchor }
+  /// Own-commit evidence is observable for n: a transmitted write is
+  /// in doubt, the apiserver still (or again) names n holder, and the
+  /// rv has MOVED past the evidence cursor -- some write of ours
+  /// committed since the last completed fetch. Identically false at
+  /// MAX_DROPS = 0 (the ledger is unmintable).
+  def evidenceEnabled(n: Node): bool = and {
+    unconfirmed.get(n) != NoUnconf,
+    lease.holder == Held(n),
+    lease.rv != lastFetchedRv.get(n),
+  }
+  /// The blindHolderFor ghost's single transition rule, applied in
+  /// every action's frame with that action's POST values (the
+  /// wrongSince discipline of leaderMarks.qnt -- no enumerated writer
+  /// list): while some alive non-believer is the lease's holder with
+  /// observable own-commit evidence, a tick increments and any other
+  /// action holds; otherwise the ghost is 0. Frozen at MAX_DROPS = 0
+  /// (byte-identical pre-existing regimes).
+  def bhNext(lz: LeaseRec, ld: Node -> bool, al: Node -> bool, uc: Node -> UnconfState, cf: Node -> int, cur: int, isTick: bool): int =
+    if (MAX_DROPS == 0) 0
+    else if (NODES.exists(m => and {
+      al.get(m),
+      not(ld.get(m)),
+      lz.holder == Held(m),
+      uc.get(m) != NoUnconf,
+      lz.rv != cf.get(m),
+    }))
+      (if (isTick) cur + 1 else cur)
+    else 0
 
   /// held tracking, gated on the shutdown fault so the four existing
   /// regimes are STATE-SPACE-IDENTICAL at MAX_SHUTDOWNS = 0 (held stays
@@ -434,6 +510,7 @@ module leaderElection {
   /// (map domains, booleans, the nullable records) is subsumed by the
   /// static type system.
   val boundsOK = and {
+    drops <= MAX_DROPS,
     NODES.forall(n => clocks.get(n) >= 0 and clocks.get(n) <= MAX_TIME),
     NODES.forall(n => fence.get(n) >= 0 and fence.get(n) <= MAX_TIME),
     NODES.forall(n => gen.get(n) >= 1 and gen.get(n) <= MAX_GEN),
@@ -519,6 +596,25 @@ module leaderElection {
   /// is reachable in the shutdown regime. Guards gracefulHandover
   /// against vacuity (a release gate nobody reaches proves nothing).
   val noFenceThenExit = not(fenceThenExit)
+
+  /// The dropped-write window bound (merged_bug_303): whenever the
+  /// lease's holder has stopped believing while own-commit evidence
+  /// of its transmitted write is OBSERVABLE, that state is younger
+  /// than BLIND_HOLDER_BOUND global ticks -- the evidence-forcing
+  /// tick cap obliges the fetch within one poll of the eldest doubt,
+  /// so a fenced holder re-believes instead of livelocking. The
+  /// lease-303-blind-timeout calibration twin removes the evidence
+  /// fetch (and its forcing cap) and the window stretches to the
+  /// trace horizon -- the leaderless livelock, one cycle of it:
+  /// committed-but-cancelled PUTs re-anchor every standby's staleness
+  /// clock while the blind ex-holder cannot re-anchor its own belief.
+  val blindHolderBounded = blindHolderFor <= BLIND_HOLDER_BOUND
+
+  /// Witness (expect-violation in the droppedWrite regime): a
+  /// transmitted write actually drops -- the blindHolderBounded and
+  /// neverDual verdicts there are about a space where the fault
+  /// bites.
+  val noDroppedCommit = drops == 0
 
   // --- expect-violation witnesses (non-vacuity probes) -------------------
   //
@@ -870,6 +966,14 @@ module leaderElection {
     (alive.get(n) and leading.get(n) and pending.get(n) == NoPending) implies
       ((clocks.get(n) + 1) - fence.get(n) <= FENCE_AFTER + RENEW),
     NODES.forall(m => (clocks.get(n) + 1) - clocks.get(m) <= MAX_SKEW),
+    // The evidence-forcing cap (merged_bug_303): the loop polls every
+    // RENEW and the fetch phase fits the mid-band budget, so a node
+    // with own-commit evidence AVAILABLE cannot tick past the poll
+    // that would observe it -- the candidate-side twin of the leading
+    // cap above, anchored at the ledger's eldest doubt. Vacuous at
+    // MAX_DROPS = 0.
+    (alive.get(n) and pending.get(n) == NoPending and evidenceEnabled(n)) implies
+      ((clocks.get(n) + 1) - unconfAnchorOf(n) <= FENCE_AFTER + RENEW),
     clocks' = clocks.put(n, clocks.get(n) + 1),
     lease' = lease, alive' = alive, leading' = leading, snap' = snap,
     obs' = obs, fence' = fence, gen' = gen, genHW' = genHW,
@@ -883,6 +987,9 @@ module leaderElection {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+    unconfirmed' = unconfirmed, lastFetchedRv' = lastFetchedRv,
+    drops' = drops,
+    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed, lastFetchedRv, blindHolderFor, true),
   }
 
   /// GET the lease. The obs[n] update follows decide_pure()'s
@@ -922,6 +1029,12 @@ module leaderElection {
   action apiGet(n: Node): bool = all {
     alive.get(n),
     pending.get(n) == NoPending,
+    // A GET that would observe own-commit evidence IS the evidence
+    // fetch (fetchObservesOwnCommit) -- production evaluates the
+    // evidence check inside every completed fetch before refreshing
+    // the cursor, so a bare GET that ignores pending evidence does
+    // not exist. Identically true at MAX_DROPS = 0.
+    not(evidenceEnabled(n)),
     snap' = snap.put(n, Snap(lease)),
     obs' = obs.put(n,
       if (lease.holder == NoHolder) NoObs
@@ -945,6 +1058,29 @@ module leaderElection {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+    // A GET observing a FOREIGN holder (or none) is the model point
+    // where production's Standby resolution lands, and a COMPLETED
+    // round answers the unconfirmed question wholesale (the fresh
+    // stamp supersedes the ledger's older anchor) -- the
+    // run_lease_loop Completed arm. Observing OURSELVES is only the
+    // fetch half of a round still in flight: ledger and cursor wait
+    // for the round's resolution. Value-identical at MAX_DROPS = 0.
+    unconfirmed' =
+      if (lease.holder == Held(n)) unconfirmed
+      else unconfirmed.put(n, NoUnconf),
+    // Cursor per the same arm (404/empty resets the baseline --
+    // production's create path); gated for byte-identical
+    // pre-existing regimes.
+    lastFetchedRv' =
+      if (MAX_DROPS == 0) lastFetchedRv
+      else if (lease.holder == Held(n)) lastFetchedRv
+      else if (lease.holder == NoHolder) lastFetchedRv.put(n, -1)
+      else lastFetchedRv.put(n, lease.rv),
+    drops' = drops,
+    // The blind condition is invariant under a bare GET: the entry
+    // only clears when the holder is foreign (that node's blind term
+    // was already false), and no other coordinate moves.
+    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed, lastFetchedRv, blindHolderFor, false),
   }
 
   /// The write-ahead claim INSERT succeeds: the PG floor advances to the
@@ -1134,6 +1270,15 @@ module leaderElection {
       suspends' = suspends, shutdowns' = shutdowns,
       releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
       suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+      // A steal is a completed round: the unconfirmed question is
+      // answered wholesale; the cursor takes the post-PUT rv (gated
+      // for byte-identical pre-existing regimes).
+      unconfirmed' = unconfirmed.put(n, NoUnconf),
+      lastFetchedRv' =
+        if (MAX_DROPS == 0) lastFetchedRv
+        else lastFetchedRv.put(n, snapRvOf(n) + 1),
+      drops' = drops,
+      blindHolderFor' = 0,  // the thief is the holder AND a believer post-state
       // The claim disjunction: the INSERT into the claims ledger either
       // lands (claimOk -- the floor advances when seeded exceeds it; on
       // seedFor's own-row-tie retain path seeded equals genHW, so claimOk
@@ -1292,6 +1437,15 @@ module leaderElection {
       suspends' = suspends, shutdowns' = shutdowns,
       releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
       suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+      // A completed renew answers the unconfirmed question wholesale;
+      // the cursor takes the post-PUT rv (gated for byte-identical
+      // pre-existing regimes).
+      unconfirmed' = unconfirmed.put(n, NoUnconf),
+      lastFetchedRv' =
+        if (MAX_DROPS == 0) lastFetchedRv
+        else lastFetchedRv.put(n, snapRvOf(n) + 1),
+      drops' = drops,
+      blindHolderFor' = 0,  // the renewer is the holder AND a believer post-state
       // The same claim disjunction as steal's, restricted to the edge
       // branch via claimTarget -- a steady-state renew never claims, so
       // it cannot fail to claim. The retry-on-the-next-acquire-edge
@@ -1332,6 +1486,16 @@ module leaderElection {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+    // A 409 is a completed round (the apiserver answered): the
+    // unconfirmed question is answered wholesale; the cursor takes
+    // the GET half's rv (gated for byte-identical pre-existing
+    // regimes).
+    unconfirmed' = unconfirmed.put(n, NoUnconf),
+    lastFetchedRv' =
+      if (MAX_DROPS == 0) lastFetchedRv
+      else lastFetchedRv.put(n, snapRvOf(n)),
+    drops' = drops,
+    blindHolderFor' = bhNext(lease, leading.put(n, false), alive, unconfirmed.put(n, NoUnconf), lastFetchedRv, blindHolderFor, false),
   }
 
   /// maybe_self_fence(): a Leading node that has not had a successful
@@ -1362,6 +1526,9 @@ module leaderElection {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+    unconfirmed' = unconfirmed, lastFetchedRv' = lastFetchedRv,
+    drops' = drops,
+    blindHolderFor' = bhNext(lease, leading.put(n, false), alive, unconfirmed, lastFetchedRv, blindHolderFor, false),
   }
 
   /// Pod crash. Loses ALL in-memory state: the belief, the snapshot, the
@@ -1395,6 +1562,13 @@ module leaderElection {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+    // The ledger and the cursor are in-memory: the crash loses both
+    // (which is why evidence can never fire post-crash at the reset
+    // generation -- the entry died with the incarnation).
+    unconfirmed' = unconfirmed.put(n, NoUnconf),
+    lastFetchedRv' = lastFetchedRv.put(n, -1),
+    drops' = drops,
+    blindHolderFor' = bhNext(lease, leading.put(n, false), alive.put(n, false), unconfirmed.put(n, NoUnconf), lastFetchedRv, blindHolderFor, false),
   }
 
   /// Pod restart. The recovered process has no observation (its first
@@ -1421,6 +1595,9 @@ module leaderElection {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+    unconfirmed' = unconfirmed, lastFetchedRv' = lastFetchedRv,
+    drops' = drops,
+    blindHolderFor' = bhNext(lease, leading, alive.put(n, true), unconfirmed, lastFetchedRv, blindHolderFor, false),
   }
 
   /// Suspend fault, send half: a steady-state renew whose PUT commits
@@ -1457,6 +1634,11 @@ module leaderElection {
     exited' = exited, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+    // The round is unresolved (the response is parked): ledger and
+    // cursor wait for renewReadOk's resolution.
+    unconfirmed' = unconfirmed, lastFetchedRv' = lastFetchedRv,
+    drops' = drops,
+    blindHolderFor' = 0,  // the holder is a believer; no other node is named
   }
 
   /// Suspend fault, read half: the parked response arrives. THE FIX
@@ -1487,6 +1669,114 @@ module leaderElection {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     fenceThenExit' = fenceThenExit,
+    // The parked read arriving IS the completed round: wholesale
+    // answer. The cursor stays frozen -- the suspend and dropped-write
+    // faults are never co-enabled in any wired regime, and the
+    // pending record deliberately does not carry the PUT-time rv
+    // (adding it would change the suspend regime's state space).
+    unconfirmed' = unconfirmed.put(n, NoUnconf),
+    lastFetchedRv' = lastFetchedRv,
+    drops' = drops,
+    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed.put(n, NoUnconf), lastFetchedRv, blindHolderFor, false),
+  }
+
+  /// The dropped-write fault (merged_bug_303): a renew-shaped PUT
+  /// whose apiserver write COMMITS while the renew composition fails
+  /// after transmission -- the mid-band act deadline (the fetch phase
+  /// fit its budget; the act's response never arrives). The loop is
+  /// NOT parked (contrast renewSendSteady): the round resolves as an
+  /// error, NO clock is stamped, and belief is UNTOUCHED -- decay is
+  /// selfFence's job. The fetch half completed first, so the evidence
+  /// cursor advances to the fetched rv; the transmitted write is
+  /// recorded in the UnconfirmedPut ledger at the attempt anchor,
+  /// OLDEST-kept (an unconsumed entry is never overwritten -- if
+  /// several writes are in doubt the blind window must cover the
+  /// eldest; production run_lease_loop's mint arm). Fires for
+  /// believers AND fenced candidates alike -- a candidate whose lease
+  /// still names it renews, and its re-acquire PUT drops the same
+  /// way; that recurrence is the livelock's engine. Never enabled at
+  /// MAX_DROPS = 0.
+  action renewSendDropped(n: Node): bool = all {
+    drops < MAX_DROPS,
+    alive.get(n),
+    pending.get(n) == NoPending,
+    hasSnap(n),
+    snapHolderOf(n) == Held(n),
+    casOk(n),
+    lease' = { ...lease, rv: snapRvOf(n) + 1 },
+    snap' = snap.put(n, NoSnap),
+    unconfirmed' = unconfirmed.put(n,
+      if (unconfirmed.get(n) == NoUnconf) Unconf({ anchor: clocks.get(n) })
+      else unconfirmed.get(n)),
+    lastFetchedRv' = lastFetchedRv.put(n, snapRvOf(n)),
+    drops' = drops + 1,
+    casRace' = casRaceAfterPut(n),
+    held' = held,
+    blindHolderFor' = bhNext(
+      { ...lease, rv: snapRvOf(n) + 1 }, leading, alive,
+      unconfirmed.put(n,
+        if (unconfirmed.get(n) == NoUnconf) Unconf({ anchor: clocks.get(n) })
+        else unconfirmed.get(n)),
+      lastFetchedRv.put(n, snapRvOf(n)),
+      blindHolderFor, false),
+    fence' = fence, clocks' = clocks, alive' = alive, leading' = leading,
+    obs' = obs, gen' = gen, genHW' = genHW, genHWHolder' = genHWHolder,
+    acquiredAt' = acquiredAt, deletes' = deletes,
+    delVictims' = delVictims, claimFailures' = claimFailures,
+    restores' = restores, stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    pending' = pending, exited' = exited,
+    suspends' = suspends, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+  }
+
+  /// The own-commit evidence rule (merged_bug_303's fix): a COMPLETED
+  /// fetch observing holder == us with the rv MOVED past the evidence
+  /// cursor while a transmitted write is in doubt. Consumes the
+  /// ledger and stamps the blind-window clock at the LEDGER's anchor
+  /// -- anchor <= send <= commit, never the observing read's time:
+  /// read-stamping is exactly the manufactured fence-creep the apiGet
+  /// comment forbids, and stamping at the anchor keeps the fence and
+  /// the thief's obs clock anchored to the same event (the last
+  /// completed write), which is what the fence/steal separation
+  /// argument requires. A frozen rv stamps NOTHING (no commit, no
+  /// evidence; the window keeps aging and the fence fires on
+  /// schedule -- the rv-frozen companion direction). If the believer
+  /// self-fenced inside the blind window, belief re-enters through
+  /// the ordinary acquire edge with the FETCHED transition count: the
+  /// same-count same-epoch re-acquire -- the generation fetch_max is
+  /// encoded verbatim and is a provable no-op here (the holder never
+  /// changed, so the transition count never moved, and a crash wiped
+  /// the ledger so a reset-gen incarnation can never reach this
+  /// action). The bump-confirmation is deliberately NOT run --
+  /// confirmation stays a completed-round property
+  /// (sched.recovery.bump-confirm). Counts as a Leading observation
+  /// for the hold. Never enabled at MAX_DROPS = 0.
+  action fetchObservesOwnCommit(n: Node): bool = all {
+    alive.get(n),
+    pending.get(n) == NoPending,
+    evidenceEnabled(n),
+    fence' = fence.put(n, unconfAnchorOf(n)),
+    leading' = leading.put(n, true),
+    gen' = gen.put(n, if (gen.get(n) > lease.gen + 1) gen.get(n) else lease.gen + 1),
+    unconfirmed' = unconfirmed.put(n, NoUnconf),
+    lastFetchedRv' = lastFetchedRv.put(n, lease.rv),
+    snap' = snap.put(n, Snap(lease)),
+    held' = trackHeld(held, n, true),
+    blindHolderFor' = 0,  // the holder re-believes; its entry is consumed
+    clocks' = clocks, lease' = lease, alive' = alive, obs' = obs,
+    genHW' = genHW, genHWHolder' = genHWHolder,
+    acquiredAt' = acquiredAt, casRace' = casRace, deletes' = deletes,
+    delVictims' = delVictims, claimFailures' = claimFailures,
+    restores' = restores, stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    pending' = pending, exited' = exited, drops' = drops,
+    suspends' = suspends, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
   }
 
   /// Shutdown fault: SIGTERM. The loop breaks and runs the release
@@ -1547,6 +1837,16 @@ module leaderElection {
     renewBumpedAboveEntry' = renewBumpedAboveEntry,
     pending' = pending, suspends' = suspends,
     suspendStraddled' = suspendStraddled,
+    // The exiting process takes its in-memory ledger and cursor with
+    // it (terminal: exited nodes never act again).
+    unconfirmed' = unconfirmed.put(n, NoUnconf),
+    lastFetchedRv' = lastFetchedRv.put(n, -1),
+    drops' = drops,
+    blindHolderFor' = bhNext(
+      if (releases) { holder: NoHolder, rv: lease.rv + 1, gen: lease.gen } else lease,
+      leading.put(n, false), alive.put(n, false),
+      unconfirmed.put(n, NoUnconf), lastFetchedRv,
+      blindHolderFor, false),
     }
   }
 
@@ -1606,6 +1906,9 @@ module leaderElection {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+    unconfirmed' = unconfirmed, lastFetchedRv' = lastFetchedRv,
+    drops' = drops,
+    blindHolderFor' = 0,  // recreated empty: nobody is named holder
   }
 
   /// Operator/infrastructure fault: a PostgreSQL point-in-time restore
@@ -1638,6 +1941,9 @@ module leaderElection {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+    unconfirmed' = unconfirmed, lastFetchedRv' = lastFetchedRv,
+    drops' = drops,
+    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed, lastFetchedRv, blindHolderFor, false),
   }
 
   // --- 7. init ----------------------------------------------------------
@@ -1673,6 +1979,10 @@ module leaderElection {
     releaseSkippedWhileHolder' = false,
     suspendStraddled' = false,
     fenceThenExit' = false,
+    unconfirmed' = NODES.mapBy(n => NoUnconf),
+    lastFetchedRv' = NODES.mapBy(n => -1),
+    blindHolderFor' = 0,
+    drops' = 0,
   }
 
   // --- 8. step ----------------------------------------------------------
@@ -1755,6 +2065,18 @@ module leaderElection {
     nondet n = NODES.oneOf()
     shutdown(n)
   }
+  /// One holder-shaped PUT commits while its round fails after
+  /// transmission (dropped-write fault).
+  action renewSendDroppedAny = {
+    nondet n = NODES.oneOf()
+    renewSendDropped(n)
+  }
+  /// One node's fetch observes its own committed-but-unconfirmed
+  /// write (dropped-write fault's evidence rule).
+  action fetchObservesOwnCommitAny = {
+    nondet n = NODES.oneOf()
+    fetchObservesOwnCommit(n)
+  }
 
   action step = any {
     tickAny,
@@ -1773,6 +2095,12 @@ module leaderElection {
     renewSendSteadyAny,
     renewReadOkAny,
     shutdownAny,
+    // Fault-gated (disabled at MAX_DROPS = 0 -- same discipline as
+    // the suspend/shutdown pair above; the six pre-existing regimes'
+    // state spaces re-measured byte-identical at the introducing
+    // commit).
+    renewSendDroppedAny,
+    fetchObservesOwnCommitAny,
   }
 }
 
@@ -1876,7 +2204,9 @@ module leaderElectionBase {
     MAX_CLAIM_FAILURES = 0,
     MAX_RESTORES = 0,
     MAX_SUSPENDS = 0,
-    MAX_SHUTDOWNS = 0
+    MAX_SHUTDOWNS = 0,
+    MAX_DROPS = 0,
+    BLIND_HOLDER_BOUND = 0
   ).*
 
   // --- deterministic protocol runs ---------------------------------------
@@ -2072,7 +2402,9 @@ module leaderElectionDeletion {
     MAX_CLAIM_FAILURES = 0,
     MAX_RESTORES = 0,
     MAX_SUSPENDS = 0,
-    MAX_SHUTDOWNS = 0
+    MAX_SHUTDOWNS = 0,
+    MAX_DROPS = 0,
+    BLIND_HOLDER_BOUND = 0
   ).*
 }
 
@@ -2160,7 +2492,9 @@ module leaderElectionAsymmetric {
     MAX_CLAIM_FAILURES = 0,
     MAX_RESTORES = 0,
     MAX_SUSPENDS = 0,
-    MAX_SHUTDOWNS = 0
+    MAX_SHUTDOWNS = 0,
+    MAX_DROPS = 0,
+    BLIND_HOLDER_BOUND = 0
   ).*
 }
 
@@ -2247,7 +2581,9 @@ module leaderElectionPgFaults {
     MAX_CLAIM_FAILURES = 1,
     MAX_RESTORES = 1,
     MAX_SUSPENDS = 0,
-    MAX_SHUTDOWNS = 0
+    MAX_SHUTDOWNS = 0,
+    MAX_DROPS = 0,
+    BLIND_HOLDER_BOUND = 0
   ).*
 }
 
@@ -2292,7 +2628,9 @@ module leaderElectionSuspend {
     MAX_CLAIM_FAILURES = 0,
     MAX_RESTORES = 0,
     MAX_SUSPENDS = 1,
-    MAX_SHUTDOWNS = 0
+    MAX_SHUTDOWNS = 0,
+    MAX_DROPS = 0,
+    BLIND_HOLDER_BOUND = 0
   ).*
 
   /// The suspend-straddle scenario, end to end: n1 acquires, its next
@@ -2352,7 +2690,9 @@ module leaderElectionShutdown {
     MAX_CLAIM_FAILURES = 0,
     MAX_RESTORES = 0,
     MAX_SUSPENDS = 0,
-    MAX_SHUTDOWNS = 1
+    MAX_SHUTDOWNS = 1,
+    MAX_DROPS = 0,
+    BLIND_HOLDER_BOUND = 0
   ).*
 
   /// Fence-then-SIGTERM releases: n1 acquires, goes blind past its
@@ -2401,5 +2741,101 @@ module leaderElectionShutdown {
         lease.holder == Held("n2"),
         exited.get("n1"),
         gracefulHandover,
+      })
+}
+
+// =========================================================================
+// The dropped-write (mid-band) fault regime: merged_bug_303. The
+// environment is the mid-band latency band -- the fetch phase of every
+// round fits its budget, the act's response never arrives, so COMPLETE
+// renew rounds do not exist (renewLease is absent from the step) while
+// transmitted PUTs still commit (renewSendDropped). Steals stay in: the
+// thief is a different pod on a different network path, and a healthy
+// thief against a blind victim is exactly the adversarial shape
+// neverDual must survive. Asymmetric-TTL constants (the healthy
+// separation: STEAL_AFTER - FENCE_AFTER = 3 >= RENEW + 2*MAX_SKEW), so
+// neverDual is checked here IN ADDITION to leaderlessBounded --
+// neverDual is the SOUNDNESS ARBITER for the evidence rule: stamping
+// the fence at the ledger anchor must never let a blind victim's
+// belief outlive the thief's steal deadline. If neverDual falls here
+// the fix design is wrong -- stop and re-derive the anchor rule, never
+// widen constants.
+//
+// BLIND_HOLDER_BOUND = 8 is a calibrated, boundary-measured value: the
+// forcing cap parks the blind node's clock at anchor + FENCE_AFTER +
+// RENEW (3 ticks of window), and the peer may start MAX_SKEW behind
+// the anchor and drag to blind + MAX_SKEW (5 ticks), so the maximal
+// open stretch is 8 global ticks. Measured from both sides at the
+// introducing commit: 7 violates (the 3+5 schedule), 8 holds. The
+// lease-303-blind-timeout calibration twin (the evidence fetch
+// removed, the pre-fix GET restored, the forcing cap dropped)
+// stretches the window to the trace horizon and violates the bound --
+// the per-cycle livelock evidence.
+// MAX_TIME = 10 covers a drop, a fence, the forced evidence poll, and
+// a second drop cycle within the skew choreography.
+// =========================================================================
+module leaderElectionDroppedWrite {
+  import leaderElection(
+    NODES = Set("n1", "n2"),
+    FENCE_AFTER = 2,
+    STEAL_AFTER = 5,
+    RENEW = 1,
+    MAX_SKEW = 1,
+    MAX_TIME = 10,
+    MAX_GEN = 4,
+    MAX_RV = 8,
+    MAX_DELETES = 0,
+    MAX_CLAIM_FAILURES = 0,
+    MAX_RESTORES = 0,
+    MAX_SUSPENDS = 0,
+    MAX_SHUTDOWNS = 0,
+    MAX_DROPS = 2,
+    BLIND_HOLDER_BOUND = 8
+  ).*
+
+  /// The mid-band step: no complete renew rounds (the regime's
+  /// premise), no crash/recover (fault economy -- the pre-existing
+  /// regimes own those conjunctions), everything else the live
+  /// model's.
+  action midBandStep = any {
+    tickAny,
+    apiGetAny,
+    stealAny,
+    conflictAny,
+    selfFenceAny,
+    renewSendDroppedAny,
+    fetchObservesOwnCommitAny,
+  }
+
+  // --- deterministic protocol runs ---------------------------------------
+  /// The livelock broken, end to end: the holder's writes drop TWICE
+  /// (committing both times, bumping the rv both times) and the
+  /// belief survives BOTH on own-commit evidence alone -- the fence
+  /// never fires, no leaderless window ever opens, and each stamp
+  /// lands at the LEDGER's anchor (not the read instant). Pre-fix
+  /// (the lease-303-blind-timeout twin) the same schedule fences the
+  /// holder and the committed garbage writes hold every standby's
+  /// staleness clock hostage.
+  run livelockBrokenRun =
+    init
+      .then(apiGet("n1"))
+      .then(steal("n1"))
+      .then(apiGet("n1"))
+      .then(renewSendDropped("n1"))
+      .then(tick("n1"))
+      .then(fetchObservesOwnCommit("n1"))
+      .then(renewSendDropped("n1"))
+      .then(tick("n2"))
+      .then(tick("n1"))
+      .then(fetchObservesOwnCommit("n1"))
+      .expect(all {
+        leading.get("n1"),
+        unconfirmed.get("n1") == NoUnconf,
+        fence.get("n1") == 1,
+        lease.rv == 3,
+        lease.holder == Held("n1"),
+        blindHolderFor == 0,
+        drops == 2,
+        not(dual),
       })
 }

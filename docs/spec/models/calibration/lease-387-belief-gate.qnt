@@ -42,7 +42,9 @@ module leaseCalib387BeliefGate {
     MAX_CLAIM_FAILURES = 0,
     MAX_RESTORES = 0,
     MAX_SUSPENDS = 0,
-    MAX_SHUTDOWNS = 1
+    MAX_SHUTDOWNS = 1,
+    MAX_DROPS = 0,
+    BLIND_HOLDER_BOUND = 0
   ).* from "../leaderElection"
 
   /// PRE-FIX shutdown: releases on BELIEF. The latch is the live
@@ -78,6 +80,17 @@ module leaseCalib387BeliefGate {
       renewBumpedAboveEntry' = renewBumpedAboveEntry,
       pending' = pending, suspends' = suspends,
       suspendStraddled' = suspendStraddled,
+      // New-var frames mirroring the live shutdown (the exiting
+      // process takes its in-memory ledger and cursor with it;
+      // MAX_DROPS = 0 here freezes all four).
+      unconfirmed' = unconfirmed.put(n, NoUnconf),
+      lastFetchedRv' = lastFetchedRv.put(n, -1),
+      drops' = drops,
+      blindHolderFor' = bhNext(
+        if (releases) { holder: NoHolder, rv: lease.rv + 1, gen: lease.gen } else lease,
+        leading.put(n, false), alive.put(n, false),
+        unconfirmed.put(n, NoUnconf), lastFetchedRv,
+        blindHolderFor, false),
     }
   }
 
