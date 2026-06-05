@@ -145,7 +145,8 @@ impl LineCursor {
 
     /// Advance the watermark to a kernel-verdict position. The
     /// argument is sealed (merged_bug_205): only
-    /// `ChunkVisit::advance()` can mint a [`CursorAdvance`], so a
+    /// `ChunkVisit::advance()` can mint a
+    /// [`CursorAdvance`](rio_log_kernel::CursorAdvance), so a
     /// serve path can move the watermark exclusively to a post-visit
     /// position some verdict computed — the open-coded
     /// `filter(>= cursor)` + `advance_to(end + 1)` shape that silently

@@ -353,9 +353,10 @@ pub(super) async fn log_is_complete(pool: &PgPool, exec_id: Uuid) -> Result<bool
 }
 
 /// The serve path's ONLY completeness source: fetch the sealed witness
-/// and the manifest fold, then mint the kernel [`FinalClaim`]
+/// and the manifest fold, then mint the kernel
+/// [`FinalClaim`](rio_log_kernel::FinalClaim)
 /// correlated with the SERVED cursor. The cursor-blind
-/// [`log_is_complete`] above is demoted to the ingest/test side — a
+/// `log_is_complete` above is demoted to the ingest/test side — a
 /// `TailLog` final message cannot be stamped from it (merged_bug_063:
 /// `send_final` takes the claim, not a bool).
 // r[impl store.log.served-claim]
@@ -416,7 +417,8 @@ pub(super) async fn sealed_final_line_count(
 }
 
 /// Does the execution's chunk manifest contiguously cover `[0, up_to)`?
-/// The second half of [`log_is_complete`]. The fold itself is the pure
+/// The second half of the (test-demoted) `log_is_complete`. The fold
+/// itself is the pure
 /// kernel [`manifest_covers_contiguously`]; this wrapper owns the SQL.
 async fn manifest_covers(pool: &PgPool, exec_id: Uuid, up_to: i64) -> Result<bool, Status> {
     // Store-owned table → runtime query (no cross-service contract to

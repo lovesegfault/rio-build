@@ -282,6 +282,11 @@
       "doc": "`rio-cli status` — cluster summary + worker/build rollup."
     },
     {
+      "path": "stream_util.rs",
+      "depth": 0,
+      "doc": "Shared server-stream draining law for CLI commands (bug_141)."
+    },
+    {
       "path": "tenants.rs",
       "depth": 0,
       "doc": "`rio-cli create-tenant|list-tenants` — tenant CRUD via AdminService."
