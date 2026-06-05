@@ -105,6 +105,25 @@ pub fn spawn_materialization_executor(
     }
     metrics::counter!("rio_store_materialization_pinned_paths_total").absolute(0);
     let mut spawned = 0;
+    // bug_257 (parse-don't-validate): mint the HostPort ONCE at the
+    // spawn boundary. The endpoint builder prepends `http://` itself,
+    // so a URL-form value used to compose `http://http://…` — which
+    // parses Ok (host `http`) — booting an "enabled" executor that
+    // could never reach the scheduler: zero claims fleet-wide,
+    // debug-only noise. Config stays a String: a bad value disables
+    // the executor LOUDLY (this arm — previously unreachable, since
+    // the double-prefix parsed) and never aborts the store's data
+    // plane (PD-D2 never-fatal posture).
+    let scheduler_addr = match client::HostPort::parse(&cfg.scheduler_addr) {
+        Ok(addr) => addr,
+        Err(e) => {
+            warn!(
+                scheduler_addr = %cfg.scheduler_addr, error = %e,
+                "materialization scheduler_addr invalid; executor disabled"
+            );
+            return spawned;
+        }
+    };
     for worker in 0..cfg.executor_concurrency {
         // merged_bug_158: the concurrency unit is the WORKER, not the
         // pod — the scheduler's one-winner arbiter keys on the
@@ -115,7 +134,7 @@ pub fn spawn_materialization_executor(
         // restarted worker n re-claims as the same `…-w{n}`.
         let worker_instance = format!("{instance}-w{worker}");
         let transport = match client::SchedulerTransport::connect_lazy(
-            &cfg.scheduler_addr,
+            &scheduler_addr,
             service_signer.clone(),
             // T-5.1: the same identity the claim loop asserts as
             // executor_instance is bound INTO every minted service
@@ -175,6 +194,10 @@ async fn claim_loop<T>(
     // response is recovered by a direct resume pull, not abandoned
     // to the charged establishment window.
     let mut ledger = client::ResumeLedger::default();
+    // bug_257 rider: per-worker warn-once escalation for persistent
+    // listing failures — a dead store→scheduler edge surfaces above
+    // debug instead of starving claims silently.
+    let mut list_health = client::ListFailureLatch::default();
     loop {
         if shutdown.is_cancelled() {
             return;
@@ -182,8 +205,15 @@ async fn claim_loop<T>(
         // Each worker claims at most one job per pass — concurrency is
         // the worker count, and the scheduler's one-winner arbitration
         // (per-replica composite identity) handles claim races.
-        let claimed =
-            client::poll_and_claim(&mut transport, &instance, 1, &mut ledger, &shutdown).await;
+        let claimed = client::poll_and_claim(
+            &mut transport,
+            &instance,
+            1,
+            &mut ledger,
+            &mut list_health,
+            &shutdown,
+        )
+        .await;
         for job in claimed {
             info!(
                 worker,
@@ -400,9 +430,11 @@ mod tests {
         );
         assert_eq!(spawned, 0, "no scheduler_addr => no executor (PD-D2)");
 
-        // Positive control: an address spawns the configured loops
-        // (connect_lazy — no scheduler needs to be listening).
-        cfg.scheduler_addr = "http://127.0.0.1:1".into();
+        // Positive control: a host:port address spawns the configured
+        // loops (connect_lazy — no scheduler needs to be listening).
+        // Bare form REQUIRED: the URL form used to sit here, silently
+        // enshrining the bug_257 double-prefix as the tested shape.
+        cfg.scheduler_addr = "127.0.0.1:1".into();
         cfg.executor_concurrency = 3;
         let spawned = spawn_materialization_executor(
             cfg,
@@ -412,6 +444,38 @@ mod tests {
             shutdown.clone(),
         );
         assert_eq!(spawned, 3, "an address spawns the configured loops");
+        shutdown.cancel();
+    }
+
+    /// bug_257: a URL-form address must DISABLE the executor loudly at
+    /// the spawn boundary. `build_endpoint` (rio-proto) prepends
+    /// `http://` unconditionally, so a scheme-bearing config value used
+    /// to compose `http://http://…` — which the http crate parses
+    /// happily (host `http`) — booting workers whose every RPC dialed a
+    /// dead authority: zero claims fleet-wide, debug-only noise.
+    #[tokio::test]
+    async fn executor_disabled_on_url_form_scheduler_addr() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let substituter =
+            std::sync::Arc::new(crate::substitute::Substituter::new(db.pool.clone(), None));
+        let shutdown = rio_common::signal::Token::new();
+
+        let cfg = crate::config::MaterializationConfig {
+            scheduler_addr: "http://127.0.0.1:1".into(),
+            executor_concurrency: 3,
+            ..Default::default()
+        };
+        let spawned = spawn_materialization_executor(
+            cfg,
+            db.pool.clone(),
+            substituter,
+            None,
+            shutdown.clone(),
+        );
+        assert_eq!(
+            spawned, 0,
+            "scheme-bearing scheduler_addr must disable the executor (bug_257)"
+        );
         shutdown.cancel();
     }
 

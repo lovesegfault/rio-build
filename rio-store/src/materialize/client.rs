@@ -141,11 +141,11 @@ impl ResumeLedger {
     /// ever live on this worker).
     fn note_pull(&mut self, entry: ResumeEntry) {
         self.entries.retain(|e| e.job_id != entry.job_id);
-        if self.entries.len() >= RESUME_LEDGER_CAP {
-            if let Some(evicted) = self.entries.pop_front() {
-                warn!(drv_hash = %evicted.drv_hash, job_id = %evicted.job_id,
-                      "resume ledger full; evicted entry settles via the establishment window");
-            }
+        if self.entries.len() >= RESUME_LEDGER_CAP
+            && let Some(evicted) = self.entries.pop_front()
+        {
+            warn!(drv_hash = %evicted.drv_hash, job_id = %evicted.job_id,
+                  "resume ledger full; evicted entry settles via the establishment window");
         }
         self.entries.push_back(entry);
     }
@@ -175,7 +175,9 @@ impl ResumeLedger {
 /// One claim attempt's wire verdict — shared by the listing pass and
 /// the resume pass so the two cannot drift on outcome semantics.
 enum PullAnswer {
-    Deliver(rio_proto::types::WorkAssignment),
+    /// Boxed: the assignment dwarfs every other variant (~224 bytes vs
+    /// zero) and the enum rides through match arms by value.
+    Deliver(Box<rio_proto::types::WorkAssignment>),
     /// Answered: the job is resolved/absent — authoritative stop.
     Gone,
     /// Answered: refused for now (race lost, parked, not ready).
@@ -210,7 +212,7 @@ async fn pull_once<T: MaterializeTransport>(
         }
         BoundedOutcome::Resolved(Ok(resp)) => match resp.outcome {
             Some(pull_assignment_response::Outcome::Assignment(assignment)) => {
-                PullAnswer::Deliver(assignment)
+                PullAnswer::Deliver(Box::new(assignment))
             }
             Some(pull_assignment_response::Outcome::Gone(_)) => PullAnswer::Gone,
             Some(pull_assignment_response::Outcome::NotYetReady(_)) | None => {
@@ -229,6 +231,61 @@ async fn pull_once<T: MaterializeTransport>(
     }
 }
 
+/// Consecutive `ListMaterializationJobs` failures before the latch
+/// escalates to `warn!`. One or two failures are routine (rollout,
+/// standby re-roll, transient blip); three in a row is a persistently
+/// dead store→scheduler edge — exactly the bug_257 outage shape that
+/// previously surfaced at `debug!` only.
+const LIST_FAILURE_WARN_THRESHOLD: u32 = 3;
+
+/// Warn-once latch for persistent listing failures (bug_257 rider).
+///
+/// The per-pass failure logs stay at `debug!` (an empty poll pass is
+/// routine); this latch owns the ESCALATION: when failures become
+/// consecutive past [`LIST_FAILURE_WARN_THRESHOLD`] it emits ONE
+/// `warn!`, then stays silent until a success resets it (recovery is
+/// logged at `info!`), so a dead edge surfaces above debug without a
+/// warn-per-pass flood.
+#[derive(Default)]
+pub struct ListFailureLatch {
+    consecutive: u32,
+    warned: bool,
+}
+
+impl ListFailureLatch {
+    /// A failed (or unanswered) listing pass.
+    fn note_failure(&mut self, detail: &str) {
+        self.consecutive = self.consecutive.saturating_add(1);
+        if self.consecutive >= LIST_FAILURE_WARN_THRESHOLD && !self.warned {
+            self.warned = true;
+            warn!(
+                consecutive = self.consecutive,
+                last_error = detail,
+                "ListMaterializationJobs failing persistently; store→scheduler edge \
+                 down — no materialization jobs are being claimed by this worker"
+            );
+        }
+    }
+
+    /// A successful listing pass: reset and (if escalated) log recovery.
+    fn note_success(&mut self) {
+        if self.warned {
+            info!(
+                after_failures = self.consecutive,
+                "ListMaterializationJobs recovered"
+            );
+        }
+        self.consecutive = 0;
+        self.warned = false;
+    }
+
+    /// Test visibility: has the latch escalated to `warn!`?
+    #[cfg(test)]
+    fn warned(&self) -> bool {
+        self.warned
+    }
+}
+
 /// One poll→claim pass: list claimable jobs, then attempt to claim up
 /// to `available_slots` of them via
 /// `PullAssignment(kind=MATERIALIZATION, executor_instance=<pod>)`.
@@ -238,13 +295,15 @@ async fn pull_once<T: MaterializeTransport>(
 /// NORMAL — another replica won the claim, or the job got resolved
 /// between list and claim — never an error and never retried within
 /// the pass (the next poll re-lists). `Gone` likewise. Per-RPC errors
-/// are logged and skipped; a failed listing yields an empty pass.
+/// are logged and skipped; a failed listing yields an empty pass (the
+/// `list_health` latch escalates once the failures become persistent).
 // r[impl store.materialize.executor+5]
 pub async fn poll_and_claim<T: MaterializeTransport>(
     transport: &mut T,
     executor_instance: &str,
     available_slots: usize,
     ledger: &mut ResumeLedger,
+    list_health: &mut ListFailureLatch,
     shutdown: &rio_common::signal::Token,
 ) -> Vec<ClaimedJob> {
     if available_slots == 0 {
@@ -330,13 +389,18 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
                 after_secs = after.as_secs(),
                 "ListMaterializationJobs unanswered; empty poll pass"
             );
+            list_health.note_failure("timed out (no answer)");
             transport.note_timeout();
             return Vec::new();
         }
-        BoundedOutcome::Resolved(Ok(resp)) => resp.jobs,
+        BoundedOutcome::Resolved(Ok(resp)) => {
+            list_health.note_success();
+            resp.jobs
+        }
         BoundedOutcome::Resolved(Err(status)) => {
             debug!(code = ?status.code(), msg = status.message(),
                    "ListMaterializationJobs failed; empty poll pass");
+            list_health.note_failure(&format!("{:?}: {}", status.code(), status.message()));
             return Vec::new();
         }
     };
@@ -567,6 +631,83 @@ type ExecutorClient = rio_proto::ExecutorServiceClient<
 /// loop clones one copy per job execution for the BC-4 progress relay
 /// task, so display traffic never contends with the claim/report
 /// transport.
+/// A bare `host:port` scheduler address, the ONLY currency
+/// [`SchedulerTransport`] accepts (bug_257, parse-don't-validate).
+///
+/// Why this type exists: `rio_proto::client::build_endpoint` prepends
+/// `http://` unconditionally, so a URL-form config value
+/// (`http://rio-scheduler.rio-system:9001` — the same shape as the
+/// sibling helm values `prometheusAddress`/`logPeerUrlTemplate`)
+/// composed to `http://http://…`, which the http crate parses *Ok*
+/// (host `http`). The executor booted "enabled", every
+/// `ListMaterializationJobs` failed at `debug!` level only, and zero
+/// jobs were claimed fleet-wide with no WARN anywhere. With the
+/// constructor below as the sole way to mint one, the silent
+/// double-prefix is unrepresentable in the transport layer.
+///
+/// The config field stays a `String` (PD-D2 never-fatal posture): a
+/// bad value disables the executor loudly at the spawn boundary
+/// instead of aborting the store's data plane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostPort(String);
+
+impl HostPort {
+    /// Accept exactly the `host:port` shape (IPv6 bracket form
+    /// included); reject schemes, paths, queries, userinfo, and
+    /// port-less authorities. The acceptance property (pinned by
+    /// `hostport_accepts_iff_authority_roundtrips` below): composing
+    /// `http://` onto an accepted value yields a URI whose authority
+    /// is byte-identical to the input — i.e. the transport dials
+    /// exactly what the operator wrote.
+    pub fn parse(raw: &str) -> anyhow::Result<Self> {
+        if raw.contains("://") {
+            anyhow::bail!(
+                "scheme-bearing address (expected bare host:port — the transport \
+                 prepends http:// itself; a scheme here composes the silent \
+                 double-prefix http://http://…)"
+            );
+        }
+        let uri: http::Uri = format!("http://{raw}")
+            .parse()
+            .map_err(|e| anyhow::anyhow!("not a valid host:port: {e}"))?;
+        let authority = uri
+            .authority()
+            .ok_or_else(|| anyhow::anyhow!("no authority parsed from {raw:?}"))?;
+        if authority.as_str() != raw {
+            anyhow::bail!(
+                "not a bare host:port: parsed authority {:?} differs from input \
+                 (path/fragment/trailing content?)",
+                authority.as_str()
+            );
+        }
+        if uri.path() != "/" || uri.query().is_some() {
+            anyhow::bail!("not a bare host:port: path/query present");
+        }
+        if raw.contains('@') {
+            anyhow::bail!("userinfo not allowed in a host:port address");
+        }
+        if uri.port_u16().is_none() {
+            anyhow::bail!(
+                "missing port (every deployed form is host:port, e.g. \
+                 rio-scheduler.rio-system:9001 — a port-less value is a config bug)"
+            );
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    /// The validated `host:port` string (what the channel dials, minus
+    /// the scheme the endpoint builder adds).
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for HostPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[derive(Clone)]
 pub struct SchedulerTransport {
     client: ExecutorClient,
@@ -574,7 +715,7 @@ pub struct SchedulerTransport {
     /// rebuild the channel when the current connection is pinned to a
     /// peer that cannot serve (finding 18: the standby replica after a
     /// scheduler Deployment rollout).
-    scheduler_addr: String,
+    scheduler_addr: HostPort,
     signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
     /// The replica identity bound into every minted token (T-5.1) —
     /// the same [`super::executor_instance`] value the claim loop
@@ -598,23 +739,24 @@ impl SchedulerTransport {
     /// service token so the scheduler can verify (not trust) the
     /// `executor_instance` field of every claim.
     pub fn connect_lazy(
-        scheduler_addr: &str,
+        scheduler_addr: &HostPort,
         signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
         instance: &str,
     ) -> anyhow::Result<Self> {
         let client = Self::build_client(scheduler_addr, signer.clone(), instance)?;
         Ok(Self {
             client,
-            scheduler_addr: scheduler_addr.to_owned(),
+            scheduler_addr: scheduler_addr.clone(),
             signer,
             instance: instance.to_owned(),
         })
     }
 
     /// The channel/interceptor/client stack shared by construction and
-    /// [`Self::abandon_connection`].
+    /// [`Self::abandon_connection`]. Takes [`HostPort`] — the
+    /// double-prefix composition bug_257 hit is unrepresentable here.
     fn build_client(
-        scheduler_addr: &str,
+        scheduler_addr: &HostPort,
         signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
         instance: &str,
     ) -> anyhow::Result<ExecutorClient> {
@@ -623,7 +765,7 @@ impl SchedulerTransport {
         // chokepoint (h2-keepalive-single-source pins the knobs there —
         // this used to hand-chain the same values and drifted out of
         // the single-source set).
-        let channel = rio_proto::client::connect_lazy_channel(scheduler_addr)?;
+        let channel = rio_proto::client::connect_lazy_channel(scheduler_addr.as_str())?;
         let interceptor = rio_auth::hmac::ServiceTokenInterceptor::with_instance(
             signer,
             STORE_SERVICE_CALLER,
@@ -915,6 +1057,7 @@ mod tests {
             "store-replica-0",
             8,
             &mut ResumeLedger::default(),
+            &mut ListFailureLatch::default(),
             &token(),
         )
         .await;
@@ -958,6 +1101,7 @@ mod tests {
             "store-replica-0",
             1,
             &mut ResumeLedger::default(),
+            &mut ListFailureLatch::default(),
             &token(),
         )
         .await;
@@ -1000,6 +1144,7 @@ mod tests {
             "store-replica-0",
             2,
             &mut ResumeLedger::default(),
+            &mut ListFailureLatch::default(),
             &token(),
         )
         .await;
@@ -1026,6 +1171,7 @@ mod tests {
             "store-replica-0",
             8,
             &mut ResumeLedger::default(),
+            &mut ListFailureLatch::default(),
             &token(),
         )
         .await;
@@ -1058,6 +1204,7 @@ mod tests {
             "store-replica-0",
             8,
             &mut ResumeLedger::default(),
+            &mut ListFailureLatch::default(),
             &token(),
         )
         .await;
@@ -1087,6 +1234,7 @@ mod tests {
             "store-replica-0",
             2,
             &mut ResumeLedger::default(),
+            &mut ListFailureLatch::default(),
             &token(),
         )
         .await;
@@ -1103,6 +1251,7 @@ mod tests {
             "store-replica-0",
             0,
             &mut ResumeLedger::default(),
+            &mut ListFailureLatch::default(),
             &token(),
         )
         .await;
@@ -1128,6 +1277,7 @@ mod tests {
             "store-replica-7",
             8,
             &mut ResumeLedger::default(),
+            &mut ListFailureLatch::default(),
             &token(),
         )
         .await;
@@ -1367,6 +1517,7 @@ mod tests {
             "store-replica-0",
             8,
             &mut ResumeLedger::default(),
+            &mut ListFailureLatch::default(),
             &shutdown,
         )
         .await;
@@ -1531,9 +1682,12 @@ mod tests {
         // The "kube-proxy": initially fronts the standby.
         let (proxy_addr, backend) = spawn_switchable_proxy(standby_addr).await;
 
-        let mut transport =
-            SchedulerTransport::connect_lazy(&proxy_addr.to_string(), None, "store-replica-0")
-                .unwrap();
+        let mut transport = SchedulerTransport::connect_lazy(
+            &HostPort::parse(&proxy_addr.to_string()).expect("proxy addr is host:port"),
+            None,
+            "store-replica-0",
+        )
+        .unwrap();
 
         // The executor's connection gets pinned to the standby: the
         // poll pass comes back empty (UNAVAILABLE answers).
@@ -1542,6 +1696,7 @@ mod tests {
             "store-replica-0",
             1,
             &mut ResumeLedger::default(),
+            &mut ListFailureLatch::default(),
             &token(),
         )
         .await;
@@ -1566,6 +1721,7 @@ mod tests {
                 "store-replica-0",
                 1,
                 &mut ResumeLedger::default(),
+                &mut ListFailureLatch::default(),
                 &token(),
             )
             .await;
@@ -1595,9 +1751,12 @@ mod tests {
         let leader_addr = spawn_executor_service(LeaderExecutorService).await;
         let (proxy_addr, backend) = spawn_switchable_proxy(standby_addr).await;
 
-        let mut transport =
-            SchedulerTransport::connect_lazy(&proxy_addr.to_string(), None, "store-replica-0")
-                .unwrap();
+        let mut transport = SchedulerTransport::connect_lazy(
+            &HostPort::parse(&proxy_addr.to_string()).expect("proxy addr is host:port"),
+            None,
+            "store-replica-0",
+        )
+        .unwrap();
 
         // Pin the connection to the standby with one failing pass.
         let _ = poll_and_claim(
@@ -1605,6 +1764,7 @@ mod tests {
             "store-replica-0",
             1,
             &mut ResumeLedger::default(),
+            &mut ListFailureLatch::default(),
             &token(),
         )
         .await;
@@ -1650,9 +1810,12 @@ mod tests {
         let leader_addr = spawn_executor_service(LeaderExecutorService).await;
         let (proxy_addr, backend) = spawn_switchable_proxy(standby_addr).await;
 
-        let mut transport =
-            SchedulerTransport::connect_lazy(&proxy_addr.to_string(), None, "store-replica-0")
-                .unwrap();
+        let mut transport = SchedulerTransport::connect_lazy(
+            &HostPort::parse(&proxy_addr.to_string()).expect("proxy addr is host:port"),
+            None,
+            "store-replica-0",
+        )
+        .unwrap();
 
         // Pin to the standby: the progress tick answers UNAVAILABLE
         // (the scheduler-side 362 fix) and the transport abandons.
@@ -1709,7 +1872,15 @@ mod tests {
 
         // Pass 1: the pull's answer never arrives — the claim is
         // recorded, nothing delivered.
-        let claimed = poll_and_claim(&mut t, "store-replica-0", 1, &mut ledger, &token()).await;
+        let claimed = poll_and_claim(
+            &mut t,
+            "store-replica-0",
+            1,
+            &mut ledger,
+            &mut ListFailureLatch::default(),
+            &token(),
+        )
+        .await;
         assert!(claimed.is_empty());
         assert_eq!(
             ledger.len(),
@@ -1725,7 +1896,15 @@ mod tests {
         // Pass 2: the job no longer lists (the attempt is open,
         // held by us, server-side); the resume pull presents the
         // SAME nonce and recovers the assignment.
-        let claimed = poll_and_claim(&mut t, "store-replica-0", 1, &mut ledger, &token()).await;
+        let claimed = poll_and_claim(
+            &mut t,
+            "store-replica-0",
+            1,
+            &mut ledger,
+            &mut ListFailureLatch::default(),
+            &token(),
+        )
+        .await;
         assert_eq!(claimed.len(), 1, "the lost-response claim is recovered");
         assert_eq!(claimed[0].exec_id, "exec-resume");
         assert_eq!(claimed[0].job_id.to_string(), job_id);
@@ -1760,13 +1939,37 @@ mod tests {
         t.hang_next_pulls = 1;
         let mut ledger = ResumeLedger::default();
         // Pass 1: unanswered — entry held.
-        let _ = poll_and_claim(&mut t, "store-replica-0", 1, &mut ledger, &token()).await;
+        let _ = poll_and_claim(
+            &mut t,
+            "store-replica-0",
+            1,
+            &mut ledger,
+            &mut ListFailureLatch::default(),
+            &token(),
+        )
+        .await;
         assert_eq!(ledger.len(), 1);
         // Pass 2: resume answered NotYetReady — entry KEPT.
-        let _ = poll_and_claim(&mut t, "store-replica-0", 1, &mut ledger, &token()).await;
+        let _ = poll_and_claim(
+            &mut t,
+            "store-replica-0",
+            1,
+            &mut ledger,
+            &mut ListFailureLatch::default(),
+            &token(),
+        )
+        .await;
         assert_eq!(ledger.len(), 1, "NotYetReady keeps the resume obligation");
         // Pass 3: resume answered Gone — entry dropped.
-        let _ = poll_and_claim(&mut t, "store-replica-0", 1, &mut ledger, &token()).await;
+        let _ = poll_and_claim(
+            &mut t,
+            "store-replica-0",
+            1,
+            &mut ledger,
+            &mut ListFailureLatch::default(),
+            &token(),
+        )
+        .await;
         assert!(ledger.is_empty(), "Gone is authoritative");
 
         // Capacity: the 33rd entry evicts the oldest.
@@ -1781,5 +1984,89 @@ mod tests {
             });
         }
         assert_eq!(full.len(), RESUME_LEDGER_CAP);
+    }
+
+    /// bug_257: the adversarial input table. The URL form (row 1) is
+    /// exactly the value that booted an "enabled" executor dialing
+    /// `http://http://…` — host `http` — for a fleet-wide silent claim
+    /// outage; every other row is a near-miss shape the parser must
+    /// also refuse.
+    #[test]
+    fn hostport_rejects_every_non_hostport_shape() {
+        for bad in [
+            "http://127.0.0.1:9001",            // the outage shape
+            "https://rio-scheduler:9001",       // sibling scheme
+            "grpc://rio-scheduler:9001",        // any scheme at all
+            "rio-scheduler.rio-system:9001/v1", // path-bearing
+            "rio-scheduler:9001?tls=off",       // query-bearing
+            "rio-scheduler:9001#frag",          // fragment-bearing
+            "user@rio-scheduler:9001",          // userinfo
+            "rio-scheduler.rio-system",         // port-less
+            "127.0.0.1",                        // port-less IP
+            "",                                 // empty
+            "rio scheduler:9001",               // whitespace
+            "rio-scheduler:port",               // non-numeric port
+        ] {
+            assert!(HostPort::parse(bad).is_err(), "{bad:?} must be rejected");
+        }
+        for good in [
+            "127.0.0.1:9001",
+            "localhost:9001",
+            "rio-scheduler.rio-system:9001",
+            "[::1]:9001",
+            "control:9001",
+        ] {
+            let parsed = HostPort::parse(good).expect("deployed shapes parse");
+            assert_eq!(parsed.as_str(), good);
+        }
+    }
+
+    proptest::proptest! {
+        /// The bug_257 soundness property: for EVERY input, either the
+        /// parser fails loudly, or composing the scheme the endpoint
+        /// builder adds yields a URI whose authority is byte-identical
+        /// to the input (the transport dials exactly what the operator
+        /// wrote — the property the double-prefix violated, where the
+        /// dialed authority became `http`).
+        #[test]
+        fn hostport_accepts_iff_authority_roundtrips(raw in ".{0,48}") {
+            if let Ok(parsed) = HostPort::parse(&raw) {
+                let uri: http::Uri = format!("http://{}", parsed.as_str())
+                    .parse()
+                    .expect("an accepted addr must compose with the endpoint scheme");
+                proptest::prop_assert_eq!(
+                    uri.authority().map(|a| a.as_str()),
+                    Some(raw.as_str())
+                );
+                proptest::prop_assert_eq!(uri.path(), "/");
+                proptest::prop_assert!(uri.query().is_none());
+                proptest::prop_assert!(uri.port_u16().is_some());
+            }
+        }
+    }
+
+    /// bug_257 rider: the warn-once latch escalates at the threshold,
+    /// stays escalated (no warn-per-pass flood), and a success re-arms
+    /// it for the next persistent episode.
+    #[test]
+    fn list_failure_latch_warns_once_and_rearms_on_recovery() {
+        let mut latch = ListFailureLatch::default();
+        latch.note_failure("unavailable");
+        latch.note_failure("unavailable");
+        assert!(!latch.warned(), "two failures are routine (rollout blip)");
+        latch.note_failure("unavailable");
+        assert!(latch.warned(), "third consecutive failure escalates");
+        latch.note_failure("unavailable");
+        assert!(
+            latch.warned(),
+            "stays latched — exactly one warn per episode"
+        );
+        latch.note_success();
+        assert!(!latch.warned(), "success resets the episode");
+        latch.note_failure("timeout");
+        latch.note_failure("timeout");
+        assert!(!latch.warned(), "fresh episode counts from zero");
+        latch.note_failure("timeout");
+        assert!(latch.warned(), "and re-escalates at the threshold");
     }
 }
