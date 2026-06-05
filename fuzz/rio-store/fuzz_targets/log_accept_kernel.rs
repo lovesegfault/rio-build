@@ -37,8 +37,8 @@ use rio_log_kernel::{AcceptVerdict, accept_verdict};
 const MAX_OPS: usize = 48;
 
 /// Independent transcription of `logService.qnt::acceptVerdict` (gate
-/// order: non-monotone, then ceiling) extended with the overflow arm
-/// the model's bounded line domain cannot represent. Deliberately a
+/// order: oversized, non-monotone, then ceiling) extended with the
+/// overflow arm the model's bounded line domain cannot represent. Deliberately a
 /// different code shape from the kernel (match-first on
 /// representability, no early returns) so a shared mistake is
 /// unlikely.
@@ -47,7 +47,9 @@ fn model_verdict(hw: u64, ceiling: Option<u64>, first: u64, count: u64) -> Accep
         None => AcceptVerdict::RejectedOverflow,
         Some(end) if end > i64::MAX as u64 => AcceptVerdict::RejectedOverflow,
         Some(end) => {
-            if first < hw {
+            if count > rio_log_kernel::MAX_BATCH_LINES {
+                AcceptVerdict::RejectedOversizedBatch
+            } else if first < hw {
                 AcceptVerdict::RejectedNonMonotone
             } else {
                 match ceiling {
@@ -97,6 +99,7 @@ fn step(hw: &mut u64, ceiling: Option<u64>, first: u64, count: u64) {
         // A rejected batch changes nothing — the model state is only
         // written on the accept arm.
         AcceptVerdict::RejectedOverflow
+        | AcceptVerdict::RejectedOversizedBatch
         | AcceptVerdict::RejectedNonMonotone
         | AcceptVerdict::RejectedPastFinal => {}
     }

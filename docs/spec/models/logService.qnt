@@ -2588,7 +2588,17 @@ module logService {
           // CALIB_RECOVERY_UNGATED counts EVERY back-fill — the
           // pre-fix amplification where admitted holes fed the
           // recovery lane.
-          val backfill = interval(readerCursor, n).filter(m => readerHeld(m))
+          // Already-served lines are excluded (the code's sealed
+          // visits dedup by construction): once the drop wake can
+          // serve ABOVE the cursor, the served set is no longer a
+          // prefix, and an unfiltered back-fill would re-count a
+          // wake-served line — the double-render the at-most-once
+          // half of servedStreamSpanExact exists to catch (and did,
+          // in the gate's exhaustive search).
+          val backfill = interval(readerCursor, n).filter(m => and {
+            readerHeld(m),
+            not(readerServed.contains(m)),
+          })
           val counted = if (CALIB_RECOVERY_UNGATED) backfill != Set()
             else backfill.intersect(fanDropped) != Set()
           all {

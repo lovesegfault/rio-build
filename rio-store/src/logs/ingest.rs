@@ -43,29 +43,20 @@ use super::kernel::{AcceptVerdict, accept_verdict};
 /// workers.
 pub const MAX_LINE_LEN: usize = rio_log_kernel::MAX_LINE_CONTENT_BYTES as usize;
 
-/// Per-line memory overhead charged in all buffer accounting: the
-/// `u64` line-number key (8 bytes) plus the `Vec<u8>` header (ptr +
-/// len + cap = 24 bytes on 64-bit). Without it a stream of 1-byte
-/// lines would hold ~33x its accounted bytes resident before the cut
-/// trigger fired.
-///
-/// Owned by the kernel ([`rio_log_kernel::PER_LINE_OVERHEAD_BYTES`])
-/// so the THREE buffer axes here (cut trigger, lifetime cap,
-/// `buffer_bytes`) and the cutter's chunk budget
-/// ([`rio_log_kernel::bounded_contiguous_prefix_len`]) charge the SAME
-/// formula — bug_298 was exactly the drift between them: the buffer
-/// axes charged this overhead while the chunk budget charged bare
-/// framing, so one committed chunk could legally pack
-/// `MAX_CHUNK_PAYLOAD_BYTES / 4` near-empty lines for the read path to
-/// materialize.
-const PER_LINE_OVERHEAD: u64 = rio_log_kernel::PER_LINE_OVERHEAD_BYTES;
-
 /// The buffer-accounting size of one (post-truncation) line —
-/// [`rio_log_kernel::charged_line_cost`], the kernel's single byte-axis
-/// formula. Used for the cut trigger, the per-execution lifetime cap,
-/// and the incremental `buffer_bytes` bookkeeping — all three must
-/// agree on the formula or the counter drifts across a drain/restore
-/// round trip.
+/// [`rio_log_kernel::charged_line_cost`], the kernel's single
+/// byte-axis formula (content plus the kernel-owned 32-byte per-line
+/// overhead: the `u64` key + the `Vec` header; without it a stream of
+/// 1-byte lines holds ~33x its accounted bytes resident). Used for the
+/// cut trigger, the per-execution lifetime cap, and the incremental
+/// `buffer_bytes` bookkeeping — all three must agree on the formula or
+/// the counter drifts across a drain/restore round trip, and the
+/// kernel owning it means the cutter's chunk budget
+/// ([`rio_log_kernel::bounded_contiguous_prefix_len`]) charges the
+/// SAME formula — bug_298 was exactly that drift: the buffer axes
+/// charged overhead while the chunk budget charged bare framing, so
+/// one committed chunk could legally pack `MAX_CHUNK_PAYLOAD_BYTES/4`
+/// near-empty lines for the read path to materialize.
 fn accounted_len(line: &[u8]) -> u64 {
     rio_log_kernel::charged_line_cost(line.len() as u64)
 }

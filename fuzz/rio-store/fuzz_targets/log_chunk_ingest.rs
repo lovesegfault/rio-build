@@ -137,6 +137,11 @@ enum Predicted {
     /// `lines.is_empty()`: accepted before any gate runs, nothing
     /// buffered, the high-water mark untouched.
     AcceptEmpty,
+    /// More lines than one chunk's charged capacity
+    /// (`MAX_BATCH_LINES`): rejected whole at admission, stream open.
+    /// Unreachable in this harness's domain (`n = c % 17`) — carried
+    /// so the oracle stays total if the domain ever widens.
+    Oversized,
     /// Buffered. `kept` is the post-ceiling line count; `end` is the
     /// new high-water mark (`min(first + n, ceiling)`).
     Accept {
@@ -229,6 +234,9 @@ impl SessionHarness {
         if end > i64::MAX as u64 {
             return Predicted::Overflow;
         }
+        if n as u64 > rio_log_kernel::MAX_BATCH_LINES {
+            return Predicted::Oversized;
+        }
         if first < self.high_water {
             return Predicted::NonMonotone;
         }
@@ -277,6 +285,7 @@ impl SessionHarness {
             // must leave no trace either way.
             (Predicted::Accept { .. }, Err(_)) => {}
             (Predicted::Overflow, Ok(AcceptOutcome::RejectedOverflow))
+            | (Predicted::Oversized, Ok(AcceptOutcome::RejectedOversizedBatch))
             | (Predicted::NonMonotone, Ok(AcceptOutcome::RejectedNonMonotone))
             | (Predicted::PastFinal, Ok(AcceptOutcome::RejectedPastFinal)) => {}
             (predicted, outcome) => panic!(

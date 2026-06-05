@@ -646,7 +646,6 @@ async fn backoff_capped(
     clippy::too_many_arguments,
     reason = "the subscription's cursor state lives in run_tail; one drive borrows it all"
 )]
-#[allow(clippy::too_many_arguments)]
 async fn drive_stream(
     mut stream: tonic::Streaming<TailLogChunk>,
     derivation_path: &str,
