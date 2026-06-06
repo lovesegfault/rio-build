@@ -1587,6 +1587,7 @@ in
         cliJson = ../docs/gen/cli.json;
         alertsJson = ../docs/gen/alerts.json;
         migrationsJson = ../docs/gen/migrations.json;
+        protosJson = ../docs/gen/protos.json;
       }
       ''
         set -euo pipefail
@@ -1612,6 +1613,34 @@ in
           echo "FAIL: raw metric name — use #(refs.metric)(\"…\")" >&2
           fail=1
         fi
+        # bug_323: every `message X {` quoted inside a ```protobuf
+        # fence in docs/spec must exist in rio-proto/proto (the
+        # docs/gen/protos.json message inventory) — a deleted wire
+        # message's spec listing goes red instead of surviving as dead
+        # protocol prose. Natural red at introduction: SchedulerMessage
+        # (deleted with the BuildExecution stream; its proto.typ
+        # listing survived until this check's commit). Removed-section
+        # treatments quote retired messages in PROSE or reserved-field
+        # comments, never as a fresh `message X {` listing.
+        livemsgs=$(jq -r '[.[].messages[]] | unique | .[]' $protosJson | paste -sd'|')
+        if [[ -z "$livemsgs" ]]; then
+          echo "FAIL: protos.json carries no message inventory — regen docs-data" >&2
+          fail=1
+        fi
+        fencehits=$(find $typSrc/spec -name '*.typ' -exec awk '
+          /^```protobuf/ { f = 1; next }
+          /^```/         { f = 0 }
+          f && /^message [A-Za-z_]+/ { print FILENAME ":" FNR ":" $2 }
+        ' {} + || true)
+        while IFS=: read -r mf ml mname; do
+          [[ -z "$mname" ]] && continue
+          if ! grep -qxE "($livemsgs)" <<<"$mname"; then
+            echo "FAIL: $mf:$ml quotes \`message $mname\` but no .proto defines it —" >&2
+            echo "the listing documents a deleted wire message (bug_323 class)." >&2
+            echo "Convert the section to a removed-treatment or delete the fence." >&2
+            fail=1
+          fi
+        done <<<"$fencehits"
         # Stale `<chapter>.md` reference in non-typ sources — the
         # chapter was migrated to typst. Stem alternation derived from
         # book.typ's #chapter() list (the canonical chapter set; same

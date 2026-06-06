@@ -603,13 +603,24 @@ fn protos() -> Result<serde_json::Value> {
     // hand-tree (R7-030: it said BuilderService; file defines
     // ExecutorService). Service-less files keep their first-comment
     // summary so the row isn't blank.
+    //
+    // bug_323: also inventory `message X` declarations per file. The
+    // docs-lint protobuf-fence membership clause asserts every
+    // `message X {` quoted in docs/spec exists here — a spec listing
+    // for a deleted wire message (the SchedulerMessage class) goes red
+    // instead of surviving as dead protocol prose.
     let svc_re = Regex::new(r"(?m)^service\s+(\w+)\b")?;
+    let msg_re = Regex::new(r"(?m)^message\s+(\w+)\b")?;
     let mut out = BTreeMap::<String, serde_json::Value>::new();
     for entry in fs::read_dir(repo_root().join("rio-proto/proto"))? {
         let p = entry?.path();
         if p.extension().is_some_and(|e| e == "proto") {
             let body = fs::read_to_string(&p)?;
             let svcs: Vec<_> = svc_re
+                .captures_iter(&body)
+                .map(|c| c[1].to_string())
+                .collect();
+            let msgs: Vec<_> = msg_re
                 .captures_iter(&body)
                 .map(|c| c[1].to_string())
                 .collect();
@@ -623,7 +634,7 @@ fn protos() -> Result<serde_json::Value> {
                     .and_then(|n| n.to_str())
                     .context("non-utf8 .proto filename")?
                     .to_owned(),
-                json!({"services": svcs, "doc": doc}),
+                json!({"services": svcs, "messages": msgs, "doc": doc}),
             );
         }
     }

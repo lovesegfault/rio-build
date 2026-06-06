@@ -268,74 +268,82 @@ service AdminService {
 
 == Key Messages
 
-=== BuildExecution Bidirectional Stream
+=== BuildExecution stream (removed)
 
-#r("proto.stream.bidi")[
-  The `BuildExecution` RPC replaces the previous `PullWork` +
-  `ReportCompletion` design with a single bidirectional stream per executor,
-  enabling:
-  - Scheduler-to-executor signals (assignment, cancellation, #glspl("prefetch-hint"))
-    without out-of-band RPCs
-  - Executor-to-scheduler signals (log batches, completion, ack) with
-    reliability guarantees
-  - Assignment acknowledgment: the executor confirms receipt of each
-    assignment
-]
+*Retired (executor-lifecycle collapse --- the stream session protocol):*
+`proto.stream.bidi` normed the `BuildExecution` bidirectional stream (one
+per executor, carrying assignment/cancel/prefetch downstream and
+ack/log-batch/completion upstream). The RPC, its scheduler-side session
+state, and the stream-only message arms were removed: dispatch is the
+pull unary (`PullAssignment` binds the open attempt), results travel on
+the `ReportOutcome` unary, log batches go to rio-store's
+`LogService.AppendLog`, and cancellation is pod termination via the
+controller's Job census. The rule id is retired with the section --- no
+live surface remains for it to norm.
+
+`ExecutorMessage` survives only as the builder-internal build-task →
+runtime envelope (the spawned build task hands its completion and phase
+edges to the pull loop through a process-lifetime channel typed with this
+message; the pull loop forwards them via `ReportOutcome`). It is not sent
+on any wire. The stream-era arms are reserved tombstones, quoting
+`build_types.proto`:
 
 ```protobuf
 message ExecutorMessage {
-  reserved 4;                         // was ProgressUpdate
-  reserved 2;                         // was BuildLogBatch log_batch — log lines now go
-                                      //   directly to rio-store's LogService.AppendLog
+  reserved 4;  // was ProgressUpdate (mid-build ema; consumer removed with legacy sizer)
+  // 2 was `BuildLogBatch log_batch` — batched log lines. Removed by the
+  // build-log data-plane cutover: builders stream log batches to
+  // rio-store's LogService.AppendLog instead of the scheduler.
+  reserved 2;
+  // 1 was `WorkAssignmentAck ack`, 5 was `ExecutorRegister register`,
+  // 6 was `PrefetchComplete prefetch_complete` — removed with the
+  // BuildExecution stream (executor-lifecycle collapse).
+  reserved 1, 5, 6;
+  reserved "ack", "register", "prefetch_complete";
   oneof msg {
-    WorkAssignmentAck ack = 1;       // Executor confirms receipt of assignment
-    CompletionReport completion = 3;  // Build result
-    ExecutorRegister register = 5;    // First message on BuildExecution stream:
-                                      //   executor_id identity. Scheduler reads this
-                                      //   to associate stream + heartbeat by same ID.
-    PrefetchComplete prefetch_complete = 6;  // Warm-gate ACK: FUSE cache warmed the hinted paths
-    BuildPhase phase = 7;             // Build phase change (forwarded resSetPhase)
-  }
-}
-
-message SchedulerMessage {
-  oneof msg {
-    WorkAssignment assignment = 1;    // New work to execute
-    CancelSignal cancel = 2;          // Cancel a specific derivation (executor pod termination only)
-    PrefetchHint prefetch = 3;        // Paths to pre-warm in FUSE cache
+    CompletionReport completion = 3;        // Build result
+    BuildPhase phase = 7;                   // Build phase change (forwarded resSetPhase)
   }
 }
 ```
 
+The scheduler-to-executor envelope (`SchedulerMessage`, with its
+assignment/cancel/prefetch arms) was deleted outright --- the pull
+response carries the assignment, and the other two arms have no
+pull-mode counterpart.
+
 === ExecutorKind
 
-#r("proto.executor.kind")[
+#r("proto.executor.kind+2")[
   `ExecutorKind` (in `build_types.proto`) is a two-value enum:
   `EXECUTOR_KIND_BUILDER = 0` (airgapped, runs arbitrary derivation code) and
   `EXECUTOR_KIND_FETCHER = 1` (open egress, FOD-only, hash-check bounded).
-  Same `rio-builder` binary, different `RIO_EXECUTOR_KIND` env. The executor
-  reports its kind in `HeartbeatRequest.kind`; the scheduler routes FODs to
-  fetchers only and non-FODs to builders only --- no fallback across kinds.
-  Default is `BUILDER` (wire-compatible: old executors don't send field 10,
-  scheduler reads zero).
+  Same `rio-builder` binary, different `RIO_EXECUTOR_KIND` env. Kind is
+  fixed at spawn, not reported on the wire: the spawn-intent pool
+  eligibility chokepoint routes FODs to the fetcher pool only and
+  non-FODs to non-fetcher pools only (enforced at construction --- no
+  fallback across kinds), the controller injects `RIO_EXECUTOR_KIND`
+  from the pool spec into the pod, and the executor's own kind gate
+  re-checks the assignment class against its env before building.
 ]
 
 === BuildPhase
 
 `BuildPhase` carries a per-derivation phase change forwarded from the daemon's
 `STDERR_RESULT{SetPhase}` (e.g. `"unpackPhase"`, `"buildPhase"`). It is its
-*own* `oneof` arm on both `ExecutorMessage` and `BuildEvent` --- NOT
-piggybacked on `BuildLogBatch` --- because it is a control-plane state edge
-the scheduler consumes, while log batches are data-plane payload that no
-longer transits the scheduler at all, and a phase edge isn't subject to the
-batcher's 100ms / 64-line buffering.
+*own* `oneof` arm on both the builder-internal `ExecutorMessage` envelope and
+the wire-facing `BuildEvent` --- NOT piggybacked on `BuildLogBatch` --- because
+it is a control-plane state edge the scheduler consumes, while log batches are
+data-plane payload that no longer transits the scheduler at all, and a phase
+edge isn't subject to the batcher's 100ms / 64-line buffering.
 
 === BuildLogBatch
 
 Log lines are *batched* for efficiency rather than sent per-line. The executor
 buffers up to 64 lines or 100ms (whichever comes first) and sends a batch ---
 since the log-data-plane move, on the builder's `LogService.AppendLog` stream
-to rio-store rather than on the `BuildExecution` stream to the scheduler. Use
+to rio-store rather than to the scheduler (whose stream-era log relay was
+removed with the `BuildExecution` stream). Use
 `bytes` (not `string`) for log content since build output may contain non-UTF-8
 data.
 
@@ -350,9 +358,11 @@ message BuildLogBatch {
 
 === CompletionReport
 
-Executor → scheduler message on the `BuildExecution` stream reporting the
-result of a single derivation build, including cgroup-v2-derived resource
-metrics:
+The build-result payload for a single derivation, including
+cgroup-v2-derived resource metrics. The build task hands it to the pull
+loop inside the builder-internal `ExecutorMessage` envelope; the wire
+carrier is the `ReportOutcome` unary (the stream-era carrier was removed
+with the `BuildExecution` stream):
 
 ```protobuf
 message CompletionReport {
@@ -537,7 +547,8 @@ message WatchBuildRequest {
       QueryBuildStatus, CancelBuild, ResolveTenant)],
 
     [`builder.proto`],
-    [`ExecutorService` --- executor-facing RPCs (BuildExecution, Heartbeat);
+    [`ExecutorService` --- executor-facing RPCs (PullAssignment,
+      ReportOutcome, and the materialization pull/list/progress unaries);
       covers builder + fetcher pods],
 
     [`store.proto`], [`StoreService`, `ChunkService`, `StoreAdminService`],
@@ -597,8 +608,7 @@ services:
 - Gateway → Scheduler (`SubmitBuild` is the largest message)
 - Gateway → Store (`GetPath` responses for large NARs use streaming, so
   unaffected)
-- Executor → Scheduler (`BuildExecution` stream messages are individually
-  small)
+- Executor → Scheduler (the pull/report unaries are individually small)
 - Executor → Store (`PutPath` uses streaming, so unaffected)
 
 == Client Helpers
