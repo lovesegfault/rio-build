@@ -2364,10 +2364,12 @@ enum GcState {
 /// Pending→Active activation, including the in-tx job creation) is
 /// claims-floor fenced: a replica whose serving generation sits below
 /// the durable floor — a successor has claimed — must NOT commit it.
-/// The merge fails with `StaleGeneration` (mapped to gRPC
-/// FAILED_PRECONDITION so the client retries against the live leader)
-/// and leaves nothing behind: no derivation rows, no build links, no
-/// Active build.
+/// The merge fails with `StaleGeneration` (mapped to gRPC UNAVAILABLE
+/// by `actor_error_to_status` — pinned by the assertion below: the
+/// health-aware balancer has already ejected the deposed replica, so
+/// the gateway's bounded SubmitBuild retry-on-UNAVAILABLE lands on the
+/// live leader) and leaves nothing behind: no derivation rows, no
+/// build links, no Active build.
 ///
 /// This is the deposed-believer MergeDag window the as-built posture
 /// documented: leadership is checked at SubmitBuild enqueue time only,
@@ -2400,6 +2402,22 @@ async fn merge_from_deposed_generation_is_fenced() -> TestResult {
             })
         ),
         "a merge from a deposed generation must fail with StaleGeneration, got {reply:?}"
+    );
+
+    // bug_081 claim-twin: the status-code claim in the doc above is
+    // executable — map the error through the PRODUCTION wire mapping
+    // (`actor_error_to_status`), not a re-derivation, and pin the code.
+    let status = crate::grpc::actor_guards::actor_error_to_status(
+        reply
+            .err()
+            .expect("fenced merge returned Ok")
+            .downcast::<ActorError>()
+            .expect("fenced merge error is not an ActorError"),
+    );
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unavailable,
+        "StaleGeneration's wire mapping changed: {status:?}"
     );
 
     // Nothing was committed: no derivation row, no build link, no
