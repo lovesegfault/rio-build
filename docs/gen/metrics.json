@@ -868,7 +868,7 @@
       {
         "name": "rio_scheduler_pull_rejected_total",
         "kind": "counter",
-        "help": "Pull-mode unaries rejected (labels: rpc = pull_assignment|report_outcome, reason = unauthenticated|token_mismatch| kind_unauthorized — the executor token verified but its kind is not allowed to take this attempt kind; consumption_not_durable — the report's consumption close failed to commit durably, the NACK rides UNAVAILABLE and the store's report redelivery re-presents the SAME outcome, so a sustained rate here is a PG brownout trace, not an identity fault). A sustained rate on the identity reasons means a pod fleet holds mis-bound/expired executor tokens or an HMAC rotation skew — the rejected pods exit nonzero and their logs are ephemeral, so this counter is the alertable trace."
+        "help": "Pull-mode unaries rejected (labels: rpc = pull_assignment|report_outcome, reason = unauthenticated|token_mismatch| kind_unauthorized — the executor token verified but its kind is not allowed to take this attempt kind; consumption_not_durable — the report's consumption close failed to commit durably, the NACK rides UNAVAILABLE and the store's report redelivery re-presents the SAME outcome, so a sustained rate here is a PG brownout trace, not an identity fault). A sustained rate on the identity reasons means a pod fleet holds mis-bound/expired executor tokens or an HMAC rotation skew; an occasional unauthenticated blip is the documented mint-skip race (drv left Ready between GetSpawnIntents and MintExecutorTokens — see mint_executor_tokens). The rejected pods exit nonzero and their logs are ephemeral, so this counter is the alertable trace."
       },
       {
         "name": "rio_scheduler_queue_backpressure",

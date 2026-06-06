@@ -342,8 +342,6 @@ impl LogServiceImpl {
         self
     }
 
-    /// Set the `{pod}` → URI template the cross-replica `TailLog` proxy
-    /// dials peers with. See `Config::log_peer_url_template`.
     /// Override the per-subscriber fan-out queue capacity (test knob;
     /// production uses `TAIL_SUBSCRIBER_QUEUE`, a private const).
     pub fn with_tail_subscriber_queue(mut self, n: usize) -> Self {
@@ -351,6 +349,9 @@ impl LogServiceImpl {
         self
     }
 
+    /// Set the `{pod}` → URI template the cross-replica `TailLog` proxy
+    /// dials peers with. See `Config::log_peer_url_template`.
+    ///
     /// An EMPTY template means the proxy is disabled — decided HERE,
     /// at construction, not deep in `uri_for`: a disabled deployment
     /// never queries `lookup_live`, never dials, never increments

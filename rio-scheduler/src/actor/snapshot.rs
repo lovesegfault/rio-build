@@ -841,8 +841,14 @@ impl DagActor {
     /// `intent_ids` not in the snapshot (drv left Ready/Queued between
     /// the two calls) are omitted from the map; the controller spawns
     /// those pods without a token and the scheduler's HMAC verifier
-    /// rejects the connection — pod idle-exits, next tick re-spawns.
-    /// Empty map when `hmac_signer` is None (dev mode).
+    /// rejects the pull (`unauthenticated`) — the pod exits nonzero
+    /// after the single answer (rio-builder treats it as a permanent
+    /// rejection; retrying cannot succeed), the Job goes Failed via the
+    /// controller's pod-terminal path, and the next spawn-intent cycle
+    /// re-spawns the intent. An occasional blip on
+    /// `rio_scheduler_pull_rejected_total{reason="unauthenticated"}`
+    /// from this race is benign — cross-referenced in that metric's
+    /// HELP. Empty map when `hmac_signer` is None (dev mode).
     ///
     /// [`compute_spawn_intents`]: Self::compute_spawn_intents
     // r[impl sec.executor.identity-token+3]

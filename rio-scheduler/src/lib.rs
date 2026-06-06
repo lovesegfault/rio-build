@@ -298,9 +298,11 @@ pub fn describe_metrics() {
          outcome, so a sustained rate here is a PG brownout trace, not an \
          identity fault). \
          A sustained rate on the identity reasons means a pod fleet holds \
-         mis-bound/expired executor tokens or an HMAC rotation skew — the \
-         rejected pods exit nonzero and their logs are ephemeral, so this \
-         counter is the alertable trace."
+         mis-bound/expired executor tokens or an HMAC rotation skew; an \
+         occasional unauthenticated blip is the documented mint-skip race \
+         (drv left Ready between GetSpawnIntents and MintExecutorTokens — \
+         see mint_executor_tokens). The rejected pods exit nonzero and \
+         their logs are ephemeral, so this counter is the alertable trace."
     );
     describe_counter!(
         "rio_scheduler_pull_establishments_total",
