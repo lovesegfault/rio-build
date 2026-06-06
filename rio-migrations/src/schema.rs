@@ -80,8 +80,10 @@ pub const EXEC_STATUS_TERMINAL: &[&str] = &[
 ///
 /// Scheduler-OWNED, store-READ: rio-scheduler INSERTs at dispatch and
 /// UPDATEs `status`/`finished_at`/`final_line_count` at terminal;
-/// rio-store reads it for latest-exec resolution (`WHERE drv_hash = ?
-/// ORDER BY exec_id DESC LIMIT 1`) and the log-completeness predicate
+/// rio-store resolves the latest BUILD execution through the
+/// kind-filtered `latest_build_exec` view (M_089; raw exec-ordered
+/// reads are banned by `log-no-raw-latest-exec`) and reads the
+/// log-completeness predicate
 /// (`status` is terminal AND `final_line_count` known AND the chunk
 /// manifest covers `[0, final_line_count)`), and its TTL sweep
 /// DELETEs by `started_at` age.

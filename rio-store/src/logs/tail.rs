@@ -501,9 +501,9 @@ async fn resolve_exec(
 
     let drv_hash = drv_log_hash(derivation);
     // r[impl store.log.read-authority]
-    // The kind-filtered view (089_log_authority) is THE unpinned resolver; the
-    // `log-no-raw-latest-exec` policy check bans new raw
-    // `ORDER BY exec_id DESC` reads of `drv_executions` so a second
+    // The kind-filtered view (089_log_authority) is THE unpinned resolver;
+    // `log-no-raw-latest-exec` bans new raw `ORDER BY exec_id DESC` reads
+    // of `drv_executions` so a second
     // kind-blind copy of this resolution cannot grow back. Runtime
     // query: the view's columns are pinned transitively by the
     // `STORE_READS` contract (`drv_executions.attempt_kind`).

@@ -684,6 +684,9 @@ in
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-gateway/src)
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-cli/src)
+            # merged_bug_173 (ban v2): doc prose lives in rio-migrations
+            # too (schema.rs narrated the raw resolution as live).
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-migrations/src)
             # merged_bug_293: the offline query cache is a source tree
             # too — an orphaned .sqlx entry caching the banned resolver
             # is a ready-made revival kit (two such orphans shipped:
@@ -701,6 +704,22 @@ in
           echo "FAIL: raw latest-exec resolution over drv_executions —" >&2
           echo "read the kind-filtered latest_build_exec view instead (M_089):" >&2
           echo "$hits" >&2
+          exit 1
+        fi
+        # v2 (merged_bug_173): prose evades the FROM-window — a doc
+        # comment citing the raw resolution shapes reader behavior as
+        # much as code does (executions.rs and schema.rs both narrated
+        # it as live). Bare-phrase scan with a content-keyed allowlist:
+        # a line may mention the raw form ONLY while citing the
+        # replacement view, the ban, or the M_089 record on that line.
+        hits2=$(rg -n -i 'ORDER BY exec_id DESC' \
+          $src/rio-store/src $src/rio-scheduler/src $src/rio-gateway/src \
+          $src/rio-cli/src $src/rio-migrations/src $src/.sqlx \
+          | rg -v 'latest_build_exec|log-no-raw-latest-exec|M_089|089_log_authority' || true)
+        if [[ -n "$hits2" ]]; then
+          echo "FAIL: bare 'ORDER BY exec_id DESC' without a same-line citation" >&2
+          echo "of latest_build_exec / the ban / M_089 — reword to the view truth:" >&2
+          echo "$hits2" >&2
           exit 1
         fi
         touch $out

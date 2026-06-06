@@ -2001,13 +2001,12 @@ pub const M_088: () = ();
 /// - `latest_build_exec` view + `drv_executions_build_latest_idx`
 ///   partial index: THE one resolver for "the derivation's latest
 ///   BUILD execution". The unpinned `TailLog` resolution used a raw
-///   `ORDER BY exec_id DESC` over all kinds, so a freshly-minted
+///   `ORDER BY exec_id DESC` (pre-latest_build_exec) over all kinds, so a freshly-minted
 ///   materialization execution (which never has chunks) shadowed the
 ///   build whose log the caller wanted (merged_bug_111). The view is
 ///   kind-filtered at the definition, every consumer inherits the
-///   filter, and the `log-no-raw-latest-exec` policy check bans new
-///   raw `ORDER BY exec_id DESC` reads of `drv_executions` outside
-///   migrations.
+///   filter; `log-no-raw-latest-exec` bans new raw `ORDER BY exec_id DESC`
+///   reads of `drv_executions` outside migrations.
 pub const M_089: () = ();
 /// `migrations/090_gc_collect_state.sql`
 ///

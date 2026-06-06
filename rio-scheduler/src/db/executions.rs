@@ -2,8 +2,9 @@
 //!
 //! One row per execution attempt (UUIDv7 `exec_id`), created at
 //! dispatch and stamped once at terminal. This is the log subsystem's
-//! per-execution anchor: rio-store's latest-exec resolution
-//! (`ORDER BY exec_id DESC`) and completeness predicate
+//! per-execution anchor: rio-store's latest-exec resolution (the
+//! kind-filtered `latest_build_exec` view, M_089 — `attempt_kind`
+//! keeps materialization attempts out) and completeness predicate
 //! (`status` ∈ terminal ∧ `final_line_count` covered by the chunk
 //! manifest) read it. It deliberately duplicates `exec_id` /
 //! `builder_id` / timestamps that also live on `assignments` —
