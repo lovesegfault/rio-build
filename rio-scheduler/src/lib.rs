@@ -407,11 +407,11 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_materialization_view_node_skew_total",
-        "Split-release wedge tripwire (merged_bug_307 rider): a pending-unclaimed          materialization job whose node is still Assigned/Running with no open          assignment — release_claim should have requeued the node in the same          step that dropped the claim. Always zero in a healthy fleet; any          increment is a re-introduced split release (fatal under debug builds)."
+        "Split-release wedge tripwire (merged_bug_307 rider): a pending-unclaimed materialization job whose node is still Assigned/Running with no open assignment — release_claim should have requeued the node in the same step that dropped the claim. Always zero in a healthy fleet; any increment is a re-introduced split release (fatal under debug builds)."
     );
     describe_counter!(
         "rio_scheduler_materialization_carrier_dropped_total",
-        "Realized-path carriers dropped from the leader-scoped retry stash          because the node went terminal/gone before the stale-reset job row          applied (merged_bug_257). The carrier had no consumer left; the paths          are reproducible from source if interest returns."
+        "Realized-path carriers dropped from the leader-scoped retry stash because the node went terminal/gone before the stale-reset job row applied (merged_bug_257). The carrier had no consumer left; the paths are reproducible from source if interest returns."
     );
     describe_histogram!(
         "rio_scheduler_critical_path_accuracy",

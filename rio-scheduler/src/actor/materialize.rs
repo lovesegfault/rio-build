@@ -817,7 +817,7 @@ impl DagActor {
         if self.materialization_jobs.hydrated().is_none() {
             debug!(
                 drv_hash = %drv_hash, %job_id,
-                "job view unavailable: creation feed dropped (durable row is authoritative;                  the next recovery hydrates)"
+                "job view unavailable: creation feed dropped (durable row is authoritative; the next recovery hydrates)"
             );
             return;
         }
@@ -846,7 +846,7 @@ impl DagActor {
                     Err(e) => {
                         warn!(
                             drv_hash = %drv_hash, %job_id, error = %e,
-                            "dedup re-feed load failed; entry stays absent                              (backstop sweep re-feeds)"
+                            "dedup re-feed load failed; entry stays absent (backstop sweep re-feeds)"
                         );
                     }
                 },
@@ -2645,7 +2645,7 @@ impl DagActor {
         if refed > 0 {
             tracing::info!(
                 refed,
-                "materialization view backstop re-fed untracked pending rows from PG                  (moot rows are closed by the zero-interest pass this tick)"
+                "materialization view backstop re-fed untracked pending rows from PG (moot rows are closed by the zero-interest pass this tick)"
             );
         }
     }

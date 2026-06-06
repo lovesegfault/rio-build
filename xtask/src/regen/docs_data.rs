@@ -115,12 +115,41 @@ struct Describe {
 /// wins" + an unsorted `read_dir` walk made the winner (and thus
 /// `docs/gen/metrics.json` and the rendered chart HELP)
 /// filesystem-order-dependent.
+/// VALIDATOR (merged_bug_016): the `split_whitespace` normalization in
+/// `collect_describes` silently launders garbled interior space runs
+/// (collapsed backslash-continuations) out of docs/gen and the rendered
+/// chart HELP — the gate could never see the defect it exists to catch.
+/// True iff the RAW source capture of a describe HELP carries a 2+
+/// interior-space run that is not the indent of a legitimate
+/// `\<newline>` continuation (those are stripped first).
+fn garbled_interior_run(raw: &str) -> bool {
+    // `\<newline>` strips the newline AND the next line's leading
+    // whitespace at compile time (the house style leaves the joining
+    // space BEFORE the backslash) — so a continuation contributes
+    // NOTHING to the compiled string. Replacing with " " here would
+    // double the author's pre-backslash space into a false positive.
+    let cont = Regex::new(r"\\\n[ \t]*").expect("static regex");
+    let run = Regex::new(r"\S  +\S").expect("static regex");
+    run.is_match(&cont.replace_all(raw, ""))
+}
+
 fn collect_describes() -> Result<BTreeMap<String, Describe>> {
     let re = Regex::new(METRICS_RE)?;
     let mut seen = BTreeMap::<String, Describe>::new();
     let mut err: Option<anyhow::Error> = None;
     visit_rio_crates(&mut |crate_name, body| {
         for c in re.captures_iter(body) {
+            if garbled_interior_run(&c[3]) {
+                err.get_or_insert(anyhow::anyhow!(
+                    "metric {} ({crate_name}): describe HELP contains an interior \
+                     space run with no line continuation — a collapsed backslash \
+                     continuation (merged_bug_016). Re-join the literal with single \
+                     spaces or a `\\` continuation: {:?}",
+                    &c[2],
+                    &c[3]
+                ));
+                continue;
+            }
             let help = unescape_rust_str(&c[3])
                 .split_whitespace()
                 .collect::<Vec<_>>()
@@ -1218,6 +1247,24 @@ spec:
         assert_eq!(unescape_rust_str(r"a\\b"), r"a\b");
         assert_eq!(unescape_rust_str("a \\\n  b"), "a   b"); // line-cont
         assert_eq!(unescape_rust_str(r"\{0}"), r"\{0}"); // unknown passes through
+    }
+
+    #[test]
+    fn garbled_interior_run_flags_collapsed_continuations() {
+        // The merged_bug_016 defect shape: a backslash-continued literal
+        // re-joined onto one line with the alignment spaces left inside.
+        // (Constructed, not literal — the string-interior-spaces
+        // misc-check scans this file too and would rightly flag a
+        // literal fixture.)
+        let garbled = format!("a pending-unclaimed{}job", " ".repeat(10));
+        assert!(garbled_interior_run(&garbled));
+        // A legitimate `\<newline>` continuation (raw source form) passes —
+        // the indent belongs to the continuation, not the string value.
+        assert!(!garbled_interior_run(
+            "Split-release wedge tripwire: a pending-unclaimed \\\n          job"
+        ));
+        // Single interior spaces pass.
+        assert!(!garbled_interior_run("plain single-spaced help"));
     }
 
     #[test]

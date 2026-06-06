@@ -713,7 +713,7 @@ fn check_swept_by(
     });
     ensure!(
         hit,
-        "`{symbol}` defines ({} file(s)) but no defining file deletes `{table}`          (no `DELETE FROM {table}` and no TRUNCATE naming it)",
+        "`{symbol}` defines ({} file(s)) but no defining file deletes `{table}` (no `DELETE FROM {table}` and no TRUNCATE naming it)",
         defs.len()
     );
     Ok(())
@@ -750,7 +750,7 @@ fn check_cascade(table: &str, parent: &str, migration: &str, root: &Path) -> Res
         .with_context(|| format!("CascadeFrom migration for `{table}`: {}", path.display()))?;
     ensure!(
         cascade_clause_ok(&normalize_decl_text(&text), parent),
-        "{migration} carries no `REFERENCES {parent} … ON DELETE CASCADE` clause          (missing or RESTRICT — the phantom-cascade class)"
+        "{migration} carries no `REFERENCES {parent} … ON DELETE CASCADE` clause (missing or RESTRICT — the phantom-cascade class)"
     );
     Ok(())
 }

@@ -1355,7 +1355,7 @@ mod tests {
         .await;
         // The stale_reset origin wrote the carrier at creation.
         sqlx::query(
-            "UPDATE materialization_jobs                 SET origin = 'stale_reset', carried_realized_paths = $2               WHERE job_id = $1",
+            "UPDATE materialization_jobs SET origin = 'stale_reset', carried_realized_paths = $2 WHERE job_id = $1",
         )
         .bind(seeded.job_id)
         .bind(vec![real.clone()])

@@ -377,7 +377,7 @@ impl DagActor {
         {
             debug!(
                 intent_id = %intent_id,
-                "materialization claim answered NotYetReady: job view unavailable                  (degraded term — never Gone for a job we cannot see)"
+                "materialization claim answered NotYetReady: job view unavailable (degraded term — never Gone for a job we cannot see)"
             );
             PullDecision::NotYetReady
         } else {
@@ -1308,7 +1308,7 @@ impl DagActor {
                 intent_id = ?identity.intent_id,
                 job_name = ?identity.job_name,
                 ?reason,
-                "synthesized verdict without exec_id refused (acked charge-free;                  synthesized closes are exec-pinned)"
+                "synthesized verdict without exec_id refused (acked charge-free; synthesized closes are exec-pinned)"
             );
             return Ok(());
         }

@@ -210,7 +210,7 @@ pub async fn read_chunk(
             "TailLog: manifest row claims more lines than any decodable chunk can hold"
         );
         let mut status = Status::internal(format!(
-            "TailLog: manifest row claims {} lines, past the {}-line absolute bound              (corrupt row): {}",
+            "TailLog: manifest row claims {} lines, past the {}-line absolute bound (corrupt row): {}",
             chunk.line_count,
             rio_log_kernel::MAX_CHUNK_LINES_ABS,
             chunk.s3_key

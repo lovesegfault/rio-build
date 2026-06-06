@@ -3027,7 +3027,7 @@ mod tests {
                     } else {
                         assert_eq!(
                             kinded, blind,
-                            "release({from} -> {to}, {kind:?}) must agree with the kind-blind                              table everywhere except the two delta cells"
+                            "release({from} -> {to}, {kind:?}) must agree with the kind-blind table everywhere except the two delta cells"
                         );
                     }
                 }

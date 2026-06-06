@@ -430,7 +430,7 @@ impl rio_common::config::ValidateConfig for Config {
         // the unvalidated-degenerate-knob class (082's sibling).
         anyhow::ensure!(
             cfg.materialization.attempt_deadline_secs >= 1,
-            "materialization.attempt_deadline_secs must be >= 1, got 0              (a zero deadline establishes every claim on its first sweep tick)"
+            "materialization.attempt_deadline_secs must be >= 1, got 0 (a zero deadline establishes every claim on its first sweep tick)"
         );
         // `actor/completion.rs` resets the per-executor `infra_count` when
         // `last.elapsed().as_secs_f64() > infra_retry_window_secs`. `as_secs_f64()`

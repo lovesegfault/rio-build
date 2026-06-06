@@ -333,7 +333,7 @@ fn dag_authority_single_mint_site() {
         .sum();
     assert_eq!(
         count, 1,
-        "DagAuthority(()) must be constructed exactly once          (DagActor::dag_authority), found {count}"
+        "DagAuthority(()) must be constructed exactly once (DagActor::dag_authority), found {count}"
     );
 }
 

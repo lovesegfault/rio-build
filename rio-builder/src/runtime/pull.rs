@@ -588,7 +588,7 @@ async fn resolve_shutdown<T: PullTransport>(
                 drv_path: a.drv_path.clone(),
                 result: Some(rio_proto::types::BuildResult {
                     status: rio_proto::types::BuildResultStatus::Cancelled.into(),
-                    error_msg: "SIGTERM before build start; assignment minted by an                                 abandoned pull (merged_bug_270 confirm path)"
+                    error_msg: "SIGTERM before build start; assignment minted by an abandoned pull (merged_bug_270 confirm path)"
                         .into(),
                     ..Default::default()
                 }),
@@ -660,7 +660,7 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
                 return Ok(());
             }
             anyhow::bail!(
-                "shutdown with a maybe-minted pull left unresolved; exiting nonzero                  so the Job goes Failed (the establishment sweep reaps the attempt)"
+                "shutdown with a maybe-minted pull left unresolved; exiting nonzero so the Job goes Failed (the establishment sweep reaps the attempt)"
             );
         }
         PullPhaseOutcome::Rejected(status) => {

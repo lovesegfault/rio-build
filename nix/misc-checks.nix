@@ -1003,6 +1003,90 @@ in
         touch $out
       '';
 
+  # merged_bug_016: a backslash-continued string literal re-joined onto
+  # one line keeps the continuation's alignment spaces INSIDE the
+  # literal — error messages, log lines, SQL, and metric HELP then carry
+  # 10-30 garbage spaces verbatim (18 live sites repaired at
+  # introduction; natural red recorded in the commit body). The
+  # describe-HELP scraper additionally hard-errors at 2+ interior spaces
+  # (xtask docs_data garbled_interior_run) since HELP flows to docs/gen
+  # and the rendered chart; this generic check holds the ≥8 line at
+  # every other literal.
+  string-interior-spaces =
+    pkgs.runCommand "rio-string-interior-spaces"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-auth/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-authz-kernel/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-builder/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-cli/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-common/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-controller/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-crds/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-dashboard/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-evidence-kernel/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-gateway/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-lease/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-log-kernel/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-migrations/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-nix/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-proto/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-retry-kernel/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-store/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-test-support/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../xtask/src)
+          ];
+        };
+        nativeBuildInputs = [ pkgs.ripgrep ];
+      }
+      ''
+        set +o pipefail
+        scan() {
+          local dir=$1 fail=0
+          while IFS= read -r hit; do
+            local file=''${hit%%:*} rest=''${hit#*:}
+            local line=''${rest%%:*} text=''${rest#*:}
+            # Carve-out 1: comment lines (trim starts with //) may
+            # draw ASCII tables and aligned columns.
+            local t=''${text#"''${text%%[![:space:]]*}"}
+            [[ $t == //* ]] && continue
+            # Carve-out 2: runs after a literal \n escape are the
+            # indentation of a multi-line template (format fixtures,
+            # YAML snippets) — collapse them, then re-test.
+            local collapsed
+            collapsed=$(sed -E 's/\\n +/\\n /g' <<<"$text")
+            if grep -qE '"[^"]*[^ "] {8,}[^ "][^"]*"' <<<"$collapsed"; then
+              echo "$file:$line: interior space run inside a string literal" >&2
+              fail=1
+            fi
+          done < <(rg -n '"[^"]*[^ "] {8,}[^ "][^"]*"' "$dir" || true)
+          if [[ $fail -ne 0 ]]; then
+            echo "FAIL: ≥8-space interior runs inside .rs string literals —" >&2
+            echo "a collapsed backslash continuation (merged_bug_016)." >&2
+            echo "Re-join with single spaces or keep the \` \\\\\` continuation." >&2
+          fi
+          [[ $fail -eq 0 ]]
+        }
+        # Self-test: planted red must FAIL, clean fixture must PASS.
+        mkdir -p "$TMPDIR/red" "$TMPDIR/green"
+        printf '%s\n' 'let m = "garbled continuation          left inside";' > "$TMPDIR/red/a.rs"
+        {
+          printf '%s\n' '// comment table:   col1          col2'
+          printf '%s\n' 'let y = "rules:\n        - alert: x";'
+          printf '%s\n' 'let z = "single spaced help";'
+        } > "$TMPDIR/green/b.rs"
+        if scan "$TMPDIR/red" 2>/dev/null; then
+          echo "SELF-TEST FAIL: the planted-red fixture passed" >&2
+          exit 1
+        fi
+        scan "$TMPDIR/green" || { echo "SELF-TEST FAIL: the clean fixture failed" >&2; exit 1; }
+        scan "$src"
+        touch $out
+      '';
+
   transport-unary-ban =
     pkgs.runCommand "rio-transport-unary-ban"
       {

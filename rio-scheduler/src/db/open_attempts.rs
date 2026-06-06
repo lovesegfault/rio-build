@@ -598,7 +598,7 @@ impl SchedulerDb {
         derivation_id: Uuid,
     ) -> Result<Option<RecoveredJobRow>, sqlx::Error> {
         sqlx::query_as(
-            "SELECT j.job_id, j.drv_hash, j.carried_realized_paths,                     EXTRACT(EPOCH FROM (j.park_until - now()))::float8 AS park_remaining_secs,                     EXTRACT(EPOCH FROM (now() - j.park_began_at))::float8 AS park_began_secs_ago,                     a.builder_id AS claimed_by                FROM materialization_jobs j                LEFT JOIN assignments a ON a.derivation_id = j.derivation_id                                       AND a.status IN ('pending', 'acknowledged')                                       AND EXISTS (                                           SELECT 1 FROM drv_executions e                                            WHERE e.exec_id = a.exec_id                                              AND e.attempt_kind = 'materialization')               WHERE j.state = 'pending' AND j.derivation_id = $1",
+            "SELECT j.job_id, j.drv_hash, j.carried_realized_paths, EXTRACT(EPOCH FROM (j.park_until - now()))::float8 AS park_remaining_secs, EXTRACT(EPOCH FROM (now() - j.park_began_at))::float8 AS park_began_secs_ago, a.builder_id AS claimed_by FROM materialization_jobs j LEFT JOIN assignments a ON a.derivation_id = j.derivation_id AND a.status IN ('pending', 'acknowledged') AND EXISTS ( SELECT 1 FROM drv_executions e WHERE e.exec_id = a.exec_id AND e.attempt_kind = 'materialization') WHERE j.state = 'pending' AND j.derivation_id = $1",
         )
         .bind(derivation_id)
         .fetch_optional(&self.pool)
