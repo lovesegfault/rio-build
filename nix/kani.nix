@@ -508,6 +508,19 @@ in
     # at every width, plus kani::cover of the complementary-coverage
     # disagreement matrix vs the old projection — 1 of 1 cover
     # satisfied, 0.6 s).
-    expectedHarnesses = 27;
+    # 27 → 28 (substitution, bug_115): +
+    # check_visibility_verdict_i217_table (K4: the eight-cell I-217
+    # table re-derived independently, plus the two dominance facts the
+    # lazy callers rely on — owned wins, and the verdict is
+    # independent of sig_trusted once owned || any_built holds, so a
+    # caller skipping the trusted-set queries for those rows cannot
+    # change the verdict). K5 (probe-polarity congruence) is
+    # DELIBERATELY NOT a kani harness (§1.6 "if expressed in kani"):
+    # the probe leg consumes the SAME classify_substitute_failure the
+    # GET leg does (one truth table, already swept by
+    # check_substitute_failure_truth_table), and the e2e pair
+    # (HEAD-429 red + upstream_5xx green) pins both polarity halves —
+    # a separate harness would re-prove the table against itself.
+    expectedHarnesses = 28;
   };
 }
