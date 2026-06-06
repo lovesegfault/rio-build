@@ -2409,8 +2409,7 @@ async fn merge_from_deposed_generation_is_fenced() -> TestResult {
     // (`actor_error_to_status`), not a re-derivation, and pin the code.
     let status = crate::grpc::actor_guards::actor_error_to_status(
         reply
-            .err()
-            .expect("fenced merge returned Ok")
+            .expect_err("fenced merge returned Ok")
             .downcast::<ActorError>()
             .expect("fenced merge error is not an ActorError"),
     );
