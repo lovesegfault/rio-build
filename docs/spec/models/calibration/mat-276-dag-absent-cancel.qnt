@@ -39,6 +39,8 @@ module matCalib276DagAbsentCancel {
     ENABLE_CRASH = true,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
@@ -67,7 +69,10 @@ module matCalib276DagAbsentCancel {
     nondet d = DRVS.oneOf()
     any {
       step,
-      calibSplitCancel(d),
+      all {
+        calibSplitCancel(d),
+        walkUnchanged,
+      },
     }
   }
 }

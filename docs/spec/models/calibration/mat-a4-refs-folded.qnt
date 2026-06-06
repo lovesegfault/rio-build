@@ -42,6 +42,8 @@ module matCalibRefsFolded {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
@@ -110,17 +112,20 @@ module matCalibRefsFolded {
     nondet missing = OUTPUTS.powerset().oneOf()
     nondet refsMissing = Set(true, false).oneOf()
     nondet origin = Set(OProbe, OMerge, OPruned, OReprobe, OStaleReset).oneOf()
-    any {
-      recordWantedRelation(b, d, outs),
-      createJob(d, origin, b),
-      claimJob(d, replica),
-      executeStep(d, o),
-      consumeSuccess(d),
-      // the override REPLACES consumeUnobtainable's moot arm
-      calibConsumeRefsFolded(d, missing, refsMissing),
-      cancelOnZeroInterest(d),
-      buildTerminal(b),
-      upstreamChange(d, o),
+    all {
+      any {
+        recordWantedRelation(b, d, outs),
+        createJob(d, origin, b),
+        claimJob(d, replica),
+        executeStep(d, o),
+        consumeSuccess(d),
+        // the override REPLACES consumeUnobtainable's moot arm
+        calibConsumeRefsFolded(d, missing, refsMissing),
+        cancelOnZeroInterest(d),
+        buildTerminal(b),
+        upstreamChange(d, o),
+      },
+      walkUnchanged,
     }
   }
 }

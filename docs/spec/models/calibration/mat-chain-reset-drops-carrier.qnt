@@ -43,6 +43,8 @@ module matCalibChainResetDropsCarrier {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
@@ -122,31 +124,34 @@ module matCalibChainResetDropsCarrier {
     nondet missing = OUTPUTS.powerset().oneOf()
     nondet rel = Set(RVouched, RPending, RChildlessLeaf, RHoled).oneOf()
     nondet refsMissing = Set(true, false).oneOf()
-    any {
-      recordWantedRelation(b, d, outs),
-      legacyBuildArrives(b, d),
-      // non-stale origins keep the as-built creation; the stale-reset
-      // origin goes through the carrier-dropping override.
-      createJob(d, origin, b),
-      calibStaleResetCreateDropsCarrier(d, b),
-      dedupRefeed(d),
-      claimJob(d, replica),
-      executeStep(d, o),
-      consumeSuccess(d),
-      consumeUnobtainable(d, missing, refsMissing),
-      reportInfra(d),
-      cancelOnZeroInterest(d),
-      obsoleteOnProduced(d),
-      parkReevaluate(d),
-      parkBackoffExpires(d),
-      buildTerminal(b),
-      builderPull(d, builder),
-      dispatchFromSource(d),
-      completeReadyFromStore(d),
-      releasePins(d),
-      storeGc(d, o),
-      upstreamChange(d, o),
-      durableRelationChange(d, rel),
+    all {
+      any {
+        recordWantedRelation(b, d, outs),
+        legacyBuildArrives(b, d),
+        // non-stale origins keep the as-built creation; the stale-reset
+        // origin goes through the carrier-dropping override.
+        createJob(d, origin, b),
+        calibStaleResetCreateDropsCarrier(d, b),
+        dedupRefeed(d),
+        claimJob(d, replica),
+        executeStep(d, o),
+        consumeSuccess(d),
+        consumeUnobtainable(d, missing, refsMissing),
+        reportInfra(d),
+        cancelOnZeroInterest(d),
+        obsoleteOnProduced(d),
+        parkReevaluate(d),
+        parkBackoffExpires(d),
+        buildTerminal(b),
+        builderPull(d, builder),
+        dispatchFromSource(d),
+        completeReadyFromStore(d),
+        releasePins(d),
+        storeGc(d, o),
+        upstreamChange(d, o),
+        durableRelationChange(d, rel),
+      },
+      walkUnchanged,
     }
   }
 }
@@ -176,6 +181,8 @@ module matCalibChainResetDropsCarrierEx {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
@@ -185,8 +192,8 @@ module matCalibChainResetDropsCarrierEx {
     BUILDS.contains(tenant),
     buildLive.get(tenant),
     or {
-      wanted.get((tenant, d)) != Set(),
-      legacyInterest.get((tenant, d)),
+        wanted.get((tenant, d)) != Set(),
+        legacyInterest.get((tenant, d)),
     },
     not(memLiveWanted(d).forall(o => present.get((d, o)))),
     not(hasUnresolvedJob(d)),
@@ -194,37 +201,37 @@ module matCalibChainResetDropsCarrierEx {
     nodeStatus.get(d) != NDepFailed,
     nodeStatus.get(d) != NRunning,
     if (OStaleReset == OStaleReset)
-      nodeStatus.get(d) == NCompleted
+        nodeStatus.get(d) == NCompleted
     else
-      nodeStatus.get(d) == NQueued or nodeStatus.get(d) == NReady,
+        nodeStatus.get(d) == NQueued or nodeStatus.get(d) == NReady,
     // in-tx origins ride the merge tx whose batch wrote the tenant's
     // rows; the standalone sites accept legacy tenants and backfill.
     (false) implies
-      wanted.get((tenant, d)) != Set(),
+        wanted.get((tenant, d)) != Set(),
     val standalone = true
     val backfills = BUILDS.filter(b => and {
-      standalone,
-      buildLive.get(b),
-      legacyInterest.get((b, d)),
+        standalone,
+        buildLive.get(b),
+        legacyInterest.get((b, d)),
     })
     val wantedNew = backfills.fold(wanted, (acc, b) => acc.put((b, d), OUTPUTS))
     all {
-      jobs' = jobs.put(d, SomeJob({ ...freshJob, origin: OStaleReset, tenant: tenant })),
-      view' = view.put(d, VPending(false)),
-      dupJob' = dupJob,
-      topdownPruned' = if (false) topdownPruned.put(d, true) else topdownPruned,
-      nodeStatus' = if (true)
-        nodeStatus.put(d, NQueued)
-      else nodeStatus,
-      wanted' = wantedNew,
-      lastWritten' = backfills.fold(lastWritten, (acc, b) => acc.put((b, d), OUTPUTS)),
-      legacyInterest' = backfills.fold(legacyInterest, (acc, b) => acc.put((b, d), false)),
-      // delta 2b invariant latch: resolvable at creation commit —
-      // some live build holds wanted rows AFTER the backfill.
-      creationResolvableAll' = and {
-        creationResolvableAll,
-        BUILDS.exists(b => buildLive.get(b) and wantedNew.get((b, d)) != Set()),
-      },
+        jobs' = jobs.put(d, SomeJob({ ...freshJob, origin: OStaleReset, tenant: tenant })),
+        view' = view.put(d, VPending(false)),
+        dupJob' = dupJob,
+        topdownPruned' = if (false) topdownPruned.put(d, true) else topdownPruned,
+        nodeStatus' = if (true)
+          nodeStatus.put(d, NQueued)
+        else nodeStatus,
+        wanted' = wantedNew,
+        lastWritten' = backfills.fold(lastWritten, (acc, b) => acc.put((b, d), OUTPUTS)),
+        legacyInterest' = backfills.fold(legacyInterest, (acc, b) => acc.put((b, d), false)),
+        // delta 2b invariant latch: resolvable at creation commit —
+        // some live build holds wanted rows AFTER the backfill.
+        creationResolvableAll' = and {
+          creationResolvableAll,
+          BUILDS.exists(b => buildLive.get(b) and wantedNew.get((b, d)) != Set()),
+        },
     },
     legacyBudget' = legacyBudget,
     attempts' = attempts, execsMinted' = execsMinted,
@@ -255,31 +262,34 @@ module matCalibChainResetDropsCarrierEx {
     nondet missing = OUTPUTS.powerset().oneOf()
     nondet rel = Set(RVouched, RPending, RChildlessLeaf, RHoled).oneOf()
     nondet refsMissing = Set(true, false).oneOf()
-    any {
-      recordWantedRelation(b, d, outs),
-      legacyBuildArrives(b, d),
-      // non-stale origins keep the as-built creation; the stale-reset
-      // origin goes through the carrier-dropping override.
-      createJob(d, origin, b),
-      calibStaleResetCreateDropsCarrier(d, b),
-      dedupRefeed(d),
-      claimJob(d, replica),
-      executeStep(d, o),
-      consumeSuccess(d),
-      consumeUnobtainable(d, missing, refsMissing),
-      reportInfra(d),
-      cancelOnZeroInterest(d),
-      obsoleteOnProduced(d),
-      parkReevaluate(d),
-      parkBackoffExpires(d),
-      buildTerminal(b),
-      builderPull(d, builder),
-      dispatchFromSource(d),
-      completeReadyFromStore(d),
-      releasePins(d),
-      storeGc(d, o),
-      upstreamChange(d, o),
-      durableRelationChange(d, rel),
+    all {
+      any {
+        recordWantedRelation(b, d, outs),
+        legacyBuildArrives(b, d),
+        // non-stale origins keep the as-built creation; the stale-reset
+        // origin goes through the carrier-dropping override.
+        createJob(d, origin, b),
+        calibStaleResetCreateDropsCarrier(d, b),
+        dedupRefeed(d),
+        claimJob(d, replica),
+        executeStep(d, o),
+        consumeSuccess(d),
+        consumeUnobtainable(d, missing, refsMissing),
+        reportInfra(d),
+        cancelOnZeroInterest(d),
+        obsoleteOnProduced(d),
+        parkReevaluate(d),
+        parkBackoffExpires(d),
+        buildTerminal(b),
+        builderPull(d, builder),
+        dispatchFromSource(d),
+        completeReadyFromStore(d),
+        releasePins(d),
+        storeGc(d, o),
+        upstreamChange(d, o),
+        durableRelationChange(d, rel),
+      },
+      walkUnchanged,
     }
   }
 }

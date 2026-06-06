@@ -46,6 +46,8 @@ module matCalibLeafParkForever {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
@@ -105,19 +107,22 @@ module matCalibLeafParkForever {
     nondet outs = OUTPUTS.powerset().oneOf()
     nondet origin = Set(OProbe, OMerge, OPruned, OReprobe, OStaleReset).oneOf()
     nondet rel = Set(RVouched, RPending, RChildlessLeaf, RHoled).oneOf()
-    any {
-      recordWantedRelation(b, d, outs),
-      createJob(d, origin, b),
-      claimJob(d, replica),
-      executeStep(d, o),
-      consumeSuccess(d),
-      reportInfra(d),
-      // the override REPLACES parkReevaluate
-      calibParkReevaluateVPOnly(d),
-      parkBackoffExpires(d),
-      buildTerminal(b),
-      upstreamChange(d, o),
-      durableRelationChange(d, rel),
+    all {
+      any {
+        recordWantedRelation(b, d, outs),
+        createJob(d, origin, b),
+        claimJob(d, replica),
+        executeStep(d, o),
+        consumeSuccess(d),
+        reportInfra(d),
+        // the override REPLACES parkReevaluate
+        calibParkReevaluateVPOnly(d),
+        parkBackoffExpires(d),
+        buildTerminal(b),
+        upstreamChange(d, o),
+        durableRelationChange(d, rel),
+      },
+      walkUnchanged,
     }
   }
 }

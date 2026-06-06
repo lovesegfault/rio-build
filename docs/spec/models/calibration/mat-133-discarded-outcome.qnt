@@ -38,6 +38,8 @@ module matCalib133DiscardedOutcome {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = true,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
@@ -61,7 +63,10 @@ module matCalib133DiscardedOutcome {
     nondet d = DRVS.oneOf()
     any {
       step,
-      calibResolveFencedDiscardsView(d),
+      all {
+        calibResolveFencedDiscardsView(d),
+        walkUnchanged,
+      },
     }
   }
 }

@@ -41,6 +41,8 @@ module matCalibTransientAsInfra {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
@@ -94,19 +96,22 @@ module matCalibTransientAsInfra {
     nondet replica = REPLICAS.oneOf()
     nondet outs = OUTPUTS.powerset().oneOf()
     nondet origin = Set(OProbe, OMerge, OPruned, OReprobe, OStaleReset).oneOf()
-    any {
-      recordWantedRelation(b, d, outs),
-      createJob(d, origin, b),
-      claimJob(d, replica),
-      executeStep(d, o),
-      consumeSuccess(d),
-      // the override REPLACES reportTransient
-      calibTransientAsInfra(d),
-      cancelOnZeroInterest(d),
-      parkReevaluate(d),
-      parkBackoffExpires(d),
-      buildTerminal(b),
-      upstreamChange(d, o),
+    all {
+      any {
+        recordWantedRelation(b, d, outs),
+        createJob(d, origin, b),
+        claimJob(d, replica),
+        executeStep(d, o),
+        consumeSuccess(d),
+        // the override REPLACES reportTransient
+        calibTransientAsInfra(d),
+        cancelOnZeroInterest(d),
+        parkReevaluate(d),
+        parkBackoffExpires(d),
+        buildTerminal(b),
+        upstreamChange(d, o),
+      },
+      walkUnchanged,
     }
   }
 }

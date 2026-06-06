@@ -1,5 +1,5 @@
 // -*- mode: Bluespec; -*-
-// quint-policy-latches: covLiveOnlyAll, failoverDroppedJobs, staleJobWriteApplied, dupJob, requeueReadyJustifiedAll, abortChargeFree
+// quint-policy-latches: covLiveOnlyAll, failoverDroppedJobs, staleJobWriteApplied, dupJob, requeueReadyJustifiedAll, abortChargeFree, reprobeCongruentAll, probeUnchargedOn429All, anyTenantHitServesAll, localServeVisibleAll, walkFoldSeen
 //
 // Substitution-replacement model (Phase C-prime, re-targeted to the
 // post-deletion system at Phase D-prime T-D7.2): the store-owned
@@ -283,6 +283,13 @@ module materializationJob {
   /// Default false — every pre-existing regime is
   /// state-space-identical.
   const ENABLE_WORKER_ABORTED: bool
+  /// Slot-10 walk-fold plane (bug_299/295/133/115): the interested
+  /// tenants of one store-walk fold evaluation (two suffice for the
+  /// complementary-coverage matrix), and the step gate. Default
+  /// false — every pre-existing regime is state-space-identical (the
+  /// plane vars are constant after init when disabled).
+  const TENANTS: Set[str]
+  const ENABLE_WALK_FOLD: bool
 
   // --- 3. pure defs ---------------------------------------------------------
 
@@ -548,6 +555,59 @@ module materializationJob {
   /// post-resolution evidence drift).
   var leafReevalReleased: bool
 
+  // --- 4b. slot-10 walk-fold plane (bug_299/295/133/115) ----------------------
+  //
+  // The store executor's per-(tenant, path) fold semantics. Two-step
+  // ORACLE shape (R10 seat discipline + quint-policy P4: a latch's
+  // law must read LIVE STATE, never caller params): `walkObserve`
+  // arms one evaluation's raw cells into state; the seat
+  // (`walkFoldApply`) recomputes each law from the ARMED CELLS
+  // against the caller's four bool decisions. The live `walkFold`
+  // derives decisions lawfully from the same state; the four mat-*
+  // walk calibrations derive ONE decision each the pre-fix way
+  // through the SAME seat (P5: perturb a decision, never a latch).
+
+  /// One fold evaluation's raw cells: which tenants' attempt legs
+  /// HIT, which paths have complete local rows, which (tenant, path)
+  /// cells pass the sig-visibility gate, which are confirmed-miss,
+  /// and which tenants produced rate-limited vs charging evidence.
+  type WalkCells = {
+    served: Set[str],
+    localPresent: Set[str],
+    localVisible: Set[(str, str)],
+    missing: Set[(str, str)],
+    rateLimited: Set[str],
+    charging: Set[str],
+  }
+
+  pure val emptyCells: WalkCells = {
+    served: Set(), localPresent: Set(), localVisible: Set(),
+    missing: Set(), rateLimited: Set(), charging: Set(),
+  }
+
+  /// The armed evaluation's cells (the oracle the seat's laws read).
+  var walkCells: WalkCells
+  /// An evaluation is armed (observe ran; the fold has not consumed it).
+  var cellsArmed: bool
+  /// Every fold's ConfirmedMissing decision matched the per-path
+  /// quantifier (exists path, forall tenant, missing) over the RAW
+  /// armed cells (bug_299 — the whole-set per-tenant projection is
+  /// the violation shape).
+  var reprobeCongruentAll: bool
+  /// Every all-rate-limited, nothing-charging, nothing-served fold
+  /// closed UNCHARGED (bug_295 — the probe-leg park burner).
+  var probeUnchargedOn429All: bool
+  /// Every fold with a serving tenant served (merged_bug_133 — the
+  /// in-loop return starving later tenants is the violation shape).
+  var anyTenantHitServesAll: bool
+  /// Every local-row serve had a gate-visible (tenant, path) cell
+  /// (bug_115 — raw physical presence is the violation shape).
+  var localServeVisibleAll: bool
+  /// Reachability marker (hazard-www vacuity guard): at least one
+  /// fold was decided under the walk regime; the witness battery
+  /// proves this flips, so the four latches are never vacuous there.
+  var walkFoldSeen: bool
+
   // --- 5. derived state -------------------------------------------------------
 
   /// In-memory interest (the DAG's interested_builds x liveness):
@@ -735,6 +795,17 @@ module materializationJob {
   /// (merged_bug_276). The mat-276-dag-absent-cancel override (the
   /// pre-fix split cancel) is its falsifiability pair.
   val chargeFreeCancellation = not(chargedAfterCancel)
+
+  /// bug_299 (slot 10): every fold's ConfirmedMissing matched the
+  /// per-path quantifier over raw (tenant, path) cells.
+  val reprobeCongruentWithCompletability = reprobeCongruentAll
+  /// bug_295 (slot 10): a rate-limit-only fold never drew budget.
+  val rateLimitedProbeDrawsNoBudget = probeUnchargedOn429All
+  /// merged_bug_133 (slot 10): a serving tenant is never starved by
+  /// the fold's order of consultation.
+  val hitUnderAnyTenantOrderSucceeds = anyTenantHitServesAll
+  /// bug_115 (slot 10): every local-row serve was visibility-gated.
+  val verifiedPathsVisibleToInterest = localServeVisibleAll
 
   /// A2 kind-partition (bughunt wave, merged_bug_146 / the 307 wedge
   /// mirror): a Claimed job view always has the open MATERIALIZATION
@@ -949,6 +1020,11 @@ module materializationJob {
   }
 
   // --- 6b. witnesses (non-vacuity probes; expect-violation) ------------------
+
+  /// Slot-10 vacuity guard (hazard www): a fold gets decided under
+  /// the walk regime — expect VIOLATION there; vacuously holds in
+  /// regimes with ENABLE_WALK_FOLD = false.
+  val noWalkFoldEvaluated = not(walkFoldSeen)
   // Each canReach* is encoded as no* = not(<interesting state>); the
   // check passes only when the checker VIOLATES it.
 
@@ -1144,6 +1220,25 @@ module materializationJob {
     noVacuousCoverageAll' = noVacuousCoverageAll,
     everContrib' = everContrib,
     leafReevalReleased' = leafReevalReleased,
+  }
+  /// Slot-10 walk-plane vars unchanged (the machine branches' frame).
+  action walkUnchanged = all {
+    walkCells' = walkCells,
+    cellsArmed' = cellsArmed,
+    reprobeCongruentAll' = reprobeCongruentAll,
+    probeUnchargedOn429All' = probeUnchargedOn429All,
+    anyTenantHitServesAll' = anyTenantHitServesAll,
+    localServeVisibleAll' = localServeVisibleAll,
+    walkFoldSeen' = walkFoldSeen,
+  }
+  /// Walk latches unchanged (the observe step's frame — observing
+  /// cells decides nothing).
+  action walkLatchesUnchanged = all {
+    reprobeCongruentAll' = reprobeCongruentAll,
+    probeUnchargedOn429All' = probeUnchargedOn429All,
+    anyTenantHitServesAll' = anyTenantHitServesAll,
+    localServeVisibleAll' = localServeVisibleAll,
+    walkFoldSeen' = walkFoldSeen,
   }
   /// Job-core vars unchanged.
   action jobCoreUnchanged = all {
@@ -2437,6 +2532,154 @@ module materializationJob {
     noVacuousCoverageAll' = true,
     everContrib' = tuples(BUILDS, DRVS).mapBy(p => Set()),
     leafReevalReleased' = false,
+    walkCells' = emptyCells,
+    cellsArmed' = false,
+    reprobeCongruentAll' = true,
+    probeUnchargedOn429All' = true,
+    anyTenantHitServesAll' = true,
+    localServeVisibleAll' = true,
+    walkFoldSeen' = false,
+  }
+
+  // --- 8b. slot-10 walk-fold seat + callers ----------------------------------
+
+  /// The full machine frozen (the plane branches' frame): the plane
+  /// reads nothing from and writes nothing to the job machine.
+  action machineFrame = all {
+    jobCoreUnchanged,
+    relUnchanged,
+    storeUnchanged,
+    ledgerUnchanged,
+    envUnchanged,
+    tenureUnchanged,
+    ghostsUnchanged,
+    a4Unchanged,
+  }
+
+  /// The visible-local-row predicate over the ARMED cells (bug_115's
+  /// lawful serve source).
+  val armedLocalVisible: bool = OUTPUTS.exists(p => and {
+    walkCells.localPresent.contains(p),
+    TENANTS.exists(t => walkCells.localVisible.contains((t, p))),
+  })
+
+  /// fold_path_reprobes' quantifier over the ARMED cells: exists path
+  /// missing under EVERY tenant (bug_299's lawful ConfirmedMissing).
+  val armedConfirmedMissing: bool = and {
+    walkCells.served == Set(),
+    OUTPUTS.exists(p => TENANTS.forall(t => walkCells.missing.contains((t, p)))),
+  }
+
+  /// The curated evaluation matrices: the four laws' full decision
+  /// partition (every partition class of every law appears, including
+  /// every calibration twin's violation cell). Curated rather than
+  /// drawn from six powersets: the powerset draw ran ~32x slower per
+  /// simulator trace (40 ms vs 1.3 ms measured — the slot-7
+  /// eternal-gate class), and the laws' evidence scales with
+  /// partition coverage, not raw matrix count; the TLC calibration
+  /// pins enumerate this set exhaustively at shallow depth.
+  pure val WALK_MATRICES: Set[WalkCells] = Set(
+    emptyCells,
+    // bug_299 defining cell: complementary coverage.
+    { ...emptyCells, missing: Set(("tA", "o1"), ("tB", "o2")) },
+    // common missing path (ConfirmedMissing truth).
+    { ...emptyCells, missing: Set(("tA", "o1"), ("tB", "o1")) },
+    // everything missing everywhere.
+    { ...emptyCells, missing: Set(("tA", "o1"), ("tA", "o2"), ("tB", "o1"), ("tB", "o2")) },
+    // one tenant missing both paths, the other clean.
+    { ...emptyCells, missing: Set(("tA", "o1"), ("tA", "o2")) },
+    // a serving tenant, nothing else.
+    { ...emptyCells, served: Set("tA") },
+    // merged_bug_133 cell: a charging tenant beside a serving one.
+    { ...emptyCells, served: Set("tB"), charging: Set("tA") },
+    // bug_295 cell: rate-limited only.
+    { ...emptyCells, rateLimited: Set("tA", "tB") },
+    // rate-limited beside charging (charge lawfully wins).
+    { ...emptyCells, rateLimited: Set("tA"), charging: Set("tB") },
+    // charging only.
+    { ...emptyCells, charging: Set("tA") },
+    // bug_115 cell: a present row with NO visible cell.
+    { ...emptyCells, localPresent: Set("o1") },
+    // present + visible (the lawful local serve).
+    { ...emptyCells, localPresent: Set("o1"), localVisible: Set(("tA", "o1")) },
+    // visible cell exists but NOT for a present path (alignment).
+    { ...emptyCells, localPresent: Set("o1"), localVisible: Set(("tB", "o2")) },
+    // mixed: a hit beside a visible row, a miss, and a 429.
+    { served: Set("tA"), localPresent: Set("o2"),
+      localVisible: Set(("tB", "o2")), missing: Set(("tB", "o1")),
+      rateLimited: Set("tB"), charging: Set() },
+    // complementary coverage beside a 429 (299 x 295 interaction).
+    { ...emptyCells, missing: Set(("tA", "o1"), ("tB", "o2")), rateLimited: Set("tA") },
+    // common missing beside a 429.
+    { ...emptyCells, missing: Set(("tA", "o2"), ("tB", "o2")), rateLimited: Set("tB") }
+  )
+
+  /// Record one evaluation's raw cells (parameterized so the run pins
+  /// and the twins can arm literal matrices).
+  action walkObserve(cells: WalkCells): bool = all {
+    ENABLE_WALK_FOLD,
+    not(cellsArmed),
+    walkCells' = cells,
+    cellsArmed' = true,
+    walkLatchesUnchanged,
+  }
+
+  /// One curated evaluation.
+  action walkObserveAny = {
+    nondet cells = WALK_MATRICES.oneOf()
+    walkObserve(cells)
+  }
+
+  /// Walk-fold seat (§8a): the caller passes its four FOLD DECISIONS
+  /// (bool-only); the seat recomputes each law from the ARMED CELLS
+  /// (live state, P4) and accumulates the latches. Consumes the armed
+  /// evaluation.
+  action walkFoldApply(
+    decideServe: bool,
+    decideLocalServe: bool,
+    decideConfirmedMissing: bool,
+    decideCharge: bool
+  ): bool = all {
+    cellsArmed,
+    walkFoldSeen' = true,
+    cellsArmed' = false,
+    walkCells' = emptyCells,
+    // merged_bug_133: a serving tenant is never starved by the fold.
+    anyTenantHitServesAll' = and {
+      anyTenantHitServesAll,
+      (walkCells.served != Set()) implies decideServe,
+    },
+    // bug_115: a local serve requires a gate-visible cell.
+    localServeVisibleAll' = and {
+      localServeVisibleAll,
+      decideLocalServe implies armedLocalVisible,
+    },
+    // bug_299: ConfirmedMissing iff the per-path quantifier over the
+    // raw cells — never a per-tenant pre-fold.
+    reprobeCongruentAll' = and {
+      reprobeCongruentAll,
+      decideConfirmedMissing iff armedConfirmedMissing,
+    },
+    // bug_295: all-429, nothing charging, nothing served closes
+    // uncharged (congruence per CLASS through the one truth table).
+    probeUnchargedOn429All' = and {
+      probeUnchargedOn429All,
+      and {
+        walkCells.rateLimited != Set(),
+        walkCells.charging == Set(),
+        walkCells.served == Set(),
+      } implies not(decideCharge),
+    },
+  }
+
+  /// The LIVE fold: decisions derived lawfully from the armed cells.
+  action walkFold = all {
+    walkFoldApply(
+      or { walkCells.served != Set(), armedLocalVisible },
+      armedLocalVisible,
+      armedConfirmedMissing,
+      and { walkCells.charging != Set(), walkCells.served == Set() }
+    ),
   }
 
   // --- 10. step --------------------------------------------------------------------
@@ -2453,6 +2696,10 @@ module materializationJob {
     nondet rel = Set(RVouched, RPending, RChildlessLeaf, RHoled).oneOf()
     nondet refsMissing = Set(true, false).oneOf()
     any {
+      // the machine moves, the walk plane frozen (slot 10: the plane
+      // composes at the STEP level so no machine action is edited).
+      all {
+        any {
       recordWantedRelation(b, d, outs),
       legacyBuildArrives(b, d),
       createJob(d, origin, b),
@@ -2485,20 +2732,52 @@ module materializationJob {
       storeGc(d, o),
       upstreamChange(d, o),
       durableRelationChange(d, rel),
+        },
+        walkUnchanged,
+      },
+      all { walkObserveAny, machineFrame },
+      all { walkFold, machineFrame },
     }
   }
 
   // --- 11. runs (deterministic scenario pins) -----------------------------------
 
+  /// Slot-10: the bug_299 defining cell — complementary coverage (tA
+  /// missing o1 only, tB missing o2 only: each tenant misses
+  /// SOMETHING, no path is missing under BOTH). The lawful fold
+  /// answers Obtainable and every walk latch holds; the pre-fix
+  /// whole-set projection folded ConfirmedMissing here (the mat-299
+  /// calibration re-finds it). Runs under the walk regime.
+  run walkFoldComplementaryCoverageRun = {
+    init
+      .then(all {
+        walkObserve({
+          served: Set(), localPresent: Set(), localVisible: Set(),
+          missing: Set(("tA", "o1"), ("tB", "o2")),
+          rateLimited: Set(), charging: Set(),
+        }),
+        machineFrame,
+      })
+      .then(all { walkFold, machineFrame })
+      .expect(and {
+        walkFoldSeen,
+        not(cellsArmed),
+        reprobeCongruentAll,
+        probeUnchargedOn429All,
+        anyTenantHitServesAll,
+        localServeVisibleAll,
+      })
+  }
+
   /// The §9.1 happy path: relation, probe-origin job, claim, ingest,
   /// success consumption -> resolved_success, node Completed, pinned.
   run happyPathRun = {
     init
-      .then(recordWantedRelation("b1", "d1", Set("o1")))
-      .then(createJob("d1", OProbe, "b1"))
-      .then(claimJob("d1", "r1"))
-      .then(executeStep("d1", "o1"))
-      .then(consumeSuccess("d1"))
+      .then(all { recordWantedRelation("b1", "d1", Set("o1")), walkUnchanged })
+      .then(all { createJob("d1", OProbe, "b1"), walkUnchanged })
+      .then(all { claimJob("d1", "r1"), walkUnchanged })
+      .then(all { executeStep("d1", "o1"), walkUnchanged })
+      .then(all { consumeSuccess("d1"), walkUnchanged })
       .expect(and {
         match jobs.get("d1") {
           | NoJob => false
@@ -2517,12 +2796,12 @@ module materializationJob {
   /// the count; the re-evaluation resolves a Vouched park from source.
   run parkSplitRun = {
     init
-      .then(recordWantedRelation("b1", "d1", Set("o1")))
-      .then(createJob("d1", OProbe, "b1"))
-      .then(claimJob("d1", "r1"))
-      .then(reportInfra("d1"))
-      .then(claimJob("d1", "r1"))
-      .then(reportInfra("d1"))
+      .then(all { recordWantedRelation("b1", "d1", Set("o1")), walkUnchanged })
+      .then(all { createJob("d1", OProbe, "b1"), walkUnchanged })
+      .then(all { claimJob("d1", "r1"), walkUnchanged })
+      .then(all { reportInfra("d1"), walkUnchanged })
+      .then(all { claimJob("d1", "r1"), walkUnchanged })
+      .then(all { reportInfra("d1"), walkUnchanged })
       .expect(and {
         match jobs.get("d1") {
           | NoJob => false
@@ -2532,19 +2811,19 @@ module materializationJob {
         stalledJobs == Set("d1"),
         view.get("d1") == VPending(true),
       })
-      .then(parkBackoffExpires("d1"))
+      .then(all { parkBackoffExpires("d1"), walkUnchanged })
       .expect(match jobs.get("d1") {
         | NoJob => false
         | SomeJob(j) => not(j.parked) and j.matInfraCount == 2
       })
-      .then(claimJob("d1", "r2"))
-      .then(reportInfra("d1"))
+      .then(all { claimJob("d1", "r2"), walkUnchanged })
+      .then(all { reportInfra("d1"), walkUnchanged })
       .expect(match jobs.get("d1") {
         | NoJob => false
         | SomeJob(j) => j.parked and j.matInfraCount == 3
       })
-      .then(durableRelationChange("d1", RVouched))
-      .then(parkReevaluate("d1"))
+      .then(all { durableRelationChange("d1", RVouched), walkUnchanged })
+      .then(all { parkReevaluate("d1"), walkUnchanged })
       .expect(and {
         match jobs.get("d1") {
           | NoJob => false
@@ -2560,12 +2839,12 @@ module materializationJob {
   /// The fail-fast consumes the mark.
   run prunedFailFastRun = {
     init
-      .then(recordWantedRelation("b1", "d1", Set("o1")))
-      .then(createJob("d1", OPruned, "b1"))
+      .then(all { recordWantedRelation("b1", "d1", Set("o1")), walkUnchanged })
+      .then(all { createJob("d1", OPruned, "b1"), walkUnchanged })
       .expect(topdownPruned.get("d1"))
-      .then(upstreamChange("d1", "o1"))
-      .then(claimJob("d1", "r1"))
-      .then(consumeUnobtainable("d1", Set("o1"), false))
+      .then(all { upstreamChange("d1", "o1"), walkUnchanged })
+      .then(all { claimJob("d1", "r1"), walkUnchanged })
+      .then(all { consumeUnobtainable("d1", Set("o1"), false), walkUnchanged })
       .expect(and {
         nodeStatus.get("d1") == NFailed,
         failFastCount.get("d1") == 1,
@@ -2583,11 +2862,11 @@ module materializationJob {
   /// dispatches from source.
   run unmarkedArm3FromSourceRun = {
     init
-      .then(recordWantedRelation("b1", "d1", Set("o1")))
-      .then(createJob("d1", OProbe, "b1"))
-      .then(upstreamChange("d1", "o1"))
-      .then(claimJob("d1", "r1"))
-      .then(consumeUnobtainable("d1", Set("o1"), false))
+      .then(all { recordWantedRelation("b1", "d1", Set("o1")), walkUnchanged })
+      .then(all { createJob("d1", OProbe, "b1"), walkUnchanged })
+      .then(all { upstreamChange("d1", "o1"), walkUnchanged })
+      .then(all { claimJob("d1", "r1"), walkUnchanged })
+      .then(all { consumeUnobtainable("d1", Set("o1"), false), walkUnchanged })
       .expect(and {
         nodeStatus.get("d1") == NReady,
         failFastCount.get("d1") == 0,
@@ -2597,8 +2876,8 @@ module materializationJob {
           | SomeJob(j) => j.state == JResolvedFromSource
         },
       })
-      .then(builderPull("d1", "w1"))
-      .then(dispatchFromSource("d1"))
+      .then(all { builderPull("d1", "w1"), walkUnchanged })
+      .then(all { dispatchFromSource("d1"), walkUnchanged })
       .expect(nodeStatus.get("d1") == NCompleted)
   }
 
@@ -2609,9 +2888,9 @@ module materializationJob {
   /// kernel's A11 arm is deleted).
   run markedClaimUpgradeRun = {
     init
-      .then(recordWantedRelation("b1", "d1", Set("o1")))
-      .then(createJob("d1", OPruned, "b1"))
-      .then(claimJob("d1", "r1"))
+      .then(all { recordWantedRelation("b1", "d1", Set("o1")), walkUnchanged })
+      .then(all { createJob("d1", OPruned, "b1"), walkUnchanged })
+      .then(all { claimJob("d1", "r1"), walkUnchanged })
       .expect(and {
         topdownPruned.get("d1"),
         match attempts.get("d1") {
@@ -2626,9 +2905,9 @@ module materializationJob {
   /// tenant-resolvable at creation commit.
   run legacyBackfillRun = {
     init
-      .then(legacyBuildArrives("b1", "d1"))
+      .then(all { legacyBuildArrives("b1", "d1"), walkUnchanged })
       .expect(liveWanted("d1") == Set())
-      .then(createJob("d1", OProbe, "b1"))
+      .then(all { createJob("d1", OProbe, "b1"), walkUnchanged })
       .expect(and {
         wanted.get(("b1", "d1")) == OUTPUTS,
         not(legacyInterest.get(("b1", "d1"))),
@@ -2642,18 +2921,18 @@ module materializationJob {
   /// resets to Queued in the same action.
   run staleResetRun = {
     init
-      .then(recordWantedRelation("b1", "d1", Set("o1")))
-      .then(createJob("d1", OProbe, "b1"))
-      .then(claimJob("d1", "r1"))
-      .then(executeStep("d1", "o1"))
-      .then(consumeSuccess("d1"))
+      .then(all { recordWantedRelation("b1", "d1", Set("o1")), walkUnchanged })
+      .then(all { createJob("d1", OProbe, "b1"), walkUnchanged })
+      .then(all { claimJob("d1", "r1"), walkUnchanged })
+      .then(all { executeStep("d1", "o1"), walkUnchanged })
+      .then(all { consumeSuccess("d1"), walkUnchanged })
       .expect(nodeStatus.get("d1") == NCompleted)
-      .then(buildTerminal("b1"))
-      .then(releasePins("d1"))
-      .then(storeGc("d1", "o1"))
+      .then(all { buildTerminal("b1"), walkUnchanged })
+      .then(all { releasePins("d1"), walkUnchanged })
+      .then(all { storeGc("d1", "o1"), walkUnchanged })
       .expect(not(present.get(("d1", "o1"))))
-      .then(recordWantedRelation("b2", "d1", Set("o1")))
-      .then(createJob("d1", OStaleReset, "b2"))
+      .then(all { recordWantedRelation("b2", "d1", Set("o1")), walkUnchanged })
+      .then(all { createJob("d1", OStaleReset, "b2"), walkUnchanged })
       .expect(and {
         nodeStatus.get("d1") == NQueued,
         match jobs.get("d1") {
@@ -2673,10 +2952,10 @@ module materializationJob {
   /// (mat-unscoped-count preserves that encoding).
   run twoJobFreshWindowRun = {
     init
-      .then(recordWantedRelation("b1", "d1", Set("o1")))
-      .then(createJob("d1", OProbe, "b1"))
-      .then(claimJob("d1", "r1"))
-      .then(reportInfra("d1"))
+      .then(all { recordWantedRelation("b1", "d1", Set("o1")), walkUnchanged })
+      .then(all { createJob("d1", OProbe, "b1"), walkUnchanged })
+      .then(all { claimJob("d1", "r1"), walkUnchanged })
+      .then(all { reportInfra("d1"), walkUnchanged })
       .expect(match jobs.get("d1") {
         | NoJob => false
         | SomeJob(j) => j.state == JPending and not(j.parked) and j.matInfraCount == 1
@@ -2684,9 +2963,9 @@ module materializationJob {
       // kill the upstream so the next report's missing path is
       // evidence-backed, then resolve job 1 from source (arm 3,
       // RBroken + unmarked).
-      .then(upstreamChange("d1", "o1"))
-      .then(claimJob("d1", "r1"))
-      .then(consumeUnobtainable("d1", Set("o1"), false))
+      .then(all { upstreamChange("d1", "o1"), walkUnchanged })
+      .then(all { claimJob("d1", "r1"), walkUnchanged })
+      .then(all { consumeUnobtainable("d1", Set("o1"), false), walkUnchanged })
       .expect(match jobs.get("d1") {
         | NoJob => false
         | SomeJob(j) => j.state == JResolvedFromSource
@@ -2694,9 +2973,9 @@ module materializationJob {
       // job 2: the creation reset starts a FRESH per-job window — its
       // first infra charge re-arms (count 1 < MAT_BUDGET 2), where the
       // pre-fix flat history count (already 2 by job 1) would park.
-      .then(createJob("d1", OProbe, "b1"))
-      .then(claimJob("d1", "r2"))
-      .then(reportInfra("d1"))
+      .then(all { createJob("d1", OProbe, "b1"), walkUnchanged })
+      .then(all { claimJob("d1", "r2"), walkUnchanged })
+      .then(all { reportInfra("d1"), walkUnchanged })
       .expect(and {
         match jobs.get("d1") {
           | NoJob => false
@@ -2711,16 +2990,16 @@ module materializationJob {
   /// population instead of re-listing forever.
   run establishmentParkRun = {
     init
-      .then(recordWantedRelation("b1", "d1", Set("o1")))
-      .then(createJob("d1", OProbe, "b1"))
-      .then(claimJob("d1", "r1"))
-      .then(establishCrashedAttempt("d1"))
+      .then(all { recordWantedRelation("b1", "d1", Set("o1")), walkUnchanged })
+      .then(all { createJob("d1", OProbe, "b1"), walkUnchanged })
+      .then(all { claimJob("d1", "r1"), walkUnchanged })
+      .then(all { establishCrashedAttempt("d1"), walkUnchanged })
       .expect(match jobs.get("d1") {
         | NoJob => false
         | SomeJob(j) => j.state == JPending and not(j.parked) and j.matInfraCount == 1
       })
-      .then(claimJob("d1", "r1"))
-      .then(establishCrashedAttempt("d1"))
+      .then(all { claimJob("d1", "r1"), walkUnchanged })
+      .then(all { establishCrashedAttempt("d1"), walkUnchanged })
       .expect(and {
         match jobs.get("d1") {
           // MAT_BUDGET = 2 in every regime: the second establishment
@@ -2734,9 +3013,9 @@ module materializationJob {
 
   run reprobeResetRun = {
     init
-      .then(recordWantedRelation("b1", "d1", Set("o1")))
-      .then(durableRelationChange("d1", RVouched))
-      .then(createJob("d1", OReprobe, "b1"))
+      .then(all { recordWantedRelation("b1", "d1", Set("o1")), walkUnchanged })
+      .then(all { durableRelationChange("d1", RVouched), walkUnchanged })
+      .then(all { createJob("d1", OReprobe, "b1"), walkUnchanged })
       .expect(and {
         nodeStatus.get("d1") == NQueued,
         match jobs.get("d1") {
@@ -2751,15 +3030,15 @@ module materializationJob {
   /// post-failover liveness the B3 fix restored).
   run failoverRedialRun = {
     init
-      .then(recordWantedRelation("b1", "d1", Set("o1")))
-      .then(createJob("d1", OProbe, "b1"))
-      .then(failover)
+      .then(all { recordWantedRelation("b1", "d1", Set("o1")), walkUnchanged })
+      .then(all { createJob("d1", OProbe, "b1"), walkUnchanged })
+      .then(all { failover, walkUnchanged })
       .expect(and {
         channelStale.get("r1"),
         view.get("d1") == VPending(false),
       })
-      .then(redialChannel("r1"))
-      .then(claimJob("d1", "r1"))
+      .then(all { redialChannel("r1"), walkUnchanged })
+      .then(all { claimJob("d1", "r1"), walkUnchanged })
       .expect(and {
         claimAfterFailover,
         match attempts.get("d1") {
@@ -2774,14 +3053,14 @@ module materializationJob {
   /// re-delivers to its holder.
   run failoverViewRebuildRun = {
     init
-      .then(recordWantedRelation("b1", "d1", Set("o1")))
-      .then(createJob("d1", OProbe, "b1"))
-      .then(claimJob("d1", "r1"))
-      .then(reportInfra("d1"))
-      .then(claimJob("d1", "r1"))
-      .then(reportInfra("d1"))
+      .then(all { recordWantedRelation("b1", "d1", Set("o1")), walkUnchanged })
+      .then(all { createJob("d1", OProbe, "b1"), walkUnchanged })
+      .then(all { claimJob("d1", "r1"), walkUnchanged })
+      .then(all { reportInfra("d1"), walkUnchanged })
+      .then(all { claimJob("d1", "r1"), walkUnchanged })
+      .then(all { reportInfra("d1"), walkUnchanged })
       .expect(view.get("d1") == VPending(true))
-      .then(failover)
+      .then(all { failover, walkUnchanged })
       .expect(and {
         view.get("d1") == VPending(true),
         unresolvedJobAlwaysArmed,
@@ -2818,6 +3097,8 @@ module materializationJobBase {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).*
 }
@@ -2841,6 +3122,8 @@ module materializationJobBaseEx {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).*
 }
@@ -2864,6 +3147,8 @@ module materializationJobFailover {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).*
 }
@@ -2886,6 +3171,8 @@ module materializationJobFailoverEx {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).*
 }
@@ -2909,6 +3196,8 @@ module materializationJobAdversarialStore {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).*
 }
@@ -2931,6 +3220,8 @@ module materializationJobAdversarialStoreEx {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).*
 }
@@ -2955,6 +3246,8 @@ module materializationJobStaleTenure {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = true,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).*
 }
@@ -2977,6 +3270,8 @@ module materializationJobStaleTenureEx {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = true,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).*
 }
@@ -3005,6 +3300,8 @@ module materializationJobCrashLoop {
     ENABLE_CRASH = true,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).*
 }
@@ -3027,6 +3324,8 @@ module materializationJobCrashLoopEx {
     ENABLE_CRASH = true,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).*
 }
@@ -3054,6 +3353,8 @@ module materializationJobResolveFaults {
     ENABLE_CRASH = true,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = true,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).*
 }
@@ -3082,6 +3383,35 @@ module materializationJobWorkerAbort {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = true
+  ).*
+}
+
+/// Slot-10 walk-fold regime: the base scope with the plane enabled —
+/// the four kernel-fold laws' live home (holds + runs + the
+/// reachability witness; the four mat-* walk calibrations bind the
+/// same scope with one perturbed decision).
+module materializationJobWalkFold {
+  import materializationJob(
+    BUILDS = Set("b1", "b2"),
+    DRVS = Set("d1"),
+    OUTPUTS = Set("o1", "o2"),
+    REPLICAS = Set("r1", "r2"),
+    BUILDERS = Set("w1"),
+    MAT_BUDGET = 2,
+    MAX_EXECS = 4,
+    MAX_GEN = 0,
+    MAX_UPSTREAM_FLIPS = 2,
+    MAX_LEGACY = 0,
+    ENABLE_FAILOVER = false,
+    ENABLE_GC = false,
+    ENABLE_CRASH = false,
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = true,
+    ENABLE_WORKER_ABORTED = false
   ).*
 }

@@ -42,6 +42,8 @@ module matCalibHeadStarvation {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
@@ -56,19 +58,19 @@ module matCalibHeadStarvation {
   run headStarvationRun = {
     init
       // the head: d1's job parks at the budget (two infra charges).
-      .then(recordWantedRelation("b1", "d1", Set("o1")))
-      .then(createJob("d1", OProbe, "b1"))
-      .then(claimJob("d1", "r1"))
-      .then(reportInfra("d1"))
-      .then(claimJob("d1", "r1"))
-      .then(reportInfra("d1"))
+      .then(all { recordWantedRelation("b1", "d1", Set("o1")), walkUnchanged })
+      .then(all { createJob("d1", OProbe, "b1"), walkUnchanged })
+      .then(all { claimJob("d1", "r1"), walkUnchanged })
+      .then(all { reportInfra("d1"), walkUnchanged })
+      .then(all { claimJob("d1", "r1"), walkUnchanged })
+      .then(all { reportInfra("d1"), walkUnchanged })
       .expect(match jobs.get("d1") {
         | NoJob => false
         | SomeJob(j) => j.state == JPending and j.parked
       })
       // the younger claimable job behind it.
-      .then(recordWantedRelation("b2", "d2", Set("o2")))
-      .then(createJob("d2", OProbe, "b2"))
+      .then(all { recordWantedRelation("b2", "d2", Set("o2")), walkUnchanged })
+      .then(all { createJob("d2", OProbe, "b2"), walkUnchanged })
       .expect(and {
         match jobs.get("d2") {
           | NoJob => false
@@ -80,7 +82,7 @@ module matCalibHeadStarvation {
       })
       // THE FIX: the as-built claim (listing window decoupled,
       // in-pass refusal skip) claims d2 from the SAME state.
-      .then(claimJob("d2", "r2"))
+      .then(all { claimJob("d2", "r2"), walkUnchanged })
       .expect(match attempts.get("d2") {
         | NoAttempt => false
         | OpenAttempt(a) => a.kind == KMaterialization

@@ -38,6 +38,8 @@ module matCalibPp4EstablishBuildCharge {
     ENABLE_CRASH = true,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
@@ -95,32 +97,35 @@ module matCalibPp4EstablishBuildCharge {
     nondet missing = OUTPUTS.powerset().oneOf()
     nondet rel = Set(RVouched, RPending, RChildlessLeaf, RHoled).oneOf()
     nondet refsMissing = Set(true, false).oneOf()
-    any {
-      recordWantedRelation(b, d, outs),
-      legacyBuildArrives(b, d),
-      createJob(d, origin, b),
-      dedupRefeed(d),
-      claimJob(d, replica),
-      executeStep(d, o),
-      consumeSuccess(d),
-      consumeUnobtainable(d, missing, refsMissing),
-      reportInfra(d),
-      calibEstablishWritesBuildCrash(d),
-      cancelOnZeroInterest(d),
-      obsoleteOnProduced(d),
-      parkReevaluate(d),
-      parkBackoffExpires(d),
-      buildTerminal(b),
-      builderPull(d, builder),
-      dispatchFromSource(d),
-      completeReadyFromStore(d),
-      failover,
-      redialChannel(replica),
-      staleTenureWriteDiscarded(d),
-      releasePins(d),
-      storeGc(d, o),
-      upstreamChange(d, o),
-      durableRelationChange(d, rel),
+    all {
+      any {
+        recordWantedRelation(b, d, outs),
+        legacyBuildArrives(b, d),
+        createJob(d, origin, b),
+        dedupRefeed(d),
+        claimJob(d, replica),
+        executeStep(d, o),
+        consumeSuccess(d),
+        consumeUnobtainable(d, missing, refsMissing),
+        reportInfra(d),
+        calibEstablishWritesBuildCrash(d),
+        cancelOnZeroInterest(d),
+        obsoleteOnProduced(d),
+        parkReevaluate(d),
+        parkBackoffExpires(d),
+        buildTerminal(b),
+        builderPull(d, builder),
+        dispatchFromSource(d),
+        completeReadyFromStore(d),
+        failover,
+        redialChannel(replica),
+        staleTenureWriteDiscarded(d),
+        releasePins(d),
+        storeGc(d, o),
+        upstreamChange(d, o),
+        durableRelationChange(d, rel),
+      },
+      walkUnchanged,
     }
   }
 }

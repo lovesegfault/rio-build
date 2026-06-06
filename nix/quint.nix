@@ -172,6 +172,18 @@ let
     "abortNeverCharges"
   ];
 
+  # Slot-10 walk-fold plane (threaded into materializationJob behind
+  # ENABLE_WALK_FOLD; the materializationJobWalkFold regime module
+  # arms it — existing regimes bind it false and stay
+  # state-space-identical). The four kernel-fold laws; calibration
+  # pairs: quint-materialization-calib-{299,295,133,115}-*.
+  walkFoldInvariants = [
+    "reprobeCongruentWithCompletability"
+    "rateLimitedProbeDrawsNoBudget"
+    "hitUnderAnyTenantOrderSucceeds"
+    "verifiedPathsVisibleToInterest"
+  ];
+
   # The leader-election model as its own single-file store path (the
   # same narrowing mkQuintCheck's src uses): the conformance check
   # depends on the model's content, not on whatever tree unfilteredRoot
@@ -4892,6 +4904,34 @@ rec {
       maxSteps = 15;
     };
 
+    # Slot-10 walk-fold plane: the four kernel-fold laws hold under
+    # the composed step (machine moves XOR one fold evaluates), PLUS
+    # the full machine conjunction under the armed regime — composition
+    # broke nothing. Falsifiability pairs:
+    # quint-materialization-calib-{299,295,133,115}-* below; the
+    # walk-fold reachability witness keeps the plane non-vacuous.
+    # r[verify store.materialize.local-visibility]
+    # r[verify store.materialize.probe-polarity]
+    # r[verify store.materialize.tenant-fold]
+    # r[verify sched.materialize.reprobe-per-path]
+    quint-materialization-holds-walk-fold = mkQuintSimHoldsCheck {
+      name = "materialization-holds-walk-fold";
+      spec = "materializationJob";
+      main = "materializationJobWalkFold";
+      invariants = matJobInvariants ++ walkFoldInvariants;
+      maxSamples = 2000000;
+      maxSteps = 15;
+    };
+    # The walk-fold deterministic pin: the bug_299 defining cell
+    # (complementary coverage folds Obtainable under the lawful
+    # quantifier).
+    quint-materialization-runs-walk-fold = mkQuintRunCheck {
+      name = "materialization-runs-walk-fold";
+      spec = "materializationJob";
+      main = "materializationJobWalkFold";
+      match = "walkFoldComplementaryCoverageRun";
+    };
+
     # Non-vacuity witnesses (rust simulator; expect-violation). Every
     # §9.1 property's contended scenario + every delta's new behavior
     # stays demonstrably reachable. No tracey markers on witnesses.
@@ -5499,6 +5539,61 @@ rec {
       extraSpecs = [ "materializationJob" ];
       step = "calibStep";
       witness = "atMostOneClaimWinner";
+    };
+
+    # ------------------------------------------------------------------
+    # Slot-10 walk-fold calibrations (the four kernel-fold laws'
+    # falsifiability pairs) + the plane's reachability witness. All
+    # five run the threaded model's composed step; the perturbed
+    # decision routes through the SAME walkFoldApply seat (P5).
+    # ------------------------------------------------------------------
+    # bug_299: the whole-set per-tenant projection folds
+    # ConfirmedMissing on the complementary-coverage matrix.
+    quint-materialization-calib-299-wholeset-projection = mkQuintWitnessCheck {
+      name = "materialization-calib-299-wholeset-projection";
+      spec = "calibration/mat-299-wholeset-projection";
+      main = "matCalibWholesetProjection";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "reprobeCongruentWithCompletability";
+    };
+    # bug_295: the probe leg's terminal 429 charged like a 5xx — the
+    # park-burning harm case.
+    quint-materialization-calib-295-probe-charged = mkQuintWitnessCheck {
+      name = "materialization-calib-295-probe-charged";
+      spec = "calibration/mat-295-probe-charged";
+      main = "matCalibProbeCharged";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "rateLimitedProbeDrawsNoBudget";
+    };
+    # merged_bug_133: the in-loop return starves the serving tenant
+    # behind a charging one.
+    quint-materialization-calib-133-inloop-return = mkQuintWitnessCheck {
+      name = "materialization-calib-133-inloop-return";
+      spec = "calibration/mat-133-inloop-return";
+      main = "matCalibInloopReturn";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "hitUnderAnyTenantOrderSucceeds";
+    };
+    # bug_115: raw physical presence serves a gate-hidden local row.
+    quint-materialization-calib-115-tenantblind-present = mkQuintWitnessCheck {
+      name = "materialization-calib-115-tenantblind-present";
+      spec = "calibration/mat-115-tenantblind-present";
+      main = "matCalibTenantblindPresent";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "verifiedPathsVisibleToInterest";
+    };
+    # The hazard-www vacuity guard: a fold IS evaluated under the
+    # composed step (expect-violation of the never-folded claim), so
+    # the four latches above are exercised, never vacuous.
+    quint-materialization-witness-walk-fold-reachable = mkQuintWitnessCheck {
+      name = "materialization-witness-walk-fold-reachable";
+      spec = "materializationJob";
+      main = "materializationJobWalkFold";
+      witness = "noWalkFoldEvaluated";
     };
 
     # ------------------------------------------------------------------

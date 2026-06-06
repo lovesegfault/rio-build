@@ -42,6 +42,8 @@ module matCalibUnionDropped {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
@@ -71,10 +73,13 @@ module matCalibUnionDropped {
     nondet d = DRVS.oneOf()
     nondet b = BUILDS.oneOf()
     nondet outs = OUTPUTS.powerset().oneOf()
-    any {
-      // the override REPLACES recordWantedRelation
-      calibRecordWantedOverwrite(b, d, outs),
-      buildTerminal(b),
+    all {
+      any {
+        // the override REPLACES recordWantedRelation
+        calibRecordWantedOverwrite(b, d, outs),
+        buildTerminal(b),
+      },
+      walkUnchanged,
     }
   }
 }

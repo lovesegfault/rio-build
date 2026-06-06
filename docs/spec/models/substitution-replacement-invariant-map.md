@@ -2196,3 +2196,64 @@ indeterminate (upstream 5xx/timeout/429)")` — the method-split
 re-pinned from the indeterminate lane to the rate_limited lane. The
 existing `upstream_5xx_reports_infra_failure` stays green via the GET
 lane (congruence's other half).
+
+### Slot-10 C-E records — constructible-only-valid values (fork 2)
+
+| id | chokepoint | recorded red (verbatim) |
+|---|---|---|
+| bug_115 | `visibility_verdict(owned, any_built, sig_trusted)` in rio-evidence-kernel (K4-swept, incl. the lazy-caller dominance facts) + `rio-store/src/visibility.rs` as the ONE projection body shared by the gRPC gates and the walk + `LocalPresence::Present` requiring the `TenantVisible` witness (tenant-blind Present uncompilable); gate-hidden rows degrade to the per-tenant substitute lane; trusted set memoized per (job, tenant) | `expected Unobtainable (gate-hidden local row must degrade), got MaterializationOutcome { outcome: Some(Success(Success { ingested_paths: [], verified_paths: ["/nix/store/8888…-vis-untrusted"] })) }` — both cells (untrusted-sig, built-by-another) |
+| merged_bug_243 | `rio_common::dns::Dns1123Label` — one alphabet, one sanitizer (`sanitize(raw, reserved, stem)` budgets the worker suffix INSIDE the 63-char bound), one composer (`with_worker`, total past the budget); transport APIs take `&Dns1123Label`; the scheduler validator re-exports the SAME `is_dns1123_label` | `composed identity must be a DNS-1123 label, got 66 chars: "aaa…aaa-w0"` + proptest over raws × workers. Deploy-boundary trade: 59–63-char raws now truncate+salt (identity changes once; establishment sweep absorbs) |
+| bug_244 | `OUTCOME_LABELS` const + exhaustive `outcome_label()` (the only variant→label map); seed loop iterates the const; HELP stays a scraper-visible literal GATE-CHECKED by a local-recorder drift test (a derived expression provably DROPPED the metric from docs/gen/metrics.json — the scraper is a regex over describe callsites) | seed tier: `emit produces "retry_later" but OUTCOME_LABELS does not seed it`; HELP tier: `HELP must name "aborted"; alphabet text drifted` |
+| bug_159 | `MonotoneProgress` — job-level high-water adapter, the ONLY constructor of per-path progress callbacks (raw callback moved in; unclamped emission unwritable); pure `clamp_progress` law proptest-swept over arbitrary candidate traces | `left: [(100, 100), (220, 300), (110, 300), (280, 300), (300, 300)] / right: […(220, 300)…]` — the (110, 300) regression event on the stall-failover trace |
+
+### Slot-10 formal delta — the walk-fold plane (threaded into materializationJob)
+
+The executor's per-(tenant, path) fold semantics, THREADED into the job
+machine behind `ENABLE_WALK_FOLD` (a first-attempt wrapper module was
+rejected by the quint-policy lint itself: the directive binds to the
+file's FIRST module, and cross-file invariant-leaf read-sets come back
+empty — P5/P1). The seven plane vars ride every module's state vector,
+but under `ENABLE_WALK_FOLD = false` (every pre-existing regime and
+calibration) both arming actions guard on the const, so the plane
+components are constant after init and the reachable state count is
+unchanged; the gate's TLC calibration pins and holds conjunctions
+re-run green over exactly those regimes, enforcing this every gate.
+The machine's inner actions are never edited — the plane composes at
+the STEP level (machine moves under `walkUnchanged` XOR one plane
+action under `machineFrame`). Two-step ORACLE shape (the
+quint-policy P4 census rejected the first, params-only seat — the lint
+catching its own author, second time this wave): `walkObserve` arms one
+evaluation's raw cells into plane state, and the §8a seat
+(`walkFoldApply`) recomputes each law from the ARMED CELLS (live state)
+against the caller's four bool decisions; the live `walkFold` derives
+decisions lawfully from the same state; the four calibrations derive
+ONE decision each the pre-fix way through the SAME seat (P5).
+Evaluations draw from `WALK_MATRICES` — the laws' full decision
+partition (16 curated matrices incl. every twin's violation cell):
+the six-powerset draw ran ~32x slower per trace (40 ms vs 1.3 ms
+measured — the slot-7 eternal-gate class), and the laws' evidence
+scales with partition coverage, not raw matrix count; the TLC
+calibration pins enumerate the curated set exhaustively at depth <= 3.
+
+| invariant | latch | twin ([violation]-verified, sim 400K×12 explicit) | baseline ([ok], sim 100K×12) |
+|---|---|---|---|
+| `reprobeCongruentWithCompletability` (bug_299) | `reprobeCongruentAll` | mat-299-wholeset-projection (per-tenant pre-fold AND'd — complementary coverage folds ConfirmedMissing) | holds |
+<!-- twins re-verified [violation] + baselines [ok] + live x4 [ok] + witness [violation] + run pin on the FINAL oracle/curated shape (sim, explicit --max-samples per hazard lll) -->
+| `rateLimitedProbeDrawsNoBudget` (bug_295) | `probeUnchargedOn429All` | mat-295-probe-charged (429 laundered into the charging class) | holds |
+| `hitUnderAnyTenantOrderSucceeds` (merged_bug_133) | `anyTenantHitServesAll` | mat-133-inloop-return (serve only when NO tenant charged) | holds |
+| `verifiedPathsVisibleToInterest` (bug_115) | `localServeVisibleAll` | mat-115-tenantblind-present (raw presence suffices) | holds |
+
+Non-vacuity: `walkFoldSeen` reachability witness
+(`noWalkFoldEvaluated` expect-violation — found in <1k samples) +
+`walkFoldComplementaryCoverageRun` (the bug_299 defining cell pinned
+deterministically: tA missing o1 only, tB missing o2 only → Obtainable
+under the lawful quantifier, all four latches hold). CI: the
+`materialization-holds-walk-fold` conjunction runs `matJobInvariants ++
+walkFoldInvariants` under the materializationJobWalkFold regime (~5,500
+traces/s measured at the
+curated draw — 2M samples ≈ 6 min, comfortably inside the 1800 s
+modelTimeoutSec) — composition broke none of the
+machine's 22 laws. Kani recount 27 → 28 (K4 visibility table; K5
+deliberately structural — the probe leg consumes the same
+classify_substitute_failure the GET leg does, and the e2e pair pins
+both polarity halves; rationale at nix/kani.nix).

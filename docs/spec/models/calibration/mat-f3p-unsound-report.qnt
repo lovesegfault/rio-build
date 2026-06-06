@@ -38,6 +38,8 @@ module matCalibF3pUnsoundReport {
     ENABLE_CRASH = false,
     ENABLE_STALE_TENURE = false,
     ENABLE_RESOLVE_FAULTS = false,
+    TENANTS = Set("tA", "tB"),
+    ENABLE_WALK_FOLD = false,
     ENABLE_WORKER_ABORTED = false
   ).* from "../materializationJob"
 
@@ -147,32 +149,35 @@ module matCalibF3pUnsoundReport {
     nondet outs = OUTPUTS.powerset().oneOf()
     nondet missing = OUTPUTS.powerset().oneOf()
     nondet rel = Set(RVouched, RPending, RChildlessLeaf, RHoled).oneOf()
-    any {
-      recordWantedRelation(b, d, outs),
-      legacyBuildArrives(b, d),
-      createJob(d, origin, b),
-      dedupRefeed(d),
-      claimJob(d, replica),
-      executeStep(d, o),
-      consumeSuccess(d),
-      calibConsumeUnobtainableUnverified(d, missing),
-      reportInfra(d),
-      establishCrashedAttempt(d),
-      cancelOnZeroInterest(d),
-      obsoleteOnProduced(d),
-      parkReevaluate(d),
-      parkBackoffExpires(d),
-      buildTerminal(b),
-      builderPull(d, builder),
-      dispatchFromSource(d),
-      completeReadyFromStore(d),
-      failover,
-      redialChannel(replica),
-      staleTenureWriteDiscarded(d),
-      releasePins(d),
-      storeGc(d, o),
-      upstreamChange(d, o),
-      durableRelationChange(d, rel),
+    all {
+      any {
+        recordWantedRelation(b, d, outs),
+        legacyBuildArrives(b, d),
+        createJob(d, origin, b),
+        dedupRefeed(d),
+        claimJob(d, replica),
+        executeStep(d, o),
+        consumeSuccess(d),
+        calibConsumeUnobtainableUnverified(d, missing),
+        reportInfra(d),
+        establishCrashedAttempt(d),
+        cancelOnZeroInterest(d),
+        obsoleteOnProduced(d),
+        parkReevaluate(d),
+        parkBackoffExpires(d),
+        buildTerminal(b),
+        builderPull(d, builder),
+        dispatchFromSource(d),
+        completeReadyFromStore(d),
+        failover,
+        redialChannel(replica),
+        staleTenureWriteDiscarded(d),
+        releasePins(d),
+        storeGc(d, o),
+        upstreamChange(d, o),
+        durableRelationChange(d, rel),
+      },
+      walkUnchanged,
     }
   }
 }
