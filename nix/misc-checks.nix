@@ -1709,15 +1709,36 @@ in
         # closure_vouched (A4), FencedWrite (A1), rollback_assignment
         # (pull-mode sweep), COLLECT_CURSOR/COLLECT_BACKLOG_ESTIMATE
         # (D1), the retired workers_active/queue_depth metric names,
-        # and the deleted rio-scheduler/src/logs/ tree. Recorded
-        # narrowing: the stream-era CONCEPT tokens (hard_filter,
-        # assign_to_worker, BuildExecution, correlation-TTL) are NOT
-        # blanket-banned — their misleading-as-live narrations were
-        # rewritten to live names (placeable()/the spawn-intent
-        # exclusion/the pull mint), but dozens of legitimate historical
-        # citations remain (incident records, ledger-class provenance
-        # docs, spec retirement framing) and a 30-entry allowlist
-        # would bury the signal.
+        # and the deleted rio-scheduler/src/logs/ tree.
+        #
+        # META-RULE (merged_bug_140 close): a narrowing record — any
+        # comment here explaining why a token is NOT denied — MUST
+        # embed its verification grep and that grep's output AT THE
+        # TIME OF WRITING. The previous record here claimed the
+        # stream-era concept tokens could not be denied because
+        # "dozens of legitimate historical citations remain and a
+        # 30-entry allowlist would bury the signal" — with no
+        # verification attached. The slot-12 sweep falsified it: 78
+        # bare-token lines were live narrations, not citations, and
+        # after rewording them the survivors all fit one ESCAPE
+        # pattern (same-line retirement qualifier), needing zero
+        # allowlist entries. The concept tier below is that close.
+        # Two narrowing records, verification embedded:
+        #  - bare `Heartbeat` is NOT in deny_concept: the lease domain
+        #    owns the word live. Verified 2026-06-06:
+        #      rg -in '\bheartbeats?\b' --type rust \
+        #        rio-{lease,scheduler,controller,store,builder}/src | wc -l
+        #      => 248 live hits (395 tree-wide) — only the
+        #    HeartbeatRequest/Response message names and the
+        #    "Heartbeat RPC/unary" phrase are retired.
+        #  - `cilium-gateway-` is NOT denied: it is Cilium's live
+        #    naming for generated Gateway workloads. Verified
+        #    2026-06-06: rg -n 'cilium-gateway-' =>
+        #      infra/helm/rio-build/templates/dashboard-gateway.yaml:11,
+        #      nix/tests/fixtures/k3s-full.nix:543,
+        #      nix/tests/scenarios/dashboard-gateway.nix:53 (3 hits,
+        #    all live-true). docker.nix's falsity was the envsubst
+        #    claim, denied exactly via deny_concept.
         #
         # Split into shared/docs/cross (R7-m025): a single alternation
         # over both scan sets is the structural reason "widen pattern X
@@ -1744,6 +1765,52 @@ in
           echo "FAIL: retired identifier in non-doc source" >&2
           fail=1
         fi
+        # CONCEPT tier (merged_bug_140 keystone): retired *concepts* —
+        # protocol names, design phrases, falsified claims — may be
+        # cited historically but never narrated as live. A line
+        # matching deny_concept passes ONLY if the SAME LINE carries a
+        # retirement qualifier (concept_escape). Same-line is the
+        # point: a qualifier on the adjacent line reads as live text
+        # when quoted alone — the sweep that introduced this tier
+        # tripped its own author three times exactly that way.
+        # Self-allowlist: misc-checks.nix only (this file names the
+        # tokens to deny them).
+        deny_concept='\bBuildExecution\b|\bCancelSignal\b|\bHeartbeatRequests?\b|\bHeartbeatResponses?\b|Heartbeat.{0,2}(RPC|unary)|\b[Rr]eady[- ]queues?\b|\bready_queue\b|terminationGracePeriodSeconds: 7200|blocks until its single in-flight build|Baked-in beats runtime envsubst|Forward-compat.*lands in P[0-9]|\(no series\).*never fires'
+        concept_escape='legacy|stream-era|removed|retired|deleted|no longer|was the|never sent|pre-pull|historical|replaced|gone from'
+        concept_scan() {
+          local dir=$1 label=$2 hits
+          hits=$(grep -rn -E "$deny_concept" "$dir" \
+            | grep -viE "$concept_escape" \
+            | grep -v 'misc-checks\.nix' || true)
+          if [[ -n "$hits" ]]; then
+            echo "FAIL: retired concept narrated as live in $label —" >&2
+            echo "add a same-line retirement qualifier ($concept_escape)" >&2
+            echo "or rewrite to the live mechanism:" >&2
+            echo "$hits" >&2
+            fail=1
+          fi
+        }
+        # Self-test before the real scans: planted red MUST trip,
+        # qualified green MUST pass (pipefail-safe: both run under if).
+        mkdir -p "$TMPDIR/c1red" "$TMPDIR/c1green"
+        echo 'the scheduler routes work over the BuildExecution stream' > "$TMPDIR/c1red/doc.typ"
+        echo 'the removed BuildExecution stream routed work (stream-era)' > "$TMPDIR/c1green/doc.typ"
+        prevfail=$fail
+        fail=0
+        concept_scan "$TMPDIR/c1red" "self-test" 2>/dev/null
+        if [[ $fail -eq 0 ]]; then
+          echo "SELF-TEST FAIL: concept tier missed the planted red" >&2
+          exit 1
+        fi
+        fail=0
+        concept_scan "$TMPDIR/c1green" "self-test"
+        if [[ $fail -ne 0 ]]; then
+          echo "SELF-TEST FAIL: concept tier flagged the qualified fixture" >&2
+          exit 1
+        fi
+        fail=$prevfail
+        concept_scan "$typSrc" "docs"
+        concept_scan "$crossSrc" "non-doc sources"
         # DEFAULT_GC_GRACE_HOURS literal-value tripwire — the const is
         # in gen/consts.json so prose must derive. Broad over $typSrc;
         # NARROW over $crossSrc (only the doc-comment shapes that

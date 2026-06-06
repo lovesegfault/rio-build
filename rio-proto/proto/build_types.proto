@@ -229,8 +229,8 @@ message ExecutorMessage {
   // rio-store's LogService.AppendLog instead of the scheduler.
   reserved 2;
   // 1 was `WorkAssignmentAck ack`, 5 was `ExecutorRegister register`,
-  // 6 was `PrefetchComplete prefetch_complete` — removed with the
-  // BuildExecution stream (executor-lifecycle collapse).
+  // 6 was `PrefetchComplete prefetch_complete` — removed when the
+  // BuildExecution stream was deleted (executor-lifecycle collapse).
   reserved 1, 5, 6;
   reserved "ack", "register", "prefetch_complete";
   oneof msg {

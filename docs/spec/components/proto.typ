@@ -137,9 +137,9 @@ service ExecutorService {
 ```
 
 #info(title: [No executor registration])[
-  There is no registration step: the executor-lifecycle collapse removed the
-  `BuildExecution` stream, the `Heartbeat` unary, and the in-memory executor
-  entry they fed. A pod's existence is the controller's Job census; its
+  There is no registration step: the executor-lifecycle collapse
+  removed the `BuildExecution` stream, the `Heartbeat` unary, and the
+  in-memory executor entry they fed. A pod's existence is the controller's Job census; its
   liveness is the kubelet/Job lifecycle; the scheduler learns about it only
   through its pull (which binds the open attempt) and its report (or the
   pod-terminal / establishment classifiers when the report never arrives).
@@ -271,9 +271,9 @@ service AdminService {
 === BuildExecution stream (removed)
 
 *Retired (executor-lifecycle collapse --- the stream session protocol):*
-`proto.stream.bidi` normed the `BuildExecution` bidirectional stream (one
-per executor, carrying assignment/cancel/prefetch downstream and
-ack/log-batch/completion upstream). The RPC, its scheduler-side session
+`proto.stream.bidi` normed the removed `BuildExecution` bidirectional
+stream (one per executor, carrying assignment/cancel/prefetch downstream
+and ack/log-batch/completion upstream). The RPC, its scheduler-side session
 state, and the stream-only message arms were removed: dispatch is the
 pull unary (`PullAssignment` binds the open attempt), results travel on
 the `ReportOutcome` unary, log batches go to rio-store's
@@ -296,8 +296,8 @@ message ExecutorMessage {
   // rio-store's LogService.AppendLog instead of the scheduler.
   reserved 2;
   // 1 was `WorkAssignmentAck ack`, 5 was `ExecutorRegister register`,
-  // 6 was `PrefetchComplete prefetch_complete` — removed with the
-  // BuildExecution stream (executor-lifecycle collapse).
+  // 6 was `PrefetchComplete prefetch_complete` — removed when the
+  // BuildExecution stream was deleted (executor-lifecycle collapse).
   reserved 1, 5, 6;
   reserved "ack", "register", "prefetch_complete";
   oneof msg {
@@ -361,8 +361,8 @@ message BuildLogBatch {
 The build-result payload for a single derivation, including
 cgroup-v2-derived resource metrics. The build task hands it to the pull
 loop inside the builder-internal `ExecutorMessage` envelope; the wire
-carrier is the `ReportOutcome` unary (the stream-era carrier was removed
-with the `BuildExecution` stream):
+carrier is the `ReportOutcome` unary (the stream-era carrier was
+removed with the `BuildExecution` stream):
 
 ```protobuf
 message CompletionReport {
@@ -385,8 +385,8 @@ executor fails startup if the delegated subtree is unavailable.
 *Retired (1d proto sweep --- the heartbeat protocol):*
 `proto.heartbeat.capability-fields` normed the dispatch-filter capability set
 (`store_degraded`, `kind`, `draining`, `running_build`) the scheduler read on
-every heartbeat. `HeartbeatRequest`/`HeartbeatResponse` and the `Heartbeat`
-RPC were removed with the stream session: there is no scheduler-side
+every heartbeat. The removed `HeartbeatRequest`/`HeartbeatResponse` pair
+and the removed `Heartbeat` RPC went with the stream session: there is no scheduler-side
 registration or capacity state left for those fields to feed. Capability
 matching happens at the spawn-intent filter (`GetSpawnIntentsRequest.{kind,
 systems, filter_features}`), the kind boundary is enforced at spawn and

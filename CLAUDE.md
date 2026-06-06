@@ -157,6 +157,18 @@ retired names from re-rooting in docs and comments; deliberate
 retirement records get a why-commented allowlist entry beside the
 existing ones.
 
+The duty extends to **concept forms**: when the deletion retires a
+protocol, design phrase, or now-false claim (not just identifiers),
+add an entry to `deny_concept` in the same file. Concept entries are
+escape-tiered, not allowlisted — a flagged line passes only when the
+retirement qualifier (see `concept_escape`) sits on the *same line*,
+so historical citations stay legal without per-site exemptions.
+
+When you *decline* to deny a token, write a narrowing record beside
+the deny lists — and the record MUST embed its verification grep plus
+that grep's output at the time of writing. An unverified narrowing
+claim is how a falsified premise survived here for two waves.
+
 ## Fuzzing
 
 Fuzz targets live in per-crate `fuzz/<crate>` workspaces (excluded from the main workspace, separate `Cargo.lock` each). Currently: `fuzz/rio-nix/` (protocol/wire parsers) and `fuzz/rio-store/` (manifest parser). The default dev shell is nightly, so `cargo fuzz` works without extra setup:
