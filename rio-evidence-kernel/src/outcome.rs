@@ -566,7 +566,7 @@ mod tests {
     /// obtainable under SOME tenant, so the job must stay armed.
     /// Recorded red (pre-fix, via the deleted pre-projected-boolean
     /// fold whose input domain had already lost the path axis):
-    /// `fold_tenant_reprobes(&[ConfirmedMissing, ConfirmedMissing])`
+    /// the per-tenant fold over `[ConfirmedMissing, ConfirmedMissing]`
     /// → `left: ConfirmedMissing` where Obtainable required.
     #[test]
     fn complementary_coverage_is_obtainable() {

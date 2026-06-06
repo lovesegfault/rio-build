@@ -500,7 +500,7 @@ in
     #     transpositions).
     # 27 → 27 (substitution, bug_299): the pre-projected-boolean
     # harness check_confirmed_missing_is_all_tenant_conjunction is
-    # DELETED with fold_tenant_reprobes (its input domain — one
+    # DELETED with the per-tenant pre-projected fold (its input domain — one
     # boolean per tenant — was the hole: it computes ∀ tenant ∃ path,
     # not ∃ path ∀ tenant) and replaced one-for-one by
     # check_reprobe_quantifier_per_path (K3: the full 3×3

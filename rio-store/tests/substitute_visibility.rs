@@ -132,15 +132,37 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
 
     // ── Configure upstreams via StoreAdminService (same path rio-cli
     //    uses). A trusts K1; B trusts K1; C trusts ONLY K2. ────────────
-    for (tid, keys) in [
-        (tid_a, vec![trusted_k1.clone()]),
-        (tid_b, vec![trusted_k1.clone()]),
-        (tid_c, vec![trusted_k2.clone()]),
+    // C's upstream must be DEAD hermetically: bind-then-drop a
+    // loopback listener so the port refuses connections without any
+    // DNS. (`cache-c.example` is NOT hermetic — wildcard resolvers,
+    // observed on the CI builder, answer for *.example with a captive
+    // 404 page, and the walk lawfully folds an upstream 404 as a MISS
+    // instead of the dead-upstream error this test pins. A/B's
+    // .example URLs are never contacted: their reads are pre-seeded
+    // local rows.)
+    let refused_url = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = l.local_addr()?.port();
+        drop(l);
+        format!("http://127.0.0.1:{port}")
+    };
+    for (tid, keys, url) in [
+        (
+            tid_a,
+            vec![trusted_k1.clone()],
+            format!("https://cache-{tid_a}.example"),
+        ),
+        (
+            tid_b,
+            vec![trusted_k1.clone()],
+            format!("https://cache-{tid_b}.example"),
+        ),
+        (tid_c, vec![trusted_k2.clone()], refused_url),
     ] {
         admin
             .add_upstream(AddUpstreamRequest {
                 tenant_id: tid.to_string(),
-                url: format!("https://cache-{tid}.example"),
+                url,
                 priority: 50,
                 trusted_keys: keys,
                 sig_mode: "keep".into(),

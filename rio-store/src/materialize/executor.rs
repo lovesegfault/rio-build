@@ -81,7 +81,7 @@ pub async fn execute_job(ctx: &ExecutorContext, claimed: &ClaimedJob) -> Materia
 /// job's whole closure walk (the sum of processed paths' NAR sizes so
 /// far). Monotone non-decreasing in `bytes_done`, and
 /// `bytes_done <= bytes_expected` at every call — ENFORCED by
-/// [`MonotoneProgress`], the only constructor of emission sites
+/// `MonotoneProgress`, the only constructor of emission sites
 /// (bug_159: within-path retry resets used to regress the counter);
 /// the final call covers the whole closure. Display-only and
 /// droppable: the callback must be cheap and non-blocking (it runs on
@@ -114,7 +114,7 @@ pub async fn execute_job_with_progress(
 /// (bug_244). The boot-time seed loop iterates this const, the emit
 /// chokepoint maps through [`outcome_label`] (whose exhaustive match
 /// is the only variant→label mapping), and the HELP string
-/// interpolates it ([`super::executions_help`]); the drift test pins
+/// interpolates it (`executions_help` in the parent module); the drift test pins
 /// const == match image, so a sixth outcome that misses any tier
 /// fails to compile (non-exhaustive match) or fails the drift test
 /// (label not seeded / not helped). Pre-fix the three tiers
@@ -146,7 +146,7 @@ pub(crate) fn outcome_label(outcome: Option<&materialization_outcome::Outcome>) 
     }
 }
 
-/// The pure clamp law behind [`MonotoneProgress`] (bug_159): given
+/// The pure clamp law behind `MonotoneProgress` (bug_159): given
 /// the previous job-level high-water mark and an absolute candidate
 /// report, the emitted pair is `done = max(high_water, done)`,
 /// `expected = max(expected, done)` — emitted `done` never regresses
@@ -2329,20 +2329,33 @@ mod tests {
             "phase-1 ingest must succeed, got {first:?}"
         );
 
-        // Phase 2: a FRESH tenant whose only upstream 404s everything
-        // (fresh tenant = fresh substitute-cache key, so phase 1's
-        // ingest cannot leak through moka); the job must verify from
-        // the LOCAL rows alone.
-        let tenant2 = seed_tenant(&db.pool, "mat-local-2").await;
+        // Phase 2: drop the seed upstream and re-point the SAME tenant
+        // at one that 404s everything — the job must verify from the
+        // LOCAL rows alone. The rows are tenant-owned, so bug_115's
+        // sig-visibility gate passes for the owner; a FOREIGN tenant's
+        // view of these rows is pinned HIDDEN (the laundering red) by
+        // vis_untrusted cells + tests/substitute_visibility.rs — the
+        // pre-gate version of this phase asserted exactly that
+        // laundering and was retired with the gate.
+        // The trusted KEY must survive: sig-trust against the
+        // tenant's configured upstreams is exactly what makes the
+        // locally-present rows visible (deleting the row would
+        // gate-hide the tenant's own ingest and re-route the walk
+        // through the substitute cache). Only the URL goes dead.
         let dead = spawn_status_upstream(axum::http::StatusCode::NOT_FOUND).await;
-        wire_upstream(&db.pool, tenant2, &dead).await;
+        sqlx::query("UPDATE tenant_upstreams SET url = $2 WHERE tenant_id = $1")
+            .bind(tenant)
+            .bind(&dead.url)
+            .execute(&db.pool)
+            .await
+            .expect("seed upstream re-pointed at the dead server");
 
         let seeded2 = seed_job(
             &db.pool,
             "mat-local-verify-drv",
             &[("out", parent.as_str())],
-            Some(tenant2),
-            Some(tenant2),
+            Some(tenant),
+            Some(tenant),
             &[],
         )
         .await;

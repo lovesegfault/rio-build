@@ -144,7 +144,7 @@ impl Dns1123Label {
             // Total fallback (worker index past the reserved budget):
             // deterministic, still collision-salted by the full
             // composed raw.
-            Dns1123Label::sanitize(&composed, 0, "rio-worker")
+            Dns1123Label::sanitize(&composed, 0, "worker")
         }
     }
 
