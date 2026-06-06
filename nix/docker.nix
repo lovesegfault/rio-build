@@ -323,17 +323,14 @@ let
   '';
 
   # ── Dashboard nginx config ───────────────────────────────────────────
-  # Proxy target is the Cilium per-Gateway Service. Cilium reconciles
-  # the rio-dashboard Gateway into a Deployment + Service named
-  # `cilium-gateway-<gateway-name>` in the Gateway's OWN namespace
-  # (rio-system) — not a separate operator namespace. gRPC-Web
-  # translation happens at rio-scheduler (tonic-web layer, D3); the
-  # gateway is plain HTTP routing.
-  #
-  # Baked-in beats runtime envsubst — a broken upstream is a build-
-  # time failure not a runtime surprise. If a deploy renames the
-  # Gateway or moves it to a different namespace, this config needs
-  # a matching rebuild.
+  # Upstream resolution, namespace overrides, and the generated
+  # upstream/CNP pairing are narrated ONCE at the head of
+  # nix/dashboard-nginx.conf (bug_238/bug_403: upstream blocks render
+  # from dashboard-upstreams.json with $ENV placeholders; the image
+  # entrypoint envsubsts them at runtime, defaults supplied from
+  # .Values.namespaces — a renamed Gateway or moved namespace is a
+  # values override, not a rebuild). This header keeps only the claim
+  # docker.nix itself enforces:
   #
   # r[dash.auth.method-gate+4] readonly allow-list. MUST match the
   # rio-scheduler-readonly + rio-store-logs-readonly HTTPRoutes in

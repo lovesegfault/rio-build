@@ -610,12 +610,13 @@ spec:
               conversions themselves are recorded, bounded fallbacks, not
               failures.
 
-        # Forward-compat: rio_store_putpath_retries_total lands in P0539d.
-        # Until then this expr evaluates empty (no series) → never fires.
-        # >10/s sustained means S3/PG backpressure or the chunk-dedup
-        # CAS loop is thrashing.
+        # rio_store_putpath_retries_total{reason} is live and alert-seeded
+        # at zero from boot (rio-store ALERT_SEEDED_COUNTERS — the
+        # alert-metric parity test imports that table), so this alert is
+        # armed on day one. >10/s sustained means S3/PG backpressure or
+        # the chunk-dedup CAS loop is thrashing.
         - alert: RioStorePutPathRetries
-          expr: rate(rio_store_putpath_retries_total[1m]) > 10
+          expr: sum by (reason) (rate(rio_store_putpath_retries_total[1m])) > 10
           for: 2m
           labels:
             severity: warning

@@ -274,7 +274,7 @@
     },
     {
       "name": "RioStorePutPathRetries",
-      "expr": "rate(rio_store_putpath_retries_total[1m]) > 10",
+      "expr": "sum by (reason) (rate(rio_store_putpath_retries_total[1m])) > 10",
       "for": "2m",
       "severity": "warning",
       "templated": false,
