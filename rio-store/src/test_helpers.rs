@@ -479,3 +479,21 @@ impl ChunkSeed {
         hash
     }
 }
+
+/// Sandbox-safe HTTP client for tests that wire a [`crate::substitute::Substituter`].
+///
+/// The default builder loads native TLS roots and FAILS inside the nix
+/// build sandbox (no `/etc/ssl`), which used to leave the substituter
+/// silently clientless — and since the capability-fault fix, a
+/// clientless substituter is a hard `Unavailable` for any tenant with
+/// upstreams configured, not a quiet NotFound. An explicit empty root
+/// set always builds, and every test upstream is plain HTTP on
+/// loopback anyway. ONE helper instead of per-module copies: the
+/// third copy is how the substitute_visibility tests shipped without
+/// one.
+pub fn sandbox_http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .tls_certs_only(std::iter::empty())
+        .build()
+        .expect("empty-cert client build never fails")
+}

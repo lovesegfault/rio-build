@@ -16,7 +16,8 @@ use tonic::transport::{Channel, Server};
 
 use rio_proto::types::{
     AddSignaturesRequest, AddUpstreamRequest, BatchGetManifestRequest, BatchQueryPathInfoRequest,
-    FindMissingPathsRequest, GetPathRequest, QueryPathFromHashPartRequest, QueryPathInfoRequest,
+    FindMissingPathsRequest, GetPathRequest, ListUpstreamsRequest, QueryPathFromHashPartRequest,
+    QueryPathInfoRequest,
 };
 use rio_proto::{
     StoreAdminServiceClient, StoreAdminServiceServer, StoreServiceClient, StoreServiceServer,
@@ -84,6 +85,7 @@ impl SwitchableTenant {
 async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
     use base64::Engine;
 
+    rio_test_support::init_test_logging("rio_store=debug");
     let db = TestDb::new(&MIGRATOR).await;
 
     // ── Seed three tenants ──────────────────────────────────────────────
@@ -114,7 +116,10 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
     // return in sig_visibility_gate). The substituter itself won't hit
     // HTTP — the path is pre-seeded, not miss-then-fetch. But it must
     // be PRESENT.
-    let sub = Arc::new(Substituter::new(db.pool.clone(), None));
+    let sub = Arc::new(
+        Substituter::new(db.pool.clone(), None)
+            .with_http_client(rio_store::test_helpers::sandbox_http()),
+    );
     let store_svc = StoreServiceImpl::new(db.pool.clone()).with_substituter(sub);
     let admin_svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
 
@@ -242,6 +247,12 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
     // false NotFound here is exactly the cached-poisoned-miss class.
     // The gate semantics this test pins are intact either way: the
     // K1-signed row's data never reaches C.
+    let c_upstreams = admin
+        .list_upstreams(ListUpstreamsRequest {
+            tenant_id: tid_c.to_string(),
+        })
+        .await?
+        .into_inner();
     let err = client
         .query_path_info(req())
         .await
@@ -249,7 +260,8 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
     assert_eq!(
         err.code(),
         tonic::Code::Unavailable,
-        "gate-hidden + dead upstream → Unavailable (cannot confirm missing), got {err:?}"
+        "gate-hidden + dead upstream → Unavailable (cannot confirm missing), got {err:?}; \
+         C upstreams: {c_upstreams:?}"
     );
 
     // GetPath: same gate, same substitute fallthrough.
@@ -482,7 +494,10 @@ async fn sig_visibility_gate_cluster_key_timing_window() -> TestResult {
 
     // ── Service WITH signer (cluster key available for the union) ──────
     // Substituter must be present or the gate short-circuits early.
-    let sub = Arc::new(Substituter::new(db.pool.clone(), None));
+    let sub = Arc::new(
+        Substituter::new(db.pool.clone(), None)
+            .with_http_client(rio_store::test_helpers::sandbox_http()),
+    );
     let ts = TenantSigner::new(cluster_signer.clone(), db.pool.clone());
     let store_svc = StoreServiceImpl::new(db.pool.clone())
         .with_substituter(sub)
@@ -620,7 +635,10 @@ async fn sig_visibility_gate_tenant_key_timing_window() -> TestResult {
     // Cluster signer DIFFERENT from tenant key (proves it's the
     // tenant_keys union doing the work, not cluster).
     let cluster = Signer::from_seed("rio-cluster", &[0xCCu8; 32]);
-    let sub = Arc::new(Substituter::new(db.pool.clone(), None));
+    let sub = Arc::new(
+        Substituter::new(db.pool.clone(), None)
+            .with_http_client(rio_store::test_helpers::sandbox_http()),
+    );
     let ts = TenantSigner::new(cluster, db.pool.clone());
     let store_svc = StoreServiceImpl::new(db.pool.clone())
         .with_substituter(sub)

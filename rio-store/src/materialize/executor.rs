@@ -1081,12 +1081,7 @@ mod tests {
 
     /// Sandbox-safe reqwest client (the substitute.rs precedent: no CA
     /// bundle in the nix sandbox; the fake upstream is plaintext).
-    fn sandbox_http() -> reqwest::Client {
-        reqwest::Client::builder()
-            .tls_certs_only(std::iter::empty())
-            .build()
-            .expect("empty-cert client build never fails")
-    }
+    use crate::test_helpers::sandbox_http;
 
     fn make_ctx(pool: PgPool) -> ExecutorContext {
         ExecutorContext {
