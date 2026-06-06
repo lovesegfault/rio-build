@@ -1554,7 +1554,15 @@ in
         # book-pdf.typ includes ⊆ book.typ chapters. Catches stale/typo'd
         # #include paths; the reverse (HTML chapter not in PDF) is
         # intentional per book-pdf.typ's scope comment.
-        pdf=$(grep -oE '#include "[^"]+\.typ"' $typSrc/book-pdf.typ | sed 's/#include "//;s/"//')
+        # merged_bug_227: book-pdf.typ stitches from a #let chapters
+        # array (one quoted path per line) — extract from the array,
+        # and fail LOUDLY if the shape drifts (an empty extraction
+        # would make this subset check vacuously green).
+        pdf=$(grep -oE '^  "[^"]+\.typ",' $typSrc/book-pdf.typ | sed 's/^  "//;s/",$//')
+        if [[ -z "$pdf" ]]; then
+          echo "FAIL: no chapters extracted from book-pdf.typ's chapters array — the stitch shape changed; update this extraction WITH it" >&2
+          fail=1
+        fi
         html=$(grep -oE '#chapter\("[^"]+\.typ"' $typSrc/book.typ | sed 's/#chapter("//;s/"//')
         stray=$(comm -23 <(echo "$pdf" | sort) <(echo "$html" | sort))
         if [[ -n "$stray" ]]; then

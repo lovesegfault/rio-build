@@ -17,52 +17,40 @@
 #import "/lib/rio.typ": book-pdf-mode
 #book-pdf-mode()
 #set document(title: "rio-build design book")
-#include "intro.typ"
-#pagebreak(weak: true)
-#include "architecture.typ"
-#pagebreak(weak: true)
-#include "spec/system/observability.typ"
-#pagebreak(weak: true)
-#include "spec/system/security.typ"
-#pagebreak(weak: true)
-#include "spec/system/tenancy.typ"
-#pagebreak(weak: true)
-#include "spec/system/failure-modes.typ"
-#pagebreak(weak: true)
-#include "spec/system/verification.typ"
-#pagebreak(weak: true)
-#include "spec/system/deployment.typ"
-#pagebreak(weak: true)
-#include "spec/system/crate-structure.typ"
-#pagebreak(weak: true)
-#include "spec/components/proto.typ"
-#pagebreak(weak: true)
-#include "spec/components/gateway.typ"
-#pagebreak(weak: true)
-#include "spec/components/scheduler.typ"
-#pagebreak(weak: true)
-#include "spec/components/sla-sizing.typ"
-#pagebreak(weak: true)
-#include "spec/components/builder.typ"
-#pagebreak(weak: true)
-#include "spec/components/fetcher.typ"
-#pagebreak(weak: true)
-#include "spec/components/store.typ"
-#pagebreak(weak: true)
-#include "spec/components/lazy-store.typ"
-#pagebreak(weak: true)
-#include "spec/components/controller.typ"
-#pagebreak(weak: true)
-#include "spec/components/dashboard.typ"
-#pagebreak(weak: true)
-#include "spec/components/cli.typ"
-#pagebreak(weak: true)
-#include "ref/configuration.typ"
-#pagebreak(weak: true)
-#include "ref/errors.typ"
-#pagebreak(weak: true)
-#include "ref/metrics.typ"
-
-#include "ref/alerts.typ"
-#pagebreak(weak: true)
+// Chapter stitch, generated from one array (merged_bug_227): every
+// chapter is joined with a weak pagebreak BY CONSTRUCTION — the
+// hand-stitched form shipped a missed seam (metrics.typ → alerts.typ
+// had no pagebreak), and a missed seam is now unrepresentable. The
+// pdf⊆html docs-lint extraction parses this array: one quoted path
+// per line, two-space indent, keep that shape.
+#let chapters = (
+  "intro.typ",
+  "architecture.typ",
+  "spec/system/observability.typ",
+  "spec/system/security.typ",
+  "spec/system/tenancy.typ",
+  "spec/system/failure-modes.typ",
+  "spec/system/verification.typ",
+  "spec/system/deployment.typ",
+  "spec/system/crate-structure.typ",
+  "spec/components/proto.typ",
+  "spec/components/gateway.typ",
+  "spec/components/scheduler.typ",
+  "spec/components/sla-sizing.typ",
+  "spec/components/builder.typ",
+  "spec/components/fetcher.typ",
+  "spec/components/store.typ",
+  "spec/components/lazy-store.typ",
+  "spec/components/controller.typ",
+  "spec/components/dashboard.typ",
+  "spec/components/cli.typ",
+  "ref/configuration.typ",
+  "ref/errors.typ",
+  "ref/metrics.typ",
+  "ref/alerts.typ",
+)
+#for c in chapters {
+  include c
+  pagebreak(weak: true)
+}
 #bibliography("/lib/bib.yml")
