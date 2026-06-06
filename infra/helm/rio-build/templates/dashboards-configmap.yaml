@@ -25,6 +25,19 @@ metadata:
     {{- include "rio.labels" (dict "root" $ "name" "rio-dashboards" "component" "monitoring") | nindent 4 }}
 data:
   {{ base $path }}: |-
-    {{- $.Files.Get $path | nindent 4 }}
+    {{- /* bug_279: substitute __RIO_NS_<KEY>__ placeholders from
+       .Values.namespaces — a values-RANGED replace, NOT a blanket
+       tpl: dashboard JSON carries Grafana {{`{{pod}}`}} legend syntax
+       that tpl would try to evaluate. The obs-surface-lint denies
+       literal rio namespaces in exprs and pins every placeholder to a
+       real namespaces key; fragment 32 proves the override round-trip
+       renders. */}}
+    {{- $body := $.Files.Get $path }}
+    {{- range $k, $cfg := $.Values.namespaces }}
+    {{- if kindIs "map" $cfg }}
+    {{- $body = replace (printf "__RIO_NS_%s__" (upper $k)) $cfg.name $body }}
+    {{- end }}
+    {{- end }}
+    {{- $body | nindent 4 }}
 {{- end }}
 {{- end }}

@@ -611,12 +611,12 @@
      "refId": "A"
     },
     {
-     "expr": "kube_horizontalpodautoscaler_status_desired_replicas{namespace=\"rio-store\", horizontalpodautoscaler=\"keda-hpa-rio-store\"}",
+     "expr": "kube_horizontalpodautoscaler_status_desired_replicas{namespace=\"__RIO_NS_STORE__\", horizontalpodautoscaler=\"keda-hpa-rio-store\"}",
      "legendFormat": "desired replicas",
      "refId": "B"
     },
     {
-     "expr": "kube_deployment_status_replicas_ready{namespace=\"rio-store\", deployment=\"rio-store\"}",
+     "expr": "kube_deployment_status_replicas_ready{namespace=\"__RIO_NS_STORE__\", deployment=\"rio-store\"}",
      "legendFormat": "ready replicas",
      "refId": "C"
     }
@@ -723,7 +723,7 @@
    },
    "targets": [
     {
-     "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"rio-store\", pod=~\"rio-store-.*\", container=\"store\"}[5m]))",
+     "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"__RIO_NS_STORE__\", pod=~\"rio-store-.*\", container=\"store\"}[5m]))",
      "legendFormat": "{{pod}}",
      "refId": "A"
     }
@@ -771,12 +771,12 @@
    },
    "targets": [
     {
-     "expr": "sum by (pod) (rate(container_network_receive_bytes_total{namespace=\"rio-store\", pod=~\"rio-store-.*\"}[5m]))",
+     "expr": "sum by (pod) (rate(container_network_receive_bytes_total{namespace=\"__RIO_NS_STORE__\", pod=~\"rio-store-.*\"}[5m]))",
      "legendFormat": "rx {{pod}}",
      "refId": "A"
     },
     {
-     "expr": "sum by (pod) (rate(container_network_transmit_bytes_total{namespace=\"rio-store\", pod=~\"rio-store-.*\"}[5m]))",
+     "expr": "sum by (pod) (rate(container_network_transmit_bytes_total{namespace=\"__RIO_NS_STORE__\", pod=~\"rio-store-.*\"}[5m]))",
      "legendFormat": "tx {{pod}}",
      "refId": "B"
     }

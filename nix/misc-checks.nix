@@ -411,13 +411,43 @@ in
         nativeBuildInputs = [
           pkgs.jq
           pkgs.gnugrep
+          pkgs.yq-go
         ];
         dashboards = ../infra/helm/rio-build/dashboards;
         alertsJson = ../docs/gen/alerts.json;
         metricsJson = ../docs/gen/metrics.json;
+        valuesYaml = ../infra/helm/rio-build/values.yaml;
       }
       ''
         fail=0
+        # bug_279: dashboard exprs MUST NOT hardcode rio namespaces —
+        # a values override (namespaces.store.name) silently breaks
+        # every hardcoded panel. Placeholders (__RIO_NS_<KEY>__) are
+        # substituted by the values-ranged replace in
+        # dashboards-configmap.yaml. Natural red at introduction: 5
+        # literal namespace="rio-store" matchers in store.json.
+        lits=$(jq -r '.. | .expr? // empty' $dashboards/*.json \
+          | grep -ohE 'namespace="rio-[a-z]*"' | sort | uniq -c || true)
+        if [[ -n "$lits" ]]; then
+          echo "FAIL: literal rio namespace matcher in a dashboard expr —" >&2
+          echo "use namespace=\"__RIO_NS_<KEY>__\" (values-ranged substitution):" >&2
+          echo "$lits" >&2
+          fail=1
+        fi
+        # …and every placeholder must name a real namespaces key, or
+        # the ranged replace never fires and Grafana queries a
+        # namespace named __RIO_NS_TYPO__.
+        yq e '.namespaces | to_entries | .[]
+              | select(.value | type == "!!map") | .key' $valuesYaml \
+          | tr '[:lower:]' '[:upper:]' | sort -u > $TMPDIR/ns-keys
+        for ph in $(grep -rohE '__RIO_NS_[A-Z]+__' $dashboards/*.json \
+                      | sed -E 's/__RIO_NS_([A-Z]+)__/\1/' | sort -u); do
+          if ! grep -qx "$ph" $TMPDIR/ns-keys; then
+            echo "FAIL: dashboard placeholder __RIO_NS_''${ph}__ has no" >&2
+            echo "      .Values.namespaces key '$(tr '[:upper:]' '[:lower:]' <<<"$ph")'" >&2
+            fail=1
+          fi
+        done
         jq -r '.. | .expr? // empty' $dashboards/*.json \
           | grep -ohE '\brio_[a-z0-9_]+' \
           | sed -E 's/_(bucket|sum|count)$//' | sort -u > $TMPDIR/dash-tokens
