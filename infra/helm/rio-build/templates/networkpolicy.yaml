@@ -292,10 +292,10 @@ spec:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
             k8s:app.kubernetes.io/name: rio-store
-        # Dashboard nginx → scheduler gRPC-Web (bug_238): generated
-        # from files/dashboard-upstreams.json — present iff the
-        # registry has a rio-scheduler:9001 record.
-        {{- include "rio.dashboardIngressFrom" (list $ "rio-scheduler" 9001) | nindent 8 }}
+        # Dashboard nginx → scheduler gRPC-Web: the per-record
+        # dashboard-to-rio-scheduler CNP below (generated from
+        # files/dashboard-upstreams.json) carries this edge — CNPs
+        # merge additively, so it composes with this policy.
       toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
     # Metrics: Prometheus scrape from host-network kubelet.
     # `cluster` covers apiserver pods/proxy (kubectl get --raw).
@@ -337,11 +337,11 @@ spec:
         - matchLabels: {app.kubernetes.io/component: rio-fetcher}
           matchExpressions:
             - {key: k8s:io.kubernetes.pod.namespace, operator: Exists}
-        # Dashboard nginx → store LogService (bug_238): generated from
-        # files/dashboard-upstreams.json (redundant with the blanket
-        # system-namespace entry above, but structural — the registry
-        # guarantees the pair even if that blanket ever narrows).
-        {{- include "rio.dashboardIngressFrom" (list $ "rio-store" 9002) | nindent 8 }}
+        # Dashboard nginx → store LogService: the per-record
+        # dashboard-to-rio-store CNP below (generated from
+        # files/dashboard-upstreams.json) carries this edge — redundant
+        # with the blanket system-namespace entry above, but structural:
+        # the registry guarantees the pair even if that blanket narrows.
       toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
     - fromEntities: [host, remote-node, cluster]
       toPorts:
@@ -478,9 +478,9 @@ spec:
 ---
 # Dashboard egress (bug_238): DNS + ONE edge per record in
 # files/dashboard-upstreams.json — the SAME registry that generates
-# the nginx upstream blocks (docker.nix) and the backend-ingress
-# entries (rio.dashboardIngressFrom), so an upstream cannot exist
-# without its policy pair. nginx dials every backend DIRECTLY (the
+# the nginx upstream blocks (docker.nix) and the per-record
+# dashboard-to-<component> ingress CNPs below (bug_221), so an
+# upstream cannot exist without its policy pair, by construction. nginx dials every backend DIRECTLY (the
 # old Gateway-proxy hop is gone — in-cluster traffic can't reach the
 # Cilium Gateway ClusterIP anyway: selectorless Service, the L7
 # redirect fires only on the LoadBalancer IP). The pre-registry
@@ -515,5 +515,34 @@ spec:
             k8s:app.kubernetes.io/name: {{ .component }}
       toPorts: [{ports: [{port: {{ .port | quote }}, protocol: TCP}]}]
     {{- end }}
+{{- range ($.Files.Get "files/dashboard-upstreams.json" | fromJsonArray) }}
+---
+# Backend-ingress pair for the {{ .name }} upstream (bug_221, §5-Q16):
+# one standalone CNP per registry record, generated from the SAME
+# range as the egress edge above — a record cannot ship an upstream
+# without both policy sides. CNPs merge additively: this composes
+# with the component's own ingress policy. NOTE the §5-Q16 flip: a
+# future record whose backend has NO policy of its own becomes
+# default-deny-ingress-except-dashboard the moment this CNP selects
+# it (pre-agreed; the registry is for dashboard upstreams, which are
+# all policied rio components).
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: dashboard-to-{{ .component }}
+  namespace: {{ index $.Values.namespaces .namespaceRef "name" }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .component }}
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns.system.name }}
+            k8s:app.kubernetes.io/name: rio-dashboard
+      toPorts: [{ports: [{port: {{ .port | quote }}, protocol: TCP}]}]
+{{- end }}
 {{- end }}
 {{- end }}
