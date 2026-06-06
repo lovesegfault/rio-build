@@ -103,9 +103,9 @@ pub const TENANT_TOKEN_HEADER: &str = "x-rio-tenant-token";
 
 /// Executor-identity HMAC token. Minted by the scheduler per
 /// `SpawnIntent`, threaded via the controller as `RIO_EXECUTOR_TOKEN`,
-/// presented by builders on `BuildExecution` / `Heartbeat`. The
-/// scheduler verifies it to bind the stream to the intent the pod was
-/// spawned for. See `rio_auth::hmac::ExecutorClaims` and
+/// presented by builders on `PullAssignment` / `ReportOutcome`. The
+/// scheduler verifies it to bind each pull/report to the intent the
+/// pod was spawned for. See `rio_auth::hmac::ExecutorClaims` and
 /// `r[sec.executor.identity-token]`.
 pub const EXECUTOR_TOKEN_HEADER: &str = "x-rio-executor-token";
 

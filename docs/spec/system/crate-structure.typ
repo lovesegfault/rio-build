@@ -443,7 +443,7 @@ directory, so a new proto file cannot ship without one.
 
 == Dependencies Considered and Rejected
 
-- *`petgraph`*: @dag representation. Rejected — the scheduler's graph is a simple adjacency-list `HashMap` with a custom `DerivationStatus` state machine; petgraph's algorithms (toposort, scc) don't match the incremental ready-queue pattern.
+- *`petgraph`*: @dag representation. Rejected — the scheduler's graph is a simple adjacency-list `HashMap` with a custom `DerivationStatus` state machine; petgraph's algorithms (toposort, scc) don't match the incremental Ready-set recompute pattern.
 - *`memmap2`*: Zero-copy chunk access for filesystem backend. Rejected — the filesystem backend uses buffered I/O; SIGBUS handling complexity not justified for a dev/test-only backend. Production uses S3 (streamed over HTTP, no mmap).
 - *`ginepro`*: gRPC client-side load balancing via DNS. Rejected — Cilium provides L4 load-balancing via eBPF kube-proxy replacement; tonic clients connect to a ClusterIP and Cilium distributes per-connection.
 - *`arbtest`*: Property testing via structure-aware fuzzing. Rejected — `proptest` covers roundtrip serialization; `cargo-fuzz` covers parser fuzzing. No gap between them.

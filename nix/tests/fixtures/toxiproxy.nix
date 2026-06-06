@@ -39,11 +39,12 @@
 #
 # WHY not also proxy worker↔scheduler:
 #
-#   The scheduler-worker relationship is a long-lived bidi stream
-#   (BuildExecution). Injecting toxics mid-stream tests a different
-#   failure domain (stream-close → reconnect loop, main.rs:413-425) that
-#   lifecycle.nix already covers via controller-restart. The chaos
-#   scenarios here target the unary-RPC retry/timeout/breaker paths.
+#   The scheduler-worker surface is the same idempotent unary-RPC
+#   family (PullAssignment/ReportOutcome) whose retry/timeout/breaker
+#   paths the proxied store legs already exercise; worker loss itself
+#   is covered by lifecycle.nix via controller-restart. (Stream-era:
+#   the removed BuildExecution bidi stream was a distinct mid-stream
+#   failure domain worth its own toxics.)
 #
 # Returns the same shape as standalone.nix:
 #   { nodes, waitReady, pyNodeVars, gatewayHost, pki }

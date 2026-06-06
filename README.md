@@ -45,8 +45,8 @@ rio-build is a **build execution backend**, not a CI system. Out of scope: Nix e
     │  locality scoring│ │  S3 blobs              │
     │  PostgreSQL      │ │  binary-cache HTTP     │
     └────────┬─────────┘ └───────────┬────────────┘
-             │ BuildExecution        │
-             │ (bidi gRPC stream)    │ gRPC + HTTP
+             │ PullAssignment /      │
+             │ ReportOutcome (gRPC)  │ gRPC + HTTP
              ▼                       ▼
    ┌──────────────────────────────────────────────┐
    │            rio-builder (K8s pods)            │

@@ -211,13 +211,13 @@ impl HmacClaims for ServiceClaims {
 
 /// Claims for an executor-identity token. Minted by the scheduler per
 /// `SpawnIntent`, threaded through the controller as the
-/// `RIO_EXECUTOR_TOKEN` pod env var, presented by builders on
-/// `BuildExecution` open and every `Heartbeat` as
-/// `x-rio-executor-token`. The scheduler verifies it to bind a
-/// stream/heartbeat to the intent the pod was spawned for — a
-/// compromised pod cannot hijack another pod's stream or spoof its
-/// heartbeat fields, because it cannot mint a token for a different
-/// `intent_id`.
+/// `RIO_EXECUTOR_TOKEN` pod env var, presented by builders on every
+/// executor unary (`PullAssignment` / `ReportOutcome`) as
+/// `x-rio-executor-token` metadata (or the in-body `executor_token`
+/// field). The scheduler verifies it to bind each pull/report to the
+/// intent the pod was spawned for — a compromised pod cannot claim
+/// another pod's assignment or spoof its report, because it cannot
+/// mint a token for a different `intent_id`.
 ///
 /// Signed with the SAME assignment-HMAC key as [`AssignmentClaims`]:
 /// both are scheduler-minted, scheduler-verified; the serde shape
@@ -228,12 +228,12 @@ impl HmacClaims for ServiceClaims {
 #[serde(deny_unknown_fields)]
 pub struct ExecutorClaims {
     /// `SpawnIntent.intent_id` (= drv_hash) the token authorizes.
-    /// Checked against `HeartbeatRequest.intent_id` and the actor's
-    /// `ExecutorState.intent_id` on reconnect.
+    /// Checked against `PullAssignmentRequest.intent_id` (and the
+    /// report's bound exec row) on every unary.
     pub intent_id: String,
     /// `SpawnIntent.kind` (proto `ExecutorKind` wire i32: 0=Builder,
-    /// 1=Fetcher) the token authorizes. Checked against
-    /// `HeartbeatRequest.kind` — `kind` decides the FOD/non-FOD
+    /// 1=Fetcher) the token authorizes. Checked when the pod pulls —
+    /// `kind` decides the FOD/non-FOD
     /// airgap routing, and the worker is NOT trusted (a compromised
     /// open-egress Fetcher heartbeating `kind=Builder` would
     /// otherwise receive non-FOD builds with secret inputs).

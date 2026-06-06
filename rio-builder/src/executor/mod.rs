@@ -328,8 +328,8 @@ pub enum BuildTaskMessage {
     Completion(Box<CompletionReport>),
     /// Build phase change (forwarded resSetPhase). Sent unbatched per
     /// `builder.stderr.forward-set-phase`; the pull loop drains and
-    /// discards it (no scheduler-side consumer since the BuildExecution
-    /// stream's removal).
+    /// discards it (no scheduler-side consumer — the stream-era
+    /// BuildExecution carrier is removed).
     Phase(BuildPhase),
 }
 

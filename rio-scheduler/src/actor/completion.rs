@@ -558,8 +558,8 @@ impl DagActor {
 
     /// Walk parents of a just-completed/skipped derivation: any
     /// `Queued` parent whose deps are now all completed-equivalent
-    /// transitions to `Ready`, gets persisted, and is pushed to the
-    /// ready queue. Shared by every completion-like path
+    /// transitions to `Ready`, gets persisted, and becomes
+    /// pull-claimable. Shared by every completion-like path
     /// (`release_downstream`, `complete_ready_from_store`,
     /// `ca_cutoff_cascade`, recovery's `adopt_orphan_completion`).
     pub(super) async fn promote_newly_ready(&mut self, completed: &DrvHash) {
@@ -1148,15 +1148,15 @@ impl DagActor {
             return;
         }
 
-        // Cancelled: scheduler transitioned BEFORE sending CancelSignal
-        // (build.rs:cancel_build_derivations), so the executor's
+        // Cancelled: scheduler transitioned BEFORE the pod observed the
+        // cancel (build.rs:cancel_build_derivations), so the executor's
         // Cancelled report finds the derivation already in this state.
         // Expected; capacity was freed above. The drv_executions row was
         // already stamped by terminal_log_epilogue at cancel time.
         // No further action.
         if current_status == DerivationStatus::Cancelled {
             debug!(drv_hash = %drv_hash, executor_id = %executor_id,
-                   "cancelled completion report (expected after CancelSignal)");
+                   "cancelled completion report (expected after a cancel)");
             return;
         }
 
@@ -3859,9 +3859,10 @@ impl DagActor {
             // derivations first — without this, sole-interest Queued/
             // Ready/Assigned derivations for this build linger:
             // Assigned ones keep burning worker CPU, Queued/Ready
-            // ones occupy the ready queue. cancel_build_derivations
-            // sends CancelSignal + transitions DependencyFailed/
-            // Cancelled + removes build interest.
+            // ones stay pull-claimable. cancel_build_derivations
+            // transitions DependencyFailed/Cancelled (the controller's
+            // Job deletion aborts in-flight pods) + removes build
+            // interest.
             self.cancel_build_derivations(
                 build_id,
                 &format!("build {build_id} failed fast (keep_going=false)"),

@@ -47,7 +47,8 @@
 #   non-empty, so gone ⇒ builder killed ⇒ kill-on-teardown ran) + a
 #   second build of the SAME drv succeeds (no EEXIST — leak is closed).
 #   Distinct from cancel-cgroup-kill: that tests runtime.rs's explicit
-#   CancelSignal path; this tests the executor's post-daemon teardown.
+#   cancel-abort path (try_cancel_build, stream-era CancelSignal's
+#   surviving machinery); this tests the executor's post-daemon teardown.
 #
 # worker.upload.references-scanned — verify marker at default.nix:subtests[refs-end-to-end]
 #   refs-end-to-end builds a consumer derivation whose $out embeds a

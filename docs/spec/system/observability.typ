@@ -11,8 +11,8 @@ viewer. The data plane is owned by rio-store: builders stream log batches to
 `LogService.AppendLog`, the store cuts immutable zstd-compressed chunks to S3
 with a PostgreSQL line-range manifest, and every reader --- the gateway's
 live tail, the dashboard, the CLI --- reads back through `LogService.TailLog`.
-The scheduler never receives a log line: the `BuildExecution` stream carries
-control messages only, and the scheduler's only log-adjacent responsibility
+The scheduler never receives a log line: the executor unaries
+(`PullAssignment`/`ReportOutcome`) carry control state only, and the scheduler's only log-adjacent responsibility
 is the `drv_executions` lifecycle row (one per execution, stamped with the
 terminal status and the builder-reported final line count). The normative
 requirements on the store's ingest and read paths live in
@@ -348,12 +348,12 @@ frozen with the CR gone.
   input-bound or output-bound.
 ]
 
-#r("obs.metric.builder-util")[
+#r("obs.metric.builder-util+2")[
   Builder utilization gauges (`rio_builder_{cpu,memory}_fraction`) are polled
   from the builder's parent cgroup every 10s by `utilization_reporter_loop`.
-  The same loop publishes a `ResourceSnapshot` that the heartbeat reads for
-  `HeartbeatRequest.resources` --- one sampling site means Prometheus and
-  `ListExecutors` always agree. These capture the whole builder tree
+  That loop is the sole sampling site --- the admin `ListExecutors` surface
+  carries no per-pod telemetry (`ExecutorInfo.resources` is unset), so
+  Prometheus is the one consumer and cannot disagree with a second reader. These capture the whole builder tree
   (rio-builder + per-build sub-cgroups + all subprocesses). CPU fraction >1.0
   on multi-core is expected under full load. Memory fraction stays 0.0 if
   `memory.max` is unbounded --- only meaningful when the pod has a memory

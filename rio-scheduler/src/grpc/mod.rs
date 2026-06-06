@@ -489,7 +489,7 @@ pub(crate) fn bridge_build_events(
 }
 
 // ---------------------------------------------------------------------------
-// BuildExecution bidirectional stream e2e
+// ExecutorService e2e
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

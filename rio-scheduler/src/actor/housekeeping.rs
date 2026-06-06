@@ -268,9 +268,10 @@ impl DagActor {
                     rio_proto::types::BuildResultStatus::TimedOut,
                 );
             }
-            // Reuse the CancelBuild derivation-cancellation path (sends
-            // CancelSignal, transitions drvs to Cancelled, removes build
-            // interest, prunes ready queue). Then fail the BUILD instead
+            // Reuse the CancelBuild derivation-cancellation path (transitions
+            // drvs to Cancelled — the controller's Job deletion aborts
+            // in-flight pods — removes build interest, revokes Ready
+            // claimability). Then fail the BUILD instead
             // of cancelling it — TimedOut is semantically "permanent-no-
             // reassign" (types.proto:278), same as a build failure.
             self.cancel_build_derivations(build_id, &reason).await;

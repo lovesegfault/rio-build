@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 ///
 /// This tests the core recover_from_pg path: load builds, load
 /// derivations, load edges, load build_derivations, rebuild DAG +
-/// interested_builds + ready queue. RecoveryFixture::run guarantees
+/// interested_builds + Ready claimability. RecoveryFixture::run guarantees
 /// the phase-2 actor is brand new (empty DAG before LeaderAcquired).
 #[tokio::test]
 async fn test_recover_from_pg_rebuilds_dag() -> TestResult {

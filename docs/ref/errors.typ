@@ -187,9 +187,9 @@ Only `TransientFailure` and `InfrastructureFailure` errors trigger retries.
 `PermanentFailure` and `DependencyFailed` are terminal.
 
 *Delayed re-queue (Phase 3b):* The computed backoff is stored in
-`DerivationState.backoff_until`. `dispatch_ready` defers the derivation until
-`Instant::now() >= backoff_until` using a defer-and-requeue pattern (push back
-onto the ready queue, skip on next tick if still early). Cleared on successful
+`DerivationState.backoff_until`. a deferred derivation stays `Ready` but is
+withheld from claimability until `Instant::now() >= backoff_until`
+(re-evaluated on every pull/tick — no timer state). Cleared on successful
 dispatch. Stateless --- no timer tasks to clean up on cancel.
 
 *Executor avoidance (Phase 3b):* Dispatch's `best_executor()` filter excludes
@@ -277,8 +277,9 @@ separately. A derivation is only globally poisoned if it fails on
   [Scheduler backstop timeout],
   [`handle_tick`],
   [When a Running derivation's `running_since.elapsed()` exceeds
-    `max(est_duration × 3, daemon_timeout + 10min)`, scheduler sends
-    CancelSignal + resets to Ready + increments retry_count + adds executor to
+    `max(est_duration × 3, daemon_timeout + 10min)`, scheduler force-closes
+    the execution (the controller's Job deletion aborts the pod) + resets to
+    Ready + increments retry_count + adds executor to
     failed_builders. Catches "executor heartbeating but daemon wedged."],
   [Implemented (Phase 3b)],
 )

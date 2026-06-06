@@ -330,7 +330,8 @@ enum Cmd {
     /// `poison-clear` takes), which workers failed, and age (TTL 24h).
     PoisonList,
     /// Cancel an active build. Transitions in-flight derivations to
-    /// Cancelled (workers receive CancelSignal → cgroup.kill) and frees
+    /// Cancelled (the controller deletes the executor Job; SIGTERM →
+    /// cgroup.kill) and frees
     /// their slots. Idempotent: returns cancelled=false for an already-
     /// terminal or unknown build_id.
     ///

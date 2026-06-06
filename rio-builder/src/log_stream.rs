@@ -2,7 +2,8 @@
 //!
 //! Buffers STDERR_NEXT messages from `nix-daemon` and batches them into
 //! `BuildLogBatch` messages (64 lines or 100ms, whichever comes first).
-//! Batches are sent on the scheduler `BuildExecution` stream.
+//! Batches ship to rio-store's `LogService.AppendLog` (the scheduler
+//! never sees a log line; the stream-era BuildExecution carrier is gone).
 //!
 //! Also enforces per-build log limits. `total_bytes` is a hard cap:
 //! exceeding it returns [`AddLineResult::LimitExceeded`] and the caller

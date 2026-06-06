@@ -23,9 +23,9 @@
 //! classification arrives via the controller's pod-terminal path.
 //!
 //! SIGTERM in pull mode is an **abort**, not a drain (AD5): an
-//! in-flight build is cgroup-killed through the same cancel-honor path
-//! `CancelSignal` uses (`try_cancel_build`: slot cancel flag +
-//! cgroup.kill), the resulting `Cancelled` completion gets exactly one
+//! in-flight build is cgroup-killed through the cancel-honor path
+//! (`try_cancel_build`: slot cancel flag + cgroup.kill — the surviving
+//! machinery of the stream-era `CancelSignal`), the resulting `Cancelled` completion gets exactly one
 //! bounded best-effort `ReportOutcome` attempt, logs are finalized by
 //! teardown, and the process exits — all inside the pull-mode
 //! `terminationGracePeriodSeconds` (45 s). There is no
@@ -473,7 +473,7 @@ async fn wait_for_completion(
 // r[impl builder.shutdown.sigint+5]
 /// AD5 abort phase: wait for the single build's completion, aborting
 /// the build if SIGTERM arrives first. The abort is the same
-/// cancel-honor path `CancelSignal` uses (`try_cancel_build`: slot
+/// cancel-honor path the stream-era `CancelSignal` used (`try_cancel_build`: slot
 /// cancel flag + cgroup.kill); the killed build task then emits its
 /// `Cancelled` completion through the permanent sink exactly as a
 /// scheduler-cancelled build does, and the caller's report phase makes

@@ -389,9 +389,10 @@ impl DerivationStatus {
             // I-094 deferred re-probe: output present but inputDrv
             // in-flight; failure history moot, gate on dep via Queued.
             (Self::Failed, Self::Queued) => true,
-            // Cancel: from any in-flight state. CancelBuild sends
-            // CancelSignal to workers running sole-interest derivations;
-            // DrainExecutor(force) cancels all a worker's in-flight.
+            // Cancel: from any in-flight state. CancelBuild cancels
+            // sole-interest derivations (the controller's Job deletion
+            // aborts the pods); DrainExecutor(force) cancels all a
+            // worker's in-flight.
             // Both require the derivation to be Assigned or Running —
             // if it's still Queued/Ready (not dispatched yet), just
             // remove build interest instead (handle_cancel_build's
@@ -1012,7 +1013,8 @@ pub struct SchedHint {
     /// Bottom-up: leaves have `priority = est_duration`; roots have
     /// the sum along the longest path. Higher = more urgent (dispatch
     /// first). Recomputed incrementally on completion via
-    /// ancestor-walk. The ready queue uses this for BinaryHeap ordering.
+    /// ancestor-walk. Spawn-intent ranking and the cluster snapshot
+    /// sort on this.
     pub priority: f64,
 }
 
@@ -2518,8 +2520,8 @@ mod tests {
             // Cancel: only from in-flight states. Queued/Ready
             // derivations are handled by orphan-removal instead
             // (handle_cancel_build's existing path).
-            (Assigned, Cancelled), // CancelSignal before worker ACK
-            (Running, Cancelled),  // CancelSignal mid-build (cgroup.kill)
+            (Assigned, Cancelled), // cancel before the pod claimed it
+            (Running, Cancelled),  // cancel mid-build (Job deletion → cgroup.kill)
             (Queued, Skipped),     // CA early-cutoff cascade
             (Ready, Skipped),      // CA cutoff after find_newly_ready promoted
         ];
@@ -2556,7 +2558,7 @@ mod tests {
                 .validate_transition(DependencyFailed)
                 .is_ok()
         );
-        // cancelled -> cancelled is no-op (duplicate CancelSignal or
+        // cancelled -> cancelled is no-op (duplicate cancel or
         // late completion report after cgroup.kill)
         assert!(Cancelled.validate_transition(Cancelled).is_ok());
         // skipped -> skipped is no-op (cascade re-visits via diamond DAG)

@@ -151,18 +151,18 @@ impl Drop for BuildSlotGuard {
 /// Returns `true` if the build was found and the flag was set (kill
 /// may still be deferred — see ENOENT handling). `false` if not found
 /// (build already finished, or the cancel is for a different drv —
-/// stale CancelSignal from a previous scheduler generation).
+/// stale cancel from a previous scheduler generation).
 ///
 /// Called from the runtime's `Msg::Cancel` stream handler.
 /// Fire-and-forget: the scheduler doesn't wait for confirmation (it
 /// moves the derivation on — to `Cancelled` or back to `Ready`,
 /// depending on the sender — in the same pass that sends the
-/// `CancelSignal`; this is just cleanup).
+/// cancel; this is just cleanup).
 pub fn try_cancel_build(slot: &BuildSlot, drv_path: &str) -> bool {
     // Single lock for the whole operation: drv_path match + flag set +
     // cgroup path read happen atomically. With one build per pod the
     // slot holds 0-or-1 entry; the drv_path check guards against a
-    // stale CancelSignal (scheduler restarted and re-sent for a build
+    // stale cancel (scheduler restarted and re-issued for a build
     // this pod never had).
     let guard = slot.inner.lock().ignore_poison();
     let Some(inner) = guard.as_ref() else {
@@ -176,7 +176,7 @@ pub fn try_cancel_build(slot: &BuildSlot, drv_path: &str) -> bool {
         tracing::debug!(
             drv_path,
             running = %inner.drv_path,
-            "cancel: drv mismatch (stale CancelSignal)"
+            "cancel: drv mismatch (stale cancel)"
         );
         return false;
     }

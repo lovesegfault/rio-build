@@ -24,7 +24,7 @@ in
       '';
     };
 
-    schedulerAddr = rioLib.mkGrpcAddrOption "scheduler" "Worker opens a bidirectional BuildExecution stream at startup.";
+    schedulerAddr = rioLib.mkGrpcAddrOption "scheduler" "Builder pulls its assignment and reports its outcome here (PullAssignment/ReportOutcome unaries).";
     storeAddr = rioLib.mkGrpcAddrOption "store" "FUSE fetches from here; executor uploads outputs via PutPath.";
 
     fuseMountPoint = lib.mkOption {

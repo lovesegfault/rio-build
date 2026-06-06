@@ -2050,7 +2050,7 @@ Dispatch-order preemption is priority-based:
     [Assigned executor is lost (heartbeat timeout, pod termination)],
 
     [`failed → ready`],
-    [Derivation re-enters the ready queue. See `running → failed` above.],
+    [Derivation re-enters `Ready` (pull-claimable). See `running → failed` above.],
 
     [`created → dependency_failed`],
     [A dependency reached `poisoned` before this node was queued],
@@ -2671,7 +2671,7 @@ leader once recovery completes.
 *Retired (1c' deletion commit C --- the operator surfaces; RPCs removed at
 the 1d proto sweep):*
 `sched.executor.dual-register`. The two-step stream+heartbeat registration
-protocol described here has no scheduler side left: the `BuildExecution`/
+protocol described here has no scheduler side left: the removed `BuildExecution`/
 `Heartbeat` RPCs are gone from the proto and the in-memory executor
 entry they used to create is deleted. There is no registration in the pull
 protocol --- work binds only at a successful `PullAssignment` (the pull is
@@ -3187,7 +3187,7 @@ consumer.
     valve, never discard.
   Normal processing resumes when the queue depth drops below 60% (hysteresis to
   prevent oscillation). (The stream-era intake arms this rule used to
-  enumerate --- blocking the `BuildExecution` reader on completions and
+  enumerate --- blocking the removed `BuildExecution` reader on completions and
   dropping `LogBatch` forwards --- left with that protocol surface.)
 ]
 
@@ -3830,7 +3830,8 @@ message.
 The rule keeps its historical `claim-before-advertise` name; there is no
 advertisement channel left, and the operative ordering is claim-before-serve.
 The stream-era form gated the heartbeat-reply sentinel
-(`HeartbeatResponse.generation = 0` until recovery completed) so that workers
+(the retired `HeartbeatResponse.generation = 0` sentinel until recovery
+completed) so that workers
 could never latch an advertised-but-unclaimed generation --- a latch that
 only rises would otherwise wedge the fleet against the active leader after a
 Lease deletion. With the latch and the heartbeat channel retired, nothing

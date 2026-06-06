@@ -893,11 +893,12 @@ rec {
   # drain via shutdown_signal → atexit → LLVM profraw flush), tars
   # /var/lib/rio/cov, and copies to $out/coverage/<node>/.
   #
-  # Stop ORDER matters: workers first. A dead worker closes the
-  # BuildExecution bidi stream → scheduler's worker-stream-reader
-  # task breaks → sends WorkerDisconnected → actor drops that
-  # worker's stream_tx. By the time the scheduler gets SIGTERM, its
-  # serve_with_shutdown has no open response streams to wait on.
+  # Stop ORDER matters: workers first. (Stream-era rationale, kept:
+  # a dead worker closed the removed BuildExecution bidi stream so
+  # the scheduler held no open response streams at SIGTERM. With
+  # pull-mode unaries there are no server streams at all; stopping
+  # workers first still lets their bounded ReportOutcome attempts
+  # finish before the scheduler's serve_with_shutdown returns.)
   # Belt-and-suspenders for the actor's own token-aware drain.
   #
   # `pyNodeVars` is a Python expression evaluating to a list of Machine

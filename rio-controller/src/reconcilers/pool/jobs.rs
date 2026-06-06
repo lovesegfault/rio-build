@@ -1103,7 +1103,7 @@ pub(super) fn build_job(
     // r[impl sec.executor.identity-token+3]
     // Pass the scheduler-signed token (from `MintExecutorTokens`, NOT
     // `SpawnIntent`) through verbatim so the builder presents it on
-    // `BuildExecution` / `Heartbeat`. Per-intent (not per-Pool), so
+    // `PullAssignment` / `ReportOutcome`. Per-intent (not per-Pool), so
     // it's appended here rather than in the static
     // `build_executor_pod_spec` env list. `None` in dev mode (or when
     // the mint RPC failed / drv left Ready between poll and mint) →

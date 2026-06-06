@@ -1196,7 +1196,7 @@ mod tests {
         slot.set_cgroup_path(PathBuf::from("/nope"));
         assert!(
             !try_cancel_build(&slot, "/nix/store/absent.drv"),
-            "drv mismatch → false (stale CancelSignal guard)"
+            "drv mismatch → false (stale cancel guard)"
         );
     }
 

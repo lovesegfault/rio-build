@@ -125,7 +125,7 @@ crate::state::db_str_enum! {
     /// `Pending` is the insert-time value. Every CompletionReport
     /// transitions it to one of the terminal values — `Completed` on
     /// `Built`, `Failed` on any failure status, `Cancelled` when the
-    /// scheduler sent a CancelSignal. I-209: leaving the row at `pending`
+    /// scheduler cancelled the build. I-209: leaving the row at `pending`
     /// after a derivation goes terminal blocks the tick-DELETE pruner
     /// (`NOT EXISTS (SELECT 1 FROM assignments …)`), leaking
     /// `derivations` rows unbounded.

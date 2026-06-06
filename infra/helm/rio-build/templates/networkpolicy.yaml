@@ -61,7 +61,7 @@ spec:
         - ports:
             - {port: "53", protocol: UDP}
             - {port: "53", protocol: TCP}
-    # Scheduler: Heartbeat/BuildExecution. Cross-ns endpoint match via
+    # Scheduler: PullAssignment/ReportOutcome unaries. Cross-ns endpoint match via
     # the auto-injected k8s:io.kubernetes.pod.namespace label.
     - toEndpoints:
         - matchLabels:

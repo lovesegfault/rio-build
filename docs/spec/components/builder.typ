@@ -332,7 +332,7 @@ classification helper (`jit_classify`) is unchanged.
 `builder.heartbeat.rpc-timeout` and `builder.heartbeat.store-degraded`
 described the periodic heartbeat loop (per-RPC timeout strictly below the
 interval; the `store_degraded` capacity flag). The heartbeat task, its
-constants, and the `HeartbeatRequest`/`HeartbeatResponse` wire surface are
+constants, and the retired `HeartbeatRequest`/`HeartbeatResponse` wire surface are
 deleted with the stream session: pod liveness belongs to the kubelet/Job
 lifecycle, attempt liveness to the durable open-attempt row plus the
 establishment sweep (#rref("sched.attempt.establishment-window")), and there
@@ -1664,7 +1664,7 @@ SSD caching.
 
 The communication model between scheduler and workers determines latency,
 failure handling, and operational characteristics. The original design (ADR-011
-and its successors) used a bidirectional `BuildExecution` stream per worker
+and its successors) used a since-removed bidirectional `BuildExecution` stream per worker
 plus a periodic `Heartbeat` unary; the executor-lifecycle campaign replaced it,
 and the stream session client was deleted at the 1d collapse.
 

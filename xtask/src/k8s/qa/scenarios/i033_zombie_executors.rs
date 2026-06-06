@@ -2,7 +2,7 @@
 //! after recovery.
 //!
 //! The original failure mode: executors heartbeat-alive but their
-//! BuildExecution stream was attached to the dead leader. They appear
+//! stream-era BuildExecution session was attached to the dead leader. They appear
 //! in `cli workers` (PG `last_seen` fresh) but the actor has no stream
 //! → never dispatched. Signature: `DebugListExecutors` shows
 //! `has_stream=false` for entries that `ListExecutors` claims live.

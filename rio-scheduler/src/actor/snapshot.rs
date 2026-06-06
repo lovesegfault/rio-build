@@ -338,9 +338,9 @@ impl DagActor {
                             // The scalar and the I-107 per-system breakdown
                             // are counted in the same arm so the sum across
                             // keys equals the scalar by construction (the
-                            // ready-queue membership the scalar used to read
-                            // was not dequeued by pull mints — the recorded
-                            // over-count).
+                            // removed ready-queue membership the scalar once
+                            // read was not dequeued by pull mints — the
+                            // recorded over-count).
                             queued_derivations += 1;
                             *queued_by_system.entry(s.system.clone()).or_default() += 1;
                         }

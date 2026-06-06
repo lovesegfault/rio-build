@@ -46,8 +46,8 @@ impl DagActor {
     /// build's interest from the DAG.
     ///
     /// Transitions sole-interest in-flight derivations to Cancelled,
-    /// removes build interest from the DAG, and prunes orphaned
-    /// ready-queue entries. Does NOT transition the build state itself
+    /// removes build interest from the DAG, and revokes orphaned
+    /// `Ready` claimability. Does NOT transition the build state itself
     /// — caller decides Cancelled vs Failed. Extracted from
     /// [`handle_cancel_build`] so the per-build-timeout check in
     /// `handle_tick` (`sched.timeout.per-build` spec) can reuse the

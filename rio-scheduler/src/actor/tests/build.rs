@@ -758,7 +758,7 @@ async fn test_cancel_records_duration_histogram() -> TestResult {
 /// fail-fast, top-down substitute fail).
 ///
 /// Pre-fix: `cancel_build_derivations` transitioned to `Cancelled`,
-/// sent `CancelSignal`, persisted — but never recorded the
+/// cancelled it (transition persisted) — but never recorded the
 /// correlation. Net effect: `bd.exec_id` stays NULL → the dashboard
 /// falls back to the latest-exec log instead of the exact execution
 /// this build observed.
@@ -819,7 +819,7 @@ async fn cancel_running_drv_records_exec_correlation(
     }
 
     // Cancel the build — the drv is sole-interest Assigned/Running, so
-    // it lands in `to_cancel` (CancelSignal + transition Cancelled).
+    // it lands in `to_cancel` (cancel + transition Cancelled).
     actor
         .cancel_build_derivations(build_id, "test cancel")
         .await;

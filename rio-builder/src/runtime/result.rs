@@ -107,8 +107,8 @@ pub(super) fn ok_completion(r: ExecutionResult, mut stamp: CompletionStamp) -> C
 /// the kill → SIGKILL → stdout-EOF → `Err` path has some latency, so by
 /// the time the result is observed the flag is set. Three buckets:
 ///
-/// - `was_cancelled` → `Cancelled`. Expected outcome of any
-///   `CancelSignal`: `CancelBuild`, the scheduler's backstop timeout, or
+/// - `was_cancelled` → `Cancelled`. Expected outcome of any cancel
+///   source: `CancelBuild`, the scheduler's backstop timeout, or
 ///   `DrainExecutor(force)`. Not an error — info-logged. Scheduler's
 ///   completion handler treats `Cancelled` as a no-op (by the time the
 ///   report arrives it has already moved the derivation on — to
@@ -223,7 +223,7 @@ pub(super) fn panic_completion(
 /// The override applies to a successful attempt's `ok` too: a cancel
 /// that lands after the daemon exits but before the footer send reports
 /// the assignment's disposition, not the daemon's exit status. The flag
-/// is set by `try_cancel_build` on any `CancelSignal` (the senders
+/// is set by `try_cancel_build` on any cancel (the senders
 /// behind [`err_completion`]'s `was_cancelled`); every sender abandons
 /// this execution on the scheduler side, so `cancelled` is the right
 /// footer regardless of how the attempt ended.
@@ -236,7 +236,7 @@ pub(super) fn panic_completion(
 /// cancel path the footer is dropped by the scheduler's cancel-path seal
 /// and never reaches the stored log (see `terminal_log_epilogue`'s
 /// sequencing note in rio-scheduler); it is still observable on the
-/// force-drain/backstop `CancelSignal` paths.
+/// force-drain/backstop cancel paths.
 pub(super) fn final_footer_result(
     last_footer_result: Option<&str>,
     was_cancelled: bool,

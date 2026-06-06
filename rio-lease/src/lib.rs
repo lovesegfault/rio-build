@@ -30,10 +30,11 @@
 //!
 //! - DAG merge dedups by `drv_hash`. Two schedulers merging the
 //!   same SubmitBuild both end up with the same DAG node.
-//! - Workers compare `WorkAssignment.generation` against
-//!   `HeartbeatResponse.generation`. Once the new leader's
-//!   generation reaches them via heartbeat, the old leader's
-//!   assignments are stale and workers reject them.
+//! - Assignment minting is fenced by the serving replica's lease
+//!   generation against the durable claims floor
+//!   (`leader_generation_claims`): a deposed leader's mint loses the
+//!   fence race instead of reaching a pod. (Stream-era: workers
+//!   compared generations from the removed heartbeat channel.)
 //! - Worst case: a derivation dispatches twice (one from each
 //!   leader), builds twice, produces the same output (deterministic
 //!   builds). Wasteful but correct.

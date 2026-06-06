@@ -692,8 +692,8 @@ impl DagActor {
         //
         // This sets est_duration (SLA T_min, default 60s on miss) +
         // priority (bottom-up) for new nodes, and propagates to existing
-        // nodes if the new subgraph raises their priority. The ready
-        // queue reads these for BinaryHeap ordering.
+        // nodes if the new subgraph raises their priority. Spawn-intent
+        // ranking and the cluster snapshot sort on these.
         crate::critical_path::compute_initial(
             &mut self.dag,
             &self.sla_estimator,
@@ -1742,8 +1742,8 @@ impl DagActor {
             // `unwanted` paths: a recorded output no LIVE interested
             // build wants (typically never present and not
             // substitutable — the steady state the demand-driven
-            // criterion leaves behind) must not push the node onto the
-            // ready queue when every WANTED missing path is
+            // criterion leaves behind) must not return the node to
+            // `Ready` (pull-claimable) when every WANTED missing path is
             // substitutable. The routing must never be stricter than
             // the reset that put the node here, otherwise the detached
             // re-substitution lane is skipped and only the

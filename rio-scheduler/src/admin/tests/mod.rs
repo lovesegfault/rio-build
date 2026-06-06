@@ -1004,7 +1004,7 @@ async fn cluster_status_counts_queued_and_running() -> anyhow::Result<()> {
     // The DAG-status-derived counts are the pull-era truth: "b" is the
     // only Ready derivation, "a" is Running under its open attempt.
     // The scalar is counted from the same DAG pass as the per-system
-    // split (the recorded ready-queue over-count is fixed), so the two
+    // split (the recorded stream-era ready-queue over-count is fixed), so the two
     // must agree exactly.
     assert_eq!(
         resp.queued_derivations, 1,

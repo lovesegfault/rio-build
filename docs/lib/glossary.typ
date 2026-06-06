@@ -337,7 +337,7 @@
   (
     key: "prefetch-hint",
     short: [prefetch hint],
-    description: [A message sent by the scheduler to an executor via the `BuildExecution` stream before assigning a build, listing input closure paths that the executor's FUSE cache should pre-warm. Converts serial "fetch then build" into overlapped execution.],
+    description: [Stream-era message (removed with the `BuildExecution` stream): the scheduler listed input closure paths for the executor's FUSE cache to pre-warm before assigning a build. The live equivalent is builder-local: `prefetch_manifests` warms the assignment's input manifests as the closure walk begins, converting serial "fetch then build" into overlapped execution.],
   ),
   (
     key: "poison-derivation",

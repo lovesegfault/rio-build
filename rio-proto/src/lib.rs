@@ -141,7 +141,7 @@ pub mod scheduler {
     tonic::include_proto!("rio.scheduler");
 }
 
-/// Executor service: builder/fetcher-facing RPCs (BuildExecution, Heartbeat).
+/// Executor service: builder/fetcher-facing RPCs (PullAssignment, ReportOutcome).
 pub mod builder {
     tonic::include_proto!("rio.builder");
 }
