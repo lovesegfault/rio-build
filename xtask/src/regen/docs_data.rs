@@ -820,6 +820,12 @@ fn consts() -> Result<serde_json::Value> {
     const TABLE: &[(&str, &str)] = &[
         ("MAX_RECONNECT", "rio-gateway/src/handler/build.rs"),
         ("DEFAULT_GC_GRACE_HOURS", "rio-store/src/grpc/admin.rs"),
+        // bug_231: deployment.typ restated a retired 7200s grace as
+        // prose; the live 45s abort grace must render from the const.
+        (
+            "PULL_MODE_TERMINATION_GRACE_SECS",
+            "rio-common/src/limits.rs",
+        ),
         // Add more as docs cite them. Threshold: cited at ≥2 prose
         // sites, value is a plain integer literal.
     ];
