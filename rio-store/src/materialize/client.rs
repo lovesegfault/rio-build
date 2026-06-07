@@ -1030,15 +1030,20 @@ impl SchedulerTransport {
         }
     }
 
-    /// Inspect one RPC outcome: an `UNAVAILABLE` answer abandons the
-    /// connection (see [`Self::abandon_connection`]). Every other
-    /// outcome — success or a different rejection — keeps it: those
-    /// answers prove the connected peer is the serving leader (or that
-    /// the request itself is at fault), so connection churn would only
-    /// cost throughput.
+    /// Inspect one RPC outcome: a BARE `UNAVAILABLE` answer abandons
+    /// the connection (see [`Self::abandon_connection`]) — that shape
+    /// means wrong/standby peer (finding 18). An UNAVAILABLE carrying
+    /// the leader-NACK marker (merged_bug_031:
+    /// `x-rio-leader-nack`, e.g. the bug_182 consumption-not-durable
+    /// NACK) KEEPS the connection: only the serving leader's
+    /// consumption path emits it, so the refusal itself proves the
+    /// pinned peer is the leader — abandoning would re-roll AWAY from
+    /// it and halve leader-landing odds inside the report retry
+    /// budget. Every other outcome — success or a different
+    /// rejection — keeps the connection too.
     fn note_rpc_outcome<T>(&mut self, result: &Result<T, tonic::Status>) {
         if let Err(status) = result
-            && status.code() == tonic::Code::Unavailable
+            && Self::should_abandon(status)
         {
             debug!(
                 msg = status.message(),
@@ -1047,6 +1052,14 @@ impl SchedulerTransport {
             );
             self.abandon_connection();
         }
+    }
+
+    /// merged_bug_031 — the ONE abandon decision: retry-class
+    /// (metadata) separated from peer-identity (status code), so a
+    /// new leader-emitted NACK can never alias the
+    /// abandon-connection trigger.
+    fn should_abandon(status: &tonic::Status) -> bool {
+        status.code() == tonic::Code::Unavailable && !rio_common::grpc::is_leader_nack(status)
     }
 }
 
@@ -1320,6 +1333,34 @@ mod tests {
         );
         assert_eq!(t.list_calls, 1);
         assert_eq!(t.pull_calls, 2);
+    }
+
+    /// merged_bug_031: the consumption-not-durable NACK is a
+    /// LEADER-emitted refusal -- it must not tear down the healthy
+    /// leader-pinned channel the way a bare standby UNAVAILABLE does.
+    /// The typed signal is the x-rio-leader-nack metadata key; the
+    /// abandon decision reads the marker, never the message text.
+    #[test]
+    fn leader_nack_keeps_the_pinned_connection() {
+        // Bare UNAVAILABLE: standby/wrong-peer shape -- abandon.
+        let bare = tonic::Status::unavailable("not leader (standby replica)");
+        assert!(SchedulerTransport::should_abandon(&bare));
+
+        // Marked UNAVAILABLE: the leader's own NACK -- keep.
+        let mut nack = tonic::Status::unavailable("consumption close not durable");
+        nack.metadata_mut().insert(
+            rio_common::grpc::LEADER_NACK_METADATA_KEY,
+            rio_common::grpc::LEADER_NACK_NOT_DURABLE.parse().unwrap(),
+        );
+        assert!(
+            !SchedulerTransport::should_abandon(&nack),
+            "a leader-emitted NACK proves the pinned peer IS the leader -- never abandon"
+        );
+
+        // Other codes never abandon (request-fault answers).
+        assert!(!SchedulerTransport::should_abandon(
+            &tonic::Status::permission_denied("nope")
+        ));
     }
 
     /// merged_bug_096 (clobber half): the ledger is the SOLE mint

@@ -121,8 +121,21 @@ pub(crate) fn pull_rejection_to_status(rejection: &crate::actor::PullRejection) 
         // bug_182 (the NACK law): the consumption close did not become
         // durable — UNAVAILABLE so the store's report redelivery
         // retries the SAME outcome against this replica.
+        // merged_bug_031: the refusal is LEADER-emitted (only the
+        // leader's consumption path reaches it), so it carries the
+        // typed leader-NACK marker — the store's transport keeps the
+        // pinned connection instead of re-rolling away from the
+        // leader on every PG-brownout NACK.
         PullRejection::ConsumptionNotDurable => {
-            Status::unavailable("consumption close not durable; re-deliver the report")
+            let mut status =
+                Status::unavailable("consumption close not durable; re-deliver the report");
+            status.metadata_mut().insert(
+                rio_common::grpc::LEADER_NACK_METADATA_KEY,
+                rio_common::grpc::LEADER_NACK_NOT_DURABLE
+                    .parse()
+                    .expect("static ascii metadata value"),
+            );
+            status
         }
         PullRejection::TokenMismatch => {
             Status::permission_denied("executor token is bound to a different intent")
@@ -138,4 +151,32 @@ pub(crate) fn pull_rejection_to_status(rejection: &crate::actor::PullRejection) 
         "pull_rejection_to_status: code/class divergence for {rejection:?}"
     );
     status
+}
+
+#[cfg(test)]
+mod tests {
+    /// merged_bug_031: the ConsumptionNotDurable NACK carries the
+    /// leader-NACK metadata marker (x-rio-leader-nack) so the store's
+    /// transport can separate retry-class from peer-identity — the
+    /// NACK retries against THIS replica instead of abandoning the
+    /// leader-pinned connection. Bare-UNAVAILABLE refusals (standby
+    /// shapes) stay unmarked.
+    #[test]
+    fn consumption_nack_carries_the_leader_marker() {
+        let nack =
+            super::pull_rejection_to_status(&crate::actor::PullRejection::ConsumptionNotDurable);
+        assert_eq!(nack.code(), tonic::Code::Unavailable);
+        assert!(
+            rio_common::grpc::is_leader_nack(&nack),
+            "the leader-emitted NACK must carry {}",
+            rio_common::grpc::LEADER_NACK_METADATA_KEY
+        );
+
+        let standby = super::pull_rejection_to_status(&crate::actor::PullRejection::NotLeader);
+        assert_eq!(standby.code(), tonic::Code::Unavailable);
+        assert!(
+            !rio_common::grpc::is_leader_nack(&standby),
+            "standby refusals stay bare — they MUST re-roll the connection"
+        );
+    }
 }

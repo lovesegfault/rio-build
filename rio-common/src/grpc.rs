@@ -109,6 +109,33 @@ pub const TENANT_TOKEN_HEADER: &str = "x-rio-tenant-token";
 /// `r[sec.executor.identity-token]`.
 pub const EXECUTOR_TOKEN_HEADER: &str = "x-rio-executor-token";
 
+/// gRPC metadata key the scheduler attaches to retryable refusals it
+/// emits AS THE SERVING LEADER (merged_bug_031). The value names the
+/// refusal class (`not-durable` -- the bug_182 consumption NACK: the
+/// close did not become durable; the store must re-deliver the SAME
+/// report to the SAME replica). The key separates retry-class from
+/// peer-identity: bare UNAVAILABLE means "wrong/standby peer"
+/// (finding 18) and clients re-roll their pinned connection; WITH
+/// this key the peer PROVED it is the serving leader (only the
+/// leader's consumption path emits the NACK), so abandoning the
+/// channel would re-roll AWAY from the leader -- connection churn
+/// plus ~halved leader-landing odds inside the report retry budget.
+/// A future leader-emitted NACK class adds a VALUE, never a new bare
+/// UNAVAILABLE. Always ASCII.
+pub const LEADER_NACK_METADATA_KEY: &str = "x-rio-leader-nack";
+
+/// [`LEADER_NACK_METADATA_KEY`] value for the consumption-not-durable
+/// NACK (bug_182's law).
+pub const LEADER_NACK_NOT_DURABLE: &str = "not-durable";
+
+/// True when a refusal status carries the leader-emitted NACK marker
+/// ([`LEADER_NACK_METADATA_KEY`]) -- the typed signal that the
+/// connected peer is the serving leader and the refusal is
+/// retry-here, never re-roll-the-connection.
+pub fn is_leader_nack(status: &Status) -> bool {
+    status.metadata().get(LEADER_NACK_METADATA_KEY).is_some()
+}
+
 /// Tenant UUID asserted by a trusted internal caller (scheduler) that
 /// has no JWT to forward. The store only honours this when the request
 /// ALSO carries a valid `x-rio-service-token` whose `caller` is in the
