@@ -1008,6 +1008,25 @@ re-substitution churn instead of an operator signal.
   a tokio worker.
 ]
 
+#r("store.substitute.content-binding")[
+  A substitution Hit over an ALREADY-STORED row MUST content-bind the
+  upstream's narinfo claim to the stored row before the row is returned as
+  that upstream's Hit or any of the upstream's signatures are appended: the
+  claimed `NarHash`, `NarSize`, and reference set MUST equal the stored row's.
+  On disagreement the upstream answers Miss for this path — the narinfo
+  verified only against tenant-supplied `trusted_keys`, which is not a trust
+  boundary, and the `AlreadyComplete` arm runs before any body fetch, so a
+  path-name-only claim must never yield stored bytes.
+]
+
+Without the binding, a tenant whose upstream self-signs a fabricated narinfo
+naming a victim path gets cross-tenant content disclosure (the stored row
+returns as a Hit and flows into `substituted_for_tenant` serving and the
+walk's pin/stamp lane) plus persisted upstream signatures whose fingerprint
+cannot match the stored row — violating the
+#rref("store.substitute.untrusted-upstream") `(nar_size, signatures)`
+consistency invariant.
+
 #r("store.substitute.compression")[
   `fetch_nar` MUST decode every `Compression:` value reference Nix's
   `libutil/compression.cc` accepts: `none`/empty, `xz`, `zstd`, `bzip2`, `br`,

@@ -1091,11 +1091,7 @@ impl Substituter {
         {
             PlaceholderClaim::Owned(claim) => claim,
             PlaceholderClaim::AlreadyComplete => {
-                // Lost the race; winner completed. Compute sigs over
-                // the STORED row (its `nar_size` is what was actually
-                // ingested, immune to a lying second upstream), append
-                // (idempotent — append_signatures dedupes), return it.
-                // NO download.
+                // Lost the race; winner completed. NO download.
                 let stored = metadata::query_path_info(&self.pool, store_path)
                     .await?
                     .ok_or_else(|| {
@@ -1103,6 +1099,51 @@ impl Substituter {
                             "claim AlreadyComplete but query_path_info miss".into(),
                         )
                     })?;
+                // r[impl store.substitute.content-binding]
+                // CONTENT BINDING (merged_bug_114): the narinfo that
+                // got us here names the path and verifies against
+                // tenant-supplied `trusted_keys` — which is NOT a
+                // trust boundary (see the size-gate comment above) —
+                // and this arm runs BEFORE any body fetch. Before the
+                // STORED row may be returned as THIS upstream's Hit
+                // (or this upstream's sigs appended over it), the
+                // upstream's claim must AGREE with the stored content:
+                // nar_hash, nar_size, and the reference set. On
+                // disagreement this upstream does not have *this*
+                // path's bytes — Miss for THIS upstream, no sig
+                // append; the winner's row stays untouched. (Pre-fix,
+                // a tenant whose upstream self-signed a fabricated
+                // narinfo naming a victim path got the stored bytes
+                // back as a Hit plus persisted upstream signatures
+                // whose fingerprint cannot match the stored row.)
+                let stored_refs: std::collections::BTreeSet<String> =
+                    stored.references.iter().map(ToString::to_string).collect();
+                let claimed_refs: std::collections::BTreeSet<String> =
+                    info.references.iter().map(ToString::to_string).collect();
+                if stored.nar_hash != expected_hash
+                    || stored.nar_size != ni.nar_size
+                    || stored_refs != claimed_refs
+                {
+                    warn!(
+                        upstream = %upstream.url,
+                        path = store_path,
+                        stored_nar_size = stored.nar_size,
+                        claimed_nar_size = ni.nar_size,
+                        "AlreadyComplete content mismatch: upstream narinfo \
+                         claims different bytes than the stored row — Miss \
+                         for this upstream (no signature appended)"
+                    );
+                    metrics::counter!(
+                        "rio_store_substitute_integrity_failures_total",
+                        "tenant" => tenant_id.to_string()
+                    )
+                    .increment(1);
+                    return Ok(UpstreamOutcome::Miss);
+                }
+                // Compute sigs over the STORED row (its `nar_size` is
+                // what was actually ingested — now PROVEN equal to the
+                // upstream's claim), append (idempotent —
+                // append_signatures dedupes), return it.
                 let sigs = self
                     .sigs_for_mode(tenant_id, upstream.sig_mode, &ni, &stored)
                     .await;
@@ -3180,6 +3221,117 @@ mod tests {
         );
     }
 
+    // r[verify store.substitute.content-binding]
+    /// merged_bug_114 (HIGH): the `AlreadyComplete` arm must
+    /// CONTENT-BIND the upstream's narinfo claim to the stored row
+    /// before returning the stored row as this upstream's Hit or
+    /// appending the upstream's signatures. The narinfo got here by
+    /// naming the path and verifying against tenant-supplied
+    /// `trusted_keys` — which the size-gate comment itself says is NOT
+    /// a trust boundary — and the arm runs BEFORE any body fetch, so a
+    /// tenant whose upstream self-signs a fabricated narinfo (forged
+    /// NarHash) for a victim path would otherwise get the stored bytes
+    /// back as a Hit (cross-tenant content disclosure via the walk's
+    /// pin/stamp lane) plus persisted upstream signatures whose
+    /// fingerprint cannot match the stored row.
+    #[tokio::test]
+    async fn already_complete_requires_content_agreement() {
+        use rio_test_support::fixtures::make_path_info;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // 1. The VICTIM row: a legitimately-ingested complete path.
+        let path = rio_test_support::fixtures::test_store_path("victim-content");
+        let (nar, nar_hash) = rio_test_support::fixtures::make_nar(b"victim-secret");
+        let info = make_path_info(&path, &nar, nar_hash);
+        let path_hash = info.store_path.sha256_digest();
+        let claim = metadata::insert_manifest_uploading(&db.pool, &path_hash, &path, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        let mut stored = info.clone();
+        stored.store_path_hash = path_hash.to_vec();
+        metadata::complete_manifest_inline(&db.pool, &stored, claim, nar.clone().into())
+            .await
+            .unwrap();
+
+        // 2. The ATTACKER tenant trusts a fake upstream that
+        //    self-signs a narinfo naming the victim path with a
+        //    DIFFERENT NarHash (forged bytes are never fetched — the
+        //    arm runs before any body fetch).
+        let upstream =
+            spawn_fake_upstream(&path, b"forged-other-bytes".to_vec(), "attacker-key").await;
+        let tid = seed_tenant(&db.pool, "attacker-content").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &upstream.url,
+            50,
+            std::slice::from_ref(&upstream.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+        let sub = test_substituter(db.pool.clone());
+
+        let before: i32 =
+            sqlx::query_scalar("SELECT cardinality(signatures) FROM narinfo WHERE store_path = $1")
+                .bind(&path)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+
+        // THE law: content disagreement ⇒ Miss for this upstream.
+        let got = sub.try_substitute(tid, &path).await;
+        assert!(
+            matches!(got, Ok(None)),
+            "a narinfo whose content claim disagrees with the stored row \
+             must be a Miss for that upstream (no cross-tenant Hit), got {got:?}"
+        );
+        let after: i32 =
+            sqlx::query_scalar("SELECT cardinality(signatures) FROM narinfo WHERE store_path = $1")
+                .bind(&path)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            before, after,
+            "no upstream signature may be appended over a content-mismatched claim"
+        );
+
+        // Positive control: an upstream whose narinfo AGREES with the
+        // stored row (same bytes ⇒ same NarHash/NarSize/refs) still
+        // gets the AlreadyComplete Hit + its signature appended — the
+        // legitimate lost-the-race flow is untouched.
+        let honest = spawn_fake_upstream(&path, nar.clone(), "honest-key").await;
+        let tid2 = seed_tenant(&db.pool, "honest-content").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid2,
+            &honest.url,
+            50,
+            std::slice::from_ref(&honest.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+        let got2 = sub.try_substitute(tid2, &path).await;
+        assert!(
+            matches!(got2, Ok(Some(_))),
+            "content-agreeing AlreadyComplete must stay a Hit, got {got2:?}"
+        );
+        let after2: i32 =
+            sqlx::query_scalar("SELECT cardinality(signatures) FROM narinfo WHERE store_path = $1")
+                .bind(&path)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(
+            after2 > after,
+            "the agreeing upstream's signature must be appended (got {after} -> {after2})"
+        );
+    }
+
     /// merged_bug_030: the capability gate's ordering law is shared by
     /// BOTH legs — upstreams-empty FIRST, clientless SECOND. An
     /// upstream-less tenant on a clientless replica is a clean no-op
@@ -5079,8 +5231,6 @@ mod tests {
     /// row, not the upstream's claim.
     #[tokio::test]
     async fn substitute_already_complete_signs_stored_size() {
-        use base64::Engine;
-
         let db = TestDb::new(&crate::MIGRATOR).await;
         let tid_a = seed_tenant(&db.pool, "sub-ac-a").await;
         let tid_b = seed_tenant(&db.pool, "sub-ac-b").await;
@@ -5137,45 +5287,42 @@ mod tests {
         let ts = Arc::new(TenantSigner::new(cluster, db.pool.clone()));
         let sub_b = test_substituter(db.pool.clone()).with_signer(ts);
 
-        // claim_placeholder → AlreadyComplete → sigs computed over the
-        // stored row.
-        let got = sub_b.try_substitute(tid_b, &path).await.unwrap().unwrap();
-        // No NAR download on AlreadyComplete.
+        // claim_placeholder → AlreadyComplete → CONTENT BINDING
+        // (merged_bug_114, r[store.substitute.content-binding]): the
+        // liar's NarSize disagrees with the stored row, so the law is
+        // now a MISS for that upstream — no Hit, no signature append.
+        // (Pre-fix this test asserted the weaker defense: the Hit was
+        // returned and the rio sig was computed over the STORED tuple
+        // rather than the liar's claim. The binding supersedes it —
+        // a content-disagreeing upstream gets nothing at all; the
+        // honest-claim sig path is covered by
+        // `already_complete_requires_content_agreement`'s positive
+        // control.)
+        let got = sub_b.try_substitute(tid_b, &path).await.unwrap();
+        assert!(
+            got.is_none(),
+            "a NarSize-disagreeing AlreadyComplete claim must be a Miss \
+             for that upstream (content binding), got {got:?}"
+        );
+        // No NAR download on AlreadyComplete — binding runs pre-fetch.
         assert_eq!(
             liar.nar_hits.load(Ordering::SeqCst),
             0,
             "AlreadyComplete must not download"
         );
-
-        // The appended rio sig must verify against the STORED tuple
-        // (correct nar_size = nar.len()), NOT the liar's NarSize.
-        let rio_sig = got
-            .signatures
-            .iter()
-            .find(|s| s.starts_with("rio-ac-1:"))
-            .expect("Replace mode appends rio sig");
-        let fp = rio_nix::narinfo::fingerprint(
-            got.store_path.as_str(),
-            &got.nar_hash,
-            got.nar_size,
-            &got.references
-                .iter()
-                .map(|r| r.to_string())
-                .collect::<Vec<_>>(),
-        );
-        let pk = ed25519_dalek::SigningKey::from_bytes(&cluster_seed).verifying_key();
-        let sig_b64 = rio_sig.split_once(':').unwrap().1;
-        let sig_bytes = base64::engine::general_purpose::STANDARD
-            .decode(sig_b64)
-            .unwrap();
-        let sig = ed25519_dalek::Signature::from_slice(&sig_bytes).unwrap();
-        use ed25519_dalek::Verifier;
+        // And NO signature was appended over the mismatched claim —
+        // the stored row keeps exactly the honest ingest's signatures.
+        let sigs: Vec<String> =
+            sqlx::query_scalar("SELECT unnest(signatures) FROM narinfo WHERE store_path = $1")
+                .bind(&path)
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
         assert!(
-            pk.verify(fp.as_bytes(), &sig).is_ok(),
-            "appended sig must verify against STORED nar_size={}, not liar's claim",
-            got.nar_size
+            !sigs.iter().any(|s| s.starts_with("rio-ac-1:")),
+            "no rio sig may be appended over a content-mismatched claim; got {sigs:?}"
         );
-        assert_eq!(got.nar_size, nar.len() as u64);
+        let _ = cluster_seed;
     }
 
     // r[verify store.put.nar-bytes-budget+3]
