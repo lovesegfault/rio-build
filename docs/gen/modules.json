@@ -1500,7 +1500,7 @@
     {
       "path": "logs/loss.rs",
       "depth": 1,
-      "doc": "The read path's loss ledger: data-loss is counted per HOLE"
+      "doc": "The read path's anomaly ledger: BOTH read-path anomaly counters —"
     },
     {
       "path": "logs/mbt_tests.rs",

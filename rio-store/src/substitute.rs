@@ -320,8 +320,16 @@ pub(crate) fn substitute_error_evidence(
 enum UpstreamOutcome {
     /// narinfo verified, NAR ingested (or `AlreadyComplete` and sigs
     /// appended). Boxed: `ValidatedPathInfo` is ~300B and the
-    /// `Miss`/`Raced` arms are zero-sized.
-    Hit(Box<ValidatedPathInfo>),
+    /// `Miss`/`Raced` arms are zero-sized. `ingested_bytes` is the
+    /// producer's OWN statement of bytes actually written
+    /// (merged_bug_091): the download path states `nar_size`, the
+    /// AlreadyComplete dedup arm states 0 — the bytes counter
+    /// consumes the fact instead of guessing from the row, so a
+    /// zero-ingest dedup hit can never inflate \"bytes ingested\".
+    Hit {
+        info: Box<ValidatedPathInfo>,
+        ingested_bytes: u64,
+    },
     /// narinfo 404 — this upstream doesn't have it.
     Miss,
     /// merged_bug_005: narinfo PRESENT and identity-correct, but no
@@ -784,10 +792,10 @@ impl Substituter {
                 // (stale_reclaimed_total{reason="stall_abort"}).
                 // `Fetch` is skipped too (merged_bug_044): the only
                 // Fetch that escapes `do_substitute` is the fold's
-                // all-errored verdict, and every contributing upstream
-                // error was already counted per-upstream inside the
-                // loop — counting the escape again would double-bill
-                // one failed iteration.
+                // all-errored verdict, already counted ONCE at the
+                // fold (merged_bug_091) — counting the escape again
+                // would double-bill the attempt. `UntrustedPresent`
+                // likewise carries its own fold label.
                 if !matches!(
                     *e,
                     SubstituteError::Raced
@@ -795,6 +803,7 @@ impl Substituter {
                         | SubstituteError::Admission(_)
                         | SubstituteError::Stalled { .. }
                         | SubstituteError::Fetch(_)
+                        | SubstituteError::UntrustedPresent
                 ) {
                     metrics::counter!(
                         "rio_store_substitute_total",
@@ -860,40 +869,46 @@ impl Substituter {
                 .try_upstream(http, tenant_id, upstream, store_path, &hash_part, progress)
                 .await
             {
-                Ok(UpstreamOutcome::Hit(info)) => {
+                Ok(UpstreamOutcome::Hit {
+                    info,
+                    ingested_bytes,
+                }) => {
                     let elapsed = start.elapsed().as_secs_f64();
                     metrics::histogram!("rio_store_substitute_duration_seconds").record(elapsed);
+                    // The hit IS the attempt verdict (the loop exits):
+                    // per-leader by construction, like every result
+                    // label below (merged_bug_091).
                     metrics::counter!(
                         "rio_store_substitute_total",
                         "result" => "hit",
                         "tenant" => tenant_label
                     )
                     .increment(1);
-                    metrics::counter!("rio_store_substitute_bytes_total").increment(info.nar_size);
+                    // Bytes INGESTED — the producer's own statement:
+                    // nar_size on a real download+persist, 0 on an
+                    // AlreadyComplete dedup hit (merged_bug_091: the
+                    // pre-fix increment added nar_size on every Hit,
+                    // so dedup hits inflated \"bytes ingested\" by
+                    // bytes that were never written).
+                    metrics::counter!("rio_store_substitute_bytes_total").increment(ingested_bytes);
                     return Ok(Some(*info));
                 }
                 Ok(UpstreamOutcome::Miss) => {
                     // This upstream doesn't have it. Try the next.
+                    // merged_bug_091: NO counter here — `result=miss`
+                    // is the ATTEMPT verdict, emitted once per leader
+                    // at the CleanMiss fold below; the per-upstream
+                    // detail is this debug! line.
                     debug!(upstream = %upstream.url, "upstream miss, trying next");
-                    metrics::counter!(
-                        "rio_store_substitute_total",
-                        "result" => "miss",
-                        "tenant" => tenant_label.clone()
-                    )
-                    .increment(1);
                 }
                 Ok(UpstreamOutcome::UntrustedPresent) => {
                     // merged_bug_005: present-but-untrusted — record
                     // the trust-refusal cell and FAIL OVER (another
                     // upstream may hold a verifiable copy). The fold
                     // below surfaces the refusal only if nothing
-                    // serves and nothing outranks it.
-                    metrics::counter!(
-                        "rio_store_substitute_total",
-                        "result" => "untrusted",
-                        "tenant" => tenant_label.clone()
-                    )
-                    .increment(1);
+                    // serves and nothing outranks it — and emits the
+                    // attempt-level `result=untrusted` there
+                    // (merged_bug_091).
                     match cells.record(
                         rio_evidence_kernel::outcome::SubstituteFailureClass::Untrusted,
                         None,
@@ -955,14 +970,13 @@ impl Substituter {
                                 )
                                 .increment(1);
                             }
+                            // merged_bug_091: NO result counter here
+                            // — `result=error` is the attempt verdict,
+                            // emitted once per leader at the Errored
+                            // fold below. The integrity counter above
+                            // stays per-occurrence (security signal).
                             warn!(upstream = %upstream.url, error = %other,
                                   "upstream fetch failed, trying next");
-                            metrics::counter!(
-                                "rio_store_substitute_total",
-                                "result" => "error",
-                                "tenant" => tenant_label.clone()
-                            )
-                            .increment(1);
                         }
                     }
                     let (class, advice) = substitute_error_evidence(&e);
@@ -984,6 +998,12 @@ impl Substituter {
         // `Fetch` error so the next attempt re-asks instead of
         // trusting a poisoned miss), then the cacheable clean miss —
         // only when every upstream answered hit-or-404.
+        // merged_bug_091: the attempt-level `result` labels are
+        // emitted HERE, from the fold verdict — one tick per
+        // singleflight leader by construction, which is what the HELP
+        // has always claimed. Stalled/RateLimited stay uncounted in
+        // this family (typed transients with their own signals), as
+        // before.
         match rio_evidence_kernel::outcome::fold_substitute_loop(cells) {
             rio_evidence_kernel::outcome::SubstituteLoopVerdict::Stalled { window } => {
                 Err(SubstituteError::Stalled { window })
@@ -992,6 +1012,12 @@ impl Substituter {
                 Err(SubstituteError::RateLimited { retry_after })
             }
             rio_evidence_kernel::outcome::SubstituteLoopVerdict::Errored => {
+                metrics::counter!(
+                    "rio_store_substitute_total",
+                    "result" => "error",
+                    "tenant" => tenant_id.to_string()
+                )
+                .increment(1);
                 Err(SubstituteError::Fetch(format!(
                     "no upstream served {store_path} and at least one errored — \
                      not a definitive miss"
@@ -1002,9 +1028,21 @@ impl Substituter {
                 // typed, UNCACHED trust refusal, never the cacheable
                 // miss the sig-blind HEAD confirmation would then
                 // contradict into an infrastructure charge.
+                metrics::counter!(
+                    "rio_store_substitute_total",
+                    "result" => "untrusted",
+                    "tenant" => tenant_id.to_string()
+                )
+                .increment(1);
                 Err(SubstituteError::UntrustedPresent)
             }
             rio_evidence_kernel::outcome::SubstituteLoopVerdict::CleanMiss => {
+                metrics::counter!(
+                    "rio_store_substitute_total",
+                    "result" => "miss",
+                    "tenant" => tenant_id.to_string()
+                )
+                .increment(1);
                 // merged_bug_016: a fresh EVERY-upstream GET-404
                 // contradicts any cached HEAD positive for this
                 // (tenant, path) — evict it, so a charge-gating
@@ -1237,7 +1275,10 @@ impl Substituter {
                             "post-append_signatures query_path_info miss".into(),
                         )
                     })?;
-                return Ok(UpstreamOutcome::Hit(Box::new(stored)));
+                return Ok(UpstreamOutcome::Hit {
+                    info: Box::new(stored),
+                    ingested_bytes: 0,
+                });
             }
             PlaceholderClaim::Concurrent => {
                 // Another replica (or this replica via a different
@@ -1360,7 +1401,11 @@ impl Substituter {
         match persist {
             Ok(()) => {
                 placeholder_guard.defuse();
-                Ok(UpstreamOutcome::Hit(Box::new(info)))
+                let ingested_bytes = info.nar_size;
+                Ok(UpstreamOutcome::Hit {
+                    info: Box::new(info),
+                    ingested_bytes,
+                })
             }
             // r[impl store.substitute.stall-abort+2]
             // Owner-side stall abort: release the claim IN PLACE —
@@ -2816,10 +2861,60 @@ mod tests {
         );
     }
 
-    /// Per-tenant miss/error labeling: an upstream that 404s emits
-    /// `{result=miss,tenant=UUID}`; one that fails fetch/verify emits
-    /// `{result=error,tenant=UUID}`. The label MUST be `tenant` (UUID,
-    /// bounded by tenant count), NOT `upstream` (tenant-supplied URL,
+    /// merged_bug_091 RED-FIRST: `result=miss` is an ATTEMPT-level
+    /// verdict (one per singleflight leader, from the post-loop
+    /// CleanMiss fold) — the HELP has claimed per-leader granularity
+    /// all along, but the increment lived inside the per-upstream
+    /// loop, so a tenant with N upstreams emitted N misses per
+    /// attempt and every hit-ratio panel over multi-upstream tenants
+    /// was wrong.
+    #[tokio::test]
+    async fn substitute_miss_counts_once_per_leader_attempt() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-miss-granularity").await;
+        let (have_path, nar) = make_path();
+        // TWO upstreams, both 404 the requested path (each serves only
+        // `have_path`; we ask for a different hash).
+        let a = spawn_fake_upstream(&have_path, nar.clone(), "cache.miss-a").await;
+        let b = spawn_fake_upstream(&have_path, nar, "cache.miss-b").await;
+        for url in [&a.url, &b.url] {
+            metadata::upstreams::insert(
+                &db.pool,
+                tid,
+                url,
+                50,
+                std::slice::from_ref(&a.trusted_key),
+                SigMode::Keep,
+            )
+            .await
+            .unwrap();
+        }
+        let other = "/nix/store/cccccccccccccccccccccccccccccccc-on-no-upstream".to_string();
+        let sub = test_substituter(db.pool.clone());
+
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let got = sub.try_substitute(tid, &other).await.unwrap();
+        assert!(got.is_none(), "clean miss across both upstreams");
+
+        assert_eq!(
+            rec.get(&format!(
+                "rio_store_substitute_total{{result=miss,tenant={tid}}}"
+            )),
+            1,
+            "one attempt = one miss, regardless of upstream count; keys={:?}",
+            rec.all_keys()
+        );
+    }
+
+    /// Per-tenant result labeling at ATTEMPT granularity
+    /// (merged_bug_091): a 404+500 mix is ONE attempt whose fold
+    /// verdict is Errored — `{result=error,tenant=UUID}` ticks once
+    /// and `result=miss` not at all (the 404 is per-upstream detail
+    /// in the debug! log). The label MUST be `tenant` (UUID, bounded
+    /// by tenant count), NOT `upstream` (tenant-supplied URL,
     /// unbounded cardinality → exporter-memory DoS).
     #[tokio::test]
     async fn substitute_per_tenant_miss_and_error_labeled() {
@@ -2870,14 +2965,14 @@ mod tests {
         let err = format!("rio_store_substitute_total{{result=error,tenant={tid}}}");
         assert_eq!(
             rec.get(&miss),
-            1,
-            "per-tenant miss; keys={:?}",
+            0,
+            "the errored attempt is NOT a miss (attempt-level verdict); keys={:?}",
             rec.all_keys()
         );
         assert_eq!(
             rec.get(&err),
             1,
-            "per-tenant error; keys={:?}",
+            "one attempt = one error tick; keys={:?}",
             rec.all_keys()
         );
         // No `upstream=` label anywhere — tenant-supplied URL must not
@@ -4873,17 +4968,27 @@ mod tests {
     /// the NAR download (narinfo IS fetched, NAR is NOT).
     #[tokio::test]
     async fn dedup_via_already_complete_no_redownload() {
+        use rio_test_support::metrics::CountingRecorder;
+
         let db = TestDb::new(&crate::MIGRATOR).await;
         let tid = seed_tenant(&db.pool, "sub-dedup").await;
         let (path, nar) = make_path();
+        let nar_len = nar.len() as u64;
         let fake = spawn_flex_upstream(&path, nar.clone(), "cache.dedup", FlexCfg::default()).await;
         insert_flex(&db.pool, tid, &fake, 50).await;
 
         let sub = test_substituter(db.pool.clone());
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
         // First call ingests.
         sub.try_substitute(tid, &path).await.unwrap().unwrap();
         let baseline = fake.nar_hits.load(Ordering::SeqCst);
         assert_eq!(baseline, 1);
+        assert_eq!(
+            rec.get("rio_store_substitute_bytes_total{}"),
+            nar_len,
+            "the real ingest counts its bytes"
+        );
         // Clear singleflight so the second call reaches do_substitute.
         sub.inflight.invalidate_all();
         sub.inflight.run_pending_tasks().await;
@@ -4894,6 +4999,14 @@ mod tests {
             fake.nar_hits.load(Ordering::SeqCst),
             baseline,
             "AlreadyComplete must short-circuit before NAR GET"
+        );
+        // merged_bug_091: the dedup hit ingested NOTHING — the bytes
+        // counter must not move ("Bytes ingested" cannot be inflated
+        // by zero-ingest dedup hits).
+        assert_eq!(
+            rec.get("rio_store_substitute_bytes_total{}"),
+            nar_len,
+            "dedup hit adds 0 to bytes ingested"
         );
     }
 

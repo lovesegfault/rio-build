@@ -356,10 +356,15 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_substitute_total",
-        "Upstream substitution attempts, labeled by result (hit/miss/error) \
-         and tenant (UUID). Per-upstream debugging detail is in the \
-         debug!/warn! log lines (which carry upstream=<url>); the metric \
-         label is bounded by tenant count, not by tenant-supplied URL."
+        "Upstream substitution attempts at ATTEMPT granularity \
+         (merged_bug_091): exactly one result tick per singleflight \
+         leader, from the post-loop fold — result = hit | miss (every \
+         upstream answered hit-or-404 with zero hits) | untrusted \
+         (present upstream, no verifiable signature) | error (>=1 \
+         upstream broke; not a definitive miss) — and tenant (UUID). \
+         Per-upstream debugging detail is in the debug!/warn! log lines \
+         (which carry upstream=<url>); the metric label is bounded by \
+         tenant count, not by tenant-supplied URL."
     );
     describe_counter!(
         "rio_store_substitute_skipped_total",
@@ -379,7 +384,10 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_substitute_bytes_total",
-        "Bytes ingested via upstream substitution (nar_size on hit)"
+        "Bytes actually INGESTED via upstream substitution: nar_size on a \
+         real download+persist, 0 on an AlreadyComplete dedup hit \
+         (merged_bug_091 — the producer states its own ingest fact, so \
+         dedup hits cannot inflate the ingest rate)"
     );
     describe_histogram!(
         "rio_store_substitute_duration_seconds",
