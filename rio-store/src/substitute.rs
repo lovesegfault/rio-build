@@ -647,9 +647,10 @@ impl Substituter {
     /// on a clientless replica answered CleanMiss on the attempt leg
     /// but all-indeterminate on the probe leg → `Failed{Fetch}` →
     /// ChargeInfra — infra-charging and parking jobs that should
-    /// settle confirmed-miss (and converting the Ready queue into
-    /// park-charging jobs replica-wide, since dispatch treats
-    /// indeterminate optimistically while every claim can only err).
+    /// settle confirmed-miss (and converting every status='ready'
+    /// materialization job into a park-charging one replica-wide,
+    /// since dispatch treats indeterminate optimistically while
+    /// every claim can only err).
     async fn capability_gate(
         &self,
         tenant_id: Uuid,

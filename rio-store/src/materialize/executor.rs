@@ -2031,7 +2031,8 @@ mod tests {
             &["out"],
         )
         .await;
-        // The migration-082 carrier on the job row (stale_reset origin).
+        // The 082_materialization_job_carried_paths carrier on the
+        // job row (stale_reset origin).
         sqlx::query(
             "UPDATE materialization_jobs SET carried_realized_paths = $1 \
               WHERE job_id = $2",
