@@ -564,3 +564,59 @@ async fn current_tenure_status_and_poison_writes_apply() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// bug_158: a latched batch whose EVERY drv was dropped at flush-time
+/// re-derivation must still close its latched exec rows — the
+/// exec-scoped assignment close is unconditional on the latched
+/// exec_ids; only the derivation-status UPDATE is kept-set-scoped
+/// (the partial-kept arm always passed ALL latched exec_ids, proving
+/// the close was meant to be unconditional). Pre-fix, the empty-drv
+/// early return discarded the close: a cancel latched during a PG
+/// blip followed by a resubmit left the attempt durably open until it
+/// aged into ChargeExecutorCrash against a healthily-rebuilding
+/// derivation.
+// r[verify sched.attempt.cancel-close-driven+1]
+#[tokio::test]
+async fn replay_with_all_drvs_dropped_still_closes_latched_execs() -> anyhow::Result<()> {
+    use crate::state::DerivationStatus;
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let drv_id = insert_test_derivation(&db, "dropall-resubmitted").await?;
+    let exec = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO assignments \
+             (derivation_id, builder_id, generation, status, exec_id) \
+         VALUES ($1, 'builder-0', 1, 'acknowledged', $2)",
+    )
+    .bind(drv_id)
+    .bind(exec)
+    .execute(&test_db.pool)
+    .await?;
+
+    // Flush-time re-derivation dropped every drv (the node was
+    // resubmitted and advanced past the latch): kept = [], latched
+    // exec_ids non-empty.
+    let outcome = db
+        .replay_status_batch_guarded(
+            &[],
+            DerivationStatus::Cancelled,
+            &[exec],
+            ServingGeneration::stamp_from_claim(1),
+        )
+        .await?;
+    assert!(
+        matches!(outcome, FencedOutcome::Applied(0)),
+        "no derivation row may be updated by an all-dropped batch, got {outcome:?}"
+    );
+
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM assignments WHERE exec_id = $1")
+        .bind(exec)
+        .fetch_one(&test_db.pool)
+        .await?;
+    assert_eq!(
+        status, "cancelled",
+        "latched exec row must close even when every drv was dropped"
+    );
+    Ok(())
+}

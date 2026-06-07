@@ -747,9 +747,11 @@ impl DagActor {
                     "status outbox: dropped stale entries (nodes advanced past the latch)"
                 );
             }
-            if kept.is_empty() {
-                continue;
-            }
+            // No kept-empty skip (bug_158): even an all-dropped batch
+            // still owes the exec-scoped close for its latched
+            // exec_ids — the replay's status UPDATE is kept-scoped,
+            // the close is not, and the fenced/err retry arms below
+            // must cover the close-only flush too.
             match self
                 .db
                 .replay_status_batch_guarded(

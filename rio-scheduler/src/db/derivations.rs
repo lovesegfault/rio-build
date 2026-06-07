@@ -178,6 +178,15 @@ impl SchedulerDb {
     /// trusts that set for the derivation UPDATE and trusts ONLY the
     /// latched exec_ids for the close.
     ///
+    /// The close is UNCONDITIONAL on the latched exec_ids (bug_158):
+    /// even when re-derivation dropped EVERY drv (the kept set is
+    /// empty because the world advanced past the latch), the latched
+    /// attempts still ended at latch time and their rows must close —
+    /// only the derivation-status UPDATE is kept-set-scoped. Pre-fix,
+    /// the empty-drv early return discarded the close and the rows
+    /// stayed open until they aged into ChargeExecutorCrash against a
+    /// healthily-rebuilding derivation.
+    ///
     /// Runtime-bound (not `query!`): `cargo xtask regen sqlx`
     /// self-builds this crate (the same posture as the other fenced
     /// writers added since).
@@ -192,22 +201,28 @@ impl SchedulerDb {
         latched_exec_ids: &[uuid::Uuid],
         serving_generation: ServingGeneration,
     ) -> Result<FencedOutcome, sqlx::Error> {
-        if drv_hashes.is_empty() {
+        if drv_hashes.is_empty() && latched_exec_ids.is_empty() {
             return Ok(FencedOutcome::Applied(0));
         }
         let mut tx = match self.begin_fenced(serving_generation).await? {
             FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
             FencedBegin::Open(ftx) => ftx,
         };
-        let result = sqlx::query(
-            "UPDATE derivations \
-             SET status = $2, assigned_builder_id = NULL, updated_at = now() \
-             WHERE drv_hash = ANY($1::text[])",
-        )
-        .bind(drv_hashes)
-        .bind(status.as_str())
-        .execute(tx.conn())
-        .await?;
+        let result = if drv_hashes.is_empty() {
+            None
+        } else {
+            Some(
+                sqlx::query(
+                    "UPDATE derivations \
+                     SET status = $2, assigned_builder_id = NULL, updated_at = now() \
+                     WHERE drv_hash = ANY($1::text[])",
+                )
+                .bind(drv_hashes)
+                .bind(status.as_str())
+                .execute(tx.conn())
+                .await?,
+            )
+        };
         if let Some(close) = terminal_assignment_status(status)
             && !latched_exec_ids.is_empty()
         {
@@ -220,7 +235,7 @@ impl SchedulerDb {
                 .fetch_one(tx.conn())
                 .await?;
         }
-        let updated = result.rows_affected();
+        let updated = result.map_or(0, |r| r.rows_affected());
         tx.commit().await?;
         Ok(FencedOutcome::Applied(updated))
     }
