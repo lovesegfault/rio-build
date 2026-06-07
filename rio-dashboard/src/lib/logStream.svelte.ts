@@ -272,37 +272,67 @@ export function createLogStream(
           r: IteratorResult<TailChunk>;
         }> | null = null;
         stream_loop: for (;;) {
+          // bug_145: arm AND enforce at the loop head, before racing.
+          // The head runs after every message and every tick, so a
+          // chatty stream arms the clock as promptly as a quiet one —
+          // and an already-expired deadline cuts the attempt
+          // deterministically, with no race for traffic to win.
+          if (isTerminal() && graceDeadline === null) {
+            graceDeadline = Date.now() + GRACE_MS;
+          }
+          if (graceDeadline !== null && Date.now() >= graceDeadline) {
+            graceCutoff = true;
+            attempt.abort();
+            break stream_loop;
+          }
           const nextMsg = (pendingNext ??= it
             .next()
             .then((r) => ({ kind: 'msg' as const, r })));
           const tickCtrl = new AbortController();
-          const winner = await Promise.race([
+          // bug_145: once armed, the deadline joins the race as an
+          // ABSOLUTE timer (the gateway's `sleep_until` shape,
+          // log_tail.rs) — never a per-iteration relative tick that a
+          // >1 msg/sec stream re-creates and starves forever. The 1 s
+          // tick stays for the QUIET stream only: it wakes the loop so
+          // the head observes a terminal flip with no traffic at all.
+          const edges: Promise<
+            | { kind: 'msg'; r: IteratorResult<TailChunk> }
+            | { kind: 'abort' }
+            | { kind: 'tick' }
+            | { kind: 'grace' }
+          >[] = [
             nextMsg,
             abortEdge,
             sleep(TERMINAL_TICK_MS, tickCtrl.signal).then(() => ({
               kind: 'tick' as const,
             })),
-          ]);
+          ];
+          if (graceDeadline !== null) {
+            edges.push(
+              sleep(
+                Math.max(0, graceDeadline - Date.now()),
+                tickCtrl.signal,
+              ).then(() => ({ kind: 'grace' as const })),
+            );
+          }
+          const winner = await Promise.race(edges);
           tickCtrl.abort();
           if (winner.kind === 'abort') {
             // Master destroy or grace cutoff; the shared post-stream
             // path sorts out which.
             break;
           }
+          if (winner.kind === 'grace') {
+            // The absolute deadline edge fired mid-race: cut THIS
+            // attempt — the exit decision itself happens on the shared
+            // tail_next path below, same as every other stream end.
+            graceCutoff = true;
+            attempt.abort();
+            break stream_loop;
+          }
           if (winner.kind === 'tick') {
-            // Observe terminality mid-stream: arm the grace clock the
-            // first time the closure says terminal, and once the
-            // armed deadline passes, cut THIS attempt — the exit
-            // decision itself happens on the shared tail_next path
-            // below, same as every other stream end.
-            if (isTerminal() && graceDeadline === null) {
-              graceDeadline = Date.now() + GRACE_MS;
-            }
-            if (graceDeadline !== null && Date.now() >= graceDeadline) {
-              graceCutoff = true;
-              attempt.abort();
-              break stream_loop;
-            }
+            // Nothing to do here: the tick only wakes the loop so the
+            // head re-checks terminality on a quiet stream.
             continue;
           }
           const { r } = winner;

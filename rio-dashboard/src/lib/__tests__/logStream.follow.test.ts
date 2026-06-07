@@ -71,6 +71,38 @@ describe('createLogStream follow mode', () => {
     s.destroy();
   });
 
+  // r[verify dash.stream.log-tail+5]
+  /// bug_145's recorded red: the post-terminal grace armed and fired
+  /// ONLY in the tick branch, and the tick was a relative 1 s timer
+  /// recreated every race iteration — a stream delivering >1 msg/sec
+  /// won every race, so the grace never armed or enforced and a
+  /// terminal build whose builder kept spewing streamed forever. The
+  /// armed deadline is now an ABSOLUTE race participant (the gateway's
+  /// sleep_until shape), immune to message traffic.
+  it('chatty_terminal_stream_exits_at_grace: >1 msg/sec cannot starve the grace clock', async () => {
+    let line = 0;
+    tailLog.mockImplementation(async function* () {
+      for (;;) {
+        yield chunk([`l${line}`], { firstLineNumber: BigInt(line) });
+        line += 1;
+        // 200 ms between chunks — five times faster than the 1 s tick,
+        // so the tick loses every Promise.race.
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    });
+    const s = createLogStream('/nix/store/x.drv', '', {
+      isTerminal: () => true,
+    });
+    // Terminal from t0: the grace must arm immediately and enforce at
+    // +5 s regardless of traffic. Ride to +20 s — pre-fix the loop is
+    // still streaming here (the red observed done=false forever).
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(s.done).toBe(true);
+    expect(s.incomplete).toBe(true);
+    expect(s.rows.length).toBeGreaterThan(0);
+    s.destroy();
+  });
+
   // r[verify dash.stream.log-tail+4]
   /// merged_bug_002's recorded red: a retry on another worker restarts
   /// numbering at zero. Pre-fix the new execution's chunk was
