@@ -3571,12 +3571,21 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
   since our GET); a 409 on steal means another standby raced and won.
 - *Observed-record expiry:* A standby does not compare the lease's `renewTime`
   against its own wall clock (cross-node skew would make that unreliable).
-  Instead, it records the lease's `metadata.resourceVersion` plus a local
-  monotonic `Instant` when that rv was first seen. The apiserver bumps rv on
-  every write, so a leader renewing every 5s produces a fresh rv every 5s. If
-  rv stays unchanged for `STEAL_AFTER` (`LEASE_TTL` + `FENCE_MARGIN` = 19s) of
-  local time, nobody has written --- steal. Only the standby's own `Instant`
-  monotonicity matters; the `renewTime` value is never read.
+  Instead, it records the holder-authored spec content --- `holderIdentity`
+  plus the `renewTime` BYTES, compared for change only --- with a local
+  monotonic `Instant` pair: the observation is stamped at the GET's response
+  instant and staleness is measured from the deciding GET's send instant, so
+  the confirmed no-write span is understated at both ends (the conservative
+  direction for steals). A live leader renews every 5s, moving `renewTime`
+  every 5s. If the content stays unchanged for `STEAL_AFTER` (`LEASE_TTL` +
+  `FENCE_MARGIN` = 19s) of local time, the holder is not writing --- steal.
+  Raw `metadata.resourceVersion` movement deliberately does NOT reset the
+  clock: the apiserver bumps rv on every object write, including annotation
+  patches by non-protocol tooling, and a periodic foreign mutator must not
+  block stealing a dead leader's lease. The rv remains the optimistic-
+  concurrency guard on the PUT; it never enters the staleness decision. Only
+  the standby's own `Instant` monotonicity matters; the `renewTime` value is
+  never compared to any clock.
 - *Transient API errors:* On apiserver errors, the loop logs a warning and
   retries on the next tick without flipping `is_leader`. If errors persist past
   `SELF_FENCE_AFTER`, the local self-fence (#rref("sched.lease.self-fence+2"))
@@ -3967,7 +3976,7 @@ counters (#(refs.metric)("rio_scheduler_lease_rebound_total"),
 #(refs.metric)("rio_scheduler_lease_acquired_total") counts acquire edges
 only.
 
-#r("sched.lease.cancelled-write")[
+#r("sched.lease.cancelled-write+2")[
   A lease write abandoned by a client-side deadline MUST be treated as
   possibly committed, never as discarded. The renew composition MUST bound
   its read and write phases separately, so that a mutating request is only
@@ -3977,10 +3986,13 @@ only.
   anchored at the attempt's pre-send clock reading, keeping the OLDEST
   anchor while unconsumed; and the blind-window clock MUST be stamped from
   that ledger only by own-commit evidence --- a later completed read
-  observing this replica as holder with a resourceVersion unequal to the
-  previous completed read's --- at the LEDGER's anchor, never the observing
-  read's time. A completed read with an unchanged resourceVersion MUST
-  stamp nothing.
+  observing this replica as holder with holder-authored spec content
+  (`renewTime` bytes) unequal to the previous completed read's --- at the
+  LEDGER's anchor, never the observing read's time. A completed read whose
+  holder-authored content is unchanged MUST stamp nothing --- even when the
+  object's `resourceVersion` moved: the apiserver bumps rv on every write,
+  including non-protocol metadata patches, and rv movement the protocol did
+  not author is not evidence that any write of OURS committed.
 ]
 
 The regime this closes is the mid-band apiserver: reads answer inside their

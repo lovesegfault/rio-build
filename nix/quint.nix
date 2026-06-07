@@ -1401,7 +1401,7 @@ rec {
     # (the evidence rule removed in its three pieces must falsify).
     # Measured: exhaustive TLC ~6s / ~619k distinct states at the
     # wired constants -- the default 1800s budget is ~300x headroom.
-    # r[verify sched.lease.cancelled-write]
+    # r[verify sched.lease.cancelled-write+2]
     quint-leader-election-dropped-write = mkQuintCheck {
       name = "leader-election-dropped-write";
       # quint-policy P1 exemption (bughunt-2 slot 11; §5-Q13): the

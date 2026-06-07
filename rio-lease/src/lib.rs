@@ -1209,13 +1209,18 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     // straddling SELF_FENCE_AFTER fences at the first post-resume
     // tick). Stamped only with attempt-START anchors; see BlindClock.
     let mut blind = BlindClock::starting_at(RenewAnchor::mint(&fence_now));
-    // r[impl sched.lease.cancelled-write]
+    // r[impl sched.lease.cancelled-write+2]
     // The cancelled-write ledger and its evidence cursor: `unconfirmed`
     // records the oldest transmitted-but-unanswered mutating act;
-    // `last_fetched_rv` is the rv of the last COMPLETED read, the
-    // baseline a later read's rv movement is judged against.
+    // `last_fetched_renew_time` is the holder-authored `renewTime`
+    // bytes of the last COMPLETED read (outer None = no completed-read
+    // baseline; the inner Option is the lease's own optional field) —
+    // the baseline a later read's content movement is judged against.
+    // Keyed on protocol-authored content, never on resourceVersion: a
+    // foreign metadata patch moves the rv without any write of OURS
+    // committing (merged_bug_180).
     let mut unconfirmed: Option<UnconfirmedPut> = None;
-    let mut last_fetched_rv: Option<String> = None;
+    let mut last_fetched_renew_time: Option<Option<String>> = None;
     let mut interval = tokio::time::interval(RENEW_INTERVAL);
     // Skip: if one renewal is slow (apiserver busy), don't fire
     // twice immediately. SELF_FENCE_AFTER is 11s; we have slack.
@@ -1324,7 +1329,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 // older anchor, and the apiserver state (whoever holds)
                 // is now known — there is nothing left in doubt.
                 unconfirmed = None;
-                last_fetched_rv = facts.map(|f| f.resource_version);
+                last_fetched_renew_time = facts.map(|f| f.renew_time);
                 // Conflict on renew = someone stole since our GET
                 // → unambiguous lose. Conflict on steal = another
                 // standby raced us → we were never leading. Both
@@ -1532,23 +1537,26 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                     ),
                 }
 
-                // r[impl sched.lease.cancelled-write]
+                // r[impl sched.lease.cancelled-write+2]
                 // Own-commit evidence: the read completed, so we have a
-                // fresh holder/rv view even though the write phase
-                // died. If the lease names US and the rv moved since
-                // our last completed read, some write of OURS committed
-                // (no other writer leaves us as holder while moving the
-                // rv) — consume the ledger and stamp the blind clock at
-                // the LEDGER's anchor (anchor ≤ send ≤ commit; never
-                // the observing read's time). A frozen rv stamps
-                // NOTHING: with no commit there is no evidence, the
-                // window keeps aging, and the fence fires on schedule
-                // (the rv-frozen companion test pins this direction).
+                // fresh holder/content view even though the write phase
+                // died. If the lease names US and the holder-authored
+                // `renewTime` bytes moved since our last completed
+                // read, some write of OURS committed (only our own
+                // renew/steal writes `renewTime` while leaving us as
+                // holder) — consume the ledger and stamp the blind
+                // clock at the LEDGER's anchor (anchor ≤ send ≤ commit;
+                // never the observing read's time). Frozen content
+                // stamps NOTHING — even under foreign rv churn: an
+                // annotation patch moves the rv without any write of
+                // OURS committing, so it is not evidence
+                // (merged_bug_180; the foreign-rv companion test pins
+                // this direction alongside the frozen-rv one).
                 if let Some(f) = &facts {
                     if f.holder_is_us
-                        && last_fetched_rv
-                            .as_deref()
-                            .is_some_and(|prev| prev != f.resource_version)
+                        && last_fetched_renew_time
+                            .as_ref()
+                            .is_some_and(|prev| prev != &f.renew_time)
                         && let Some(led) = unconfirmed.take()
                     {
                         blind.stamp(led.anchor);
@@ -1605,11 +1613,11 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             );
                         }
                     }
-                    last_fetched_rv = Some(f.resource_version.clone());
+                    last_fetched_renew_time = Some(f.renew_time.clone());
                 } else {
                     // 404→Create round: no lease was fetched; the next
-                    // read starts a fresh rv baseline.
-                    last_fetched_rv = None;
+                    // read starts a fresh content baseline.
+                    last_fetched_renew_time = None;
                 }
 
                 // Record THIS round's transmitted write as in doubt —
@@ -3653,6 +3661,21 @@ mod tests {
         transitions: u64,
         rv: u64,
     ) -> k8s_openapi::serde_json::Value {
+        park_lease_json_rt(holder, transitions, rv, rv)
+    }
+
+    /// Like [`park_lease_json`] but with the protocol-authored
+    /// `renewTime` controlled separately from the apiserver's
+    /// `resourceVersion`: `rt` is folded into a synthetic micro-time
+    /// so equal `rt` values model "no protocol write since" while a
+    /// moving `rv` with frozen `rt` models foreign non-protocol
+    /// writes (annotation/label patches).
+    fn park_lease_json_rt(
+        holder: Option<&str>,
+        transitions: u64,
+        rv: u64,
+        rt: u64,
+    ) -> k8s_openapi::serde_json::Value {
         json!({
             "apiVersion": "coordination.k8s.io/v1",
             "kind": "Lease",
@@ -3665,6 +3688,7 @@ mod tests {
                 "holderIdentity": holder,
                 "leaseTransitions": transitions,
                 "leaseDurationSeconds": 15,
+                "renewTime": format!("2026-01-01T00:00:{:02}.{:06}Z", rt % 60, rt),
             },
         })
     }
@@ -3682,7 +3706,7 @@ mod tests {
     /// completed read observing holder==us with a moved rv), stamping
     /// the blind clock at the LEDGER's anchor — the leader keeps
     /// leading exactly because its writes keep committing.
-    // r[verify sched.lease.cancelled-write]
+    // r[verify sched.lease.cancelled-write+2]
     #[tokio::test(start_paused = true)]
     async fn mid_band_committed_writes_keep_the_leader_leading() {
         let (client, mut park) = RequestPark::new();
@@ -3871,7 +3895,7 @@ mod tests {
     /// rv stamps NOTHING (read-stamping is the regression the model's
     /// falsify twin guards: it would let a read-only replica believe
     /// past every steal).
-    // r[verify sched.lease.cancelled-write]
+    // r[verify sched.lease.cancelled-write+2]
     // r[verify sched.lease.self-fence+2]
     #[tokio::test(start_paused = true)]
     async fn rv_frozen_act_failures_still_fence_on_schedule() {
@@ -3950,6 +3974,186 @@ mod tests {
             req.respond_status(404, "NotFound", "gone");
         }
         loop_task.await.expect("lease loop exits");
+    }
+
+    /// merged_bug_180, evidence direction: own-commit evidence keys on
+    /// holder-authored spec content (`renewTime` bytes changing while
+    /// the holder stays us), never on raw `resourceVersion` movement —
+    /// the apiserver bumps rv on EVERY object write, including
+    /// annotation/label patches by non-protocol tooling. A write-dead
+    /// leader under a periodic foreign mutator must still fence on
+    /// schedule: rv churn that the protocol did not author is not
+    /// evidence that OUR write committed.
+    // r[verify sched.lease.cancelled-write+2]
+    #[tokio::test(start_paused = true)]
+    async fn foreign_rv_movement_is_not_own_commit_evidence() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Healthy acquire round (renewTime rt=100 written by our PUT).
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 10, 100));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json_rt(Some("us"), 3, 11, 101));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Write-dead regime under a foreign mutator: every read shows
+        // a FRESH rv (annotation patches) but the protocol-authored
+        // renewTime is frozen — none of OUR abandoned writes commit.
+        // There is no own-commit evidence; the fence must fire on the
+        // same schedule as the frozen-rv regime.
+        let mut fenced_at: Option<u32> = None;
+        for round in 0..5u32 {
+            let get = park.next().await;
+            get.respond_ok(park_lease_json_rt(
+                Some("us"),
+                3,
+                12 + u64::from(round),
+                101,
+            ));
+            let put = park.next().await;
+            drop(put);
+            settle().await;
+            if fenced_at.is_none() && !state.is_leader() {
+                fenced_at = Some(round);
+            }
+        }
+
+        assert!(
+            !state.is_leader(),
+            "foreign rv churn with a frozen renewTime is NOT own-commit \
+             evidence: the write-dead leader must fence"
+        );
+        assert!(
+            fenced_at.is_some_and(|r| r <= 2),
+            "the fence must fire on the SELF_FENCE_AFTER schedule, got {fenced_at:?}"
+        );
+
+        shutdown.cancel();
+        if let Some(req) = park.try_next().await {
+            req.respond_status(404, "NotFound", "gone");
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// merged_bug_180, liveness direction: the standby steal clock keys
+    /// observation identity on holder-authored spec content
+    /// (`holderIdentity` + `renewTime` bytes), never on the object
+    /// version counter — so a periodic non-protocol Lease write
+    /// (annotation/label patch under the steal cadence) cannot
+    /// indefinitely block stealing a genuinely dead leader's lease.
+    /// The observation was recorded while the apiserver was at one rv;
+    /// by the deciding read the foreign mutator has pushed the rv far
+    /// past it — and the decision must not care, because the dead
+    /// leader's CONTENT never moved. (The pre-fix red was captured by
+    /// driving the lease loop through the mock apiserver with the rv
+    /// bumped every tick: the rv-keyed clock reset each round and the
+    /// standby never stole. The green is pinned at the composition
+    /// grain because a paused-clock loop cannot age the std-Instant
+    /// observation record — the same constraint the suspend test
+    /// documents.)
+    // r[verify sched.lease.k8s-lease+2]
+    #[tokio::test]
+    async fn foreign_metadata_patches_do_not_block_stealing_a_dead_leader() {
+        use crate::election::{ElectionResult, LeaderElection};
+        let (client, verifier) = rio_test_support::kube_mock::ApiServerVerifier::new();
+        let lease_with_rt = |rv: &str| {
+            serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": { "name": "rio-sched", "namespace": "default",
+                              "resourceVersion": rv },
+                "spec": { "holderIdentity": "dead-leader", "leaseTransitions": 2,
+                          "leaseDurationSeconds": 15,
+                          "renewTime": "2026-01-01T00:00:00.000100Z" },
+            })
+            .to_string()
+        };
+        let guard = verifier.run(vec![
+            // The deciding GET: the foreign mutator has pushed the rv
+            // far past wherever it was when we started observing; the
+            // dead leader's spec content is byte-identical.
+            rio_test_support::kube_mock::Scenario::ok(
+                http::Method::GET,
+                "/leases/rio-sched",
+                lease_with_rt("105"),
+            ),
+            // The steal PUT succeeds (rv-guarded on the GET's rv).
+            rio_test_support::kube_mock::Scenario::ok(
+                http::Method::PUT,
+                "/leases/rio-sched",
+                serde_json::json!({
+                    "apiVersion": "coordination.k8s.io/v1",
+                    "kind": "Lease",
+                    "metadata": { "name": "rio-sched", "namespace": "default",
+                                  "resourceVersion": "106" },
+                    "spec": { "holderIdentity": "us", "leaseTransitions": 3,
+                              "leaseDurationSeconds": 15 },
+                })
+                .to_string(),
+            ),
+        ]);
+
+        let mut election = LeaderElection::new(
+            client,
+            "default",
+            "rio-sched".into(),
+            "us".into(),
+            LEASE_TTL,
+            STEAL_AFTER,
+        );
+        // The content-keyed observation, recorded STEAL_AFTER+1s ago.
+        // The identity bytes are the parse-normalized rendering — the
+        // same pipeline fetch_and_decide feeds decide() — so the
+        // comparison is literal-format-agnostic.
+        let rt_bytes = {
+            let mt: k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime =
+                k8s_openapi::serde_json::from_str("\"2026-01-01T00:00:00.000100Z\"")
+                    .expect("micro-time literal parses");
+            mt.0.to_string()
+        };
+        election.observed = crate::election::test_observed(
+            "dead-leader",
+            Some(&rt_bytes),
+            std::time::Instant::now() - STEAL_AFTER - Duration::from_secs(1),
+        );
+
+        let result = election
+            .try_acquire_or_renew()
+            .await
+            .expect("steal round-trip");
+        assert_eq!(
+            result,
+            ElectionResult::Leading { transitions: 3 },
+            "a periodic non-protocol Lease write must not indefinitely block \
+             stealing a dead leader's lease — observation identity keys on \
+             holder-authored spec content, not the rv"
+        );
+
+        guard.verified().await;
     }
 
     // ---- Peer sweep: stale leader label on another pod ----

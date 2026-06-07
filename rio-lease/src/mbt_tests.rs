@@ -375,20 +375,20 @@ impl MbtSystem {
             FetchOutcome::Create => FetchOutcome::Create,
             FetchOutcome::Decided { lease, .. } => {
                 // The same projection fetch_and_decide() performs
-                // (election.rs): holder + resourceVersion out of the
-                // fetched object, into decide().
+                // (election.rs): holder + holder-authored renewTime
+                // bytes out of the fetched object, into decide().
                 let holder = lease
                     .spec
                     .as_ref()
                     .and_then(|s| s.holder_identity.as_deref());
-                let rv = lease
-                    .metadata
-                    .resource_version
-                    .as_deref()
-                    .unwrap_or_default();
+                let rt = lease
+                    .spec
+                    .as_ref()
+                    .and_then(|sp| sp.renew_time.as_ref())
+                    .map(|mt| mt.0.to_string());
                 let decision = decide(
                     holder,
-                    rv,
+                    rt.as_deref(),
                     &mut h.election.observed,
                     &our_id,
                     STEAL_AFTER,
