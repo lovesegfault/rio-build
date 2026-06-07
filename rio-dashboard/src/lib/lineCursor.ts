@@ -174,6 +174,50 @@ export function assertNever(x: never): never {
   throw new Error(`lineCursor: unreachable variant ${JSON.stringify(x)}`);
 }
 
+/// WHY the stream is in the state it is, as ONE discriminated union
+/// (bug_065). The viewer's banner zone renders exclusively from an
+/// exhaustive match over this type ([`bannerFor`], below) — adding a terminal
+/// cause without a render arm is a compile error (`assertNever`), so
+/// "the state machine landed but the renderer didn't" is unrepresentable.
+export type StreamPhase =
+  | { kind: 'streaming' }
+  | { kind: 'complete' }
+  | { kind: 'incomplete'; err: Error | null }
+  | { kind: 'authRequired'; err: Error | null }
+  | { kind: 'permanentHole'; err: Error | null };
+
+/// The banner zone's view model: at most one banner story at a time,
+/// derived ONLY from the phase. `signIn` and `incomplete` are mutually
+/// exclusive by construction of the switch below.
+export type BannerView = {
+  signIn: boolean;
+  incomplete: boolean;
+  err: Error | null;
+};
+
+/// The exhaustive render law (bug_065): every `StreamPhase` variant maps
+/// to its banner story here and ONLY here. The auth-denied terminal
+/// suppresses both the raw transport error and the incomplete-log
+/// heuristics — the log is intact; the viewer merely lacks credentials
+/// (merged_bug_108's promised surface, now load-bearing).
+export function bannerFor(phase: StreamPhase): BannerView {
+  switch (phase.kind) {
+    case 'streaming':
+    case 'complete':
+      return { signIn: false, incomplete: false, err: null };
+    case 'authRequired':
+      return { signIn: true, incomplete: false, err: null };
+    case 'permanentHole':
+      // A typed-permanent hole: the incomplete banner tells the truth
+      // (some lines can never be served) and the error rides along.
+      return { signIn: false, incomplete: true, err: phase.err };
+    case 'incomplete':
+      return { signIn: false, incomplete: true, err: phase.err };
+    default:
+      return assertNever(phase);
+  }
+}
+
 /// Re-open pacing for the dashboard's follow loop (merged_bug_054).
 ///
 /// The pre-fix loop reset its backoff on `receivedThisAttempt` — ANY

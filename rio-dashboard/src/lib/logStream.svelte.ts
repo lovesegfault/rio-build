@@ -31,8 +31,12 @@ import {
   assertNever,
   tailNext,
   visitChunkKeyed,
+  type StreamPhase,
   type TailStopCause,
 } from './lineCursor';
+
+export type { BannerView, StreamPhase } from './lineCursor';
+export { bannerFor } from './lineCursor';
 
 // r[impl dash.stream.log-tail+4]
 // r[impl dash.log.cap]
@@ -107,6 +111,10 @@ export type LogStream = {
    * hold (terminal — never retried). The viewer renders the
    * sign-in-required notice instead of the incomplete-log banner. */
   readonly authRequired: boolean;
+  /** The terminal-cause surface the banner zone renders from. The
+   * boolean flags above remain for tests/back-compat; the phase is the
+   * law-bearing render input (bug_065). */
+  readonly phase: StreamPhase;
   destroy: () => void;
 };
 
@@ -162,6 +170,7 @@ export function createLogStream(
   let incomplete = $state(false);
   let gapCount = $state(0);
   let authRequired = $state(false);
+  let phase = $state<StreamPhase>({ kind: 'streaming' });
   const isTerminal = opts?.isTerminal ?? (() => false);
   const ctrl = new AbortController();
 
@@ -380,6 +389,7 @@ export function createLogStream(
             // execution is terminal AND the manifest contiguously covers
             // the log. Everything servable was served: exit immediately,
             // no grace needed.
+            phase = { kind: 'complete' };
             done = true;
             return;
           }
@@ -388,6 +398,9 @@ export function createLogStream(
           // destroy() while the transport stayed silent (signal-deaf
           // mocks, an already-buffered stream): same exit as the
           // rejected-transport path below.
+          phase = servedComplete
+            ? { kind: 'complete' }
+            : { kind: 'incomplete', err: null };
           done = true;
           return;
         }
@@ -399,6 +412,9 @@ export function createLogStream(
         // Swallow AbortError: our own destroy() (master) or the
         // mid-stream grace cutoff (attempt) firing.
         if (ctrl.signal.aborted) {
+          phase = servedComplete
+            ? { kind: 'complete' }
+            : { kind: 'incomplete', err: null };
           done = true;
           return;
         }
@@ -458,13 +474,20 @@ export function createLogStream(
           // sign-in notice, not the incomplete-log banner heuristics.
           authRequired = true;
           err = lastErr;
+          phase = { kind: 'authRequired', err: lastErr };
         } else if (cause === 'permanentErr') {
           // A typed-permanent hole: the incomplete banner tells the
           // truth (some lines can never be served) and the error rides
           // along for the detail line.
           err = lastErr;
+          phase = { kind: 'permanentHole', err: lastErr };
         } else if (!servedComplete && rows.length === 0 && lastErr !== null) {
           err = lastErr;
+          phase = { kind: 'incomplete', err: lastErr };
+        } else {
+          phase = servedComplete
+            ? { kind: 'complete' }
+            : { kind: 'incomplete', err: null };
         }
         done = true;
         return;
@@ -478,6 +501,9 @@ export function createLogStream(
       }
       await sleep(delay, ctrl.signal);
       if (ctrl.signal.aborted) {
+        phase = servedComplete
+          ? { kind: 'complete' }
+          : { kind: 'incomplete', err: null };
         done = true;
         return;
       }
@@ -508,6 +534,9 @@ export function createLogStream(
     },
     get authRequired() {
       return authRequired;
+    },
+    get phase() {
+      return phase;
     },
     destroy: () => ctrl.abort(),
   };

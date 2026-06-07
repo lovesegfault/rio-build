@@ -16,6 +16,10 @@
   // off-screen ranges. The container's scrollHeight stays synthetic
   // (spacer-driven) but arithmetically identical to full render, so
   // follow-tail's scrollTop = scrollHeight still lands at the bottom.
+  // bannerFor comes from lineCursor (the law file) directly — NOT via
+  // logStream's re-export: component tests mock the logStream module
+  // wholesale, and the render law must stay real under that mock.
+  import { bannerFor } from '../lib/lineCursor';
   import { createLogStream, type LogStream } from '../lib/logStream.svelte';
 
   let {
@@ -73,6 +77,14 @@
   // whole-build view (drvPath undefined) doesn't get the banner —
   // there's no per-drv exec_id to be approximate against.
   const approximate = $derived(drvPath !== undefined && execId === '');
+
+  // The banner zone's single render input (bug_065): the exhaustive
+  // bannerFor match over the stream's terminal-cause phase. The raw
+  // error alert, the sign-in notice, and the incomplete-log banner are
+  // all decided HERE — adding a terminal cause without a render arm
+  // fails to compile (assertNever in bannerFor), so a write-only
+  // terminal state is unrepresentable.
+  const banner = $derived(bannerFor(stream.phase));
   $effect(() => () => stream.destroy());
 
   let container: HTMLElement | undefined = $state();
@@ -169,8 +181,18 @@
   onscroll={onScroll}
   data-testid="log-viewer"
 >
-  {#if stream.err}
-    <div role="alert" class="err">log stream failed: {stream.err.message}</div>
+  {#if banner.err}
+    <div role="alert" class="err">log stream failed: {banner.err.message}</div>
+  {/if}
+  {#if banner.signIn}
+    <!-- The store demanded credentials the KeylessOnly dashboard does
+         not hold (merged_bug_108 / bug_065). The log itself is intact —
+         this notice REPLACES the raw error and the incomplete-log
+         truncation diagnosis, which would both mislead. -->
+    <div class="incomplete" data-testid="log-auth-required">
+      — sign-in required: the store demands tenant credentials to serve
+      this log; the log itself is intact —
+    </div>
   {/if}
   {#if approximate}
     <div class="approximate" data-testid="log-approximate">
@@ -229,7 +251,7 @@
       durable storage; the holes are marked inline —
     </div>
   {/if}
-  {#if stream.incomplete}
+  {#if banner.incomplete}
     <div class="incomplete" data-testid="log-incomplete">
       — log incomplete: the stored log ends before the final line (the
       missing tail usually holds the build error) —

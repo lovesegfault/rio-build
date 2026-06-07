@@ -35,11 +35,45 @@ describe('LogViewer', () => {
     createLogStream.mockReset();
   });
 
+  // r[verify dash.stream.log-tail+5]
+  /// bug_065's recorded red: the lib classified PermissionDenied as the
+  /// terminal authRequired state and PROMISED the sign-in notice, but no
+  /// component ever read the flag — a jwt-enabled deployment rendered
+  /// the raw gRPC error plus the misleading "missing tail usually holds
+  /// the build error" banner for a fully-intact log. The phase union +
+  /// exhaustive bannerFor make the render arm load-bearing: a new
+  /// terminal cause cannot compile without one.
+  it('auth-required renders the sign-in notice, not the raw error or incomplete banner', () => {
+    createLogStream.mockReturnValue({
+      rows: [],
+      done: true,
+      err: new Error('[permission_denied] tenant credentials required'),
+      incomplete: true,
+      authRequired: true,
+      phase: {
+        kind: 'authRequired',
+        err: new Error('[permission_denied] tenant credentials required'),
+      },
+      destroy: vi.fn(),
+    });
+    render(LogViewer, { props: {} });
+
+    // The promised surface: a sign-in notice...
+    expect(screen.getByTestId('log-auth-required').textContent).toMatch(
+      /sign-in required/,
+    );
+    // ...and NOT the truncation diagnosis (the log is intact) nor the
+    // raw transport error (the sign-in notice carries the story).
+    expect(screen.queryByTestId('log-incomplete')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
   it('renders error alert when stream.err is set', () => {
     createLogStream.mockReturnValue({
       rows: [],
       done: true,
       err: new Error('boom'),
+      phase: { kind: 'incomplete', err: new Error('boom') },
       destroy: vi.fn(),
     });
     render(LogViewer, { props: {} });
@@ -60,6 +94,7 @@ describe('LogViewer', () => {
       rows: [],
       done: true,
       err: null,
+      phase: { kind: 'complete' },
       destroy: vi.fn(),
     });
     render(LogViewer, { props: {} });
@@ -77,6 +112,7 @@ describe('LogViewer', () => {
       rows: lineRows(['line1', 'line2']),
       done: false,
       err: null,
+      phase: { kind: 'streaming' },
       destroy: vi.fn(),
     });
     render(LogViewer, { props: {} });
@@ -95,6 +131,7 @@ describe('LogViewer', () => {
       rows: lineRows(['final line']),
       done: true,
       err: null,
+      phase: { kind: 'complete' },
       destroy: vi.fn(),
     });
     render(LogViewer, { props: {} });
@@ -126,6 +163,7 @@ describe('LogViewer', () => {
       done: true,
       err: null,
       truncated: false,
+      phase: { kind: 'complete' },
       destroy: vi.fn(),
     });
     const { container } = render(LogViewer, { props: {} });
@@ -148,6 +186,7 @@ describe('LogViewer', () => {
       done: true,
       err: null,
       truncated: false,
+      phase: { kind: 'complete' },
       destroy: vi.fn(),
     });
     const { container } = render(LogViewer, {
@@ -183,6 +222,7 @@ describe('LogViewer', () => {
       err: null,
       truncated: true,
       droppedLines: 12340,
+      phase: { kind: 'complete' },
       destroy: vi.fn(),
     });
     render(LogViewer, { props: {} });
@@ -204,6 +244,7 @@ describe('LogViewer', () => {
       err: null,
       truncated: false,
       incomplete: true,
+      phase: { kind: 'incomplete', err: null },
       destroy: vi.fn(),
     });
     render(LogViewer, { props: {} });
@@ -237,6 +278,7 @@ describe('LogViewer', () => {
         done: true,
         err: null,
         truncated: false,
+        phase: { kind: 'complete' },
         destroy: vi.fn(),
       });
       const { container } = render(LogViewer, {
@@ -267,6 +309,7 @@ describe('LogViewer', () => {
       truncated: false,
       incomplete: false,
       gapCount: 1,
+      phase: { kind: 'complete' },
       destroy: vi.fn(),
     });
     render(LogViewer, { props: {} });
@@ -290,6 +333,7 @@ describe('LogViewer', () => {
       truncated: false,
       incomplete: true,
       gapCount: 1,
+      phase: { kind: 'incomplete', err: null },
       destroy: vi.fn(),
     });
     render(LogViewer, { props: {} });
