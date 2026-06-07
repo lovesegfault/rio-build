@@ -1003,7 +1003,23 @@ impl Substituter {
                 // contradict into an infrastructure charge.
                 Err(SubstituteError::UntrustedPresent)
             }
-            rio_evidence_kernel::outcome::SubstituteLoopVerdict::CleanMiss => Ok(None),
+            rio_evidence_kernel::outcome::SubstituteLoopVerdict::CleanMiss => {
+                // merged_bug_016: a fresh EVERY-upstream GET-404
+                // contradicts any cached HEAD positive for this
+                // (tenant, path) — evict it, so a charge-gating
+                // confirmation probe observes live state instead of
+                // a stale `true` for the rest of the 1h TTL
+                // ("present but not ingested" charged the park
+                // budget until the TTL lapsed). Aggregate granularity
+                // is load-bearing: ONE upstream's 404 does not
+                // contradict a positive another upstream produced;
+                // the CleanMiss fold — every upstream answered
+                // hit-or-404 with zero hits — does.
+                self.probe_cache
+                    .invalidate(&(tenant_id, store_path.to_string()))
+                    .await;
+                Ok(None)
+            }
         }
     }
 

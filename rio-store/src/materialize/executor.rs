@@ -1127,6 +1127,100 @@ mod tests {
         }
     }
 
+    /// merged_bug_016: a multi-path upstream with a kill switch — once
+    /// `gone` is set, EVERY route answers 404 (the upstream evicted
+    /// the path between the dispatch-time HEAD probe and the
+    /// execution-time GET).
+    async fn spawn_flippable_upstream(
+        paths: Vec<(String, Vec<u8>, Vec<String>)>,
+        key_name: &str,
+    ) -> (FakeUpstream, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        use axum::{Router, http::StatusCode, routing::get};
+        use base64::Engine;
+        use sha2::Digest;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let gone = Arc::new(AtomicBool::new(false));
+        let seed = [0x42u8; 32];
+        let signer = Signer::from_seed(key_name, &seed);
+        let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+        let trusted_key = format!(
+            "{key_name}:{}",
+            base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes())
+        );
+
+        let mut app = Router::new().route(
+            "/nix-cache-info",
+            get(|| async { "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n" }),
+        );
+        for (path, nar, refs) in paths {
+            let nar_hash: [u8; 32] = sha2::Sha256::digest(&nar).into();
+            let nar_hash_str = format!(
+                "sha256:{}",
+                rio_nix::store_path::nixbase32::encode(&nar_hash)
+            );
+            let fp = fingerprint(&path, &nar_hash, nar.len() as u64, &refs);
+            let sig = signer.sign(&fp);
+            let sp = StorePath::parse(&path).unwrap();
+            let hash_part = sp.hash_part();
+            let ref_basenames: Vec<&str> = refs
+                .iter()
+                .map(|r| r.strip_prefix("/nix/store/").unwrap_or(r))
+                .collect();
+            let narinfo = format!(
+                "StorePath: {path}\n\
+                 URL: nar/{hash_part}.nar\n\
+                 Compression: none\n\
+                 NarHash: {nar_hash_str}\n\
+                 NarSize: {}\n\
+                 References: {}\n\
+                 Sig: {sig}\n",
+                nar.len(),
+                ref_basenames.join(" ")
+            );
+            let g1 = gone.clone();
+            let g2 = gone.clone();
+            app = app
+                .route(
+                    &format!("/{hash_part}.narinfo"),
+                    get(move || async move {
+                        if g1.load(Ordering::SeqCst) {
+                            Err(StatusCode::NOT_FOUND)
+                        } else {
+                            Ok(narinfo)
+                        }
+                    }),
+                )
+                .route(
+                    &format!("/nar/{hash_part}.nar"),
+                    get(move || async move {
+                        if g2.load(Ordering::SeqCst) {
+                            Err(StatusCode::NOT_FOUND)
+                        } else {
+                            Ok(nar)
+                        }
+                    }),
+                );
+        }
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            FakeUpstream {
+                url: format!("http://{addr}"),
+                trusted_key,
+                _task: task,
+            },
+            gone,
+        )
+    }
+
     /// Sandbox-safe reqwest client (the substitute.rs precedent: no CA
     /// bundle in the nix sandbox; the fake upstream is plaintext).
     use crate::test_helpers::sandbox_http;
@@ -1894,6 +1988,67 @@ mod tests {
             unobtainable.cause.contains("signature"),
             "the cause names the trust refusal, not a generic miss: {}",
             unobtainable.cause
+        );
+    }
+
+    /// merged_bug_016: a positive probe-cache entry (1h TTL, written
+    /// by the dispatch-time HEAD probe) must not override the
+    /// execution-time GETs' fresh 404s. Pre-fix nothing invalidated
+    /// the entry when the attempt leg observed the upstream evicted
+    /// the path, so `probe_miss`'s confirmation read the STALE cached
+    /// `true` → "present but not ingested" → InfraFailure on every
+    /// retry until the TTL lapsed — burning the park budget instead
+    /// of settling confirmed-absent.
+    #[tokio::test]
+    async fn stale_probe_cache_positive_does_not_charge_after_eviction() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-evicted").await;
+
+        let path = store_path(34, "mat-evicted");
+        let (nar, _) = rio_test_support::fixtures::make_nar(b"evicted");
+        let (upstream, gone) =
+            spawn_flippable_upstream(vec![(path.clone(), nar, vec![])], "cache.evict").await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+
+        let ctx = make_ctx(db.pool.clone());
+        // Dispatch-time probe: HEAD 200 → probe_cache stores the
+        // positive (the very probe that spawns the job in production
+        // — the executor shares the same Substituter).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let probed = ctx
+            .substituter
+            .check_available(tenant, std::slice::from_ref(&path), deadline)
+            .await
+            .expect("dispatch-time probe");
+        assert!(
+            probed.hits.iter().any(|p| p == &path),
+            "the probe primed the positive cache entry"
+        );
+
+        // The upstream evicts the path before execution claims it.
+        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let seeded = seed_job(
+            &db.pool,
+            "mat-evicted-drv",
+            &[("out", path.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await;
+
+        let unobtainable = outcome_unobtainable(&outcome).unwrap_or_else(|| {
+            panic!(
+                "fresh all-404 GETs must outrank the stale cached positive \
+                 (settle Unobtainable), got {outcome:?}"
+            )
+        });
+        assert_eq!(
+            unobtainable.missing_paths,
+            vec![path.clone()],
+            "the evicted path settles confirmed-absent"
         );
     }
 
