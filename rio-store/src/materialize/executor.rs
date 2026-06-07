@@ -69,7 +69,7 @@ pub struct ExecutorContext {
 ///    coverage is against execution-end live wanted, not a snapshot.
 // r[impl store.materialize.executor+5]
 // r[impl sched.materialize.pinning]
-pub async fn execute_job(ctx: &ExecutorContext, claimed: &ClaimedJob) -> MaterializationOutcome {
+pub async fn execute_job(ctx: &ExecutorContext, claimed: &ClaimedJob) -> CountedOutcome {
     execute_job_with_progress(ctx, claimed, |_, _, _| {}).await
 }
 
@@ -92,20 +92,44 @@ pub async fn execute_job_with_progress(
     ctx: &ExecutorContext,
     claimed: &ClaimedJob,
     on_progress: impl Fn(u64, u64, &str) + Send + Sync + 'static,
-) -> MaterializationOutcome {
-    let outcome = execute_job_inner(ctx, claimed, on_progress).await;
-    // T-6.2 lifecycle counter: one increment per finished execution,
-    // labeled by outcome class — the dashboard's execution rates and
-    // the upstream-health signal (a rising infra/unobtainable share).
-    // Sited at this single chokepoint so every return path of the
-    // walk is counted exactly once; the label comes from the ONE
-    // alphabet mapping (bug_244).
-    metrics::counter!(
-        "rio_store_materialization_executions_total",
-        "outcome" => outcome_label(outcome.outcome.as_ref())
-    )
-    .increment(1);
-    outcome
+) -> CountedOutcome {
+    CountedOutcome::count(execute_job_inner(ctx, claimed, on_progress).await)
+}
+
+/// Witness that a [`MaterializationOutcome`] passed the ONE counting
+/// chokepoint (merged_bug_115). [`super::client::report_until_acked`]
+/// DEMANDS it in its signature, so an uncounted report does not
+/// typecheck: the SIGTERM arm used to synthesize `Aborted` straight
+/// onto the wire, leaving `outcome="aborted"` seeded, HELP'd, and
+/// documented as live while its only producer bypassed the counter
+/// the bug_244 totality close blessed. A voluntary helper both paths
+/// merely *may* call is the recurrence shape this type forbids.
+pub struct CountedOutcome {
+    outcome: MaterializationOutcome,
+}
+
+impl CountedOutcome {
+    /// THE count-and-report mint — the only constructor. T-6.2
+    /// lifecycle counter: one increment per finished (or synthesized)
+    /// execution, labeled through the ONE alphabet mapping (bug_244).
+    pub(crate) fn count(outcome: MaterializationOutcome) -> Self {
+        metrics::counter!(
+            "rio_store_materialization_executions_total",
+            "outcome" => outcome_label(outcome.outcome.as_ref())
+        )
+        .increment(1);
+        Self { outcome }
+    }
+
+    /// Consume the witness into the wire outcome (the report path).
+    pub(crate) fn into_outcome(self) -> MaterializationOutcome {
+        self.outcome
+    }
+
+    /// The counted outcome, for callers that only inspect it.
+    pub(crate) fn outcome(&self) -> &MaterializationOutcome {
+        &self.outcome
+    }
 }
 
 /// The outcome-label alphabet of
@@ -135,8 +159,11 @@ pub(crate) fn outcome_label(outcome: Option<&materialization_outcome::Outcome>) 
         Some(materialization_outcome::Outcome::Unobtainable(_)) => "unobtainable",
         Some(materialization_outcome::Outcome::InfraFailure(_)) | None => "infra",
         // Synthesized by the claim loop's SIGTERM arm, never by the
-        // walk itself — but counted like every other outcome so the
-        // chokepoint stays total over the alphabet.
+        // walk itself — and counted like every other outcome BECAUSE
+        // the arm must mint a `CountedOutcome` to reach
+        // `report_until_acked` (merged_bug_115: pre-fix the arm
+        // bypassed the counter and this comment asserted the
+        // opposite of the code).
         Some(materialization_outcome::Outcome::Aborted(_)) => "aborted",
         // Transient, uncharged retry (merged_bug_178): raced placeholder
         // or upstream 429 — counted so the dashboard sees deferral
@@ -1594,7 +1621,7 @@ mod tests {
         .await;
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
 
         let success = outcome_success(&outcome)
             .unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
@@ -1683,7 +1710,7 @@ mod tests {
         .expect("carrier seeded");
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
 
         let success = outcome_success(&outcome)
             .unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
@@ -1770,7 +1797,7 @@ mod tests {
             .unwrap();
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
 
         let success = outcome_success(&outcome)
             .unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
@@ -1809,7 +1836,7 @@ mod tests {
         .await;
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
 
         let infra = outcome_infra(&outcome)
             .unwrap_or_else(|| panic!("expected InfraFailure, got {outcome:?}"));
@@ -1884,7 +1911,7 @@ mod tests {
             .unwrap();
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
 
         let success = outcome_success(&outcome).unwrap_or_else(|| {
             panic!(
@@ -1946,7 +1973,7 @@ mod tests {
 
         let ctx = make_ctx(db.pool.clone());
         let claimed = seeded.claimed.clone();
-        let walk = tokio::spawn(async move { execute_job(&ctx, &claimed).await });
+        let walk = tokio::spawn(async move { execute_job(&ctx, &claimed).await.into_outcome() });
 
         // Deterministic seam: the walk is INSIDE iteration 1's NAR
         // fetch of P when the gate reports the hit.
@@ -2126,7 +2153,7 @@ mod tests {
         .unwrap();
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
         let success = outcome_success(&outcome).unwrap_or_else(|| {
             panic!(
                 "expected Success via the second (serving) tenant, got {outcome:?} — \
@@ -2206,7 +2233,7 @@ mod tests {
         .unwrap();
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
         let retry = outcome_retry_later(&outcome).unwrap_or_else(|| {
             panic!(
                 "expected uncharged RetryLater (the race defers; the sibling's \
@@ -2244,7 +2271,7 @@ mod tests {
         .await;
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
 
         let unobtainable = outcome_unobtainable(&outcome)
             .unwrap_or_else(|| panic!("expected Unobtainable, got {outcome:?}"));
@@ -2312,7 +2339,7 @@ mod tests {
         .await;
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
 
         let unobtainable = outcome_unobtainable(&outcome).unwrap_or_else(|| {
             panic!("present-but-untrusted must settle Unobtainable (uncharged), got {outcome:?}")
@@ -2375,7 +2402,7 @@ mod tests {
             &[],
         )
         .await;
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
 
         let unobtainable = outcome_unobtainable(&outcome).unwrap_or_else(|| {
             panic!(
@@ -2490,10 +2517,9 @@ mod tests {
             ),
             pool: db.pool.clone(),
         };
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            execute_job(&ctx, &seeded.claimed),
-        )
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            execute_job(&ctx, &seeded.claimed).await.into_outcome()
+        })
         .await
         .expect("the stall abort must end the wedged download (no hang)");
 
@@ -2536,7 +2562,7 @@ mod tests {
         .await;
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
 
         let infra = outcome_infra(&outcome).unwrap_or_else(|| {
             panic!("expected InfraFailure for a 5xx-only upstream, got {outcome:?}")
@@ -2609,7 +2635,8 @@ mod tests {
                     .unwrap()
                     .push((done, expected, uri.to_string()));
             })
-            .await;
+            .await
+            .into_outcome();
 
         outcome_success(&outcome).unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
 
@@ -2701,7 +2728,7 @@ mod tests {
         )
         .await;
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
         assert!(
             outcome_success(&outcome).is_some(),
             "precondition: the execution succeeds, got {outcome:?}"
@@ -2864,7 +2891,7 @@ mod tests {
         .await;
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
 
         let unobtainable = outcome_unobtainable(&outcome)
             .unwrap_or_else(|| panic!("expected Unobtainable, got {outcome:?}"));
@@ -2946,7 +2973,7 @@ mod tests {
         .await;
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
         let retry = outcome_retry_later(&outcome).unwrap_or_else(|| {
             panic!(
                 "expected RetryLater (probe-leg 429 closes uncharged), got {outcome:?} — \
@@ -3000,7 +3027,7 @@ mod tests {
         )
         .await;
         let ctx = make_ctx(db.pool.clone());
-        let first = execute_job(&ctx, &seeded1.claimed).await;
+        let first = execute_job(&ctx, &seeded1.claimed).await.into_outcome();
         assert!(
             outcome_success(&first).is_some(),
             "phase-1 ingest must succeed, got {first:?}"
@@ -3036,7 +3063,7 @@ mod tests {
             &[],
         )
         .await;
-        let outcome = execute_job(&ctx, &seeded2.claimed).await;
+        let outcome = execute_job(&ctx, &seeded2.claimed).await.into_outcome();
         let success = outcome_success(&outcome)
             .unwrap_or_else(|| panic!("expected Success from local presence, got {outcome:?}"));
         assert!(
@@ -3083,7 +3110,7 @@ mod tests {
             .await
             .unwrap();
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
         let infra = outcome_infra(&outcome)
             .unwrap_or_else(|| panic!("expected InfraFailure, got {outcome:?}"));
         assert!(
@@ -3146,7 +3173,7 @@ mod tests {
         )
         .await;
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
         let retry = outcome_retry_later(&outcome)
             .unwrap_or_else(|| panic!("expected RetryLater, got {outcome:?}"));
         assert_eq!(retry.class, "rate_limited");
@@ -3188,7 +3215,7 @@ mod tests {
         )
         .await;
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
         let retry = outcome_retry_later(&outcome)
             .unwrap_or_else(|| panic!("expected RetryLater, got {outcome:?}"));
         assert_eq!(retry.class, "raced");
@@ -3231,7 +3258,7 @@ mod tests {
         )
         .await;
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
         let infra = outcome_infra(&outcome)
             .unwrap_or_else(|| panic!("expected InfraFailure, got {outcome:?}"));
         assert!(
@@ -3299,7 +3326,7 @@ mod tests {
         .unwrap();
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
         let success = outcome_success(&outcome)
             .unwrap_or_else(|| panic!("expected Success via tenant2, got {outcome:?}"));
         assert_eq!(
@@ -3361,7 +3388,7 @@ mod tests {
         .unwrap();
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
         assert!(
             outcome_infra(&outcome).is_some(),
             "an unconfirmable tenant view must report infra, got {outcome:?}"
@@ -3604,7 +3631,7 @@ mod tests {
         )
         .await;
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
         let unobtainable = outcome_unobtainable(&outcome).unwrap_or_else(|| {
             panic!("expected Unobtainable (gate-hidden local row must degrade), got {outcome:?}")
         });
@@ -3656,7 +3683,7 @@ mod tests {
         )
         .await;
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
         assert!(
             outcome_unobtainable(&outcome).is_some(),
             "I-217: another tenant's built output must be hidden from the walk, got {outcome:?}"
@@ -3702,7 +3729,7 @@ mod tests {
         )
         .await;
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
         let success = outcome_success(&outcome)
             .unwrap_or_else(|| panic!("expected Success via the local row, got {outcome:?}"));
         assert_eq!(success.verified_paths, vec![path.clone()]);

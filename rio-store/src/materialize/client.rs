@@ -736,11 +736,14 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
 pub async fn report_until_acked<T: MaterializeTransport>(
     transport: &mut T,
     exec_id: &str,
-    outcome: MaterializationOutcome,
+    outcome: super::executor::CountedOutcome,
     budget: Duration,
     shutdown: &rio_common::signal::Token,
 ) -> bool {
     let budget = AttemptBudget::new(budget);
+    // Consume the witness once: the retry loop re-sends the SAME
+    // counted outcome (one execution = one count, N report attempts).
+    let outcome = outcome.into_outcome();
     let mut attempt: u32 = 0;
     loop {
         let req = ReportOutcomeRequest {
@@ -1994,7 +1997,7 @@ mod tests {
         let acked = report_until_acked(
             &mut t,
             "exec-1",
-            outcome.clone(),
+            crate::materialize::executor::CountedOutcome::count(outcome.clone()),
             Duration::from_secs(600),
             &token(),
         )
@@ -2011,7 +2014,7 @@ mod tests {
         let acked = report_until_acked(
             &mut t,
             "exec-2",
-            outcome.clone(),
+            crate::materialize::executor::CountedOutcome::count(outcome.clone()),
             Duration::from_secs(600),
             &token(),
         )
@@ -2025,8 +2028,14 @@ mod tests {
             vec![],
             vec![Err(tonic::Status::unavailable("scheduler gone"))],
         );
-        let acked =
-            report_until_acked(&mut t, "exec-3", outcome, Duration::from_secs(60), &token()).await;
+        let acked = report_until_acked(
+            &mut t,
+            "exec-3",
+            crate::materialize::executor::CountedOutcome::count(outcome),
+            Duration::from_secs(60),
+            &token(),
+        )
+        .await;
         assert!(
             !acked,
             "an unacked report inside the budget is not a success"
@@ -2084,7 +2093,9 @@ mod tests {
             report_until_acked(
                 &mut t,
                 "exec-bh",
-                MaterializationOutcome { outcome: None },
+                crate::materialize::executor::CountedOutcome::count(MaterializationOutcome {
+                    outcome: None,
+                }),
                 Duration::from_secs(120),
                 &shutdown,
             ),
@@ -2116,7 +2127,9 @@ mod tests {
         let acked = report_until_acked(
             &mut t,
             "exec-sig",
-            MaterializationOutcome { outcome: None },
+            crate::materialize::executor::CountedOutcome::count(MaterializationOutcome {
+                outcome: None,
+            }),
             Duration::from_secs(600),
             &shutdown,
         )
@@ -2445,7 +2458,7 @@ mod tests {
         let acked = report_until_acked(
             &mut transport,
             "exec-rollout-1",
-            outcome,
+            crate::materialize::executor::CountedOutcome::count(outcome),
             Duration::from_secs(20),
             &token(),
         )

@@ -298,7 +298,12 @@ async fn claim_loop<T>(
                         exec_id = %job.exec_id,
                         "SIGTERM during the materialization walk: aborting and reporting Aborted"
                     );
-                    rio_proto::types::MaterializationOutcome {
+                    // merged_bug_115: the synthesized outcome routes
+                    // through the SAME count-and-report mint as the
+                    // walk's — report_until_acked demands the witness,
+                    // so an uncounted synthesized report does not
+                    // typecheck.
+                    executor::CountedOutcome::count(rio_proto::types::MaterializationOutcome {
                         outcome: Some(
                             rio_proto::types::materialization_outcome::Outcome::Aborted(
                                 rio_proto::types::materialization_outcome::Aborted {
@@ -307,7 +312,7 @@ async fn claim_loop<T>(
                                 },
                             ),
                         ),
-                    }
+                    })
                 }
                 outcome = execute => outcome,
             };
@@ -542,6 +547,8 @@ mod tests {
         }
 
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let rec = rio_test_support::metrics::CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
         let substituter =
             std::sync::Arc::new(crate::substitute::Substituter::new(db.pool.clone(), None));
         let shutdown = rio_common::signal::Token::new();
@@ -576,6 +583,15 @@ mod tests {
         let reports = reports.lock().unwrap();
         assert_eq!(reports.len(), 1, "exactly one Aborted report");
         assert_eq!(reports[0].exec_id, "exec-sigterm-1");
+        // merged_bug_115: the synthesized SIGTERM outcome must move
+        // the executions counter like every other outcome - the
+        // series is seeded, HELP'd, and documented as live, but its
+        // ONLY producer bypassed the counting chokepoint.
+        assert_eq!(
+            rec.get("rio_store_materialization_executions_total{outcome=aborted}"),
+            1,
+            "the SIGTERM-synthesized Aborted is COUNTED"
+        );
         match &reports[0].materialization_outcome {
             Some(rio_proto::types::MaterializationOutcome {
                 outcome: Some(rio_proto::types::materialization_outcome::Outcome::Aborted(aborted)),
