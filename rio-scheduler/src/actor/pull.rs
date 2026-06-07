@@ -626,10 +626,25 @@ impl DagActor {
             {
                 // TOCTOU vs a concurrent cancel between the admit and
                 // the commit: the durable rows exist but the node left
-                // Ready/Queued. The attempt resolves via the normal
-                // terminal paths (report or establishment); never deliver.
+                // Ready/Queued. Never deliver. The committed mint is
+                // NOT stranded into a charged settlement
+                // (merged_bug_096 recovery contract, both branches):
+                //  - job still live: the client KEEPS its nonce on
+                //    this NotYetReady (the credential survives), the
+                //    job view already says Claimed-by-this-puller
+                //    (note_claimed ran above), so the next resume
+                //    pull re-delivers through the Claimed arm's
+                //    credential disjunction;
+                //  - job cancelled (the race that rejected the
+                //    transition): the flag-gated housekeeping closer
+                //    sweeps the cancelled job's open attempt
+                //    CHARGE-FREE from a PG snapshot taken after this
+                //    commit, and the client's next resume answers
+                //    Gone, dropping the entry cleanly.
                 warn!(drv_hash = %drv_hash, error = %e,
-                      "pull minted but the mint transition was rejected; answering NotYetReady");
+                      "pull minted but the mint transition was rejected; answering NotYetReady \
+                       (credential kept client-side; cancelled-job mints settle charge-free \
+                       via the housekeeping closer)");
                 return Ok(PullOutcome::NotYetReady {
                     retry_after_secs: NOT_YET_READY_RETRY_AFTER_SECS,
                 });

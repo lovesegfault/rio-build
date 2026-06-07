@@ -212,12 +212,16 @@ pub const REBOUND_ORIGIN: &str = "resume_rebound";
 /// presenting the nonce; the kernel's credential disjunction
 /// re-delivers and the worker recovers the assignment.
 ///
-/// Entries leave on every ANSWERED outcome (Assignment — we hold the
-/// job; Gone — resolved/absent, authoritative) and on capacity
-/// eviction (oldest first). `NotYetReady` KEEPS the entry: the job
-/// may be parked, raced to another replica (their resolution answers
-/// Gone later), or our own attempt seen through a mid-recovery stale
-/// view — the retry costs one bounded RPC per pass. An evicted or
+/// Entries leave on every AUTHORITATIVE answer (Assignment — we hold
+/// the job; Gone — resolved/absent; Rejected — answered permanent
+/// refusal, no mint behind it) and on capacity eviction (oldest
+/// first). `NotYetReady` KEEPS the entry on BOTH passes
+/// (merged_bug_096): the job may be parked, raced to another replica
+/// (their resolution answers Gone later), seen through a mid-recovery
+/// stale view — or OUR OWN committed mint answered through the
+/// scheduler's post-mint TOCTOU arm, which says NotYetReady after
+/// persisting this worker's nonce. The retry costs one bounded RPC
+/// per pass. An evicted or
 /// process-lost entry settles through the charged establishment
 /// window — the SIGNED residual (rule-4b): real crashes still pay,
 /// lost responses no longer do.
@@ -263,6 +267,33 @@ impl ResumeLedger {
         self.entries.retain(|e| e.job_id != job_id);
     }
 
+    /// merged_bug_096 — the SOLE fresh-mint authority. A claim pull
+    /// for a job can only be issued through its ledger entry: one
+    /// nonce per job lifecycle. Returns `None` when a LIVE entry
+    /// exists — the fresh pass then SKIPS the job (the resume pass at
+    /// the head of the same poll already presented the live
+    /// credential; minting here would clobber the only proof of a
+    /// possibly-committed server-side mint). The skip falls out of
+    /// the API instead of being a remembered check.
+    fn begin_fresh_claim(
+        &mut self,
+        job_id: Uuid,
+        fill: impl FnOnce(Uuid) -> ResumeEntry,
+    ) -> Option<MintedClaim> {
+        if self.entries.iter().any(|e| e.job_id == job_id) {
+            return None;
+        }
+        let nonce = Uuid::new_v4();
+        if self.entries.len() >= RESUME_LEDGER_CAP
+            && let Some(evicted) = self.entries.pop_front()
+        {
+            warn!(drv_hash = %evicted.drv_hash, job_id = %evicted.job_id,
+                  "resume ledger full; evicted entry settles via the establishment window");
+        }
+        self.entries.push_back(fill(nonce));
+        Some(MintedClaim { nonce })
+    }
+
     /// Snapshot for the resume pass (entries are a handful of small
     /// strings; the pass mutates the ledger per answer).
     fn snapshot(&self) -> Vec<ResumeEntry> {
@@ -277,6 +308,22 @@ impl ResumeLedger {
     /// True when no unanswered claim is outstanding.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+/// A fresh-claim credential minted THROUGH the ledger
+/// ([`ResumeLedger::begin_fresh_claim`] is the only constructor): the
+/// claim request's nonce field is filled from this token, so a fresh
+/// pull that did not register its credential in the ledger does not
+/// typecheck (merged_bug_096 — the ledger is the mint authority as an
+/// API, not a convention).
+struct MintedClaim {
+    nonce: Uuid,
+}
+
+impl MintedClaim {
+    fn nonce_string(&self) -> String {
+        self.nonce.to_string()
     }
 }
 
@@ -587,15 +634,19 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         // never arrives, the scheduler may still have committed the
         // mint WITH this nonce persisted (`assignments.claim_nonce`) —
         // the ledger entry is then the credential that recovers the
-        // attempt on the next pass.
-        let nonce = Uuid::new_v4();
-        ledger.note_pull(ResumeEntry {
+        // attempt on the next pass. merged_bug_096: the mint goes
+        // THROUGH the ledger — a job with a live entry is skipped
+        // (its credential was already presented by the resume pass
+        // this very poll; a second mint would clobber it).
+        let Some(minted) = ledger.begin_fresh_claim(job_id, |nonce| ResumeEntry {
             job_id,
             drv_hash: descriptor.drv_hash.clone(),
             tenant_hint: Uuid::parse_str(&descriptor.tenant_id).ok(),
             origin: descriptor.origin.clone(),
             nonce,
-        });
+        }) else {
+            continue;
+        };
         outstanding_mints += 1;
         let req = PullAssignmentRequest {
             // No executor token: the store's credential is the
@@ -615,7 +666,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             // window (the T-0e.6 rule-4 amendment — status at the
             // executor-invariant-map.md rule-4 anchor).
             resume_exec_id: String::new(),
-            claim_nonce: nonce.to_string(),
+            claim_nonce: minted.nonce_string(),
         };
         match pull_once(transport, shutdown, req, &descriptor.drv_hash).await {
             // SIGTERM mid-pass: return what was already claimed so the
@@ -638,14 +689,24 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
                     &assignment,
                 ));
             }
-            // ANSWERED refusals on a FRESH claim: the scheduler did
-            // not mint for us — drop the nonce (unlike the resume
-            // pass, where NotYetReady may shadow our own held
-            // attempt through a stale view). Rejected (bug_119) is the
-            // permanent-refusal shape of the same answered class.
-            PullAnswer::Gone | PullAnswer::NotYetReady | PullAnswer::Rejected => {
+            // AUTHORITATIVE no-mint answers on a FRESH claim resolve
+            // the credential: Gone (job settled without us) and
+            // Rejected (bug_119 — answered permanent refusal; the
+            // gates run before any mint).
+            PullAnswer::Gone | PullAnswer::Rejected => {
                 outstanding_mints -= 1;
                 ledger.resolve(job_id)
+            }
+            // merged_bug_096: NotYetReady is NOT proof of no-mint —
+            // the scheduler's post-mint TOCTOU arm answers it AFTER
+            // the durable mint committed with this nonce. The
+            // credential survives (one bounded resume RPC per pass
+            // until Gone or delivery; cap bounds the total); the
+            // PASS budget refunds — the possibly-minted attempt is
+            // ledger-tracked now, and starving the walk behind a
+            // raced head would undo bug_385's in-pass skip.
+            PullAnswer::NotYetReady => {
+                outstanding_mints -= 1;
             }
             // The answer never arrived: the entry STAYS — the next
             // pass resumes it directly with the nonce.
@@ -1259,6 +1320,93 @@ mod tests {
         );
         assert_eq!(t.list_calls, 1);
         assert_eq!(t.pull_calls, 2);
+    }
+
+    /// merged_bug_096 (clobber half): the ledger is the SOLE mint
+    /// authority — a fresh-claim pass cannot mint over a LIVE entry.
+    /// Pre-fix, a job re-appearing in the listing (live PG anti-join +
+    /// a brownout-delayed mint tx) had its persisted credential
+    /// silently replaced by a fresh nonce (note_pull's upsert), which
+    /// destroyed the only proof of the possibly-committed mint.
+    #[tokio::test]
+    async fn fresh_pass_cannot_mint_over_a_live_entry() {
+        let job = Uuid::now_v7();
+        let live_nonce = Uuid::new_v4();
+        let mut ledger = ResumeLedger::default();
+        ledger.note_pull(ResumeEntry {
+            job_id: job,
+            drv_hash: "drv-live".into(),
+            tenant_hint: None,
+            origin: "pruned".into(),
+            nonce: live_nonce,
+        });
+        // The same job is STILL LISTED (pass-N mint tx not yet visible
+        // to pass-N+1's listing snapshot). Resume pull answers
+        // NotYetReady (entry kept); the fresh loop must SKIP the job.
+        let d = rio_proto::types::MaterializationJobDescriptor {
+            job_id: job.to_string(),
+            drv_hash: "drv-live".into(),
+            tenant_id: String::new(),
+            origin: "pruned".into(),
+        };
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![d]))],
+            vec![Ok(not_yet_ready())],
+            vec![],
+        );
+        let claimed = poll_and_claim(
+            &mut t,
+            &instance("store-replica-0"),
+            2,
+            &mut ledger,
+            &mut ListFailureLatch::default(),
+            &token(),
+        )
+        .await;
+        assert!(claimed.is_empty());
+        assert_eq!(
+            t.pull_calls, 1,
+            "one resume pull only — the fresh loop skips the live entry"
+        );
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(
+            t.seen_pull_requests[0].claim_nonce,
+            live_nonce.to_string(),
+            "the LIVE credential is presented, never clobbered by a fresh mint"
+        );
+    }
+
+    /// merged_bug_096 (drop half): a fresh claim answered NotYetReady
+    /// KEEPS its entry. The scheduler's post-mint TOCTOU arm answers
+    /// NotYetReady AFTER the durable mint committed with this worker's
+    /// nonce — dropping the nonce on that answer strands the committed
+    /// mint into the charged establishment window, the exact wedge
+    /// rule-4b was signed to close. (Gone and Rejected still resolve:
+    /// both are authoritative no-mint answers.)
+    #[tokio::test]
+    async fn fresh_not_yet_ready_keeps_the_credential() {
+        let d = descriptor(96);
+        let mut ledger = ResumeLedger::default();
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![d.clone()]))],
+            vec![Ok(not_yet_ready())],
+            vec![],
+        );
+        let claimed = poll_and_claim(
+            &mut t,
+            &instance("store-replica-0"),
+            1,
+            &mut ledger,
+            &mut ListFailureLatch::default(),
+            &token(),
+        )
+        .await;
+        assert!(claimed.is_empty());
+        assert_eq!(
+            ledger.len(),
+            1,
+            "NotYetReady is not proof of no-mint (post-mint TOCTOU answers it) — the credential survives"
+        );
     }
 
     /// bug_099: the fresh-claim walk is budgeted by ISSUED claims
