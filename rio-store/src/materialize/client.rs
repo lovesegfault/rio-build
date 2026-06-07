@@ -507,6 +507,9 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             // proof of holdership (rule-4b).
             resume_exec_id: String::new(),
             claim_nonce: entry.nonce.to_string(),
+            // A resume is a CLAIMING pull (the nonce credential may
+            // re-deliver); never a confirm probe.
+            confirm_only: false,
         };
         match pull_once(transport, shutdown, req, &entry.drv_hash).await {
             PullAnswer::Shutdown => return claimed,
@@ -667,6 +670,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             // executor-invariant-map.md rule-4 anchor).
             resume_exec_id: String::new(),
             claim_nonce: minted.nonce_string(),
+            confirm_only: false,
         };
         match pull_once(transport, shutdown, req, &descriptor.drv_hash).await {
             // SIGTERM mid-pass: return what was already claimed so the

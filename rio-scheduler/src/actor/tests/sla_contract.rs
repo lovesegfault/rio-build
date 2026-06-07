@@ -3632,6 +3632,7 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
             None,
             None,
             None,
+            false,
             tx,
         )
         .await;
@@ -3661,6 +3662,7 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
             None,
             None,
             None,
+            false,
             tx,
         )
         .await;

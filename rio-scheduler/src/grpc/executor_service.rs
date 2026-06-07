@@ -632,6 +632,7 @@ impl ExecutorService for SchedulerGrpc {
                 executor_instance,
                 resume_exec_id,
                 claim_nonce,
+                confirm_only: req.confirm_only,
                 reply: reply_tx,
             })
             .await

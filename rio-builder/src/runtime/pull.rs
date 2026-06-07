@@ -105,6 +105,46 @@ const _: () = assert!(
     2 * SIGTERM_FINAL_ATTEMPT.as_secs() <= rio_common::limits::PULL_MODE_TERMINATION_GRACE_SECS
 );
 
+/// merged_bug_083 — the wire-effect evidence, typed. The latch can be
+/// SET by any post-send uncertainty and CLEARED only by an operation
+/// that is authoritative about every send this process ever made:
+/// there is deliberately NO method that clears it on an interleaved
+/// per-request answer (`NotYetReady` to request N proves nothing
+/// about abandoned request N-1 — no requester-liveness gate exists on
+/// the durable mint), so the pre-fix bug shape (an answer laundering
+/// an earlier maybe-mint) is unrepresentable in the API.
+#[derive(Debug, Default)]
+struct MintEvidence {
+    unconfirmed_send: bool,
+}
+
+impl MintEvidence {
+    /// A pull reached (or may have reached) the wire and was never
+    /// answered: timeout, post-send shutdown abandonment, or a
+    /// post-send transport error (`Resolved(Err)` — transport.rs
+    /// documents Resolved as "answer OR transport error"; a
+    /// connection reset after send is the same epistemic state as a
+    /// timeout).
+    fn latch_send(&mut self) {
+        self.unconfirmed_send = true;
+    }
+
+    /// A LOOP-TERMINATING protocol resolution that is authoritative
+    /// for this pod's whole send history: Gone (the scheduler says
+    /// nothing is or will be held for this intent) or a delivered
+    /// assignment (we hold the work — the report path owns it now).
+    fn clear_loop_terminating(&mut self) {
+        self.unconfirmed_send = false;
+    }
+
+    /// One chokepoint deciding exit-0 from send history
+    /// (merged_bug_083's keystone): true = every pull this process
+    /// ever sent was answered (or none was sent).
+    fn may_exit_zero(&self) -> bool {
+        !self.unconfirmed_send
+    }
+}
+
 /// What the pull phase resolved to.
 #[derive(Debug)]
 pub(super) enum PullPhaseOutcome {
@@ -113,8 +153,10 @@ pub(super) enum PullPhaseOutcome {
     /// No longer wanted: exit 0 without building (charge-free).
     Gone,
     /// Received only `NotYetReady` for the idle bound: exit 0
-    /// charge-free (the OA6 pod-side bounded retry loop).
-    IdleExit,
+    /// charge-free (the OA6 pod-side bounded retry loop) — UNLESS
+    /// `maybe_minted` is set (merged_bug_083: an earlier abandoned
+    /// send may have minted; the caller confirms before any exit 0).
+    IdleExit { maybe_minted: bool },
     /// Shutdown fired while still waiting for work. `maybe_minted` is
     /// the sticky wire-effect latch: false = every pull this process
     /// ever sent was answered (or none was sent) — provably nothing is
@@ -248,10 +290,12 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
     // pull idempotency makes a later answer authoritative about held
     // attempts). Transport errors and empty oneofs are not answers and
     // leave the latch alone.
-    let mut maybe_minted = false;
+    let mut evidence = MintEvidence::default();
     loop {
         if shutdown.is_cancelled() {
-            return PullPhaseOutcome::Shutdown { maybe_minted };
+            return PullPhaseOutcome::Shutdown {
+                maybe_minted: !evidence.may_exit_zero(),
+            };
         }
         let req = PullAssignmentRequest {
             executor_token: executor_token.to_owned(),
@@ -271,10 +315,13 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
                 // Never polled: this request provably did nothing; the
                 // latch keeps whatever earlier attempts established.
                 EffectfulOutcome::ShutdownBeforeSend => {
-                    return PullPhaseOutcome::Shutdown { maybe_minted };
+                    return PullPhaseOutcome::Shutdown {
+                        maybe_minted: !evidence.may_exit_zero(),
+                    };
                 }
                 // Polled then abandoned: the request may be on the wire.
                 EffectfulOutcome::ShutdownAfterSend => {
+                    evidence.latch_send();
                     return PullPhaseOutcome::Shutdown { maybe_minted: true };
                 }
                 EffectfulOutcome::TimedOut { after } => {
@@ -282,24 +329,28 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
                         after_secs = after.as_secs(),
                         "PullAssignment unanswered; retrying"
                     );
-                    maybe_minted = true;
+                    evidence.latch_send();
                     attempt = attempt.saturating_add(1);
                     RETRY_ENVELOPE.duration(attempt - 1)
                 }
                 EffectfulOutcome::Resolved(Ok(resp)) => match resp.outcome {
                     Some(pull_assignment_response::Outcome::Assignment(a)) => {
+                        evidence.clear_loop_terminating();
                         return PullPhaseOutcome::Assigned(Box::new(a));
                     }
                     Some(pull_assignment_response::Outcome::Gone(_)) => {
+                        evidence.clear_loop_terminating();
                         return PullPhaseOutcome::Gone;
                     }
                     Some(pull_assignment_response::Outcome::NotYetReady(nyr)) => {
                         // A NotYetReady answer is contact with the leader:
-                        // reset the unservable backoff curve AND the
-                        // wire-effect latch (an answer is authoritative —
-                        // nothing unconfirmed is held for this pod).
+                        // reset the unservable backoff curve. It does NOT
+                        // clear the wire-effect latch (merged_bug_083: the
+                        // answer is authoritative only about attempts held
+                        // at ITS answer time — an earlier abandoned send
+                        // may still mint; only a loop-terminating answer
+                        // or the confirm-only pull clears).
                         attempt = 0;
-                        maybe_minted = false;
                         let suggested = if nyr.retry_after_seconds == 0 {
                             DEFAULT_RETRY_AFTER
                         } else {
@@ -313,7 +364,9 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
                         // here.
                         idle.on_answer(tokio::time::Instant::now(), suggested);
                         if idle.idle_for() >= idle_timeout {
-                            return PullPhaseOutcome::IdleExit;
+                            return PullPhaseOutcome::IdleExit {
+                                maybe_minted: !evidence.may_exit_zero(),
+                            };
                         }
                         RETRY_AFTER_JITTER.apply(suggested)
                     }
@@ -333,6 +386,10 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
                 EffectfulOutcome::Resolved(Err(status)) => {
                     warn!(code = ?status.code(), msg = status.message(),
                     "PullAssignment unservable; retrying");
+                    // merged_bug_083 residual (1): a post-send transport
+                    // error is the same epistemic state as a timeout —
+                    // the request may have been processed.
+                    evidence.latch_send();
                     attempt = attempt.saturating_add(1);
                     RETRY_ENVELOPE.duration(attempt - 1)
                 }
@@ -342,7 +399,9 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
         // backoff under a deletion grace period).
         tokio::select! {
             biased;
-            _ = shutdown.cancelled() => return PullPhaseOutcome::Shutdown { maybe_minted },
+            _ = shutdown.cancelled() => return PullPhaseOutcome::Shutdown {
+                maybe_minted: !evidence.may_exit_zero(),
+            },
             _ = tokio::time::sleep(delay) => {}
         }
     }
@@ -549,7 +608,7 @@ async fn build_phase_with_abort(
 ///   `Succeeded` one.
 ///
 /// Returns true iff the maybe-minted state was resolved clean.
-async fn resolve_shutdown<T: PullTransport>(
+async fn resolve_maybe_minted<T: PullTransport>(
     transport: &mut T,
     intent_id: &str,
     executor_token: &str,
@@ -558,6 +617,12 @@ async fn resolve_shutdown<T: PullTransport>(
     let req = PullAssignmentRequest {
         executor_token: executor_token.to_owned(),
         intent_id: intent_id.to_owned(),
+        // merged_bug_083 residual (3): the confirm probe is a READ —
+        // the wire discriminator screens the DeliverNew admission, so
+        // the probe itself can never mint fresh work for a dying or
+        // idle-exiting pod (pre-field it could: kernel
+        // `Ready => DeliverNew`).
+        confirm_only: true,
         ..Default::default()
     };
     let resp = match tokio::time::timeout(SIGTERM_FINAL_ATTEMPT, transport.pull(req)).await {
@@ -633,7 +698,9 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
             run_teardown(rt);
             return Ok(());
         }
-        PullPhaseOutcome::IdleExit => {
+        PullPhaseOutcome::IdleExit {
+            maybe_minted: false,
+        } => {
             info!(
                 intent_id = %rt.intent_id,
                 idle_secs = rt.idle_timeout.as_secs(),
@@ -641,6 +708,26 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
             );
             run_teardown(rt);
             return Ok(());
+        }
+        PullPhaseOutcome::IdleExit { maybe_minted: true } => {
+            // merged_bug_083: an exit-0 with unconfirmed sends in the
+            // history must CONFIRM first — same resolution protocol as
+            // the SIGTERM path (the confirm-only pull cannot mint).
+            info!(
+                intent_id = %rt.intent_id,
+                "idle bound reached with unconfirmed sends; confirming before exit"
+            );
+            let resolved =
+                resolve_maybe_minted(&mut transport, &rt.intent_id, &executor_token, &rt.shutdown)
+                    .await;
+            run_teardown(rt);
+            if resolved {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "idle-exit confirm could not resolve the maybe-minted state; exiting nonzero \
+                 so the establishment sweep reaps against a Failed pod"
+            );
         }
         PullPhaseOutcome::Shutdown {
             maybe_minted: false,
@@ -653,7 +740,7 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
         }
         PullPhaseOutcome::Shutdown { maybe_minted: true } => {
             let resolved =
-                resolve_shutdown(&mut transport, &rt.intent_id, &executor_token, &rt.shutdown)
+                resolve_maybe_minted(&mut transport, &rt.intent_id, &executor_token, &rt.shutdown)
                     .await;
             run_teardown(rt);
             if resolved {
@@ -908,6 +995,45 @@ mod tests {
         ));
     }
 
+    /// merged_bug_083 residuals (1)+(2): the wire-effect latch is
+    /// TOTAL over post-send uncertainty. A non-fatal transport error
+    /// after send is the same epistemic state as a timeout (the
+    /// request may have been processed; transport.rs documents
+    /// Resolved as "answer OR transport error"), so it LATCHES; and an
+    /// interleaved NotYetReady to a LATER request is not proof the
+    /// EARLIER abandoned request never minted (no requester-liveness
+    /// gate exists on the durable mint), so it must NOT clear the
+    /// latch. Pre-fix: the error arm never latched and NotYetReady
+    /// cleared -- a SIGTERM after [err, nyr] exited 0 with a possibly
+    /// durable open attempt (the Succeeded-Job-with-charged-crash
+    /// state).
+    // r[verify builder.pull.exit-codes+1]
+    #[tokio::test(start_paused = true)]
+    async fn post_send_error_then_nyr_keeps_the_latch() {
+        let mut t = ScriptedTransport::new(
+            vec![
+                // Post-send transport fault: epistemically maybe-sent.
+                Err(tonic::Status::unknown("h2 connection reset post-send")),
+                // A LATER request answered NotYetReady: authoritative
+                // only about attempts held at ITS answer time.
+                Ok(not_yet_ready_resp(1)),
+            ],
+            vec![],
+        );
+        let shutdown = token();
+        let sd = shutdown.clone();
+        tokio::spawn(async move {
+            // Past the error backoff and the NYR retry_after.
+            tokio::time::sleep(Duration::from_secs(40)).await;
+            sd.cancel();
+        });
+        let outcome = pull_until_resolved(&mut t, "intent-mm", "tok", IDLE, &shutdown).await;
+        assert!(
+            matches!(outcome, PullPhaseOutcome::Shutdown { maybe_minted: true }),
+            "post-send error latches and an interleaved NotYetReady cannot launder it, got {outcome:?}"
+        );
+    }
+
     /// (2) timed-out pull, then SIGTERM in the backoff → maybe_minted
     /// (the sticky latch survives the non-answer gap).
     // r[verify builder.pull.exit-codes+1]
@@ -958,12 +1084,18 @@ mod tests {
         assert_eq!(t.pull_calls, 0, "nothing may be sent after shutdown");
     }
 
-    /// (4) a timed-out pull followed by a NotYetReady ANSWER clears the
-    /// latch — the answer is authoritative (pull idempotency), so a
-    /// later SIGTERM exits clean.
+    /// (4) RE-AIMED by merged_bug_083: a timed-out pull followed by a
+    /// NotYetReady answer to a LATER request keeps the latch — the
+    /// signed rule text defines maybe-minted PER PULL ("a pull that
+    /// reached the wire and was never answered"), and pull #1 was
+    /// never answered; pull #2's answer is authoritative only about
+    /// holdings at ITS answer time (no requester-liveness gate exists
+    /// on the durable mint). The pre-fix clear was the laundering this
+    /// test used to assert; exit 0 is still reached, via the blessed
+    /// bounded confirm pull instead of by assumption.
     // r[verify builder.pull.exit-codes+1]
     #[tokio::test(start_paused = true)]
-    async fn answer_after_timeout_clears_the_latch() {
+    async fn answer_after_timeout_keeps_the_latch() {
         struct HangThenAnswer {
             calls: u32,
         }
@@ -994,13 +1126,9 @@ mod tests {
         });
         let outcome = pull_until_resolved(&mut t, "intent-a", "tok", IDLE, &shutdown).await;
         assert!(
-            matches!(
-                outcome,
-                PullPhaseOutcome::Shutdown {
-                    maybe_minted: false
-                }
-            ),
-            "a protocol answer must clear the wire-effect latch, got {outcome:?}"
+            matches!(outcome, PullPhaseOutcome::Shutdown { maybe_minted: true }),
+            "the timed-out pull was never answered -- an interleaved answer to a \
+             later request must not launder it, got {outcome:?}"
         );
     }
 
@@ -1015,21 +1143,21 @@ mod tests {
         shutdown.cancel();
         // NotYetReady → clean, exactly one RPC.
         let mut t = ScriptedTransport::new(vec![Ok(not_yet_ready_resp(5))], vec![]);
-        assert!(resolve_shutdown(&mut t, "i", "tok", &shutdown).await);
+        assert!(resolve_maybe_minted(&mut t, "i", "tok", &shutdown).await);
         assert_eq!((t.pull_calls, t.report_calls), (1, 0));
         // Minted → synthesized Cancelled, acked → clean.
         let mut t = ScriptedTransport::new(vec![Ok(assignment_resp("exec-9"))], vec![Ok(())]);
-        assert!(resolve_shutdown(&mut t, "i", "tok", &shutdown).await);
+        assert!(resolve_maybe_minted(&mut t, "i", "tok", &shutdown).await);
         assert_eq!((t.pull_calls, t.report_calls), (1, 1));
         // Confirm pull errors → unresolved.
         let mut t = ScriptedTransport::new(vec![Err(tonic::Status::unavailable("gone"))], vec![]);
-        assert!(!resolve_shutdown(&mut t, "i", "tok", &shutdown).await);
+        assert!(!resolve_maybe_minted(&mut t, "i", "tok", &shutdown).await);
         // Minted but the report is never acked → unresolved.
         let mut t = ScriptedTransport::new(
             vec![Ok(assignment_resp("exec-9"))],
             vec![Err(tonic::Status::unavailable("no leader"))],
         );
-        assert!(!resolve_shutdown(&mut t, "i", "tok", &shutdown).await);
+        assert!(!resolve_maybe_minted(&mut t, "i", "tok", &shutdown).await);
     }
 
     /// (b) `Gone` resolves immediately: exit 0 without building, no
@@ -1055,7 +1183,15 @@ mod tests {
         let shutdown = token();
         let started = tokio::time::Instant::now();
         let outcome = pull_until_resolved(&mut t, "intent-a", "tok", IDLE, &shutdown).await;
-        assert!(matches!(outcome, PullPhaseOutcome::IdleExit));
+        assert!(
+            matches!(
+                outcome,
+                PullPhaseOutcome::IdleExit {
+                    maybe_minted: false
+                }
+            ),
+            "pure answered NYRs: idle exit is provably clean, got {outcome:?}"
+        );
         let waited = started.elapsed();
         assert!(
             waited >= IDLE,
@@ -1414,7 +1550,11 @@ mod tests {
         let mut t = ScriptedTransport::new(pulls, vec![]);
         let shutdown = token();
         let outcome = pull_until_resolved(&mut t, "intent-idle", "tok", IDLE, &shutdown).await;
-        assert!(matches!(outcome, PullPhaseOutcome::IdleExit));
+        assert!(
+            matches!(outcome, PullPhaseOutcome::IdleExit { maybe_minted: true }),
+            "the 14 post-send transport errors are unconfirmed sends — the idle \
+             exit must carry the latch into the confirm pass, got {outcome:?}"
+        );
         // Structural assertion (jitter-proof): if the outage counted,
         // the FIRST post-outage answer would exit (1 NYR + 14 errors +
         // 1 NYR = 16 calls). Told-time accumulation requires ~120 s of

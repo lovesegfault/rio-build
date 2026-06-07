@@ -592,6 +592,7 @@ async fn flag_on_infra_failure_charges_and_rearms() -> TestResult {
             executor_instance: Some("store-replica-0".into()),
             resume_exec_id: None,
             claim_nonce: None,
+            confirm_only: false,
             reply,
         })
         .await
@@ -697,6 +698,7 @@ async fn aborted_outcome_closes_attempt_uncharged() -> TestResult {
             executor_instance: Some("store-replica-0-w0".into()),
             resume_exec_id: None,
             claim_nonce: None,
+            confirm_only: false,
             reply,
         })
         .await
@@ -761,6 +763,7 @@ async fn aborted_outcome_closes_attempt_uncharged() -> TestResult {
             executor_instance: Some("store-replica-1-w0".into()),
             resume_exec_id: None,
             claim_nonce: None,
+            confirm_only: false,
             reply,
         })
         .await
@@ -801,6 +804,7 @@ async fn retry_later_consumption_closes_uncharged_and_defers() -> TestResult {
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-0-w0".into()),
             claim_nonce: None,
+            confirm_only: false,
             reply,
             resume_exec_id: None,
         })
@@ -871,6 +875,7 @@ async fn retry_later_consumption_closes_uncharged_and_defers() -> TestResult {
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-1-w0".into()),
             claim_nonce: None,
+            confirm_only: false,
             reply,
             resume_exec_id: None,
         })
@@ -934,6 +939,7 @@ async fn deferred_job_hidden_from_listing_until_admittable() -> TestResult {
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-0-w0".into()),
             claim_nonce: None,
+            confirm_only: false,
             reply,
             resume_exec_id: None,
         })
@@ -995,6 +1001,7 @@ async fn deferred_job_hidden_from_listing_until_admittable() -> TestResult {
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-1-w0".into()),
             claim_nonce: None,
+            confirm_only: false,
             reply,
             resume_exec_id: None,
         })
@@ -1012,6 +1019,7 @@ async fn deferred_job_hidden_from_listing_until_admittable() -> TestResult {
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-1-w0".into()),
             claim_nonce: None,
+            confirm_only: false,
             reply,
             resume_exec_id: None,
         })
@@ -1365,6 +1373,7 @@ async fn establishment_writes_materialization_infra_never_adopts() -> TestResult
             executor_instance: Some("store-replica-0".into()),
             resume_exec_id: None,
             claim_nonce: None,
+            confirm_only: false,
             reply,
         })
         .await
@@ -1443,6 +1452,7 @@ async fn cancellation_closes_open_attempt_charge_free() -> TestResult {
             executor_instance: Some("store-replica-0".into()),
             resume_exec_id: None,
             claim_nonce: None,
+            confirm_only: false,
             reply,
         })
         .await
@@ -1552,6 +1562,7 @@ async fn claim_materialization(
             executor_instance: Some(instance.into()),
             resume_exec_id: None,
             claim_nonce: None,
+            confirm_only: false,
             reply,
         })
         .await
@@ -1575,6 +1586,7 @@ async fn resume_materialization(
             executor_instance: Some(instance.into()),
             resume_exec_id: Some(exec_id),
             claim_nonce: None,
+            confirm_only: false,
             reply,
         })
         .await
@@ -1600,6 +1612,7 @@ async fn claim_materialization_with_nonce(
             executor_instance: Some(instance.into()),
             resume_exec_id: None,
             claim_nonce: Some(nonce),
+            confirm_only: false,
             reply,
         })
         .await

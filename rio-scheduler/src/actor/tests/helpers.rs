@@ -1042,6 +1042,7 @@ pub(crate) async fn try_pull_attempt(
             executor_instance: None,
             resume_exec_id: None,
             claim_nonce: None,
+            confirm_only: false,
             reply,
         })
         .await

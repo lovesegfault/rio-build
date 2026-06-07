@@ -117,6 +117,7 @@ async fn materialization_pull_with_empty_instance_rejected() -> anyhow::Result<(
             executor_instance: String::new(),
             resume_exec_id: String::new(),
             claim_nonce: String::new(),
+            confirm_only: false,
         }))
         .await
         .expect_err("a materialization pull without executor_instance must be rejected");
@@ -186,6 +187,7 @@ async fn materialization_pull_with_executor_token_rejected() -> anyhow::Result<(
             executor_instance: "store-replica-0".into(),
             resume_exec_id: String::new(),
             claim_nonce: String::new(),
+            confirm_only: false,
         }))
         .await
         .expect_err("a builder-kind executor token must not authorize a materialization pull");
@@ -203,6 +205,7 @@ async fn materialization_pull_with_executor_token_rejected() -> anyhow::Result<(
         executor_instance: "store-replica-0".into(),
         resume_exec_id: String::new(),
         claim_nonce: String::new(),
+        confirm_only: false,
     });
     req.metadata_mut()
         .insert(rio_proto::EXECUTOR_TOKEN_HEADER, token.parse()?);
@@ -332,6 +335,7 @@ async fn materialization_pull_instance_validated_as_dns_label() -> anyhow::Resul
                 executor_instance: bad.into(),
                 resume_exec_id: String::new(),
                 claim_nonce: String::new(),
+                confirm_only: false,
             }))
             .await
             .expect_err("malformed executor_instance must be rejected");
@@ -351,6 +355,7 @@ async fn materialization_pull_instance_validated_as_dns_label() -> anyhow::Resul
             executor_instance: "store-replica-0".into(),
             resume_exec_id: String::new(),
             claim_nonce: String::new(),
+            confirm_only: false,
         }))
         .await
         .expect("a valid DNS-1123 instance is accepted")
@@ -407,6 +412,7 @@ async fn pull_intent_id_with_separator_rejected() -> anyhow::Result<()> {
             executor_instance: String::new(),
             resume_exec_id: String::new(),
             claim_nonce: String::new(),
+            confirm_only: false,
         }))
         .await
         .expect_err("a build pull whose attested intent contains '@' must be rejected");
@@ -429,6 +435,7 @@ async fn pull_intent_id_with_separator_rejected() -> anyhow::Result<()> {
             executor_instance: "store-replica-0".into(),
             resume_exec_id: String::new(),
             claim_nonce: String::new(),
+            confirm_only: false,
         }))
         .await
         .expect_err("a materialization pull whose intent contains '@' must be rejected");
@@ -552,6 +559,7 @@ async fn materialization_ops_accept_store_service_credential() -> anyhow::Result
         executor_instance: "store-replica-0".into(),
         resume_exec_id: String::new(),
         claim_nonce: String::new(),
+        confirm_only: false,
     });
     req.metadata_mut()
         .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
@@ -628,6 +636,7 @@ async fn store_service_credential_scoping_is_exact() -> anyhow::Result<()> {
         executor_instance: "store-replica-0".into(),
         resume_exec_id: String::new(),
         claim_nonce: String::new(),
+        confirm_only: false,
     });
     req.metadata_mut().insert(
         rio_common::grpc::SERVICE_TOKEN_HEADER,
@@ -731,6 +740,7 @@ async fn materialization_claim_with_mismatched_instance_rejected() -> anyhow::Re
         executor_instance: "store-b".into(),
         resume_exec_id: String::new(),
         claim_nonce: String::new(),
+        confirm_only: false,
     });
     req.metadata_mut()
         .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, token_a.parse()?);
@@ -759,6 +769,7 @@ async fn materialization_claim_with_mismatched_instance_rejected() -> anyhow::Re
         executor_instance: "store-a".into(),
         resume_exec_id: String::new(),
         claim_nonce: String::new(),
+        confirm_only: false,
     });
     req.metadata_mut()
         .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, token_a.parse()?);
@@ -808,6 +819,7 @@ async fn materialization_claim_without_instance_claim_rejected() -> anyhow::Resu
         executor_instance: "store-replica-0".into(),
         resume_exec_id: String::new(),
         claim_nonce: String::new(),
+        confirm_only: false,
     });
     req.metadata_mut()
         .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, unbound.parse()?);
@@ -1141,6 +1153,7 @@ async fn flag_on_materialization_lifecycle_through_grpc() -> anyhow::Result<()> 
         executor_instance: String::new(),
         resume_exec_id: String::new(),
         claim_nonce: String::new(),
+        confirm_only: false,
     });
     req.metadata_mut()
         .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
@@ -1159,6 +1172,7 @@ async fn flag_on_materialization_lifecycle_through_grpc() -> anyhow::Result<()> 
         executor_instance: "store-test-0".into(),
         resume_exec_id: String::new(),
         claim_nonce: String::new(),
+        confirm_only: false,
     });
     req.metadata_mut()
         .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
@@ -1289,6 +1303,7 @@ async fn flag_on_progress_relay_reaches_build_events() -> anyhow::Result<()> {
         executor_instance: "store-test-0".into(),
         resume_exec_id: String::new(),
         claim_nonce: String::new(),
+        confirm_only: false,
     });
     req.metadata_mut()
         .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
@@ -1392,6 +1407,7 @@ async fn call_mat_surface(
                 executor_instance: "store-replica-0".into(),
                 resume_exec_id: String::new(),
                 claim_nonce: String::new(),
+                confirm_only: false,
             }))
             .await
             .map(|_| ()),
@@ -1620,6 +1636,7 @@ async fn every_executor_service_method_is_standby_gated() -> anyhow::Result<()> 
                     executor_instance: String::new(),
                     resume_exec_id: String::new(),
                     claim_nonce: String::new(),
+                    confirm_only: false,
                 }))
                 .await
                 .expect_err("standby")

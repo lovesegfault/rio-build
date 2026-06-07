@@ -21,6 +21,29 @@ async fn pull(
             executor_instance: None,
             resume_exec_id: None,
             claim_nonce: None,
+            confirm_only: false,
+            reply,
+        })
+        .await
+        .expect("actor alive")
+}
+
+/// [`pull`] with the merged_bug_083 confirm-only discriminator: a
+/// READ of the puller's holdings -- never a mint.
+async fn confirm_pull(
+    handle: &ActorHandle,
+    intent_id: &str,
+    auth_intent: Option<&str>,
+) -> Result<PullOutcome, PullRejection> {
+    handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: intent_id.into(),
+            auth_intent: auth_intent.map(Into::into),
+            kind: rio_evidence_kernel::pull::PullKind::Build,
+            executor_instance: None,
+            resume_exec_id: None,
+            claim_nonce: None,
+            confirm_only: true,
             reply,
         })
         .await
@@ -1928,4 +1951,45 @@ async fn clear_minted_source_node(
         .execute(pool)
         .await
         .map(|_| ())
+}
+
+/// merged_bug_083 residual (3): the confirm-only pull is a READ. On a
+/// Ready node -- where a plain pull mints (`Ready => DeliverNew`) --
+/// the confirm probe answers NotYetReady and writes NOTHING; after a
+/// real mint, the same probe re-delivers the existing attempt
+/// (DeliverExisting passes the screen). Pre-field, resolve-shutdown's
+/// probe was a plain pull: the dying pod's own confirm could mint
+/// fresh work for it.
+// r[verify builder.pull.exit-codes+1]
+#[tokio::test]
+async fn confirm_only_pull_never_mints() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "confirm-ro",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+
+    // Confirm probe on a Ready (mintable) node: screened, no mint.
+    let outcome = confirm_pull(&handle, "confirm-ro", Some("confirm-ro")).await;
+    assert!(
+        matches!(outcome, Ok(PullOutcome::NotYetReady { .. })),
+        "confirm-only on a Ready node must screen the mint, got {outcome:?}"
+    );
+    let (assignments, execs) = row_counts(&db.pool, "confirm-ro").await;
+    assert_eq!((assignments, execs), (0, 0), "the probe wrote nothing");
+
+    // A real claiming pull mints; the confirm probe then RE-DELIVERS
+    // the held attempt (DeliverExisting passes the screen).
+    let first = expect_deliver(pull(&handle, "confirm-ro", Some("confirm-ro")).await);
+    let confirmed = expect_deliver(confirm_pull(&handle, "confirm-ro", Some("confirm-ro")).await);
+    assert_eq!(
+        first.exec_id, confirmed.exec_id,
+        "the confirm probe re-delivers the SAME open attempt, never a new one"
+    );
+    let (assignments, _execs) = row_counts(&db.pool, "confirm-ro").await;
+    assert_eq!(assignments, 1, "still exactly one mint");
+    Ok(())
 }

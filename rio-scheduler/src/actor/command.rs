@@ -152,6 +152,13 @@ pub enum ActorCommand {
         /// the assignment at mint, compared by the kernel's
         /// re-delivery cell. Always `None` for build pulls.
         claim_nonce: Option<uuid::Uuid>,
+        /// merged_bug_083: confirm-only pull
+        /// (`PullAssignmentRequest.confirm_only`) — a READ of the
+        /// puller's holdings. The DeliverNew admission is screened to
+        /// NotYetReady at the decision-consumption site, so a confirm
+        /// probe can never mint fresh work for a dying/idle-exiting
+        /// pod.
+        confirm_only: bool,
         reply: oneshot::Sender<Result<super::pull::PullOutcome, super::pull::PullRejection>>,
     },
 

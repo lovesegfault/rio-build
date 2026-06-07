@@ -507,6 +507,21 @@ message PullAssignmentRequest {
   // store (an old scheduler never persists it — the store's resume
   // degrades to the establishment window, the pre-field behavior).
   string claim_nonce = 6;
+  // NEW (additive, bughunt-3 — merged_bug_083): confirm-only pull.
+  // When set, the pull is a READ of this pod's holdings — the
+  // scheduler answers DeliverExisting (an attempt already bound to
+  // this identity), Gone, or NotYetReady, and NEVER mints a fresh
+  // attempt (the DeliverNew admission is screened to NotYetReady).
+  // Used by the builder's maybe-minted resolution (SIGTERM and
+  // idle-exit confirm passes): pre-field, the confirm probe was a
+  // plain pull the kernel could answer `Ready => DeliverNew`, so the
+  // probe itself could mint fresh work for a dying pod. False/absent
+  // (proto3 zero value) = a normal claiming pull — old builders and
+  // old schedulers interoperate bit-for-bit (an old scheduler
+  // ignoring the flag can still mint on a confirm probe: the
+  // pre-field behavior, handled by the synthesized-Cancelled report
+  // path). Deploy order: any (additive).
+  bool confirm_only = 7;
 }
 
 // The drv is no longer wanted (cancelled, substituted, completed,

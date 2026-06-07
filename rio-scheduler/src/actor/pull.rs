@@ -258,6 +258,7 @@ impl DagActor {
         executor_instance: Option<String>,
         resume_exec_id: Option<Uuid>,
         claim_nonce: Option<Uuid>,
+        confirm_only: bool,
         reply: oneshot::Sender<Result<PullOutcome, PullRejection>>,
     ) {
         let result = self
@@ -268,6 +269,7 @@ impl DagActor {
                 executor_instance.as_deref(),
                 resume_exec_id,
                 claim_nonce,
+                confirm_only,
             )
             .await;
         let _ = reply.send(result);
@@ -282,6 +284,7 @@ impl DagActor {
         executor_instance: Option<&str>,
         resume_exec_id: Option<Uuid>,
         claim_nonce: Option<Uuid>,
+        confirm_only: bool,
     ) -> Result<PullOutcome, PullRejection> {
         // Standby replicas answer nothing (the gRPC layer already
         // gates; this closes the in-flight-deposed window).
@@ -380,6 +383,29 @@ impl DagActor {
                 "materialization claim answered NotYetReady: job view unavailable (degraded term — never Gone for a job we cannot see)"
             );
             PullDecision::NotYetReady
+        } else {
+            decision
+        };
+
+        // merged_bug_083 (the confirm screen): a confirm-only pull is a
+        // READ of this puller's holdings — DeliverNew (the only
+        // minting admission) is screened to NotYetReady BEFORE the
+        // decision is consumed, so the mint arm below is structurally
+        // unreachable on a confirm probe. Exhaustive match: a future
+        // PullDecision variant forces a screening decision here.
+        let decision = if confirm_only {
+            match decision {
+                PullDecision::DeliverNew => {
+                    debug!(intent_id = %intent_id,
+                           "confirm-only pull screened a DeliverNew admission to NotYetReady");
+                    PullDecision::NotYetReady
+                }
+                d @ (PullDecision::RejectToken
+                | PullDecision::RejectStaleGeneration
+                | PullDecision::Gone
+                | PullDecision::NotYetReady
+                | PullDecision::DeliverExisting { .. }) => d,
+            }
         } else {
             decision
         };
